@@ -55,5 +55,9 @@ name = "ox-ui"
 version = "0.1.0"
 
 [[package]]
+name = "ox-uv"
+version = "0.1.0"
+
+[[package]]
 name = "oxvim"
 version = "0.1.0"

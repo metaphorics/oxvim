@@ -1,2 +1,3 @@
-// unsafe-permitted crate: FFI surface; safe API exposed to dependents.
-//! libuv event loop wrapper, fast/deferred work queues.
+//! mio reactor, timer heap, MultiQueue, and fast/deferred work queues.
+
+#![forbid(unsafe_code)]

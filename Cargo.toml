@@ -4,6 +4,7 @@ members = [
     "crates/ox-types",
     "crates/ox-rpc",
     "crates/ox-loop",
+    "crates/ox-uv",
     "crates/ox-text",
     "crates/ox-regex",
     "crates/ox-eval",
@@ -30,7 +31,9 @@ rmpv = "1.3.1"
 rmp-serde = "1.3.1"
 tree-sitter = "0.26.12"
 ropey = "1.6.1"
-libuv-sys2 = "1.52.3"
+mio = { version = "1.2.2", features = ["net", "os-ext"] }
+signal-hook = "0.4.4"
+rustix = { version = "1.1.4", features = ["process", "termios", "pty", "fs", "net"] }
 similar = "3.2.0"
 encoding_rs = "0.8.35"
 crossterm = "0.29.0"

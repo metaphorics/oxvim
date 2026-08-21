@@ -1,0 +1,9 @@
+[package]
+name = "ox-uv"
+description = "Pure-Rust vim.uv engine: handles, fs thread pool, process/PTY, net, dns, signals"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
