@@ -209,6 +209,7 @@ dependencies = [
 name = "ox-editor"
 version = "0.1.0"
 dependencies = [
+ "ox-excmd",
  "ox-text",
  "ox-types",
  "thiserror 2.0.20",

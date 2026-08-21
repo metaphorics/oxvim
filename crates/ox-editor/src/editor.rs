@@ -6,11 +6,14 @@ use ox_text::{Buffer, Position};
 use ox_types::{BufHandle, TabHandle, WinHandle};
 use thiserror::Error;
 
+use crate::autocmd::Autocmds;
 use crate::buffer::{BufferState, BufferStateError};
 use crate::layout::{Geometry, Layout, LayoutError, TabpageState, WinConfig, WindowState};
+use crate::mapping::Mappings;
 use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError};
 use crate::options::OptionStore;
 use crate::register::{put_content, RegisterError, Registers};
+use crate::typeahead::Typeahead;
 
 /// Failures while mutating [`Editor`] state.
 #[derive(Debug, Error)]
@@ -79,6 +82,12 @@ pub struct Editor {
     jumplist: Jumplist,
     /// Buffer-separated change histories.
     changelists: Changelists,
+    /// Registered autocmds and augroups.
+    autocmds: Autocmds,
+    /// Mode-aware mappings and insert abbreviations.
+    mappings: Mappings,
+    /// Encoded pending input stack.
+    typeahead: Typeahead,
     current_tab: Option<TabHandle>,
     next_buffer: i64,
     next_window: i64,
@@ -104,6 +113,9 @@ impl Editor {
             global_marks: GlobalMarks::new(),
             jumplist: Jumplist::new(),
             changelists: Changelists::new(),
+            autocmds: Autocmds::new(),
+            mappings: Mappings::new(),
+            typeahead: Typeahead::new(),
             current_tab: None,
             next_buffer: 1,
             next_window: 1,
@@ -266,6 +278,39 @@ impl Editor {
         &self.changelists
     }
 
+    /// Returns registered autocmd and augroup state.
+    #[must_use]
+    pub const fn autocmds(&self) -> &Autocmds {
+        &self.autocmds
+    }
+
+    /// Returns mutable autocmd and augroup state.
+    pub const fn autocmds_mut(&mut self) -> &mut Autocmds {
+        &mut self.autocmds
+    }
+
+    /// Returns mapping and abbreviation state.
+    #[must_use]
+    pub const fn mappings(&self) -> &Mappings {
+        &self.mappings
+    }
+
+    /// Returns mutable mapping and abbreviation state.
+    pub const fn mappings_mut(&mut self) -> &mut Mappings {
+        &mut self.mappings
+    }
+
+    /// Returns queued encoded input.
+    #[must_use]
+    pub const fn typeahead(&self) -> &Typeahead {
+        &self.typeahead
+    }
+
+    /// Returns mutable queued encoded input.
+    pub const fn typeahead_mut(&mut self) -> &mut Typeahead {
+        &mut self.typeahead
+    }
+
     /// Allocates a listed, loaded empty buffer.
     pub fn create_buffer(&mut self, listed: bool) -> Result<BufHandle, EditorError> {
         self.create_buffer_with(Buffer::new(), listed)
@@ -296,6 +341,8 @@ impl Editor {
         }
         self.changelists.remove_buffer(buffer);
         self.options.remove_buffer(buffer);
+        self.autocmds.remove_buffer(buffer);
+        self.mappings.remove_buffer(buffer);
         self.buffers
             .remove(&buffer)
             .ok_or(EditorError::UnknownBuffer(buffer))
