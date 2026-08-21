@@ -12,7 +12,8 @@ use crate::scope::Scope;
 
 fn text(value: &str) -> Typval { Typval::String(OxStr::from(value)) }
 fn number(value: i64) -> Typval { Typval::Number(value) }
-fn list(values: &[i64]) -> Typval { Typval::List(values.iter().copied().map(Typval::Number).collect()) }
+fn list(values: &[i64]) -> Typval { Typval::list(values.iter().copied().map(Typval::Number).collect()) }
+fn funcref(name: &str) -> Typval { Typval::Funcref(ox_types::Funcref { name: OxStr::from(name), args: vec![], dict: None, registry: None }) }
 fn call(name: &str, args: Vec<Typval>) -> crate::Result<Typval> {
     let mut builtins = Builtins::without_regex();
     builtins.call(&OxStr::from(name), args, &mut Scope::new())
@@ -49,10 +50,10 @@ case!(empty_nonzero, "empty", [number(1)], number(0));
 case!(empty_string, "empty", [text("")], number(1));
 case!(empty_nonempty_string, "empty", [text("x")], number(0));
 case!(empty_list, "empty", [list(&[])], number(1));
-case!(empty_dict, "empty", [Typval::Dict(vec![])], number(1));
+case!(empty_dict, "empty", [Typval::dict(vec![])], number(1));
 case!(len_string_bytes, "len", [text("abc")], number(3));
 case!(len_list, "len", [list(&[1, 2, 3])], number(3));
-case!(len_dict, "len", [Typval::Dict(vec![(OxStr::from("a"), number(1))])], number(1));
+case!(len_dict, "len", [Typval::dict(vec![(OxStr::from("a"), number(1))])], number(1));
 case!(strlen_unicode_bytes, "strlen", [text("é")], number(2));
 case!(strcharlen_unicode, "strcharlen", [text("é")], number(1));
 case!(strchars_ascii, "strchars", [text("abc")], number(3));
@@ -62,8 +63,8 @@ case!(trim_default, "trim", [text("  a \n")], text("a"));
 case!(trim_mask, "trim", [text("xxabcxx"), text("x")], text("abc"));
 case!(trim_left, "trim", [text("xxabcxx"), text("x"), number(1)], text("abcxx"));
 case!(trim_right, "trim", [text("xxabcxx"), text("x"), number(2)], text("xxabc"));
-case!(join_default, "join", [Typval::List(vec![text("a"), text("b")])], text("a b"));
-case!(join_custom, "join", [Typval::List(vec![text("a"), text("b")]), text(",")], text("a,b"));
+case!(join_default, "join", [Typval::list(vec![text("a"), text("b")])], text("a b"));
+case!(join_custom, "join", [Typval::list(vec![text("a"), text("b")]), text(",")], text("a,b"));
 case!(repeat_string, "repeat", [text("ab"), number(3)], text("ababab"));
 case!(repeat_string_zero, "repeat", [text("ab"), number(0)], text(""));
 case!(repeat_list, "repeat", [list(&[1, 2]), number(2)], list(&[1, 2, 1, 2]));
@@ -83,23 +84,23 @@ case!(add_list, "add", [list(&[1, 2]), number(3)], list(&[1, 2, 3]));
 case!(add_blob, "add", [Typval::Blob(vec![1, 2]), number(3)], Typval::Blob(vec![1, 2, 3]));
 case!(copy_number, "copy", [number(4)], number(4));
 case!(copy_list, "copy", [list(&[1, 2])], list(&[1, 2]));
-case!(deepcopy_nested, "deepcopy", [Typval::List(vec![list(&[1])])], Typval::List(vec![list(&[1])]));
+case!(deepcopy_nested, "deepcopy", [Typval::list(vec![list(&[1])])], Typval::list(vec![list(&[1])]));
 case!(count_list, "count", [list(&[1, 2, 1]), number(1)], number(2));
 case!(count_string, "count", [text("aaaa"), text("aa")], number(2));
 case!(get_list, "get", [list(&[4, 5]), number(1)], number(5));
 case!(get_list_negative, "get", [list(&[4, 5]), number(-1)], number(5));
 case!(get_list_default, "get", [list(&[4]), number(9), number(7)], number(7));
 case!(get_blob, "get", [Typval::Blob(vec![8]), number(0)], number(8));
-case!(get_dict, "get", [Typval::Dict(vec![(OxStr::from("k"), number(9))]), text("k")], number(9));
-case!(has_key_true, "has_key", [Typval::Dict(vec![(OxStr::from("k"), number(1))]), text("k")], number(1));
-case!(has_key_false, "has_key", [Typval::Dict(vec![]), text("k")], number(0));
+case!(get_dict, "get", [Typval::dict(vec![(OxStr::from("k"), number(9))]), text("k")], number(9));
+case!(has_key_true, "has_key", [Typval::dict(vec![(OxStr::from("k"), number(1))]), text("k")], number(1));
+case!(has_key_false, "has_key", [Typval::dict(vec![]), text("k")], number(0));
 case!(index_found, "index", [list(&[4, 5, 4]), number(5)], number(1));
 case!(index_missing, "index", [list(&[4, 5]), number(9)], number(-1));
 case!(insert_front, "insert", [list(&[2, 3]), number(1)], list(&[1, 2, 3]));
 case!(insert_middle, "insert", [list(&[1, 3]), number(2), number(1)], list(&[1, 2, 3]));
-case!(keys_dict, "keys", [Typval::Dict(vec![(OxStr::from("a"), number(1)), (OxStr::from("b"), number(2))])], Typval::List(vec![text("a"), text("b")]));
-case!(values_dict, "values", [Typval::Dict(vec![(OxStr::from("a"), number(1)), (OxStr::from("b"), number(2))])], list(&[1, 2]));
-case!(items_dict, "items", [Typval::Dict(vec![(OxStr::from("a"), number(1))])], Typval::List(vec![Typval::List(vec![text("a"), number(1)])]));
+case!(keys_dict, "keys", [Typval::dict(vec![(OxStr::from("a"), number(1)), (OxStr::from("b"), number(2))])], Typval::list(vec![text("a"), text("b")]));
+case!(values_dict, "values", [Typval::dict(vec![(OxStr::from("a"), number(1)), (OxStr::from("b"), number(2))])], list(&[1, 2]));
+case!(items_dict, "items", [Typval::dict(vec![(OxStr::from("a"), number(1))])], Typval::list(vec![Typval::list(vec![text("a"), number(1)])]));
 case!(max_list, "max", [list(&[1, 9, 2])], number(9));
 case!(min_list, "min", [list(&[1, -2, 9])], number(-2));
 case!(max_empty, "max", [list(&[])], number(0));
@@ -109,13 +110,13 @@ case!(range_stride, "range", [number(2), number(8), number(3)], list(&[2, 5, 8])
 case!(range_negative_stride, "range", [number(3), number(1), number(-1)], list(&[3, 2, 1]));
 case!(remove_list_item, "remove", [list(&[1, 2, 3]), number(1)], number(2));
 case!(remove_list_range, "remove", [list(&[1, 2, 3, 4]), number(1), number(2)], list(&[2, 3]));
-case!(remove_dict_item, "remove", [Typval::Dict(vec![(OxStr::from("a"), number(3))]), text("a")], number(3));
+case!(remove_dict_item, "remove", [Typval::dict(vec![(OxStr::from("a"), number(3))]), text("a")], number(3));
 case!(sort_numbers, "sort", [list(&[3, 1, 2]), text("n")], list(&[1, 2, 3]));
 case!(sort_stable_equal, "sort", [list(&[2, 1, 2]), text("n")], list(&[1, 2, 2]));
 case!(uniq_adjacent, "uniq", [list(&[1, 1, 2, 1])], list(&[1, 2, 1]));
 case!(extend_lists, "extend", [list(&[1]), list(&[2, 3])], list(&[1, 2, 3]));
-case!(flatten_one, "flatten", [Typval::List(vec![number(1), list(&[2, 3])])], list(&[1, 2, 3]));
-case!(flatten_depth_zero, "flatten", [Typval::List(vec![list(&[1])]), number(0)], Typval::List(vec![list(&[1])]));
+case!(flatten_one, "flatten", [Typval::list(vec![number(1), list(&[2, 3])])], list(&[1, 2, 3]));
+case!(flatten_depth_zero, "flatten", [Typval::list(vec![list(&[1])]), number(0)], Typval::list(vec![list(&[1])]));
 case!(blob2list_basic, "blob2list", [Typval::Blob(vec![0, 255])], list(&[0, 255]));
 case!(list2blob_basic, "list2blob", [list(&[0, 255])], Typval::Blob(vec![0, 255]));
 case!(list2str_bytes, "list2str", [list(&[65, 66])], text("AB"));
@@ -134,7 +135,7 @@ case!(str2float_basic, "str2float", [text("1.25")], Typval::Float(1.25));
 case!(type_number, "type", [number(1)], number(1));
 case!(type_string, "type", [text("x")], number(2));
 case!(type_list, "type", [list(&[])], number(4));
-case!(type_dict, "type", [Typval::Dict(vec![])], number(5));
+case!(type_dict, "type", [Typval::dict(vec![])], number(5));
 case!(type_float, "type", [Typval::Float(1.0)], number(6));
 case!(type_bool, "type", [Typval::Bool(true)], number(7));
 case!(type_null, "type", [Typval::Special(Special::Null)], number(8));
@@ -144,7 +145,7 @@ case!(string_bool, "string", [Typval::Bool(true)], text("v:true"));
 case!(json_encode_null, "json_encode", [Typval::Special(Special::Null)], text("null"));
 case!(json_encode_bool, "json_encode", [Typval::Bool(true)], text("true"));
 case!(json_encode_list, "json_encode", [list(&[1, 2])], text("[1,2]"));
-case!(json_encode_dict_order, "json_encode", [Typval::Dict(vec![(OxStr::from("b"), number(2)), (OxStr::from("a"), number(1))])], text("{\"b\":2,\"a\":1}"));
+case!(json_encode_dict_order, "json_encode", [Typval::dict(vec![(OxStr::from("b"), number(2)), (OxStr::from("a"), number(1))])], text("{\"b\":2,\"a\":1}"));
 case!(json_decode_null, "json_decode", [text("null")], Typval::Special(Special::Null));
 case!(json_decode_bool, "json_decode", [text("false")], Typval::Bool(false));
 case!(json_decode_list, "json_decode", [text("[1,2]")], list(&[1, 2]));
@@ -295,8 +296,8 @@ fn sort_default_comparator_uses_strings() {
     let result = call("sort", vec![list(&[2, 10])]).unwrap();
     assert_eq!(result, list(&[10, 2]));
     // A String compared against a non-String sorts as a leading quote.
-    let mixed = call("sort", vec![Typval::List(vec![number(0), text("x")])]).unwrap();
-    assert_eq!(mixed, Typval::List(vec![text("x"), number(0)]));
+    let mixed = call("sort", vec![Typval::list(vec![number(0), text("x")])]).unwrap();
+    assert_eq!(mixed, Typval::list(vec![text("x"), number(0)]));
 }
 
 #[test]
@@ -305,8 +306,8 @@ fn sort_numeric_mode() {
     // numeric values order numerically while strings order as 0.
     let result = call("sort", vec![list(&[2, 10, 1]), text("n")]).unwrap();
     assert_eq!(result, list(&[1, 2, 10]));
-    let mixed = call("sort", vec![Typval::List(vec![text("a"), number(5), number(3)]), text("n")]).unwrap();
-    assert_eq!(mixed, Typval::List(vec![text("a"), number(3), number(5)]));
+    let mixed = call("sort", vec![Typval::list(vec![text("a"), number(5), number(3)]), text("n")]).unwrap();
+    assert_eq!(mixed, Typval::list(vec![text("a"), number(3), number(5)]));
 }
 
 #[test]
@@ -319,16 +320,16 @@ fn sort_integer_mode() {
 #[test]
 fn sort_float_mode() {
     // `f` mode: float comparison via `tv_get_float`.
-    let values = Typval::List(vec![Typval::Float(2.5), Typval::Float(1.5), Typval::Float(10.0)]);
+    let values = Typval::list(vec![Typval::Float(2.5), Typval::Float(1.5), Typval::Float(10.0)]);
     let result = call("sort", vec![values, text("f")]).unwrap();
-    assert_eq!(result, Typval::List(vec![Typval::Float(1.5), Typval::Float(2.5), Typval::Float(10.0)]));
+    assert_eq!(result, Typval::list(vec![Typval::Float(1.5), Typval::Float(2.5), Typval::Float(10.0)]));
 }
 
 #[test]
 fn sort_ignore_case_mode() {
     // `i` mode: case-insensitive string sort.
-    let result = call("sort", vec![Typval::List(vec![text("banana"), text("Apple"), text("cherry")]), text("i")]).unwrap();
-    assert_eq!(result, Typval::List(vec![text("Apple"), text("banana"), text("cherry")]));
+    let result = call("sort", vec![Typval::list(vec![text("banana"), text("Apple"), text("cherry")]), text("i")]).unwrap();
+    assert_eq!(result, Typval::list(vec![text("Apple"), text("banana"), text("cherry")]));
 }
 
 #[test]
@@ -336,10 +337,25 @@ fn sort_locale_mode_is_byte_wise_fallback() {
     // `l` mode is documented to sort by the locale of the running system; this
     // port uses a byte-wise fallback for the C-locale `strcoll` comparison, so
     // it matches the default ordering here.
-    let result = call("sort", vec![Typval::List(vec![text("banana"), text("Apple")]), text("l")]).unwrap();
-    assert_eq!(result, Typval::List(vec![text("Apple"), text("banana")]));
+    let result = call("sort", vec![Typval::list(vec![text("banana"), text("Apple")]), text("l")]).unwrap();
+    assert_eq!(result, Typval::list(vec![text("Apple"), text("banana")]));
     let numbers = call("sort", vec![list(&[2, 10]), text("l")]).unwrap();
     assert_eq!(numbers, list(&[10, 2]));
+}
+
+#[test]
+fn sort_callback_stops_after_first_failure_and_retains_first_error() {
+    // Once the comparator errors, `sort()` must not invoke it again for later
+    // pairs, and the original error must be returned rather than overwritten.
+    let mut scope = Scope::new();
+    let counter = Typval::list(vec![]);
+    scope.set(b"counter", counter.clone());
+    let values = Typval::list(vec![number(3), number(1), number(2)]);
+    let callback = text("add(counter, 1) + missing");
+    let mut builtins = Builtins::without_regex();
+    let error = builtins.call(&OxStr::from("sort"), vec![values, callback], &mut scope).unwrap_err();
+    assert_eq!(error.code, "E121");
+    assert_eq!(counter, Typval::list(vec![number(1)]));
 }
 
 #[test]
@@ -380,8 +396,8 @@ fn str2nr_prefix_rules_follow_force_mode() {
 fn nested_comparison_propagates_recursion_error() {
     // `test/old/testdir/test_listdict.vim`: recursive compare guard.
     let mut value = number(1);
-    for _ in 0..101 { value = Typval::List(vec![value]); }
-    assert_eq!(call("count", vec![Typval::List(vec![value.clone()]), value]).unwrap_err().code, "E724");
+    for _ in 0..101 { value = Typval::list(vec![value]); }
+    assert_eq!(call("count", vec![Typval::list(vec![value.clone()]), value]).unwrap_err().code, "E724");
 }
 
 struct LiteralRegex { calls: Cell<usize> }
@@ -411,7 +427,7 @@ fn split_uses_regex_engine_seam() {
     let regex = LiteralRegex { calls: Cell::new(0) };
     let mut builtins = Builtins::new(&regex);
     let result = builtins.call(&OxStr::from("split"), vec![text("a,b"), text(",")], &mut Scope::new()).unwrap();
-    assert_eq!(result, Typval::List(vec![text("a"), text("b")]));
+    assert_eq!(result, Typval::list(vec![text("a"), text("b")]));
     assert_eq!(regex.calls.get(), 1);
 }
 
@@ -430,7 +446,7 @@ fn match_family_honors_count_and_list_inputs() {
     let regex = LiteralRegex { calls: Cell::new(0) };
     let mut builtins = Builtins::new(&regex);
     assert_eq!(builtins.call(&OxStr::from("match"), vec![text("ababa"), text("ba"), number(0), number(2)], &mut Scope::new()).unwrap(), number(3));
-    assert_eq!(builtins.call(&OxStr::from("match"), vec![Typval::List(vec![text("x"), text("ab"), text("ab")]), text("b"), number(0), number(2)], &mut Scope::new()).unwrap(), number(2));
+    assert_eq!(builtins.call(&OxStr::from("match"), vec![Typval::list(vec![text("x"), text("ab"), text("ab")]), text("b"), number(0), number(2)], &mut Scope::new()).unwrap(), number(2));
 }
 
 #[test]
@@ -445,4 +461,218 @@ fn substitute_uses_regex_engine_seam() {
 #[test]
 fn regex_builtin_without_engine_is_typed_error() {
     assert_eq!(call("split", vec![text("a b")]).unwrap_err().code, "E54");
+}
+
+
+fn eval_builtin(source: &[u8], mut scope: Scope) -> (Typval, Scope) {
+    let expression = Parser::new(source).parse().unwrap();
+    let regex = NoRegex;
+    let mut builtins = Builtins::without_regex();
+    let result = Evaluator::new(&mut builtins, &regex).eval(&expression, &mut scope).unwrap();
+    (result, scope)
+}
+
+#[test]
+fn assignment_clone_shares_list_mutation() {
+    let shared = list(&[1]);
+    let mut scope = Scope::new();
+    scope.set(b"a", shared.clone());
+    scope.set(b"b", shared);
+    let (result, scope) = eval_builtin(b"add(a, 2)", scope);
+    assert_eq!(result, list(&[1, 2]));
+    assert_eq!(scope.get(b"b", 0).unwrap(), &list(&[1, 2]));
+}
+
+#[test]
+fn identity_and_equality_distinguish_shared_lists() {
+    let mut scope = Scope::new();
+    let shared = list(&[1]);
+    scope.set(b"a", shared.clone());
+    scope.set(b"alias", shared);
+    scope.set(b"equal", list(&[1]));
+    assert_eq!(eval_builtin(b"a is alias", scope.clone()).0, number(1));
+    assert_eq!(eval_builtin(b"a is equal", scope.clone()).0, number(0));
+    assert_eq!(eval_builtin(b"a == equal", scope).0, number(1));
+}
+
+#[test]
+fn copy_is_outer_independent_but_keeps_nested_aliases() {
+    let nested = list(&[1]);
+    let source = Typval::list(vec![nested.clone()]);
+    let copied = call("copy", vec![source.clone()]).unwrap();
+    call("add", vec![copied.clone(), number(9)]).unwrap();
+    assert_eq!(call("len", vec![source.clone()]).unwrap(), number(1));
+    let Typval::List(copied_ref) = copied else { panic!("List expected") };
+    let copied_nested = copied_ref.borrow().items[0].clone();
+    call("add", vec![copied_nested, number(2)]).unwrap();
+    assert_eq!(nested, list(&[1, 2]));
+}
+
+#[test]
+fn deepcopy_reproduces_cycles_and_breaks_source_aliases() {
+    let source = Typval::list(vec![]);
+    call("add", vec![source.clone(), source.clone()]).unwrap();
+    assert_eq!(call("string", vec![source.clone()]).unwrap(), text("[[...]]"));
+    let copied = call("deepcopy", vec![source.clone()]).unwrap();
+    assert_eq!(call("string", vec![copied.clone()]).unwrap(), text("[[...]]"));
+    let (Typval::List(source_ref), Typval::List(copy_ref)) = (&source, &copied) else { panic!("Lists expected") };
+    assert!(!std::rc::Rc::ptr_eq(source_ref, copy_ref));
+    let Typval::List(cycle_ref) = &copy_ref.borrow().items[0] else { panic!("cycle expected") };
+    assert!(std::rc::Rc::ptr_eq(copy_ref, cycle_ref));
+}
+
+#[test]
+fn cycle_equality_terminates_coinductively() {
+    let left = Typval::list(vec![]);
+    let right = Typval::list(vec![]);
+    call("add", vec![left.clone(), left.clone()]).unwrap();
+    call("add", vec![right.clone(), right.clone()]).unwrap();
+    let mut scope = Scope::new();
+    scope.set(b"left", left);
+    scope.set(b"right", right);
+    assert_eq!(eval_builtin(b"left == right", scope).0, number(1));
+}
+
+#[test]
+fn shallow_and_deep_locks_enforce_mutation_and_report_state() {
+    let nested = list(&[1]);
+    let shallow = Typval::list(vec![nested.clone()]);
+    crate::lock_value(&shallow, false).unwrap();
+    assert_eq!(crate::is_locked_value(&shallow).unwrap(), number(2));
+    assert_eq!(call("add", vec![shallow, number(2)]).unwrap_err().code, "E741");
+    assert_eq!(crate::is_locked_value(&nested).unwrap(), number(0));
+
+    let deep_nested = list(&[1]);
+    let deep = Typval::list(vec![deep_nested.clone()]);
+    crate::lock_value(&deep, true).unwrap();
+    assert_eq!(crate::is_locked_value(&deep).unwrap(), number(3));
+    assert_eq!(crate::is_locked_value(&deep_nested).unwrap(), number(3));
+    assert_eq!(call("add", vec![deep_nested, number(2)]).unwrap_err().code, "E741");
+}
+
+#[test]
+fn lambda_callbacks_cover_map_filter_sort_foreach_reduce() {
+    assert_eq!(eval_builtin(b"map([1, 2, 3], {k, v -> v * 2})", Scope::new()).0, list(&[2, 4, 6]));
+    assert_eq!(eval_builtin(b"filter([1, 2, 3, 4], {k, v -> v % 2})", Scope::new()).0, list(&[1, 3]));
+    assert_eq!(eval_builtin(b"sort([3, 1, 2], {a, b -> a - b})", Scope::new()).0, list(&[1, 2, 3]));
+    assert_eq!(eval_builtin(b"foreach([1, 2], {k, v -> v * 9})", Scope::new()).0, list(&[1, 2]));
+    assert_eq!(eval_builtin(b"reduce([1, 2, 3], {a, v -> a + v})", Scope::new()).0, number(6));
+}
+
+#[test]
+fn mapnew_and_flattennew_do_not_mutate_inputs() {
+    let source = list(&[1, 2]);
+    let mut scope = Scope::new();
+    scope.set(b"xs", source.clone());
+    assert_eq!(eval_builtin(b"mapnew(xs, {k, v -> v + 10})", scope).0, list(&[11, 12]));
+    assert_eq!(source, list(&[1, 2]));
+
+    let nested = Typval::list(vec![number(1), list(&[2, 3])]);
+    assert_eq!(call("flattennew", vec![nested.clone()]).unwrap(), list(&[1, 2, 3]));
+    assert_eq!(nested, Typval::list(vec![number(1), list(&[2, 3])]));
+}
+
+#[test]
+fn string_expression_and_funcref_callbacks_use_shared_dispatch() {
+    assert_eq!(call("map", vec![list(&[1, 2]), text("v:val * 3")]).unwrap(), list(&[3, 6]));
+    let and = Typval::Funcref(ox_types::Funcref { name: OxStr::from("and"), args: vec![], dict: None, registry: None });
+    assert_eq!(call("map", vec![list(&[3, 3]), and]).unwrap(), list(&[0, 1]));
+}
+
+#[test]
+fn callback_structural_mutation_is_rejected_and_lock_restored() {
+    let mut scope = Scope::new();
+    scope.set(b"xs", list(&[1, 2]));
+    let expression = Parser::new(b"map(xs, {k, v -> add(xs, 9)})").parse().unwrap();
+    let regex = NoRegex;
+    let mut builtins = Builtins::without_regex();
+    let error = Evaluator::new(&mut builtins, &regex).eval(&expression, &mut scope).unwrap_err();
+    assert_eq!(error.code, "E741");
+    let xs = scope.get(b"xs", 0).unwrap().clone();
+    assert_eq!(call("add", vec![xs, number(3)]).unwrap(), list(&[1, 2, 3]));
+}
+
+
+#[test]
+fn named_funcref_callbacks_cover_collection_builtins() {
+    assert_eq!(call("map", vec![list(&[3, 3]), funcref("and")]).unwrap(), list(&[0, 1]));
+    assert_eq!(call("filter", vec![list(&[3, 3]), funcref("and")]).unwrap(), list(&[3]));
+    assert_eq!(call("foreach", vec![list(&[3, 3]), funcref("and")]).unwrap(), list(&[3, 3]));
+    assert_eq!(call("reduce", vec![list(&[1, 2, 3]), funcref("or")]).unwrap(), number(3));
+    let sorted = call("sort", vec![list(&[1, 2]), funcref("and")]).unwrap();
+    assert_eq!(call("len", vec![sorted]).unwrap(), number(2));
+}
+
+#[test]
+fn string_expression_callbacks_cover_collection_builtins() {
+    assert_eq!(call("map", vec![list(&[1, 2]), text("v:val * 3")]).unwrap(), list(&[3, 6]));
+    assert_eq!(call("filter", vec![list(&[1, 2, 3]), text("v:val % 2")]).unwrap(), list(&[1, 3]));
+    assert_eq!(call("foreach", vec![list(&[1, 2]), text("v:val * 9")]).unwrap(), list(&[1, 2]));
+    assert_eq!(call("reduce", vec![list(&[1, 2, 3]), text("v:key + v:val")]).unwrap(), number(6));
+    assert_eq!(call("sort", vec![list(&[3, 1, 2]), text("v:key - v:val")]).unwrap(), list(&[1, 2, 3]));
+}
+
+#[test]
+fn scope_lockvar_facade_reports_all_container_lock_states() {
+    let direct = list(&[]);
+    let Typval::List(reference) = &direct else { panic!("List expected") };
+    reference.borrow_mut().lock.locked = true;
+    let mut scope = Scope::new();
+    scope.set(b"direct", direct);
+    scope.set(b"shallow", list(&[]));
+    scope.set(b"deep", list(&[]));
+    assert_eq!(scope.islocked(b"missing", 0).unwrap_err().code, "E121");
+    assert_eq!(scope.islocked(b"direct", 0).unwrap(), 1);
+    scope.lockvar(b"shallow", false, 0).unwrap();
+    scope.lockvar(b"deep", true, 0).unwrap();
+    assert_eq!(scope.islocked(b"shallow", 0).unwrap(), 2);
+    assert_eq!(scope.islocked(b"deep", 0).unwrap(), 3);
+}
+
+
+#[test]
+fn callback_collections_support_blob_and_string_inputs() {
+    assert_eq!(call("map", vec![Typval::Blob(vec![1, 2]), text("v:val + 1")]).unwrap(), Typval::Blob(vec![2, 3]));
+    assert_eq!(call("mapnew", vec![Typval::Blob(vec![1, 2]), text("v:val + 2")]).unwrap(), Typval::Blob(vec![3, 4]));
+    assert_eq!(call("filter", vec![Typval::Blob(vec![1, 2, 3]), text("v:val % 2")]).unwrap(), Typval::Blob(vec![1, 3]));
+    assert_eq!(call("foreach", vec![Typval::Blob(vec![1, 2]), text("v:val + 9")]).unwrap(), Typval::Blob(vec![1, 2]));
+
+    assert_eq!(call("map", vec![text("ab"), text("'x'")]).unwrap(), text("xx"));
+    assert_eq!(call("mapnew", vec![text("ab"), text("'y'")]).unwrap(), text("yy"));
+    assert_eq!(call("filter", vec![text("abc"), text("v:key % 2")]).unwrap(), text("b"));
+    assert_eq!(call("foreach", vec![text("ab"), text("v:key")]).unwrap(), text("ab"));
+}
+
+#[test]
+fn reduce_supports_blob_and_string_inputs() {
+    assert_eq!(call("reduce", vec![Typval::Blob(vec![1, 2, 3]), text("v:key + v:val")]).unwrap(), number(6));
+    assert_eq!(call("reduce", vec![text("abc"), text("v:key")]).unwrap(), text("a"));
+}
+
+
+#[test]
+fn map_exposes_prior_mutations_and_keeps_them_after_later_error() {
+    let shared = list(&[1, 2]);
+    let mut scope = Scope::new();
+    scope.set(b"xs", shared.clone());
+    assert_eq!(eval_builtin(b"map(xs, {k, v -> k ? xs[0] : 9})", scope).0, list(&[9, 9]));
+
+    let partial = list(&[1, 2]);
+    let mut scope = Scope::new();
+    scope.set(b"xs", partial.clone());
+    let expression = Parser::new(b"map(xs, {k, v -> k ? missing : 9})").parse().unwrap();
+    let regex = NoRegex;
+    let mut builtins = Builtins::without_regex();
+    assert_eq!(Evaluator::new(&mut builtins, &regex).eval(&expression, &mut scope).unwrap_err().code, "E121");
+    assert_eq!(partial, list(&[9, 2]));
+    assert_eq!(call("add", vec![partial, number(3)]).unwrap(), list(&[9, 2, 3]));
+}
+
+#[test]
+fn string_callbacks_preserve_invalid_bytes() {
+    let raw = Typval::String(OxStr(vec![0xff, b'a']));
+    assert_eq!(call("map", vec![raw.clone(), text("v:val")]).unwrap(), raw);
+    assert_eq!(call("filter", vec![raw.clone(), text("1")]).unwrap(), raw);
+    assert_eq!(call("foreach", vec![raw.clone(), text("v:val")]).unwrap(), raw);
+    assert_eq!(call("reduce", vec![raw, text("v:key")]).unwrap(), Typval::String(OxStr(vec![0xff])));
 }

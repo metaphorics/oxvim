@@ -3,6 +3,7 @@
 use ox_types::{Funcref, OxStr, Special, Typval};
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -23,6 +24,9 @@ pub trait BuiltinHost {
     fn call_method(&mut self, name: &OxStr, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
         self.call(name, args, scope)
     }
+
+    /// Registry shared with callback-capable builtins, when this host owns one.
+    fn closure_registry(&self) -> Option<ClosureRegistry> { None }
 }
 
 /// Regular-expression integration point for operators and pure regex builtins.
@@ -159,13 +163,8 @@ pub struct Evaluator<'a, H: BuiltinHost, R: RegexEngine> {
 impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
     /// Construct an evaluator. Default string comparisons are case-sensitive.
     pub fn new(host: &'a mut H, regex: &'a R) -> Self {
-        Self {
-            host,
-            regex,
-            ignore_case: false,
-            max_depth: DEFAULT_MAX_EVAL_DEPTH,
-            closures: ClosureRegistry::new(),
-        }
+        let closures = host.closure_registry().unwrap_or_default();
+        Self { host, regex, ignore_case: false, max_depth: DEFAULT_MAX_EVAL_DEPTH, closures }
     }
 
     /// Borrow the shared closure registry.
@@ -224,23 +223,23 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                 Ok(Evaluated { value: value.clone(), identity })
             }
             ExprKind::Variable(name) => self.eval_variable(name, expression.span.start, scope),
-            ExprKind::Environment(name) => Ok(Evaluated::plain(scope.get_env(name.as_bytes()).clone())),
+            ExprKind::Environment(name) => Ok(Evaluated::plain(scope.get_env(name.as_bytes()))),
             ExprKind::Option { scope: option_scope, name } => {
                 let option_scope = match option_scope {
                     AstOptionScope::Effective => OptionScope::Effective,
                     AstOptionScope::Global => OptionScope::Global,
                     AstOptionScope::Local => OptionScope::Local,
                 };
-                Ok(Evaluated::plain(scope.get_option(option_scope, name.as_bytes()).clone()))
+                Ok(Evaluated::plain(scope.get_option(option_scope, name.as_bytes())))
             }
-            ExprKind::Register(name) => Ok(Evaluated::plain(scope.get_register(&[*name]).clone())),
+            ExprKind::Register(name) => Ok(Evaluated::plain(scope.get_register(&[*name]))),
             ExprKind::List(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
                     values.push(self.eval_at(item, scope, next)?.value);
                 }
                 Ok(Evaluated {
-                    value: Typval::List(values),
+                    value: Typval::list(values),
                     identity: Some(expression as *const Expr as usize),
                 })
             }
@@ -256,7 +255,7 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                     values.push((key, self.eval_at(value, scope, next)?.value));
                 }
                 Ok(Evaluated {
-                    value: Typval::Dict(values),
+                    value: Typval::dict(values),
                     identity: Some(expression as *const Expr as usize),
                 })
             }
@@ -418,9 +417,11 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         }
         if op == BinaryOp::Add {
             match (lhs, rhs) {
-                (Typval::List(mut left), Typval::List(right)) => {
-                    left.extend(right);
-                    return Ok(Evaluated::plain(Typval::List(left)));
+                (Typval::List(left), Typval::List(right)) => {
+                    let mut items = left.try_borrow().map_err(|_| borrow_error(offset))?.items.clone();
+                    let right_items = right.try_borrow().map_err(|_| borrow_error(offset))?.items.clone();
+                    items.extend(right_items);
+                    return Ok(Evaluated::plain(Typval::list(items)));
                 }
                 (Typval::Blob(mut left), Typval::Blob(right)) => {
                     left.extend(right);
@@ -448,11 +449,8 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
             return Ok(if op == CompareOp::NoMatch { !matched } else { matched });
         }
         if matches!(op, CompareOp::Is | CompareOp::IsNot) {
-            let same = if identity_type(&lhs.value) && identity_type(&rhs.value) {
-                lhs.identity.is_some() && lhs.identity == rhs.identity
-            } else {
-                equal_values(&lhs.value, &rhs.value, ignore_case, depth, self.max_depth)?
-            };
+            let same = identical_values(&lhs.value, &rhs.value, ignore_case, depth, self.max_depth)?
+                || (lhs.identity.is_some() && lhs.identity == rhs.identity);
             return Ok(if op == CompareOp::IsNot { !same } else { same });
         }
         if matches!((&lhs.value, &rhs.value), (Typval::List(_), Typval::List(_)))
@@ -481,11 +479,10 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         match target.value {
             Typval::List(values) => {
                 let requested = to_number(&index, offset)?;
-                let normalized = normalize_list_index(values.len(), requested)
+                let items = values.try_borrow().map_err(|_| borrow_error(offset))?.items.clone();
+                let normalized = normalize_list_index(items.len(), requested)
                     .ok_or_else(|| EvalError::new("E684", offset, format!("list index out of range: {requested}")))?;
-                let value = values[normalized].clone();
-                let identity = identity_type(&value).then(|| derive_identity(target.identity, &normalized.to_le_bytes())).flatten();
-                Ok(Evaluated { value, identity })
+                Ok(Evaluated::plain(items[normalized].clone()))
             }
             Typval::Blob(values) => {
                 let requested = to_number(&index, offset)?;
@@ -493,9 +490,9 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                     .ok_or_else(|| EvalError::new("E979", offset, format!("blob index out of range: {requested}")))?;
                 Ok(Evaluated::plain(Typval::Number(i64::from(values[normalized]))))
             }
-            Typval::Dict(values) => {
+            value @ Typval::Dict(_) => {
                 let key = to_string(&index, offset)?;
-                dict_lookup(&Typval::Dict(values), key.as_bytes(), offset, target.identity)
+                dict_lookup(&value, key.as_bytes(), offset, target.identity)
             }
             value @ (Typval::Number(_) | Typval::String(_)) => {
                 let bytes = to_string(&value, offset)?;
@@ -513,8 +510,9 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
     fn slice(&self, target: Typval, start: Option<i64>, end: Option<i64>, offset: usize) -> Result<Evaluated> {
         match target {
             Typval::List(values) => {
-                let (start, end) = list_slice_bounds(values.len(), start, end);
-                Ok(Evaluated::plain(Typval::List(values[start..end].to_vec())))
+                let items = values.try_borrow().map_err(|_| borrow_error(offset))?.items.clone();
+                let (start, end) = list_slice_bounds(items.len(), start, end);
+                Ok(Evaluated::plain(Typval::list(items[start..end].to_vec())))
             }
             Typval::Blob(values) => {
                 let (start, end) = list_slice_bounds(values.len(), start, end);
@@ -573,6 +571,11 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         })
     }
 
+    /// Invoke an already-evaluated callable through this evaluator's registry.
+    pub(crate) fn invoke(&mut self, callee: Typval, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
+        self.call_value(callee, args, scope, 0).map(|evaluated| evaluated.value)
+    }
+
     fn call_value(&mut self, callee: Typval, mut args: Vec<Typval>, scope: &mut Scope, depth: usize) -> Result<Evaluated> {
         match callee {
             Typval::Funcref(funcref) | Typval::Partial(funcref) => {
@@ -622,7 +625,7 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         let extras = &args[closure.params.len()..];
         let extra_count = i64::try_from(extras.len()).unwrap_or(i64::MAX);
         bind_argument(&mut scope, &OxStr::from("0"), Typval::Number(extra_count));
-        bind_argument(&mut scope, &OxStr::from("000"), Typval::List(extras.to_vec()));
+        bind_argument(&mut scope, &OxStr::from("000"), Typval::list(extras.to_vec()));
         for (index, value) in extras.iter().enumerate() {
             let name = OxStr(format!("{}", index + 1).into_bytes());
             bind_argument(&mut scope, &name, value.clone());
@@ -646,17 +649,15 @@ fn closure_index(name: &[u8]) -> Option<usize> {
     text.parse().ok()
 }
 
-fn dict_lookup(value: &Typval, key: &[u8], offset: usize, parent_identity: Option<usize>) -> Result<Evaluated> {
+fn dict_lookup(value: &Typval, key: &[u8], offset: usize, _parent_identity: Option<usize>) -> Result<Evaluated> {
     let Typval::Dict(entries) = value else {
         return Err(EvalError::new("E715", offset, "Dictionary required"));
     };
+    let entries = entries.try_borrow().map_err(|_| borrow_error(offset))?.entries.clone();
     entries
-        .iter()
+        .into_iter()
         .find(|(candidate, _)| candidate.as_bytes() == key)
-        .map(|(_, value)| Evaluated {
-            value: value.clone(),
-            identity: identity_type(value).then(|| derive_identity(parent_identity, key)).flatten(),
-        })
+        .map(|(_, value)| Evaluated::plain(value))
         .ok_or_else(|| EvalError::new("E716", offset, format!("Key not present in Dictionary: {}", String::from_utf8_lossy(key))))
 }
 
@@ -805,29 +806,62 @@ fn compare_values(
     Ok(compare_bytes(left.as_bytes(), right.as_bytes(), ignore_case))
 }
 
-fn equal_values(lhs: &Typval, rhs: &Typval, ignore_case: bool, depth: usize, maximum: usize) -> Result<bool> {
-    if depth >= maximum {
-        return Err(EvalError::new("E1169", 0, "value comparison nesting is too deep"));
-    }
+fn identical_values(lhs: &Typval, rhs: &Typval, ignore_case: bool, depth: usize, maximum: usize) -> Result<bool> {
     match (lhs, rhs) {
-        (Typval::String(left), Typval::String(right)) => Ok(compare_bytes(left.as_bytes(), right.as_bytes(), ignore_case) == 0),
-        (Typval::List(left), Typval::List(right)) => {
-            if left.len() != right.len() { return Ok(false); }
-            for (left, right) in left.iter().zip(right) {
-                if !equal_values(left, right, ignore_case, depth + 1, maximum)? { return Ok(false); }
-            }
-            Ok(true)
-        }
-        (Typval::Dict(left), Typval::Dict(right)) => {
-            if left.len() != right.len() { return Ok(false); }
-            for (key, value) in left {
-                let Some((_, other)) = right.iter().find(|(candidate, _)| candidate == key) else { return Ok(false); };
-                if !equal_values(value, other, ignore_case, depth + 1, maximum)? { return Ok(false); }
-            }
-            Ok(true)
-        }
-        _ => Ok(lhs == rhs),
+        (Typval::List(left), Typval::List(right)) => Ok(Rc::ptr_eq(left, right)),
+        (Typval::Dict(left), Typval::Dict(right)) => Ok(Rc::ptr_eq(left, right)),
+        (Typval::Partial(left), Typval::Partial(right)) => Ok(left.registry.is_some()
+            && left.registry == right.registry && left.name == right.name),
+        _ => equal_values(lhs, rhs, ignore_case, depth, maximum),
     }
+}
+
+fn equal_values(lhs: &Typval, rhs: &Typval, ignore_case: bool, depth: usize, maximum: usize) -> Result<bool> {
+    fn recurse(
+        lhs: &Typval,
+        rhs: &Typval,
+        ignore_case: bool,
+        depth: usize,
+        maximum: usize,
+        seen: &mut HashSet<(usize, usize, u8)>,
+    ) -> Result<bool> {
+        if depth >= maximum {
+            return Err(EvalError::new("E1169", 0, "value comparison nesting is too deep"));
+        }
+        match (lhs, rhs) {
+            (Typval::String(left), Typval::String(right)) => Ok(compare_bytes(left.as_bytes(), right.as_bytes(), ignore_case) == 0),
+            (Typval::List(left), Typval::List(right)) => {
+                let pair = (Rc::as_ptr(left) as usize, Rc::as_ptr(right) as usize, ox_types::VAR_LIST);
+                if !seen.insert(pair) { return Ok(true); }
+                let left = left.try_borrow().map_err(|_| borrow_error(0))?.items.clone();
+                let right = right.try_borrow().map_err(|_| borrow_error(0))?.items.clone();
+                if left.len() != right.len() { return Ok(false); }
+                for (left, right) in left.iter().zip(&right) {
+                    if !recurse(left, right, ignore_case, depth + 1, maximum, seen)? { return Ok(false); }
+                }
+                Ok(true)
+            }
+            (Typval::Dict(left), Typval::Dict(right)) => {
+                let pair = (Rc::as_ptr(left) as usize, Rc::as_ptr(right) as usize, ox_types::VAR_DICT);
+                if !seen.insert(pair) { return Ok(true); }
+                let left = left.try_borrow().map_err(|_| borrow_error(0))?.entries.clone();
+                let right = right.try_borrow().map_err(|_| borrow_error(0))?.entries.clone();
+                if left.len() != right.len() { return Ok(false); }
+                for (key, value) in &left {
+                    let Some((_, other)) = right.iter().find(|(candidate, _)| candidate == key) else { return Ok(false); };
+                    if !recurse(value, other, ignore_case, depth + 1, maximum, seen)? { return Ok(false); }
+                }
+                Ok(true)
+            }
+            _ => Ok(lhs == rhs),
+        }
+    }
+
+    recurse(lhs, rhs, ignore_case, depth, maximum, &mut HashSet::new())
+}
+
+fn borrow_error(offset: usize) -> EvalError {
+    EvalError::new("E742", offset, "Cannot change value during recursive container access")
 }
 
 /// Length in bytes of the UTF-8 sequence starting with `lead`, using only the
@@ -929,12 +963,4 @@ fn string_slice_bounds(length: usize, start: Option<i64>, end: Option<i64>) -> (
     let start = usize::try_from(first).unwrap_or(length).min(length);
     let exclusive = usize::try_from(last.saturating_add(1)).unwrap_or(length).min(length);
     (start, exclusive.max(start))
-}
-
-fn derive_identity(parent: Option<usize>, component: &[u8]) -> Option<usize> {
-    let mut hash = (parent? as u64) ^ 0xcbf2_9ce4_8422_2325_u64;
-    for &byte in component {
-        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3_u64);
-    }
-    Some(hash as usize)
 }

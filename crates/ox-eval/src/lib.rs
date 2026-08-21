@@ -8,7 +8,7 @@ pub mod lexer;
 pub mod parser;
 pub mod scope;
 
-pub use builtins::{builtin_spec, BuiltinSpec, Builtins, BUILTINS};
+pub use builtins::{builtin_spec, is_locked_value, lock_value, BuiltinSpec, Builtins, BUILTINS};
 pub use error::{EvalError, EvalErrorKind, Result};
 pub use eval::{BuiltinHost, Evaluator, NoBuiltins, NoRegex, RegexEngine};
 pub use parser::{Expr, Parser};

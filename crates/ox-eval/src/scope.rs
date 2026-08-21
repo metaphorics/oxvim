@@ -132,11 +132,6 @@ pub struct Scope {
     pub registers: ScopeMap,
 }
 
-/// Default value returned for an unset environment variable or register.
-static DEFAULT_STRING: Typval = Typval::String(OxStr(Vec::new()));
-/// Default value returned for an unset option.
-static DEFAULT_NUMBER: Typval = Typval::Number(0);
-
 impl Scope {
     /// Create an empty scope set.
     #[must_use]
@@ -183,7 +178,7 @@ impl Scope {
     /// Return a namespace dictionary snapshot for a bare scope expression.
     #[must_use]
     pub fn scope_dict(&self, kind: ScopeKind) -> Typval {
-        Typval::Dict(self.map(kind).clone())
+        Typval::dict(self.map(kind).clone())
     }
 
     /// Assign a value to an unqualified name, storing it in `l:`.
@@ -192,6 +187,19 @@ impl Scope {
     /// otherwise a new entry is appended, preserving insertion order.
     pub fn set(&mut self, name: &[u8], value: Typval) {
         assign(&mut self.local, name, value);
+    }
+
+    /// Apply `:lockvar` to an unqualified container variable; `deep` models `!`.
+    pub fn lockvar(&self, name: &[u8], deep: bool, offset: usize) -> Result<()> {
+        crate::builtins::lock_value(self.get(name, offset)?, deep)
+    }
+
+    /// Return the lock state of an unqualified variable (0 through 3).
+    pub fn islocked(&self, name: &[u8], offset: usize) -> Result<i64> {
+        match crate::builtins::is_locked_value(self.get(name, offset)?)? {
+            Typval::Number(status) => Ok(status),
+            _ => Ok(0),
+        }
     }
 
     /// Assign a value to a scoped name.
@@ -220,8 +228,8 @@ impl Scope {
     /// Missing environment variables return an empty string, mirroring Vim's
     /// behavior that `$UNSET` evaluates to `""`.
     #[must_use]
-    pub fn get_env(&self, name: &[u8]) -> &Typval {
-        get_or_default(&self.env, name, &DEFAULT_STRING)
+    pub fn get_env(&self, name: &[u8]) -> Typval {
+        find_pair(&self.env, name).map_or_else(|| Typval::String(OxStr(Vec::new())), |(_, value)| value.clone())
     }
 
     /// Set or create an environment variable (`$VAR = ...`).
@@ -233,8 +241,8 @@ impl Scope {
     ///
     /// Missing registers return an empty string.
     #[must_use]
-    pub fn get_register(&self, name: &[u8]) -> &Typval {
-        get_or_default(&self.registers, name, &DEFAULT_STRING)
+    pub fn get_register(&self, name: &[u8]) -> Typval {
+        find_pair(&self.registers, name).map_or_else(|| Typval::String(OxStr(Vec::new())), |(_, value)| value.clone())
     }
 
     /// Set or create a register (`@r = ...`).
@@ -248,17 +256,13 @@ impl Scope {
     /// global value otherwise. Missing options default to `0`, because this
     /// module has no editor knowledge of real option defaults.
     #[must_use]
-    pub fn get_option(&self, scope: OptionScope, name: &[u8]) -> &Typval {
-        match scope {
-            OptionScope::Global => get_or_default(&self.options_global, name, &DEFAULT_NUMBER),
-            OptionScope::Local => get_or_default(&self.options_local, name, &DEFAULT_NUMBER),
-            OptionScope::Effective => {
-                if let Some((_, value)) = find_pair(&self.options_local, name) {
-                    return value;
-                }
-                get_or_default(&self.options_global, name, &DEFAULT_NUMBER)
-            }
-        }
+    pub fn get_option(&self, scope: OptionScope, name: &[u8]) -> Typval {
+        let value = match scope {
+            OptionScope::Global => find_pair(&self.options_global, name),
+            OptionScope::Local => find_pair(&self.options_local, name),
+            OptionScope::Effective => find_pair(&self.options_local, name).or_else(|| find_pair(&self.options_global, name)),
+        };
+        value.map_or(Typval::Number(0), |(_, value)| value.clone())
     }
 
     /// Set an option value (`&`, `&g:`, or `&l:`).
@@ -317,14 +321,6 @@ fn find_index(map: &ScopeMap, key: &[u8]) -> Option<usize> {
         }
     }
     None
-}
-
-fn get_or_default<'a>(map: &'a ScopeMap, key: &[u8], default: &'a Typval) -> &'a Typval {
-    if let Some((_, value)) = find_pair(map, key) {
-        value
-    } else {
-        default
-    }
 }
 
 fn assign(map: &mut ScopeMap, key: &[u8], value: Typval) {
