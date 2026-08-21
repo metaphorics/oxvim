@@ -5,5 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 description = "rope buffer, line index, undo tree, swapfile, ShaDa."
 
+[dependencies]
+ropey.workspace = true
+rmpv.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
 [lints]
 workspace = true
