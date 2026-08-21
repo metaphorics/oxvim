@@ -290,6 +290,14 @@ impl ProcessPipe {
         Ok(Self { id, token, state, _callback: callback })
     }
 
+    /// Replaces the event callback used for reads, writes, and shutdown completion.
+    pub fn set_callback<F>(&mut self, callback: F)
+    where
+        F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static,
+    {
+        *self._callback.borrow_mut() = Some(Box::new(callback));
+    }
+
     /// Starts reading bytes from this endpoint, installing `callback`.
     ///
     /// Readable events emit [`NetEvent::Read`] until [`NetEvent::Eof`]. The
@@ -299,6 +307,12 @@ impl ProcessPipe {
     where
         F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static,
     {
+        self.set_callback(callback);
+        self.read_start_current(uv_loop)
+    }
+
+    /// Starts reading while retaining the callback installed with `set_callback`.
+    pub fn read_start_current(&mut self, uv_loop: &mut UvLoop) -> NetResult<()> {
         {
             let mut state = self.state.borrow_mut();
             if state.io.is_none() {
@@ -309,7 +323,6 @@ impl ProcessPipe {
             }
             state.reading = true;
         }
-        *self._callback.borrow_mut() = Some(Box::new(callback));
         sync_process_pipe(uv_loop, self.id, self.token, &self.state)
     }
 
@@ -360,6 +373,27 @@ impl ProcessPipe {
         }
         sync_process_pipe(uv_loop, self.id, self.token, &self.state)?;
         Ok(id)
+    }
+
+    /// Finishes pending writes and closes the child-stdin stream.
+    pub fn shutdown(&mut self, uv_loop: &mut UvLoop) -> NetResult<()> {
+        let result = {
+            let mut state = self.state.borrow_mut();
+            if !matches!(state.io, Some(ChildStream::In(_))) {
+                return if state.io.is_none() {
+                    Err(NetError::Closed)
+                } else {
+                    Err(NetError::InvalidState("child stdout/stderr cannot be shut down"))
+                };
+            }
+            if !state.writes.pending.is_empty() {
+                return Err(NetError::InvalidState("cannot shut down with pending writes"));
+            }
+            state.io = None;
+            Ok(())
+        };
+        invoke(&self._callback, uv_loop, self.id, NetEvent::ShutdownComplete(result));
+        uv_loop.set_external_active(self.id, false).map_err(NetError::from)
     }
 }
 

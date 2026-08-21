@@ -6,10 +6,19 @@ rust-version.workspace = true
 description = "mlua-hosted LuaJIT executor, converters, and vim table core."
 
 [dependencies]
+libloading = { workspace = true }
 mlua = { workspace = true }
+ox-regex = { path = "../ox-regex" }
 ox-rpc = { path = "../ox-rpc" }
 ox-types = { path = "../ox-types" }
+ox-uv = { path = "../ox-uv" }
+rmpv = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+similar = { workspace = true }
 thiserror = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-language = "0.1.5"
 
 [lints]
 workspace = true
