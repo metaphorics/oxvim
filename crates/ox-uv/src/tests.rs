@@ -398,6 +398,47 @@ fn walk_sees_closing_handles_until_the_next_turn() {
 }
 
 #[test]
+fn stop_raised_during_forced_turn_is_consumed() {
+    // A stop requested before run executes one forced-nowait iteration.
+    // If a callback calls stop() during that forced turn, the flag must be
+    // consumed along with the pre-run stop so the next run behaves normally.
+    let mut uv_loop = UvLoop::new().expect("loop");
+    let forced_fired = Rc::new(Cell::new(false));
+    let forced_copy = Rc::clone(&forced_fired);
+    let stopper = Timer::new(&mut uv_loop).expect("stopper");
+    stopper
+        .start(&mut uv_loop, 0, 0, move |event_loop, _| {
+            forced_copy.set(true);
+            event_loop.stop();
+            Ok(())
+        })
+        .expect("start stopper");
+
+    uv_loop.stop();
+    assert!(!uv_loop.run_default().expect("forced turn consumes pending stop"));
+    assert!(forced_fired.get());
+
+    // A fresh repeating timer must run normally afterward, not exit after one turn.
+    let calls = Rc::new(Cell::new(0));
+    let timer = Timer::new(&mut uv_loop).expect("timer");
+    let timer_copy = timer;
+    let callback_calls = Rc::clone(&calls);
+    timer
+        .start(&mut uv_loop, 0, 1, move |event_loop, _| {
+            let next = callback_calls.get() + 1;
+            callback_calls.set(next);
+            if next >= 3 {
+                timer_copy.stop(event_loop)?;
+            }
+            Ok(())
+        })
+        .expect("start repeating timer");
+
+    assert!(!uv_loop.run_default().expect("default should run to completion"));
+    assert_eq!(calls.get(), 3, "repeating timer must fire three times");
+}
+
+#[test]
 fn misc_time_and_directory_contracts_are_sane() {
     let first = misc::hrtime();
     let second = misc::hrtime();

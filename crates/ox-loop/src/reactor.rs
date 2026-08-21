@@ -98,7 +98,7 @@ impl Reactor {
     /// guard on [`Reactor::register`], so sibling runtime crates can claim them
     /// without ever colliding with caller-owned I/O tokens that begin at
     /// `IO_TOKEN_START`.
-    pub fn next_internal_token(&self) -> Result<Token> {
+    pub(crate) fn next_internal_token(&self) -> Result<Token> {
         let current = self.next_internal.get();
         if current >= IO_TOKEN_START {
             return Err(Error::ReservedToken(Token(current)));
