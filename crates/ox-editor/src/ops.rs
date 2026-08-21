@@ -92,9 +92,21 @@ pub fn apply(editor: &mut Editor, buffer: BufHandle, window: WinHandle, operator
     let content = capture(&lines, normalized)?;
     match operator {
         Operator::Yank => store_yank(editor, register, content)?,
-        Operator::Delete | Operator::Change => {
+        Operator::Delete => {
             store_delete(editor, register, content)?;
             mutate_delete(&mut lines, normalized);
+        }
+        Operator::Change => {
+            // A linewise change clears the first line and drops the rest
+            // (`ops.c:888-901`: OP_CHANGE deletes the lines except the first,
+            // then truncates it), so `cc` leaves an empty line behind.
+            store_delete(editor, register, content)?;
+            if normalized.kind == MotionKind::LineWise {
+                lines[normalized.start.lnum - 1].clear();
+                lines.drain(normalized.start.lnum..normalized.end.lnum);
+            } else {
+                mutate_delete(&mut lines, normalized);
+            }
         }
         Operator::Lowercase | Operator::Uppercase | Operator::ToggleCase => mutate_case(&mut lines, normalized, operator),
         Operator::Indent | Operator::Unindent => mutate_indent(&mut lines, normalized, operator == Operator::Indent, shiftwidth),
@@ -114,6 +126,25 @@ pub fn apply(editor: &mut Editor, buffer: BufHandle, window: WinHandle, operator
 fn normalize(lines: &[Vec<u8>], mut range: EditRange) -> EditRange {
     range.start.lnum = range.start.lnum.clamp(1, lines.len().max(1));
     range.end.lnum = range.end.lnum.clamp(range.start.lnum, lines.len().max(1));
+    // Exclusive cross-line characterwise motions back onto the row they started
+    // from, rather than deleting (and joining) the row below (`ops.c:3517-3539`).
+    // A motion that ends in column zero of the next line backs onto the previous
+    // line; when the origin lies in the start line's indentation, or the origin is
+    // the very first byte of its line, the delete promotes to linewise.  Otherwise
+    // the endpoint becomes the last byte of the start line so `dw`/`db` crossing a
+    // line boundary never pull the following line up.
+    if range.kind == MotionKind::CharacterWise && !range.inclusive && range.end.lnum > range.start.lnum {
+        let start_line = &lines[range.start.lnum - 1];
+        let indent = start_line.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(start_line.len());
+        let linewise = if range.end.col == 0 { range.start.col <= indent } else { range.start.col == 0 };
+        range.end.lnum = range.start.lnum;
+        if linewise {
+            range.kind = MotionKind::LineWise;
+        } else {
+            range.end.col = start_line.len();
+            range.inclusive = true;
+        }
+    }
     if range.kind == MotionKind::LineWise { range.start.col = 0; range.end.col = lines[range.end.lnum - 1].len().saturating_sub(1); range.inclusive = true; }
     range.start.col = range.start.col.min(lines[range.start.lnum - 1].len().saturating_sub(1));
     range.end.col = range.end.col.min(lines[range.end.lnum - 1].len().saturating_sub(1));

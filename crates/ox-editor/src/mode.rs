@@ -232,13 +232,13 @@ impl ModeMachine {
                 return self.finish_visual_operator(editor, state, operator);
             }
             let ctx = context(editor)?; let command = format!("g{key}");
-            if let Some(motion) = resolve(&ctx.lines, ctx.cursor, &command, state.count.max(1), option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { editor.set_window_cursor(ctx.window, motion.target)?; state.extend(motion.target); }
+            if let Some(motion) = resolve(&ctx.lines, ctx.cursor, &command, state.count.max(1), option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(&mut state, motion.target, ctx.cursor); }
             state.count = 0; return Ok(Mode::Visual(state));
         }
         if matches!(state.prefix.as_str(), "f" | "F" | "t" | "T") {
             if key.len_utf8() != 1 { state.prefix.clear(); return Ok(Mode::Visual(state)); }
             let find = FindMotion { direction: if matches!(state.prefix.as_str(), "f" | "t") { FindDirection::Forward } else { FindDirection::Backward }, till: matches!(state.prefix.as_str(), "t" | "T"), target: key as u8 };
-            let ctx = context(editor)?; if let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, state.count.max(1)) { editor.set_window_cursor(ctx.window, motion.target)?; state.extend(motion.target); self.last_find = Some(find); }
+            let ctx = context(editor)?; if let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, state.count.max(1)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(&mut state, motion.target, ctx.cursor); self.last_find = Some(find); }
             state.prefix.clear(); state.count = 0; return Ok(Mode::Visual(state));
         }
         if state.prefix == "i" || state.prefix == "a" {
@@ -252,10 +252,9 @@ impl ModeMachine {
             'o' | 'O' => { if key == 'O' && state.kind == VisualKind::Block { state.swap_columns(); } else { state.swap_ends(); } let window = context(editor)?.window; editor.set_window_cursor(window, state.cursor)?; Ok(Mode::Visual(state)) }
             'g' | 'f' | 'F' | 't' | 'T' | 'i' | 'a' => { state.prefix = key.to_string(); Ok(Mode::Visual(state)) }
             'd' | 'c' | 'y' | '>' | '<' | '=' | 'u' | 'U' | '~' => self.finish_visual_operator(editor, state, match key { 'u' => Operator::Lowercase, 'U' => Operator::Uppercase, '~' => Operator::ToggleCase, _ => operator_for(key) }),
-            _ => { let ctx = context(editor)?; if let Some(motion) = resolve(&ctx.lines, ctx.cursor, &key.to_string(), state.count.max(1), option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { editor.set_window_cursor(ctx.window, motion.target)?; state.extend(motion.target); } state.count = 0; Ok(Mode::Visual(state)) }
+            _ => { let ctx = context(editor)?; if let Some(motion) = resolve(&ctx.lines, ctx.cursor, &key.to_string(), state.count.max(1), option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(&mut state, motion.target, ctx.cursor); } state.count = 0; Ok(Mode::Visual(state)) }
         }
     }
-
     fn finish_visual_operator(&mut self, editor: &mut Editor, state: VisualState, operator: Operator) -> Result<Mode, ModeError> {
         let ctx = context(editor)?; self.last_visual = Some(state.clone()); let result = ops::apply(editor, ctx.buffer, ctx.window, operator, state.range(), None, self.timestamp)?; Ok(if result.enter_insert { Mode::Insert(InsertState) } else { Mode::default() })
     }
@@ -286,6 +285,12 @@ impl ModeMachine {
     fn repeat_search(&mut self, editor: &mut Editor, opposite: bool, count: usize) -> Result<(), ModeError> { let ctx = context(editor)?; let result = self.search.repeat(&ctx.lines, ctx.cursor, opposite, count, option_bool(editor, "wrapscan", true))?; push_jump(editor, ctx.buffer, ctx.cursor); editor.set_window_cursor(ctx.window, result.target)?; Ok(()) }
     fn advance_insert_cursor(&self, editor: &mut Editor, line_end: bool) -> Result<(), ModeError> { let ctx = context(editor)?; let line = &ctx.lines[ctx.cursor.lnum - 1]; let col = if line_end { line.len() } else { next_boundary(line, ctx.cursor.col) }; editor.set_window_cursor(ctx.window, Position { lnum: ctx.cursor.lnum, col })?; Ok(()) }
     fn open_line(&self, editor: &mut Editor, below: bool) -> Result<(), ModeError> { let ctx = context(editor)?; let after_line = if below { ctx.cursor.lnum } else { ctx.cursor.lnum.saturating_sub(1) }; let pos = Position { lnum: after_line + 1, col: 0 }; editor.append_buffer_lines(ctx.buffer, after_line, &[Vec::new()], ctx.cursor, self.timestamp)?; editor.set_window_cursor(ctx.window, pos)?; Ok(()) }
+}
+
+/// Extends a visual selection with a resolved motion target, keeping the
+/// wanted block column on vertical motions (virtual edges on short lines).
+fn extend_visual(state: &mut VisualState, target: Position, from: Position) {
+    if state.kind == VisualKind::Block { state.extend_block(target, from); } else { state.extend(target); }
 }
 
 fn context(editor: &Editor) -> Result<Context, ModeError> {

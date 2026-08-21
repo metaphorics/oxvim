@@ -59,11 +59,55 @@ fn delimited(lines: &[Vec<u8>], cursor: Position, inner: bool, open: u8, close: 
 fn matching_close(bytes: &[u8], open_at: usize, open: u8, close: u8) -> Option<usize> { let mut depth = 0usize; for (index, byte) in bytes.iter().enumerate().skip(open_at) { if *byte == open { depth += 1; } else if *byte == close { depth -= 1; if depth == 0 { return Some(index); } } } None }
 
 fn quoted(lines: &[Vec<u8>], cursor: Position, inner: bool, quote: u8, count: usize) -> Option<EditRange> {
-    let line = lines.get(cursor.lnum.checked_sub(1)?)?; let escaped = |index: usize| index > 0 && line[index - 1] == b'\\';
-    let mut left = (0..=cursor.col.min(line.len().saturating_sub(1))).rev().find(|index| line[*index] == quote && !escaped(*index))?;
-    let mut right = (left + 1..line.len()).find(|index| line[*index] == quote && !escaped(*index))?;
-    for _ in 1..count.max(1) { left = (0..left).rev().find(|index| line[*index] == quote && !escaped(*index))?; right = (right + 1..line.len()).find(|index| line[*index] == quote && !escaped(*index))?; }
-    if inner { left += 1; right = right.saturating_sub(1); }
+    // `current_quote` (`textobject.c:1539-1745`): select the quote pair that
+    // surrounds the cursor.  A quote is escaped by an odd run of backslashes, and
+    // `count >= 2` (or an `a`-object) includes the quotes themselves.
+    let line = lines.get(cursor.lnum.checked_sub(1)?)?;
+    let at = cursor.col.min(line.len().saturating_sub(1));
+    let escaped = |index: usize| {
+        let mut backs = 0usize;
+        while index > backs && line[index - backs - 1] == b'\\' { backs += 1; }
+        backs % 2 == 1
+    };
+    let is_quote = |col: usize| col < line.len() && line[col] == quote && !escaped(col);
+    let next_quote = |mut col: usize| { while col < line.len() { if is_quote(col) { return col; } col += 1; } line.len() };
+    let prev_quote = |mut col: usize| { while col > 0 { col -= 1; if is_quote(col) { return col; } } line.len() };
+
+    let (mut left, mut right) = if is_quote(at) {
+        // Cursor is on a quote character.  It could be an opening or closing quote,
+        // so scan the line's pairs and pick the one that contains the cursor.
+        let mut start = 0usize;
+        loop {
+            let open = next_quote(start);
+            if open >= line.len() || open > at { return None; }
+            let close = next_quote(open + 1);
+            if close >= line.len() { return None; }
+            if open <= at && at <= close { break (open, close); }
+            start = close + 1;
+        }
+    } else {
+        // Cursor between or inside quotes: the nearest unescaped quote at-or-before
+        // the cursor opens the pair; otherwise take the next quote after the cursor.
+        let open = match prev_quote(at) { found if found < line.len() => found, _ => { let first = next_quote(0); if first >= line.len() { return None; } first } };
+        let close = next_quote(open + 1);
+        if close >= line.len() { return None; }
+        (open, close)
+    };
+
+    let include_quotes = !inner || count >= 2;
+    if !include_quotes {
+        left += 1;
+        right = right.saturating_sub(1);
+        if right < left { right = left; }
+    } else if !inner {
+        // `a"`: include the quotes and the adjacent whitespace (`current_quote`'s
+        // `if (include)` block).
+        if right + 1 < line.len() && line[right + 1].is_ascii_whitespace() {
+            while right + 1 < line.len() && line[right + 1].is_ascii_whitespace() { right += 1; }
+        } else {
+            while left > 0 && line[left - 1].is_ascii_whitespace() { left -= 1; }
+        }
+    }
     Some(EditRange { start: Position { lnum: cursor.lnum, col: left }, end: Position { lnum: cursor.lnum, col: right }, kind: MotionKind::CharacterWise, inclusive: true })
 }
 
@@ -73,15 +117,25 @@ fn paragraph(lines: &[Vec<u8>], cursor: Position, inner: bool, count: usize) -> 
     Some(EditRange { start: Position { lnum: start, col: 0 }, end: Position { lnum: end, col: lines[end - 1].len().saturating_sub(1) }, kind: MotionKind::LineWise, inclusive: true })
 }
 
+/// A `.`/`!`/`?` ends a sentence only when the trailing closers `)]"'` give way to
+/// whitespace (or the end of the text).  A period inside a word (`foo.bar`) is not a
+/// sentence terminator (`textobject.c:103-131`).
+fn terminated(bytes: &[u8], at: usize) -> bool {
+    let mut j = at + 1;
+    while j < bytes.len() && matches!(bytes[j], b')' | b']' | b'"' | b'\'') { j += 1; }
+    j >= bytes.len() || bytes[j].is_ascii_whitespace()
+}
+
 fn sentence(lines: &[Vec<u8>], cursor: Position, inner: bool, count: usize) -> Option<EditRange> {
     let (bytes, starts) = flattened(lines); let at = offset(&starts, cursor)?.min(bytes.len().checked_sub(1)?);
-    let mut start = at; while start > 0 { if matches!(bytes[start - 1], b'.' | b'!' | b'?') { break; } start -= 1; }
-    while start < bytes.len() && bytes[start].is_ascii_whitespace() { start += 1; }
+    let mut start = at;
+    while start > 0 { if matches!(bytes[start - 1], b'.' | b'!' | b'?') && terminated(&bytes, start - 1) { break; } start -= 1; }
+    while start < bytes.len() && (bytes[start].is_ascii_whitespace() || matches!(bytes[start], b')' | b']' | b'"' | b'\'')) { start += 1; }
     let mut end = start;
     for index in 0..count.max(1) {
-        while end + 1 < bytes.len() && !matches!(bytes[end], b'.' | b'!' | b'?') { end += 1; }
+        while end + 1 < bytes.len() && !(matches!(bytes[end], b'.' | b'!' | b'?') && terminated(&bytes, end)) { end += 1; }
         if index + 1 < count.max(1) {
-            while end + 1 < bytes.len() && bytes[end + 1].is_ascii_whitespace() { end += 1; }
+            while end + 1 < bytes.len() && (bytes[end + 1].is_ascii_whitespace() || matches!(bytes[end + 1], b')' | b']' | b'"' | b'\'')) { end += 1; }
             if end + 1 < bytes.len() { end += 1; }
         }
     }

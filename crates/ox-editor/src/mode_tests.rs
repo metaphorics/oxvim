@@ -89,7 +89,7 @@ behavior!(visual_block_delete, "abcd\nefgh", position(1,0), "\u{16}ljd", "cd\ngh
 behavior!(visual_uppercase, "one", position(1,0), "vllU", "ONE", position(1,0), "normal");
 behavior!(visual_reselect, "one", position(1,0), "vldgv", "e", position(1,1), "visual");
 
-behavior!(multiline_delete_promotes_linewise, "one\n\ntwo", position(1,0), "d}", "two", position(1,0), "normal");
+behavior!(multiline_delete_promotes_linewise, "one\n\ntwo", position(1,0), "d}", "\ntwo", position(1,0), "normal");
 behavior!(vertical_operator_is_linewise, "abc\ndef\nghi", position(1,1), "dj", "ghi", position(1,0), "normal");
 behavior!(counted_search, "x a a", position(1,0), "2/a\n", "x a a", position(1,4), "normal");
 behavior!(explicit_one_G, "one\ntwo\nthree", position(3,0), "1G", "one\ntwo\nthree", position(1,0), "normal");
@@ -161,103 +161,61 @@ fn jump_motions_record_only_jump_origins() {
     assert_eq!(editor.jumplist().len(), 1);
     assert_eq!(editor.jumplist().entries()[0].position, position(3,0));
 }
-behavior!(generated_append_01, "x", position(1,0), "Ax\u{1b}", "xx", position(1,1), "normal");
-behavior!(generated_append_02, "x", position(1,0), "Axx\u{1b}", "xxx", position(1,2), "normal");
-behavior!(generated_append_03, "x", position(1,0), "Axxx\u{1b}", "xxxx", position(1,3), "normal");
-behavior!(generated_append_04, "x", position(1,0), "Axxxx\u{1b}", "xxxxx", position(1,4), "normal");
-behavior!(generated_append_05, "x", position(1,0), "Axxxxx\u{1b}", "xxxxxx", position(1,5), "normal");
-behavior!(generated_append_06, "x", position(1,0), "Axxxxxx\u{1b}", "xxxxxxx", position(1,6), "normal");
-behavior!(generated_append_07, "x", position(1,0), "Axxxxxxx\u{1b}", "xxxxxxxx", position(1,7), "normal");
-behavior!(generated_append_08, "x", position(1,0), "Axxxxxxxx\u{1b}", "xxxxxxxxx", position(1,8), "normal");
-behavior!(generated_append_09, "x", position(1,0), "Axxxxxxxxx\u{1b}", "xxxxxxxxxx", position(1,9), "normal");
-behavior!(generated_append_10, "x", position(1,0), "Axxxxxxxxxx\u{1b}", "xxxxxxxxxxx", position(1,10), "normal");
-behavior!(generated_append_11, "x", position(1,0), "Axxxxxxxxxxx\u{1b}", "xxxxxxxxxxxx", position(1,11), "normal");
-behavior!(generated_append_12, "x", position(1,0), "Axxxxxxxxxxxx\u{1b}", "xxxxxxxxxxxxx", position(1,12), "normal");
-behavior!(generated_append_13, "x", position(1,0), "Axxxxxxxxxxxxx\u{1b}", "xxxxxxxxxxxxxx", position(1,13), "normal");
-behavior!(generated_append_14, "x", position(1,0), "Axxxxxxxxxxxxxx\u{1b}", "xxxxxxxxxxxxxxx", position(1,14), "normal");
-behavior!(generated_append_15, "x", position(1,0), "Axxxxxxxxxxxxxxx\u{1b}", "xxxxxxxxxxxxxxxx", position(1,15), "normal");
-behavior!(generated_append_16, "x", position(1,0), "Axxxxxxxxxxxxxxxx\u{1b}", "xxxxxxxxxxxxxxxxx", position(1,16), "normal");
-behavior!(generated_append_17, "x", position(1,0), "Axxxxxxxxxxxxxxxxx\u{1b}", "xxxxxxxxxxxxxxxxxx", position(1,17), "normal");
-behavior!(generated_append_18, "x", position(1,0), "Axxxxxxxxxxxxxxxxxx\u{1b}", "xxxxxxxxxxxxxxxxxxx", position(1,18), "normal");
-behavior!(generated_append_19, "x", position(1,0), "Axxxxxxxxxxxxxxxxxxx\u{1b}", "xxxxxxxxxxxxxxxxxxxx", position(1,19), "normal");
-behavior!(generated_append_20, "x", position(1,0), "Axxxxxxxxxxxxxxxxxxxx\u{1b}", "xxxxxxxxxxxxxxxxxxxxx", position(1,20), "normal");
-behavior!(generated_append_21, "x", position(1,0), "Axxxxxxxxxxxxxxxxxxxxx\u{1b}", "xxxxxxxxxxxxxxxxxxxxxx", position(1,21), "normal");
-behavior!(generated_append_22, "x", position(1,0), "Axxxxxxxxxxxxxxxxxxxxxx\u{1b}", "xxxxxxxxxxxxxxxxxxxxxxx", position(1,22), "normal");
-behavior!(generated_append_23, "x", position(1,0), "Axxxxxxxxxxxxxxxxxxxxxxx\u{1b}", "xxxxxxxxxxxxxxxxxxxxxxxx", position(1,23), "normal");
-behavior!(generated_append_24, "x", position(1,0), "Axxxxxxxxxxxxxxxxxxxxxxxx\u{1b}", "xxxxxxxxxxxxxxxxxxxxxxxxx", position(1,24), "normal");
-behavior!(generated_append_25, "x", position(1,0), "Axxxxxxxxxxxxxxxxxxxxxxxxx\u{1b}", "xxxxxxxxxxxxxxxxxxxxxxxxxx", position(1,25), "normal");
-behavior!(generated_delete_01, "abcdefghijklmnopqrstuvwxyz", position(1,0), "1x", "bcdefghijklmnopqrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_02, "abcdefghijklmnopqrstuvwxyz", position(1,0), "2x", "cdefghijklmnopqrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_03, "abcdefghijklmnopqrstuvwxyz", position(1,0), "3x", "defghijklmnopqrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_04, "abcdefghijklmnopqrstuvwxyz", position(1,0), "4x", "efghijklmnopqrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_05, "abcdefghijklmnopqrstuvwxyz", position(1,0), "5x", "fghijklmnopqrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_06, "abcdefghijklmnopqrstuvwxyz", position(1,0), "6x", "ghijklmnopqrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_07, "abcdefghijklmnopqrstuvwxyz", position(1,0), "7x", "hijklmnopqrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_08, "abcdefghijklmnopqrstuvwxyz", position(1,0), "8x", "ijklmnopqrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_09, "abcdefghijklmnopqrstuvwxyz", position(1,0), "9x", "jklmnopqrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_10, "abcdefghijklmnopqrstuvwxyz", position(1,0), "10x", "klmnopqrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_11, "abcdefghijklmnopqrstuvwxyz", position(1,0), "11x", "lmnopqrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_12, "abcdefghijklmnopqrstuvwxyz", position(1,0), "12x", "mnopqrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_13, "abcdefghijklmnopqrstuvwxyz", position(1,0), "13x", "nopqrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_14, "abcdefghijklmnopqrstuvwxyz", position(1,0), "14x", "opqrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_15, "abcdefghijklmnopqrstuvwxyz", position(1,0), "15x", "pqrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_16, "abcdefghijklmnopqrstuvwxyz", position(1,0), "16x", "qrstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_17, "abcdefghijklmnopqrstuvwxyz", position(1,0), "17x", "rstuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_18, "abcdefghijklmnopqrstuvwxyz", position(1,0), "18x", "stuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_19, "abcdefghijklmnopqrstuvwxyz", position(1,0), "19x", "tuvwxyz", position(1,0), "normal");
-behavior!(generated_delete_20, "abcdefghijklmnopqrstuvwxyz", position(1,0), "20x", "uvwxyz", position(1,0), "normal");
-behavior!(generated_delete_21, "abcdefghijklmnopqrstuvwxyz", position(1,0), "21x", "vwxyz", position(1,0), "normal");
-behavior!(generated_delete_22, "abcdefghijklmnopqrstuvwxyz", position(1,0), "22x", "wxyz", position(1,0), "normal");
-behavior!(generated_delete_23, "abcdefghijklmnopqrstuvwxyz", position(1,0), "23x", "xyz", position(1,0), "normal");
-behavior!(generated_delete_24, "abcdefghijklmnopqrstuvwxyz", position(1,0), "24x", "yz", position(1,0), "normal");
-behavior!(generated_delete_25, "abcdefghijklmnopqrstuvwxyz", position(1,0), "25x", "z", position(1,0), "normal");
-behavior!(generated_right_01, "abcdefghijklmnopqrstuvwxyz", position(1,0), "1l", "abcdefghijklmnopqrstuvwxyz", position(1,1), "normal");
-behavior!(generated_right_02, "abcdefghijklmnopqrstuvwxyz", position(1,0), "2l", "abcdefghijklmnopqrstuvwxyz", position(1,2), "normal");
-behavior!(generated_right_03, "abcdefghijklmnopqrstuvwxyz", position(1,0), "3l", "abcdefghijklmnopqrstuvwxyz", position(1,3), "normal");
-behavior!(generated_right_04, "abcdefghijklmnopqrstuvwxyz", position(1,0), "4l", "abcdefghijklmnopqrstuvwxyz", position(1,4), "normal");
-behavior!(generated_right_05, "abcdefghijklmnopqrstuvwxyz", position(1,0), "5l", "abcdefghijklmnopqrstuvwxyz", position(1,5), "normal");
-behavior!(generated_right_06, "abcdefghijklmnopqrstuvwxyz", position(1,0), "6l", "abcdefghijklmnopqrstuvwxyz", position(1,6), "normal");
-behavior!(generated_right_07, "abcdefghijklmnopqrstuvwxyz", position(1,0), "7l", "abcdefghijklmnopqrstuvwxyz", position(1,7), "normal");
-behavior!(generated_right_08, "abcdefghijklmnopqrstuvwxyz", position(1,0), "8l", "abcdefghijklmnopqrstuvwxyz", position(1,8), "normal");
-behavior!(generated_right_09, "abcdefghijklmnopqrstuvwxyz", position(1,0), "9l", "abcdefghijklmnopqrstuvwxyz", position(1,9), "normal");
-behavior!(generated_right_10, "abcdefghijklmnopqrstuvwxyz", position(1,0), "10l", "abcdefghijklmnopqrstuvwxyz", position(1,10), "normal");
-behavior!(generated_right_11, "abcdefghijklmnopqrstuvwxyz", position(1,0), "11l", "abcdefghijklmnopqrstuvwxyz", position(1,11), "normal");
-behavior!(generated_right_12, "abcdefghijklmnopqrstuvwxyz", position(1,0), "12l", "abcdefghijklmnopqrstuvwxyz", position(1,12), "normal");
-behavior!(generated_right_13, "abcdefghijklmnopqrstuvwxyz", position(1,0), "13l", "abcdefghijklmnopqrstuvwxyz", position(1,13), "normal");
-behavior!(generated_right_14, "abcdefghijklmnopqrstuvwxyz", position(1,0), "14l", "abcdefghijklmnopqrstuvwxyz", position(1,14), "normal");
-behavior!(generated_right_15, "abcdefghijklmnopqrstuvwxyz", position(1,0), "15l", "abcdefghijklmnopqrstuvwxyz", position(1,15), "normal");
-behavior!(generated_right_16, "abcdefghijklmnopqrstuvwxyz", position(1,0), "16l", "abcdefghijklmnopqrstuvwxyz", position(1,16), "normal");
-behavior!(generated_right_17, "abcdefghijklmnopqrstuvwxyz", position(1,0), "17l", "abcdefghijklmnopqrstuvwxyz", position(1,17), "normal");
-behavior!(generated_right_18, "abcdefghijklmnopqrstuvwxyz", position(1,0), "18l", "abcdefghijklmnopqrstuvwxyz", position(1,18), "normal");
-behavior!(generated_right_19, "abcdefghijklmnopqrstuvwxyz", position(1,0), "19l", "abcdefghijklmnopqrstuvwxyz", position(1,19), "normal");
-behavior!(generated_right_20, "abcdefghijklmnopqrstuvwxyz", position(1,0), "20l", "abcdefghijklmnopqrstuvwxyz", position(1,20), "normal");
-behavior!(generated_right_21, "abcdefghijklmnopqrstuvwxyz", position(1,0), "21l", "abcdefghijklmnopqrstuvwxyz", position(1,21), "normal");
-behavior!(generated_right_22, "abcdefghijklmnopqrstuvwxyz", position(1,0), "22l", "abcdefghijklmnopqrstuvwxyz", position(1,22), "normal");
-behavior!(generated_right_23, "abcdefghijklmnopqrstuvwxyz", position(1,0), "23l", "abcdefghijklmnopqrstuvwxyz", position(1,23), "normal");
-behavior!(generated_right_24, "abcdefghijklmnopqrstuvwxyz", position(1,0), "24l", "abcdefghijklmnopqrstuvwxyz", position(1,24), "normal");
-behavior!(generated_right_25, "abcdefghijklmnopqrstuvwxyz", position(1,0), "25l", "abcdefghijklmnopqrstuvwxyz", position(1,25), "normal");
-behavior!(generated_line_delete_01, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "1dd", "l02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_02, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "2dd", "l03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_03, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "3dd", "l04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_04, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "4dd", "l05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_05, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "5dd", "l06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_06, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "6dd", "l07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_07, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "7dd", "l08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_08, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "8dd", "l09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_09, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "9dd", "l10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_10, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "10dd", "l11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_11, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "11dd", "l12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_12, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "12dd", "l13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_13, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "13dd", "l14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_14, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "14dd", "l15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_15, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "15dd", "l16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_16, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "16dd", "l17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_17, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "17dd", "l18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_18, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "18dd", "l19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_19, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "19dd", "l20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_20, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "20dd", "l21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_21, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "21dd", "l22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_22, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "22dd", "l23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_23, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "23dd", "l24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_24, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "24dd", "l25\nl26\nl27\nl28\nl29\nl30", position(1,0), "normal");
-behavior!(generated_line_delete_25, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "25dd", "l26\nl27\nl28\nl29\nl30", position(1,0), "normal");
+// Real behavior matrix (replaces earlier padded A/x/l/dd repetition).  Each
+// family cites the upstream function or oldtest that defines it.
+
+// Operator and motion counts multiply (`normal.c:1145-1158`: "If you give a
+// count before AND after the operator, they are multiplied").
+behavior!(counts_before_and_after_operator_multiply, "one two three four five six seven eight", position(1,0), "2d3w", "seven eight", position(1,0), "normal");
+
+// `cc` clears the line in place and enters insert (`ops.c:888-901`: OP_CHANGE
+// deletes the other lines, then truncates the first).
+behavior!(change_line_clears_and_enters_insert, "one\ntwo", position(1,0), "cc", "\ntwo", position(1,0), "insert");
+
+// An exclusive charwise motion that ends in column zero of the next line backs
+// onto the previous row, so a cross-line `dw` never joins lines
+// (`ops.c:3517-3539`).
+behavior!(cross_line_dw_never_joins, "alpha gamma\nbeta", position(1,6), "dw", "alpha \nbeta", position(1,5), "normal");
+behavior!(cross_line_dw_indent_end_backs_off, "aa bb\ncc", position(1,3), "dw", "aa \ncc", position(1,2), "normal");
+
+// Quote objects select the pair under the cursor, skip escaped quotes, and
+// include the quotes themselves when `count >= 2` (`textobject.c:1539-1745`,
+// `current_quote`; adjacent pairs never combine).
+behavior!(quote_count_two_includes_quotes, "a \"x y\" b \"p q\" c", position(1,3), "d2i\"", "a  b \"p q\" c", position(1,2), "normal");
+behavior!(quote_object_targets_current_pair, "hi \"pp\" there \"qq\" now", position(1,15), "di\"", "hi \"pp\" there \"\" now", position(1,15), "normal");
+behavior!(quote_object_skips_escaped_quotes, "x \"a \\\"b\\\" c\" y", position(1,3), "ci\"Z\u{1b}", "x \"Z\" y", position(1,3), "normal");
+
+// A `.`/`!`/`?` ends a sentence only after trailing `)]"'` closers give way to
+// whitespace; applies to the `)`/`(` motions and the `as`/`is` objects
+// (`textobject.c:103-131`, `find_sent`).
+behavior!(sentence_motion_skips_trailing_closers, "a.) b.", position(1,0), ")", "a.) b.", position(1,4), "normal");
+behavior!(sentence_object_ends_after_closers, "One.) Two.", position(1,7), "dis", "One.) ", position(1,5), "normal");
+
+// Block visual keeps its virtual edge columns across short rows; a row without
+// cells at those columns contributes no bytes but keeps the rectangle width
+// (`ops.c:2223-2231`, `block_prep` is_short accounting).
+behavior!(block_ragged_delete_keeps_short_row, "abcdef\nx\nuvwxyz", position(1,2), "\u{16}lljjd", "abf\nx\nuvz", position(1,2), "normal");
+behavior!(block_ragged_uppercase_wide_edges, "abcde\nz\nqrstu", position(1,0), "\u{16}llljjU", "ABCDe\nZ\nQRSTu", position(1,0), "normal");
+
+#[test]
+fn nowrap_search_reports_pattern_not_found_at_end() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer_with(Buffer::from_bytes(b"one two").unwrap(), true).unwrap();
+    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    editor.options_mut().set_global("wrapscan", crate::OptionValue::Boolean(false)).unwrap();
+    let window = editor.tabpage(editor.current_tabpage().unwrap()).unwrap().current_window();
+    editor.set_window_cursor(window, position(1,4)).unwrap();
+    let mut machine = ModeMachine::default();
+    // 'wrapscan' off stops the search at the buffer end instead of wrapping
+    // (`search.c:933-944`).
+    let error = machine.feed_keys(&mut editor, "/two\n").unwrap_err();
+    assert!(matches!(error, crate::ModeError::Search(crate::SearchError::PatternNotFound(pattern)) if pattern == "two"));
+}
+
+#[test]
+fn block_ragged_yank_keeps_rectangle_width() {
+    let (_, _, _, editor, _) = run("abcdef\nx\nuvwxyz", position(1,2), "\u{16}lljjy");
+    let unnamed = editor.registers().get('"').unwrap().unwrap();
+    assert_eq!(unnamed.kind(), crate::RegisterKind::BlockWise { width: 3 });
+    assert_eq!(unnamed.to_bytes(), b"cde\n\nwxy");
+}

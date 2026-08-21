@@ -28,17 +28,33 @@ pub struct VisualState {
     pub count: usize,
     /// Incomplete `g`, find, or text-object prefix.
     pub prefix: String,
+    /// Virtual column the active endpoint holds during vertical block motions,
+    /// tracked independently of the clamped byte cursor.  Block visual keeps this
+    /// edge column (possibly beyond a shorter line's end) so a ragged rectangle
+    /// keeps its width (`ops.c:2223-2231`).
+    pub wanted: Option<usize>,
 }
 
 impl VisualState {
     /// Starts a selection at `anchor`.
-    #[must_use] pub fn new(anchor: Position, kind: VisualKind) -> Self { Self { anchor, cursor: anchor, kind, count: 0, prefix: String::new() } }
+    #[must_use] pub fn new(anchor: Position, kind: VisualKind) -> Self { Self { anchor, cursor: anchor, kind, count: 0, prefix: String::new(), wanted: (kind == VisualKind::Block).then_some(anchor.col) } }
     /// Extends the active endpoint.
     pub fn extend(&mut self, cursor: Position) { self.cursor = cursor; }
+    /// Extends the active endpoint in a block, preserving the wanted column across
+    /// vertical motions and adopting the new column on horizontal motions.
+    pub fn extend_block(&mut self, target: Position, from: Position) {
+        if target.lnum == from.lnum {
+            self.wanted = Some(target.col);
+            self.cursor = target;
+        } else {
+            self.cursor.lnum = target.lnum;
+            self.cursor.col = self.wanted.unwrap_or(self.cursor.col);
+        }
+    }
     /// Exchanges the active and fixed endpoints.
-    pub fn swap_ends(&mut self) { std::mem::swap(&mut self.anchor, &mut self.cursor); }
+    pub fn swap_ends(&mut self) { std::mem::swap(&mut self.anchor, &mut self.cursor); if self.kind == VisualKind::Block { self.wanted = Some(self.cursor.col); } }
     /// Exchanges only endpoint columns, moving to the other block corner on the active row.
-    pub fn swap_columns(&mut self) { std::mem::swap(&mut self.anchor.col, &mut self.cursor.col); }
+    pub fn swap_columns(&mut self) { std::mem::swap(&mut self.anchor.col, &mut self.cursor.col); self.wanted = Some(self.cursor.col); }
     /// Converts the selection into normalized operator endpoints.
     #[must_use]
     pub fn range(&self) -> EditRange {

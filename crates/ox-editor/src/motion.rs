@@ -178,17 +178,30 @@ fn first_nonblank(lines: &[Vec<u8>], lnum: usize) -> usize { lines.get(lnum.satu
 fn previous_blank(lines: &[Vec<u8>], lnum: usize) -> usize { (1..lnum).rev().find(|n| lines[*n - 1].is_empty()).map_or(1, |line| line) }
 fn next_blank(lines: &[Vec<u8>], lnum: usize) -> usize { ((lnum + 1)..=lines.len()).find(|n| lines[*n - 1].is_empty()).map_or(lines.len().max(1), |line| line) }
 
+/// A `.`/`!`/`?` ends a sentence only when trailing closers `)]"'` give way to
+/// whitespace or the end of the text (`textobject.c:103-131`).
+fn sentence_terminated(bytes: &[u8], at: usize) -> bool {
+    let mut j = at + 1;
+    while j < bytes.len() && matches!(bytes[j], b')' | b']' | b'"' | b'\'') { j += 1; }
+    j >= bytes.len() || bytes[j].is_ascii_whitespace()
+}
+
 fn sentence_boundary(lines: &[Vec<u8>], start: Position, count: usize, forward: bool) -> Position {
     let (bytes, starts) = flatten(lines);
     if bytes.is_empty() { return Position { lnum: 1, col: 0 }; }
     let mut at = offset_of(&starts, start).min(bytes.len() - 1);
+    let skip_tail = |at: usize| {
+        let mut at = at;
+        while at < bytes.len() && (bytes[at].is_ascii_whitespace() || matches!(bytes[at], b')' | b']' | b'"' | b'\'')) { at += 1; }
+        at.min(bytes.len() - 1)
+    };
     for _ in 0..count.max(1) {
         if forward {
-            while at + 1 < bytes.len() { at += 1; if matches!(bytes[at - 1], b'.' | b'!' | b'?') && (bytes[at].is_ascii_whitespace()) { while at < bytes.len() && bytes[at].is_ascii_whitespace() { at += 1; } break; } }
+            while at + 1 < bytes.len() { at += 1; if matches!(bytes[at - 1], b'.' | b'!' | b'?') && sentence_terminated(&bytes, at - 1) { at = skip_tail(at); break; } }
             at = at.min(bytes.len() - 1);
         } else {
             at = at.saturating_sub(1);
-            while at > 0 { if matches!(bytes[at - 1], b'.' | b'!' | b'?') && bytes[at].is_ascii_whitespace() { while at < bytes.len() && bytes[at].is_ascii_whitespace() { at += 1; } break; } at -= 1; }
+            while at > 0 { if matches!(bytes[at - 1], b'.' | b'!' | b'?') && sentence_terminated(&bytes, at - 1) { at = skip_tail(at); break; } at -= 1; }
         }
     }
     pos_of(lines, &starts, at)
