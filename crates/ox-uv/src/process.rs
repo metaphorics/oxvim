@@ -16,7 +16,7 @@ use crate::{Handle, HandleId, UvLoop};
 #[cfg(unix)]
 use std::cell::RefCell;
 #[cfg(unix)]
-use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::fd::AsRawFd as _;
 #[cfg(unix)]
 use std::rc::Rc;
 
@@ -58,12 +58,16 @@ pub enum StdioConfig {
 /// child process, per `uv.spawn-options.stdio` in `runtime/doc/luvref.txt`
 /// (lines 1434-1447).
 ///
-/// `StdioConfig::CreatePipe` delivers a fresh pipe whose child end is
-/// installed as descriptor `fd` in the child; the parent endpoint is returned
-/// from [`spawn`]. `Inherit` and `Ignore` are accepted for API completeness
-/// but require no parent-side action (a child fd is inherited or pointer than
-/// any descriptor, and `Ignore` simply leaves it unspecified, matching the
-/// luvref `nil` placeholder).
+/// `Inherit` and `Ignore` are accepted for API completeness and need no
+/// parent-side action: an inherited child fd just walks the parent's open
+/// descriptor table past 2, and `Ignore` leaves the child fd unspecified,
+/// matching the luvref `nil` placeholder.
+///
+/// `StdioConfig::CreatePipe` at an **exact** fd ≥ 3 is returned by [`spawn`]
+/// as [`ProcessError::Unsupported`]: delivering a fresh pipe at a precise
+/// child descriptor number requires duplicating into the parent's own
+/// descriptor table, which the crate's no-unsafe policy cannot honor without
+/// risking a false-success install at a number the parent already occupies.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExtraStdio {
     /// Child file-descriptor number (3 or greater).
@@ -843,66 +847,29 @@ impl Handle for Process {
 /// owning loop, never by the waiter. See `luvref.txt`, `uv.spawn()` and
 /// `uv.spawn-options` (lines 1340-1455).
 ///
-/// Extra (fd ≥ 3) `StdioConfig::CreatePipe` descriptors are installed by
-/// duplicating a fresh pipe's write end into the parent's own descriptor
-/// table so the child inherits it at the requested number. This is safe-only:
-/// every call is a rustix fd routine, and the reservation is single-threaded
-/// (spawn runs on the loop thread; the process waiter never duplicates fds).
-#[cfg(unix)]
+/// Installing a `StdioConfig::CreatePipe` descriptor at an exact child fd ≥ 3
+/// would require duplicating a fresh pipe's end into the parent's own
+/// descriptor table so the child inherits it at the requested number. That
+/// reservation is not expressible with the safe, non-interfering primitives
+/// this crate restricts itself to (the parent may legitimately occupy any
+/// descriptor, so an "exact-fd" claim can silently land elsewhere). Per the
+/// no-unsafe policy an honest typed rejection is preferable to a false
+/// success, so any extra entry requesting an exact fd > 2 is rejected as
+/// [`ProcessError::Unsupported`]; `Inherit`/`Ignore` entries need no parent
+/// action and are accepted.
 struct PreparedExtra {
     parents: Vec<ExtraPipe>,
-    keep_alive: Vec<OwnedFd>,
 }
 
-#[cfg(unix)]
 fn prepare_extra_stdio(options: &SpawnOptions) -> Result<PreparedExtra, ProcessError> {
-    let mut sorted: Vec<&ExtraStdio> = options
+    if options
         .extra_stdio
         .iter()
-        .filter(|entry| entry.fd >= 3)
-        .collect();
-    sorted.sort_by_key(|entry| entry.fd);
-
-    let mut held: Vec<OwnedFd> = Vec::new();
-    let mut next_high: u32 = 2;
-    let mut parents: Vec<ExtraPipe> = Vec::new();
-    let mut keep_alive: Vec<OwnedFd> = Vec::new();
-
-    for entry in sorted {
-        if entry.config != StdioConfig::CreatePipe {
-            continue;
-        }
-        let (read, write) = rustix::pipe::pipe().map_err(|error| {
-            ProcessError::io("extra stdio pipe", std::io::Error::from_raw_os_error(error.raw_os_error()))
-        })?;
-        while next_high < entry.fd {
-            held.push(rustix::io::dup(&read).map_err(|error| {
-                ProcessError::io("reserve extra stdio fd", std::io::Error::from_raw_os_error(error.raw_os_error()))
-            })?);
-            next_high += 1;
-        }
-        let mut slot = held.pop().ok_or_else(|| ProcessError::io("extra stdio slot", std::io::Error::from(std::io::ErrorKind::NotFound)))?;
-        rustix::io::dup2(&write, &mut slot).map_err(|error| {
-            ProcessError::io("install extra stdio fd", std::io::Error::from_raw_os_error(error.raw_os_error()))
-        })?;
-        keep_alive.push(slot);
-        drop(write);
-        parents.push(ExtraPipe { fd: entry.fd, parent: std::fs::File::from(read) });
-    }
-    Ok(PreparedExtra { parents, keep_alive })
-}
-
-#[cfg(not(unix))]
-struct PreparedExtra {
-    parents: Vec<ExtraPipe>,
-}
-
-#[cfg(not(unix))]
-fn prepare_extra_stdio(options: &SpawnOptions) -> Result<PreparedExtra, ProcessError> {
-    if options.extra_stdio.iter().any(|entry| entry.config == StdioConfig::CreatePipe) {
+        .any(|entry| entry.fd > 2 && entry.config == StdioConfig::CreatePipe)
+    {
         return Err(ProcessError::Unsupported {
-            feature: "extra stdio pipe creation",
-            reason: "fd 3+ pass-through requires a Unix descriptor-table dup that this platform cannot express safely",
+            feature: "extra stdio exact-fd pipe pass-through",
+            reason: "installing a created pipe at child fd >= 3 requires a parent descriptor-table dup that the no-unsafe policy cannot honor",
         });
     }
     Ok(PreparedExtra { parents: Vec::new() })
@@ -944,7 +911,6 @@ where
     let child_stdout = child.stdout.take();
     let child_stderr = child.stderr.take();
     let extra = prepared.parents;
-    drop(prepared.keep_alive);
     let state = Arc::new(Mutex::new(ChildState::Standard(child)));
     let handle_id = match uv_loop.allocate_external(true) {
         Ok(id) => id,

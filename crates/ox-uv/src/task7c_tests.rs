@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::{Handle, UvLoop};
-use crate::net::{NetEvent, Pipe};
+use crate::net::{NetEvent, Pipe, PipeHandleKind};
 use crate::process::{self, ExtraStdio, SpawnOptions, StdioConfig};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -86,6 +86,31 @@ fn poll_event_strings_parse_and_report_names() {
     assert_eq!(PollEvents::from_mask(0).name(), None);
 }
 
+/// Starting a poll with a `"p"` (PRIORITIZED) mask is rejected with a typed
+/// [`NetError::Unsupported`]: the reactor pipeline this handle is built on
+/// cannot surface real POLLPRI, so silently mapping it would report false
+/// readiness (Task 7c finding 2).
+#[test]
+fn poll_start_rejects_prioritized_as_unsupported() {
+    use crate::Poll;
+    use crate::net::NetError;
+
+    let (read, _write) = rustix::pipe::pipe().expect("create pipe");
+    let mut uv_loop = UvLoop::new().expect("create loop");
+    let mut poll = Poll::new(&mut uv_loop, &read, |_, _, _| {}).expect("new_poll");
+
+    let error = poll
+        .poll_start(&mut uv_loop, "p")
+        .err()
+        .expect("poll_start(events=\"p\") is rejected");
+    assert!(
+        matches!(error, NetError::Unsupported(_)),
+        "expected typed Unsupported, got {error:?}"
+    );
+
+    poll.close(&mut uv_loop).expect("close poll handle");
+}
+
 // ---------------------------------------------------------------------------
 // IPC write2 + pipe_pending_* (luvref 1632-1690, 2091-2130).
 // ---------------------------------------------------------------------------
@@ -118,7 +143,7 @@ fn ipc_write2_passes_fd_which_receiver_can_use() {
     })
     .expect("wrap sender pipe");
     sender
-        .write2(&mut uv_loop, b"hi".to_vec(), &pipe_write)
+        .write2(&mut uv_loop, b"hi".to_vec(), &pipe_write, PipeHandleKind::Pipe)
         .expect("write2 sends handle");
 
     // Pump until the receiver's recvmsg has captured the ancillary fd.
@@ -146,55 +171,157 @@ fn ipc_write2_passes_fd_which_receiver_can_use() {
     assert_eq!(&buf[..n], b"through-passed-fd", "received fd is a working dup of the pipe write end");
 }
 
+/// `write2` on a pipe that was not created with the `ipc` option is rejected
+/// with a typed error (Task 7c finding 3).
+#[test]
+fn write2_requires_ipc_pipe() {
+    use crate::net::NetError;
+
+    let (pair_a, _pair_b) = mio::net::UnixStream::pair().expect("socketpair");
+    let (_, pipe_write) = rustix::pipe::pipe().expect("create pipe");
+
+    let mut uv_loop = UvLoop::new().expect("create loop");
+    let sender = Pipe::from_stream(&mut uv_loop, pair_a, false, |_, _, event| match event {
+        NetEvent::Error(error) => panic!("send error: {error}"),
+        _ => {}
+    })
+    .expect("wrap non-ipc sender pipe");
+
+    let error = sender
+        .write2(&mut uv_loop, b"hi".to_vec(), &pipe_write, PipeHandleKind::Pipe)
+        .err()
+        .expect("write2 on a non-IPC pipe is rejected");
+    assert!(
+        matches!(error, NetError::InvalidState(_)),
+        "expected typed InvalidState, got {error:?}"
+    );
+}
+
+/// The pending queue is FIFO: `pending_type` and `pending_take_fd` refer to
+/// the same (front) item, in arrival order, even when several descriptors are
+/// pending. The first taken fd must be a working dup of the FIRST sent write
+/// end, not the last (Task 7c finding 4).
+#[test]
+fn pending_queue_is_fifo() {
+    let (pair_a, pair_b) = mio::net::UnixStream::pair().expect("socketpair");
+    let (read_1, write_1) = rustix::pipe::pipe().expect("pipe 1");
+    let (read_2, write_2) = rustix::pipe::pipe().expect("pipe 2");
+
+    let mut uv_loop = UvLoop::new().expect("create loop");
+    let receiver = {
+        let mut child = Pipe::from_stream(&mut uv_loop, pair_b, true, |_, _, event| match event {
+            NetEvent::Error(error) => panic!("ipc receive error: {error}"),
+            _ => {}
+        })
+        .expect("wrap receiver pipe");
+        child.read_start(&mut uv_loop).expect("read_start ipc pipe");
+        std::cell::RefCell::new(Some(child))
+    };
+
+    let sender = Pipe::from_stream(&mut uv_loop, pair_a, true, |_, _, event| match event {
+        NetEvent::Error(error) => panic!("ipc send error: {error}"),
+        _ => {}
+    })
+    .expect("wrap sender pipe");
+    sender
+        .write2(&mut uv_loop, b"a".to_vec(), &write_1, PipeHandleKind::Pipe)
+        .expect("write2 #1");
+    sender
+        .write2(&mut uv_loop, b"b".to_vec(), &write_2, PipeHandleKind::Pipe)
+        .expect("write2 #2");
+
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline {
+        let have = receiver
+            .borrow()
+            .as_ref()
+            .is_some_and(|pipe| pipe.pending_count() >= 2);
+        if have {
+            break;
+        }
+        uv_loop.run_nowait().expect("pump ipc loop");
+    }
+
+    let receiver = receiver.borrow();
+    let child = receiver.as_ref().expect("receiver pipe");
+    assert_eq!(child.pending_count(), 2, "both descriptors pending");
+
+    // FIFO: the front item reported by pending_type is the one take_fd pops.
+    assert_eq!(child.pending_type(), Some("pipe"), "front item pending type");
+    let first = child.pending_take_fd().expect("take front pending descriptor");
+
+    // Prove the taken fd is a dup of the FIRST write end (pipe 1): a write
+    // through it must land in read_1, while read_2 stays empty.
+    rustix::io::write(&first, b"F").expect("write through front fd");
+
+    let probe = |file: &std::fs::File| {
+        use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+        let _ = fcntl_setfl(file, fcntl_getfl(file).expect("getfl") | OFlags::NONBLOCK);
+        let mut byte = [0u8; 1];
+        match rustix::io::read(file, &mut byte) {
+            Ok(1) => Some(byte[0]),
+            Ok(_) | Err(_) => None,
+        }
+    };
+    let read_1 = std::fs::File::from(read_1);
+    let read_2 = std::fs::File::from(read_2);
+    assert_eq!(probe(&read_1), Some(b'F'), "front-taken fd reaches pipe 1");
+    assert_eq!(probe(&read_2), None, "second pipe must remain untouched by the front take");
+}
+
 // ---------------------------------------------------------------------------
 // Extra stdio (fd >= 3) (luvref 1434-1447).
 // ---------------------------------------------------------------------------
 
-/// Spawns `sh -c 'echo x >&3'` with fd 3 wired to a created pipe; the parent
-/// reads the child's write back from the extra parent endpoint.
+/// Spawning with a `CreatePipe` extra descriptor at an exact fd ≥ 3 is
+/// rejected with a typed [`ProcessError::Unsupported`] instead of silently
+/// installing the pipe at whatever descriptor number the parent happens to
+/// have free. False success is worse than an honest rejection (Task 7c
+/// finding 1); `Inherit`/`Ignore` extra entries still need no parent action.
 #[test]
-fn extra_stdio_fd3_child_writes_and_parent_reads() {
-    use std::io::Read as _;
-
+fn extra_stdio_create_pipe_is_typed_unsupported() {
     let mut uv_loop = UvLoop::new().expect("create loop");
-    let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut options = SpawnOptions::new("/bin/bash");
-    // The parent loop owns several low-numbered internal fds, so the child's
-    // inherited descriptor number varies; probe a range and the byte that
-    // lands in our created pipe is the one we read back.
-    options.args = vec![
-        "-c".into(),
-        "{ for f in $(seq 3 40); do printf x >&$f 2>/dev/null; done; } 2>/dev/null".into(),
-    ];
+    let mut options = SpawnOptions::new("/bin/true");
     options.extra_stdio = vec![ExtraStdio {
         fd: 3,
         config: StdioConfig::CreatePipe,
     }];
 
-    let mut spawned = {
+    let error = process::spawn(&mut uv_loop, options, |_, _| {})
+        .err()
+        .expect("exact-fd extra stdio CreatePipe is rejected");
+    assert!(
+        matches!(&error, crate::process::ProcessError::Unsupported { .. }),
+        "expected typed Unsupported, got {error:?}"
+    );
+}
+
+/// `Inherit` extra entries on fd ≥ 3 are accepted (they need no parent-side
+/// descriptor manipulation) and spawn proceeds to launch the child.
+#[test]
+fn extra_stdio_inherit_fd3_spawns_ok() {
+    let mut uv_loop = UvLoop::new().expect("create loop");
+    let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut options = SpawnOptions::new("/bin/true");
+    options.extra_stdio = vec![ExtraStdio {
+        fd: 3,
+        config: StdioConfig::Inherit,
+    }];
+
+    let spawned = {
         let exited = exited.clone();
         process::spawn(&mut uv_loop, options, move |_, _exit| {
             exited.store(true, std::sync::atomic::Ordering::SeqCst);
         })
-        .expect("spawn child with fd 3")
+        .expect("Inherit extra stdio spawns")
     };
-    assert_eq!(spawned.extra.len(), 1, "one extra parent endpoint");
+    assert_eq!(spawned.extra.len(), 0, "no created endpoints for Inherit entries");
 
     let deadline = Instant::now() + TIMEOUT;
     while !exited.load(std::sync::atomic::Ordering::SeqCst) && Instant::now() < deadline {
-        uv_loop.run_nowait().expect("pump extra stdio loop");
+        uv_loop.run_nowait().expect("pump spawn loop");
     }
     assert!(exited.load(std::sync::atomic::Ordering::SeqCst), "child never exited");
-
-    let mut content = String::new();
-    spawned
-        .extra
-        .first_mut()
-        .expect("extra endpoint")
-        .parent
-        .read_to_string(&mut content)
-        .expect("read fd 3 parent endpoint");
-    assert!(content.contains('x'), "child wrote a byte to the inherited fd; got {:?}", content);
 }
 
 // ---------------------------------------------------------------------------

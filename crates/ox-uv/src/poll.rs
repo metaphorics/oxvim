@@ -6,6 +6,22 @@
 //! `poll(2)` accepts may be watched; the descriptor is duplicated and placed
 //! in non-blocking mode, then registered with the owning loop's reactor
 //! through the sanctioned `UvLoop::inner_mut` seam.
+//!
+//! # PRIORITIZED (`"p"`) is rejected at start
+//!
+//! libuv's `POLLPRI` (the `"p"` event) has no faithful equivalent in the
+//! reactor pipeline this handle is built on: mio 1.2 can register an `EPOLLPRI`
+//! interest and detect it (`mio::Interest::PRIORITY` / `event::is_priority`),
+//! but `ox_loop` collapses the event into its `Readiness` struct, which has no
+//! priority field, and mio's own epoll `is_readable` returns true for
+//! `EPOLLPRI` — so a prioritized read is indistinguishable from ordinary
+//! readable data at the loop boundary. Surfacing real POLLPRI readiness would
+//! require a priority channel through `ox_loop` (outside this crate), and
+//! silently mapping `"p"` onto WRITABLE would report false writability. Per
+//! the crate's no-wrong-mapping policy, [`Poll::poll_start`] therefore rejects
+//! any mask containing `"p"` with a typed [`NetError::Unsupported`]. The
+//! parser and [`PollEvents::prioritized`] accessor remain for API
+//! compatibility; only starting a watch on them is refused.
 
 use std::cell::RefCell;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -84,14 +100,15 @@ pub(crate) fn poll_start_mask(events: &str) -> Option<u8> {
 
 /// Maps requested event bits to mio readiness interests.
 ///
-/// DISCONNECT and PRIORITIZED have no exact epoll/mio equivalent; READABLE
-/// carries data and hangup (`EPOLLIN`/`EPOLLHUP`) while WRITABLE carries
-/// `EPOLLOUT`. These classes therefore map onto READABLE/WRITABLE and the
-/// distinction is surfaced in the reported mask, documented as an
-/// approximation on the epoll backend.
+/// DISCONNECT has no exact epoll/mio equivalent; READABLE carries data and
+/// hangup (`EPOLLIN`/`EPOLLHUP`) while WRITABLE carries `EPOLLOUT`, so
+/// DISCONNECT maps onto READABLE and the distinction is surfaced in the
+/// reported mask, documented as an approximation on the epoll backend.
+/// PRIORITIZED never reaches this point: [`Poll::poll_start`] rejects any
+/// mask containing it before registration.
 fn poll_interest(mask: u8) -> mio::Interest {
     let readable = mask & (POLL_READABLE | POLL_DISCONNECT) != 0;
-    let writable = mask & (POLL_WRITABLE | POLL_PRIORITIZED) != 0;
+    let writable = mask & POLL_WRITABLE != 0;
     match (readable, writable) {
         (true, true) => mio::Interest::READABLE.add(mio::Interest::WRITABLE),
         (true, false) => mio::Interest::READABLE,
@@ -101,6 +118,9 @@ fn poll_interest(mask: u8) -> mio::Interest {
 }
 
 /// Computes which requested events fired for a mio readiness notification.
+///
+/// PRIORITIZED is never in `mask` (rejected at [`Poll::poll_start`]), so it
+/// is not reported here.
 fn fired_events(mask: u8, ready: Readiness) -> u8 {
     let mut fired = 0u8;
     if mask & POLL_READABLE != 0 && (ready.readable || ready.error) {
@@ -111,9 +131,6 @@ fn fired_events(mask: u8, ready: Readiness) -> u8 {
     }
     if mask & POLL_DISCONNECT != 0 && (ready.error || ready.read_closed || ready.write_closed) {
         fired |= POLL_DISCONNECT;
-    }
-    if mask & POLL_PRIORITIZED != 0 && ready.error {
-        fired |= POLL_PRIORITIZED;
     }
     fired
 }
@@ -206,9 +223,17 @@ impl Poll {
     /// Starts polling with an `events` mask, firing `callback` on readiness.
     ///
     /// Calling start on an already-active handle updates the watched mask.
+    /// A mask containing `"p"` (PRIORITIZED) is rejected with
+    /// [`NetError::Unsupported`] because the reactor pipeline this handle is
+    /// built on cannot surface real `POLLPRI` readiness (see the module docs).
     /// See `uv.poll_start()` in `runtime/doc/luvref.txt` (lines 1169-1196).
     pub fn poll_start(&mut self, uv_loop: &mut UvLoop, events: &str) -> crate::net::NetResult<()> {
         let mask = poll_start_mask(events).ok_or_else(|| crate::net::NetError::InvalidState("invalid poll events mask"))?;
+        if mask & POLL_PRIORITIZED != 0 {
+            return Err(crate::net::NetError::Unsupported(
+                "poll PRIORITIZED ('p') readiness has no reactor equivalent; the loop cannot surface real POLLPRI",
+            ));
+        }
         {
             let mut state = self.state.borrow_mut();
             state.mask = mask;

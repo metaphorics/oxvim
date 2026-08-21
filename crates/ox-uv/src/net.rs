@@ -549,6 +549,18 @@ enum PipeIo { Listener(UnixListener), Stream(UnixStream) }
 #[cfg(unix)]
 enum PipeReadyEvent { Public(NetEvent), Accepted(UnixStream) }
 
+/// The kind of stream handle passed by [`Pipe::write2`].
+///
+/// Matches the `uv.write2()` contract in `runtime/doc/luvref.txt` (lines
+/// 1632-1666): `send_handle` must be a TCP socket or a pipe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PipeHandleKind {
+    /// A TCP stream (listening or connected).
+    Tcp,
+    /// A Unix domain socket / named pipe.
+    Pipe,
+}
+
 #[cfg(unix)]
 struct PipePending {
     fd: std::os::fd::OwnedFd,
@@ -565,7 +577,7 @@ struct PipeState {
     writes: WriteQueue,
     registered: bool,
     ipc: bool,
-    pending: Vec<PipePending>,
+    pending: VecDeque<PipePending>,
     pending_instances: u32,
 }
 
@@ -584,13 +596,13 @@ impl Pipe {
     pub fn bind<F>(uv_loop: &mut UvLoop, path: impl AsRef<Path>, callback: F) -> NetResult<Self>
     where F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static {
         let path = path.as_ref().to_path_buf();
-        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Listener(UnixListener::bind(&path)?)), path: Some(path), listening: false, reading: false, connecting: false, writes: WriteQueue::new(), registered: false, ipc: false, pending: Vec::new(), pending_instances: 0 }, Rc::new(RefCell::new(Some(Box::new(callback)))))
+        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Listener(UnixListener::bind(&path)?)), path: Some(path), listening: false, reading: false, connecting: false, writes: WriteQueue::new(), registered: false, ipc: false, pending: VecDeque::new(), pending_instances: 0 }, Rc::new(RefCell::new(Some(Box::new(callback)))))
     }
 
     /// Connects a pipe to `path`. See `uv.pipe_connect()` in `runtime/doc/luvref.txt`.
     pub fn connect<F>(uv_loop: &mut UvLoop, path: impl AsRef<Path>, callback: F) -> NetResult<Self>
     where F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static {
-        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Stream(UnixStream::connect(path.as_ref())?)), path: None, listening: false, reading: false, connecting: true, writes: WriteQueue::new(), registered: false, ipc: false, pending: Vec::new(), pending_instances: 0 }, Rc::new(RefCell::new(Some(Box::new(callback)))))
+        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Stream(UnixStream::connect(path.as_ref())?)), path: None, listening: false, reading: false, connecting: true, writes: WriteQueue::new(), registered: false, ipc: false, pending: VecDeque::new(), pending_instances: 0 }, Rc::new(RefCell::new(Some(Box::new(callback)))))
     }
 
     fn attach(uv_loop: &mut UvLoop, state: PipeState, callback: CallbackCell) -> NetResult<Self> {
@@ -671,25 +683,45 @@ impl Pipe {
     /// combination in `runtime/doc/luvref.txt` (lines 2007-2032).
     pub fn from_stream<F>(uv_loop: &mut UvLoop, stream: mio::net::UnixStream, ipc: bool, callback: F) -> NetResult<Self>
     where F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static {
-        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Stream(stream)), path: None, listening: false, reading: false, connecting: true, writes: WriteQueue::new(), registered: false, ipc, pending: Vec::new(), pending_instances: 0 }, Rc::new(RefCell::new(Some(Box::new(callback)))))
+        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Stream(stream)), path: None, listening: false, reading: false, connecting: true, writes: WriteQueue::new(), registered: false, ipc, pending: VecDeque::new(), pending_instances: 0 }, Rc::new(RefCell::new(Some(Box::new(callback)))))
     }
 
     /// Sends `data` and passes `send_handle`'s descriptor over an IPC pipe.
     ///
     /// See `uv.write2()` in `runtime/doc/luvref.txt` (lines 1632-1666). The
     /// descriptor is delivered as an `SCM_RIGHTS` ancillary message alongside
-    /// the payload via a single `sendmsg`. The pipe must be a connected
-    /// stream (initialized with the ipc option); bound listeners cannot send.
-    /// `send_handle` must be a TCP socket or pipe whose descriptor is passed.
+    /// the payload via a single `sendmsg`. The pipe must have been created
+    /// with the `ipc` option (`new_pipe(true)`), be a connected stream, and
+    /// `kind` must name what `send_handle` actually is (`tcp` or `pipe` per
+    /// luvref). Requiring an explicit kind keeps the sender from silently
+    /// passing a bare `AsFd` and letting the whole path assume "pipe".
+    /// A Unix `SCM_RIGHTS` transfer carries no type tag on the wire, so the
+    /// receiving side reports only the generic stream present.
     ///
     /// ox-uv performs the fd-passing synchronously rather than queueing a
     /// deferred `uv_write_t` request; the return value is the number of bytes
     /// written.
-    pub fn write2<S: std::os::fd::AsFd>(&self, uv_loop: &mut UvLoop, data: Vec<u8>, send_handle: &S) -> NetResult<usize> {
+    pub fn write2<S: std::os::fd::AsFd>(
+        &self,
+        uv_loop: &mut UvLoop,
+        data: Vec<u8>,
+        send_handle: &S,
+        kind: PipeHandleKind,
+    ) -> NetResult<usize> {
         let _ = uv_loop;
+        let _kind = kind;
         let state = self.state.borrow();
+        if !state.ipc {
+            return Err(NetError::InvalidState(
+                "write2 requires an IPC pipe (create it with new_pipe(true))",
+            ));
+        }
         let Some(PipeIo::Stream(stream)) = state.io.as_ref() else {
-            return if state.io.is_none() { Err(NetError::Closed) } else { Err(NetError::InvalidState("pipe listener cannot send handles")) };
+            return if state.io.is_none() {
+                Err(NetError::Closed)
+            } else {
+                Err(NetError::InvalidState("pipe listener cannot send handles"))
+            };
         };
         crate::ipc::send_handle(stream, &data, send_handle).map_err(NetError::Io)
     }
@@ -707,7 +739,7 @@ impl Pipe {
     /// (lines 2117-2130). Descriptors received over a Unix socket carry no
     /// type tag, so ox-uv reports `"pipe"` for the generic stream case.
     pub fn pending_type(&self) -> Option<&'static str> {
-        self.state.borrow().pending.first().map(|pending| pending.kind)
+        self.state.borrow().pending.front().map(|pending| pending.kind)
     }
 
     /// Sets the pipe's IPC pending-instance count.
@@ -726,7 +758,7 @@ impl Pipe {
     /// pending queue and returned for the caller to re-wrap, because luv
     /// consumes pending handles through `accept`.
     pub fn pending_take_fd(&self) -> Option<std::os::fd::OwnedFd> {
-        self.state.borrow_mut().pending.pop().map(|pending| pending.fd)
+        self.state.borrow_mut().pending.pop_front().map(|pending| pending.fd)
     }
 }
 
@@ -838,7 +870,7 @@ fn deliver_pipe(uv_loop: &mut UvLoop, id: HandleId, token: Token, state: Rc<RefC
         let event = match event {
             PipeReadyEvent::Public(event) => event,
             PipeReadyEvent::Accepted(stream) => {
-                let child_state = PipeState { io: Some(PipeIo::Stream(stream)), path: None, listening: false, reading: false, connecting: false, writes: WriteQueue::new(), registered: false, ipc: state.borrow().ipc, pending: Vec::new(), pending_instances: 0 };
+                let child_state = PipeState { io: Some(PipeIo::Stream(stream)), path: None, listening: false, reading: false, connecting: false, writes: WriteQueue::new(), registered: false, ipc: state.borrow().ipc, pending: VecDeque::new(), pending_instances: 0 };
                 match Pipe::attach(uv_loop, child_state, Rc::clone(&callback)) { Ok(child) => NetEvent::AcceptedPipe(Box::new(child)), Err(error) => NetEvent::Error(error) }
             }
         };
