@@ -1,6 +1,6 @@
 //! Buffer ownership, text mutation, and buflist lifecycle.
 
-use ox_text::{Buffer, BufferError, Cursor, LineEdit, Position, UndoTree};
+use ox_text::{Buffer, BufferError, Cursor, LineEdit, Position, UndoStep, UndoTree};
 use thiserror::Error;
 
 use crate::marks::LocalMarks;
@@ -46,6 +46,22 @@ impl Default for BufferState {
     fn default() -> Self {
         Self::new(Buffer::new(), true)
     }
+}
+
+/// Metadata recovered by replaying one undo/redo step, for adjusting the
+/// editor-wide position-bearing subsystems (jump/change history, windows).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplayedEdit {
+    /// The undone or redone header's sequence.
+    pub seq: u64,
+    /// First affected line (one-based).
+    pub start: usize,
+    /// Lines present before the replayed step.
+    pub old_count: usize,
+    /// Lines present after the replayed step.
+    pub new_count: usize,
+    /// Cursor the replayed step leaves the edit at.
+    pub cursor: Position,
 }
 
 impl BufferState {
@@ -200,6 +216,77 @@ impl BufferState {
         timestamp: i64,
     ) -> Result<u64, BufferStateError> {
         self.replace_lines(start, end, &[], cursor, cursor, timestamp)
+    }
+
+    /// Undoes the most recent change, replaying its inverse edit through the
+    /// text and mark pipeline with the changedtick advanced. Returns the
+    /// undone header's sequence, or `None` when already at the oldest change.
+    pub fn undo(&mut self) -> Result<Option<ReplayedEdit>, BufferStateError> {
+        let Ok(UndoStep::Undo(entry)) = self.undo.undo() else {
+            return Ok(None);
+        };
+        let edit = &entry.edit;
+        self.replay_text(edit.start, &edit.after, &edit.before)?;
+        self.marks
+            .splice(edit.start, edit.after.len(), edit.before.len());
+        self.bump_derived_ticks();
+        Ok(Some(ReplayedEdit {
+            seq: entry.seq,
+            start: edit.start,
+            old_count: edit.after.len(),
+            new_count: edit.before.len(),
+            cursor: Position {
+                lnum: edit.cursor_before.lnum,
+                col: edit.cursor_before.col,
+            },
+        }))
+    }
+
+    /// Redoes the next change, replaying its stored edit through the text and
+    /// mark pipeline with the changedtick advanced. Returns the redone
+    /// header's sequence, or `None` when already at the newest change.
+    pub fn redo(&mut self) -> Result<Option<ReplayedEdit>, BufferStateError> {
+        let Ok(UndoStep::Redo(entry)) = self.undo.redo() else {
+            return Ok(None);
+        };
+        let edit = &entry.edit;
+        self.replay_text(edit.start, &edit.before, &edit.after)?;
+        self.marks
+            .splice(edit.start, edit.before.len(), edit.after.len());
+        self.bump_derived_ticks();
+        Ok(Some(ReplayedEdit {
+            seq: entry.seq,
+            start: edit.start,
+            old_count: edit.before.len(),
+            new_count: edit.after.len(),
+            cursor: Position {
+                lnum: edit.cursor_after.lnum,
+                col: edit.cursor_after.col,
+            },
+        }))
+    }
+
+    /// Applies `apply` in place of the `remove` lines currently at `start`,
+    /// mirroring the buffer mutation used by direct edits without recording a
+    /// new undo header (the tree already navigated).
+    fn replay_text(
+        &mut self,
+        start: usize,
+        remove: &[Vec<u8>],
+        apply: &[Vec<u8>],
+    ) -> Result<(), BufferStateError> {
+        if remove.is_empty() {
+            if !apply.is_empty() {
+                self.text.append_lines(start.saturating_sub(1), apply)?;
+            }
+        } else {
+            let end = start
+                .checked_add(remove.len())
+                .and_then(|line| line.checked_sub(1))
+                .unwrap_or(start);
+            self.text.replace_lines(start, end, apply)?;
+        }
+        Ok(())
     }
 
     /// Changes final-EOL state and advances every text-derived generation.

@@ -478,6 +478,42 @@ impl Editor {
         Ok(seq)
     }
 
+    /// Undoes a buffer's most recent change, replaying its inverse through
+    /// every position-bearing subsystem (marks, jump/change history, window
+    /// cursors), matching the direct-mutation pipeline. Returns the undone
+    /// header's sequence, or `None` at the oldest change.
+    pub fn buffer_undo(&mut self, buffer: BufHandle) -> Result<Option<u64>, EditorError> {
+        let state = self
+            .buffers
+            .get_mut(&buffer)
+            .ok_or(EditorError::UnknownBuffer(buffer))?;
+        let Some(replayed) = state.undo()? else {
+            return Ok(None);
+        };
+        self.finish_replay(buffer, replayed);
+        Ok(Some(replayed.seq))
+    }
+
+    /// Redoes a buffer's next change, replaying its stored edit through every
+    /// position-bearing subsystem. Returns the redone header's sequence, or
+    /// `None` at the newest change.
+    pub fn buffer_redo(&mut self, buffer: BufHandle) -> Result<Option<u64>, EditorError> {
+        let state = self
+            .buffers
+            .get_mut(&buffer)
+            .ok_or(EditorError::UnknownBuffer(buffer))?;
+        let Some(replayed) = state.redo()? else {
+            return Ok(None);
+        };
+        self.finish_replay(buffer, replayed);
+        Ok(Some(replayed.seq))
+    }
+
+    fn finish_replay(&mut self, buffer: BufHandle, replayed: crate::buffer::ReplayedEdit) {
+        self.splice_positions(buffer, replayed.start, replayed.old_count, replayed.new_count);
+        self.changelists.push(buffer, replayed.cursor);
+    }
+
     /// Puts a stored register through the buffer mutation pipeline.
     ///
     /// Returns false when the selected register has no retained content.

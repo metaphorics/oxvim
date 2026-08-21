@@ -363,25 +363,32 @@ impl Layout {
             });
         }
 
-        let target_leaf = find_leaf_mut(&mut self.root, target)
-            .ok_or(LayoutError::UnknownWindow(target))?;
-        let old_leaf = target_leaf.clone();
         let new_leaf = Frame::Leaf(LeafFrame {
             window,
             state,
             geometry: target_geometry,
         });
-        let replacement = match axis {
-            SplitAxis::Vertical => Frame::Row {
-                geometry: target_geometry,
-                children: vec![Frame::Leaf(old_leaf), new_leaf],
-            },
-            SplitAxis::Horizontal => Frame::Column {
-                geometry: target_geometry,
-                children: vec![Frame::Leaf(old_leaf), new_leaf],
-            },
-        };
-        replace_leaf(&mut self.root, target, replacement);
+        // Same-axis splits join the matching ancestor container instead of
+        // nesting (upstream `win_split_ins`): a vertical split of a window
+        // already inside a row of columns is inserted into that row, so
+        // equalization divides every sibling on the same axis. When no
+        // same-axis container exists, wrap the leaf in a fresh one.
+        if let Err(new_leaf) = insert_into_matching_container(&mut self.root, target, new_leaf, axis) {
+            let old_leaf = find_leaf_mut(&mut self.root, target)
+                .ok_or(LayoutError::UnknownWindow(target))?
+                .clone();
+            let replacement = match axis {
+                SplitAxis::Vertical => Frame::Row {
+                    geometry: target_geometry,
+                    children: vec![Frame::Leaf(old_leaf), new_leaf],
+                },
+                SplitAxis::Horizontal => Frame::Column {
+                    geometry: target_geometry,
+                    children: vec![Frame::Leaf(old_leaf), new_leaf],
+                },
+            };
+            replace_leaf(&mut self.root, target, replacement);
+        }
         let geometry = self.root.geometry();
         equalize_frame(&mut self.root, geometry)?;
         self.current = window;
@@ -791,6 +798,88 @@ fn find_leaf_mut(frame: &mut Frame, window: WinHandle) -> Option<&mut LeafFrame>
             .iter_mut()
             .find_map(|child| find_leaf_mut(child, window)),
     }
+}
+
+/// Lists the child indices from the root down to (but not including) the leaf
+/// whose window matches `wanted`.
+fn collect_container_path(frame: &Frame, wanted: WinHandle, path: &mut Vec<usize>) -> bool {
+    match frame {
+        Frame::Leaf(leaf) => leaf.window == wanted,
+        Frame::Row { children, .. } | Frame::Column { children, .. } => children
+            .iter()
+            .enumerate()
+            .find_map(|(index, child)| {
+                collect_container_path(child, wanted, path).then_some(index)
+            })
+            .is_some_and(|index| {
+                path.push(index);
+                true
+            }),
+    }
+}
+
+/// Returns the frame reached by descending `path` from `frame`.
+fn container_at<'a>(frame: &'a Frame, path: &[usize]) -> &'a Frame {
+    let mut current = frame;
+    for &index in path {
+        current = match current {
+            Frame::Leaf(_) => unreachable!("split path descends only through containers"),
+            Frame::Row { children, .. } | Frame::Column { children, .. } => &children[index],
+        };
+    }
+    current
+}
+
+fn container_at_mut<'a>(frame: &'a mut Frame, path: &[usize]) -> &'a mut Frame {
+    let mut current = frame;
+    for &index in path {
+        current = match current {
+            Frame::Leaf(_) => unreachable!("split path descends only through containers"),
+            Frame::Row { children, .. } | Frame::Column { children, .. } => &mut children[index],
+        };
+    }
+    current
+}
+
+/// Whether `frame` stacks its children along `axis` (columns for a Row of
+/// vertical splits, rows for a Column of horizontal splits).
+fn matches_axis(frame: &Frame, axis: SplitAxis) -> bool {
+    matches!(
+        (axis, frame),
+        (SplitAxis::Vertical, Frame::Row { .. }) | (SplitAxis::Horizontal, Frame::Column { .. })
+    )
+}
+
+/// Inserts `new_leaf` as a sibling of `window` inside the nearest ancestor
+/// container whose orientation matches `axis`. Returns `Ok(())` on success or
+/// `Err(new_leaf)` back to the caller when no matching ancestor exists.
+fn insert_into_matching_container(
+    root: &mut Frame,
+    window: WinHandle,
+    new_leaf: Frame,
+    axis: SplitAxis,
+) -> Result<(), Frame> {
+    let mut path = Vec::new();
+    if !collect_container_path(root, window, &mut path) {
+        return Err(new_leaf);
+    }
+    // `path[depth]` is the child index of the container reached via
+    // `path[..depth]` that continues toward `window`. Prefer the deepest
+    // (nearest the leaf) same-axis container first.
+    let chosen = (0..path.len()).rev().find(|&depth| {
+        matches_axis(container_at(root, &path[..depth]), axis)
+    });
+    let Some(depth) = chosen else {
+        return Err(new_leaf);
+    };
+    let insert_at = path[depth].saturating_add(1);
+    match container_at_mut(root, &path[..depth]) {
+        Frame::Leaf(_) => unreachable!("chosen split container is a container"),
+        Frame::Row { children, .. } | Frame::Column { children, .. } => {
+            children.insert(insert_at.min(children.len()), new_leaf);
+        }
+    }
+    Ok(())
 }
 
 fn replace_leaf(frame: &mut Frame, window: WinHandle, replacement: Frame) -> bool {

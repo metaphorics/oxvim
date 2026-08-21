@@ -145,6 +145,28 @@ fn frame_tree_matches_naive_equal_partition_geometry() {
 }
 
 #[test]
+fn three_same_axis_splits_equalize_into_equal_thirds() {
+    let w1 = window_handle(1);
+    let w2 = window_handle(2);
+    let w3 = window_handle(3);
+    let buffer = buffer_handle(1);
+    let geometry = Geometry::new(0, 0, 9, 7).unwrap();
+    let mut layout = Layout::new(w1, WindowState::new(buffer, position(1, 0)), geometry).unwrap();
+
+    layout
+        .split_vertical(w1, w2, WindowState::new(buffer, position(1, 0)))
+        .unwrap();
+    layout
+        .split_vertical(w2, w3, WindowState::new(buffer, position(1, 0)))
+        .unwrap();
+    layout.equalize().unwrap();
+
+    assert_eq!(layout.window_geometry(w1).unwrap(), Geometry::new(0, 0, 3, 7).unwrap());
+    assert_eq!(layout.window_geometry(w2).unwrap(), Geometry::new(0, 3, 3, 7).unwrap());
+    assert_eq!(layout.window_geometry(w3).unwrap(), Geometry::new(0, 6, 3, 7).unwrap());
+}
+
+#[test]
 fn failed_window_creation_on_unloaded_buffer_is_atomic() {
     let mut editor = Editor::new();
     let loaded = editor.create_buffer(true).unwrap();
@@ -262,6 +284,93 @@ fn editor_register_put_updates_text_undo_ticks_marks_and_changes() {
     assert_eq!(editor.window(window).unwrap().cursor, position(3, 1));
     assert_eq!(editor.window(window).unwrap().topline, 3);
     assert_eq!(editor.changelists().len(buffer), 1);
+}
+
+#[test]
+fn undo_redo_replay_through_ticks_marks_and_winpos() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(
+            Buffer::from_lines(
+                &[
+                    b"one".to_vec(),
+                    b"two".to_vec(),
+                    b"three".to_vec(),
+                    b"four".to_vec(),
+                ],
+                false,
+            )
+            .unwrap(),
+            true,
+        )
+        .unwrap();
+    editor.set_local_mark(buffer, 'a', position(4, 0)).unwrap();
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 20, 10).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.set_window_cursor(window, position(4, 1)).unwrap();
+    editor.set_window_topline(window, 4).unwrap();
+
+    editor
+        .replace_buffer_lines(
+            buffer,
+            2,
+            2,
+            &[b"x".to_vec(), b"y".to_vec()],
+            position(2, 0),
+            position(5, 0),
+            10,
+        )
+        .unwrap();
+    let state = editor.buffer(buffer).unwrap();
+    assert_eq!(state.changedtick(), 1);
+    assert_eq!(state.changedtick_diag, 1);
+    assert_eq!(state.changedtick_fold, 1);
+    assert_eq!(editor.local_mark(buffer, 'a').unwrap(), Some(position(5, 0)));
+    assert_eq!(editor.window(window).unwrap().cursor, position(5, 1));
+    assert_eq!(editor.window(window).unwrap().topline, 5);
+    assert_eq!(editor.changelists().len(buffer), 1);
+
+    assert_eq!(editor.buffer_undo(buffer).unwrap(), Some(1));
+    let state = editor.buffer(buffer).unwrap();
+    assert_eq!(state.text().unwrap().line(2).unwrap(), b"two");
+    assert_eq!(
+        state.text().unwrap().to_bytes(),
+        b"one\ntwo\nthree\nfour"
+    );
+    assert_eq!(state.changedtick(), 2);
+    assert_eq!(state.changedtick_diag, 2);
+    assert_eq!(state.changedtick_fold, 2);
+    assert_eq!(editor.local_mark(buffer, 'a').unwrap(), Some(position(4, 0)));
+    assert_eq!(editor.window(window).unwrap().cursor, position(4, 1));
+    assert_eq!(editor.window(window).unwrap().topline, 4);
+    assert_eq!(editor.changelists().len(buffer), 2);
+
+    assert_eq!(editor.buffer_redo(buffer).unwrap(), Some(1));
+    let state = editor.buffer(buffer).unwrap();
+    assert_eq!(state.text().unwrap().line(2).unwrap(), b"x");
+    assert_eq!(state.text().unwrap().line(3).unwrap(), b"y");
+    assert_eq!(
+        state.text().unwrap().to_bytes(),
+        b"one\nx\ny\nthree\nfour"
+    );
+    assert_eq!(state.changedtick(), 3);
+    assert_eq!(state.changedtick_diag, 3);
+    assert_eq!(state.changedtick_fold, 3);
+    assert_eq!(editor.local_mark(buffer, 'a').unwrap(), Some(position(5, 0)));
+    assert_eq!(editor.window(window).unwrap().cursor, position(5, 1));
+    assert_eq!(editor.window(window).unwrap().topline, 5);
+    assert_eq!(editor.changelists().len(buffer), 3);
+
+    assert_eq!(editor.buffer_undo(buffer).unwrap(), Some(1));
+    let state = editor.buffer(buffer).unwrap();
+    assert_eq!(
+        state.text().unwrap().to_bytes(),
+        b"one\ntwo\nthree\nfour"
+    );
+    assert_eq!(editor.buffer_undo(buffer).unwrap(), None);
+    assert_eq!(editor.buffer_redo(buffer).unwrap(), Some(1));
 }
 
 #[test]
