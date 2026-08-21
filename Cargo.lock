@@ -221,6 +221,11 @@ dependencies = [
 [[package]]
 name = "ox-excmd"
 version = "0.1.0"
+dependencies = [
+ "ox-eval",
+ "ox-types",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "ox-loop"
