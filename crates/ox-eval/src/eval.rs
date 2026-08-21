@@ -18,12 +18,32 @@ pub const DEFAULT_MAX_EVAL_DEPTH: usize = 1_000;
 pub trait BuiltinHost {
     /// Invoke a named Vimscript function.
     fn call(&mut self, name: &OxStr, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval>;
+
+    /// Invoke a named function through `receiver->name(...)`.
+    fn call_method(&mut self, name: &OxStr, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
+        self.call(name, args, scope)
+    }
 }
 
-/// Regular-expression integration point for the `=~` and `!~` operators.
+/// Regular-expression integration point for operators and pure regex builtins.
 pub trait RegexEngine {
     /// Match `text` against a Vim regular expression.
     fn is_match(&self, text: &OxStr, pattern: &OxStr, ignore_case: bool) -> Result<bool>;
+
+    /// Split `text` at Vim regular-expression matches.
+    fn split(&self, _text: &OxStr, _pattern: &OxStr, _keep_empty: bool) -> Result<Vec<OxStr>> {
+        Err(EvalError::new("E54", 0, "regular-expression split is not supported by this engine"))
+    }
+
+    /// Return the byte range of the first match at or after `start`.
+    fn find(&self, _text: &OxStr, _pattern: &OxStr, _start: usize) -> Result<Option<(usize, usize)>> {
+        Err(EvalError::new("E54", 0, "regular-expression search is not supported by this engine"))
+    }
+
+    /// Replace matches according to Vim's substitute flags.
+    fn substitute(&self, _text: &OxStr, _pattern: &OxStr, _replacement: &OxStr, _flags: &OxStr) -> Result<OxStr> {
+        Err(EvalError::new("E54", 0, "regular-expression substitution is not supported by this engine"))
+    }
 }
 
 /// Host used when builtins have not been installed.
@@ -529,7 +549,10 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
 
     fn call_method(&mut self, method: &Expr, args: Vec<Typval>, scope: &mut Scope, depth: usize) -> Result<Evaluated> {
         if let ExprKind::Variable(name) = &method.kind {
-            self.call_named(name, args, scope, method.span.start, depth)
+            self.host.call_method(name, args, scope).map(Evaluated::plain).map_err(|mut error| {
+                if error.code == "E117" { error.offset = method.span.start; }
+                error
+            })
         } else {
             let method = self.eval_at(method, scope, depth)?;
             self.call_value(method.value, args, scope, depth)
@@ -855,7 +878,7 @@ fn fold_bytes(bytes: &[u8]) -> Vec<u8> {
     folded
 }
 
-fn compare_bytes(lhs: &[u8], rhs: &[u8], ignore_case: bool) -> i8 {
+pub(crate) fn compare_bytes(lhs: &[u8], rhs: &[u8], ignore_case: bool) -> i8 {
     if !ignore_case {
         for (&left, &right) in lhs.iter().zip(rhs) {
             if left < right { return -1; }

@@ -10,4 +10,5 @@ workspace = true
 
 [dependencies]
 ox-types = { path = "../ox-types" }
+serde_json.workspace = true
 thiserror.workspace = true
