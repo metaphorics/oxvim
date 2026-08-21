@@ -11,9 +11,9 @@
 //!     per `api/private/defs.h` `kErrorType*`).
 
 use ox_types::{ApiError, Object, OxStr};
-use rmpv::{Integer, Utf8String, Value};
+use rmpv::Value;
 
-use crate::codec::{object_from_value, value_from_object, DecodeError};
+use crate::codec::{object_from_value, DecodeError};
 
 /// A single msgpack-RPC message (`kMessageType*` in `api/private/defs.h`).
 #[derive(Debug, Clone, PartialEq)]
@@ -45,46 +45,39 @@ pub enum Message {
 }
 
 impl Message {
-    /// Build the `rmpv::Value` for this message's byte frame.
-    pub fn to_value(&self) -> Value {
-        match self {
-            Message::Request { msgid, method, params } => Value::Array(vec![
-                Value::Integer(Integer::from(0)),
-                Value::Integer(Integer::from(i64::from(*msgid))),
-                str_value(method),
-                object_array(params),
-            ]),
-            Message::Notification { method, params } => Value::Array(vec![
-                Value::Integer(Integer::from(2)),
-                str_value(method),
-                object_array(params),
-            ]),
-            Message::Response { msgid, result } => match result {
-                Ok(res) => Value::Array(vec![
-                    Value::Integer(Integer::from(1)),
-                    Value::Integer(Integer::from(i64::from(*msgid))),
-                    Value::Nil,
-                    value_from_object(res),
-                ]),
-                Err(err) => Value::Array(vec![
-                    Value::Integer(Integer::from(1)),
-                    Value::Integer(Integer::from(i64::from(*msgid))),
-                    Value::Array(vec![
-                        Value::Integer(Integer::from(err.error_type())),
-                        Value::String(Utf8String::from(err.message())),
-                    ]),
-                    Value::Nil,
-                ]),
-            },
-        }
-    }
-
     /// Encode the message to its exact wire bytes.
     pub fn encode_bytes(&self) -> Vec<u8> {
-        let value = self.to_value();
-        let mut out = Vec::new();
-        let _ = rmpv::encode::write_value(&mut out, &value);
-        out
+        let frame = match self {
+            Message::Request { msgid, method, params } => Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(i64::from(*msgid)),
+                Object::String(method.clone()),
+                Object::Array(params.clone()),
+            ]),
+            Message::Notification { method, params } => Object::Array(vec![
+                Object::Integer(2),
+                Object::String(method.clone()),
+                Object::Array(params.clone()),
+            ]),
+            Message::Response { msgid, result } => match result {
+                Ok(res) => Object::Array(vec![
+                    Object::Integer(1),
+                    Object::Integer(i64::from(*msgid)),
+                    Object::Nil,
+                    res.clone(),
+                ]),
+                Err(err) => Object::Array(vec![
+                    Object::Integer(1),
+                    Object::Integer(i64::from(*msgid)),
+                    Object::Array(vec![
+                        Object::Integer(err.error_type()),
+                        Object::String(OxStr::from(err.message())),
+                    ]),
+                    Object::Nil,
+                ]),
+            },
+        };
+        crate::codec::encode(&frame)
     }
 
     /// Decode a complete message frame from an `rmpv::Value`.
@@ -207,15 +200,6 @@ impl MsgidCounter {
         }
         id
     }
-}
-
-fn str_value(s: &OxStr) -> Value {
-    // Method names are valid UTF-8; `Utf8String::from(&str)` is lossless.
-    Value::String(Utf8String::from(s.to_string_lossy().as_ref()))
-}
-
-fn object_array(items: &[Object]) -> Value {
-    Value::Array(items.iter().map(value_from_object).collect())
 }
 
 /// Extract an `i64` from an integer `Value`, or else a message-shape error.

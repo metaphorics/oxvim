@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 ox-types = { path = "../ox-types" }
+rmp = "0.8.15"
 rmpv = { workspace = true }
 rmp-serde = { workspace = true }
 thiserror = { workspace = true }

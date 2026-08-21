@@ -4,22 +4,20 @@
 //!
 //! `Object` mirrors `src/nvim/msgpack_rpc/packer.c`'s `mpack_object_inner()`:
 //!
-//!   - `String` is packed as a msgpack **str** when valid UTF-8, else as a
-//!     **bin** (`Value::Binary`). Upstream always emits `str`
-//!     (`packer.c mpack_str`), even for arbitrary byte strings; `rmpv` can only
-//!     hold lossless arbitrary bytes in its `Binary` form, so non-UTF-8 strings
-//!     ride as bin and decode back to the same `OxStr`. Both str and bin decode
-//!     to `Object::String`.
+//!   - `String` is always packed as a msgpack **str**, regardless of UTF-8
+//!     validity, matching upstream `packer.c mpack_str()`. Decoding accepts
+//!     both **str** and **bin** (`unpacker.c`); both become `Object::String`.
 //!   - `LuaRef` is packed as a human-readable string `<Lua <n>>`, exactly as
 //!     `packer.c` (`nlua_funcref_str(ref, NULL, true)`, `executor.c:2481`).
 //!   - Handles are packed as msgpack EXT with type
 //!     `ObjectType - EXT_OBJECT_TYPE_SHIFT` (`packer.c mpack_handle()`):
 //!     Buffer=0, Window=1, Tabpage=2. The payload is the handle as a
 //!     non-negative integer. For `handle <= 0x7f` upstream uses fixext1
-//!     (`0xd4`); larger handles get a uint-encoded payload inside ext8. We
-//!     build the same uint payload bytes and let `rmpv` pick the header; for a
-//!     2-byte payload `rmpv` emits fixext2 (`0xd5`) where upstream uses ext8
-//!     (`0xc7`) — every reader decodes both identically.
+//!     (`0xd4`); larger handles get a uint-encoded payload. We build the same
+//!     uint payload bytes and let `rmpv` pick the most compact EXT header.
+//!     That means a 2-byte payload becomes fixext2 (`0xd5`) while upstream
+//!     forces ext8 (`0xc7`) for any payload — the decoded handle is identical,
+//!     so we deliberately keep rmpv's compact form.
 //!   - Decoding an EXT with an out-of-range type or an unparseable payload
 //!     yields `Nil`, mirroring `unpacker.c` (`*res = NIL;`).
 //!
@@ -31,13 +29,14 @@
 //! bytes" (wait for the next read); anything else is barfed input and fails
 //! with a typed [`DecodeError`].
 
-use std::io::{Cursor, ErrorKind};
+use std::io::{Cursor, ErrorKind, Write};
 
 use ox_types::{
     BufHandle, Dict, HandleError, Object, OxStr, TabHandle, WinHandle, EXT_TYPE_BUFFER,
     EXT_TYPE_TABPAGE, EXT_TYPE_WINDOW,
 };
-use rmpv::{Integer, Utf8String, Value};
+use rmp::encode::{write_array_len, write_map_len, write_str_len};
+use rmpv::{Integer, Value};
 
 use crate::message::Message;
 
@@ -75,31 +74,76 @@ pub enum DecodeError {
 /// we wait for a frame that never completes.
 pub const DEFAULT_DECODE_LIMIT: usize = 64 * 1024 * 1024;
 
-/// Convert an [`Object`] into an `rmpv::Value` for wire building.
-pub fn value_from_object(obj: &Object) -> Value {
+/// Write a raw byte sequence as a msgpack **str** header and payload.
+///
+/// This intentionally ignores UTF-8 validity, matching upstream `packer.c`
+/// `mpack_str()` which treats Object strings as opaque byte sequences.
+fn write_str_bytes<W: Write>(out: &mut W, bytes: &[u8]) -> Result<(), rmpv::encode::Error> {
+    let len = u32::try_from(bytes.len()).map_err(|_| {
+        rmpv::encode::Error::InvalidDataWrite(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "string length exceeds u32",
+        ))
+    })?;
+    write_str_len(out, len)?;
+    out.write_all(bytes)
+        .map_err(rmpv::encode::Error::InvalidDataWrite)
+}
+
+/// Encode an [`Object`] directly into a msgpack byte stream.
+///
+/// `Object::String` is always encoded as a msgpack **str**, even when the
+/// bytes are not valid UTF-8, so the wire format matches upstream Neovim.
+pub(crate) fn write_object<W: Write>(out: &mut W, obj: &Object) -> Result<(), rmpv::encode::Error> {
     match obj {
-        Object::Nil => Value::Nil,
-        Object::Boolean(b) => Value::Boolean(*b),
-        Object::Integer(n) => Value::Integer(Integer::from(*n)),
-        Object::Float(f) => Value::F64(*f),
-        Object::String(s) => {
-            // Valid UTF-8 rides as msgpack str; arbitrary bytes as bin. Both
-            // decode back to `Object::String`. See module docs.
-            match std::str::from_utf8(s.as_bytes()) {
-                Ok(valid) => Value::String(Utf8String::from(valid)),
-                Err(_) => Value::Binary(s.as_bytes().to_vec()),
+        Object::Nil => rmpv::encode::write_value(out, &Value::Nil),
+        Object::Boolean(b) => rmpv::encode::write_value(out, &Value::Boolean(*b)),
+        Object::Integer(n) => rmpv::encode::write_value(out, &Value::Integer(Integer::from(*n))),
+        Object::Float(f) => rmpv::encode::write_value(out, &Value::F64(*f)),
+        Object::String(s) => write_str_bytes(out, s.as_bytes()),
+        Object::Array(items) => {
+            let len = u32::try_from(items.len()).map_err(|_| {
+                rmpv::encode::Error::InvalidDataWrite(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "array length exceeds u32",
+                ))
+            })?;
+            write_array_len(out, len)?;
+            for item in items {
+                write_object(out, item)?;
             }
+            Ok(())
         }
-        Object::Array(items) => Value::Array(items.iter().map(value_from_object).collect()),
-        Object::Dict(d) => Value::Map(
-            d.iter()
-                .map(|(k, v)| (value_from_object(&Object::String(k.clone())), value_from_object(v)))
-                .collect(),
+        Object::Dict(d) => {
+            let len = u32::try_from(d.0.len()).map_err(|_| {
+                rmpv::encode::Error::InvalidDataWrite(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "dict length exceeds u32",
+                ))
+            })?;
+            write_map_len(out, len)?;
+            for (k, v) in &d.0 {
+                write_str_bytes(out, k.as_bytes())?;
+                write_object(out, v)?;
+            }
+            Ok(())
+        }
+        Object::LuaRef(r) => {
+            let s = format!("<Lua {r}>");
+            write_str_bytes(out, s.as_bytes())
+        }
+        Object::Buffer(h) => rmpv::encode::write_value(
+            out,
+            &Value::Ext(EXT_TYPE_BUFFER, handle_payload(i64::from(*h))),
         ),
-        Object::LuaRef(r) => Value::String(Utf8String::from(format!("<Lua {r}>"))),
-        Object::Buffer(h) => Value::Ext(EXT_TYPE_BUFFER, handle_payload(i64::from(*h))),
-        Object::Window(h) => Value::Ext(EXT_TYPE_WINDOW, handle_payload(i64::from(*h))),
-        Object::Tabpage(h) => Value::Ext(EXT_TYPE_TABPAGE, handle_payload(i64::from(*h))),
+        Object::Window(h) => rmpv::encode::write_value(
+            out,
+            &Value::Ext(EXT_TYPE_WINDOW, handle_payload(i64::from(*h))),
+        ),
+        Object::Tabpage(h) => rmpv::encode::write_value(
+            out,
+            &Value::Ext(EXT_TYPE_TABPAGE, handle_payload(i64::from(*h))),
+        ),
     }
 }
 
@@ -190,13 +234,11 @@ fn ext_payload_uint(payload: &[u8]) -> Option<i64> {
 
 /// Encode a single [`Object`] to its msgpack byte representation.
 ///
-/// `rmpv::encode::write_value` into an in-memory `Vec<u8>` cannot fail: `Vec`'s
-/// `io::Write` is infallible and the depth limit applies to decoding only, so
-/// the `Result` is discarded and the buffer is returned regardless.
+/// Encoding into an in-memory `Vec<u8>` cannot fail; any `Result` from the
+/// generic writer is discarded and the buffer is returned regardless.
 pub fn encode(obj: &Object) -> Vec<u8> {
-    let value = value_from_object(obj);
     let mut out = Vec::new();
-    let _ = rmpv::encode::write_value(&mut out, &value);
+    let _res = write_object(&mut out, obj);
     out
 }
 
@@ -375,10 +417,22 @@ mod tests {
     }
 
     #[test]
-    fn non_utf8_string_round_trips_via_bin() {
+    fn non_utf8_string_encodes_as_str() {
+        // Non-UTF-8 bytes must ride as msgpack str, not bin, to match upstream.
         let raw = OxStr::from(&[0xff, b'x', 0x00][..]);
         let encoded = encode(&Object::String(raw.clone()));
+        assert_eq!(encoded, [0xa3, 0xff, b'x', 0x00]);
         assert_eq!(decode(&encoded).unwrap(), Object::String(raw));
+    }
+
+    #[test]
+    fn str_and_bin_both_decode_to_oxstr() {
+        let raw = OxStr::from(&[0xff, b'x'][..]);
+        // Manually-built str and bin frames with identical payload bytes.
+        let as_str = [0xa2, 0xff, b'x'];
+        let as_bin = [0xc4, 0x02, 0xff, b'x'];
+        assert_eq!(decode(&as_str).unwrap(), Object::String(raw.clone()));
+        assert_eq!(decode(&as_bin).unwrap(), Object::String(raw));
     }
 
     #[test]

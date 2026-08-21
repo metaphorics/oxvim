@@ -123,30 +123,21 @@ impl RedrawBatch {
     /// `[name, args1, args2, …]` — matching `flush_event`'s `1 + ncalls`
     /// accounting.
     pub fn pack(&self) -> Vec<u8> {
-        let events: Vec<rmpv::Value> = self
+        let events: Vec<Object> = self
             .events
             .iter()
             .map(|event| {
-                let mut entry = vec![event.name_value()];
-                entry.extend(event.argsets.iter().map(|args| value_array(args)));
-                rmpv::Value::Array(entry)
+                let mut entry: Vec<Object> = vec![Object::String(event.name.clone())];
+                entry.extend(event.argsets.iter().map(|args| Object::Array(args.clone())));
+                Object::Array(entry)
             })
             .collect();
-        let frame = rmpv::Value::Array(vec![
-            rmpv::Value::Integer(rmpv::Integer::from(2)),
-            rmpv::Value::String(rmpv::Utf8String::from("redraw")),
-            rmpv::Value::Array(events),
+        let frame = Object::Array(vec![
+            Object::Integer(2),
+            Object::String(OxStr::from("redraw")),
+            Object::Array(events),
         ]);
-        let mut out = Vec::new();
-        let _ = rmpv::encode::write_value(&mut out, &frame);
-        out
-    }
-}
-
-impl RedrawEvent {
-    /// The event name as a wire string value.
-    fn name_value(&self) -> rmpv::Value {
-        rmpv::Value::String(rmpv::Utf8String::from(self.name.to_string_lossy().as_ref()))
+        crate::codec::encode(&frame)
     }
 }
 
@@ -177,13 +168,16 @@ fn can_fuse(prev: &[Object], grid: i64, row: i64, startcol: i64) -> bool {
     let Object::Array(cells) = &prev[ARG_CELLS] else {
         return false;
     };
-    let covered: i64 = cells.iter().map(cell_count).sum();
-    prev_start + covered == startcol
-}
-
-/// Convert a `Vec<Object>` into an `rmpv` array value.
-fn value_array(items: &[Object]) -> rmpv::Value {
-    rmpv::Value::Array(items.iter().map(crate::codec::value_from_object).collect())
+    let covered = cells
+        .iter()
+        .try_fold(0i64, |acc, tuple| acc.checked_add(cell_count(tuple)));
+    let Some(covered) = covered else {
+        return false;
+    };
+    let Some(end) = prev_start.checked_add(covered) else {
+        return false;
+    };
+    end == startcol
 }
 
 #[cfg(test)]
@@ -241,6 +235,16 @@ mod tests {
         let mut b = RedrawBatch::new();
         b.grid_line(1, 3, 0, vec![cell("a", 0, 1), cell("b", 1, 1)], false);
         b.grid_line(1, 3, 5, vec![cell("c", 2, 1)], false); // gap at col 2..5
+        assert_eq!(b.events()[0].argsets.len(), 2);
+    }
+
+    #[test]
+    fn overflow_startcol_returns_false() {
+        let mut b = RedrawBatch::new();
+        // prev_start = i64::MAX and one cell of width 1 would overflow when
+        // computing the end column; can_fuse must return false, not panic.
+        b.grid_line(1, 3, i64::MAX, vec![cell("a", 0, 1)], false);
+        b.grid_line(1, 3, i64::MAX, vec![cell("b", 0, 1)], false);
         assert_eq!(b.events()[0].argsets.len(), 2);
     }
 
