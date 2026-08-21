@@ -132,12 +132,35 @@ impl Buffer {
     }
 
     /// Returns the zero-based serialized byte offset of a one-based line.
+    ///
+    /// Accepts one past the logical line count, the EOF pseudo-line, which
+    /// maps to the full serialized byte length. A final line without a line
+    /// break contributes no terminator, so that length numerically subtracts
+    /// the absent `\n` (memline.c:4078-4162). Any higher line is rejected.
     pub fn byte_of_line(&self, lnum: usize) -> Result<usize, BufferError> {
-        self.check_line(lnum)?;
+        let line_count = self.line_count();
+        if lnum == 0 || lnum > line_count + 1 {
+            return Err(BufferError::LineRange {
+                start: lnum,
+                end: lnum,
+                line_count,
+            });
+        }
+        if lnum == line_count + 1 {
+            // EOF pseudo-line: the whole serialized stream. A noeol final
+            // line is simply absent from the rope, so `len_bytes` equals the
+            // serialized length without the missing terminator.
+            return Ok(self.rope.len_bytes());
+        }
         Ok(self.rope.line_to_byte(lnum - 1))
     }
 
     /// Returns the one-based line containing a serialized byte offset.
+    ///
+    /// Any in-range offset maps to a line; an offset that splits a UTF-8 code
+    /// point resolves to the line containing that code point, because `byte_to_line`
+    /// counts single-byte line breaks rather than requiring a char boundary
+    /// (memline.c:4078-4141).
     pub fn lnum_of_byte(&self, offset: usize) -> Result<usize, BufferError> {
         let len = self.rope.len_bytes();
         if offset > len {
@@ -146,12 +169,8 @@ impl Buffer {
                 byte_len: len,
             });
         }
-        if offset < len {
-            self.rope
-                .try_byte_to_char(offset)
-                .map_err(|_| BufferError::NotCharBoundary(offset))?;
-        }
         if offset == len && self.has_eol {
+            // Past the trailing line break: the last logical line.
             return Ok(self.line_count());
         }
         Ok(self.rope.byte_to_line(offset) + 1)

@@ -21,6 +21,9 @@ const SAVE_NR: u8 = 1; // optional save-count field kind
 const NAMED_MARKS: usize = 26;
 const HASH_SIZE: usize = 32;
 const FIXED_PREFIX: usize = 9 + 2 + HASH_SIZE + 4;
+// Both serialized extmark object variants (splice and move) carry a fixed
+// 48-byte payload: six 32-bit fields then three 64-bit byte counts.
+const EXTMARK_PAYLOAD: usize = 48;
 
 /// Persistent-undo decoding or encoding error.
 #[derive(Debug, Error)]
@@ -51,7 +54,11 @@ pub struct UndoFile {
 }
 
 impl UndoFile {
-    /// Reads an upstream-format file and validates its top-level header.
+    /// Reads an upstream-format file and fully validates its structure: the
+    /// global header, the declared header record count and links, per-header
+    /// entry framing and length-prefixed payloads, both end markers, and the
+    /// end of input. Truncated, mis-framed, or trailing-garbage tails are
+    /// rejected.
     pub fn read(mut reader: impl Read) -> Result<Self, UndoFileError> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes)?;
@@ -68,7 +75,7 @@ impl UndoFile {
         let mut content_hash = [0; HASH_SIZE];
         content_hash.copy_from_slice(hash_slice);
         let line_count = read_u32(&bytes, 11 + HASH_SIZE)?;
-        validate_global_header(&bytes)?;
+        validate_structure(&bytes)?;
         Ok(Self {
             content_hash,
             line_count,
@@ -183,33 +190,130 @@ pub fn content_hash(buffer: &Buffer) -> [u8; HASH_SIZE] {
     digest.finalize().into()
 }
 
-fn validate_global_header(bytes: &[u8]) -> Result<(), UndoFileError> {
-    let mut offset = FIXED_PREFIX;
-    let saved_line_len = usize::try_from(read_u32(bytes, offset)?).map_err(|_| UndoFileError::Malformed)?;
-    offset = offset.checked_add(4).ok_or(UndoFileError::Malformed)?;
-    offset = offset
-        .checked_add(saved_line_len)
-        .ok_or(UndoFileError::Malformed)?;
-    // saved line position, three head pointers, head count, two sequences, time
-    offset = offset.checked_add(4 * 8 + 8).ok_or(UndoFileError::Malformed)?;
-    loop {
-        let len = *bytes.get(offset).ok_or(UndoFileError::Malformed)?;
-        offset += 1;
-        if len == 0 {
-            break;
+/// Walks the whole file: the global header, `num_head` undo headers (each
+/// with its entry list and empty extmark section), the header-end marker, and
+/// then requires end of input. Every length prefix is bounds-checked against
+/// the remaining bytes; trailing bytes after the header-end marker reject the
+/// file. Framing mirrors `u_read_undo` in `undo.c`.
+fn validate_structure(bytes: &[u8]) -> Result<(), UndoFileError> {
+    // Saved line for the "U" command: a length prefix then its payload.
+    let saved_len = read_u32(bytes, FIXED_PREFIX)?;
+    let mut offset = add(
+        FIXED_PREFIX + 4,
+        usize::try_from(saved_len).map_err(|_| UndoFileError::Malformed)?,
+    )?;
+    // Saved line lnum/col, old/new/current head, then the declared head count.
+    let num_head = read_u32(bytes, add(offset, 20)?)?;
+    // Consume the remaining fixed fields (5 heads + seq_last/seq_cur + time).
+    offset = add(offset, 8 * 4 + 8)?;
+    offset = skip_optional(bytes, offset)?;
+    if num_head == 0 {
+        expect_u16(bytes, offset, HEADER_END_MAGIC)?;
+        offset = add(offset, 2)?;
+        return end_of_input(bytes, offset);
+    }
+    for _ in 0..num_head {
+        expect_u16(bytes, offset, HEADER_MAGIC)?;
+        offset = add(offset, 2)?;
+        offset = validate_header(bytes, offset)?;
+    }
+    expect_u16(bytes, offset, HEADER_END_MAGIC)?;
+    offset = add(offset, 2)?;
+    end_of_input(bytes, offset)
+}
+
+/// Validates one undo header after its `HEADER_MAGIC`, returning the offset
+/// just past its entries and extmark terminator.
+fn validate_header(bytes: &[u8], mut offset: usize) -> Result<usize, UndoFileError> {
+    // Four branch links and the sequence number.
+    offset = add(offset, 5 * 4)?;
+    // Saved cursor (lnum, col, coladd), vcol, flags.
+    offset = add(offset, 3 * 4 + 4 + 2)?;
+    // Named marks (each a position triple) and the visual info block.
+    offset = add(offset, NAMED_MARKS * 12)?;
+    offset = add(offset, 2 * 12 + 4 + 4)?;
+    // Header timestamp.
+    offset = add(offset, 8)?;
+    offset = skip_optional(bytes, offset)?;
+    // Undo entries: ENTRY_MAGIC, lengths, terminated by ENTRY_END_MAGIC.
+    while peek_is(bytes, offset, ENTRY_MAGIC) {
+        offset = add(offset, 2)?;
+        offset = validate_entry(bytes, offset)?;
+    }
+    expect_u16(bytes, offset, ENTRY_END_MAGIC)?;
+    offset = add(offset, 2)?;
+    // Extmark undo section: optional extmark objects then ENTRY_END_MAGIC.
+    while peek_is(bytes, offset, ENTRY_MAGIC) {
+        offset = add(offset, 2)?;
+        let kind = read_u32(bytes, offset)?;
+        offset = add(offset, 4)?;
+        if kind > 1 {
+            // Only splice and move objects are ever serialized.
+            return Err(UndoFileError::Malformed);
         }
-        let payload = usize::from(len);
-        offset = offset
-            .checked_add(1 + payload)
-            .ok_or(UndoFileError::Malformed)?;
+        offset = add(offset, EXTMARK_PAYLOAD)?;
         if offset > bytes.len() {
             return Err(UndoFileError::Malformed);
         }
     }
-    if bytes.len().saturating_sub(offset) < 2 {
-        return Err(UndoFileError::Malformed);
+    expect_u16(bytes, offset, ENTRY_END_MAGIC)?;
+    add(offset, 2)
+}
+
+/// Validates one length-prefixed series of saved lines after its `ENTRY_MAGIC`.
+fn validate_entry(bytes: &[u8], mut offset: usize) -> Result<usize, UndoFileError> {
+    // ue_top, ue_bot, ue_lcount, then ue_size.
+    offset = add(offset, 3 * 4)?;
+    let size = read_u32(bytes, offset)?;
+    offset = add(offset, 4)?;
+    for _ in 0..size {
+        let line_len = read_u32(bytes, offset)?;
+        offset = add(offset, 4)?;
+        offset = add(offset, usize::try_from(line_len).map_err(|_| UndoFileError::Malformed)?)?;
+        if offset > bytes.len() {
+            return Err(UndoFileError::Malformed);
+        }
     }
-    Ok(())
+    Ok(offset)
+}
+
+/// Skips a sequence of optional fields: `len == 0` terminates, otherwise each
+/// field is a `len` byte, a kind byte, and `len` payload bytes (all bounded).
+fn skip_optional(bytes: &[u8], mut offset: usize) -> Result<usize, UndoFileError> {
+    loop {
+        let len = *bytes.get(offset).ok_or(UndoFileError::Malformed)?;
+        offset = add(offset, 1)?;
+        if len == 0 {
+            return Ok(offset);
+        }
+        offset = add(offset, usize::from(len) + 1)?;
+        if offset > bytes.len() {
+            return Err(UndoFileError::Malformed);
+        }
+    }
+}
+
+fn peek_is(bytes: &[u8], offset: usize, expected: u16) -> bool {
+    matches!(read_u16(bytes, offset), Ok(value) if value == expected)
+}
+
+fn expect_u16(bytes: &[u8], offset: usize, expected: u16) -> Result<(), UndoFileError> {
+    match read_u16(bytes, offset)? {
+        value if value == expected => Ok(()),
+        _ => Err(UndoFileError::Malformed),
+    }
+}
+
+fn add(offset: usize, n: usize) -> Result<usize, UndoFileError> {
+    offset.checked_add(n).ok_or(UndoFileError::Malformed)
+}
+
+fn end_of_input(bytes: &[u8], offset: usize) -> Result<(), UndoFileError> {
+    if offset == bytes.len() {
+        Ok(())
+    } else {
+        Err(UndoFileError::Malformed)
+    }
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, UndoFileError> {

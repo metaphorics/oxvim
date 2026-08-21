@@ -33,6 +33,84 @@ fn buffer_preserves_newline_contract_and_tick() {
 }
 
 #[test]
+fn byte_of_line_accepts_eof_pseudo_line_and_noeol() {
+    let eol = Buffer::from_bytes(b"a\nb\n").unwrap();
+    assert_eq!(eol.line_count(), 2);
+    // EOF pseudo-line (line_count + 1) maps to the full serialized length.
+    assert_eq!(eol.byte_of_line(3).unwrap(), 4);
+    assert_eq!(eol.to_bytes().len(), 4);
+    assert_eq!(
+        eol.byte_of_line(4).unwrap_err(),
+        BufferError::LineRange { start: 4, end: 4, line_count: 2 }
+    );
+
+    let noeol = Buffer::from_lines(&bytes(&["a", "b"]), false).unwrap();
+    assert_eq!(noeol.line_count(), 2);
+    assert!(!noeol.has_eol());
+    // "a\nb": the absent final terminator is excluded from the EOF length.
+    assert_eq!(noeol.byte_of_line(3).unwrap(), 3);
+    assert_eq!(noeol.to_bytes(), b"a\nb");
+    assert_eq!(
+        noeol.byte_of_line(0).unwrap_err(),
+        BufferError::LineRange { start: 0, end: 0, line_count: 2 }
+    );
+}
+
+#[test]
+fn lnum_of_byte_classifies_mid_char_offsets() {
+    let buffer = Buffer::from_bytes("é\nx".as_bytes()).unwrap();
+    assert_eq!(buffer.line_count(), 2);
+    // Offsets 1 and 2 split the "é" code point but both live in line 1.
+    assert_eq!(buffer.lnum_of_byte(1).unwrap(), 1);
+    assert_eq!(buffer.lnum_of_byte(2).unwrap(), 1);
+    assert_eq!(buffer.lnum_of_byte(3).unwrap(), 2); // the "\n"
+    assert_eq!(buffer.lnum_of_byte(4).unwrap(), 2); // "x"
+
+    let two_line = Buffer::from_bytes("a\né".as_bytes()).unwrap();
+    assert_eq!(two_line.lnum_of_byte(3).unwrap(), 2); // mid "é"
+    assert_eq!(two_line.lnum_of_byte(4).unwrap(), 2);
+}
+
+#[test]
+fn undo_file_read_rejects_trailing_and_truncated_tails() {
+    let buffer = Buffer::from_bytes(b"a\nb\n").unwrap();
+    let mut tree = UndoTree::new();
+    tree.record(edit_at(2, &bytes(&["b"]), &bytes(&["c"])), 1710000001);
+    let undo = UndoFile::from_tree(&buffer, &tree);
+    let mut valid = Vec::new();
+    undo.write(&mut valid).unwrap();
+    assert!(UndoFile::read(IoCursor::new(valid.clone())).is_ok());
+
+    // A valid prefix plus two garbage bytes must be rejected.
+    let mut garbage = valid.clone();
+    garbage.extend_from_slice(b"ab");
+    assert!(matches!(
+        UndoFile::read(IoCursor::new(garbage)),
+        Err(UndoFileError::Malformed)
+    ));
+
+    // Every truncation point must be rejected.
+    for cut in [0, 9, 10, 11, valid.len() - 3, valid.len() - 1] {
+        assert!(
+            UndoFile::read(IoCursor::new(&valid[..cut])).is_err(),
+            "truncated at {cut} accepted"
+        );
+    }
+
+    // The empty-history file also rejects a trailing tail.
+    let mut empty_bytes = Vec::new();
+    UndoFile::empty_for_buffer(&buffer)
+        .write(&mut empty_bytes)
+        .unwrap();
+    let mut polluted = empty_bytes;
+    polluted.extend_from_slice(b"\0\0");
+    assert!(matches!(
+        UndoFile::read(IoCursor::new(polluted)),
+        Err(UndoFileError::Malformed)
+    ));
+}
+
+#[test]
 fn randomized_buffer_matches_vec_model() {
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
     let mut buffer = Buffer::new();
