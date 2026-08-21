@@ -6,6 +6,13 @@ pub mod buffer;
 pub mod editor;
 pub mod layout;
 pub mod mapping;
+pub mod mode;
+pub mod motion;
+pub mod ops;
+pub mod search;
+pub mod textobject;
+pub mod visual;
+pub mod insert;
 pub mod marks;
 pub mod options;
 pub mod register;
@@ -27,6 +34,11 @@ pub use mapping::{
     Abbreviation, Lookup, MapMode, MapModes, MapScope, Mapping, MappingAction, MappingError,
     MappingExprSink, MappingOptions, Mappings,
 };
+pub use mode::{CmdlineState, InsertState, Mode, ModeError, ModeMachine, NormalState, OperatorPendingState, Step};
+pub use motion::{FindDirection, FindMotion, Motion, MotionKind};
+pub use ops::{EditRange, Operator, OperatorError, OperatorResult};
+pub use search::{SearchDirection, SearchError, SearchOffset, SearchResult, SearchState};
+pub use visual::{VisualKind, VisualState};
 pub use marks::{
     Changelists, GlobalMarks, Jumplist, LocalMarks, MarkError, MarkLocation, MarkTarget,
     HISTORY_CAPACITY,
@@ -46,5 +58,7 @@ pub use typeahead::{
 
 #[cfg(test)]
 mod input_tests;
+#[cfg(test)]
+mod mode_tests;
 #[cfg(test)]
 mod tests;

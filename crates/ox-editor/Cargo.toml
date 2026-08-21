@@ -9,6 +9,7 @@ description = "Single-writer editor state, layout, options, registers, and marks
 ox-types = { path = "../ox-types" }
 ox-text = { path = "../ox-text" }
 ox-excmd = { path = "../ox-excmd" }
+ox-regex = { path = "../ox-regex" }
 thiserror.workspace = true
 
 [lints]

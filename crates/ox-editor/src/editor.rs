@@ -416,6 +416,17 @@ impl Editor {
         &self.changelists
     }
 
+    /// Returns editor jump history.
+    #[must_use]
+    pub const fn jumplist(&self) -> &Jumplist {
+        &self.jumplist
+    }
+
+    /// Returns mutable editor jump history.
+    pub const fn jumplist_mut(&mut self) -> &mut Jumplist {
+        &mut self.jumplist
+    }
+
     /// Returns registered autocmd and augroup state.
     #[must_use]
     pub const fn autocmds(&self) -> &Autocmds {
