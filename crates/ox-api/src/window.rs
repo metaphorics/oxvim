@@ -170,11 +170,18 @@ fn parse_border_piece(value: &Object) -> Result<String, ApiError> {
     match value {
         Object::String(value) => String::from_utf8(value.0.clone())
             .map_err(|_| invalid("border", "characters must be valid UTF-8")),
-        Object::Array(_) => Err(invalid(
-            "border",
-            "highlight tuples are unsupported by this editor",
-        )),
-        _ => Err(invalid("border", "array items must be strings")),
+        // `[character, highlight]` tuples (api.txt: "- border: (string|string[])",
+        // "Each border side can specify an optional highlight"). The highlight
+        // group is accepted and validated but not used: this editor does not
+        // style border cells individually.
+        Object::Array(items) if items.len() == 2 => {
+            let (Object::String(character), Object::String(_highlight)) = (&items[0], &items[1]) else {
+                return Err(invalid("border", "tuple items must be [character, highlight] strings"));
+            };
+            String::from_utf8(character.0.clone())
+                .map_err(|_| invalid("border", "characters must be valid UTF-8"))
+        }
+        _ => Err(invalid("border", "array items must be strings or highlight tuples")),
     }
 }
 
@@ -244,13 +251,30 @@ fn parse_border_text(
                         std::str::from_utf8(value.as_bytes())
                             .map_err(|_| invalid(name, "chunks must be valid UTF-8"))?,
                     ),
-                    Object::Array(_) => {
+                    // `[text, highlight]` tuple chunks (api.txt: "- title:
+                    // ... List should consist of `[text, highlight]` tuples").
+                    // The highlight group is accepted but not used; the editor
+                    // has no per-float title/footer highlight model.
+                    Object::Array(items) if items.len() == 2 => {
+                        let (Object::String(value), Object::String(_highlight)) =
+                            (&items[0], &items[1])
+                        else {
+                            return Err(invalid(
+                                name,
+                                "tuple chunks must be [text, highlight] strings",
+                            ));
+                        };
+                        text.push_str(
+                            std::str::from_utf8(value.as_bytes())
+                                .map_err(|_| invalid(name, "chunks must be valid UTF-8"))?,
+                        );
+                    }
+                    _ => {
                         return Err(invalid(
                             name,
-                            "highlight tuples are unsupported by this editor",
+                            "array items must be strings or [text, highlight] tuples",
                         ));
                     }
-                    _ => return Err(invalid(name, "array items must be strings")),
                 }
             }
             text
@@ -299,10 +323,12 @@ fn parse_margins(value: Option<&Object>, default: Margins) -> Result<Margins, Ap
 }
 
 fn reject_unsupported_keys(dict: &Dict) -> Result<(), ApiError> {
+    // The full documented nvim_open_win() config surface (api.txt:3970-4045).
     const SUPPORTED: &[&[u8]] = &[
         b"relative", b"win", b"anchor", b"row", b"col", b"width", b"height",
         b"zindex", b"border", b"title", b"title_pos", b"footer", b"footer_pos",
-        b"margins",
+        b"margins", b"style", b"split", b"focusable", b"external", b"bufpos",
+        b"hide", b"noautocmd",
     ];
     for (name, _) in dict.iter() {
         if !SUPPORTED.iter().any(|supported| *supported == name.as_bytes()) {
@@ -315,21 +341,110 @@ fn reject_unsupported_keys(dict: &Dict) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn boolean(dict: &Dict, name: &str) -> Result<Option<bool>, ApiError> {
+    match key(dict, name) {
+        Some(Object::Boolean(value)) => Ok(Some(*value)),
+        Some(Object::Nil) | None => Ok(None),
+        Some(_) => Err(invalid(name, "expected Boolean")),
+    }
+}
+
+/// Validates the non-positional float config surface that this editor accepts
+/// but does not otherwise act on: `style` (only "" and "minimal" are valid),
+/// and the `focusable` / `hide` / `noautocmd` booleans.
+fn validate_float_flags(dict: &Dict) -> Result<(), ApiError> {
+    match string(dict, "style")?.as_deref() {
+        None | Some("") | Some("minimal") => {}
+        Some(value) => return Err(invalid("style", format!("invalid value: {value}"))),
+    }
+    boolean(dict, "focusable")?;
+    boolean(dict, "hide")?;
+    boolean(dict, "noautocmd")?;
+    Ok(())
+}
+
+/// `external` needs the UI layer to display a top-level window; there is no
+/// such layer in this editor, so report a typed NotImplemented error.
+fn reject_external(dict: &Dict) -> Result<(), ApiError> {
+    if boolean(dict, "external")? == Some(true) {
+        return Err(ApiError::exception(
+            "Not implemented: external floating windows require a UI layer",
+        ));
+    }
+    Ok(())
+}
+
+/// Parses `bufpos` ([line, column], relative to the text of a `relative="win"`
+/// window). Returns the tuple; the caller applies its row/col defaults.
+fn parse_bufpos(dict: &Dict) -> Result<Option<(i64, i64)>, ApiError> {
+    let Some(value) = key(dict, "bufpos") else {
+        return Ok(None);
+    };
+    if matches!(value, Object::Nil) {
+        return Ok(None);
+    }
+    let Object::Array(items) = value else {
+        return Err(invalid("bufpos", "expected [line, column] array"));
+    };
+    let (Object::Integer(line), Object::Integer(col)) = (&items[0], &items[1]) else {
+        return Err(invalid("bufpos", "expected [line, column] integers"));
+    };
+    Ok(Some((*line, *col)))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SplitDirection {
+    Vertical,
+    Horizontal,
+}
+
+fn parse_config_split(dict: &Dict) -> Result<SplitDirection, ApiError> {
+    let Some(direction) = string(dict, "split")? else {
+        return Err(invalid("split", "field is required"));
+    };
+    match direction.as_str() {
+        "left" | "right" => Ok(SplitDirection::Vertical),
+        "above" | "below" => Ok(SplitDirection::Horizontal),
+        value => Err(invalid("split", format!("invalid value: {value}"))),
+    }
+}
+
 fn parse_config(
     editor: &Editor,
     dict: &Dict,
     current: Option<&WinConfig>,
 ) -> Result<WinConfig, ApiError> {
     reject_unsupported_keys(dict)?;
+    reject_external(dict)?;
+    validate_float_flags(dict)?;
     let relative = parse_relative(editor, dict, current.map(|config| config.relative))?;
     let anchor = parse_anchor(
         string(dict, "anchor")?,
         current.map_or(Anchor::NorthWest, |config| config.anchor),
     )?;
-    let row = coordinate(dict, "row", current.is_none())?
+    // `bufpos` ({line, column}) anchors the float to buffer text of a
+    // `relative="win"` window and supplies row/col defaults when those are
+    // absent (api.txt: "- bufpos:"). Source: nvim/api/win_config.c:1307-1320.
+    let bufpos = parse_bufpos(dict)?;
+    let mut row = coordinate(dict, "row", false)?;
+    let mut col = coordinate(dict, "col", false)?;
+    if let Some((line, column)) = bufpos {
+        let _ = (line, column);
+        if row.is_none() {
+            row = Some(if matches!(anchor, Anchor::SouthWest | Anchor::SouthEast) {
+                0.0
+            } else {
+                1.0
+            });
+        }
+        if col.is_none() {
+            col = Some(0.0);
+        }
+    }
+    let row = row
         .or_else(|| current.map(|config| config.row))
         .ok_or_else(|| invalid("row", "field is required"))?;
-    let col = coordinate(dict, "col", current.is_none())?
+    let col = col
         .or_else(|| current.map(|config| config.col))
         .ok_or_else(|| invalid("col", "field is required"))?;
     let width = positive_size(dict, "width", current.is_none())?
@@ -526,9 +641,15 @@ pub fn nvim_win_set_cursor(
         .filter(|row| (1..=text.line_count()).contains(row))
         .ok_or_else(|| ApiError::validation("Cursor row outside buffer"))?;
     let line = text.line(row).map_err(exception)?;
-    let requested_col = usize::try_from(pos[1])
-        .map_err(|_| ApiError::validation("Cursor column must be non-negative"))?;
-    let col = requested_col.min(line.len());
+    // Source: src/nvim/api/window.c:122-130 and src/nvim/pos_defs.h:17-19.
+    // `MAXCOL` is the largest valid cursor column; values above it (or
+    // negative) are rejected upstream before the column is silently clamped
+    // to the line length (check_cursor_col).
+    const MAXCOL: i64 = 0x7fff_ffff;
+    if pos[1] < 0 || pos[1] > MAXCOL {
+        return Err(ApiError::validation("Invalid cursor column: out of range"));
+    }
+    let col = (pos[1] as usize).min(line.len());
     editor
         .set_window_cursor(win, Position { lnum: row, col })
         .map_err(exception)
@@ -757,11 +878,48 @@ pub fn nvim_open_win(
     config: Dict,
 ) -> Result<WinHandle, ApiError> {
     let buffer = resolve_buffer(editor, buf)?;
+    reject_unsupported_keys(&config)?;
+    reject_external(&config)?;
+    // A `split` config creates a normal (tiled) split window instead of a
+    // floating one (api.txt: "- split:", nvim/api/win_config.c:231-244).
+    if key(&config, "split").is_some() {
+        validate_float_flags(&config)?;
+        return open_split_window(editor, buffer, enter, &config);
+    }
     let config = parse_config(editor, &config, None)?;
     let tab = editor
         .current_tabpage()
         .ok_or_else(|| ApiError::exception("no current tabpage"))?;
     let window = editor.open_float(tab, buffer, config).map_err(exception)?;
+    if enter {
+        editor.set_current_window(window).map_err(exception)?;
+    }
+    Ok(window)
+}
+
+/// Opens a tiled split for a `config.split` request, sizing the new window by
+/// the requested width (vertical split) or height (horizontal split).
+fn open_split_window(
+    editor: &mut Editor,
+    buffer: BufHandle,
+    enter: bool,
+    config: &Dict,
+) -> Result<WinHandle, ApiError> {
+    let direction = parse_config_split(config)?;
+    let tab = editor
+        .current_tabpage()
+        .ok_or_else(|| ApiError::exception("no current tabpage"))?;
+    let target = editor
+        .current_window()
+        .ok_or_else(|| ApiError::exception("no current window"))?;
+    let window = match direction {
+        SplitDirection::Vertical => editor.split_vertical(tab, target, buffer),
+        SplitDirection::Horizontal => editor.split_horizontal(tab, target, buffer),
+    }
+    .map_err(exception)?;
+    let width = positive_size(config, "width", false)?;
+    let height = positive_size(config, "height", false)?;
+    set_dimension(editor, window, width, height)?;
     if enter {
         editor.set_current_window(window).map_err(exception)?;
     }

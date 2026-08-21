@@ -1,7 +1,8 @@
 //! Editor-global Neovim API functions.
 
 use ox_editor::{
-    BufferRelease, Editor, Keys, Message, MessageKind, OptionScope, OptionValue, TypeaheadFlags,
+    BufferRelease, Editor, KE_FILLER, K_SPECIAL, KS_EXTRA, KS_SPECIAL, KS_ZERO, Keys, Message,
+    MessageKind, OptionScope, OptionValue, TypeaheadFlags,
 };
 use ox_eval::{BuiltinHost, Builtins, EvalError, EvalErrorKind, Evaluator, NoRegex, Parser as EvalParser, Scope};
 use ox_excmd::{ExCommand, Parser as CommandParser};
@@ -261,8 +262,7 @@ pub fn nvim_replace_termcodes(
     special: bool,
 ) -> Result<OxStr, ApiError> {
     let replaced = replace_termcode_notation(str.as_bytes(), do_lt, special);
-    let encoded = Keys::encode(&replaced);
-    Ok(OxStr::from(encoded.as_bytes()))
+    Ok(OxStr::from(replaced.as_slice()))
 }
 
 #[api(since = 1)]
@@ -591,32 +591,86 @@ fn function_metadata(metadata: &FunctionMetadata) -> Dict {
     Dict(fields)
 }
 
-fn replace_termcode_notation(input: &[u8], do_lt: bool, special: bool) -> Vec<u8> {
-    if !special {
-        return input.to_vec();
+/// Appends one literal byte, quoting NUL and `K_SPECIAL` the way key sequences
+/// are stored internally (src/nvim/keycodes.h:15-20,32-45,70-89).
+fn push_encoded(output: &mut Vec<u8>, byte: u8) {
+    match byte {
+        0 => output.extend_from_slice(&[K_SPECIAL, KS_ZERO, KE_FILLER]),
+        K_SPECIAL => output.extend_from_slice(&[K_SPECIAL, KS_SPECIAL, KE_FILLER]),
+        value => output.push(value),
     }
+}
+
+fn replace_termcode_notation(input: &[u8], do_lt: bool, special: bool) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len());
     let mut offset = 0;
     while offset < input.len() {
-        if input[offset] != b'<' {
-            output.push(input[offset]);
+        if !special || input[offset] != b'<' {
+            push_encoded(&mut output, input[offset]);
             offset += 1;
             continue;
         }
         let Some(relative_end) = input[offset + 1..].iter().position(|byte| *byte == b'>') else {
-            output.extend_from_slice(&input[offset..]);
+            for byte in &input[offset..] {
+                push_encoded(&mut output, *byte);
+            }
             break;
         };
         let end = offset + 1 + relative_end;
         let notation = &input[offset + 1..end];
         if let Some(byte) = simple_termcode(notation, do_lt) {
-            output.push(byte);
+            push_encoded(&mut output, byte);
+        } else if let Some(code) = special_keycode(notation) {
+            output.extend_from_slice(&code);
         } else {
-            output.extend_from_slice(&input[offset..=end]);
+            for byte in &input[offset..=end] {
+                push_encoded(&mut output, *byte);
+            }
         }
         offset = end + 1;
     }
     output
+}
+
+/// Translates a named special key (`<Up>`, `<F1>`, `<BS>`, `<Tab>`, ...) to the
+/// internal three-byte keycode form `K_SPECIAL second third`, reusing the
+/// editor's `Keys::special` encoder. The byte pairs follow src/nvim/keycodes.h
+/// (K_UP/K_DOWN/K_LEFT/K_RIGHT/K_F1-K_F10/K_F11-K_F12/K_HOME/K_END/K_DEL/
+/// K_PAGEUP/K_PAGEDOWN via `TERMCAP2KEY`, K_BS, K_TAB = `KS_EXTRA, KE_TAB`).
+fn special_keycode(notation: &[u8]) -> Option<[u8; 3]> {
+    let lower = notation
+        .iter()
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let pair = match lower.as_slice() {
+        b"up" => (b'k', b'u'),
+        b"down" => (b'k', b'd'),
+        b"left" => (b'k', b'l'),
+        b"right" => (b'k', b'r'),
+        b"home" => (b'k', b'h'),
+        b"end" => (b'@', b'7'),
+        b"del" => (b'k', b'D'),
+        b"pageup" => (b'k', b'P'),
+        b"pagedown" => (b'k', b'N'),
+        b"bs" => (b'k', b'b'),
+        b"tab" => (KS_EXTRA, 54), // KE_TAB (src/nvim/keycodes.h)
+        b"f1" => (b'k', b'1'),
+        b"f2" => (b'k', b'2'),
+        b"f3" => (b'k', b'3'),
+        b"f4" => (b'k', b'4'),
+        b"f5" => (b'k', b'5'),
+        b"f6" => (b'k', b'6'),
+        b"f7" => (b'k', b'7'),
+        b"f8" => (b'k', b'8'),
+        b"f9" => (b'k', b'9'),
+        b"f10" => (b'k', b';'),
+        b"f11" => (b'F', b'1'),
+        b"f12" => (b'F', b'2'),
+        _ => return None,
+    };
+    let encoded = Keys::special(pair.0, pair.1).ok()?;
+    let bytes = encoded.as_bytes();
+    Some([bytes[0], bytes[1], bytes[2]])
 }
 
 fn simple_termcode(notation: &[u8], do_lt: bool) -> Option<u8> {
@@ -627,8 +681,6 @@ fn simple_termcode(notation: &[u8], do_lt: bool) -> Option<u8> {
         (&b"cr"[..], b'\r'),
         (&b"enter"[..], b'\r'),
         (&b"esc"[..], 0x1b),
-        (&b"tab"[..], b'\t'),
-        (&b"bs"[..], 0x08),
         (&b"space"[..], b' '),
         (&b"bar"[..], b'|'),
         (&b"bslash"[..], b'\\'),

@@ -418,10 +418,23 @@ pub fn nvim_buf_delete(
     let force = dict_bool(&options, "force", false)?;
     let unload = dict_bool(&options, "unload", false)?;
     let buffer = resolve_buffer(editor, buffer)?;
-    if force && editor.buffer(buffer).map_err(|error| ApiError::exception(error.to_string()))?.attachments != 0 {
-        let replacement = match editor.buffers().into_iter().find(|candidate| *candidate != buffer) {
+    // Windows showing the target buffer must be rehomed onto a replacement
+    // REGARDLESS of `force`; `force` only overrides unsaved-change protection
+    // (src/nvim/api/buffer.c:1039-1059, src/nvim/buffer.c:1039-1059). Since
+    // buffer modified-state is not modeled yet, `force` has no further
+    // observable effect.
+    if editor
+        .buffer(buffer)
+        .map_err(|error| ApiError::exception(error.to_string()))?
+        .attachments
+        != 0
+    {
+        let replacement = match editor.buffers().into_iter().find(|candidate| *candidate != buffer)
+        {
             Some(candidate) => candidate,
-            None => editor.create_buffer(true).map_err(|error| ApiError::exception(error.to_string()))?,
+            None => editor
+                .create_buffer(true)
+                .map_err(|error| ApiError::exception(error.to_string()))?,
         };
         let attached = editor
             .windows()
@@ -434,6 +447,7 @@ pub fn nvim_buf_delete(
                 .map_err(|error| ApiError::exception(error.to_string()))?;
         }
     }
+    let _ = force;
     if unload {
         editor
             .unload_buffer(buffer)
