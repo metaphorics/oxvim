@@ -43,12 +43,6 @@ macro_rules! handle_type {
             pub const fn is_current(self) -> bool {
                 self.0 == 0
             }
-
-            /// The raw 1-based id (`0` when current).
-            #[must_use]
-            pub const fn raw(self) -> i32 {
-                self.0
-            }
         }
 
         impl From<$name> for i64 {
@@ -94,7 +88,7 @@ mod tests {
     #[test]
     fn current_sentinel() {
         assert!(BufHandle::CURRENT.is_current());
-        assert_eq!(BufHandle::CURRENT.raw(), 0);
+        assert_eq!(i64::from(BufHandle::CURRENT), 0);
         assert!(!BufHandle::try_from(3).unwrap().is_current());
     }
 

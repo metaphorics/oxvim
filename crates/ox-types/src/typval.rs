@@ -104,16 +104,25 @@ impl Typval {
         }
     }
 
-    /// Vimscript truthiness, per upstream `tv2bool()` (`eval/typval.c:4778-4817`):
-    /// a value is falsy iff zero, an empty string/blob/list/dict, `false`, or
-    /// `v:null`.
+    /// Vimscript truthiness, per upstream `tv2bool()` (`eval/typval.c:4778-4817`).
+    ///
+    /// A value is falsy iff zero, an empty string/blob/list/dict, `false`, or
+    /// `v:null`. Strings are tested by emptiness only: `"0"` is non-empty and
+    /// therefore truthy here.
+    ///
+    /// This is NOT the coercion used by the `:if` command, which converts its
+    /// argument with `tv_get_number_chk()` (`ex_eval.c:865-872`) and is the
+    /// responsibility of `ox-eval`; under that coercion `"0"` becomes `0` and
+    /// the `:if` body does not execute.
     #[must_use]
     pub fn is_truthy(&self) -> bool {
         match self {
             Typval::Number(n) => *n != 0,
             Typval::Float(f) => *f != 0.0,
             // tv2bool VAR_STRING: `*v_string != NUL` — "0" is non-empty, so
-            // truthy.
+            // truthy. The `:if` command uses numeric coercion in ox-eval
+            // (ex_eval.c:865-872 via tv_get_number_chk), where "0" would be
+            // false.
             Typval::String(s) => !s.as_bytes().is_empty(),
             Typval::Blob(b) => !b.is_empty(),
             Typval::List(l) => !l.is_empty(),
@@ -164,7 +173,10 @@ mod tests {
     fn truthiness_falsy() {
         assert!(!Typval::Number(0).is_truthy());
         assert!(!Typval::Float(0.0).is_truthy());
-        // "0" is a non-empty string → truthy per tv2bool VAR_STRING.
+        // "0" is a non-empty string → truthy per tv2bool VAR_STRING.  The
+        // legacy `:if` command uses numeric coercion (tv_get_number_chk,
+        // ex_eval.c:865-872), so `if "0"` does NOT execute; that is handled
+        // by ox-eval, not by this type.
         assert!(Typval::String(OxStr::from("0")).is_truthy());
         assert!(!Typval::String(OxStr::from("")).is_truthy());
         assert!(!Typval::Blob(vec![]).is_truthy());

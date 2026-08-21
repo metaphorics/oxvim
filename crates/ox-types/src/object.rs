@@ -51,28 +51,10 @@ pub enum Object {
 /// Upstream dicts are hash tables, but both the API-metadata schema and RPC
 /// consumers observe a stable order, so a `Vec`-backed map is chosen (per the
 /// project plan).
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Dict(pub Vec<(OxStr, Object)>);
 
 impl Dict {
-    /// Create an empty [`Dict`].
-    #[must_use]
-    pub fn new() -> Self {
-        Dict(Vec::new())
-    }
-
-    /// Number of entries.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Whether the dict has no entries.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
     /// Look up a value by key.
     #[must_use]
     pub fn get(&self, key: &OxStr) -> Option<&Object> {
@@ -98,12 +80,6 @@ impl Dict {
     }
 }
 
-impl FromIterator<(OxStr, Object)> for Dict {
-    fn from_iter<T: IntoIterator<Item = (OxStr, Object)>>(iter: T) -> Self {
-        Dict(iter.into_iter().collect())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -114,7 +90,7 @@ mod tests {
 
     #[test]
     fn dict_insert_replaces_in_place() {
-        let mut d = Dict::new();
+        let mut d = Dict(vec![]);
         let a = OxStr::from("a");
         let b = OxStr::from("b");
         d.insert(a.clone(), Object::Integer(1));
@@ -122,7 +98,7 @@ mod tests {
         d.insert(a.clone(), Object::Integer(99));
 
         // "a" stays at its original first position with the new value.
-        assert_eq!(d.len(), 2);
+        assert_eq!(d.0.len(), 2);
         assert_eq!(d.get(&a), Some(&Object::Integer(99)));
         assert_eq!(d.get(&b), Some(&Object::Integer(2)));
         assert_eq!(d.0[0].0, a);
@@ -132,14 +108,14 @@ mod tests {
 
     #[test]
     fn dict_get_missing_returns_none() {
-        let d = Dict::new();
+        let d = Dict(vec![]);
         assert_eq!(d.get(&OxStr::from("nope")), None);
-        assert!(d.is_empty());
+        assert!(d.0.is_empty());
     }
 
     #[test]
     fn dict_iter_preserves_order() {
-        let d = Dict::from_iter([
+        let d = Dict(vec![
             (OxStr::from("x"), Object::Nil),
             (OxStr::from("y"), Object::Integer(1)),
         ]);

@@ -16,22 +16,10 @@ use std::fmt::Write as _;
 pub struct OxStr(pub Vec<u8>);
 
 impl OxStr {
-    /// Wrap the given bytes into an [`OxStr`].
-    #[must_use]
-    pub const fn new(bytes: Vec<u8>) -> Self {
-        OxStr(bytes)
-    }
-
     /// Borrow the underlying bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_slice()
-    }
-
-    /// Consume the string, returning the underlying bytes.
-    #[must_use]
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.0
     }
 
     /// Decode as lossy UTF-8, replacing any invalid sequences with U+FFFD.
@@ -59,12 +47,6 @@ impl OxStr {
     }
 }
 
-impl fmt::Display for OxStr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.to_string_lossy(), f)
-    }
-}
-
 impl fmt::Debug for OxStr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("OxStr(")?;
@@ -79,26 +61,8 @@ impl From<&str> for OxStr {
     }
 }
 
-impl From<String> for OxStr {
-    fn from(s: String) -> Self {
-        OxStr(s.into_bytes())
-    }
-}
-
 impl From<&[u8]> for OxStr {
     fn from(b: &[u8]) -> Self {
-        OxStr(b.to_vec())
-    }
-}
-
-impl From<Vec<u8>> for OxStr {
-    fn from(b: Vec<u8>) -> Self {
-        OxStr(b)
-    }
-}
-
-impl<const N: usize> From<&[u8; N]> for OxStr {
-    fn from(b: &[u8; N]) -> Self {
         OxStr(b.to_vec())
     }
 }
@@ -115,9 +79,9 @@ mod tests {
     }
 
     #[test]
-    fn lossy_display() {
-        assert_eq!(OxStr::from("héllo").to_string(), "héllo");
-        assert_eq!(OxStr::from(&[0xFF, b'x']).to_string(), "\u{FFFD}x");
+    fn lossy_decode() {
+        assert_eq!(OxStr::from("héllo").to_string_lossy().as_ref(), "héllo");
+        assert_eq!(OxStr::from(&[0xFF, b'x'][..]).to_string_lossy().as_ref(), "\u{FFFD}x");
     }
 
     #[test]
