@@ -15,6 +15,7 @@ pub use error::ApiError;
 pub use handle::{BufHandle, HandleError, TabHandle, WinHandle};
 pub use object::{Dict, Object, EXT_TYPE_BUFFER, EXT_TYPE_TABPAGE, EXT_TYPE_WINDOW};
 pub use typval::{
-    Funcref, Special, Typval, VAR_BLOB, VAR_BOOL, VAR_DICT, VAR_FLOAT, VAR_FUNC, VAR_LIST,
+    DictData, DictRef, Funcref, ListData, ListRef, LockScope, LockState, Special, Typval, VAR_BLOB,
+    VAR_BOOL, VAR_DICT, VAR_FLOAT, VAR_FUNC, VAR_LIST,
     VAR_NUMBER, VAR_PARTIAL, VAR_SPECIAL, VAR_STRING, VAR_UNKNOWN,
 };

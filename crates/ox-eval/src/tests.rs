@@ -16,9 +16,9 @@ impl BuiltinHost for Host {
         match name.as_bytes() {
             b"id" => args.into_iter().next().ok_or_else(|| EvalError::new("E119", 0, "argument required")),
             b"len" => match args.first() {
-                Some(Typval::List(v)) => Ok(Typval::Number(v.len() as i64)),
+                Some(Typval::List(v)) => Ok(Typval::Number(v.borrow().items.len() as i64)),
                 Some(Typval::String(v)) => Ok(Typval::Number(v.as_bytes().len() as i64)),
-                Some(Typval::Dict(v)) => Ok(Typval::Number(v.len() as i64)),
+                Some(Typval::Dict(v)) => Ok(Typval::Number(v.borrow().entries.len() as i64)),
                 _ => Err(EvalError::new("E701", 0, "invalid type for len")),
             },
             b"first" => args.into_iter().next().ok_or_else(|| EvalError::new("E119", 0, "argument required")),
@@ -32,7 +32,7 @@ impl BuiltinHost for Host {
                 let rhs = args.pop().unwrap();
                 let lhs = args.pop().unwrap();
                 match lhs {
-                    Typval::List(mut list) => { list.push(rhs); Ok(Typval::List(list)) }
+                    Typval::List(list) => { list.borrow_mut().items.push(rhs); Ok(Typval::List(list)) }
                     _ => Err(EvalError::new("E714", 0, "List required")),
                 }
             }
@@ -121,10 +121,10 @@ eval_cases!(
     (literal_double_escapes, b"\"a\\nb\\tc\\\"\\\\\"", Typval::String(OxStr(b"a\nb\tc\"\\".to_vec())), "vimeval.txt:1413-1448"),
     (literal_single_quote, b"'a''b'", Typval::String(OxStr(b"a'b".to_vec())), "vimeval.txt:1461-1474"),
     (literal_blob, b"0z0102.0304", Typval::Blob(vec![1,2,3,4]), "vimeval.txt:1451-1458"),
-    (literal_nested_list, b"[1, 'two', [3]]", Typval::List(vec![Typval::Number(1), Typval::String(OxStr::from("two")), Typval::List(vec![Typval::Number(3)])]), "vimeval.txt:882"),
-    (literal_list_trailing_comma, b"[1, 2,]", Typval::List(vec![Typval::Number(1), Typval::Number(2)]), "eval.c:3902"),
-    (literal_dict, b"{'a': 1, 'b': 2,}", Typval::Dict(vec![(OxStr::from("a"), Typval::Number(1)), (OxStr::from("b"), Typval::Number(2))]), "vimeval.txt:883"),
-    (literal_hash_dict, b"#{a: 1, b: 2}", Typval::Dict(vec![(OxStr::from("a"), Typval::Number(1)), (OxStr::from("b"), Typval::Number(2))]), "vimeval.txt:884"),
+    (literal_nested_list, b"[1, 'two', [3]]", Typval::list(vec![Typval::Number(1), Typval::String(OxStr::from("two")), Typval::list(vec![Typval::Number(3)])]), "vimeval.txt:882"),
+    (literal_list_trailing_comma, b"[1, 2,]", Typval::list(vec![Typval::Number(1), Typval::Number(2)]), "eval.c:3902"),
+    (literal_dict, b"{'a': 1, 'b': 2,}", Typval::dict(vec![(OxStr::from("a"), Typval::Number(1)), (OxStr::from("b"), Typval::Number(2))]), "vimeval.txt:883"),
+    (literal_hash_dict, b"#{a: 1, b: 2}", Typval::dict(vec![(OxStr::from("a"), Typval::Number(1)), (OxStr::from("b"), Typval::Number(2))]), "vimeval.txt:884"),
     (coerce_not_text, b"!'hello'", Typval::Number(1), "typval.c:4292-4311"),
     (coerce_not_number_text, b"!'123'", Typval::Number(0), "typval.c:4306-4311"),
     (coerce_not_zero_text, b"!'0'", Typval::Number(1), "typval.c:4306-4311"),
@@ -142,7 +142,7 @@ eval_cases!(
     (coalesce_empty_string, b"'' ?? 456", Typval::Number(456), "test_expr.vim:78"),
     (coalesce_zero_string_truthy, b"'0' ?? 456", Typval::String(OxStr::from("0")), "typval.c:4778-4804"),
     (coalesce_empty_list, b"[] ?? 456", Typval::Number(456), "test_expr.vim:80"),
-    (coalesce_nonempty_list, b"[0] ?? 456", Typval::List(vec![Typval::Number(0)]), "test_expr.vim:72"),
+    (coalesce_nonempty_list, b"[0] ?? 456", Typval::list(vec![Typval::Number(0)]), "test_expr.vim:72"),
     (coalesce_empty_dict, b"{} ?? 456", Typval::Number(456), "test_expr.vim:81"),
     (coalesce_null, b"v:null ?? 456", Typval::Number(456), "test_expr.vim:84"),
     (compare_string_equal, b"'abc' == 'abc'", Typval::Number(1), "vimeval.txt:993-1017"),
@@ -166,11 +166,11 @@ eval_cases!(
     (slice_string_negative, b"'editor'[-3:]", Typval::String(OxStr::from("tor")), "vimeval.txt:1230-1241"),
     (index_list_first, b"[10, 20, 30][0]", Typval::Number(10), "vimeval.txt:1204-1211"),
     (index_list_negative, b"[10, 20, 30][-1]", Typval::Number(30), "vimeval.txt:1204-1211"),
-    (slice_list_middle, b"[1, 2, 3, 4][1:2]", Typval::List(vec![Typval::Number(2), Typval::Number(3)]), "vimeval.txt:1243-1249"),
-    (slice_list_prefix, b"[1, 2, 3][:1]", Typval::List(vec![Typval::Number(1), Typval::Number(2)]), "vimeval.txt:1243-1249"),
-    (slice_list_clamped, b"[1, 2][0:8]", Typval::List(vec![Typval::Number(1), Typval::Number(2)]), "test_listdict.vim:37"),
-    (slice_list_empty_high, b"[1, 2][8:]", Typval::List(vec![]), "test_listdict.vim:38"),
-    (slice_list_empty_low, b"[1, 2][-3:-1]", Typval::List(vec![]), "test_listdict.vim:47"),
+    (slice_list_middle, b"[1, 2, 3, 4][1:2]", Typval::list(vec![Typval::Number(2), Typval::Number(3)]), "vimeval.txt:1243-1249"),
+    (slice_list_prefix, b"[1, 2, 3][:1]", Typval::list(vec![Typval::Number(1), Typval::Number(2)]), "vimeval.txt:1243-1249"),
+    (slice_list_clamped, b"[1, 2][0:8]", Typval::list(vec![Typval::Number(1), Typval::Number(2)]), "test_listdict.vim:37"),
+    (slice_list_empty_high, b"[1, 2][8:]", Typval::list(vec![]), "test_listdict.vim:38"),
+    (slice_list_empty_low, b"[1, 2][-3:-1]", Typval::list(vec![]), "test_listdict.vim:47"),
     (dict_index_string, b"{'name': 'ox'}['name']", Typval::String(OxStr::from("ox")), "vimeval.txt:1266-1280"),
     (dict_member, b"{'name': 'ox'}.name", Typval::String(OxStr::from("ox")), "vimeval.txt:1266-1280"),
     (dict_index_number_key, b"{0: 'zero'}[0]", Typval::String(OxStr::from("zero")), "test_expr.vim:111"),
@@ -179,9 +179,9 @@ eval_cases!(
     (lambda_nullary, b"{-> 42}()", Typval::Number(42), "vimeval.txt:1608-1626"),
     (lambda_binary, b"{a, b -> a + b}(10, 20)", Typval::Number(30), "test_lambda.vim:56"),
     (lambda_unary, b"{x -> x * 2}(21)", Typval::Number(42), "vimeval.txt:1611-1626"),
-    (lambda_returns_list, b"{x -> [x, x + 1]}(3)", Typval::List(vec![Typval::Number(3), Typval::Number(4)]), "vimeval.txt:1641-1647"),
+    (lambda_returns_list, b"{x -> [x, x + 1]}(3)", Typval::list(vec![Typval::Number(3), Typval::Number(4)]), "vimeval.txt:1641-1647"),
     (lambda_variadic_count, b"{... -> a:0}(1, 2, 3)", Typval::Number(3), "test_lambda.vim:55-58"),
-    (lambda_variadic_list, b"{... -> a:000}(7, 8)", Typval::List(vec![Typval::Number(7), Typval::Number(8)]), "userfunc.txt:a:000"),
+    (lambda_variadic_list, b"{... -> a:000}(7, 8)", Typval::list(vec![Typval::Number(7), Typval::Number(8)]), "userfunc.txt:a:000"),
     (lambda_variadic_index, b"{... -> a:1}(10, 20)", Typval::Number(10), "userfunc.txt:a:1"),
     (lambda_named_then_variadic, b"{a, ... -> a + a:0}(1, 2, 3)", Typval::Number(3), "test_lambda.vim:55-62"),
     (lambda_extra_args_accepted, b"{a -> a}(1, 2, 3)", Typval::Number(1), "userfunc.c:396 uf_varargs=true"),
@@ -255,7 +255,7 @@ fn unary_not_float_nonzero() {
 fn same_variable_preserves_list_identity() {
     // runtime/doc/vimeval.txt:1049-1053.
     let mut scope = Scope::new();
-    scope.set(b"xs", Typval::List(vec![Typval::Number(1)]));
+    scope.set(b"xs", Typval::list(vec![Typval::Number(1)]));
     assert_eq!(value_in(b"xs is xs", &mut scope), Typval::Number(1));
 }
 
@@ -263,7 +263,7 @@ fn same_variable_preserves_list_identity() {
 fn repeated_list_index_preserves_nested_identity() {
     // runtime/doc/vimeval.txt:1049-1053 and 1182-1211.
     let mut scope = Scope::new();
-    scope.set(b"xs", Typval::List(vec![Typval::List(vec![Typval::Number(1)])]));
+    scope.set(b"xs", Typval::list(vec![Typval::list(vec![Typval::Number(1)])]));
     assert_eq!(value_in(b"xs[0] is xs[0]", &mut scope), Typval::Number(1));
 }
 
@@ -271,7 +271,7 @@ fn repeated_list_index_preserves_nested_identity() {
 fn repeated_dict_member_preserves_nested_identity() {
     // runtime/doc/vimeval.txt:1049-1053 and 1266-1280.
     let mut scope = Scope::new();
-    scope.set(b"d", Typval::Dict(vec![(OxStr::from("x"), Typval::List(vec![]))]));
+    scope.set(b"d", Typval::dict(vec![(OxStr::from("x"), Typval::list(vec![]))]));
     assert_eq!(value_in(b"d.x is d.x", &mut scope), Typval::Number(1));
 }
 
@@ -307,7 +307,7 @@ fn bare_global_scope_returns_dictionary() {
     // runtime/doc/vimeval.txt:1703-1707.
     let mut scope = Scope::new();
     scope.global.push((OxStr::from("x"), Typval::Number(7)));
-    assert_eq!(value_in(b"g:", &mut scope), Typval::Dict(vec![(OxStr::from("x"), Typval::Number(7))]));
+    assert_eq!(value_in(b"g:", &mut scope), Typval::dict(vec![(OxStr::from("x"), Typval::Number(7))]));
 }
 
 #[test]
@@ -466,7 +466,7 @@ fn variadic_lambda_partial_binds_leading_args() {
     let result = callee.eval(&call, &mut scope).unwrap();
     assert_eq!(
         result,
-        Typval::List(vec![
+        Typval::list(vec![
             Typval::String(OxStr::from("one")),
             Typval::String(OxStr::from("two")),
             Typval::String(OxStr::from("three")),

@@ -1,13 +1,15 @@
 //! Generated builtin metadata and typval-only builtin implementations.
 
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::rc::Rc;
 
 use ox_types::{Funcref, OxStr, Special, Typval};
 use serde_json::Value as JsonValue;
 
 use crate::error::{EvalError, Result};
-use crate::eval::{compare_bytes, BuiltinHost, Evaluator, RegexEngine};
+use crate::eval::{compare_bytes, BuiltinHost, ClosureRegistry, Evaluator, RegexEngine};
 use crate::parser::Parser;
 use crate::scope::Scope;
 
@@ -39,20 +41,32 @@ pub fn builtin_spec(name: &str) -> Option<&'static BuiltinSpec> {
 /// Typval-only builtin dispatcher. Regex operations use only the supplied seam.
 pub struct Builtins<'a> {
     regex: Option<&'a dyn RegexEngine>,
+    closures: ClosureRegistry,
 }
 
 impl<'a> Builtins<'a> {
     /// Create a dispatcher with regex-backed builtins enabled through `regex`.
     #[must_use]
-    pub const fn new(regex: &'a dyn RegexEngine) -> Self {
-        Self { regex: Some(regex) }
+    pub fn new(regex: &'a dyn RegexEngine) -> Self {
+        Self { regex: Some(regex), closures: ClosureRegistry::new() }
     }
 
     /// Create a dispatcher whose regex-backed operations return a typed error.
     #[must_use]
-    pub const fn without_regex() -> Self {
-        Self { regex: None }
+    pub fn without_regex() -> Self {
+        Self { regex: None, closures: ClosureRegistry::new() }
     }
+
+    /// Reuse the evaluator's closure registry for callback-capable builtins.
+    #[must_use]
+    pub fn with_closure_registry(mut self, registry: ClosureRegistry) -> Self {
+        self.closures = registry;
+        self
+    }
+
+    /// Borrow the shared closure registry.
+    #[must_use]
+    pub const fn closure_registry(&self) -> &ClosureRegistry { &self.closures }
 
     fn dispatch(&mut self, name: &str, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
         let spec = builtin_spec(name).ok_or_else(|| EvalError::not_implemented(OxStr::from(name)))?;
@@ -67,20 +81,22 @@ impl<'a> Builtins<'a> {
             "blob2list" => blob2list(&args[0]),
             "ceil" => float_unary(&args[0], f64::ceil),
             "char2nr" => char2nr(&args),
-            "copy" => Ok(args[0].clone()),
+            "copy" => shallow_copy(&args[0]),
             "count" => count(&args),
-            "deepcopy" => deep_copy(&args[0], 0),
+            "deepcopy" => deep_copy(&args[0]),
             "empty" => Ok(Typval::Number(i64::from(is_empty(&args[0])))),
             "escape" => escape(&args),
             "extend" | "extendnew" => extend(args),
-            "filter" => self.filter_or_map(args, scope, false),
-            "flatten" | "flattennew" => flatten(&args),
+            "filter" => self.filter_or_map(args, scope, CollectionOp::Filter),
+            "flatten" => flatten(&args, true),
+            "flattennew" => flatten(&args, false),
             "float2nr" | "trunc" => float_to_number(&args[0]),
             "floor" => float_unary(&args[0], f64::floor),
             "get" => get(&args),
             "has_key" => has_key(&args),
             "index" => index(&args),
             "insert" => insert(args),
+            "islocked" => is_locked_value(&args[0]),
             "items" => dict_projection(&args[0], Projection::Items),
             "join" => join(&args),
             "json_decode" => json_decode(&args[0]),
@@ -89,7 +105,10 @@ impl<'a> Builtins<'a> {
             "len" | "strlen" => length(&args[0], name == "strlen"),
             "list2blob" => list2blob(&args[0]),
             "list2str" => list2str(&args),
-            "map" => self.filter_or_map(args, scope, true),
+            "map" => self.filter_or_map(args, scope, CollectionOp::Map),
+            "mapnew" => self.filter_or_map(args, scope, CollectionOp::MapNew),
+            "foreach" => self.filter_or_map(args, scope, CollectionOp::ForEach),
+            "reduce" => self.reduce(args, scope),
             "match" | "matchend" | "matchstr" => self.regex_match(name, &args),
             "max" => extremum(&args[0], true),
             "min" => extremum(&args[0], false),
@@ -132,7 +151,7 @@ impl<'a> Builtins<'a> {
         let pattern = args.get(1).map_or_else(|| Ok(OxStr::from("\\s\\+")), string_arg)?;
         let keep_empty = args.get(2).is_some_and(Typval::is_truthy);
         self.regex()?.split(&text, &pattern, keep_empty).map(|parts| {
-            Typval::List(parts.into_iter().map(Typval::String).collect())
+            Typval::list(parts.into_iter().map(Typval::String).collect())
         })
     }
 
@@ -142,6 +161,7 @@ impl<'a> Builtins<'a> {
         let occurrence = args.get(3).map(number_arg).transpose()?.unwrap_or(1).max(1) as usize;
         match &args[0] {
             Typval::List(values) => {
+                let values = list_items(values)?;
                 let start = usize::try_from(start_number).unwrap_or(usize::MAX);
                 let mut seen = 0usize;
                 for (index, value) in values.iter().enumerate().skip(start) {
@@ -184,33 +204,118 @@ impl<'a> Builtins<'a> {
         self.regex()?.substitute(&text, &pattern, &replacement, &flags).map(Typval::String)
     }
 
-    fn filter_or_map(&mut self, mut args: Vec<Typval>, scope: &mut Scope, mapping: bool) -> Result<Typval> {
+    fn filter_or_map(&mut self, mut args: Vec<Typval>, scope: &mut Scope, operation: CollectionOp) -> Result<Typval> {
         let callback = args.pop().ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
         let container = args.pop().ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
-        match container {
-            Typval::List(values) => {
-                let mut result = Vec::with_capacity(values.len());
-                for (key, value) in values.into_iter().enumerate() {
-                    let mapped = self.eval_callback(&callback, Typval::Number(saturating_i64(key)), value.clone(), scope)?;
-                    if mapping {
-                        result.push(mapped);
-                    } else if mapped.is_truthy() {
-                        result.push(value);
+        match &container {
+            Typval::List(reference) => {
+                let (items, previous_lock) = {
+                    let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+                    if data.lock.locked && matches!(operation, CollectionOp::Map | CollectionOp::Filter) { return Err(locked_error()); }
+                    let items = data.items.clone();
+                    let previous = data.lock;
+                    data.lock.locked = true;
+                    (items, previous)
+                };
+                let mut output = Vec::with_capacity(items.len());
+                let mut current_index = 0usize;
+                let evaluated = (|| {
+                    for (callback_index, value) in items.iter().cloned().enumerate() {
+                        let mapped = self.eval_callback(&callback, Typval::Number(saturating_i64(callback_index)), value, scope)?;
+                        match operation {
+                            CollectionOp::Map => {
+                                let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+                                let Some(slot) = data.items.get_mut(current_index) else { return Err(borrow_error()); };
+                                *slot = mapped;
+                                current_index += 1;
+                            }
+                            CollectionOp::Filter => {
+                                let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+                                if mapped.is_truthy() { current_index += 1; } else if current_index < data.items.len() { data.items.remove(current_index); }
+                            }
+                            CollectionOp::MapNew => output.push(mapped),
+                            CollectionOp::ForEach => {}
+                        }
                     }
-                }
-                Ok(Typval::List(result))
+                    Ok(())
+                })();
+                reference.try_borrow_mut().map_err(|_| borrow_error())?.lock = previous_lock;
+                evaluated?;
+                Ok(match operation {
+                    CollectionOp::MapNew => Typval::list(output),
+                    CollectionOp::Map | CollectionOp::Filter | CollectionOp::ForEach => container,
+                })
             }
-            Typval::Dict(values) => {
-                let mut result = Vec::with_capacity(values.len());
-                for (key, value) in values {
-                    let mapped = self.eval_callback(&callback, Typval::String(key.clone()), value.clone(), scope)?;
-                    if mapping {
-                        result.push((key, mapped));
-                    } else if mapped.is_truthy() {
-                        result.push((key, value));
+            Typval::Dict(reference) => {
+                let (entries, previous_lock) = {
+                    let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+                    if data.lock.locked && matches!(operation, CollectionOp::Map | CollectionOp::Filter) { return Err(locked_error()); }
+                    let entries = data.entries.clone();
+                    let previous = data.lock;
+                    data.lock.locked = true;
+                    (entries, previous)
+                };
+                let mut output = Vec::with_capacity(entries.len());
+                let evaluated = (|| {
+                    for (key, value) in entries.iter().cloned() {
+                        let mapped = self.eval_callback(&callback, Typval::String(key.clone()), value, scope)?;
+                        match operation {
+                            CollectionOp::Map => {
+                                let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+                                let Some((_, slot)) = data.entries.iter_mut().find(|(candidate, _)| candidate == &key) else { return Err(borrow_error()); };
+                                *slot = mapped;
+                            }
+                            CollectionOp::Filter => {
+                                if !mapped.is_truthy() {
+                                    let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+                                    let Some(index) = data.entries.iter().position(|(candidate, _)| candidate == &key) else { return Err(borrow_error()); };
+                                    data.entries.remove(index);
+                                }
+                            }
+                            CollectionOp::MapNew => output.push((key, mapped)),
+                            CollectionOp::ForEach => {}
+                        }
+                    }
+                    Ok(())
+                })();
+                reference.try_borrow_mut().map_err(|_| borrow_error())?.lock = previous_lock;
+                evaluated?;
+                Ok(match operation {
+                    CollectionOp::MapNew => Typval::dict(output),
+                    CollectionOp::Map | CollectionOp::Filter | CollectionOp::ForEach => container,
+                })
+            }
+            Typval::Blob(bytes) => {
+                let mut output = Vec::with_capacity(bytes.len());
+                for (index, byte) in bytes.iter().copied().enumerate() {
+                    let mapped = self.eval_callback(&callback, Typval::Number(saturating_i64(index)), Typval::Number(i64::from(byte)), scope)?;
+                    match operation {
+                        CollectionOp::Map | CollectionOp::MapNew => output.push(u8::try_from(number_arg(&mapped)?).map_err(|_| EvalError::new("E1230", 0, "Blob value must be in range 0 to 255"))?),
+                        CollectionOp::Filter if mapped.is_truthy() => output.push(byte),
+                        CollectionOp::Filter | CollectionOp::ForEach => {}
                     }
                 }
-                Ok(Typval::Dict(result))
+                Ok(match operation {
+                    CollectionOp::ForEach => container,
+                    CollectionOp::Map | CollectionOp::MapNew | CollectionOp::Filter => Typval::Blob(output),
+                })
+            }
+            Typval::String(text) => {
+                let characters = string_elements(text.as_bytes());
+                let mut output = Vec::new();
+                for (index, character) in characters.into_iter().enumerate() {
+                    let original = Typval::String(character.clone());
+                    let mapped = self.eval_callback(&callback, Typval::Number(saturating_i64(index)), original, scope)?;
+                    match operation {
+                        CollectionOp::Map | CollectionOp::MapNew => output.extend_from_slice(string_arg(&mapped)?.as_bytes()),
+                        CollectionOp::Filter if mapped.is_truthy() => output.extend_from_slice(character.as_bytes()),
+                        CollectionOp::Filter | CollectionOp::ForEach => {}
+                    }
+                }
+                Ok(match operation {
+                    CollectionOp::ForEach => container,
+                    CollectionOp::Map | CollectionOp::MapNew | CollectionOp::Filter => Typval::String(OxStr(output)),
+                })
             }
             _ => Err(EvalError::new("E1251", 0, "List, Dictionary, Blob or String required")),
         }
@@ -226,23 +331,18 @@ impl<'a> Builtins<'a> {
                 let regex = RegexRef(self.regex);
                 Evaluator::new(self, &regex).eval(&parsed, &mut callback_scope)
             }
-            Typval::Funcref(funcref) | Typval::Partial(funcref) if funcref.registry.is_none() => {
-                let mut callback_args = funcref.args.clone();
-                callback_args.push(key);
-                callback_args.push(value);
-                self.dispatch(&funcref.name.to_string_lossy(), callback_args, &mut scope.snapshot())
+            Typval::Funcref(_) | Typval::Partial(_) => {
+                let regex = RegexRef(self.regex);
+                Evaluator::new(self, &regex).invoke(callback.clone(), vec![key, value], &mut scope.snapshot())
             }
             _ => Err(EvalError::new("E921", 0, "Invalid callback argument")),
         }
     }
 
     fn sort(&mut self, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
-        let Some(Typval::List(values)) = args.first() else {
+        let Some(Typval::List(reference)) = args.first() else {
             return Err(EvalError::new("E714", 0, "List required"));
         };
-        let mut values = values.clone();
-        // Resolve the kind of comparison from the optional second argument,
-        // mirroring `parse_sort_uniq_args` (funcs.c:1551-1593).
         let mode = match args.get(1) {
             None => SortMode::Default,
             Some(Typval::Number(number)) => match *number {
@@ -257,32 +357,75 @@ impl<'a> Builtins<'a> {
                 b"N" => SortMode::Integer,
                 b"f" => SortMode::Float,
                 b"l" => SortMode::Locale,
-                _ => SortMode::Callback(Typval::String((*text).clone())),
+                _ => SortMode::Callback(args[1].clone()),
             },
             Some(Typval::Funcref(_) | Typval::Partial(_)) => SortMode::Callback(args[1].clone()),
             _ => return Err(EvalError::new("E921", 0, "Invalid callback argument")),
         };
+        let (mut values, previous_lock) = {
+            let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+            if data.lock.locked { return Err(locked_error()); }
+            let values = data.items.clone();
+            let previous = data.lock;
+            data.lock.locked = true;
+            (values, previous)
+        };
         let mut failure = None;
         values.sort_by(|left, right| {
             let result = match &mode {
-                // Default and locale sorting compare the stringified values
-                // (`sort([2, 10])` is `[10, 2]`, because "10" sorts before
-                // "2"). `l` mode uses the documented byte-wise fallback for
-                // the C-locale `strcoll` comparison, so it behaves exactly
-                // like the default here.
                 SortMode::Default | SortMode::Locale => Ok(sort_string_pair(left, right, false)),
                 SortMode::IgnoreCase => Ok(sort_string_pair(left, right, true)),
                 SortMode::Numeric => Ok(sort_numeric(left).total_cmp(&sort_numeric(right))),
                 SortMode::Integer => Ok(sort_integer(left).cmp(&sort_integer(right))),
                 SortMode::Float => Ok(sort_float(left).total_cmp(&sort_float(right))),
-                SortMode::Callback(callback) => self.eval_callback(callback, left.clone(), right.clone(), scope).and_then(|value| number_arg(&value)).map(|value| value.cmp(&0)),
+                SortMode::Callback(callback) => self.eval_callback(callback, left.clone(), right.clone(), scope)
+                    .and_then(|value| number_arg(&value)).map(|value| value.cmp(&0)),
             };
             match result { Ok(ordering) => ordering, Err(error) => { failure = Some(error); Ordering::Equal } }
         });
+        reference.try_borrow_mut().map_err(|_| borrow_error())?.lock = previous_lock;
         if let Some(error) = failure { return Err(error); }
-        Ok(Typval::List(values))
+        reference.try_borrow_mut().map_err(|_| borrow_error())?.items = values;
+        Ok(args[0].clone())
     }
+
+    fn reduce(&mut self, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
+        let source = args.first().ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
+        let callback = args.get(1).ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
+        let mut previous_lock = None;
+        let mut items = match source {
+            Typval::List(reference) => {
+                let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+                let items = data.items.clone();
+                previous_lock = Some((reference.clone(), data.lock));
+                data.lock.locked = true;
+                items
+            }
+            Typval::Blob(bytes) => bytes.iter().map(|byte| Typval::Number(i64::from(*byte))).collect(),
+            Typval::String(text) => string_elements(text.as_bytes()).into_iter().map(Typval::String).collect(),
+            _ => return Err(EvalError::new("E1252", 0, "String, List or Blob required")),
+        };
+        let reduced = (|| {
+            let mut accumulator = if let Some(initial) = args.get(2) {
+                initial.clone()
+            } else if items.is_empty() {
+                return Err(EvalError::new("E998", 0, "Reduce of an empty value with no initial value"));
+            } else {
+                items.remove(0)
+            };
+            for item in items { accumulator = self.eval_callback(callback, accumulator, item, scope)?; }
+            Ok(accumulator)
+        })();
+        if let Some((reference, lock)) = previous_lock {
+            reference.try_borrow_mut().map_err(|_| borrow_error())?.lock = lock;
+        }
+        reduced
+    }
+
 }
+
+#[derive(Clone, Copy)]
+enum CollectionOp { Map, Filter, MapNew, ForEach }
 
 /// How the builtin `sort()`/`uniq()` comparison behaves (parse_sort_uniq_args).
 enum SortMode {
@@ -370,6 +513,8 @@ impl BuiltinHost for Builtins<'_> {
         }
         self.dispatch(&name_text, args, scope)
     }
+
+    fn closure_registry(&self) -> Option<ClosureRegistry> { Some(self.closures.clone()) }
 }
 
 struct RegexRef<'a>(Option<&'a dyn RegexEngine>);
@@ -403,9 +548,9 @@ fn is_implemented(name: &str) -> bool {
     matches!(name,
         "abs" | "add" | "and" | "blob2list" | "ceil" | "char2nr" | "copy" | "count" |
         "deepcopy" | "empty" | "escape" | "extend" | "extendnew" | "filter" | "flatten" |
-        "flattennew" | "float2nr" | "floor" | "get" | "has_key" | "index" | "insert" | "items" |
-        "join" | "json_decode" | "json_encode" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" |
-        "match" | "matchend" | "matchstr" | "max" | "min" | "nr2char" | "or" | "pow" | "range" |
+        "flattennew" | "foreach" | "float2nr" | "floor" | "get" | "has_key" | "index" | "insert" | "items" |
+        "islocked" | "join" | "json_decode" | "json_encode" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
+        "match" | "matchend" | "matchstr" | "max" | "min" | "nr2char" | "or" | "pow" | "range" | "reduce" |
         "remove" | "repeat" | "reverse" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
         "str2nr" | "strcharlen" | "strchars" | "stridx" | "string" | "strpart" | "strridx" |
         "substitute" | "tolower" | "toupper" | "trim" | "trunc" | "type" | "uniq" | "values" | "xor"
@@ -446,6 +591,21 @@ fn string_arg(value: &Typval) -> Result<OxStr> {
     }
 }
 
+fn borrow_error() -> EvalError { EvalError::new("E742", 0, "Cannot change value during recursive container access") }
+fn locked_error() -> EvalError { EvalError::new("E741", 0, "Value is locked") }
+
+fn list_items(reference: &ox_types::ListRef) -> Result<Vec<Typval>> {
+    reference.try_borrow().map(|data| data.items.clone()).map_err(|_| borrow_error())
+}
+
+fn dict_entries(reference: &ox_types::DictRef) -> Result<Vec<(OxStr, Typval)>> {
+    reference.try_borrow().map(|data| data.entries.clone()).map_err(|_| borrow_error())
+}
+
+fn ensure_unlocked(lock: ox_types::LockState) -> Result<()> {
+    if lock.locked { Err(locked_error()) } else { Ok(()) }
+}
+
 fn absolute(value: &Typval) -> Result<Typval> {
     match value {
         Typval::Float(value) => Ok(Typval::Float(value.abs())),
@@ -474,14 +634,20 @@ fn float_to_number(value: &Typval) -> Result<Typval> {
 fn add(mut args: Vec<Typval>) -> Result<Typval> {
     let value = args.pop().ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
     match args.pop() {
-        Some(Typval::List(mut values)) => { values.push(value); Ok(Typval::List(values)) }
+        Some(container @ Typval::List(_)) => {
+            let Typval::List(reference) = &container else { return Err(EvalError::new("E714", 0, "List required")); };
+            let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+            ensure_unlocked(data.lock)?;
+            data.items.push(value);
+            drop(data);
+            Ok(container)
+        }
         Some(Typval::Blob(mut values)) => {
-            let number = number_arg(&value)?;
-            let byte = u8::try_from(number).map_err(|_| EvalError::new("E1230", 0, "Blob value must be in range 0 to 255"))?;
+            let byte = u8::try_from(number_arg(&value)?).map_err(|_| EvalError::new("E1230", 0, "Blob value must be in range 0 to 255"))?;
             values.push(byte);
             Ok(Typval::Blob(values))
         }
-        _ => Err(EvalError::new("E897", 0, "List or Blob required")),
+        _ => Err(EvalError::new("E899", 0, "List or Blob required")),
     }
 }
 
@@ -491,8 +657,8 @@ fn is_empty(value: &Typval) -> bool {
         Typval::Float(value) => *value == 0.0,
         Typval::String(value) => value.as_bytes().is_empty(),
         Typval::Blob(value) => value.is_empty(),
-        Typval::List(value) => value.is_empty(),
-        Typval::Dict(value) => value.is_empty(),
+        Typval::List(value) => value.try_borrow().map_or(true, |data| data.items.is_empty()),
+        Typval::Dict(value) => value.try_borrow().map_or(true, |data| data.entries.is_empty()),
         Typval::Bool(value) => !value,
         Typval::Special(Special::Null) => true,
         Typval::Funcref(value) | Typval::Partial(value) => value.name.as_bytes().is_empty(),
@@ -504,8 +670,8 @@ fn length(value: &Typval, bytes_only: bool) -> Result<Typval> {
     let length = match value {
         Typval::String(value) => if bytes_only { value.as_bytes().len() } else { value.as_bytes().len() },
         Typval::Blob(value) => value.len(),
-        Typval::List(value) => value.len(),
-        Typval::Dict(value) => value.len(),
+        Typval::List(value) => list_items(value)?.len(),
+        Typval::Dict(value) => dict_entries(value)?.len(),
         _ => string_arg(value)?.as_bytes().len(),
     };
     Ok(Typval::Number(saturating_i64(length)))
@@ -514,6 +680,23 @@ fn length(value: &Typval, bytes_only: bool) -> Result<Typval> {
 fn strcharlen(value: &Typval) -> Result<Typval> {
     let value = string_arg(value)?;
     Ok(Typval::Number(saturating_i64(String::from_utf8_lossy(value.as_bytes()).chars().count())))
+}
+
+fn string_elements(mut bytes: &[u8]) -> Vec<OxStr> {
+    let mut elements = Vec::new();
+    while !bytes.is_empty() {
+        let width = match bytes[0] {
+            0x00..=0x7f => 1,
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => 1,
+        }.min(bytes.len());
+        let length = if width > 1 && std::str::from_utf8(&bytes[..width]).is_ok() { width } else { 1 };
+        elements.push(OxStr(bytes[..length].to_vec()));
+        bytes = &bytes[length..];
+    }
+    elements
 }
 
 fn change_case(value: &Typval, upper: bool) -> Result<Typval> {
@@ -537,7 +720,8 @@ fn trim(args: &[Typval]) -> Result<Typval> {
 }
 
 fn join(args: &[Typval]) -> Result<Typval> {
-    let Typval::List(values) = &args[0] else { return Err(EvalError::new("E714", 0, "List required")); };
+    let Typval::List(reference) = &args[0] else { return Err(EvalError::new("E714", 0, "List required")); };
+    let values = list_items(reference)?;
     let separator = args.get(1).map(string_arg).transpose()?.unwrap_or_else(|| OxStr::from(" "));
     let mut result = Vec::new();
     for (index, value) in values.iter().enumerate() {
@@ -548,16 +732,14 @@ fn join(args: &[Typval]) -> Result<Typval> {
 }
 
 fn repeat(args: &[Typval]) -> Result<Typval> {
-    let count = number_arg(&args[1])?;
-    let count = usize::try_from(count.max(0)).map_err(|_| EvalError::new("E1240", 0, "Resulting text too long"))?;
+    let count = usize::try_from(number_arg(&args[1])?.max(0)).map_err(|_| EvalError::new("E1240", 0, "Resulting text too long"))?;
     match &args[0] {
         Typval::String(value) => Ok(Typval::String(OxStr(value.as_bytes().repeat(count)))),
         Typval::List(value) => {
-            let mut repeated = Vec::with_capacity(value.len().saturating_mul(count));
-            for _ in 0..count {
-                repeated.extend(value.iter().cloned());
-            }
-            Ok(Typval::List(repeated))
+            let items = list_items(value)?;
+            let mut repeated = Vec::with_capacity(items.len().saturating_mul(count));
+            for _ in 0..count { repeated.extend(items.iter().cloned()); }
+            Ok(Typval::list(repeated))
         }
         Typval::Blob(value) => Ok(Typval::Blob(value.repeat(count))),
         _ => Err(EvalError::new("E1294", 0, "String, List or Blob required")),
@@ -566,11 +748,15 @@ fn repeat(args: &[Typval]) -> Result<Typval> {
 
 fn reverse(mut args: Vec<Typval>) -> Result<Typval> {
     match args.pop() {
-        Some(Typval::String(value)) => {
-            let reversed: String = String::from_utf8_lossy(value.as_bytes()).chars().rev().collect();
-            Ok(Typval::String(OxStr(reversed.into_bytes())))
+        Some(Typval::String(value)) => Ok(Typval::String(OxStr(String::from_utf8_lossy(value.as_bytes()).chars().rev().collect::<String>().into_bytes()))),
+        Some(container @ Typval::List(_)) => {
+            let Typval::List(reference) = &container else { return Err(EvalError::new("E714", 0, "List required")); };
+            let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+            ensure_unlocked(data.lock)?;
+            data.items.reverse();
+            drop(data);
+            Ok(container)
         }
-        Some(Typval::List(mut value)) => { value.reverse(); Ok(Typval::List(value)) }
         Some(Typval::Blob(mut value)) => { value.reverse(); Ok(Typval::Blob(value)) }
         _ => Err(EvalError::new("E899", 0, "List, Blob or String required")),
     }
@@ -618,20 +804,9 @@ fn count(args: &[Typval]) -> Result<Typval> {
     let ignore_case = args.get(2).is_some_and(Typval::is_truthy);
     let start = args.get(3).map(number_arg).transpose()?.unwrap_or(0).max(0) as usize;
     let total = match &args[0] {
-        Typval::List(values) => {
-            let mut total = 0;
-            for value in values.iter().skip(start) { if values_equal(value, needle, ignore_case, 0)? { total += 1; } }
-            total
-        }
-        Typval::Dict(values) => {
-            let mut total = 0;
-            for (_, value) in values.iter().skip(start) { if values_equal(value, needle, ignore_case, 0)? { total += 1; } }
-            total
-        }
-        Typval::String(value) => {
-            let needle = string_arg(needle)?;
-            non_overlapping_count(value.as_bytes(), needle.as_bytes())
-        }
+        Typval::List(values) => list_items(values)?.iter().skip(start).try_fold(0usize, |total, value| Ok::<_, EvalError>(total + usize::from(values_equal(value, needle, ignore_case, 0)?)))?,
+        Typval::Dict(values) => dict_entries(values)?.iter().skip(start).try_fold(0usize, |total, (_, value)| Ok::<_, EvalError>(total + usize::from(values_equal(value, needle, ignore_case, 0)?)))?,
+        Typval::String(value) => non_overlapping_count(value.as_bytes(), string_arg(needle)?.as_bytes()),
         _ => return Err(EvalError::new("E706", 0, "List, Dictionary or String required")),
     };
     Ok(Typval::Number(saturating_i64(total)))
@@ -640,21 +815,32 @@ fn count(args: &[Typval]) -> Result<Typval> {
 fn extend(mut args: Vec<Typval>) -> Result<Typval> {
     let mode = if args.len() > 2 { Some(string_arg(&args[2])?) } else { None };
     let right = args.get(1).cloned().ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
-    let left = args.get_mut(0).ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
-    match (left, right) {
-        (Typval::List(left), Typval::List(right)) => { left.extend(right); Ok(args.remove(0)) }
-        (Typval::Dict(left), Typval::Dict(right)) => {
+    let left = args.first().cloned().ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
+    match (&left, right) {
+        (Typval::List(left_ref), Typval::List(right_ref)) => {
+            let right = list_items(&right_ref)?;
+            let mut left = left_ref.try_borrow_mut().map_err(|_| borrow_error())?;
+            ensure_unlocked(left.lock)?;
+            left.items.extend(right);
+            drop(left);
+            Ok(args.remove(0))
+        }
+        (Typval::Dict(left_ref), Typval::Dict(right_ref)) => {
+            let right = dict_entries(&right_ref)?;
+            let mut left = left_ref.try_borrow_mut().map_err(|_| borrow_error())?;
+            ensure_unlocked(left.lock)?;
             let mode = mode.as_ref().map_or(b"force".as_slice(), OxStr::as_bytes);
             for (key, value) in right {
-                if let Some((_, existing)) = left.iter_mut().find(|(candidate, _)| candidate == &key) {
+                if let Some((_, existing)) = left.entries.iter_mut().find(|(candidate, _)| candidate == &key) {
                     match mode {
                         b"keep" => {}
                         b"error" => return Err(EvalError::new("E737", 0, format!("Key already exists: {}", key.to_string_lossy()))),
                         b"force" => *existing = value,
                         _ => return Err(EvalError::new("E475", 0, "Invalid argument")),
                     }
-                } else { left.push((key, value)); }
+                } else { left.entries.push((key, value)); }
             }
+            drop(left);
             Ok(args.remove(0))
         }
         _ => Err(EvalError::new("E712", 0, "Argument of extend() must be a List or Dictionary")),
@@ -664,11 +850,14 @@ fn extend(mut args: Vec<Typval>) -> Result<Typval> {
 fn get(args: &[Typval]) -> Result<Typval> {
     let fallback = args.get(2).cloned().unwrap_or(Typval::Number(0));
     match &args[0] {
-        Typval::List(values) => Ok(normalize_index(values.len(), number_arg(&args[1])?).and_then(|index| values.get(index)).cloned().unwrap_or(fallback)),
+        Typval::List(values) => {
+            let values = list_items(values)?;
+            Ok(normalize_index(values.len(), number_arg(&args[1])?).and_then(|index| values.get(index)).cloned().unwrap_or(fallback))
+        }
         Typval::Blob(values) => Ok(normalize_index(values.len(), number_arg(&args[1])?).and_then(|index| values.get(index)).map_or(fallback, |value| Typval::Number(i64::from(*value)))),
         Typval::Dict(values) => {
             let key = string_arg(&args[1])?;
-            Ok(values.iter().find(|(candidate, _)| candidate == &key).map(|(_, value)| value.clone()).unwrap_or(fallback))
+            Ok(dict_entries(values)?.into_iter().find(|(candidate, _)| candidate == &key).map_or(fallback, |(_, value)| value))
         }
         _ => Err(EvalError::new("E896", 0, "List, Dictionary or Blob required")),
     }
@@ -677,14 +866,15 @@ fn get(args: &[Typval]) -> Result<Typval> {
 fn has_key(args: &[Typval]) -> Result<Typval> {
     let Typval::Dict(values) = &args[0] else { return Err(EvalError::new("E1206", 0, "Dictionary required")); };
     let key = string_arg(&args[1])?;
-    Ok(Typval::Number(i64::from(values.iter().any(|(candidate, _)| candidate == &key))))
+    Ok(Typval::Number(i64::from(dict_entries(values)?.iter().any(|(candidate, _)| candidate == &key))))
 }
 
 fn index(args: &[Typval]) -> Result<Typval> {
     let Typval::List(values) = &args[0] else { return Err(EvalError::new("E714", 0, "List required")); };
+    let values = list_items(values)?;
     let ignore_case = args.get(3).is_some_and(Typval::is_truthy);
-    let start = args.get(2).map(number_arg).transpose()?.unwrap_or(0);
-    let start = normalize_index(values.len(), start).unwrap_or(values.len());
+    let start_number = args.get(2).map(number_arg).transpose()?.unwrap_or(0);
+    let start = normalize_index(values.len(), start_number).unwrap_or(values.len());
     for (index, value) in values.iter().enumerate().skip(start) {
         if values_equal(value, &args[1], ignore_case, 0)? { return Ok(Typval::Number(saturating_i64(index))); }
     }
@@ -694,19 +884,23 @@ fn index(args: &[Typval]) -> Result<Typval> {
 fn insert(mut args: Vec<Typval>) -> Result<Typval> {
     let index = if args.len() > 2 { number_arg(&args[2])? } else { 0 };
     let value = args.get(1).cloned().ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
-    match args.get_mut(0) {
-        Some(Typval::List(values)) => {
-            let index = if index < 0 { values.len().saturating_sub(index.unsigned_abs() as usize).saturating_add(1) } else { usize::try_from(index).unwrap_or(usize::MAX) };
-            if index > values.len() { return Err(EvalError::new("E684", 0, "List index out of range")); }
-            values.insert(index, value);
+    match args.first() {
+        Some(Typval::List(reference)) => {
+            let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+            ensure_unlocked(data.lock)?;
+            let index = if index < 0 { data.items.len().saturating_sub(index.unsigned_abs() as usize).saturating_add(1) } else { usize::try_from(index).unwrap_or(usize::MAX) };
+            if index > data.items.len() { return Err(EvalError::new("E684", 0, "List index out of range")); }
+            data.items.insert(index, value);
+            drop(data);
             Ok(args.remove(0))
         }
         Some(Typval::Blob(values)) => {
+            let mut values = values.clone();
             let byte = u8::try_from(number_arg(&value)?).map_err(|_| EvalError::new("E1230", 0, "Blob value must be in range 0 to 255"))?;
             let index = usize::try_from(index.max(0)).unwrap_or(usize::MAX);
             if index > values.len() { return Err(EvalError::new("E979", 0, "Blob index out of range")); }
             values.insert(index, byte);
-            Ok(args.remove(0))
+            Ok(Typval::Blob(values))
         }
         _ => Err(EvalError::new("E899", 0, "List or Blob required")),
     }
@@ -716,26 +910,26 @@ enum Projection { Items, Keys, Values }
 
 fn dict_projection(value: &Typval, projection: Projection) -> Result<Typval> {
     let Typval::Dict(values) = value else { return Err(EvalError::new("E1206", 0, "Dictionary required")); };
-    Ok(Typval::List(values.iter().map(|(key, value)| match projection {
-        Projection::Items => Typval::List(vec![Typval::String(key.clone()), value.clone()]),
+    Ok(Typval::list(dict_entries(values)?.iter().map(|(key, value)| match projection {
+        Projection::Items => Typval::list(vec![Typval::String(key.clone()), value.clone()]),
         Projection::Keys => Typval::String(key.clone()),
         Projection::Values => value.clone(),
     }).collect()))
 }
 
 fn extremum(value: &Typval, maximum: bool) -> Result<Typval> {
-    let values: Vec<&Typval> = match value {
-        Typval::List(values) => values.iter().collect(),
-        Typval::Dict(values) => values.iter().map(|(_, value)| value).collect(),
+    let values = match value {
+        Typval::List(values) => list_items(values)?,
+        Typval::Dict(values) => dict_entries(values)?.into_iter().map(|(_, value)| value).collect(),
         _ => return Err(EvalError::new("E712", 0, "List or Dictionary required")),
     };
     if values.is_empty() { return Ok(Typval::Number(0)); }
-    let mut selected = values[0];
+    let mut selected = values[0].clone();
     for value in &values[1..] {
-        let ordering = compare_values(selected, value, 0)?;
-        if (maximum && ordering == Ordering::Less) || (!maximum && ordering == Ordering::Greater) { selected = value; }
+        let ordering = compare_values(&selected, value, 0)?;
+        if (maximum && ordering == Ordering::Less) || (!maximum && ordering == Ordering::Greater) { selected = value.clone(); }
     }
-    Ok(selected.clone())
+    Ok(selected)
 }
 
 fn range(args: &[Typval]) -> Result<Typval> {
@@ -753,90 +947,191 @@ fn range(args: &[Typval]) -> Result<Typval> {
         current = next;
         if values.len() > 1_000_000 { return Err(EvalError::new("E1240", 0, "Resulting List too long")); }
     }
-    Ok(Typval::List(values))
+    Ok(Typval::list(values))
 }
 
-fn remove(mut args: Vec<Typval>) -> Result<Typval> {
+fn remove(args: Vec<Typval>) -> Result<Typval> {
     let first = number_arg(&args[1])?;
     let last = args.get(2).map(number_arg).transpose()?;
     let dict_key = string_arg(&args[1]).ok();
-    match args.get_mut(0) {
-        Some(Typval::List(values)) => {
-            let index = normalize_index(values.len(), first).ok_or_else(|| EvalError::new("E684", 0, "List index out of range"))?;
+    match args.first() {
+        Some(Typval::List(reference)) => {
+            let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+            ensure_unlocked(data.lock)?;
+            let index = normalize_index(data.items.len(), first).ok_or_else(|| EvalError::new("E684", 0, "List index out of range"))?;
             if let Some(last) = last {
-                let end = normalize_index(values.len(), last).ok_or_else(|| EvalError::new("E684", 0, "List index out of range"))?;
-                if end < index { return Err(EvalError::new("E16", 0, "Invalid range")); }
-                Ok(Typval::List(values.drain(index..=end).collect()))
-            } else { Ok(values.remove(index)) }
+                let end = normalize_index(data.items.len(), last).ok_or_else(|| EvalError::new("E684", 0, "List index out of range"))?;
+                if end < index { return Ok(Typval::list(vec![])); }
+                Ok(Typval::list(data.items.drain(index..=end).collect()))
+            } else { Ok(data.items.remove(index)) }
         }
         Some(Typval::Blob(values)) => {
+            let mut values = values.clone();
             let index = normalize_index(values.len(), first).ok_or_else(|| EvalError::new("E979", 0, "Blob index out of range"))?;
             if let Some(last) = last {
                 let end = normalize_index(values.len(), last).ok_or_else(|| EvalError::new("E979", 0, "Blob index out of range"))?;
                 Ok(Typval::Blob(values.drain(index..=end).collect()))
             } else { Ok(Typval::Number(i64::from(values.remove(index)))) }
         }
-        Some(Typval::Dict(values)) => {
+        Some(Typval::Dict(reference)) => {
             let key = dict_key.ok_or_else(|| EvalError::new("E731", 0, "Dictionary key must be a String"))?;
-            let index = values.iter().position(|(candidate, _)| candidate == &key).ok_or_else(|| EvalError::new("E716", 0, "Key not present in Dictionary"))?;
-            Ok(values.remove(index).1)
+            let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+            ensure_unlocked(data.lock)?;
+            let index = data.entries.iter().position(|(candidate, _)| candidate == &key).ok_or_else(|| EvalError::new("E716", 0, "Key not present in Dictionary"))?;
+            Ok(data.entries.remove(index).1)
         }
         _ => Err(EvalError::new("E896", 0, "List, Dictionary or Blob required")),
     }
 }
 
 fn uniq(mut args: Vec<Typval>) -> Result<Typval> {
-    let Some(Typval::List(values)) = args.get_mut(0) else { return Err(EvalError::new("E714", 0, "List required")); };
+    let Some(container @ Typval::List(_)) = args.get_mut(0).cloned() else { return Err(EvalError::new("E714", 0, "List required")); };
+    let Typval::List(reference) = &container else { return Err(EvalError::new("E714", 0, "List required")); };
+    let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+    ensure_unlocked(data.lock)?;
     let mut index = 1;
-    while index < values.len() {
-        if values_equal(&values[index - 1], &values[index], false, 0)? { values.remove(index); } else { index += 1; }
+    while index < data.items.len() {
+        if values_equal(&data.items[index - 1], &data.items[index], false, 0)? { data.items.remove(index); } else { index += 1; }
     }
-    Ok(args.remove(0))
+    drop(data);
+    Ok(container)
 }
 
-fn flatten(args: &[Typval]) -> Result<Typval> {
-    let Typval::List(values) = &args[0] else { return Err(EvalError::new("E686", 0, "Argument of flatten() must be a List")); };
-    let maximum = args.get(1).map(number_arg).transpose()?.unwrap_or(i64::MAX);
-    let mut output = Vec::new();
-    flatten_into(values, maximum, 0, &mut output)?;
-    Ok(Typval::List(output))
-}
-
-fn flatten_into(values: &[Typval], maximum: i64, depth: usize, output: &mut Vec<Typval>) -> Result<()> {
-    if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E724", 0, "too much recursion")); }
-    for value in values {
-        if let Typval::List(nested) = value {
-            if maximum > 0 { flatten_into(nested, maximum - 1, depth + 1, output)?; } else { output.push(value.clone()); }
-        } else { output.push(value.clone()); }
-    }
-    Ok(())
-}
-
-fn deep_copy(value: &Typval, depth: usize) -> Result<Typval> {
-    if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E724", 0, "too much recursion in deepcopy()")); }
+fn shallow_copy(value: &Typval) -> Result<Typval> {
     match value {
-        Typval::List(values) => values.iter().map(|value| deep_copy(value, depth + 1)).collect::<Result<Vec<_>>>().map(Typval::List),
-        Typval::Dict(values) => values.iter().map(|(key, value)| deep_copy(value, depth + 1).map(|value| (key.clone(), value))).collect::<Result<Vec<_>>>().map(Typval::Dict),
+        Typval::List(reference) => Ok(Typval::list(list_items(reference)?)),
+        Typval::Dict(reference) => Ok(Typval::dict(dict_entries(reference)?)),
         _ => Ok(value.clone()),
     }
 }
 
+fn flatten(args: &[Typval], mutate: bool) -> Result<Typval> {
+    let Typval::List(reference) = &args[0] else { return Err(EvalError::new("E686", 0, "Argument of flatten() must be a List")); };
+    if mutate { ensure_unlocked(reference.try_borrow().map_err(|_| borrow_error())?.lock)?; }
+    let maximum = args.get(1).map(number_arg).transpose()?.unwrap_or(i64::MAX);
+    let mut output = Vec::new();
+    flatten_into(reference, maximum, 0, &mut HashSet::new(), &mut output)?;
+    if mutate {
+        reference.try_borrow_mut().map_err(|_| borrow_error())?.items = output;
+        Ok(args[0].clone())
+    } else {
+        Ok(Typval::list(output))
+    }
+}
+
+fn flatten_into(reference: &ox_types::ListRef, maximum: i64, depth: usize, active: &mut HashSet<usize>, output: &mut Vec<Typval>) -> Result<()> {
+    if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E724", 0, "too much recursion")); }
+    let pointer = Rc::as_ptr(reference) as usize;
+    if !active.insert(pointer) { return Err(EvalError::new("E724", 0, "too much recursion in flatten()")); }
+    for value in list_items(reference)? {
+        if let Typval::List(nested) = &value {
+            if maximum > 0 { flatten_into(nested, maximum - 1, depth + 1, active, output)?; } else { output.push(value); }
+        } else { output.push(value); }
+    }
+    active.remove(&pointer);
+    Ok(())
+}
+
+fn deep_copy(value: &Typval) -> Result<Typval> {
+    fn copy(
+        value: &Typval,
+        lists: &mut HashMap<usize, ox_types::ListRef>,
+        dicts: &mut HashMap<usize, ox_types::DictRef>,
+        depth: usize,
+    ) -> Result<Typval> {
+        if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E698", 0, "variable nested too deep for making a copy")); }
+        match value {
+            Typval::List(source) => {
+                let key = Rc::as_ptr(source) as usize;
+                if let Some(existing) = lists.get(&key) { return Ok(Typval::List(existing.clone())); }
+                let Typval::List(target) = Typval::list(vec![]) else { return Err(EvalError::new("E698", 0, "copy failed")); };
+                lists.insert(key, target.clone());
+                let source_items = list_items(source)?;
+                let mut items = Vec::with_capacity(source_items.len());
+                for item in &source_items { items.push(copy(item, lists, dicts, depth + 1)?); }
+                target.try_borrow_mut().map_err(|_| borrow_error())?.items = items;
+                Ok(Typval::List(target))
+            }
+            Typval::Dict(source) => {
+                let key = Rc::as_ptr(source) as usize;
+                if let Some(existing) = dicts.get(&key) { return Ok(Typval::Dict(existing.clone())); }
+                let Typval::Dict(target) = Typval::dict(vec![]) else { return Err(EvalError::new("E698", 0, "copy failed")); };
+                dicts.insert(key, target.clone());
+                let source_entries = dict_entries(source)?;
+                let mut entries = Vec::with_capacity(source_entries.len());
+                for (name, item) in &source_entries { entries.push((name.clone(), copy(item, lists, dicts, depth + 1)?)); }
+                target.try_borrow_mut().map_err(|_| borrow_error())?.entries = entries;
+                Ok(Typval::Dict(target))
+            }
+            _ => Ok(value.clone()),
+        }
+    }
+    copy(value, &mut HashMap::new(), &mut HashMap::new(), 0)
+}
+
+/// Lock a container shallowly or through every reachable container.
+pub fn lock_value(value: &Typval, deep: bool) -> Result<()> {
+    fn lock(value: &Typval, scope: ox_types::LockScope, seen: &mut HashSet<(usize, u8)>) -> Result<()> {
+        match value {
+            Typval::List(reference) => {
+                let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_LIST);
+                if !seen.insert(key) { return Ok(()); }
+                let items = {
+                    let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+                    data.lock = ox_types::LockState { scope, locked: true };
+                    data.items.clone()
+                };
+                if scope == ox_types::LockScope::Deep { for item in &items { lock(item, scope, seen)?; } }
+            }
+            Typval::Dict(reference) => {
+                let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_DICT);
+                if !seen.insert(key) { return Ok(()); }
+                let entries = {
+                    let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+                    data.lock = ox_types::LockState { scope, locked: true };
+                    data.entries.clone()
+                };
+                if scope == ox_types::LockScope::Deep { for (_, item) in &entries { lock(item, scope, seen)?; } }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    lock(value, if deep { ox_types::LockScope::Deep } else { ox_types::LockScope::Shallow }, &mut HashSet::new())
+}
+
+/// Return the encoded lock state: 0 unlocked, 1 direct, 2 shallow, 3 deep.
+pub fn is_locked_value(value: &Typval) -> Result<Typval> {
+    let lock = match value {
+        Typval::List(reference) => reference.try_borrow().map_err(|_| borrow_error())?.lock,
+        Typval::Dict(reference) => reference.try_borrow().map_err(|_| borrow_error())?.lock,
+        _ => ox_types::LockState::default(),
+    };
+    let status = match (lock.locked, lock.scope) {
+        (false, _) => 0,
+        (true, ox_types::LockScope::None) => 1,
+        (true, ox_types::LockScope::Shallow) => 2,
+        (true, ox_types::LockScope::Deep) => 3,
+    };
+    Ok(Typval::Number(status))
+}
+
 fn blob2list(value: &Typval) -> Result<Typval> {
     let Typval::Blob(values) = value else { return Err(EvalError::new("E972", 0, "Blob required")); };
-    Ok(Typval::List(values.iter().map(|value| Typval::Number(i64::from(*value))).collect()))
+    Ok(Typval::list(values.iter().map(|value| Typval::Number(i64::from(*value))).collect()))
 }
 
 fn list2blob(value: &Typval) -> Result<Typval> {
     let Typval::List(values) = value else { return Err(EvalError::new("E714", 0, "List required")); };
-    values.iter().map(|value| u8::try_from(number_arg(value)?).map_err(|_| EvalError::new("E1230", 0, "Blob value must be in range 0 to 255"))).collect::<Result<Vec<_>>>().map(Typval::Blob)
+    list_items(values)?.iter().map(|value| u8::try_from(number_arg(value)?).map_err(|_| EvalError::new("E1230", 0, "Blob value must be in range 0 to 255"))).collect::<Result<Vec<_>>>().map(Typval::Blob)
 }
 
 fn list2str(args: &[Typval]) -> Result<Typval> {
     let Typval::List(values) = &args[0] else { return Err(EvalError::new("E714", 0, "List required")); };
     let utf8 = args.get(1).is_some_and(Typval::is_truthy);
     let mut output = Vec::new();
-    for value in values {
-        let number = number_arg(value)?;
+    for value in list_items(values)? {
+        let number = number_arg(&value)?;
         if utf8 {
             let character = u32::try_from(number).ok().and_then(char::from_u32).ok_or_else(|| EvalError::new("E1280", 0, "Illegal character code"))?;
             let mut encoded = [0; 4];
@@ -852,7 +1147,7 @@ fn str2list(args: &[Typval]) -> Result<Typval> {
     let values = if utf8 {
         String::from_utf8_lossy(value.as_bytes()).chars().map(|character| Typval::Number(i64::from(u32::from(character)))).collect()
     } else { value.as_bytes().iter().map(|byte| Typval::Number(i64::from(*byte))).collect() };
-    Ok(Typval::List(values))
+    Ok(Typval::list(values))
 }
 
 fn char2nr(args: &[Typval]) -> Result<Typval> {
@@ -934,47 +1229,45 @@ fn parse_integer_prefix(bytes: &[u8], base: u32) -> Option<i64> {
 }
 
 fn json_encode(value: &Typval) -> Result<Typval> {
+    fn encode(value: &Typval, depth: usize, active: &mut HashSet<(usize, u8)>, output: &mut String) -> Result<()> {
+        if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E724", 0, "too much recursion in json_encode()")); }
+        match value {
+            Typval::Special(Special::Null) => output.push_str("null"),
+            Typval::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+            Typval::Number(value) => { let _ = write!(output, "{value}"); }
+            Typval::Float(value) => {
+                let number = serde_json::Number::from_f64(*value).ok_or_else(|| EvalError::new("E474", 0, "NaN or Infinity cannot be JSON encoded"))?;
+                output.push_str(&number.to_string());
+            }
+            Typval::String(value) => output.push_str(&serde_json::to_string(&String::from_utf8_lossy(value.as_bytes())).map_err(|error| EvalError::new("E474", 0, error.to_string()))?),
+            Typval::Blob(values) => {
+                output.push('['); for (index, value) in values.iter().enumerate() { if index > 0 { output.push(','); } let _ = write!(output, "{value}"); } output.push(']');
+            }
+            Typval::List(reference) => {
+                let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_LIST);
+                if !active.insert(key) { return Err(EvalError::new("E724", 0, "recursive List cannot be JSON encoded")); }
+                output.push('['); for (index, value) in list_items(reference)?.iter().enumerate() { if index > 0 { output.push(','); } encode(value, depth + 1, active, output)?; } output.push(']');
+                active.remove(&key);
+            }
+            Typval::Dict(reference) => {
+                let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_DICT);
+                if !active.insert(key) { return Err(EvalError::new("E724", 0, "recursive Dictionary cannot be JSON encoded")); }
+                output.push('{');
+                for (index, (name, value)) in dict_entries(reference)?.iter().enumerate() {
+                    if index > 0 { output.push(','); }
+                    output.push_str(&serde_json::to_string(&String::from_utf8_lossy(name.as_bytes())).map_err(|error| EvalError::new("E474", 0, error.to_string()))?);
+                    output.push(':'); encode(value, depth + 1, active, output)?;
+                }
+                output.push('}'); active.remove(&key);
+            }
+            _ => return Err(EvalError::new("E474", 0, "value cannot be JSON encoded")),
+        }
+        Ok(())
+    }
     let mut output = String::new();
-    encode_json(value, 0, &mut output)?;
+    encode(value, 0, &mut HashSet::new(), &mut output)?;
     Ok(Typval::String(OxStr(output.into_bytes())))
 }
-
-fn encode_json(value: &Typval, depth: usize, output: &mut String) -> Result<()> {
-    if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E724", 0, "too much recursion in json_encode()")); }
-    match value {
-        Typval::Special(Special::Null) => output.push_str("null"),
-        Typval::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
-        Typval::Number(value) => { let _ = write!(output, "{value}"); }
-        Typval::Float(value) => {
-            let number = serde_json::Number::from_f64(*value).ok_or_else(|| EvalError::new("E474", 0, "NaN or Infinity cannot be JSON encoded"))?;
-            output.push_str(&number.to_string());
-        }
-        Typval::String(value) => output.push_str(&serde_json::to_string(&String::from_utf8_lossy(value.as_bytes())).map_err(|error| EvalError::new("E474", 0, error.to_string()))?),
-        Typval::Blob(values) => {
-            output.push('[');
-            for (index, value) in values.iter().enumerate() { if index > 0 { output.push(','); } let _ = write!(output, "{value}"); }
-            output.push(']');
-        }
-        Typval::List(values) => {
-            output.push('[');
-            for (index, value) in values.iter().enumerate() { if index > 0 { output.push(','); } encode_json(value, depth + 1, output)?; }
-            output.push(']');
-        }
-        Typval::Dict(values) => {
-            output.push('{');
-            for (index, (key, value)) in values.iter().enumerate() {
-                if index > 0 { output.push(','); }
-                output.push_str(&serde_json::to_string(&String::from_utf8_lossy(key.as_bytes())).map_err(|error| EvalError::new("E474", 0, error.to_string()))?);
-                output.push(':');
-                encode_json(value, depth + 1, output)?;
-            }
-            output.push('}');
-        }
-        _ => return Err(EvalError::new("E474", 0, "value cannot be JSON encoded")),
-    }
-    Ok(())
-}
-
 fn json_decode(value: &Typval) -> Result<Typval> {
     let value = string_arg(value)?;
     let decoded: JsonValue = serde_json::from_slice(value.as_bytes()).map_err(|error| EvalError::new("E474", error.column(), format!("Invalid JSON: {error}")))?;
@@ -988,63 +1281,69 @@ fn json_to_typval(value: JsonValue, depth: usize) -> Result<Typval> {
         JsonValue::Bool(value) => Ok(Typval::Bool(value)),
         JsonValue::Number(value) => value.as_i64().map(Typval::Number).or_else(|| value.as_f64().map(Typval::Float)).ok_or_else(|| EvalError::new("E474", 0, "JSON number is out of range")),
         JsonValue::String(value) => Ok(Typval::String(OxStr(value.into_bytes()))),
-        JsonValue::Array(values) => values.into_iter().map(|value| json_to_typval(value, depth + 1)).collect::<Result<Vec<_>>>().map(Typval::List),
-        JsonValue::Object(values) => values.into_iter().map(|(key, value)| json_to_typval(value, depth + 1).map(|value| (OxStr(key.into_bytes()), value))).collect::<Result<Vec<_>>>().map(Typval::Dict),
+        JsonValue::Array(values) => values.into_iter().map(|value| json_to_typval(value, depth + 1)).collect::<Result<Vec<_>>>().map(Typval::list),
+        JsonValue::Object(values) => values.into_iter().map(|(key, value)| json_to_typval(value, depth + 1).map(|value| (OxStr(key.into_bytes()), value))).collect::<Result<Vec<_>>>().map(Typval::dict),
     }
 }
 
-fn vim_string(value: &Typval, depth: usize) -> Result<OxStr> {
-    if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E724", 0, "too much recursion in string()")); }
-    let mut output = Vec::new();
-    match value {
-        Typval::String(value) => { output.push(b'\''); for byte in value.as_bytes() { output.push(*byte); if *byte == b'\'' { output.push(b'\''); } } output.push(b'\''); }
-        Typval::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
-        Typval::Float(value) => output.extend_from_slice(value.to_string().as_bytes()),
-        Typval::Bool(value) => output.extend_from_slice(if *value { b"v:true" } else { b"v:false" }),
-        Typval::Special(Special::Null) => output.extend_from_slice(b"v:null"),
-        Typval::Blob(value) => { output.extend_from_slice(b"0z"); for byte in value { let _ = write!(StringWriter(&mut output), "{byte:02X}"); } }
-        Typval::List(values) => {
-            output.push(b'['); for (index, value) in values.iter().enumerate() { if index > 0 { output.extend_from_slice(b", "); } output.extend_from_slice(vim_string(value, depth + 1)?.as_bytes()); } output.push(b']');
+fn vim_string(value: &Typval, _depth: usize) -> Result<OxStr> {
+    fn render(value: &Typval, active: &mut HashSet<(usize, u8)>, output: &mut Vec<u8>) -> Result<()> {
+        match value {
+            Typval::String(value) => { output.push(b'\''); for byte in value.as_bytes() { output.push(*byte); if *byte == b'\'' { output.push(b'\''); } } output.push(b'\''); }
+            Typval::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
+            Typval::Float(value) => output.extend_from_slice(value.to_string().as_bytes()),
+            Typval::Bool(value) => output.extend_from_slice(if *value { b"v:true" } else { b"v:false" }),
+            Typval::Special(Special::Null) => output.extend_from_slice(b"v:null"),
+            Typval::Blob(value) => { output.extend_from_slice(b"0z"); for byte in value { let _ = write!(StringWriter(output), "{byte:02X}"); } }
+            Typval::List(reference) => {
+                let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_LIST);
+                if !active.insert(key) { output.extend_from_slice(b"[...]"); return Ok(()); }
+                output.push(b'[');
+                for (index, item) in list_items(reference)?.iter().enumerate() { if index > 0 { output.extend_from_slice(b", "); } render(item, active, output)?; }
+                output.push(b']'); active.remove(&key);
+            }
+            Typval::Dict(reference) => {
+                let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_DICT);
+                if !active.insert(key) { output.extend_from_slice(b"{...}"); return Ok(()); }
+                output.push(b'{');
+                for (index, (name, item)) in dict_entries(reference)?.iter().enumerate() {
+                    if index > 0 { output.extend_from_slice(b", "); }
+                    render(&Typval::String(name.clone()), active, output)?; output.extend_from_slice(b": "); render(item, active, output)?;
+                }
+                output.push(b'}'); active.remove(&key);
+            }
+            Typval::Funcref(Funcref { name, .. }) | Typval::Partial(Funcref { name, .. }) => { output.extend_from_slice(b"function('"); output.extend_from_slice(name.as_bytes()); output.extend_from_slice(b"')"); }
+            Typval::Channel(value) | Typval::Job(value) => output.extend_from_slice(value.to_string().as_bytes()),
         }
-        Typval::Dict(values) => {
-            output.push(b'{'); for (index, (key, value)) in values.iter().enumerate() { if index > 0 { output.extend_from_slice(b", "); } output.extend_from_slice(vim_string(&Typval::String(key.clone()), depth + 1)?.as_bytes()); output.extend_from_slice(b": "); output.extend_from_slice(vim_string(value, depth + 1)?.as_bytes()); } output.push(b'}');
-        }
-        Typval::Funcref(Funcref { name, .. }) => { output.extend_from_slice(b"function('"); output.extend_from_slice(name.as_bytes()); output.extend_from_slice(b"')"); }
-        Typval::Partial(Funcref { name, .. }) => { output.extend_from_slice(b"function('"); output.extend_from_slice(name.as_bytes()); output.extend_from_slice(b"')"); }
-        Typval::Channel(value) | Typval::Job(value) => output.extend_from_slice(value.to_string().as_bytes()),
+        Ok(())
     }
+    let mut output = Vec::new();
+    render(value, &mut HashSet::new(), &mut output)?;
     Ok(OxStr(output))
 }
-
 struct StringWriter<'a>(&'a mut Vec<u8>);
 impl std::fmt::Write for StringWriter<'_> { fn write_str(&mut self, value: &str) -> std::fmt::Result { self.0.extend_from_slice(value.as_bytes()); Ok(()) } }
 
 fn values_equal(left: &Typval, right: &Typval, ignore_case: bool, depth: usize) -> Result<bool> {
-    if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E724", 0, "too much recursion comparing values")); }
-    match (left, right) {
-        (Typval::Number(left), Typval::Number(right)) => Ok(left == right),
-        (Typval::Float(left), Typval::Float(right)) => Ok(left == right),
-        (Typval::String(left), Typval::String(right)) => Ok(if ignore_case { left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase() } else { left == right }),
-        (Typval::Bool(left), Typval::Bool(right)) => Ok(left == right),
-        (Typval::Special(left), Typval::Special(right)) => Ok(left == right),
-        (Typval::Blob(left), Typval::Blob(right)) => Ok(left == right),
-        (Typval::List(left), Typval::List(right)) => {
-            if left.len() != right.len() { return Ok(false); }
-            for (left, right) in left.iter().zip(right) { if !values_equal(left, right, ignore_case, depth + 1)? { return Ok(false); } }
-            Ok(true)
-        }
-        (Typval::Dict(left), Typval::Dict(right)) => {
-            if left.len() != right.len() { return Ok(false); }
-            for (key, left) in left {
-                let Some((_, right)) = right.iter().find(|(candidate, _)| candidate == key) else { return Ok(false) };
-                if !values_equal(left, right, ignore_case, depth + 1)? { return Ok(false); }
+    fn equal(left: &Typval, right: &Typval, ignore_case: bool, depth: usize, seen: &mut HashSet<(usize, usize, u8)>) -> Result<bool> {
+        if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E724", 0, "too much recursion comparing values")); }
+        match (left, right) {
+            (Typval::String(left), Typval::String(right)) => Ok(if ignore_case { left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase() } else { left == right }),
+            (Typval::List(left), Typval::List(right)) => {
+                let pair=(Rc::as_ptr(left) as usize,Rc::as_ptr(right) as usize,ox_types::VAR_LIST); if !seen.insert(pair) { return Ok(true); }
+                let left=list_items(left)?; let right=list_items(right)?; if left.len()!=right.len(){return Ok(false)}
+                for (left,right) in left.iter().zip(&right){if !equal(left,right,ignore_case,depth+1,seen)?{return Ok(false)}} Ok(true)
             }
-            Ok(true)
+            (Typval::Dict(left), Typval::Dict(right)) => {
+                let pair=(Rc::as_ptr(left) as usize,Rc::as_ptr(right) as usize,ox_types::VAR_DICT); if !seen.insert(pair) { return Ok(true); }
+                let left=dict_entries(left)?; let right=dict_entries(right)?; if left.len()!=right.len(){return Ok(false)}
+                for (key,value) in &left { let Some((_,other))=right.iter().find(|(candidate,_)|candidate==key) else{return Ok(false)}; if !equal(value,other,ignore_case,depth+1,seen)?{return Ok(false)} } Ok(true)
+            }
+            _ => Ok(left == right),
         }
-        _ => Ok(false),
     }
+    equal(left, right, ignore_case, depth, &mut HashSet::new())
 }
-
 fn compare_values(left: &Typval, right: &Typval, depth: usize) -> Result<Ordering> {
     if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E724", 0, "too much recursion comparing values")); }
     match (left, right) {
