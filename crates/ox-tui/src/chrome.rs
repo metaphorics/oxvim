@@ -108,7 +108,7 @@ impl RenderedChunkMap {
     }
 }
 
-fn decoded_cell_width(bytes: &[u8], start: usize, column: usize) -> (usize, usize) {
+pub(crate) fn decoded_cell_width(bytes: &[u8], start: usize, column: usize) -> (usize, usize) {
     let first = match bytes.get(start) {
         Some(value) => *value,
         None => 0,
@@ -927,6 +927,13 @@ impl Rect {
     pub fn contains_row(self, row: usize) -> bool {
         row >= self.y && row < self.y.saturating_add(self.height)
     }
+
+    #[must_use]
+    pub fn contains(self, column: usize, row: usize) -> bool {
+        column >= self.x
+            && column < self.x.saturating_add(self.width)
+            && self.contains_row(row)
+    }
 }
 
 /// Responsive layout descriptions for every client-owned surface.
@@ -940,6 +947,28 @@ pub struct ChromeLayout {
     pub insert_popup: Option<Rect>,
     pub documentation: Option<Rect>,
     pub history: Option<Rect>,
+}
+
+impl ChromeLayout {
+    /// Whether a terminal-space `(column, row)` falls inside any client-owned
+    /// chrome surface. Mouse events inside these rectangles are suppressed
+    /// rather than forwarded to the server as grid events.
+    #[must_use]
+    pub fn contains(self, column: usize, row: usize) -> bool {
+        [
+            self.cmdline,
+            self.wildlist,
+            self.wildmenu,
+            self.messages,
+            self.search_count,
+            self.insert_popup,
+            self.documentation,
+            self.history,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|rect| rect.contains(column, row))
+    }
 }
 
 fn cmdline_layout(
@@ -1438,6 +1467,24 @@ mod tests {
         assert!(layers.windows(2).all(|pair| pair[0].z_index() < pair[1].z_index()));
         assert_eq!(ChromeLayer::Messages.z_index(), 200);
         assert!(layers.iter().all(|layer| !layer.description().is_empty()));
+    }
+
+    #[test]
+    fn chrome_layout_hit_tests_own_surface_coordinates() {
+        let layout = ChromeLayout {
+            cmdline: Some(Rect { x: 14, y: 10, width: 72, height: 3 }),
+            wildmenu: Some(Rect { x: 14, y: 14, width: 72, height: 1 }),
+            messages: Some(Rect { x: 56, y: 24, width: 44, height: 6 }),
+            ..ChromeLayout::default()
+        };
+        assert!(layout.contains(15, 11));
+        assert!(layout.contains(20, 14));
+        assert!(layout.contains(99, 29));
+        assert!(!layout.contains(0, 0));
+        assert!(!layout.contains(14, 9));
+        assert!(!layout.contains(14, 13));
+        assert!(!layout.contains(55, 26));
+        assert!(ChromeLayout::default().contains(3, 3) == false);
     }
 
     #[test]

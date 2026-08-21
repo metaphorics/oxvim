@@ -10,6 +10,7 @@ ox-rpc = { path = "../ox-rpc" }
 ox-types = { path = "../ox-types" }
 crossterm.workspace = true
 thiserror.workspace = true
+mio.workspace = true
 
 [lints]
 workspace = true

@@ -1,8 +1,9 @@
 //! Terminal capability negotiation, lifecycle restoration, and retained output.
 #![allow(missing_docs)]
 
-use std::io::{self, Write};
-use std::time::Duration;
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor::MoveTo;
 use crossterm::style::{
@@ -10,6 +11,8 @@ use crossterm::style::{
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::QueueableCommand;
+use mio::unix::SourceFd;
+use mio::{Events, Interest, Poll, Token};
 use thiserror::Error;
 
 use crate::theme::{Ansi16Color, QuantizedColor, Rgb};
@@ -79,6 +82,11 @@ pub struct TerminalCapabilities {
 }
 
 impl TerminalCapabilities {
+    /// Environment-derived baseline: color support and the OSC 4 palette
+    /// safety decision. The probe-dependent features (kitty keyboard, sync
+    /// output, undercurl, OSC 52) start disabled here and are populated by
+    /// [`probe_terminal`] on the live terminal; environment hints only ever
+    /// short-circuit color and palette decisions, never the negotiated probes.
     pub fn from_environment(environment: &TerminalEnvironment) -> Self {
         Self {
             colors: detect_color_support(environment),
@@ -104,6 +112,103 @@ impl TerminalCapabilities {
         self.colored_underline = undercurl.is_supported();
         self.osc52_clipboard = osc52.is_supported();
     }
+}
+
+/// Query the live terminal for the negotiated features within `policy.timeout`.
+///
+/// Raw mode is enabled for the query window so the terminal's escape
+/// responses reach the reader, then restored; the caller's
+/// [`TerminalSession::start`] re-enables raw mode for the interactive phase.
+/// Incomplete or unanswered probes remain disabled.
+pub fn probe_terminal<R: Read + AsRawFd, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    environment: &TerminalEnvironment,
+    policy: ProbePolicy,
+) -> Result<TerminalCapabilities, TerminalError> {
+    enable_raw_mode().map_err(|error| TerminalError::io("raw-mode enable for probe", error))?;
+    let result = probe_io(reader, writer, environment, policy);
+    let _ = disable_raw_mode();
+    result
+}
+
+/// Write every probe query, then read bounded responses and parse them.
+///
+/// Pure with respect to the reader/writer once raw mode is handled by the
+/// caller, so it is driveable with local sockets in tests.
+fn probe_io<R: Read + AsRawFd, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    environment: &TerminalEnvironment,
+    policy: ProbePolicy,
+) -> Result<TerminalCapabilities, TerminalError> {
+    let mut capabilities = TerminalCapabilities::from_environment(environment);
+    for query in [KITTY_KEYBOARD_QUERY, SYNC_OUTPUT_QUERY, UNDERCURL_QUERY, OSC52_QUERY] {
+        writer
+            .write_all(query)
+            .map_err(|error| TerminalError::io("capability probe write", error))?;
+    }
+    writer
+        .flush()
+        .map_err(|error| TerminalError::io("capability probe flush", error))?;
+
+    let mut poll = Poll::new().map_err(|error| TerminalError::io("capability probe poll", error))?;
+    let mut events = Events::with_capacity(8);
+    {
+        let fd = reader.as_raw_fd();
+        let mut source = SourceFd(&fd);
+        poll.registry()
+            .register(&mut source, Token(0), Interest::READABLE)
+            .map_err(|error| TerminalError::io("capability probe register", error))?;
+    }
+    let deadline = Instant::now()
+        .checked_add(policy.timeout)
+        .unwrap_or_else(Instant::now);
+    let terminfo_smulx = terminfo_colored_underline(environment.terminfo.as_deref());
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        let all_answered = [
+            parse_kitty_keyboard_response(&response),
+            parse_sync_output_response(&response),
+            parse_undercurl_response(&response, terminfo_smulx),
+            parse_osc52_response(&response),
+        ]
+        .iter()
+        .all(|answer| *answer != ProbeAnswer::Incomplete);
+        if all_answered || Instant::now() >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        poll.poll(&mut events, Some(remaining))
+            .map_err(|error| TerminalError::io("capability probe wait", error))?;
+        if events.is_empty() {
+            continue;
+        }
+        let read =
+            reader.read(&mut chunk).map_err(|error| TerminalError::io("capability probe read", error))?;
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..read]);
+    }
+
+    let kitty = parse_kitty_keyboard_response(&response);
+    let sync = parse_sync_output_response(&response);
+    let undercurl = parse_undercurl_response(&response, terminfo_smulx);
+    let osc52 = parse_osc52_response(&response);
+    capabilities.apply_probe_answers(kitty, sync, undercurl, osc52);
+    Ok(capabilities)
+}
+
+/// Whether the terminal's own terminfo advertises the colored-underline
+/// (Smulx) capability, allowing the DCS probe to be skipped.
+fn terminfo_colored_underline(terminfo: Option<&str>) -> bool {
+    terminfo.is_some_and(|capabilities| {
+        capabilities
+            .split([',', ':', '\n', '|'])
+            .any(|capability| matches!(capability.trim().split('=').next(), Some("Smulx" | "smulx")))
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -799,6 +904,56 @@ mod tests {
         assert_eq!(parse_undercurl_response(b"\x1bP0$r\x1b\\", false), ProbeAnswer::Unsupported);
         assert_eq!(parse_osc52_response(b"\x1b]52;c;YWJj\x07"), ProbeAnswer::Supported);
         assert_eq!(parse_osc52_response(b"\x1b]52;c;YWJj"), ProbeAnswer::Incomplete);
+    }
+
+    #[test]
+    fn live_probe_wires_queries_to_parsers() {
+        let (mut server, mut client) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        server
+            .write_all(b"\x1b[?3u\x1b[?2026;1$y\x1bP1$r4:3m\x1b\\\x1b]52;c;dGVzdA\x07")
+            .expect("write fixtures");
+        drop(server);
+        let mut writer = Vec::new();
+        let environment = TerminalEnvironment {
+            terminfo: None,
+            ..TerminalEnvironment::default()
+        };
+        let capabilities =
+            probe_io(&mut client, &mut writer, &environment, ProbePolicy::default())
+                .expect("probe succeeds");
+        assert!(capabilities.kitty_keyboard);
+        assert!(capabilities.synchronized_output);
+        assert!(capabilities.undercurl);
+        assert!(capabilities.colored_underline);
+        assert!(capabilities.osc52_clipboard);
+        assert!(writer.starts_with(KITTY_KEYBOARD_QUERY));
+        assert!(writer.windows(SYNC_OUTPUT_QUERY.len()).any(|w| w == SYNC_OUTPUT_QUERY));
+        assert!(writer.windows(UNDERCURL_QUERY.len()).any(|w| w == UNDERCURL_QUERY));
+        assert!(writer.windows(OSC52_QUERY.len()).any(|w| w == OSC52_QUERY));
+    }
+
+    #[test]
+    fn terminfo_smulx_short_circuits_the_undercurl_probe() {
+        assert!(terminfo_colored_underline(Some("xterm-kitty|Smulx")));
+        assert!(terminfo_colored_underline(Some("setrgbf=abc,smulx")));
+        assert!(!terminfo_colored_underline(Some("xterm-256color")));
+        assert!(!terminfo_colored_underline(None));
+    }
+
+    #[test]
+    fn unmatched_probe_response_leaves_features_disabled() {
+        let (mut server, mut client) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        server.write_all(b"\x1b[\x1b]52;unterminated").expect("write noise");
+        drop(server);
+        let mut writer = Vec::new();
+        let environment = TerminalEnvironment::default();
+        let capabilities =
+            probe_io(&mut client, &mut writer, &environment, ProbePolicy::default())
+                .expect("probe succeeds");
+        assert!(!capabilities.kitty_keyboard);
+        assert!(!capabilities.synchronized_output);
+        assert!(!capabilities.undercurl);
+        assert!(!capabilities.osc52_clipboard);
     }
 
     #[test]

@@ -21,14 +21,16 @@ use chrome::{
     Chrome, ChromeError, ChunkLine, HistoryEntry, MessageUpdate, PopupItem, Rect, TextChunk, TimeMs,
 };
 use client::{Client, ClientError};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ox_rpc::RedrawEvent;
 use ox_types::{Dict, Object, OxStr};
 use screen::{ApplyOutcome, ComposedGrid, Screen, ScreenError};
 use terminal::{
     Cell as TerminalCell, CellAttributes, ColorSupport, DamageWriter, Frame, FrameError,
-    ProcessFailure, ProcessFailureKind, TerminalCapabilities, TerminalColor, TerminalEnvironment,
-    TerminalError, TerminalSession, UnderlineStyle,
+    ProcessFailure, ProcessFailureKind, ProbePolicy, TerminalCapabilities, TerminalColor,
+    TerminalEnvironment, TerminalError, TerminalSession, UnderlineStyle,
 };
 use theme::{HighlightGroup, HighlightStyle, Rgb, Theme};
 use thiserror::Error;
@@ -175,7 +177,15 @@ impl TuiState {
     fn apply_client_event(&mut self, event: &RedrawEvent) -> Result<(), TuiError> {
         for args in &event.argsets {
             match event.name.as_bytes() {
-                b"flush" => {}
+                b"flush" | b"option_set" | b"default_colors_set" | b"hl_group_set"
+                | b"mouse_on" | b"mouse_off" | b"busy_start" | b"busy_stop"
+                | b"bell" | b"visual_bell" | b"update_menu" | b"menu_show"
+                | b"menu_hide" | b"set_title" | b"set_icon" => {
+                    // These carry no client-rendered content, so they are
+                    // consumed intentionally: the client must survive its
+                    // first redraw regardless of which core negotiation/status
+                    // events the server emits.
+                }
                 b"cmdline_show" => self.apply_cmdline_show(args)?,
                 b"cmdline_pos" => {
                     self.chrome.cmdline_pos(as_u32(args, 1, "cmdline_pos")?, as_usize(args, 0, "cmdline_pos")?);
@@ -345,7 +355,14 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
     client.attach(width, height)?;
 
     let environment = terminal_environment();
-    let capabilities = TerminalCapabilities::from_environment(&environment);
+    let mut probe_reader = io::stdin();
+    let mut probe_writer = io::stdout();
+    let capabilities = terminal::probe_terminal(
+        &mut probe_reader,
+        &mut probe_writer,
+        &environment,
+        ProbePolicy::default(),
+    )?;
     let shared = SharedWriter::stdout();
     let mut session = TerminalSession::start(shared.clone(), capabilities)?;
     let mut damage = DamageWriter::new(shared, capabilities.undercurl);
@@ -407,7 +424,25 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
                     }
                 }
                 Event::Resize(columns, rows) => client.try_resize(columns, rows)?,
-                Event::Mouse(_) => {}
+                Event::Mouse(mouse) => {
+                    let dimensions = state
+                        .screen
+                        .composed_grid()
+                        .ok()
+                        .map(|grid| (grid.width(), grid.height()));
+                    let hit_chrome = dimensions
+                        .is_some_and(|(columns, rows)| {
+                            let cursor_row = state.screen.cursor().map(|cursor| cursor.row);
+                            state.chrome.layout(columns, rows, cursor_row).contains(
+                                usize::from(mouse.column),
+                                usize::from(mouse.row),
+                            )
+                        });
+                    if !hit_chrome {
+                        let (button, action, modifier) = encode_mouse(mouse);
+                        client.input_mouse(&button, &action, &modifier, mouse.row, mouse.column)?;
+                    }
+                }
                 _ => {}
             }
         }
@@ -604,13 +639,22 @@ fn paint_surface(
     let inner_height = rect.height.saturating_sub(2);
     let mut x = 0usize;
     let mut y = 0usize;
-    for character in String::from_utf8_lossy(text).chars() {
-        if character == '\n' || x >= inner_width {
+    let mut offset = 0usize;
+    let mut last_glyph_x: Option<usize> = None;
+    while offset < text.len() {
+        if text[offset] == b'\n' {
             x = 0;
             y = y.saturating_add(1);
-            if character == '\n' {
-                continue;
-            }
+            last_glyph_x = None;
+            offset = offset.saturating_add(1);
+            continue;
+        }
+        let (consumed, mut advance) = chrome::decoded_cell_width(text, offset, x);
+        if advance > 0 && x.saturating_add(advance) > inner_width {
+            x = 0;
+            y = y.saturating_add(1);
+            last_glyph_x = None;
+            advance = chrome::decoded_cell_width(text, offset, 0).1.min(inner_width);
         }
         if y >= inner_height {
             break;
@@ -618,11 +662,22 @@ fn paint_surface(
         let column = inner_x.saturating_add(x);
         let row = inner_y.saturating_add(y);
         if let Some(cell) = row.checked_mul(width).and_then(|base| base.checked_add(column)).and_then(|index| cells.get_mut(index)) {
-            cell.text = character.to_string().into_bytes();
-            cell.foreground = foreground;
-            cell.background = background;
+            if advance > 0 {
+                cell.text = text[offset..offset.saturating_add(consumed)].to_vec();
+                cell.foreground = foreground;
+                cell.background = background;
+                last_glyph_x = Some(x);
+            } else if let Some(base_x) = last_glyph_x {
+                // Zero-width combining/decorative marks overlay the preceding
+                // glyph, preserving the original byte sequence.
+                let base_column = inner_x.saturating_add(base_x);
+                if let Some(base_cell) = row.checked_mul(width).and_then(|base| base.checked_add(base_column)).and_then(|index| cells.get_mut(index)) {
+                    base_cell.text.extend_from_slice(&text[offset..offset.saturating_add(consumed)]);
+                }
+            }
         }
-        x = x.saturating_add(1);
+        x = x.saturating_add(advance);
+        offset = offset.saturating_add(consumed);
     }
 }
 
@@ -700,6 +755,48 @@ fn encode_key(key: KeyEvent) -> Option<String> {
     if key.modifiers.contains(KeyModifiers::ALT) { prefix.push_str("A-"); }
     if key.modifiers.contains(KeyModifiers::SHIFT) && !key_name.starts_with("S-") { prefix.push_str("S-"); }
     Some(format!("<{prefix}{key_name}>"))
+}
+
+/// Translate a decoded mouse event into the `nvim_input_mouse` `(button,
+/// action, modifier)` tuple. Wheel directions map to the `up`/`down`/`left`/
+/// `right` action names the editor expects.
+fn encode_mouse(event: MouseEvent) -> (String, String, String) {
+    let (button, action) = match event.kind {
+        MouseEventKind::Down(button) => (mouse_button_name(button), "press"),
+        MouseEventKind::Up(button) => (mouse_button_name(button), "release"),
+        MouseEventKind::Drag(button) => (mouse_button_name(button), "drag"),
+        MouseEventKind::Moved => ("move", "move"),
+        MouseEventKind::ScrollUp => ("wheel", "up"),
+        MouseEventKind::ScrollDown => ("wheel", "down"),
+        MouseEventKind::ScrollLeft => ("wheel", "left"),
+        MouseEventKind::ScrollRight => ("wheel", "right"),
+    };
+    (button.to_owned(), action.to_owned(), encode_mouse_modifiers(event.modifiers))
+}
+
+fn mouse_button_name(button: MouseButton) -> &'static str {
+    match button {
+        MouseButton::Left => "left",
+        MouseButton::Right => "right",
+        MouseButton::Middle => "middle",
+    }
+}
+
+fn encode_mouse_modifiers(modifiers: KeyModifiers) -> String {
+    let mut encoded = String::new();
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        encoded.push('C');
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        encoded.push('A');
+    }
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        encoded.push('S');
+    }
+    if modifiers.contains(KeyModifiers::META) {
+        encoded.push('M');
+    }
+    encoded
 }
 
 fn terminal_highlight_color(dict: &Dict, key: &str, support: ColorSupport) -> TerminalColor {
@@ -938,5 +1035,137 @@ mod tests {
         let mut state = TuiState::default();
         let result = state.apply_redraw(&[RedrawEvent { name: OxStr::from("future_event"), argsets: vec![vec![]] }], TimeMs(0));
         assert!(matches!(result, Err(TuiError::NotImplemented(_))));
+    }
+
+    #[test]
+    fn initial_redraw_survives_core_negotiation_events() {
+        let mut state = TuiState::default();
+        let event = |name: &str, args: Vec<Object>| RedrawEvent {
+            name: OxStr::from(name),
+            argsets: vec![args],
+        };
+        let batch = vec![
+            event("option_set", vec![Object::String(OxStr::from("title")), Object::Boolean(false)]),
+            event(
+                "default_colors_set",
+                vec![
+                    Object::Integer(0x11_22_33),
+                    Object::Integer(0xee_ee_ee),
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(0),
+                ],
+            ),
+            event("mouse_on", vec![]),
+            event("mouse_off", vec![]),
+            event("busy_start", vec![]),
+            event("busy_stop", vec![]),
+            event("bell", vec![]),
+            event("visual_bell", vec![]),
+            event("hl_group_set", vec![Object::Integer(0), Object::Integer(1)]),
+            event("update_menu", vec![Object::Integer(0)]),
+        ];
+        assert!(state.apply_redraw(&batch, TimeMs(0)).is_ok());
+    }
+
+    #[test]
+    fn mouse_encoding_maps_buttons_actions_and_modifiers() {
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        };
+        assert_eq!(encode_mouse(down), ("left".into(), "press".into(), "CS".into()));
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Right),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(encode_mouse(up), ("right".into(), "release".into(), String::new()));
+        let scrolled = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::ALT,
+        };
+        assert_eq!(encode_mouse(scrolled), ("wheel".into(), "down".into(), "A".into()));
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Middle),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(encode_mouse(drag), ("middle".into(), "drag".into(), String::new()));
+        let moved = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(encode_mouse(moved), ("move".into(), "move".into(), String::new()));
+    }
+
+    #[test]
+    fn surface_rendering_advances_by_cell_width_and_preserves_bytes() {
+        let width = 20usize;
+        let height = 3usize;
+        let mut cells = vec![TerminalCell::default(); width * height];
+        let theme = Theme::new(None);
+        let rect = Rect { x: 0, y: 0, width, height };
+        let mut text: Vec<u8> = Vec::new();
+        text.push(b'a');
+        text.extend_from_slice("界".as_bytes());
+        text.extend_from_slice("\u{301}".as_bytes());
+        text.push(0xff);
+        paint_surface(
+            &mut cells,
+            width,
+            height,
+            rect,
+            &text,
+            &theme,
+            HighlightGroup::NormalFloat,
+            ColorSupport::TrueColor,
+            1.0,
+        );
+        let cell_text = |row: usize, column: usize| cells[row * width + column].text.clone();
+        assert_eq!(cell_text(1, 1), b"a");
+        assert_eq!(cell_text(1, 2), b"\xe7\x95\x8c\xcc\x81");
+        assert_eq!(cell_text(1, 3), b" ");
+        assert_eq!(cell_text(1, 4), vec![0xff]);
+    }
+
+    #[test]
+    fn surface_advance_matches_chunk_map_for_multibyte_anchors() {
+        // A wildmenu/cmdline anchor must agree with the byte-offset map: a
+        // wide char consumes two columns and a combining mark none.
+        let width = 20usize;
+        let height = 3usize;
+        let mut cells = vec![TerminalCell::default(); width * height];
+        let theme = Theme::new(None);
+        let rect = Rect { x: 0, y: 0, width, height };
+        let mut text: Vec<u8> = Vec::new();
+        text.extend_from_slice("界".as_bytes());
+        text.push(b'x');
+        text.extend_from_slice("\u{301}".as_bytes());
+        text.push(b'y');
+        paint_surface(
+            &mut cells,
+            width,
+            height,
+            rect,
+            &text,
+            &theme,
+            HighlightGroup::NormalFloat,
+            ColorSupport::TrueColor,
+            1.0,
+        );
+        let cell_text = |row: usize, column: usize| cells[row * width + column].text.clone();
+        // 界 at inner col 0 (2 wide), x lands on inner col 2, y lands on col 3.
+        assert_eq!(cell_text(1, 1), "界".as_bytes());
+        assert_eq!(cell_text(1, 3), b"\x78\xcc\x81");
+        assert_eq!(cell_text(1, 4), b"y");
     }
 }

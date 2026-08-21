@@ -205,6 +205,33 @@ impl Client {
             .map_err(|_| ClientError::Protocol("nvim_input returned a negative byte count".into()))
     }
 
+    /// Send a mouse event to the server at terminal coordinates.
+    ///
+    /// Grid `0` lets the server decide which window the position targets, as
+    /// documented for multigrid clients; the caller suppresses chrome-owned
+    /// coordinates before calling this.
+    pub fn input_mouse(
+        &mut self,
+        button: &str,
+        action: &str,
+        modifier: &str,
+        row: u16,
+        column: u16,
+    ) -> Result<(), ClientError> {
+        let result = self.request(
+            OxStr::from("nvim_input_mouse"),
+            vec![
+                Object::String(OxStr::from(button)),
+                Object::String(OxStr::from(action)),
+                Object::String(OxStr::from(modifier)),
+                Object::Integer(0),
+                Object::Integer(i64::from(row)),
+                Object::Integer(i64::from(column)),
+            ],
+        )?;
+        require_nil("nvim_input_mouse", result)
+    }
+
     /// Notify the server that the terminal grid changed size.
     pub fn try_resize(&mut self, width: u16, height: u16) -> Result<(), ClientError> {
         let result = self.request(
