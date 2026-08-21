@@ -3,7 +3,11 @@ name = "ox-eval"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
-description = "Vimscript lexer/parser/evaluator, builtins (codegen from upstream eval.lua)."
+description = "Vimscript expression lexer, parser, evaluator, and scopes"
 
 [lints]
 workspace = true
+
+[dependencies]
+ox-types = { path = "../ox-types" }
+thiserror.workspace = true

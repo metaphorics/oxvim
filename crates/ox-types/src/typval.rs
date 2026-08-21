@@ -43,6 +43,9 @@ pub enum Special {
 ///
 /// This carries what upstream `partial_T` holds: a name plus optional bound
 /// arguments and `self` dict (`pt_argv`/`pt_dict`, `typval_defs.h:369-372`).
+/// A `registry` nonce is stored for lambdas so that `ox-eval` can resolve a
+/// closure back to the registry that created it without encoding provenance in
+/// the function name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Funcref {
     /// The function name.
@@ -51,6 +54,8 @@ pub struct Funcref {
     pub args: Vec<Typval>,
     /// The `self` dict, if bound.
     pub dict: Option<Vec<(OxStr, Typval)>>,
+    /// Closure registry nonce for lambdas; `None` for plain named funcrefs.
+    pub registry: Option<usize>,
 }
 
 /// A Vimscript value (`typval_T`).
@@ -154,7 +159,7 @@ mod tests {
         assert_eq!(Typval::String(OxStr::from("")).vartype(), super::VAR_STRING);
         assert_eq!(Typval::Blob(vec![1]).vartype(), super::VAR_BLOB);
 
-        let f = Funcref { name: OxStr::from("g:fn"), args: vec![], dict: None };
+        let f = Funcref { name: OxStr::from("g:fn"), args: vec![], dict: None, registry: None };
         assert_eq!(Typval::Funcref(f.clone()).vartype(), super::VAR_FUNC);
         assert_eq!(Typval::Partial(f).vartype(), super::VAR_PARTIAL);
         assert_eq!(Typval::List(vec![]).vartype(), super::VAR_LIST);
@@ -198,12 +203,12 @@ mod tests {
         assert!(Typval::List(vec![Typval::Number(0)]).is_truthy());
         assert!(Typval::Dict(vec![(OxStr::from("k"), Typval::Number(0))]).is_truthy());
         assert!(Typval::Bool(true).is_truthy());
-        let f = Funcref { name: OxStr::from("fn"), args: vec![], dict: None };
+        let f = Funcref { name: OxStr::from("fn"), args: vec![], dict: None, registry: None };
         assert!(Typval::Funcref(f.clone()).is_truthy());
         assert!(Typval::Partial(f).is_truthy());
         // A funcref with an empty name is VAR_FUNC with an empty string:
         // falsy like an empty string.
-        let empty = Funcref { name: OxStr::from(""), args: vec![], dict: None };
+        let empty = Funcref { name: OxStr::from(""), args: vec![], dict: None, registry: None };
         assert!(!Typval::Funcref(empty).is_truthy());
     }
 }

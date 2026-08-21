@@ -190,6 +190,10 @@ version = "0.1.0"
 [[package]]
 name = "ox-eval"
 version = "0.1.0"
+dependencies = [
+ "ox-types",
+ "thiserror",
+]
 
 [[package]]
 name = "ox-excmd"
