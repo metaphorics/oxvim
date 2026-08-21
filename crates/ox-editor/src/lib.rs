@@ -3,7 +3,10 @@
 
 pub mod autocmd;
 pub mod buffer;
+pub mod decoration;
 pub mod editor;
+pub mod extmark;
+pub mod fold;
 pub mod layout;
 pub mod mapping;
 pub mod mode;
@@ -25,7 +28,10 @@ pub use autocmd::{
 pub use buffer::{
     BufferAttachSubscription, BufferState, BufferStateError, UserCommandDefinition,
 };
+pub use decoration::Decorations;
 pub use editor::{BufferRelease, Editor, EditorError, Message, MessageKind};
+pub use extmark::Extmarks;
+pub use fold::Folds;
 pub use layout::{
     Anchor, Border, BorderText, FloatingWindow, Frame, Geometry, Layout, LayoutError, LeafFrame,
     Margins, RelativeTo, TabpageState, TextAlignment, WinConfig, WindowApiState, WindowState,
@@ -60,5 +66,7 @@ pub use typeahead::{
 mod input_tests;
 #[cfg(test)]
 mod mode_tests;
+#[cfg(test)]
+mod task09d_tests;
 #[cfg(test)]
 mod tests;
