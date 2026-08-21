@@ -3,7 +3,12 @@ name = "ox-editor"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
-description = "single-writer Editor state, modes, autocmds, extmarks."
+description = "Single-writer editor state, layout, options, registers, and marks."
+
+[dependencies]
+ox-types = { path = "../ox-types" }
+ox-text = { path = "../ox-text" }
+thiserror.workspace = true
 
 [lints]
 workspace = true

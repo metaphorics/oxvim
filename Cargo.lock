@@ -208,6 +208,11 @@ dependencies = [
 [[package]]
 name = "ox-editor"
 version = "0.1.0"
+dependencies = [
+ "ox-text",
+ "ox-types",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "ox-eval"
