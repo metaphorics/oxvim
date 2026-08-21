@@ -83,6 +83,16 @@ fn opens_upstream_luajit_library_set_and_runtime_path() {
 }
 
 #[test]
+fn ffi_is_preloaded_and_requireable_without_global() {
+    let (host, _, _) = host();
+    let globals = host.lua().globals();
+    assert!(matches!(globals.get::<Value>("ffi").unwrap(), Value::Nil));
+    let ffi: Value = host.lua().load("return require('ffi')").eval().unwrap();
+    assert!(matches!(ffi, Value::Table(_)), "require('ffi') should return the ffi module table");
+    assert!(matches!(globals.get::<Value>("ffi").unwrap(), Value::Nil), "ffi must not be a global after require");
+}
+
+#[test]
 fn object_converter_covers_scalars_containers_bytes_and_handles() {
     let (host, _, _) = host();
     let lua = host.lua();

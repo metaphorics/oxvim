@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use mlua::{Lua, LuaOptions, StdLib, Table};
+use mlua::{Lua, LuaOptions, StdLib, Table, Value};
 use thiserror::Error;
 
 use crate::vim::{install_vim_core, BuiltinHost, FastCallbackState, Scheduler};
@@ -70,9 +70,14 @@ impl LuaHost {
             | StdLib::PACKAGE
             | StdLib::DEBUG
             | StdLib::BIT
-            | StdLib::JIT;
+            | StdLib::JIT
+            | StdLib::FFI;
         // Contract: only the trusted libraries opened by upstream luaL_openlibs are enabled.
         let lua = unsafe { Lua::unsafe_new_with(libraries, LuaOptions::default()) };
+        // LuaJIT's luaL_openlibs preloads ffi but does not create a global "ffi" table.
+        // mlua's StdLib::FFI loads it via luaL_requiref with glb=1, so undo the global side
+        // effect to keep upstream's package-only placement while leaving package.loaded.ffi.
+        lua.globals().set("ffi", Value::Nil)?;
         configure_package_path(&lua, &runtime_root)?;
         let fast_callbacks = install_vim_core(&lua, builtins, scheduler)?;
         Ok(Self { lua, runtime_root, fast_callbacks })
