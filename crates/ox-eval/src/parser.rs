@@ -133,8 +133,9 @@ pub enum ExprKind {
     },
     /// `receiver->method(args)`; `method` may be a name or lambda.
     MethodCall { receiver: Box<Expr>, method: Box<Expr>, args: Vec<Expr> },
-    /// `{arg, ... -> expr}`.
-    Lambda { params: Vec<OxStr>, body: Box<Expr> },
+    /// `{arg, ... -> expr}`. `varargs` is true when the parameter list ends
+    /// with `...`, matching `get_lambda_tv`'s acceptance of the variadic form.
+    Lambda { params: Vec<OxStr>, varargs: bool, body: Box<Expr> },
 }
 
 /// Parser for one complete Vimscript expression.
@@ -394,10 +395,22 @@ impl<'a> Parser<'a> {
             let colon = self.advance().clone();
             name.push(b':');
             span.end = colon.span.end;
-            if let TokenKind::Identifier(suffix) = &self.current().kind {
-                if span.end == self.current().span.start {
-                    name.extend_from_slice(suffix);
-                    span.end = self.advance().span.end;
+            if span.end == self.current().span.start {
+                match &self.current().kind {
+                    TokenKind::Identifier(suffix) => {
+                        name.extend_from_slice(suffix);
+                        span.end = self.advance().span.end;
+                    }
+                    // `a:0`, `a:000`, `a:1`, ... — variadic lambda arguments.
+                    // The raw source is captured so `a:000` (the List) stays
+                    // distinct from `a:0` (the count), which both lex as the
+                    // integer token `0`.
+                    TokenKind::Integer(_) if name.as_slice() == b"a:" => {
+                        let suffix = &self.source[self.current().span.start..self.current().span.end];
+                        name.extend_from_slice(suffix);
+                        span.end = self.advance().span.end;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -488,14 +501,31 @@ impl<'a> Parser<'a> {
 
     fn parse_lambda(&mut self, start: usize) -> Result<Expr, EvalError> {
         let mut params = Vec::new();
+        let mut varargs = false;
         if !matches!(self.current().kind, TokenKind::Arrow) {
             loop {
+                // The variadic form `...` ends the parameter list; it accepts
+                // any number of extra arguments (a:0 / a:000 / a:1 ...).
+                if self.take(|kind| matches!(kind, TokenKind::DotDotDot)).is_some() {
+                    varargs = true;
+                    break;
+                }
                 let token = self.advance().clone();
                 let TokenKind::Identifier(name) = token.kind else {
                     return Err(EvalError::new("E451", token.span.start, "lambda argument name expected"));
                 };
                 if name.contains(&b':') {
                     return Err(EvalError::new("E451", token.span.start, "lambda arguments must be unscoped"));
+                }
+                if params.iter().any(|existing: &OxStr| existing.as_bytes() == name.as_slice()) {
+                    return Err(EvalError::new(
+                        "E853",
+                        token.span.start,
+                        format!(
+                            "Duplicate argument name: {}",
+                            String::from_utf8_lossy(&name)
+                        ),
+                    ));
                 }
                 params.push(OxStr(name));
                 if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
@@ -507,7 +537,7 @@ impl<'a> Parser<'a> {
         let body = self.parse_expr1()?;
         let close = self.require(|kind| matches!(kind, TokenKind::RBrace), "E451", "missing '}' after lambda")?;
         Ok(Expr::new(
-            ExprKind::Lambda { params, body: Box::new(body) },
+            ExprKind::Lambda { params, varargs, body: Box::new(body) },
             Span::new(start, close.span.end),
         ))
     }

@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use ox_types::{OxStr, Special, Typval};
+use ox_types::{Funcref, OxStr, Special, Typval};
 
 use crate::eval::{BuiltinHost, Evaluator, RegexEngine};
 use crate::lexer::{Lexer, TokenKind};
@@ -180,6 +180,13 @@ eval_cases!(
     (lambda_binary, b"{a, b -> a + b}(10, 20)", Typval::Number(30), "test_lambda.vim:56"),
     (lambda_unary, b"{x -> x * 2}(21)", Typval::Number(42), "vimeval.txt:1611-1626"),
     (lambda_returns_list, b"{x -> [x, x + 1]}(3)", Typval::List(vec![Typval::Number(3), Typval::Number(4)]), "vimeval.txt:1641-1647"),
+    (lambda_variadic_count, b"{... -> a:0}(1, 2, 3)", Typval::Number(3), "test_lambda.vim:55-58"),
+    (lambda_variadic_list, b"{... -> a:000}(7, 8)", Typval::List(vec![Typval::Number(7), Typval::Number(8)]), "userfunc.txt:a:000"),
+    (lambda_variadic_index, b"{... -> a:1}(10, 20)", Typval::Number(10), "userfunc.txt:a:1"),
+    (lambda_named_then_variadic, b"{a, ... -> a + a:0}(1, 2, 3)", Typval::Number(3), "test_lambda.vim:55-62"),
+    (lambda_extra_args_accepted, b"{a -> a}(1, 2, 3)", Typval::Number(1), "userfunc.c:396 uf_varargs=true"),
+    (string_multibyte_fold_equal, b"\"\xc3\x84\" ==? \"\xc3\xa4\"", Typval::Number(1), "mbyte.c:mb_stricmp"),
+    (string_multibyte_fold_sensitive, b"\"\xc3\x84\" ==# \"\xc3\xa4\"", Typval::Number(0), "vimeval.txt:1075-1081"),
     (method_len, b"[1, 2, 3]->len()", Typval::Number(3), "vimeval.txt:1292-1305"),
     (method_chain, b"[1, 2, 3]->len()->id()", Typval::Number(3), "vimeval.txt:1300-1305"),
     (method_receiver_first, b"10->sum(20, 30)", Typval::Number(60), "vimeval.txt:1295-1298")
@@ -211,6 +218,8 @@ error_cases!(
     (error_undefined_variable, b"missing", "E121", "vimeval.txt:1683-1687"),
     (error_undefined_function, b"missing()", "E117", "eval.c:E117"),
     (error_duplicate_dict_key, b"{'a': 1, 'a': 2}", "E721", "eval.c:E721"),
+    (error_duplicate_lambda_param, b"{a, a -> a + a}(1, 2)", "E853", "test_lambda.vim:61"),
+    (error_duplicate_lambda_param_types, b"{list, list -> 1}([1], [2])", "E853", "userfunc.c:134"),
     (error_list_relational_compare, b"[1] > [2]", "E692", "eval.c:6789-6791"),
     (error_dict_relational_compare, b"{'a': 1} > {'a': 0}", "E736", "eval.c:6822-6828"),
     (error_float_string_concat, b"1.5 .. 'x'", "E806", "vimeval.txt:1121-1131"),
@@ -413,4 +422,90 @@ fn coalesce_uses_tv2bool_not_numeric_coercion() {
 fn special_null_numeric_coercion() {
     // typval.c:4315-4316.
     assert!(!Evaluator::<Host, Regex>::condition_number(&Typval::Special(Special::Null)).unwrap());
+}
+
+#[test]
+fn invalid_utf8_compared_case_sensitively_byte_wise() {
+    // mb_stricmp fallback: invalid byte sequences are compared byte-for-byte,
+    // never folded. Equal raw bytes are equal; differing bytes differ.
+    assert_eq!(value(b"'\\xff' ==? '\\xff'"), Typval::Number(1));
+    assert_eq!(value(b"'\\xff' ==? '\\xfe'"), Typval::Number(0));
+    assert_eq!(value(b"'\\xc3' ==? '\\xc3'"), Typval::Number(1));
+    // A lone lead byte that is not a complete sequence compares byte-wise.
+    assert_eq!(value(b"'\\xc3' ==? '\\xc3\\xa4'"), Typval::Number(0));
+}
+
+#[test]
+fn variadic_lambda_partial_binds_leading_args() {
+    // test/old/testdir/test_lambda.vim:55-58. A `...` lambda accessed through a
+    // partially-bound Funcref: bound args fill a:1.. before call-time extras.
+    let expression = Parser::new(b"{... -> [a:1, a:2, a:3]}").parse().unwrap();
+    let mut host = Host;
+    let regex = Regex;
+    let mut evaluator = Evaluator::new(&mut host, &regex);
+    let closure = evaluator.eval(&expression, &mut Scope::new()).unwrap();
+    let Typval::Partial(funcref) = closure else { panic!("expected a Partial") };
+    let bound = Typval::Partial(Funcref {
+        name: funcref.name,
+        args: vec![Typval::String(OxStr::from("one")), Typval::String(OxStr::from("two"))],
+        dict: None,
+    });
+    let mut scope = Scope::new();
+    scope.set(b"cb", bound);
+    let call = Parser::new(b"cb('three')").parse().unwrap();
+    let mut call_host = Host;
+    let registry = evaluator.closure_registry().clone();
+    let mut callee = Evaluator::new(&mut call_host, &regex).with_closure_registry(registry);
+    let result = callee.eval(&call, &mut scope).unwrap();
+    assert_eq!(
+        result,
+        Typval::List(vec![
+            Typval::String(OxStr::from("one")),
+            Typval::String(OxStr::from("two")),
+            Typval::String(OxStr::from("three")),
+        ])
+    );
+}
+
+#[test]
+fn closure_resolves_across_evaluator_sharing_registry() {
+    // Finding 3: a Partial stored in one scope resolves to its original closure
+    // when invoked by a different Evaluator that shares the closure registry.
+    let mut first_host = Host;
+    let mut second_host = Host;
+    let regex = Regex;
+    let mut creator = Evaluator::new(&mut first_host, &regex);
+    let mut caller = Evaluator::new(&mut second_host, &regex)
+        .with_closure_registry(creator.closure_registry().clone());
+
+    // Define `{x -> x + base}` and keep the Partial in a scope.
+    let define = Parser::new(b"{x -> x + base}").parse().unwrap();
+    let mut scope = Scope::new();
+    scope.set(b"base", Typval::Number(40));
+    let closure = creator.eval(&define, &mut scope).unwrap();
+    let mut store = Scope::new();
+    store.set(b"f", closure);
+    let call = Parser::new(b"f(2)").parse().unwrap();
+
+    // A second evaluator that shares the registry resolves the stored Partial
+    // to the closure created by the first evaluator, including its capture.
+    assert_eq!(caller.eval(&call, &mut store).unwrap(), Typval::Number(42));
+}
+
+#[test]
+fn closure_from_isolated_evaluator_is_not_callable() {
+    // Without the shared registry a second evaluator cannot resolve a stored
+    // Partial — matching upstream where a lambda lives in the evaluator state.
+    let mut first_host = Host;
+    let mut second_host = Host;
+    let regex = Regex;
+    let mut creator = Evaluator::new(&mut first_host, &regex);
+    let mut caller = Evaluator::new(&mut second_host, &regex);
+
+    let define = Parser::new(b"{x -> x * 2}").parse().unwrap();
+    let closure = creator.eval(&define, &mut Scope::new()).unwrap();
+    let mut store = Scope::new();
+    store.set(b"f", closure);
+    let call = Parser::new(b"f(2)").parse().unwrap();
+    assert_eq!(caller.eval(&call, &mut store).unwrap_err().code, "E117");
 }

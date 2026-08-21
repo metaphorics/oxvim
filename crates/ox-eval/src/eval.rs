@@ -2,6 +2,9 @@
 
 use ox_types::{Funcref, OxStr, Special, Typval};
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::error::{EvalError, Result};
 use crate::lexer::CaseSensitivity;
 use crate::parser::{BinaryOp, CompareOp, Expr, ExprKind, OptionScope as AstOptionScope, UnaryOp};
@@ -53,6 +56,49 @@ struct Closure {
     captured: Scope,
 }
 
+/// A shared, externally-oblivious registry of lambda closures.
+///
+/// Closure bodies and captured scopes live here under a stable index so that a
+/// stored `Partial` (`<lambda>{id}`) resolves to the original closure even when
+/// called through a different [`Evaluator`] that shares this registry. Sharing
+/// one registry across evaluators makes a lambda defined by one evaluator and
+/// invoked by another evaluate against the same closure body and capture.
+#[derive(Clone, Default)]
+pub struct ClosureRegistry {
+    closures: Rc<RefCell<Vec<Closure>>>,
+}
+
+impl ClosureRegistry {
+    /// Create an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of closures registered so far.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.closures.borrow().len()
+    }
+
+    /// True when no closures have been registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.closures.borrow().is_empty()
+    }
+
+    fn register(&self, closure: Closure) -> usize {
+        let mut closures = self.closures.borrow_mut();
+        let id = closures.len();
+        closures.push(closure);
+        id
+    }
+
+    fn resolve(&self, id: usize) -> Option<Closure> {
+        self.closures.borrow().get(id).cloned()
+    }
+}
+
 struct Evaluated {
     value: Typval,
     identity: Option<usize>,
@@ -64,13 +110,13 @@ impl Evaluated {
     }
 }
 
-/// A reusable evaluator with host seams and a closure registry.
+/// A reusable evaluator with host seams and a shared closure registry.
 pub struct Evaluator<'a, H: BuiltinHost, R: RegexEngine> {
     host: &'a mut H,
     regex: &'a R,
     ignore_case: bool,
     max_depth: usize,
-    closures: Vec<Closure>,
+    closures: ClosureRegistry,
 }
 
 impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
@@ -81,8 +127,25 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
             regex,
             ignore_case: false,
             max_depth: DEFAULT_MAX_EVAL_DEPTH,
-            closures: Vec::new(),
+            closures: ClosureRegistry::new(),
         }
+    }
+
+    /// Borrow the shared closure registry.
+    ///
+    /// Cloning the registry and passing it to another [`Evaluator`] (or reusing
+    /// it for a second run) lets stored `Partial`s resolve to the closures they
+    /// were created from, independent of which evaluator invokes them.
+    #[must_use]
+    pub const fn closure_registry(&self) -> &ClosureRegistry {
+        &self.closures
+    }
+
+    /// Reuse an existing closure registry for this evaluator.
+    #[must_use]
+    pub fn with_closure_registry(mut self, registry: ClosureRegistry) -> Self {
+        self.closures = registry;
+        self
     }
 
     /// Select the value of Vim's `'ignorecase'` option for unsuffixed comparisons.
@@ -239,9 +302,8 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                 }
                 self.call_method(method, values, scope, next)
             }
-            ExprKind::Lambda { params, body } => {
-                let id = self.closures.len();
-                self.closures.push(Closure {
+            ExprKind::Lambda { params, body, .. } => {
+                let id = self.closures.register(Closure {
                     params: params.clone(),
                     body: body.as_ref().clone(),
                     captured: scope.snapshot(),
@@ -465,7 +527,7 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         depth: usize,
     ) -> Result<Evaluated> {
         if let Some(id) = closure_id(name.as_bytes()) {
-            return self.call_closure(id, args, depth, offset);
+            return self.call_closure(id, &args, depth, offset);
         }
         self.host.call(name, args, scope).map(Evaluated::plain).map_err(|mut error| {
             if error.code == "E117" { error.offset = offset; }
@@ -487,20 +549,37 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         }
     }
 
-    fn call_closure(&mut self, id: usize, args: Vec<Typval>, depth: usize, offset: usize) -> Result<Evaluated> {
-        let closure = self.closures.get(id).cloned().ok_or_else(|| {
+    fn call_closure(&mut self, id: usize, args: &[Typval], depth: usize, offset: usize) -> Result<Evaluated> {
+        let closure = self.closures.resolve(id).ok_or_else(|| {
             EvalError::new("E117", offset, format!("Unknown function: <lambda>{id}"))
         })?;
-        if args.len() != closure.params.len() {
+        if args.len() < closure.params.len() {
             return Err(EvalError::new("E119", offset, "not enough or too many arguments for function"));
         }
         let mut scope = closure.captured;
         for (param, value) in closure.params.iter().zip(args) {
+            // Named parameters resolve both unqualified and as `a:name`.
             scope.local.retain(|(name, _)| name != param);
-            scope.argument.push((param.clone(), value));
+            bind_argument(&mut scope, param, value.clone());
+        }
+        // Any extra arguments behave like a variadic `...`: `a:0` is their
+        // count, `a:000` is the List, and `a:1`, `a:2`, ... index them. Vim
+        // always treats lambda parameter lists as variadic (uf_varargs=true).
+        let extras = &args[closure.params.len()..];
+        let extra_count = i64::try_from(extras.len()).unwrap_or(i64::MAX);
+        bind_argument(&mut scope, &OxStr::from("0"), Typval::Number(extra_count));
+        bind_argument(&mut scope, &OxStr::from("000"), Typval::List(extras.to_vec()));
+        for (index, value) in extras.iter().enumerate() {
+            let name = OxStr(format!("{}", index + 1).into_bytes());
+            bind_argument(&mut scope, &name, value.clone());
         }
         self.eval_at(&closure.body, &mut scope, depth)
     }
+}
+
+fn bind_argument(scope: &mut Scope, name: &OxStr, value: Typval) {
+    scope.argument.retain(|(existing, _)| existing != name);
+    scope.argument.push((name.clone(), value));
 }
 
 fn identity_type(value: &Typval) -> bool {
@@ -697,14 +776,91 @@ fn equal_values(lhs: &Typval, rhs: &Typval, ignore_case: bool, depth: usize, max
     }
 }
 
-fn compare_bytes(lhs: &[u8], rhs: &[u8], ignore_case: bool) -> i8 {
-    for (&left, &right) in lhs.iter().zip(rhs) {
-        let left = if ignore_case { left.to_ascii_lowercase() } else { left };
-        let right = if ignore_case { right.to_ascii_lowercase() } else { right };
-        if left < right { return -1; }
-        if left > right { return 1; }
+/// One folded comparison unit: the lower-cased expansion of a single decoded
+/// character, or a single raw byte from an invalid UTF-8 sequence.
+///
+/// A decoded character folds its *entire* lower-casing expansion (e.g. `İ`
+/// becomes `i` + `U+0307`), mirroring `char::to_lowercase`. Bytes that do not
+/// begin a valid UTF-8 sequence are kept byte-for-byte and compared
+/// case-sensitively, so invalid input never causes a panic and the ordering
+/// stays deterministic.
+#[derive(Debug, Eq, PartialEq)]
+enum FoldUnit {
+    Char(Vec<u8>),
+    Raw(u8),
+}
+
+/// Length in bytes of the UTF-8 sequence starting with `lead`, using only the
+/// lead byte's value. Invalid or overlong leads, and continuation bytes, map
+/// to 1 so they are decoded as a single raw byte below.
+fn utf8_char_len(lead: u8) -> usize {
+    if lead < 0x80 {
+        1
+    } else if (0xC2..=0xDF).contains(&lead) {
+        2
+    } else if (0xE0..=0xEF).contains(&lead) {
+        3
+    } else if (0xF0..=0xF4).contains(&lead) {
+        4
+    } else {
+        1
     }
-    lhs.len().cmp(&rhs.len()) as i8
+}
+
+fn fold_bytes(bytes: &[u8]) -> Vec<FoldUnit> {
+    let mut units = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let len = utf8_char_len(rest[0]).min(rest.len());
+        if let Ok(text) = std::str::from_utf8(&rest[..len]) {
+            for ch in text.chars() {
+                let folded = ch.to_lowercase().collect::<String>().into_bytes();
+                units.push(FoldUnit::Char(folded));
+            }
+            rest = &rest[len..];
+        } else {
+            // Invalid, overlong, or truncated sequence: keep the offending
+            // byte raw so it is compared case-sensitively and byte-wise.
+            units.push(FoldUnit::Raw(rest[0]));
+            rest = &rest[1..];
+        }
+    }
+    units
+}
+
+fn fold_unit_cmp(left: &FoldUnit, right: &FoldUnit) -> std::cmp::Ordering {
+    let left: &[u8] = match left {
+        FoldUnit::Char(bytes) => bytes,
+        FoldUnit::Raw(byte) => std::slice::from_ref(byte),
+    };
+    let right: &[u8] = match right {
+        FoldUnit::Char(bytes) => bytes,
+        FoldUnit::Raw(byte) => std::slice::from_ref(byte),
+    };
+    left.cmp(right)
+}
+
+fn compare_bytes(lhs: &[u8], rhs: &[u8], ignore_case: bool) -> i8 {
+    if !ignore_case {
+        for (&left, &right) in lhs.iter().zip(rhs) {
+            if left < right { return -1; }
+            if left > right { return 1; }
+        }
+        return lhs.len().cmp(&rhs.len()) as i8;
+    }
+    // Unicode case folding from mb_strcmp_ic / mb_stricmp (mbyte.c utf_strnicmp):
+    // compare the lower-cased expansions of each decoded character, and fall
+    // back to a byte-wise case-sensitive comparison for invalid sequences.
+    let left = fold_bytes(lhs);
+    let right = fold_bytes(rhs);
+    for (l, r) in left.iter().zip(&right) {
+        match fold_unit_cmp(l, r) {
+            std::cmp::Ordering::Less => return -1,
+            std::cmp::Ordering::Greater => return 1,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    left.len().cmp(&right.len()) as i8
 }
 
 fn normalize_list_index(length: usize, requested: i64) -> Option<usize> {

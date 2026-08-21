@@ -72,6 +72,7 @@ pub enum TokenKind {
     Colon,
     Dot,
     DotDot,
+    DotDotDot,
     Plus,
     Minus,
     Star,
@@ -160,6 +161,10 @@ impl<'a> Lexer<'a> {
                     TokenKind::Arrow
                 }
                 Some(b'-') => self.one(TokenKind::Minus),
+                Some(b'.') if self.peek(1) == Some(b'.') && self.peek(2) == Some(b'.') => {
+                    self.offset += 3;
+                    TokenKind::DotDotDot
+                }
                 Some(b'.') if self.peek(1) == Some(b'.') => {
                     self.offset += 2;
                     TokenKind::DotDot
