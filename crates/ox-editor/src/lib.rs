@@ -22,15 +22,18 @@ pub mod register;
 pub mod typeahead;
 
 pub use autocmd::{
-    AutocmdAction, AutocmdContext, AutocmdError, AutocmdKind, AutocmdOptions, AutocmdSink,
-    Autocmds, AugroupId, DeleteAutocmds, Event, FiringPlan, PatternKind, EVENT_COUNT,
+    AutocmdAction, AutocmdContext, AutocmdDefinition, AutocmdError, AutocmdKind, AutocmdOptions,
+    AutocmdSink, Autocmds, AugroupId, DeleteAutocmds, Event, FiringPlan, PatternKind, EVENT_COUNT,
 };
 pub use buffer::{
     BufferAttachSubscription, BufferState, BufferStateError, UserCommandDefinition,
 };
 pub use decoration::Decorations;
 pub use editor::{BufferRelease, Editor, EditorError, Message, MessageKind};
-pub use extmark::Extmarks;
+pub use extmark::{
+    Extmark, ExtmarkAttributes, ExtmarkEnd, ExtmarkGravity, ExtmarkId, ExtmarkPlacement,
+    ExtmarkPosition, Extmarks, NamespaceId, VirtualLine, VirtualTextChunk,
+};
 pub use fold::Folds;
 pub use layout::{
     Anchor, Border, BorderText, FloatingWindow, Frame, Geometry, Layout, LayoutError, LeafFrame,

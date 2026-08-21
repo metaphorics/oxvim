@@ -1,6 +1,7 @@
 //! The single-writer root for all editor state.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ox_text::{Buffer, Position};
 use ox_types::{BufHandle, Dict, Object, TabHandle, WinHandle};
@@ -16,6 +17,8 @@ use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError};
 use crate::options::OptionStore;
 use crate::register::{put_content, RegisterError, Registers};
 use crate::typeahead::Typeahead;
+
+static NEXT_API_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Classification retained with a message submitted to the editor sink.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +97,8 @@ pub enum BufferRelease {
 /// No state is process-global. Event-loop and RPC layers can serialize their
 /// requests into calls on this root without introducing locks into the model.
 pub struct Editor {
+    /// Stable identity for host-layer state associated with this editor.
+    api_instance_id: u64,
     /// Live buffers in monotonically allocated handle order.
     buffers: BTreeMap<BufHandle, BufferState>,
     /// Tabpage owning each live window handle.
@@ -139,6 +144,7 @@ impl Editor {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            api_instance_id: NEXT_API_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             buffers: BTreeMap::new(),
             windows: BTreeMap::new(),
             tabpages: BTreeMap::new(),
@@ -158,6 +164,12 @@ impl Editor {
             next_window: 1,
             next_tabpage: 1,
         }
+    }
+
+    /// Stable identity for state owned by API and UI host layers.
+    #[must_use]
+    pub const fn api_instance_id(&self) -> u64 {
+        self.api_instance_id
     }
 
     /// Returns the current tabpage, if one has been created.
@@ -1023,13 +1035,25 @@ impl Editor {
         let Some(content) = self.registers.get(name)?.cloned() else {
             return Ok(false);
         };
+        self.put_content(buffer, position, &content, timestamp)?;
+        Ok(true)
+    }
+
+    /// Inserts explicit content through the same undo-aware pipeline as a register put.
+    pub fn put_content(
+        &mut self,
+        buffer: BufHandle,
+        position: Position,
+        content: &crate::register::RegisterContent,
+        timestamp: i64,
+    ) -> Result<(), EditorError> {
         let original = self.buffer(buffer)?.text()?.clone();
         let before = buffer_lines(&original)?;
         let mut resulting = original;
-        put_content(&mut resulting, position, &content)?;
+        put_content(&mut resulting, position, content)?;
         let after = buffer_lines(&resulting)?;
         if before == after {
-            return Ok(true);
+            return Ok(());
         }
 
         let prefix = before
@@ -1059,7 +1083,7 @@ impl Editor {
                 timestamp,
             )?;
         }
-        Ok(true)
+        Ok(())
     }
 
     fn split_window(

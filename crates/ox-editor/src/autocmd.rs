@@ -250,6 +250,31 @@ pub struct AutocmdAction {
     pub description: Option<String>,
 }
 
+/// One registered autocmd definition exposed to API query layers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutocmdDefinition {
+    /// Stable definition identity.
+    pub id: u64,
+    /// Event matched by the definition.
+    pub event: Event,
+    /// Destination augroup.
+    pub group: AugroupId,
+    /// Augroup name, absent for the default group.
+    pub group_name: Option<String>,
+    /// Original source pattern.
+    pub pattern: String,
+    /// Buffer selected by a buffer-local pattern.
+    pub buffer: Option<BufHandle>,
+    /// Host-owned executable payload.
+    pub kind: AutocmdKind,
+    /// Whether the definition is removed after execution.
+    pub once: bool,
+    /// Whether nested autocmds may fire.
+    pub nested: bool,
+    /// Optional user-facing description.
+    pub description: Option<String>,
+}
+
 /// Execution seam implemented by Vimscript/Lua hosting layers.
 pub trait AutocmdSink {
     /// Host execution failure.
@@ -402,7 +427,14 @@ impl Autocmds {
     }
 
     /// Looks up an augroup by name.
+    #[must_use]
     pub fn group(&self, name: &str) -> Option<AugroupId> { self.group_names.get(name).copied() }
+
+    /// Whether an augroup id exists (the default group always exists).
+    #[must_use]
+    pub fn has_group(&self, id: AugroupId) -> bool {
+        id == AugroupId::default() || self.groups.contains_key(&id)
+    }
 
     /// Deletes an augroup and all of its definitions.
     pub fn delete_group(&mut self, id: AugroupId) -> Result<(), AutocmdError> {
@@ -472,6 +504,36 @@ impl Autocmds {
             (group_matches && event_matches && pattern_matches) == false
         });
         Ok(before - self.entries.len())
+    }
+
+    /// Removes one definition by stable id.
+    pub fn delete_id(&mut self, id: u64) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|entry| entry.id != id);
+        before != self.entries.len()
+    }
+
+    /// Returns definitions in registration order.
+    #[must_use]
+    pub fn definitions(&self) -> Vec<AutocmdDefinition> {
+        self.entries
+            .iter()
+            .map(|entry| AutocmdDefinition {
+                id: entry.id,
+                event: entry.event,
+                group: entry.options.group,
+                group_name: self.groups.get(&entry.options.group).map(|(name, _)| name.clone()),
+                pattern: entry.source_pattern.clone(),
+                buffer: match entry.pattern {
+                    StoredPattern::Buffer(buffer) => Some(buffer),
+                    StoredPattern::Glob(_) => None,
+                },
+                kind: entry.kind.clone(),
+                once: entry.options.once,
+                nested: entry.options.nested,
+                description: entry.options.description.clone(),
+            })
+            .collect()
     }
 
     /// Adds an event to the editor's `eventignore` set.

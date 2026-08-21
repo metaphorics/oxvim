@@ -76,6 +76,15 @@ pub enum ExtmarkGravity {
 pub struct NamespaceId(u32);
 
 impl NamespaceId {
+    /// Creates a positive namespace identifier.
+    pub const fn new(value: u32) -> Result<Self, ExtmarkError> {
+        if value == 0 {
+            Err(ExtmarkError::UnknownNamespace(value))
+        } else {
+            Ok(Self(value))
+        }
+    }
+
     /// Returns the positive integer identifier.
     #[must_use]
     pub const fn get(self) -> u32 {
@@ -366,10 +375,23 @@ impl Extmarks {
         Ok(id)
     }
 
+    /// Ensures a namespace allocated by the editor-global API registry exists locally.
+    pub fn ensure_namespace(&mut self, namespace: NamespaceId) -> Result<(), ExtmarkError> {
+        self.highest_namespace = self.highest_namespace.max(namespace.get());
+        self.namespaces.entry(namespace).or_default();
+        Ok(())
+    }
+
     /// Gets a previously allocated named namespace.
     #[must_use]
     pub fn namespace(&self, name: &str) -> Option<NamespaceId> {
         self.named_namespaces.get(name).copied()
+    }
+
+    /// Returns all allocated namespace ids in ascending order.
+    #[must_use]
+    pub fn namespace_ids(&self) -> Vec<NamespaceId> {
+        self.namespaces.keys().copied().collect()
     }
 
     /// Inserts a mark or replaces the mark with the requested id.

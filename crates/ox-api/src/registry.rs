@@ -101,9 +101,15 @@ impl Registry {
 /// Returns an error if two implementation modules accidentally register the same public name.
 pub fn core() -> Result<Registry, RegistryError> {
     let mut registry = Registry::new();
+    crate::autocmd::register(&mut registry)?;
     crate::buffer::register(&mut registry)?;
+    crate::channel::register(&mut registry)?;
+    crate::context::register(&mut registry)?;
+    crate::deprecated::register(&mut registry)?;
+    crate::extmark::register(&mut registry)?;
     crate::window::register(&mut registry)?;
     crate::tabpage::register(&mut registry)?;
+    crate::ui::register(&mut registry)?;
     crate::global::register(&mut registry)?;
     Ok(registry)
 }
