@@ -2,8 +2,13 @@
 //! mlua-hosted LuaJIT executor, converters, and the C-side `vim` table core.
 
 pub mod converter;
+mod embedded;
 pub mod host;
+mod stdlib;
+mod treesitter;
 pub mod typval_bridge;
+mod uv_core;
+mod uv_handles;
 pub mod vim;
 
 pub use converter::{

@@ -7,6 +7,7 @@ use mlua::{Lua, LuaOptions, StdLib, Table, Value};
 use thiserror::Error;
 
 use crate::vim::{install_vim_core, BuiltinHost, FastCallbackState, Scheduler};
+use crate::{embedded, stdlib, treesitter, uv_core};
 
 /// Caller-provided root of the checked-out Neovim-compatible runtime tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,7 +80,17 @@ impl LuaHost {
         // effect to keep upstream's package-only placement while leaving package.loaded.ffi.
         lua.globals().set("ffi", Value::Nil)?;
         configure_package_path(&lua, &runtime_root)?;
-        let fast_callbacks = install_vim_core(&lua, builtins, scheduler)?;
+        let fast_callbacks = install_vim_core(&lua, builtins.clone(), scheduler.clone())?;
+        stdlib::install(&lua)?;
+        embedded::install(&lua, runtime_root.clone())?;
+        treesitter::install(&lua, scheduler.clone())?;
+        uv_core::install(
+            &lua,
+            scheduler,
+            fast_callbacks.clone(),
+            runtime_root.clone(),
+            builtins,
+        )?;
         Ok(Self { lua, runtime_root, fast_callbacks })
     }
 
