@@ -187,6 +187,123 @@ fn command_arg(command: impl AsRef<str>) -> String {
     command.as_ref().to_owned()
 }
 
+/// Emits Edits written by ox-text, then asks real upstream Neovim to load the
+/// undo file and dump the buffer content after each consecutive `:undo`.
+/// Returns the per-step dump paths (in undo order) plus the dir.
+fn forward_undo_dumps(dir: &Path, text: &[u8], undo_bytes: &[u8]) -> Vec<PathBuf> {
+    let text_path = dir.join("fwd-text.txt");
+    let undo_path = dir.join("fwd.un~");
+    fs::write(&text_path, text).unwrap();
+    fs::write(&undo_path, undo_bytes).unwrap();
+    let mut args = vec![
+        "--headless".into(), "-u".into(), "NONE".into(), "-n".into(),
+        text_path.display().to_string(),
+        "-c".into(), command_arg(format!("rundo {}", undo_path.display())),
+    ];
+    let mut dumps = Vec::new();
+    for step in 0..4 {
+        let out = dir.join(format!("fwd-step-{step}"));
+        dumps.push(out.clone());
+        args.push("-c".into());
+        args.push("silent! undo".into());
+        args.push("-c".into());
+        args.push(command_arg(format!("silent! call writefile(getline(1, '$'), '{}')", out.display())));
+    }
+    args.push("-c".into());
+    args.push("qa!".into());
+    run_nvim(&args);
+    dumps
+}
+
+#[test]
+fn ox_text_writes_undo_history_real_nvim_undoes_forward() {
+    if !Path::new(nvim()).exists() {
+        return;
+    }
+    let dir = oracle_dir("fwd-linear");
+    let mut buffer = Buffer::from_bytes(b"a\nb\n").unwrap();
+    let mut tree = UndoTree::new();
+
+    // Three sequential edits: line 2 b->c, c->d, then append "e".
+    tree.record(edit_at(2, &bytes(&["b"]), &bytes(&["c"])), 1710000001);
+    buffer.replace_lines(2, 2, &bytes(&["c"])).unwrap();
+    tree.record(edit_at(2, &bytes(&["c"]), &bytes(&["d"])), 1710000002);
+    buffer.replace_lines(2, 2, &bytes(&["d"])).unwrap();
+    tree.record(edit_at(3, &[], &bytes(&["e"])), 1710000003);
+    buffer.append_lines(2, &bytes(&["e"])).unwrap();
+
+    assert_eq!(buffer.to_bytes(), b"a\nd\ne\n");
+    let undo = UndoFile::from_tree(&buffer, &tree);
+    undo.verify_buffer(&buffer).unwrap();
+    let mut undo_bytes = Vec::new();
+    undo.write(&mut undo_bytes).unwrap();
+    assert_eq!(written_header_count(&undo_bytes), 3);
+
+    let dumps = forward_undo_dumps(&dir, b"a\nd\ne\n", &undo_bytes);
+    assert_eq!(fs::read_to_string(&dumps[0]).unwrap(), "a\nd\n");
+    assert_eq!(fs::read_to_string(&dumps[1]).unwrap(), "a\nc\n");
+    assert_eq!(fs::read_to_string(&dumps[2]).unwrap(), "a\nb\n");
+    // Already at oldest: content must not change.
+    assert_eq!(fs::read_to_string(&dumps[3]).unwrap(), "a\nb\n");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn ox_text_writes_branching_history_real_nvim_follows_active_branch() {
+    if !Path::new(nvim()).exists() {
+        return;
+    }
+    let dir = oracle_dir("fwd-branch");
+    let mut buffer = Buffer::from_bytes(b"a\nb\n").unwrap();
+    let mut tree = UndoTree::new();
+
+    // E1 b->c, E2 c->d, then abandon E2 (undo) and branch fresh edit E3.
+    tree.record(edit_at(2, &bytes(&["b"]), &bytes(&["c"])), 1710000001);
+    buffer.replace_lines(2, 2, &bytes(&["c"])).unwrap();
+    tree.record(edit_at(2, &bytes(&["c"]), &bytes(&["d"])), 1710000002);
+    buffer.replace_lines(2, 2, &bytes(&["d"])).unwrap();
+    buffer.replace_lines(2, 2, &bytes(&["c"])).unwrap(); // sync buffer to E1 state
+    tree.undo().unwrap();
+    tree.record(edit_at(2, &bytes(&["c"]), &bytes(&["e"])), 1710000003);
+    buffer.replace_lines(2, 2, &bytes(&["e"])).unwrap();
+
+    assert_eq!(buffer.to_bytes(), b"a\ne\n");
+    let undo = UndoFile::from_tree(&buffer, &tree);
+    undo.verify_buffer(&buffer).unwrap();
+    let mut undo_bytes = Vec::new();
+    undo.write(&mut undo_bytes).unwrap();
+    // All three headers (including the abandoned E2 sibling) are serialized.
+    assert_eq!(written_header_count(&undo_bytes), 3);
+
+    let dumps = forward_undo_dumps(&dir, b"a\ne\n", &undo_bytes);
+    // Active branch is E1 -> E3; undoing goes E3 then E1, never E2.
+    assert_eq!(fs::read_to_string(&dumps[0]).unwrap(), "a\nc\n");
+    assert_eq!(fs::read_to_string(&dumps[1]).unwrap(), "a\nb\n");
+    assert_eq!(fs::read_to_string(&dumps[2]).unwrap(), "a\nb\n");
+    assert_eq!(fs::read_to_string(&dumps[3]).unwrap(), "a\nb\n");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+fn edit_at(start: usize, before: &[Vec<u8>], after: &[Vec<u8>]) -> LineEdit {
+    LineEdit {
+        start,
+        before: before.to_vec(),
+        after: after.to_vec(),
+        cursor_before: Cursor { lnum: start, col: 0 },
+        cursor_after: Cursor { lnum: start, col: 0 },
+    }
+}
+
+/// Counts the leading header records (each begins with `0x5fd0`) in an
+/// emitted persistent-undo byte stream.
+fn written_header_count(undo_bytes: &[u8]) -> usize {
+    let magic = [0x5f, 0xd0];
+    undo_bytes
+        .windows(2)
+        .filter(|window| **window == magic)
+        .count()
+}
+
 #[test]
 fn real_nvim_undo_and_shada_interoperate_both_directions() {
     if !Path::new(nvim()).exists() {

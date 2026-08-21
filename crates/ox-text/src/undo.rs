@@ -76,6 +76,47 @@ struct Node {
     preferred_child: Option<usize>,
 }
 
+/// Upstream-compatible link coordinates for one undo header.
+///
+/// Mirrors the four `uh_*` sequence links plus the fields Neovim stores
+/// per header. `next` points to the older (parent) header, `prev` to the
+/// newer continuation along the active branch; `alt_next`/`alt_prev` chain
+/// the inactive sibling branches. Zero means "no link".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeaderRecord {
+    /// Header sequence number.
+    pub seq: u64,
+    /// Unix timestamp in seconds.
+    pub timestamp: i64,
+    /// The edit this header records.
+    pub edit: LineEdit,
+    /// Link to the older header.
+    pub next: u64,
+    /// Link to the newer active header.
+    pub prev: u64,
+    /// Link to the first inactive sibling header.
+    pub alt_next: u64,
+    /// Link to the previous inactive sibling header.
+    pub alt_prev: u64,
+}
+
+/// Tree-wide fields required by the persistent-undo top-level header.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UndoSummary {
+    /// Sequence of the oldest header on the active branch.
+    pub oldhead: u64,
+    /// Sequence of the newest header on the active branch.
+    pub newhead: u64,
+    /// Sequence of the current header, or zero when at the newest state.
+    pub curhead: u64,
+    /// Highest sequence number ever allocated.
+    pub seq_last: u64,
+    /// Current sequence number.
+    pub seq_cur: u64,
+    /// Timestamp of the current state.
+    pub time_cur: i64,
+}
+
 /// An explicit branch-preserving undo tree.
 #[derive(Clone, Debug)]
 pub struct UndoTree {
@@ -246,5 +287,109 @@ impl UndoTree {
             }
         }
         path
+    }
+
+    /// The child of `node` that continues the active branch.
+    ///
+    /// Prefers the recorded preferred child; when navigation left none set
+    /// (only possible for an untouched root), the most recently created
+    /// child is the active one, matching upstream's incremental builder.
+    fn active_child(&self, node: usize) -> Option<usize> {
+        match self.nodes[node].preferred_child {
+            Some(index) => self.nodes[node].children.get(index).copied(),
+            None => self.nodes[node].children.last().copied(),
+        }
+    }
+
+    fn seq_of(&self, node: usize) -> u64 {
+        self.nodes[node]
+            .entry
+            .as_ref()
+            .map_or(0, |entry| entry.seq)
+    }
+
+    /// Computes upstream-compatible header records for every node with an
+    /// entry. Link semantics follow Neovim's `u_addbranch`:
+    /// `next` is the parent (older) header, `prev` is the active child
+    /// (newer) header, and non-active siblings chain through
+    /// `alt_next`/`alt_prev` from the active child.
+    #[must_use]
+    pub fn header_records(&self) -> Vec<HeaderRecord> {
+        let mut records = Vec::with_capacity(self.nodes.len().saturating_sub(1));
+        let mut alt_next_of = vec![0_u64; self.nodes.len()];
+        let mut alt_prev_of = vec![0_u64; self.nodes.len()];
+
+        for parent in 0..self.nodes.len() {
+            let mut inactive: Vec<usize> = self.nodes[parent]
+                .children
+                .iter()
+                .copied()
+                .filter(|&child| Some(child) != self.active_child(parent))
+                .collect();
+            if inactive.is_empty() {
+                continue;
+            }
+            // Newest (highest index) inactive sibling first.
+            inactive.sort_unstable();
+            inactive.reverse();
+            if let Some(active) = self.active_child(parent) {
+                alt_next_of[active] = self.seq_of(inactive[0]);
+            }
+            for (slot, &sibling) in inactive.iter().enumerate() {
+                alt_next_of[sibling] = inactive
+                    .get(slot + 1)
+                    .map_or(0, |&next_sib| self.seq_of(next_sib));
+                alt_prev_of[sibling] = if slot == 0 {
+                    self.active_child(parent).map_or(0, |active| self.seq_of(active))
+                } else {
+                    self.seq_of(inactive[slot - 1])
+                };
+            }
+        }
+
+        for (index, node) in self.nodes.iter().enumerate() {
+            let Some(entry) = node.entry.as_ref() else {
+                continue;
+            };
+            let next = node.parent.map_or(0, |parent| self.seq_of(parent));
+            let prev = self
+                .active_child(index)
+                .map_or(0, |child| self.seq_of(child));
+            records.push(HeaderRecord {
+                seq: entry.seq,
+                timestamp: entry.timestamp,
+                edit: entry.edit.clone(),
+                next,
+                prev,
+                alt_next: alt_next_of[index],
+                alt_prev: alt_prev_of[index],
+            });
+        }
+        records
+    }
+
+    /// Computes the top-level header fields for serialization.
+    #[must_use]
+    pub fn summary(&self) -> UndoSummary {
+        let oldhead = self.active_child(0).map_or(0, |child| self.seq_of(child));
+        // Walk the active-child chain from the current node to its leaf.
+        let mut newhead = self.current;
+        while let Some(child) = self.active_child(newhead) {
+            newhead = child;
+        }
+        let curhead = self
+            .active_child(self.current)
+            .map_or(0, |child| self.seq_of(child));
+        UndoSummary {
+            oldhead,
+            newhead: self.seq_of(newhead),
+            curhead,
+            seq_last: self.next_seq.saturating_sub(1),
+            seq_cur: self.current_seq(),
+            time_cur: self.nodes[self.current]
+                .entry
+                .as_ref()
+                .map_or(0, |entry| entry.timestamp),
+        }
     }
 }

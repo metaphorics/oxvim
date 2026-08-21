@@ -9,11 +9,16 @@ use std::io::{Read, Write};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::Buffer;
+use crate::{Buffer, UndoTree};
 
 const MAGIC: &[u8; 9] = b"Vim\x9fUnDo\xe5";
 const VERSION: u16 = 3;
+const HEADER_MAGIC: u16 = 0x5fd0;
 const HEADER_END_MAGIC: u16 = 0xe7aa;
+const ENTRY_MAGIC: u16 = 0xf518;
+const ENTRY_END_MAGIC: u16 = 0x3581;
+const SAVE_NR: u8 = 1; // optional save-count field kind
+const NAMED_MARKS: usize = 26;
 const HASH_SIZE: usize = 32;
 const FIXED_PREFIX: usize = 9 + 2 + HASH_SIZE + 4;
 
@@ -96,6 +101,33 @@ impl UndoFile {
         put_u32(&mut bytes, 0);
         bytes.push(0); // optional-field terminator
         put_u16(&mut bytes, HEADER_END_MAGIC);
+        Self {
+            content_hash,
+            line_count,
+            bytes,
+        }
+    }
+
+    /// Serializes an undo tree in upstream persistent-undo format.
+    ///
+    /// Produces a valid file that Neovim can load with `:rundo`: the global
+    /// header, one header per tree node (with branch links, cursor and
+    /// timestamp), and the entry lines Neovim needs to undo each edit.
+    #[must_use]
+    pub fn from_tree(buffer: &Buffer, tree: &UndoTree) -> Self {
+        let content_hash = content_hash(buffer);
+        let line_count = u32::try_from(buffer.line_count()).unwrap_or(u32::MAX);
+        let records = tree.header_records();
+        let summary = tree.summary();
+        let num_head = u32::try_from(records.len()).unwrap_or(u32::MAX);
+
+        let mut bytes = Vec::with_capacity(FIXED_PREFIX + 4 * 8 + 8 + 12 + records.len() * 96);
+        put_global_header(&mut bytes, &content_hash, line_count, &summary, num_head);
+        for record in &records {
+            put_header(&mut bytes, record);
+        }
+        put_u16(&mut bytes, HEADER_END_MAGIC);
+
         Self {
             content_hash,
             line_count,
@@ -204,4 +236,89 @@ fn put_u16(bytes: &mut Vec<u8>, value: u16) {
 
 fn put_u32(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+fn put_u64(bytes: &mut Vec<u8>, value: i64) {
+    bytes.extend_from_slice(&value.to_be_bytes());
+}
+
+/// Writes the shared top-level header from `empty_for_buffer`/`from_tree`.
+fn put_global_header(
+    bytes: &mut Vec<u8>,
+    content_hash: &[u8; HASH_SIZE],
+    line_count: u32,
+    summary: &crate::UndoSummary,
+    num_head: u32,
+) {
+    bytes.extend_from_slice(MAGIC);
+    put_u16(bytes, VERSION);
+    bytes.extend_from_slice(content_hash);
+    put_u32(bytes, line_count);
+    // Saved line for the "U" command: none (zero length, so no bytes follow).
+    put_u32(bytes, 0); // saved line length
+    put_u32(bytes, 0); // saved line lnum
+    put_u32(bytes, 0); // saved line column
+    put_u32(bytes, u32::try_from(summary.oldhead).unwrap_or(u32::MAX)); // old head
+    put_u32(bytes, u32::try_from(summary.newhead).unwrap_or(u32::MAX)); // new head
+    put_u32(bytes, u32::try_from(summary.curhead).unwrap_or(u32::MAX)); // current head
+    put_u32(bytes, num_head); // number of headers
+    put_u32(bytes, u32::try_from(summary.seq_last).unwrap_or(u32::MAX)); // last sequence
+    put_u32(bytes, u32::try_from(summary.seq_cur).unwrap_or(u32::MAX)); // current sequence
+    put_u64(bytes, summary.time_cur); // current time
+    bytes.push(4); // optional payload size
+    bytes.push(SAVE_NR); // UF_LAST_SAVE_NR
+    put_u32(bytes, 0); // save count last
+    bytes.push(0); // optional-field terminator
+}
+
+/// Writes one undo header and its entry lines.
+fn put_header(bytes: &mut Vec<u8>, record: &crate::HeaderRecord) {
+    put_u16(bytes, HEADER_MAGIC);
+    for link in [record.next, record.prev, record.alt_next, record.alt_prev] {
+        put_u32(bytes, u32::try_from(link).unwrap_or(u32::MAX));
+    }
+    put_u32(bytes, u32::try_from(record.seq).unwrap_or(u32::MAX));
+    // Saved cursor (before the edit: the state undoing restores), then vcol.
+    put_pos(bytes, record.edit.cursor_before.lnum, record.edit.cursor_before.col);
+    put_u32(bytes, 0); // cursor vcol
+    put_u16(bytes, 0); // flags
+    for _ in 0..NAMED_MARKS {
+        put_pos(bytes, 0, 0);
+    }
+    // Visualinfo: two positions, mode, curswant — all zero.
+    put_pos(bytes, 0, 0);
+    put_pos(bytes, 0, 0);
+    put_u32(bytes, 0);
+    put_u32(bytes, 0);
+    put_u64(bytes, record.timestamp);
+    bytes.push(4); // optional payload size
+    bytes.push(SAVE_NR); // UHP_SAVE_NR
+    put_u32(bytes, 0); // save count
+    bytes.push(0); // optional-field terminator
+
+    // One entry undoing the "after" range back to the "before" lines.
+    // `u_undoredo` deletes lines (top+1 .. bot-1) and inserts `ue_size`
+    // lines after `top`; anchoring at `start-1` with `bot = start+after.len`
+    // therefore deletes the `after` block and reinserts `before` at `start`.
+    put_u16(bytes, ENTRY_MAGIC);
+    let start = u32::try_from(record.edit.start).unwrap_or(u32::MAX);
+    let after = u32::try_from(record.edit.after.len()).unwrap_or(u32::MAX);
+    let before = u32::try_from(record.edit.before.len()).unwrap_or(u32::MAX);
+    put_u32(bytes, start.saturating_sub(1)); // ue_top
+    put_u32(bytes, start.saturating_add(after)); // ue_bot
+    put_u32(bytes, 0); // ue_lcount
+    put_u32(bytes, before); // ue_size
+    for line in &record.edit.before {
+        let len = u32::try_from(line.len()).unwrap_or(u32::MAX);
+        put_u32(bytes, len);
+        bytes.extend_from_slice(line);
+    }
+    put_u16(bytes, ENTRY_END_MAGIC);
+    put_u16(bytes, ENTRY_END_MAGIC); // extmark section is empty
+}
+
+fn put_pos(bytes: &mut Vec<u8>, lnum: usize, col: usize) {
+    put_u32(bytes, u32::try_from(lnum).unwrap_or(u32::MAX));
+    put_u32(bytes, u32::try_from(col).unwrap_or(u32::MAX));
+    put_u32(bytes, 0); // coladd
 }

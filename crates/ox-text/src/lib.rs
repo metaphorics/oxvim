@@ -12,7 +12,7 @@ pub use buffer::{Buffer, BufferError};
 pub use marks::{MarkId, Marks, Position};
 pub use shada::{Entry as ShaDaEntry, EntryType as ShaDaEntryType, ShaDa, ShaDaError};
 pub use swapfile::{SwapError, SwapFile};
-pub use undo::{Cursor, LineEdit, UndoEntry, UndoError, UndoStep, UndoTree};
+pub use undo::{Cursor, HeaderRecord, LineEdit, UndoEntry, UndoError, UndoStep, UndoSummary, UndoTree};
 pub use undo_file::{UndoFile, UndoFileError};
 
 #[cfg(test)]
