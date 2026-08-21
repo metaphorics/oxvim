@@ -269,6 +269,74 @@ fn pending_queue_is_fifo() {
     assert_eq!(probe(&read_2), None, "second pipe must remain untouched by the front take");
 }
 
+/// `write2` derives the received handle kind from the fd: a TCP stream is
+/// reported as `"tcp"` and the passed descriptor remains a working duplicate
+/// of the original stream (Task 7c final fix).
+#[test]
+fn ipc_write2_tcp_roundtrip_reports_tcp_kind() {
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    let (pair_a, pair_b) = mio::net::UnixStream::pair().expect("socketpair");
+
+    let mut uv_loop = UvLoop::new().expect("create loop");
+    let receiver = {
+        let mut child = Pipe::from_stream(&mut uv_loop, pair_b, true, |_, _, event| match event {
+            NetEvent::Error(error) => panic!("tcp receiver error: {error}"),
+            _ => {}
+        })
+        .expect("wrap receiver pipe");
+        child.read_start(&mut uv_loop).expect("read_start receiver pipe");
+        std::cell::RefCell::new(Some(child))
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp listener");
+    let addr = listener.local_addr().expect("listener local addr");
+    let client = TcpStream::connect(addr).expect("connect tcp client");
+    let (mut server, _) = listener.accept().expect("accept tcp server");
+
+    let sender = Pipe::from_stream(&mut uv_loop, pair_a, true, |_, _, event| match event {
+        NetEvent::Error(error) => panic!("tcp sender error: {error}"),
+        _ => {}
+    })
+    .expect("wrap sender pipe");
+    sender
+        .write2(&mut uv_loop, b"tcp-handshake".to_vec(), &client, PipeHandleKind::Tcp)
+        .expect("write2 sends tcp handle");
+
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline {
+        let ready = receiver
+            .borrow()
+            .as_ref()
+            .is_some_and(|pipe| pipe.pending_count() > 0);
+        if ready {
+            break;
+        }
+        uv_loop.run_nowait().expect("pump ipc loop");
+    }
+
+    let receiver = receiver.borrow();
+    let child = receiver.as_ref().expect("receiver pipe");
+    assert_eq!(child.pending_count(), 1, "uv.pipe_pending_count()");
+    assert_eq!(child.pending_type(), Some("tcp"), "uv.pipe_pending_type() for tcp");
+
+    let received_fd = child.pending_take_fd().expect("take pending tcp descriptor");
+    rustix::io::write(&received_fd, b"through-tcp-fd").expect("write through received tcp fd");
+
+    server
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    let mut buf = [0u8; 64];
+    let n = server.read(&mut buf).expect("read server side");
+    assert_eq!(
+        &buf[..n],
+        b"through-tcp-fd",
+        "received fd is a working dup of the tcp stream"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Extra stdio (fd >= 3) (luvref 1434-1447).
 // ---------------------------------------------------------------------------

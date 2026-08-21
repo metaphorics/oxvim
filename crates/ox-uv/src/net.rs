@@ -18,7 +18,7 @@ use crate::{CallbackError, HandleId, UvLoop};
 #[cfg(unix)]
 use std::fs::File;
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -29,6 +29,8 @@ use mio::net::{UnixListener, UnixStream};
 use mio::unix::SourceFd;
 #[cfg(unix)]
 use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+#[cfg(unix)]
+use rustix::net::{AddressFamily, SocketType};
 #[cfg(unix)]
 use rustix::termios::{
     LocalModes, OptionalActions, SpecialCodeIndex, Termios, tcgetattr, tcgetwinsize, tcsetattr,
@@ -561,6 +563,53 @@ pub enum PipeHandleKind {
     Pipe,
 }
 
+impl PipeHandleKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Pipe => "pipe",
+        }
+    }
+}
+
+/// Derives the luv-style handle type ("pipe" or "tcp") from an open file
+/// descriptor by inspecting its `stat` mode, socket type, and address family.
+///
+/// FIFOs and Unix domain sockets (`AF_UNIX` + `SOCK_STREAM`) resolve to
+/// `"pipe"`; TCP sockets (`AF_INET`/`AF_INET6` + `SOCK_STREAM`) resolve to
+/// `"tcp"`. Any other file type is rejected.
+#[cfg(unix)]
+fn inspect_fd_kind<Fd: AsFd>(fd: &Fd) -> NetResult<&'static str> {
+    let stat = rustix::fs::fstat(fd).map_err(errno_error)?;
+    let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+    if file_type.is_fifo() {
+        return Ok("pipe");
+    }
+    if !file_type.is_socket() {
+        return Err(NetError::Unsupported(
+            "write2 send_handle must be a TCP socket or pipe",
+        ));
+    }
+    let sock_type = rustix::net::sockopt::socket_type(fd).map_err(errno_error)?;
+    if sock_type != SocketType::STREAM {
+        return Err(NetError::Unsupported(
+            "write2 send_handle must be a TCP socket or pipe",
+        ));
+    }
+    let domain = rustix::net::getsockname(fd)
+        .map_err(errno_error)?
+        .address_family();
+    if domain == AddressFamily::UNIX {
+        return Ok("pipe");
+    }
+    if domain == AddressFamily::INET || domain == AddressFamily::INET6 {
+        return Ok("tcp");
+    }
+    Err(NetError::Unsupported(
+        "write2 send_handle must be a TCP socket or pipe",
+    ))
+}
+
 #[cfg(unix)]
 struct PipePending {
     fd: std::os::fd::OwnedFd,
@@ -693,10 +742,13 @@ impl Pipe {
     /// the payload via a single `sendmsg`. The pipe must have been created
     /// with the `ipc` option (`new_pipe(true)`), be a connected stream, and
     /// `kind` must name what `send_handle` actually is (`tcp` or `pipe` per
-    /// luvref). Requiring an explicit kind keeps the sender from silently
-    /// passing a bare `AsFd` and letting the whole path assume "pipe".
-    /// A Unix `SCM_RIGHTS` transfer carries no type tag on the wire, so the
-    /// receiving side reports only the generic stream present.
+    /// luvref). The actual file descriptor is inspected before sending; a kind
+    /// that does not match the fd's derived type is rejected with a typed
+    /// error.
+    ///
+    /// Because a Unix `SCM_RIGHTS` transfer carries no type tag on the wire,
+    /// the receiving side derives the pending handle type from the received fd
+    /// itself (`fstat` + `getsockopt` `SO_TYPE` + `getsockname`).
     ///
     /// ox-uv performs the fd-passing synchronously rather than queueing a
     /// deferred `uv_write_t` request; the return value is the number of bytes
@@ -709,7 +761,6 @@ impl Pipe {
         kind: PipeHandleKind,
     ) -> NetResult<usize> {
         let _ = uv_loop;
-        let _kind = kind;
         let state = self.state.borrow();
         if !state.ipc {
             return Err(NetError::InvalidState(
@@ -723,6 +774,12 @@ impl Pipe {
                 Err(NetError::InvalidState("pipe listener cannot send handles"))
             };
         };
+        let derived = inspect_fd_kind(send_handle)?;
+        if derived != kind.as_str() {
+            return Err(NetError::InvalidState(
+                "send_handle kind does not match the actual file descriptor",
+            ));
+        }
         crate::ipc::send_handle(stream, &data, send_handle).map_err(NetError::Io)
     }
 
@@ -736,8 +793,9 @@ impl Pipe {
     /// Returns the type of the next pending IPC handle.
     ///
     /// See `uv.pipe_pending_type()` in `runtime/doc/luvref.txt`
-    /// (lines 2117-2130). Descriptors received over a Unix socket carry no
-    /// type tag, so ox-uv reports `"pipe"` for the generic stream case.
+    /// (lines 2117-2130). The type is derived by inspecting the received file
+    /// descriptor (`fstat` + `getsockopt` `SO_TYPE` + `getsockname`): FIFOs and
+    /// Unix domain sockets report `"pipe"`; TCP sockets report `"tcp"`.
     pub fn pending_type(&self) -> Option<&'static str> {
         self.state.borrow().pending.front().map(|pending| pending.kind)
     }
@@ -826,7 +884,12 @@ fn pipe_ready(state: &mut PipeState, ready: Readiness) -> Vec<PipeReadyEvent> {
                 if state.ipc {
                     let (ipc_events, fds) = drain_ipc_reads(stream);
                     public.extend(ipc_events);
-                    received = fds.into_iter().map(|fd| PipePending { fd, kind: "pipe" }).collect();
+                    for fd in fds {
+                        match inspect_fd_kind(&fd) {
+                            Ok(kind) => received.push(PipePending { fd, kind }),
+                            Err(error) => public.push(NetEvent::Error(error)),
+                        }
+                    }
                 } else {
                     drain_reads(stream, &mut public);
                 }
