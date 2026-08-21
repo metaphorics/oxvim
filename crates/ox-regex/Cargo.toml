@@ -5,5 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Vim regex engines (backtracking + NFA)."
 
+[dependencies]
+thiserror.workspace = true
+
 [lints]
 workspace = true

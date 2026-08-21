@@ -99,6 +99,9 @@ version = "0.1.0"
 [[package]]
 name = "ox-regex"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "ox-rpc"
