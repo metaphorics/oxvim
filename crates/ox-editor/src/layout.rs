@@ -340,6 +340,26 @@ impl Layout {
         self.split(target, window, state, SplitAxis::Horizontal)
     }
 
+    /// Splits `target` vertically, placing `window` to its left.
+    pub fn split_left(
+        &mut self,
+        target: WinHandle,
+        window: WinHandle,
+        state: WindowState,
+    ) -> Result<(), LayoutError> {
+        self.split_placed(target, window, state, SplitAxis::Vertical, SplitPlacement::Before)
+    }
+
+    /// Splits `target` horizontally, placing `window` above it.
+    pub fn split_above(
+        &mut self,
+        target: WinHandle,
+        window: WinHandle,
+        state: WindowState,
+    ) -> Result<(), LayoutError> {
+        self.split_placed(target, window, state, SplitAxis::Horizontal, SplitPlacement::Before)
+    }
+
     /// Closes a tiled window and collapses redundant containers.
     ///
     /// When the current window closes, the window that takes its old preorder
@@ -449,6 +469,17 @@ impl Layout {
         state: WindowState,
         axis: SplitAxis,
     ) -> Result<(), LayoutError> {
+        self.split_placed(target, window, state, axis, SplitPlacement::After)
+    }
+
+    fn split_placed(
+        &mut self,
+        target: WinHandle,
+        window: WinHandle,
+        state: WindowState,
+        axis: SplitAxis,
+        placement: SplitPlacement,
+    ) -> Result<(), LayoutError> {
         validate_identity(window)?;
         if find_leaf(&self.root, window).is_some() {
             return Err(LayoutError::DuplicateWindow(window));
@@ -478,18 +509,26 @@ impl Layout {
         // already inside a row of columns is inserted into that row, so
         // equalization divides every sibling on the same axis. When no
         // same-axis container exists, wrap the leaf in a fresh one.
-        if let Err(new_leaf) = insert_into_matching_container(&mut self.root, target, new_leaf, axis) {
+        if let Err(new_leaf) = insert_into_matching_container(&mut self.root, target, new_leaf, axis, placement) {
             let old_leaf = find_leaf_mut(&mut self.root, target)
                 .ok_or(LayoutError::UnknownWindow(target))?
                 .clone();
-            let replacement = match axis {
-                SplitAxis::Vertical => Frame::Row {
+            let replacement = match (axis, placement) {
+                (SplitAxis::Vertical, SplitPlacement::After) => Frame::Row {
                     geometry: target_geometry,
                     children: vec![Frame::Leaf(old_leaf), new_leaf],
                 },
-                SplitAxis::Horizontal => Frame::Column {
+                (SplitAxis::Vertical, SplitPlacement::Before) => Frame::Row {
+                    geometry: target_geometry,
+                    children: vec![new_leaf, Frame::Leaf(old_leaf)],
+                },
+                (SplitAxis::Horizontal, SplitPlacement::After) => Frame::Column {
                     geometry: target_geometry,
                     children: vec![Frame::Leaf(old_leaf), new_leaf],
+                },
+                (SplitAxis::Horizontal, SplitPlacement::Before) => Frame::Column {
+                    geometry: target_geometry,
+                    children: vec![new_leaf, Frame::Leaf(old_leaf)],
                 },
             };
             replace_leaf(&mut self.root, target, replacement);
@@ -505,6 +544,15 @@ impl Layout {
 enum SplitAxis {
     Vertical,
     Horizontal,
+}
+
+/// Which side of `target` a new tiled window lands on within its container.
+#[derive(Clone, Copy)]
+enum SplitPlacement {
+    /// Insert the new window before `target` (left / above).
+    Before,
+    /// Insert the new window after `target` (right / below).
+    After,
 }
 
 /// Reference coordinate space for a floating window.
@@ -973,6 +1021,42 @@ impl TabpageState {
         Ok(())
     }
 
+    /// Splits a tiled window, placing the new window to the left of `target`.
+    pub fn split_left(
+        &mut self,
+        target: WinHandle,
+        window: WinHandle,
+        state: WindowState,
+    ) -> Result<(), LayoutError> {
+        validate_identity(window)?;
+        if self.contains(window) {
+            return Err(LayoutError::DuplicateWindow(window));
+        }
+        let target = self.resolve(target);
+        self.layout.split_left(target, window, state)?;
+        self.window_api.insert(window, WindowApiState::new());
+        self.current = window;
+        Ok(())
+    }
+
+    /// Splits a tiled window, placing the new window above `target`.
+    pub fn split_above(
+        &mut self,
+        target: WinHandle,
+        window: WinHandle,
+        state: WindowState,
+    ) -> Result<(), LayoutError> {
+        validate_identity(window)?;
+        if self.contains(window) {
+            return Err(LayoutError::DuplicateWindow(window));
+        }
+        let target = self.resolve(target);
+        self.layout.split_above(target, window, state)?;
+        self.window_api.insert(window, WindowApiState::new());
+        self.current = window;
+        Ok(())
+    }
+
     /// Resizes and equalizes the tiled layout.
     pub fn resize(&mut self, geometry: Geometry) -> Result<(), LayoutError> {
         self.layout.resize(geometry)
@@ -1314,6 +1398,7 @@ fn insert_into_matching_container(
     window: WinHandle,
     new_leaf: Frame,
     axis: SplitAxis,
+    placement: SplitPlacement,
 ) -> Result<(), Frame> {
     let mut path = Vec::new();
     if !collect_container_path(root, window, &mut path) {
@@ -1327,7 +1412,10 @@ fn insert_into_matching_container(
         return Err(new_leaf);
     }
     let target_index = path[path.len() - 1];
-    let insert_at = target_index.saturating_add(1);
+    let insert_at = match placement {
+        SplitPlacement::After => target_index.saturating_add(1),
+        SplitPlacement::Before => target_index,
+    };
     match container_at_mut(root, parent_path) {
         Frame::Leaf(_) => unreachable!("split path ends in a container"),
         Frame::Row { children, .. } | Frame::Column { children, .. } => {

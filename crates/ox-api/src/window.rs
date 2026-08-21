@@ -386,16 +386,26 @@ fn parse_bufpos(dict: &Dict) -> Result<Option<(i64, i64)>, ApiError> {
     let Object::Array(items) = value else {
         return Err(invalid("bufpos", "expected [line, column] array"));
     };
+    // `bufpos` is a two-element [line, column] array (upstream
+    // `parse_float_bufpos`); index only after bounding the length so a
+    // one-element array yields a typed Validation error, never a panic.
+    if items.len() != 2 {
+        return Err(invalid("bufpos", "expected [line, column] array of length 2"));
+    }
     let (Object::Integer(line), Object::Integer(col)) = (&items[0], &items[1]) else {
         return Err(invalid("bufpos", "expected [line, column] integers"));
     };
     Ok(Some((*line, *col)))
 }
 
+/// Four-way tiled split direction: `left`/`right` are vertical splits and
+/// `above`/`below` are horizontal splits (upstream `kWinSplitLeft` etc.).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SplitDirection {
-    Vertical,
-    Horizontal,
+    Left,
+    Right,
+    Above,
+    Below,
 }
 
 fn parse_config_split(dict: &Dict) -> Result<SplitDirection, ApiError> {
@@ -403,8 +413,10 @@ fn parse_config_split(dict: &Dict) -> Result<SplitDirection, ApiError> {
         return Err(invalid("split", "field is required"));
     };
     match direction.as_str() {
-        "left" | "right" => Ok(SplitDirection::Vertical),
-        "above" | "below" => Ok(SplitDirection::Horizontal),
+        "left" => Ok(SplitDirection::Left),
+        "right" => Ok(SplitDirection::Right),
+        "above" => Ok(SplitDirection::Above),
+        "below" => Ok(SplitDirection::Below),
         value => Err(invalid("split", format!("invalid value: {value}"))),
     }
 }
@@ -422,14 +434,16 @@ fn parse_config(
         string(dict, "anchor")?,
         current.map_or(Anchor::NorthWest, |config| config.anchor),
     )?;
-    // `bufpos` ({line, column}) anchors the float to buffer text of a
+    // `bufpos` ([line, column]) anchors the float to buffer text of a
     // `relative="win"` window and supplies row/col defaults when those are
     // absent (api.txt: "- bufpos:"). Source: nvim/api/win_config.c:1307-1320.
     let bufpos = parse_bufpos(dict)?;
+    if bufpos.is_some() && !matches!(relative, RelativeTo::Window(_)) {
+        return Err(invalid("bufpos", "only valid when relative is 'win'"));
+    }
     let mut row = coordinate(dict, "row", false)?;
     let mut col = coordinate(dict, "col", false)?;
-    if let Some((line, column)) = bufpos {
-        let _ = (line, column);
+    if bufpos.is_some() {
         if row.is_none() {
             row = Some(if matches!(anchor, Anchor::SouthWest | Anchor::SouthEast) {
                 0.0
@@ -897,8 +911,29 @@ pub fn nvim_open_win(
     Ok(window)
 }
 
-/// Opens a tiled split for a `config.split` request, sizing the new window by
-/// the requested width (vertical split) or height (horizontal split).
+/// Resolves the window `config.win` selects as the split target, defaulting to
+/// the current window. The target may live on any tabpage (upstream: "Can be
+/// in a different tab page"). Splitting a floating window is rejected
+/// (nvim/api/win_config.c: "Cannot split a floating window").
+fn parse_split_target(editor: &Editor, config: &Dict) -> Result<WinHandle, ApiError> {
+    let target = match key(config, "win") {
+        None | Some(Object::Nil) => resolve_window(editor, WinHandle::CURRENT)?,
+        Some(Object::Window(window)) => resolve_window(editor, *window)?,
+        Some(Object::Integer(window)) => WinHandle::try_from(*window)
+            .map_err(|error| invalid("win", error))
+            .and_then(|window| resolve_window(editor, window))?,
+        Some(_) => return Err(invalid("win", "expected Window")),
+    };
+    if editor.window_config(target).map_err(exception)?.is_some() {
+        return Err(ApiError::exception("Cannot split a floating window"));
+    }
+    Ok(target)
+}
+
+/// Opens a tiled split for a `config.split` request. The target window honors
+/// `config.win` (any tabpage) and the four-way direction follows upstream:
+/// `left`/`right` split vertically with the new window before/after, and
+/// `above`/`below` split horizontally with the new window before/after.
 fn open_split_window(
     editor: &mut Editor,
     buffer: BufHandle,
@@ -906,15 +941,14 @@ fn open_split_window(
     config: &Dict,
 ) -> Result<WinHandle, ApiError> {
     let direction = parse_config_split(config)?;
-    let tab = editor
-        .current_tabpage()
-        .ok_or_else(|| ApiError::exception("no current tabpage"))?;
-    let target = editor
-        .current_window()
-        .ok_or_else(|| ApiError::exception("no current window"))?;
+    let target = parse_split_target(editor, config)?;
+    // `target` may belong to a non-current tabpage; split it there.
+    let tab = window_tabpage(editor, target)?;
     let window = match direction {
-        SplitDirection::Vertical => editor.split_vertical(tab, target, buffer),
-        SplitDirection::Horizontal => editor.split_horizontal(tab, target, buffer),
+        SplitDirection::Left => editor.split_left(tab, target, buffer),
+        SplitDirection::Right => editor.split_vertical(tab, target, buffer),
+        SplitDirection::Above => editor.split_above(tab, target, buffer),
+        SplitDirection::Below => editor.split_horizontal(tab, target, buffer),
     }
     .map_err(exception)?;
     let width = positive_size(config, "width", false)?;

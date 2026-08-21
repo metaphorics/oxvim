@@ -732,7 +732,7 @@ impl Editor {
         target: WinHandle,
         buffer: BufHandle,
     ) -> Result<WinHandle, EditorError> {
-        self.split_window(tab, target, buffer, SplitDirection::Vertical)
+        self.split_window(tab, target, buffer, SplitDirection::Right)
     }
 
     /// Splits a tiled window horizontally and displays `buffer` below.
@@ -742,7 +742,27 @@ impl Editor {
         target: WinHandle,
         buffer: BufHandle,
     ) -> Result<WinHandle, EditorError> {
-        self.split_window(tab, target, buffer, SplitDirection::Horizontal)
+        self.split_window(tab, target, buffer, SplitDirection::Below)
+    }
+
+    /// Splits a tiled window vertically and displays `buffer` to the left.
+    pub fn split_left(
+        &mut self,
+        tab: TabHandle,
+        target: WinHandle,
+        buffer: BufHandle,
+    ) -> Result<WinHandle, EditorError> {
+        self.split_window(tab, target, buffer, SplitDirection::Left)
+    }
+
+    /// Splits a tiled window horizontally and displays `buffer` above.
+    pub fn split_above(
+        &mut self,
+        tab: TabHandle,
+        target: WinHandle,
+        buffer: BufHandle,
+    ) -> Result<WinHandle, EditorError> {
+        self.split_window(tab, target, buffer, SplitDirection::Above)
     }
 
     /// Opens a floating window in `tab`.
@@ -979,8 +999,10 @@ impl Editor {
             .get_mut(&tab)
             .ok_or(EditorError::UnknownTabpage(tab))?;
         let inserted = match direction {
-            SplitDirection::Vertical => tabpage.split_vertical(target, window, state),
-            SplitDirection::Horizontal => tabpage.split_horizontal(target, window, state),
+            SplitDirection::Right => tabpage.split_vertical(target, window, state),
+            SplitDirection::Below => tabpage.split_horizontal(target, window, state),
+            SplitDirection::Left => tabpage.split_left(target, window, state),
+            SplitDirection::Above => tabpage.split_above(target, window, state),
         };
         if let Err(error) = inserted {
             if let Some(buffer_state) = self.buffers.get_mut(&buffer) {
@@ -1099,8 +1121,10 @@ fn buffer_lines(buffer: &Buffer) -> Result<Vec<Vec<u8>>, BufferStateError> {
 
 #[derive(Clone, Copy)]
 enum SplitDirection {
-    Vertical,
-    Horizontal,
+    Left,
+    Right,
+    Above,
+    Below,
 }
 
 fn allocate_buffer_handle(next: &mut i64) -> Result<BufHandle, EditorError> {

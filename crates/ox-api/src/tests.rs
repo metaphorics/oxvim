@@ -275,6 +275,102 @@ fn open_win_split_creates_tiled_window() {
 }
 
 #[test]
+fn open_win_split_honors_four_way_direction() {
+    // "left"/"above" place the new window before the target; "right"/"below"
+    // place it after, matching upstream split directions. Preorder order shows
+    // the side each direction lands on.
+    let (mut editor, buffer, tab, window) = editor_with_lines(&["one"]);
+    let left = crate::window::nvim_open_win(
+        &mut editor,
+        buffer,
+        false,
+        dict(&[("split", Object::String(OxStr::from("left")))]),
+    )
+    .unwrap();
+    assert_eq!(editor.tabpage(tab).unwrap().windows(), vec![left, window]);
+
+    let (mut editor, buffer, tab, window) = editor_with_lines(&["one"]);
+    let right = crate::window::nvim_open_win(
+        &mut editor,
+        buffer,
+        false,
+        dict(&[("split", Object::String(OxStr::from("right")))]),
+    )
+    .unwrap();
+    assert_eq!(editor.tabpage(tab).unwrap().windows(), vec![window, right]);
+
+    let (mut editor, buffer, tab, window) = editor_with_lines(&["one"]);
+    let above = crate::window::nvim_open_win(
+        &mut editor,
+        buffer,
+        false,
+        dict(&[("split", Object::String(OxStr::from("above")))]),
+    )
+    .unwrap();
+    assert_eq!(editor.tabpage(tab).unwrap().windows(), vec![above, window]);
+
+    let (mut editor, buffer, tab, window) = editor_with_lines(&["one"]);
+    let below = crate::window::nvim_open_win(
+        &mut editor,
+        buffer,
+        false,
+        dict(&[("split", Object::String(OxStr::from("below")))]),
+    )
+    .unwrap();
+    assert_eq!(editor.tabpage(tab).unwrap().windows(), vec![window, below]);
+}
+
+#[test]
+fn open_win_split_honors_config_win_target_on_any_tabpage() {
+    let (mut editor, buffer, tab, _) = editor_with_lines(&["one"]);
+    let other_tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let far = editor.tabpage(other_tab).unwrap().current_window();
+    // The `win` config selects the split target even though it lives on a
+    // different (non-current) tabpage.
+    let split = crate::window::nvim_open_win(
+        &mut editor,
+        buffer,
+        false,
+        dict(&[
+            ("split", Object::String(OxStr::from("right"))),
+            ("win", Object::Window(far)),
+        ]),
+    )
+    .unwrap();
+    // The new window joins its target on `other_tab`, not the current tab.
+    assert_eq!(editor.tabpage(other_tab).unwrap().windows(), vec![far, split]);
+    assert!(!editor.tabpage(tab).unwrap().windows().contains(&split));
+    // Passing a floating window as the split target is rejected.
+    let float = crate::window::nvim_open_win(
+        &mut editor,
+        buffer,
+        false,
+        dict(&[
+            ("relative", Object::String(OxStr::from("editor"))),
+            ("row", Object::Float(0.0)),
+            ("col", Object::Float(0.0)),
+            ("width", Object::Integer(10)),
+            ("height", Object::Integer(2)),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::window::nvim_open_win(
+            &mut editor,
+            buffer,
+            false,
+            dict(&[
+                ("split", Object::String(OxStr::from("right"))),
+                ("win", Object::Window(float)),
+            ]),
+        ),
+        Err(ApiError::exception("Cannot split a floating window"))
+    );
+}
+
+#[test]
 fn open_win_external_reports_typed_not_implemented() {
     let (mut editor, buffer, _, _) = editor_with_lines(&["one"]);
     assert_eq!(
@@ -330,15 +426,16 @@ fn open_win_accepts_style_focusable_hide_noautocmd() {
 
 #[test]
 fn open_win_bufpos_supplies_default_row_and_col() {
-    // bufpos ([line, column]) supplies row/col defaults: row=1 (NW anchor),
-    // col=0 when neither is given (api/window.c:1307-1320).
+    // bufpos ([line, column]) is valid only with relative="win" and supplies
+    // row/col defaults: row=1 (NW anchor), col=0 when neither is given
+    // (api/window.c:1307-1320).
     let (mut editor, buffer, _, _) = editor_with_lines(&["one"]);
     let float = crate::window::nvim_open_win(
         &mut editor,
         buffer,
         false,
         dict(&[
-            ("relative", Object::String(OxStr::from("editor"))),
+            ("relative", Object::String(OxStr::from("win"))),
             ("bufpos", Object::Array(vec![Object::Integer(2), Object::Integer(3)])),
             ("width", Object::Integer(10)),
             ("height", Object::Integer(2)),
@@ -346,6 +443,42 @@ fn open_win_bufpos_supplies_default_row_and_col() {
     )
     .unwrap();
     assert_eq!(crate::window::nvim_win_get_position(&mut editor, float), Ok(vec![1, 0]));
+}
+
+#[test]
+fn open_win_rejects_invalid_bufpos_combinations() {
+    let (mut editor, buffer, _, _) = editor_with_lines(&["one"]);
+    // A one-element "array" is rejected with a typed Validation error (no panic).
+    assert_eq!(
+        crate::window::nvim_open_win(
+            &mut editor,
+            buffer,
+            false,
+            dict(&[
+                ("relative", Object::String(OxStr::from("win"))),
+                ("bufpos", Object::Array(vec![Object::Integer(2)])),
+                ("width", Object::Integer(10)),
+                ("height", Object::Integer(2)),
+            ]),
+        ),
+        Err(ApiError::validation("Invalid 'config.bufpos': expected [line, column] array of length 2"))
+    );
+    // bufpos anchors float geometry to a window's text, so it is only valid
+    // together with relative="win".
+    assert_eq!(
+        crate::window::nvim_open_win(
+            &mut editor,
+            buffer,
+            false,
+            dict(&[
+                ("relative", Object::String(OxStr::from("editor"))),
+                ("bufpos", Object::Array(vec![Object::Integer(2), Object::Integer(3)])),
+                ("width", Object::Integer(10)),
+                ("height", Object::Integer(2)),
+            ]),
+        ),
+        Err(ApiError::validation("Invalid 'config.bufpos': only valid when relative is 'win'"))
+    );
 }
 
 #[test]
@@ -404,6 +537,39 @@ fn replace_termcodes_translates_named_special_keys() {
     // <BS> and <Tab> are special keys (K_BS, K_TAB), not literal control bytes.
     assert_eq!(termcodes("<BS>", true, true).as_bytes(), &[K_SPECIAL, b'k', b'b']);
     assert_eq!(termcodes("<Tab>", true, true).as_bytes(), &[K_SPECIAL, KS_EXTRA, 54]);
+    // Editing/document keys (K_INS, K_HELP, K_UNDO).
+    assert_eq!(termcodes("<Insert>", true, true).as_bytes(), &[K_SPECIAL, b'k', b'I']);
+    assert_eq!(termcodes("<Ins>", true, true).as_bytes(), &[K_SPECIAL, b'k', b'I']);
+    assert_eq!(termcodes("<Help>", true, true).as_bytes(), &[K_SPECIAL, b'%', b'1']);
+    assert_eq!(termcodes("<Undo>", true, true).as_bytes(), &[K_SPECIAL, b'&', b'8']);
+    // Shifted Tab (K_S_TAB).
+    assert_eq!(termcodes("<S-Tab>", true, true).as_bytes(), &[K_SPECIAL, b'k', b'B']);
+    // Keypad keys (k0-k9 and k-prefixed navigation/arithmetic).
+    assert_eq!(termcodes("<k0>", true, true).as_bytes(), &[K_SPECIAL, b'K', b'C']);
+    assert_eq!(termcodes("<kUp>", true, true).as_bytes(), &[K_SPECIAL, b'K', b'u']);
+    assert_eq!(termcodes("<kEnd>", true, true).as_bytes(), &[K_SPECIAL, b'K', b'4']);
+    assert_eq!(termcodes("<kPlus>", true, true).as_bytes(), &[K_SPECIAL, b'K', b'6']);
+    // Shifted and control cursor keys.
+    assert_eq!(termcodes("<S-Up>", true, true).as_bytes(), &[K_SPECIAL, KS_EXTRA, 4]);
+    assert_eq!(termcodes("<S-Down>", true, true).as_bytes(), &[K_SPECIAL, KS_EXTRA, 5]);
+    assert_eq!(termcodes("<S-Left>", true, true).as_bytes(), &[K_SPECIAL, b'#', b'4']);
+    assert_eq!(termcodes("<S-Right>", true, true).as_bytes(), &[K_SPECIAL, b'%', b'i']);
+    assert_eq!(termcodes("<S-Home>", true, true).as_bytes(), &[K_SPECIAL, b'#', b'2']);
+    assert_eq!(termcodes("<C-Left>", true, true).as_bytes(), &[K_SPECIAL, KS_EXTRA, 85]);
+    assert_eq!(termcodes("<C-Right>", true, true).as_bytes(), &[K_SPECIAL, KS_EXTRA, 86]);
+    assert_eq!(termcodes("<C-Home>", true, true).as_bytes(), &[K_SPECIAL, KS_EXTRA, 87]);
+    assert_eq!(termcodes("<C-End>", true, true).as_bytes(), &[K_SPECIAL, KS_EXTRA, 88]);
+    // Function keys beyond F12 (computed K_F13..K_F63 bytes).
+    assert_eq!(termcodes("<F13>", true, true).as_bytes(), &[K_SPECIAL, b'F', b'3']);
+    assert_eq!(termcodes("<F20>", true, true).as_bytes(), &[K_SPECIAL, b'F', b'A']);
+    assert_eq!(termcodes("<F40>", true, true).as_bytes(), &[K_SPECIAL, b'F', b'U']);
+    assert_eq!(termcodes("<F41>", true, true).as_bytes(), &[K_SPECIAL, b'F', b'V']);
+    assert_eq!(termcodes("<F46>", true, true).as_bytes(), &[K_SPECIAL, b'F', b'a']);
+    assert_eq!(termcodes("<F63>", true, true).as_bytes(), &[K_SPECIAL, b'F', b'r']);
+    // Shifted function keys and extra xterm keys.
+    assert_eq!(termcodes("<S-F1>", true, true).as_bytes(), &[K_SPECIAL, KS_EXTRA, 6]);
+    assert_eq!(termcodes("<S-F12>", true, true).as_bytes(), &[K_SPECIAL, KS_EXTRA, 17]);
+    assert_eq!(termcodes("<xUp>", true, true).as_bytes(), &[K_SPECIAL, KS_EXTRA, 65]);
     // Literal control keys remain single bytes.
     assert_eq!(termcodes("<CR>", true, true).as_bytes(), &[b'\r']);
     assert_eq!(termcodes("<Esc>", true, true).as_bytes(), &[0x1b]);
