@@ -3,7 +3,13 @@ name = "ox-lua"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
-description = "mlua-hosted LuaJIT executor, converter, stdlib, luv/treesitter bindings."
+description = "mlua-hosted LuaJIT executor, converters, and vim table core."
+
+[dependencies]
+mlua = { workspace = true }
+ox-rpc = { path = "../ox-rpc" }
+ox-types = { path = "../ox-types" }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
