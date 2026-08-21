@@ -657,6 +657,10 @@ pub struct WinConfig {
     pub footer: Option<BorderText>,
     /// Extra space around the content.
     pub margins: Margins,
+    /// Optional zero-indexed `[line, column]` buffer cell used as the origin
+    /// for `relative="win"` floats; `None` anchors the float to the target
+    /// window's top-left cell.
+    pub bufpos: Option<(i64, i64)>,
 }
 
 impl WinConfig {
@@ -687,6 +691,7 @@ impl WinConfig {
             title: None,
             footer: None,
             margins: Margins::default(),
+            bufpos: None,
         })
     }
 
@@ -1097,7 +1102,14 @@ impl TabpageState {
             RelativeTo::Window(relative) => {
                 let geometry =
                     self.resolve_window_geometry(self.resolve(relative), next_depth)?;
-                (geometry.row as f64, geometry.col as f64)
+                let mut origin_row = geometry.row as f64;
+                let mut origin_col = geometry.col as f64;
+                if let Some((line, col)) = floating.config.bufpos {
+                    let state = self.window(relative)?;
+                    origin_row += (line as f64 + 1.0) - state.topline as f64;
+                    origin_col += col as f64;
+                }
+                (origin_row, origin_col)
             }
             RelativeTo::Cursor => {
                 let relative = self.current;

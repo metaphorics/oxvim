@@ -428,7 +428,8 @@ fn open_win_accepts_style_focusable_hide_noautocmd() {
 fn open_win_bufpos_supplies_default_row_and_col() {
     // bufpos ([line, column]) is valid only with relative="win" and supplies
     // row/col defaults: row=1 (NW anchor), col=0 when neither is given
-    // (api/window.c:1307-1320).
+    // (api/window.c:1307-1320). With a [0, 0] bufpos the float is anchored
+    // to the first buffer cell, so the resolved geometry is the default offset.
     let (mut editor, buffer, _, _) = editor_with_lines(&["one"]);
     let float = crate::window::nvim_open_win(
         &mut editor,
@@ -436,13 +437,51 @@ fn open_win_bufpos_supplies_default_row_and_col() {
         false,
         dict(&[
             ("relative", Object::String(OxStr::from("win"))),
-            ("bufpos", Object::Array(vec![Object::Integer(2), Object::Integer(3)])),
+            ("bufpos", Object::Array(vec![Object::Integer(0), Object::Integer(0)])),
             ("width", Object::Integer(10)),
             ("height", Object::Integer(2)),
         ]),
     )
     .unwrap();
     assert_eq!(crate::window::nvim_win_get_position(&mut editor, float), Ok(vec![1, 0]));
+}
+
+#[test]
+fn open_win_bufpos_changes_resolved_geometry() {
+    // Buffer-relative float placement must depend on the supplied bufpos:
+    // [1, 0] and [20, 40] resolve to different screen cells in the window.
+    let owned: Vec<String> = (0..30).map(|i| format!("line {}", i)).collect();
+    let lines: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    let (mut editor, buffer, _, _) = editor_with_lines(&lines);
+    let first = crate::window::nvim_open_win(
+        &mut editor,
+        buffer,
+        false,
+        dict(&[
+            ("relative", Object::String(OxStr::from("win"))),
+            ("bufpos", Object::Array(vec![Object::Integer(1), Object::Integer(0)])),
+            ("width", Object::Integer(10)),
+            ("height", Object::Integer(2)),
+        ]),
+    )
+    .unwrap();
+    let first_pos = crate::window::nvim_win_get_position(&mut editor, first).unwrap();
+    let second = crate::window::nvim_open_win(
+        &mut editor,
+        buffer,
+        false,
+        dict(&[
+            ("relative", Object::String(OxStr::from("win"))),
+            ("bufpos", Object::Array(vec![Object::Integer(20), Object::Integer(40)])),
+            ("width", Object::Integer(10)),
+            ("height", Object::Integer(2)),
+        ]),
+    )
+    .unwrap();
+    let second_pos = crate::window::nvim_win_get_position(&mut editor, second).unwrap();
+    assert_ne!(first_pos, second_pos);
+    assert_eq!(first_pos, vec![2, 0]);
+    assert_eq!(second_pos, vec![21, 40]);
 }
 
 #[test]

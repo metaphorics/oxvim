@@ -437,7 +437,7 @@ fn parse_config(
     // `bufpos` ([line, column]) anchors the float to buffer text of a
     // `relative="win"` window and supplies row/col defaults when those are
     // absent (api.txt: "- bufpos:"). Source: nvim/api/win_config.c:1307-1320.
-    let bufpos = parse_bufpos(dict)?;
+    let bufpos = parse_bufpos(dict)?.or_else(|| current.and_then(|config| config.bufpos));
     if bufpos.is_some() && !matches!(relative, RelativeTo::Window(_)) {
         return Err(invalid("bufpos", "only valid when relative is 'win'"));
     }
@@ -509,6 +509,7 @@ fn parse_config(
         title,
         footer,
         margins,
+        bufpos,
     };
     config.validate().map_err(exception)?;
     Ok(config)
@@ -572,6 +573,12 @@ fn config_to_dict(config: Option<&WinConfig>) -> Dict {
     ]);
     if let Some(target) = target {
         result.insert(OxStr::from("win"), Object::Window(target));
+    }
+    if let Some((line, col)) = config.bufpos {
+        result.insert(
+            OxStr::from("bufpos"),
+            Object::Array(vec![Object::Integer(line), Object::Integer(col)]),
+        );
     }
     if let Some(title) = &config.title {
         result.insert(
