@@ -234,6 +234,85 @@ pub fn write(handle: &FileHandle, data: &[u8], offset: Option<u64>) -> FsResult<
     handle.with_file(|file| match offset { Some(offset) => write_at(file, data, offset), None => (&*file).write(data) })
 }
 
+/// Reads bytes into multiple buffers with a single `readv`/`preadv` call.
+///
+/// Each element of `sizes` is one destination buffer; the returned vector has
+/// one entry per requested buffer, truncated to the number of bytes actually
+/// read into it. This is the table-of-buffers form of `uv.fs_read()` in
+/// `runtime/doc/luvref.txt`.
+#[cfg(unix)]
+pub fn readv(handle: &FileHandle, sizes: &[usize], offset: Option<u64>) -> FsResult<Vec<Vec<u8>>> {
+    use std::io::{Error as IoError, IoSliceMut};
+    use std::os::fd::AsFd as _;
+
+    handle.with_file(|file| {
+        let fd = file.as_fd();
+        let mut buffers: Vec<Vec<u8>> = sizes.iter().map(|size| vec![0u8; *size]).collect();
+        let mut iovecs: Vec<IoSliceMut<'_>> = buffers.iter_mut().map(|buffer| IoSliceMut::new(buffer)).collect();
+        let read_total: usize = match offset {
+            Some(offset) => rustix::io::preadv(fd, &mut iovecs, offset),
+            None => rustix::io::readv(fd, &mut iovecs),
+        }
+        .map_err(|error| IoError::from_raw_os_error(error.raw_os_error()))?;
+        let mut remaining = read_total;
+        for buffer in buffers.iter_mut() {
+            if remaining == 0 {
+                buffer.clear();
+                continue;
+            }
+            let take = buffer.len().min(remaining);
+            buffer.truncate(take);
+            remaining -= take;
+        }
+        Ok(buffers)
+    })
+}
+
+/// Sequential approximation of [`readv`] for platforms without `readv`/`preadv`.
+#[cfg(not(unix))]
+pub fn readv(handle: &FileHandle, sizes: &[usize], mut offset: Option<u64>) -> FsResult<Vec<Vec<u8>>> {
+    let mut buffers = Vec::with_capacity(sizes.len());
+    for size in sizes {
+        let data = read(handle, *size, offset)?;
+        offset = None;
+        buffers.push(data);
+    }
+    Ok(buffers)
+}
+
+/// Writes multiple buffers with a single `writev`/`pwritev` call.
+///
+/// The buffers are emitted in order in one system call; the return value is
+/// the total number of bytes written. This is the table-of-buffers form of
+/// `uv.fs_write()` in `runtime/doc/luvref.txt`, whose `data` argument is a
+/// `buffer` (a string or a sequential table of strings).
+#[cfg(unix)]
+pub fn writev(handle: &FileHandle, buffers: &[Vec<u8>], offset: Option<u64>) -> FsResult<usize> {
+    use std::io::{Error as IoError, IoSlice};
+    use std::os::fd::AsFd as _;
+
+    handle.with_file(|file| {
+        let fd = file.as_fd();
+        let iovecs: Vec<IoSlice<'_>> = buffers.iter().map(|buffer| IoSlice::new(buffer.as_slice())).collect();
+        match offset {
+            Some(offset) => rustix::io::pwritev(fd, &iovecs, offset),
+            None => rustix::io::writev(fd, &iovecs),
+        }
+        .map_err(|error| IoError::from_raw_os_error(error.raw_os_error()))
+    })
+}
+
+/// Sequential approximation of [`writev`] for platforms without `writev`/`pwritev`.
+#[cfg(not(unix))]
+pub fn writev(handle: &FileHandle, buffers: &[Vec<u8>], mut offset: Option<u64>) -> FsResult<usize> {
+    let mut total = 0usize;
+    for buffer in buffers {
+        total += write(handle, buffer, offset)?;
+        offset = None;
+    }
+    Ok(total)
+}
+
 /// Creates a directory. See `uv.fs_mkdir()` in `runtime/doc/luvref.txt`.
 pub fn mkdir(path: impl AsRef<Path>, mode: u32) -> FsResult<()> {
     fs::create_dir(&path).map_err(FsError::from_io)?;
@@ -414,6 +493,10 @@ pub fn close_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, callback: C
 pub fn read_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, size: usize, offset: Option<u64>, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<Vec<u8>>) + Send + 'static { run_async(pool, poster, move || read(&handle, size, offset), callback) }
 /// Runs write on the pool. See `uv.fs_write()` in `runtime/doc/luvref.txt`.
 pub fn write_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, data: Vec<u8>, offset: Option<u64>, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<usize>) + Send + 'static { run_async(pool, poster, move || write(&handle, &data, offset), callback) }
+/// Runs a vectored read on the pool. See `uv.fs_read()` in `runtime/doc/luvref.txt`.
+pub fn readv_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, sizes: Vec<usize>, offset: Option<u64>, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<Vec<Vec<u8>>>) + Send + 'static { run_async(pool, poster, move || readv(&handle, &sizes, offset), callback) }
+/// Runs a vectored write on the pool. See `uv.fs_write()` in `runtime/doc/luvref.txt`.
+pub fn writev_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, buffers: Vec<Vec<u8>>, offset: Option<u64>, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<usize>) + Send + 'static { run_async(pool, poster, move || writev(&handle, &buffers, offset), callback) }
 /// Runs mkdir on the pool. See `uv.fs_mkdir()` in `runtime/doc/luvref.txt`.
 pub fn mkdir_async<P, C>(pool: &Pool, poster: P, path: PathBuf, mode: u32, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || mkdir(path, mode), callback) }
 /// Runs rmdir on the pool. See `uv.fs_rmdir()` in `runtime/doc/luvref.txt`.

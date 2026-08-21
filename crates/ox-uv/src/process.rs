@@ -16,7 +16,7 @@ use crate::{Handle, HandleId, UvLoop};
 #[cfg(unix)]
 use std::cell::RefCell;
 #[cfg(unix)]
-use std::os::fd::AsRawFd as _;
+use std::os::fd::{AsRawFd as _, OwnedFd};
 #[cfg(unix)]
 use std::rc::Rc;
 
@@ -54,6 +54,24 @@ pub enum StdioConfig {
     CreatePipe,
 }
 
+/// An additional (fd ≥ 3) child standard descriptor mapped through to the
+/// child process, per `uv.spawn-options.stdio` in `runtime/doc/luvref.txt`
+/// (lines 1434-1447).
+///
+/// `StdioConfig::CreatePipe` delivers a fresh pipe whose child end is
+/// installed as descriptor `fd` in the child; the parent endpoint is returned
+/// from [`spawn`]. `Inherit` and `Ignore` are accepted for API completeness
+/// but require no parent-side action (a child fd is inherited or pointer than
+/// any descriptor, and `Ignore` simply leaves it unspecified, matching the
+/// luvref `nil` placeholder).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtraStdio {
+    /// Child file-descriptor number (3 or greater).
+    pub fd: u32,
+    /// How to wire that descriptor.
+    pub config: StdioConfig,
+}
+
 /// Options accepted by [`spawn`].
 ///
 /// `environment: None` inherits the parent environment. `Some(entries)`
@@ -70,6 +88,8 @@ pub struct SpawnOptions {
     pub cwd: Option<PathBuf>,
     /// Standard input, output, and error configuration, in that order.
     pub stdio: [StdioConfig; 3],
+    /// Additional descriptors (fd ≥ 3) passed through to the child.
+    pub extra_stdio: Vec<ExtraStdio>,
     /// Spawn as a process-group leader where the platform supports it.
     pub detached: bool,
     /// Unix child user ID. Supplying it on Windows is unsupported.
@@ -91,6 +111,7 @@ impl SpawnOptions {
             environment: None,
             cwd: None,
             stdio: [StdioConfig::Inherit; 3],
+            extra_stdio: Vec::new(),
             detached: false,
             uid: None,
             gid: None,
@@ -159,6 +180,31 @@ pub struct SpawnedProcess {
     pub process: Process,
     /// Parent-side pipe endpoints requested in the spawn options.
     pub pipes: ProcessPipes,
+    /// Parent-side endpoints for extra (fd ≥ 3) created pipes, keyed by child
+    /// descriptor number.
+    pub extra: Vec<ExtraPipe>,
+}
+
+/// A parent-side endpoint for an extra child descriptor created by
+/// [`StdioConfig::CreatePipe`].
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct ExtraPipe {
+    /// Child descriptor number the pipe was installed at.
+    pub fd: u32,
+    /// Blocking parent endpoint; reading reaches the child's descriptor.
+    pub parent: std::fs::File,
+}
+
+/// A parent-side endpoint for an extra child descriptor created by
+/// [`StdioConfig::CreatePipe`] on a platform without Unix fd pass-through.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct ExtraPipe {
+    /// Child descriptor number the pipe was installed at.
+    pub fd: u32,
+    /// Parent endpoint; reading reaches the child's descriptor.
+    pub parent: std::fs::File,
 }
 
 /// A parent-side endpoint of a [`StdioConfig::CreatePipe`] child stream.
@@ -796,6 +842,75 @@ impl Handle for Process {
 /// The child waiter only reaps and posts. The callback itself is invoked by the
 /// owning loop, never by the waiter. See `luvref.txt`, `uv.spawn()` and
 /// `uv.spawn-options` (lines 1340-1455).
+///
+/// Extra (fd ≥ 3) `StdioConfig::CreatePipe` descriptors are installed by
+/// duplicating a fresh pipe's write end into the parent's own descriptor
+/// table so the child inherits it at the requested number. This is safe-only:
+/// every call is a rustix fd routine, and the reservation is single-threaded
+/// (spawn runs on the loop thread; the process waiter never duplicates fds).
+#[cfg(unix)]
+struct PreparedExtra {
+    parents: Vec<ExtraPipe>,
+    keep_alive: Vec<OwnedFd>,
+}
+
+#[cfg(unix)]
+fn prepare_extra_stdio(options: &SpawnOptions) -> Result<PreparedExtra, ProcessError> {
+    let mut sorted: Vec<&ExtraStdio> = options
+        .extra_stdio
+        .iter()
+        .filter(|entry| entry.fd >= 3)
+        .collect();
+    sorted.sort_by_key(|entry| entry.fd);
+
+    let mut held: Vec<OwnedFd> = Vec::new();
+    let mut next_high: u32 = 2;
+    let mut parents: Vec<ExtraPipe> = Vec::new();
+    let mut keep_alive: Vec<OwnedFd> = Vec::new();
+
+    for entry in sorted {
+        if entry.config != StdioConfig::CreatePipe {
+            continue;
+        }
+        let (read, write) = rustix::pipe::pipe().map_err(|error| {
+            ProcessError::io("extra stdio pipe", std::io::Error::from_raw_os_error(error.raw_os_error()))
+        })?;
+        while next_high < entry.fd {
+            held.push(rustix::io::dup(&read).map_err(|error| {
+                ProcessError::io("reserve extra stdio fd", std::io::Error::from_raw_os_error(error.raw_os_error()))
+            })?);
+            next_high += 1;
+        }
+        let mut slot = held.pop().ok_or_else(|| ProcessError::io("extra stdio slot", std::io::Error::from(std::io::ErrorKind::NotFound)))?;
+        rustix::io::dup2(&write, &mut slot).map_err(|error| {
+            ProcessError::io("install extra stdio fd", std::io::Error::from_raw_os_error(error.raw_os_error()))
+        })?;
+        keep_alive.push(slot);
+        drop(write);
+        parents.push(ExtraPipe { fd: entry.fd, parent: std::fs::File::from(read) });
+    }
+    Ok(PreparedExtra { parents, keep_alive })
+}
+
+#[cfg(not(unix))]
+struct PreparedExtra {
+    parents: Vec<ExtraPipe>,
+}
+
+#[cfg(not(unix))]
+fn prepare_extra_stdio(options: &SpawnOptions) -> Result<PreparedExtra, ProcessError> {
+    if options.extra_stdio.iter().any(|entry| entry.config == StdioConfig::CreatePipe) {
+        return Err(ProcessError::Unsupported {
+            feature: "extra stdio pipe creation",
+            reason: "fd 3+ pass-through requires a Unix descriptor-table dup that this platform cannot express safely",
+        });
+    }
+    Ok(PreparedExtra { parents: Vec::new() })
+}
+
+/// The child waiter only reaps and posts. The callback itself is invoked by the
+/// owning loop, never by the waiter. See `luvref.txt`, `uv.spawn()` and
+/// `uv.spawn-options` (lines 1340-1455).
 pub fn spawn<F>(
     uv_loop: &mut UvLoop,
     options: SpawnOptions,
@@ -820,6 +935,7 @@ where
     command.stderr(map_stdio(options.stdio[2]));
     configure_platform_command(&mut command, &options);
 
+    let prepared = prepare_extra_stdio(&options)?;
     let mut child = command
         .spawn()
         .map_err(|error| ProcessError::io("spawn", error))?;
@@ -827,6 +943,8 @@ where
     let child_stdin = child.stdin.take();
     let child_stdout = child.stdout.take();
     let child_stderr = child.stderr.take();
+    let extra = prepared.parents;
+    drop(prepared.keep_alive);
     let state = Arc::new(Mutex::new(ChildState::Standard(child)));
     let handle_id = match uv_loop.allocate_external(true) {
         Ok(id) => id,
@@ -856,7 +974,7 @@ where
         return Err(ProcessError::io("start process waiter", error));
     }
 
-    Ok(SpawnedProcess { process, pipes })
+    Ok(SpawnedProcess { process, pipes, extra })
 }
 
 /// Sends a signal to an arbitrary PID, defaulting to SIGTERM.

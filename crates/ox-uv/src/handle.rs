@@ -112,6 +112,19 @@ impl HandleKind {
             Self::External(state) => state.active = false,
         }
     }
+
+    /// Reports the luv-style handle type name for `print_*_handles`.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::Timer(_) => "timer",
+            Self::Idle(_) => "idle",
+            Self::Prepare(_) => "prepare",
+            Self::Check(_) => "check",
+            Self::Async(_) => "async",
+            Self::Signal(_) => "signal",
+            Self::External(_) => "handle",
+        }
+    }
 }
 
 pub(crate) struct ExternalState {

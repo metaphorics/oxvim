@@ -11,6 +11,10 @@ pub mod dns;
 pub mod fs;
 pub mod fs_watch;
 mod handle;
+#[cfg(unix)]
+mod ipc;
+#[cfg(unix)]
+mod poll;
 pub mod misc;
 pub mod net;
 pub mod pool;
@@ -25,6 +29,9 @@ pub use async_handle::{Async, AsyncSender};
 pub use aux_handles::{Check, Idle, Prepare};
 pub use handle::{Handle, HandleId};
 pub use pool::UvLoopPoster;
+pub use net::{NetError, NetEvent, NetResult, Tcp, Udp};
+#[cfg(unix)]
+pub use poll::{Poll, PollEvents};
 pub use signal::Signal;
 pub use timer::Timer;
 pub use uv_loop::{RunMode, UvLoop};
@@ -76,6 +83,14 @@ pub enum Error {
     /// The signal cannot be intercepted safely on this platform.
     #[error("signal {0} cannot be registered")]
     InvalidSignal(i32),
+    /// The operation is not safely expressible on this platform.
+    #[error("{feature} is unsupported: {reason}")]
+    Unsupported {
+        /// Operation that cannot be performed.
+        feature: &'static str,
+        /// Platform reason.
+        reason: &'static str,
+    },
     /// The loop cannot be pumped recursively from one of its callbacks.
     #[error("event loop is already running")]
     LoopAlreadyRunning,
@@ -149,6 +164,9 @@ pub struct CallbackErrorEvent {
 
 #[cfg(test)]
 mod io_tests;
+
+#[cfg(all(test, unix))]
+mod task7c_tests;
 
 #[cfg(test)]
 mod tests;
