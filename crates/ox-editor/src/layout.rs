@@ -850,9 +850,11 @@ fn matches_axis(frame: &Frame, axis: SplitAxis) -> bool {
     )
 }
 
-/// Inserts `new_leaf` as a sibling of `window` inside the nearest ancestor
-/// container whose orientation matches `axis`. Returns `Ok(())` on success or
-/// `Err(new_leaf)` back to the caller when no matching ancestor exists.
+/// Inserts `new_leaf` as a sibling of `window` inside the target's immediate
+/// parent container, but only when that parent already stacks children along
+/// `axis`. If the immediate parent has the opposite orientation, or `window`
+/// is the root leaf, returns `Err(new_leaf)` so the caller can wrap the
+/// target in a fresh container instead (upstream `win_split_ins`).
 fn insert_into_matching_container(
     root: &mut Frame,
     window: WinHandle,
@@ -863,18 +865,17 @@ fn insert_into_matching_container(
     if !collect_container_path(root, window, &mut path) {
         return Err(new_leaf);
     }
-    // `path[depth]` is the child index of the container reached via
-    // `path[..depth]` that continues toward `window`. Prefer the deepest
-    // (nearest the leaf) same-axis container first.
-    let chosen = (0..path.len()).rev().find(|&depth| {
-        matches_axis(container_at(root, &path[..depth]), axis)
-    });
-    let Some(depth) = chosen else {
+    if path.is_empty() {
         return Err(new_leaf);
-    };
-    let insert_at = path[depth].saturating_add(1);
-    match container_at_mut(root, &path[..depth]) {
-        Frame::Leaf(_) => unreachable!("chosen split container is a container"),
+    }
+    let parent_path = &path[..path.len() - 1];
+    if !matches_axis(container_at(root, parent_path), axis) {
+        return Err(new_leaf);
+    }
+    let target_index = path[path.len() - 1];
+    let insert_at = target_index.saturating_add(1);
+    match container_at_mut(root, parent_path) {
+        Frame::Leaf(_) => unreachable!("split path ends in a container"),
         Frame::Row { children, .. } | Frame::Column { children, .. } => {
             children.insert(insert_at.min(children.len()), new_leaf);
         }

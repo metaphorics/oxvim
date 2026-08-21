@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use ox_text::{Buffer, Position};
 use ox_types::{BufHandle, WinHandle};
 
-use crate::layout::{Anchor, Geometry, Layout, RelativeTo, TabpageState, WinConfig, WindowState};
+use crate::layout::{Anchor, Frame, Geometry, Layout, RelativeTo, TabpageState, WinConfig, WindowState};
 use crate::marks::{Changelists, Jumplist, LocalMarks, MarkLocation};
 use crate::options::{OptionError, OptionStore, OptionValue, OPTION_COUNT, OPTION_METADATA};
 use crate::register::{RegisterContent, Registers};
@@ -164,6 +164,62 @@ fn three_same_axis_splits_equalize_into_equal_thirds() {
     assert_eq!(layout.window_geometry(w1).unwrap(), Geometry::new(0, 0, 3, 7).unwrap());
     assert_eq!(layout.window_geometry(w2).unwrap(), Geometry::new(0, 3, 3, 7).unwrap());
     assert_eq!(layout.window_geometry(w3).unwrap(), Geometry::new(0, 6, 3, 7).unwrap());
+}
+
+#[test]
+fn split_uses_immediate_parent_axis_not_deepest_matching_ancestor() {
+    let w1 = window_handle(1);
+    let w2 = window_handle(2);
+    let w3 = window_handle(3);
+    let w4 = window_handle(4);
+    let buffer = buffer_handle(1);
+    let geometry = Geometry::new(0, 0, 9, 7).unwrap();
+    let mut layout = Layout::new(w1, WindowState::new(buffer, position(1, 0)), geometry).unwrap();
+
+    layout
+        .split_vertical(w1, w2, WindowState::new(buffer, position(1, 0)))
+        .unwrap();
+    layout
+        .split_horizontal(w2, w3, WindowState::new(buffer, position(1, 0)))
+        .unwrap();
+    layout
+        .split_vertical(w3, w4, WindowState::new(buffer, position(1, 0)))
+        .unwrap();
+
+    assert_eq!(layout.window_geometry(w1).unwrap(), Geometry::new(0, 0, 5, 7).unwrap());
+    assert_eq!(layout.window_geometry(w2).unwrap(), Geometry::new(0, 5, 4, 4).unwrap());
+    assert_eq!(layout.window_geometry(w3).unwrap(), Geometry::new(4, 5, 2, 3).unwrap());
+    assert_eq!(layout.window_geometry(w4).unwrap(), Geometry::new(4, 7, 2, 3).unwrap());
+    assert_eq!(layout.winnr(w1).unwrap(), 1);
+    assert_eq!(layout.winnr(w2).unwrap(), 2);
+    assert_eq!(layout.winnr(w3).unwrap(), 3);
+    assert_eq!(layout.winnr(w4).unwrap(), 4);
+
+    // A vertical split of a window inside a Column nested under a root Row
+    // must create a Row around that target within the Column, not insert the
+    // new window into the root Row.
+    match layout.root() {
+        Frame::Row { children, .. } => {
+            assert_eq!(children.len(), 2);
+            assert!(matches!(&children[0], Frame::Leaf(leaf) if leaf.window == w1));
+            match &children[1] {
+                Frame::Column { children, .. } => {
+                    assert_eq!(children.len(), 2);
+                    assert!(matches!(&children[0], Frame::Leaf(leaf) if leaf.window == w2));
+                    match &children[1] {
+                        Frame::Row { children, .. } => {
+                            assert_eq!(children.len(), 2);
+                            assert!(matches!(&children[0], Frame::Leaf(leaf) if leaf.window == w3));
+                            assert!(matches!(&children[1], Frame::Leaf(leaf) if leaf.window == w4));
+                        }
+                        _ => panic!("expected Row wrapping w3 and w4"),
+                    }
+                }
+                _ => panic!("expected Column wrapping w2 and the new Row"),
+            }
+        }
+        _ => panic!("expected root Row"),
+    }
 }
 
 #[test]
