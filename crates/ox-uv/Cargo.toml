@@ -5,5 +5,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+mio.workspace = true
+ox-loop = { path = "../ox-loop" }
+rustix = { workspace = true, features = ["system"] }
+signal-hook.workspace = true
+thiserror.workspace = true
+
 [lints]
 workspace = true
