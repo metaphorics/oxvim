@@ -344,6 +344,21 @@ fn sort_locale_mode_is_byte_wise_fallback() {
 }
 
 #[test]
+fn sort_callback_stops_after_first_failure_and_retains_first_error() {
+    // Once the comparator errors, `sort()` must not invoke it again for later
+    // pairs, and the original error must be returned rather than overwritten.
+    let mut scope = Scope::new();
+    let counter = Typval::list(vec![]);
+    scope.set(b"counter", counter.clone());
+    let values = Typval::list(vec![number(3), number(1), number(2)]);
+    let callback = text("add(counter, 1) + missing");
+    let mut builtins = Builtins::without_regex();
+    let error = builtins.call(&OxStr::from("sort"), vec![values, callback], &mut scope).unwrap_err();
+    assert_eq!(error.code, "E121");
+    assert_eq!(counter, Typval::list(vec![number(1)]));
+}
+
+#[test]
 fn str2nr_base_zero_is_rejected() {
     // `test/old/testdir/test_functions.vim`: only 2/8/10/16 are valid bases;
     // base 0 is rejected with E474 (f_str2nr, strings.c:2593-2598).

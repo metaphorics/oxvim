@@ -372,6 +372,9 @@ impl<'a> Builtins<'a> {
         };
         let mut failure = None;
         values.sort_by(|left, right| {
+            if failure.is_some() {
+                return Ordering::Equal;
+            }
             let result = match &mode {
                 SortMode::Default | SortMode::Locale => Ok(sort_string_pair(left, right, false)),
                 SortMode::IgnoreCase => Ok(sort_string_pair(left, right, true)),
@@ -381,7 +384,15 @@ impl<'a> Builtins<'a> {
                 SortMode::Callback(callback) => self.eval_callback(callback, left.clone(), right.clone(), scope)
                     .and_then(|value| number_arg(&value)).map(|value| value.cmp(&0)),
             };
-            match result { Ok(ordering) => ordering, Err(error) => { failure = Some(error); Ordering::Equal } }
+            match result {
+                Ok(ordering) => ordering,
+                Err(error) => {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                    Ordering::Equal
+                }
+            }
         });
         reference.try_borrow_mut().map_err(|_| borrow_error())?.lock = previous_lock;
         if let Some(error) = failure { return Err(error); }
