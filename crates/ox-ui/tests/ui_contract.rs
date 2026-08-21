@@ -1,4 +1,7 @@
+//! Integration tests for the `ox-ui` redraw pipeline (emitter, grid, compositor, chrome).
 #![allow(clippy::unwrap_used)]
+
+use std::collections::BTreeMap;
 
 use ox_rpc::decode;
 use ox_types::{Dict, Object, OxStr};
@@ -247,6 +250,91 @@ fn mode_events_emit_only_on_transition_and_preserve_order() {
     let events = chrome.take_events();
     let names: Vec<_> = events.iter().map(|event| event.name.to_string_lossy().into_owned()).collect();
     assert_eq!(names, ["mode_info_set", "mode_change", "mode_change"]);
+}
+
+#[test]
+fn multigrid_without_ext_messages_renders_message_once_via_compositor_grid() {
+    let mut message = Grid::new(5, 4, 1).unwrap();
+    message.write_text(0, 0, "msg", 0).unwrap();
+    let mut compositor = Compositor::new(4, 2);
+    compositor.push_layer(Layer::new(message, 1, 0, 0, LayerKind::Message));
+    let mut channels = UiChannels::new();
+    channels.attach(
+        9, 4, 2,
+        UiOptions { ext_linegrid: true, ext_multigrid: true, ..UiOptions::default() },
+    ).unwrap();
+    let frames = Emitter::new().redraw(&mut channels, &compositor, &mut HlState::new(), &mut ChromeState::new()).unwrap();
+    let decoded = decode(&frames[&9]).unwrap();
+    // The compositor message grid is the single render path (msg_set_pos + its own grid).
+    assert!(event_names(decoded.clone()).contains(&"msg_set_pos".to_owned()));
+    // The message text lands on the compositor message grid, not duplicated into grid one.
+    assert!(grid_text(&decoded, 5).contains("msg"));
+    assert!(!grid_text(&decoded, 1).contains("msg"));
+}
+
+#[test]
+fn float_compindex_is_distinct_ordered_and_stable_not_channel_id() {
+    let mut first = Grid::new(3, 2, 1).unwrap();
+    first.put(0, 0, "A", 0, 1).unwrap();
+    let mut second = Grid::new(4, 2, 1).unwrap();
+    second.put(0, 0, "B", 0, 1).unwrap();
+    let mut compositor = Compositor::new(6, 2);
+    compositor.push_layer(Layer::new(first, 0, 0, 300, LayerKind::Float));
+    compositor.push_layer(Layer::new(second, 0, 3, 300, LayerKind::Float));
+    let mut channels = UiChannels::new();
+    channels.attach(
+        7, 6, 2,
+        UiOptions { ext_linegrid: true, ext_multigrid: true, ..UiOptions::default() },
+    ).unwrap();
+    let frame = Emitter::new().redraw(&mut channels, &compositor, &mut HlState::new(), &mut ChromeState::new()).unwrap();
+    let decoded = decode(&frame[&7]).unwrap();
+    // Two equal-z-index floats get distinct compindexes in compositor (insertion) order,
+    // independent of the channel id.
+    let compindexes = win_float_compindexes(&decoded);
+    assert_eq!(compindexes.len(), 2);
+    assert_eq!(compindexes[&3], 1);
+    assert_eq!(compindexes[&4], 2);
+    assert!(compindexes.values().all(|&index| index != 7));
+    // Stable across a second redraw.
+    let frame2 = Emitter::new().redraw(&mut channels, &compositor, &mut HlState::new(), &mut ChromeState::new()).unwrap();
+    let decoded2 = decode(&frame2[&7]).unwrap();
+    assert_eq!(win_float_compindexes(&decoded2), compindexes);
+}
+
+fn grid_text(frame: &Object, target: i64) -> String {
+    let Object::Array(frame) = frame else { return String::new() };
+    let Some(Object::Array(events)) = frame.get(2) else { return String::new() };
+    let mut out = String::new();
+    for event in events {
+        let Object::Array(parts) = event else { continue };
+        let Some(Object::String(name)) = parts.first() else { continue };
+        if *name != OxStr::from("grid_line") { continue; }
+        let Some(Object::Array(args)) = parts.get(1) else { continue };
+        let Some(Object::Integer(grid)) = args.first() else { continue };
+        if *grid != target { continue; }
+        let Some(Object::Array(cells)) = args.get(3) else { continue };
+        for cell_repeat in cells {
+            let Object::Array(cell) = cell_repeat else { continue };
+            if let Some(Object::String(text)) = cell.first() { out.push_str(&text.to_string_lossy()); }
+        }
+    }
+    out
+}
+
+fn win_float_compindexes(frame: &Object) -> BTreeMap<i64, i64> {
+    let Object::Array(frame) = frame else { return BTreeMap::new() };
+    let Some(Object::Array(events)) = frame.get(2) else { return BTreeMap::new() };
+    let mut map = BTreeMap::new();
+    for event in events {
+        let Object::Array(parts) = event else { continue };
+        let Some(Object::String(name)) = parts.first() else { continue };
+        if *name != OxStr::from("win_float_pos") { continue; }
+        let Some(Object::Array(args)) = parts.get(1) else { continue };
+        let (Some(Object::Integer(grid)), Some(Object::Integer(compindex))) =
+            (args.first(), args.get(8)) else { continue };
+        map.insert(*grid, *compindex);
+    }
+    map
 }
 
 fn has_grid_resize(frame: &Object, grid: i64) -> bool {

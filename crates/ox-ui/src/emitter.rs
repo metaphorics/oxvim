@@ -77,12 +77,12 @@ impl Emitter {
                 self.emit_highlights(channel_id, channel, highlights, options)?;
                 let (width, height) = channel.size();
                 let mut default_grid = Grid::new(1, width, height)?;
-                if !options.ext_messages { apply_message_fallback(&mut default_grid, chrome)?; }
                 if !options.ext_cmdline { apply_cmdline_fallback(&mut default_grid, chrome)?; }
                 self.emit_grid(channel_id, channel, &default_grid)?;
-                for layer in compositor.layers() {
+                let float_compindex = float_compindexes(compositor);
+                for (index, layer) in compositor.layers().iter().enumerate() {
                     if options.ext_messages && layer.kind == LayerKind::Message { continue; }
-                    emit_position(channel_id, channel, layer)?;
+                    emit_position(channel, layer, float_compindex.get(&index).copied())?;
                     self.emit_grid(channel_id, channel, &layer.grid)?;
                     if let Some((row, col)) = layer.cursor {
                         channel.emit(UiEvent::new("grid_cursor_goto", vec![
@@ -179,9 +179,9 @@ impl Emitter {
 }
 
 fn emit_position(
-    channel_id: u64,
     channel: &mut crate::channel::UiChannel,
     layer: &Layer,
+    compindex: Option<usize>,
 ) -> Result<(), UiChannelError> {
     let window = layer.window.map_or(Object::Nil, Object::Window);
     match layer.kind {
@@ -202,7 +202,7 @@ fn emit_position(
             Object::Float(layer.col as f64),
             Object::Boolean(false),
             Object::Integer(i64::from(layer.zindex)),
-            Object::Integer(i64::try_from(channel_id).unwrap_or(i64::MAX)),
+            Object::Integer(i64::try_from(compindex.unwrap_or(0)).unwrap_or(i64::MAX)),
             signed(layer.row),
             signed(layer.col),
         ])),
@@ -215,6 +215,19 @@ fn emit_position(
             Object::Integer(0),
         ])),
     }
+}
+
+/// Computes the 1-based compositor index of every float layer, in stacking
+/// order. Mirrors Neovim's `comp_index`: the position of a float grid among
+/// the layered grids above the default grid, not the UI channel id. Two floats
+/// with equal z-index keep distinct, stable indexes in insertion order.
+fn float_compindexes(compositor: &Compositor) -> BTreeMap<usize, usize> {
+    let mut floats: Vec<(u32, usize)> = compositor.layers().iter().enumerate()
+        .filter(|(_, layer)| layer.kind == LayerKind::Float)
+        .map(|(index, layer)| (layer.zindex, index))
+        .collect();
+    floats.sort();
+    floats.into_iter().enumerate().map(|(rank, (_, index))| (index, rank + 1)).collect()
 }
 
 fn route_chrome(
