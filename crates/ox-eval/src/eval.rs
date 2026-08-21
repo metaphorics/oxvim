@@ -60,11 +60,12 @@ struct Closure {
 /// A shared, externally-oblivious registry of lambda closures.
 ///
 /// Closure bodies and captured scopes live here under a stable index so that a
-/// stored `Partial` (`<lambda>{registry_id}:{id}`) resolves to the original
-/// closure even when called through a different [`Evaluator`] that shares this
-/// registry. Each registry carries a unique nonce so that a `Partial` created
-/// by one registry cannot accidentally resolve to a closure with the same local
-/// index in an unrelated registry.
+/// stored `Partial` (`<lambda>N`) resolves to the original closure even when
+/// called through a different [`Evaluator`] that shares this registry. Each
+/// registry carries a unique nonce so that a `Partial` created by one registry
+/// cannot accidentally resolve to a closure with the same local index in an
+/// unrelated registry. The nonce is carried on the `Funcref` itself, not in
+/// the lambda name.
 #[derive(Clone)]
 pub struct ClosureRegistry {
     id: usize,
@@ -324,10 +325,10 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                     body: body.as_ref().clone(),
                     captured: scope.snapshot(),
                 });
-                let name = OxStr(format!("<lambda>{registry_id}:{id}").into_bytes());
+                let name = OxStr(format!("<lambda>{id}").into_bytes());
                 let identity = Some(registry_id.wrapping_mul(0x9e37_79b9).wrapping_add(id));
                 Ok(Evaluated {
-                    value: Typval::Partial(Funcref { name, args: Vec::new(), dict: None }),
+                    value: Typval::Partial(Funcref { name, args: Vec::new(), dict: None, registry: Some(registry_id) }),
                     identity,
                 })
             }
@@ -541,11 +542,8 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         args: Vec<Typval>,
         scope: &mut Scope,
         offset: usize,
-        depth: usize,
+        _depth: usize,
     ) -> Result<Evaluated> {
-        if let Some((registry_id, id)) = closure_id(name.as_bytes()) {
-            return self.call_closure(name, registry_id, id, &args, depth, offset);
-        }
         self.host.call(name, args, scope).map(Evaluated::plain).map_err(|mut error| {
             if error.code == "E117" { error.offset = offset; }
             error
@@ -560,7 +558,15 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                     bound.append(&mut args);
                     args = bound;
                 }
-                self.call_named(&funcref.name, args, scope, 0, depth)
+                match funcref.registry {
+                    Some(registry_id) => {
+                        let id = closure_index(funcref.name.as_bytes()).ok_or_else(|| {
+                            EvalError::new("E117", 0, format!("Unknown function: {}", funcref.name.to_string_lossy()))
+                        })?;
+                        self.call_closure(&funcref.name, registry_id, id, &args, depth, 0)
+                    }
+                    None => self.call_named(&funcref.name, args, scope, 0, depth),
+                }
             }
             _ => Err(EvalError::new("E1085", 0, "not a callable value")),
         }
@@ -611,11 +617,10 @@ fn identity_type(value: &Typval) -> bool {
     matches!(value, Typval::List(_) | Typval::Dict(_) | Typval::Blob(_) | Typval::Funcref(_) | Typval::Partial(_))
 }
 
-fn closure_id(name: &[u8]) -> Option<(usize, usize)> {
+fn closure_index(name: &[u8]) -> Option<usize> {
     let digits = name.strip_prefix(b"<lambda>")?;
     let text = std::str::from_utf8(digits).ok()?;
-    let (registry, id) = text.split_once(':')?;
-    Some((registry.parse().ok()?, id.parse().ok()?))
+    text.parse().ok()
 }
 
 fn dict_lookup(value: &Typval, key: &[u8], offset: usize, parent_identity: Option<usize>) -> Result<Evaluated> {

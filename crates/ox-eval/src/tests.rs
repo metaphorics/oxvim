@@ -453,6 +453,7 @@ fn variadic_lambda_partial_binds_leading_args() {
     let Typval::Partial(funcref) = closure else { panic!("expected a Partial") };
     let bound = Typval::Partial(Funcref {
         name: funcref.name,
+        registry: funcref.registry,
         args: vec![Typval::String(OxStr::from("one")), Typval::String(OxStr::from("two"))],
         dict: None,
     });
@@ -470,6 +471,29 @@ fn variadic_lambda_partial_binds_leading_args() {
             Typval::String(OxStr::from("two")),
             Typval::String(OxStr::from("three")),
         ])
+    );
+}
+
+#[test]
+fn lambda_name_is_upstream_compatible() {
+    // Upstream lambda names are `<lambda>N` where N is a per-registry
+    // monotonic counter. The registry nonce lives on the Funcref, not in the
+    // name, so `string()` / `string2function()` observes upstream-compatible
+    // output.
+    let expression = Parser::new(b"{x -> x + 1}").parse().unwrap();
+    let mut host = Host;
+    let regex = Regex;
+    let mut evaluator = Evaluator::new(&mut host, &regex);
+    let value = evaluator.eval(&expression, &mut Scope::new()).unwrap();
+    let Typval::Partial(funcref) = value else { panic!("expected a Partial") };
+    let bytes = funcref.name.as_bytes();
+    assert!(bytes.starts_with(b"<lambda>"));
+    let suffix = &bytes[b"<lambda>".len()..];
+    assert!(!suffix.is_empty(), "lambda name must have a numeric suffix");
+    assert!(
+        suffix.iter().all(|b| b.is_ascii_digit()),
+        "lambda name suffix must be digits only: {:?}",
+        String::from_utf8_lossy(bytes)
     );
 }
 
