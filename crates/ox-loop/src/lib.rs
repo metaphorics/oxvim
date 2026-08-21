@@ -13,7 +13,7 @@ mod timer;
 mod work;
 
 pub use events::{Event, MultiQueue, Owner};
-pub use r#loop::{Loop, Readiness, WaitOutcome};
+pub use r#loop::{DrainState, Loop, Readiness, StopHandle, WaitOutcome};
 pub use reactor::{IO_TOKEN_START, Reactor, SIGNAL_TOKEN, WAKE_TOKEN};
 pub use signal::Signals;
 pub use timer::{TimerEntry, TimerHeap, TimerId};

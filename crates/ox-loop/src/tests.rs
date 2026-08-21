@@ -9,7 +9,8 @@ use mio::net::TcpListener;
 use mio::{Events as MioEvents, Interest, Token};
 
 use crate::{
-    Event, IO_TOKEN_START, Loop, MultiQueue, Reactor, TimerEntry, TimerHeap, WaitOutcome,
+    DrainState, Event, IO_TOKEN_START, Loop, MultiQueue, Reactor, TimerEntry, TimerHeap,
+    WaitOutcome,
 };
 
 #[test]
@@ -271,10 +272,12 @@ fn timer_expiring_during_poll_precedes_deferred_drain() {
             readiness_order.lock().unwrap().push("io");
             thread::sleep(Duration::from_millis(20));
             let deferred_order = Arc::clone(&readiness_order);
-            queues.put(
-                root,
-                Event::callback(move || deferred_order.lock().unwrap().push("deferred")),
-            )
+            queues
+                .put(
+                    root,
+                    Event::callback(move || deferred_order.lock().unwrap().push("deferred")),
+                )
+                .map(|()| DrainState::Drained)
         })
         .unwrap();
     let client = StdTcpStream::connect(address).unwrap();
@@ -298,4 +301,116 @@ fn removing_child_purges_descendant_links_from_root() {
     assert!(queues.is_empty(root).unwrap());
     assert!(queues.len(child).is_err());
     assert!(queues.len(nested).is_err());
+}
+
+#[test]
+fn partial_read_per_callback_still_drains_edgetriggered_stream() {
+    // A readiness callback that consumes only one byte per invocation still
+    // receives the whole payload: the pump re-invokes it until WouldBlock, so
+    // under EPOLLET a partial read cannot strand buffered data.
+    let mut event_loop = Loop::new().unwrap();
+    let address = "127.0.0.1:0".to_socket_addrs().unwrap().next().unwrap();
+    let listener = TcpListener::bind(address).unwrap();
+    let address = listener.local_addr().unwrap();
+    // The accepted stream is moved into the readiness callback; it is dropped
+    // when `event_loop` (and its callback map) drop at the end of the test.
+
+    let payload: Vec<u8> = (0..8192u16).map(|i| (i % 251) as u8).collect();
+    let payload_for_client = payload.clone();
+    let peer_done = Arc::new(AtomicBool::new(false));
+    let client_done = Arc::clone(&peer_done);
+    let client = thread::spawn(move || {
+        let mut stream = StdTcpStream::connect(address).unwrap();
+        stream.write_all(&payload_for_client).unwrap();
+        while !client_done.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    // Accept synchronously; loopback connect completes almost immediately.
+    let accept_deadline = Instant::now() + Duration::from_secs(2);
+    let (mut server_stream, _) = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < accept_deadline, "listener accept timed out");
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("accept failed: {error}"),
+        }
+    };
+
+    let stream_token = Token(IO_TOKEN_START);
+    event_loop
+        .reactor()
+        .register(&mut server_stream, stream_token, Interest::READABLE)
+        .unwrap();
+
+    let received = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let callback_received = Arc::clone(&received);
+    event_loop
+        .on_readiness(stream_token, move |_, _queues| {
+            let mut buf = [0u8; 1];
+            match server_stream.read(&mut buf) {
+                Ok(0) => Ok(DrainState::Drained), // EOF; nothing more to consume.
+                Ok(n) => {
+                    callback_received.lock().unwrap().extend_from_slice(&buf[..n]);
+                    // Deliberately stop after one byte: the pump must re-invoke
+                    // us until WouldBlock, proving partial reads cannot strand.
+                    Ok(DrainState::KeepDraining)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    Ok(DrainState::Drained)
+                }
+                Err(error) => Err(error.into()),
+            }
+        })
+        .unwrap();
+
+    let drain_deadline = Instant::now() + Duration::from_secs(5);
+    while received.lock().unwrap().len() < payload.len() {
+        assert!(
+            Instant::now() < drain_deadline,
+            "readiness callback never drained the full payload"
+        );
+        event_loop
+            .run_once(Some(Duration::from_millis(50)))
+            .unwrap();
+    }
+
+    assert_eq!(*received.lock().unwrap(), payload);
+    peer_done.store(true, Ordering::Release);
+    client.join().unwrap();
+}
+
+#[test]
+fn stop_from_another_thread_terminates_running_loop() {
+    let mut event_loop = Loop::new().unwrap();
+    let stop_handle = event_loop.stop_handle();
+    let stopper = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        stop_handle.stop();
+    });
+
+    let started = Instant::now();
+    event_loop.run().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "loop did not terminate promptly after StopHandle::stop"
+    );
+    stopper.join().unwrap();
+}
+
+#[test]
+fn stop_before_run_makes_run_return_immediately() {
+    let mut event_loop = Loop::new().unwrap();
+    let stop_handle = event_loop.stop_handle();
+    stop_handle.stop();
+
+    let started = Instant::now();
+    event_loop.run().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "run should return immediately when stopped before entry"
+    );
 }

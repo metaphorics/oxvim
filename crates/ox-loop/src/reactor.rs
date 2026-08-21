@@ -28,8 +28,14 @@ impl Reactor {
         Ok(Self { poll, waker })
     }
 
-    /// Registers a caller-owned source. Mio readiness is level-triggered on the
-    /// supported platform backends; callbacks must still drain until WouldBlock.
+    /// Registers a caller-owned source.
+    ///
+    /// Mio's epoll backend registers with `EPOLLET` unconditionally
+    /// (edge-triggered), so a readiness notification is delivered once per
+    /// state change and is not re-reported while buffered data remains.
+    /// Callers MUST drain readable sources until `WouldBlock` before
+    /// returning; [`crate::Loop`] enforces this by re-invoking callbacks that
+    /// report [`crate::DrainState::KeepDraining`].
     pub fn register<S: Source + ?Sized>(
         &self,
         source: &mut S,
@@ -44,6 +50,9 @@ impl Reactor {
     }
 
     /// Changes a caller-owned source's token or readiness interests.
+    ///
+    /// The same edge-triggered (`EPOLLET`) and drain-until-WouldBlock contract
+    /// applies as for [`Reactor::register`].
     pub fn reregister<S: Source + ?Sized>(
         &self,
         source: &mut S,

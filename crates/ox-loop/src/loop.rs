@@ -4,10 +4,29 @@
 //! (timer phase), readiness polling and dispatch (poll phase), then owned
 //! MultiQueue processing (check/deferred phase). Timers that become due while
 //! poll sleeps are fired before readiness dispatch, preserving timers-before-I/O.
+//!
+//! # Readiness contract (edge-triggered, drain-until-WouldBlock)
+//!
+//! mio's `epoll` backend sets `EPOLLET` unconditionally (see
+//! `mio::sys::unix::selector::epoll::interests_to_epoll`), so a readiness
+//! notification is delivered at most once per state change and is **not**
+//! re-reported while buffered data remains. A readiness callback that
+//! consumes only part of an available byte stream and returns would leave the
+//! remainder stranded until new data arrives.
+//!
+//! To keep msgpack frame streams from ever starving, every readable source
+//! must be drained until `WouldBlock`. This pump enforces that contract: a
+//! callback returning [`DrainState::KeepDraining`] is re-invoked
+//! synchronously until it returns [`DrainState::Drained`] (i.e. the source
+//! reported `WouldBlock`). A partial read therefore advances the buffer that
+//! was already available on this edge and cannot strand buffered frames.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mio::Waker as MioWaker;
 use mio::{Events as MioEvents, Token};
 
 use crate::{
@@ -43,7 +62,44 @@ pub enum WaitOutcome {
     Stopped,
 }
 
-type ReadinessCallback = Box<dyn FnMut(Readiness, &mut MultiQueue) -> Result<()> + 'static>;
+/// Signal a readiness callback returns to tell the pump whether the source
+/// was fully drained on this readiness edge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DrainState {
+    /// The source was read (or written) until `WouldBlock`; the OS buffer is
+    /// exhausted and no further notification is warranted for this edge.
+    Drained,
+    /// The callback stopped before observing `WouldBlock` (for example, it
+    /// consumed a single buffered message). The pump re-invokes it until it
+    /// returns [`DrainState::Drained`], so a partial read can never strand
+    /// remaining data under edge-triggered readiness.
+    KeepDraining,
+}
+
+type ReadinessCallback = Box<dyn FnMut(Readiness, &mut MultiQueue) -> Result<DrainState> + 'static>;
+
+/// Cloneable, thread-safe stop signal for a [`Loop`].
+///
+/// Obtain one with [`Loop::stop_handle`] before pumping. Calling [`stop`] on
+/// any clone sets a shared flag and wakes the reactor, so a loop blocked in
+/// [`Loop::run`] returns promptly and a loop that has not started yet returns
+/// immediately on entry.
+/// [`stop`]: StopHandle::stop
+#[derive(Clone)]
+pub struct StopHandle {
+    stopped: Arc<AtomicBool>,
+    waker: Arc<MioWaker>,
+}
+
+impl StopHandle {
+    /// Requests that the associated loop stop after its current iteration.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        // Wake the reactor so a loop blocked in poll returns and observes the
+        // flag instead of waiting out its timeout.
+        let _ = self.waker.wake();
+    }
+}
 
 /// Single-threaded callback pump with thread-safe work ingress.
 pub struct Loop {
@@ -53,7 +109,7 @@ pub struct Loop {
     work: WorkQueues,
     signals: Signals,
     callbacks: HashMap<Token, ReadinessCallback>,
-    stopped: bool,
+    stopped: Arc<AtomicBool>,
 }
 
 impl Loop {
@@ -75,7 +131,7 @@ impl Loop {
             work,
             signals,
             callbacks: HashMap::new(),
-            stopped: false,
+            stopped: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -110,10 +166,13 @@ impl Loop {
     }
 
     /// Associates a readiness callback with a caller-owned token.
+    ///
+    /// The callback returns [`DrainState`] to signal whether the source was
+    /// drained until `WouldBlock`; see the crate-module readiness contract.
     pub fn on_readiness(
         &mut self,
         token: Token,
-        callback: impl FnMut(Readiness, &mut MultiQueue) -> Result<()> + 'static,
+        callback: impl FnMut(Readiness, &mut MultiQueue) -> Result<DrainState> + 'static,
     ) -> Result<()> {
         if token == WAKE_TOKEN || token == SIGNAL_TOKEN {
             return Err(Error::ReservedToken(token));
@@ -130,15 +189,36 @@ impl Loop {
         self.callbacks.remove(&token).is_some()
     }
 
-    /// Requests that `run` return after its current iteration.
-    pub fn stop(&mut self) {
-        self.stopped = true;
+    /// Returns a cloneable, thread-safe stop signal backed by this loop's
+    /// reactor waker. Obtain it before pumping; once `run` is under way no
+    /// other thread can reach the loop's `&mut self` to request a stop.
+    pub fn stop_handle(&self) -> StopHandle {
+        StopHandle {
+            stopped: Arc::clone(&self.stopped),
+            waker: self.reactor.waker(),
+        }
     }
 
-    /// Pumps until [`Loop::stop`] is requested or an error occurs.
+    /// Requests that `run` return after its current iteration.
+    ///
+    /// Equivalent to [`StopHandle::stop`]; it is a convenience for the loop
+    /// thread itself, which already holds `&mut self`.
+    pub fn stop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        let _ = self.reactor.waker().wake();
+    }
+
+    /// Pumps until [`StopHandle::stop`] (or [`Loop::stop`]) is requested or an
+    /// error occurs.
+    ///
+    /// A stop requested before `run` is entered is honored: the flag is
+    /// observed on entry and never cleared, so `run` returns immediately
+    /// without pumping.
     pub fn run(&mut self) -> Result<()> {
-        self.stopped = false;
-        while !self.stopped {
+        if self.stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        while !self.stopped.load(Ordering::Acquire) {
             let _ = self.run_once(None)?;
         }
         Ok(())
@@ -163,7 +243,7 @@ impl Loop {
             if condition() {
                 return Ok(WaitOutcome::ConditionMet);
             }
-            if self.stopped {
+            if self.stopped.load(Ordering::Acquire) {
                 return Ok(WaitOutcome::Stopped);
             }
             let remaining = timeout.and_then(|limit| limit.checked_sub(started.elapsed()));
@@ -220,7 +300,7 @@ impl Loop {
                 write_closed: event.is_write_closed(),
             };
             if let Some(mut callback) = self.callbacks.remove(&token) {
-                let result = callback(readiness, &mut self.events);
+                let result = self.dispatch_readiness(&mut callback, readiness);
                 self.callbacks.insert(token, callback);
                 result?;
             }
@@ -240,6 +320,26 @@ impl Loop {
             }
         }
         Ok(unhandled)
+    }
+
+    /// Invokes `callback` until it reports [`DrainState::Drained`].
+    ///
+    /// mio's epoll backend is edge-triggered (`EPOLLET`), so a readiness
+    /// notification is delivered once per state change. Re-invoking until the
+    /// callback observes `WouldBlock` guarantees a partial read advances the
+    /// entire buffer available on this edge and never strands buffered
+    /// msgpack frames waiting for a readiness report that will not come.
+    fn dispatch_readiness(
+        &mut self,
+        callback: &mut ReadinessCallback,
+        readiness: Readiness,
+    ) -> Result<()> {
+        loop {
+            match callback(readiness, &mut self.events)? {
+                DrainState::Drained => return Ok(()),
+                DrainState::KeepDraining => continue,
+            }
+        }
     }
 
     fn fire_expired(&mut self, now: Instant) {
