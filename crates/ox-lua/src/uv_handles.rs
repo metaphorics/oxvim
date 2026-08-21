@@ -92,9 +92,13 @@ struct StreamCallbacks {
     /// Pipe-only: callback of the write being queued; a synchronously flushed
     /// completion claims it during `ProcessPipe::write` before its id is known.
     pending_write: Option<Function>,
-    /// Pipe-only: (callback, result) of a write completed synchronously inside
-    /// `ProcessPipe::write`; invoked once the pipe borrow is released.
-    completed_write: Option<(Function, Result<(), String>)>,
+    /// Pipe-only: set while a `ProcessPipe::write` call holds the pipe borrow.
+    /// Every completion it delivers — this write or an earlier buffered one
+    /// flushed by it — parks instead of invoking Lua under the borrow.
+    write_in_flight: bool,
+    /// Pipe-only: (callback, result) parked in completion order while a write
+    /// call is in flight; delivered in order once the pipe borrow is released.
+    parked_writes: VecDeque<(Function, Result<(), String>)>,
     shutdown: Option<Function>,
     accepted_tcp: VecDeque<Tcp>,
     #[cfg(unix)]
@@ -247,12 +251,16 @@ impl LuaProcessPipe {
             // Release the borrow before invoking: the Lua write callback may
             // call back into this pipe (shutdown/close/write).
             NetEvent::WriteComplete { id, result } => {
+                let result = result.map_err(|error| error.to_string());
                 let mut state = callbacks.borrow_mut();
-                match state.writes.remove(&id.get()) {
+                let callback = state.writes.remove(&id.get()).or_else(|| state.pending_write.take());
+                match callback {
+                    // A completion delivered inside `ProcessPipe::write` — for
+                    // the write being queued or an earlier buffered one it just
+                    // flushed: park it; the pipe borrow is still held.
+                    Some(callback) if state.write_in_flight => { state.parked_writes.push_back((callback, result)); }
                     Some(callback) => { drop(state); if let Ok(args) = error_args(&lua, result) { invoke(&lua, &fast, &callback, args); } }
-                    // A completion racing its own queueing: stash it — the
-                    // pipe is borrowed while `ProcessPipe::write` delivers this.
-                    None => { if let Some(callback) = state.pending_write.take() { state.completed_write = Some((callback, result.map_err(|error| error.to_string()))); } }
+                    None => {}
                 }
             },
             _ => {}
@@ -275,31 +283,38 @@ impl UserData for LuaProcessPipe {
             let access = this.access.clone();
             this.access.apply(Box::new(move |uv_loop| {
                 if let Some(callback) = callback { callbacks.borrow_mut().pending_write = Some(callback); }
-                // A synchronously flushed write delivers its WriteComplete
-                // inside this call; keep Lua out until the pipe is released.
+                // `ProcessPipe::write` flushes synchronously and delivers
+                // WriteComplete events inside this call — for the write being
+                // queued and for any earlier buffered writes it drains. Park
+                // them all; keep Lua out until the pipe borrow is released.
                 let queued = {
-                    let mut inner = inner.borrow_mut();
-                    match inner.as_mut() {
-                        Some(pipe) => pipe.write(uv_loop, data),
-                        None => Err(ox_uv::net::NetError::Closed),
-                    }
-                };
-                let delivery = match queued {
-                    Ok(id) => {
-                        let claimed = callbacks.borrow_mut().pending_write.take();
-                        match claimed {
-                            // An outstanding remainder completes on a later
-                            // loop turn under this write id, like TCP/TTY.
-                            Some(callback) => { callbacks.borrow_mut().writes.insert(id.get(), callback); None }
-                            None => callbacks.borrow_mut().completed_write.take(),
+                    callbacks.borrow_mut().write_in_flight = true;
+                    let queued = {
+                        let mut inner = inner.borrow_mut();
+                        match inner.as_mut() {
+                            Some(pipe) => pipe.write(uv_loop, data),
+                            None => Err(ox_uv::net::NetError::Closed),
                         }
-                    }
-                    Err(error) => {
-                        callbacks.borrow_mut().pending_write.take().map(|callback| (callback, Err(error.to_string())))
-                    }
+                    };
+                    callbacks.borrow_mut().write_in_flight = false;
+                    queued
                 };
-                if let Some((callback, result)) = delivery {
-                    access.callback(uv_loop, || { if let Ok(args) = error_args(&lua, result) { invoke(&lua, &fast, &callback, args); } });
+                let claimed = callbacks.borrow_mut().pending_write.take();
+                match (queued, claimed) {
+                    // An outstanding remainder completes on a later loop turn
+                    // under this write id, like TCP/TTY.
+                    (Ok(id), Some(callback)) => { callbacks.borrow_mut().writes.insert(id.get(), callback); }
+                    // The queued write never reached the pipe: report it here.
+                    (Err(error), Some(callback)) => { callbacks.borrow_mut().parked_writes.push_back((callback, Err(error.to_string()))); }
+                    _ => {}
+                }
+                let parked: Vec<_> = callbacks.borrow_mut().parked_writes.drain(..).collect();
+                if !parked.is_empty() {
+                    access.callback(uv_loop, move || {
+                        for (callback, result) in parked {
+                            if let Ok(args) = error_args(&lua, result) { invoke(&lua, &fast, &callback, args); }
+                        }
+                    });
                 }
             }))?;
             Ok(true)

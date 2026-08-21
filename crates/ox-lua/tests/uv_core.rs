@@ -269,6 +269,79 @@ fn pipe_write_callback_fires_only_when_the_loop_pumps_the_write() {
     assert!(host.lua().globals().get::<bool>("write_fired").unwrap());
 }
 
+/// Capacity of a fresh child-stdin pipe: one blocking oversized write fills
+/// the pipe, and the `head -c 1` child exits after its single-byte read and
+/// closes the read end, so the write returns the partial count it copied —
+/// the pipe capacity — instead of blocking for a reader that never drains.
+fn stdin_pipe_capacity() -> usize {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("head")
+        .args(["-c", "1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pipe capacity probe");
+    let mut stdin = child.stdin.take().expect("probe stdin pipe");
+    let accepted = stdin.write(&vec![b'x'; 1 << 20]).expect("probe write");
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    accepted.max(1)
+}
+
+#[test]
+fn pipe_write_flushing_earlier_write_parks_completion_until_borrow_release() {
+    let (host, scheduler) = host();
+    // Write A exceeds the pipe capacity by half of it, so it buffers a
+    // remainder that a single later flush can carry together with write B.
+    let capacity = stdin_pipe_capacity();
+    let payload_a = capacity + capacity / 2;
+    host.lua()
+        .load(
+            format!(
+                r"
+            order = ''
+            local input = vim.uv.new_pipe(false)
+            local process
+            process = assert(vim.uv.spawn('/bin/cat', {{
+              stdio = {{ input, nil, nil }},
+            }}, function(code, signal)
+              assert(code == 0 and signal == 0)
+              process:close()
+            end))
+            -- Larger than the pipe capacity: write A returns with a buffered
+            -- remainder, so its completion is still queued when write B runs.
+            input:write(('a'):rep({payload_a}), function(err)
+              assert(err == nil)
+              order = order .. 'A'
+              -- Close from inside the completion: this fires while write B's
+              -- synchronous flush still holds the pipe borrow, and closing
+              -- used to re-enter that borrow and panic.
+              input:close()
+            end)
+            assert(order == '', 'write A completed before write B was queued')
+            -- Let cat drain the pipe so write B's synchronous flush carries
+            -- A's remainder and B in a single pass.
+            local deadline = os.clock() + 0.25
+            while os.clock() < deadline do end
+            input:write('b', function(err)
+              assert(err == nil)
+              order = order .. 'B'
+            end)
+            vim.uv.run('default')
+            assert(order == 'AB', 'completion order was: ' .. order)
+            "
+            )
+            .as_str(),
+        )
+        .exec()
+        .unwrap();
+    scheduler.drain().unwrap();
+    assert_eq!(host.lua().globals().get::<String>("order").unwrap(), "AB");
+}
+
 #[test]
 fn timer_close_is_idempotent() {
     let (host, scheduler) = host();
