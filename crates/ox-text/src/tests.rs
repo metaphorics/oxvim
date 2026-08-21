@@ -491,3 +491,84 @@ fn real_nvim_swap_interoperates_both_directions() {
     assert_eq!(fs::read_to_string(recovered).unwrap(), "red\ngreen\nblue\nORANGE\n");
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn undo_file_header_seq_validation() {
+    let buffer = Buffer::from_bytes(b"a\nb\n").unwrap();
+    let mut tree = UndoTree::new();
+    tree.record(edit_at(2, &bytes(&["b"]), &bytes(&["c"])), 1710000001);
+    tree.record(edit_at(2, &bytes(&["c"]), &bytes(&["d"])), 1710000002);
+    let undo = UndoFile::from_tree(&buffer, &tree);
+    let mut valid = Vec::new();
+    undo.write(&mut valid).unwrap();
+    assert!(UndoFile::read(IoCursor::new(valid.clone())).is_ok());
+
+    let header_positions: Vec<usize> = valid
+        .windows(2)
+        .enumerate()
+        .filter(|(_, w)| **w == [0x5f, 0xd0])
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(header_positions.len(), 2, "fixture must contain two headers");
+
+    let seq_offset = |header_index: usize| header_positions[header_index] + 2 + 4 * 4;
+
+    // A zero sequence number on the second header must be rejected.
+    let mut zero_seq = valid.clone();
+    zero_seq[seq_offset(1)..seq_offset(1) + 4].copy_from_slice(&0_i32.to_be_bytes());
+    assert!(matches!(
+        UndoFile::read(IoCursor::new(zero_seq)),
+        Err(UndoFileError::Malformed)
+    ));
+
+    // A negative sequence number on the second header must be rejected.
+    let mut neg_seq = valid.clone();
+    neg_seq[seq_offset(1)..seq_offset(1) + 4].copy_from_slice(&i32::MIN.to_be_bytes());
+    assert!(matches!(
+        UndoFile::read(IoCursor::new(neg_seq)),
+        Err(UndoFileError::Malformed)
+    ));
+
+    // A duplicate sequence number across headers must be rejected.
+    let mut dup_seq = valid.clone();
+    dup_seq[seq_offset(1)..seq_offset(1) + 4]
+        .copy_from_slice(&valid[seq_offset(0)..seq_offset(0) + 4]);
+    assert!(matches!(
+        UndoFile::read(IoCursor::new(dup_seq)),
+        Err(UndoFileError::Malformed)
+    ));
+}
+
+#[test]
+fn undo_file_entry_fields_reject_negative() {
+    let buffer = Buffer::from_bytes(b"a\nb\n").unwrap();
+    let mut tree = UndoTree::new();
+    tree.record(edit_at(2, &bytes(&["b"]), &bytes(&["c"])), 1710000001);
+    let undo = UndoFile::from_tree(&buffer, &tree);
+    let mut valid = Vec::new();
+    undo.write(&mut valid).unwrap();
+    assert!(UndoFile::read(IoCursor::new(valid.clone())).is_ok());
+
+    let entry_positions: Vec<usize> = valid
+        .windows(2)
+        .enumerate()
+        .filter(|(_, w)| **w == [0xf5, 0x18])
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(entry_positions.len(), 1, "fixture must contain one entry");
+    let entry_top = entry_positions[0] + 2;
+    let neg = i32::MIN.to_be_bytes();
+
+    for (name, field_offset) in [("ue_top", 0), ("ue_bot", 4), ("ue_lcount", 8)] {
+        let mut mutated = valid.clone();
+        let offset = entry_top + field_offset;
+        mutated[offset..offset + 4].copy_from_slice(&neg);
+        assert!(
+            matches!(
+                UndoFile::read(IoCursor::new(mutated)),
+                Err(UndoFileError::Malformed)
+            ),
+            "negative {name} was accepted"
+        );
+    }
+}

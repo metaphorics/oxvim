@@ -4,6 +4,7 @@
 //! parsed file retains its complete byte stream, including header branches and
 //! extension records, so read/write preserves fields this crate does not edit.
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
 
 use sha2::{Digest, Sha256};
@@ -212,10 +213,11 @@ fn validate_structure(bytes: &[u8]) -> Result<(), UndoFileError> {
         offset = add(offset, 2)?;
         return end_of_input(bytes, offset);
     }
+    let mut seen_seqs = HashSet::new();
     for _ in 0..num_head {
         expect_u16(bytes, offset, HEADER_MAGIC)?;
         offset = add(offset, 2)?;
-        offset = validate_header(bytes, offset)?;
+        offset = validate_header(bytes, offset, &mut seen_seqs)?;
     }
     expect_u16(bytes, offset, HEADER_END_MAGIC)?;
     offset = add(offset, 2)?;
@@ -224,9 +226,26 @@ fn validate_structure(bytes: &[u8]) -> Result<(), UndoFileError> {
 
 /// Validates one undo header after its `HEADER_MAGIC`, returning the offset
 /// just past its entries and extmark terminator.
-fn validate_header(bytes: &[u8], mut offset: usize) -> Result<usize, UndoFileError> {
-    // Four branch links and the sequence number.
-    offset = add(offset, 5 * 4)?;
+fn validate_header(
+    bytes: &[u8],
+    mut offset: usize,
+    seen_seqs: &mut HashSet<i32>,
+) -> Result<usize, UndoFileError> {
+    // Four signed branch links (uh_next, uh_prev, uh_alt_next, uh_alt_prev).
+    let _uh_next = read_i32(bytes, offset)?;
+    offset = add(offset, 4)?;
+    let _uh_prev = read_i32(bytes, offset)?;
+    offset = add(offset, 4)?;
+    let _uh_alt_next = read_i32(bytes, offset)?;
+    offset = add(offset, 4)?;
+    let _uh_alt_prev = read_i32(bytes, offset)?;
+    offset = add(offset, 4)?;
+    // Header sequence number must be positive and unique across all headers.
+    let uh_seq = read_i32(bytes, offset)?;
+    offset = add(offset, 4)?;
+    if uh_seq <= 0 || !seen_seqs.insert(uh_seq) {
+        return Err(UndoFileError::Malformed);
+    }
     // Saved cursor (lnum, col, coladd), vcol, flags.
     offset = add(offset, 3 * 4 + 4 + 2)?;
     // Named marks (each a position triple) and the visual info block.
@@ -262,8 +281,17 @@ fn validate_header(bytes: &[u8], mut offset: usize) -> Result<usize, UndoFileErr
 
 /// Validates one length-prefixed series of saved lines after its `ENTRY_MAGIC`.
 fn validate_entry(bytes: &[u8], mut offset: usize) -> Result<usize, UndoFileError> {
-    // ue_top, ue_bot, ue_lcount, then ue_size.
-    offset = add(offset, 3 * 4)?;
+    // ue_top, ue_bot, and ue_lcount are signed big-endian line numbers.
+    let ue_top = read_i32(bytes, offset)?;
+    offset = add(offset, 4)?;
+    let ue_bot = read_i32(bytes, offset)?;
+    offset = add(offset, 4)?;
+    let ue_lcount = read_i32(bytes, offset)?;
+    offset = add(offset, 4)?;
+    if ue_top < 0 || ue_bot < 0 || ue_lcount < 0 {
+        return Err(UndoFileError::Malformed);
+    }
+    // ue_size is the unsigned length-prefixed line count.
     let size = read_u32(bytes, offset)?;
     offset = add(offset, 4)?;
     for _ in 0..size {
@@ -332,6 +360,15 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, UndoFileError> {
         .try_into()
         .map_err(|_| UndoFileError::Malformed)?;
     Ok(u32::from_be_bytes(raw))
+}
+
+fn read_i32(bytes: &[u8], offset: usize) -> Result<i32, UndoFileError> {
+    let raw: [u8; 4] = bytes
+        .get(offset..offset + 4)
+        .ok_or(UndoFileError::Malformed)?
+        .try_into()
+        .map_err(|_| UndoFileError::Malformed)?;
+    Ok(i32::from_be_bytes(raw))
 }
 
 fn put_u16(bytes: &mut Vec<u8>, value: u16) {
