@@ -1,7 +1,5 @@
 use std::cell::{Cell, RefCell};
 use std::fs as std_fs;
-#[cfg(unix)]
-use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -46,18 +44,6 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std_fs::remove_dir_all(&self.0);
     }
-}
-
-#[cfg(unix)]
-fn read_bounded(
-    read: impl FnOnce() -> std::io::Result<Vec<u8>> + Send + 'static,
-) -> std::io::Result<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(read());
-    });
-    rx.recv_timeout(TIMEOUT)
-        .expect("process output read timed out")
 }
 
 fn run_default_bounded(uv_loop: &mut UvLoop) {
@@ -199,6 +185,8 @@ fn new_thread_join_returns_entry_value() {
 #[cfg(unix)]
 #[test]
 fn process_cat_echoes_through_pipes_and_exits_cleanly() {
+    use crate::net::NetEvent;
+
     let mut uv_loop = UvLoop::new().expect("create loop");
     let (tx, rx) = mpsc::channel();
     let mut options = SpawnOptions::new("/bin/cat");
@@ -209,19 +197,32 @@ fn process_cat_echoes_through_pipes_and_exits_cleanly() {
     .expect("spawn cat");
 
     let payload = b"cat pipe echo\n";
-    let mut stdin = spawned.pipes.stdin.take().expect("cat stdin pipe");
-    stdin.write_all(payload).expect("write cat stdin");
-    drop(stdin);
-    let mut stdout = spawned.pipes.stdout.take().expect("cat stdout pipe");
-    let output = read_bounded(move || {
-        let mut output = Vec::new();
-        stdout.read_to_end(&mut output)?;
-        Ok(output)
-    })
-    .expect("read cat stdout");
-    assert_eq!(output, payload);
+    let echoed: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+    let eof_reached: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    {
+        let mut stdin = spawned.pipes.stdin.take().expect("cat stdin pipe");
+        stdin.write(&mut uv_loop, payload.to_vec()).expect("write cat stdin");
+        // The small write flushes synchronously; closing stdin signals EOF.
+        stdin.close(&mut uv_loop).expect("close cat stdin");
+    }
+    {
+        let echoed = echoed.clone();
+        let eof_reached = eof_reached.clone();
+        let mut stdout = spawned.pipes.stdout.take().expect("cat stdout pipe");
+        stdout
+            .read_start(&mut uv_loop, move |_, _, event| match event {
+                NetEvent::Read(data) => echoed.borrow_mut().extend(data),
+                NetEvent::Eof => eof_reached.set(true),
+                NetEvent::Error(error) => panic!("cat stdout read error: {error}"),
+                _ => {}
+            })
+            .expect("start reading cat stdout");
+    }
 
     run_default_bounded(&mut uv_loop);
+    assert!(eof_reached.get(), "cat stdout did not reach EOF");
+    assert_eq!(&*echoed.borrow(), &payload);
+
     let exit = rx.recv_timeout(TIMEOUT).expect("cat exit callback");
     assert_eq!((exit.code, exit.signal), (0, 0));
 }
@@ -255,13 +256,14 @@ fn sigterm_is_reported_as_terminating_signal() {
 #[cfg(unix)]
 #[test]
 fn pty_reports_terminal_and_supports_resize() {
+    use crate::net::NetEvent;
     use crate::process::PtySize;
 
     let mut uv_loop = UvLoop::new().expect("create loop");
     let (tx, rx) = mpsc::channel();
     let mut options = SpawnOptions::new("/bin/sh");
     options.args = vec!["-c".into(), "tty".into()];
-    let spawned = process::spawn_pty(
+    let mut spawned = process::spawn_pty(
         &mut uv_loop,
         options,
         PtySize { rows: 24, columns: 80 },
@@ -271,37 +273,66 @@ fn pty_reports_terminal_and_supports_resize() {
     )
     .expect("spawn PTY");
 
-    spawned
-        .master
-        .resize(portable_pty::PtySize { rows: 40, cols: 100, pixel_width: 0, pixel_height: 0 })
-        .expect("resize PTY");
+    spawned.master.resize(PtySize { rows: 40, columns: 100 }).expect("resize PTY");
     let size = spawned.master.get_size().expect("read PTY size");
-    assert_eq!((size.rows, size.cols), (40, 100));
+    assert_eq!((size.rows, size.columns), (40, 100));
 
-    let mut reader = spawned.master.try_clone_reader().expect("clone PTY reader");
-    let output = read_bounded(move || {
-        let mut output = Vec::new();
-        loop {
-            let mut chunk = [0_u8; 256];
-            match reader.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(count) => output.extend_from_slice(&chunk[..count]),
-                Err(error) if error.raw_os_error() == Some(5) => break,
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(output)
-    })
-    .expect("read tty output");
-    let output = String::from_utf8(output).expect("tty output is UTF-8");
+    let output: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+    let eof_reached: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    {
+        let output = output.clone();
+        let eof_reached = eof_reached.clone();
+        spawned
+            .master
+            .read_start(&mut uv_loop, move |_, _, event| match event {
+                NetEvent::Read(data) => output.borrow_mut().extend(data),
+                NetEvent::Eof => eof_reached.set(true),
+                NetEvent::Error(error) => panic!("PTY read error: {error}"),
+                _ => {}
+            })
+            .expect("start reading PTY");
+    }
+
+    let deadline = Instant::now() + TIMEOUT;
+    while !eof_reached.get() && Instant::now() < deadline {
+        uv_loop.run_nowait().expect("pump PTY");
+    }
+    assert!(eof_reached.get(), "PTY did not reach EOF");
+    let output = String::from_utf8(output.borrow().clone()).expect("tty output is UTF-8");
     #[cfg(target_os = "linux")]
     assert!(output.trim().starts_with("/dev/pts/"), "unexpected tty path: {output:?}");
     #[cfg(not(target_os = "linux"))]
     assert!(output.trim().starts_with("/dev/"), "unexpected tty path: {output:?}");
 
+    spawned.master.close(&mut uv_loop).expect("close PTY master");
     run_default_bounded(&mut uv_loop);
     let exit = rx.recv_timeout(TIMEOUT).expect("PTY exit callback");
     assert_eq!((exit.code, exit.signal), (0, 0));
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_sigterm_reports_terminating_signal() {
+    use crate::process::PtySize;
+
+    let mut uv_loop = UvLoop::new().expect("create loop");
+    let (tx, rx) = mpsc::channel();
+    let mut options = SpawnOptions::new("/bin/sh");
+    options.args = vec!["-c".into(), "exec sleep 30".into()];
+    let spawned = process::spawn_pty(
+        &mut uv_loop,
+        options,
+        PtySize { rows: 24, columns: 80 },
+        move |_, result| {
+            tx.send(result.expect("PTY sleeper exits by signal")).expect("send terminated PTY exit");
+        },
+    )
+    .expect("spawn PTY sleeper");
+
+    process::process_kill(&spawned.process, Some(15)).expect("send SIGTERM to PTY child");
+    run_default_bounded(&mut uv_loop);
+    let exit = rx.recv_timeout(TIMEOUT).expect("PTY terminated exit callback");
+    assert_eq!((exit.code, exit.signal), (0, 15));
 }
 
 #[test]

@@ -14,6 +14,26 @@ use crate::pool::{LoopPoster, UvLoopPoster};
 use crate::{Handle, HandleId, UvLoop};
 
 #[cfg(unix)]
+use std::cell::RefCell;
+#[cfg(unix)]
+use std::os::fd::AsRawFd as _;
+#[cfg(unix)]
+use std::rc::Rc;
+
+#[cfg(unix)]
+use mio::unix::SourceFd;
+#[cfg(unix)]
+use mio::{Interest, Token};
+#[cfg(unix)]
+use ox_loop::{DrainState, Readiness};
+
+#[cfg(unix)]
+use crate::net::{
+    CallbackCell, NetError, NetEvent, NetResult, WriteId, WriteQueue, drain_reads, drive_writes,
+    interest, invoke, is_would_block, live, queue_batch,
+};
+
+#[cfg(unix)]
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 
 /// Result delivered to a process exit callback.
@@ -91,6 +111,25 @@ pub struct ProcessExit {
 }
 
 /// Parent-side endpoints created by [`StdioConfig::CreatePipe`].
+///
+/// On Unix each endpoint is a loop-managed, nonblocking [`ProcessPipe`]
+/// handle registered with the owning [`UvLoop`]; reads and writes are drained
+/// until `WouldBlock` and delivered as [`NetEvent`] readiness callbacks. On
+/// other platforms the underlying blocking standard-stream types are returned
+/// because the platform lacks a safe nonblocking registration primitive here.
+#[cfg(unix)]
+#[derive(Default)]
+pub struct ProcessPipes {
+    /// Writable parent endpoint connected to child stdin.
+    pub stdin: Option<ProcessPipe>,
+    /// Readable parent endpoint connected to child stdout.
+    pub stdout: Option<ProcessPipe>,
+    /// Readable parent endpoint connected to child stderr.
+    pub stderr: Option<ProcessPipe>,
+}
+
+/// Parent-side endpoints created by [`StdioConfig::CreatePipe`].
+#[cfg(not(unix))]
 #[derive(Debug, Default)]
 pub struct ProcessPipes {
     /// Writable parent endpoint connected to child stdin.
@@ -101,6 +140,18 @@ pub struct ProcessPipes {
     pub stderr: Option<ChildStderr>,
 }
 
+#[cfg(unix)]
+impl std::fmt::Debug for ProcessPipes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProcessPipes")
+            .field("stdin", &self.stdin.as_ref().map(ProcessPipe::id))
+            .field("stdout", &self.stdout.as_ref().map(ProcessPipe::id))
+            .field("stderr", &self.stderr.as_ref().map(ProcessPipe::id))
+            .finish()
+    }
+}
+
 /// A spawned and asynchronously reaped child plus its created pipes.
 #[derive(Debug)]
 pub struct SpawnedProcess {
@@ -108,6 +159,392 @@ pub struct SpawnedProcess {
     pub process: Process,
     /// Parent-side pipe endpoints requested in the spawn options.
     pub pipes: ProcessPipes,
+}
+
+/// A parent-side endpoint of a [`StdioConfig::CreatePipe`] child stream.
+#[cfg(unix)]
+enum ChildStream {
+    /// Writable child-stdin endpoint.
+    In(ChildStdin),
+    /// Readable child-stdout endpoint.
+    Out(ChildStdout),
+    /// Readable child-stderr endpoint.
+    Err(ChildStderr),
+}
+
+#[cfg(unix)]
+impl ChildStream {
+    fn set_nonblocking(&self) -> io::Result<()> {
+        use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+        match self {
+            ChildStream::In(stream) => {
+                fcntl_setfl(stream, fcntl_getfl(stream)? | OFlags::NONBLOCK)
+            }
+            ChildStream::Out(stream) => {
+                fcntl_setfl(stream, fcntl_getfl(stream)? | OFlags::NONBLOCK)
+            }
+            ChildStream::Err(stream) => {
+                fcntl_setfl(stream, fcntl_getfl(stream)? | OFlags::NONBLOCK)
+            }
+        }
+        .map_err(io::Error::from)
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for ChildStream {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            ChildStream::In(stream) => stream.as_raw_fd(),
+            ChildStream::Out(stream) => stream.as_raw_fd(),
+            ChildStream::Err(stream) => stream.as_raw_fd(),
+        }
+    }
+}
+
+#[cfg(unix)]
+struct ProcessPipeState {
+    io: Option<ChildStream>,
+    reading: bool,
+    writes: WriteQueue,
+    registered: bool,
+}
+
+#[cfg(unix)]
+fn process_pipe_interest(state: &ProcessPipeState) -> Interest {
+    match &state.io {
+        Some(ChildStream::In(_)) => interest(false, state.writes.wants_write()),
+        Some(ChildStream::Out(_)) | Some(ChildStream::Err(_)) => {
+            interest(state.reading, state.writes.wants_write())
+        }
+        None => Interest::READABLE,
+    }
+}
+
+#[cfg(unix)]
+fn process_pipe_active(state: &ProcessPipeState) -> bool {
+    state.reading || state.writes.wants_write()
+}
+
+/// A [`StdioConfig::CreatePipe`] parent endpoint that pumps through the owning
+/// loop instead of blocking the host thread.
+///
+/// The child stream's descriptor is registered with the loop's reactor through
+/// the sanctioned `UvLoop::inner_mut` seam, placed in nonblocking mode, and
+/// drained until `WouldBlock` on readiness the same way the network handles in
+/// `net.rs` drain their streams. Events surface as [`NetEvent`] readiness
+/// callbacks delivered during the loop's pending phase.
+///
+/// See `luvref.txt`, `uv.spawn()` / `uv.spawn-options` (lines 1340-1452).
+#[cfg(unix)]
+pub struct ProcessPipe {
+    id: HandleId,
+    token: Token,
+    state: Rc<RefCell<ProcessPipeState>>,
+    _callback: CallbackCell,
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for ProcessPipe {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ProcessPipe").field("id", &self.id).finish()
+    }
+}
+
+#[cfg(unix)]
+impl ProcessPipe {
+    fn attach(uv_loop: &mut UvLoop, stream: ChildStream) -> NetResult<Self> {
+        stream.set_nonblocking().map_err(NetError::Io)?;
+        let id = uv_loop.allocate_external(false)?;
+        let token = uv_loop.allocate_io_token()?;
+        let state = Rc::new(RefCell::new(ProcessPipeState {
+            io: Some(stream),
+            reading: false,
+            writes: WriteQueue::new(),
+            registered: false,
+        }));
+        let callback: CallbackCell = Rc::new(RefCell::new(None));
+        register_process_pipe(uv_loop, id, token, &state, &callback)?;
+        Ok(Self { id, token, state, _callback: callback })
+    }
+
+    /// Starts reading bytes from this endpoint, installing `callback`.
+    ///
+    /// Readable events emit [`NetEvent::Read`] until [`NetEvent::Eof`]. The
+    /// endpoint must be a stdout or stderr pipe; child stdin is write-only.
+    /// See `luvref.txt`, `uv.read_start()` (lines 1948-1992).
+    pub fn read_start<F>(&mut self, uv_loop: &mut UvLoop, callback: F) -> NetResult<()>
+    where
+        F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static,
+    {
+        {
+            let mut state = self.state.borrow_mut();
+            if state.io.is_none() {
+                return Err(NetError::Closed);
+            }
+            if matches!(state.io, Some(ChildStream::In(_))) {
+                return Err(NetError::InvalidState("child stdin cannot be read"));
+            }
+            state.reading = true;
+        }
+        *self._callback.borrow_mut() = Some(Box::new(callback));
+        sync_process_pipe(uv_loop, self.id, self.token, &self.state)
+    }
+
+    /// Stops reading bytes from this endpoint. See `uv.read_stop()`.
+    pub fn read_stop(&mut self, uv_loop: &mut UvLoop) -> NetResult<()> {
+        {
+            let mut state = self.state.borrow_mut();
+            if state.io.is_none() {
+                return Err(NetError::Closed);
+            }
+            state.reading = false;
+        }
+        sync_process_pipe(uv_loop, self.id, self.token, &self.state)
+    }
+
+    /// Queues or immediately writes `data` to this endpoint.
+    ///
+    /// The endpoint must be child stdin. A small write is flushed
+    /// synchronously so callers may close the pipe immediately after; a
+    /// partially buffered remainder resumes on writable readiness with a
+    /// [`NetEvent::WriteComplete`]. See `luvref.txt`, `uv.write()`.
+    pub fn write(&mut self, uv_loop: &mut UvLoop, data: Vec<u8>) -> NetResult<WriteId> {
+        let id;
+        let mut events = Vec::new();
+        {
+            let mut state = self.state.borrow_mut();
+            if state.io.is_none() {
+                return Err(NetError::Closed);
+            }
+            if !matches!(state.io, Some(ChildStream::In(_))) {
+                return Err(NetError::InvalidState("child stdout/stderr cannot be written"));
+            }
+            id = state.writes.push(data)?;
+            let ProcessPipeState { io, writes, .. } = &mut *state;
+            if let Some(ChildStream::In(stream)) = io {
+                drive_writes(stream, writes, &mut events);
+            }
+        }
+        if !events.is_empty() && live(uv_loop, self.id) {
+            deliver_process_pipe(
+                uv_loop,
+                self.id,
+                self.token,
+                Rc::clone(&self.state),
+                Rc::clone(&self._callback),
+                events,
+            );
+        }
+        sync_process_pipe(uv_loop, self.id, self.token, &self.state)?;
+        Ok(id)
+    }
+}
+
+#[cfg(unix)]
+fn register_process_pipe(
+    uv_loop: &mut UvLoop,
+    id: HandleId,
+    token: Token,
+    state: &Rc<RefCell<ProcessPipeState>>,
+    callback: &CallbackCell,
+) -> NetResult<()> {
+    {
+        let mut state = state.borrow_mut();
+        let interests = process_pipe_interest(&state);
+        let fd = state.io.as_ref().ok_or(NetError::Closed)?.as_raw_fd();
+        uv_loop.inner_mut().reactor().register(&mut SourceFd(&fd), token, interests)?;
+        state.registered = true;
+    }
+    let shared = Rc::clone(state);
+    let user_callback = Rc::clone(callback);
+    let queue = uv_loop.net_dispatch_queue();
+    uv_loop
+        .inner_mut()
+        .on_readiness(token, move |ready, _| {
+            let events = process_pipe_ready(&mut shared.borrow_mut(), ready);
+            if !events.is_empty() {
+                let dispatch_state = Rc::clone(&shared);
+                let dispatch_callback = Rc::clone(&user_callback);
+                queue_batch(&queue, move |uv_loop| {
+                    deliver_process_pipe(uv_loop, id, token, dispatch_state, dispatch_callback, events)
+                });
+            }
+            Ok(DrainState::Drained)
+        })
+        .map_err(crate::Error::from)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_process_pipe(
+    uv_loop: &mut UvLoop,
+    id: HandleId,
+    token: Token,
+    state: &Rc<RefCell<ProcessPipeState>>,
+) -> NetResult<()> {
+    if !live(uv_loop, id) {
+        return Ok(());
+    }
+    let active;
+    {
+        let state = state.borrow_mut();
+        active = process_pipe_active(&state);
+        let interests = process_pipe_interest(&state);
+        if state.registered {
+            let fd = state.io.as_ref().ok_or(NetError::Closed)?.as_raw_fd();
+            uv_loop.inner_mut().reactor().reregister(&mut SourceFd(&fd), token, interests)?;
+        }
+    }
+    uv_loop.set_external_active(id, active)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_pipe_drain<R: std::io::Read>(
+    ready: Readiness,
+    reading: &mut bool,
+    reader: &mut R,
+    events: &mut Vec<NetEvent>,
+) {
+    if ready.readable && *reading {
+        drain_reads(reader, events);
+        if events.iter().any(|event| matches!(event, NetEvent::Eof)) {
+            *reading = false;
+        }
+    }
+    if ready.read_closed && *reading {
+        *reading = false;
+        events.push(NetEvent::Eof);
+    }
+}
+
+#[cfg(unix)]
+fn process_pipe_ready(state: &mut ProcessPipeState, ready: Readiness) -> Vec<NetEvent> {
+    let mut events = Vec::new();
+    match &mut state.io {
+        Some(ChildStream::In(stream)) => {
+            if ready.writable {
+                drive_writes(stream, &mut state.writes, &mut events);
+            }
+            if ready.write_closed && !state.writes.pending.is_empty() {
+                while let Some(write) = state.writes.pending.pop_front() {
+                    events.push(NetEvent::WriteComplete { id: write.id, result: Err(NetError::Closed) });
+                }
+            }
+        }
+        Some(ChildStream::Out(stream)) => {
+            process_pipe_drain(ready, &mut state.reading, stream, &mut events)
+        }
+        Some(ChildStream::Err(stream)) => {
+            process_pipe_drain(ready, &mut state.reading, stream, &mut events)
+        }
+        None => {}
+    }
+    events
+}
+
+#[cfg(unix)]
+fn deliver_process_pipe(
+    uv_loop: &mut UvLoop,
+    id: HandleId,
+    token: Token,
+    state: Rc<RefCell<ProcessPipeState>>,
+    callback: CallbackCell,
+    events: Vec<NetEvent>,
+) {
+    if !live(uv_loop, id) {
+        return;
+    }
+    if let Err(error) = sync_process_pipe(uv_loop, id, token, &state) {
+        invoke(&callback, uv_loop, id, NetEvent::Error(error));
+    }
+    for event in events {
+        if !live(uv_loop, id) {
+            break;
+        }
+        invoke(&callback, uv_loop, id, event);
+    }
+}
+
+#[cfg(unix)]
+fn close_process_pipe(uv_loop: &mut UvLoop, handle: &ProcessPipe) -> crate::Result<()> {
+    uv_loop.inner_mut().remove_readiness(handle.token);
+    let mut state = handle.state.borrow_mut();
+    if state.registered {
+        if let Some(stream) = state.io.as_ref() {
+            let fd = stream.as_raw_fd();
+            uv_loop.inner_mut().reactor().deregister(&mut SourceFd(&fd))?;
+        }
+        state.registered = false;
+    }
+    state.io = None;
+    state.reading = false;
+    state.writes.clear();
+    Ok(())
+}
+
+#[cfg(unix)]
+impl Handle for ProcessPipe {
+    fn id(&self) -> HandleId {
+        self.id
+    }
+
+    fn close(&self, uv_loop: &mut UvLoop) -> crate::Result<()> {
+        close_process_pipe(uv_loop, self)?;
+        uv_loop.close(
+            self.id,
+            None::<fn(&mut UvLoop, HandleId) -> std::result::Result<(), crate::CallbackError>>,
+        )
+    }
+
+    fn close_with<F>(&self, uv_loop: &mut UvLoop, callback: F) -> crate::Result<()>
+    where
+        F: FnOnce(&mut UvLoop, HandleId)
+                -> std::result::Result<(), crate::CallbackError>
+            + 'static,
+    {
+        close_process_pipe(uv_loop, self)?;
+        uv_loop.close(self.id, Some(callback))
+    }
+}
+
+/// Builds loop-managed pipe endpoints from the child's standard streams.
+#[cfg(unix)]
+fn build_process_pipes(
+    uv_loop: &mut UvLoop,
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+) -> Result<ProcessPipes, ProcessError> {
+    let map_error = |error: NetError| {
+        ProcessError::io("setup process pipe", io::Error::other(error.to_string()))
+    };
+    Ok(ProcessPipes {
+        stdin: stdin
+            .map(|stream| ProcessPipe::attach(uv_loop, ChildStream::In(stream)))
+            .transpose()
+            .map_err(map_error)?,
+        stdout: stdout
+            .map(|stream| ProcessPipe::attach(uv_loop, ChildStream::Out(stream)))
+            .transpose()
+            .map_err(map_error)?,
+        stderr: stderr
+            .map(|stream| ProcessPipe::attach(uv_loop, ChildStream::Err(stream)))
+            .transpose()
+            .map_err(map_error)?,
+    })
+}
+
+/// Builds blocking endpoints on platforms without a safe loop registration path.
+#[cfg(not(unix))]
+fn build_process_pipes(
+    _uv_loop: &mut UvLoop,
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+) -> Result<ProcessPipes, ProcessError> {
+    Ok(ProcessPipes { stdin, stdout, stderr })
 }
 
 /// Process and PTY operation failures.
@@ -273,17 +710,24 @@ where
         .spawn()
         .map_err(|error| ProcessError::io("spawn", error))?;
     let pid = child.id();
-    let pipes = ProcessPipes {
-        stdin: child.stdin.take(),
-        stdout: child.stdout.take(),
-        stderr: child.stderr.take(),
-    };
+    let child_stdin = child.stdin.take();
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
     let state = Arc::new(Mutex::new(ChildState::Standard(child)));
     let handle_id = match uv_loop.allocate_external(true) {
         Ok(id) => id,
         Err(error) => {
             terminate_and_reap(&state);
             return Err(error.into());
+        }
+    };
+    let pipes = match build_process_pipes(uv_loop, child_stdin, child_stdout, child_stderr) {
+        Ok(pipes) => pipes,
+        Err(error) => {
+            let process = Process { id: handle_id, pid, child: Arc::clone(&state) };
+            let _ = process.close(uv_loop);
+            terminate_and_reap(&state);
+            return Err(error);
         }
     };
     let process = Process { id: handle_id, pid, child: Arc::clone(&state) };
@@ -407,10 +851,20 @@ pub struct PtySize {
 }
 
 /// A spawned PTY child and the parent-side PTY master.
+#[cfg(unix)]
 pub struct SpawnedPty {
     /// Child process handle.
     pub process: Process,
-    /// Duplex parent-side PTY master.
+    /// Loop-managed, nonblocking parent-side PTY master.
+    pub master: PtyHandle,
+}
+
+/// A spawned PTY child and the parent-side PTY master.
+#[cfg(not(unix))]
+pub struct SpawnedPty {
+    /// Child process handle.
+    pub process: Process,
+    /// Parent-side PTY master.
     pub master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
@@ -424,14 +878,406 @@ impl std::fmt::Debug for SpawnedPty {
     }
 }
 
+#[cfg(unix)]
+struct BorrowedUnixFd(i32);
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for BorrowedUnixFd {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0
+    }
+}
+
+#[cfg(unix)]
+struct PtyState {
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    fd: Option<filedescriptor::FileDescriptor>,
+    reading: bool,
+    writes: WriteQueue,
+    registered: bool,
+}
+
+#[cfg(unix)]
+fn pty_interest(state: &PtyState) -> Interest {
+    interest(state.reading, state.writes.wants_write())
+}
+
+#[cfg(unix)]
+fn pty_active(state: &PtyState) -> bool {
+    state.reading || state.writes.wants_write()
+}
+
+/// A parent-side pseudoterminal master wrapped as a registered loop handle.
+///
+/// The native master descriptor is duplicated, placed in nonblocking mode, and
+/// registered with the owning loop's reactor through [`UvLoop::inner_mut`].
+/// Reads and writes drain until `WouldBlock` on readiness and surface as
+/// [`NetEvent`] callbacks during the loop's pending phase, matching the
+/// `net.rs` handle contract instead of exposing a blocking
+/// `portable_pty::MasterPty` to the host.
+///
+/// PTY stdio is necessarily the slave terminal, so `options.stdio` is ignored.
+/// See `luvref.txt`, `uv.spawn()` and the Task 7b PTY extension.
+#[cfg(unix)]
+pub struct PtyHandle {
+    id: HandleId,
+    token: Token,
+    state: Rc<RefCell<PtyState>>,
+    _callback: CallbackCell,
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for PtyHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("PtyHandle").field("id", &self.id).finish()
+    }
+}
+
+#[cfg(unix)]
+impl PtyHandle {
+    fn wrap(
+        uv_loop: &mut UvLoop,
+        master: Box<dyn portable_pty::MasterPty + Send>,
+    ) -> Result<Self, ProcessError> {
+        let raw = master.as_raw_fd().ok_or(ProcessError::Unsupported {
+            feature: "PTY master fd",
+            reason: "the native portable-pty backend exposed no Unix master descriptor",
+        })?;
+        let mut fd = filedescriptor::FileDescriptor::dup(&BorrowedUnixFd(raw))
+            .map_err(|error| {
+                ProcessError::io(
+                    "duplicate PTY master fd",
+                    io::Error::other(error.to_string()),
+                )
+            })?;
+        fd.set_non_blocking(true).map_err(|error| {
+            ProcessError::io(
+                "make PTY master nonblocking",
+                io::Error::other(error.to_string()),
+            )
+        })?;
+
+        let id = uv_loop.allocate_external(false).map_err(ProcessError::from)?;
+        let token = uv_loop.allocate_io_token().map_err(ProcessError::from)?;
+        let state = Rc::new(RefCell::new(PtyState {
+            master: Some(master),
+            fd: Some(fd),
+            reading: false,
+            writes: WriteQueue::new(),
+            registered: false,
+        }));
+        let callback: CallbackCell = Rc::new(RefCell::new(None));
+        register_pty(uv_loop, id, token, &state, &callback)
+            .map_err(|error| ProcessError::io("PTY handle", io::Error::other(error.to_string())))?;
+        Ok(Self { id, token, state, _callback: callback })
+    }
+
+    /// Starts reading output from the session, installing `callback`.
+    ///
+    /// Readable bytes surface as [`NetEvent::Read`] until [`NetEvent::Eof`];
+    /// a terminated session whose slave has closed reads as end-of-file.
+    /// See `luvref.txt`, `uv.read_start()`.
+    pub fn read_start<F>(&mut self, uv_loop: &mut UvLoop, callback: F) -> NetResult<()>
+    where
+        F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static,
+    {
+        {
+            let mut state = self.state.borrow_mut();
+            if state.fd.is_none() {
+                return Err(NetError::Closed);
+            }
+            state.reading = true;
+        }
+        *self._callback.borrow_mut() = Some(Box::new(callback));
+        sync_pty(uv_loop, self.id, self.token, &self.state)
+    }
+
+    /// Stops reading session output. See `luvref.txt`, `uv.read_stop()`.
+    pub fn read_stop(&mut self, uv_loop: &mut UvLoop) -> NetResult<()> {
+        {
+            let mut state = self.state.borrow_mut();
+            if state.fd.is_none() {
+                return Err(NetError::Closed);
+            }
+            state.reading = false;
+        }
+        sync_pty(uv_loop, self.id, self.token, &self.state)
+    }
+
+    /// Writes `data` to the child's terminal input.
+    ///
+    /// A small write is flushed synchronously; a partially buffered remainder
+    /// resumes on writable readiness and reports a [`NetEvent::WriteComplete`].
+    /// See `luvref.txt`, `uv.write()`.
+    pub fn write(&mut self, uv_loop: &mut UvLoop, data: Vec<u8>) -> NetResult<WriteId> {
+        let id;
+        let mut events = Vec::new();
+        {
+            let mut state = self.state.borrow_mut();
+            if state.fd.is_none() {
+                return Err(NetError::Closed);
+            }
+            id = state.writes.push(data)?;
+            let PtyState { fd, writes, .. } = &mut *state;
+            if let Some(pipe_fd) = fd {
+                drive_writes(pipe_fd, writes, &mut events);
+            }
+        }
+        if !events.is_empty() && live(uv_loop, self.id) {
+            deliver_pty(
+                uv_loop,
+                self.id,
+                self.token,
+                Rc::clone(&self.state),
+                Rc::clone(&self._callback),
+                events,
+            );
+        }
+        sync_pty(uv_loop, self.id, self.token, &self.state)?;
+        Ok(id)
+    }
+
+    /// Resizes the pseudoterminal window. See `luvref.txt`, `uv.tty_set_size()`.
+    pub fn resize(&self, size: PtySize) -> Result<(), ProcessError> {
+        let state = self.state.borrow();
+        let master = state.master.as_ref().ok_or_else(closed_pty_error)?;
+        master
+            .resize(portable_pty::PtySize {
+                rows: size.rows,
+                cols: size.columns,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| ProcessError::io("resize PTY", io::Error::other(error.to_string())))
+    }
+
+    /// Returns the current pseudoterminal window geometry.
+    pub fn get_size(&self) -> Result<PtySize, ProcessError> {
+        let state = self.state.borrow();
+        let master = state.master.as_ref().ok_or_else(closed_pty_error)?;
+        master
+            .get_size()
+            .map(|size| PtySize { rows: size.rows, columns: size.cols })
+            .map_err(|error| ProcessError::io("read PTY size", io::Error::other(error.to_string())))
+    }
+}
+
+#[cfg(unix)]
+fn closed_pty_error() -> ProcessError {
+    ProcessError::io(
+        "PTY master",
+        io::Error::new(io::ErrorKind::BrokenPipe, "PTY master is closed"),
+    )
+}
+
+#[cfg(unix)]
+fn drain_pty_reads<R: std::io::Read>(reader: &mut R, events: &mut Vec<NetEvent>) {
+    let chunk = crate::net::STREAM_CHUNK;
+    loop {
+        let mut data = vec![0; chunk];
+        match reader.read(&mut data) {
+            Ok(0) => {
+                events.push(NetEvent::Eof);
+                break;
+            }
+            Ok(read) => {
+                data.truncate(read);
+                events.push(NetEvent::Read(data));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if is_would_block(&error) => break,
+            // Linux reports EIO when the slave has closed; libuv treats a
+            // closed master read as end-of-stream, so map it to EOF here.
+            Err(error) if error.raw_os_error() == Some(5) => {
+                events.push(NetEvent::Eof);
+                break;
+            }
+            Err(error) => {
+                events.push(NetEvent::Error(NetError::Io(error)));
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn register_pty(
+    uv_loop: &mut UvLoop,
+    id: HandleId,
+    token: Token,
+    state: &Rc<RefCell<PtyState>>,
+    callback: &CallbackCell,
+) -> NetResult<()> {
+    {
+        let mut state = state.borrow_mut();
+        let interests = pty_interest(&state);
+        let fd = state.fd.as_ref().ok_or(NetError::Closed)?.as_raw_fd();
+        uv_loop.inner_mut().reactor().register(&mut SourceFd(&fd), token, interests)?;
+        state.registered = true;
+    }
+    let shared = Rc::clone(state);
+    let user_callback = Rc::clone(callback);
+    let queue = uv_loop.net_dispatch_queue();
+    uv_loop
+        .inner_mut()
+        .on_readiness(token, move |ready, _| {
+            let events = pty_ready(&mut shared.borrow_mut(), ready);
+            if !events.is_empty() {
+                let dispatch_state = Rc::clone(&shared);
+                let dispatch_callback = Rc::clone(&user_callback);
+                queue_batch(&queue, move |uv_loop| {
+                    deliver_pty(uv_loop, id, token, dispatch_state, dispatch_callback, events)
+                });
+            }
+            Ok(DrainState::Drained)
+        })
+        .map_err(crate::Error::from)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_pty(
+    uv_loop: &mut UvLoop,
+    id: HandleId,
+    token: Token,
+    state: &Rc<RefCell<PtyState>>,
+) -> NetResult<()> {
+    if !live(uv_loop, id) {
+        return Ok(());
+    }
+    let active;
+    {
+        let state = state.borrow_mut();
+        active = pty_active(&state);
+        let interests = pty_interest(&state);
+        if state.registered {
+            let fd = state.fd.as_ref().ok_or(NetError::Closed)?.as_raw_fd();
+            uv_loop.inner_mut().reactor().reregister(&mut SourceFd(&fd), token, interests)?;
+        }
+    }
+    uv_loop.set_external_active(id, active)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn pty_ready(state: &mut PtyState, ready: Readiness) -> Vec<NetEvent> {
+    let mut events = Vec::new();
+    if ready.writable {
+        if let Some(fd) = state.fd.as_mut() {
+            drive_writes(fd, &mut state.writes, &mut events);
+        }
+    }
+    if ready.readable && state.reading {
+        if let Some(fd) = state.fd.as_mut() {
+            drain_pty_reads(fd, &mut events);
+        }
+        if events.iter().any(|event| matches!(event, NetEvent::Eof)) {
+            state.reading = false;
+        }
+    }
+    if ready.read_closed && state.reading {
+        state.reading = false;
+        events.push(NetEvent::Eof);
+    }
+    if ready.write_closed && !state.writes.pending.is_empty() {
+        while let Some(write) = state.writes.pending.pop_front() {
+            events.push(NetEvent::WriteComplete { id: write.id, result: Err(NetError::Closed) });
+        }
+    }
+    events
+}
+
+#[cfg(unix)]
+fn deliver_pty(
+    uv_loop: &mut UvLoop,
+    id: HandleId,
+    token: Token,
+    state: Rc<RefCell<PtyState>>,
+    callback: CallbackCell,
+    events: Vec<NetEvent>,
+) {
+    if !live(uv_loop, id) {
+        return;
+    }
+    if let Err(error) = sync_pty(uv_loop, id, token, &state) {
+        invoke(&callback, uv_loop, id, NetEvent::Error(error));
+    }
+    for event in events {
+        if !live(uv_loop, id) {
+            break;
+        }
+        invoke(&callback, uv_loop, id, event);
+    }
+}
+
+#[cfg(unix)]
+fn close_pty(uv_loop: &mut UvLoop, handle: &PtyHandle) -> crate::Result<()> {
+    uv_loop.inner_mut().remove_readiness(handle.token);
+    let mut state = handle.state.borrow_mut();
+    if state.registered {
+        if let Some(fd) = state.fd.as_ref() {
+            let raw = fd.as_raw_fd();
+            uv_loop.inner_mut().reactor().deregister(&mut SourceFd(&raw))?;
+        }
+        state.registered = false;
+    }
+    state.fd = None;
+    state.master = None;
+    state.reading = false;
+    state.writes.clear();
+    Ok(())
+}
+
+#[cfg(unix)]
+impl Handle for PtyHandle {
+    fn id(&self) -> HandleId {
+        self.id
+    }
+
+    fn close(&self, uv_loop: &mut UvLoop) -> crate::Result<()> {
+        close_pty(uv_loop, self)?;
+        uv_loop.close(
+            self.id,
+            None::<fn(&mut UvLoop, HandleId) -> std::result::Result<(), crate::CallbackError>>,
+        )
+    }
+
+    fn close_with<F>(&self, uv_loop: &mut UvLoop, callback: F) -> crate::Result<()>
+    where
+        F: FnOnce(&mut UvLoop, HandleId)
+                -> std::result::Result<(), crate::CallbackError>
+            + 'static,
+    {
+        close_pty(uv_loop, self)?;
+        uv_loop.close(self.id, Some(callback))
+    }
+}
+
+#[cfg(unix)]
+fn build_pty_master(
+    uv_loop: &mut UvLoop,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+) -> Result<PtyHandle, ProcessError> {
+    PtyHandle::wrap(uv_loop, master)
+}
+
+#[cfg(not(unix))]
+fn build_pty_master(
+    _uv_loop: &mut UvLoop,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+) -> Result<Box<dyn portable_pty::MasterPty + Send>, ProcessError> {
+    Ok(master)
+}
+
 /// Spawns a child attached to a native pseudoterminal.
 ///
 /// `portable-pty` owns the platform-specific, safe child setup required for a
-/// controlling terminal on Unix and ConPTY on Windows. The returned master is
-/// duplex: clone a reader and take its writer through the `MasterPty` methods.
-/// PTY stdio is necessarily the slave terminal, so `options.stdio` is ignored.
-/// PTY identity changes and detached mode are rejected because
-/// `portable_pty::CommandBuilder` 0.9.0 has no corresponding safe controls.
+/// controlling terminal on Unix and ConPTY on Windows. On Unix the returned
+/// master is a loop-managed [`PtyHandle`] that pumps through the owning loop;
+/// elsewhere it is the platform `MasterPty`. PTY stdio is necessarily the slave
+/// terminal, so `options.stdio` is ignored. PTY identity changes and detached
+/// mode are rejected because `portable_pty::CommandBuilder` 0.9.0 has no
+/// corresponding safe controls.
 ///
 /// PTY spawning extends the process semantics in `luvref.txt`, `uv.spawn()` /
 /// `uv.spawn-options` (lines 1340-1452).
@@ -508,6 +1354,13 @@ where
         }
     };
     let process = Process { id: handle_id, pid, child: Arc::clone(&state) };
+    let master = match build_pty_master(uv_loop, pair.master) {
+        Ok(master) => master,
+        Err(error) => {
+            let _ = process.close(uv_loop);
+            return Err(error);
+        }
+    };
     let waiter_state = Arc::clone(&state);
     let waiter_poster = uv_loop.completion_poster();
 
@@ -521,7 +1374,7 @@ where
 
     Ok(SpawnedPty {
         process,
-        master: pair.master,
+        master,
     })
 }
 
@@ -609,9 +1462,31 @@ fn wait_and_post<F>(
             let mut state = lock_recover(&child);
             let result = match &mut *state {
                 ChildState::Standard(child) => child.try_wait().map(|status| status.map(exit_values)),
-                ChildState::Portable(child) => child
-                    .try_wait()
-                    .map(|status| status.map(portable_exit_values)),
+                ChildState::Portable(child) => {
+                    #[cfg(unix)]
+                    {
+                        // portable-pty wraps a real `std::process::Child`
+                        // (its `Child` trait exposes only an exit code). Recover
+                        // the genuine wait status so a signal death reports the
+                        // terminating signal, matching ordinary `spawn`.
+                        let std_status = {
+                            let erased: &mut dyn portable_pty::Child = &mut **child;
+                            erased.downcast_mut::<std::process::Child>()
+                        };
+                        match std_status {
+                            Some(std_child) => {
+                                std_child.try_wait().map(|status| status.map(exit_values))
+                            }
+                            None => child
+                                .try_wait()
+                                .map(|status| status.map(portable_exit_values)),
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        child.try_wait().map(|status| status.map(portable_exit_values))
+                    }
+                }
                 ChildState::Exited => return,
             };
             if matches!(result, Ok(Some(_))) {

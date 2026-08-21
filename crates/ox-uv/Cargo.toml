@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+filedescriptor = "0.8.3"
 mio.workspace = true
 ox-loop = { path = "../ox-loop" }
 portable-pty = "0.9.0"

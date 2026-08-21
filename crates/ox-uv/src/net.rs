@@ -34,7 +34,7 @@ use rustix::termios::{
     LocalModes, OptionalActions, SpecialCodeIndex, Termios, tcgetattr, tcgetwinsize, tcsetattr,
 };
 
-const STREAM_CHUNK: usize = 64 * 1024;
+pub(crate) const STREAM_CHUNK: usize = 64 * 1024;
 const DATAGRAM_CHUNK: usize = 65_536;
 
 /// A result type for network operations. See `uv` error conventions in `runtime/doc/luvref.txt`.
@@ -113,47 +113,47 @@ pub enum NetEvent {
 
 /// Loop callback invoked with handle events. See `uv.read_start()` and `uv.udp_recv_start()` in `runtime/doc/luvref.txt`.
 pub type NetCallback = Box<dyn FnMut(&mut UvLoop, HandleId, NetEvent)>;
-type CallbackCell = Rc<RefCell<Option<NetCallback>>>;
+pub(crate) type CallbackCell = Rc<RefCell<Option<NetCallback>>>;
 
-struct PendingWrite {
-    id: WriteId,
-    data: Vec<u8>,
-    offset: usize,
+pub(crate) struct PendingWrite {
+    pub(crate) id: WriteId,
+    pub(crate) data: Vec<u8>,
+    pub(crate) offset: usize,
 }
 
-struct WriteQueue {
+pub(crate) struct WriteQueue {
     next_id: u64,
-    pending: VecDeque<PendingWrite>,
+    pub(crate) pending: VecDeque<PendingWrite>,
     shutdown_requested: bool,
 }
 
 impl WriteQueue {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { next_id: 0, pending: VecDeque::new(), shutdown_requested: false }
     }
 
-    fn push(&mut self, data: Vec<u8>) -> NetResult<WriteId> {
+    pub(crate) fn push(&mut self, data: Vec<u8>) -> NetResult<WriteId> {
         let id = WriteId(self.next_id);
         self.next_id = self.next_id.checked_add(1).ok_or(NetError::RequestLimit)?;
         self.pending.push_back(PendingWrite { id, data, offset: 0 });
         Ok(id)
     }
 
-    fn wants_write(&self) -> bool {
+    pub(crate) fn wants_write(&self) -> bool {
         !self.pending.is_empty() || self.shutdown_requested
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.pending.clear();
         self.shutdown_requested = false;
     }
 }
 
-fn is_would_block(error: &io::Error) -> bool {
+pub(crate) fn is_would_block(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::WouldBlock
 }
 
-fn drive_writes<W: Write>(writer: &mut W, queue: &mut WriteQueue, events: &mut Vec<NetEvent>) {
+pub(crate) fn drive_writes<W: Write>(writer: &mut W, queue: &mut WriteQueue, events: &mut Vec<NetEvent>) {
     loop {
         let Some(write) = queue.pending.front_mut() else { break };
         if write.offset == write.data.len() {
@@ -183,7 +183,7 @@ fn drive_writes<W: Write>(writer: &mut W, queue: &mut WriteQueue, events: &mut V
     }
 }
 
-fn drain_reads<R: Read>(reader: &mut R, events: &mut Vec<NetEvent>) {
+pub(crate) fn drain_reads<R: Read>(reader: &mut R, events: &mut Vec<NetEvent>) {
     loop {
         let mut data = vec![0; STREAM_CHUNK];
         match reader.read(&mut data) {
@@ -196,7 +196,7 @@ fn drain_reads<R: Read>(reader: &mut R, events: &mut Vec<NetEvent>) {
     }
 }
 
-fn interest(readable: bool, writable: bool) -> Interest {
+pub(crate) fn interest(readable: bool, writable: bool) -> Interest {
     match (readable, writable) {
         (true, true) => Interest::READABLE.add(Interest::WRITABLE),
         (false, true) => Interest::WRITABLE,
@@ -204,11 +204,11 @@ fn interest(readable: bool, writable: bool) -> Interest {
     }
 }
 
-fn live(uv_loop: &UvLoop, id: HandleId) -> bool {
+pub(crate) fn live(uv_loop: &UvLoop, id: HandleId) -> bool {
     uv_loop.state(id).is_some() && !uv_loop.is_closing(id)
 }
 
-fn invoke(callback: &CallbackCell, uv_loop: &mut UvLoop, id: HandleId, event: NetEvent) {
+pub(crate) fn invoke(callback: &CallbackCell, uv_loop: &mut UvLoop, id: HandleId, event: NetEvent) {
     if !live(uv_loop, id) { return; }
     let taken = callback.borrow_mut().take();
     let Some(mut user_callback) = taken else { return };
@@ -217,7 +217,7 @@ fn invoke(callback: &CallbackCell, uv_loop: &mut UvLoop, id: HandleId, event: Ne
     if slot.is_none() { *slot = Some(user_callback); }
 }
 
-fn queue_batch(queue: &NetDispatchQueue, dispatch: impl FnOnce(&mut UvLoop) + 'static) {
+pub(crate) fn queue_batch(queue: &NetDispatchQueue, dispatch: impl FnOnce(&mut UvLoop) + 'static) {
     queue.borrow_mut().push_back(Box::new(dispatch));
 }
 
@@ -540,7 +540,7 @@ impl Handle for Tcp {
 }
 
 #[cfg(unix)]
-fn errno_error(error: rustix::io::Errno) -> NetError {
+pub(crate) fn errno_error(error: rustix::io::Errno) -> NetError {
     NetError::Io(io::Error::from_raw_os_error(error.raw_os_error()))
 }
 
