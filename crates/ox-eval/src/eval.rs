@@ -878,7 +878,7 @@ fn fold_bytes(bytes: &[u8]) -> Vec<u8> {
     folded
 }
 
-fn compare_bytes(lhs: &[u8], rhs: &[u8], ignore_case: bool) -> i8 {
+pub(crate) fn compare_bytes(lhs: &[u8], rhs: &[u8], ignore_case: bool) -> i8 {
     if !ignore_case {
         for (&left, &right) in lhs.iter().zip(rhs) {
             if left < right { return -1; }

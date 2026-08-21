@@ -7,7 +7,7 @@ use ox_types::{Funcref, OxStr, Special, Typval};
 use serde_json::Value as JsonValue;
 
 use crate::error::{EvalError, Result};
-use crate::eval::{BuiltinHost, Evaluator, RegexEngine};
+use crate::eval::{compare_bytes, BuiltinHost, Evaluator, RegexEngine};
 use crate::parser::Parser;
 use crate::scope::Scope;
 
@@ -236,25 +236,125 @@ impl<'a> Builtins<'a> {
         }
     }
 
-    fn sort(&mut self, mut args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
-        let comparator = args.get(1).cloned();
-        let Typval::List(mut values) = args.remove(0) else {
+    fn sort(&mut self, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
+        let Some(Typval::List(values)) = args.first() else {
             return Err(EvalError::new("E714", 0, "List required"));
+        };
+        let mut values = values.clone();
+        // Resolve the kind of comparison from the optional second argument,
+        // mirroring `parse_sort_uniq_args` (funcs.c:1551-1593).
+        let mode = match args.get(1) {
+            None => SortMode::Default,
+            Some(Typval::Number(number)) => match *number {
+                0 => SortMode::Default,
+                1 => SortMode::IgnoreCase,
+                _ => return Err(EvalError::new("E474", 0, "Invalid argument")),
+            },
+            Some(Typval::String(text)) => match text.as_bytes() {
+                b"" => SortMode::Default,
+                b"i" => SortMode::IgnoreCase,
+                b"n" => SortMode::Numeric,
+                b"N" => SortMode::Integer,
+                b"f" => SortMode::Float,
+                b"l" => SortMode::Locale,
+                _ => SortMode::Callback(Typval::String((*text).clone())),
+            },
+            Some(Typval::Funcref(_) | Typval::Partial(_)) => SortMode::Callback(args[1].clone()),
+            _ => return Err(EvalError::new("E921", 0, "Invalid callback argument")),
         };
         let mut failure = None;
         values.sort_by(|left, right| {
-            let result = match &comparator {
-                None => compare_values(left, right, 0),
-                Some(Typval::String(mode)) if mode.as_bytes() == b"i" => compare_strings(left, right, true),
-                Some(Typval::String(mode)) if mode.as_bytes() == b"n" => number_arg(left).and_then(|left| number_arg(right).map(|right| left.cmp(&right))),
-                Some(Typval::String(mode)) if mode.as_bytes() == b"f" => float_arg(left).and_then(|left| float_arg(right).map(|right| left.total_cmp(&right))),
-                Some(callback) => self.eval_callback(callback, left.clone(), right.clone(), scope).and_then(|value| number_arg(&value)).map(|value| value.cmp(&0)),
+            let result = match &mode {
+                // Default and locale sorting compare the stringified values
+                // (`sort([2, 10])` is `[10, 2]`, because "10" sorts before
+                // "2"). `l` mode uses the documented byte-wise fallback for
+                // the C-locale `strcoll` comparison, so it behaves exactly
+                // like the default here.
+                SortMode::Default | SortMode::Locale => Ok(sort_string_pair(left, right, false)),
+                SortMode::IgnoreCase => Ok(sort_string_pair(left, right, true)),
+                SortMode::Numeric => Ok(sort_numeric(left).total_cmp(&sort_numeric(right))),
+                SortMode::Integer => Ok(sort_integer(left).cmp(&sort_integer(right))),
+                SortMode::Float => Ok(sort_float(left).total_cmp(&sort_float(right))),
+                SortMode::Callback(callback) => self.eval_callback(callback, left.clone(), right.clone(), scope).and_then(|value| number_arg(&value)).map(|value| value.cmp(&0)),
             };
             match result { Ok(ordering) => ordering, Err(error) => { failure = Some(error); Ordering::Equal } }
         });
         if let Some(error) = failure { return Err(error); }
         Ok(Typval::List(values))
     }
+}
+
+/// How the builtin `sort()`/`uniq()` comparison behaves (parse_sort_uniq_args).
+enum SortMode {
+    Default,
+    IgnoreCase,
+    Locale,
+    Numeric,
+    Integer,
+    Float,
+    Callback(Typval),
+}
+
+/// Encode a value for string comparison, following upstream `item_compare`
+/// (typval.c:1228-1257): a raw String is used as-is, any other value is
+/// stringified, and a String compared against a non-String sorts as a single
+/// quote (`'`) so it precedes other encoded values.
+fn sort_string_key(value: &Typval, peer_is_string: bool, depth: usize) -> Result<OxStr> {
+    match value {
+        Typval::String(text) if peer_is_string => Ok((*text).clone()),
+        Typval::String(_) => Ok(OxStr::from("'")),
+        _ => vim_string(value, depth),
+    }
+}
+
+fn sort_string_pair(left: &Typval, right: &Typval, ignore_case: bool) -> Ordering {
+    match (sort_string_key(left, matches!(right, Typval::String(_)), 0), sort_string_key(right, matches!(left, Typval::String(_)), 0)) {
+        (Ok(left), Ok(right)) => match compare_bytes(left.as_bytes(), right.as_bytes(), ignore_case) { -1 => Ordering::Less, 1 => Ordering::Greater, _ => Ordering::Equal },
+        _ => Ordering::Equal,
+    }
+}
+
+/// Numeric mode `n`: upstream converts each value to a string and parses its
+/// leading number, and a string value sorts as `0` (it becomes a single quote
+/// that `strtod` reads as 0).
+fn sort_numeric(value: &Typval) -> f64 {
+    match value {
+        Typval::String(_) => 0.0,
+        _ => match vim_string(value, 0) { Ok(encoded) => leading_float(encoded.as_bytes()), Err(_) => 0.0 },
+    }
+}
+
+/// Number mode `N`: integer comparison (`tv_get_number`), tolerant of
+/// non-number values, matching upstream's integer key computation.
+fn sort_integer(value: &Typval) -> i64 {
+    match value {
+        Typval::Number(number) => *number,
+        Typval::Bool(boolean) => i64::from(*boolean),
+        Typval::String(text) => parse_integer_prefix(text.as_bytes(), 10).unwrap_or(0),
+        Typval::Special(Special::Null) => 0,
+        _ => 0,
+    }
+}
+
+/// Float mode `f`: float comparison (`tv_get_float`).
+fn sort_float(value: &Typval) -> f64 {
+    match value {
+        Typval::Number(number) => *number as f64,
+        Typval::Float(number) => *number,
+        Typval::String(text) => leading_float(text.as_bytes()),
+        _ => 0.0,
+    }
+}
+
+/// Parse the leading decimal float of `bytes`, like `strtod`.
+fn leading_float(bytes: &[u8]) -> f64 {
+    String::from_utf8_lossy(bytes)
+        .trim_start()
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || matches!(character, '+' | '-' | '.' | 'e' | 'E'))
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0.0)
 }
 
 impl BuiltinHost for Builtins<'_> {
@@ -775,6 +875,12 @@ fn nr2char(args: &[Typval]) -> Result<Typval> {
 fn str2nr(args: &[Typval]) -> Result<Typval> {
     let value = string_arg(&args[0])?;
     let base = args.get(1).map(number_arg).transpose()?.unwrap_or(10);
+    // Only the bases 2, 8, 10 and 16 are accepted; any other explicit base is
+    // an error (`f_str2nr`, strings.c:2593-2598). Note that base 0 (which used
+    // to trigger auto-detection here) is rejected, exactly as upstream.
+    if !matches!(base, 2 | 8 | 10 | 16) {
+        return Err(EvalError::new("E474", 0, "Invalid argument"));
+    }
     let quoted = args.get(2).is_some_and(Typval::is_truthy);
     let number = parse_vim_number(value.as_bytes(), base, quoted)?;
     Ok(Typval::Number(number))
@@ -787,22 +893,31 @@ fn str2float(value: &Typval) -> Result<Typval> {
     Ok(Typval::Float(prefix.parse().unwrap_or(0.0)))
 }
 
-fn parse_vim_number(bytes: &[u8], requested_base: i64, quoted: bool) -> Result<i64> {
-    let mut cleaned = Vec::with_capacity(bytes.len());
-    for byte in bytes.iter().copied().skip_while(u8::is_ascii_whitespace) {
-        if quoted && byte == b'\'' { continue; }
-        cleaned.push(byte);
+/// "str2nr()" digit conversion following upstream `vim_str2nr`
+/// (charset.c:1219-1300) with the STR2NR_FORCE flag set by `f_str2nr`
+/// (strings.c:2589-2633).
+///
+/// Whitespace is skipped before the optional sign and again after it, so
+/// `str2nr(" - 42 ")` is `-42`. A base marker ("0x"/"0X" for 16, "0b"/"0B"
+/// for 2, "0o"/"0O" for 8) is consumed as a prefix only when a digit valid in
+/// that base follows it. Base 10 has no prefixes and is parsed as plain
+/// decimal, so `str2nr("0xff")` is `0`. Text after the number is ignored.
+fn parse_vim_number(bytes: &[u8], base: i64, quoted: bool) -> Result<i64> {
+    let mut digits: Vec<u8> = bytes.iter().copied().skip_while(u8::is_ascii_whitespace).collect();
+    let negative = digits.first() == Some(&b'-');
+    if matches!(digits.first(), Some(b'-' | b'+')) {
+        digits.drain(..1);
+        while digits.first().is_some_and(u8::is_ascii_whitespace) { digits.remove(0); }
     }
-    let negative = cleaned.first() == Some(&b'-');
-    let mut digits = if matches!(cleaned.first(), Some(b'-' | b'+')) { &cleaned[1..] } else { &cleaned[..] };
-    let mut base = requested_base;
-    if base == 0 {
-        if digits.starts_with(b"0x") || digits.starts_with(b"0X") { base = 16; digits = &digits[2..]; }
-        else if digits.starts_with(b"0b") || digits.starts_with(b"0B") { base = 2; digits = &digits[2..]; }
-        else if digits.starts_with(b"0o") || digits.starts_with(b"0O") { base = 8; digits = &digits[2..]; }
-        else { base = 10; }
-    } else if base == 16 && (digits.starts_with(b"0x") || digits.starts_with(b"0X")) { digits = &digits[2..]; }
-    if !matches!(base, 2 | 8 | 10 | 16) { return Err(EvalError::new("E474", 0, "Invalid argument")); }
+    if quoted { digits.retain(|byte| *byte != b'\''); }
+    let digits: &[u8] = &digits;
+    // STR2NR_FORCE: skip the base marker only when a valid digit follows it.
+    let digits = match base {
+        16 if digits.len() > 2 && (digits.starts_with(b"0x") || digits.starts_with(b"0X")) && digits[2].is_ascii_hexdigit() => &digits[2..],
+        2 if digits.len() > 2 && (digits.starts_with(b"0b") || digits.starts_with(b"0B")) && matches!(digits[2], b'0' | b'1') => &digits[2..],
+        8 if digits.len() > 2 && (digits.starts_with(b"0o") || digits.starts_with(b"0O")) && matches!(digits[2], b'0'..=b'7') => &digits[2..],
+        _ => digits,
+    };
     let magnitude = parse_integer_prefix(digits, base as u32).unwrap_or(0);
     Ok(if negative { magnitude.saturating_neg() } else { magnitude })
 }

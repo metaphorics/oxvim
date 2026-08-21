@@ -126,9 +126,10 @@ case!(nr2char_ascii, "nr2char", [number(65)], text("A"));
 case!(nr2char_unicode, "nr2char", [number(0xE9)], text("é"));
 case!(str2nr_decimal, "str2nr", [text("123")], number(123));
 case!(str2nr_negative, "str2nr", [text("-42")], number(-42));
-case!(str2nr_hex_auto, "str2nr", [text("0xff"), number(0)], number(255));
-case!(str2nr_binary_auto, "str2nr", [text("0b101"), number(0)], number(5));
-case!(str2nr_octal_auto, "str2nr", [text("0o17"), number(0)], number(15));
+case!(str2nr_hex_explicit, "str2nr", [text("0xff"), number(16)], number(255));
+case!(str2nr_binary_explicit, "str2nr", [text("0b101"), number(2)], number(5));
+case!(str2nr_octal_explicit, "str2nr", [text("0o17"), number(8)], number(15));
+case!(str2nr_default_is_decimal, "str2nr", [text("0xff")], number(0));
 case!(str2float_basic, "str2float", [text("1.25")], Typval::Float(1.25));
 case!(type_number, "type", [number(1)], number(1));
 case!(type_string, "type", [text("x")], number(2));
@@ -284,6 +285,95 @@ fn sort_expression_comparator_receives_both_values() {
     // `runtime/doc/builtin.txt` `sort()` comparator form.
     let result = call("sort", vec![list(&[3, 1, 2]), text("v:key - v:val")]).unwrap();
     assert_eq!(result, list(&[1, 2, 3]));
+}
+
+#[test]
+fn sort_default_comparator_uses_strings() {
+    // `test/old/testdir/test_functions.vim` `Test_sort_numbers()` and
+    // the default comparator in `item_compare` (typval.c:1192-1310): values
+    // are converted to strings, so `sort([2, 10])` is `[10, 2]`.
+    let result = call("sort", vec![list(&[2, 10])]).unwrap();
+    assert_eq!(result, list(&[10, 2]));
+    // A String compared against a non-String sorts as a leading quote.
+    let mixed = call("sort", vec![Typval::List(vec![number(0), text("x")])]).unwrap();
+    assert_eq!(mixed, Typval::List(vec![text("x"), number(0)]));
+}
+
+#[test]
+fn sort_numeric_mode() {
+    // `n` mode: each value is stringified and its leading number parsed, so
+    // numeric values order numerically while strings order as 0.
+    let result = call("sort", vec![list(&[2, 10, 1]), text("n")]).unwrap();
+    assert_eq!(result, list(&[1, 2, 10]));
+    let mixed = call("sort", vec![Typval::List(vec![text("a"), number(5), number(3)]), text("n")]).unwrap();
+    assert_eq!(mixed, Typval::List(vec![text("a"), number(3), number(5)]));
+}
+
+#[test]
+fn sort_integer_mode() {
+    // `N` mode: integer comparison via `tv_get_number`.
+    let result = call("sort", vec![list(&[10, 2, -1]), text("N")]).unwrap();
+    assert_eq!(result, list(&[-1, 2, 10]));
+}
+
+#[test]
+fn sort_float_mode() {
+    // `f` mode: float comparison via `tv_get_float`.
+    let values = Typval::List(vec![Typval::Float(2.5), Typval::Float(1.5), Typval::Float(10.0)]);
+    let result = call("sort", vec![values, text("f")]).unwrap();
+    assert_eq!(result, Typval::List(vec![Typval::Float(1.5), Typval::Float(2.5), Typval::Float(10.0)]));
+}
+
+#[test]
+fn sort_ignore_case_mode() {
+    // `i` mode: case-insensitive string sort.
+    let result = call("sort", vec![Typval::List(vec![text("banana"), text("Apple"), text("cherry")]), text("i")]).unwrap();
+    assert_eq!(result, Typval::List(vec![text("Apple"), text("banana"), text("cherry")]));
+}
+
+#[test]
+fn sort_locale_mode_is_byte_wise_fallback() {
+    // `l` mode is documented to sort by the locale of the running system; this
+    // port uses a byte-wise fallback for the C-locale `strcoll` comparison, so
+    // it matches the default ordering here.
+    let result = call("sort", vec![Typval::List(vec![text("banana"), text("Apple")]), text("l")]).unwrap();
+    assert_eq!(result, Typval::List(vec![text("Apple"), text("banana")]));
+    let numbers = call("sort", vec![list(&[2, 10]), text("l")]).unwrap();
+    assert_eq!(numbers, list(&[10, 2]));
+}
+
+#[test]
+fn str2nr_base_zero_is_rejected() {
+    // `test/old/testdir/test_functions.vim`: only 2/8/10/16 are valid bases;
+    // base 0 is rejected with E474 (f_str2nr, strings.c:2593-2598).
+    let error = call("str2nr", vec![text("0xff"), number(0)]).unwrap_err();
+    assert_eq!(error.code, "E474");
+    let error = call("str2nr", vec![text("123"), number(1)]).unwrap_err();
+    assert_eq!(error.code, "E474");
+}
+
+#[test]
+fn str2nr_allows_whitespace_after_sign() {
+    // `test/old/testdir/test_functions.vim` `Test_str2nr()`: whitespace after
+    // the sign is skipped.
+    assert_eq!(call("str2nr", vec![text("+ 1")]).unwrap(), number(1));
+    assert_eq!(call("str2nr", vec![text("- 1")]).unwrap(), number(-1));
+    assert_eq!(call("str2nr", vec![text(" - 42 ")]).unwrap(), number(-42));
+    assert_eq!(call("str2nr", vec![text("+ 10"), number(16)]).unwrap(), number(16));
+}
+
+#[test]
+fn str2nr_prefix_rules_follow_force_mode() {
+    // `test/old/testdir/test_functions.vim` `Test_str2nr()`: with an explicit
+    // base the "0b"/"0o"/"0x" prefix is consumed (STR2NR_FORCE), and text
+    // after the parsed digits is ignored.
+    assert_eq!(call("str2nr", vec![text("0101"), number(8)]).unwrap(), number(65));
+    assert_eq!(call("str2nr", vec![text("0o0101"), number(8)]).unwrap(), number(65));
+    assert_eq!(call("str2nr", vec![text("-0b101"), number(2)]).unwrap(), number(-5));
+    assert_eq!(call("str2nr", vec![text("0Xabcdef"), number(16)]).unwrap(), number(11259375));
+    assert_eq!(call("str2nr", vec![text("12"), number(2)]).unwrap(), number(1));
+    assert_eq!(call("str2nr", vec![text("18"), number(8)]).unwrap(), number(1));
+    assert_eq!(call("str2nr", vec![text("1g"), number(16)]).unwrap(), number(1));
 }
 
 #[test]
