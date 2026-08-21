@@ -252,6 +252,28 @@ fn substitute_case_sensitive_by_default() {
     assert_eq!(text.to_bytes(), b"bar\nbar");
 }
 
+#[test]
+fn substitute_i_flag_ignores_case() {
+    // The `i` flag makes the pattern case-insensitive (`test_substitute.vim`).
+    let (mut editor, _buffer, _window, mut executor) = setup("Foo\nFoo");
+    executor.execute_line(&mut editor, r"%s/foo/bar/i").unwrap();
+    let state = editor.current_buffer().unwrap();
+    let text = editor.buffer(state).unwrap().text().unwrap();
+    assert_eq!(text.to_bytes(), b"bar\nbar");
+}
+
+#[test]
+fn substitute_c_flag_errors_without_interactive_ui() {
+    // The `c` flag requires confirmation UI; without one the command errors
+    // and must not silently replace.
+    let (mut editor, _buffer, _window, mut executor) = setup("foo");
+    let error = executor.execute_line(&mut editor, r"s/foo/bar/c").unwrap_err();
+    assert!(error.to_string().contains("confirmation"));
+    let state = editor.current_buffer().unwrap();
+    let text = editor.buffer(state).unwrap().text().unwrap();
+    assert_eq!(text.to_bytes(), b"foo");
+}
+
 // ---------------------------------------------------------------------------
 // :delete, :yank and :put with registers
 // ---------------------------------------------------------------------------

@@ -522,7 +522,7 @@ fn run_program<F: FileIO>(
                     for catch in &block.catches {
                         let matched = match catch.pattern.as_deref() {
                             None => true,
-                            Some(pattern) => match regex_matches_at_start(pattern, &message) {
+                            Some(pattern) => match regex_matches_catch_pattern(pattern, &message) {
                                 Ok(value) => value,
                                 Err(detail) => return error_flow(runtime, "E54", detail),
                             },
@@ -1303,9 +1303,32 @@ fn command_substitute<F: FileIO>(
         return error_flow(runtime, "E488", "Trailing characters");
     };
     let flags = flags.trim();
+    if flags.contains('c') {
+        return error_flow(
+            runtime,
+            "E999",
+            "Substitution confirmation is not supported without an interactive UI",
+        );
+    }
     let global = flags.contains('g');
     let suppress_nomatch = flags.contains('e');
+    let mut ignore_case = false;
+    let mut match_case = false;
+    for flag in flags.chars() {
+        if flag == 'i' {
+            ignore_case = true;
+        } else if flag == 'I' {
+            match_case = true;
+        }
+    }
     let expression = replacement.strip_prefix("\\=");
+    let compiled_pattern = if match_case {
+        format!("\\C{pattern}")
+    } else if ignore_case {
+        format!("\\c{pattern}")
+    } else {
+        pattern.clone()
+    };
     let (start, end) = match resolve_range(editor, command) {
         Ok(range) => range,
         Err(message) => return error_flow(runtime, "E16", message),
@@ -1318,7 +1341,7 @@ fn command_substitute<F: FileIO>(
         Ok(lines) => lines,
         Err(message) => return error_flow(runtime, "E749", message),
     };
-    let program_regex = match compile_regex(&pattern, Magic::Magic) {
+    let program_regex = match compile_regex(&compiled_pattern, Magic::Magic) {
         Ok(program) => program,
         Err(error) => return error_flow(runtime, "E54", error.to_string()),
     };
@@ -2161,9 +2184,8 @@ fn parse_catch_pattern(args: &str) -> Option<String> {
     take_delimited(args, delimiter).map(|(pattern, _)| pattern)
 }
 
-fn regex_matches_at_start(pattern: &str, text: &str) -> Result<bool, String> {
-    let anchored = if pattern.starts_with('^') { pattern.to_owned() } else { format!("^{pattern}") };
-    let program = compile_regex(&anchored, Magic::Magic).map_err(|error| error.to_string())?;
+fn regex_matches_catch_pattern(pattern: &str, text: &str) -> Result<bool, String> {
+    let program = compile_regex(pattern, Magic::Magic).map_err(|error| error.to_string())?;
     Ok(ox_regex::exec(&program, &RegexText::new(text.to_owned())).is_some())
 }
 

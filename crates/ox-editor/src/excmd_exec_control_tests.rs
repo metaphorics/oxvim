@@ -272,14 +272,15 @@ fn inactive_elseif_condition_not_evaluated() {
 
 // ===========================================================================
 // try / catch regex matching
-// (ex_docmd.c: ex_catch — catch pattern is a Vim regex matched at start
-//  of the exception message; test_trycatch.vim: catch pattern cases)
+// (ex_docmd.c: ex_catch — catch pattern is a Vim regex compiled as-is; it may
+//  match anywhere in the exception message. An authored `^` anchors it.
+//  test_trycatch.vim: catch pattern cases)
 // ===========================================================================
 
 #[test]
 fn catch_regex_matches_thrown_string() {
-    // ex_docmd.c: `:catch /pattern/` matches when the pattern (anchored at
-    // start) matches the exception message.
+    // ex_docmd.c: `:catch /pattern/` matches when the pattern (searched
+    // through the exception message) matches.
     // test_trycatch.vim: `:throw "MyError" | catch /MyError/`
     let mut executor = ExExecutor::new();
     let mut editor = Editor::new();
@@ -291,6 +292,39 @@ fn catch_regex_matches_thrown_string() {
         )
         .unwrap();
     assert_eq!(gnum(&executor, "caught"), 1);
+}
+
+#[test]
+fn catch_unanchored_pattern_matches_suffix() {
+    // test_trycatch.vim: `:throw "prefix-suffix"` is caught by `/suffix/`.
+    // Patterns compile with search semantics; only an authored `^` anchors.
+    let mut executor = ExExecutor::new();
+    let mut editor = Editor::new();
+    executor
+        .execute_script(
+            &mut editor,
+            "test.vim",
+            "try\nthrow \"prefix-suffix\"\ncatch /suffix/\nlet g:caught = 1\nendtry",
+        )
+        .unwrap();
+    assert_eq!(gnum(&executor, "caught"), 1);
+}
+
+#[test]
+fn catch_anchored_pattern_requires_exact_start() {
+    // An authored `^` anchors the catch pattern; `/^suffix$/` does not match
+    // `prefix-suffix`.
+    let mut executor = ExExecutor::new();
+    let mut editor = Editor::new();
+    let result = executor.execute_script(
+        &mut editor,
+        "test.vim",
+        "try\nthrow \"prefix-suffix\"\ncatch /^suffix$/\nlet g:wrong = 1\nendtry",
+    );
+    let exception = vim_error(result.map(|_| ()));
+    assert_eq!(exception.kind, VimExceptionKind::Throw);
+    assert_eq!(exception.message(), "prefix-suffix");
+    gundefined(&executor, "wrong");
 }
 
 #[test]
