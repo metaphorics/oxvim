@@ -153,8 +153,10 @@ case!(json_decode_list, "json_decode", [text("[1,2]")], list(&[1, 2]));
 #[test]
 fn generated_inventory_is_complete_sorted_and_unique() {
     // `src/nvim/eval.lua:37-14147`: independent source parse versus codegen.
-    let root = std::env::var("OXVIM_REF_ROOT").unwrap();
-    let source = std::fs::read_to_string(format!("{root}/src/nvim/eval.lua")).unwrap();
+    let source_path = std::env::var("OXVIM_REF_ROOT")
+        .map(|root| format!("{root}/src/nvim/eval.lua"))
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../codegen/upstream/eval.lua").to_owned());
+    let source = std::fs::read_to_string(source_path).unwrap();
     let source_names: std::collections::BTreeSet<&str> = source
         .lines()
         .filter_map(|line| line.trim().strip_prefix("name = '").and_then(|value| value.strip_suffix("',")))
@@ -168,8 +170,10 @@ fn generated_inventory_is_complete_sorted_and_unique() {
 #[test]
 fn implemented_specs_match_upstream_args_and_method_flag() {
     // `src/nvim/eval.lua:37-14147`: all public overloads are folded by name.
-    let root = std::env::var("OXVIM_REF_ROOT").unwrap();
-    let source = std::fs::read_to_string(format!("{root}/src/nvim/eval.lua")).unwrap();
+    let source_path = std::env::var("OXVIM_REF_ROOT")
+        .map(|root| format!("{root}/src/nvim/eval.lua"))
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../codegen/upstream/eval.lua").to_owned());
+    let source = std::fs::read_to_string(source_path).unwrap();
     let parsed = parse_source_specs(&source);
     assert_eq!(parsed.len(), BUILTINS.len());
     for spec in BUILTINS {

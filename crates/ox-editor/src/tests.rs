@@ -267,8 +267,10 @@ fn floats_are_stably_sorted_by_zindex() {
 
 #[test]
 fn generated_option_table_matches_authoritative_source_count() {
-    let root = PathBuf::from(std::env::var("OXVIM_REF_ROOT").unwrap());
-    let source = fs::read_to_string(root.join("src/nvim/options.lua")).unwrap();
+    let source_path = std::env::var("OXVIM_REF_ROOT")
+        .map(|root| format!("{root}/src/nvim/options.lua"))
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../codegen/upstream/options.lua").to_owned());
+    let source = fs::read_to_string(source_path).unwrap();
     let source_count = source
         .lines()
         .filter(|line| line.starts_with("      full_name = "))
