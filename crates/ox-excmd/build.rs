@@ -13,13 +13,13 @@ struct LuaCommand {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let reference_root = env::var_os("OXVIM_REF_ROOT").ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "OXVIM_REF_ROOT must point to the Neovim reference checkout",
-        )
-    })?;
-    let source = PathBuf::from(reference_root).join("src/nvim/ex_cmds.lua");
+    let source = env::var_os("OXVIM_REF_ROOT")
+        .map(PathBuf::from)
+        .map(|root| root.join("src/nvim/ex_cmds.lua"))
+        .unwrap_or_else(|| {
+            PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"))
+                .join("../../codegen/upstream/ex_cmds.lua")
+        });
     println!("cargo:rerun-if-env-changed=OXVIM_REF_ROOT");
     println!("cargo:rerun-if-changed={}", source.display());
 

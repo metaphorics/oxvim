@@ -16,10 +16,10 @@ fn main() {
 
 fn generate() -> Result<(), String> {
     let manifest_dir = required_path("CARGO_MANIFEST_DIR")?;
-    let reference_root = env::var_os("OXVIM_REF_ROOT")
+    let source_path = env::var_os("OXVIM_REF_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| manifest_dir.join("../../.."));
-    let source_path = reference_root.join("src/nvim/options.lua");
+        .map(|root| root.join("src/nvim/options.lua"))
+        .unwrap_or_else(|| manifest_dir.join("../../codegen/upstream/options.lua"));
     println!("cargo:rerun-if-changed={}", source_path.display());
 
     if !source_path.is_file() {

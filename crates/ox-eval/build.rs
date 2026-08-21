@@ -21,10 +21,13 @@ fn main() {
 }
 
 fn generate() -> Result<(), String> {
-    let root = env::var_os("OXVIM_REF_ROOT")
+    let source_path = env::var_os("OXVIM_REF_ROOT")
         .map(PathBuf::from)
-        .ok_or_else(|| "OXVIM_REF_ROOT must point to a Neovim source tree".to_owned())?;
-    let source_path = root.join("src/nvim/eval.lua");
+        .map(|root| root.join("src/nvim/eval.lua"))
+        .unwrap_or_else(|| {
+            PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"))
+                .join("../../codegen/upstream/eval.lua")
+        });
     println!("cargo:rerun-if-env-changed=OXVIM_REF_ROOT");
     println!("cargo:rerun-if-changed={}", source_path.display());
     let source = fs::read_to_string(&source_path)
