@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,11 +14,15 @@ pub const WAKE_TOKEN: Token = Token(0);
 pub const SIGNAL_TOKEN: Token = Token(1);
 /// First token available to caller-owned mio sources.
 pub const IO_TOKEN_START: usize = 1024;
+/// First token allocatable to sibling-runtime internal sources; `SIGNAL_TOKEN`
+/// is excluded because ox-loop's own signal self-pipe owns it.
+const INTERNAL_TOKEN_FIRST: usize = SIGNAL_TOKEN.0 + 1;
 
 /// Thin owner of the platform reactor and its cross-thread wakeup source.
 pub struct Reactor {
     poll: Poll,
     waker: Arc<Waker>,
+    next_internal: Cell<usize>,
 }
 
 impl Reactor {
@@ -25,7 +30,11 @@ impl Reactor {
     pub fn new() -> Result<Self> {
         let poll = Poll::new()?;
         let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
-        Ok(Self { poll, waker })
+        Ok(Self {
+            poll,
+            waker,
+            next_internal: Cell::new(INTERNAL_TOKEN_FIRST),
+        })
     }
 
     /// Registers a caller-owned source.
@@ -80,6 +89,22 @@ impl Reactor {
     ) -> Result<()> {
         self.poll.registry().register(source, token, interest)?;
         Ok(())
+    }
+
+    /// Allocates the next token in the reserved internal range `2..IO_TOKEN_START`
+    /// (skipping the signal self-pipe token), advancing the internal cursor.
+    ///
+    /// Internal tokens are privileged: they are not subject to the public-range
+    /// guard on [`Reactor::register`], so sibling runtime crates can claim them
+    /// without ever colliding with caller-owned I/O tokens that begin at
+    /// `IO_TOKEN_START`.
+    pub fn next_internal_token(&self) -> Result<Token> {
+        let current = self.next_internal.get();
+        if current >= IO_TOKEN_START {
+            return Err(Error::ReservedToken(Token(current)));
+        }
+        self.next_internal.set(current + 1);
+        Ok(Token(current))
     }
 
     /// Waits for readiness, bounded by `timeout` when supplied.

@@ -198,6 +198,53 @@ fn signal_is_delivered_as_loop_event() {
         .any(|event| matches!(event, Event::Signal(SIGUSR1))));
 }
 
+#[cfg(unix)]
+#[test]
+fn internal_sources_never_collide_with_public_tokens() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    use mio::unix::SourceFd;
+
+    use crate::SIGNAL_TOKEN;
+
+    let mut event_loop = Loop::new().unwrap();
+
+    let alloc_internal = |event_loop: &mut Loop| {
+        // A raw fd decoupled from the loop; registration is what is under test.
+        let (read, _write) = UnixStream::pair().unwrap();
+        read.set_nonblocking(true).unwrap();
+        let fd = read.as_raw_fd();
+        let mut source = SourceFd(&fd);
+        let token = event_loop
+            .register_internal(&mut source, Interest::READABLE)
+            .unwrap();
+        // The allocated token lives strictly between the reserved signal token
+        // and the public range; it must never step on either.
+        assert!(token.0 > SIGNAL_TOKEN.0 && token.0 < IO_TOKEN_START);
+        token
+    };
+
+    let first = alloc_internal(&mut event_loop);
+    let second = alloc_internal(&mut event_loop);
+    assert_ne!(first, second, "repeat internal allocations must be distinct");
+
+    // A caller-owned source at the first public token registers with no
+    // DuplicateReadiness collision against the internal tokens.
+    let (read, _write) = UnixStream::pair().unwrap();
+    read.set_nonblocking(true).unwrap();
+    let fd = read.as_raw_fd();
+    let mut public_source = SourceFd(&fd);
+    let public = Token(IO_TOKEN_START);
+    event_loop
+        .reactor()
+        .register(&mut public_source, public, Interest::READABLE)
+        .unwrap();
+    event_loop
+        .on_readiness(public, |_, _| Ok(DrainState::Drained))
+        .expect("public token must not collide with internal registrations");
+}
+
 #[test]
 fn mio_reactor_echoes_loopback_tcp() {
     let mut reactor = Reactor::new().unwrap();

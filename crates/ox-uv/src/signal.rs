@@ -99,14 +99,12 @@ mod platform {
     use std::sync::{Arc, Mutex};
 
     use mio::unix::SourceFd;
-    use mio::{Interest, Token};
+    use mio::Interest;
     use ox_loop::{DrainState, Loop};
     use signal_hook::iterator::backend::{Handle as SignalHandle, SignalDelivery};
     use signal_hook::iterator::exfiltrator::SignalOnly;
 
     use crate::{Error, Result};
-
-    const UV_SIGNAL_TOKEN: Token = Token(ox_loop::IO_TOKEN_START);
 
     pub(crate) struct SignalDriver {
         handle: SignalHandle,
@@ -128,13 +126,14 @@ mod platform {
 
             let fd = delivery.borrow().get_read().as_raw_fd();
             let mut source = SourceFd(&fd);
-            event_loop
-                .reactor()
-                .register(&mut source, UV_SIGNAL_TOKEN, Interest::READABLE)?;
+            // Register on ox-loop's reserved internal token range instead of a
+            // public caller token, so a caller-owned source at IO_TOKEN_START
+            // never collides with the signal self-pipe.
+            let token = event_loop.register_internal(&mut source, Interest::READABLE)?;
 
             let callback_delivery = Rc::clone(&delivery);
             let callback_pending = Arc::clone(&pending);
-            event_loop.on_readiness(UV_SIGNAL_TOKEN, move |_, _| {
+            event_loop.on_readiness(token, move |_, _| {
                 let signals: Vec<_> = callback_delivery.borrow_mut().pending().collect();
                 let mut pending = callback_pending
                     .lock()

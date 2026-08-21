@@ -27,7 +27,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mio::Waker as MioWaker;
-use mio::{Events as MioEvents, Token};
+use mio::event::Source;
+use mio::{Events as MioEvents, Interest, Token};
 
 use crate::{
     DeferredScheduler, Error, Event, MultiQueue, Owner, Reactor, Result, SIGNAL_TOKEN, Signals,
@@ -138,6 +139,25 @@ impl Loop {
     /// Returns the reactor for source registration.
     pub fn reactor(&self) -> &Reactor {
         &self.reactor
+    }
+
+    /// Registers a sibling-runtime (ox-uv) internal source on a token in the
+    /// reserved internal range, skipping the token owned by this loop's own
+    /// signal self-pipe.
+    ///
+    /// This is the privileged seam for internal sources that must not consume a
+    /// public caller token: it allocates from `2..IO_TOKEN_START` and returns
+    /// the chosen token, so a later caller-owned source at `IO_TOKEN_START`
+    /// never collides with it. The returned token is dispatched through the
+    /// ordinary callbacks map, so pair it with [`Loop::on_readiness`].
+    pub fn register_internal<S: Source + ?Sized>(
+        &mut self,
+        source: &mut S,
+        interest: Interest,
+    ) -> Result<Token> {
+        let token = self.reactor.next_internal_token()?;
+        self.reactor.register_internal(source, token, interest)?;
+        Ok(token)
     }
 
     /// Returns the loop's timer heap.

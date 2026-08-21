@@ -41,6 +41,72 @@ fn run_modes_respect_liveness_stop_and_unref() {
 }
 
 #[test]
+fn stop_before_run_still_fires_due_timer_once() {
+    // Per luvref.txt:464-471 a stop requested before run ends the loop no
+    // sooner than one forced-nowait iteration, so a due timer still fires.
+    let mut uv_loop = UvLoop::new().expect("loop");
+    let fired = Rc::new(Cell::new(0));
+    let timer = Timer::new(&mut uv_loop).expect("timer");
+    let callback_fired = Rc::clone(&fired);
+    timer
+        .start(&mut uv_loop, 1, 0, move |_, _| {
+            callback_fired.set(callback_fired.get() + 1);
+            Ok(())
+        })
+        .expect("start");
+    thread::sleep(Duration::from_millis(5)); // deadline has passed; timer is due
+
+    uv_loop.stop();
+    assert!(!uv_loop.run_default().expect("default honoring pending stop"));
+    assert_eq!(fired.get(), 1, "due timer fired exactly once");
+
+    // run_once honors the same pending-stop contract.
+    let mut uv_loop = UvLoop::new().expect("loop");
+    let once_fired = Rc::new(Cell::new(0));
+    let timer = Timer::new(&mut uv_loop).expect("timer");
+    let once_callback = Rc::clone(&once_fired);
+    timer
+        .start(&mut uv_loop, 1, 0, move |_, _| {
+            once_callback.set(once_callback.get() + 1);
+            Ok(())
+        })
+        .expect("start");
+    thread::sleep(Duration::from_millis(5));
+
+    uv_loop.stop();
+    assert!(!uv_loop.run_once().expect("once honoring pending stop"));
+    assert_eq!(once_fired.get(), 1, "due timer fired exactly once");
+}
+
+#[cfg(unix)]
+#[test]
+fn signal_driver_does_not_consume_public_io_token() {
+    use std::os::unix::net::UnixStream;
+
+    use mio::{Interest, Token};
+    use ox_loop::DrainState;
+
+    // Constructing the loop installs the signal driver, whose self-pipe now
+    // lives on ox-loop's internal token range. The first public I/O source at
+    // IO_TOKEN_START must register without a DuplicateReadiness collision.
+    let mut uv_loop = UvLoop::new().expect("loop");
+    let (read, _write) = UnixStream::pair().expect("socket pair");
+    read.set_nonblocking(true).expect("nonblocking");
+    let mut source = mio::net::UnixStream::from_std(read);
+    let token = Token(ox_loop::IO_TOKEN_START);
+
+    uv_loop
+        .inner()
+        .reactor()
+        .register(&mut source, token, Interest::READABLE)
+        .expect("public source must register with the signal driver installed");
+    uv_loop
+        .inner_mut()
+        .on_readiness(token, |_, _| Ok(DrainState::Drained))
+        .expect("public readiness token must not collide with the signal pipe");
+}
+
+#[test]
 fn timer_repeat_again_and_repeat_mutation_follow_luv_cadence() {
     let mut uv_loop = UvLoop::new().expect("loop");
     let timer = Timer::new(&mut uv_loop).expect("timer");
