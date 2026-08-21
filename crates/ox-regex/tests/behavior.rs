@@ -67,6 +67,7 @@ case!(negative_lookbehind, "pattern.txt:764-781", "\\(foo\\)\\@<!bar", Magic::Ma
 case!(negative_lookbehind_fails, "pattern.txt:764-781", "\\(foo\\)\\@<!bar", Magic::Magic, "foobar", None);
 case!(lookbehind_stops_after_previous_line, "pattern.txt:734-738", "\\(foo\\nbar\\n\\)\\@<=baz", Magic::Magic, "foo\nbar\nbaz", None);
 case!(limited_lookbehind, "pattern.txt:752-758", "<\\@1<=span", Magic::Magic, "<span", Some("span"));
+case!(limited_lookbehind_cross_line_long_prefix, "pattern.txt:752-758", "\\(\\_.\\{6}\\)\\@5<=span", Magic::Magic, "abcd\nwxyzspan", Some("span"));
 case!(atomic_group_prevents_backtrack, "pattern.txt:783-792", "\\(a*\\)\\@>a", Magic::Magic, "aaa", None);
 
 // pattern.txt:803-874 (/^, /$, /\<, /\>, /\zs, /\ze).
@@ -80,6 +81,12 @@ case!(set_match_start, "pattern.txt:854-865", "foo\\zsbar", Magic::Magic, "fooba
 case!(last_set_match_start_wins, "pattern.txt:854-865", "f\\zso\\zso", Magic::Magic, "foo", Some("o"));
 case!(set_match_end, "pattern.txt:867-874", "foo\\zebar", Magic::Magic, "foobar", Some("foo"));
 case!(set_both_boundaries, "pattern.txt:854-874", "x\\zsa\\zey", Magic::Magic, "xay", Some("a"));
+
+#[test]
+fn set_start_multiplier_is_compile_error() {
+    let _spec = "pattern.txt:854-865";
+    assert!(compile("\\zs*", Magic::Magic).is_err());
+}
 
 // pattern.txt:934-1014 (/\%l, /\%c, /\%v) and 895-932 (/\%V, /\%#, /\%'m).
 case!(line_number_anchor, "pattern.txt:934-953", "\\%2lfoo", Magic::Magic, "bar\nfoo", Some("foo"));

@@ -286,8 +286,7 @@ fn match_look(
             Ok(match_expr(expr, state, context, depth + 1)?.into_iter().take(1).collect())
         }
         LookKind::Behind | LookKind::NotBehind => {
-            let earliest = limit
-                .map_or_else(|| previous_line_start(context.text.as_str(), state.pos), |bytes| state.pos.saturating_sub(bytes));
+            let earliest = lookbehind_earliest(context.text.as_str(), state.pos, limit);
             let mut found = false;
             for candidate in candidate_offsets(context.text.as_str(), earliest) {
                 if candidate > state.pos {
@@ -385,6 +384,26 @@ fn previous_line_start(text: &str, offset: usize) -> usize {
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |index| index + 1)
+}
+
+fn lookbehind_earliest(text: &str, pos: usize, limit: Option<usize>) -> usize {
+    let Some(limit) = limit else {
+        return previous_line_start(text, pos);
+    };
+    let bytes = text.as_bytes();
+    let line_start = bytes[..pos]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    if pos - line_start >= limit {
+        pos - limit
+    } else {
+        let previous_start = previous_line_start(text, pos);
+        line_start
+            .saturating_sub(1)
+            .saturating_sub(limit)
+            .max(previous_start)
+    }
 }
 
 fn virtual_column(text: &str, offset: usize) -> usize {

@@ -196,8 +196,8 @@ impl<'a> Parser<'a> {
     fn parse_piece(&mut self) -> Result<Expr, CompileError> {
         let mut atom = self.parse_atom()?;
         if let Some((min, max, greedy)) = self.parse_multiplier()? {
-            if matches!(atom, Expr::SetEnd) {
-                return Err(self.error("\\ze cannot be followed by a multiplier"));
+            if matches!(atom, Expr::SetStart | Expr::SetEnd) {
+                return Err(self.error("\\zs and \\ze cannot be followed by a multiplier"));
             }
             atom = Expr::Repeat {
                 expr: Box::new(atom),
