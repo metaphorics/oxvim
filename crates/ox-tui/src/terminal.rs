@@ -586,8 +586,9 @@ impl<W: Write> DamageWriter<W> {
                     .queue(SetAttribute(attribute))
                     .map_err(|error| TerminalError::io("underline attribute", error))?;
             }
+            let safe = terminal_safe_bytes(&cell.text);
             self.writer
-                .write_all(&cell.text)
+                .write_all(&safe)
                 .map_err(|error| TerminalError::io("cell text", error))?;
             changed += 1;
         }
@@ -612,6 +613,86 @@ fn resolved_underline(style: UnderlineStyle, undercurl: bool) -> Option<Attribut
         UnderlineStyle::Curl if undercurl => Some(Attribute::Undercurled),
         UnderlineStyle::Curl => Some(Attribute::Underlined),
     }
+}
+
+/// Expected UTF-8 sequence length for a leading byte, or 0 when it cannot
+/// begin a valid sequence.
+fn utf8_sequence_len(first: u8) -> usize {
+    match first {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 0,
+    }
+}
+
+/// Caret notation (`^X`, `^@`, `^[`, `^?`, …) for a C0 control or DEL byte.
+fn control_caret(byte: u8) -> [u8; 2] {
+    let code = match byte {
+        0x00 => b'@',
+        0x01..=0x1a => b'@' + byte,
+        0x1b => b'[',
+        0x1c => b'\\',
+        0x1d => b']',
+        0x1e => b'^',
+        0x1f => b'_',
+        0x7f => b'?',
+        _ => b'?',
+    };
+    [b'^', code]
+}
+
+/// Render `text` so it is safe to write to a terminal: every byte emitted is a
+/// printable ASCII or valid printable-UTF-8 glyph, so hostile or malformed
+/// cell content cannot inject terminal control sequences. C0 controls and DEL
+/// become caret notation (`^X`); C1 controls and invalid/incomplete bytes
+/// become `\xHH` hex escapes. The original bytes are retained unchanged in the
+/// [`Frame`]/cell state (the byte-exact contract); only the bytes handed to the
+/// terminal writer are re-encoded.
+fn terminal_safe_bytes(text: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(text.len());
+    let mut index = 0;
+    while index < text.len() {
+        let first = text[index];
+        match first {
+            // C0 controls and DEL are escaped in caret notation.
+            0x00..=0x1f | 0x7f => {
+                output.extend_from_slice(&control_caret(first));
+                index += 1;
+            }
+            // Printable ASCII passes through verbatim.
+            0x20..=0x7e => {
+                output.push(first);
+                index += 1;
+            }
+            // Possible multi-byte UTF-8 leading byte.
+            _ => {
+                let len = utf8_sequence_len(first);
+                let end = index.saturating_add(len);
+                if len >= 2
+                    && end <= text.len()
+                    && let Ok(chunk) = std::str::from_utf8(&text[index..end])
+                    && let Some(character) = chunk.chars().next()
+                {
+                    if character.is_control() {
+                        // C1 control character (U+0080..U+009F).
+                        output.extend_from_slice(format!("\\x{:02X}", character as u32).as_bytes());
+                    } else {
+                        output.extend_from_slice(&text[index..end]);
+                    }
+                    index = end;
+                } else {
+                    // Lone high byte or truncated multi-byte sequence: raw
+                    // high bytes include the C1 control spans, so escape
+                    // instead of leaking them into the terminal.
+                    output.extend_from_slice(format!("\\x{:02X}", first).as_bytes());
+                    index += 1;
+                }
+            }
+        }
+    }
+    output
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -987,6 +1068,55 @@ mod tests {
         assert_eq!(writer.render(&changed).expect("changed render"), 1);
         let delta = &writer.writer[first_len..];
         assert!(delta.windows(4).any(|window| window == b"\x1b[2G") || delta.ends_with(b"c"));
+    }
+
+    #[test]
+    fn terminal_safe_bytes_escapes_controls_and_invalid_bytes() {
+        // Printable ASCII and multibyte UTF-8 pass through unchanged.
+        assert_eq!(terminal_safe_bytes(b"plain \xe7\x95\x8c"), b"plain \xe7\x95\x8c");
+        // C0 controls become caret notation.
+        assert_eq!(terminal_safe_bytes(b"\x00\x01\x1b\x7f"), b"^@^A^[^?");
+        // C1 controls and invalid lone bytes become hex escapes.
+        assert_eq!(terminal_safe_bytes(b"\x9b\xff\xc0\xb0"), b"\\x9B\\xFF\\xC0\\xB0");
+        // A validly-encoded C1 control and a lone continuation byte.
+        assert_eq!(terminal_safe_bytes(b"a\xc2\x85b\x80"), b"a\\x85b\\x80");
+        // Escaping is never skipped: every output byte is printable ASCII.
+        assert!(terminal_safe_bytes(b"\x1b[2J\x00\xfe").iter().all(|b| b.is_ascii()));
+    }
+
+    #[test]
+    fn damage_writer_skips_continuation_cells() {
+        let frame = Frame::new(2, 1, vec![cell("界"), Cell::continuation()]).expect("valid frame");
+        let mut writer = DamageWriter::new(Vec::new(), false);
+        // Only the leading glyph is drawn; the continuation cell is skipped.
+        assert_eq!(writer.render(&frame).expect("render"), 1);
+    }
+
+    #[test]
+    fn damage_writer_escapes_control_bytes_in_cell_text() {
+        let frame = Frame::new(
+            1,
+            1,
+            vec![Cell { text: b"a\x1b[2J\x7f\x00\x9b\xff\xc0\xb0".to_vec(), ..Cell::default() }],
+        )
+        .expect("valid frame");
+        let mut writer = DamageWriter::new(Vec::new(), false);
+        writer.render(&frame).expect("render");
+        let out = &writer.writer;
+        // The cell text is re-encoded to a printable visible form...
+        let escaped = b"a^[[2J^?^@\\x9B\\xFF\\xC0\\xB0";
+        assert!(
+            out.windows(escaped.len()).any(|window| window == escaped),
+            "escaped cell text must be present, got {out:?}"
+        );
+        // ...and the raw control sequence and control bytes never reach the terminal.
+        assert!(!out.windows(4).any(|window| window == b"\x1b[2J"), "ESC sequence leaked: {out:?}");
+        for forbidden in [b"\x00", b"\x7f", b"\x9b", b"\xff", b"\xc0"] {
+            assert!(
+                !out.windows(forbidden.len()).any(|window| window == forbidden),
+                "raw byte leaked: {forbidden:?} in {out:?}"
+            );
+        }
     }
 
     #[test]

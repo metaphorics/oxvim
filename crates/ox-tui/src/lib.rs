@@ -21,6 +21,7 @@ use chrome::{
     Chrome, ChromeError, ChunkLine, HistoryEntry, MessageUpdate, PopupItem, Rect, TextChunk, TimeMs,
 };
 use client::{Client, ClientError};
+use crossterm::Command as _;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -80,6 +81,9 @@ pub struct TuiState {
     pub theme: Theme,
     /// Selected motion posture.
     pub motion: MotionPolicy,
+    /// Whether the editor has asked for mouse input (`mouse_on`). Drives
+    /// crossterm's terminal mouse-capture enable/disable at the run boundary.
+    pub mouse_capture: bool,
     highlight_groups: BTreeMap<HighlightGroup, HighlightStyle>,
     current_time: TimeMs,
     notification_started: Option<TimeMs>,
@@ -100,6 +104,7 @@ impl TuiState {
             chrome: Chrome::default(),
             theme: Theme::new(colorfgbg),
             motion,
+            mouse_capture: false,
             highlight_groups: BTreeMap::new(),
             current_time: TimeMs(0),
             notification_started: None,
@@ -177,8 +182,10 @@ impl TuiState {
     fn apply_client_event(&mut self, event: &RedrawEvent) -> Result<(), TuiError> {
         for args in &event.argsets {
             match event.name.as_bytes() {
+                b"mouse_on" => self.mouse_capture = true,
+                b"mouse_off" => self.mouse_capture = false,
                 b"flush" | b"option_set" | b"default_colors_set" | b"hl_group_set"
-                | b"mouse_on" | b"mouse_off" | b"busy_start" | b"busy_stop"
+                | b"busy_start" | b"busy_stop"
                 | b"bell" | b"visual_bell" | b"update_menu" | b"menu_show"
                 | b"menu_hide" | b"set_title" | b"set_icon" => {
                     // These carry no client-rendered content, so they are
@@ -363,9 +370,9 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
         &environment,
         ProbePolicy::default(),
     )?;
-    let shared = SharedWriter::stdout();
+    let mut shared = SharedWriter::stdout();
     let mut session = TerminalSession::start(shared.clone(), capabilities)?;
-    let mut damage = DamageWriter::new(shared, capabilities.undercurl);
+    let mut damage = DamageWriter::new(shared.clone(), capabilities.undercurl);
     let mut state = TuiState::new(env::var("COLORFGBG").ok().as_deref(), MotionPolicy::from_environment());
     let tokens = state.theme.tokens();
     session.program_palette(&[
@@ -378,12 +385,17 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
         (9, tokens.accent),
     ])?;
     let started = Instant::now();
+    let mut mouse_capture_emitted = false;
 
     loop {
         match client.recv_redraw_timeout(LOOP_SLICE) {
             Ok(Some(events)) => {
                 let now = TimeMs(duration_millis(started.elapsed()));
                 state.apply_redraw(&events, now)?;
+                if state.mouse_capture != mouse_capture_emitted {
+                    mouse_capture_emitted = state.mouse_capture;
+                    apply_mouse_capture(&mut shared, state.mouse_capture)?;
+                }
                 if let Ok(grid) = state.screen.composed_grid() {
                     let frame = render_frame(&grid, &state, capabilities)?;
                     session.begin_synchronized_output()?;
@@ -409,6 +421,9 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
             }
             Err(error) => {
                 let failure = process_failure(&error);
+                if mouse_capture_emitted {
+                    let _ = apply_mouse_capture(&mut shared, false);
+                }
                 session.restore()?;
                 failure.write_diagnostic(&mut io::stderr())?;
                 return Err(TuiError::Client(error));
@@ -459,6 +474,24 @@ pub fn run_command(command: Command) -> Result<(), TuiError> {
             Err(TuiError::Client(error))
         }
     }
+}
+
+/// Enable or disable terminal mouse capture to match the editor's `mouse_on`/
+/// `mouse_off` signal. Forwarding mouse input to the editor is only reachable
+/// while the terminal actually reports mouse events.
+fn apply_mouse_capture(shared: &mut SharedWriter, enabled: bool) -> Result<(), TuiError> {
+    let mut command = String::new();
+    // EnableMouseCapture/DisableMouseCapture are distinct crossterm Command
+    // types (no shared supertype), so they are serialized to ANSI here and
+    // written as a single byte string.
+    let result = if enabled {
+        crossterm::event::EnableMouseCapture.write_ansi(&mut command)
+    } else {
+        crossterm::event::DisableMouseCapture.write_ansi(&mut command)
+    };
+    result.map_err(|error| TuiError::Input(io::Error::other(error)))?;
+    shared.write_all(command.as_bytes()).map_err(TuiError::Input)?;
+    shared.flush().map_err(TuiError::Input)
 }
 
 fn render_frame(
@@ -626,6 +659,7 @@ fn paint_surface(
                 continue;
             };
             cell.text = " ".into();
+            cell.continuation = false;
             cell.foreground = foreground;
             cell.background = background;
             if y == rect.y || y + 1 == rect.y.saturating_add(rect.height) || x == rect.x || x + 1 == rect.x.saturating_add(rect.width) {
@@ -666,13 +700,31 @@ fn paint_surface(
                 cell.text = text[offset..offset.saturating_add(consumed)].to_vec();
                 cell.foreground = foreground;
                 cell.background = background;
+                // Overwriting a cell must clear any stale continuation marker
+                // (e.g. an earlier wide glyph's trailing column) so the cell is
+                // redrawn rather than skipped by the damage writer.
+                cell.continuation = false;
                 last_glyph_x = Some(x);
+                // A double-width glyph paints its trailing column itself. Mark
+                // that trailing cell as a continuation so the damage writer
+                // skips it instead of overlaying a space over the glyph's
+                // right half.
+                if advance == 2 {
+                    let trailing_column = column.saturating_add(1);
+                    if let Some(trailing) = row.checked_mul(width).and_then(|base| base.checked_add(trailing_column)).and_then(|index| cells.get_mut(index)) {
+                        trailing.text = Vec::new();
+                        trailing.continuation = true;
+                        trailing.foreground = foreground;
+                        trailing.background = background;
+                    }
+                }
             } else if let Some(base_x) = last_glyph_x {
                 // Zero-width combining/decorative marks overlay the preceding
                 // glyph, preserving the original byte sequence.
                 let base_column = inner_x.saturating_add(base_x);
                 if let Some(base_cell) = row.checked_mul(width).and_then(|base| base.checked_add(base_column)).and_then(|index| cells.get_mut(index)) {
                     base_cell.text.extend_from_slice(&text[offset..offset.saturating_add(consumed)]);
+                    base_cell.continuation = false;
                 }
             }
         }
@@ -1133,7 +1185,11 @@ mod tests {
         let cell_text = |row: usize, column: usize| cells[row * width + column].text.clone();
         assert_eq!(cell_text(1, 1), b"a");
         assert_eq!(cell_text(1, 2), b"\xe7\x95\x8c\xcc\x81");
-        assert_eq!(cell_text(1, 3), b" ");
+        // The wide glyph 界 (width 2) marks its trailing column as a
+        // continuation so the damage writer skips it, rather than a space.
+        let trailing = &cells[width + 3];
+        assert!(trailing.continuation);
+        assert!(trailing.text.is_empty());
         assert_eq!(cell_text(1, 4), vec![0xff]);
     }
 
@@ -1167,5 +1223,55 @@ mod tests {
         assert_eq!(cell_text(1, 1), "界".as_bytes());
         assert_eq!(cell_text(1, 3), b"\x78\xcc\x81");
         assert_eq!(cell_text(1, 4), b"y");
+    }
+
+    #[test]
+    fn surface_overwrite_clears_stale_continuations() {
+        // render_frame turns empty grid cells into continuation cells before
+        // paint_surface draws chrome over them. Painting over such a cell must
+        // clear the continuation marker, or the damage writer would skip the
+        // repaint and leave stale background behind.
+        let width = 6usize;
+        let height = 3usize;
+        let mut cells = vec![TerminalCell::default(); width * height];
+        cells[width + 2] = TerminalCell::continuation();
+        cells[width + 4] = TerminalCell::continuation();
+        let theme = Theme::new(None);
+        let rect = Rect { x: 0, y: 0, width, height };
+        paint_surface(
+            &mut cells,
+            width,
+            height,
+            rect,
+            b"ab",
+            &theme,
+            HighlightGroup::NormalFloat,
+            ColorSupport::TrueColor,
+            1.0,
+        );
+        // "ab" paints inner columns 0..2 -> absolute columns 1..2; the former
+        // continuation at absolute column 2 is now a real glyph.
+        let cell2 = &cells[width + 2];
+        assert_eq!(cell2.text, b"b");
+        assert!(!cell2.continuation);
+        // Absolute column 4 is cleared by the rect wipe (no glyph there): its
+        // continuation marker is dropped so it repaints as background space.
+        let cell4 = &cells[width + 4];
+        assert_eq!(cell4.text, b" ");
+        assert!(!cell4.continuation);
+    }
+
+    #[test]
+    fn mouse_on_off_drives_capture_state() {
+        let mut state = TuiState::default();
+        let event = |name: &str| RedrawEvent { name: OxStr::from(name), argsets: vec![vec![]] };
+        assert!(!state.mouse_capture);
+        state.apply_redraw(&[event("mouse_on")], TimeMs(0)).unwrap();
+        assert!(state.mouse_capture);
+        // A repeated mouse_on keeps capture enabled.
+        state.apply_redraw(&[event("mouse_on")], TimeMs(0)).unwrap();
+        assert!(state.mouse_capture);
+        state.apply_redraw(&[event("mouse_off")], TimeMs(0)).unwrap();
+        assert!(!state.mouse_capture);
     }
 }
