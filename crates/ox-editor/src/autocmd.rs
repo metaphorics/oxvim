@@ -233,7 +233,8 @@ pub struct AutocmdAction {
     pub event: Event,
     /// Host-owned executable payload.
     pub kind: AutocmdKind,
-    /// Whether the definition is removed by this plan.
+    /// Whether the definition is one-shot and removed when the host
+    /// acknowledges execution via `Autocmds::consume_once`.
     pub once: bool,
     /// Whether actions raised while this action runs may execute immediately.
     pub nested: bool,
@@ -279,17 +280,19 @@ pub struct AutocmdContext<'a> {
     pub buffer: Option<BufHandle>,
     /// Event match name, normally a buffer or file name.
     pub file_name: Option<&'a str>,
-    /// True when this event was raised while another autocmd is active.
+    /// True when this event may fire nested, false when it is raised inside a
+    /// non-`++nested` outer autocmd and must be suppressed entirely.
+    ///
+    /// The host passes the *outer* autocmd's `++nested` flag, and `true` for a
+    /// top-level event. Gating is decided once per event, never per candidate.
     pub nested: bool,
 }
 
-/// Ordered actions. Non-`++nested` actions are separated for host deferral.
+/// Ordered actions for one event occurrence.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FiringPlan {
-    /// Actions which may run immediately.
+    /// Actions which may run immediately, in global definition order.
     pub ready: Vec<AutocmdAction>,
-    /// Non-nested actions held for the outer execution to finish.
-    pub deferred: Vec<AutocmdAction>,
 }
 
 /// Selector corresponding to the useful `:autocmd!` forms.
@@ -478,25 +481,33 @@ impl Autocmds {
         self.entries.retain(|entry| !matches!(entry.pattern, StoredPattern::Buffer(value) if value == buffer));
     }
 
-    /// Builds the stable firing order and consumes one-shot entries before execution.
+    /// Builds the firing plan for one event occurrence.
+    ///
+    /// Matching actions are returned in global definition order; augroups
+    /// filter definitions but never reorder them (autocmd.c:80-83). When the
+    /// event is raised inside a non-`++nested` outer autocmd the whole event
+    /// is suppressed rather than split by candidate flags (autocmd.c:1465-1468,
+    /// 2000-2002). One-shot definitions are *not* consumed here; the host
+    /// acknowledges execution with `consume_once`, so abandoned plans leave
+    /// `++once` definitions intact.
     pub fn plan(&mut self, event: Event, context: AutocmdContext<'_>) -> FiringPlan {
-        if self.ignored.contains(&event) { return FiringPlan::default(); }
+        if self.ignored.contains(&event) || !context.nested {
+            return FiringPlan::default();
+        }
         let mut matched: Vec<&Entry> = self.entries.iter().filter(|entry| {
             entry.event == event && pattern_matches(&entry.pattern, context.buffer, context.file_name)
         }).collect();
-        matched.sort_by_key(|entry| (self.group_order(entry.options.group), entry.sequence));
-        let actions: Vec<AutocmdAction> = matched.into_iter().map(|entry| self.action(entry)).collect();
-        let once_ids: BTreeSet<u64> = actions.iter().filter(|action| action.once).map(|action| action.id).collect();
-        if !once_ids.is_empty() { self.entries.retain(|entry| !once_ids.contains(&entry.id)); }
-        let mut plan = FiringPlan::default();
-        for action in actions {
-            if context.nested && !action.nested { plan.deferred.push(action); } else { plan.ready.push(action); }
-        }
-        plan
+        matched.sort_by_key(|entry| entry.sequence);
+        let ready: Vec<AutocmdAction> = matched.into_iter().map(|entry| self.action(entry)).collect();
+        FiringPlan { ready }
     }
 
-    fn group_order(&self, id: AugroupId) -> u64 {
-        if id == AugroupId::default() { 0 } else { self.groups.get(&id).map_or(u64::MAX, |(_, order)| *order) }
+    /// Removes the one-shot definition identified by `id` once the host begins
+    /// executing it. Returns `true` when a `++once` definition was removed.
+    pub fn consume_once(&mut self, id: u64) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|entry| !(entry.id == id && entry.options.once));
+        self.entries.len() != before
     }
 
     fn action(&self, entry: &Entry) -> AutocmdAction {

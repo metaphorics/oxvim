@@ -29,7 +29,9 @@ fn context<'a>(buffer: Option<BufHandle>, file_name: Option<&'a str>) -> Autocmd
     AutocmdContext {
         buffer,
         file_name,
-        nested: false,
+        // A top-level event is not raised inside a non-nested outer autocmd,
+        // so nesting is permitted and no event-level gate applies.
+        nested: true,
     }
 }
 
@@ -307,7 +309,7 @@ fn slash_pattern_matches_full_path_not_tail() {
 }
 
 #[test]
-fn groups_fire_in_creation_order_then_definition_order() {
+fn definitions_fire_in_registration_order_regardless_of_group() {
     let mut autocmds = Autocmds::new();
     let first = autocmds.create_group("first", false).unwrap();
     let second = autocmds.create_group("second", false).unwrap();
@@ -333,11 +335,13 @@ fn groups_fire_in_creation_order_then_definition_order() {
             AutocmdKind::LuaCallback(_) => "lua",
         })
         .collect();
-    assert_eq!(values, ["first-a", "first-b", "second"]);
+    // augroups filter but never reorder (autocmd.c:80-83): firing is global
+    // definition order, so the first-registered (group "second") leads.
+    assert_eq!(values, ["second", "first-a", "first-b"]);
 }
 
 #[test]
-fn default_group_fires_before_named_groups() {
+fn definitions_fire_in_registration_order_across_groups() {
     let mut autocmds = Autocmds::new();
     let named = autocmds.create_group("named", false).unwrap();
     autocmds
@@ -359,14 +363,16 @@ fn default_group_fires_before_named_groups() {
             AutocmdOptions::default(),
         )
         .unwrap();
+    // Definition order, not group, determines firing: "named" was registered
+    // first even though the default group sorts low.
     assert_eq!(
         autocmds.plan(Event::BufEnter, context(None, Some("x"))).ready[0].group,
-        AugroupId::default()
+        named
     );
 }
 
 #[test]
-fn once_definition_is_consumed_by_first_plan() {
+fn plan_then_abandon_keeps_once_definition() {
     let mut autocmds = Autocmds::new();
     autocmds
         .register(
@@ -379,36 +385,64 @@ fn once_definition_is_consumed_by_first_plan() {
             },
         )
         .unwrap();
+    let plan = autocmds.plan(Event::BufEnter, context(None, Some("x")));
+    assert_eq!(plan.ready.len(), 1);
+    // The plan is abandoned (never executed): a later plan still sees it.
     assert_eq!(autocmds.plan(Event::BufEnter, context(None, Some("x"))).ready.len(), 1);
-    assert!(autocmds.plan(Event::BufEnter, context(None, Some("x"))).ready.is_empty());
+    assert_eq!(autocmds.len(), 1);
 }
 
 #[test]
-fn non_nested_definition_is_deferred_during_nested_firing() {
+fn executed_once_definition_is_consumed_at_execution() {
+    let mut autocmds = Autocmds::new();
+    autocmds
+        .register(
+            Event::BufEnter,
+            "*",
+            ex("once"),
+            AutocmdOptions {
+                once: true,
+                ..AutocmdOptions::default()
+            },
+        )
+        .unwrap();
+    let plan = autocmds.plan(Event::BufEnter, context(None, Some("x")));
+    let action_id = plan.ready[0].id;
+    // The host acknowledges execution, consuming the definition.
+    assert!(autocmds.consume_once(action_id));
+    assert!(autocmds.plan(Event::BufEnter, context(None, Some("x"))).ready.is_empty());
+    assert!(autocmds.is_empty());
+    // A second, unrelated id removes nothing.
+    assert!(!autocmds.consume_once(action_id));
+}
+
+#[test]
+fn consume_once_ignores_non_once_definitions() {
+    let mut autocmds = Autocmds::new();
+    autocmds
+        .register(
+            Event::BufEnter,
+            "*",
+            ex("keep"),
+            AutocmdOptions::default(),
+        )
+        .unwrap();
+    let plan = autocmds.plan(Event::BufEnter, context(None, Some("x")));
+    assert!(!autocmds.consume_once(plan.ready[0].id));
+    assert_eq!(autocmds.len(), 1);
+}
+
+#[test]
+fn non_nested_outer_suppresses_whole_nested_event() {
     let mut autocmds = Autocmds::new();
     autocmds
         .register(
             Event::User,
             "*",
-            ex("later"),
+            ex("late"),
             AutocmdOptions::default(),
         )
         .unwrap();
-    let plan = autocmds.plan(
-        Event::User,
-        AutocmdContext {
-            buffer: None,
-            file_name: Some("x"),
-            nested: true,
-        },
-    );
-    assert!(plan.ready.is_empty());
-    assert_eq!(plan.deferred.len(), 1);
-}
-
-#[test]
-fn nested_definition_is_ready_during_nested_firing() {
-    let mut autocmds = Autocmds::new();
     autocmds
         .register(
             Event::User,
@@ -420,6 +454,43 @@ fn nested_definition_is_ready_during_nested_firing() {
             },
         )
         .unwrap();
+    // The outer autocmd is not ++nested: the whole nested event is suppressed
+    // (autocmd.c:1465-1468), regardless of any candidate's own nested flag.
+    let plan = autocmds.plan(
+        Event::User,
+        AutocmdContext {
+            buffer: None,
+            file_name: Some("x"),
+            nested: false,
+        },
+    );
+    assert!(plan.ready.is_empty());
+}
+
+#[test]
+fn nested_outer_plans_all_matching_inner_actions() {
+    let mut autocmds = Autocmds::new();
+    autocmds
+        .register(
+            Event::User,
+            "*",
+            ex("plain"),
+            AutocmdOptions::default(),
+        )
+        .unwrap();
+    autocmds
+        .register(
+            Event::User,
+            "*",
+            ex("nested"),
+            AutocmdOptions {
+                nested: true,
+                ..AutocmdOptions::default()
+            },
+        )
+        .unwrap();
+    // The outer autocmd is ++nested: every matching inner action plans
+    // normally. Candidate flags never partition the event (autocmd.c:2000-2002).
     let plan = autocmds.plan(
         Event::User,
         AutocmdContext {
@@ -428,8 +499,15 @@ fn nested_definition_is_ready_during_nested_firing() {
             nested: true,
         },
     );
-    assert_eq!(plan.ready.len(), 1);
-    assert!(plan.deferred.is_empty());
+    let values: Vec<_> = plan
+        .ready
+        .iter()
+        .map(|action| match &action.kind {
+            AutocmdKind::ExString(value) => value.as_str(),
+            AutocmdKind::LuaCallback(_) => "lua",
+        })
+        .collect();
+    assert_eq!(values, ["plain", "nested"]);
 }
 
 #[test]
