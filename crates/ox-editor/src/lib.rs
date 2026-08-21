@@ -15,11 +15,13 @@ pub use autocmd::{
     AutocmdAction, AutocmdContext, AutocmdError, AutocmdKind, AutocmdOptions, AutocmdSink,
     Autocmds, AugroupId, DeleteAutocmds, Event, FiringPlan, PatternKind, EVENT_COUNT,
 };
-pub use buffer::{BufferState, BufferStateError};
-pub use editor::{BufferRelease, Editor, EditorError};
+pub use buffer::{
+    BufferAttachSubscription, BufferState, BufferStateError, UserCommandDefinition,
+};
+pub use editor::{BufferRelease, Editor, EditorError, Message, MessageKind};
 pub use layout::{
     Anchor, Border, BorderText, FloatingWindow, Frame, Geometry, Layout, LayoutError, LeafFrame,
-    Margins, RelativeTo, TabpageState, TextAlignment, WinConfig, WindowState,
+    Margins, RelativeTo, TabpageState, TextAlignment, WinConfig, WindowApiState, WindowState,
 };
 pub use mapping::{
     Abbreviation, Lookup, MapMode, MapModes, MapScope, Mapping, MappingAction, MappingError,

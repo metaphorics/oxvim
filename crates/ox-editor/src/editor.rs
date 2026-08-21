@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use ox_text::{Buffer, Position};
-use ox_types::{BufHandle, TabHandle, WinHandle};
+use ox_types::{BufHandle, Dict, Object, TabHandle, WinHandle};
 use thiserror::Error;
 
 use crate::autocmd::Autocmds;
@@ -14,6 +14,26 @@ use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError};
 use crate::options::OptionStore;
 use crate::register::{put_content, RegisterError, Registers};
 use crate::typeahead::Typeahead;
+
+/// Classification retained with a message submitted to the editor sink.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageKind {
+    /// Error output such as `nvim_err_writeln`.
+    Error,
+    /// General echo output.
+    Echo,
+}
+
+/// A message retained until a UI or server consumes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Message {
+    /// Message category.
+    pub kind: MessageKind,
+    /// API-compatible message payload.
+    pub content: Object,
+    /// Whether the message should enter message history.
+    pub history: bool,
+}
 
 /// Failures while mutating [`Editor`] state.
 #[derive(Debug, Error)]
@@ -27,6 +47,9 @@ pub enum EditorError {
     /// A tabpage handle is not live.
     #[error("unknown tabpage {0:?}")]
     UnknownTabpage(TabHandle),
+    /// An operation requiring a current tabpage was requested in an empty editor.
+    #[error("no current tabpage")]
+    NoCurrentTabpage,
     /// A displayed buffer cannot be wiped.
     #[error("cannot wipe buffer {buffer:?} attached to {windows} window(s)")]
     BufferInUse {
@@ -88,6 +111,10 @@ pub struct Editor {
     mappings: Mappings,
     /// Encoded pending input stack.
     typeahead: Typeahead,
+    /// Editor-wide `v:` variables.
+    vvars: Dict,
+    /// Messages waiting for a UI or server consumer.
+    messages: Vec<Message>,
     current_tab: Option<TabHandle>,
     next_buffer: i64,
     next_window: i64,
@@ -116,6 +143,8 @@ impl Editor {
             autocmds: Autocmds::new(),
             mappings: Mappings::new(),
             typeahead: Typeahead::new(),
+            vvars: Dict(Vec::new()),
+            messages: Vec::new(),
             current_tab: None,
             next_buffer: 1,
             next_window: 1,
@@ -129,28 +158,133 @@ impl Editor {
         self.current_tab
     }
 
+    /// Returns the current window, if a tabpage has been created.
+    #[must_use]
+    pub fn current_window(&self) -> Option<WinHandle> {
+        self.current_tab
+            .and_then(|tab| self.tabpages.get(&tab))
+            .map(TabpageState::current_window)
+    }
+
+    /// Returns the buffer displayed by the current window.
+    #[must_use]
+    pub fn current_buffer(&self) -> Option<BufHandle> {
+        self.current_window()
+            .and_then(|window| self.window(window).ok())
+            .map(|window| window.buffer)
+    }
+
+    /// Returns live buffer handles in allocation order.
+    #[must_use]
+    pub fn buffers(&self) -> Vec<BufHandle> {
+        self.buffers.keys().copied().collect()
+    }
+
+    /// Returns live window handles in allocation order.
+    #[must_use]
+    pub fn windows(&self) -> Vec<WinHandle> {
+        self.windows.keys().copied().collect()
+    }
+
+    /// Returns live tabpage handles in allocation order.
+    #[must_use]
+    pub fn tabpages(&self) -> Vec<TabHandle> {
+        self.tabpages.keys().copied().collect()
+    }
+
+    /// Returns the tabpage that owns a live window.
+    pub fn window_tabpage(&self, window: WinHandle) -> Result<TabHandle, EditorError> {
+        let resolved = if window.is_current() {
+            self.current_window().ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            window
+        };
+        self.windows
+            .get(&resolved)
+            .copied()
+            .ok_or(EditorError::UnknownWindow(resolved))
+    }
+
     /// Returns an immutable live buffer state.
     pub fn buffer(&self, buffer: BufHandle) -> Result<&BufferState, EditorError> {
+        let resolved = if buffer.is_current() {
+            self.current_buffer().ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            buffer
+        };
         self.buffers
-            .get(&buffer)
-            .ok_or(EditorError::UnknownBuffer(buffer))
+            .get(&resolved)
+            .ok_or(EditorError::UnknownBuffer(resolved))
+    }
+
+    /// Returns mutable state for a live buffer.
+    pub fn buffer_mut(&mut self, buffer: BufHandle) -> Result<&mut BufferState, EditorError> {
+        let resolved = if buffer.is_current() {
+            self.current_buffer().ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            buffer
+        };
+        self.buffers
+            .get_mut(&resolved)
+            .ok_or(EditorError::UnknownBuffer(resolved))
     }
 
     /// Returns an immutable live tabpage state.
     pub fn tabpage(&self, tab: TabHandle) -> Result<&TabpageState, EditorError> {
+        let resolved = if tab.is_current() {
+            self.current_tab.ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            tab
+        };
         self.tabpages
-            .get(&tab)
-            .ok_or(EditorError::UnknownTabpage(tab))
+            .get(&resolved)
+            .ok_or(EditorError::UnknownTabpage(resolved))
     }
 
     /// Returns immutable viewport state for a live window.
     pub fn window(&self, window: WinHandle) -> Result<&WindowState, EditorError> {
+        let resolved = if window.is_current() {
+            self.current_window().ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            window
+        };
         let tab = self
             .windows
-            .get(&window)
+            .get(&resolved)
             .copied()
-            .ok_or(EditorError::UnknownWindow(window))?;
-        Ok(self.tabpage(tab)?.window(window)?)
+            .ok_or(EditorError::UnknownWindow(resolved))?;
+        Ok(self.tabpage(tab)?.window(resolved)?)
+    }
+
+    /// Makes a live window and its owning tabpage current.
+    pub fn set_current_window(&mut self, window: WinHandle) -> Result<(), EditorError> {
+        let resolved = if window.is_current() {
+            self.current_window().ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            window
+        };
+        let tab = self
+            .windows
+            .get(&resolved)
+            .copied()
+            .ok_or(EditorError::UnknownWindow(resolved))?;
+        self.tabpages
+            .get_mut(&tab)
+            .ok_or(EditorError::UnknownTabpage(tab))?
+            .set_current(resolved)?;
+        self.current_tab = Some(tab);
+        Ok(())
+    }
+
+    /// Displays a live buffer in the current window.
+    pub fn set_current_buffer(
+        &mut self,
+        buffer: BufHandle,
+        release: BufferRelease,
+    ) -> Result<(), EditorError> {
+        let buffer = self.resolve_buffer_handle(buffer)?;
+        let window = self.current_window().ok_or(EditorError::NoCurrentTabpage)?;
+        self.set_window_buffer(window, buffer, release)
     }
 
     /// Changes a live window's cursor position.
@@ -159,6 +293,7 @@ impl Editor {
         window: WinHandle,
         position: Position,
     ) -> Result<(), EditorError> {
+        let window = self.resolve_window_handle(window)?;
         let tab = self
             .windows
             .get(&window)
@@ -178,6 +313,7 @@ impl Editor {
         window: WinHandle,
         topline: usize,
     ) -> Result<(), EditorError> {
+        let window = self.resolve_window_handle(window)?;
         let tab = self
             .windows
             .get(&window)
@@ -198,6 +334,8 @@ impl Editor {
         buffer: BufHandle,
         release: BufferRelease,
     ) -> Result<(), EditorError> {
+        let window = self.resolve_window_handle(window)?;
+        let buffer = self.resolve_buffer_handle(buffer)?;
         self.require_buffer(buffer)?;
         let old_buffer = self.window(window)?.buffer;
         if old_buffer == buffer {
@@ -311,6 +449,204 @@ impl Editor {
         &mut self.typeahead
     }
 
+    /// Returns editor-wide `v:` variables.
+    #[must_use]
+    pub const fn vvars(&self) -> &Dict {
+        &self.vvars
+    }
+
+    /// Returns mutable editor-wide `v:` variables.
+    pub const fn vvars_mut(&mut self) -> &mut Dict {
+        &mut self.vvars
+    }
+
+    /// Returns messages retained by the editor sink.
+    #[must_use]
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// Stores a message without claiming that a UI has rendered it.
+    pub fn push_message(&mut self, message: Message) {
+        self.messages.push(message);
+    }
+
+    /// Returns tabpage-local variables.
+    pub fn tabpage_variables(&self, tab: TabHandle) -> Result<&Dict, EditorError> {
+        Ok(self.tabpage(tab)?.variables())
+    }
+
+    /// Returns mutable tabpage-local variables.
+    pub fn tabpage_variables_mut(&mut self, tab: TabHandle) -> Result<&mut Dict, EditorError> {
+        let resolved = if tab.is_current() {
+            self.current_tab.ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            tab
+        };
+        Ok(self
+            .tabpages
+            .get_mut(&resolved)
+            .ok_or(EditorError::UnknownTabpage(resolved))?
+            .variables_mut())
+    }
+
+    /// Returns one tabpage's tiled and floating windows in display order.
+    pub fn tabpage_windows(&self, tab: TabHandle) -> Result<Vec<WinHandle>, EditorError> {
+        Ok(self.tabpage(tab)?.windows())
+    }
+
+    /// Resizes and equalizes a tabpage's tiled layout.
+    pub fn resize_tabpage(
+        &mut self,
+        tab: TabHandle,
+        geometry: Geometry,
+    ) -> Result<(), EditorError> {
+        let resolved = if tab.is_current() {
+            self.current_tab.ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            tab
+        };
+        self.tabpages
+            .get_mut(&resolved)
+            .ok_or(EditorError::UnknownTabpage(resolved))?
+            .resize(geometry)?;
+        Ok(())
+    }
+
+    /// Equalizes a tabpage's tiled layout within its current rectangle.
+    pub fn equalize_tabpage(&mut self, tab: TabHandle) -> Result<(), EditorError> {
+        let resolved = if tab.is_current() {
+            self.current_tab.ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            tab
+        };
+        self.tabpages
+            .get_mut(&resolved)
+            .ok_or(EditorError::UnknownTabpage(resolved))?
+            .equalize()?;
+        Ok(())
+    }
+
+    /// Returns window-local variables.
+    pub fn window_variables(&self, window: WinHandle) -> Result<&Dict, EditorError> {
+        let tab = self.window_tabpage(window)?;
+        Ok(self.tabpage(tab)?.window_api_state(window)?.variables())
+    }
+
+    /// Returns mutable window-local variables.
+    pub fn window_variables_mut(&mut self, window: WinHandle) -> Result<&mut Dict, EditorError> {
+        let resolved = if window.is_current() {
+            self.current_window().ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            window
+        };
+        let tab = self.window_tabpage(resolved)?;
+        Ok(self
+            .tabpages
+            .get_mut(&tab)
+            .ok_or(EditorError::UnknownTabpage(tab))?
+            .window_api_state_mut(resolved)?
+            .variables_mut())
+    }
+
+    /// Returns the highlight namespace selected for a window.
+    pub fn window_highlight_namespace(&self, window: WinHandle) -> Result<i64, EditorError> {
+        let tab = self.window_tabpage(window)?;
+        Ok(self
+            .tabpage(tab)?
+            .window_api_state(window)?
+            .highlight_namespace())
+    }
+
+    /// Selects a window highlight namespace without attempting to render it.
+    pub fn set_window_highlight_namespace(
+        &mut self,
+        window: WinHandle,
+        namespace: i64,
+    ) -> Result<(), EditorError> {
+        let resolved = if window.is_current() {
+            self.current_window().ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            window
+        };
+        let tab = self.window_tabpage(resolved)?;
+        self.tabpages
+            .get_mut(&tab)
+            .ok_or(EditorError::UnknownTabpage(tab))?
+            .window_api_state_mut(resolved)?
+            .set_highlight_namespace(namespace);
+        Ok(())
+    }
+
+    /// Returns assigned screen geometry for a tiled window.
+    pub fn window_geometry(&self, window: WinHandle) -> Result<Geometry, EditorError> {
+        let tab = self.window_tabpage(window)?;
+        Ok(self.tabpage(tab)?.window_geometry(window)?)
+    }
+
+    /// Changes a tiled or floating window's width.
+    pub fn set_window_width(
+        &mut self,
+        window: WinHandle,
+        width: usize,
+    ) -> Result<(), EditorError> {
+        let resolved = if window.is_current() {
+            self.current_window().ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            window
+        };
+        let tab = self.window_tabpage(resolved)?;
+        self.tabpages
+            .get_mut(&tab)
+            .ok_or(EditorError::UnknownTabpage(tab))?
+            .set_window_width(resolved, width)?;
+        Ok(())
+    }
+
+    /// Changes a tiled or floating window's height.
+    pub fn set_window_height(
+        &mut self,
+        window: WinHandle,
+        height: usize,
+    ) -> Result<(), EditorError> {
+        let resolved = if window.is_current() {
+            self.current_window().ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            window
+        };
+        let tab = self.window_tabpage(resolved)?;
+        self.tabpages
+            .get_mut(&tab)
+            .ok_or(EditorError::UnknownTabpage(tab))?
+            .set_window_height(resolved, height)?;
+        Ok(())
+    }
+
+    /// Returns floating configuration, or `None` for a tiled window.
+    pub fn window_config(&self, window: WinHandle) -> Result<Option<&WinConfig>, EditorError> {
+        let tab = self.window_tabpage(window)?;
+        Ok(self.tabpage(tab)?.window_config(window)?)
+    }
+
+    /// Updates an existing floating window configuration.
+    pub fn set_window_config(
+        &mut self,
+        window: WinHandle,
+        config: WinConfig,
+    ) -> Result<(), EditorError> {
+        let resolved = if window.is_current() {
+            self.current_window().ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            window
+        };
+        let tab = self.window_tabpage(resolved)?;
+        self.tabpages
+            .get_mut(&tab)
+            .ok_or(EditorError::UnknownTabpage(tab))?
+            .set_window_config(resolved, config)?;
+        Ok(())
+    }
+
     /// Allocates a listed, loaded empty buffer.
     pub fn create_buffer(&mut self, listed: bool) -> Result<BufHandle, EditorError> {
         self.create_buffer_with(Buffer::new(), listed)
@@ -329,6 +665,7 @@ impl Editor {
 
     /// Permanently removes an unattached buffer; its handle is never reused.
     pub fn wipe_buffer(&mut self, buffer: BufHandle) -> Result<BufferState, EditorError> {
+        let buffer = self.resolve_buffer_handle(buffer)?;
         let state = self
             .buffers
             .get(&buffer)
@@ -350,6 +687,7 @@ impl Editor {
 
     /// Releases resident text and undo state for an unattached buffer.
     pub fn unload_buffer(&mut self, buffer: BufHandle) -> Result<(), EditorError> {
+        let buffer = self.resolve_buffer_handle(buffer)?;
         let state = self
             .buffers
             .get_mut(&buffer)
@@ -364,6 +702,7 @@ impl Editor {
         buffer: BufHandle,
         geometry: Geometry,
     ) -> Result<TabHandle, EditorError> {
+        let buffer = self.resolve_buffer_handle(buffer)?;
         self.require_buffer(buffer)?;
         let window = allocate_window_handle(&mut self.next_window)?;
         let tab = allocate_tab_handle(&mut self.next_tabpage)?;
@@ -380,6 +719,7 @@ impl Editor {
 
     /// Makes a live tabpage current.
     pub fn set_current_tabpage(&mut self, tab: TabHandle) -> Result<(), EditorError> {
+        let tab = self.resolve_tabpage_handle(tab)?;
         self.require_tabpage(tab)?;
         self.current_tab = Some(tab);
         Ok(())
@@ -392,7 +732,7 @@ impl Editor {
         target: WinHandle,
         buffer: BufHandle,
     ) -> Result<WinHandle, EditorError> {
-        self.split_window(tab, target, buffer, SplitDirection::Vertical)
+        self.split_window(tab, target, buffer, SplitDirection::Right)
     }
 
     /// Splits a tiled window horizontally and displays `buffer` below.
@@ -402,7 +742,27 @@ impl Editor {
         target: WinHandle,
         buffer: BufHandle,
     ) -> Result<WinHandle, EditorError> {
-        self.split_window(tab, target, buffer, SplitDirection::Horizontal)
+        self.split_window(tab, target, buffer, SplitDirection::Below)
+    }
+
+    /// Splits a tiled window vertically and displays `buffer` to the left.
+    pub fn split_left(
+        &mut self,
+        tab: TabHandle,
+        target: WinHandle,
+        buffer: BufHandle,
+    ) -> Result<WinHandle, EditorError> {
+        self.split_window(tab, target, buffer, SplitDirection::Left)
+    }
+
+    /// Splits a tiled window horizontally and displays `buffer` above.
+    pub fn split_above(
+        &mut self,
+        tab: TabHandle,
+        target: WinHandle,
+        buffer: BufHandle,
+    ) -> Result<WinHandle, EditorError> {
+        self.split_window(tab, target, buffer, SplitDirection::Above)
     }
 
     /// Opens a floating window in `tab`.
@@ -412,6 +772,8 @@ impl Editor {
         buffer: BufHandle,
         config: WinConfig,
     ) -> Result<WinHandle, EditorError> {
+        let tab = self.resolve_tabpage_handle(tab)?;
+        let buffer = self.resolve_buffer_handle(buffer)?;
         self.require_buffer(buffer)?;
         self.require_tabpage(tab)?;
         let window = allocate_window_handle(&mut self.next_window)?;
@@ -440,6 +802,8 @@ impl Editor {
         window: WinHandle,
         keep_buffer_loaded: bool,
     ) -> Result<WindowState, EditorError> {
+        let tab = self.resolve_tabpage_handle(tab)?;
+        let window = self.resolve_window_handle(window)?;
         self.require_tabpage(tab)?;
         if self.windows.get(&window) != Some(&tab) {
             return Err(EditorError::UnknownWindow(window));
@@ -620,6 +984,9 @@ impl Editor {
         buffer: BufHandle,
         direction: SplitDirection,
     ) -> Result<WinHandle, EditorError> {
+        let tab = self.resolve_tabpage_handle(tab)?;
+        let target = self.resolve_window_handle(target)?;
+        let buffer = self.resolve_buffer_handle(buffer)?;
         self.require_buffer(buffer)?;
         self.require_tabpage(tab)?;
         let window = allocate_window_handle(&mut self.next_window)?;
@@ -632,8 +999,10 @@ impl Editor {
             .get_mut(&tab)
             .ok_or(EditorError::UnknownTabpage(tab))?;
         let inserted = match direction {
-            SplitDirection::Vertical => tabpage.split_vertical(target, window, state),
-            SplitDirection::Horizontal => tabpage.split_horizontal(target, window, state),
+            SplitDirection::Right => tabpage.split_vertical(target, window, state),
+            SplitDirection::Below => tabpage.split_horizontal(target, window, state),
+            SplitDirection::Left => tabpage.split_left(target, window, state),
+            SplitDirection::Above => tabpage.split_above(target, window, state),
         };
         if let Err(error) = inserted {
             if let Some(buffer_state) = self.buffers.get_mut(&buffer) {
@@ -688,6 +1057,30 @@ impl Editor {
         }
     }
 
+    fn resolve_buffer_handle(&self, buffer: BufHandle) -> Result<BufHandle, EditorError> {
+        if buffer.is_current() {
+            self.current_buffer().ok_or(EditorError::NoCurrentTabpage)
+        } else {
+            Ok(buffer)
+        }
+    }
+
+    fn resolve_window_handle(&self, window: WinHandle) -> Result<WinHandle, EditorError> {
+        if window.is_current() {
+            self.current_window().ok_or(EditorError::NoCurrentTabpage)
+        } else {
+            Ok(window)
+        }
+    }
+
+    fn resolve_tabpage_handle(&self, tab: TabHandle) -> Result<TabHandle, EditorError> {
+        if tab.is_current() {
+            self.current_tab.ok_or(EditorError::NoCurrentTabpage)
+        } else {
+            Ok(tab)
+        }
+    }
+
     fn require_tabpage(&self, tab: TabHandle) -> Result<(), EditorError> {
         if self.tabpages.contains_key(&tab) {
             Ok(())
@@ -728,8 +1121,10 @@ fn buffer_lines(buffer: &Buffer) -> Result<Vec<Vec<u8>>, BufferStateError> {
 
 #[derive(Clone, Copy)]
 enum SplitDirection {
-    Vertical,
-    Horizontal,
+    Left,
+    Right,
+    Above,
+    Below,
 }
 
 fn allocate_buffer_handle(next: &mut i64) -> Result<BufHandle, EditorError> {

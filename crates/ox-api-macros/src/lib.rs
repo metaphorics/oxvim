@@ -119,6 +119,7 @@ fn set_flag(slot: &mut bool, path: &syn::Path, name: &str) -> Result<(), Error> 
 }
 
 struct Signature {
+    has_editor_context: bool,
     parameter_names: Vec<syn::Ident>,
     parameter_types: Vec<Type>,
     return_type: Type,
@@ -144,9 +145,10 @@ fn validate_signature(function: &ItemFn, args: ApiArgs) -> Result<Signature, Err
         ));
     }
 
+    let mut has_editor_context = false;
     let mut parameter_names = Vec::with_capacity(function.sig.inputs.len());
     let mut parameter_types = Vec::with_capacity(function.sig.inputs.len());
-    for input in &function.sig.inputs {
+    for (index, input) in function.sig.inputs.iter().enumerate() {
         let FnArg::Typed(parameter) = input else {
             return Err(Error::new_spanned(input, "#[api] functions cannot have a receiver"));
         };
@@ -162,6 +164,10 @@ fn validate_signature(function: &ItemFn, args: ApiArgs) -> Result<Signature, Err
                 "#[api] parameters must be plain identifiers",
             ));
         }
+        if index == 0 && is_mut_editor_reference(&parameter.ty) {
+            has_editor_context = true;
+            continue;
+        }
         parameter_names.push(name.ident.clone());
         parameter_types.push((*parameter.ty).clone());
     }
@@ -172,10 +178,19 @@ fn validate_signature(function: &ItemFn, args: ApiArgs) -> Result<Signature, Err
     }
 
     Ok(Signature {
+        has_editor_context,
         parameter_names,
         parameter_types,
         return_type,
     })
+}
+
+fn is_mut_editor_reference(ty: &Type) -> bool {
+    let Type::Reference(reference) = ty else {
+        return false;
+    };
+    reference.mutability.is_some()
+        && type_last_ident(&reference.elem).is_some_and(|ident| ident == "Editor")
 }
 
 fn result_ok_type(output: &ReturnType) -> Result<Type, Error> {
@@ -283,6 +298,11 @@ fn expand(args: ApiArgs, function: ItemFn) -> Result<TokenStream2, Error> {
     let argument_count = parameter_names.len();
     let argument_positions = 1..=argument_count;
     let argument_indexes = 0..argument_count;
+    let invocation = if signature.has_editor_context {
+        quote!(#name(_editor #(, #parameter_names)*))
+    } else {
+        quote!(#name(#(#parameter_names),*))
+    };
     let since = args.since.ok_or_else(|| {
         Error::new(
             proc_macro2::Span::call_site(),
@@ -320,6 +340,7 @@ fn expand(args: ApiArgs, function: ItemFn) -> Result<TokenStream2, Error> {
         #visibility const #metadata_const: fn() -> ::ox_api::FunctionMetadata = #metadata_function;
 
         fn #dispatch_function(
+            _editor: &mut ::ox_editor::Editor,
             arguments: &[::ox_api::Object],
         ) -> ::core::result::Result<::ox_api::Object, ::ox_api::ApiError> {
             if arguments.len() != #argument_count {
@@ -338,7 +359,7 @@ fn expand(args: ApiArgs, function: ItemFn) -> Result<TokenStream2, Error> {
                     #function_name,
                 )?;
             )*
-            let result = #name(#(#parameter_names),*)?;
+            let result = #invocation?;
             ::core::result::Result::Ok(
                 <#return_type as ::ox_api::IntoObject>::into_object(result)
             )
@@ -365,7 +386,7 @@ pub fn api(attributes: TokenStream, item: TokenStream) -> TokenStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiArgs, expand};
+    use super::{ApiArgs, expand, validate_signature};
     use quote::quote;
 
     fn error(attributes: proc_macro2::TokenStream, function: proc_macro2::TokenStream) -> String {
@@ -402,6 +423,51 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_only_leading_mutable_editor_context() {
+        let args = ApiArgs::parse(quote!(since = 1)).expect("valid attributes");
+        let leading = syn::parse2(quote!(
+            fn nvim_leading(editor: &mut Editor, value: i64) -> Result<Object, ApiError> {
+                loop {}
+            }
+        ))
+        .expect("valid function");
+        let leading = validate_signature(&leading, args).expect("valid signature");
+        assert!(leading.has_editor_context);
+        let leading_names: Vec<_> = leading.parameter_names.iter().map(ToString::to_string).collect();
+        assert_eq!(leading_names, ["value"]);
+
+        let immutable = syn::parse2(quote!(
+            fn nvim_immutable(editor: &Editor, value: i64) -> Result<Object, ApiError> {
+                loop {}
+            }
+        ))
+        .expect("valid function");
+        let immutable = validate_signature(&immutable, args).expect("valid signature");
+        assert!(!immutable.has_editor_context);
+        let immutable_names: Vec<_> = immutable
+            .parameter_names
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(immutable_names, ["editor", "value"]);
+
+        let nonleading = syn::parse2(quote!(
+            fn nvim_nonleading(value: i64, editor: &mut Editor) -> Result<Object, ApiError> {
+                loop {}
+            }
+        ))
+        .expect("valid function");
+        let nonleading = validate_signature(&nonleading, args).expect("valid signature");
+        assert!(!nonleading.has_editor_context);
+        let nonleading_names: Vec<_> = nonleading
+            .parameter_names
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(nonleading_names, ["value", "editor"]);
+    }
+
+    #[test]
     fn noexport_preserves_only_the_original_function() {
         let args = ApiArgs::parse(quote!(noexport)).expect("valid noexport attribute");
         let function = syn::parse2(quote!(
@@ -417,9 +483,24 @@ mod tests {
 
     #[test]
     fn validates_method_name_and_receiver_prefix() {
+        let args = ApiArgs::parse(quote!(since = 1, method)).expect("valid attributes");
+        let function = syn::parse2(quote!(
+            fn nvim_buf_get_name(
+                editor: &mut Editor,
+                buf: BufHandle,
+            ) -> Result<Object, ApiError> { loop {} }
+        ))
+        .expect("valid function");
+        assert!(expand(args, function).is_ok());
+
         let valid = error(
             quote!(since = 1, method),
-            quote!(fn nvim_buf_get_name(buf: WinHandle) -> Result<Object, ApiError> { loop {} }),
+            quote!(
+                fn nvim_buf_get_name(
+                    editor: &mut Editor,
+                    buf: WinHandle,
+                ) -> Result<Object, ApiError> { loop {} }
+            ),
         );
         assert_eq!(
             valid,

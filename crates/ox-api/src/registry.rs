@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::metadata::FunctionMetadata;
 
 /// The callable shape emitted for every exported API function.
-pub type DispatchFn = fn(&[Object]) -> Result<Object, ApiError>;
+pub type DispatchFn = fn(&mut ox_editor::Editor, &[Object]) -> Result<Object, ApiError>;
 
 #[derive(Clone, Copy)]
 struct Entry {
@@ -94,13 +94,28 @@ impl Registry {
     }
 }
 
+/// Builds the registry containing every core buffer, window, tabpage, and global API.
+///
+/// # Errors
+///
+/// Returns an error if two implementation modules accidentally register the same public name.
+pub fn core() -> Result<Registry, RegistryError> {
+    let mut registry = Registry::new();
+    crate::buffer::register(&mut registry)?;
+    crate::window::register(&mut registry)?;
+    crate::tabpage::register(&mut registry)?;
+    crate::global::register(&mut registry)?;
+    Ok(registry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Registry, RegistryError};
     use crate::metadata::{FunctionMetadata, TypeRef};
+    use ox_editor::Editor;
     use ox_types::{ApiError, Object};
 
-    fn dispatch(args: &[Object]) -> Result<Object, ApiError> {
+    fn dispatch(_editor: &mut Editor, args: &[Object]) -> Result<Object, ApiError> {
         Ok(args.first().cloned().unwrap_or(Object::Nil))
     }
 
@@ -136,7 +151,11 @@ mod tests {
 
         let names: Vec<_> = registry.iter().map(|(metadata, _)| metadata.name).collect();
         assert_eq!(names, ["second", "first"]);
-        assert_eq!(registry.get("first").map(|entry| entry.0.name), Some("first"));
+        let mut editor = Editor::new();
+        let result = registry
+            .get("first")
+            .map(|(_, dispatch)| dispatch(&mut editor, &[Object::Integer(1)]));
+        assert_eq!(result, Some(Ok(Object::Integer(1))));
         assert!(registry.get("missing").is_none());
     }
 }
