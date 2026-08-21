@@ -92,7 +92,7 @@ behavior!(visual_reselect, "one", position(1,0), "vldgv", "e", position(1,1), "v
 behavior!(multiline_delete_promotes_linewise, "one\n\ntwo", position(1,0), "d}", "\ntwo", position(1,0), "normal");
 behavior!(vertical_operator_is_linewise, "abc\ndef\nghi", position(1,1), "dj", "ghi", position(1,0), "normal");
 behavior!(counted_search, "x a a", position(1,0), "2/a\n", "x a a", position(1,4), "normal");
-behavior!(explicit_one_G, "one\ntwo\nthree", position(3,0), "1G", "one\ntwo\nthree", position(1,0), "normal");
+behavior!(explicit_one_g, "one\ntwo\nthree", position(3,0), "1G", "one\ntwo\nthree", position(1,0), "normal");
 behavior!(screen_bottom_uses_window_height, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "L", "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(24,0), "normal");
 behavior!(visual_block_horizontal_corner, "abcd\nefgh", position(1,0), "\u{16}ljO", "abcd\nefgh", position(2,0), "visual");
 behavior!(visual_block_uppercase, "abcd\nefgh", position(1,0), "\u{16}ljU", "ABcd\nEFgh", position(1,0), "normal");
@@ -177,6 +177,11 @@ behavior!(change_line_clears_and_enters_insert, "one\ntwo", position(1,0), "cc",
 // (`ops.c:3517-3539`).
 behavior!(cross_line_dw_never_joins, "alpha gamma\nbeta", position(1,6), "dw", "alpha \nbeta", position(1,5), "normal");
 behavior!(cross_line_dw_indent_end_backs_off, "aa bb\ncc", position(1,3), "dw", "aa \ncc", position(1,2), "normal");
+
+// An exclusive charwise motion that ends past column zero of the next line is
+// allowed to join lines, so `d)` from the start of a sentence deletes the
+// sentence and pulls the next one up (`ops.c:3517-3539`).
+behavior!(delete_sentence_cross_line_joins, "one.\n  two.", position(1,0), "d)", "two.", position(1,0), "normal");
 
 // Quote objects select the pair under the cursor, skip escaped quotes, and
 // include the quotes themselves when `count >= 2` (`textobject.c:1539-1745`,

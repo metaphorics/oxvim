@@ -126,19 +126,16 @@ pub fn apply(editor: &mut Editor, buffer: BufHandle, window: WinHandle, operator
 fn normalize(lines: &[Vec<u8>], mut range: EditRange) -> EditRange {
     range.start.lnum = range.start.lnum.clamp(1, lines.len().max(1));
     range.end.lnum = range.end.lnum.clamp(range.start.lnum, lines.len().max(1));
-    // Exclusive cross-line characterwise motions back onto the row they started
-    // from, rather than deleting (and joining) the row below (`ops.c:3517-3539`).
-    // A motion that ends in column zero of the next line backs onto the previous
-    // line; when the origin lies in the start line's indentation, or the origin is
-    // the very first byte of its line, the delete promotes to linewise.  Otherwise
-    // the endpoint becomes the last byte of the start line so `dw`/`db` crossing a
-    // line boundary never pull the following line up.
-    if range.kind == MotionKind::CharacterWise && !range.inclusive && range.end.lnum > range.start.lnum {
+    // The back-off in ops.c:3517-3539 runs only for an exclusive charwise
+    // motion whose endpoint is column zero of a later line. When the origin is
+    // on or before the first non-blank of the start line, the operator becomes
+    // linewise; otherwise the endpoint becomes the last byte of the start line
+    // so `dw`/`db` crossing a line boundary never pull the following line up.
+    if range.kind == MotionKind::CharacterWise && !range.inclusive && range.end.lnum > range.start.lnum && range.end.col == 0 {
         let start_line = &lines[range.start.lnum - 1];
         let indent = start_line.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(start_line.len());
-        let linewise = if range.end.col == 0 { range.start.col <= indent } else { range.start.col == 0 };
         range.end.lnum = range.start.lnum;
-        if linewise {
+        if range.start.col <= indent {
             range.kind = MotionKind::LineWise;
         } else {
             range.end.col = start_line.len();
