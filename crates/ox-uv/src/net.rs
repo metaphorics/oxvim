@@ -18,7 +18,7 @@ use crate::{CallbackError, HandleId, UvLoop};
 #[cfg(unix)]
 use std::fs::File;
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -29,6 +29,8 @@ use mio::net::{UnixListener, UnixStream};
 use mio::unix::SourceFd;
 #[cfg(unix)]
 use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+#[cfg(unix)]
+use rustix::net::{AddressFamily, SocketType};
 #[cfg(unix)]
 use rustix::termios::{
     LocalModes, OptionalActions, SpecialCodeIndex, Termios, tcgetattr, tcgetwinsize, tcsetattr,
@@ -549,6 +551,71 @@ enum PipeIo { Listener(UnixListener), Stream(UnixStream) }
 #[cfg(unix)]
 enum PipeReadyEvent { Public(NetEvent), Accepted(UnixStream) }
 
+/// The kind of stream handle passed by [`Pipe::write2`].
+///
+/// Matches the `uv.write2()` contract in `runtime/doc/luvref.txt` (lines
+/// 1632-1666): `send_handle` must be a TCP socket or a pipe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PipeHandleKind {
+    /// A TCP stream (listening or connected).
+    Tcp,
+    /// A Unix domain socket / named pipe.
+    Pipe,
+}
+
+impl PipeHandleKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Pipe => "pipe",
+        }
+    }
+}
+
+/// Derives the luv-style handle type ("pipe" or "tcp") from an open file
+/// descriptor by inspecting its `stat` mode, socket type, and address family.
+///
+/// FIFOs and Unix domain sockets (`AF_UNIX` + `SOCK_STREAM`) resolve to
+/// `"pipe"`; TCP sockets (`AF_INET`/`AF_INET6` + `SOCK_STREAM`) resolve to
+/// `"tcp"`. Any other file type is rejected.
+#[cfg(unix)]
+fn inspect_fd_kind<Fd: AsFd>(fd: &Fd) -> NetResult<&'static str> {
+    let stat = rustix::fs::fstat(fd).map_err(errno_error)?;
+    let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+    if file_type.is_fifo() {
+        return Ok("pipe");
+    }
+    if !file_type.is_socket() {
+        return Err(NetError::Unsupported(
+            "write2 send_handle must be a TCP socket or pipe",
+        ));
+    }
+    let sock_type = rustix::net::sockopt::socket_type(fd).map_err(errno_error)?;
+    if sock_type != SocketType::STREAM {
+        return Err(NetError::Unsupported(
+            "write2 send_handle must be a TCP socket or pipe",
+        ));
+    }
+    let domain = rustix::net::getsockname(fd)
+        .map_err(errno_error)?
+        .address_family();
+    if domain == AddressFamily::UNIX {
+        return Ok("pipe");
+    }
+    if domain == AddressFamily::INET || domain == AddressFamily::INET6 {
+        return Ok("tcp");
+    }
+    Err(NetError::Unsupported(
+        "write2 send_handle must be a TCP socket or pipe",
+    ))
+}
+
+#[cfg(unix)]
+struct PipePending {
+    fd: std::os::fd::OwnedFd,
+    kind: &'static str,
+}
+
 #[cfg(unix)]
 struct PipeState {
     io: Option<PipeIo>,
@@ -558,6 +625,9 @@ struct PipeState {
     connecting: bool,
     writes: WriteQueue,
     registered: bool,
+    ipc: bool,
+    pending: VecDeque<PipePending>,
+    pending_instances: u32,
 }
 
 #[cfg(unix)]
@@ -575,13 +645,13 @@ impl Pipe {
     pub fn bind<F>(uv_loop: &mut UvLoop, path: impl AsRef<Path>, callback: F) -> NetResult<Self>
     where F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static {
         let path = path.as_ref().to_path_buf();
-        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Listener(UnixListener::bind(&path)?)), path: Some(path), listening: false, reading: false, connecting: false, writes: WriteQueue::new(), registered: false }, Rc::new(RefCell::new(Some(Box::new(callback)))))
+        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Listener(UnixListener::bind(&path)?)), path: Some(path), listening: false, reading: false, connecting: false, writes: WriteQueue::new(), registered: false, ipc: false, pending: VecDeque::new(), pending_instances: 0 }, Rc::new(RefCell::new(Some(Box::new(callback)))))
     }
 
     /// Connects a pipe to `path`. See `uv.pipe_connect()` in `runtime/doc/luvref.txt`.
     pub fn connect<F>(uv_loop: &mut UvLoop, path: impl AsRef<Path>, callback: F) -> NetResult<Self>
     where F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static {
-        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Stream(UnixStream::connect(path.as_ref())?)), path: None, listening: false, reading: false, connecting: true, writes: WriteQueue::new(), registered: false }, Rc::new(RefCell::new(Some(Box::new(callback)))))
+        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Stream(UnixStream::connect(path.as_ref())?)), path: None, listening: false, reading: false, connecting: true, writes: WriteQueue::new(), registered: false, ipc: false, pending: VecDeque::new(), pending_instances: 0 }, Rc::new(RefCell::new(Some(Box::new(callback)))))
     }
 
     fn attach(uv_loop: &mut UvLoop, state: PipeState, callback: CallbackCell) -> NetResult<Self> {
@@ -653,6 +723,101 @@ impl Pipe {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
         Ok(())
     }
+
+    /// Wraps an already-connected stream as an IPC pipe.
+    ///
+    /// `ipc` enables the `SCM_RIGHTS` receive track so `write2`'s counterpart
+    /// can publish received descriptors for `pipe_pending_count`/`type`. This
+    /// is the ox-uv spelling of the `uv.new_pipe(ipc)` + `uv.pipe_open(fd)`
+    /// combination in `runtime/doc/luvref.txt` (lines 2007-2032).
+    pub fn from_stream<F>(uv_loop: &mut UvLoop, stream: mio::net::UnixStream, ipc: bool, callback: F) -> NetResult<Self>
+    where F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static {
+        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Stream(stream)), path: None, listening: false, reading: false, connecting: true, writes: WriteQueue::new(), registered: false, ipc, pending: VecDeque::new(), pending_instances: 0 }, Rc::new(RefCell::new(Some(Box::new(callback)))))
+    }
+
+    /// Sends `data` and passes `send_handle`'s descriptor over an IPC pipe.
+    ///
+    /// See `uv.write2()` in `runtime/doc/luvref.txt` (lines 1632-1666). The
+    /// descriptor is delivered as an `SCM_RIGHTS` ancillary message alongside
+    /// the payload via a single `sendmsg`. The pipe must have been created
+    /// with the `ipc` option (`new_pipe(true)`), be a connected stream, and
+    /// `kind` must name what `send_handle` actually is (`tcp` or `pipe` per
+    /// luvref). The actual file descriptor is inspected before sending; a kind
+    /// that does not match the fd's derived type is rejected with a typed
+    /// error.
+    ///
+    /// Because a Unix `SCM_RIGHTS` transfer carries no type tag on the wire,
+    /// the receiving side derives the pending handle type from the received fd
+    /// itself (`fstat` + `getsockopt` `SO_TYPE` + `getsockname`).
+    ///
+    /// ox-uv performs the fd-passing synchronously rather than queueing a
+    /// deferred `uv_write_t` request; the return value is the number of bytes
+    /// written.
+    pub fn write2<S: std::os::fd::AsFd>(
+        &self,
+        uv_loop: &mut UvLoop,
+        data: Vec<u8>,
+        send_handle: &S,
+        kind: PipeHandleKind,
+    ) -> NetResult<usize> {
+        let _ = uv_loop;
+        let state = self.state.borrow();
+        if !state.ipc {
+            return Err(NetError::InvalidState(
+                "write2 requires an IPC pipe (create it with new_pipe(true))",
+            ));
+        }
+        let Some(PipeIo::Stream(stream)) = state.io.as_ref() else {
+            return if state.io.is_none() {
+                Err(NetError::Closed)
+            } else {
+                Err(NetError::InvalidState("pipe listener cannot send handles"))
+            };
+        };
+        let derived = inspect_fd_kind(send_handle)?;
+        if derived != kind.as_str() {
+            return Err(NetError::InvalidState(
+                "send_handle kind does not match the actual file descriptor",
+            ));
+        }
+        crate::ipc::send_handle(stream, &data, send_handle).map_err(NetError::Io)
+    }
+
+    /// Returns the number of handles received over an IPC pipe but not yet
+    /// accepted. See `uv.pipe_pending_count()` in `runtime/doc/luvref.txt`
+    /// (lines 2106-2115).
+    pub fn pending_count(&self) -> usize {
+        self.state.borrow().pending.len()
+    }
+
+    /// Returns the type of the next pending IPC handle.
+    ///
+    /// See `uv.pipe_pending_type()` in `runtime/doc/luvref.txt`
+    /// (lines 2117-2130). The type is derived by inspecting the received file
+    /// descriptor (`fstat` + `getsockopt` `SO_TYPE` + `getsockname`): FIFOs and
+    /// Unix domain sockets report `"pipe"`; TCP sockets report `"tcp"`.
+    pub fn pending_type(&self) -> Option<&'static str> {
+        self.state.borrow().pending.front().map(|pending| pending.kind)
+    }
+
+    /// Sets the pipe's IPC pending-instance count.
+    ///
+    /// See `uv.pipe_pending_instances()` in `runtime/doc/luvref.txt`
+    /// (lines 2091-2104). This setting applies to Windows only; ox-uv stores
+    /// it for API compatibility and it has no runtime effect on Unix.
+    pub fn pending_instances(&self, count: u32) {
+        self.state.borrow_mut().pending_instances = count;
+    }
+
+    /// Takes the next pending IPC descriptor out of the queue.
+    ///
+    /// This is the ox-uv counterpart of libuv's `uv_accept`-based consumption
+    /// of a pending handle: the received descriptor is removed from the
+    /// pending queue and returned for the caller to re-wrap, because luv
+    /// consumes pending handles through `accept`.
+    pub fn pending_take_fd(&self) -> Option<std::os::fd::OwnedFd> {
+        self.state.borrow_mut().pending.pop_front().map(|pending| pending.fd)
+    }
 }
 
 #[cfg(unix)]
@@ -703,6 +868,7 @@ fn sync_pipe(uv_loop: &mut UvLoop, id: HandleId, token: Token, state: &Rc<RefCel
 #[cfg(unix)]
 fn pipe_ready(state: &mut PipeState, ready: Readiness) -> Vec<PipeReadyEvent> {
     let mut events = Vec::new();
+    let mut received: Vec<PipePending> = Vec::new();
     if (ready.writable || ready.error) && state.connecting {
         let result = match state.io.as_ref() { Some(PipeIo::Stream(stream)) => match stream.take_error() { Ok(Some(error)) => Err(NetError::Io(error)), Ok(None) => stream.peer_addr().map(|_| ()).map_err(NetError::Io), Err(error) => Err(NetError::Io(error)) }, _ => Err(NetError::Closed) };
         state.connecting = false; events.push(PipeReadyEvent::Public(NetEvent::Connected(result)));
@@ -714,14 +880,48 @@ fn pipe_ready(state: &mut PipeState, ready: Readiness) -> Vec<PipeReadyEvent> {
         Some(PipeIo::Stream(stream)) => {
             let mut public = Vec::new();
             if ready.writable { drive_writes(stream, &mut state.writes, &mut public); if state.writes.shutdown_requested && state.writes.pending.is_empty() { state.writes.shutdown_requested = false; public.push(NetEvent::ShutdownComplete(stream.shutdown(Shutdown::Write).map_err(NetError::Io))); } }
-            if ready.readable && state.reading { drain_reads(stream, &mut public); if public.iter().any(|event| matches!(event, NetEvent::Eof)) { state.reading = false; } }
+            if ready.readable && state.reading {
+                if state.ipc {
+                    let (ipc_events, fds) = drain_ipc_reads(stream);
+                    public.extend(ipc_events);
+                    for fd in fds {
+                        match inspect_fd_kind(&fd) {
+                            Ok(kind) => received.push(PipePending { fd, kind }),
+                            Err(error) => public.push(NetEvent::Error(error)),
+                        }
+                    }
+                } else {
+                    drain_reads(stream, &mut public);
+                }
+                if public.iter().any(|event| matches!(event, NetEvent::Eof)) { state.reading = false; }
+            }
             if ready.read_closed && state.reading { state.reading = false; public.push(NetEvent::Eof); }
             if ready.write_closed && !state.writes.pending.is_empty() { while let Some(write) = state.writes.pending.pop_front() { public.push(NetEvent::WriteComplete { id: write.id, result: Err(NetError::Closed) }); } }
             events.extend(public.into_iter().map(PipeReadyEvent::Public));
         }
         _ => {}
     }
+    state.pending.extend(received);
     events
+}
+
+#[cfg(unix)]
+fn drain_ipc_reads(stream: &UnixStream) -> (Vec<NetEvent>, Vec<std::os::fd::OwnedFd>) {
+    let mut events = Vec::new();
+    let mut fds = Vec::new();
+    loop {
+        match crate::ipc::recv_handle(stream, STREAM_CHUNK) {
+            Ok((data, received)) => {
+                if data.is_empty() && received.is_none() { events.push(NetEvent::Eof); break; }
+                if let Some(fd) = received { fds.push(fd); }
+                if !data.is_empty() { events.push(NetEvent::Read(data)); }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if is_would_block(&error) => break,
+            Err(error) => { events.push(NetEvent::Error(NetError::Io(error))); break; }
+        }
+    }
+    (events, fds)
 }
 
 #[cfg(unix)]
@@ -733,7 +933,7 @@ fn deliver_pipe(uv_loop: &mut UvLoop, id: HandleId, token: Token, state: Rc<RefC
         let event = match event {
             PipeReadyEvent::Public(event) => event,
             PipeReadyEvent::Accepted(stream) => {
-                let child_state = PipeState { io: Some(PipeIo::Stream(stream)), path: None, listening: false, reading: false, connecting: false, writes: WriteQueue::new(), registered: false };
+                let child_state = PipeState { io: Some(PipeIo::Stream(stream)), path: None, listening: false, reading: false, connecting: false, writes: WriteQueue::new(), registered: false, ipc: state.borrow().ipc, pending: VecDeque::new(), pending_instances: 0 };
                 match Pipe::attach(uv_loop, child_state, Rc::clone(&callback)) { Ok(child) => NetEvent::AcceptedPipe(Box::new(child)), Err(error) => NetEvent::Error(error) }
             }
         };
@@ -749,7 +949,7 @@ fn close_pipe(uv_loop: &mut UvLoop, handle: &Pipe) -> crate::Result<()> {
         if let Some(io) = state.io.as_mut() { match io { PipeIo::Listener(source) => uv_loop.inner_mut().reactor().deregister(source)?, PipeIo::Stream(source) => uv_loop.inner_mut().reactor().deregister(source)? } }
         state.registered = false;
     }
-    state.io = None; state.listening = false; state.reading = false; state.connecting = false; state.writes.clear();
+    state.io = None; state.listening = false; state.reading = false; state.connecting = false; state.writes.clear(); state.pending.clear();
     Ok(())
 }
 

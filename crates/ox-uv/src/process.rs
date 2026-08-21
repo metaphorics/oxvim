@@ -54,6 +54,28 @@ pub enum StdioConfig {
     CreatePipe,
 }
 
+/// An additional (fd ≥ 3) child standard descriptor mapped through to the
+/// child process, per `uv.spawn-options.stdio` in `runtime/doc/luvref.txt`
+/// (lines 1434-1447).
+///
+/// `Inherit` and `Ignore` are accepted for API completeness and need no
+/// parent-side action: an inherited child fd just walks the parent's open
+/// descriptor table past 2, and `Ignore` leaves the child fd unspecified,
+/// matching the luvref `nil` placeholder.
+///
+/// `StdioConfig::CreatePipe` at an **exact** fd ≥ 3 is returned by [`spawn`]
+/// as [`ProcessError::Unsupported`]: delivering a fresh pipe at a precise
+/// child descriptor number requires duplicating into the parent's own
+/// descriptor table, which the crate's no-unsafe policy cannot honor without
+/// risking a false-success install at a number the parent already occupies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtraStdio {
+    /// Child file-descriptor number (3 or greater).
+    pub fd: u32,
+    /// How to wire that descriptor.
+    pub config: StdioConfig,
+}
+
 /// Options accepted by [`spawn`].
 ///
 /// `environment: None` inherits the parent environment. `Some(entries)`
@@ -70,6 +92,8 @@ pub struct SpawnOptions {
     pub cwd: Option<PathBuf>,
     /// Standard input, output, and error configuration, in that order.
     pub stdio: [StdioConfig; 3],
+    /// Additional descriptors (fd ≥ 3) passed through to the child.
+    pub extra_stdio: Vec<ExtraStdio>,
     /// Spawn as a process-group leader where the platform supports it.
     pub detached: bool,
     /// Unix child user ID. Supplying it on Windows is unsupported.
@@ -91,6 +115,7 @@ impl SpawnOptions {
             environment: None,
             cwd: None,
             stdio: [StdioConfig::Inherit; 3],
+            extra_stdio: Vec::new(),
             detached: false,
             uid: None,
             gid: None,
@@ -159,6 +184,31 @@ pub struct SpawnedProcess {
     pub process: Process,
     /// Parent-side pipe endpoints requested in the spawn options.
     pub pipes: ProcessPipes,
+    /// Parent-side endpoints for extra (fd ≥ 3) created pipes, keyed by child
+    /// descriptor number.
+    pub extra: Vec<ExtraPipe>,
+}
+
+/// A parent-side endpoint for an extra child descriptor created by
+/// [`StdioConfig::CreatePipe`].
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct ExtraPipe {
+    /// Child descriptor number the pipe was installed at.
+    pub fd: u32,
+    /// Blocking parent endpoint; reading reaches the child's descriptor.
+    pub parent: std::fs::File,
+}
+
+/// A parent-side endpoint for an extra child descriptor created by
+/// [`StdioConfig::CreatePipe`] on a platform without Unix fd pass-through.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct ExtraPipe {
+    /// Child descriptor number the pipe was installed at.
+    pub fd: u32,
+    /// Parent endpoint; reading reaches the child's descriptor.
+    pub parent: std::fs::File,
 }
 
 /// A parent-side endpoint of a [`StdioConfig::CreatePipe`] child stream.
@@ -796,6 +846,38 @@ impl Handle for Process {
 /// The child waiter only reaps and posts. The callback itself is invoked by the
 /// owning loop, never by the waiter. See `luvref.txt`, `uv.spawn()` and
 /// `uv.spawn-options` (lines 1340-1455).
+///
+/// Installing a `StdioConfig::CreatePipe` descriptor at an exact child fd ≥ 3
+/// would require duplicating a fresh pipe's end into the parent's own
+/// descriptor table so the child inherits it at the requested number. That
+/// reservation is not expressible with the safe, non-interfering primitives
+/// this crate restricts itself to (the parent may legitimately occupy any
+/// descriptor, so an "exact-fd" claim can silently land elsewhere). Per the
+/// no-unsafe policy an honest typed rejection is preferable to a false
+/// success, so any extra entry requesting an exact fd > 2 is rejected as
+/// [`ProcessError::Unsupported`]; `Inherit`/`Ignore` entries need no parent
+/// action and are accepted.
+struct PreparedExtra {
+    parents: Vec<ExtraPipe>,
+}
+
+fn prepare_extra_stdio(options: &SpawnOptions) -> Result<PreparedExtra, ProcessError> {
+    if options
+        .extra_stdio
+        .iter()
+        .any(|entry| entry.fd > 2 && entry.config == StdioConfig::CreatePipe)
+    {
+        return Err(ProcessError::Unsupported {
+            feature: "extra stdio exact-fd pipe pass-through",
+            reason: "installing a created pipe at child fd >= 3 requires a parent descriptor-table dup that the no-unsafe policy cannot honor",
+        });
+    }
+    Ok(PreparedExtra { parents: Vec::new() })
+}
+
+/// The child waiter only reaps and posts. The callback itself is invoked by the
+/// owning loop, never by the waiter. See `luvref.txt`, `uv.spawn()` and
+/// `uv.spawn-options` (lines 1340-1455).
 pub fn spawn<F>(
     uv_loop: &mut UvLoop,
     options: SpawnOptions,
@@ -820,6 +902,7 @@ where
     command.stderr(map_stdio(options.stdio[2]));
     configure_platform_command(&mut command, &options);
 
+    let prepared = prepare_extra_stdio(&options)?;
     let mut child = command
         .spawn()
         .map_err(|error| ProcessError::io("spawn", error))?;
@@ -827,6 +910,7 @@ where
     let child_stdin = child.stdin.take();
     let child_stdout = child.stdout.take();
     let child_stderr = child.stderr.take();
+    let extra = prepared.parents;
     let state = Arc::new(Mutex::new(ChildState::Standard(child)));
     let handle_id = match uv_loop.allocate_external(true) {
         Ok(id) => id,
@@ -856,7 +940,7 @@ where
         return Err(ProcessError::io("start process waiter", error));
     }
 
-    Ok(SpawnedProcess { process, pipes })
+    Ok(SpawnedProcess { process, pipes, extra })
 }
 
 /// Sends a signal to an arbitrary PID, defaulting to SIGTERM.
