@@ -64,7 +64,7 @@ fn utf8(value: &OxStr, field: &str) -> Result<String, ApiError> {
 pub fn nvim_set_client_info(editor: &mut Editor, name: OxStr, version: Dict, client_type: OxStr, methods: Dict, attributes: Dict) -> Result<(), ApiError> {
     if name.0.is_empty() { return Err(ApiError::validation("client name must not be empty")); }
     let client_type_text = utf8(&client_type, "type")?;
-    if !["remote", "ui", "embedder", "host", "plugin"].contains(&client_type_text.as_str()) {
+    if !["remote", "ui", "embedder", "host", "plugin", "msgpack-rpc"].contains(&client_type_text.as_str()) {
         return Err(ApiError::validation(format!("Invalid client type: {client_type_text}")));
     }
     for (method, value) in &methods.0 {

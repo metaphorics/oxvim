@@ -707,3 +707,166 @@ fn replace_termcodes_translates_named_special_keys() {
     assert_eq!(termcodes("<lt>", false, true).as_bytes(), b"<lt>");
     assert_eq!(termcodes("<CR>", true, false).as_bytes(), b"<CR>");
 }
+
+#[test]
+fn clear_autocmds_omitted_group_only_targets_default_group() {
+    // api.txt `nvim_clear_autocmds()`: an omitted group matches autocommands
+    // that are in NO group (the default augroup), not every group.
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    let group_id = crate::autocmd::nvim_create_augroup(
+        &mut editor,
+        OxStr::from("mine"),
+        dict(&[("clear", Object::Boolean(false))]),
+    )
+    .unwrap();
+    crate::autocmd::nvim_create_autocmd(
+        &mut editor,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[("command", Object::String(OxStr::from("default")))]),
+    )
+    .unwrap();
+    crate::autocmd::nvim_create_autocmd(
+        &mut editor,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[
+            ("group", Object::Integer(group_id)),
+            ("command", Object::String(OxStr::from("grouped"))),
+        ]),
+    )
+    .unwrap();
+    crate::autocmd::nvim_clear_autocmds(
+        &mut editor,
+        dict(&[("event", Object::String(OxStr::from("BufEnter")))]),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::autocmd::nvim_get_autocmds(&mut editor, dict(&[("event", Object::String(OxStr::from("BufEnter")))]))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        crate::autocmd::nvim_get_autocmds(&mut editor, dict(&[("group", Object::Integer(group_id))]))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn get_extmarks_all_namespaces_and_mark_id_bounds() {
+    // api.txt `nvim_buf_get_extmarks()`: ns_id -1 queries every namespace, and
+    // start/end may be valid extmark ids whose positions define the bounds.
+    let (mut editor, buffer, _, _) = editor_with_lines(&["one", "two", "three"]);
+    let ns_a = crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("a")).unwrap();
+    let ns_b = crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("b")).unwrap();
+    let m1 = crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, ns_a, 0, 0, dict(&[])).unwrap();
+    let m2 = crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, ns_b, 2, 0, dict(&[])).unwrap();
+
+    let all = crate::extmark::nvim_buf_get_extmarks(
+        &mut editor, buffer, -1,
+        Object::Array(vec![Object::Integer(0), Object::Integer(0)]),
+        Object::Integer(-1),
+        dict(&[]),
+    )
+    .unwrap();
+    assert_eq!(all.len(), 2);
+    for id in [m1, m2] {
+        assert!(all.iter().any(|mark| mark[0] == Object::Integer(id)));
+    }
+
+    // Positive integer bounds are extmark ids resolved within the namespace.
+    let in_ns = crate::extmark::nvim_buf_get_extmarks(
+        &mut editor, buffer, ns_a,
+        Object::Integer(m1), Object::Integer(m1),
+        dict(&[]),
+    )
+    .unwrap();
+    assert_eq!(in_ns.len(), 1);
+    assert_eq!(in_ns[0][0], Object::Integer(m1));
+
+    // All-namespace queries cannot resolve an id bound to one namespace.
+    assert!(crate::extmark::nvim_buf_get_extmarks(
+        &mut editor, buffer, -1,
+        Object::Integer(m2), Object::Integer(-1),
+        dict(&[]),
+    )
+    .is_err());
+}
+
+#[test]
+fn set_extmark_strict_rejects_out_of_buffer_and_line() {
+    // api.txt `nvim_buf_set_extmark()` `strict` (default true): the mark is not
+    // placed if the line is past end-of-buffer or the column past end-of-line.
+    let (mut editor, buffer, _, _) = editor_with_lines(&["one", "two"]);
+    let ns = crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("s")).unwrap();
+    assert!(crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, ns, 5, 0, dict(&[])).is_err());
+    assert!(crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, ns, 0, 50, dict(&[])).is_err());
+    assert!(crate::extmark::nvim_buf_set_extmark(
+        &mut editor, buffer, ns, 0, 0,
+        dict(&[("end_row", Object::Integer(9)), ("end_col", Object::Integer(0))]),
+    )
+    .is_err());
+    // strict=false allows out-of-range placement.
+    let id = crate::extmark::nvim_buf_set_extmark(
+        &mut editor, buffer, ns, 5, 50,
+        dict(&[("strict", Object::Boolean(false))]),
+    )
+    .unwrap();
+    let marks = crate::extmark::nvim_buf_get_extmarks(
+        &mut editor, buffer, ns,
+        Object::Integer(0), Object::Integer(-1),
+        dict(&[]),
+    )
+    .unwrap();
+    assert_eq!(marks.len(), 1);
+    assert_eq!(marks[0][0], Object::Integer(id));
+}
+
+#[test]
+fn highlight_groups_are_namespace_scoped_and_activatible() {
+    // api.txt `nvim_set_hl()`/`nvim_get_hl()`: namespaces scope highlight
+    // groups (ns 0 is global) and `nvim_set_hl_ns()` activates a namespace's
+    // distinct definitions.
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    crate::ui::nvim_set_hl(&mut editor, 0, OxStr::from("Scope"), dict(&[("fg", Object::Integer(0x111111))]))
+        .unwrap();
+    crate::ui::nvim_set_hl(&mut editor, 7, OxStr::from("Scope"), dict(&[("fg", Object::Integer(0x777777))]))
+        .unwrap();
+    let global = crate::ui::nvim_get_hl(&mut editor, 0, dict(&[("name", Object::String(OxStr::from("Scope")))])).unwrap();
+    assert_eq!(global.get(&OxStr::from("foreground")), Some(&Object::Integer(0x111111)));
+    let scoped = crate::ui::nvim_get_hl(&mut editor, 7, dict(&[("name", Object::String(OxStr::from("Scope")))])).unwrap();
+    assert_eq!(scoped.get(&OxStr::from("foreground")), Some(&Object::Integer(0x777777)));
+    // A namespace that has not defined the group reports not found.
+    assert!(crate::ui::nvim_get_hl(&mut editor, 9, dict(&[("name", Object::String(OxStr::from("Scope")))])).is_err());
+    // set_hl_ns switches the active namespace, and edits to it stay distinct.
+    crate::ui::nvim_set_hl_ns(&mut editor, 7).unwrap();
+    assert_eq!(crate::ui::nvim_get_hl_ns(&mut editor, dict(&[])), Ok(7));
+    crate::ui::nvim_set_hl(&mut editor, 7, OxStr::from("Scope"), dict(&[("fg", Object::Integer(0x060606))])).unwrap();
+    let updated = crate::ui::nvim_get_hl(&mut editor, 7, dict(&[("name", Object::String(OxStr::from("Scope")))])).unwrap();
+    assert_eq!(updated.get(&OxStr::from("foreground")), Some(&Object::Integer(0x060606)));
+    assert_eq!(
+        crate::ui::nvim_get_hl(&mut editor, 0, dict(&[("name", Object::String(OxStr::from("Scope")))])).unwrap()
+            .get(&OxStr::from("foreground")),
+        Some(&Object::Integer(0x111111))
+    );
+}
+
+#[test]
+fn set_client_info_accepts_msgpack_rpc_type() {
+    // api.txt `nvim_set_client_info()`: "msgpack-rpc" is a valid client type.
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    crate::channel::nvim_set_client_info(
+        &mut editor,
+        OxStr::from("rpc"),
+        dict(&[("major", Object::Integer(1))]),
+        OxStr::from("msgpack-rpc"),
+        dict(&[]),
+        dict(&[]),
+    )
+    .unwrap();
+    let info = crate::channel::nvim_get_chan_info(&mut editor, 1).unwrap();
+    let Object::Dict(client) = info.get(&OxStr::from("client")).unwrap() else { panic!("missing client dict") };
+    assert_eq!(client.get(&OxStr::from("type")), Some(&Object::String(OxStr::from("msgpack-rpc"))));
+    assert_eq!(client.get(&OxStr::from("name")), Some(&Object::String(OxStr::from("rpc"))));
+}

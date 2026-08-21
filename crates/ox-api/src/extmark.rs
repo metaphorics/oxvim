@@ -2,8 +2,9 @@
 
 use ox_editor::{
     Editor, Extmark, ExtmarkAttributes, ExtmarkEnd, ExtmarkGravity, ExtmarkId, ExtmarkPlacement,
-    ExtmarkPosition, NamespaceId, VirtualLine, VirtualTextChunk,
+    ExtmarkPosition, Extmarks, NamespaceId, VirtualLine, VirtualTextChunk,
 };
+use ox_text::Buffer;
 
 use crate::runtime::{with_state, with_state_mut};
 use crate::{api, ApiError, BufHandle, Dict, Object, OxStr, Registry, RegistryError};
@@ -145,11 +146,33 @@ pub fn nvim_buf_set_extmark(editor: &mut Editor, buffer: BufHandle, ns_id: i64, 
     let buffer = resolve_buffer(editor, buffer)?;
     let namespace = namespace(ns_id)?;
     let requested = integer(&opts, "id")?.map(|id| u32::try_from(id).map_err(|_| ApiError::validation("id must be positive")).and_then(|id| ExtmarkId::new(id).map_err(|error| ApiError::validation(error.to_string())))).transpose()?;
+    let strict = boolean(&opts, "strict", true)?;
     let placement = placement(line, col, &opts)?;
     let state = editor.buffer_mut(buffer).map_err(|error| ApiError::validation(error.to_string()))?;
+    if strict {
+        // Per api.txt `nvim_buf_set_extmark()`: strict (default true) rejects a
+        // line past end-of-buffer or a column past end-of-line.
+        let text = state.text().map_err(|error| ApiError::exception(error.to_string()))?;
+        validate_strict_position(text, &placement)?;
+    }
     state.extmarks.ensure_namespace(namespace).map_err(|error| ApiError::validation(error.to_string()))?;
     let id = state.extmarks.set(namespace, requested, placement).map_err(|error| ApiError::validation(error.to_string()))?;
     Ok(i64::from(id.get()))
+}
+
+fn validate_strict_position(text: &Buffer, placement: &ExtmarkPlacement) -> Result<(), ApiError> {
+    let line_count = text.line_count();
+    let line = placement.position.row;
+    if line > line_count { return Err(ApiError::validation("line: value outside range")); }
+    let line_len = if line < line_count { text.line(line + 1).map_err(|error| ApiError::exception(error.to_string()))?.len() } else { 0 };
+    if placement.position.column > line_len { return Err(ApiError::validation("col: value outside range")); }
+    if let Some(end) = &placement.end {
+        let end_line = end.position.row;
+        if end_line > line_count { return Err(ApiError::validation("end_row: value outside range")); }
+        let end_len = if end_line < line_count { text.line(end_line + 1).map_err(|error| ApiError::exception(error.to_string()))?.len() } else { 0 };
+        if end.position.column > end_len { return Err(ApiError::validation("end_col: value outside range")); }
+    }
+    Ok(())
 }
 
 #[api(since = 7, method)]
@@ -171,10 +194,21 @@ pub fn nvim_buf_get_extmark_by_id(editor: &mut Editor, buffer: BufHandle, ns_id:
     Ok(result)
 }
 
-fn bound(value: Object) -> Result<ExtmarkPosition, ApiError> {
+fn bound(extmarks: &Extmarks, namespace: Option<NamespaceId>, value: Object) -> Result<ExtmarkPosition, ApiError> {
     match value {
-        Object::Integer(value) if value == 0 => Ok(ExtmarkPosition::new(0, 0)),
-        Object::Integer(value) if value == -1 => Ok(ExtmarkPosition::new(usize::MAX, usize::MAX)),
+        Object::Integer(0) => Ok(ExtmarkPosition::new(0, 0)),
+        Object::Integer(-1) => Ok(ExtmarkPosition::new(usize::MAX, usize::MAX)),
+        Object::Integer(value) if value > 0 => {
+            // A positive integer bound is a valid extmark id whose position
+            // defines the bound (api.txt `nvim_buf_get_extmarks()`).
+            let namespace = namespace.ok_or_else(|| ApiError::validation("mark id bounds require a namespace"))?;
+            let id = u32::try_from(value).map_err(|_| ApiError::validation("invalid extmark id"))?;
+            let id = ExtmarkId::new(id).map_err(|error| ApiError::validation(error.to_string()))?;
+            let mark = extmarks.get(namespace, id).map_err(|error| ApiError::validation(error.to_string()))?
+                .ok_or_else(|| ApiError::validation(format!("invalid extmark id: {value}")))?;
+            Ok(mark.position())
+        }
+        Object::Integer(_) => Err(ApiError::validation("invalid extmark bound")),
         Object::Array(values) if values.len() == 2 => match (&values[0], &values[1]) { (Object::Integer(row), Object::Integer(col)) => position(*row, *col), _ => Err(ApiError::validation("invalid extmark position")) },
         _ => Err(ApiError::validation("invalid extmark position")),
     }
@@ -183,10 +217,16 @@ fn bound(value: Object) -> Result<ExtmarkPosition, ApiError> {
 #[api(since = 7, method)]
 pub fn nvim_buf_get_extmarks(editor: &mut Editor, buffer: BufHandle, ns_id: i64, start: Object, end: Object, opts: Dict) -> Result<Vec<Vec<Object>>, ApiError> {
     let buffer = resolve_buffer(editor, buffer)?;
-    let namespace = namespace(ns_id)?;
     let limit = integer(&opts, "limit")?.map(|value| usize::try_from(value).map_err(|_| ApiError::validation("limit must be non-negative"))).transpose()?;
     let include_details = boolean(&opts, "details", false)?;
-    let marks = editor.buffer(buffer).map_err(|error| ApiError::validation(error.to_string()))?.extmarks.query(namespace, bound(start)?, bound(end)?, limit).map_err(|error| ApiError::validation(error.to_string()))?;
+    let state = editor.buffer(buffer).map_err(|error| ApiError::validation(error.to_string()))?;
+    let marks = if ns_id == -1 {
+        // ns_id -1 queries every namespace (api.txt `nvim_buf_get_extmarks()`).
+        state.extmarks.query_all(bound(&state.extmarks, None, start)?, bound(&state.extmarks, None, end)?, limit)
+    } else {
+        let namespace = namespace(ns_id)?;
+        state.extmarks.query(namespace, bound(&state.extmarks, Some(namespace), start)?, bound(&state.extmarks, Some(namespace), end)?, limit).map_err(|error| ApiError::validation(error.to_string()))?
+    };
     Ok(marks.into_iter().map(|mark| {
         let mut row = vec![Object::Integer(i64::from(mark.id.get())), Object::Integer(i64::try_from(mark.position().row).unwrap_or(i64::MAX)), Object::Integer(i64::try_from(mark.position().column).unwrap_or(i64::MAX))];
         if include_details { row.push(Object::Dict(details(&mark))); }

@@ -5,7 +5,7 @@ use ox_editor::{Editor, Keys, RegisterContent, Remap, TypeaheadFlags};
 use ox_text::Position;
 use ox_ui::{Highlight, HlAttrs, UiOptions};
 
-use crate::runtime::{with_state, with_state_mut};
+use crate::runtime::{with_state, with_state_mut, RuntimeState};
 use crate::{api, ApiError, BufHandle, Dict, Object, OxStr, Registry, RegistryError};
 
 const CHANNEL_ID: u64 = 1;
@@ -89,13 +89,21 @@ fn group_id(state: &ox_ui::HlState, name: &OxStr) -> Option<u64> {
     state.groups().find_map(|(candidate, id)| (candidate == name).then_some(id))
 }
 
+/// Rebuilds the active render table from the given namespace's definitions.
+fn activate_hl(state: &mut RuntimeState, ns_id: i64) {
+    let active = state.hl_namespaces.entry(ns_id).or_default().clone();
+    state.highlights = active;
+}
+
 #[api(since = 7)]
 pub fn nvim_set_hl(editor: &mut Editor, ns_id: i64, name: OxStr, val: Dict) -> Result<(), ApiError> {
     if ns_id < 0 { return Err(ApiError::validation("namespace must be non-negative")); }
     with_state_mut(editor, |state| {
         let highlight = Highlight { rgb: attrs(&val)?, cterm: match val.get(&OxStr::from("cterm")) { Some(Object::Dict(dict)) => attrs(dict)?, _ => HlAttrs::default() }, info: Vec::new() };
-        let (id, _) = state.highlights.intern(highlight).map_err(|error| ApiError::exception(error.to_string()))?;
-        state.highlights.set_group(name, id).map_err(|error| ApiError::exception(error.to_string()))?;
+        let ns = state.hl_namespaces.entry(ns_id).or_default();
+        let (id, _) = ns.intern(highlight).map_err(|error| ApiError::exception(error.to_string()))?;
+        ns.set_group(name, id).map_err(|error| ApiError::exception(error.to_string()))?;
+        if ns_id == state.current_hl_ns { activate_hl(state, ns_id); }
         Ok(())
     })
 }
@@ -104,13 +112,16 @@ pub fn nvim_set_hl(editor: &mut Editor, ns_id: i64, name: OxStr, val: Dict) -> R
 pub fn nvim_get_hl(editor: &mut Editor, ns_id: i64, opts: Dict) -> Result<Dict, ApiError> {
     if ns_id < 0 { return Err(ApiError::validation("namespace must be non-negative")); }
     with_state(editor, |state| {
+        // An undefined namespace has no highlight definitions of its own; it
+        // never falls back to the global (ns 0) table.
+        let ns = state.hl_namespaces.get(&ns_id);
         let id = match (opts.get(&OxStr::from("id")), opts.get(&OxStr::from("name"))) {
             (Some(Object::Integer(id)), _) => u64::try_from(*id).map_err(|_| ApiError::validation("invalid highlight id"))?,
-            (_, Some(Object::String(name))) => group_id(&state.highlights, name).ok_or_else(|| ApiError::validation("highlight group not found"))?,
-            (None, None) => return Ok(Dict(state.highlights.groups().filter_map(|(name, id)| state.highlights.get(id).map(|highlight| (name.clone(), highlight.rgb.to_object()))).collect::<Vec<_>>())),
+            (_, Some(Object::String(name))) => ns.and_then(|ns| group_id(ns, name)).ok_or_else(|| ApiError::validation("highlight group not found"))?,
+            (None, None) => return Ok(Dict(ns.map(|ns| ns.groups().filter_map(|(name, id)| ns.get(id).map(|highlight| (name.clone(), highlight.rgb.to_object()))).collect::<Vec<_>>()).unwrap_or_default())),
             _ => return Err(ApiError::validation("id or name has wrong type")),
         };
-        let highlight = state.highlights.get(id).ok_or_else(|| ApiError::validation("highlight id not found"))?;
+        let highlight = ns.and_then(|ns| ns.get(id)).ok_or_else(|| ApiError::validation("highlight id not found"))?;
         match highlight.rgb.to_object() { Object::Dict(dict) => Ok(dict), _ => Ok(Dict(Vec::new())) }
     })
 }
@@ -118,9 +129,11 @@ pub fn nvim_get_hl(editor: &mut Editor, ns_id: i64, opts: Dict) -> Result<Dict, 
 #[api(since = 7)]
 pub fn nvim_get_hl_id_by_name(editor: &mut Editor, name: OxStr) -> Result<i64, ApiError> {
     with_state_mut(editor, |state| {
-        if let Some(id) = group_id(&state.highlights, &name) { return i64::try_from(id).map_err(|_| ApiError::exception("highlight id out of range")); }
-        let (id, _) = state.highlights.intern(Highlight::default()).map_err(|error| ApiError::exception(error.to_string()))?;
-        state.highlights.set_group(name, id).map_err(|error| ApiError::exception(error.to_string()))?;
+        let ns = state.hl_namespaces.entry(0).or_default();
+        if let Some(id) = group_id(ns, &name) { return i64::try_from(id).map_err(|_| ApiError::exception("highlight id out of range")); }
+        let (id, _) = ns.intern(Highlight::default()).map_err(|error| ApiError::exception(error.to_string()))?;
+        ns.set_group(name, id).map_err(|error| ApiError::exception(error.to_string()))?;
+        if state.current_hl_ns == 0 { activate_hl(state, 0); }
         i64::try_from(id).map_err(|_| ApiError::exception("highlight id out of range"))
     })
 }
@@ -131,13 +144,15 @@ pub fn nvim_get_hl_ns(editor: &mut Editor, _opts: Dict) -> Result<i64, ApiError>
 #[api(since = 10)]
 pub fn nvim_set_hl_ns(editor: &mut Editor, ns_id: i64) -> Result<(), ApiError> {
     if ns_id < 0 { return Err(ApiError::validation("namespace must be non-negative")); }
-    with_state_mut(editor, |state| state.current_hl_ns = ns_id); Ok(())
+    with_state_mut(editor, |state| { state.current_hl_ns = ns_id; activate_hl(state, ns_id); });
+    Ok(())
 }
 
 #[api(since = 10, fast)]
 pub fn nvim_set_hl_ns_fast(editor: &mut Editor, ns_id: i64) -> Result<(), ApiError> {
     if ns_id < 0 { return Err(ApiError::validation("namespace must be non-negative")); }
-    with_state_mut(editor, |state| state.fast_hl_ns = ns_id); Ok(())
+    with_state_mut(editor, |state| { state.fast_hl_ns = ns_id; activate_hl(state, ns_id); });
+    Ok(())
 }
 
 #[api(since = 6)]

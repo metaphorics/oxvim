@@ -94,7 +94,11 @@ pub(crate) struct RuntimeState {
     pub next_namespace: u32,
     pub ui_channels: UiChannels,
     pub chrome: ChromeState,
+    /// Active highlight definitions used for rendering (the namespace selected
+    /// by `nvim_set_hl_ns()`/`nvim_set_hl_ns_fast()`, global ns 0 by default).
     pub highlights: HlState,
+    /// Per-namespace highlight tables keyed by `ns_id`; ns 0 is global.
+    pub hl_namespaces: BTreeMap<i64, HlState>,
     pub current_hl_ns: i64,
     pub fast_hl_ns: i64,
     pub channels: BTreeMap<u64, ChannelInfo>,
@@ -128,6 +132,7 @@ impl Default for RuntimeState {
             ui_channels: UiChannels::new(),
             chrome: ChromeState::new(),
             highlights: HlState::new(),
+            hl_namespaces: BTreeMap::from([(0, HlState::new())]),
             current_hl_ns: 0,
             fast_hl_ns: 0,
             channels,

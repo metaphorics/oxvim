@@ -117,7 +117,10 @@ fn filter_patterns(opts: &Dict) -> Result<Option<Vec<String>>, ApiError> {
 #[api(since = 9)]
 pub fn nvim_clear_autocmds(editor: &mut Editor, opts: Dict) -> Result<(), ApiError> {
     let selected_group = group(editor, opts.get(&OxStr::from("group")))?;
-    let groups = opts.get(&OxStr::from("group")).map(|_| selected_group);
+    // Per api.txt `nvim_clear_autocmds()`: when no group is given, only
+    // autocommands that are NOT in any group (the default augroup) match,
+    // never every group.
+    let groups = Some(selected_group);
     let selected_events = filter_events(&opts)?.unwrap_or_else(|| vec![Event::ALL[0]]);
     let all_events = opts.get(&OxStr::from("event")).is_none();
     let patterns = filter_patterns(&opts)?;
