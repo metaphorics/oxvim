@@ -170,8 +170,10 @@ pub struct CommandModifier {
     pub kind: ModifierKind,
     /// Optional prefix count (`3verbose`, `2tab`).
     pub count: Option<u64>,
-    /// Whether the modifier carried `!` (`silent!`).
+    /// Whether the modifier carried `!` (`silent!`, `filter!`).
     pub bang: bool,
+    /// Delimited pattern for the `filter` modifier; `None` otherwise.
+    pub pattern: Option<String>,
 }
 
 /// One parsed command. Execution is intentionally out of scope.
@@ -412,21 +414,107 @@ fn parse_modifiers(input: &str, cursor: &mut usize) -> Result<Vec<CommandModifie
             *cursor = saved;
             break;
         }
-        let bang = input.as_bytes().get(probe) == Some(&b'!') && kind == ModifierKind::Silent;
-        if bang {
+        let mut bang = false;
+        if input.as_bytes().get(probe) == Some(&b'!')
+            && matches!(kind, ModifierKind::Silent | ModifierKind::Filter)
+        {
+            bang = true;
             probe += 1;
         }
-        if input.as_bytes().get(probe).is_some_and(u8::is_ascii_alphabetic) {
+        let mut pattern = None;
+        let is_filter = kind == ModifierKind::Filter;
+        if is_filter {
+            // ":filter {pat} cmd": the pattern is mandatory and belongs to
+            // the modifier, so it is consumed and retained here before the
+            // nested command is routed (the 'f' case in parse_command_
+            // modifiers: ex_docmd.c:2561-2591). Without a pattern, or when
+            // no command follows, "filter" is not a modifier at all.
+            let pattern_start = skip_ascii_space(input, probe);
+            let at_command_end = matches!(
+                input.as_bytes().get(pattern_start).copied(),
+                None | Some(b'|') | Some(b'"')
+            );
+            if at_command_end {
+                *cursor = saved;
+                break;
+            }
+            let Ok((parsed_pattern, after_pattern)) =
+                parse_vimgrep_pattern(input, pattern_start)
+            else {
+                *cursor = saved;
+                break;
+            };
+            pattern = Some(parsed_pattern);
+            probe = after_pattern;
+        } else if kind == ModifierKind::Hide {
+            // ":hide" and ":hide | cmd" stay the builtin command; "hide" is
+            // a modifier only when another command follows (the 'h' case in
+            // parse_command_modifiers: ex_docmd.c:2594-2603).
+            let after_word = skip_ascii_space(input, probe);
+            if matches!(input.as_bytes().get(after_word).copied(), None | Some(b'|') | Some(b'"'))
+            {
+                *cursor = saved;
+                break;
+            }
+        }
+        // A modifier must not be a prefix of a longer identifier. "filter"
+        // is exempt because probe has advanced past its pattern, where a
+        // following identifier is the nested command, not a word extension
+        // (":filter /pat/delete" has no separating space).
+        if !is_filter && input.as_bytes().get(probe).is_some_and(u8::is_ascii_alphabetic) {
             *cursor = saved;
             break;
         }
-        modifiers.push(CommandModifier { kind, count, bang });
+        modifiers.push(CommandModifier { kind, count, bang, pattern });
         if modifiers.len() == MAX_MODIFIERS {
             return Err(error(ErrorCode::E488, probe, "too many modifiers"));
         }
         *cursor = skip_ascii_space(input, probe);
     }
     Ok(modifiers)
+}
+
+/// Parses one vimgrep-style pattern: a bare identifier word ("pattern fname")
+/// or a delimited pattern with optional `g`/`j`/`f` flags ("/pattern/ fname"),
+/// returning the pattern text and the cursor just past the pattern.
+/// Mirrors `skip_vimgrep_pat`: `ex_cmds.c:4972-5010`.
+fn parse_vimgrep_pattern(input: &str, start: usize) -> Result<(String, usize), ParseError> {
+    let bytes = input.as_bytes();
+    let Some(&first) = bytes.get(start) else {
+        return Err(error(ErrorCode::E488, start, "search pattern required"));
+    };
+    if first.is_ascii_alphanumeric() || first == b'_' {
+        // ":filter foo cmd" / ":vimgrep foo fname": bare pattern up to space.
+        let pattern_start = start;
+        let mut cursor = start;
+        while bytes.get(cursor).is_some_and(|byte| !byte.is_ascii_whitespace()) {
+            cursor += 1;
+        }
+        return Ok((input[pattern_start..cursor].to_owned(), cursor));
+    }
+    // Delimited pattern ":filter /foo/ cmd", optionally followed by flags.
+    let (pattern, after) = parse_pattern(input, start, first)?;
+    let mut cursor = after;
+    while matches!(bytes.get(cursor), Some(b'g') | Some(b'j') | Some(b'f')) {
+        cursor += 1;
+    }
+    Ok((pattern, cursor))
+}
+
+/// Whether `command_end` must skip a leading grep pattern before scanning
+/// for `|` separators and `"` comments.
+fn is_grep_command(name: &str) -> bool {
+    matches!(name, "vimgrep" | "lvimgrep" | "vimgrepadd" | "lvimgrepadd")
+}
+
+/// Returns the cursor just past a vimgrep-family leading pattern, or
+/// `args_start` when no pattern can be skipped (`skip_grep_pat`: ex_docmd.c
+/// 3840-3854; used by `separate_nextcmd` at ex_docmd.c:4114).
+fn skip_grep_pattern(input: &str, args_start: usize) -> usize {
+    match parse_vimgrep_pattern(input, args_start) {
+        Ok((_, after)) => after,
+        Err(_) => args_start,
+    }
 }
 
 fn modifier(typed: &str) -> Option<(ModifierKind, bool)> {
@@ -627,6 +715,13 @@ fn command_end(
     let bytes = input.as_bytes();
     let mut escaped = false;
     let mut cursor = args_start;
+    // vimgrep family patterns are regexes that may contain `|`; skip the
+    // leading pattern (plus g/j/f flags) before scanning for bar separators
+    // and quote comments, so ":vimgrep /foo|bar/ f | copen" splits after the
+    // file argument (separate_nextcmd: ex_docmd.c:4112-4165).
+    if is_grep_command(name) {
+        cursor = skip_grep_pattern(input, args_start);
+    }
     while let Some(&byte) = bytes.get(cursor) {
         if escaped {
             escaped = false;

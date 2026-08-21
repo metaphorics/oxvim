@@ -14,8 +14,9 @@ fn parse_one(input: &str) -> crate::ExCommand {
     commands.remove(0)
 }
 
-// src/nvim/ex_docmd.c:3051-3164: built-ins use the first table-prefix match,
-// with the one-letter substitute special case and user commands as fallback.
+// src/nvim/ex_docmd.c:3057-3165 (find_ex_command): built-ins use the first
+// table-prefix match, with the one-letter substitute special case and user
+// commands as fallback.
 macro_rules! resolution_case {
     ($name:ident, $typed:literal, $canonical:literal) => {
         #[test]
@@ -127,8 +128,10 @@ fn user_command_name_may_contain_digits() {
     assert_eq!(commands[0].args, "arg");
 }
 
-// src/nvim/ex_docmd.c:3313 onward: ranges accept numeric/current/last/mark/
-// search addresses, signed offsets, and comma/semicolon evaluation semantics.
+// src/nvim/ex_docmd.c:2826-2949 (parse_cmd_address): ranges accept numeric/
+// current/last/mark/search addresses with signed offsets and comma/semicolon
+// evaluation semantics; `%` whole-buffer shorthand and omitted endpoints are
+// handled by the same function.
 macro_rules! address_case {
     ($name:ident, $input:literal, $base:pat, $offsets:expr) => {
         #[test]
@@ -235,8 +238,9 @@ fn earlier_semicolon_in_chain_records_cursor_advance() {
     );
 }
 
-// src/nvim/ex_docmd.c:3167-3220: modifiers have minimum prefixes, preserve
-// stack order, and permit counts for the count-bearing forms.
+// src/nvim/ex_docmd.c:2464-2725 (parse_command_modifiers) and 3167-3227
+// (cmdmods[]): modifiers have minimum prefixes, preserve stack order, and
+// permit counts for the count-bearing forms.
 macro_rules! modifier_case {
     ($name:ident, $typed:literal, $kind:path) => {
         #[test]
@@ -294,14 +298,120 @@ fn tab_modifier_carries_count() {
     assert_eq!(command.modifiers[0].count, Some(2));
 }
 
-// src/nvim/ex_docmd.c do_one_cmd: EX_TRLBAR gates generic bar splitting;
-// commands such as :normal and :global own their remaining argument text.
+// ":filter {pat} cmd" — the optional `!` and delimited pattern are part of
+// the modifier (parse_command_modifiers 'f' case: ex_docmd.c:2558-2591).
+#[test]
+fn filter_modifier_parses_and_retains_pattern() {
+    let command = parse_one("filter /foo/ print");
+    assert_eq!(command.modifiers.len(), 1);
+    assert_eq!(command.modifiers[0].kind, ModifierKind::Filter);
+    assert_eq!(command.modifiers[0].pattern.as_deref(), Some("foo"));
+    assert!(!command.modifiers[0].bang);
+    assert_eq!(command.command.name(), "print");
+}
+
+#[test]
+fn filter_modifier_bang_conveys_force() {
+    let command = parse_one("filter! /foo/ print");
+    assert_eq!(command.modifiers.len(), 1);
+    assert_eq!(command.modifiers[0].kind, ModifierKind::Filter);
+    assert!(command.modifiers[0].bang);
+    assert_eq!(command.modifiers[0].pattern.as_deref(), Some("foo"));
+    assert_eq!(command.command.name(), "print");
+}
+
+#[test]
+fn filter_modifier_accepts_bare_pattern() {
+    let command = parse_one("filter foo print");
+    assert_eq!(command.modifiers.len(), 1);
+    assert_eq!(command.modifiers[0].kind, ModifierKind::Filter);
+    assert_eq!(command.modifiers[0].pattern.as_deref(), Some("foo"));
+    assert_eq!(command.command.name(), "print");
+}
+
+#[test]
+fn filter_modifier_pattern_may_abut_the_command() {
+    let command = parse_one("filter /foo/print");
+    assert_eq!(command.modifiers.len(), 1);
+    assert_eq!(command.modifiers[0].kind, ModifierKind::Filter);
+    assert_eq!(command.modifiers[0].pattern.as_deref(), Some("foo"));
+    assert_eq!(command.command.name(), "print");
+}
+
+#[test]
+fn filter_without_pattern_is_not_a_modifier() {
+    // ":filter" alone falls through to the builtin (NEEDARG -> E471).
+    assert_eq!(
+        Parser::new().parse("filter").expect_err("filter requires an argument").code,
+        ErrorCode::E471
+    );
+}
+
+// ":hide" and ":hide | cmd" are the builtin command; only ":hide cmd" is a
+// modifier (parse_command_modifiers 'h' case: ex_docmd.c:2597-2603).
+#[test]
+fn hide_alone_is_the_builtin_command() {
+    let command = parse_one("hide");
+    assert_eq!(command.command.name(), "hide");
+    assert!(command.modifiers.is_empty());
+}
+
+#[test]
+fn hide_followed_by_bar_is_the_builtin_command() {
+    let parsed = Parser::new().parse("hide | print").unwrap_or_default();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].command.name(), "hide");
+    assert!(parsed[0].modifiers.is_empty());
+    assert_eq!(parsed[1].command.name(), "print");
+}
+
+#[test]
+fn hide_is_a_modifier_when_a_command_follows() {
+    let command = parse_one("hide print");
+    assert_eq!(command.modifiers.len(), 1);
+    assert_eq!(command.modifiers[0].kind, ModifierKind::Hide);
+    assert_eq!(command.command.name(), "print");
+}
+
+// src/nvim/ex_docmd.c:4112-4165 (separate_nextcmd): EX_TRLBAR gates generic
+// bar splitting; commands such as :normal and :global own their remaining
+// argument text.
 #[test]
 fn substitute_splits_at_trailing_bar() {
     let commands = Parser::new().parse("s/a/b/ | echo done").unwrap_or_default();
     assert_eq!(commands.len(), 2);
     assert_eq!(commands[0].args, "/a/b/");
     assert_eq!(commands[1].command.name(), "echo");
+}
+
+// vimgrep-family patterns are regexes that may contain `|`; the leading
+// pattern (+ g/j/f flags) is skipped before bar scanning so the command
+// splits after the file argument (separate_nextcmd via skip_grep_pat:
+// ex_docmd.c:4112-4165 and 3840-3854).
+#[test]
+fn vimgrep_pattern_bar_is_not_a_separator() {
+    let commands = Parser::new().parse("vimgrep /foo|bar/ f | copen").unwrap_or_default();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].command.name(), "vimgrep");
+    assert_eq!(commands[0].args, "/foo|bar/ f");
+    assert_eq!(commands[1].command.name(), "copen");
+}
+
+#[test]
+fn vimgrepadd_pattern_bar_is_not_a_separator() {
+    let commands = Parser::new().parse("vimgrepadd /a|b/ file | echo x").unwrap_or_default();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].command.name(), "vimgrepadd");
+    assert_eq!(commands[0].args, "/a|b/ file");
+    assert_eq!(commands[1].command.name(), "echo");
+}
+
+#[test]
+fn lvimgrep_pattern_with_flags_splits_after_files() {
+    let commands = Parser::new().parse("lvimgrep /a|b/g file | print").unwrap_or_default();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].command.name(), "lvimgrep");
+    assert_eq!(commands[0].args, "/a|b/g file");
 }
 
 #[test]
@@ -468,8 +578,9 @@ fn expression_arguments_use_ox_eval() {
     assert!(command.parse_expression_args().is_ok());
 }
 
-// src/nvim/ex_docmd.c eval_vars(): command-line specials are recognized only
-// when unescaped; <lt> emits a literal less-than sign.
+// src/nvim/ex_docmd.c:7488-7519 (find_cmdline_var) and 7551 onward (eval_vars):
+// command-line specials are recognized only when unescaped; <lt> emits a
+// literal less-than sign.
 struct Context;
 impl CmdlineContext for Context {
     fn resolve(&self, special: CmdlineSpecial) -> Option<String> {
@@ -544,8 +655,9 @@ fn literal_segments_surround_placeholders() {
     assert!(matches!(&parts[2], ExpansionPart::Literal { text, .. } if text == "post"));
 }
 
-// Error sites correspond to checks in do_one_cmd: E492 unknown command, E481
-// disallowed range, E488 trailing input, and E471 missing required argument.
+// Error sites correspond to checks in do_one_cmd (ex_docmd.c:1979 onward)
+// and resolve_command/find_ex_command: E492 unknown command, E481 disallowed
+// range, E488 trailing input, and E471 missing required argument.
 macro_rules! error_case {
     ($name:ident, $input:literal, $code:path) => {
         #[test]
