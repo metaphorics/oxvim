@@ -187,6 +187,12 @@ eval_cases!(
     (lambda_extra_args_accepted, b"{a -> a}(1, 2, 3)", Typval::Number(1), "userfunc.c:396 uf_varargs=true"),
     (string_multibyte_fold_equal, b"\"\xc3\x84\" ==? \"\xc3\xa4\"", Typval::Number(1), "mbyte.c:mb_stricmp"),
     (string_multibyte_fold_sensitive, b"\"\xc3\x84\" ==# \"\xc3\xa4\"", Typval::Number(0), "vimeval.txt:1075-1081"),
+    (turkish_dotted_i_fold_equal, b"\"\xc4\xb0\" ==? \"i\xcc\x87\"", Typval::Number(1), "mbyte.c:mb_stricmp"),
+    (turkish_dotted_i_fold_equal_reverse, b"\"i\xcc\x87\" ==? \"\xc4\xb0\"", Typval::Number(1), "mbyte.c:mb_stricmp"),
+    (turkish_dotted_i_fold_sensitive, b"\"\xc4\xb0\" ==# \"i\xcc\x87\"", Typval::Number(0), "vimeval.txt:1075-1081"),
+    (casefold_ordering_lower_first, b"'a' <? 'B'", Typval::Number(1), "mbyte.c:mb_stricmp"),
+    (casefold_ordering_upper_greater, b"'B' >? 'a'", Typval::Number(1), "mbyte.c:mb_stricmp"),
+    (turkish_dotted_i_fold_ordering, b"\"\xc4\xb0\" >? \"I\"", Typval::Number(1), "mbyte.c:mb_stricmp"),
     (method_len, b"[1, 2, 3]->len()", Typval::Number(3), "vimeval.txt:1292-1305"),
     (method_chain, b"[1, 2, 3]->len()->id()", Typval::Number(3), "vimeval.txt:1300-1305"),
     (method_receiver_first, b"10->sum(20, 30)", Typval::Number(60), "vimeval.txt:1295-1298")
@@ -494,18 +500,22 @@ fn closure_resolves_across_evaluator_sharing_registry() {
 
 #[test]
 fn closure_from_isolated_evaluator_is_not_callable() {
-    // Without the shared registry a second evaluator cannot resolve a stored
-    // Partial — matching upstream where a lambda lives in the evaluator state.
+    // Two independent registries each create a <lambda>0. A Partial from the
+    // first registry must not resolve to the second registry's closure with the
+    // same local index; instead it returns E117.
     let mut first_host = Host;
     let mut second_host = Host;
     let regex = Regex;
     let mut creator = Evaluator::new(&mut first_host, &regex);
     let mut caller = Evaluator::new(&mut second_host, &regex);
 
-    let define = Parser::new(b"{x -> x * 2}").parse().unwrap();
-    let closure = creator.eval(&define, &mut Scope::new()).unwrap();
+    let define_a = Parser::new(b"{x -> x + 1}").parse().unwrap();
+    let define_b = Parser::new(b"{x -> x * 2}").parse().unwrap();
+    let closure_a = creator.eval(&define_a, &mut Scope::new()).unwrap();
+    // Ensure caller's registry also has a closure at index 0.
+    let _closure_b = caller.eval(&define_b, &mut Scope::new()).unwrap();
     let mut store = Scope::new();
-    store.set(b"f", closure);
-    let call = Parser::new(b"f(2)").parse().unwrap();
+    store.set(b"f", closure_a);
+    let call = Parser::new(b"f(5)").parse().unwrap();
     assert_eq!(caller.eval(&call, &mut store).unwrap_err().code, "E117");
 }
