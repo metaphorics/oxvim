@@ -430,7 +430,7 @@ fn indent_levels_expand_tabs_to_shiftwidth() {
 }
 
 #[test]
-fn indent_levels_keep_interior_blank_previous_level() {
+fn indent_levels_resolve_interior_blank_to_lower_surrounding() {
     assert_eq!(
         indent_levels(
             &[b"root".as_slice(), b"    child", b"", b"    next", b"end"],
@@ -442,8 +442,30 @@ fn indent_levels_keep_interior_blank_previous_level() {
 }
 
 #[test]
-fn indent_levels_force_boundary_blanks_to_zero() {
-    assert_eq!(indent_levels(&[b"".as_slice(), b"  x", b""], 2).unwrap(), vec![0, 1, 0]);
+fn indent_levels_blank_takes_lower_of_surrounding_levels() {
+    // fold.txt:54-61: a blank line takes the level above or below, lower.
+    // [2, blank, 1] -> the blank resolves to 1, not the preceding 2.
+    assert_eq!(
+        indent_levels(&[b"    a".as_slice(), b"", b"  b"], 2).unwrap(),
+        vec![2, 1, 1]
+    );
+}
+
+#[test]
+fn indent_levels_trailing_blank_run_resolves_to_zero() {
+    // A trailing blank run has no concrete level below it; the last line is
+    // forced to zero and the blanks above resolve to the lower of 1 and 0.
+    assert_eq!(
+        indent_levels(&[b"a".as_slice(), b"  b", b"", b""], 2).unwrap(),
+        vec![0, 1, 0, 0]
+    );
+}
+
+#[test]
+fn indent_levels_all_blank_buffer_is_zero() {
+    // First and last lines are always defined (fold.c:2852-2854); with no
+    // concrete neighbor either side every blank resolves to zero.
+    assert_eq!(indent_levels(&[b"".as_slice(), b"", b""], 4).unwrap(), vec![0, 0, 0]);
 }
 
 #[test]
@@ -765,6 +787,30 @@ fn readonly_is_policy_data_not_mutation_suppression() {
 fn eol_content_change_sets_modified() {
     let mut state = state_with_lines(&[b"a"]);
     state.set_eol(true).unwrap();
+    assert!(state.modified);
+}
+
+#[test]
+fn restoring_saved_eol_clears_modified_when_undo_matches() {
+    let mut state = state_with_lines(&[b"a"]);
+    state.set_eol(true).unwrap();
+    assert!(state.modified);
+    // Restoring the saved final-EOL with no other pending edits returns the
+    // buffer to the saved undo point, so 'modified' clears.
+    state.set_eol(false).unwrap();
+    assert!(!state.modified);
+}
+
+#[test]
+fn restoring_saved_eol_keeps_modified_with_pending_edits() {
+    let mut state = state_with_lines(&[b"a"]);
+    state.set_eol(true).unwrap();
+    state
+        .replace_lines(1, 1, &[b"b".to_vec()], text_pos(1), text_pos(1), 1)
+        .unwrap();
+    // Restoring the saved EOL keeps 'modified' set because pending text edits
+    // still diverge from the saved undo point.
+    state.set_eol(false).unwrap();
     assert!(state.modified);
 }
 

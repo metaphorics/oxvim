@@ -459,14 +459,18 @@ impl BufferState {
     }
 
     /// Changes final-EOL state and advances every text-derived generation.
+    ///
+    /// `'modified'` is recomputed from the undo point and saved EOL state, so
+    /// restoring the saved EOL (with no other pending edits) clears the flag
+    /// again instead of latching it once changed.
     pub fn set_eol(&mut self, has_eol: bool) -> Result<(), BufferStateError> {
         self.require_loaded()?;
         let changed = self.text.has_eol() != has_eol;
         self.text.set_eol(has_eol);
         if changed {
-            self.modified = true;
             self.folds.invalidate(self.changedtick());
         }
+        self.refresh_modified();
         self.bump_derived_ticks();
         Ok(())
     }

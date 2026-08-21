@@ -835,10 +835,14 @@ impl Folds {
 
 /// Computes indent fold levels for byte lines.
 ///
-/// Neovim returns an undefined level for blank/ignored lines and otherwise
-/// divides indentation by shift width in `src/nvim/fold.c:2841-2862`. Here an
-/// interior blank line retains the preceding concrete level; leading and
-/// trailing blank lines are level zero, matching the source's boundary rule.
+/// Neovim reports an undefined level for blank/ignored lines and otherwise
+/// divides indentation by shift width in `src/nvim/fold.c:2841-2862`, then
+/// skips over undefined lines to resolve a fold level in
+/// `src/nvim/fold.c:2410-2425`. Per `src/nvim/fold.txt:54-61` such lines take
+/// the level of the line above or below, whichever is lower. Here an interior
+/// blank line resolves to the lower of the nearest concrete level above and
+/// below (looking across runs of blanks); the first and last lines are never
+/// undefined and stay at level zero (`src/nvim/fold.c:2852-2854`).
 pub fn indent_levels<B: AsRef<[u8]>>(
     lines: &[B],
     shift_width: usize,
@@ -868,16 +872,29 @@ pub fn indent_levels<B: AsRef<[u8]>>(
         raw.push((!blank).then_some((columns / shift_width).min(MAX_FOLD_DEPTH)));
     }
 
-    let mut levels = Vec::with_capacity(raw.len());
+    let line_count = raw.len();
+    let mut levels = vec![0usize; line_count];
     let mut previous = 0usize;
+    // Forward pass: for each blank seed the nearest concrete level above
+    // (0 before the buffer start).
     for (index, level) in raw.iter().copied().enumerate() {
-        let resolved = if index == 0 || index + 1 == raw.len() {
-            level.unwrap_or(0)
+        if let Some(lvl) = level {
+            previous = lvl;
+            levels[index] = lvl;
         } else {
-            level.unwrap_or(previous)
-        };
-        previous = resolved;
-        levels.push(resolved);
+            levels[index] = previous;
+        }
+    }
+    // Backward pass: take the lower of the level above and the nearest
+    // concrete level below (0 past the buffer end), which is how a blank
+    // run inside a fold resolves.
+    let mut next = 0usize;
+    for (index, level) in raw.iter().copied().enumerate().rev() {
+        if let Some(lvl) = level {
+            next = lvl;
+        } else {
+            levels[index] = levels[index].min(next);
+        }
     }
     Ok(levels)
 }
