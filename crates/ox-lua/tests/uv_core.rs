@@ -207,3 +207,86 @@ fn new_thread_uses_an_isolated_lua_global_table() {
     assert_eq!(std::fs::read_to_string(&marker_path).unwrap(), "child-only");
     std::fs::remove_file(marker_path).unwrap();
 }
+
+#[test]
+fn failing_fs_open_callback_receives_error_as_first_argument() {
+    let (host, scheduler) = host();
+    host.lua().globals().set("missing_path", "/definitely/not/a/real/ox-lua-file").unwrap();
+    host.lua()
+        .load(
+            r#"
+            open_error = nil
+            vim.uv.fs_open(missing_path, 'r', 0, function(err, fd)
+              assert(err ~= nil, 'error must arrive as the first callback argument')
+              assert(fd == nil)
+              open_error = err
+            end)
+            "#,
+        )
+        .exec()
+        .unwrap();
+    scheduler.drain().unwrap();
+    let error = host.lua().globals().get::<String>("open_error").unwrap();
+    assert!(error.contains("ENOENT"), "unexpected error string: {error}");
+}
+
+#[test]
+fn pipe_write_callback_fires_only_when_the_loop_pumps_the_write() {
+    let (host, scheduler) = host();
+    host.lua()
+        .load(
+            r#"
+            write_fired = false
+            local input = vim.uv.new_pipe(false)
+            local output = vim.uv.new_pipe(false)
+            local process
+            process = assert(vim.uv.spawn('/bin/cat', {
+              stdio = { input, output, nil },
+            }, function(code, signal)
+              assert(code == 0 and signal == 0)
+              process:close()
+            end))
+            output:read_start(function(err, chunk)
+              assert(err == nil)
+              if not chunk then output:close() end
+            end)
+            -- Larger than the kernel pipe buffer, so queueing the write cannot
+            -- also complete it.
+            local payload = ('x'):rep(256 * 1024)
+            input:write(payload, function(err)
+              assert(err == nil)
+              write_fired = true
+              input:close()
+            end)
+            assert(write_fired == false, 'write callback fired before completion')
+            vim.uv.run('default')
+            assert(write_fired == true, 'write callback did not fire after the loop pumped the write')
+            "#,
+        )
+        .exec()
+        .unwrap();
+    scheduler.drain().unwrap();
+    assert!(host.lua().globals().get::<bool>("write_fired").unwrap());
+}
+
+#[test]
+fn timer_close_is_idempotent() {
+    let (host, scheduler) = host();
+    host.lua()
+        .load(
+            r#"
+            local timer = vim.uv.new_timer()
+            timer:start(60000, 0, function() end)
+            timer:close()
+            timer:close()
+            assert(timer:is_closing())
+            vim.uv.run('nowait')
+            timer:close()
+            closed_twice = true
+            "#,
+        )
+        .exec()
+        .unwrap();
+    scheduler.drain().unwrap();
+    assert!(host.lua().globals().get::<bool>("closed_twice").unwrap());
+}

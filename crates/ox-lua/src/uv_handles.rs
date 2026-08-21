@@ -89,6 +89,12 @@ struct StreamCallbacks {
     connect: Option<Function>,
     read: Option<Function>,
     writes: HashMap<u64, Function>,
+    /// Pipe-only: callback of the write being queued; a synchronously flushed
+    /// completion claims it during `ProcessPipe::write` before its id is known.
+    pending_write: Option<Function>,
+    /// Pipe-only: (callback, result) of a write completed synchronously inside
+    /// `ProcessPipe::write`; invoked once the pipe borrow is released.
+    completed_write: Option<(Function, Result<(), String>)>,
     shutdown: Option<Function>,
     accepted_tcp: VecDeque<Tcp>,
     #[cfg(unix)]
@@ -235,15 +241,21 @@ struct LuaProcessPipe {
 impl LuaProcessPipe {
     fn install_endpoint(&self, mut pipe: ProcessPipe) {
         let callbacks = self.callbacks.clone(); let lua = self.lua.clone(); let fast = self.fast.clone(); let access = self.access.clone();
-        pipe.set_callback(move |uv_loop, _, event| access.callback(uv_loop, || {
-            let mut callbacks = callbacks.borrow_mut();
-            match event {
-                NetEvent::Read(bytes) => if let Some(callback) = &callbacks.read { if let Ok(string) = lua.create_string(bytes) { let mut args = MultiValue::new(); args.push_back(Value::Nil); args.push_back(Value::String(string)); invoke(&lua, &fast, callback, args); } },
-                NetEvent::Eof => if let Some(callback) = &callbacks.read { let mut args = MultiValue::new(); args.push_back(Value::Nil); args.push_back(Value::Nil); invoke(&lua, &fast, callback, args); },
-                NetEvent::WriteComplete { id, result } => if let Some(callback) = callbacks.writes.remove(&id.get()) { if let Ok(args) = error_args(&lua, result) { invoke(&lua, &fast, &callback, args); } },
-                NetEvent::ShutdownComplete(result) => if let Some(callback) = callbacks.shutdown.take() { if let Ok(args) = error_args(&lua, result) { invoke(&lua, &fast, &callback, args); } },
-                _ => {}
-            }
+        pipe.set_callback(move |uv_loop, _, event| access.callback(uv_loop, || match event {
+            NetEvent::Read(bytes) => if let Some(callback) = callbacks.borrow().read.clone() { if let Ok(string) = lua.create_string(bytes) { let mut args = MultiValue::new(); args.push_back(Value::Nil); args.push_back(Value::String(string)); invoke(&lua, &fast, &callback, args); } },
+            NetEvent::Eof => if let Some(callback) = callbacks.borrow().read.clone() { let mut args = MultiValue::new(); args.push_back(Value::Nil); args.push_back(Value::Nil); invoke(&lua, &fast, &callback, args); },
+            // Release the borrow before invoking: the Lua write callback may
+            // call back into this pipe (shutdown/close/write).
+            NetEvent::WriteComplete { id, result } => {
+                let mut state = callbacks.borrow_mut();
+                match state.writes.remove(&id.get()) {
+                    Some(callback) => { drop(state); if let Ok(args) = error_args(&lua, result) { invoke(&lua, &fast, &callback, args); } }
+                    // A completion racing its own queueing: stash it — the
+                    // pipe is borrowed while `ProcessPipe::write` delivers this.
+                    None => { if let Some(callback) = state.pending_write.take() { state.completed_write = Some((callback, result.map_err(|error| error.to_string()))); } }
+                }
+            },
+            _ => {}
         }));
         *self.inner.borrow_mut() = Some(pipe);
     }
@@ -254,7 +266,44 @@ impl UserData for LuaProcessPipe {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("read_start", |_, this, callback: Function| { this.callbacks.borrow_mut().read = Some(callback); let inner = this.inner.clone(); this.access.apply(Box::new(move |uv_loop| if let Some(pipe) = inner.borrow_mut().as_mut() { let _ = pipe.read_start_current(uv_loop); }))?; Ok(true) });
         methods.add_method("read_stop", |_, this, ()| { this.callbacks.borrow_mut().read = None; let inner = this.inner.clone(); this.access.apply(Box::new(move |uv_loop| if let Some(pipe) = inner.borrow_mut().as_mut() { let _ = pipe.read_stop(uv_loop); }))?; Ok(true) });
-        methods.add_method("write", |_, this, (bytes, callback): (LuaString, Option<Function>)| { let data = bytes.as_bytes().to_vec(); let inner = this.inner.clone(); let lua = this.lua.clone(); let fast = this.fast.clone(); let access = this.access.clone(); this.access.apply(Box::new(move |uv_loop| { let result = { let mut inner = inner.borrow_mut(); inner.as_mut().ok_or_else(|| ox_uv::net::NetError::Closed).and_then(|pipe| pipe.write(uv_loop, data).map(|_| ())) }; if let Some(callback) = callback { access.callback(uv_loop, || { if let Ok(args) = error_args(&lua, result) { invoke(&lua, &fast, &callback, args); } }); } }))?; Ok(true) });
+        methods.add_method("write", |_, this, (bytes, callback): (LuaString, Option<Function>)| {
+            let data = bytes.as_bytes().to_vec();
+            let inner = this.inner.clone();
+            let callbacks = this.callbacks.clone();
+            let lua = this.lua.clone();
+            let fast = this.fast.clone();
+            let access = this.access.clone();
+            this.access.apply(Box::new(move |uv_loop| {
+                if let Some(callback) = callback { callbacks.borrow_mut().pending_write = Some(callback); }
+                // A synchronously flushed write delivers its WriteComplete
+                // inside this call; keep Lua out until the pipe is released.
+                let queued = {
+                    let mut inner = inner.borrow_mut();
+                    match inner.as_mut() {
+                        Some(pipe) => pipe.write(uv_loop, data),
+                        None => Err(ox_uv::net::NetError::Closed),
+                    }
+                };
+                let delivery = match queued {
+                    Ok(id) => {
+                        let claimed = callbacks.borrow_mut().pending_write.take();
+                        match claimed {
+                            // An outstanding remainder completes on a later
+                            // loop turn under this write id, like TCP/TTY.
+                            Some(callback) => { callbacks.borrow_mut().writes.insert(id.get(), callback); None }
+                            None => callbacks.borrow_mut().completed_write.take(),
+                        }
+                    }
+                    Err(error) => {
+                        callbacks.borrow_mut().pending_write.take().map(|callback| (callback, Err(error.to_string())))
+                    }
+                };
+                if let Some((callback, result)) = delivery {
+                    access.callback(uv_loop, || { if let Ok(args) = error_args(&lua, result) { invoke(&lua, &fast, &callback, args); } });
+                }
+            }))?;
+            Ok(true)
+        });
         methods.add_method("shutdown", |_, this, callback: Option<Function>| { this.callbacks.borrow_mut().shutdown = callback; let inner = this.inner.clone(); this.access.apply(Box::new(move |uv_loop| if let Some(pipe) = inner.borrow_mut().as_mut() { let _ = pipe.shutdown(uv_loop); }))?; Ok(true) });
         methods.add_method("close", |_, this, callback: Option<Function>| { let inner = this.inner.clone(); let lua = this.lua.clone(); let fast = this.fast.clone(); this.access.apply(Box::new(move |uv_loop| if let Some(pipe) = inner.borrow_mut().take() { let _ = pipe.close(uv_loop); if let Some(callback) = callback { invoke(&lua, &fast, &callback, MultiValue::new()); } }))?; Ok(()) });
         methods.add_method("is_closing", |_, this, ()| Ok(this.inner.borrow().as_ref().is_none_or(|pipe| pipe.is_closing(&this.access.uv_loop.borrow()))));

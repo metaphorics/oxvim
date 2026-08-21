@@ -101,6 +101,10 @@ impl UserData for LuaTimer {
             Ok(this.timer.is_closing(&this.uv_loop.borrow()))
         });
         methods.add_method("close", |lua, this, callback: Option<Function>| {
+            // Closing twice is a harmless no-op, like the Option-backed stream handles.
+            if this.timer.is_closing(&this.uv_loop.borrow()) {
+                return Ok(());
+            }
             match callback {
                 Some(callback) => {
                     let lua = lua.clone();
@@ -123,7 +127,13 @@ impl UserData for LuaTimer {
                         })
                         .map_err(mlua::Error::external)?;
                 }
-                None => this.timer.close(&mut this.uv_loop.borrow_mut()).map_err(mlua::Error::external)?,
+                None => match this.timer.close(&mut this.uv_loop.borrow_mut()) {
+                    Ok(()) => {}
+                    // A handle whose close already completed no longer names a
+                    // registry entry; treat it as another close request.
+                    Err(ox_uv::Error::InvalidHandle(_) | ox_uv::Error::AlreadyClosing(_)) => {}
+                    Err(error) => return Err(mlua::Error::external(error)),
+                },
             }
             Ok(())
         });
@@ -291,7 +301,7 @@ fn finish_fs<T: mlua::IntoLuaMulti + 'static>(
             Ok(MultiValue::new())
         }
         (Err(error), Some(callback)) => {
-            let args = error_values(lua, &error)?;
+            let args = callback_error_values(lua, &error)?;
             schedule_callback(scheduler, lua.clone(), callback, args, fast).map_err(mlua::Error::runtime)?;
             Ok(MultiValue::new())
         }
@@ -300,19 +310,30 @@ fn finish_fs<T: mlua::IntoLuaMulti + 'static>(
     }
 }
 
-fn error_values(lua: &Lua, error: &std::io::Error) -> mlua::Result<MultiValue> {
-    let name = match error.kind() {
+fn errno_name(error: &std::io::Error) -> &'static str {
+    match error.kind() {
         std::io::ErrorKind::NotFound => "ENOENT",
         std::io::ErrorKind::PermissionDenied => "EACCES",
         std::io::ErrorKind::AlreadyExists => "EEXIST",
         std::io::ErrorKind::InvalidInput => "EINVAL",
         std::io::ErrorKind::WouldBlock => "EAGAIN",
         _ => "EIO",
-    };
+    }
+}
+
+/// Synchronous failure shape: `nil, err, name` (luv `fail` returns).
+fn error_values(lua: &Lua, error: &std::io::Error) -> mlua::Result<MultiValue> {
     Ok(MultiValue::from_vec(vec![
         Value::Nil,
         Value::String(lua.create_string(error.to_string())?),
-        Value::String(lua.create_string(name)?),
+        Value::String(lua.create_string(errno_name(error))?),
+    ]))
+}
+
+/// Async failure shape: a single leading error string, as in luv callbacks.
+fn callback_error_values(lua: &Lua, error: &std::io::Error) -> mlua::Result<MultiValue> {
+    Ok(MultiValue::from_vec(vec![
+        Value::String(lua.create_string(format!("{}: {error}", errno_name(error)))?),
     ]))
 }
 
