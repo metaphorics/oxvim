@@ -5,5 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 description = "#[api]-annotated nvim_* API implementations."
 
+[dependencies]
+ox-api-macros = { path = "../ox-api-macros" }
+ox-types = { path = "../ox-types" }
+thiserror.workspace = true
+
 [lints]
 workspace = true

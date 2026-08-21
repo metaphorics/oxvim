@@ -8,5 +8,13 @@ description = "the #[api] proc-macro (dispatch + metadata codegen)."
 [lib]
 proc-macro = true
 
+[dependencies]
+# proc-macro2: latest stable from crates.io as of 2026-08-22.
+proc-macro2 = "1.0.107"
+# quote: latest stable from crates.io as of 2026-08-22.
+quote = "1.0.47"
+# syn: latest stable from crates.io as of 2026-08-22.
+syn = { version = "3.0.3", features = ["full"] }
+
 [lints]
 workspace = true
