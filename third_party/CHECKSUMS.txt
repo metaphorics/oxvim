@@ -1,0 +1,4 @@
+e8b8774b31d24be4fcf2b021b90599ecccc8e476c61efcc59c3c10cab813a885  third_party/archives/luv-1.52.1-0.tar.gz
+4b155d67d2246c1ffa7ad7bc466c1ea899bbc40fef0257cc9c03cecbaed4352a  third_party/archives/lpeg-1.1.0.tar.gz
+f5dc30e7b1fda856ee4d392be457642c1f0c259264a9b9bfbcb680302ce88fc2  third_party/archives/lua-compat-5.3-0.13.tar.gz
+abfed50b6d4da51345713661370290f4f4747263ee73dc90356299dfc7990c78  third_party/archives/utf8proc-2.11.3.tar.gz
