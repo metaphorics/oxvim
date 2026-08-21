@@ -5,8 +5,10 @@
 //! numbers are derived from a stable, one-based preorder traversal; handles,
 //! rather than numbers, remain the persistent identity.
 
+use std::collections::BTreeMap;
+
 use ox_text::Position;
-use ox_types::{BufHandle, WinHandle};
+use ox_types::{BufHandle, Dict, WinHandle};
 use thiserror::Error;
 
 /// A rectangular screen region.
@@ -60,6 +62,46 @@ impl WindowState {
             cursor,
             topline: 1,
         }
+    }
+}
+
+/// API-visible state that does not affect window layout topology.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowApiState {
+    /// Window-local variables in insertion order.
+    variables: Dict,
+    /// Highlight namespace selected for this window.
+    highlight_namespace: i64,
+}
+
+impl WindowApiState {
+    fn new() -> Self {
+        Self {
+            variables: Dict(Vec::new()),
+            highlight_namespace: 0,
+        }
+    }
+
+    /// Returns window-local variables.
+    #[must_use]
+    pub const fn variables(&self) -> &Dict {
+        &self.variables
+    }
+
+    /// Returns mutable window-local variables.
+    pub const fn variables_mut(&mut self) -> &mut Dict {
+        &mut self.variables
+    }
+
+    /// Returns the selected highlight namespace.
+    #[must_use]
+    pub const fn highlight_namespace(&self) -> i64 {
+        self.highlight_namespace
+    }
+
+    /// Selects the highlight namespace without attempting to render it.
+    pub fn set_highlight_namespace(&mut self, namespace: i64) {
+        self.highlight_namespace = namespace;
     }
 }
 
@@ -151,6 +193,20 @@ pub enum LayoutError {
         /// Number of children sharing the axis.
         children: usize,
     },
+    /// Geometry cannot satisfy the requested window extent while retaining siblings.
+    #[error("requested window extent {requested} exceeds {available} available cells")]
+    InvalidWindowExtent {
+        /// Requested width or height.
+        requested: usize,
+        /// Cells available on that axis.
+        available: usize,
+    },
+    /// Floating-window relative references must not form a cycle.
+    #[error("floating-window geometry contains a reference cycle at {0:?}")]
+    FloatingReferenceCycle(WinHandle),
+    /// Resolved floating-window content must begin at a non-negative finite position.
+    #[error("floating-window content resolves outside the editor grid")]
+    InvalidResolvedPosition,
     /// A floating-window coordinate must be finite.
     #[error("floating-window row and column must be finite")]
     InvalidCoordinate,
@@ -318,6 +374,24 @@ impl Layout {
         Ok(removed.state)
     }
 
+    /// Changes one tiled window's width while preserving the root rectangle.
+    pub fn set_window_width(
+        &mut self,
+        window: WinHandle,
+        width: usize,
+    ) -> Result<(), LayoutError> {
+        self.set_window_extent(window, width, SplitAxis::Vertical)
+    }
+
+    /// Changes one tiled window's height while preserving the root rectangle.
+    pub fn set_window_height(
+        &mut self,
+        window: WinHandle,
+        height: usize,
+    ) -> Result<(), LayoutError> {
+        self.set_window_extent(window, height, SplitAxis::Horizontal)
+    }
+
     /// Changes the root rectangle and equalizes every split below it.
     pub fn resize(&mut self, geometry: Geometry) -> Result<(), LayoutError> {
         equalize_frame(&mut self.root, geometry)
@@ -334,6 +408,37 @@ impl Layout {
             self.current
         } else {
             window
+        }
+    }
+
+    fn set_window_extent(
+        &mut self,
+        window: WinHandle,
+        extent: usize,
+        axis: SplitAxis,
+    ) -> Result<(), LayoutError> {
+        let resolved = self.resolve(window);
+        let geometry = self.window_geometry(resolved)?;
+        let current = match axis {
+            SplitAxis::Vertical => geometry.width,
+            SplitAxis::Horizontal => geometry.height,
+        };
+        if extent == 0 {
+            return Err(LayoutError::InvalidDimensions {
+                width: if matches!(axis, SplitAxis::Vertical) { 0 } else { geometry.width },
+                height: if matches!(axis, SplitAxis::Horizontal) { 0 } else { geometry.height },
+            });
+        }
+        if extent == current {
+            return Ok(());
+        }
+        if resize_window_extent(&mut self.root, resolved, extent, axis)? {
+            Ok(())
+        } else {
+            Err(LayoutError::InvalidWindowExtent {
+                requested: extent,
+                available: current,
+            })
         }
     }
 
@@ -568,6 +673,8 @@ pub struct FloatingWindow {
 pub struct TabpageState {
     layout: Layout,
     floats: Vec<FloatingWindow>,
+    window_api: BTreeMap<WinHandle, WindowApiState>,
+    variables: Dict,
     current: WinHandle,
 }
 
@@ -576,11 +683,139 @@ impl TabpageState {
     #[must_use]
     pub fn new(layout: Layout) -> Self {
         let current = layout.current_window();
+        let window_api = layout
+            .windows()
+            .into_iter()
+            .map(|window| (window, WindowApiState::new()))
+            .collect();
         Self {
             layout,
             floats: Vec::new(),
+            window_api,
+            variables: Dict(Vec::new()),
             current,
         }
+    }
+
+    /// Returns tabpage-local variables.
+    #[must_use]
+    pub const fn variables(&self) -> &Dict {
+        &self.variables
+    }
+
+    /// Returns mutable tabpage-local variables.
+    pub const fn variables_mut(&mut self) -> &mut Dict {
+        &mut self.variables
+    }
+
+    /// Returns tiled windows in preorder followed by floating windows in z-order.
+    #[must_use]
+    pub fn windows(&self) -> Vec<WinHandle> {
+        let mut windows = self.layout.windows();
+        windows.extend(self.floats.iter().map(|window| window.window));
+        windows
+    }
+
+    /// Returns API-visible state for a tiled or floating window.
+    pub fn window_api_state(&self, window: WinHandle) -> Result<&WindowApiState, LayoutError> {
+        let resolved = self.resolve(window);
+        self.window_api
+            .get(&resolved)
+            .ok_or(LayoutError::UnknownWindow(resolved))
+    }
+
+    /// Returns mutable API-visible state for a tiled or floating window.
+    pub fn window_api_state_mut(
+        &mut self,
+        window: WinHandle,
+    ) -> Result<&mut WindowApiState, LayoutError> {
+        let resolved = self.resolve(window);
+        self.window_api
+            .get_mut(&resolved)
+            .ok_or(LayoutError::UnknownWindow(resolved))
+    }
+
+    /// Returns assigned content geometry for a tiled or floating window.
+    pub fn window_geometry(&self, window: WinHandle) -> Result<Geometry, LayoutError> {
+        let resolved = self.resolve(window);
+        if let Ok(geometry) = self.layout.window_geometry(resolved) {
+            return Ok(geometry);
+        }
+        self.resolve_window_geometry(resolved, 0)
+    }
+
+    /// Returns floating configuration, or `None` for a tiled window.
+    pub fn window_config(&self, window: WinHandle) -> Result<Option<&WinConfig>, LayoutError> {
+        let resolved = self.resolve(window);
+        if let Some(window) = self
+            .floats
+            .iter()
+            .find(|candidate| candidate.window == resolved)
+        {
+            return Ok(Some(&window.config));
+        }
+        self.layout.window(resolved)?;
+        Ok(None)
+    }
+
+    /// Updates an existing floating window configuration and restores z-order.
+    pub fn set_window_config(
+        &mut self,
+        window: WinHandle,
+        config: WinConfig,
+    ) -> Result<(), LayoutError> {
+        config.validate()?;
+        let resolved = self.resolve(window);
+        let floating = self
+            .floats
+            .iter_mut()
+            .find(|candidate| candidate.window == resolved)
+            .ok_or(LayoutError::UnknownWindow(resolved))?;
+        floating.config = config;
+        self.floats.sort_by_key(|window| window.config.zindex);
+        Ok(())
+    }
+
+    /// Changes a tiled or floating window's width.
+    pub fn set_window_width(
+        &mut self,
+        window: WinHandle,
+        width: usize,
+    ) -> Result<(), LayoutError> {
+        let resolved = self.resolve(window);
+        if let Some(floating) = self
+            .floats
+            .iter_mut()
+            .find(|candidate| candidate.window == resolved)
+        {
+            let mut config = floating.config.clone();
+            config.width = width;
+            config.validate()?;
+            floating.config = config;
+            return Ok(());
+        }
+        self.layout.set_window_width(resolved, width)
+    }
+
+    /// Changes a tiled or floating window's height.
+    pub fn set_window_height(
+        &mut self,
+        window: WinHandle,
+        height: usize,
+    ) -> Result<(), LayoutError> {
+        let resolved = self.resolve(window);
+        if let Some(floating) = self
+            .floats
+            .iter_mut()
+            .find(|candidate| candidate.window == resolved)
+        {
+            let mut config = floating.config.clone();
+            config.height = height;
+            config.validate()?;
+            floating.config = config;
+            return Ok(());
+        }
+        self.layout.set_window_height(resolved, height)
     }
 
     /// Returns the tiled layout.
@@ -671,6 +906,7 @@ impl TabpageState {
                 config,
             },
         );
+        self.window_api.insert(window, WindowApiState::new());
         Ok(())
     }
 
@@ -683,6 +919,7 @@ impl TabpageState {
             .position(|candidate| candidate.window == resolved)
             .ok_or(LayoutError::UnknownWindow(resolved))?;
         let removed = self.floats.remove(index);
+        self.window_api.remove(&resolved);
         if self.current == resolved {
             self.current = self.layout.current_window();
         }
@@ -693,6 +930,7 @@ impl TabpageState {
     pub fn close_tiled(&mut self, window: WinHandle) -> Result<WindowState, LayoutError> {
         let resolved = self.resolve(window);
         let removed = self.layout.close(resolved)?;
+        self.window_api.remove(&resolved);
         if self.current == resolved {
             self.current = self.layout.current_window();
         }
@@ -712,6 +950,7 @@ impl TabpageState {
         }
         let target = self.resolve(target);
         self.layout.split_vertical(target, window, state)?;
+        self.window_api.insert(window, WindowApiState::new());
         self.current = window;
         Ok(())
     }
@@ -729,6 +968,7 @@ impl TabpageState {
         }
         let target = self.resolve(target);
         self.layout.split_horizontal(target, window, state)?;
+        self.window_api.insert(window, WindowApiState::new());
         self.current = window;
         Ok(())
     }
@@ -751,12 +991,100 @@ impl TabpageState {
         }
     }
 
+    fn resolve_window_geometry(
+        &self,
+        window: WinHandle,
+        depth: usize,
+    ) -> Result<Geometry, LayoutError> {
+        if let Ok(geometry) = self.layout.window_geometry(window) {
+            return Ok(geometry);
+        }
+        if depth > self.floats.len() {
+            return Err(LayoutError::FloatingReferenceCycle(window));
+        }
+        let floating = self
+            .floats
+            .iter()
+            .find(|candidate| candidate.window == window)
+            .ok_or(LayoutError::UnknownWindow(window))?;
+        let next_depth = depth.saturating_add(1);
+        let (origin_row, origin_col) = match floating.config.relative {
+            RelativeTo::Editor => (0.0, 0.0),
+            RelativeTo::Window(relative) => {
+                let geometry =
+                    self.resolve_window_geometry(self.resolve(relative), next_depth)?;
+                (geometry.row as f64, geometry.col as f64)
+            }
+            RelativeTo::Cursor => {
+                let relative = self.current;
+                let geometry = self.resolve_window_geometry(relative, next_depth)?;
+                let state = self.window(relative)?;
+                let cursor_row = state.cursor.lnum.saturating_sub(state.topline);
+                (
+                    geometry.row as f64 + cursor_row as f64,
+                    geometry.col as f64 + state.cursor.col as f64,
+                )
+            }
+        };
+        floating_content_geometry(&floating.config, origin_row, origin_col)
+    }
+
     fn contains(&self, window: WinHandle) -> bool {
         self.floats
             .iter()
             .any(|candidate| candidate.window == window)
             || self.layout.window(window).is_ok()
     }
+}
+
+fn floating_content_geometry(
+    config: &WinConfig,
+    origin_row: f64,
+    origin_col: f64,
+) -> Result<Geometry, LayoutError> {
+    config.validate()?;
+    let border = usize::from(!matches!(&config.border, Border::None));
+    let top_inset = config
+        .margins
+        .top
+        .checked_add(border)
+        .ok_or(LayoutError::GeometryOverflow)?;
+    let left_inset = config
+        .margins
+        .left
+        .checked_add(border)
+        .ok_or(LayoutError::GeometryOverflow)?;
+    let outer_width = config
+        .width
+        .checked_add(config.margins.left)
+        .and_then(|value| value.checked_add(config.margins.right))
+        .and_then(|value| value.checked_add(border.saturating_mul(2)))
+        .ok_or(LayoutError::GeometryOverflow)?;
+    let outer_height = config
+        .height
+        .checked_add(config.margins.top)
+        .and_then(|value| value.checked_add(config.margins.bottom))
+        .and_then(|value| value.checked_add(border.saturating_mul(2)))
+        .ok_or(LayoutError::GeometryOverflow)?;
+    let anchor_row = origin_row + config.row;
+    let anchor_col = origin_col + config.col;
+    let outer_row = match config.anchor {
+        Anchor::NorthWest | Anchor::NorthEast => anchor_row,
+        Anchor::SouthWest | Anchor::SouthEast => anchor_row - outer_height as f64,
+    };
+    let outer_col = match config.anchor {
+        Anchor::NorthWest | Anchor::SouthWest => anchor_col,
+        Anchor::NorthEast | Anchor::SouthEast => anchor_col - outer_width as f64,
+    };
+    let row = outer_row + top_inset as f64;
+    let col = outer_col + left_inset as f64;
+    if !row.is_finite() || !col.is_finite() || row < 0.0 || col < 0.0 {
+        return Err(LayoutError::InvalidResolvedPosition);
+    }
+    if row > usize::MAX as f64 || col > usize::MAX as f64 {
+        return Err(LayoutError::GeometryOverflow);
+    }
+    Geometry::new(row.floor() as usize, col.floor() as usize, config.width, config.height)
 }
 
 fn validate_identity(window: WinHandle) -> Result<(), LayoutError> {
@@ -797,6 +1125,132 @@ fn find_leaf_mut(frame: &mut Frame, window: WinHandle) -> Option<&mut LeafFrame>
         Frame::Row { children, .. } | Frame::Column { children, .. } => children
             .iter_mut()
             .find_map(|child| find_leaf_mut(child, window)),
+    }
+}
+
+fn resize_window_extent(
+    frame: &mut Frame,
+    window: WinHandle,
+    requested: usize,
+    axis: SplitAxis,
+) -> Result<bool, LayoutError> {
+    let container_matches = matches_axis(frame, axis);
+    let (geometry, children) = match frame {
+        Frame::Leaf(_) => return Ok(false),
+        Frame::Row { geometry, children } | Frame::Column { geometry, children } => {
+            (*geometry, children)
+        }
+    };
+    let Some(target_index) = children
+        .iter()
+        .position(|child| find_leaf(child, window).is_some())
+    else {
+        return Ok(false);
+    };
+    if !container_matches {
+        return resize_window_extent(&mut children[target_index], window, requested, axis);
+    }
+
+    let available = match axis {
+        SplitAxis::Vertical => geometry.width,
+        SplitAxis::Horizontal => geometry.height,
+    };
+    let sibling_count = children.len().saturating_sub(1);
+    let target_minimum = minimum_extent(&children[target_index], axis);
+    let sibling_minimum = children
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != target_index)
+        .map(|(_, child)| minimum_extent(child, axis))
+        .try_fold(0usize, |total, minimum| total.checked_add(minimum))
+        .ok_or(LayoutError::GeometryOverflow)?;
+    let required = requested
+        .checked_add(sibling_minimum)
+        .ok_or(LayoutError::GeometryOverflow)?;
+    if requested < target_minimum || required > available {
+        return Err(LayoutError::InvalidWindowExtent { requested, available });
+    }
+    let remaining = available - required;
+    let sibling_base = if sibling_count == 0 {
+        0
+    } else {
+        remaining / sibling_count
+    };
+    let sibling_remainder = if sibling_count == 0 {
+        0
+    } else {
+        remaining % sibling_count
+    };
+    let distributed_extent = |index: usize, frame: &Frame| {
+        if index == target_index {
+            requested
+        } else {
+            let sibling_index = index - usize::from(index > target_index);
+            minimum_extent(frame, axis)
+                + sibling_base
+                + usize::from(sibling_index < sibling_remainder)
+        }
+    };
+    let mut offset = 0usize;
+    for (index, child) in children.iter().enumerate() {
+        let extent = distributed_extent(index, child);
+        let child_geometry = geometry_with_extent(geometry, axis, offset, extent)?;
+        validate_frame_geometry(child, child_geometry)?;
+        offset = offset
+            .checked_add(extent)
+            .ok_or(LayoutError::GeometryOverflow)?;
+    }
+    offset = 0;
+    for (index, child) in children.iter_mut().enumerate() {
+        let extent = distributed_extent(index, child);
+        let child_geometry = geometry_with_extent(geometry, axis, offset, extent)?;
+        assign_frame_geometry(child, child_geometry);
+        offset = offset
+            .checked_add(extent)
+            .ok_or(LayoutError::GeometryOverflow)?;
+    }
+    Ok(true)
+}
+
+fn minimum_extent(frame: &Frame, axis: SplitAxis) -> usize {
+    match frame {
+        Frame::Leaf(_) => 1,
+        Frame::Row { children, .. } | Frame::Column { children, .. } if matches_axis(frame, axis) => {
+            children.iter().fold(0usize, |total, child| {
+                total.saturating_add(minimum_extent(child, axis))
+            })
+        }
+        Frame::Row { children, .. } | Frame::Column { children, .. } => children
+            .iter()
+            .fold(1usize, |minimum, child| minimum.max(minimum_extent(child, axis))),
+    }
+}
+
+fn geometry_with_extent(
+    geometry: Geometry,
+    axis: SplitAxis,
+    offset: usize,
+    extent: usize,
+) -> Result<Geometry, LayoutError> {
+    match axis {
+        SplitAxis::Vertical => Ok(Geometry {
+            row: geometry.row,
+            col: geometry
+                .col
+                .checked_add(offset)
+                .ok_or(LayoutError::GeometryOverflow)?,
+            width: extent,
+            height: geometry.height,
+        }),
+        SplitAxis::Horizontal => Ok(Geometry {
+            row: geometry
+                .row
+                .checked_add(offset)
+                .ok_or(LayoutError::GeometryOverflow)?,
+            col: geometry.col,
+            width: geometry.width,
+            height: extent,
+        }),
     }
 }
 

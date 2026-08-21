@@ -1,9 +1,32 @@
 //! Buffer ownership, text mutation, and buflist lifecycle.
 
+use std::collections::BTreeMap;
+
 use ox_text::{Buffer, BufferError, Cursor, LineEdit, Position, UndoStep, UndoTree};
+use ox_types::{Dict, Object, OxStr};
 use thiserror::Error;
 
 use crate::marks::LocalMarks;
+
+/// A buffer-local user command retained for later command execution.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UserCommandDefinition {
+    /// Command body or callable reference supplied through the API.
+    pub command: Object,
+    /// API options retained with the definition.
+    pub options: Dict,
+}
+
+/// A channel's intent to receive buffer update events.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BufferAttachSubscription {
+    /// RPC channel that requested the subscription.
+    pub channel_id: u64,
+    /// Whether initial buffer contents were requested.
+    pub send_buffer: bool,
+    /// Event and callback options supplied by the caller.
+    pub options: Dict,
+}
 
 /// Failures while changing a buffer or its lifecycle.
 #[derive(Debug, Error)]
@@ -24,6 +47,14 @@ pub enum BufferStateError {
 pub struct BufferState {
     /// Rope-backed text.
     text: Buffer,
+    /// API-visible buffer name as uninterpreted bytes.
+    name: OxStr,
+    /// Buffer-local API variables in insertion order.
+    variables: Dict,
+    /// Buffer-local user commands keyed by command name.
+    user_commands: BTreeMap<OxStr, UserCommandDefinition>,
+    /// Attached RPC channels keyed by channel identity.
+    subscriptions: BTreeMap<u64, BufferAttachSubscription>,
     /// Branch-preserving undo history.
     pub undo: UndoTree,
     /// Named and special buffer-local marks.
@@ -70,6 +101,10 @@ impl BufferState {
     pub fn new(text: Buffer, listed: bool) -> Self {
         Self {
             text,
+            name: OxStr::from(""),
+            variables: Dict(Vec::new()),
+            user_commands: BTreeMap::new(),
+            subscriptions: BTreeMap::new(),
             undo: UndoTree::new(),
             marks: LocalMarks::new(),
             listed,
@@ -79,6 +114,54 @@ impl BufferState {
             changedtick_diag: 0,
             changedtick_fold: 0,
         }
+    }
+
+    /// Returns the API-visible buffer name.
+    #[must_use]
+    pub const fn name(&self) -> &OxStr {
+        &self.name
+    }
+
+    /// Replaces the API-visible buffer name.
+    pub fn set_name(&mut self, name: OxStr) {
+        self.name = name;
+    }
+
+    /// Returns buffer-local API variables.
+    #[must_use]
+    pub const fn variables(&self) -> &Dict {
+        &self.variables
+    }
+
+    /// Returns mutable buffer-local API variables.
+    pub const fn variables_mut(&mut self) -> &mut Dict {
+        &mut self.variables
+    }
+
+    /// Returns stored buffer-local user commands.
+    #[must_use]
+    pub const fn user_commands(&self) -> &BTreeMap<OxStr, UserCommandDefinition> {
+        &self.user_commands
+    }
+
+    /// Returns mutable stored buffer-local user commands.
+    pub const fn user_commands_mut(
+        &mut self,
+    ) -> &mut BTreeMap<OxStr, UserCommandDefinition> {
+        &mut self.user_commands
+    }
+
+    /// Returns requested buffer event subscriptions.
+    #[must_use]
+    pub const fn subscriptions(&self) -> &BTreeMap<u64, BufferAttachSubscription> {
+        &self.subscriptions
+    }
+
+    /// Returns mutable requested buffer event subscriptions.
+    pub const fn subscriptions_mut(
+        &mut self,
+    ) -> &mut BTreeMap<u64, BufferAttachSubscription> {
+        &mut self.subscriptions
     }
 
     /// Returns the text change counter maintained by `ox-text`.
@@ -308,6 +391,7 @@ impl BufferState {
     fn release_resident_state(&mut self) {
         self.text = Buffer::new();
         self.undo = UndoTree::new();
+        self.subscriptions.clear();
     }
 
     fn bump_derived_ticks(&mut self) {

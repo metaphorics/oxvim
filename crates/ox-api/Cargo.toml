@@ -7,8 +7,14 @@ description = "#[api]-annotated nvim_* API implementations."
 
 [dependencies]
 ox-api-macros = { path = "../ox-api-macros" }
+ox-editor = { path = "../ox-editor" }
+ox-eval = { path = "../ox-eval" }
+ox-excmd = { path = "../ox-excmd" }
+ox-rpc = { path = "../ox-rpc" }
+ox-text = { path = "../ox-text" }
 ox-types = { path = "../ox-types" }
 thiserror.workspace = true
+unicode-width = "0.2.2"
 
 [lints]
 workspace = true
