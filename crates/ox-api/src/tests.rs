@@ -1,6 +1,9 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use ox_editor::{Editor, Geometry, K_SPECIAL, KS_EXTRA};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use ox_editor::{AutocmdAction, Editor, Geometry, K_SPECIAL, KS_EXTRA};
 use ox_text::Buffer;
 
 use crate::{ApiError, Dict, Object, OxStr, TypeRef};
@@ -178,7 +181,7 @@ fn option_value_scope_distinguishes_global_and_local() {
 #[test]
 fn core_registry_metadata_matches_cross_family_sample() {
     let registry = crate::core().unwrap();
-    assert_eq!(registry.len(), 77);
+    assert_eq!(registry.len(), 147);
     let expected = [
         ("nvim_buf_get_lines", 1, TypeRef::ArrayOf(&TypeRef::String)),
         ("nvim_buf_get_text", 9, TypeRef::ArrayOf(&TypeRef::String)),
@@ -253,6 +256,92 @@ fn cursor_column_rejects_values_above_maxcol_before_clamping() {
     // MAXCOL itself is accepted, then clamped to the line length.
     crate::window::nvim_win_set_cursor(&mut editor, window, vec![1, 0x7fff_ffff]).unwrap();
     assert_eq!(crate::window::nvim_win_get_cursor(&mut editor, window), Ok(vec![1, 3]));
+}
+
+#[derive(Clone)]
+struct CapturingAutocmds(Rc<RefCell<Vec<u64>>>);
+
+impl crate::AutocmdExecutor for CapturingAutocmds {
+    fn execute(&mut self, action: &AutocmdAction) -> Result<(), String> {
+        self.0.borrow_mut().push(action.id);
+        Ok(())
+    }
+}
+
+#[test]
+fn autocmd_round_trip_shape_clear_and_definition_order() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    let first = crate::autocmd::nvim_create_autocmd(
+        &mut editor, Object::String(OxStr::from("BufEnter")),
+        dict(&[("pattern", Object::String(OxStr::from("*.rs"))), ("command", Object::String(OxStr::from("first")))]),
+    ).unwrap();
+    let second = crate::autocmd::nvim_create_autocmd(
+        &mut editor, Object::String(OxStr::from("BufEnter")),
+        dict(&[("pattern", Object::String(OxStr::from("*.rs"))), ("command", Object::String(OxStr::from("second")))]),
+    ).unwrap();
+    let returned = crate::autocmd::nvim_get_autocmds(&mut editor, dict(&[("event", Object::String(OxStr::from("BufEnter")))])).unwrap();
+    assert_eq!(returned.len(), 2);
+    let keys = returned[0].iter().map(|(key, _)| key.to_string_lossy().into_owned()).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(keys, ["command", "desc", "event", "group", "id", "once", "pattern"].into_iter().map(str::to_owned).collect());
+    let captured = Rc::new(RefCell::new(Vec::new()));
+    crate::set_autocmd_executor(&editor, Box::new(CapturingAutocmds(captured.clone())));
+    crate::autocmd::nvim_exec_autocmds(&mut editor, Object::String(OxStr::from("BufEnter")), dict(&[("pattern", Object::String(OxStr::from("file.rs")))])).unwrap();
+    assert_eq!(&*captured.borrow(), &[first as u64, second as u64]);
+    crate::autocmd::nvim_clear_autocmds(&mut editor, dict(&[("event", Object::String(OxStr::from("BufEnter"))), ("pattern", Object::String(OxStr::from("*.rs")))] )).unwrap();
+    assert!(crate::autocmd::nvim_get_autocmds(&mut editor, dict(&[])).unwrap().is_empty());
+}
+
+#[test]
+fn extmark_details_order_limit_delete_and_clear() {
+    let (mut editor, buffer, _, _) = editor_with_lines(&["one", "two"]);
+    let namespace = crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("tests")).unwrap();
+    let first = crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, namespace, 0, 1, dict(&[("right_gravity", Object::Boolean(false)), ("end_row", Object::Integer(1)), ("end_col", Object::Integer(2)), ("hl_group", Object::String(OxStr::from("Visual")))] )).unwrap();
+    let second = crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, namespace, 1, 0, dict(&[])).unwrap();
+    let marks = crate::extmark::nvim_buf_get_extmarks(&mut editor, buffer, namespace, Object::Array(vec![Object::Integer(0), Object::Integer(0)]), Object::Integer(-1), dict(&[("details", Object::Boolean(true)), ("limit", Object::Integer(1))])).unwrap();
+    assert_eq!(marks.len(), 1);
+    assert_eq!(marks[0][0], Object::Integer(first));
+    let Object::Dict(details) = &marks[0][3] else { panic!("missing details") };
+    assert_eq!(details.get(&OxStr::from("right_gravity")), Some(&Object::Boolean(false)));
+    assert!(crate::extmark::nvim_buf_del_extmark(&mut editor, buffer, namespace, second).unwrap());
+    crate::extmark::nvim_buf_clear_namespace(&mut editor, buffer, namespace, 0, -1).unwrap();
+    assert!(crate::extmark::nvim_buf_get_extmark_by_id(&mut editor, buffer, namespace, first, dict(&[])).unwrap().is_empty());
+}
+
+#[test]
+fn context_channel_and_ui_round_trip() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    editor.vvars_mut().0.push((OxStr::from("answer"), Object::Integer(42)));
+    let context = crate::context::nvim_get_context(&mut editor, dict(&[("types", Object::Array(vec![Object::String(OxStr::from("gvars")), Object::String(OxStr::from("bufs"))]))])).unwrap();
+    editor.vvars_mut().0.clear();
+    crate::context::nvim_load_context(&mut editor, context).unwrap();
+    assert_eq!(editor.vvars().get(&OxStr::from("answer")), Some(&Object::Integer(42)));
+
+    crate::channel::nvim_set_client_info(&mut editor, OxStr::from("tests"), dict(&[("major", Object::Integer(1))]), OxStr::from("remote"), dict(&[]), dict(&[])).unwrap();
+    let info = crate::channel::nvim_get_chan_info(&mut editor, 1).unwrap();
+    assert_eq!(info.iter().map(|(key, _)| key.to_string_lossy().into_owned()).collect::<std::collections::BTreeSet<_>>(), ["client", "id", "mode", "stream"].into_iter().map(str::to_owned).collect());
+    assert!(crate::channel::nvim_set_client_info(&mut editor, OxStr::from("bad"), dict(&[]), OxStr::from("invalid"), dict(&[]), dict(&[])).is_err());
+
+    crate::ui::nvim_ui_attach(&mut editor, 80, 24, dict(&[("ext_linegrid", Object::Boolean(true)), ("ext_hlstate", Object::Boolean(true))])).unwrap();
+    assert_eq!(crate::ui::nvim_list_uis(&mut editor).unwrap().len(), 1);
+    crate::ui::nvim_set_hl(&mut editor, 0, OxStr::from("Task11b"), dict(&[("fg", Object::Integer(0x112233)), ("bold", Object::Boolean(true))])).unwrap();
+    let highlight = crate::ui::nvim_get_hl(&mut editor, 0, dict(&[("name", Object::String(OxStr::from("Task11b")))])).unwrap();
+    assert_eq!(highlight.get(&OxStr::from("foreground")), Some(&Object::Integer(0x112233)));
+    crate::ui::nvim_set_hl_ns(&mut editor, 9).unwrap();
+    assert_eq!(crate::ui::nvim_get_hl_ns(&mut editor, dict(&[])), Ok(9));
+}
+
+#[test]
+fn new_family_metadata_and_dispatch_are_registered() {
+    let registry = crate::core().unwrap();
+    for (name, since, deprecated) in [("nvim_create_autocmd", 9, None), ("nvim_buf_set_extmark", 7, None), ("nvim_get_context", 6, None), ("nvim_ui_attach", 1, None), ("nvim_buf_get_number", 1, Some(2))] {
+        let metadata = registry.get(name).unwrap().0;
+        assert_eq!((metadata.since, metadata.deprecated_since), (since, deprecated));
+    }
+    let mut editor = Editor::new();
+    let dispatch = registry.get("nvim_create_namespace").unwrap().1;
+    assert_eq!(dispatch(&mut editor, &[Object::String(OxStr::from("dispatch"))]), Ok(Object::Integer(1)));
+    let dispatch = registry.get("nvim_list_uis").unwrap().1;
+    assert_eq!(dispatch(&mut editor, &[]), Ok(Object::Array(Vec::new())));
 }
 
 #[test]

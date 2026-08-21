@@ -328,6 +328,7 @@ dependencies = [
  "ox-rpc",
  "ox-text",
  "ox-types",
+ "ox-ui",
  "thiserror 2.0.20",
  "unicode-width",
 ]

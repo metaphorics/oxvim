@@ -214,6 +214,11 @@ impl UiChannels {
     pub fn get_mut(&mut self, id: u64) -> Option<&mut UiChannel> { self.channels.get_mut(&id) }
 
     /// Iterates attached channels in stable id order.
+    pub fn iter(&self) -> impl Iterator<Item = (&u64, &UiChannel)> {
+        self.channels.iter()
+    }
+
+    /// Iterates attached channels in stable id order.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&u64, &mut UiChannel)> {
         self.channels.iter_mut()
     }
