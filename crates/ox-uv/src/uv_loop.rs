@@ -1,10 +1,16 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::handle::{Callback, HandleKind, HandleState};
+use crate::handle::{Callback, ExternalState, HandleKind, HandleState};
+use crate::pool::UvLoopPoster;
 use crate::signal::SignalDriver;
 use crate::{CallbackError, CallbackErrorEvent, CallbackPhase, Error, HandleId, Result};
+
+pub(crate) type NetDispatch = Box<dyn FnOnce(&mut UvLoop)>;
+pub(crate) type NetDispatchQueue = Rc<RefCell<VecDeque<NetDispatch>>>;
 
 /// libuv-compatible run modes over ox-loop's single-threaded pump.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,9 +37,13 @@ pub struct UvLoop {
     handles: Vec<(HandleId, HandleState)>,
     locations: HashMap<HandleId, usize>,
     next_handle_id: u64,
+    next_io_token: usize,
     pending_callbacks: VecDeque<(HandleId, CallbackPhase, Option<u64>)>,
     close_next: VecDeque<HandleId>,
     callback_errors: VecDeque<CallbackErrorEvent>,
+    completion_errors: VecDeque<CallbackError>,
+    completions: UvLoopPoster,
+    net_dispatches: NetDispatchQueue,
     stop_requested: bool,
     running_mode: Option<RunMode>,
     now_origin: Instant,
@@ -46,15 +56,20 @@ impl UvLoop {
     pub fn new() -> Result<Self> {
         let mut inner = ox_loop::Loop::new()?;
         let signals = SignalDriver::new(&mut inner)?;
+        let completions = UvLoopPoster::new(inner.reactor().waker());
         let now_origin = Instant::now();
         Ok(Self {
             inner,
             handles: Vec::new(),
             locations: HashMap::new(),
             next_handle_id: 0,
+            next_io_token: ox_loop::IO_TOKEN_START,
             pending_callbacks: VecDeque::new(),
             close_next: VecDeque::new(),
             callback_errors: VecDeque::new(),
+            completion_errors: VecDeque::new(),
+            completions,
+            net_dispatches: Rc::new(RefCell::new(VecDeque::new())),
             stop_requested: false,
             running_mode: None,
             now_origin,
@@ -141,9 +156,10 @@ impl UvLoop {
 
     /// Reports referenced active handles and all closing handles.
     pub fn loop_alive(&self) -> bool {
-        self.handles.iter().any(|(_, state)| {
-            state.closing || (state.referenced && state.is_active())
-        })
+        self.completions.has_outstanding()
+            || self.handles.iter().any(|(_, state)| {
+                state.closing || (state.referenced && state.is_active())
+            })
     }
 
     /// Visits a stable snapshot of every allocated handle identity.
@@ -175,6 +191,16 @@ impl UvLoop {
         self.callback_errors.pop_front()
     }
 
+    /// Removes the oldest panic captured from a posted completion.
+    pub fn pop_completion_error(&mut self) -> Option<CallbackError> {
+        self.completion_errors.pop_front()
+    }
+
+    /// Returns a cloneable producer for thread-pool and process completions.
+    pub fn completion_poster(&self) -> UvLoopPoster {
+        self.completions.clone()
+    }
+
     /// Returns the underlying ox-loop for Task 7b source registration.
     pub(crate) fn inner(&self) -> &ox_loop::Loop {
         &self.inner
@@ -185,6 +211,10 @@ impl UvLoop {
         &mut self.inner
     }
 
+    pub(crate) fn net_dispatch_queue(&self) -> NetDispatchQueue {
+        Rc::clone(&self.net_dispatches)
+    }
+
     pub(crate) fn allocate(&mut self, kind: HandleKind) -> Result<HandleId> {
         let raw = u32::try_from(self.next_handle_id).map_err(|_| Error::HandleLimit)?;
         self.next_handle_id += 1;
@@ -193,6 +223,28 @@ impl UvLoop {
         self.handles.push((id, HandleState::new(kind)));
         self.locations.insert(id, slot);
         Ok(id)
+    }
+
+    pub(crate) fn allocate_external(&mut self, active: bool) -> Result<HandleId> {
+        self.allocate(HandleKind::External(ExternalState { active }))
+    }
+
+    pub(crate) fn set_external_active(&mut self, id: HandleId, active: bool) -> Result<()> {
+        let state = self.state_mut(id)?;
+        let HandleKind::External(external) = &mut state.kind else {
+            return Err(crate::handle::wrong_kind(id, "external"));
+        };
+        if state.closing {
+            return Err(Error::ClosingHandle(id));
+        }
+        external.active = active;
+        Ok(())
+    }
+
+    pub(crate) fn allocate_io_token(&mut self) -> Result<mio::Token> {
+        let token = self.next_io_token;
+        self.next_io_token = self.next_io_token.checked_add(1).ok_or(Error::HandleLimit)?;
+        Ok(mio::Token(token))
     }
 
     pub(crate) fn state(&self, id: HandleId) -> Option<&HandleState> {
@@ -256,6 +308,7 @@ impl UvLoop {
         let timeout = self.poll_timeout(force_nowait);
         let _ = self.inner.run_once(timeout)?;
 
+        self.dispatch_net_events();
         self.dispatch_pending_sources();
         self.fire_phase(CallbackPhase::Check);
         self.fire_closes(&mut close_due);
@@ -379,6 +432,12 @@ impl UvLoop {
     }
 
     fn dispatch_pending_sources(&mut self) {
+        while let Some(completion) = self.completions.pop() {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| completion(self))) {
+                self.completion_errors.push_back(CallbackError::panic(payload));
+            }
+        }
+
         let async_ids: Vec<_> = self
             .handles
             .iter()
@@ -446,6 +505,18 @@ impl UvLoop {
                 if let Some(callback) = self.take_callback(id, phase, allow_inactive) {
                     self.invoke_callback(id, phase, callback);
                 }
+            }
+        }
+    }
+
+    fn dispatch_net_events(&mut self) {
+        loop {
+            let dispatch = { self.net_dispatches.borrow_mut().pop_front() };
+            let Some(dispatch) = dispatch else {
+                break;
+            };
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| dispatch(self))) {
+                self.completion_errors.push_back(CallbackError::panic(payload));
             }
         }
     }
@@ -537,5 +608,11 @@ impl UvLoop {
     fn state_mut_if_present(&mut self, id: HandleId) -> Option<&mut HandleState> {
         let slot = *self.locations.get(&id)?;
         self.handles.get_mut(slot).map(|(_, state)| state)
+    }
+}
+
+impl Drop for UvLoop {
+    fn drop(&mut self) {
+        self.completions.close();
     }
 }

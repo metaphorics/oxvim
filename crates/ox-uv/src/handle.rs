@@ -87,6 +87,7 @@ pub(crate) enum HandleKind {
     Check(PhaseState),
     Async(AsyncState),
     Signal(SignalState),
+    External(ExternalState),
 }
 
 impl HandleKind {
@@ -96,6 +97,7 @@ impl HandleKind {
             Self::Idle(state) | Self::Prepare(state) | Self::Check(state) => state.active,
             Self::Async(state) => state.active,
             Self::Signal(state) => state.active,
+            Self::External(state) => state.active,
         }
     }
 
@@ -107,8 +109,13 @@ impl HandleKind {
             }
             Self::Async(state) => state.active = false,
             Self::Signal(state) => state.active = false,
+            Self::External(state) => state.active = false,
         }
     }
+}
+
+pub(crate) struct ExternalState {
+    pub(crate) active: bool,
 }
 
 pub(crate) struct TimerState {

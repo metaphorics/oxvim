@@ -1,23 +1,30 @@
 //! Pure-Rust core of the `vim.uv` engine.
 //!
-//! This task implements libuv-style loop modes, lifecycle-safe handles, timers,
-//! phase watchers, cross-thread async wakeups, signals, and the documented misc
-//! subset. Stream, filesystem, process, DNS, and IPC handles are intentionally
-//! left for the next layer.
+//! Provides libuv-style loop and handle lifecycles together with filesystem,
+//! process and PTY, network, DNS, work-queue, and thread primitives.
 
 #![forbid(unsafe_code)]
 
 mod async_handle;
 mod aux_handles;
+pub mod dns;
+pub mod fs;
+pub mod fs_watch;
 mod handle;
 pub mod misc;
+pub mod net;
+pub mod pool;
+pub mod process;
 mod signal;
 mod timer;
+pub mod thread;
 mod uv_loop;
+pub mod work;
 
 pub use async_handle::{Async, AsyncSender};
 pub use aux_handles::{Check, Idle, Prepare};
 pub use handle::{Handle, HandleId};
+pub use pool::UvLoopPoster;
 pub use signal::Signal;
 pub use timer::Timer;
 pub use uv_loop::{RunMode, UvLoop};
@@ -139,6 +146,9 @@ pub struct CallbackErrorEvent {
     /// Captured returned error or panic.
     pub error: CallbackError,
 }
+
+#[cfg(test)]
+mod io_tests;
 
 #[cfg(test)]
 mod tests;
