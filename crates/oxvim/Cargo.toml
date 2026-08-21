@@ -1,0 +1,9 @@
+[package]
+name = "oxvim"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "binary entry point (CLI parsing, startup, server/client fork)."
+
+[lints]
+workspace = true

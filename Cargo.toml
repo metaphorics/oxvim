@@ -1,0 +1,58 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ox-types",
+    "crates/ox-rpc",
+    "crates/ox-loop",
+    "crates/ox-text",
+    "crates/ox-regex",
+    "crates/ox-eval",
+    "crates/ox-excmd",
+    "crates/ox-editor",
+    "crates/ox-api",
+    "crates/ox-api-macros",
+    "crates/ox-lua",
+    "crates/ox-ui",
+    "crates/ox-tui",
+    "crates/oxvim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+
+[workspace.dependencies]
+# Dependencies are pinned for the rewrite; see .references/neovim/cmake.deps/deps.txt
+# for the upstream-pinned C versions this project mirrors.
+mlua = { version = "0.12.0", features = ["luajit", "vendored"] }
+rmpv = "1.3.1"
+rmp-serde = "1.3.1"
+tree-sitter = "0.26.12"
+ropey = "1.6.1"
+libuv-sys2 = "1.52.3"
+similar = "3.2.0"
+encoding_rs = "0.8.35"
+crossterm = "0.29.0"
+libloading = "0.9.0"
+thiserror = "2.0.20"
+sha2 = "0.11.0"
+criterion = "0.8.2"
+# serde: latest stable from crates.io as of 2026-08-21.
+serde = { version = "1.0.229", features = ["derive"] }
+# serde_json: latest stable from crates.io as of 2026-08-21.
+serde_json = "1.0.151"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "warn"

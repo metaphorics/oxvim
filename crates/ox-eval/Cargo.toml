@@ -1,0 +1,9 @@
+[package]
+name = "ox-eval"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Vimscript lexer/parser/evaluator, builtins (codegen from upstream eval.lua)."
+
+[lints]
+workspace = true

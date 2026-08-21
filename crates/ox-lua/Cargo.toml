@@ -1,0 +1,9 @@
+[package]
+name = "ox-lua"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "mlua-hosted LuaJIT executor, converter, stdlib, luv/treesitter bindings."
+
+[lints]
+workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "ox-regex"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Vim regex engines (backtracking + NFA)."
+
+[lints]
+workspace = true

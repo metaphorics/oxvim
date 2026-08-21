@@ -1,0 +1,12 @@
+[package]
+name = "ox-api-macros"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "the #[api] proc-macro (dispatch + metadata codegen)."
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true

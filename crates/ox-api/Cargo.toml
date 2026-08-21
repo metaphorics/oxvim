@@ -1,0 +1,9 @@
+[package]
+name = "ox-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "#[api]-annotated nvim_* API implementations."
+
+[lints]
+workspace = true
