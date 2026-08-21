@@ -274,7 +274,7 @@ pub struct AutocmdOptions {
 }
 
 /// Event occurrence supplied to the firing planner.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AutocmdContext<'a> {
     /// Buffer associated with the event.
     pub buffer: Option<BufHandle>,
@@ -286,6 +286,18 @@ pub struct AutocmdContext<'a> {
     /// The host passes the *outer* autocmd's `++nested` flag, and `true` for a
     /// top-level event. Gating is decided once per event, never per candidate.
     pub nested: bool,
+}
+
+impl<'a> Default for AutocmdContext<'a> {
+    fn default() -> Self {
+        Self {
+            buffer: None,
+            file_name: None,
+            // A top-level event is not raised inside a non-nested outer
+            // autocmd, so nesting is permitted and no event-level gate applies.
+            nested: true,
+        }
+    }
 }
 
 /// Ordered actions for one event occurrence.

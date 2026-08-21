@@ -511,6 +511,17 @@ fn nested_outer_plans_all_matching_inner_actions() {
 }
 
 #[test]
+fn default_context_plans_top_level_events() {
+    let mut autocmds = Autocmds::new();
+    autocmds
+        .register(Event::BufEnter, "*", ex("top-level"), AutocmdOptions::default())
+        .unwrap();
+    let plan = autocmds.plan(Event::BufEnter, AutocmdContext::default());
+    assert_eq!(plan.ready.len(), 1);
+    assert_eq!(plan.ready[0].kind, ex("top-level"));
+}
+
+#[test]
 fn eventignore_suppresses_planning() {
     let mut autocmds = Autocmds::new();
     autocmds
