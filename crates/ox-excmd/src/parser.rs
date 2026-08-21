@@ -446,6 +446,15 @@ fn parse_modifiers(input: &str, cursor: &mut usize) -> Result<Vec<CommandModifie
             };
             pattern = Some(parsed_pattern);
             probe = after_pattern;
+            // Without a following nested command, "filter" is not a modifier.
+            let after_pattern_space = skip_ascii_space(input, probe);
+            if matches!(
+                input.as_bytes().get(after_pattern_space).copied(),
+                None | Some(b'|') | Some(b'"')
+            ) {
+                *cursor = saved;
+                break;
+            }
         } else if kind == ModifierKind::Hide {
             // ":hide" and ":hide | cmd" stay the builtin command; "hide" is
             // a modifier only when another command follows (the 'h' case in

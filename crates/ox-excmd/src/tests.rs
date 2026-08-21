@@ -347,6 +347,26 @@ fn filter_without_pattern_is_not_a_modifier() {
     );
 }
 
+// ":filter /foo/" has no nested command, so it routes to the builtin filter
+// command (upstream parse_command_modifiers falls through for the 'f' case
+// when no command follows the pattern).
+#[test]
+fn filter_pattern_without_nested_command_is_builtin() {
+    let command = parse_one("filter /foo/");
+    assert!(command.modifiers.is_empty());
+    assert_eq!(command.command.name(), "filter");
+    assert_eq!(command.args, "/foo/");
+}
+
+#[test]
+fn filter_pattern_with_nested_command_stays_modifier() {
+    let command = parse_one("filter /foo/ print");
+    assert_eq!(command.modifiers.len(), 1);
+    assert_eq!(command.modifiers[0].kind, ModifierKind::Filter);
+    assert_eq!(command.modifiers[0].pattern.as_deref(), Some("foo"));
+    assert_eq!(command.command.name(), "print");
+}
+
 // ":hide" and ":hide | cmd" are the builtin command; only ":hide cmd" is a
 // modifier (parse_command_modifiers 'h' case: ex_docmd.c:2597-2603).
 #[test]
