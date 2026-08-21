@@ -7,3 +7,9 @@ description = "msgpack-RPC codec, channel state machine, api-info metadata."
 
 [lints]
 workspace = true
+
+[dependencies]
+ox-types = { path = "../ox-types" }
+rmpv = { workspace = true }
+rmp-serde = { workspace = true }
+thiserror = { workspace = true }
