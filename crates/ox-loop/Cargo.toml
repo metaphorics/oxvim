@@ -3,7 +3,12 @@ name = "ox-loop"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
-description = "libuv event loop wrapper, fast/deferred work queues."
+description = "mio reactor, timer heap, MultiQueue, and fast/deferred work queues."
+
+[dependencies]
+mio = { workspace = true }
+signal-hook = { workspace = true }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
