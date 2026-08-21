@@ -1,0 +1,217 @@
+*repeat.txt*    Nvim
+
+
+                            NVIM REFERENCE MANUAL
+
+
+Repeating commands						*repeating*
+
+Chapter 26 of the user manual introduces repeating |usr_26.txt|.
+
+                                      Type |gO| to see the table of contents.
+
+==============================================================================
+Single repeats						*single-repeat*
+
+							*.*
+.			Repeat last change, with count replaced with [count].
+			Also repeat a yank command, when the 'y' flag is
+			included in 'cpoptions'.  Does not repeat a
+			command-line command.
+
+							*@:*
+@:			Repeat last command-line [count] times.
+
+Simple changes can be repeated with the "." command.  Without a count, the
+count of the last change is used.  If you enter a count, it will replace the
+last one.  |v:count| and |v:count1| will be set.
+
+If the last change included a specification of a numbered register, the
+register number will be incremented.  See |redo-register| for an example how
+to use this.
+
+Repeating an insert |ins-repeat| re-executes the whole session, including
+non-jump cursor-moves: "iab<Left>c<Esc>." produces "acb", not "c".  Note that
+jumps (mouse, |i_<PageUp>|, …) split an insert session.
+
+Repeating a Visual-mode command re-executes the captured keysequence,
+selection included.  See |visual-repeat|.
+
+							*motion-repeat*
+Example: a "," mapping that repeats the last motion, like |;| but for any
+motion ("3w", "fx", "/pat<CR>"): remember the last "motion" |CmdAtom| and
+replay its keys: >lua
+    local last ---@type string?
+    vim.api.nvim_create_autocmd('CmdAtom', {
+      pattern = 'motion',
+      callback = function(ev)
+        last = ev.data.keys
+      end,
+    })
+    vim.keymap.set('n', ',', function()
+      -- CmdAtom is deferred: schedule the replay after any pending event,
+      -- so `last` is fresh when "," follows a motion.
+      vim.schedule(function()
+        if last then
+          vim.api.nvim_feedkeys(last, 'n', false)  -- "n": already resolved
+        end
+      end)
+    end)
+<
+
+==============================================================================
+Multiple repeats					*multi-repeat*
+
+						*:g* *:global* *E148*
+:[range]g[lobal]/{pattern}/[cmd]
+			Execute the Ex command [cmd] (default ":p") on the
+			lines within [range] where {pattern} matches.
+
+:[range]g[lobal]!/{pattern}/[cmd]
+			Execute the Ex command [cmd] (default ":p") on the
+			lines within [range] where {pattern} does NOT match.
+
+							*:v* *:vglobal*
+:[range]v[global]/{pattern}/[cmd]
+			Same as :g!.
+
+Example: >
+	:g/^Obsolete/d _
+Using the underscore after `:d` avoids clobbering registers or the clipboard.
+This also makes it faster.
+
+Instead of the '/' which surrounds the {pattern}, you can use any other
+single byte character, but not an alphabetic character, '\', '"', '|' or '!'.
+This is useful if you want to include a '/' in the search pattern or
+replacement string.
+
+For the definition of a pattern, see |pattern|.
+
+NOTE [cmd] may contain a range; see |collapse| and |edit-paragraph-join| for
+examples.
+
+The global commands work by first scanning through the [range] lines and
+marking each line where a match occurs (for a multi-line pattern, only the
+start of the match matters).
+In a second scan the [cmd] is executed for each marked line, as if the cursor
+was in that line.  For ":v" and ":g!" the command is executed for each not
+marked line.  If a line is deleted its mark disappears.
+The default for [range] is the whole buffer (1,$).  Use "CTRL-C" to interrupt
+the command.  If an error message is given for a line, the command for that
+line is aborted and the global command continues with the next marked or
+unmarked line.
+								*E147*
+When the command is used recursively, it only works on one line.  Giving a
+range is then not allowed.  This is useful to find all lines that match a
+pattern and do not match another pattern: >
+	:g/found/v/notfound/{cmd}
+This first finds all lines containing "found", but only executes {cmd} when
+there is no match for "notfound".
+
+Any Ex command can be used, see |ex-cmd-index|.  To execute a Normal mode
+command, you can use the `:normal` command: >
+	:g/pat/normal {commands}
+Make sure that {commands} ends with a whole command, otherwise Vim will wait
+for you to type the rest of the command for each match.  The screen will not
+have been updated, so you don't know what you are doing.  See |:normal|.
+
+The undo/redo command will undo/redo the whole global command at once.
+The previous context mark will only be set once (with "''" you go back to
+where the cursor was before the global command).
+
+The global command sets both the last used search pattern and the last used
+substitute pattern (this is vi compatible).  This makes it easy to globally
+replace a string: >
+	:g/pat/s//PAT/g
+This replaces all occurrences of "pat" with "PAT".  The same can be done with: >
+	:%s/pat/PAT/g
+Which is two characters shorter!
+
+==============================================================================
+Complex repeats						*complex-repeat*
+
+							*q* *recording* *macro*
+q{0-9a-zA-Z"}		Record typed characters into register {0-9a-zA-Z"}
+			(uppercase to append).  The 'q' command is disabled
+			while executing a register, and it doesn't work inside
+			a mapping and |:normal|.
+
+			Note: If the register being used for recording is also
+			used for |y| and |p| the result is most likely not
+			what is expected, because the put will paste the
+			recorded macro and the yank will overwrite the
+			recorded macro.
+
+			Note: The recording happens while you type, replaying
+			the register happens as if the keys come from a
+			mapping.  This matters, for example, for undo, which
+			only syncs when commands were typed.
+
+q			Stops recording.
+			Implementation note: The 'q' that stops recording is
+			not stored in the register, unless it was the result
+			of a mapping
+
+							*@*
+@{0-9a-z".=*+}		Execute the contents of register {0-9a-z".=*+} [count]
+			times.  Note that register '%' (name of the current
+			file) and '#' (name of the alternate file) cannot be
+			used.
+			The register is executed like a mapping, that means
+			that the difference between 'wildchar' and 'wildcharm'
+			applies, and undo might not be synced in the same way.
+			For "@=" you are prompted to enter an expression.  The
+			result of the expression is then executed.
+			See also |@:|.
+
+							*@@* *E748*
+@@			Repeat the previous @{0-9a-z":*} [count] times.
+
+							*v_@-default*
+{Visual}@{0-9a-z".=*+}	In linewise Visual mode, execute the contents of the
+{Visual}@@		register for each selected line.
+			See |visual-repeat|, |default-mappings|.
+
+							*Q*
+Q			Repeat the last recorded register [count] times.
+			See |reg_recorded()|.
+
+							*v_Q-default*
+{Visual}Q		In linewise Visual mode, repeat the last recorded
+			register for each selected line.
+			See |visual-repeat|, |default-mappings|.
+
+							*v_Q*
+{Visual}Q		Place a cursor on each line of the Visual selection.
+
+							*:@*
+:[addr]@{0-9a-z".=*+}	Execute the contents of register {0-9a-z".=*+} as an
+			Ex command.  First set cursor at line [addr] (default
+			is current line).  When the last line in the register
+			does not have a <CR> it will be added automatically
+			when the 'e' flag is present in 'cpoptions'.
+			For ":@=" the last used expression is used.  The
+			result of evaluating the expression is executed as an
+			Ex command.
+			Mappings are not recognized in these commands.
+			When the |line-continuation| character (\) is present
+			at the beginning of a line in a linewise register,
+			then it is combined with the previous line.  This is
+			useful for yanking and executing parts of a Vim
+			script.
+
+							*:@:*
+:[addr]@:		Repeat last command-line.  First set cursor at line
+			[addr] (default is current line).
+
+:[addr]@						*:@@*
+:[addr]@@		Repeat the previous :@{register}.  First set cursor at
+			line [addr] (default is current line).
+
+==============================================================================
+Multiple cursors					*mcursor* *multicursor*
+
+todo
+
+
+ vim:tw=78:ts=8:noet:ft=help:norl:
