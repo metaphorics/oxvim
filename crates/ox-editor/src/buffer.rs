@@ -7,6 +7,10 @@ use ox_types::{Dict, Object, OxStr};
 use thiserror::Error;
 
 use crate::marks::LocalMarks;
+use crate::{Extmarks, Folds};
+use crate::extmark::{ExtmarkError, ExtmarkPosition, TextExtent};
+use crate::extmark::ExtmarkSpliceUndo;
+use crate::fold::FoldError;
 
 /// A buffer-local user command retained for later command execution.
 #[derive(Clone, Debug, PartialEq)]
@@ -40,6 +44,12 @@ pub enum BufferStateError {
     /// Text is unavailable until the buffer is loaded again.
     #[error("buffer text is not loaded")]
     Unloaded,
+    /// An extmark could not be adjusted through the text mutation.
+    #[error(transparent)]
+    Extmark(#[from] ExtmarkError),
+    /// A manual fold could not be normalized after the text mutation.
+    #[error(transparent)]
+    Fold(#[from] FoldError),
 }
 
 /// Text and buffer-local state owned by [`crate::Editor`].
@@ -59,6 +69,22 @@ pub struct BufferState {
     pub undo: UndoTree,
     /// Named and special buffer-local marks.
     pub marks: LocalMarks,
+    /// Buffer-relative extmarks and their decoration attributes.
+    pub extmarks: Extmarks,
+    /// Compact extmark position deltas keyed by undo sequence.
+    extmark_undo: BTreeMap<u64, ExtmarkSpliceUndo>,
+    /// Lazily computed and manual buffer folds.
+    pub folds: Folds,
+    /// Whether resident text differs from the last saved undo state.
+    pub modified: bool,
+    /// Read-only policy data; command layers decide whether to raise E37/E89-class errors.
+    pub readonly: bool,
+    /// Text changedtick observed when the buffer was last marked saved.
+    saved_changedtick: u64,
+    /// Final-EOL state at the last save.
+    saved_has_eol: bool,
+    /// Undo-tree state corresponding to the last saved contents.
+    saved_undo_seq: u64,
     /// Whether the buffer appears in the buffer list.
     pub listed: bool,
     /// Whether text and undo state are resident.
@@ -99,6 +125,8 @@ impl BufferState {
     /// Creates a loaded buffer with no window attachments.
     #[must_use]
     pub fn new(text: Buffer, listed: bool) -> Self {
+        let saved_changedtick = text.changedtick();
+        let saved_has_eol = text.has_eol();
         Self {
             text,
             name: OxStr::from(""),
@@ -107,6 +135,14 @@ impl BufferState {
             subscriptions: BTreeMap::new(),
             undo: UndoTree::new(),
             marks: LocalMarks::new(),
+            extmarks: Extmarks::new(),
+            extmark_undo: BTreeMap::new(),
+            folds: Folds::new(),
+            modified: false,
+            readonly: false,
+            saved_changedtick,
+            saved_has_eol,
+            saved_undo_seq: 0,
             listed,
             loaded: true,
             hidden: true,
@@ -170,6 +206,24 @@ impl BufferState {
         self.text.changedtick()
     }
 
+    /// Returns the text generation recorded at the last successful save.
+    #[must_use]
+    pub const fn saved_changedtick(&self) -> u64 {
+        self.saved_changedtick
+    }
+
+    /// Records the current undo state as saved and clears `'modified'`.
+    ///
+    /// Neovim marks the active undo branch unchanged after writing so that
+    /// undoing away from, or returning to, that point restores the flag
+    /// (`src/nvim/undo.c:2818-2824`, `src/nvim/bufwrite.c:1727-1738`).
+    pub fn mark_saved(&mut self) {
+        self.saved_changedtick = self.changedtick();
+        self.saved_has_eol = self.text.has_eol();
+        self.saved_undo_seq = self.undo.current_seq();
+        self.modified = false;
+    }
+
     /// Returns resident text, or an unloaded-state error.
     pub fn text(&self) -> Result<&Buffer, BufferStateError> {
         if self.loaded {
@@ -183,6 +237,13 @@ impl BufferState {
     pub fn load(&mut self, text: Buffer) {
         self.text = text;
         self.undo = UndoTree::new();
+        self.extmarks = Extmarks::new();
+        self.extmark_undo.clear();
+        self.folds = Folds::new();
+        self.modified = false;
+        self.saved_changedtick = self.text.changedtick();
+        self.saved_has_eol = self.text.has_eol();
+        self.saved_undo_seq = 0;
         self.loaded = true;
         self.hidden = self.attachments == 0;
     }
@@ -239,6 +300,7 @@ impl BufferState {
             .collect::<Result<Vec<_>, _>>()?;
         self.text.replace_lines(start, end, lines)?;
         self.marks.splice(start, before.len(), lines.len());
+        let extmark_undo = self.splice_derived_state(start, before.len(), lines.len())?;
         let seq = self.undo.record(
             LineEdit {
                 start,
@@ -255,6 +317,8 @@ impl BufferState {
             },
             timestamp,
         );
+        self.extmark_undo.insert(seq, extmark_undo);
+        self.refresh_modified();
         self.bump_derived_ticks();
         Ok(seq)
     }
@@ -270,6 +334,8 @@ impl BufferState {
         self.require_loaded()?;
         self.text.append_lines(lnum, lines)?;
         self.marks.splice(lnum.saturating_add(1), 0, lines.len());
+        let extmark_undo =
+            self.splice_derived_state(lnum.saturating_add(1), 0, lines.len())?;
         let seq = self.undo.record(
             LineEdit {
                 start: lnum.saturating_add(1),
@@ -286,6 +352,8 @@ impl BufferState {
             },
             timestamp,
         );
+        self.extmark_undo.insert(seq, extmark_undo);
+        self.refresh_modified();
         self.bump_derived_ticks();
         Ok(seq)
     }
@@ -312,6 +380,22 @@ impl BufferState {
         self.replay_text(edit.start, &edit.after, &edit.before)?;
         self.marks
             .splice(edit.start, edit.after.len(), edit.before.len());
+        self.splice_folds(edit.start, edit.after.len(), edit.before.len())?;
+        if let Some(extmark_undo) = self.extmark_undo.get(&entry.seq) {
+            self.extmarks.undo_splice(
+                extmark_undo,
+                ExtmarkPosition::new(edit.start.saturating_sub(1), 0),
+                TextExtent::new(edit.before.len(), 0),
+                TextExtent::new(edit.after.len(), 0),
+            )?;
+        } else {
+            self.extmarks.splice(
+                ExtmarkPosition::new(edit.start.saturating_sub(1), 0),
+                TextExtent::new(edit.after.len(), 0),
+                TextExtent::new(edit.before.len(), 0),
+            )?;
+        }
+        self.refresh_modified();
         self.bump_derived_ticks();
         Ok(Some(ReplayedEdit {
             seq: entry.seq,
@@ -336,6 +420,8 @@ impl BufferState {
         self.replay_text(edit.start, &edit.before, &edit.after)?;
         self.marks
             .splice(edit.start, edit.before.len(), edit.after.len());
+        let _ = self.splice_derived_state(edit.start, edit.before.len(), edit.after.len())?;
+        self.refresh_modified();
         self.bump_derived_ticks();
         Ok(Some(ReplayedEdit {
             seq: entry.seq,
@@ -373,9 +459,18 @@ impl BufferState {
     }
 
     /// Changes final-EOL state and advances every text-derived generation.
+    ///
+    /// `'modified'` is recomputed from the undo point and saved EOL state, so
+    /// restoring the saved EOL (with no other pending edits) clears the flag
+    /// again instead of latching it once changed.
     pub fn set_eol(&mut self, has_eol: bool) -> Result<(), BufferStateError> {
         self.require_loaded()?;
+        let changed = self.text.has_eol() != has_eol;
         self.text.set_eol(has_eol);
+        if changed {
+            self.folds.invalidate(self.changedtick());
+        }
+        self.refresh_modified();
         self.bump_derived_ticks();
         Ok(())
     }
@@ -391,7 +486,46 @@ impl BufferState {
     fn release_resident_state(&mut self) {
         self.text = Buffer::new();
         self.undo = UndoTree::new();
+        self.extmarks = Extmarks::new();
+        self.extmark_undo.clear();
+        self.folds = Folds::new();
+        self.modified = false;
+        self.saved_changedtick = self.text.changedtick();
+        self.saved_has_eol = self.text.has_eol();
+        self.saved_undo_seq = 0;
         self.subscriptions.clear();
+    }
+
+    fn splice_derived_state(
+        &mut self,
+        start: usize,
+        old_rows: usize,
+        new_rows: usize,
+    ) -> Result<ExtmarkSpliceUndo, BufferStateError> {
+        let (_, undo) = self.extmarks.splice_recording(
+            ExtmarkPosition::new(start.saturating_sub(1), 0),
+            TextExtent::new(old_rows, 0),
+            TextExtent::new(new_rows, 0),
+        )?;
+        self.splice_folds(start, old_rows, new_rows)?;
+        Ok(undo)
+    }
+
+    fn splice_folds(
+        &mut self,
+        start: usize,
+        old_rows: usize,
+        new_rows: usize,
+    ) -> Result<(), FoldError> {
+        self.folds
+            .splice_rows(start.saturating_sub(1), old_rows, new_rows)?;
+        self.folds.invalidate(self.changedtick());
+        Ok(())
+    }
+
+    fn refresh_modified(&mut self) {
+        self.modified = self.undo.current_seq() != self.saved_undo_seq
+            || self.text.has_eol() != self.saved_has_eol;
     }
 
     fn bump_derived_ticks(&mut self) {

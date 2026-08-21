@@ -8,6 +8,8 @@ use thiserror::Error;
 
 use crate::autocmd::Autocmds;
 use crate::buffer::{BufferState, BufferStateError};
+use crate::decoration::Decorations;
+use crate::fold::{FoldError, Position as FoldPosition};
 use crate::layout::{Geometry, Layout, LayoutError, TabpageState, WinConfig, WindowState};
 use crate::mapping::Mappings;
 use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError};
@@ -73,6 +75,9 @@ pub enum EditorError {
     /// A named-mark operation failed.
     #[error(transparent)]
     Mark(#[from] MarkError),
+    /// A fold operation failed.
+    #[error(transparent)]
+    Fold(#[from] FoldError),
 }
 
 /// What to do with an old buffer after its last window switches away.
@@ -107,6 +112,8 @@ pub struct Editor {
     changelists: Changelists,
     /// Registered autocmds and augroups.
     autocmds: Autocmds,
+    /// Registered decoration providers and active redraw-scoped output.
+    decorations: Decorations,
     /// Mode-aware mappings and insert abbreviations.
     mappings: Mappings,
     /// Encoded pending input stack.
@@ -141,6 +148,7 @@ impl Editor {
             jumplist: Jumplist::new(),
             changelists: Changelists::new(),
             autocmds: Autocmds::new(),
+            decorations: Decorations::new(),
             mappings: Mappings::new(),
             typeahead: Typeahead::new(),
             vvars: Dict(Vec::new()),
@@ -369,6 +377,17 @@ impl Editor {
     #[must_use]
     pub const fn options(&self) -> &OptionStore {
         &self.options
+    }
+
+    /// Returns the decoration provider registry.
+    #[must_use]
+    pub const fn decorations(&self) -> &Decorations {
+        &self.decorations
+    }
+
+    /// Returns mutable decoration provider and redraw state.
+    pub const fn decorations_mut(&mut self) -> &mut Decorations {
+        &mut self.decorations
     }
 
     /// Returns mutable option state.
@@ -929,6 +948,61 @@ impl Editor {
         };
         self.finish_replay(buffer, replayed);
         Ok(Some(replayed.seq))
+    }
+
+    /// Opens one containing fold, corresponding to `zo`.
+    pub fn fold_open(
+        &mut self,
+        buffer: BufHandle,
+        position: FoldPosition,
+    ) -> Result<bool, EditorError> {
+        Ok(self.buffer_mut(buffer)?.folds.open(position)?)
+    }
+
+    /// Closes one visible containing fold, corresponding to `zc`.
+    pub fn fold_close(
+        &mut self,
+        buffer: BufHandle,
+        position: FoldPosition,
+    ) -> Result<bool, EditorError> {
+        Ok(self.buffer_mut(buffer)?.folds.close(position)?)
+    }
+
+    /// Toggles one containing fold, corresponding to `za`.
+    pub fn fold_toggle(
+        &mut self,
+        buffer: BufHandle,
+        position: FoldPosition,
+    ) -> Result<bool, EditorError> {
+        Ok(self.buffer_mut(buffer)?.folds.toggle(position)?)
+    }
+
+    /// Opens a containing fold and descendants, corresponding to `zO`.
+    pub fn fold_open_recursive(
+        &mut self,
+        buffer: BufHandle,
+        position: FoldPosition,
+    ) -> Result<usize, EditorError> {
+        Ok(self.buffer_mut(buffer)?.folds.open_recursive(position)?)
+    }
+
+    /// Closes the outer containing fold, corresponding to `zC`.
+    pub fn fold_close_recursive(
+        &mut self,
+        buffer: BufHandle,
+        position: FoldPosition,
+    ) -> Result<usize, EditorError> {
+        Ok(self.buffer_mut(buffer)?.folds.close_recursive(position)?)
+    }
+
+    /// Opens every fold in a buffer, corresponding to `zR`.
+    pub fn fold_open_all(&mut self, buffer: BufHandle) -> Result<usize, EditorError> {
+        Ok(self.buffer_mut(buffer)?.folds.open_all())
+    }
+
+    /// Closes every fold in a buffer, corresponding to `zM`.
+    pub fn fold_close_all(&mut self, buffer: BufHandle) -> Result<usize, EditorError> {
+        Ok(self.buffer_mut(buffer)?.folds.close_all())
     }
 
     fn finish_replay(&mut self, buffer: BufHandle, replayed: crate::buffer::ReplayedEdit) {
