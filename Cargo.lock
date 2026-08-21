@@ -437,6 +437,14 @@ version = "0.1.0"
 [[package]]
 name = "ox-ui"
 version = "0.1.0"
+dependencies = [
+ "ox-editor",
+ "ox-rpc",
+ "ox-text",
+ "ox-types",
+ "thiserror 2.0.20",
+ "unicode-width",
+]
 
 [[package]]
 name = "ox-uv"
