@@ -245,7 +245,7 @@ impl IntoObject for () {
 }
 
 impl ApiType for Object {
-    const TYPE: TypeRef = TypeRef::Nil;
+    const TYPE: TypeRef = TypeRef::Object;
 }
 
 impl FromObject for Object {

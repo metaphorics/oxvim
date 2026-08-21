@@ -19,6 +19,8 @@ pub enum TypeRef {
     Array,
     /// Untyped dictionary value.
     Dict,
+    /// Any object value.
+    Object,
     /// Reference into the Lua registry.
     LuaRef,
     /// Buffer handle.
@@ -45,6 +47,7 @@ impl fmt::Display for TypeRef {
             Self::String => formatter.write_str("String"),
             Self::Array => formatter.write_str("Array"),
             Self::Dict => formatter.write_str("Dict"),
+            Self::Object => formatter.write_str("Object"),
             Self::LuaRef => formatter.write_str("LuaRef"),
             Self::Buffer => formatter.write_str("Buffer"),
             Self::Window => formatter.write_str("Window"),

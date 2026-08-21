@@ -1,5 +1,7 @@
+//! Integration tests for the `#[api]` macro and dispatch conversions.
+
 use ox_api::{
-    ApiError, BufHandle, Dict, LuaRef, Nil, Object, OxStr, Registry, TabHandle, TypeRef,
+    ApiError, BufHandle, Dict, IntoObject, LuaRef, Nil, Object, OxStr, Registry, TabHandle, TypeRef,
     WinHandle, api,
 };
 
@@ -29,7 +31,7 @@ fn nvim_buf_boundary(
         Object::LuaRef(lua_ref.0),
         Object::Window(window),
         Object::Tabpage(tabpage),
-        Object::Nil,
+        nil.into_object(),
         object,
     ]))
 }
@@ -70,7 +72,7 @@ fn generated_metadata_matches_the_rust_signature() {
     assert!(metadata.method);
     assert!(!metadata.fast);
     assert!(!metadata.textlock);
-    assert_eq!(metadata.returns, TypeRef::Nil);
+    assert_eq!(metadata.returns, TypeRef::Object);
     assert_eq!(
         metadata.params,
         &[
@@ -85,7 +87,7 @@ fn generated_metadata_matches_the_rust_signature() {
             ("window", TypeRef::Window),
             ("tabpage", TypeRef::Tabpage),
             ("nil", TypeRef::Nil),
-            ("object", TypeRef::Nil),
+            ("object", TypeRef::Object),
         ]
     );
 
