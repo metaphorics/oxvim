@@ -29,6 +29,12 @@ pub enum MessageKind {
     Echo,
 }
 
+/// Attributes retained for one `:highlight` group.
+///
+/// Values remain source spellings (`guifg=#rrggbb`, `bold`, `NONE`) so the
+/// UI layer can apply terminal- or GUI-specific interpretation later.
+pub type HighlightDefinition = BTreeMap<String, String>;
+
 /// A message retained until a UI or server consumes it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Message {
@@ -125,6 +131,8 @@ pub struct Editor {
     typeahead: Typeahead,
     /// Editor-wide `v:` variables.
     vvars: Dict,
+    /// Named highlight groups defined by `:highlight`.
+    highlights: BTreeMap<String, HighlightDefinition>,
     /// Messages waiting for a UI or server consumer.
     messages: Vec<Message>,
     current_tab: Option<TabHandle>,
@@ -158,6 +166,7 @@ impl Editor {
             mappings: Mappings::new(),
             typeahead: Typeahead::new(),
             vvars: Dict(Vec::new()),
+            highlights: BTreeMap::new(),
             messages: Vec::new(),
             current_tab: None,
             next_buffer: 1,
@@ -439,6 +448,27 @@ impl Editor {
         name: char,
     ) -> Result<Option<Position>, EditorError> {
         Ok(self.buffer(buffer)?.marks.get(name)?)
+    }
+    /// Returns global marks.
+    #[must_use]
+    pub const fn global_marks(&self) -> &GlobalMarks {
+        &self.global_marks
+    }
+
+    /// Returns mutable global marks.
+    pub const fn global_marks_mut(&mut self) -> &mut GlobalMarks {
+        &mut self.global_marks
+    }
+
+    /// Returns named highlight definitions.
+    #[must_use]
+    pub const fn highlights(&self) -> &BTreeMap<String, HighlightDefinition> {
+        &self.highlights
+    }
+
+    /// Returns mutable named highlight definitions.
+    pub const fn highlights_mut(&mut self) -> &mut BTreeMap<String, HighlightDefinition> {
+        &mut self.highlights
     }
 
     /// Returns buffer-separated change history.

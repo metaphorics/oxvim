@@ -346,6 +346,7 @@ dependencies = [
 name = "ox-editor"
 version = "0.1.0"
 dependencies = [
+ "ox-eval",
  "ox-excmd",
  "ox-regex",
  "ox-text",
