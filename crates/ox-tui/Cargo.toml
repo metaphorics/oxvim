@@ -5,5 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 description = "redesigned bundled TUI client (crossterm)."
 
+[dependencies]
+ox-rpc = { path = "../ox-rpc" }
+ox-types = { path = "../ox-types" }
+crossterm.workspace = true
+thiserror.workspace = true
+mio.workspace = true
+
 [lints]
 workspace = true
