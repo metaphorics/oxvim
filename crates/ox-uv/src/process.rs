@@ -255,8 +255,8 @@ impl std::fmt::Debug for ProcessPipe {
 impl ProcessPipe {
     fn attach(uv_loop: &mut UvLoop, stream: ChildStream) -> NetResult<Self> {
         stream.set_nonblocking().map_err(NetError::Io)?;
-        let id = uv_loop.allocate_external(false)?;
         let token = uv_loop.allocate_io_token()?;
+
         let state = Rc::new(RefCell::new(ProcessPipeState {
             io: Some(stream),
             reading: false,
@@ -264,7 +264,29 @@ impl ProcessPipe {
             registered: false,
         }));
         let callback: CallbackCell = Rc::new(RefCell::new(None));
-        register_process_pipe(uv_loop, id, token, &state, &callback)?;
+
+        // Register the mio source first; only after it succeeds do we allocate
+        // the external handle and the readiness callback. This build-then-commit
+        // ordering guarantees that a failure after this point rolls back every
+        // loop-level allocation made so far.
+        if let Err(error) = register_process_pipe_mio(uv_loop, token, &state) {
+            rollback_process_pipe(uv_loop, None, token, &state);
+            return Err(error);
+        }
+
+        let id = match uv_loop.allocate_external(false) {
+            Ok(id) => id,
+            Err(error) => {
+                rollback_process_pipe(uv_loop, None, token, &state);
+                return Err(NetError::from(error));
+            }
+        };
+
+        if let Err(error) = register_process_pipe_readiness(uv_loop, id, token, &state, &callback) {
+            rollback_process_pipe(uv_loop, Some(id), token, &state);
+            return Err(error);
+        }
+
         Ok(Self { id, token, state, _callback: callback })
     }
 
@@ -342,20 +364,27 @@ impl ProcessPipe {
 }
 
 #[cfg(unix)]
-fn register_process_pipe(
+fn register_process_pipe_mio(
+    uv_loop: &mut UvLoop,
+    token: Token,
+    state: &Rc<RefCell<ProcessPipeState>>,
+) -> NetResult<()> {
+    let mut state = state.borrow_mut();
+    let interests = process_pipe_interest(&state);
+    let fd = state.io.as_ref().ok_or(NetError::Closed)?.as_raw_fd();
+    uv_loop.inner_mut().reactor().register(&mut SourceFd(&fd), token, interests)?;
+    state.registered = true;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn register_process_pipe_readiness(
     uv_loop: &mut UvLoop,
     id: HandleId,
     token: Token,
     state: &Rc<RefCell<ProcessPipeState>>,
     callback: &CallbackCell,
 ) -> NetResult<()> {
-    {
-        let mut state = state.borrow_mut();
-        let interests = process_pipe_interest(&state);
-        let fd = state.io.as_ref().ok_or(NetError::Closed)?.as_raw_fd();
-        uv_loop.inner_mut().reactor().register(&mut SourceFd(&fd), token, interests)?;
-        state.registered = true;
-    }
     let shared = Rc::clone(state);
     let user_callback = Rc::clone(callback);
     let queue = uv_loop.net_dispatch_queue();
@@ -374,6 +403,35 @@ fn register_process_pipe(
         })
         .map_err(crate::Error::from)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn rollback_process_pipe(
+    uv_loop: &mut UvLoop,
+    id: Option<HandleId>,
+    token: Token,
+    state: &Rc<RefCell<ProcessPipeState>>,
+) {
+    uv_loop.inner_mut().remove_readiness(token);
+    {
+        let mut state = state.borrow_mut();
+        if state.registered {
+            if let Some(stream) = state.io.as_ref() {
+                let fd = stream.as_raw_fd();
+                let _ = uv_loop.inner_mut().reactor().deregister(&mut SourceFd(&fd));
+            }
+            state.registered = false;
+        }
+        state.io = None;
+        state.reading = false;
+        state.writes.clear();
+    }
+    if let Some(id) = id {
+        let _ = uv_loop.close(
+            id,
+            None::<fn(&mut UvLoop, HandleId) -> std::result::Result<(), crate::CallbackError>>,
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -520,20 +578,42 @@ fn build_process_pipes(
     let map_error = |error: NetError| {
         ProcessError::io("setup process pipe", io::Error::other(error.to_string()))
     };
-    Ok(ProcessPipes {
-        stdin: stdin
-            .map(|stream| ProcessPipe::attach(uv_loop, ChildStream::In(stream)))
-            .transpose()
-            .map_err(map_error)?,
-        stdout: stdout
-            .map(|stream| ProcessPipe::attach(uv_loop, ChildStream::Out(stream)))
-            .transpose()
-            .map_err(map_error)?,
-        stderr: stderr
-            .map(|stream| ProcessPipe::attach(uv_loop, ChildStream::Err(stream)))
-            .transpose()
-            .map_err(map_error)?,
-    })
+
+    let stdin = match stdin {
+        Some(stream) => Some(ProcessPipe::attach(uv_loop, ChildStream::In(stream)).map_err(map_error)?),
+        None => None,
+    };
+
+    let stdout = match stdout {
+        Some(stream) => match ProcessPipe::attach(uv_loop, ChildStream::Out(stream)) {
+            Ok(pipe) => Some(pipe),
+            Err(error) => {
+                if let Some(stdin) = stdin {
+                    let _ = stdin.close(uv_loop);
+                }
+                return Err(map_error(error));
+            }
+        },
+        None => None,
+    };
+
+    let stderr = match stderr {
+        Some(stream) => match ProcessPipe::attach(uv_loop, ChildStream::Err(stream)) {
+            Ok(pipe) => Some(pipe),
+            Err(error) => {
+                if let Some(stdin) = stdin {
+                    let _ = stdin.close(uv_loop);
+                }
+                if let Some(stdout) = stdout {
+                    let _ = stdout.close(uv_loop);
+                }
+                return Err(map_error(error));
+            }
+        },
+        None => None,
+    };
+
+    Ok(ProcessPipes { stdin, stdout, stderr })
 }
 
 /// Builds blocking endpoints on platforms without a safe loop registration path.
@@ -957,7 +1037,6 @@ impl PtyHandle {
             )
         })?;
 
-        let id = uv_loop.allocate_external(false).map_err(ProcessError::from)?;
         let token = uv_loop.allocate_io_token().map_err(ProcessError::from)?;
         let state = Rc::new(RefCell::new(PtyState {
             master: Some(master),
@@ -967,8 +1046,29 @@ impl PtyHandle {
             registered: false,
         }));
         let callback: CallbackCell = Rc::new(RefCell::new(None));
-        register_pty(uv_loop, id, token, &state, &callback)
-            .map_err(|error| ProcessError::io("PTY handle", io::Error::other(error.to_string())))?;
+
+        // Register the mio source first; only after it succeeds do we allocate
+        // the external handle and the readiness callback. This build-then-commit
+        // ordering guarantees that a failure after this point rolls back every
+        // loop-level allocation made so far.
+        if let Err(error) = register_pty_mio(uv_loop, token, &state) {
+            rollback_pty(uv_loop, None, token, &state);
+            return Err(ProcessError::io("PTY handle", io::Error::other(error.to_string())));
+        }
+
+        let id = match uv_loop.allocate_external(false) {
+            Ok(id) => id,
+            Err(error) => {
+                rollback_pty(uv_loop, None, token, &state);
+                return Err(ProcessError::from(error));
+            }
+        };
+
+        if let Err(error) = register_pty_readiness(uv_loop, id, token, &state, &callback) {
+            rollback_pty(uv_loop, Some(id), token, &state);
+            return Err(ProcessError::io("PTY handle", io::Error::other(error.to_string())));
+        }
+
         Ok(Self { id, token, state, _callback: callback })
     }
 
@@ -1101,20 +1201,27 @@ fn drain_pty_reads<R: std::io::Read>(reader: &mut R, events: &mut Vec<NetEvent>)
 }
 
 #[cfg(unix)]
-fn register_pty(
+fn register_pty_mio(
+    uv_loop: &mut UvLoop,
+    token: Token,
+    state: &Rc<RefCell<PtyState>>,
+) -> NetResult<()> {
+    let mut state = state.borrow_mut();
+    let interests = pty_interest(&state);
+    let fd = state.fd.as_ref().ok_or(NetError::Closed)?.as_raw_fd();
+    uv_loop.inner_mut().reactor().register(&mut SourceFd(&fd), token, interests)?;
+    state.registered = true;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn register_pty_readiness(
     uv_loop: &mut UvLoop,
     id: HandleId,
     token: Token,
     state: &Rc<RefCell<PtyState>>,
     callback: &CallbackCell,
 ) -> NetResult<()> {
-    {
-        let mut state = state.borrow_mut();
-        let interests = pty_interest(&state);
-        let fd = state.fd.as_ref().ok_or(NetError::Closed)?.as_raw_fd();
-        uv_loop.inner_mut().reactor().register(&mut SourceFd(&fd), token, interests)?;
-        state.registered = true;
-    }
     let shared = Rc::clone(state);
     let user_callback = Rc::clone(callback);
     let queue = uv_loop.net_dispatch_queue();
@@ -1133,6 +1240,36 @@ fn register_pty(
         })
         .map_err(crate::Error::from)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn rollback_pty(
+    uv_loop: &mut UvLoop,
+    id: Option<HandleId>,
+    token: Token,
+    state: &Rc<RefCell<PtyState>>,
+) {
+    uv_loop.inner_mut().remove_readiness(token);
+    {
+        let mut state = state.borrow_mut();
+        if state.registered {
+            if let Some(fd) = state.fd.as_ref() {
+                let raw = fd.as_raw_fd();
+                let _ = uv_loop.inner_mut().reactor().deregister(&mut SourceFd(&raw));
+            }
+            state.registered = false;
+        }
+        state.fd = None;
+        state.master = None;
+        state.reading = false;
+        state.writes.clear();
+    }
+    if let Some(id) = id {
+        let _ = uv_loop.close(
+            id,
+            None::<fn(&mut UvLoop, HandleId) -> std::result::Result<(), crate::CallbackError>>,
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -1597,5 +1734,123 @@ fn portable_exit_values(status: portable_pty::ExitStatus) -> ProcessExit {
     ProcessExit {
         code: i64::from(status.exit_code()),
         signal: 0,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod transaction_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    fn count_handles(uv_loop: &mut UvLoop) -> usize {
+        let mut ids = Vec::new();
+        uv_loop.walk(|_, id| ids.push(id));
+        ids.len()
+    }
+
+    fn spawn_child_with_pipes() -> (Option<ChildStdin>, Option<ChildStdout>, Option<ChildStderr>, std::process::Child) {
+        let mut child = Command::new("/bin/sleep")
+            .arg("10")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sleeper");
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        (stdin, stdout, stderr, child)
+    }
+
+    fn reap_child(mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn process_pipe_rolls_back_on_readiness_failure() {
+        let mut uv_loop = UvLoop::new().expect("create loop");
+
+        let (_, stdout, _, child) = spawn_child_with_pipes();
+        let stdout = stdout.expect("stdout pipe");
+
+        // Steal a token and pre-register a callback at the next token so that
+        // ProcessPipe::attach fails when it tries to install its readiness.
+        let token = uv_loop.allocate_io_token().expect("allocate token");
+        uv_loop
+            .inner_mut()
+            .on_readiness(Token(token.0 + 1), |_, _| Ok(DrainState::Drained))
+            .expect("pre-register dummy callback");
+
+        let baseline = count_handles(&mut uv_loop);
+
+        let result = ProcessPipe::attach(&mut uv_loop, ChildStream::Out(stdout));
+        assert!(result.is_err(), "attach must fail when readiness collides");
+
+        // Pump the loop so deferred close callbacks for the rolled-back handle run.
+        let _ = uv_loop.run_nowait();
+
+        let after = count_handles(&mut uv_loop);
+        assert_eq!(after, baseline, "rolled-back pipe handle must not remain");
+
+        reap_child(child);
+    }
+
+    #[test]
+    fn build_process_pipes_rolls_back_siblings_on_failure() {
+        let mut uv_loop = UvLoop::new().expect("create loop");
+
+        let (stdin, stdout, stderr, child) = spawn_child_with_pipes();
+
+        // Pre-register a callback at the token that the second pipe (stdout)
+        // will try to consume, forcing a failure mid-construction.
+        let token = uv_loop.allocate_io_token().expect("allocate token");
+        uv_loop
+            .inner_mut()
+            .on_readiness(Token(token.0 + 2), |_, _| Ok(DrainState::Drained))
+            .expect("pre-register dummy callback");
+
+        let baseline = count_handles(&mut uv_loop);
+
+        let result = build_process_pipes(
+            &mut uv_loop,
+            stdin,
+            stdout,
+            stderr,
+        );
+        assert!(result.is_err(), "build must fail when a sibling pipe cannot register");
+
+        let _ = uv_loop.run_nowait();
+
+        let after = count_handles(&mut uv_loop);
+        assert_eq!(after, baseline, "all rolled-back pipe handles must be removed");
+
+        reap_child(child);
+    }
+
+    #[test]
+    fn pty_handle_rolls_back_on_readiness_failure() {
+        let mut uv_loop = UvLoop::new().expect("create loop");
+
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .expect("open pty");
+        drop(pair.slave);
+
+        let token = uv_loop.allocate_io_token().expect("allocate token");
+        uv_loop
+            .inner_mut()
+            .on_readiness(Token(token.0 + 1), |_, _| Ok(DrainState::Drained))
+            .expect("pre-register dummy callback");
+
+        let baseline = count_handles(&mut uv_loop);
+
+        let result = PtyHandle::wrap(&mut uv_loop, pair.master);
+        assert!(result.is_err(), "wrap must fail when readiness collides");
+
+        let _ = uv_loop.run_nowait();
+
+        let after = count_handles(&mut uv_loop);
+        assert_eq!(after, baseline, "rolled-back PTY handle must not remain");
     }
 }
