@@ -90,12 +90,9 @@ impl UvLoop {
 
     fn run_default_inner(&mut self) -> Result<bool> {
         if self.stop_requested {
-            // A stop requested before run must still execute one forced-nowait
-            // iteration (luvref.txt:464-471): uv.run() ends no sooner than the
-            // next loop iteration, and a pre-`stop` call prevents blocking on
-            // I/O but not the turn's due-timer/pending/check callbacks.
-            self.run_turn(true)?;
+            let result = self.run_turn(true);
             self.stop_requested = false;
+            result?;
             return Ok(self.loop_alive());
         }
         while self.loop_alive() && !self.stop_requested {
@@ -112,10 +109,9 @@ impl UvLoop {
 
     fn run_once_inner(&mut self) -> Result<bool> {
         if self.stop_requested {
-            // As for `run_default_inner`, a pending stop forces one non-blocking
-            // iteration so due callbacks still run before the loop ends.
-            self.run_turn(true)?;
+            let result = self.run_turn(true);
             self.stop_requested = false;
+            result?;
             return Ok(self.loop_alive());
         }
         if self.loop_alive() {

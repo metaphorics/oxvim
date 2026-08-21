@@ -465,3 +465,80 @@ fn misc_time_and_directory_contracts_are_sane() {
     uv_loop.update_time();
     assert!(uv_loop.now() >= cached);
 }
+
+
+#[cfg(unix)]
+#[test]
+fn pending_stop_cleared_on_forced_turn_error() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    use mio::{Interest, Token};
+
+    for mode in [RunMode::Default, RunMode::Once] {
+        let mut uv_loop = UvLoop::new().expect("loop");
+        let (read, mut write) = UnixStream::pair().expect("socket pair");
+        read.set_nonblocking(true).expect("nonblocking");
+        let mut read = mio::net::UnixStream::from_std(read);
+        let token = Token(ox_loop::IO_TOKEN_START + 2);
+
+        uv_loop
+            .inner()
+            .reactor()
+            .register(&mut read, token, Interest::READABLE)
+            .expect("register");
+        uv_loop
+            .inner_mut()
+            .on_readiness(token, |_readiness, _events| {
+                Err(ox_loop::Error::Io(std::io::Error::other(
+                    "forced readiness error",
+                )))
+            })
+            .expect("on_readiness");
+
+        write.write_all(&[1]).expect("make readable");
+
+        uv_loop.stop();
+        assert!(
+            uv_loop.run(mode).is_err(),
+            "{mode:?} should propagate forced-turn readiness error"
+        );
+
+        // The pending stop must be consumed even though run_turn errored, so
+        // a subsequent normal run is not dominated by the stale flag.
+        uv_loop
+            .inner()
+            .reactor()
+            .deregister(&mut read)
+            .expect("deregister");
+        assert!(uv_loop.inner_mut().remove_readiness(token));
+
+        let calls = Rc::new(Cell::new(0));
+        let timer = Timer::new(&mut uv_loop).expect("timer");
+        let timer_copy = timer;
+        let callback_calls = Rc::clone(&calls);
+        timer
+            .start(&mut uv_loop, 0, 1, move |event_loop, _| {
+                let next = callback_calls.get() + 1;
+                callback_calls.set(next);
+                if next >= 3 {
+                    timer_copy.stop(event_loop)?;
+                }
+                Ok(())
+            })
+            .expect("start repeating timer");
+
+        assert_eq!(
+            uv_loop
+                .run_default()
+                .expect("subsequent default should run to completion"),
+            false,
+            "stale stop after {mode:?} forced-turn error"
+        );
+        assert_eq!(
+            calls.get(),
+            3,
+            "timer must fire three times after {mode:?} error"
+        );
+    }
+}
