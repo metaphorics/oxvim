@@ -101,6 +101,7 @@ impl<'a> Builtins<'a> {
             "has" => has_feature(&args),
             "has_key" => has_key(&args),
             "index" => index(&args),
+            "indexof" => self.indexof(&args, scope),
             "insert" => insert(args),
             "islocked" => is_locked_value(&args[0]),
             "items" => dict_projection(&args[0], Projection::Items),
@@ -349,6 +350,63 @@ impl<'a> Builtins<'a> {
         }
     }
 
+    /// `indexof()` — upstream `f_indexof` (eval/funcs.c 2961-3002): evaluate
+    /// the callback with `v:key`/`v:val` for each List item or Blob byte
+    /// starting at `opts.startidx` (negative counts from the end; out of range
+    /// finds nothing) and return the first index whose result converts to a
+    /// nonzero number (tv_get_bool_chk, funcs.c 2872), else -1. An empty or
+    /// null-string callback never matches, and a callback error aborts the
+    /// search like upstream's `did_emsg` check.
+    fn indexof(&mut self, args: &[Typval], scope: &mut Scope) -> Result<Typval> {
+        let callback = match &args[1] {
+            Typval::String(expression) if expression.as_bytes().is_empty() => return Ok(Typval::Number(-1)),
+            Typval::Special(Special::Null) => return Ok(Typval::Number(-1)),
+            Typval::String(_) | Typval::Funcref(_) | Typval::Partial(_) => args[1].clone(),
+            _ => return Err(EvalError::new("E1256", 0, "String or function required for argument 2")),
+        };
+        let startidx = match args.get(2) {
+            None | Some(Typval::Special(Special::Null)) => 0,
+            Some(Typval::Dict(reference)) => dict_entries(reference)?
+                .iter()
+                .find(|(key, _)| key.as_bytes() == b"startidx")
+                .map_or(0, |(_, value)| number_arg(value).unwrap_or(0)),
+            Some(_) => return Err(EvalError::new("E1206", 0, "Dictionary required for argument 3")),
+        };
+        let found = match &args[0] {
+            Typval::List(reference) => {
+                let items = list_items(reference)?;
+                let start = normalize_index(items.len(), startidx).unwrap_or(items.len());
+                let mut found = -1;
+                for (index, value) in items.into_iter().enumerate().skip(start) {
+                    let matched = self
+                        .eval_callback(&callback, Typval::Number(saturating_i64(index)), value, scope)
+                        .and_then(|result| number_arg(&result).map(|number| number != 0))?;
+                    if matched {
+                        found = saturating_i64(index);
+                        break;
+                    }
+                }
+                found
+            }
+            Typval::Blob(bytes) => {
+                let start = normalize_index(bytes.len(), startidx).unwrap_or(bytes.len());
+                let mut found = -1;
+                for (index, byte) in bytes.iter().copied().enumerate().skip(start) {
+                    let matched = self
+                        .eval_callback(&callback, Typval::Number(saturating_i64(index)), Typval::Number(i64::from(byte)), scope)
+                        .and_then(|result| number_arg(&result).map(|number| number != 0))?;
+                    if matched {
+                        found = saturating_i64(index);
+                        break;
+                    }
+                }
+                found
+            }
+            _ => return Err(EvalError::new("E1226", 0, "List or Blob required for argument 1")),
+        };
+        Ok(Typval::Number(found))
+    }
+
     fn sort(&mut self, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
         let Some(Typval::List(reference)) = args.first() else {
             return Err(EvalError::new("E714", 0, "List required"));
@@ -570,7 +628,7 @@ fn is_implemented(name: &str) -> bool {
         "abs" | "add" | "and" | "blob2list" | "ceil" | "char2nr" | "copy" | "count" |
         "deepcopy" | "empty" | "escape" | "executable" | "exists" | "extend" | "extendnew" | "filter" | "flatten" |
         "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "get" | "getcwd" | "has" | "has_key" | "index" | "insert" | "items" |
-        "islocked" | "join" | "json_decode" | "json_encode" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
+        "indexof" | "islocked" | "join" | "json_decode" | "json_encode" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
         "match" | "matchend" | "matchstr" | "max" | "min" | "nr2char" | "or" | "pow" | "printf" | "range" | "reduce" | "resolve" |
         "remove" | "repeat" | "reverse" | "setenv" | "simplify" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
         "str2nr" | "strcharlen" | "strchars" | "stridx" | "string" | "strpart" | "strridx" |

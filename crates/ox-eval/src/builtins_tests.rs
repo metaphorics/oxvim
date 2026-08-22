@@ -1118,3 +1118,35 @@ fn exists_checks_evaluator_owned_namespaces_without_mutation() {
         );
     }
 }
+
+// `indexof()` — oracle: test/old/testdir/test_listdict.vim Test_indexof and
+// test_blob.vim Test_indexof.
+#[test]
+fn indexof_matches_upstream_string_callback_and_startidx() {
+    let values = Typval::list(vec![number(10), number(10), number(20)]);
+    assert_eq!(call("indexof", vec![values.clone(), text("v:val == 10")]).unwrap(), number(0));
+    assert_eq!(call("indexof", vec![values.clone(), text("v:val == 20")]).unwrap(), number(2));
+    assert_eq!(call("indexof", vec![values.clone(), text("v:val == 30")]).unwrap(), number(-1));
+    let opts = |start: i64| Typval::dict(vec![(OxStr::from("startidx"), number(start))]);
+    assert_eq!(call("indexof", vec![values.clone(), text("v:val == 10"), opts(0)]).unwrap(), number(0));
+    assert_eq!(call("indexof", vec![values.clone(), text("v:val == 10"), opts(-2)]).unwrap(), number(1));
+    assert_eq!(call("indexof", vec![values.clone(), text("v:val == 10"), opts(4)]).unwrap(), number(-1));
+    assert_eq!(call("indexof", vec![values.clone(), text("v:val == 10"), opts(-4)]).unwrap(), number(-1));
+    assert_eq!(call("indexof", vec![values.clone(), text("v:val == 10"), Typval::dict(vec![])]).unwrap(), number(0));
+    // Empty and null-string callbacks never match (funcs.c 2972-2975).
+    assert_eq!(call("indexof", vec![values.clone(), text("")]).unwrap(), number(-1));
+    assert_eq!(call("indexof", vec![values.clone(), Typval::Special(Special::Null)]).unwrap(), number(-1));
+    // A String result converts as a number, so a non-numeric string is 0.
+    let strings = Typval::list(vec![text("a"), text("b"), text("c")]);
+    let blob = Typval::Blob(vec![0xde, 0xad, 0x01, 0xef]);
+    assert_eq!(call("indexof", vec![blob.clone(), text("v:val == 0xef")]).unwrap(), number(3));
+    assert_eq!(call("indexof", vec![blob.clone(), text("v:val == 0xff")]).unwrap(), number(-1));
+    assert_eq!(call("indexof", vec![blob, text("v:val == 0x01"), opts(-2)]).unwrap(), number(2));
+    // Type errors: E1226 container, E1256 callback, E1206 opts.
+    assert_eq!(call("indexof", vec![Typval::dict(vec![]), text("v:val == 2")]).unwrap_err().code, "E1226");
+    assert_eq!(call("indexof", vec![values.clone(), Typval::dict(vec![])]).unwrap_err().code, "E1256");
+    assert_eq!(call("indexof", vec![values, text("v:val == 2"), Typval::list(vec![])]).unwrap_err().code, "E1206");
+    // Callback errors abort the search and surface (upstream did_emsg check).
+    assert_eq!(call("indexof", vec![strings, text("v:val == 'b'")]).unwrap(), number(1));
+    assert_eq!(call("indexof", vec![Typval::list(vec![]), text("v:val == 1")]).unwrap(), number(-1));
+}
