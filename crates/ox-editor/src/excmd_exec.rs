@@ -1638,7 +1638,12 @@ fn command_let<F: FileIO>(
             Ok(value) => value,
             Err(flow) => return flow,
         };
-        match apply_assignment_operator(runtime, previous, value, operator) {
+        let combined = if target.trim_start().starts_with('&') {
+            apply_option_assignment_operator(runtime, previous, value, operator)
+        } else {
+            apply_assignment_operator(runtime, previous, value, operator)
+        };
+        match combined {
             Ok(value) => value,
             Err(flow) => return flow,
         }
@@ -3138,7 +3143,16 @@ fn split_assignment(args: &str) -> Option<(&str, &str, &str)> {
         if matches!(byte, b'(' | b'[' | b'{') { depth += 1; continue; }
         if matches!(byte, b')' | b']' | b'}') { depth = depth.saturating_sub(1); continue; }
         if depth == 0 && byte == b'=' {
-            let start = if index > 0 && matches!(bytes[index - 1], b'+' | b'-' | b'.') { index - 1 } else { index };
+            // eval.c ex_let: the compound operators are `+=`, `-=`, `.=`, and
+            // `..=` (string concat). `..=` must claim both dots, otherwise the
+            // stray first dot stays in the target name.
+            let start = if index >= 2 && bytes[index - 1] == b'.' && bytes[index - 2] == b'.' {
+                index - 2
+            } else if index > 0 && matches!(bytes[index - 1], b'+' | b'-' | b'.') {
+                index - 1
+            } else {
+                index
+            };
             return Some((args[..start].trim(), args[start..=index].trim(), args[index + 1..].trim()));
         }
     }
@@ -3159,9 +3173,28 @@ fn apply_assignment_operator<F: FileIO>(runtime: &ExRuntime<F>, left: Typval, ri
     match operator {
         "+=" => Ok(Typval::Number(typval_number(&left).unwrap_or(0).saturating_add(typval_number(&right).unwrap_or(0)))),
         "-=" => Ok(Typval::Number(typval_number(&left).unwrap_or(0).saturating_sub(typval_number(&right).unwrap_or(0)))),
-        ".=" => Ok(Typval::String(OxStr(
+        ".=" | "..=" => Ok(Typval::String(OxStr(
             format!("{}{}", typval_to_text(&left), typval_to_text(&right)).into_bytes(),
         ))),
+        _ => Err(error_flow(runtime, "E734", format!("Wrong variable type for {operator}"))),
+    }
+}
+
+/// Compound assignment on an option reference, per eval/vars.c
+/// `ex_let_option`: `.`/`..` operators concatenate and are rejected on
+/// number and boolean options, while `+`/`-` do arithmetic and are
+/// rejected on string options — both rejections raise E734.
+fn apply_option_assignment_operator<F: FileIO>(runtime: &ExRuntime<F>, current: Typval, operand: Typval, operator: &str) -> Result<Typval, Flow> {
+    let concatenate = operator.starts_with('.');
+    match (current, concatenate) {
+        (Typval::String(current), true) => Ok(Typval::String(OxStr(
+            format!("{}{}", current.to_string_lossy(), typval_to_text(&operand)).into_bytes(),
+        ))),
+        (Typval::Number(current), false) => match operator {
+            "+=" => Ok(Typval::Number(current.saturating_add(typval_number(&operand).unwrap_or(0)))),
+            "-=" => Ok(Typval::Number(current.saturating_sub(typval_number(&operand).unwrap_or(0)))),
+            _ => Err(error_flow(runtime, "E734", format!("Wrong variable type for {operator}"))),
+        },
         _ => Err(error_flow(runtime, "E734", format!("Wrong variable type for {operator}"))),
     }
 }

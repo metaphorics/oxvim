@@ -148,6 +148,90 @@ fn let_assigns_options_through_ampersand() {
     );
 }
 
+// eval/vars.c ex_let_option — compound operators on option references.
+// `..=` claims both dots (the legacy single-dot `.` form behaves the
+// same), concatenates string options, and `+=`/`-=` do arithmetic on
+// number options. Cross-kind use raises E734 before any state changes.
+#[test]
+fn let_option_compound_concatenates_dot_dot_equals() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&mut editor, "let &runtimepath = '/first'")
+        .unwrap();
+    exec.execute_line(&mut editor, "let &runtimepath ..= ',/second'")
+        .unwrap();
+    assert_eq!(
+        editor.options().get_global("runtimepath").unwrap(),
+        &crate::options::OptionValue::String("/first,/second".to_owned())
+    );
+    // Legacy single-dot form has identical behavior.
+    exec.execute_line(&mut editor, "let &runtimepath .= ',/third'")
+        .unwrap();
+    assert_eq!(
+        editor.options().get_global("runtimepath").unwrap(),
+        &crate::options::OptionValue::String("/first,/second,/third".to_owned())
+    );
+}
+
+// eval/vars.c ex_let_option — `+=` on a number option adds through the
+// option layer.
+#[test]
+fn let_option_compound_adds_number_option() {
+    let (mut editor, buffer, _) = editor_with_window();
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&mut editor, "let &tabstop = 4").unwrap();
+    exec.execute_line(&mut editor, "let &tabstop += 2").unwrap();
+    assert_eq!(
+        editor.options().get_buffer(buffer, "tabstop").unwrap(),
+        &crate::options::OptionValue::Number(6)
+    );
+}
+
+// eval/vars.c ex_let_option — a `.` operator on a number option and a
+// `+` operator on a string option both raise E734 without writing.
+#[test]
+fn let_option_compound_rejects_wrong_kind_with_e734() {
+    let (mut editor, _, _) = editor_with_window();
+    let mut exec = ExExecutor::new();
+    let error = exec
+        .execute_line(&mut editor, "let &tabstop ..= 'x'")
+        .unwrap_err();
+    match error {
+        ExecError::Vim(exception) => {
+            assert_eq!(exception.kind, VimExceptionKind::Error("E734".to_owned()));
+        }
+        other => panic!("expected Vim E734, got {other:?}"),
+    }
+    let error = exec
+        .execute_line(&mut editor, "let &runtimepath += '/x'")
+        .unwrap_err();
+    match error {
+        ExecError::Vim(exception) => {
+            assert_eq!(exception.kind, VimExceptionKind::Error("E734".to_owned()));
+        }
+        other => panic!("expected Vim E734, got {other:?}"),
+    }
+    // The rejected writes left the stored values untouched.
+    assert_eq!(
+        editor.options().get_global("runtimepath").unwrap(),
+        &crate::options::OptionValue::String(String::new())
+    );
+}
+
+// eval/vars.c ex_let — `..=` also compounds plain variables with string
+// concatenation.
+#[test]
+fn let_variable_compound_dot_dot_equals_concatenates() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&mut editor, r#"let g:parts = "a""#).unwrap();
+    exec.execute_line(&mut editor, r#"let g:parts ..= "b""#).unwrap();
+    assert_eq!(
+        *exec.scope().get_scoped(ScopeKind::Global, b"parts", 0).unwrap(),
+        Typval::String(OxStr::from("ab"))
+    );
+}
+
 // ex_docmd.c:ex_let with `@r` target — `:let @a = "text"` stores
 // characterwise content into the editor register (register.c:set_register).
 #[test]
