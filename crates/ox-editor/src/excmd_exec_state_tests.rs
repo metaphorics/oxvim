@@ -612,3 +612,15 @@ fn lua_runtime_error_is_catchable_vim_error() {
         other => panic!("expected Vim error, got {other:?}"),
     }
 }
+
+
+#[test]
+fn put_expression_evaluates_and_inserts_expression_register() {
+    let (mut editor, buffer, _) = editor_with_window();
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&mut editor, "let g:error = 'screen too small'").unwrap();
+    exec.execute_line(&mut editor, "$put =g:error").unwrap();
+
+    let text = editor.buffer(buffer).unwrap().text().unwrap();
+    assert_eq!(text.line(2).unwrap(), b"screen too small");
+}

@@ -40,6 +40,15 @@ pub enum CaseSensitivity {
     IgnoreCase,
 }
 
+/// One literal or expression segment in an interpolated string token.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InterpolationPart {
+    /// Decoded literal bytes.
+    Literal(Vec<u8>),
+    /// Raw source bytes of one embedded expression.
+    Expression(Vec<u8>),
+}
+
 /// Tokens accepted by the legacy expression parser.
 #[allow(missing_docs)]
 #[derive(Clone, Debug, PartialEq)]
@@ -52,6 +61,8 @@ pub enum TokenKind {
     Float(f64),
     /// A decoded single- or double-quoted byte string.
     String(Vec<u8>),
+    /// A `$"..."` or `$'...'` string split into literal and expression parts.
+    Interpolated(Vec<InterpolationPart>),
     /// A decoded `0z` hexadecimal blob.
     Blob(Vec<u8>),
     /// An internal variable or function name.
@@ -133,6 +144,7 @@ impl<'a> Lexer<'a> {
                 Some(b'0'..=b'9') => self.lex_number()?,
                 Some(b'\'') => self.lex_single_string()?,
                 Some(b'"') => self.lex_double_string()?,
+                Some(b'$') if matches!(self.peek(1), Some(b'\'' | b'"')) => self.lex_interpolated()?,
                 Some(b'$') => self.lex_environment()?,
                 Some(b'&') if self.peek(1) == Some(b'&') => {
                     self.offset += 2;
@@ -448,6 +460,76 @@ impl<'a> Lexer<'a> {
             bytes.push((high << 4) | low);
         }
         Ok(TokenKind::Blob(bytes))
+    }
+
+    fn lex_interpolated(&mut self) -> Result<TokenKind, EvalError> {
+        let start = self.offset;
+        let quote = self.peek(1).expect("interpolated quote checked by caller");
+        self.offset += 2;
+        let mut parts = Vec::new();
+        let mut literal = Vec::new();
+        loop {
+            match self.peek(0) {
+                None => return Err(EvalError::new(if quote == b'"' { "E114" } else { "E115" }, start, "missing quote in interpolated string")),
+                Some(byte) if byte == quote => {
+                    if quote == b'\'' && self.peek(1) == Some(b'\'') {
+                        literal.push(b'\'');
+                        self.offset += 2;
+                        continue;
+                    }
+                    self.offset += 1;
+                    if !literal.is_empty() { parts.push(InterpolationPart::Literal(literal)); }
+                    return Ok(TokenKind::Interpolated(parts));
+                }
+                Some(byte) if quote == b'"' && byte == 0x5c => {
+                    self.offset += 1;
+                    literal.extend(self.lex_escape(start)?);
+                }
+                Some(b'{') if self.peek(1) == Some(b'{') => { literal.push(b'{'); self.offset += 2; }
+                Some(b'}') if self.peek(1) == Some(b'}') => { literal.push(b'}'); self.offset += 2; }
+                Some(b'}') => return Err(EvalError::new("E1278", self.offset, "stray closing brace in interpolated string")),
+                Some(b'{') => {
+                    if !literal.is_empty() { parts.push(InterpolationPart::Literal(std::mem::take(&mut literal))); }
+                    self.offset += 1;
+                    let expression_start = self.offset;
+                    let expression_end = self.scan_interpolation_expression(start)?;
+                    let expression = self.source[expression_start..expression_end].to_vec();
+                    if expression.iter().all(u8::is_ascii_whitespace) {
+                        return Err(EvalError::new("E15", expression_start, "empty interpolated expression"));
+                    }
+                    parts.push(InterpolationPart::Expression(expression));
+                }
+                Some(byte) => { literal.push(byte); self.offset += 1; }
+            }
+        }
+    }
+
+    fn scan_interpolation_expression(&mut self, string_start: usize) -> Result<usize, EvalError> {
+        let mut braces = 0usize;
+        let mut quote = None;
+        while let Some(byte) = self.peek(0) {
+            if let Some(active) = quote {
+                if active == b'"' && byte == b'\\' {
+                    self.offset += 1;
+                    if self.peek(0).is_some() { self.offset += 1; }
+                    continue;
+                }
+                if byte == active {
+                    if active == b'\'' && self.peek(1) == Some(b'\'') { self.offset += 2; continue; }
+                    quote = None;
+                }
+                self.offset += 1;
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' => { quote = Some(byte); self.offset += 1; }
+                b'{' => { braces += 1; self.offset += 1; }
+                b'}' if braces == 0 => { let end = self.offset; self.offset += 1; return Ok(end); }
+                b'}' => { braces -= 1; self.offset += 1; }
+                _ => self.offset += 1,
+            }
+        }
+        Err(EvalError::new("E1279", string_start, "missing closing brace in interpolated string"))
     }
 
     fn lex_single_string(&mut self) -> Result<TokenKind, EvalError> {

@@ -10,7 +10,7 @@ mod path_builtins;
 pub mod scope;
 
 pub use builtins::{
-    builtin_spec, call_buffer_builtin, is_buffer_builtin, is_locked_value, lock_value, BuiltinSpec,
+    builtin_spec, call_buffer_builtin, exists, is_buffer_builtin, is_locked_value, lock_value, BuiltinSpec,
     Builtins, BUILTINS,
 };
 pub use error::{EvalError, EvalErrorKind, Result};

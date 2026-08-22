@@ -357,6 +357,12 @@ impl UserFunctions {
         &self.call_stack
     }
 
+    /// SID visible to `s:` names in the active function body.
+    #[must_use]
+    pub fn active_sid(&self) -> Option<Sid> {
+        self.call_stack.last().map(|frame| frame.sid).filter(|sid| *sid != 0)
+    }
+
     /// Upstream-style call-stack throwpoint prefix.
     #[must_use]
     pub fn throwpoint_prefix(&self) -> String {

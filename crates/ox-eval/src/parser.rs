@@ -7,7 +7,9 @@
 use ox_types::{OxStr, Typval};
 
 use crate::error::EvalError;
-use crate::lexer::{CaseSensitivity, Lexer, Span, Token, TokenKind};
+use crate::lexer::{
+    CaseSensitivity, InterpolationPart as LexInterpolationPart, Lexer, Span, Token, TokenKind,
+};
 
 static FALLBACK_EOF: Token = Token {
     kind: TokenKind::Eof,
@@ -88,6 +90,8 @@ pub enum CompareOp {
 pub enum ExprKind {
     /// A number, float, string, or blob literal.
     Literal(Typval),
+    /// A string assembled from literal and evaluated expression parts.
+    Interpolated(Vec<InterpolatedPart>),
     /// A scoped or unscoped internal variable name.
     Variable(OxStr),
     /// `$NAME`.
@@ -136,6 +140,15 @@ pub enum ExprKind {
     /// `{arg, ... -> expr}`. `varargs` is true when the parameter list ends
     /// with `...`, matching `get_lambda_tv`'s acceptance of the variadic form.
     Lambda { params: Vec<OxStr>, varargs: bool, body: Box<Expr> },
+}
+
+/// One literal or parsed-expression segment in an interpolated string.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InterpolatedPart {
+    /// Decoded literal bytes.
+    Literal(OxStr),
+    /// Parsed embedded expression.
+    Expression(Expr),
 }
 
 /// Parser for one complete Vimscript expression.
@@ -360,6 +373,20 @@ impl<'a> Parser<'a> {
             TokenKind::Integer(value) => Ok(Expr::new(ExprKind::Literal(Typval::Number(value)), token.span)),
             TokenKind::Float(value) => Ok(Expr::new(ExprKind::Literal(Typval::Float(value)), token.span)),
             TokenKind::String(value) => Ok(Expr::new(ExprKind::Literal(Typval::String(OxStr(value))), token.span)),
+            TokenKind::Interpolated(parts) => {
+                let parts = parts
+                    .into_iter()
+                    .map(|part| match part {
+                        LexInterpolationPart::Literal(bytes) => {
+                            Ok(InterpolatedPart::Literal(OxStr(bytes)))
+                        }
+                        LexInterpolationPart::Expression(source) => {
+                            Parser::new(&source).parse().map(InterpolatedPart::Expression)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, EvalError>>()?;
+                Ok(Expr::new(ExprKind::Interpolated(parts), token.span))
+            }
             TokenKind::Blob(value) => Ok(Expr::new(ExprKind::Literal(Typval::Blob(value)), token.span)),
             TokenKind::Identifier(value) => self.parse_variable(value, token.span),
             TokenKind::Environment(value) => Ok(Expr::new(ExprKind::Environment(OxStr(value)), token.span)),

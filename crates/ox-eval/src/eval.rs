@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error::{EvalError, Result};
 use crate::lexer::CaseSensitivity;
-use crate::parser::{BinaryOp, CompareOp, Expr, ExprKind, OptionScope as AstOptionScope, UnaryOp};
+use crate::parser::{BinaryOp, CompareOp, Expr, ExprKind, InterpolatedPart, OptionScope as AstOptionScope, UnaryOp};
 use crate::scope::{OptionScope, Scope, ScopeKind};
 
 /// Default maximum recursive evaluator depth.
@@ -252,6 +252,19 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
             ExprKind::Literal(value) => {
                 let identity = identity_type(value).then_some(expression as *const Expr as usize);
                 Ok(Evaluated { value: value.clone(), identity })
+            }
+            ExprKind::Interpolated(parts) => {
+                let mut bytes = Vec::new();
+                for part in parts {
+                    match part {
+                        InterpolatedPart::Literal(literal) => bytes.extend_from_slice(literal.as_bytes()),
+                        InterpolatedPart::Expression(part) => {
+                            let value = self.eval_at(part, scope, next)?.value;
+                            bytes.extend_from_slice(to_string(&value, expression.span.start)?.as_bytes());
+                        }
+                    }
+                }
+                Ok(Evaluated::plain(Typval::String(OxStr(bytes))))
             }
             ExprKind::Variable(name) => self.eval_variable(name, expression.span.start, scope),
             ExprKind::Environment(name) => Ok(Evaluated::plain(scope.get_env(name.as_bytes()))),

@@ -88,6 +88,7 @@ impl<'a> Builtins<'a> {
             "empty" => Ok(Typval::Number(i64::from(is_empty(&args[0])))),
             "escape" => escape(&args),
             "executable" => path_builtins::executable(&args[0]),
+            "exists" => exists(&args[0], scope),
             "extend" | "extendnew" => extend(args),
             "filereadable" => path_builtins::filereadable(&args[0]),
             "filter" => self.filter_or_map(args, scope, CollectionOp::Filter),
@@ -571,7 +572,7 @@ fn check_arity(spec: &BuiltinSpec, count: usize) -> Result<()> {
 fn is_implemented(name: &str) -> bool {
     matches!(name,
         "abs" | "add" | "and" | "blob2list" | "ceil" | "char2nr" | "copy" | "count" |
-        "deepcopy" | "empty" | "escape" | "executable" | "extend" | "extendnew" | "filereadable" | "filter" | "flatten" |
+        "deepcopy" | "empty" | "escape" | "executable" | "exists" | "extend" | "extendnew" | "filereadable" | "filter" | "flatten" |
         "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "get" | "getcwd" | "glob" | "globpath" | "has" | "has_key" | "index" | "insert" | "isdirectory" | "items" |
         "islocked" | "join" | "json_decode" | "json_encode" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
         "match" | "matchend" | "matchstr" | "max" | "min" | "nr2char" | "or" | "pow" | "printf" | "range" | "reduce" | "resolve" |
@@ -579,6 +580,40 @@ fn is_implemented(name: &str) -> bool {
         "str2nr" | "strcharlen" | "strchars" | "stridx" | "string" | "strpart" | "strridx" |
         "substitute" | "tolower" | "toupper" | "trim" | "trunc" | "type" | "uniq" | "values" | "xor"
     )
+}
+
+/// Implements the evaluator-owned portions of `exists()`: environment,
+/// option, builtin-function, and variable names. Hosts with user functions,
+/// Ex commands, and autocommands layer those namespaces on top.
+pub fn exists(value: &Typval, scope: &Scope) -> Result<Typval> {
+    let operand = string_arg(value)?;
+    let bytes = operand.as_bytes();
+    let found = match bytes.first() {
+        Some(b'$') => {
+            let name = &bytes[1..];
+            scope.contains_env(name)
+                || std::env::var_os(String::from_utf8_lossy(name).as_ref()).is_some()
+        }
+        Some(b'&' | b'+') => option_exists(scope, &bytes[1..]),
+        Some(b'*') => std::str::from_utf8(&bytes[1..])
+            .ok()
+            .is_some_and(|name| builtin_spec(name).is_some()),
+        Some(b':' | b'#') | None => false,
+        _ => matches!(bytes, b"v:true" | b"v:false" | b"v:null" | b"v:none")
+            || scope.contains_variable(bytes),
+    };
+    Ok(Typval::Number(i64::from(found)))
+}
+
+fn option_exists(scope: &Scope, name: &[u8]) -> bool {
+    let (option_scope, name) = if let Some(name) = name.strip_prefix(b"g:") {
+        (crate::scope::OptionScope::Global, name)
+    } else if let Some(name) = name.strip_prefix(b"l:") {
+        (crate::scope::OptionScope::Local, name)
+    } else {
+        (crate::scope::OptionScope::Effective, name)
+    };
+    !name.is_empty() && scope.contains_option(option_scope, name)
 }
 
 /// Whether `name` is a builtin served through a [`BufferHost`] seam rather

@@ -436,6 +436,28 @@ impl Autocmds {
         id == AugroupId::default() || self.groups.contains_key(&id)
     }
 
+    /// Whether a group or registered group/event/pattern query exists.
+    /// The input omits the leading `#`, as in upstream `au_exists()`.
+    #[must_use]
+    pub fn exists(&self, query: &str) -> bool {
+        let mut fields = query.splitn(3, '#');
+        let first = fields.next().unwrap_or_default();
+        let second = fields.next();
+        let third = fields.next();
+        let (group, event_name, pattern) = if let Some(group) = self.group(first) {
+            let Some(event_name) = second else { return true };
+            (Some(group), event_name, third)
+        } else {
+            (None, first, second)
+        };
+        let Some(event) = Event::from_name(event_name) else { return false };
+        self.entries.iter().any(|entry| {
+            entry.event == event
+                && group.is_none_or(|group| entry.options.group == group)
+                && pattern.is_none_or(|pattern| entry.source_pattern.eq_ignore_ascii_case(pattern))
+        })
+    }
+
     /// Deletes an augroup and all of its definitions.
     pub fn delete_group(&mut self, id: AugroupId) -> Result<(), AutocmdError> {
         let Some((name, _)) = self.groups.remove(&id) else { return Err(AutocmdError::UnknownGroup(id)); };

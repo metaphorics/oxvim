@@ -202,6 +202,35 @@ impl Scope {
         }
     }
 
+    /// Whether a scoped or unqualified variable name is currently bound.
+    #[must_use]
+    pub fn contains_variable(&self, name: &[u8]) -> bool {
+        if name.len() >= 2 && name[1] == b':' {
+            return ScopeKind::from_byte(name[0])
+                .is_some_and(|kind| find_pair(self.map(kind), &name[2..]).is_some());
+        }
+        self.get(name, 0).is_ok()
+    }
+
+    /// Whether an environment name is present in the evaluator overlay.
+    #[must_use]
+    pub fn contains_env(&self, name: &[u8]) -> bool {
+        find_pair(&self.env, name).is_some()
+    }
+
+    /// Whether an option name is present in the requested scope.
+    #[must_use]
+    pub fn contains_option(&self, scope: OptionScope, name: &[u8]) -> bool {
+        match scope {
+            OptionScope::Global => find_pair(&self.options_global, name).is_some(),
+            OptionScope::Local => find_pair(&self.options_local, name).is_some(),
+            OptionScope::Effective => {
+                find_pair(&self.options_local, name).is_some()
+                    || find_pair(&self.options_global, name).is_some()
+            }
+        }
+    }
+
     /// Assign a value to a scoped name.
     ///
     /// `v:` and `a:` are read-only for normal assignment and produce `E46`.

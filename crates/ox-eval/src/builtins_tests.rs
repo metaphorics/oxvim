@@ -1133,3 +1133,30 @@ fn printf_formats_strings_numbers_and_radices() {
     assert_eq!(call("printf", vec![text("100%% and %s"), text("done")]).unwrap(), text("100% and done"));
     assert!(call("printf", vec![text("%d %d"), number(1)]).is_err());
 }
+
+
+#[test]
+fn exists_checks_evaluator_owned_namespaces_without_mutation() {
+    let mut builtins = Builtins::without_regex();
+    let mut scope = Scope::new();
+    scope.set_scoped(crate::scope::ScopeKind::Global, b"answer", 0, Typval::Number(42)).unwrap();
+    scope.set_option(crate::scope::OptionScope::Global, b"number", Typval::Number(1));
+
+    for (query, expected) in [
+        ("g:answer", 1),
+        ("g:missing", 0),
+        ("&number", 1),
+        ("&g:number", 1),
+        ("&missing", 0),
+        ("*printf", 1),
+        ("*DefinitelyMissing", 0),
+        ("v:true", 1),
+        ("", 0),
+    ] {
+        assert_eq!(
+            builtins.call(&OxStr::from("exists"), vec![text(query)], &mut scope).unwrap(),
+            Typval::Number(expected),
+            "query {query}",
+        );
+    }
+}

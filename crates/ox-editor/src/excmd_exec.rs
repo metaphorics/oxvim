@@ -13,12 +13,13 @@ use std::rc::Rc;
 
 use ox_eval::scope::{OptionScope as EvalOptionScope, ScopeMap};
 use ox_eval::{
-    call_buffer_builtin, is_buffer_builtin, BuiltinHost, BufferHost, Builtins, EvalError,
-    EvalErrorKind, Evaluator, Parser as ExprParser, RegexEngine, Scope, ScopeKind,
+    builtin_spec, call_buffer_builtin, exists as exists_in_scope, is_buffer_builtin, BuiltinHost,
+    BufferHost, Builtins, EvalError, EvalErrorKind, Evaluator, Parser as ExprParser, RegexEngine,
+    Scope, ScopeKind,
 };
 use ox_excmd::{
-    Address, AddressBase, ExCommand, ParseError, Parser as ExParser, Range, RangeKind,
-    ResolvedCommand, UserCommandMatch, UserCommandProvider,
+    resolve_command, Address, AddressBase, ExCommand, ParseError, Parser as ExParser, Range,
+    RangeKind, ResolveError, ResolvedCommand, UserCommandMatch, UserCommandProvider,
 };
 use ox_regex::{
     compile as compile_regex, exec_at as regex_exec_at, Magic, Position as RegexPosition,
@@ -487,7 +488,11 @@ fn parse_program(
     let parser = ExParser::with_user_commands(users);
     let mut program = Vec::new();
     for line in logical {
-        for command in parser.parse(&line.text)? {
+        let commands = match parser.parse(&line.text) {
+            Ok(commands) => commands,
+            Err(error) => parse_put_expression(&parser, &line.text).ok_or(error)?,
+        };
+        for command in commands {
             program.push(Instruction {
                 command,
                 line: line.first_line,
@@ -495,6 +500,29 @@ fn parse_program(
         }
     }
     Ok(program)
+}
+
+fn parse_put_expression(
+    parser: &ExParser<'_, UserCommandRegistry>,
+    line: &str,
+) -> Option<Vec<ExCommand>> {
+    for (offset, _) in line.match_indices('=') {
+        let Ok(mut commands) = parser.parse(&line[..=offset]) else { continue };
+        if commands.len() != 1
+            || commands[0].command.name() != "put"
+            || commands[0].register != Some('=')
+        {
+            continue;
+        }
+        let expression = line[offset + 1..].trim();
+        if expression.is_empty() {
+            return None;
+        }
+        commands[0].args = expression.to_owned();
+        commands[0].span.end = line.len();
+        return Some(commands);
+    }
+    None
 }
 
 fn run_program<F: FileIO>(
@@ -743,11 +771,13 @@ fn dispatch<F: FileIO>(
         "source" => {
             let path = PathBuf::from(command.args.trim());
             match source_path(runtime, editor, scope, lua, &path, false) {
+                Ok(Flow::Finish) => Flow::Normal,
                 Ok(flow) => flow,
                 Err(error) => exec_error_flow(runtime, error),
             }
         }
-        "finish" => Flow::Finish,
+        "finish" if runtime.scripts.current_sid().is_some() => Flow::Finish,
+        "finish" => error_flow(runtime, "E168", ":finish used outside of a sourced file"),
         "normal" => command_normal(runtime, editor, &command.args),
         "global" => command_global(runtime, editor, scope, lua, command, false),
         "vglobal" => command_global(runtime, editor, scope, lua, command, true),
@@ -773,7 +803,7 @@ fn dispatch<F: FileIO>(
         "buffer" => command_buffer(runtime, editor, command),
         "bwipeout" | "bwipe" => command_buffer_remove(runtime, editor, command, true),
         "bdelete" | "bdel" | "bunload" | "bun" => command_buffer_remove(runtime, editor, command, false),
-        "put" => command_put(runtime, editor, command),
+        "put" => command_put(runtime, editor, scope, lua, command),
         "print" => command_print(runtime, editor, command),
         "delete" => command_delete(runtime, editor, command),
         "yank" => command_yank(runtime, editor, command),
@@ -881,14 +911,22 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
                 .unwrap_or_default();
             return Ok(Typval::String(OxStr(value.into_bytes())));
         }
-        // Buffer-seam builtins (getline/setline) reach the current buffer
+        if name_text == "exists" {
+            return exists_with_editor(self.runtime, self.editor, scope, args);
+        }
+        // Buffer-seam builtins (`getline`/`setline`) reach the current buffer
         // through ox_eval::BufferHost; the typval-only dispatcher below has
         // no buffer access.
         if is_buffer_builtin(&name_text) {
             let mut seam = CurrentBuffer(self.editor);
             return call_buffer_builtin(&mut seam, &name_text, args);
         }
-        let sid = self.runtime.scripts.current_sid().unwrap_or(0);
+        let sid = self
+            .runtime
+            .functions
+            .active_sid()
+            .or_else(|| self.runtime.scripts.current_sid())
+            .unwrap_or(0);
         if self.runtime.functions.contains(&name_text, sid) || name_text.contains('#') {
             let (first, last) = current_line_pair(self.editor);
             return call_user_function(
@@ -1365,7 +1403,11 @@ fn call_user_function_with_self<F: FileIO>(
     last_line: usize,
     receiver: Option<DictRef>,
 ) -> Result<Typval, Flow> {
-    let mut sid = runtime.scripts.current_sid().unwrap_or(0);
+    let mut sid = runtime
+        .functions
+        .active_sid()
+        .or_else(|| runtime.scripts.current_sid())
+        .unwrap_or(0);
     if !runtime.functions.contains(name, sid) && name.contains('#') {
         let path = runtime.scripts.resolve_autoload(name).ok_or_else(|| {
             error_flow(runtime, "E117", format!("Unknown function: {name}"))
@@ -2299,10 +2341,32 @@ fn command_buffer<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, comman
     }
 }
 
-fn command_put<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+fn command_put<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    command: &ExCommand,
+) -> Flow {
     let buffer = match editor.current_buffer() { Some(buffer) => buffer, None => return error_flow(runtime, "E749", "Empty buffer") };
     let position = editor.current_window().and_then(|window| editor.window(window).ok()).map_or(Position { lnum: 1, col: 0 }, |window| window.cursor);
     let register = command.register.unwrap_or('"');
+    if register == '=' && !command.args.is_empty() {
+        let value = match eval_text(runtime, editor, scope, lua, &command.args) {
+            Ok(value) => value,
+            Err(flow) => return flow,
+        };
+        let lines = typval_to_text(&value)
+            .split('\n')
+            .map(|line| line.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        return match editor.buffer_mut(buffer).and_then(|state| {
+            state.append_lines(position.lnum, &lines, position, 0).map_err(Into::into)
+        }) {
+            Ok(_) => Flow::Normal,
+            Err(error) => error_flow(runtime, "E354", error.to_string()),
+        };
+    }
     match editor.put_register(buffer, position, register, 0) {
         Ok(true) => Flow::Normal,
         Ok(false) => error_flow(runtime, "E353", format!("Nothing in register {register}")),
@@ -2448,7 +2512,7 @@ fn command_augroup<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, c
     }
 }
 
-fn command_autocmd<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+fn command_autocmd<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
     let args = command.args.trim();
     if args.is_empty() { return Flow::Normal; }
     let mut words = args.splitn(3, char::is_whitespace).filter(|word| !word.is_empty());
@@ -3386,4 +3450,34 @@ fn lua_error_flow<F: FileIO>(runtime: &ExRuntime<F>, error: LuaExecError, load_c
             error_flow(runtime, runtime_code, message)
         }
     }
+}
+
+fn exists_with_editor<F: FileIO>(
+    runtime: &ExRuntime<F>,
+    editor: &Editor,
+    scope: &Scope,
+    args: Vec<Typval>,
+) -> ox_eval::Result<Typval> {
+    let value = args.first().cloned().unwrap_or(Typval::String(OxStr::from("")));
+    let operand = typval_to_text(&value);
+    let result = if let Some(option) = operand.strip_prefix('&').or_else(|| operand.strip_prefix('+')) {
+        let option = option.strip_prefix("g:").or_else(|| option.strip_prefix("l:")).unwrap_or(option);
+        i64::from(crate::options::OptionStore::metadata(option).is_ok())
+    } else if let Some(name) = operand.strip_prefix('*') {
+        let sid = runtime.functions.active_sid().or_else(|| runtime.scripts.current_sid()).unwrap_or(0);
+        i64::from(builtin_spec(name).is_some() || runtime.functions.contains(name, sid))
+    } else if let Some(name) = operand.strip_prefix(':') {
+        match resolve_command(name, &runtime.user_commands) {
+            Ok(command) => if command.name() == name { 2 } else { 1 },
+            Err(ResolveError::AmbiguousUserCommand) => 3,
+            Err(ResolveError::NotFound) => 0,
+        }
+    } else if let Some(event) = operand.strip_prefix("##") {
+        i64::from(Event::from_name(event).is_some())
+    } else if let Some(query) = operand.strip_prefix('#') {
+        i64::from(editor.autocmds().exists(query))
+    } else {
+        return exists_in_scope(&value, scope);
+    };
+    Ok(Typval::Number(result))
 }

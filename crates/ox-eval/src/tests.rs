@@ -543,3 +543,20 @@ fn closure_from_isolated_evaluator_is_not_callable() {
     let call = Parser::new(b"f(5)").parse().unwrap();
     assert_eq!(caller.eval(&call, &mut store).unwrap_err().code, "E117");
 }
+
+
+#[test]
+fn interpolated_strings_evaluate_literals_expressions_and_escapes() {
+    assert_eq!(value(br#"$"""#), Typval::String(OxStr::from("")));
+    assert_eq!(value(br#"$"foo{1 + 2}bar""#), Typval::String(OxStr::from("foo3bar")));
+    assert_eq!(value(br#"$"{{x}}={v:true}""#), Typval::String(OxStr::from("{x}=v:true")));
+    assert_eq!(value(br#"$'left{'mid'}right'"#), Typval::String(OxStr::from("leftmidright")));
+    assert_eq!(value(br#"$"outer{$"{'inner'}"}end""#), Typval::String(OxStr::from("outerinnerend")));
+}
+
+#[test]
+fn malformed_interpolated_strings_report_typed_errors() {
+    assert_eq!(error(br#"$"moo}""#).code, "E1278");
+    assert_eq!(error(br#"$"{}""#).code, "E15");
+    assert_eq!(error(br#"$"{1 + 2""#).code, "E1279");
+}

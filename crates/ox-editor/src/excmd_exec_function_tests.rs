@@ -654,3 +654,86 @@ fn job_callbacks_bind_the_options_dictionary_as_self() {
     assert_eq!(global_number(exec.scope(), "exit_code"), Some(0));
     assert!(global_number(exec.scope(), "event_count").is_some_and(|count| count >= 2));
 }
+
+
+#[test]
+fn script_local_calls_inside_persisted_functions_use_defining_sid() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    exec.execute_script(
+        &mut editor,
+        "plugin.vim",
+        "function! s:Helper()\nlet g:called = 17\nendfunction\nfunction! Entry()\ncall s:Helper()\nendfunction",
+    )
+    .unwrap();
+
+    exec.execute_line(&mut editor, "call Entry()").unwrap();
+    assert_eq!(global_number(exec.scope(), "called"), Some(17));
+}
+
+#[test]
+fn same_script_local_function_name_stays_isolated_after_source_returns() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    exec.execute_script(
+        &mut editor,
+        "one.vim",
+        "function! s:Helper()\nlet g:which = 1\nendfunction\nfunction! One()\ncall s:Helper()\nendfunction",
+    )
+    .unwrap();
+    exec.execute_script(
+        &mut editor,
+        "two.vim",
+        "function! s:Helper()\nlet g:which = 2\nendfunction\nfunction! Two()\ncall s:Helper()\nendfunction",
+    )
+    .unwrap();
+
+    exec.execute_line(&mut editor, "call One()").unwrap();
+    assert_eq!(global_number(exec.scope(), "which"), Some(1));
+    exec.execute_line(&mut editor, "call Two()").unwrap();
+    assert_eq!(global_number(exec.scope(), "which"), Some(2));
+}
+
+#[test]
+fn nested_finish_returns_control_to_sourcing_caller() {
+    let io = MemoryFileIO::new();
+    io.insert("/inner.vim", "let g:inner_before = 1\nfinish\nlet g:inner_after = 1");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.execute_script(
+        &mut editor,
+        "/outer.vim",
+        "source /inner.vim\nlet g:outer_after = 1",
+    )
+    .unwrap();
+
+    assert_eq!(global_number(exec.scope(), "inner_before"), Some(1));
+    assert_eq!(global_number(exec.scope(), "inner_after"), None);
+    assert_eq!(global_number(exec.scope(), "outer_after"), Some(1));
+}
+
+#[test]
+fn finish_outside_sourced_script_is_e168() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    assert_eq!(error_code(&exec.execute_line(&mut editor, "finish").unwrap_err()), "E168");
+}
+
+#[test]
+fn exists_reports_editor_options_functions_commands_and_autocmds() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    exec.execute_script(
+        &mut editor,
+        "exists.vim",
+        "function! s:Local()\nendfunction\naugroup ExistGroup\nautocmd BufEnter *.rs let g:event_fired = 1\naugroup END\nlet g:opt = exists('&number')\nlet g:short_opt = exists('+nu')\nlet g:func = exists('*s:Local')\nlet g:command = exists(':set')\nlet g:abbrev = exists(':se')\nlet g:event = exists('##BufEnter')\nlet g:group = exists('#ExistGroup')\nlet g:registered = exists('#ExistGroup#BufEnter')\nlet g:missing = exists('#ExistGroup#BufLeave')",
+    )
+    .unwrap();
+
+    for name in ["opt", "short_opt", "func", "event", "group", "registered"] {
+        assert_eq!(global_number(exec.scope(), name), Some(1), "{name}");
+    }
+    assert_eq!(global_number(exec.scope(), "command"), Some(2));
+    assert_eq!(global_number(exec.scope(), "abbrev"), Some(1));
+    assert_eq!(global_number(exec.scope(), "missing"), Some(0));
+}
