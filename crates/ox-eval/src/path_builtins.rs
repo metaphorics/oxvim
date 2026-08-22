@@ -198,10 +198,6 @@ fn parse_integer_prefix(bytes: &[u8]) -> Option<i64> {
     text[..end].parse().ok()
 }
 
-fn path_arg(value: &Typval) -> Result<PathBuf> {
-    Ok(PathBuf::from(string_arg(value)?.to_string_lossy().into_owned()))
-}
-
 fn absolute_name(name: &str) -> String {
     let expanded = expand_home(name);
     let path = Path::new(&expanded);
