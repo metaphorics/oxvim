@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +17,7 @@ use ox_uv::net::{NetEvent, Tcp, Udp};
 use ox_uv::net::{Pipe, Tty, TtyMode};
 use ox_uv::process::{self, Process, ProcessPipe, SpawnOptions, StdioConfig};
 use ox_uv::thread;
-use ox_uv::{Async, CallbackError, Check, Handle, HandleId, Idle, Prepare, RunMode, Signal, UvLoop};
+use ox_uv::{Async, CallbackError, Check, Handle, HandleId, Idle, Prepare, RunMode, Signal, Timer, UvLoop};
 
 #[cfg(unix)]
 const SIGNALS: &[(&str, i32)] = &[
@@ -80,12 +81,16 @@ fn signal_name(lua: &Lua, number: i32) -> mlua::Result<Value> {
 use crate::vim::{call_with_traceback, FastCallbackState, Scheduler};
 
 type DeferredOperation = Box<dyn FnOnce(&mut UvLoop)>;
+type AfterRun = Rc<dyn Fn() -> mlua::Result<()>>;
 
 #[derive(Clone)]
 pub(crate) struct LoopAccess {
     pub(crate) uv_loop: Rc<RefCell<UvLoop>>,
     in_callback: Rc<Cell<bool>>,
+    draining: Rc<Cell<bool>>,
+    active_loop: Rc<Cell<Option<NonNull<UvLoop>>>>,
     deferred: Rc<RefCell<VecDeque<DeferredOperation>>>,
+    after_run: Rc<RefCell<Option<AfterRun>>>,
 }
 
 impl LoopAccess {
@@ -93,8 +98,15 @@ impl LoopAccess {
         Self {
             uv_loop,
             in_callback: Rc::new(Cell::new(false)),
+            draining: Rc::new(Cell::new(false)),
+            active_loop: Rc::new(Cell::new(None)),
             deferred: Rc::new(RefCell::new(VecDeque::new())),
+            after_run: Rc::new(RefCell::new(None)),
         }
+    }
+
+    pub(crate) fn set_after_run(&self, after_run: AfterRun) {
+        *self.after_run.borrow_mut() = Some(after_run);
     }
 
     pub(crate) fn apply(&self, operation: DeferredOperation) -> mlua::Result<()> {
@@ -108,19 +120,76 @@ impl LoopAccess {
 
     pub(crate) fn callback<R>(&self, uv_loop: &mut UvLoop, callback: impl FnOnce() -> R) -> R {
         let nested = self.in_callback.replace(true);
+        let parent_loop = self.active_loop.replace(Some(NonNull::from(&mut *uv_loop)));
         let result = callback();
+        self.active_loop.set(parent_loop);
         self.in_callback.set(nested);
-        if !nested {
-            loop {
-                let operation = self.deferred.borrow_mut().pop_front();
-                let Some(operation) = operation else { break };
-                self.in_callback.set(true);
-                operation(uv_loop);
-                self.in_callback.set(false);
-            }
+        if !self.draining.get() {
+            self.drain_deferred(uv_loop);
         }
         result
     }
+
+    fn drain_deferred(&self, uv_loop: &mut UvLoop) {
+        let parent_draining = self.draining.replace(true);
+        loop {
+            let operation = self.deferred.borrow_mut().pop_front();
+            let Some(operation) = operation else { break };
+            let nested = self.in_callback.replace(true);
+            operation(uv_loop);
+            self.in_callback.set(nested);
+        }
+        self.draining.set(parent_draining);
+    }
+
+    fn run(&self, mode: RunMode) -> mlua::Result<bool> {
+        let alive = if let Some(mut active_loop) = self.active_loop.get() {
+            // `callback` installs this pointer only for the synchronous lifetime
+            // of the exact `&mut UvLoop` supplied by ox-uv.
+            let uv_loop = unsafe { active_loop.as_mut() };
+            self.drain_deferred(uv_loop);
+            uv_loop.run_nested(mode).map_err(mlua::Error::external)?
+        } else {
+            self.uv_loop.borrow_mut().run(mode).map_err(mlua::Error::external)?
+        };
+        self.finish_run()?;
+        Ok(alive)
+    }
+
+    pub(crate) fn poll(&self, timeout: i64) -> mlua::Result<()> {
+        if let Some(mut active_loop) = self.active_loop.get() {
+            // Sound for the same callback-scoped reason documented in `run`.
+            let uv_loop = unsafe { active_loop.as_mut() };
+            self.drain_deferred(uv_loop);
+            poll_loop(uv_loop, timeout, true)?;
+        } else {
+            poll_loop(&mut self.uv_loop.borrow_mut(), timeout, false)?;
+        }
+        self.finish_run()
+    }
+
+    fn finish_run(&self) -> mlua::Result<()> {
+        let after_run = self.after_run.borrow().clone();
+        match after_run { Some(after_run) => after_run(), None => Ok(()) }
+    }
+}
+
+fn poll_loop(uv_loop: &mut UvLoop, timeout: i64, nested: bool) -> mlua::Result<()> {
+    let timeout_timer = if timeout >= 0 {
+        let timer = Timer::new(uv_loop).map_err(mlua::Error::external)?;
+        timer.start(uv_loop, timeout as u64, 0, |_, _| Ok(())).map_err(mlua::Error::external)?;
+        Some(timer)
+    } else {
+        None
+    };
+    if nested { uv_loop.run_nested(RunMode::Once) } else { uv_loop.run(RunMode::Once) }
+        .map_err(mlua::Error::external)?;
+    if let Some(timer) = timeout_timer {
+        timer.close(uv_loop).map_err(mlua::Error::external)?;
+        if nested { uv_loop.run_nested(RunMode::NoWait) } else { uv_loop.run(RunMode::NoWait) }
+            .map_err(mlua::Error::external)?;
+    }
+    Ok(())
 }
 
 fn invoke(lua: &Lua, fast: &FastCallbackState, callback: &Function, args: MultiValue) {
@@ -406,7 +475,12 @@ impl UserData for LuaProcessPipe {
         methods.add_method("close", |_, this, callback: Option<Function>| {
             if this.closing.replace(true) { return Ok(()); }
             let inner = this.inner.clone(); let lua = this.lua.clone(); let fast = this.fast.clone();
-            this.access.apply(Box::new(move |uv_loop| if let Some(pipe) = inner.borrow_mut().take() { let _ = pipe.close(uv_loop); if let Some(callback) = callback { invoke(&lua, &fast, &callback, MultiValue::new()); } }))?;
+            this.access.apply(Box::new(move |uv_loop| {
+                if let Some(pipe) = inner.borrow_mut().take() {
+                    let _ = pipe.close(uv_loop);
+                    if let Some(callback) = callback { invoke(&lua, &fast, &callback, MultiValue::new()); }
+                }
+            }))?;
             Ok(())
         });
         methods.add_method("is_closing", |_, this, ()| Ok(this.closing.get() || this.inner.borrow().is_none()));
@@ -595,20 +669,40 @@ pub(crate) fn install(lua: &Lua, uv: &Table, access: LoopAccess, scheduler: Rc<d
     let pending_processes: Rc<RefCell<Vec<PendingProcess>>> = Rc::new(RefCell::new(Vec::new()));
     let pending_works: Rc<RefCell<Vec<PendingWork>>> = Rc::new(RefCell::new(Vec::new()));
 
-    let run_loop = uv_loop.clone(); let run_pending = pending_processes.clone(); let run_works = pending_works.clone(); let run_scheduler = scheduler.clone(); let run_lua = lua.clone(); let run_fast = fast.clone();
+    let completion_pending = pending_processes.clone();
+    let completion_lua = lua.clone();
+    let completion_fast = fast.clone();
+    access.set_after_run(Rc::new(move || {
+        loop {
+            let completed = {
+                let mut pending = completion_pending.borrow_mut();
+                let mut found = None;
+                for index in 0..pending.len() {
+                    let result = pending[index].completion.result.lock()
+                        .map_err(|_| mlua::Error::runtime("process completion lock poisoned"))?
+                        .take();
+                    if let Some(result) = result {
+                        found = Some((pending.remove(index), result));
+                        break;
+                    }
+                }
+                found
+            };
+            let Some((process, result)) = completed else { break };
+            let (code, signal) = result.map_err(mlua::Error::runtime)?;
+            let mut args = MultiValue::new();
+            args.push_back(Value::Integer(code));
+            args.push_back(Value::Integer(i64::from(signal)));
+            let _guard = completion_fast.enter();
+            call_with_traceback(&completion_lua, &process.callback, args)?;
+        }
+        Ok(())
+    }));
+
+    let run_access = access.clone(); let run_works = pending_works.clone(); let run_scheduler = scheduler.clone(); let run_lua = lua.clone(); let run_fast = fast.clone();
     uv.set("run", lua.create_function(move |_, mode: Option<String>| {
         let mode = match mode.as_deref().unwrap_or("default") { "default" => RunMode::Default, "once" => RunMode::Once, "nowait" => RunMode::NoWait, other => return Err(mlua::Error::runtime(format!("invalid run mode: {other}"))) };
-        let alive = run_loop.borrow_mut().run(mode).map_err(mlua::Error::external)?;
-        let mut pending = run_pending.borrow_mut();
-        let mut index = 0;
-        while index < pending.len() {
-            let result = pending[index].completion.result.lock().map_err(|_| mlua::Error::runtime("process completion lock poisoned"))?.take();
-            if let Some(result) = result {
-                let process = pending.remove(index); let callback = process.callback; let lua = run_lua.clone(); let fast = run_fast.clone();
-                let (code, signal) = result.map_err(mlua::Error::runtime)?;
-                run_scheduler.schedule_deferred(Box::new(move || { let mut args = MultiValue::new(); args.push_back(Value::Integer(code)); args.push_back(Value::Integer(i64::from(signal))); let _guard = fast.enter(); call_with_traceback(&lua, &callback, args).map(|_| ()) })).map_err(mlua::Error::runtime)?;
-            } else { index += 1; }
-        }
+        let alive = run_access.run(mode)?;
         for pending in run_works.borrow().iter() {
             loop {
                 let result = pending.completion.results.lock().map_err(|_| mlua::Error::runtime("work completion lock poisoned"))?.pop_front();

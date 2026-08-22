@@ -507,6 +507,49 @@ fn pipe_write_flushing_earlier_write_parks_completion_until_borrow_release() {
     assert_eq!(host.lua().globals().get::<String>("order").unwrap(), "AB");
 }
 
+#[cfg(unix)]
+#[test]
+fn nested_run_drains_pipe_close_requested_by_write_callback() {
+    let (host, scheduler) = host();
+    host.lua()
+        .load(
+            r#"
+            nested_completed = false
+            process_exited = false
+            local input = assert(vim.uv.new_pipe(false))
+            local output = assert(vim.uv.new_pipe(false))
+            local process
+            process = assert(vim.uv.spawn('/bin/cat', {
+              stdio = { input, output, nil },
+            }, function(code, signal)
+              assert(code == 0 and signal == 0)
+              process_exited = true
+              process:close()
+            end))
+            output:read_start(function(err, chunk)
+              assert(err == nil)
+              if chunk then
+                input:close()
+                while not process_exited do
+                  vim.uv.run('once')
+                end
+                nested_completed = true
+              else
+                output:close()
+              end
+            end)
+            input:write('x')
+            vim.uv.run('default')
+            assert(nested_completed, 'read callback did not complete its nested wait')
+            "#,
+        )
+        .exec()
+        .unwrap();
+    scheduler.drain().unwrap();
+    assert!(host.lua().globals().get::<bool>("nested_completed").unwrap());
+    assert!(host.lua().globals().get::<bool>("process_exited").unwrap());
+}
+
 #[test]
 fn timer_close_is_idempotent() {
     let (host, scheduler) = host();

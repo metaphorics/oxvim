@@ -180,24 +180,9 @@ pub(crate) fn install(
     core.set("ui_flush", lua.create_function(|_, ()| Ok(()))?)?;
     core.set("check_interrupt", lua.create_function(|_, ()| Ok(false))?)?;
 
-    let loop_for_poll = uv_loop.clone();
+    let poll_access = loop_access.clone();
     core.set("loop_poll", lua.create_function(move |_, (timeout, _fast_only): (i64, bool)| {
-        let mut uv_loop = loop_for_poll.borrow_mut();
-        let timeout_timer = if timeout >= 0 {
-            let timer = Timer::new(&mut uv_loop).map_err(mlua::Error::external)?;
-            timer
-                .start(&mut uv_loop, timeout as u64, 0, |_, _| Ok(()))
-                .map_err(mlua::Error::external)?;
-            Some(timer)
-        } else {
-            None
-        };
-        uv_loop.run(RunMode::Once).map_err(mlua::Error::external)?;
-        if let Some(timer) = timeout_timer {
-            timer.close(&mut uv_loop).map_err(mlua::Error::external)?;
-            uv_loop.run(RunMode::NoWait).map_err(mlua::Error::external)?;
-        }
-        Ok(())
+        poll_access.poll(timeout)
     })?)?;
 
     let uv = lua.create_table()?;

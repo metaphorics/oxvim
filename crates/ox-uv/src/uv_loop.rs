@@ -93,6 +93,22 @@ impl UvLoop {
         result
     }
 
+    /// Runs a loop from one of this loop's callbacks.
+    ///
+    /// The caller must already hold callback-scoped access to this exact loop.
+    /// An outer run mode, when present, remains installed while the nested run
+    /// executes; synchronous callbacks without an outer run use normal setup.
+    pub fn run_nested(&mut self, mode: RunMode) -> Result<bool> {
+        if self.running_mode.is_none() {
+            return self.run(mode);
+        }
+        match mode {
+            RunMode::Default => self.run_default_inner(),
+            RunMode::Once => self.run_once_inner(),
+            RunMode::NoWait => self.run_nowait_inner(),
+        }
+    }
+
     /// Returns the active run mode while inside a callback.
     pub fn loop_mode(&self) -> Option<RunMode> {
         self.running_mode
