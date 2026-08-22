@@ -450,9 +450,17 @@ impl RegexEngine for LiteralRegex {
         self.calls.set(self.calls.get() + 1);
         Ok(text.as_bytes().get(start..).and_then(|tail| tail.windows(pattern.as_bytes().len()).position(|window| window == pattern.as_bytes())).map(|position| (start + position, start + position + pattern.as_bytes().len())))
     }
-    fn substitute(&self, text: &OxStr, pattern: &OxStr, replacement: &OxStr, _flags: &OxStr) -> crate::Result<OxStr> {
+    fn substitute(&self, text: &OxStr, pattern: &OxStr, replacement: &OxStr, flags: &OxStr) -> crate::Result<OxStr> {
         self.calls.set(self.calls.get() + 1);
-        Ok(OxStr(text.to_string_lossy().replacen(pattern.to_string_lossy().as_ref(), replacement.to_string_lossy().as_ref(), 1).into_bytes()))
+        let source = text.to_string_lossy();
+        let pattern = pattern.to_string_lossy();
+        let replacement = replacement.to_string_lossy();
+        let replaced = if flags.as_bytes().contains(&b'g') {
+            source.replace(pattern.as_ref(), replacement.as_ref())
+        } else {
+            source.replacen(pattern.as_ref(), replacement.as_ref(), 1)
+        };
+        Ok(OxStr(replaced.into_bytes()))
     }
 }
 
@@ -923,4 +931,69 @@ fn typval_dispatcher_leaves_buffer_builtins_unimplemented() {
     assert!(!crate::builtins::is_buffer_builtin("getbufline"));
     let error = call("setline", vec![number(1), text("x")]).unwrap_err();
     assert!(matches!(error.kind, crate::EvalErrorKind::NotImplemented(_)));
+}
+
+#[test]
+fn fnamemodify_obeys_filename_modifier_order() {
+    // cmdline.txt `filename-modifiers`: :h/:t and repeated :r/:e.
+    assert_eq!(call("fnamemodify", vec![text("src/archive.tar.gz"), text(":h")]).unwrap(), text("src"));
+    assert_eq!(call("fnamemodify", vec![text("src/archive.tar.gz"), text(":t:r:r")]).unwrap(), text("archive"));
+    assert_eq!(call("fnamemodify", vec![text("src/archive.tar.gz"), text(":e:e")]).unwrap(), text("tar.gz"));
+    assert_eq!(call("fnamemodify", vec![text(".nvimrc"), text(":r")]).unwrap(), text(".nvimrc"));
+    assert_eq!(call("fnamemodify", vec![text(""), text(":h")]).unwrap(), text("."));
+}
+
+#[test]
+fn fnamemodify_full_relative_and_home_forms() {
+    let current = std::env::current_dir().unwrap();
+    let absolute = call("fnamemodify", vec![text("src/file.rs"), text(":p")]).unwrap();
+    assert_eq!(absolute, text(&current.join("src/file.rs").to_string_lossy()));
+    assert_eq!(call("fnamemodify", vec![absolute.clone(), text(":.")]).unwrap(), text("src/file.rs"));
+    if let Some(home) = std::env::var_os("HOME") {
+        let path = std::path::PathBuf::from(home).join("file");
+        assert_eq!(call("fnamemodify", vec![text(&path.to_string_lossy()), text(":~")]).unwrap(), text("~/file"));
+    }
+    assert_eq!(call("fnamemodify", vec![text("file"), text(":unsupported")]).unwrap(), text("file"));
+}
+
+#[test]
+fn fnamemodify_substitutions_use_regex_seam() {
+    let regex = LiteralRegex { calls: Cell::new(0) };
+    let mut builtins = Builtins::new(&regex);
+    let mut scope = Scope::new();
+    assert_eq!(builtins.call(&OxStr::from("fnamemodify"), vec![text("src/version.c"), text(":s?version?main?")], &mut scope).unwrap(), text("src/main.c"));
+    assert_eq!(builtins.call(&OxStr::from("fnamemodify"), vec![text("a/a/a"), text(":gs?a?b?")], &mut scope).unwrap(), text("b/b/b"));
+    assert_eq!(regex.calls.get(), 2);
+}
+
+#[test]
+fn simplify_preserves_relative_and_trailing_separators() {
+    // vimfn.txt simplify(): simplify("./dir/.././/file/") == "./file/".
+    assert_eq!(call("simplify", vec![text("./dir/.././/file/")]).unwrap(), text("./file/"));
+    assert_eq!(call("simplify", vec![text("///one//two/../three")]).unwrap(), text("/one/three"));
+}
+
+#[test]
+fn filesystem_predicates_and_resolve_use_real_file_types() {
+    let root = std::env::temp_dir().join(format!("ox-eval-path-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("directory")).unwrap();
+    std::fs::write(root.join("file"), b"data").unwrap();
+    assert_eq!(call("filereadable", vec![text(&root.join("file").to_string_lossy())]).unwrap(), number(1));
+    assert_eq!(call("filereadable", vec![text(&root.join("directory").to_string_lossy())]).unwrap(), number(0));
+    assert_eq!(call("isdirectory", vec![text(&root.join("directory").to_string_lossy())]).unwrap(), number(1));
+    assert_eq!(call("isdirectory", vec![text(&root.join("missing").to_string_lossy())]).unwrap(), number(0));
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(root.join("directory"), root.join("link")).unwrap();
+        assert_eq!(call("resolve", vec![text(&root.join("link/").to_string_lossy())]).unwrap(), text(&format!("{}/", root.join("directory").to_string_lossy())));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn getcwd_accepts_upstream_optional_numeric_selectors() {
+    let expected = text(&std::env::current_dir().unwrap().to_string_lossy());
+    assert_eq!(call("getcwd", vec![]).unwrap(), expected);
+    assert_eq!(call("getcwd", vec![number(-1), number(-1), number(-1)]).unwrap(), expected);
 }

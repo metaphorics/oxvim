@@ -11,6 +11,7 @@ use serde_json::Value as JsonValue;
 use crate::error::{EvalError, Result};
 use crate::eval::{compare_bytes, BuiltinHost, BufferHost, ClosureRegistry, Evaluator, RegexEngine};
 use crate::parser::Parser;
+use crate::path_builtins;
 use crate::scope::Scope;
 
 const MAX_CONTAINER_DEPTH: usize = 100;
@@ -87,16 +88,20 @@ impl<'a> Builtins<'a> {
             "empty" => Ok(Typval::Number(i64::from(is_empty(&args[0])))),
             "escape" => escape(&args),
             "extend" | "extendnew" => extend(args),
+            "filereadable" => path_builtins::filereadable(&args[0]),
             "filter" => self.filter_or_map(args, scope, CollectionOp::Filter),
             "flatten" => flatten(&args, true),
             "flattennew" => flatten(&args, false),
             "float2nr" | "trunc" => float_to_number(&args[0]),
             "floor" => float_unary(&args[0], f64::floor),
+            "fnamemodify" => path_builtins::fnamemodify(self.regex, &args[0], &args[1]),
             "get" => get(&args),
+            "getcwd" => path_builtins::getcwd(&args),
             "has" => has_feature(&args),
             "has_key" => has_key(&args),
             "index" => index(&args),
             "insert" => insert(args),
+            "isdirectory" => path_builtins::isdirectory(&args[0]),
             "islocked" => is_locked_value(&args[0]),
             "items" => dict_projection(&args[0], Projection::Items),
             "join" => join(&args),
@@ -119,7 +124,9 @@ impl<'a> Builtins<'a> {
             "range" => range(&args),
             "remove" => remove(args),
             "repeat" => repeat(&args),
+            "resolve" => path_builtins::resolve(&args[0]),
             "reverse" => reverse(args),
+            "simplify" => path_builtins::simplify(&args[0]),
             "sort" => self.sort(args, scope),
             "split" => self.regex_split(&args),
             "sqrt" => float_unary(&args[0], f64::sqrt),
@@ -559,11 +566,11 @@ fn check_arity(spec: &BuiltinSpec, count: usize) -> Result<()> {
 fn is_implemented(name: &str) -> bool {
     matches!(name,
         "abs" | "add" | "and" | "blob2list" | "ceil" | "char2nr" | "copy" | "count" |
-        "deepcopy" | "empty" | "escape" | "extend" | "extendnew" | "filter" | "flatten" |
-        "flattennew" | "foreach" | "float2nr" | "floor" | "get" | "has" | "has_key" | "index" | "insert" | "items" |
+        "deepcopy" | "empty" | "escape" | "extend" | "extendnew" | "filereadable" | "filter" | "flatten" |
+        "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "get" | "getcwd" | "has" | "has_key" | "index" | "insert" | "isdirectory" | "items" |
         "islocked" | "join" | "json_decode" | "json_encode" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
-        "match" | "matchend" | "matchstr" | "max" | "min" | "nr2char" | "or" | "pow" | "range" | "reduce" |
-        "remove" | "repeat" | "reverse" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
+        "match" | "matchend" | "matchstr" | "max" | "min" | "nr2char" | "or" | "pow" | "range" | "reduce" | "resolve" |
+        "remove" | "repeat" | "reverse" | "simplify" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
         "str2nr" | "strcharlen" | "strchars" | "stridx" | "string" | "strpart" | "strridx" |
         "substitute" | "tolower" | "toupper" | "trim" | "trunc" | "type" | "uniq" | "values" | "xor"
     )
