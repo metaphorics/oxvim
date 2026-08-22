@@ -77,7 +77,7 @@ fn run() -> Result<(), AppError> {
         return Err(AppError::NotWired("normal-mode script"));
     }
     if cli.batch.is_some() {
-        return runtime::run_batch(&cli.pre_commands, &cli.commands);
+        return runtime::run_batch(&cli);
     }
     // A listening headless process must enter its network loop rather than the
     // stdio server; --listen is therefore selected before --headless/embed.

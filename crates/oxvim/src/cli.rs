@@ -82,6 +82,11 @@ pub struct Cli {
     pub verbose: Option<VerboseConfig>,
     /// Print API metadata and exit.
     pub api_info: bool,
+    /// Whether plugin scripts should be loaded on startup.
+    ///
+    /// `--noplugin` resets this to `false`; `-u NONE` also resets it unless
+    /// `--clean` was given, matching upstream `main.c`.
+    pub loadplugins: bool,
     /// Files to edit.
     pub files: Vec<String>,
 }
@@ -102,6 +107,7 @@ impl Default for Cli {
             commands: Vec::new(),
             verbose: None,
             api_info: false,
+            loadplugins: true,
             files: Vec::new(),
         }
     }
@@ -158,6 +164,8 @@ impl Cli {
                 cli.shada = if value == "NONE" { ShadaConfig::None } else { ShadaConfig::File(value) };
             } else if options && argument == "--clean" {
                 cli.clean = true;
+            } else if options && (argument == "--noplugin" || argument == "--noplugins") {
+                cli.loadplugins = false;
             } else if options && argument == "--embed" {
                 cli.embed = true;
             } else if options && argument == "--headless" {
@@ -174,10 +182,27 @@ impl Cli {
             } else if options && argument == "-e" {
                 set_batch_mode(&mut cli, BatchMode::Ex)?;
             } else if options && argument == "-s" {
-                if cli.scriptin.is_some() {
-                    return Err(UsageError::new("Only one -s script may be given"));
+                if cli.batch.is_some() {
+                    // `-s` after `-e` or `-es` is the silent batch modifier.
+                    cli.batch = Some(BatchMode::SilentEx);
+                } else {
+                    if cli.scriptin.is_some() {
+                        return Err(UsageError::new("Only one -s script may be given"));
+                    }
+                    cli.scriptin = Some(required_value(&args, &mut index, "-s")?);
                 }
-                cli.scriptin = Some(required_value(&args, &mut index, "-s")?);
+            } else if options && argument == "-S" {
+                let file = if let Some(next) = args.get(index + 1) {
+                    if next.starts_with('-') {
+                        "Session.vim".to_owned()
+                    } else {
+                        index += 1;
+                        next.clone()
+                    }
+                } else {
+                    "Session.vim".to_owned()
+                };
+                cli.commands.push(format!("so {file}"));
             } else if options && argument == "--cmd" {
                 cli.pre_commands.push(required_value(&args, &mut index, "--cmd")?);
             } else if options && argument == "--api-info" {
@@ -192,6 +217,12 @@ impl Cli {
                 cli.files.push(argument.clone());
             }
             index += 1;
+        }
+
+        // Upstream main.c: `-u NONE` resets 'loadplugins' to false, unless
+        // `--clean` was also given (`p_lpl = vimrc_none ? params.clean : p_lpl`).
+        if cli.user_config == UserConfig::None {
+            cli.loadplugins = cli.clean;
         }
 
         if cli.embed && (cli.batch.is_some() || cli.lua_script.is_some() || cli.scriptin.is_some()) {
@@ -270,6 +301,47 @@ mod tests {
             let parsed = Cli::parse(case.args.iter().copied()).unwrap_or_else(|error| panic!("{:?}: {error}", case.args));
             assert!((case.check)(&parsed), "failed form: {:?}", case.args);
         }
+    }
+
+    #[test]
+    fn noplugin_and_session_flags_parse_with_upstream_semantics() {
+        let parsed = Cli::parse(["--noplugin"]).unwrap();
+        assert!(!parsed.loadplugins);
+
+        let parsed = Cli::parse(["--noplugins"]).unwrap();
+        assert!(!parsed.loadplugins);
+
+        let parsed = Cli::parse(["-u", "NONE"]).unwrap();
+        assert!(!parsed.loadplugins);
+
+        let parsed = Cli::parse(["-u", "NONE", "--clean"]).unwrap();
+        assert!(parsed.loadplugins);
+
+        let parsed = Cli::parse(["-u", "NORC", "--noplugin"]).unwrap();
+        assert!(!parsed.loadplugins);
+
+        let parsed = Cli::parse(["-S", "session.vim"]).unwrap();
+        assert_eq!(parsed.commands, ["so session.vim"]);
+
+        let parsed = Cli::parse(["-S"]).unwrap();
+        assert_eq!(parsed.commands, ["so Session.vim"]);
+
+        let parsed = Cli::parse(["-S", "-u", "NONE"]).unwrap();
+        assert_eq!(parsed.commands, ["so Session.vim"]);
+        assert_eq!(parsed.user_config, UserConfig::None);
+
+        let parsed = Cli::parse(["+echo 1", "-S", "session.vim", "+echo 2"]).unwrap();
+        assert_eq!(parsed.commands, ["echo 1", "so session.vim", "echo 2"]);
+
+        let parsed = Cli::parse(["-e", "-s", "-u", "NONE"]).unwrap();
+        assert_eq!(parsed.batch, Some(BatchMode::SilentEx));
+        assert_eq!(parsed.user_config, UserConfig::None);
+        assert!(parsed.scriptin.is_none());
+
+        let parsed = Cli::parse(["-e", "-s", "file"]).unwrap();
+        assert_eq!(parsed.batch, Some(BatchMode::SilentEx));
+        assert_eq!(parsed.files, ["file"]);
+        assert!(parsed.scriptin.is_none());
     }
 
     #[test]

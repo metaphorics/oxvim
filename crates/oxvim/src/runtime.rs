@@ -7,7 +7,7 @@ use std::process::Command;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use ox_editor::{Editor, ExExecutor, ExecOutcome, Geometry, MessageKind};
+use ox_editor::{Editor, ExExecutor, ExecOutcome, Geometry, MessageKind, OptionValue};
 use ox_eval::{Builtins, Scope};
 use ox_eval::BuiltinHost as EvalBuiltins;
 use ox_lua::{
@@ -57,6 +57,9 @@ fn interactive_child_arguments(cli: &Cli) -> Vec<String> {
         let suffix = verbose.file.as_deref().unwrap_or_default();
         arguments.push(format!("-V{}{suffix}", verbose.level));
     }
+    if !cli.loadplugins {
+        arguments.push("--noplugin".into());
+    }
     if !cli.files.is_empty() {
         arguments.push("--".into());
         arguments.extend(cli.files.iter().cloned());
@@ -80,7 +83,7 @@ pub fn runtime_root() -> Result<PathBuf, AppError> {
 }
 
 /// Execute Ex source read from stdin, with `--cmd` before and `+cmd` after.
-pub fn run_batch(pre_commands: &[String], commands: &[String]) -> Result<(), AppError> {
+pub fn run_batch(cli: &Cli) -> Result<(), AppError> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).map_err(AppError::Io)?;
 
@@ -89,11 +92,15 @@ pub fn run_batch(pre_commands: &[String], commands: &[String]) -> Result<(), App
     editor
         .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).map_err(|error| AppError::Editor(error.to_string()))?)
         .map_err(|error| AppError::Editor(error.to_string()))?;
+    editor
+        .options_mut()
+        .set_global("loadplugins", OptionValue::Boolean(cli.loadplugins))
+        .map_err(|error| AppError::Editor(error.to_string()))?;
     let mut executor = ExExecutor::new();
 
-    execute_lines(&mut executor, &mut editor, pre_commands)?;
+    execute_lines(&mut executor, &mut editor, &cli.pre_commands)?;
     execute_lines(&mut executor, &mut editor, input.lines().collect::<Vec<_>>().as_slice())?;
-    execute_lines(&mut executor, &mut editor, commands)?;
+    execute_lines(&mut executor, &mut editor, &cli.commands)?;
 
     let stdout = io::stdout();
     let stderr = io::stderr();

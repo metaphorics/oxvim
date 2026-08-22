@@ -12,7 +12,8 @@ use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
 use ox_api::{CommandExecutor, Registry};
 use ox_editor::{
     AutocmdContext, AutocmdKind, CmdlineKind, Editor, Event, ExExecutor, ExecOutcome, Geometry,
-    LuaExec, LuaExecError, MappingAction, MessageKind, Mode, ModeMachine, Keys, TypeaheadFlags,
+    LuaExec, LuaExecError, MappingAction, MessageKind, Mode, ModeMachine, Keys, OptionValue,
+    TypeaheadFlags,
 };
 use ox_eval::{
     BufferHost, BuiltinHost as EvalBuiltinHost, Builtins, Scope, call_buffer_builtin,
@@ -86,6 +87,10 @@ impl AppState {
             OxStr::from("servername"),
             Object::String(OxStr::from("")),
         );
+        editor
+            .options_mut()
+            .set_global("loadplugins", OptionValue::Boolean(cli.loadplugins))
+            .map_err(|error| AppError::Editor(error.to_string()))?;
         let editor = Rc::new(RefCell::new(editor));
         let registry = Rc::new(ox_api::core().map_err(|error| AppError::Api(error.to_string()))?);
         let lua_work = Rc::new(RefCell::new(VecDeque::new()));

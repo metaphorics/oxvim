@@ -118,3 +118,54 @@ fn script_input_is_not_yet_wired() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("normal-mode script mode is not yet wired"));
 }
+
+#[test]
+fn noplugin_resets_loadplugins_option() {
+    let mut child = oxvim()
+        .args(["-e", "-s", "--noplugin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxvim");
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(b"set loadplugins?\n")
+        .expect("write Ex input");
+    let output = child.wait_with_output().expect("wait for oxvim");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("noloadplugins"));
+}
+
+#[test]
+fn session_flag_sources_file_after_startup() {
+    let path = std::env::temp_dir().join(format!("oxvim-session-{}.vim", std::process::id()));
+    std::fs::write(&path, "call setline(1, \"sourced\")\n%print\n").expect("write session script");
+    let mut child = oxvim()
+        .args([
+            "-e",
+            "-s",
+            "-u",
+            "NONE",
+            "--noplugin",
+            "-S",
+            path.to_str().expect("UTF-8 temp path"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxvim");
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(b"\n")
+        .expect("write empty Ex input");
+    let output = child.wait_with_output().expect("wait for oxvim");
+    let _removed = std::fs::remove_file(&path);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("sourced"));
+}
