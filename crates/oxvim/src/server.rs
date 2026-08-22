@@ -24,7 +24,7 @@ use ox_lua::{
     bind_variables, call_with_traceback, lua_to_object, object_to_lua,
 };
 use ox_rpc::{
-    CHAN_STDIO, ChannelId, ChannelIdAllocator, IncrementalDecoder, Message,
+    CHAN_STDIO, ChannelId, IncrementalDecoder, Message,
 };
 use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, Typval, WinHandle};
 use ox_ui::{
@@ -58,7 +58,7 @@ pub struct AppState {
     editor: Rc<RefCell<Editor>>,
     lua: Rc<RefCell<LuaHost>>,
     registry: Rc<Registry>,
-    ex: ExExecutor,
+    ex: Rc<RefCell<ExExecutor>>,
     mode: ModeMachine,
     exiting: bool,
     rendered_messages: usize,
@@ -94,9 +94,14 @@ impl AppState {
         let editor = Rc::new(RefCell::new(editor));
         let registry = Rc::new(ox_api::core().map_err(|error| AppError::Api(error.to_string()))?);
         let lua_work = Rc::new(RefCell::new(VecDeque::new()));
+        let ex = Rc::new(RefCell::new(ExExecutor::new()));
+        let nested_ex = Rc::new(RefCell::new(ExExecutor::new()));
+        let channel_ids = editor.borrow().channel_ids();
+        ex.borrow_mut().set_channel_ids(channel_ids.clone());
+        nested_ex.borrow_mut().set_channel_ids(channel_ids);
         let mut lua = LuaHost::new(
             RuntimeRoot::new(runtime_root()?),
-            Rc::new(EditorBuiltins { editor: editor.clone() }),
+            Rc::new(EditorBuiltins { editor: editor.clone(), ex: ex.clone(), nested_ex: nested_ex.clone() }),
             Rc::new(LuaScheduler { queue: lua_work.clone() }),
         )
         .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -114,12 +119,14 @@ impl AppState {
         // Load the reachable embedded core prelude before user-controlled Ex startup commands.
         lua.exec("require('vim._core.shared')", Vec::new())
             .map_err(|error| AppError::Lua(error.to_string()))?;
+        let callback_lua = lua.lua().clone();
         let lua = Rc::new(RefCell::new(lua));
-        let mut ex = ExExecutor::new();
-        ex.set_lua_exec(Rc::new(RefCell::new(ServerLuaExec {
-            lua: lua.clone(),
+        let callback_host = || Rc::new(RefCell::new(ServerLuaExec {
+            lua: callback_lua.clone(),
             registry: registry.clone(),
-        })));
+        }));
+        ex.borrow_mut().set_lua_exec(callback_host());
+        nested_ex.borrow_mut().set_lua_exec(callback_host());
 
         let mut state = Self {
             editor,
@@ -156,6 +163,7 @@ impl AppState {
             } else {
                 let source = fs::read_to_string(path).map_err(AppError::Io)?;
                 self.ex
+                    .borrow_mut()
                     .execute_script(&mut self.editor.borrow_mut(), path, &source)
                     .map_err(|error| AppError::Ex(error.to_string()))?;
             }
@@ -169,6 +177,7 @@ impl AppState {
 
     fn execute_ex(&mut self, command: &str) -> Result<(), AppError> {
         self.ex
+            .borrow_mut()
             .execute_line(&mut self.editor.borrow_mut(), command)
             .map_err(|error| AppError::Ex(error.to_string()))?;
         Ok(())
@@ -345,6 +354,7 @@ impl AppState {
         let command = std::str::from_utf8(command.as_bytes())
             .map_err(|_| ApiError::validation("Ex command must be valid UTF-8"))?;
         let outcome = self.ex
+            .borrow_mut()
             .execute_line(&mut self.editor.borrow_mut(), command)
             .map_err(|error| ApiError::exception(error.to_string()))?;
         if outcome == ExecOutcome::Quit {
@@ -355,7 +365,8 @@ impl AppState {
 
     fn dispatch_nvim_cmd(&mut self, params: &[Object]) -> Result<Object, ApiError> {
         let (cmd, opts) = nvim_cmd_args(params)?;
-        let mut executor = ExApiExecutor { executor: &mut self.ex, outcome: ExecOutcome::Completed };
+        let mut ex = self.ex.borrow_mut();
+        let mut executor = ExApiExecutor { executor: &mut ex, outcome: ExecOutcome::Completed };
         let result = ox_api::execute_nvim_cmd(&mut self.editor.borrow_mut(), cmd, opts, &mut executor)?;
         if executor.outcome == ExecOutcome::Quit {
             self.exiting = true;
@@ -477,13 +488,17 @@ impl AppState {
             if !ready { break; }
 
             if let Some(command) = self.mode.take_ex_command() {
-                let outcome = self.ex.execute_line(&mut self.editor.borrow_mut(), &command)
+                let outcome = self.ex
+                    .borrow_mut()
+                    .execute_line(&mut self.editor.borrow_mut(), &command)
                     .map_err(|error| ApiError::exception(error.to_string()))?;
                 if outcome == ExecOutcome::Quit { self.exiting = true; }
             }
             if let Some(action) = self.mode.take_mapping_action() {
                 let outcome = match action {
-                    MappingAction::ExCommands(commands) => self.ex.execute_commands(&mut self.editor.borrow_mut(), &commands)
+                    MappingAction::ExCommands(commands) => self.ex
+                        .borrow_mut()
+                        .execute_commands(&mut self.editor.borrow_mut(), &commands)
                         .map_err(|error| ApiError::exception(error.to_string()))?,
                     MappingAction::Expr(id) | MappingAction::Callback(id) => {
                         return Err(ApiError::exception(format!("mapping callback {id} has no registered host evaluator")));
@@ -842,7 +857,6 @@ struct Peer {
 
 struct NetworkRuntime {
     state: Rc<RefCell<AppState>>,
-    allocator: ChannelIdAllocator,
     peers: HashMap<HandleId, Peer>,
     streams: HashMap<HandleId, Stream>,
     error: Option<String>,
@@ -852,7 +866,6 @@ impl NetworkRuntime {
     fn new(state: Rc<RefCell<AppState>>) -> Self {
         Self {
             state,
-            allocator: ChannelIdAllocator::new(),
             peers: HashMap::new(),
             streams: HashMap::new(),
             error: None,
@@ -869,8 +882,11 @@ impl NetworkRuntime {
             let _ = stream.close(uv_loop);
             return Ok(());
         }
+        let channel = ChannelId::new(
+            self.state.borrow_mut().editor.borrow_mut().allocate_channel_id(),
+        );
         self.peers.insert(id, Peer {
-            channel: self.allocator.alloc(),
+            channel,
             decoder: IncrementalDecoder::new(),
         });
         self.streams.insert(id, stream);
@@ -949,11 +965,21 @@ fn handle_network_event(
 
 struct EditorBuiltins {
     editor: Rc<RefCell<Editor>>,
+    ex: Rc<RefCell<ExExecutor>>,
+    nested_ex: Rc<RefCell<ExExecutor>>,
 }
 
 impl BuiltinHost for EditorBuiltins {
     fn call(&self, name: &OxStr, args: Vec<Typval>) -> Result<Typval, String> {
         let name_text = name.to_string_lossy();
+        if matches!(&*name_text, "jobstart" | "jobstop" | "jobwait" | "jobpid" | "chansend" | "jobsend") {
+            let mut fallback = Editor::new();
+            let result = match (self.editor.try_borrow_mut(), self.ex.try_borrow_mut()) {
+                (Ok(mut editor), Ok(mut ex)) => ex.call_builtin(&mut editor, name, args),
+                _ => self.nested_ex.borrow_mut().call_builtin(&mut fallback, name, args),
+            };
+            return result.map_err(|error| error.to_string());
+        }
         if is_buffer_builtin(&name_text) {
             return call_buffer_builtin(
                 &mut CurrentBuffer(&mut self.editor.borrow_mut()),
@@ -1131,7 +1157,7 @@ impl BufferHost for CurrentBuffer<'_> {
 }
 
 struct ServerLuaExec {
-    lua: Rc<RefCell<LuaHost>>,
+    lua: Lua,
     registry: Rc<Registry>,
 }
 
@@ -1142,8 +1168,7 @@ impl LuaExec for ServerLuaExec {
         code: &str,
         args: Vec<Object>,
     ) -> Result<Object, LuaExecError> {
-        let host = self.lua.borrow();
-        let lua = host.lua();
+        let lua = &self.lua;
         with_scoped_editor_api(lua, &self.registry, editor, || {
             let function = lua
                 .load(code)
@@ -1164,8 +1189,7 @@ impl LuaExec for ServerLuaExec {
     }
 
     fn execute_file(&mut self, editor: &mut Editor, path: &Path) -> Result<(), LuaExecError> {
-        let host = self.lua.borrow();
-        let lua = host.lua();
+        let lua = &self.lua;
         with_scoped_editor_api(lua, &self.registry, editor, || {
             let loadfile: Function = lua.globals().get("loadfile")
                 .map_err(|error| LuaExecError::Load(error.to_string()))?;
@@ -1188,6 +1212,29 @@ impl LuaExec for ServerLuaExec {
                 (None, _) => Err(LuaExecError::Load("loadfile returned no values".to_owned())),
             }
         })
+    }
+
+    fn invoke_callback(
+        &mut self,
+        _editor: &mut Editor,
+        reference: usize,
+        args: Vec<Object>,
+    ) -> Result<(), LuaExecError> {
+        let reference = i32::try_from(reference)
+            .map_err(|_| LuaExecError::Conversion("Lua callback reference is out of range".to_owned()))?;
+        let lua = &self.lua;
+        let value = object_to_lua(lua, &Object::LuaRef(reference))
+            .map_err(|error| LuaExecError::Conversion(error.to_string()))?;
+        let Value::Function(function) = value else {
+            return Err(LuaExecError::Conversion("Lua callback reference is not a function".to_owned()));
+        };
+        let args = args.iter()
+            .map(|argument| object_to_lua(lua, argument).map_err(|error| LuaExecError::Conversion(error.to_string())))
+            .collect::<Result<Vec<_>, _>>()?
+            .into();
+        call_with_traceback(lua, &function, args)
+            .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+        Ok(())
     }
 }
 

@@ -97,6 +97,7 @@ pub fn run_batch(cli: &Cli) -> Result<(), AppError> {
         .set_global("loadplugins", OptionValue::Boolean(cli.loadplugins))
         .map_err(|error| AppError::Editor(error.to_string()))?;
     let mut executor = ExExecutor::new();
+    executor.set_channel_ids(editor.channel_ids());
 
     execute_lines(&mut executor, &mut editor, &cli.pre_commands)?;
     execute_lines(&mut executor, &mut editor, input.lines().collect::<Vec<_>>().as_slice())?;
