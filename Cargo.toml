@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/ox-types",
+    "crates/ox-sys",
     "crates/ox-rpc",
     "crates/ox-loop",
     "crates/ox-uv",
