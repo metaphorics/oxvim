@@ -2116,10 +2116,19 @@ fn command_echo<F: FileIO>(
         );
         return Flow::Normal;
     }
-    let expressions = split_expressions(args);
-    let mut pieces = Vec::new();
+    let expressions = match ExprParser::new(args.as_bytes()).parse_many() {
+        Ok(expressions) => expressions,
+        Err(error) => return eval_error_flow(runtime, error),
+    };
+    let mut pieces = Vec::with_capacity(expressions.len());
     for expression in expressions {
-        let value = match eval_text(runtime, editor, scope, lua, expression) {
+        let value = match eval_text(
+            runtime,
+            editor,
+            scope,
+            lua,
+            &args[expression.span.start..expression.span.end],
+        ) {
             Ok(value) => value,
             Err(flow) => return flow,
         };
@@ -2460,9 +2469,19 @@ fn command_execute<F: FileIO>(
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     args: &str,
 ) -> Flow {
-    let mut pieces = Vec::new();
-    for expression in split_expressions(args) {
-        match eval_text(runtime, editor, scope, lua, expression) {
+    let expressions = match ExprParser::new(args.as_bytes()).parse_many() {
+        Ok(expressions) => expressions,
+        Err(error) => return eval_error_flow(runtime, error),
+    };
+    let mut pieces = Vec::with_capacity(expressions.len());
+    for expression in expressions {
+        match eval_text(
+            runtime,
+            editor,
+            scope,
+            lua,
+            &args[expression.span.start..expression.span.end],
+        ) {
             Ok(value) => pieces.push(typval_to_text(&value)),
             Err(flow) => return flow,
         }
@@ -3894,7 +3913,7 @@ fn count_ex_arguments(args: &str) -> usize {
     count + usize::from(in_argument)
 }
 
-fn command_map<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+fn command_map<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
     let name = command.command.name();
     let modes = map_modes(name, command.bang);
     let scope = if command.args.contains("<buffer>") { MapScope::Buffer(editor.current_buffer().unwrap_or(BufHandle::CURRENT)) } else { MapScope::Global };
@@ -4265,10 +4284,6 @@ fn render_address(address: &Address) -> String {
     let mut text = match &address.base { AddressBase::Current => ".".to_owned(), AddressBase::Last => "$".to_owned(), AddressBase::Line(line) => line.to_string(), AddressBase::Mark(mark) => format!("'{mark}"), AddressBase::ForwardSearch(pattern) => format!("/{pattern}/"), AddressBase::BackwardSearch(pattern) => format!("?{pattern}?") };
     for offset in &address.offsets { if *offset >= 0 { text.push('+'); text.push_str(&offset.to_string()); } else { text.push_str(&offset.to_string()); } }
     text
-}
-
-fn split_expressions(source: &str) -> Vec<&str> {
-    split_top_level(source, b' ', false)
 }
 
 fn split_comma_args(source: &str) -> Vec<&str> { split_top_level(source, b',', true) }

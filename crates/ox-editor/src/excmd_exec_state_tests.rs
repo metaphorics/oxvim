@@ -514,6 +514,24 @@ fn execute_evaluates_and_runs_string_as_command() {
     assert_eq!(*value, Typval::Number(99));
 }
 
+#[test]
+fn execute_keeps_spaced_operators_inside_each_expression() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &mut editor,
+        "<execute-concat>",
+        "function! Mark(value)\nlet g:marked = a:value\nendfunction\n\
+         let g:name = 'Mark'\nexecute 'call ' . g:name . '(' 7 ')'",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"marked", 0),
+        Ok(&Typval::Number(7)),
+    );
+}
+
 // ── normal ─────────────────────────────────────────────────────────────
 
 // ex_docmd.c:ex_normal — `:normal` requires keys and completes after queuing them.

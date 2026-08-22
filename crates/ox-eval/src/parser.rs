@@ -190,6 +190,26 @@ impl<'a> Parser<'a> {
         Ok(expression)
     }
 
+    /// Parse whitespace-separated expressions, as consumed by `:execute`.
+    pub fn parse_many(mut self) -> Result<Vec<Expr>, EvalError> {
+        self.tokens = Lexer::new(self.source).tokenize()?;
+        let mut expressions: Vec<Expr> = Vec::new();
+        while !matches!(self.current().kind, TokenKind::Eof) {
+            if let Some(previous) = expressions.last() {
+                let gap = &self.source[previous.span.end..self.current().span.start];
+                if !gap.iter().any(|byte| matches!(byte, b' ' | b'\t')) {
+                    return Err(EvalError::new(
+                        "E15",
+                        self.current().span.start,
+                        "trailing characters after expression",
+                    ));
+                }
+            }
+            expressions.push(self.parse_expr1()?);
+        }
+        Ok(expressions)
+    }
+
     fn parse_expr1(&mut self) -> Result<Expr, EvalError> {
         let offset = self.current().span.start;
         if self.nesting >= self.max_nesting {
