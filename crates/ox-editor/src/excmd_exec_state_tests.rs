@@ -650,6 +650,8 @@ struct FakeLua {
     chunks: Vec<(String, Vec<Object>)>,
     files: Vec<PathBuf>,
     error: Option<LuaExecError>,
+    evals: Vec<(String, Option<Typval>)>,
+    eval_result: Option<Typval>,
 }
 
 impl LuaExec for FakeLua {
@@ -672,6 +674,19 @@ impl LuaExec for FakeLua {
     fn execute_file(&mut self, _editor: &mut Editor, path: &Path) -> Result<(), LuaExecError> {
         self.files.push(path.to_path_buf());
         self.error.clone().map_or(Ok(()), Err)
+    }
+
+    fn eval_expression(
+        &mut self,
+        _editor: &mut Editor,
+        expression: &str,
+        arg: Option<&Typval>,
+    ) -> Result<Typval, LuaExecError> {
+        self.evals.push((expression.to_owned(), arg.cloned()));
+        if let Some(error) = self.error.clone() {
+            return Err(error);
+        }
+        Ok(self.eval_result.clone().unwrap_or(Typval::Number(0)))
     }
 }
 
@@ -898,6 +913,83 @@ fn writable_vim_variables_match_upstream_table() {
     for name in ["count", "count1", "dying", "register", "event", "servername"] {
         assert!(!vim_variable_is_writable(name.as_bytes()), "v:{name}");
     }
+}
+
+#[test]
+fn luaeval_passes_expression_and_argument_to_host() {
+    let mut editor = Editor::new();
+    let host = Rc::new(RefCell::new(FakeLua {
+        eval_result: Some(Typval::Number(42)),
+        ..FakeLua::default()
+    }));
+    let mut executor = lua_executor(host.clone());
+    executor
+        .execute_line(&mut editor, "let g:answer = luaeval('_A[1] + _A[2]', [40, 2])")
+        .unwrap();
+    assert_eq!(
+        executor.scope().get_scoped(ScopeKind::Global, b"answer", 0).unwrap(),
+        &Typval::Number(42),
+    );
+    let Typval::List(argument) = host.borrow().evals[0].1.clone().unwrap() else {
+        panic!("expected list argument");
+    };
+    assert_eq!(
+        argument.borrow().items,
+        vec![Typval::Number(40), Typval::Number(2)],
+    );
+}
+
+#[test]
+fn luaeval_without_argument_passes_none_to_host() {
+    let mut editor = Editor::new();
+    let host = Rc::new(RefCell::new(FakeLua::default()));
+    lua_executor(host.clone())
+        .execute_line(&mut editor, "let g:solo = luaeval('pcall(require, \"ffi\")')")
+        .unwrap();
+    assert_eq!(host.borrow().evals[0].0, "pcall(require, \"ffi\")");
+    assert!(host.borrow().evals[0].1.is_none());
+}
+
+#[test]
+fn luaeval_without_host_stays_not_implemented() {
+    let mut editor = Editor::new();
+    let mut executor = ExExecutor::new();
+    let error = executor.execute_line(&mut editor, "echo luaeval('1')").unwrap_err();
+    assert_eq!(error.to_string(), "not implemented: luaeval");
+}
+
+#[test]
+fn luaeval_rejects_wrong_argument_counts() {
+    let mut editor = Editor::new();
+    let host = Rc::new(RefCell::new(FakeLua::default()));
+    let mut executor = lua_executor(host);
+    let error = executor.execute_line(&mut editor, "echo luaeval()").unwrap_err();
+    assert!(error.to_string().contains("E119"), "{}", error);
+    let error = executor.execute_line(&mut editor, "echo luaeval('1', 2, 3)").unwrap_err();
+    assert!(error.to_string().contains("E118"), "{}", error);
+}
+
+#[test]
+fn luaeval_load_and_runtime_errors_use_upstream_codes() {
+    let mut editor = Editor::new();
+    let host = Rc::new(RefCell::new(FakeLua {
+        error: Some(LuaExecError::Load("[string \"luaeval()\"]:1: syntax".to_owned())),
+        ..FakeLua::default()
+    }));
+    let error = lua_executor(host).execute_line(&mut editor, "echo luaeval('synta x')").unwrap_err();
+    let ExecError::Vim(exception) = error else { panic!("expected Vim error") };
+    assert_eq!(exception.kind, VimExceptionKind::Error("E5107".to_owned()));
+    assert!(exception.message().contains("Lua: [string \"luaeval()\"]:1: syntax"));
+
+    let mut editor = Editor::new();
+    let host = Rc::new(RefCell::new(FakeLua {
+        error: Some(LuaExecError::Runtime("boom".to_owned())),
+        ..FakeLua::default()
+    }));
+    let error = lua_executor(host).execute_line(&mut editor, "echo luaeval('error(1)')").unwrap_err();
+    let ExecError::Vim(exception) = error else { panic!("expected Vim error") };
+    assert_eq!(exception.kind, VimExceptionKind::Error("E5108".to_owned()));
+    assert!(exception.message().contains("Lua: boom"));
 }
 
 #[test]

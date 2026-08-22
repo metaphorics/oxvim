@@ -152,6 +152,20 @@ pub trait LuaExec {
 
     /// Load and execute one Lua file.
     fn execute_file(&mut self, editor: &mut Editor, path: &Path) -> Result<(), LuaExecError>;
+    /// Evaluate one Lua expression with `_A` bound to `arg` (`luaeval()`).
+    ///
+    /// Hosts wrap the expression exactly like upstream `nlua_call_luaeval`
+    /// (`local _A=select(1,...) return (<expr>)`) and convert the argument
+    /// and result with typval semantics; hosts without a typval bridge
+    /// report the missing capability.
+    fn eval_expression(
+        &mut self,
+        _editor: &mut Editor,
+        _expression: &str,
+        _arg: Option<&Typval>,
+    ) -> Result<Typval, LuaExecError> {
+        Err(LuaExecError::Runtime("luaeval host is not installed".to_owned()))
+    }
 
     /// Invoke a Lua registry callback with values converted by the host.
     fn invoke_callback(
@@ -589,7 +603,7 @@ fn run_program<F: FileIO>(
                 let mut chosen = None;
                 for branch in &block.branches {
                     let take = match branch.condition.as_deref() {
-                        Some(condition) => match eval_condition(runtime, editor, scope, condition) {
+                        Some(condition) => match eval_condition(runtime, editor, scope, lua, condition) {
                             Ok(value) => value,
                             Err(flow) => return flow,
                         },
@@ -614,7 +628,7 @@ fn run_program<F: FileIO>(
                     return error_flow(runtime, "E170", "Missing :endwhile");
                 };
                 loop {
-                    match eval_condition(runtime, editor, scope, command.args.trim()) {
+                    match eval_condition(runtime, editor, scope, lua, command.args.trim()) {
                         Ok(true) => {}
                         Ok(false) => break,
                         Err(flow) => return flow,
@@ -778,15 +792,15 @@ fn dispatch<F: FileIO>(
         "lua" => command_lua(runtime, editor, scope, lua, command),
         "luado" => command_luado(runtime, editor, scope, lua, command),
         "luafile" => command_luafile(runtime, editor, scope, lua, command),
-        "let" => command_let(runtime, editor, scope, &command.args, false),
-        "const" => command_let(runtime, editor, scope, &command.args, true),
+        "let" => command_let(runtime, editor, scope, lua, &command.args, false),
+        "const" => command_let(runtime, editor, scope, lua, &command.args, true),
         "unlet" => command_unlet(runtime, editor, scope, &command.args, command.bang),
         "set" => command_set(runtime, editor, scope, &command.args, SetLayer::Effective),
         "setlocal" => command_set(runtime, editor, scope, &command.args, SetLayer::Local),
         "setglobal" => command_set(runtime, editor, scope, &command.args, SetLayer::Global),
         "aunmenu" | "tlunmenu" if command.args.trim() == "*" => Flow::Normal,
         "echo" | "echomsg" | "echon" | "echoerr" => {
-            command_echo(runtime, editor, scope, name, &command.args)
+            command_echo(runtime, editor, scope, lua, name, &command.args)
         }
         "break" => Flow::Break,
         "continue" => Flow::Continue,
@@ -903,9 +917,10 @@ fn eval_condition<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     text: &str,
 ) -> Result<bool, Flow> {
-    let value = eval_text(runtime, editor, scope, None, text)?;
+    let value = eval_text(runtime, editor, scope, lua, text)?;
     match value {
         Typval::Number(number) => Ok(number != 0),
         Typval::Bool(value) => Ok(value),
@@ -963,6 +978,9 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         }
         if name_text == "system" {
             return call_system_builtin(args, scope);
+        }
+        if name_text == "luaeval" {
+            return call_luaeval_builtin(self.runtime, self.editor, scope, self.lua, args);
         }
         if crate::fs_builtins::is_filesystem_builtin(&name_text) {
             return crate::fs_builtins::call(self.runtime.scripts.io(), &name_text, args);
@@ -1079,6 +1097,67 @@ fn call_system_builtin(args: Vec<Typval>, scope: &mut Scope) -> ox_eval::Result<
     let status = output.status.code().unwrap_or(-1);
     replace_scope_pair(&mut scope.vim, "shell_error", Typval::Number(i64::from(status)));
     Ok(Typval::String(OxStr(output.stdout)))
+}
+
+/// `luaeval({expr}[, {arg}])`: eval/funcs.c `f_luaeval` → lua/executor.c
+/// `nlua_call_luaeval`. The host compiles `local _A=select(1,...) return
+/// (<expr>)` and converts the argument and result with typval semantics.
+/// Errors surface as E5107 (load) / E5108 (runtime) with the upstream
+/// `Lua:` message prefix.
+fn call_luaeval_builtin<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    args: Vec<Typval>,
+) -> ox_eval::Result<Typval> {
+    let Some(lua) = lua else {
+        return Err(EvalError::not_implemented(OxStr::from("luaeval")));
+    };
+    let Some(spec) = builtin_spec("luaeval") else {
+        return Err(EvalError::not_implemented(OxStr::from("luaeval")));
+    };
+    if args.len() < spec.min_args {
+        return Err(EvalError::new("E119", 0, "Not enough arguments for function: luaeval"));
+    }
+    if spec.max_args.is_some_and(|maximum| args.len() > maximum) {
+        return Err(EvalError::new("E118", 0, "Too many arguments for function: luaeval"));
+    }
+    // f_luaeval reads the expression through tv_get_string_chk.
+    let expression = match &args[0] {
+        Typval::String(value) => value.to_string_lossy().into_owned(),
+        Typval::Number(value) => value.to_string(),
+        Typval::Bool(value) => OxStr::from(if *value { "v:true" } else { "v:false" }).to_string_lossy().into_owned(),
+        Typval::Special(Special::Null) => "v:null".to_owned(),
+        Typval::Float(_) => {
+            return Err(EvalError::new("E806", 0, "Using a Float as a String"));
+        }
+        Typval::List(_) => {
+            return Err(EvalError::new("E730", 0, "Using a List as a String"));
+        }
+        Typval::Dict(_) => {
+            return Err(EvalError::new("E731", 0, "Using a Dictionary as a String"));
+        }
+        _ => return Err(EvalError::new("E729", 0, "Using invalid value as a String")),
+    };
+    // The Lua host reads and writes editor variables (`vim.g` inside the
+    // expression), so live Ex variables are synchronized in and back out
+    // exactly like the `:lua` command path.
+    if let Err(error) = sync_scope_into_editor(editor, scope) {
+        return Err(flow_to_eval_error(exec_error_flow(runtime, error), "luaeval"));
+    }
+    let result = lua.borrow_mut().eval_expression(editor, &expression, args.get(1));
+    let sync = sync_editor_into_scope(editor, scope);
+    match (result, sync) {
+        (Err(LuaExecError::Load(message)), _) => {
+            Err(EvalError::new("E5107", 0, format!("Lua: {message}")))
+        }
+        (Err(LuaExecError::Runtime(message)) | Err(LuaExecError::Conversion(message)), _) => {
+            Err(EvalError::new("E5108", 0, format!("Lua: {message}")))
+        }
+        (Ok(_), Err(error)) => Err(flow_to_eval_error(exec_error_flow(runtime, error), "luaeval")),
+        (Ok(value), Ok(())) => Ok(value),
+    }
 }
 
 fn call_expand_builtin<F: FileIO>(
@@ -1601,6 +1680,7 @@ fn command_let<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     args: &str,
     constant: bool,
 ) -> Flow {
@@ -1622,7 +1702,7 @@ fn command_let<F: FileIO>(
         };
         Typval::list(items)
     } else {
-        match eval_text(runtime, editor, scope, None, expression) {
+        match eval_text(runtime, editor, scope, lua, expression) {
             Ok(value) => value,
             Err(flow) => return flow,
         }
@@ -1743,13 +1823,14 @@ fn command_echo<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     name: &str,
     args: &str,
 ) -> Flow {
     let expressions = split_expressions(args);
     let mut pieces = Vec::new();
     for expression in expressions {
-        let value = match eval_text(runtime, editor, scope, None, expression) {
+        let value = match eval_text(runtime, editor, scope, lua, expression) {
             Ok(value) => value,
             Err(flow) => return flow,
         };
