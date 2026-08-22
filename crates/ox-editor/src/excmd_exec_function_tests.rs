@@ -21,14 +21,18 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use ox_eval::Scope;
 use ox_text::Buffer;
-use ox_types::Typval;
+use ox_types::{Object, OxStr, Typval};
 
 use crate::script::{FileIO, ScriptCtx};
 use crate::userfunc::{UserFunctions, MAX_FUNC_DEPTH};
-use crate::{Editor, ExecError, ExExecutor, Geometry, RuntimeRoot, VimExceptionKind};
+use crate::{
+    AutocmdKind, AutocmdOptions, Editor, Event, ExecError, ExExecutor, Geometry, LuaExec,
+    LuaExecError, RuntimeRoot, VimExceptionKind,
+};
 
 // ---------------------------------------------------------------------------
 // Deterministic in-memory FileIO for source/autoload tests.
@@ -84,6 +88,17 @@ fn global_number(scope: &Scope, name: &str) -> Option<i64> {
         .iter()
         .find(|(k, _)| k.as_bytes() == name.as_bytes())
         .and_then(|(_, v)| if let Typval::Number(n) = v { Some(*n) } else { None })
+}
+
+fn global_string(scope: &Scope, name: &str) -> Option<String> {
+    scope
+        .global
+        .iter()
+        .find(|(key, _)| key.as_bytes() == name.as_bytes())
+        .and_then(|(_, value)| match value {
+            Typval::String(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
 }
 
 fn error_code(err: &ExecError) -> String {
@@ -639,6 +654,120 @@ fn autoload_path_resolution_and_load_once() {
     assert!(exec
         .scripts()
         .is_sourced_once(&PathBuf::from("/rt/autoload/mylib.vim")));
+}
+
+#[test]
+fn colorscheme_sources_runtime_file_then_fires_matching_autocmd() {
+    let io = MemoryFileIO::new();
+    io.insert(
+        "/first/colors/sample.vim",
+        "highlight Sample guifg=blue\nlet g:scheme_body = 1",
+    );
+    io.insert(
+        "/second/colors/sample.vim",
+        "let g:wrong_runtime_root = 1",
+    );
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.scripts_mut().add_runtime_root(RuntimeRoot::new(PathBuf::from("/first")));
+    exec.scripts_mut().add_runtime_root(RuntimeRoot::new(PathBuf::from("/second")));
+    exec.execute_line(
+        &mut editor,
+        "autocmd ColorScheme sample let g:event_colors_name = g:colors_name",
+    )
+    .unwrap();
+
+    exec.execute_line(&mut editor, "colorscheme sample").unwrap();
+
+    assert_eq!(global_number(exec.scope(), "scheme_body"), Some(1));
+    assert_eq!(global_number(exec.scope(), "wrong_runtime_root"), None);
+    assert_eq!(global_string(exec.scope(), "colors_name").as_deref(), Some("sample"));
+    assert_eq!(
+        global_string(exec.scope(), "event_colors_name").as_deref(),
+        Some("sample")
+    );
+    assert_eq!(editor.highlights()["Sample"]["guifg"], "blue");
+}
+
+#[test]
+fn colorscheme_missing_runtime_file_is_e185_without_state_or_event() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    exec.scripts_mut().add_runtime_root(RuntimeRoot::new(PathBuf::from("/rt")));
+    exec.execute_line(&mut editor, "let g:colors_name = 'before'").unwrap();
+    exec.execute_line(
+        &mut editor,
+        "autocmd ColorScheme * let g:unexpected_colorscheme_event = 1",
+    )
+    .unwrap();
+
+    let error = exec.execute_line(&mut editor, "colorscheme missing").unwrap_err();
+
+    assert_eq!(error_code(&error), "E185");
+    assert!(error.to_string().contains("Cannot find color scheme 'missing'"));
+    assert_eq!(global_string(exec.scope(), "colors_name").as_deref(), Some("before"));
+    assert_eq!(global_number(exec.scope(), "unexpected_colorscheme_event"), None);
+}
+
+#[derive(Default)]
+struct ColorschemeLua {
+    callback_colors_name: Option<String>,
+}
+
+impl LuaExec for ColorschemeLua {
+    fn execute_chunk(
+        &mut self,
+        _editor: &mut Editor,
+        _code: &str,
+        _args: Vec<Object>,
+    ) -> Result<Object, LuaExecError> {
+        Ok(Object::Nil)
+    }
+
+    fn execute_file(&mut self, _editor: &mut Editor, _path: &Path) -> Result<(), LuaExecError> {
+        Ok(())
+    }
+
+    fn invoke_callback(
+        &mut self,
+        editor: &mut Editor,
+        _reference: usize,
+        _args: Vec<Object>,
+    ) -> Result<(), LuaExecError> {
+        self.callback_colors_name = editor
+            .gvars()
+            .get(&OxStr::from("colors_name"))
+            .and_then(|value| match value {
+                Object::String(value) => Some(value.to_string_lossy().into_owned()),
+                _ => None,
+            });
+        Ok(())
+    }
+}
+
+#[test]
+fn colorscheme_lua_autocmd_observes_and_preserves_new_global_name() {
+    let io = MemoryFileIO::new();
+    io.insert("/rt/colors/luaonly.lua", "");
+    let host = Rc::new(RefCell::new(ColorschemeLua::default()));
+    let mut editor = Editor::new();
+    editor
+        .autocmds_mut()
+        .register(
+            Event::ColorScheme,
+            "luaonly",
+            AutocmdKind::LuaCallback(7),
+            AutocmdOptions::default(),
+        )
+        .unwrap();
+    let mut exec = ExExecutor::with_io(io);
+    exec.scripts_mut().add_runtime_root(RuntimeRoot::new(PathBuf::from("/rt")));
+    exec.set_lua_exec(host.clone());
+
+    exec.execute_line(&mut editor, "colorscheme luaonly").unwrap();
+
+    assert_eq!(host.borrow().callback_colors_name.as_deref(), Some("luaonly"));
+    assert_eq!(global_string(exec.scope(), "colors_name").as_deref(), Some("luaonly"));
 }
 
 #[test]

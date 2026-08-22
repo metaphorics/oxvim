@@ -28,7 +28,7 @@ use ox_regex::{
 use ox_text::{Buffer, Position};
 use ox_types::{BufHandle, Dict, DictRef, Funcref, Object, OxStr, Special, Typval};
 
-use crate::autocmd::{AutocmdKind, AutocmdOptions, AugroupId, DeleteAutocmds, Event};
+use crate::autocmd::{AutocmdContext, AutocmdKind, AutocmdOptions, AugroupId, DeleteAutocmds, Event};
 use crate::extmark::{ExtmarkAttributes, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, NamespaceId};
 use crate::mapping::{MapMode, MapModes, MapScope, MappingAction, MappingOptions};
 use crate::options::{find_unescaped, CommaItems, OptionListKind, OptionScope, OptionType, OptionValue, OPTION_METADATA};
@@ -851,6 +851,7 @@ fn dispatch<F: FileIO>(
         "mark" | "k" => command_mark(runtime, editor, command),
         "marks" => command_marks(runtime, editor),
         "registers" | "display" => command_registers(runtime, editor, &command.args),
+        "colorscheme" => command_colorscheme(runtime, editor, scope, lua, command),
         "highlight" => command_highlight(runtime, editor, command),
         "augroup" => command_augroup(runtime, editor, command),
         "autocmd" => command_autocmd(runtime, editor, command),
@@ -2573,6 +2574,108 @@ fn command_registers<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, arg
     Flow::Normal
 }
 
+fn command_colorscheme<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    command: &ExCommand,
+) -> Flow {
+    let name = command.args.trim();
+    if name.is_empty() {
+        return error_flow(runtime, "E471", "Argument required");
+    }
+
+    let mut scheme = None;
+    for root in runtime.scripts.runtime_roots() {
+        let base = root.path().join("colors").join(name);
+        let vim = base.with_extension("vim");
+        if runtime.scripts.io().exists(&vim) {
+            scheme = Some((vim, false));
+            break;
+        }
+        let lua = base.with_extension("lua");
+        if runtime.scripts.io().exists(&lua) {
+            scheme = Some((lua, true));
+            break;
+        }
+    }
+
+    let flow = if let Some((path, false)) = scheme {
+        match source_path(runtime, editor, scope, lua, &path, false) {
+            Ok(Flow::Finish) => Flow::Normal,
+            Ok(flow) => flow,
+            Err(error) => exec_error_flow(runtime, error),
+        }
+    } else if let Some((path, true)) = scheme {
+        let Some(lua) = lua else { return Flow::NotImplemented("luafile".to_owned()) };
+        let result = lua.borrow_mut().execute_file(editor, &path);
+        let sync = sync_editor_into_scope(editor, scope);
+        match (result, sync) {
+            (Err(error), _) => lua_error_flow(runtime, error, "E5112", "E5113"),
+            (Ok(()), Err(error)) => exec_error_flow(runtime, error),
+            (Ok(()), Ok(())) => Flow::Normal,
+        }
+    } else {
+        return error_flow(runtime, "E185", format!("Cannot find color scheme '{name}'"));
+    };
+    if !matches!(flow, Flow::Normal) {
+        return flow;
+    }
+
+    if let Err(error) = scope.set_scoped(
+        ScopeKind::Global,
+        b"colors_name",
+        0,
+        Typval::String(OxStr::from(name)),
+    ) {
+        return eval_error_flow(runtime, error);
+    }
+    let plan = editor.autocmds_mut().plan(
+        Event::ColorScheme,
+        AutocmdContext { file_name: Some(name), ..AutocmdContext::default() },
+    );
+    for action in plan.ready {
+        if action.once {
+            editor.autocmds_mut().consume_once(action.id);
+        }
+        let action_flow = match action.kind {
+            AutocmdKind::ExString(source) => {
+                let logical = vec![LogicalLine {
+                    text: source,
+                    first_line: runtime.scripts.current_line(),
+                }];
+                match parse_program(&runtime.user_commands, &logical) {
+                    Ok(program) => run_program(runtime, editor, scope, lua, &program, 0, program.len()),
+                    Err(error) => exec_error_flow(runtime, error),
+                }
+            }
+            AutocmdKind::LuaCallback(reference) => {
+                let Some(lua) = lua else {
+                    return error_flow(runtime, "E5108", "Lua callbacks are not installed");
+                };
+                if let Err(error) = sync_scope_into_editor(editor, scope) {
+                    return exec_error_flow(runtime, error);
+                }
+                match usize::try_from(reference) {
+                    Ok(reference) => match lua.borrow_mut().invoke_callback(editor, reference, Vec::new()) {
+                        Ok(()) => match sync_editor_into_scope(editor, scope) {
+                            Ok(()) => Flow::Normal,
+                            Err(error) => exec_error_flow(runtime, error),
+                        },
+                        Err(error) => lua_error_flow(runtime, error, "E5107", "E5108"),
+                    },
+                    Err(_) => error_flow(runtime, "E5108", "Lua callback reference is out of range"),
+                }
+            }
+        };
+        if !matches!(action_flow, Flow::Normal) {
+            return action_flow;
+        }
+    }
+    Flow::Normal
+}
+
 fn command_highlight<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
     let args = command.args.trim();
     if args.is_empty() {
@@ -2594,15 +2697,38 @@ fn command_highlight<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, com
         return Flow::Normal;
     }
     let mut words = args.split_ascii_whitespace();
-    let Some(group) = words.next() else { return Flow::Normal };
-    if group.eq_ignore_ascii_case("clear") {
+    let Some(first) = words.next() else { return Flow::Normal };
+    if first.eq_ignore_ascii_case("clear") {
         if let Some(name) = words.next() { editor.highlights_mut().remove(name); } else { editor.highlights_mut().clear(); }
         return Flow::Normal;
     }
+
+    let default = first.eq_ignore_ascii_case("default") || first.eq_ignore_ascii_case("def");
+    let Some(group_or_link) = (if default { words.next() } else { Some(first) }) else {
+        return error_flow(runtime, "E471", "Argument required");
+    };
+    let link = group_or_link.eq_ignore_ascii_case("link");
+    let Some(group) = (if link { words.next() } else { Some(group_or_link) }) else {
+        return error_flow(runtime, "E412", "Not enough arguments: highlight link");
+    };
+    if default && editor.highlights().contains_key(group) {
+        return Flow::Normal;
+    }
+
     let mut attributes = BTreeMap::new();
-    for word in words {
-        let Some((key, value)) = word.split_once('=') else { return error_flow(runtime, "E416", format!("Missing equal sign: {word}")) };
-        attributes.insert(key.to_ascii_lowercase(), value.to_owned());
+    if link {
+        let Some(target) = words.next() else {
+            return error_flow(runtime, "E412", "Not enough arguments: highlight link");
+        };
+        if words.next().is_some() {
+            return error_flow(runtime, "E488", "Trailing characters");
+        }
+        attributes.insert("link".to_owned(), target.to_owned());
+    } else {
+        for word in words {
+            let Some((key, value)) = word.split_once('=') else { return error_flow(runtime, "E416", format!("Missing equal sign: {word}")) };
+            attributes.insert(key.to_ascii_lowercase(), value.to_owned());
+        }
     }
     editor.highlights_mut().insert(group.to_owned(), attributes);
     Flow::Normal

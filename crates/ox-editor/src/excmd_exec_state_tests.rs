@@ -464,6 +464,22 @@ fn highlight_stores_and_clears_group_attributes() {
     assert!(editor.highlights().get("MyGroup").is_none());
 }
 
+#[test]
+fn highlight_default_and_link_forms_retain_definitions() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&mut editor, "highlight Existing guifg=red").unwrap();
+    exec.execute_line(&mut editor, "highlight default Existing guifg=blue").unwrap();
+    exec.execute_line(&mut editor, "highlight default NewGroup cterm=bold").unwrap();
+    exec.execute_line(&mut editor, "highlight link Linked Existing").unwrap();
+    exec.execute_line(&mut editor, "highlight default link DefaultLinked NewGroup").unwrap();
+
+    assert_eq!(editor.highlights()["Existing"]["guifg"], "red");
+    assert_eq!(editor.highlights()["NewGroup"]["cterm"], "bold");
+    assert_eq!(editor.highlights()["Linked"]["link"], "Existing");
+    assert_eq!(editor.highlights()["DefaultLinked"]["link"], "NewGroup");
+}
+
 // ── unsupported-command NotImplemented identity ────────────────────────
 
 // ex_docmd.c:do_one_cmd dispatch — a builtin command not in the handler

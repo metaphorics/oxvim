@@ -13,14 +13,14 @@ use ox_api::{CommandExecutor, Registry};
 use ox_editor::{
     AutocmdContext, AutocmdKind, CmdlineKind, Editor, Event, ExExecutor, ExecOutcome, Geometry,
     LuaExec, LuaExecError, MappingAction, MessageKind, Mode, ModeMachine, Keys, OptionValue,
-    TypeaheadFlags,
+    RuntimeRoot as EditorRuntimeRoot, TypeaheadFlags,
 };
 use ox_eval::{
     BufferHost, BuiltinHost as EvalBuiltinHost, Builtins, Scope, call_buffer_builtin,
     is_buffer_builtin,
 };
 use ox_lua::{
-    ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, VariableHost, VariableScope, Work, bind_api,
+    ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot as LuaRuntimeRoot, Scheduler, VariableHost, VariableScope, Work, bind_api,
     bind_variables, call_with_traceback, free_lua_ref, lua_to_object, object_to_lua,
 };
 use ox_rpc::{CHAN_STDIO, ChannelId, IncrementalDecoder, Message};
@@ -97,11 +97,19 @@ impl AppState {
         let lua_work = Rc::new(RefCell::new(VecDeque::new()));
         let ex = Rc::new(RefCell::new(ExExecutor::new()));
         let nested_ex = Rc::new(RefCell::new(ExExecutor::new()));
+        let runtime_path = runtime_root()?;
+        ex.borrow_mut()
+            .scripts_mut()
+            .add_runtime_root(EditorRuntimeRoot::new(runtime_path.clone()));
+        nested_ex
+            .borrow_mut()
+            .scripts_mut()
+            .add_runtime_root(EditorRuntimeRoot::new(runtime_path.clone()));
         let channel_ids = editor.borrow().channel_ids();
         ex.borrow_mut().set_channel_ids(channel_ids.clone());
         nested_ex.borrow_mut().set_channel_ids(channel_ids);
         let mut lua = LuaHost::new(
-            RuntimeRoot::new(runtime_root()?),
+            LuaRuntimeRoot::new(runtime_path),
             Rc::new(EditorBuiltins { editor: editor.clone(), ex: ex.clone(), nested_ex: nested_ex.clone() }),
             Rc::new(LuaScheduler { queue: lua_work.clone() }),
         )
