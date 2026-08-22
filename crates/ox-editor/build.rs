@@ -209,6 +209,11 @@ fn parse_literal(value: &str) -> Option<Literal> {
     match value {
         "true" => Some(Literal::Boolean(true)),
         "false" => Some(Literal::Boolean(false)),
+        // globals.h:103-104 — DFLT_COLS 80, DFLT_ROWS 24 — the headless
+        // baseline the oldtest screen-size guard (`&lines < 24 ||
+        // &columns < 80`) relies on.
+        "macros('DFLT_COLS', 'number')" => Some(Literal::Number(80)),
+        "macros('DFLT_ROWS', 'number')" => Some(Literal::Number(24)),
         _ => parse_string(value)
             .map(Literal::String)
             .or_else(|| value.parse::<i64>().ok().map(Literal::Number)),
