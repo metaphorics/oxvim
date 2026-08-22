@@ -7,6 +7,8 @@ use std::process::Command;
 use std::rc::Rc;
 
 use ox_editor::{Editor, ExExecutor, ExecOutcome, Geometry, MessageKind};
+use ox_eval::{Builtins, Scope};
+use ox_eval::BuiltinHost as EvalBuiltins;
 use ox_lua::{BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work};
 use ox_types::{Object, OxStr, Typval};
 
@@ -170,7 +172,7 @@ pub fn run_lua(script: &LuaScript) -> Result<(), AppError> {
     };
     let host = LuaHost::new(
         RuntimeRoot::new(runtime_root()?),
-        Rc::new(NoBuiltins),
+        Rc::new(ScriptBuiltins),
         Rc::new(ImmediateScheduler),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -189,11 +191,17 @@ pub fn run_lua(script: &LuaScript) -> Result<(), AppError> {
         .map_err(|error| AppError::Lua(error.to_string()))
 }
 
-struct NoBuiltins;
-
-impl BuiltinHost for NoBuiltins {
-    fn call(&self, name: &OxStr, _args: Vec<Typval>) -> Result<Typval, String> {
-        Err(format!("Vimscript builtin unavailable: {}", name.to_string_lossy()))
+struct ScriptBuiltins;
+impl BuiltinHost for ScriptBuiltins {
+    fn call(&self, name: &OxStr, args: Vec<Typval>) -> Result<Typval, String> {
+        // Pure-eval vimscript builtins with no editor state: the runtime
+        // prelude probes has('win32') during host init
+        // (runtime/lua/vim/_core/system.lua), and `-l` scripts may call any
+        // stateless builtin.
+        let mut builtins = Builtins::without_regex();
+        let mut scope = Scope::new();
+        EvalBuiltins::call(&mut builtins, name, args, &mut scope)
+            .map_err(|error| error.to_string())
     }
 }
 

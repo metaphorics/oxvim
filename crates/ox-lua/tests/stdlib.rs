@@ -11,7 +11,12 @@ use ox_types::{OxStr, Typval};
 struct NoBuiltins;
 
 impl BuiltinHost for NoBuiltins {
-    fn call(&self, _name: &OxStr, _args: Vec<Typval>) -> Result<Typval, String> {
+    fn call(&self, name: &OxStr, _args: Vec<Typval>) -> Result<Typval, String> {
+        // The runtime prelude probes has('win32') during host init
+        // (runtime/lua/vim/_core/system.lua).
+        if name.as_bytes() == b"has" {
+            return Ok(Typval::Number(0));
+        }
         Err("builtin unavailable in stdlib test".to_owned())
     }
 }

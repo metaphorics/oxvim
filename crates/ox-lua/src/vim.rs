@@ -138,6 +138,11 @@ pub fn install_vim_core(
     scheduler: Rc<dyn Scheduler>,
 ) -> mlua::Result<FastCallbackState> {
     let vim = lua.create_table()?;
+    // executor.c:nlua_common_vim_init: vim.is_thread and the vim._core table
+    // the Lua prelude (vim._init_packages) attaches editor hooks to. This host
+    // only creates main-thread states, so is_thread reports false.
+    vim.set("is_thread", lua.create_function(|_, ()| Ok(false))?)?;
+    vim.set("_core", lua.create_table()?)?;
     vim.set("NIL", lua.create_userdata(NilSentinel)?)?;
 
     let empty_dict_mt = lua.create_table()?;

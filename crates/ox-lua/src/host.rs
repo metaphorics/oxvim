@@ -118,6 +118,14 @@ impl LuaHost {
             runtime_root.clone(),
             builtins,
         )?;
+
+        // executor.c:nlua_init_packages tail: with the builtin preloaders in
+        // place, require the runtime prelude. vim._init_packages merges
+        // vim._core.shared (vim.startswith, vim.split, ...) into the global
+        // vim table, then runs the vim._core.editor assembly on the main
+        // state, matching upstream's load order.
+        let require: Function = lua.globals().get("require")?;
+        require.call::<()>("vim._init_packages")?;
         Ok(Self { lua, runtime_root, fast_callbacks })
     }
 

@@ -94,6 +94,45 @@ fn ffi_is_preloaded_and_requireable_without_global() {
 }
 
 #[test]
+fn prelude_merges_shared_functions_into_vim_table() {
+    let (host, _, _) = host();
+    let lua = host.lua();
+    // executor.c:nlua_init_packages tail: require('vim._init_packages') ran
+    // during host init, so vim._core.shared's surface is live on the global
+    // vim table, and the vim._core.editor assembly followed it.
+    let loaded: bool = lua
+        .load("return package.loaded['vim._init_packages'] ~= nil")
+        .eval()
+        .unwrap();
+    assert!(loaded, "vim._init_packages should have been required during init");
+    let shared_surface: bool = lua
+        .load(
+            "return vim.startswith('abc', 'a') \
+             and vim.endswith('abc', 'c') \
+             and vim.split('a,b,c', ',')[2] == 'b' \
+             and vim.tbl_isempty({}) \
+             and vim.tbl_contains({ 'x' }, 'x') \
+             and vim.deepcopy({ 1, { 2 } })[2][1] == 2",
+        )
+        .eval()
+        .unwrap();
+    assert!(shared_surface, "vim._core.shared functions missing after init");
+    let editor_assembly: bool = lua
+        .load(
+            "return type(vim.wait) == 'function' \
+             and type(vim.schedule_wrap) == 'function' \
+             and type(vim.fn) == 'table' \
+             and type(vim.cmd) == 'table' \
+             and type(vim.o) == 'table' \
+             and vim.is_thread() == false \
+             and type(vim._core) == 'table'",
+        )
+        .eval()
+        .unwrap();
+    assert!(editor_assembly, "vim._core.editor assembly missing after init");
+}
+
+#[test]
 fn object_converter_covers_scalars_containers_bytes_and_handles() {
     let (host, _, _) = host();
     let lua = host.lua();
@@ -279,9 +318,14 @@ fn vim_call_and_fn_dispatch_through_builtin_host() {
         "called"
     );
     let calls = builtins.calls.borrow();
-    assert_eq!(calls[0].0, OxStr::from("Record"));
-    assert_eq!(calls[0].1, vec![Typval::Number(3), Typval::String(OxStr::from("x"))]);
-    assert_eq!(calls[1].0, OxStr::from("Other"));
+    // Host init runs the runtime prelude, which probes has('win32') exactly
+    // once (runtime/lua/vim/_core/system.lua).
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0].0, OxStr::from("has"));
+    assert_eq!(calls[0].1, vec![Typval::String(OxStr::from("win32"))]);
+    assert_eq!(calls[1].0, OxStr::from("Record"));
+    assert_eq!(calls[1].1, vec![Typval::Number(3), Typval::String(OxStr::from("x"))]);
+    assert_eq!(calls[2].0, OxStr::from("Other"));
 }
 
 #[test]
