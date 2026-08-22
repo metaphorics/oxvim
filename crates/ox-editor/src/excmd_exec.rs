@@ -955,6 +955,9 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         if name_text == "exists" {
             return exists_with_editor(self.runtime, self.editor, scope, args);
         }
+        if name_text == "expand" {
+            return call_expand_builtin(self.runtime, self.editor, args);
+        }
         if name_text == "system" {
             return call_system_builtin(args, scope);
         }
@@ -1070,6 +1073,30 @@ fn call_system_builtin(args: Vec<Typval>, scope: &mut Scope) -> ox_eval::Result<
     let status = output.status.code().unwrap_or(-1);
     replace_scope_pair(&mut scope.vim, "shell_error", Typval::Number(i64::from(status)));
     Ok(Typval::String(OxStr(output.stdout)))
+}
+
+fn call_expand_builtin<F: FileIO>(
+    runtime: &ExRuntime<F>,
+    editor: &Editor,
+    args: Vec<Typval>,
+) -> ox_eval::Result<Typval> {
+    let [Typval::String(value), ..] = args.as_slice() else {
+        return Err(EvalError::new("E730", 0, "Using a List as a String"));
+    };
+    let text = value.to_string_lossy();
+    let expanded = match text.as_ref() {
+        "%" => editor
+            .current_buffer()
+            .and_then(|buffer| editor.buffer(buffer).ok())
+            .map_or_else(String::new, |buffer| buffer.name().to_string_lossy().into_owned()),
+        "<SID>" => runtime
+            .functions
+            .active_sid()
+            .or_else(|| runtime.scripts.current_sid())
+            .map_or_else(String::new, |sid| format!("<SNR>{sid}_")),
+        _ => text.into_owned(),
+    };
+    Ok(Typval::String(OxStr(expanded.into_bytes())))
 }
 
 fn normalize_job_options(args: &[Typval]) -> ox_eval::Result<JobStartOptions> {

@@ -759,3 +759,24 @@ fn system_builtin_captures_stdout_and_exit_status() {
         Some((_, Typval::Number(7)))
     ));
 }
+
+#[test]
+fn expand_builtin_reads_current_buffer_and_preserves_paths() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor.buffer_mut(buffer).unwrap().set_name("test_functions.vim".into());
+    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&mut editor, "let g:name = expand('%')").unwrap();
+    exec.execute_line(&mut editor, "let g:path = expand('/tmp/build')").unwrap();
+
+    assert!(matches!(
+        exec.scope().global.iter().find(|(key, _)| key.as_bytes() == b"name"),
+        Some((_, Typval::String(value))) if value.as_bytes() == b"test_functions.vim"
+    ));
+    assert!(matches!(
+        exec.scope().global.iter().find(|(key, _)| key.as_bytes() == b"path"),
+        Some((_, Typval::String(value))) if value.as_bytes() == b"/tmp/build"
+    ));
+}
