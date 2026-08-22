@@ -182,6 +182,29 @@ fn wait_primitives_poll_the_owned_uv_loop() {
 }
 
 #[test]
+fn phase_handles_support_between_case_cleanup() {
+    let (host, _) = host();
+    host.lua()
+        .load(
+            r#"
+            for _, constructor in ipairs({
+              vim.uv.new_idle,
+              vim.uv.new_prepare,
+              vim.uv.new_check,
+            }) do
+              local handle = assert(constructor())
+              assert(not handle:is_closing())
+              handle:close()
+              assert(handle:is_closing())
+            end
+            vim.wait(0)
+            "#,
+        )
+        .exec()
+        .unwrap();
+}
+
+#[test]
 fn callback_file_read_preserves_bytes_and_error_first_shape() {
     let path = temp_path("file-read");
     std::fs::write(&path, b"a\0b\n").unwrap();

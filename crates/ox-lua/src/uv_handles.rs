@@ -582,6 +582,7 @@ impl PhaseHandle {
     fn stop(&self, uv_loop: &mut UvLoop) -> ox_uv::Result<()> { match self { Self::Idle(handle) => handle.stop(uv_loop), Self::Prepare(handle) => handle.stop(uv_loop), Self::Check(handle) => handle.stop(uv_loop) } }
     fn close(&self, uv_loop: &mut UvLoop) -> ox_uv::Result<()> { match self { Self::Idle(handle) => handle.close(uv_loop), Self::Prepare(handle) => handle.close(uv_loop), Self::Check(handle) => handle.close(uv_loop) } }
     fn active(&self, uv_loop: &UvLoop) -> bool { match self { Self::Idle(handle) => handle.is_active(uv_loop), Self::Prepare(handle) => handle.is_active(uv_loop), Self::Check(handle) => handle.is_active(uv_loop) } }
+    fn closing(&self, uv_loop: &UvLoop) -> bool { match self { Self::Idle(handle) => handle.is_closing(uv_loop), Self::Prepare(handle) => handle.is_closing(uv_loop), Self::Check(handle) => handle.is_closing(uv_loop) } }
 }
 struct LuaPhase { handle: PhaseHandle, access: LoopAccess, lua: Lua, fast: FastCallbackState }
 impl UserData for LuaPhase {
@@ -589,6 +590,7 @@ impl UserData for LuaPhase {
         methods.add_method("start", |_, this, callback: Function| { let handle = this.handle; let access = this.access.clone(); let event_access = access.clone(); let lua = this.lua.clone(); let fast = this.fast.clone(); access.apply(Box::new(move |uv_loop| { let _ = handle.start(uv_loop, move |loop_| { event_access.callback(loop_, || invoke(&lua, &fast, &callback, MultiValue::new())); Ok(()) }); }))?; Ok(true) });
         methods.add_method("stop", |_, this, ()| { let handle = this.handle; this.access.apply(Box::new(move |uv_loop| { let _ = handle.stop(uv_loop); }))?; Ok(true) });
         methods.add_method("is_active", |_, this, ()| Ok(this.handle.active(&this.access.uv_loop.borrow())));
+        methods.add_method("is_closing", |_, this, ()| Ok(this.handle.closing(&this.access.uv_loop.borrow())));
         methods.add_method("close", |_, this, ()| { let handle = this.handle; this.access.apply(Box::new(move |uv_loop| { let _ = handle.close(uv_loop); }))?; Ok(()) });
     }
 }
