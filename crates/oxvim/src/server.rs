@@ -191,7 +191,9 @@ fn dispatch_message(state: &mut AppState, message: Message, output: &mut impl Wr
             output.write_all(&response.encode_bytes()).map_err(AppError::Io)
         }
         Message::Notification { method, params } => {
-            let _ = state.dispatch(&method, &params);
+            if let Err(error) = state.dispatch(&method, &params) {
+                output.write_all(&ox_rpc::nvim_error_event(&error)).map_err(AppError::Io)?;
+            }
             Ok(())
         }
         Message::Response { .. } => Ok(()),

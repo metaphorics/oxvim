@@ -28,6 +28,16 @@ impl Embedded {
         Self { child, input, output, next_id: 1 }
     }
 
+    fn notify(&mut self, method: &str, params: Vec<Value>) {
+        let message = Value::Array(vec![
+            Value::from(2),
+            Value::from(method),
+            Value::Array(params),
+        ]);
+        rmpv::encode::write_value(&mut self.input, &message).expect("encode notification");
+        self.input.flush().expect("flush notification");
+    }
+
     fn request(&mut self, method: &str, params: Vec<Value>) -> Value {
         let id = self.next_id;
         self.next_id += 1;
@@ -46,6 +56,10 @@ impl Embedded {
         assert_eq!(fields[1], Value::from(id));
         assert_eq!(fields[2], Value::Nil, "RPC error: {:?}", fields[2]);
         fields[3].clone()
+    }
+
+    fn next_message(&mut self) -> Value {
+        rmpv::decode::read_value(&mut self.output).expect("decode message")
     }
 }
 
@@ -97,4 +111,34 @@ fn embedded_stdio_serves_core_rpc_contracts() {
         oxvim.request("nvim_buf_get_lines", vec![Value::from(0), Value::from(0), Value::from(-1), Value::Boolean(true)]),
         Value::Array(vec![Value::from("vim")]),
     );
+}
+
+#[test]
+fn failed_notification_emits_nvim_error_event() {
+    let mut oxvim = Embedded::spawn();
+
+    oxvim.notify("missing", vec![]);
+    let message = oxvim.next_message();
+    let Value::Array(fields) = message else { panic!("error event is not an array") };
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0], Value::from(2));
+    assert_eq!(fields[1], Value::from("nvim_error_event"));
+    let Value::Array(args) = &fields[2] else { panic!("error event params are not an array") };
+    assert_eq!(args.len(), 2);
+    assert_eq!(args[0], Value::from(0));
+    assert_eq!(args[1], Value::from("Invalid method: missing"));
+}
+
+#[test]
+fn valid_notification_produces_no_response() {
+    let mut oxvim = Embedded::spawn();
+
+    // A notification that succeeds must not write anything to stdout.  We
+    // prove this by following it with a request: if the notification had
+    // emitted a stray frame, `request()` would decode that frame instead of
+    // the expected response and panic.
+    oxvim.notify("nvim_get_api_info", vec![]);
+    let info = oxvim.request("nvim_get_api_info", vec![]);
+    let Value::Array(info) = info else { panic!("api info is not an array") };
+    assert_eq!(info[0], Value::from(1));
 }
