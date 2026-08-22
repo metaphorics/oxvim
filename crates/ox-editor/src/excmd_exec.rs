@@ -814,6 +814,14 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         scope: &mut Scope,
     ) -> ox_eval::Result<Typval> {
         let name_text = name.to_string_lossy();
+        if name_text == "eval" {
+            let [Typval::String(source)] = args.as_slice() else {
+                return Err(EvalError::new("E119", 0, "One string argument required"));
+            };
+            let expression = ExprParser::new(source.as_bytes()).parse()?;
+            let regex = VimRegex;
+            return Evaluator::new(self, &regex).eval(&expression, scope);
+        }
         if name_text == "submatch" {
             let index = args.first().and_then(typval_number).unwrap_or(0).max(0) as usize;
             let value = self

@@ -139,6 +139,15 @@ fn function_return_value_via_expression_call() {
 }
 
 #[test]
+fn eval_builtin_evaluates_string_in_current_scope() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(&mut exec, &mut editor, "let g:source_value = 42");
+    script(&mut exec, &mut editor, "let g:evaluated = eval('g:source_value')");
+    assert_eq!(global_number(exec.scope(), "evaluated"), Some(42));
+}
+
+#[test]
 fn function_empty_signature_calls_cleanly() {
     // eval/userfunc.c: a function with no parameters accepts exactly zero
     // arguments and executes its body.
