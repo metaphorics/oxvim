@@ -49,7 +49,7 @@ pub use mapping::{
     Abbreviation, Lookup, MapMode, MapModes, MapScope, Mapping, MappingAction, MappingError,
     MappingExprSink, MappingOptions, Mappings,
 };
-pub use mode::{CmdlineState, InsertState, Mode, ModeError, ModeMachine, NormalState, OperatorPendingState, Step};
+pub use mode::{CmdlineKind, CmdlineState, InsertState, Mode, ModeError, ModeMachine, NormalState, OperatorPendingState, Step};
 pub use script::{
     FileIO, LogicalLine, RealFileIO, RuntimeRoot, ScriptCtx, ScriptError, ScriptInfo, Sid,
     SourceFrame,

@@ -5,7 +5,7 @@
 
 use ox_text::{Buffer, Position};
 
-use crate::{Editor, Geometry, Mode, ModeMachine};
+use crate::{Editor, Geometry, Keys, MapMode, MappingAction, MappingOptions, Mode, ModeMachine, TypeaheadFlags};
 
 fn position(lnum: usize, col: usize) -> Position { Position { lnum, col } }
 
@@ -223,4 +223,39 @@ fn block_ragged_yank_keeps_rectangle_width() {
     let unnamed = editor.registers().get('"').unwrap().unwrap();
     assert_eq!(unnamed.kind(), crate::RegisterKind::BlockWise { width: 3 });
     assert_eq!(unnamed.to_bytes(), b"cde\n\nwxy");
+}
+
+#[test]
+fn ex_cmdline_completes_and_aborts_without_executing_in_the_machine() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    let mut machine = ModeMachine::default();
+
+    machine.feed_keys(&mut editor, ":echo 1+1\r").unwrap();
+    assert_eq!(machine.take_ex_command().as_deref(), Some("echo 1+1"));
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+
+    machine.feed_keys(&mut editor, ":quit\u{1b}").unwrap();
+    assert_eq!(machine.take_ex_command(), None);
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+}
+
+#[test]
+fn run_once_expands_mapped_keys_before_mode_execution() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    editor.mappings_mut().map(
+        Keys::from("Q"),
+        MappingAction::Keys(Keys::from("iX\u{1b}")),
+        MappingOptions { modes: MapMode::Normal.into(), ..MappingOptions::default() },
+    ).unwrap();
+    editor.typeahead_mut().append(&Keys::from("Q"), TypeaheadFlags::default());
+    let mut machine = ModeMachine::default();
+
+    while machine.run_once(&mut editor).unwrap() {}
+
+    assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), b"X");
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
 }

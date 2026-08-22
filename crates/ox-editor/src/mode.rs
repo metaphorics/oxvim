@@ -10,6 +10,16 @@ use crate::ops::{self, EditRange, Operator};
 use crate::search::{SearchDirection, SearchState};
 use crate::textobject;
 use crate::{BufferStateError, Editor, EditorError, Key, KeyDecodeError, MarkLocation, MotionKind, OptionValue, SearchError, VisualKind, VisualState};
+use crate::{Lookup, MapMode, MappingAction, Remap, TypeaheadError, TypeaheadFlags};
+
+/// Kind of command line currently being edited.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CmdlineKind {
+    /// Forward or backward search.
+    Search(SearchDirection),
+    /// Ex command entered with `:`.
+    Ex,
+}
 
 /// Parser state retained between normal-mode keys.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -27,9 +37,9 @@ pub struct InsertState;
 /// Search command-line state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CmdlineState {
-    /// Direction selected by `/` or `?`.
-    pub direction: SearchDirection,
-    /// Pattern and offset text entered so far.
+    /// Search or Ex command-line behavior.
+    pub kind: CmdlineKind,
+    /// Pattern or command text entered so far.
     pub text: String,
     /// Match occurrence requested before entering command-line mode.
     pub count: usize,
@@ -85,6 +95,8 @@ pub enum ModeError {
     #[error(transparent)] Editor(#[from] EditorError),
     /// Encoded input could not be decoded.
     #[error(transparent)] KeyDecode(#[from] KeyDecodeError),
+    /// Mapped input could not be inserted into typeahead.
+    #[error(transparent)] Typeahead(#[from] TypeaheadError),
     /// Search parsing or execution failed.
     #[error(transparent)] Search(#[from] SearchError),
     /// Operator range application failed.
@@ -104,6 +116,8 @@ pub struct ModeMachine {
     search: SearchState,
     last_find: Option<FindMotion>,
     last_visual: Option<VisualState>,
+    completed_ex_command: Option<String>,
+    pending_mapping_action: Option<MappingAction>,
     timestamp: i64,
 }
 
@@ -114,11 +128,45 @@ impl ModeMachine {
     #[must_use] pub const fn mode(&self) -> &Mode { &self.mode }
     /// Returns the last-search state.
     #[must_use] pub const fn search_state(&self) -> &SearchState { &self.search }
+    /// Takes an Ex command completed with Enter.
+    pub fn take_ex_command(&mut self) -> Option<String> { self.completed_ex_command.take() }
+    /// Takes a non-key mapping action for execution by the embedding host.
+    pub fn take_mapping_action(&mut self) -> Option<MappingAction> { self.pending_mapping_action.take() }
 
-    /// `state.c:34-106`: checking consumes input but performs no buffer mutation.
+    /// `state.c:34-106`: checking consumes mappings and input but performs no buffer mutation.
     pub fn check(&mut self, editor: &mut Editor) -> Result<Step, ModeError> {
-        let Some(key) = editor.typeahead_mut().pop()? else { return Ok(Step::Idle); };
-        match key { Key::Byte(byte) => Ok(Step::Key(char::from(byte))), Key::Special(_, _) => Ok(Step::ProcessEvents) }
+        loop {
+            let Some(flags) = editor.typeahead().front_flags() else { return Ok(Step::Idle); };
+            if flags.remap == Remap::Yes {
+                let mode = map_mode(&self.mode);
+                let buffer = editor.current_buffer();
+                let lookup = editor.mappings().lookup_typeahead(editor.typeahead(), mode, buffer);
+                let resolved = match lookup {
+                    Lookup::Exact(mapping, width) => Some((mapping.action.clone(), mapping.options.clone(), width)),
+                    Lookup::Prefix(_) => return Ok(Step::Idle),
+                    Lookup::None => None,
+                };
+                if let Some((action, options, width)) = resolved {
+                    editor.typeahead_mut().consume(width);
+                    match action {
+                        MappingAction::Keys(keys) => {
+                            editor.typeahead_mut().push(&keys, 0, TypeaheadFlags {
+                                remap: if options.remap { Remap::Yes } else { Remap::No },
+                                modes: options.modes,
+                                buffer,
+                                mapped: true,
+                                silent: options.silent,
+                            })?;
+                            continue;
+                        }
+                        MappingAction::Nop => continue,
+                        action => { self.pending_mapping_action = Some(action); return Ok(Step::ProcessEvents); }
+                    }
+                }
+            }
+            let Some(key) = editor.typeahead_mut().pop()? else { return Ok(Step::Idle); };
+            return match key { Key::Byte(byte) => Ok(Step::Key(char::from(byte))), Key::Special(_, _) => Ok(Step::ProcessEvents) };
+        }
     }
 
     /// Executes the action classified by [`Self::check`].
@@ -180,7 +228,8 @@ impl ModeMachine {
             'I' => { self.move_command(editor, "^", 1, false)?; Ok(Mode::Insert(InsertState)) }
             'o' | 'O' => { self.open_line(editor, key == 'o')?; Ok(Mode::Insert(InsertState)) }
             'v' | 'V' | '\u{16}' => { let cursor = context(editor)?.cursor; Ok(Mode::Visual(VisualState::new(cursor, if key == 'v' { VisualKind::Character } else if key == 'V' { VisualKind::Line } else { VisualKind::Block }))) }
-            '/' | '?' => Ok(Mode::Cmdline(CmdlineState { direction: if key == '/' { SearchDirection::Forward } else { SearchDirection::Backward }, text: String::new(), count })),
+            '/' | '?' => Ok(Mode::Cmdline(CmdlineState { kind: CmdlineKind::Search(if key == '/' { SearchDirection::Forward } else { SearchDirection::Backward }), text: String::new(), count })),
+            ':' => Ok(Mode::Cmdline(CmdlineState { kind: CmdlineKind::Ex, text: String::new(), count })),
             'n' | 'N' => { self.repeat_search(editor, key == 'N', count)?; Ok(Mode::default()) }
             'x' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::Delete, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, state.register, self.timestamp)?; Ok(Mode::default()) }
             '~' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::ToggleCase, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, None, self.timestamp)?; self.move_command(editor, "l", count, false)?; Ok(Mode::default()) }
@@ -274,7 +323,18 @@ impl ModeMachine {
         match key {
             '\u{1b}' => Ok(Mode::default()),
             '\u{8}' | '\u{7f}' => { state.text.pop(); Ok(Mode::Cmdline(state)) }
-            '\n' | '\r' => { let ctx = context(editor)?; let result = self.search.search(&ctx.lines, ctx.cursor, &state.text, state.direction, state.count.max(1), option_bool(editor, "wrapscan", true))?; push_jump(editor, ctx.buffer, ctx.cursor); editor.set_window_cursor(ctx.window, result.target)?; Ok(Mode::default()) }
+            '\n' | '\r' => {
+                match state.kind {
+                    CmdlineKind::Search(direction) => {
+                        let ctx = context(editor)?;
+                        let result = self.search.search(&ctx.lines, ctx.cursor, &state.text, direction, state.count.max(1), option_bool(editor, "wrapscan", true))?;
+                        push_jump(editor, ctx.buffer, ctx.cursor);
+                        editor.set_window_cursor(ctx.window, result.target)?;
+                    }
+                    CmdlineKind::Ex => self.completed_ex_command = Some(state.text),
+                }
+                Ok(Mode::default())
+            }
             ch if !ch.is_control() => { state.text.push(ch); Ok(Mode::Cmdline(state)) }
             _ => Ok(Mode::Cmdline(state)),
         }
@@ -285,6 +345,16 @@ impl ModeMachine {
     fn repeat_search(&mut self, editor: &mut Editor, opposite: bool, count: usize) -> Result<(), ModeError> { let ctx = context(editor)?; let result = self.search.repeat(&ctx.lines, ctx.cursor, opposite, count, option_bool(editor, "wrapscan", true))?; push_jump(editor, ctx.buffer, ctx.cursor); editor.set_window_cursor(ctx.window, result.target)?; Ok(()) }
     fn advance_insert_cursor(&self, editor: &mut Editor, line_end: bool) -> Result<(), ModeError> { let ctx = context(editor)?; let line = &ctx.lines[ctx.cursor.lnum - 1]; let col = if line_end { line.len() } else { next_boundary(line, ctx.cursor.col) }; editor.set_window_cursor(ctx.window, Position { lnum: ctx.cursor.lnum, col })?; Ok(()) }
     fn open_line(&self, editor: &mut Editor, below: bool) -> Result<(), ModeError> { let ctx = context(editor)?; let after_line = if below { ctx.cursor.lnum } else { ctx.cursor.lnum.saturating_sub(1) }; let pos = Position { lnum: after_line + 1, col: 0 }; editor.append_buffer_lines(ctx.buffer, after_line, &[Vec::new()], ctx.cursor, self.timestamp)?; editor.set_window_cursor(ctx.window, pos)?; Ok(()) }
+}
+
+fn map_mode(mode: &Mode) -> MapMode {
+    match mode {
+        Mode::Normal(_) => MapMode::Normal,
+        Mode::Insert(_) => MapMode::Insert,
+        Mode::Visual(_) => MapMode::Visual,
+        Mode::Cmdline(_) => MapMode::CommandLine,
+        Mode::OperatorPending(_) => MapMode::OperatorPending,
+    }
 }
 
 /// Extends a visual selection with a resolved motion target, keeping the
