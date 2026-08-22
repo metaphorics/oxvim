@@ -581,3 +581,191 @@ fn delcommand_removes_user_command() {
         "expected E492, got: {error}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Buffer-seam builtins: setline() / getline() through ox_eval::BufferHost
+// Citations: src/nvim/eval/buffer.c f_setline/f_getline (set_buffer_lines,
+// get_buffer_lines), runtime/doc/vimfn.txt setline()/getline().
+// ---------------------------------------------------------------------------
+
+fn buffer_text(editor: &Editor) -> Vec<String> {
+    let buffer = editor.current_buffer().unwrap();
+    let state = editor.buffer(buffer).unwrap();
+    let text = state.text().unwrap();
+    (1..=text.line_count())
+        .map(|lnum| String::from_utf8_lossy(&text.line(lnum).unwrap()).into_owned())
+        .collect()
+}
+
+fn global_value(executor: &ExExecutor<MemoryFileIO>, name: &str) -> Option<ox_types::Typval> {
+    executor
+        .scope()
+        .global
+        .iter()
+        .find(|(key, _)| key.as_bytes() == name.as_bytes())
+        .map(|(_, value)| value.clone())
+}
+
+/// `setline()` on an existing line replaces it and reports 0 (FALSE).
+/// Upstream: `eval/buffer.c` `set_buffer_lines` — `lnum <= ml_line_count`
+/// takes the `ml_replace` path.
+#[test]
+fn setline_replaces_existing_line() {
+    let (mut editor, mut executor) = setup_with_content(&[b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]);
+    executor.execute_line(&mut editor, "let g:r = setline(2, 'BETA')").unwrap();
+    assert_eq!(global_value(&executor, "r"), Some(ox_types::Typval::Number(0)));
+    assert_eq!(buffer_text(&editor), vec!["alpha", "BETA", "gamma"]);
+}
+
+/// `setline(lnum, text)` with `lnum` just past the end appends the line.
+/// Upstream: `set_buffer_lines` — the `ml_append` path at
+/// `lnum == ml_line_count + 1`; further out fails with 1 and writes nothing.
+#[test]
+fn setline_appends_past_end_and_fails_beyond() {
+    let (mut editor, mut executor) = setup_with_content(&[b"alpha".to_vec(), b"beta".to_vec()]);
+    executor.execute_line(&mut editor, "let g:ok = setline(3, 'gamma')").unwrap();
+    assert_eq!(global_value(&executor, "ok"), Some(ox_types::Typval::Number(0)));
+    assert_eq!(buffer_text(&editor), vec!["alpha", "beta", "gamma"]);
+    executor.execute_line(&mut editor, "let g:fail = setline(9, 'x')").unwrap();
+    assert_eq!(global_value(&executor, "fail"), Some(ox_types::Typval::Number(1)));
+    assert_eq!(buffer_text(&editor), vec!["alpha", "beta", "gamma"]);
+}
+
+/// `setline(lnum, [items])` writes the items onto consecutive lines,
+/// replacing in range and appending past the end.
+/// Upstream: `set_buffer_lines` list loop; builtin.txt setline().
+#[test]
+fn setline_list_form_replaces_and_appends() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&mut editor, "let g:r = setline(2, ['X', 'Y', 'Z'])").unwrap();
+    assert_eq!(global_value(&executor, "r"), Some(ox_types::Typval::Number(0)));
+    assert_eq!(buffer_text(&editor), vec!["a", "X", "Y", "Z"]);
+}
+
+/// `:call setline(...)` reaches the same seam through `ex_call`.
+#[test]
+fn call_setline_mutates_buffer() {
+    let (mut editor, mut executor) = setup_with_content(&[b"one".to_vec()]);
+    executor.execute_line(&mut editor, "call setline(1, 'uno')").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["uno"]);
+}
+
+/// `getline(lnum)` returns the line as a String; `getline(start, end)`
+/// returns the inclusive range as a List; out-of-range single reads are "".
+/// Upstream: `eval/buffer.c` `get_buffer_lines` single/list branches.
+#[test]
+fn getline_single_and_range_forms() {
+    let (mut editor, mut executor) = setup_with_content(&[b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
+    executor.execute_line(&mut editor, "let g:one = getline(1)").unwrap();
+    executor.execute_line(&mut editor, "let g:rest = getline(2, 3)").unwrap();
+    executor.execute_line(&mut editor, "let g:none = getline(99)").unwrap();
+    let string_of = |value: ox_types::Typval| match value {
+        ox_types::Typval::String(text) => text.to_string_lossy().into_owned(),
+        other => panic!("expected String, got {other:?}"),
+    };
+    assert_eq!(global_value(&executor, "one").map(string_of), Some("one".to_owned()));
+    assert_eq!(global_value(&executor, "none").map(string_of), Some(String::new()));
+    match global_value(&executor, "rest") {
+        Some(ox_types::Typval::List(list)) => {
+            let items = list.borrow().items.clone();
+            assert_eq!(items.len(), 2);
+            assert_eq!(string_of(items[0].clone()), "two");
+            assert_eq!(string_of(items[1].clone()), "three");
+        }
+        other => panic!("expected List, got {other:?}"),
+    }
+}
+
+/// setline writes survive the single-writer pipeline: the modified flag
+/// flips like any other buffer mutation.
+#[test]
+fn setline_marks_buffer_modified() {
+    let (mut editor, mut executor) = setup_with_content(&[b"saved".to_vec()]);
+    let buffer = editor.current_buffer().unwrap();
+    assert!(!editor.buffer(buffer).unwrap().modified);
+    executor.execute_line(&mut editor, "call setline(1, 'changed')").unwrap();
+    assert!(editor.buffer(buffer).unwrap().modified);
+}
+
+// ---------------------------------------------------------------------------
+// :print / :p
+// Citations: src/nvim/ex_docmd.c ex_print; src/nvim/ex_cmds.c print_line,
+// print_line_no_prefix (numbering via 'number' + number_width).
+// ---------------------------------------------------------------------------
+
+fn echo_messages(editor: &Editor) -> Vec<String> {
+    editor
+        .messages()
+        .iter()
+        .filter(|message| message.kind == crate::MessageKind::Echo)
+        .map(|message| match &message.content {
+            ox_types::Object::String(text) => text.to_string_lossy().into_owned(),
+            other => panic!("expected string message, got {other:?}"),
+        })
+        .collect()
+}
+
+/// `:{range}p` sends each addressed line to the message sink as its own
+/// Echo message and leaves the cursor on the last printed line.
+/// Upstream: `ex_docmd.c` `ex_print` loop over `eap->line1..eap->line2`,
+/// then `curwin->w_cursor.lnum = eap->line2`.
+#[test]
+fn print_addrressed_lines_to_message_sink() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
+    executor.execute_line(&mut editor, "2p").unwrap();
+    assert_eq!(echo_messages(&editor), vec!["two"]);
+    let window = editor.current_window().unwrap();
+    assert_eq!(editor.window(window).unwrap().cursor.lnum, 2);
+    assert_eq!(editor.window(window).unwrap().cursor.col, 0);
+}
+
+/// `:1,3print` prints the explicit inclusive range.
+#[test]
+fn print_explicit_range() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
+    executor.execute_line(&mut editor, "1,3print").unwrap();
+    assert_eq!(echo_messages(&editor), vec!["one", "two", "three"]);
+}
+
+/// `:%print` prints the whole buffer.
+#[test]
+fn percent_print_whole_buffer() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"one".to_vec(), b"two".to_vec()]);
+    executor.execute_line(&mut editor, "%print").unwrap();
+    assert_eq!(echo_messages(&editor), vec!["one", "two"]);
+}
+
+/// With 'number' set, each printed line is prefixed by its right-aligned
+/// line number padded to the width of the last line number.
+/// Upstream: `ex_cmds.c` `print_line_no_prefix` — `curwin->w_p_nu` and
+/// `number_width(curwin)`; `msg_prt_line` appends the text.
+#[test]
+fn print_with_number_option_numbers_lines() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
+    executor.execute_line(&mut editor, "set number").unwrap();
+    executor.execute_line(&mut editor, "%p").unwrap();
+    assert_eq!(echo_messages(&editor), vec!["1 one", "2 two", "3 three"]);
+}
+
+/// `:print` on an empty buffer raises E749 before printing anything.
+/// Upstream: `ex_print` — `ML_EMPTY` → `e_empty_buffer`.
+#[test]
+fn print_empty_buffer_raises_e749() {
+    let (mut editor, mut executor) = setup();
+    assert_vim_error(executor.execute_line(&mut editor, "print"), "E749");
+}
+
+/// `%g/pat/p` prints every matching line through `:print` as the nested
+/// default command (`:g` addresses a range like the other line commands).
+/// Upstream: `ex_docmd.c` `ex_global` → default `"print"` subcommand.
+#[test]
+fn global_nested_print_outputs_matches() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
+    executor.execute_line(&mut editor, "%g/o/p").unwrap();
+    assert_eq!(echo_messages(&editor), vec!["one", "two"]);
+}

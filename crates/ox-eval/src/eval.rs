@@ -50,6 +50,31 @@ pub trait RegexEngine {
     }
 }
 
+/// Buffer-line integration point for line-addressed builtins (`getline()`,
+/// `setline()`), mirroring how upstream's `eval/buffer.c` reaches `curbuf`
+/// without the evaluator owning buffer state.
+///
+/// Hosts that own a current buffer implement this seam and route the two
+/// buffer builtins through [`crate::builtins::call_buffer_builtin`] before
+/// generic dispatch; hosts without a buffer leave those names
+/// unimplemented. Line numbers are 1-based. The seam is deliberately
+/// minimal: cursor-, mark-, and window-dependent string addresses
+/// (`.`, `'x`, `w0`, `w$`) are not translated and degrade to 0 exactly
+/// like an unresolvable upstream `var2fpos` call.
+pub trait BufferHost {
+    /// Number of lines in the current buffer.
+    fn line_count(&self) -> Result<usize>;
+
+    /// Read the 1-based line `lnum`; `None` when it falls outside the buffer.
+    fn get_line(&self, lnum: usize) -> Result<Option<OxStr>>;
+
+    /// Replace the existing 1-based line `lnum` with `text`.
+    fn replace_line(&mut self, lnum: usize, text: &OxStr) -> Result<()>;
+
+    /// Append `text` as the new last line.
+    fn append_line(&mut self, text: &OxStr) -> Result<()>;
+}
+
 /// Host used when builtins have not been installed.
 #[derive(Debug, Default)]
 pub struct NoBuiltins;

@@ -710,3 +710,217 @@ fn string_callbacks_preserve_invalid_bytes() {
     assert_eq!(call("foreach", vec![raw.clone(), text("v:val")]).unwrap(), raw);
     assert_eq!(call("reduce", vec![raw, text("v:key")]).unwrap(), Typval::String(OxStr(vec![0xff])));
 }
+
+// ── Buffer-seam builtins: getline / setline ───────────────────────────
+// Upstream: src/nvim/eval/buffer.c set_buffer_lines / get_buffer_lines,
+// f_setline / f_getline; runtime/doc/vimfn.txt setline() / getline();
+// test/old/testdir/test_bufline.vim covers the same surface per-buffer.
+
+/// Minimal seam double: a flat line list with 1-based addressing, exactly
+/// the operations `BufferHost` promises.
+#[derive(Default)]
+struct FakeBuffer {
+    lines: Vec<String>,
+}
+
+impl FakeBuffer {
+    fn new(lines: &[&str]) -> Self {
+        Self { lines: lines.iter().map(|line| (*line).to_owned()).collect() }
+    }
+}
+
+impl crate::eval::BufferHost for FakeBuffer {
+    fn line_count(&self) -> crate::Result<usize> {
+        Ok(self.lines.len())
+    }
+
+    fn get_line(&self, lnum: usize) -> crate::Result<Option<OxStr>> {
+        Ok(self.lines.get(lnum - 1).map(|line| OxStr::from(line.as_str())))
+    }
+
+    fn replace_line(&mut self, lnum: usize, text: &OxStr) -> crate::Result<()> {
+        self.lines[lnum - 1] = text.to_string_lossy().into_owned();
+        Ok(())
+    }
+
+    fn append_line(&mut self, text: &OxStr) -> crate::Result<()> {
+        self.lines.push(text.to_string_lossy().into_owned());
+        Ok(())
+    }
+}
+
+fn buffer_call(lines: &[&str], name: &str, args: Vec<Typval>) -> (crate::Result<Typval>, FakeBuffer) {
+    let mut buffer = FakeBuffer::new(lines);
+    let result = crate::builtins::call_buffer_builtin(&mut buffer, name, args);
+    (result, buffer)
+}
+
+fn texts(values: &[&str]) -> Typval {
+    Typval::list(values.iter().map(|value| text(value)).collect())
+}
+
+#[test]
+fn setline_replaces_existing_line_and_returns_zero() {
+    // f_setline → set_buffer_lines: `lnum <= ml_line_count` replaces.
+    let (result, buffer) = buffer_call(&["a", "b", "c"], "setline", vec![number(2), text("x")]);
+    assert_eq!(result.unwrap(), number(0));
+    assert_eq!(buffer.lines, vec!["a", "x", "c"]);
+}
+
+#[test]
+fn setline_appends_just_past_the_last_line() {
+    // builtin.txt setline(): "When {lnum} is just below the last line the
+    // {text} will be added below the last line."
+    let (result, buffer) = buffer_call(&["a", "b", "c"], "setline", vec![number(4), text("d")]);
+    assert_eq!(result.unwrap(), number(0));
+    assert_eq!(buffer.lines, vec!["a", "b", "c", "d"]);
+}
+
+#[test]
+fn setline_beyond_line_count_plus_one_fails_without_writing() {
+    // set_buffer_lines: `lnum > ml_line_count + 1` breaks with FAIL (1).
+    let (result, buffer) = buffer_call(&["a", "b", "c"], "setline", vec![number(5), text("x")]);
+    assert_eq!(result.unwrap(), number(1));
+    assert_eq!(buffer.lines, vec!["a", "b", "c"]);
+}
+
+#[test]
+fn setline_below_one_fails_without_writing() {
+    // set_buffer_lines: `lnum < 1` reports FAIL before any write.
+    let (result, buffer) = buffer_call(&["a", "b"], "setline", vec![number(0), text("x")]);
+    assert_eq!(result.unwrap(), number(1));
+    assert_eq!(buffer.lines, vec!["a", "b"]);
+}
+
+#[test]
+fn setline_empty_list_always_succeeds_and_writes_nothing() {
+    // set_buffer_lines: "not appending anything always succeeds".
+    let (result, buffer) = buffer_call(&["a"], "setline", vec![number(1), texts(&[])]);
+    assert_eq!(result.unwrap(), number(0));
+    assert_eq!(buffer.lines, vec!["a"]);
+}
+
+#[test]
+fn setline_list_replaces_then_appends_consecutive_lines() {
+    // builtin.txt setline(): equivalent to one setline() per item, so line
+    // 2 of three is replaced and items past the end are appended.
+    let (result, buffer) =
+        buffer_call(&["a", "b", "c"], "setline", vec![number(2), texts(&["x", "y", "z"])]);
+    assert_eq!(result.unwrap(), number(0));
+    assert_eq!(buffer.lines, vec!["a", "x", "y", "z"]);
+}
+
+#[test]
+fn setline_list_starting_out_of_bounds_fails_unchanged() {
+    // The loop's first iteration hits `lnum > ml_line_count + 1`.
+    let (result, buffer) = buffer_call(&["a", "b", "c"], "setline", vec![number(9), texts(&["x", "y"])]);
+    assert_eq!(result.unwrap(), number(1));
+    assert_eq!(buffer.lines, vec!["a", "b", "c"]);
+}
+
+#[test]
+fn setline_appends_list_into_empty_tail_starting_at_last_plus_one() {
+    // A 1-line buffer growing to three: first item appends, later items
+    // append behind it because the count grows with each write.
+    let (result, buffer) = buffer_call(&["a"], "setline", vec![number(2), texts(&["x", "y"])]);
+    assert_eq!(result.unwrap(), number(0));
+    assert_eq!(buffer.lines, vec!["a", "x", "y"]);
+}
+
+#[test]
+fn setline_converts_non_string_types_like_string() {
+    // typval_tostring(_, false): non-Strings use their string() rendering.
+    let (result, buffer) = buffer_call(&["a"], "setline", vec![number(1), number(42)]);
+    assert_eq!(result.unwrap(), number(0));
+    assert_eq!(buffer.lines, vec!["42"]);
+    // A List nested as the single item of the outer list renders like
+    // string(): "[7, 8]".
+    let nested = Typval::list(vec![list(&[7, 8])]);
+    let (result, buffer) = buffer_call(&["a"], "setline", vec![number(1), nested]);
+    assert_eq!(result.unwrap(), number(0));
+    assert_eq!(buffer.lines, vec!["[7, 8]"]);
+}
+
+#[test]
+fn setline_dollar_address_targets_last_line() {
+    // tv_get_lnum → var2fpos("$") resolves to the last line.
+    let (result, buffer) = buffer_call(&["a", "b", "c"], "setline", vec![text("$"), text("x")]);
+    assert_eq!(result.unwrap(), number(0));
+    assert_eq!(buffer.lines, vec!["a", "b", "x"]);
+}
+
+#[test]
+fn getline_single_line_returns_string() {
+    let (result, buffer) = buffer_call(&["a", "b", "c"], "getline", vec![number(2)]);
+    assert_eq!(result.unwrap(), text("b"));
+    assert_eq!(buffer.lines, vec!["a", "b", "c"]);
+}
+
+#[test]
+fn getline_out_of_range_single_yields_empty_string() {
+    // builtin.txt getline(): "smaller than 1 or bigger than the number of
+    // lines in the buffer, an empty string is returned".
+    let (result, _) = buffer_call(&["a", "b"], "getline", vec![number(0)]);
+    assert_eq!(result.unwrap(), text(""));
+    let (result, _) = buffer_call(&["a", "b"], "getline", vec![number(9)]);
+    assert_eq!(result.unwrap(), text(""));
+}
+
+#[test]
+fn getline_range_returns_inclusive_list() {
+    let (result, _) = buffer_call(&["a", "b", "c"], "getline", vec![number(1), number(3)]);
+    let expected = Typval::list(vec![text("a"), text("b"), text("c")]);
+    assert_eq!(result.unwrap(), expected);
+}
+
+#[test]
+fn getline_range_clamps_and_omits_missing_lines() {
+    // get_buffer_lines: start clamps up to 1, end clamps down to
+    // ml_line_count; non-existing lines are silently omitted.
+    let (result, _) = buffer_call(&["a", "b", "c"], "getline", vec![number(0), number(2)]);
+    let expected = Typval::list(vec![text("a"), text("b")]);
+    assert_eq!(result.unwrap(), expected);
+    let (result, _) = buffer_call(&["a", "b", "c"], "getline", vec![number(2), number(99)]);
+    let expected = Typval::list(vec![text("b"), text("c")]);
+    assert_eq!(result.unwrap(), expected);
+}
+
+#[test]
+fn getline_inverted_or_negative_range_yields_empty_list() {
+    // get_buffer_lines: `start < 0 || end < start` → empty List.
+    let (result, _) = buffer_call(&["a", "b", "c"], "getline", vec![number(3), number(2)]);
+    assert_eq!(result.unwrap(), texts(&[]));
+    let (result, _) = buffer_call(&["a", "b", "c"], "getline", vec![number(-1), number(2)]);
+    assert_eq!(result.unwrap(), texts(&[]));
+}
+
+#[test]
+fn getline_dollar_address_reads_last_line() {
+    let (result, _) = buffer_call(&["a", "b", "c"], "getline", vec![text("$")]);
+    assert_eq!(result.unwrap(), text("c"));
+    let (result, _) = buffer_call(&["a", "b", "c"], "getline", vec![number(2), text("$")]);
+    let expected = Typval::list(vec![text("b"), text("c")]);
+    assert_eq!(result.unwrap(), expected);
+}
+
+#[test]
+fn buffer_builtins_check_arity_from_generated_specs() {
+    // eval.lua rows: getline {1,2}, setline {2,2} → E119/E118.
+    let (result, _) = buffer_call(&["a"], "getline", vec![]);
+    assert_eq!(result.unwrap_err().code, "E119");
+    let (result, _) = buffer_call(&["a"], "setline", vec![number(1)]);
+    assert_eq!(result.unwrap_err().code, "E119");
+    let (result, _) = buffer_call(&["a"], "setline", vec![number(1), text("x"), number(3)]);
+    assert_eq!(result.unwrap_err().code, "E118");
+}
+
+#[test]
+fn typval_dispatcher_leaves_buffer_builtins_unimplemented() {
+    // `Builtins` alone has no buffer; only hosts routing through
+    // `call_buffer_builtin` serve getline/setline.
+    assert!(crate::builtins::is_buffer_builtin("getline"));
+    assert!(crate::builtins::is_buffer_builtin("setline"));
+    assert!(!crate::builtins::is_buffer_builtin("getbufline"));
+    let error = call("setline", vec![number(1), text("x")]).unwrap_err();
+    assert!(matches!(error.kind, crate::EvalErrorKind::NotImplemented(_)));
+}

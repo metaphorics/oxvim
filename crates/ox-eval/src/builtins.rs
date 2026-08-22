@@ -9,7 +9,7 @@ use ox_types::{Funcref, OxStr, Special, Typval};
 use serde_json::Value as JsonValue;
 
 use crate::error::{EvalError, Result};
-use crate::eval::{compare_bytes, BuiltinHost, ClosureRegistry, Evaluator, RegexEngine};
+use crate::eval::{compare_bytes, BuiltinHost, BufferHost, ClosureRegistry, Evaluator, RegexEngine};
 use crate::parser::Parser;
 use crate::scope::Scope;
 
@@ -567,6 +567,130 @@ fn is_implemented(name: &str) -> bool {
         "str2nr" | "strcharlen" | "strchars" | "stridx" | "string" | "strpart" | "strridx" |
         "substitute" | "tolower" | "toupper" | "trim" | "trunc" | "type" | "uniq" | "values" | "xor"
     )
+}
+
+/// Whether `name` is a builtin served through a [`BufferHost`] seam rather
+/// than this typval-only dispatcher.
+#[must_use]
+pub fn is_buffer_builtin(name: &str) -> bool {
+    matches!(name, "getline" | "setline")
+}
+
+/// Serve `getline()`/`setline()` against a buffer seam, mirroring
+/// `f_getline`/`f_setline` in `eval/buffer.c` (`get_buffer_lines` and
+/// `set_buffer_lines`). Hosts call this before generic dispatch for names
+/// admitted by [`is_buffer_builtin`].
+///
+/// # Panics
+/// Panics when `name` is not admitted by [`is_buffer_builtin`].
+pub fn call_buffer_builtin(buffer: &mut dyn BufferHost, name: &str, args: Vec<Typval>) -> Result<Typval> {
+    assert!(is_buffer_builtin(name), "{name} is not a buffer builtin");
+    let spec = builtin_spec(name).expect("getline and setline are in the generated eval.lua table");
+    check_arity(spec, args.len())?;
+    match name {
+        "getline" => get_buffer_lines(buffer, &args),
+        _ => set_buffer_lines(buffer, &args),
+    }
+}
+
+/// `tv_get_lnum` (`eval/typval.c`): numeric conversion first; the `"$"`
+/// special resolves to the last line through the seam. Other strings that
+/// upstream would translate through `var2fpos` (`.`, `'x`, `w0`) have no
+/// position state on this seam and degrade to 0.
+fn lnum_arg(value: &Typval, line_count: usize) -> Result<i64> {
+    if let Typval::String(text) = value {
+        if text.as_bytes() == b"$" {
+            return Ok(saturating_i64(line_count));
+        }
+    }
+    number_arg(value)
+}
+
+/// `typval_tostring(value, false)` (`eval.c`): a String stays itself; any
+/// other type uses its `string()` rendering.
+fn line_text_arg(value: &Typval) -> Result<OxStr> {
+    match value {
+        Typval::String(text) => Ok(text.clone()),
+        other => vim_string(other, 0),
+    }
+}
+
+/// `f_getline` → `get_buffer_lines(curbuf, lnum, end, retlist, rettv)`:
+/// a String without `{end}` (empty when out of range) and a List with it,
+/// clamped to the buffer with `end < start` and negative `start` yielding
+/// an empty List.
+fn get_buffer_lines(buffer: &mut dyn BufferHost, args: &[Typval]) -> Result<Typval> {
+    let line_count = buffer.line_count()?;
+    let start = lnum_arg(&args[0], line_count)?;
+    let Some(end_arg) = args.get(1) else {
+        let line = if start >= 1 && start <= saturating_i64(line_count) {
+            buffer.get_line(start as usize)?
+        } else {
+            None
+        };
+        return Ok(Typval::String(line.unwrap_or_else(|| OxStr(Vec::new()))));
+    };
+    let end = lnum_arg(end_arg, line_count)?;
+    if start < 0 || end < start {
+        return Ok(Typval::list(Vec::new()));
+    }
+    let first = start.max(1) as usize;
+    let last = end.min(saturating_i64(line_count)) as usize;
+    let mut lines = Vec::new();
+    for lnum in first..=last {
+        lines.push(Typval::String(buffer.get_line(lnum)?.unwrap_or_else(|| OxStr(Vec::new()))));
+    }
+    Ok(Typval::list(lines))
+}
+
+/// `f_setline` → `set_buffer_lines(curbuf, lnum, append = false, ...)`:
+/// replaces existing lines, appends at `line_count + 1`, writes list items
+/// onto consecutive lines, stops at the first line past `line_count + 1`,
+/// and reports failure as 1 — except an empty List, which always succeeds.
+fn set_buffer_lines(buffer: &mut dyn BufferHost, args: &[Typval]) -> Result<Typval> {
+    let line_count = buffer.line_count()?;
+    let mut lnum = lnum_arg(&args[0], line_count)?;
+    if lnum < 1 {
+        return Ok(Typval::Number(1));
+    }
+    match &args[1] {
+        Typval::List(reference) => {
+            let items = list_items(reference)?;
+            if items.is_empty() {
+                return Ok(Typval::Number(0));
+            }
+            let mut failed = false;
+            for item in items {
+                // Lines already appended extend the buffer, so re-read the
+                // count like upstream re-reads b_ml.ml_line_count per item.
+                if lnum > saturating_i64(buffer.line_count()?) + 1 {
+                    failed = true;
+                    break;
+                }
+                set_buffer_line(buffer, lnum, &line_text_arg(&item)?)?;
+                lnum += 1;
+            }
+            Ok(Typval::Number(i64::from(failed)))
+        }
+        single => {
+            if lnum > saturating_i64(buffer.line_count()?) + 1 {
+                return Ok(Typval::Number(1));
+            }
+            set_buffer_line(buffer, lnum, &line_text_arg(single)?)?;
+            Ok(Typval::Number(0))
+        }
+    }
+}
+
+/// One iteration of upstream's write loop: replace an existing line, or
+/// append when `lnum` is the line just past the end.
+fn set_buffer_line(buffer: &mut dyn BufferHost, lnum: i64, text: &OxStr) -> Result<()> {
+    let line_count = buffer.line_count()?;
+    if lnum <= saturating_i64(line_count) {
+        buffer.replace_line(lnum as usize, text)
+    } else {
+        buffer.append_line(text)
+    }
 }
 
 fn number_arg(value: &Typval) -> Result<i64> {

@@ -1,7 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
 use std::fs;
-use std::path::PathBuf;
 
 use ox_text::{Buffer, Position};
 use ox_types::{BufHandle, WinHandle};

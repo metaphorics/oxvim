@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use ox_eval::scope::{OptionScope as EvalOptionScope, ScopeMap};
 use ox_eval::{
-    BuiltinHost, Builtins, EvalError, EvalErrorKind, Evaluator, Parser as ExprParser, RegexEngine,
-    Scope, ScopeKind,
+    call_buffer_builtin, is_buffer_builtin, BuiltinHost, BufferHost, Builtins, EvalError,
+    EvalErrorKind, Evaluator, Parser as ExprParser, RegexEngine, Scope, ScopeKind,
 };
 use ox_excmd::{
     Address, AddressBase, ExCommand, ParseError, Parser as ExParser, Range, RangeKind,
@@ -668,6 +668,7 @@ fn dispatch<F: FileIO>(
         "bprevious" | "bprev" => command_buffer_step(runtime, editor, command, -1),
         "buffer" => command_buffer(runtime, editor, command),
         "put" => command_put(runtime, editor, command),
+        "print" => command_print(runtime, editor, command),
         "delete" => command_delete(runtime, editor, command),
         "yank" => command_yank(runtime, editor, command),
         "mark" | "k" => command_mark(runtime, editor, command),
@@ -757,6 +758,13 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
                 .unwrap_or_default();
             return Ok(Typval::String(OxStr(value.into_bytes())));
         }
+        // Buffer-seam builtins (getline/setline) reach the current buffer
+        // through ox_eval::BufferHost; the typval-only dispatcher below has
+        // no buffer access.
+        if is_buffer_builtin(&name_text) {
+            let mut seam = CurrentBuffer(self.editor);
+            return call_buffer_builtin(&mut seam, &name_text, args);
+        }
         let sid = self.runtime.scripts.current_sid().unwrap_or(0);
         if self.runtime.functions.contains(&name_text, sid) || name_text.contains('#') {
             return call_user_function(self.runtime, self.editor, scope, &name_text, args, 1, 1)
@@ -767,6 +775,79 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
 
     fn closure_registry(&self) -> Option<ox_eval::eval::ClosureRegistry> {
         Some(self.builtins.closure_registry().clone())
+    }
+}
+
+/// [`BufferHost`] adapter over the editor's current buffer, mapping the
+/// evaluator's line-addressed builtins onto the single-writer line
+/// mutations `Editor::replace_buffer_lines`/`append_buffer_lines`. Undo
+/// timestamps match the other ex mutations here (0); the recorded cursor is
+/// the window cursor, like `:substitute`.
+struct CurrentBuffer<'a>(&'a mut Editor);
+
+impl BufferHost for CurrentBuffer<'_> {
+    fn line_count(&self) -> ox_eval::Result<usize> {
+        let Some(buffer) = self.0.current_buffer() else { return Ok(0); };
+        Ok(self
+            .0
+            .buffer(buffer)
+            .ok()
+            .and_then(|state| state.text().ok())
+            .map_or(0, Buffer::line_count))
+    }
+
+    fn get_line(&self, lnum: usize) -> ox_eval::Result<Option<OxStr>> {
+        let Some(buffer) = self.0.current_buffer() else { return Ok(None); };
+        let line = self
+            .0
+            .buffer(buffer)
+            .ok()
+            .and_then(|state| state.text().ok())
+            .and_then(|text| text.line(lnum).ok());
+        Ok(line.map(OxStr))
+    }
+
+    fn replace_line(&mut self, lnum: usize, text: &OxStr) -> ox_eval::Result<()> {
+        let buffer = self
+            .0
+            .current_buffer()
+            .ok_or_else(|| EvalError::new("E749", 0, "Empty buffer"))?;
+        let cursor = self.cursor_or(Position { lnum, col: 0 });
+        self.0
+            .replace_buffer_lines(buffer, lnum, lnum, &[text.as_bytes().to_vec()], cursor, cursor, 0)
+            .map(|_| ())
+            .map_err(|error| EvalError::new("E16", 0, error.to_string()))
+    }
+
+    fn append_line(&mut self, text: &OxStr) -> ox_eval::Result<()> {
+        let buffer = self
+            .0
+            .current_buffer()
+            .ok_or_else(|| EvalError::new("E749", 0, "Empty buffer"))?;
+        let after = {
+            let state = self
+                .0
+                .buffer(buffer)
+                .map_err(|error| EvalError::new("E749", 0, error.to_string()))?;
+            let text_state = state
+                .text()
+                .map_err(|error| EvalError::new("E749", 0, error.to_string()))?;
+            text_state.line_count()
+        };
+        let cursor = self.cursor_or(Position { lnum: after + 1, col: 0 });
+        self.0
+            .append_buffer_lines(buffer, after, &[text.as_bytes().to_vec()], cursor, 0)
+            .map(|_| ())
+            .map_err(|error| EvalError::new("E16", 0, error.to_string()))
+    }
+}
+
+impl CurrentBuffer<'_> {
+    fn cursor_or(&self, fallback: Position) -> Position {
+        self.0
+            .current_window()
+            .and_then(|window| self.0.window(window).ok())
+            .map_or(fallback, |window| window.cursor)
     }
 }
 
@@ -1093,6 +1174,32 @@ fn command_call<F: FileIO>(
         return error_flow(runtime, "E488", "Trailing characters");
     }
     let name = text[..open].trim();
+    let sid = runtime.scripts.current_sid().unwrap_or(0);
+    // Builtin callees evaluate as call expressions through the expression
+    // evaluator, which routes the editor seams (buffer builtins, regex,
+    // user functions) the same way `:let` does; upstream `:call` reaches
+    // builtins through the same eval machinery (`eval/userfunc.c`
+    // `call_func`). Unknown names keep the registry's E117 below.
+    if !runtime.functions.contains(name, sid)
+        && !name.contains('#')
+        && ox_eval::builtin_spec(name).is_some()
+    {
+        let (first, last) = resolve_range(editor, command).unwrap_or_else(|_| current_line_pair(editor));
+        let addressed = if command.range.is_none() { first..=first } else { first..=last };
+        for lnum in addressed {
+            if command.range.is_some() {
+                if let Some(window) = editor.current_window() {
+                    if let Err(error) = editor.set_window_cursor(window, Position { lnum, col: 0 }) {
+                        return error_flow(runtime, "E16", error.to_string());
+                    }
+                }
+            }
+            if let Err(flow) = eval_text(runtime, editor, scope, text) {
+                return flow;
+            }
+        }
+        return Flow::Normal;
+    }
     let mut values = Vec::new();
     for arg in split_comma_args(&text[open + 1..close]) {
         if arg.trim().is_empty() {
@@ -1104,7 +1211,6 @@ fn command_call<F: FileIO>(
         }
     }
     let (first, last) = resolve_range(editor, command).unwrap_or_else(|_| current_line_pair(editor));
-    let sid = runtime.scripts.current_sid().unwrap_or(0);
     let accepts_range = runtime
         .functions
         .get(name, sid)
@@ -1692,6 +1798,33 @@ fn command_yank<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command:
     let content = match RegisterContent::linewise(lines[start.saturating_sub(1)..end.min(lines.len())].to_vec()) { Ok(content) => content, Err(error) => return error_flow(runtime, "E354", error.to_string()) };
     let result = if let Some(register) = command.register { editor.registers_mut().yank_to(register, content) } else { editor.registers_mut().yank(content); Ok(()) };
     match result { Ok(()) => Flow::Normal, Err(error) => error_flow(runtime, "E354", error.to_string()) }
+}
+
+/// `:print` / `:p` — `ex_docmd.c` `ex_print`: every addressed line goes to
+/// the message sink as an Echo message. Numbering follows `print_line` →
+/// `print_line_no_prefix` (`ex_cmds.c`): the 'number' option prefixes each
+/// line with its right-aligned line number padded to the width of the last
+/// line number (`number_width`). An empty buffer raises E749 first, and the
+/// cursor lands on the last printed line.
+fn command_print<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    let buffer = match editor.current_buffer() { Some(buffer) => buffer, None => return error_flow(runtime, "E749", "Empty buffer") };
+    let lines = match buffer_lines(editor, buffer) { Ok(lines) => lines, Err(message) => return error_flow(runtime, "E749", message) };
+    if lines.len() == 1 && lines[0].is_empty() { return error_flow(runtime, "E749", "Empty buffer"); }
+    let (start, end) = match resolve_range(editor, command) { Ok(range) => range, Err(message) => return error_flow(runtime, "E16", message) };
+    let number = matches!(option_value(editor, "number", SetLayer::Effective), Some(OptionValue::Boolean(true)));
+    let width = lines.len().to_string().len();
+    let last = end.min(lines.len());
+    for lnum in start..=last {
+        let text = String::from_utf8_lossy(&lines[lnum - 1]).into_owned();
+        let message = if number { format!("{lnum:>width$} {text}") } else { text };
+        push_text_message(editor, message, false, false);
+    }
+    if let Some(window) = editor.current_window() {
+        if let Err(error) = editor.set_window_cursor(window, Position { lnum: last, col: 0 }) {
+            return error_flow(runtime, "E16", error.to_string());
+        }
+    }
+    Flow::Normal
 }
 
 fn command_mark<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
