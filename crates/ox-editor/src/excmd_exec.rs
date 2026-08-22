@@ -193,6 +193,8 @@ pub struct UserCommand {
     pub accepts_range: bool,
     /// Whether invocation accepts a register.
     pub accepts_register: bool,
+    /// Canonical source script and sourcing SID that defined this command.
+    source: Option<(String, Sid)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -542,16 +544,19 @@ fn parse_program(
             .map_or((line.text.as_str(), None), |(command, body)| (command, Some(body)));
         let commands = match parser.parse(command_text) {
             Ok(commands) => commands,
-            Err(error) if error.code == ox_excmd::ErrorCode::E492 => {
-                program.push(Instruction {
-                    command: None,
-                    parse_error: Some(error),
-                    source: command_text.to_owned(),
-                    line: line.first_line,
-                });
-                continue;
+            Err(error) => {
+                if let Some(commands) = parse_put_expression(&parser, command_text) {
+                    commands
+                } else {
+                    program.push(Instruction {
+                        command: None,
+                        parse_error: Some(error),
+                        source: command_text.to_owned(),
+                        line: line.first_line,
+                    });
+                    continue;
+                }
             }
-            Err(error) => parse_put_expression(&parser, command_text).ok_or(error)?,
         };
         for mut command in commands {
             if let Some(body) = heredoc_body {
@@ -762,11 +767,16 @@ fn run_program<F: FileIO>(
                     .map(|item| item.source.clone())
                     .collect::<Vec<_>>();
                 let sid = runtime.scripts.current_sid().unwrap_or(0);
+                let same_script_reload = runtime.functions.get(&signature.name, sid).is_some_and(|existing| {
+                    existing.sid != sid
+                        && runtime.scripts.current_name().is_some_and(|name| !name.starts_with('<'))
+                        && runtime.scripts.script_name(existing.sid) == runtime.scripts.current_name()
+                });
                 let canonical = match runtime.functions.define(
                     signature,
                     body,
                     sid,
-                    command.bang,
+                    command.bang || same_script_reload,
                     scope,
                 ) {
                     Ok(name) => name,
@@ -1067,6 +1077,39 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         }
         if name_text == "append" {
             return call_append_builtin(self.editor, args);
+        }
+        if name_text == "strftime" {
+            return call_strftime_builtin(args);
+        }
+        if name_text == "tabpagenr" {
+            if args.len() > 1 {
+                return Err(EvalError::new("E118", 0, "Too many arguments for function: tabpagenr"));
+            }
+            let tabs = self.editor.tabpages();
+            let number = if args.first().is_some_and(|value| typval_to_text(value) == "$") {
+                tabs.len()
+            } else {
+                self.editor
+                    .current_tabpage()
+                    .and_then(|current| tabs.iter().position(|tab| *tab == current))
+                    .map_or(0, |index| index + 1)
+            };
+            return Ok(Typval::Number(i64::try_from(number).unwrap_or(i64::MAX)));
+        }
+        if name_text == "winnr" {
+            if args.len() > 1 {
+                return Err(EvalError::new("E118", 0, "Too many arguments for function: winnr"));
+            }
+            let windows = self.editor.windows();
+            let number = if args.first().is_some_and(|value| typval_to_text(value) == "$") {
+                windows.len()
+            } else {
+                self.editor
+                    .current_window()
+                    .and_then(|current| windows.iter().position(|window| *window == current))
+                    .map_or(0, |index| index + 1)
+            };
+            return Ok(Typval::Number(i64::try_from(number).unwrap_or(i64::MAX)));
         }
         let sid = self
             .runtime
@@ -2064,6 +2107,15 @@ fn command_echo<F: FileIO>(
     name: &str,
     args: &str,
 ) -> Flow {
+    if let Ok(value) = eval_text(runtime, editor, scope, lua, args) {
+        push_text_message(
+            editor,
+            typval_to_display(&value, false),
+            name == "echoerr",
+            name == "echomsg",
+        );
+        return Flow::Normal;
+    }
     let expressions = split_expressions(args);
     let mut pieces = Vec::new();
     for expression in expressions {
@@ -3736,9 +3788,24 @@ fn command_user_command<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Edit
     }
     let Some(name) = words.next() else { return error_flow(runtime, "E183", "User defined commands must be capitalized") };
     if !valid_user_command_name(name) { return error_flow(runtime, "E183", "User defined commands must be capitalized") }
-    if runtime.user_commands.commands.contains_key(name) && !command.bang { return error_flow(runtime, "E174", "Command already exists: add ! to replace it") }
+    let source = runtime
+        .scripts
+        .current_name()
+        .zip(runtime.scripts.current_sid())
+        .map(|(name, sid)| (name.to_owned(), sid));
+    if let Some(existing) = runtime.user_commands.commands.get(name) {
+        let same_script_new_source = match (&existing.source, &source) {
+            (Some((existing_name, existing_sid)), Some((current_name, current_sid))) => {
+                existing_name == current_name && existing_sid != current_sid
+            }
+            _ => false,
+        };
+        if !command.bang && !same_script_new_source {
+            return error_flow(runtime, "E174", "Command already exists: add ! to replace it");
+        }
+    }
     let body = words.collect::<Vec<_>>().join(" ");
-    runtime.user_commands.commands.insert(name.to_owned(), UserCommand { name: name.to_owned(), body, nargs, accepts_bang, accepts_range, accepts_register });
+    runtime.user_commands.commands.insert(name.to_owned(), UserCommand { name: name.to_owned(), body, nargs, accepts_bang, accepts_range, accepts_register, source });
     Flow::Normal
 }
 
@@ -4874,4 +4941,29 @@ fn current_line_address(editor: &mut Editor, value: &Typval) -> ox_eval::Result<
         _ => typval_number(value).unwrap_or(0),
     };
     Ok(usize::try_from(line.max(0)).unwrap_or(usize::MAX))
+}
+
+fn call_strftime_builtin(args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    if args.is_empty() {
+        return Err(EvalError::new("E119", 0, "Not enough arguments for function: strftime"));
+    }
+    if args.len() > 2 {
+        return Err(EvalError::new("E118", 0, "Too many arguments for function: strftime"));
+    }
+    if typval_to_text(&args[0]) != "%H:%M:%S" {
+        return Err(EvalError::not_implemented(OxStr::from("strftime format")));
+    }
+    let timestamp = args
+        .get(1)
+        .and_then(typval_number)
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        });
+    let seconds = timestamp.rem_euclid(86_400);
+    let hours = seconds / 3_600;
+    let minutes = seconds % 3_600 / 60;
+    let seconds = seconds % 60;
+    Ok(Typval::String(OxStr::from(format!("{hours:02}:{minutes:02}:{seconds:02}").as_str())))
 }

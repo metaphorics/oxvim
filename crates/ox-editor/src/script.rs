@@ -235,9 +235,16 @@ fn heredoc_spec(line: &str) -> Result<Option<HeredocSpec<'_>>, (&'static str, St
 
     let mut words = modifiers.trim_start_matches([' ', '\t']);
     let mut trim = false;
-    if words == "trim" || words.starts_with("trim ") || words.starts_with("trim\t") {
-        trim = true;
-        words = words[4..].trim_start_matches([' ', '\t']);
+    loop {
+        let modifier_end = words
+            .find(|character: char| character.is_ascii_whitespace())
+            .unwrap_or(words.len());
+        match &words[..modifier_end] {
+            "trim" => trim = true,
+            "eval" => {},
+            _ => break,
+        }
+        words = words[modifier_end..].trim_start_matches([' ', '\t']);
     }
     let marker_end = words
         .find(|character: char| character.is_ascii_whitespace())

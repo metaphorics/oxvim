@@ -817,6 +817,24 @@ fn let_heredoc_assigns_trimmed_lines_as_list() {
 }
 
 #[test]
+fn let_heredoc_accepts_eval_before_trim() {
+    let mut editor = Editor::new();
+    let mut executor = ExExecutor::new();
+    executor
+        .execute_script(
+            &mut editor,
+            "test.vim",
+            "let g:lines =<< eval trim END\n  alpha\nEND",
+        )
+        .unwrap();
+
+    assert_eq!(
+        executor.scope().get_scoped(ScopeKind::Global, b"lines", 0),
+        Ok(&Typval::list(vec![Typval::String(OxStr::from("alpha"))]))
+    );
+}
+
+#[test]
 fn let_heredoc_requires_end_marker() {
     let mut editor = Editor::new();
     let mut executor = ExExecutor::new();
