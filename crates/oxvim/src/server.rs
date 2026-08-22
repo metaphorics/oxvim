@@ -21,7 +21,8 @@ use ox_eval::{
 };
 use ox_lua::{
     ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot as LuaRuntimeRoot, Scheduler, VariableHost, VariableScope, Work, bind_api,
-    bind_variables, call_with_traceback, free_lua_ref, lua_to_object, object_to_lua,
+    bind_variables, call_with_traceback, free_lua_ref, lua_to_object, lua_to_typval, object_to_lua,
+    typval_to_lua,
 };
 use ox_rpc::{CHAN_STDIO, ChannelId, IncrementalDecoder, Message};
 use ox_text::Buffer;
@@ -1434,6 +1435,37 @@ impl LuaExec for ServerLuaExec {
         call_with_traceback(lua, &function, args)
             .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
         Ok(())
+    }
+
+    fn eval_expression(
+        &mut self,
+        editor: &mut Editor,
+        expression: &str,
+        arg: Option<&Typval>,
+    ) -> Result<Typval, LuaExecError> {
+        let lua = &self.lua;
+        with_scoped_editor_api(lua, &self.registry, editor, || {
+            // lua/executor.c nlua_call_luaeval wraps the expression exactly
+            // like `local _A=select(1,...) return (<expr>)` named "luaeval()".
+            let chunk = format!("local _A=select(1,...) return ({expression})");
+            let function = lua
+                .load(chunk.as_bytes())
+                .set_name("luaeval()")
+                .into_function()
+                .map_err(|error| LuaExecError::Load(error.to_string()))?;
+            let argument = match arg {
+                Some(value) => typval_to_lua(lua, value)
+                    .map_err(|error| LuaExecError::Conversion(error.to_string()))?,
+                // A missing second argument reaches Lua as nil, mirroring
+                // PUSH_ALL_TYPVALS lowering VAR_UNKNOWN to lua_pushnil.
+                None => Value::Nil,
+            };
+            let mut results = call_with_traceback(lua, &function, MultiValue::from_vec(vec![argument]))
+                .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+            let value = results.pop_front().unwrap_or(Value::Nil);
+            lua_to_typval(lua, &value)
+                .map_err(|error| LuaExecError::Conversion(error.to_string()))
+        })
     }
 }
 

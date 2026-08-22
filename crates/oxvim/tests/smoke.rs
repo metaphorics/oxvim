@@ -762,6 +762,99 @@ fn lua_integration_smoke() {
 }
 
 #[test]
+fn luaeval_evaluates_expressions_with_upstream_conversion() {
+    let mut oxvim = Embedded::spawn();
+    let mut read_global = |oxvim: &mut Embedded, name: &str| {
+        oxvim.request(
+            "nvim_exec_lua",
+            vec![Value::from(format!("return vim.g.{name}")), Value::Array(vec![])],
+        )
+    };
+
+    // The oldtest harness setup (runtest.vim:173) evaluates a boolean pcall.
+    oxvim.request(
+        "nvim_command",
+        vec![Value::from("let g:has_ffi = luaeval('pcall(require, \"ffi\")')")],
+    );
+    assert_eq!(read_global(&mut oxvim, "has_ffi"), Value::Boolean(true));
+
+    // `_A` binds the second argument (lua-eval documentation example).
+    oxvim.request(
+        "nvim_command",
+        vec![Value::from("let g:sum = luaeval('_A[1] + _A[2]', [40, 2])")],
+    );
+    assert_eq!(read_global(&mut oxvim, "sum"), Value::from(42));
+    oxvim.request(
+        "nvim_command",
+        vec![Value::from("let g:piece = luaeval('string.match(_A, \"[a-z]+\")', 'XYXfoo123')")],
+    );
+    assert_eq!(read_global(&mut oxvim, "piece"), Value::from("foo"));
+
+    // Integer-valued Lua numbers become Numbers, others stay Floats, and
+    // nil crosses back as v:null (msgpack nil).
+    oxvim.request(
+        "nvim_command",
+        vec![Value::from("let g:whole = luaeval('3.0')")],
+    );
+    assert_eq!(read_global(&mut oxvim, "whole"), Value::from(3));
+    oxvim.request(
+        "nvim_command",
+        vec![Value::from("let g:pi = luaeval('math.pi')")],
+    );
+    assert_eq!(read_global(&mut oxvim, "pi"), Value::F64(std::f64::consts::PI));
+    oxvim.request(
+        "nvim_command",
+        vec![Value::from("let g:nothing = luaeval('nil')")],
+    );
+    assert_eq!(read_global(&mut oxvim, "nothing"), Value::Nil);
+
+    // Tables convert by shape: array part → List, string keys → Dictionary.
+    oxvim.request(
+        "nvim_command",
+        vec![Value::from("let g:row = luaeval('{1, 2, 3}')")],
+    );
+    assert_eq!(
+        read_global(&mut oxvim, "row"),
+        Value::Array(vec![Value::from(1), Value::from(2), Value::from(3)]),
+    );
+    oxvim.request(
+        "nvim_command",
+        vec![Value::from("let g:point = luaeval('{x = 40, y = 2}')")],
+    );
+    assert_eq!(
+        map_get(&read_global(&mut oxvim, "point"), "x"),
+        &Value::from(40),
+    );
+
+    // Load failures raise E5107 and runtime failures raise E5108, both with
+    // the upstream "Lua:" message prefix.
+    let error_text = |value: &Value| -> String {
+        match value {
+            Value::Array(fields) => fields
+                .iter()
+                .rev()
+                .find_map(|field| field.as_str().map(str::to_owned))
+                .unwrap_or_else(|| panic!("error is not a string: {value:?}")),
+            Value::String(value) => value.as_str().unwrap_or_else(|| panic!("{value:?}")).to_owned(),
+            other => panic!("error is not a string: {other:?}"),
+        }
+    };
+    let error = oxvim.request_error(
+        "nvim_command",
+        vec![Value::from("echo luaeval('synta x')")],
+    );
+    let error = error_text(&error);
+    assert!(error.contains("E5107: Lua: "), "{error}");
+    let error = oxvim.request_error(
+        "nvim_command",
+        vec![Value::from("echo luaeval('error(\"boom\")')")],
+    );
+    let error = error_text(&error);
+    assert!(error.contains("E5108: Lua: "), "{error}");
+    assert!(error.contains("boom"), "{error}");
+}
+
+#[test]
 fn startup_file_arguments_become_named_buffers_with_first_current() {
     let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let first = std::env::temp_dir().join(format!(
