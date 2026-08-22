@@ -5,5 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Audited system-operation boundary for Oxvim"
 
+[dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true

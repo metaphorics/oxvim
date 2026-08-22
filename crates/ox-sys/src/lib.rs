@@ -1,4 +1,8 @@
 //! Audited boundary for system operations that require unsafe Rust.
+//!
+//! Locale state lives in [`locale`]; environment mutation below.
+
+pub mod locale;
 
 use std::ffi::OsStr;
 

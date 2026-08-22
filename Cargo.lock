@@ -515,6 +515,9 @@ dependencies = [
 [[package]]
 name = "ox-sys"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "ox-text"
