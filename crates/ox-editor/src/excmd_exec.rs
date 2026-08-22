@@ -1079,6 +1079,23 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         if name_text == "append" {
             return call_append_builtin(self.editor, args);
         }
+        if matches!(&*name_text, "bufname" | "bufnr") {
+            if args.len() > 1 {
+                return Err(EvalError::new(
+                    "E118",
+                    0,
+                    format!("Too many arguments for function: {name_text}"),
+                ));
+            }
+            let buffer = resolve_buffer_argument(self.editor, args.first());
+            if name_text == "bufnr" {
+                return Ok(Typval::Number(buffer.map_or(-1, i64::from)));
+            }
+            let name = buffer
+                .and_then(|handle| self.editor.buffer(handle).ok())
+                .map_or_else(|| OxStr::from(""), |state| state.name().clone());
+            return Ok(Typval::String(name));
+        }
         if name_text == "strftime" {
             return call_strftime_builtin(args);
         }
@@ -1450,6 +1467,22 @@ fn source_argument_path(editor: &Editor, argument: &str) -> PathBuf {
         .current_buffer()
         .and_then(|buffer| editor.buffer(buffer).ok())
         .map_or_else(|| PathBuf::from(argument), |buffer| PathBuf::from(buffer.name().to_string_lossy().into_owned()))
+}
+
+fn resolve_buffer_argument(editor: &Editor, argument: Option<&Typval>) -> Option<BufHandle> {
+    match argument {
+        None => editor.current_buffer(),
+        Some(Typval::Number(0)) => editor.current_buffer(),
+        Some(Typval::Number(number)) => BufHandle::try_from(*number)
+            .ok()
+            .filter(|buffer| editor.buffer(*buffer).is_ok()),
+        Some(Typval::String(name)) if name.as_bytes().is_empty() => editor.current_buffer(),
+        Some(Typval::String(name)) => editor
+            .buffers()
+            .into_iter()
+            .find(|buffer| editor.buffer(*buffer).is_ok_and(|state| state.name() == name)),
+        _ => None,
+    }
 }
 
 fn normalize_job_options(args: &[Typval]) -> ox_eval::Result<JobStartOptions> {

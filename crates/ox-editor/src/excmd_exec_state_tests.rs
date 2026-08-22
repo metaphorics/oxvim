@@ -551,6 +551,32 @@ fn cd_changes_the_directory_observed_by_getcwd() {
     assert_eq!(changed.unwrap(), target);
 }
 
+#[test]
+fn buffer_identity_builtins_resolve_current_and_named_buffers() {
+    let (mut editor, buffer, _) = editor_with_window();
+    editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_name(OxStr::from("named.vim"));
+    let mut exec = ExExecutor::new();
+
+    exec.execute_script(
+        &mut editor,
+        "<buffer-identity>",
+        "let g:current_name = bufname()\nlet g:named_number = bufnr('named.vim')",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"current_name", 0),
+        Ok(&Typval::String(OxStr::from("named.vim"))),
+    );
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"named_number", 0),
+        Ok(&Typval::Number(i64::from(buffer))),
+    );
+}
+
 // ── normal ─────────────────────────────────────────────────────────────
 
 // ex_docmd.c:ex_normal — `:normal` requires keys and completes after queuing them.
