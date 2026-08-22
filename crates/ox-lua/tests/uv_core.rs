@@ -109,6 +109,30 @@ fn immediate_timer_callback_can_close_its_handle() {
 
 #[cfg(unix)]
 #[test]
+fn immediate_pipe_callback_can_close_process_handles() {
+    let runtime = RuntimeRoot::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime"));
+    let host = LuaHost::new(runtime, Rc::new(TestBuiltins), Rc::new(ImmediateScheduler)).unwrap();
+    host.lua()
+        .load(
+            r#"
+            local output = vim.uv.new_pipe(false)
+            local process
+            process = assert(vim.uv.spawn('/bin/true', { stdio = { nil, output, nil } }, function()
+              if not process:is_closing() then process:close() end
+            end))
+            output:read_start(function(err, chunk)
+              assert(err == nil)
+              if chunk == nil and not output:is_closing() then output:close() end
+            end)
+            vim.uv.run('default')
+            "#,
+        )
+        .exec()
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn signal_binding_supports_luv_module_and_method_forms() {
     let (host, _) = host();
     host.lua()

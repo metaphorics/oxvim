@@ -306,6 +306,7 @@ struct LuaProcessPipe {
     lua: Lua,
     fast: FastCallbackState,
     access: LoopAccess,
+    closing: Rc<Cell<bool>>,
 }
 
 #[cfg(unix)]
@@ -387,19 +388,29 @@ impl UserData for LuaProcessPipe {
             Ok(true)
         });
         methods.add_method("shutdown", |_, this, callback: Option<Function>| { this.callbacks.borrow_mut().shutdown = callback; let inner = this.inner.clone(); this.access.apply(Box::new(move |uv_loop| if let Some(pipe) = inner.borrow_mut().as_mut() { let _ = pipe.shutdown(uv_loop); }))?; Ok(true) });
-        methods.add_method("close", |_, this, callback: Option<Function>| { let inner = this.inner.clone(); let lua = this.lua.clone(); let fast = this.fast.clone(); this.access.apply(Box::new(move |uv_loop| if let Some(pipe) = inner.borrow_mut().take() { let _ = pipe.close(uv_loop); if let Some(callback) = callback { invoke(&lua, &fast, &callback, MultiValue::new()); } }))?; Ok(()) });
-        methods.add_method("is_closing", |_, this, ()| Ok(this.inner.borrow().as_ref().is_none_or(|pipe| pipe.is_closing(&this.access.uv_loop.borrow()))));
+        methods.add_method("close", |_, this, callback: Option<Function>| {
+            if this.closing.replace(true) { return Ok(()); }
+            let inner = this.inner.clone(); let lua = this.lua.clone(); let fast = this.fast.clone();
+            this.access.apply(Box::new(move |uv_loop| if let Some(pipe) = inner.borrow_mut().take() { let _ = pipe.close(uv_loop); if let Some(callback) = callback { invoke(&lua, &fast, &callback, MultiValue::new()); } }))?;
+            Ok(())
+        });
+        methods.add_method("is_closing", |_, this, ()| Ok(this.closing.get() || this.inner.borrow().is_none()));
     }
 }
 
 #[derive(Clone)]
-struct LuaProcess { inner: Rc<RefCell<Option<Process>>>, access: LoopAccess }
+struct LuaProcess { inner: Rc<RefCell<Option<Process>>>, access: LoopAccess, closing: Rc<Cell<bool>> }
 impl UserData for LuaProcess {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("get_pid", |_, this, ()| Ok(this.inner.borrow().as_ref().map(Process::pid)));
         methods.add_method("kill", |_, this, signal: Option<i32>| { this.inner.borrow().as_ref().ok_or_else(|| mlua::Error::runtime("process is closed"))?.kill(signal).map_err(mlua::Error::external)?; Ok(true) });
-        methods.add_method("close", |_, this, ()| { let inner = this.inner.clone(); this.access.apply(Box::new(move |uv_loop| if let Some(process) = inner.borrow_mut().take() { let _ = process.close(uv_loop); }))?; Ok(()) });
-        methods.add_method("is_closing", |_, this, ()| Ok(this.inner.borrow().as_ref().is_none_or(|process| process.is_closing(&this.access.uv_loop.borrow()))));
+        methods.add_method("close", |_, this, ()| {
+            if this.closing.replace(true) { return Ok(()); }
+            let inner = this.inner.clone();
+            this.access.apply(Box::new(move |uv_loop| if let Some(process) = inner.borrow_mut().take() { let _ = process.close(uv_loop); }))?;
+            Ok(())
+        });
+        methods.add_method("is_closing", |_, this, ()| Ok(this.closing.get() || this.inner.borrow().is_none()));
     }
 }
 
@@ -591,7 +602,7 @@ pub(crate) fn install(lua: &Lua, uv: &Table, uv_loop: Rc<RefCell<UvLoop>>, sched
 
     #[cfg(unix)] {
         let pipe_access = access.clone(); let pipe_fast = fast.clone(); let pipe_lua = lua.clone();
-        uv.set("new_pipe", lua.create_function(move |lua, _ipc: Option<bool>| lua.create_userdata(LuaProcessPipe { inner: Rc::new(RefCell::new(None)), callbacks: Rc::new(RefCell::new(StreamCallbacks::default())), lua: pipe_lua.clone(), fast: pipe_fast.clone(), access: pipe_access.clone() }))?)?;
+        uv.set("new_pipe", lua.create_function(move |lua, _ipc: Option<bool>| lua.create_userdata(LuaProcessPipe { inner: Rc::new(RefCell::new(None)), callbacks: Rc::new(RefCell::new(StreamCallbacks::default())), lua: pipe_lua.clone(), fast: pipe_fast.clone(), access: pipe_access.clone(), closing: Rc::new(Cell::new(false)) }))?)?;
 
         let spawn_loop = uv_loop.clone(); let spawn_pending = pending_processes.clone(); let spawn_access = access.clone();
         uv.set("spawn", lua.create_function(move |lua, (program, options, callback): (String, Table, Function)| {
@@ -612,7 +623,7 @@ pub(crate) fn install(lua: &Lua, uv: &Table, uv_loop: Rc<RefCell<UvLoop>>, sched
             if let (Some(target), Some(pipe)) = (&pipe_targets[0], pipes.stdin.take()) { target.install_endpoint(pipe); }
             if let (Some(target), Some(pipe)) = (&pipe_targets[1], pipes.stdout.take()) { target.install_endpoint(pipe); }
             if let (Some(target), Some(pipe)) = (&pipe_targets[2], pipes.stderr.take()) { target.install_endpoint(pipe); }
-            let process = LuaProcess { inner: Rc::new(RefCell::new(Some(spawned.process))), access: spawn_access.clone() };
+            let process = LuaProcess { inner: Rc::new(RefCell::new(Some(spawned.process))), access: spawn_access.clone(), closing: Rc::new(Cell::new(false)) };
             let pid = process.inner.borrow().as_ref().map(Process::pid).unwrap_or_default();
             spawn_pending.borrow_mut().push(PendingProcess { completion, callback });
             Ok((lua.create_userdata(process)?, pid))
