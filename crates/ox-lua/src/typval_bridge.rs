@@ -95,11 +95,45 @@ fn typval_to_lua_inner(
         }
     })
 }
-
 /// Convert a Lua executor value to a Vimscript [`Typval`].
 pub fn lua_to_typval(lua: &Lua, value: &Value) -> Result<Typval, ConversionError> {
     lua_to_typval_inner(lua, value, 0, &mut HashMap::new())
 }
+
+/// Collect every Lua reference id stored while converting `value` (the
+/// function references of `Funcref` typvals, including those nested in lists,
+/// dictionaries, and bound arguments).
+pub fn collect_typval_refs(value: &Typval, out: &mut Vec<i32>) {
+    match value {
+        Typval::List(items) => items
+            .borrow()
+            .items
+            .iter()
+            .for_each(|item| collect_typval_refs(item, out)),
+        Typval::Dict(pairs) => pairs
+            .borrow()
+            .entries
+            .iter()
+            .for_each(|(_, item)| collect_typval_refs(item, out)),
+        Typval::Funcref(funcref) | Typval::Partial(funcref) => {
+            funcref.args.iter().for_each(|arg| collect_typval_refs(arg, out));
+            if let Some(reference) = funcref.registry {
+                if let Ok(reference) = i32::try_from(reference) {
+                    out.push(reference);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Release every Lua reference id collected from a converted [`Typval`].
+pub fn free_typval_refs(lua: &Lua, refs: &[i32]) {
+    for reference in refs {
+        let _ = crate::converter::free_lua_ref(lua, *reference);
+    }
+}
+
 
 fn lua_to_typval_inner(
     lua: &Lua,

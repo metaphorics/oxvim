@@ -12,7 +12,7 @@ mod uv_handles;
 pub mod vim;
 
 pub use converter::{
-    lua_to_object, object_to_lua, ConversionError, CONVERSION_RECURSION_LIMIT,
+    free_lua_ref, lua_to_object, object_to_lua, ConversionError, CONVERSION_RECURSION_LIMIT,
 };
 pub use host::{ExecError, HostError, LuaHost, RuntimeRoot};
 pub use typval_bridge::{lua_to_typval, typval_to_lua};

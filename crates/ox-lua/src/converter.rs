@@ -16,6 +16,7 @@ pub const CONVERSION_RECURSION_LIMIT: usize = 100;
 
 const LUA_REFS_REGISTRY_KEY: &str = "ox-lua.refs";
 const NEXT_REF_KEY: &str = "__next";
+const FREE_REF_KEY: &str = "__free";
 
 /// Failure converting between Lua and the API object model.
 #[derive(Debug, Error)]
@@ -226,6 +227,7 @@ fn lua_refs(lua: &Lua) -> Result<Table, ConversionError> {
         Err(_) => {
             let table = lua.create_table()?;
             table.raw_set(NEXT_REF_KEY, 1_i32)?;
+            table.raw_set(FREE_REF_KEY, lua.create_table()?)?;
             lua.set_named_registry_value(LUA_REFS_REGISTRY_KEY, table.clone())?;
             Ok(table)
         }
@@ -234,9 +236,26 @@ fn lua_refs(lua: &Lua) -> Result<Table, ConversionError> {
 
 fn store_lua_ref(lua: &Lua, value: Value) -> Result<i32, ConversionError> {
     let refs = lua_refs(lua)?;
-    let next: i32 = refs.raw_get(NEXT_REF_KEY)?;
+    let free: Table = refs.raw_get(FREE_REF_KEY)?;
+    let len = free.raw_len();
+    let slot = if len > 0 {
+        let slot: i32 = free.raw_get(len)?;
+        free.raw_set(len, Value::Nil)?;
+        Some(slot)
+    } else {
+        None
+    };
+    let next = match slot {
+        Some(slot) => slot,
+        None => refs.raw_get(NEXT_REF_KEY)?,
+    };
     refs.raw_set(next, value)?;
-    refs.raw_set(NEXT_REF_KEY, next.checked_add(1).ok_or(ConversionError::MissingLuaRef(next))?)?;
+    if slot.is_none() {
+        refs.raw_set(
+            NEXT_REF_KEY,
+            next.checked_add(1).ok_or(ConversionError::MissingLuaRef(next))?,
+        )?;
+    }
     Ok(next)
 }
 
@@ -247,4 +266,29 @@ fn load_lua_ref(lua: &Lua, reference: i32) -> Result<Value, ConversionError> {
     } else {
         Ok(value)
     }
+}
+
+/// Release one stored Lua reference, mirroring upstream `nlua_unref` /
+/// `api_free_luaref`.
+///
+/// The slot is cleared and recycled by a later [`lua_to_object`] conversion,
+/// so long-running sessions do not grow the reference table without bound.
+/// Releasing an already-released (or never-issued) reference is a no-op, so
+/// double release is safe; exactly one owner must release each live
+/// reference.
+///
+/// # Errors
+///
+/// Returns [`ConversionError::Lua`] when the Lua registry is unreachable.
+pub fn free_lua_ref(lua: &Lua, reference: i32) -> Result<(), ConversionError> {
+    let refs = lua_refs(lua)?;
+    let existing: Value = refs.raw_get(reference)?;
+    if matches!(existing, Value::Nil) {
+        return Ok(());
+    }
+    refs.raw_set(reference, Value::Nil)?;
+    let free: Table = refs.raw_get(FREE_REF_KEY)?;
+    let tail = free.raw_len() + 1;
+    free.raw_set(tail, reference)?;
+    Ok(())
 }

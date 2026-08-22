@@ -296,7 +296,9 @@ struct LuaTcp {
     inner: Rc<RefCell<Option<Tcp>>>,
     callbacks: Rc<RefCell<StreamCallbacks>>,
     context: Rc<TcpContext>,
+    closing: Rc<Cell<bool>>,
 }
+
 
 impl UserData for LuaTcp {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
@@ -346,11 +348,35 @@ impl UserData for LuaTcp {
         methods.add_method("nodelay", |_, this, enable: bool| { let inner = this.inner.borrow(); inner.as_ref().ok_or_else(|| mlua::Error::runtime("TCP handle is not initialized"))?.nodelay(enable).map_err(mlua::Error::external)?; Ok(true) });
         methods.add_method("is_closing", |_, this, ()| Ok(this.inner.borrow().as_ref().is_none_or(|tcp| tcp.is_closing(&this.context.access.uv_loop.borrow()))));
         methods.add_method("close", |_, this, callback: Option<Function>| {
-            let inner = this.inner.clone(); let context = this.context.clone();
+            if this.closing.replace(true) { return Ok(()); }
+            let inner = this.inner.clone(); let context = this.context.clone(); let callbacks = this.callbacks.clone();
             let access = context.access.clone();
-            access.apply(Box::new(move |uv_loop| if let Some(tcp) = inner.borrow_mut().take() { let id = tcp.id(); let _ = tcp.close(uv_loop); context.routes.borrow_mut().remove(&id); if let Some(callback) = callback { invoke(&context.lua, &context.fast, &callback, MultiValue::new()); } }))?;
+            access.apply(Box::new(move |uv_loop| if let Some(tcp) = inner.borrow_mut().take() { let id = tcp.id(); let _ = tcp.close(uv_loop); context.routes.borrow_mut().remove(&id); *callbacks.borrow_mut() = StreamCallbacks::default(); if let Some(callback) = callback { invoke(&context.lua, &context.fast, &callback, MultiValue::new()); } }))?;
             Ok(())
         });
+    }
+}
+
+impl Drop for LuaTcp {
+    /// luv `__gc`: a collected handle closes its stream so the Rust event
+    /// closure (and every callback reference it holds) is released instead of
+    /// pinning auxiliary-stack slots for the lifetime of the loop.
+    fn drop(&mut self) {
+        if Rc::strong_count(&self.inner) != 1 || self.closing.replace(true) {
+            return;
+        }
+        let inner = self.inner.clone();
+        let context = self.context.clone();
+        let callbacks = self.callbacks.clone();
+        let access = context.access.clone();
+        let _ = access.apply(Box::new(move |uv_loop| {
+            if let Some(tcp) = inner.borrow_mut().take() {
+                let id = tcp.id();
+                let _ = tcp.close(uv_loop);
+                context.routes.borrow_mut().remove(&id);
+                *callbacks.borrow_mut() = StreamCallbacks::default();
+            }
+        }));
     }
 }
 
@@ -474,10 +500,11 @@ impl UserData for LuaProcessPipe {
         methods.add_method("shutdown", |_, this, callback: Option<Function>| { this.callbacks.borrow_mut().shutdown = callback; let inner = this.inner.clone(); this.access.apply(Box::new(move |uv_loop| if let Some(pipe) = inner.borrow_mut().as_mut() { let _ = pipe.shutdown(uv_loop); }))?; Ok(true) });
         methods.add_method("close", |_, this, callback: Option<Function>| {
             if this.closing.replace(true) { return Ok(()); }
-            let inner = this.inner.clone(); let lua = this.lua.clone(); let fast = this.fast.clone();
+            let inner = this.inner.clone(); let lua = this.lua.clone(); let fast = this.fast.clone(); let callbacks = this.callbacks.clone();
             this.access.apply(Box::new(move |uv_loop| {
                 if let Some(pipe) = inner.borrow_mut().take() {
                     let _ = pipe.close(uv_loop);
+                    *callbacks.borrow_mut() = StreamCallbacks::default();
                     if let Some(callback) = callback { invoke(&lua, &fast, &callback, MultiValue::new()); }
                 }
             }))?;
@@ -544,9 +571,16 @@ fn run_isolated(chunk: &[u8], arguments: Vec<ThreadArg>) -> Result<Vec<ThreadArg
 
 #[derive(Default)]
 struct WorkCompletion { results: Mutex<VecDeque<Result<Vec<ThreadArg>, String>>> }
-struct PendingWork { completion: Arc<WorkCompletion>, callback: Function }
+struct PendingWork {
+    completion: Arc<WorkCompletion>,
+    callback: Function,
+}
 struct LuaWork {
     work: ox_uv::work::Work<ox_uv::UvLoopPoster>,
+    /// Owns the after-work callback; dropped deterministically when this
+    /// userdata is collected, releasing its auxiliary-stack reference.
+    #[allow(dead_code)]
+    pending: Rc<PendingWork>,
 }
 impl UserData for LuaWork {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
@@ -667,9 +701,9 @@ fn install_aux(lua: &Lua, uv: &Table, access: &LoopAccess, fast: &FastCallbackSt
 
 pub(crate) fn install(lua: &Lua, uv: &Table, access: LoopAccess, scheduler: Rc<dyn Scheduler>, fast: FastCallbackState) -> mlua::Result<()> {
     let uv_loop = access.uv_loop.clone();
+    let pending_works: Rc<RefCell<Vec<std::rc::Weak<PendingWork>>>> = Rc::new(RefCell::new(Vec::new()));
     let tcp_context = Rc::new(TcpContext { lua: lua.clone(), fast: fast.clone(), access: access.clone(), routes: RefCell::new(HashMap::new()) });
     let pending_processes: Rc<RefCell<Vec<PendingProcess>>> = Rc::new(RefCell::new(Vec::new()));
-    let pending_works: Rc<RefCell<Vec<PendingWork>>> = Rc::new(RefCell::new(Vec::new()));
 
     let completion_pending = pending_processes.clone();
     let completion_lua = lua.clone();
@@ -705,7 +739,8 @@ pub(crate) fn install(lua: &Lua, uv: &Table, access: LoopAccess, scheduler: Rc<d
     uv.set("run", lua.create_function(move |_, mode: Option<String>| {
         let mode = match mode.as_deref().unwrap_or("default") { "default" => RunMode::Default, "once" => RunMode::Once, "nowait" => RunMode::NoWait, other => return Err(mlua::Error::runtime(format!("invalid run mode: {other}"))) };
         let alive = run_access.run(mode)?;
-        for pending in run_works.borrow().iter() {
+        let works: Vec<_> = run_works.borrow_mut().drain(..).filter_map(|pending| pending.upgrade()).collect();
+        for pending in &works {
             loop {
                 let result = pending.completion.results.lock().map_err(|_| mlua::Error::runtime("work completion lock poisoned"))?.pop_front();
                 let Some(result) = result else { break };
@@ -720,11 +755,13 @@ pub(crate) fn install(lua: &Lua, uv: &Table, access: LoopAccess, scheduler: Rc<d
                 })).map_err(mlua::Error::runtime)?;
             }
         }
+        let live = works.iter().map(|pending| Rc::downgrade(pending)).collect::<Vec<_>>();
+        *run_works.borrow_mut() = live;
         Ok(alive)
     })?)?;
 
     let new_tcp_context = tcp_context.clone();
-    uv.set("new_tcp", lua.create_function(move |lua, ()| lua.create_userdata(LuaTcp { inner: Rc::new(RefCell::new(None)), callbacks: Rc::new(RefCell::new(StreamCallbacks::default())), context: new_tcp_context.clone() }))?)?;
+    uv.set("new_tcp", lua.create_function(move |lua, ()| lua.create_userdata(LuaTcp { inner: Rc::new(RefCell::new(None)), callbacks: Rc::new(RefCell::new(StreamCallbacks::default())), context: new_tcp_context.clone(), closing: Rc::new(Cell::new(false)) }))?)?;
 
     #[cfg(unix)] {
         let pipe_access = access.clone(); let pipe_fast = fast.clone(); let pipe_lua = lua.clone();
@@ -813,8 +850,9 @@ pub(crate) fn install(lua: &Lua, uv: &Table, access: LoopAccess, scheduler: Rc<d
             let value = result.map_err(|error| error.to_string()).and_then(|data| data.downcast::<Result<Vec<ThreadArg>, String>>().map(|data| *data).unwrap_or_else(|_| Err("invalid work result".into())));
             if let Ok(mut results) = after_completion.results.lock() { results.push_back(value); }
         });
-        work_pending.borrow_mut().push(PendingWork { completion, callback: after_function });
-        lua.create_userdata(LuaWork { work })
+        let pending = Rc::new(PendingWork { completion, callback: after_function });
+        work_pending.borrow_mut().push(Rc::downgrade(&pending));
+        lua.create_userdata(LuaWork { work, pending })
     })?)?;
 
     let addrinfo_fast = fast.clone();
@@ -834,7 +872,22 @@ pub(crate) fn install(lua: &Lua, uv: &Table, access: LoopAccess, scheduler: Rc<d
 #[derive(Default)]
 struct UdpCallbacks { recv: Option<Function>, sends: HashMap<u64, Function> }
 #[derive(Clone)]
-struct LuaUdp { inner: Rc<RefCell<Option<Udp>>>, callbacks: Rc<RefCell<UdpCallbacks>>, lua: Lua, fast: FastCallbackState, access: LoopAccess }
+struct LuaUdp { inner: Rc<RefCell<Option<Udp>>>, callbacks: Rc<RefCell<UdpCallbacks>>, lua: Lua, fast: FastCallbackState, access: LoopAccess, closing: Rc<Cell<bool>> }
+impl Drop for LuaUdp {
+    fn drop(&mut self) {
+        if Rc::strong_count(&self.inner) != 1 || self.closing.replace(true) {
+            return;
+        }
+        let inner = self.inner.clone();
+        let callbacks = self.callbacks.clone();
+        let _ = self.access.apply(Box::new(move |uv_loop| {
+            if let Some(udp) = inner.borrow_mut().take() {
+                let _ = udp.close(uv_loop);
+                *callbacks.borrow_mut() = UdpCallbacks::default();
+            }
+        }));
+    }
+}
 impl UserData for LuaUdp {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("bind", |_, this, (host, port): (String, u16)| {
@@ -856,13 +909,17 @@ impl UserData for LuaUdp {
         methods.add_method("getpeername", |lua, this, ()| { let inner = this.inner.borrow(); address_table(lua, inner.as_ref().ok_or_else(|| mlua::Error::runtime("UDP handle is not initialized"))?.peer_addr().map_err(mlua::Error::external)?) });
         methods.add_method("set_broadcast", |_, this, enable: bool| { this.inner.borrow().as_ref().ok_or_else(|| mlua::Error::runtime("UDP handle is not initialized"))?.set_broadcast(enable).map_err(mlua::Error::external)?; Ok(true) });
         methods.add_method("set_ttl", |_, this, ttl: u32| { this.inner.borrow().as_ref().ok_or_else(|| mlua::Error::runtime("UDP handle is not initialized"))?.set_ttl(ttl).map_err(mlua::Error::external)?; Ok(true) });
-        methods.add_method("close", |_, this, ()| { let inner = this.inner.clone(); this.access.apply(Box::new(move |uv_loop| if let Some(udp) = inner.borrow_mut().take() { let _ = udp.close(uv_loop); }))?; Ok(()) });
+        methods.add_method("close", |_, this, ()| {
+            if this.closing.replace(true) { return Ok(()); }
+            let inner = this.inner.clone(); let callbacks = this.callbacks.clone();
+            this.access.apply(Box::new(move |uv_loop| if let Some(udp) = inner.borrow_mut().take() { let _ = udp.close(uv_loop); *callbacks.borrow_mut() = UdpCallbacks::default(); }))?; Ok(())
+        });
     }
 }
 
 fn install_udp_tty(lua: &Lua, uv: &Table, access: LoopAccess, fast: FastCallbackState) -> mlua::Result<()> {
     let udp_access = access.clone(); let udp_lua = lua.clone(); let udp_fast = fast.clone();
-    uv.set("new_udp", lua.create_function(move |lua, ()| lua.create_userdata(LuaUdp { inner: Rc::new(RefCell::new(None)), callbacks: Rc::new(RefCell::new(UdpCallbacks::default())), lua: udp_lua.clone(), fast: udp_fast.clone(), access: udp_access.clone() }))?)?;
+    uv.set("new_udp", lua.create_function(move |lua, ()| lua.create_userdata(LuaUdp { inner: Rc::new(RefCell::new(None)), callbacks: Rc::new(RefCell::new(UdpCallbacks::default())), lua: udp_lua.clone(), fast: udp_fast.clone(), access: udp_access.clone(), closing: Rc::new(Cell::new(false)) }))?)?;
     #[cfg(unix)] {
         let tty_access = access.clone(); let tty_lua = lua.clone(); let tty_fast = fast.clone();
         uv.set("new_tty", lua.create_function(move |lua, (fd, readable): (i32, bool)| {
@@ -876,14 +933,29 @@ fn install_udp_tty(lua: &Lua, uv: &Table, access: LoopAccess, fast: FastCallback
                     _ => {}
                 }
             })).map_err(mlua::Error::external)?;
-            lua.create_userdata(LuaTty { inner: Rc::new(RefCell::new(Some(tty))), callbacks, access: tty_access.clone() })
+            lua.create_userdata(LuaTty { inner: Rc::new(RefCell::new(Some(tty))), callbacks, access: tty_access.clone(), closing: Rc::new(Cell::new(false)) })
         })?)?;
     }
     Ok(())
 }
 
 #[cfg(unix)]
-struct LuaTty { inner: Rc<RefCell<Option<Tty>>>, callbacks: Rc<RefCell<StreamCallbacks>>, access: LoopAccess }
+struct LuaTty { inner: Rc<RefCell<Option<Tty>>>, callbacks: Rc<RefCell<StreamCallbacks>>, access: LoopAccess, closing: Rc<Cell<bool>> }
+impl Drop for LuaTty {
+    fn drop(&mut self) {
+        if Rc::strong_count(&self.inner) != 1 || self.closing.replace(true) {
+            return;
+        }
+        let inner = self.inner.clone();
+        let callbacks = self.callbacks.clone();
+        let _ = self.access.apply(Box::new(move |uv_loop| {
+            if let Some(tty) = inner.borrow_mut().take() {
+                let _ = tty.close(uv_loop);
+                *callbacks.borrow_mut() = StreamCallbacks::default();
+            }
+        }));
+    }
+}
 #[cfg(unix)]
 impl UserData for LuaTty {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
@@ -892,6 +964,10 @@ impl UserData for LuaTty {
         methods.add_method("write", |_, this, (bytes, callback): (LuaString, Option<Function>)| { let data = bytes.as_bytes().to_vec(); let inner = this.inner.clone(); let callbacks = this.callbacks.clone(); this.access.apply(Box::new(move |uv_loop| if let Some(tty) = inner.borrow_mut().as_mut() { if let Ok(id) = tty.write(uv_loop, data) { if let Some(callback) = callback { callbacks.borrow_mut().writes.insert(id.get(), callback); } } }))?; Ok(true) });
         methods.add_method("get_winsize", |_, this, ()| this.inner.borrow().as_ref().ok_or_else(|| mlua::Error::runtime("TTY is closed"))?.get_winsize().map_err(mlua::Error::external));
         methods.add_method("set_mode", |_, this, mode: String| { let mode = match mode.as_str() { "normal" => TtyMode::Normal, "raw" => TtyMode::Raw, "io" => TtyMode::Cbreak, _ => return Err(mlua::Error::runtime("invalid TTY mode")) }; this.inner.borrow().as_ref().ok_or_else(|| mlua::Error::runtime("TTY is closed"))?.set_mode(mode).map_err(mlua::Error::external)?; Ok(true) });
-        methods.add_method("close", |_, this, ()| { let inner = this.inner.clone(); this.access.apply(Box::new(move |uv_loop| if let Some(tty) = inner.borrow_mut().take() { let _ = tty.close(uv_loop); }))?; Ok(()) });
+        methods.add_method("close", |_, this, ()| {
+            if this.closing.replace(true) { return Ok(()); }
+            let inner = this.inner.clone(); let callbacks = this.callbacks.clone();
+            this.access.apply(Box::new(move |uv_loop| if let Some(tty) = inner.borrow_mut().take() { let _ = tty.close(uv_loop); *callbacks.borrow_mut() = StreamCallbacks::default(); }))?; Ok(())
+        });
     }
 }

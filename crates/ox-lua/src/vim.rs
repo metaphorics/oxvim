@@ -11,7 +11,7 @@ use ox_editor::Editor;
 use ox_types::{Object, OxStr, Typval};
 
 use crate::converter::{lua_to_object, object_to_lua};
-use crate::typval_bridge::{lua_to_typval, typval_to_lua};
+use crate::typval_bridge::{collect_typval_refs, free_typval_refs, lua_to_typval, typval_to_lua};
 
 /// A deferred Lua callback owned by the eventual main-loop adapter.
 pub type Work = Box<dyn FnOnce() -> mlua::Result<()> + 'static>;
@@ -269,11 +269,17 @@ fn dispatch_builtin(
     if fast_state.in_fast_callback() && !host.is_fast(&name) {
         fast_state.guard(&format!("Vimscript function \"{}\"", name.to_string_lossy()))?;
     }
+    let mut arg_refs = Vec::new();
     let converted = args
         .iter()
         .map(|value| lua_to_typval(lua, value).map_err(mlua::Error::external))
         .collect::<Result<Vec<_>, _>>()?;
+    for value in &converted {
+        collect_typval_refs(value, &mut arg_refs);
+    }
     let result = host.call(&name, converted).map_err(mlua::Error::runtime)?;
+    // executor.c:nlua_call frees the argument LuaRefs once the call returns.
+    free_typval_refs(lua, &arg_refs);
     typval_to_lua(lua, &result).map_err(mlua::Error::external)
 }
 
