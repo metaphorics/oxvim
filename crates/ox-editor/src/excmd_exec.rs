@@ -2572,6 +2572,18 @@ fn command_augroup<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, c
 fn command_autocmd<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
     let args = command.args.trim();
     if args.is_empty() { return Flow::Normal; }
+    if command.bang {
+        if let Some(group) = editor.autocmds().group(args) {
+            return match editor.autocmds_mut().delete(DeleteAutocmds {
+                group: Some(group),
+                event: None,
+                pattern: None,
+            }) {
+                Ok(_) => Flow::Normal,
+                Err(error) => error_flow(runtime, "E216", error.to_string()),
+            };
+        }
+    }
     let mut words = args.splitn(3, char::is_whitespace).filter(|word| !word.is_empty());
     let Some(event_name) = words.next() else { return Flow::Normal };
     let event = match Event::from_name(event_name) { Some(event) => event, None => return error_flow(runtime, "E216", format!("No such group or event: {event_name}")) };

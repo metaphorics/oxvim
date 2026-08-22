@@ -397,15 +397,16 @@ impl Default for Autocmds {
 }
 
 impl Autocmds {
-    /// Creates an empty autocmd and augroup store.
+    /// Creates an autocmd store with Neovim's core augroups and no definitions.
     #[must_use]
     pub fn new() -> Self {
+        let popupmenu = AugroupId(1);
         Self {
-            groups: BTreeMap::new(),
-            group_names: BTreeMap::new(),
+            groups: BTreeMap::from([(popupmenu, ("nvim.popupmenu".to_owned(), 1))]),
+            group_names: BTreeMap::from([("nvim.popupmenu".to_owned(), popupmenu)]),
             entries: Vec::new(),
             ignored: BTreeSet::new(),
-            next_group: 1,
+            next_group: 2,
             next_id: 1,
             next_sequence: 1,
         }

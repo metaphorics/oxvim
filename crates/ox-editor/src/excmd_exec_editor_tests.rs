@@ -29,7 +29,10 @@ use std::rc::Rc;
 use ox_text::Buffer;
 
 use crate::script::FileIO;
-use crate::{Editor, ExecError, ExecOutcome, ExExecutor, Geometry, Lookup, MapMode, VimExceptionKind};
+use crate::{
+    AutocmdKind, AutocmdOptions, Editor, Event, ExecError, ExecOutcome, ExExecutor, Geometry, Lookup,
+    MapMode, VimExceptionKind,
+};
 
 // ---------------------------------------------------------------------------
 // In-memory FileIO for :edit/:write tests
@@ -505,6 +508,26 @@ fn augroup_create_end_scopes_registration() {
         editor.autocmds().group("MyGroup").is_some(),
         "augroup MyGroup should exist after END"
     );
+}
+
+#[test]
+fn autocmd_bang_clears_builtin_popupmenu_group() {
+    let (mut editor, mut executor) = setup();
+    let group = editor.autocmds().group("nvim.popupmenu").unwrap();
+    editor
+        .autocmds_mut()
+        .register(
+            Event::BufEnter,
+            "*",
+            AutocmdKind::ExString("echo stale".to_owned()),
+            AutocmdOptions { group, ..AutocmdOptions::default() },
+        )
+        .unwrap();
+
+    executor.execute_line(&mut editor, "autocmd! nvim.popupmenu").unwrap();
+
+    assert!(editor.autocmds().is_empty());
+    assert_eq!(editor.autocmds().group("nvim.popupmenu"), Some(group));
 }
 
 // ---------------------------------------------------------------------------
