@@ -997,3 +997,57 @@ fn getcwd_accepts_upstream_optional_numeric_selectors() {
     assert_eq!(call("getcwd", vec![]).unwrap(), expected);
     assert_eq!(call("getcwd", vec![number(-1), number(-1), number(-1)]).unwrap(), expected);
 }
+
+#[test]
+fn glob_supports_sorted_string_list_and_recursive_results() {
+    let root = std::env::temp_dir().join(format!("ox-eval-glob-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("nested/deeper")).unwrap();
+    std::fs::write(root.join("b.txt"), b"b").unwrap();
+    std::fs::write(root.join("a.txt"), b"a").unwrap();
+    std::fs::write(root.join("nested/deeper/c.txt"), b"c").unwrap();
+    let first = root.join("a.txt").to_string_lossy().into_owned();
+    let second = root.join("b.txt").to_string_lossy().into_owned();
+    assert_eq!(call("glob", vec![text(&root.join("*.txt").to_string_lossy())]).unwrap(), text(&format!("{first}\n{second}")));
+    assert_eq!(call("glob", vec![text(&root.join("*.txt").to_string_lossy()), number(0), number(1)]).unwrap(), Typval::list(vec![text(&first), text(&second)]));
+    let recursive = call("glob", vec![text(&root.join("**/*.txt").to_string_lossy()), number(0), number(1)]).unwrap();
+    let Typval::List(items) = recursive else { panic!("list expected") };
+    assert_eq!(items.borrow().items.len(), 3);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn globpath_joins_each_directory_and_honors_alllinks() {
+    let root = std::env::temp_dir().join(format!("ox-eval-globpath-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("one")).unwrap();
+    std::fs::create_dir_all(root.join("two")).unwrap();
+    std::fs::write(root.join("one/item.vim"), b"one").unwrap();
+    std::fs::write(root.join("two/item.vim"), b"two").unwrap();
+    let paths = format!("{},{}", root.join("one").to_string_lossy(), root.join("two").to_string_lossy());
+    assert_eq!(call("globpath", vec![text(&paths), text("*.vim"), number(0), number(1)]).unwrap(), Typval::list(vec![text(&root.join("one/item.vim").to_string_lossy()), text(&root.join("two/item.vim").to_string_lossy())]));
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(root.join("missing"), root.join("one/dangling")).unwrap();
+        assert_eq!(call("glob", vec![text(&root.join("one/dangling").to_string_lossy()), number(0), number(0), number(0)]).unwrap(), text(""));
+        assert_eq!(call("glob", vec![text(&root.join("one/dangling").to_string_lossy()), number(0), number(0), number(1)]).unwrap(), text(&root.join("one/dangling").to_string_lossy()));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn executable_checks_mode_bits_for_explicit_paths() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = std::env::temp_dir().join(format!("ox-eval-executable-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let program = root.join("program");
+    std::fs::write(&program, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(call("executable", vec![text(&program.to_string_lossy())]).unwrap(), number(0));
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(call("executable", vec![text(&program.to_string_lossy())]).unwrap(), number(1));
+    assert_eq!(call("executable", vec![text("sh")]).unwrap(), number(1));
+    std::fs::remove_dir_all(root).unwrap();
+}
