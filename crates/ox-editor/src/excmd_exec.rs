@@ -955,6 +955,9 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         if name_text == "exists" {
             return exists_with_editor(self.runtime, self.editor, scope, args);
         }
+        if name_text == "system" {
+            return call_system_builtin(args, scope);
+        }
         // Buffer-seam builtins (`getline`/`setline`) reach the current buffer
         // through ox_eval::BufferHost; the typval-only dispatcher below has
         // no buffer access.
@@ -1049,6 +1052,24 @@ fn call_job_builtin<F: FileIO>(
         }
         _ => unreachable!(),
     }
+}
+
+fn call_system_builtin(args: Vec<Typval>, scope: &mut Scope) -> ox_eval::Result<Typval> {
+    let Some(command) = args.first().and_then(|value| match value {
+        Typval::String(value) => Some(value.to_string_lossy()),
+        _ => None,
+    }) else {
+        return Err(EvalError::new("E730", 0, "Using a List as a String"));
+    };
+    let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+    let output = std::process::Command::new(shell)
+        .arg(flag)
+        .arg(command.as_ref())
+        .output()
+        .map_err(|error| EvalError::new("E677", 0, format!("Error writing temp file: {error}")))?;
+    let status = output.status.code().unwrap_or(-1);
+    replace_scope_pair(&mut scope.vim, "shell_error", Typval::Number(i64::from(status)));
+    Ok(Typval::String(OxStr(output.stdout)))
 }
 
 fn normalize_job_options(args: &[Typval]) -> ox_eval::Result<JobStartOptions> {

@@ -737,3 +737,25 @@ fn exists_reports_editor_options_functions_commands_and_autocmds() {
     assert_eq!(global_number(exec.scope(), "abbrev"), Some(1));
     assert_eq!(global_number(exec.scope(), "missing"), Some(0));
 }
+
+#[test]
+fn system_builtin_captures_stdout_and_exit_status() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&mut editor, "let g:out = system('printf oxvim')").unwrap();
+    assert!(matches!(
+        exec.scope().global.iter().find(|(key, _)| key.as_bytes() == b"out"),
+        Some((_, Typval::String(value))) if value.as_bytes() == b"oxvim"
+    ));
+    assert!(matches!(
+        exec.scope().vim.iter().find(|(key, _)| key.as_bytes() == b"shell_error"),
+        Some((_, Typval::Number(0)))
+    ));
+
+    exec.execute_line(&mut editor, "call system('exit 7')").unwrap();
+    assert!(matches!(
+        exec.scope().vim.iter().find(|(key, _)| key.as_bytes() == b"shell_error"),
+        Some((_, Typval::Number(7)))
+    ));
+}
