@@ -32,6 +32,8 @@ use ox_ui::{
 };
 use ox_uv::{Handle, HandleId, NetEvent, RunMode, Tcp, UvLoop};
 #[cfg(unix)]
+use ox_uv::{Poll, PollEvents};
+#[cfg(unix)]
 use ox_uv::net::Pipe;
 
 use crate::AppError;
@@ -658,14 +660,83 @@ pub fn run_listener(cli: &Cli, address: &str) -> Result<(), AppError> {
         OxStr::from("servername"),
         Object::String(OxStr::from(servername.as_str())),
     );
+    #[cfg(unix)]
+    let stdio_poll = cli.embed.then(|| bind_stdio(&mut uv_loop, runtime.clone())).transpose()?;
+    #[cfg(not(unix))]
+    if cli.embed {
+        return Err(AppError::Server("--embed with --listen is unsupported on this platform".into()));
+    }
 
-    uv_loop
+    let run_result = uv_loop
         .run(RunMode::Default)
-        .map_err(|error| AppError::Server(error.to_string()))?;
+        .map_err(|error| AppError::Server(error.to_string()));
+    #[cfg(unix)]
+    let stdio_close_result = stdio_poll
+        .map(|poll| poll.close(&mut uv_loop).map_err(|error| AppError::Server(error.to_string())))
+        .transpose();
+    let close_result = listener
+        .close(&mut uv_loop)
+        .map_err(|error| AppError::Server(error.to_string()));
+    run_result?;
+    #[cfg(unix)]
+    stdio_close_result?;
     if let Some(error) = runtime.borrow_mut().error.take() {
         return Err(AppError::Server(error));
     }
-    Ok(())
+    close_result
+}
+
+#[cfg(unix)]
+fn bind_stdio(uv_loop: &mut UvLoop, runtime: Rc<RefCell<NetworkRuntime>>) -> Result<Poll, AppError> {
+    let mut decoder = IncrementalDecoder::new();
+    let callback_runtime = runtime.clone();
+    let callback = move |uv_loop: &mut UvLoop, _id: HandleId, events: PollEvents| {
+        if !events.readable() && !events.disconnect() {
+            return;
+        }
+        let result = (|| -> Result<(), AppError> {
+            let mut input = io::stdin().lock();
+            let mut output = io::stdout().lock();
+            loop {
+                let mut bytes = [0; 64 * 1024];
+                match input.read(&mut bytes) {
+                    Ok(0) => {
+                        uv_loop.stop();
+                        break;
+                    }
+                    Ok(count) => {
+                        let messages = decoder
+                            .feed(&bytes[..count])
+                            .map_err(|error| AppError::Server(error.to_string()))?;
+                        for message in messages {
+                            let state = callback_runtime.borrow().state.clone();
+                            for (channel, bytes) in state.borrow_mut().process_message(CHAN_STDIO, message)? {
+                                if channel == CHAN_STDIO.get() {
+                                    output.write_all(&bytes).map_err(AppError::Io)?;
+                                }
+                            }
+                            if state.borrow().should_exit() {
+                                uv_loop.stop();
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(AppError::Io(error)),
+                }
+            }
+            output.flush().map_err(AppError::Io)
+        })();
+        if let Err(error) = result {
+            callback_runtime.borrow_mut().error = Some(error.to_string());
+            uv_loop.stop();
+        }
+    };
+    let mut poll = Poll::new(uv_loop, io::stdin(), callback)
+        .map_err(|error| AppError::Server(error.to_string()))?;
+    poll.poll_start(uv_loop, "rd")
+        .map_err(|error| AppError::Server(error.to_string()))?;
+    Ok(poll)
 }
 
 #[allow(dead_code)]
@@ -688,6 +759,14 @@ impl Listener {
                 .map_err(|error| AppError::Server(error.to_string()))?
                 .map(|path| path.to_string_lossy().into_owned())
                 .ok_or_else(|| AppError::Server("bound pipe has no local name".into())),
+        }
+    }
+
+    fn close(&self, uv_loop: &mut UvLoop) -> Result<(), ox_uv::Error> {
+        match self {
+            Self::Tcp(listener) => listener.close(uv_loop),
+            #[cfg(unix)]
+            Self::Pipe(listener) => listener.close(uv_loop),
         }
     }
 }

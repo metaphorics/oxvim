@@ -1,7 +1,7 @@
 //! End-to-end MessagePack smoke coverage for the embedded stdio server.
 
 use std::fs;
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
@@ -144,9 +144,9 @@ fn contains_string(value: &Value, expected: &str) -> bool {
     }
 }
 
-fn tcp_request(
-    writer: &mut TcpStream,
-    reader: &mut BufReader<TcpStream>,
+fn stream_request<W: Write, R: Read>(
+    writer: &mut W,
+    reader: &mut R,
     id: i64,
     method: &str,
     params: Vec<Value>,
@@ -157,10 +157,10 @@ fn tcp_request(
         Value::from(method),
         Value::Array(params),
     ]);
-    rmpv::encode::write_value(writer, &request).expect("encode TCP request");
-    writer.flush().expect("flush TCP request");
-    let response = rmpv::decode::read_value(reader).expect("decode TCP response");
-    let Value::Array(fields) = response else { panic!("TCP response is not an array") };
+    rmpv::encode::write_value(writer, &request).expect("encode RPC request");
+    writer.flush().expect("flush RPC request");
+    let response = rmpv::decode::read_value(reader).expect("decode RPC response");
+    let Value::Array(fields) = response else { panic!("RPC response is not an array") };
     assert_eq!(fields[0], Value::from(1));
     assert_eq!(fields[1], Value::from(id));
     assert_eq!(fields[2], Value::Nil);
@@ -406,11 +406,11 @@ fn tcp_listener_allocates_dynamic_channel_and_serves_api_info() {
     };
     let mut first_writer = stream.try_clone().expect("clone first TCP stream");
     let mut first_reader = BufReader::new(stream);
-    let first_info = tcp_request(&mut first_writer, &mut first_reader, 1, "nvim_get_api_info", vec![]);
+    let first_info = stream_request(&mut first_writer, &mut first_reader, 1, "nvim_get_api_info", vec![]);
     let Value::Array(first_info) = first_info else { panic!("API info is not an array") };
     assert_eq!(first_info[0], Value::from(3));
     assert_eq!(
-        tcp_request(
+        stream_request(
             &mut first_writer,
             &mut first_reader,
             2,
@@ -426,12 +426,12 @@ fn tcp_listener_allocates_dynamic_channel_and_serves_api_info() {
     let second = TcpStream::connect(address).expect("connect second TCP peer");
     let mut second_writer = second.try_clone().expect("clone second TCP stream");
     let mut second_reader = BufReader::new(second);
-    let second_info = tcp_request(&mut second_writer, &mut second_reader, 1, "nvim_get_api_info", vec![]);
+    let second_info = stream_request(&mut second_writer, &mut second_reader, 1, "nvim_get_api_info", vec![]);
     let Value::Array(second_info) = second_info else { panic!("API info is not an array") };
     assert_eq!(second_info[0], Value::from(4));
 
     assert_eq!(
-        tcp_request(
+        stream_request(
             &mut first_writer,
             &mut first_reader,
             3,
@@ -447,7 +447,7 @@ fn tcp_listener_allocates_dynamic_channel_and_serves_api_info() {
         Value::Nil,
     );
     assert_eq!(
-        tcp_request(
+        stream_request(
             &mut second_writer,
             &mut second_reader,
             2,
@@ -462,46 +462,131 @@ fn tcp_listener_allocates_dynamic_channel_and_serves_api_info() {
 
 #[cfg(unix)]
 #[test]
-fn pipe_listener_allocates_dynamic_channel_and_serves_api_info() {
+fn pipe_listener_reuses_requested_address_and_reports_servername() {
     use std::os::unix::net::UnixStream;
 
     let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let socket = std::env::temp_dir().join(format!("oxvim-listen-{}-{unique}.sock", std::process::id()));
+    fs::write(&socket, b"stale").expect("create stale listen path");
+    let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
+
+    for generation in 0..2 {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_oxvim"))
+            .args(["--headless", "--listen", socket.to_str().unwrap()])
+            .env("OXVIM_RUNTIME", &runtime)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn pipe listener");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            match UnixStream::connect(&socket) {
+                Ok(stream) => break stream,
+                Err(error) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                    let _ = error;
+                }
+                Err(error) => panic!("connect generation {generation} pipe listener: {error}"),
+            }
+        };
+        let mut writer = stream.try_clone().expect("clone pipe stream");
+        let mut reader = BufReader::new(stream);
+        assert_eq!(
+            stream_request(
+                &mut writer,
+                &mut reader,
+                1,
+                "nvim_exec_lua",
+                vec![Value::from("return vim.v.servername"), Value::Array(vec![])],
+            ),
+            Value::from(socket.to_string_lossy().into_owned()),
+        );
+        let quit = Value::Array(vec![
+            Value::from(2),
+            Value::from("nvim_command"),
+            Value::Array(vec![Value::from("qa!")]),
+        ]);
+        rmpv::encode::write_value(&mut writer, &quit).expect("encode quit notification");
+        writer.flush().expect("flush quit notification");
+        let exit_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll pipe listener") {
+                assert!(status.success(), "generation {generation} exited with {status}");
+                break;
+            }
+            assert!(Instant::now() < exit_deadline, "generation {generation} did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!socket.exists(), "generation {generation} left its socket path behind");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn embedded_listener_serves_stdio_and_cleans_up_on_exit() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let socket = std::env::temp_dir().join(format!("oxvim-embed-listen-{}-{unique}.sock", std::process::id()));
+    fs::write(&socket, b"stale").expect("create stale embedded listen path");
+    let socket_text = socket.to_string_lossy().into_owned();
+    let mut oxvim = Embedded::spawn_with(&["--headless", "--listen", &socket_text]);
+
+    assert_eq!(
+        oxvim.request(
+            "nvim_exec_lua",
+            vec![Value::from("return vim.v.servername"), Value::Array(vec![])],
+        ),
+        Value::from(socket_text),
+    );
+    oxvim.notify("nvim_command", vec![Value::from("qa!")]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = oxvim.child.try_wait().expect("poll embedded listener") {
+            assert!(status.success(), "embedded listener exited with {status}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "embedded listener did not exit after stdin quit");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!socket.exists(), "embedded listener left its socket path behind");
+}
+
+#[cfg(unix)]
+#[test]
+fn embedded_listener_exits_when_stdio_reaches_eof() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let socket = std::env::temp_dir().join(format!("oxvim-embed-eof-{}-{unique}.sock", std::process::id()));
     let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
     let mut child = Command::new(env!("CARGO_BIN_EXE_oxvim"))
-        .args(["--headless", "--listen", socket.to_str().unwrap()])
+        .args(["--embed", "--headless", "--listen", socket.to_str().unwrap()])
         .env("OXVIM_RUNTIME", runtime)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .expect("spawn pipe listener");
+        .expect("spawn embedded EOF listener");
+    let mut input = child.stdin.take().expect("embedded EOF stdin");
+    let mut output = BufReader::new(child.stdout.take().expect("embedded EOF stdout"));
+    assert_eq!(
+        stream_request(&mut input, &mut output, 1, "nvim_get_vvar", vec![Value::from("servername")]),
+        Value::from(socket.to_string_lossy().into_owned()),
+    );
+    drop(input);
+
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut stream = loop {
-        match UnixStream::connect(&socket) {
-            Ok(stream) => break stream,
-            Err(error) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10));
-                let _ = error;
-            }
-            Err(error) => panic!("connect pipe listener: {error}"),
+    loop {
+        if let Some(status) = child.try_wait().expect("poll embedded EOF listener") {
+            assert!(status.success(), "embedded EOF listener exited with {status}");
+            break;
         }
-    };
-    let request = Value::Array(vec![
-        Value::from(0),
-        Value::from(1),
-        Value::from("nvim_get_api_info"),
-        Value::Array(vec![]),
-    ]);
-    rmpv::encode::write_value(&mut stream, &request).expect("encode pipe request");
-    stream.flush().expect("flush pipe request");
-    let response = rmpv::decode::read_value(&mut BufReader::new(stream)).expect("decode pipe response");
-    let Value::Array(fields) = response else { panic!("pipe response is not an array") };
-    let Value::Array(info) = &fields[3] else { panic!("API info is not an array") };
-    assert_eq!(info[0], Value::from(3));
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = fs::remove_file(socket);
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("embedded listener did not exit after stdin EOF");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!socket.exists(), "embedded EOF listener left its socket path behind");
 }
 
 #[test]
