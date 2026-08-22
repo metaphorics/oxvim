@@ -615,6 +615,8 @@ fn misc_surface_reports_process_and_system_state() {
         assert(uv.get_total_memory() > 0)
         assert(uv.get_free_memory() > 0 and uv.get_free_memory() <= uv.get_total_memory())
         assert(type(uv.os_getenv('PATH')) == 'string')
+        local environment = uv.os_environ()
+        assert(type(environment) == 'table' and environment.PATH == uv.os_getenv('PATH'))
         local missing, missing_err, missing_name = uv.os_getenv('OXVIM_UNSET_ENV_VAR_12345')
         assert(missing == nil and missing_name == 'ENOENT' and type(missing_err) == 'string')
         misc_ok = true

@@ -296,6 +296,16 @@ fn install_misc(lua: &Lua, uv: &Table) -> mlua::Result<()> {
             )),
         ),
     })?)?;
+    uv.set("os_environ", lua.create_function(|lua, ()| {
+        let environment = lua.create_table()?;
+        for (name, value) in std::env::vars_os() {
+            environment.set(
+                name.to_string_lossy().as_ref(),
+                value.to_string_lossy().as_ref(),
+            )?;
+        }
+        Ok(environment)
+    })?)?;
     Ok(())
 }
 
