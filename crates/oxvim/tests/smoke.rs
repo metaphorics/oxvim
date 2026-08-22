@@ -477,7 +477,7 @@ fn pipe_listener_allocates_dynamic_channel_and_serves_api_info() {
         .spawn()
         .expect("spawn pipe listener");
     let deadline = Instant::now() + Duration::from_secs(5);
-    let stream = loop {
+    let mut stream = loop {
         match UnixStream::connect(&socket) {
             Ok(stream) => break stream,
             Err(error) if Instant::now() < deadline => {
