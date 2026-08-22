@@ -2837,6 +2837,9 @@ fn command_luado<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, lua: Op
             &chunk,
             vec![Object::String(OxStr(line)), Object::Integer(lnum as i64)],
         );
+        if editor.current_buffer() != Some(buffer) {
+            break;
+        }
         let replacement = match result {
             Ok(Object::String(value)) => Some(value.as_bytes().to_vec()),
             Ok(Object::Integer(value)) => Some(value.to_string().into_bytes()),
@@ -2845,7 +2848,6 @@ fn command_luado<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, lua: Op
             Err(error) => return lua_error_flow(runtime, error, "E5109", "E5111"),
         };
         if let Some(replacement) = replacement {
-            if editor.current_buffer() != Some(buffer) { break; }
             let cursor = editor.current_window().and_then(|window| editor.window(window).ok()).map_or(Position { lnum, col: 0 }, |window| window.cursor);
             if let Err(error) = editor.replace_buffer_lines(buffer, lnum, lnum, &[replacement], cursor, cursor, 0) {
                 return error_flow(runtime, "E16", error.to_string());
