@@ -1543,7 +1543,9 @@ fn with_scoped_editor_api<T>(
                         .iter()
                         .map(|value| lua_to_object(lua, value).map_err(mlua::Error::external))
                         .collect::<Result<Vec<_>, _>>()?;
-                    if metadata.name == "nvim_get_option_value" && args.len() == 1 {
+                    if (metadata.name == "nvim_get_option_value" && args.len() == 1)
+                        || (metadata.name == "nvim_set_option_value" && args.len() == 2)
+                    {
                         args.push(Object::Dict(Dict(Vec::new())));
                     }
                     let result = dispatch(&mut editor.borrow_mut(), &args).map_err(mlua::Error::external)?;

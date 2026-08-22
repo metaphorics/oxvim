@@ -706,6 +706,21 @@ fn lua_script_preserves_vimscript_globals_across_lua_commands() {
 fn lua_integration_smoke() {
     let mut oxvim = Embedded::spawn();
 
+    assert_eq!(
+        oxvim.request(
+            "nvim_command",
+            vec![Value::from("lua vim.o.background = 'light'")],
+        ),
+        Value::Nil,
+    );
+    assert_eq!(
+        oxvim.request(
+            "nvim_exec_lua",
+            vec![Value::from("return vim.o.background"), Value::Array(vec![])],
+        ),
+        Value::from("light"),
+    );
+
     // Call a Lua function that uses vim.api against the current editor.
     assert_eq!(
         oxvim.request("nvim_command", vec![Value::from("lua _G.oxvim_ex_buffer = vim.api.nvim_get_current_buf(); vim.g.oxvim_ex_value = 42")]),
