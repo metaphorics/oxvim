@@ -34,7 +34,7 @@ use crate::register::RegisterContent;
 use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid};
 use crate::typeahead::Keys;
 use crate::userfunc::{UserFuncError, UserFunctions};
-use crate::{BufferRelease, Editor, Message, MessageKind, ModeMachine};
+use crate::{BufferRelease, Editor, Message, MessageKind, ModeMachine, Geometry};
 
 /// Result of one public execution entry point.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -714,6 +714,7 @@ fn dispatch<F: FileIO>(
         "vglobal" => command_global(runtime, editor, scope, lua, command, true),
         "substitute" => command_substitute(runtime, editor, scope, command),
         "edit" => command_edit(runtime, editor, command),
+        "enew" => command_enew(runtime, editor, command),
         "write" | "wq" | "xit" => {
             let flow = command_write(runtime, editor, command);
             if matches!(flow, Flow::Normal) && matches!(name, "wq" | "xit") {
@@ -1680,6 +1681,26 @@ fn command_edit<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, comm
         match editor.create_tabpage(handle, crate::Geometry { row: 0, col: 0, width: 80, height: 24 }) {
             Ok(_) => {}
             Err(error) => return error_flow(runtime, "E948", error.to_string()),
+        }
+    } else if let Err(error) = editor.set_current_buffer(handle, BufferRelease::KeepLoaded) {
+        return error_flow(runtime, "E948", error.to_string());
+    }
+    Flow::Normal
+}
+
+fn command_enew<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    if let Some(current) = editor.current_buffer() {
+        if editor.buffer(current).is_ok_and(|buffer| buffer.modified) && !command.bang {
+            return error_flow(runtime, "E37", "No write since last change (add ! to override)");
+        }
+    }
+    let handle = match editor.create_buffer(true) {
+        Ok(handle) => handle,
+        Err(error) => return error_flow(runtime, "E948", error.to_string()),
+    };
+    if editor.current_window().is_none() {
+        if let Err(error) = editor.create_tabpage(handle, Geometry { row: 0, col: 0, width: 80, height: 24 }) {
+            return error_flow(runtime, "E948", error.to_string());
         }
     } else if let Err(error) = editor.set_current_buffer(handle, BufferRelease::KeepLoaded) {
         return error_flow(runtime, "E948", error.to_string());

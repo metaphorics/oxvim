@@ -291,6 +291,18 @@ fn setlocal_and_setglobal_route_to_correct_layer() {
     );
 }
 
+#[test]
+fn enew_selects_a_distinct_empty_buffer() {
+    let (mut editor, original, _) = editor_with_window();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&mut editor, "enew").unwrap();
+
+    let current = editor.current_buffer().unwrap();
+    assert_ne!(current, original);
+    assert_eq!(editor.buffer(current).unwrap().text().unwrap().line_count(), 1);
+}
+
 // ── echo / echomsg / echon ─────────────────────────────────────────────
 
 // ex_docmd.c:ex_echo — `:echo "hello"` produces an Echo message without
