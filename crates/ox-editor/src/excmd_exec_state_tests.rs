@@ -26,7 +26,7 @@ use ox_types::{Object, OxStr, Typval};
 
 use crate::excmd_exec::{ExecError, ExecOutcome};
 use crate::register::RegisterContent;
-use crate::{Editor, ExExecutor, Geometry, MessageKind, VimExceptionKind};
+use crate::{Editor, ExExecutor, Geometry, MessageKind, OptionValue, VimExceptionKind};
 use ox_types::WinHandle;
 
 /// Build an editor with one listed buffer and a tabpage so window-local
@@ -316,6 +316,15 @@ fn echon_joins_without_space_separator() {
 }
 
 // ── execute ────────────────────────────────────────────────────────────
+
+#[test]
+fn set_minus_equal_removes_complete_comma_list_item() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&mut editor, "set wildoptions-=pum").unwrap();
+    assert_eq!(editor.options().get_global("wildoptions").unwrap(), &OptionValue::String("tagfile".to_owned()));
+}
 
 // ex_docmd.c:ex_execute — `:execute` evaluates expression arguments,
 // joins the resulting strings, and runs the joined text as a command.

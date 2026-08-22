@@ -463,7 +463,7 @@ fn has_duplicate_items(value: &str) -> bool {
     false
 }
 
-fn find_unescaped(value: &str, needle: char) -> Option<usize> {
+pub(crate) fn find_unescaped(value: &str, needle: char) -> Option<usize> {
     let mut escaped = false;
     for (offset, character) in value.char_indices() {
         if character == needle && !escaped {
@@ -478,12 +478,12 @@ fn find_unescaped(value: &str, needle: char) -> Option<usize> {
     None
 }
 
-struct CommaItems<'a> {
+pub(crate) struct CommaItems<'a> {
     remaining: Option<&'a str>,
 }
 
 impl<'a> CommaItems<'a> {
-    fn new(value: &'a str) -> Self {
+    pub(crate) fn new(value: &'a str) -> Self {
         Self {
             remaining: Some(value),
         }

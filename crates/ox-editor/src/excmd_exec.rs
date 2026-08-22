@@ -27,7 +27,7 @@ use ox_types::{BufHandle, Dict, Object, OxStr, Special, Typval};
 use crate::autocmd::{AutocmdKind, AutocmdOptions, AugroupId, DeleteAutocmds, Event};
 use crate::extmark::{ExtmarkAttributes, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, NamespaceId};
 use crate::mapping::{MapMode, MapModes, MapScope, MappingAction, MappingOptions};
-use crate::options::{OptionScope, OptionType, OptionValue, OPTION_METADATA};
+use crate::options::{find_unescaped, CommaItems, OptionListKind, OptionScope, OptionType, OptionValue, OPTION_METADATA};
 use crate::register::RegisterContent;
 use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid};
 use crate::typeahead::Keys;
@@ -678,6 +678,7 @@ fn dispatch<F: FileIO>(
         "augroup" => command_augroup(runtime, editor, command),
         "autocmd" => command_autocmd(runtime, editor, command),
         "command" => command_user_command(runtime, editor, command),
+        "comclear" => { runtime.user_commands.commands.clear(); Flow::Normal },
         "delcommand" => command_delcommand(runtime, command),
         "map" | "nmap" | "vmap" | "xmap" | "smap" | "omap" | "imap" | "cmap"
         | "lmap" | "tmap" | "noremap" | "nnoremap" | "vnoremap" | "xnoremap"
@@ -2475,33 +2476,184 @@ fn set_one(editor: &mut Editor, raw: &str, layer: SetLayer) -> Result<(), (&'sta
     let raw = raw.trim();
     if let Some(name) = raw.strip_suffix('?') { if let Some(text) = display_option(editor, name, layer) { editor.push_message(Message { kind: MessageKind::Echo, content: Object::String(OxStr(text.into_bytes())), history: false }); return Ok(()); } return Err(("E518", format!("Unknown option: {name}"))); }
     if let Some(name) = raw.strip_suffix('&') { let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?; let value = metadata.default.value.map(OptionValue::from).ok_or_else(|| ("E474", format!("No literal default for {name}")))?; return set_option_value(editor, metadata.name, value, layer); }
-    for operator in ["+=", "-=", "^=", "="] { if let Some((name, value)) = raw.split_once(operator) { let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?; let mut next = match metadata.value_type { OptionType::Boolean => OptionValue::Boolean(matches!(value, "1" | "true" | "on")), OptionType::Number => OptionValue::Number(value.parse().map_err(|_| ("E521", format!("Number required after =: {value}")))?), OptionType::String => OptionValue::String(value.to_owned()) }; if operator != "=" { let current = option_value(editor, metadata.name, layer).cloned().unwrap_or_else(|| metadata.default.value.map(OptionValue::from).unwrap_or(OptionValue::String(String::new()))); next = modify_option(current, next, operator)?; } return set_option_value(editor, metadata.name, next, layer); } }
+    for operator in ["+=", "-=", "^=", "="] { if let Some((name, value)) = raw.split_once(operator) { let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?; let mut next = match metadata.value_type { OptionType::Boolean => OptionValue::Boolean(matches!(value, "1" | "true" | "on")), OptionType::Number => OptionValue::Number(value.parse().map_err(|_| ("E521", format!("Number required after =: {value}")))?), OptionType::String => OptionValue::String(value.to_owned()) }; if operator != "=" { let current = option_value(editor, metadata.name, layer).cloned().unwrap_or_else(|| metadata.default.value.map(OptionValue::from).unwrap_or(OptionValue::String(String::new()))); next = modify_option(current, next, operator, metadata.list)?; } return set_option_value(editor, metadata.name, next, layer); } }
     let (name, value) = if let Some(name) = raw.strip_prefix("no") { (name, false) } else if let Some(name) = raw.strip_prefix("inv") { let current = option_value(editor, name, layer).and_then(|value| match value { OptionValue::Boolean(value) => Some(*value), _ => None }).unwrap_or(false); (name, !current) } else if let Some(name) = raw.strip_suffix('!') { let current = option_value(editor, name, layer).and_then(|value| match value { OptionValue::Boolean(value) => Some(*value), _ => None }).unwrap_or(false); (name, !current) } else { (raw, true) };
     let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?;
     if metadata.value_type != OptionType::Boolean { if let Some(text) = display_option(editor, name, layer) { editor.push_message(Message { kind: MessageKind::Echo, content: Object::String(OxStr(text.into_bytes())), history: false }); return Ok(()); } }
     set_option_value(editor, metadata.name, OptionValue::Boolean(value), layer)
 }
 
-fn modify_option(current: OptionValue, next: OptionValue, operator: &str) -> Result<OptionValue, (&'static str, String)> { match (current, next) { (OptionValue::Number(left), OptionValue::Number(right)) => Ok(OptionValue::Number(match operator { "+=" => left.saturating_add(right), "-=" => left.saturating_sub(right), "^=" => right.saturating_mul(10).saturating_add(left), _ => right })), (OptionValue::String(mut left), OptionValue::String(right)) => { match operator { "+=" => left.push_str(&right), "^=" => left.insert_str(0, &right), "-=" => left = left.replace(&right, ""), _ => {} } Ok(OptionValue::String(left)) }, _ => Err(("E734", format!("Wrong variable type for {operator}"))) } }
+fn modify_option(current: OptionValue, next: OptionValue, operator: &str, list: Option<OptionListKind>) -> Result<OptionValue, (&'static str, String)> {
+    match (current, next) {
+        (OptionValue::Number(left), OptionValue::Number(right)) => Ok(OptionValue::Number(match operator {
+            "+=" => left.saturating_add(right),
+            "-=" => left.saturating_sub(right),
+            "^=" => right.saturating_mul(10).saturating_add(left),
+            _ => right,
+        })),
+        (OptionValue::String(mut left), OptionValue::String(right)) => {
+            if let Some(kind @ (OptionListKind::Comma | OptionListKind::OneComma | OptionListKind::CommaColon | OptionListKind::OneCommaColon | OptionListKind::FlagsComma)) = list {
+                left = modify_comma_list(&left, &right, operator, kind);
+            } else {
+                match operator {
+                    "+=" => left.push_str(&right),
+                    "^=" => left.insert_str(0, &right),
+                    "-=" => left = left.replace(&right, ""),
+                    _ => {}
+                }
+            }
+            Ok(OptionValue::String(left))
+        }
+        _ => Err(("E734", format!("Wrong variable type for {operator}"))),
+    }
+}
 
-fn split_set_args(args: &str) -> Vec<String> { let mut output = Vec::new(); let mut current = String::new(); let mut escaped = false; for character in args.chars() { if escaped { current.push(character); escaped = false; } else if character == '\\' { escaped = true; current.push(character); } else if character.is_whitespace() { if !current.is_empty() { output.push(std::mem::take(&mut current)); } } else { current.push(character); } } if !current.is_empty() { output.push(current); } output }
+fn modify_comma_list(left: &str, right: &str, operator: &str, kind: OptionListKind) -> String {
+    if right.is_empty() {
+        return left.to_owned();
+    }
+    let colon = matches!(kind, OptionListKind::CommaColon | OptionListKind::OneCommaColon);
+    let reject_empty = matches!(kind, OptionListKind::OneComma | OptionListKind::OneCommaColon);
+    let mut items = CommaItems::new(left)
+        .filter(|item| !reject_empty || !item.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for operand in CommaItems::new(right) {
+        let matches = |item: &str| {
+            if colon {
+                if let Some(offset) = find_unescaped(operand, ':') {
+                    return item.get(..=offset) == operand.get(..=offset);
+                }
+            }
+            item == operand
+        };
+        match operator {
+            "-=" => items.retain(|item| !matches(item)),
+            "+=" => {
+                if colon { items.retain(|item| !matches(item)); }
+                if !items.iter().any(|item| item == operand) { items.push(operand.to_owned()); }
+            }
+            "^=" => {
+                if colon { items.retain(|item| !matches(item)); }
+                if !items.iter().any(|item| item == operand) { items.insert(0, operand.to_owned()); }
+            }
+            _ => {}
+        }
+    }
+    items.join(",")
+}
 
-fn display_option(editor: &Editor, name: &str, layer: SetLayer) -> Option<String> { let metadata = crate::option_metadata(name)?; let value = option_value(editor, metadata.name, layer)?; Some(match value { OptionValue::Boolean(true) => metadata.name.to_owned(), OptionValue::Boolean(false) => format!("no{}", metadata.name), OptionValue::Number(value) => format!("{}={value}", metadata.name), OptionValue::String(value) => format!("{}={value}", metadata.name) }) }
+fn split_set_args(args: &str) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for character in args.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+            current.push(character);
+        } else if character.is_whitespace() {
+            if !current.is_empty() {
+                output.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(character);
+        }
+    }
+    if !current.is_empty() {
+        output.push(current);
+    }
+    output
+}
 
-fn option_is_default(editor: &Editor, name: &str) -> bool { let Some(metadata) = crate::option_metadata(name) else { return true }; let Some(default) = metadata.default.value.map(OptionValue::from) else { return false }; editor.options().get_global(metadata.name).is_ok_and(|value| value == &default) }
+fn display_option(editor: &Editor, name: &str, layer: SetLayer) -> Option<String> {
+    let metadata = crate::option_metadata(name)?;
+    let value = option_value(editor, metadata.name, layer)?;
+    Some(match value {
+        OptionValue::Boolean(true) => metadata.name.to_owned(),
+        OptionValue::Boolean(false) => format!("no{}", metadata.name),
+        OptionValue::Number(value) => format!("{}={value}", metadata.name),
+        OptionValue::String(value) => format!("{}={value}", metadata.name),
+    })
+}
 
-fn map_modes(name: &str, bang: bool) -> MapModes { if bang { return MapModes::MAP_BANG; } match name.chars().next() { Some('n') if name != "noremap" => MapModes::one(MapMode::Normal), Some('v') => MapModes::one(MapMode::Visual) | MapModes::one(MapMode::Select), Some('x') => MapModes::one(MapMode::Visual), Some('s') => MapModes::one(MapMode::Select), Some('o') => MapModes::one(MapMode::OperatorPending), Some('i') => MapModes::one(MapMode::Insert), Some('c') => MapModes::one(MapMode::CommandLine), Some('l') => MapModes::one(MapMode::LangArg), Some('t') => MapModes::one(MapMode::Terminal), _ => MapModes::MAP } }
+fn option_is_default(editor: &Editor, name: &str) -> bool {
+    let Some(metadata) = crate::option_metadata(name) else { return true };
+    let Some(default) = metadata.default.value.map(OptionValue::from) else { return false };
+    editor.options().get_global(metadata.name).is_ok_and(|value| value == &default)
+}
 
-fn valid_user_command_name(name: &str) -> bool { name.as_bytes().first().is_some_and(u8::is_ascii_uppercase) && name.bytes().all(|byte| byte.is_ascii_alphanumeric()) }
+fn map_modes(name: &str, bang: bool) -> MapModes {
+    if bang {
+        return MapModes::MAP_BANG;
+    }
+    match name.chars().next() {
+        Some('n') if name != "noremap" => MapModes::one(MapMode::Normal),
+        Some('v') => MapModes::one(MapMode::Visual) | MapModes::one(MapMode::Select),
+        Some('x') => MapModes::one(MapMode::Visual),
+        Some('s') => MapModes::one(MapMode::Select),
+        Some('o') => MapModes::one(MapMode::OperatorPending),
+        Some('i') => MapModes::one(MapMode::Insert),
+        Some('c') => MapModes::one(MapMode::CommandLine),
+        Some('l') => MapModes::one(MapMode::LangArg),
+        Some('t') => MapModes::one(MapMode::Terminal),
+        _ => MapModes::MAP,
+    }
+}
 
-fn buffer_lines(editor: &Editor, buffer: BufHandle) -> Result<Vec<Vec<u8>>, String> { let state = editor.buffer(buffer).map_err(|error| error.to_string())?; let text = state.text().map_err(|error| error.to_string())?; (1..=text.line_count()).map(|line| text.line(line).map_err(|error| error.to_string())).collect() }
+fn valid_user_command_name(name: &str) -> bool {
+    name.as_bytes().first().is_some_and(u8::is_ascii_uppercase) && name.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
 
-fn dict_to_scope(dict: &Dict) -> ScopeMap { dict.0.iter().map(|(key, value)| (key.clone(), object_to_typval(value))).collect() }
-fn scope_to_dict(scope: &ScopeMap) -> Dict { Dict(scope.iter().map(|(key, value)| (key.clone(), typval_to_object(value))).collect()) }
-fn object_to_typval(value: &Object) -> Typval { match value { Object::Nil => Typval::Special(Special::Null), Object::Boolean(value) => Typval::Bool(*value), Object::Integer(value) => Typval::Number(*value), Object::Float(value) => Typval::Float(*value), Object::String(value) => Typval::String(value.clone()), Object::Array(values) => Typval::list(values.iter().map(object_to_typval).collect()), Object::Dict(values) => Typval::dict(values.0.iter().map(|(key, value)| (key.clone(), object_to_typval(value))).collect()), Object::LuaRef(value) => Typval::Number(i64::from(*value)), Object::Buffer(value) => Typval::Number(i64::from(*value)), Object::Window(value) => Typval::Number(i64::from(*value)), Object::Tabpage(value) => Typval::Number(i64::from(*value)) } }
-fn typval_to_object(value: &Typval) -> Object { match value { Typval::Number(value) => Object::Integer(*value), Typval::Float(value) => Object::Float(*value), Typval::String(value) => Object::String(value.clone()), Typval::Blob(value) => Object::Array(value.iter().map(|byte| Object::Integer(i64::from(*byte))).collect()), Typval::List(value) => value.try_borrow().map_or(Object::Nil, |data| Object::Array(data.items.iter().map(typval_to_object).collect())), Typval::Dict(value) => value.try_borrow().map_or(Object::Nil, |data| Object::Dict(Dict(data.entries.iter().map(|(key, value)| (key.clone(), typval_to_object(value))).collect()))), Typval::Funcref(value) | Typval::Partial(value) => Object::String(value.name.clone()), Typval::Bool(value) => Object::Boolean(*value), Typval::Special(Special::Null) => Object::Nil, Typval::Channel(value) | Typval::Job(value) => Object::Integer(i64::try_from(*value).unwrap_or(i64::MAX)) } }
+fn buffer_lines(editor: &Editor, buffer: BufHandle) -> Result<Vec<Vec<u8>>, String> {
+    let state = editor.buffer(buffer).map_err(|error| error.to_string())?;
+    let text = state.text().map_err(|error| error.to_string())?;
+    (1..=text.line_count()).map(|line| text.line(line).map_err(|error| error.to_string())).collect()
+}
 
-fn remove_scope_pair(map: &mut ScopeMap, name: &str) -> bool { let before = map.len(); map.retain(|(key, _)| key.as_bytes() != name.as_bytes()); before != map.len() }
+fn dict_to_scope(dict: &Dict) -> ScopeMap {
+    dict.0.iter().map(|(key, value)| (key.clone(), object_to_typval(value))).collect()
+}
+fn scope_to_dict(scope: &ScopeMap) -> Dict {
+    Dict(scope.iter().map(|(key, value)| (key.clone(), typval_to_object(value))).collect())
+}
+fn object_to_typval(value: &Object) -> Typval {
+    match value {
+        Object::Nil => Typval::Special(Special::Null),
+        Object::Boolean(value) => Typval::Bool(*value),
+        Object::Integer(value) => Typval::Number(*value),
+        Object::Float(value) => Typval::Float(*value),
+        Object::String(value) => Typval::String(value.clone()),
+        Object::Array(values) => Typval::list(values.iter().map(object_to_typval).collect()),
+        Object::Dict(values) => Typval::dict(values.0.iter().map(|(key, value)| (key.clone(), object_to_typval(value))).collect()),
+        Object::LuaRef(value) => Typval::Number(i64::from(*value)),
+        Object::Buffer(value) => Typval::Number(i64::from(*value)),
+        Object::Window(value) => Typval::Number(i64::from(*value)),
+        Object::Tabpage(value) => Typval::Number(i64::from(*value)),
+    }
+}
+fn typval_to_object(value: &Typval) -> Object {
+    match value {
+        Typval::Number(value) => Object::Integer(*value),
+        Typval::Float(value) => Object::Float(*value),
+        Typval::String(value) => Object::String(value.clone()),
+        Typval::Blob(value) => Object::Array(value.iter().map(|byte| Object::Integer(i64::from(*byte))).collect()),
+        Typval::List(value) => value.try_borrow().map_or(Object::Nil, |data| Object::Array(data.items.iter().map(typval_to_object).collect())),
+        Typval::Dict(value) => value.try_borrow().map_or(Object::Nil, |data| Object::Dict(Dict(data.entries.iter().map(|(key, value)| (key.clone(), typval_to_object(value))).collect()))),
+        Typval::Funcref(value) | Typval::Partial(value) => Object::String(value.name.clone()),
+        Typval::Bool(value) => Object::Boolean(*value),
+        Typval::Special(Special::Null) => Object::Nil,
+        Typval::Channel(value) | Typval::Job(value) => Object::Integer(i64::try_from(*value).unwrap_or(i64::MAX)),
+    }
+}
+
+fn remove_scope_pair(map: &mut ScopeMap, name: &str) -> bool {
+    let before = map.len();
+    map.retain(|(key, _)| key.as_bytes() != name.as_bytes());
+    before != map.len()
+}
 
 fn replace_scope_pair(map: &mut ScopeMap, name: &str, value: Typval) -> Option<Typval> {
     let previous = map
@@ -2520,12 +2672,36 @@ fn restore_scope_pair(map: &mut ScopeMap, name: &str, previous: Option<Typval>) 
     }
 }
 
-fn push_text_message(editor: &mut Editor, text: String, error: bool, history: bool) { editor.push_message(Message { kind: if error { MessageKind::Error } else { MessageKind::Echo }, content: Object::String(OxStr(text.into_bytes())), history }); }
+fn push_text_message(editor: &mut Editor, text: String, error: bool, history: bool) {
+    editor.push_message(Message {
+        kind: if error { MessageKind::Error } else { MessageKind::Echo },
+        content: Object::String(OxStr(text.into_bytes())),
+        history,
+    });
+}
 
-fn error_flow<F: FileIO>(runtime: &ExRuntime<F>, code: &'static str, message: impl Into<String>) -> Flow { Flow::Exception(runtime.exception(code, message)) }
-fn userfunc_error_flow<F: FileIO>(runtime: &ExRuntime<F>, error: UserFuncError) -> Flow { error_flow(runtime, error.code, error.message) }
-fn eval_error_flow<F: FileIO>(runtime: &ExRuntime<F>, error: EvalError) -> Flow { match error.kind { EvalErrorKind::NotImplemented(name) => Flow::NotImplemented(name.to_string_lossy().into_owned()), EvalErrorKind::Vim => error_flow(runtime, error.code, error.message) } }
-fn exec_error_flow<F: FileIO>(runtime: &ExRuntime<F>, error: ExecError) -> Flow { match error { ExecError::Vim(exception) => Flow::Exception(exception), ExecError::NotImplemented(name) => Flow::NotImplemented(name), ExecError::Eval(error) => eval_error_flow(runtime, error), ExecError::Parse(error) => error_flow(runtime, error.code.as_str(), error.message), ExecError::Io { path, message } => error_flow(runtime, "E484", format!("{}: {message}", path.display())), ExecError::Editor(message) => error_flow(runtime, "E605", message) } }
+fn error_flow<F: FileIO>(runtime: &ExRuntime<F>, code: &'static str, message: impl Into<String>) -> Flow {
+    Flow::Exception(runtime.exception(code, message))
+}
+fn userfunc_error_flow<F: FileIO>(runtime: &ExRuntime<F>, error: UserFuncError) -> Flow {
+    error_flow(runtime, error.code, error.message)
+}
+fn eval_error_flow<F: FileIO>(runtime: &ExRuntime<F>, error: EvalError) -> Flow {
+    match error.kind {
+        EvalErrorKind::NotImplemented(name) => Flow::NotImplemented(name.to_string_lossy().into_owned()),
+        EvalErrorKind::Vim => error_flow(runtime, error.code, error.message),
+    }
+}
+fn exec_error_flow<F: FileIO>(runtime: &ExRuntime<F>, error: ExecError) -> Flow {
+    match error {
+        ExecError::Vim(exception) => Flow::Exception(exception),
+        ExecError::NotImplemented(name) => Flow::NotImplemented(name),
+        ExecError::Eval(error) => eval_error_flow(runtime, error),
+        ExecError::Parse(error) => error_flow(runtime, error.code.as_str(), error.message),
+        ExecError::Io { path, message } => error_flow(runtime, "E484", format!("{}: {message}", path.display())),
+        ExecError::Editor(message) => error_flow(runtime, "E605", message),
+    }
+}
 fn flow_to_eval_error(flow: Flow, name: &str) -> EvalError {
     match flow {
         Flow::Exception(exception) => {
