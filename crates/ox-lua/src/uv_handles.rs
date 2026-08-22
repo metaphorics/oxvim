@@ -589,8 +589,8 @@ fn install_aux(lua: &Lua, uv: &Table, access: &LoopAccess, fast: &FastCallbackSt
     Ok(())
 }
 
-pub(crate) fn install(lua: &Lua, uv: &Table, uv_loop: Rc<RefCell<UvLoop>>, scheduler: Rc<dyn Scheduler>, fast: FastCallbackState) -> mlua::Result<()> {
-    let access = LoopAccess::new(uv_loop.clone());
+pub(crate) fn install(lua: &Lua, uv: &Table, access: LoopAccess, scheduler: Rc<dyn Scheduler>, fast: FastCallbackState) -> mlua::Result<()> {
+    let uv_loop = access.uv_loop.clone();
     let tcp_context = Rc::new(TcpContext { lua: lua.clone(), fast: fast.clone(), access: access.clone(), routes: RefCell::new(HashMap::new()) });
     let pending_processes: Rc<RefCell<Vec<PendingProcess>>> = Rc::new(RefCell::new(Vec::new()));
     let pending_works: Rc<RefCell<Vec<PendingWork>>> = Rc::new(RefCell::new(Vec::new()));

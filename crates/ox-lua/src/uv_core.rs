@@ -173,6 +173,7 @@ pub(crate) fn install(
     lua.set_app_data(CallbackContext { scheduler: scheduler.clone(), fast: fast.clone() });
 
     let uv_loop = Rc::new(RefCell::new(UvLoop::new().map_err(mlua::Error::external)?));
+    let loop_access = LoopAccess::new(uv_loop.clone());
     let state = Rc::new(CoreState::new());
     let vim: Table = lua.globals().get("vim")?;
     let core: Table = vim.get("_core")?;
@@ -212,9 +213,9 @@ pub(crate) fn install(
         loop_for_run.borrow_mut().run(mode).map_err(mlua::Error::external)
     })?)?;
 
-    let loop_for_stop = uv_loop.clone();
+    let stop_access = loop_access.clone();
     uv.set("stop", lua.create_function(move |_, ()| {
-        loop_for_stop.borrow_mut().stop();
+        stop_access.apply(Box::new(|uv_loop| uv_loop.stop()))?;
         Ok(())
     })?)?;
 
@@ -231,7 +232,7 @@ pub(crate) fn install(
     })?)?;
 
     let loop_for_timer = uv_loop.clone();
-    let timer_access = LoopAccess::new(uv_loop.clone());
+    let timer_access = loop_access.clone();
     uv.set("new_timer", lua.create_function(move |lua, ()| {
         let timer = Timer::new(&mut loop_for_timer.borrow_mut()).map_err(mlua::Error::external)?;
         lua.create_userdata(LuaTimer {
@@ -243,7 +244,7 @@ pub(crate) fn install(
 
     install_misc(lua, &uv)?;
     install_fs(lua, &uv, &state, &scheduler, &fast)?;
-    crate::uv_handles::install(lua, &uv, uv_loop, scheduler, fast)?;
+    crate::uv_handles::install(lua, &uv, loop_access, scheduler, fast)?;
     vim.set("uv", uv.clone())?;
     vim.set("loop", uv)?;
     Ok(())

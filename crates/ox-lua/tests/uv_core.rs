@@ -96,6 +96,7 @@ fn immediate_timer_callback_can_close_its_handle() {
             local timer = vim.uv.new_timer()
             timer:start(0, 0, function()
               assert(not timer:is_closing())
+              vim.uv.stop()
               timer:stop()
               timer:close()
             end)
