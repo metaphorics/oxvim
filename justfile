@@ -14,9 +14,11 @@ test:
 _guard_binary:
     @test -x target/release/oxvim || { echo "oxvim binary not built yet (later task)" >&2; exit 1; }
 
-# Run upstream Neovim functional tests against oxvim via NVIM_PRG.
+# Run upstream Neovim functional tests against oxvim. The make target's cmake
+# wrapper hardcodes the oracle binary, so invoke RunTests.cmake directly with
+# our -D NVIM_PRG.
 functional: _guard_binary
-    NVIM_PRG=$PWD/target/release/oxvim make -C .references/neovim functionaltest
+    cd "{{justfile_directory()}}/.references/neovim/build/test" && cmake -D TEST_TYPE=functional -D BUILD_DIR="{{justfile_directory()}}/.references/neovim/build" -D CI_BUILD=OFF -D NVIM_PRG="{{justfile_directory()}}/target/release/oxvim" -D TEST_DIR="{{justfile_directory()}}/.references/neovim/test" -D ROOT_DIR="{{justfile_directory()}}/.references/neovim" -P "{{justfile_directory()}}/.references/neovim/cmake/RunTests.cmake"
 
 # Run upstream Neovim oldtests against oxvim via NVIM_PRG.
 oldtest: _guard_binary
