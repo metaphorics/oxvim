@@ -128,7 +128,7 @@ fn execute_lines<S: AsRef<str>>(
             let outcome = executor
                 .execute_line(editor, command)
                 .map_err(|error| AppError::Ex(error.to_string()))?;
-            if outcome == ExecOutcome::Quit {
+            if let ExecOutcome::Quit(_) = outcome {
                 return Ok(());
             }
         }

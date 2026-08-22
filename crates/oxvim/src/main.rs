@@ -55,7 +55,7 @@ impl std::error::Error for AppError {}
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             let _ignored = writeln!(io::stderr().lock(), "{error}");
             ExitCode::from(1)
@@ -63,29 +63,35 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), AppError> {
+/// Maps a requested exit code onto a process status the way C `exit()`
+/// does: truncated to the low eight bits.
+fn process_code(code: i64) -> ExitCode {
+    ExitCode::from(code.rem_euclid(256) as u8)
+}
+
+fn run() -> Result<ExitCode, AppError> {
     let cli = Cli::parse(std::env::args().skip(1)).map_err(AppError::Usage)?;
     if cli.api_info {
         let bytes = api_info::encoded().map_err(|error| AppError::Api(error.to_string()))?;
         io::stdout().lock().write_all(&bytes).map_err(AppError::Io)?;
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     if let Some(script) = &cli.lua_script {
-        return runtime::run_lua(script);
+        return runtime::run_lua(script).map(|()| ExitCode::SUCCESS);
     }
     if cli.scriptin.is_some() {
         return Err(AppError::NotWired("normal-mode script"));
     }
     if cli.batch.is_some() {
-        return runtime::run_batch(&cli);
+        return runtime::run_batch(&cli).map(|()| ExitCode::SUCCESS);
     }
     // A listening headless process must enter its network loop rather than the
     // stdio server; --listen is therefore selected before --headless/embed.
     if let Some(address) = &cli.listen {
-        return server::run_listener(&cli, address);
+        return server::run_listener(&cli, address).map(process_code);
     }
     if cli.embed || cli.headless {
-        return server::run_stdio(&cli);
+        return server::run_stdio(&cli).map(process_code);
     }
-    runtime::run_interactive(&cli)
+    runtime::run_interactive(&cli).map(|()| ExitCode::SUCCESS)
 }

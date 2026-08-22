@@ -60,6 +60,8 @@ pub struct AppState {
     ex: Rc<RefCell<ExExecutor>>,
     mode: ModeMachine,
     exiting: bool,
+    /// Process exit code requested by `:cquit` (0 for plain quits).
+    exit_code: i64,
     rendered_messages: usize,
     lua_work: Rc<RefCell<VecDeque<Work>>>,
     ui_channels: UiChannels,
@@ -134,6 +136,7 @@ impl AppState {
             ex,
             mode: ModeMachine::default(),
             exiting: false,
+            exit_code: 0,
             rendered_messages: 0,
             lua_work,
             ui_channels: UiChannels::new(),
@@ -148,6 +151,9 @@ impl AppState {
     fn run_startup(&mut self, cli: &Cli) -> Result<(), AppError> {
         for command in &cli.pre_commands {
             self.execute_ex(command)?;
+            if self.exiting {
+                return Ok(());
+            }
         }
 
         // No user-config discovery contract is exported yet.  Explicit files
@@ -172,21 +178,32 @@ impl AppState {
         // every positional file becomes a named buffer loaded from disk
         // (upstream also names a buffer when the file does not exist
         // yet), and the first file is displayed in the startup window.
+        if self.exiting {
+            return Ok(());
+        }
         if !cli.files.is_empty() {
             self.open_startup_files(&cli.files)?;
         }
  
         for command in &cli.commands {
             self.execute_ex(command)?;
+            if self.exiting {
+                return Ok(());
+            }
         }
         self.fire_vim_enter()
     }
 
     fn execute_ex(&mut self, command: &str) -> Result<(), AppError> {
-        self.ex
+        let outcome = self
+            .ex
             .borrow_mut()
             .execute_line(&mut self.editor.borrow_mut(), command)
             .map_err(|error| AppError::Ex(error.to_string()))?;
+        if let ExecOutcome::Quit(code) = outcome {
+            self.exiting = true;
+            self.exit_code = code;
+        }
         Ok(())
     }
 
@@ -410,8 +427,9 @@ impl AppState {
             .borrow_mut()
             .execute_line(&mut self.editor.borrow_mut(), command)
             .map_err(|error| ApiError::exception(error.to_string()))?;
-        if outcome == ExecOutcome::Quit {
+        if let ExecOutcome::Quit(code) = outcome {
             self.exiting = true;
+            self.exit_code = code;
         }
         Ok(Object::Nil)
     }
@@ -421,8 +439,9 @@ impl AppState {
         let mut ex = self.ex.borrow_mut();
         let mut executor = ExApiExecutor { executor: &mut ex, outcome: ExecOutcome::Completed };
         let result = ox_api::execute_nvim_cmd(&mut self.editor.borrow_mut(), cmd, opts, &mut executor)?;
-        if executor.outcome == ExecOutcome::Quit {
+        if let ExecOutcome::Quit(code) = executor.outcome {
             self.exiting = true;
+            self.exit_code = code;
         }
         Ok(Object::String(result))
     }
@@ -545,7 +564,10 @@ impl AppState {
                     .borrow_mut()
                     .execute_line(&mut self.editor.borrow_mut(), &command)
                     .map_err(|error| ApiError::exception(error.to_string()))?;
-                if outcome == ExecOutcome::Quit { self.exiting = true; }
+                if let ExecOutcome::Quit(code) = outcome {
+                    self.exiting = true;
+                    self.exit_code = code;
+                }
             }
             if let Some(action) = self.mode.take_mapping_action() {
                 let outcome = match action {
@@ -558,7 +580,10 @@ impl AppState {
                     }
                     MappingAction::Keys(_) | MappingAction::Nop => ExecOutcome::Completed,
                 };
-                if outcome == ExecOutcome::Quit { self.exiting = true; }
+                if let ExecOutcome::Quit(code) = outcome {
+                    self.exiting = true;
+                    self.exit_code = code;
+                }
             }
             if self.exiting { break; }
         }
@@ -649,6 +674,9 @@ impl AppState {
     }
 
     fn should_exit(&self) -> bool { self.exiting }
+
+    /// Process exit code requested so far (`:cquit`, else 0).
+    fn exit_code(&self) -> i64 { self.exit_code }
 }
 
 /// Reads one startup file argument into buffer text.  A file that does
@@ -694,7 +722,8 @@ fn method_is_mutating(method: &str) -> bool {
 }
 
 /// Serve channel 1 over stdin/stdout until the peer closes its write side.
-pub fn run_stdio(cli: &Cli) -> Result<(), AppError> {
+/// Returns the process exit code requested by `:cquit` (0 otherwise).
+pub fn run_stdio(cli: &Cli) -> Result<i64, AppError> {
     let mut state = AppState::new(cli)?;
     let mut decoder = IncrementalDecoder::new();
     let mut input = io::stdin().lock();
@@ -717,11 +746,12 @@ pub fn run_stdio(cli: &Cli) -> Result<(), AppError> {
         output.flush().map_err(AppError::Io)?;
         if state.should_exit() { break; }
     }
-    Ok(())
+    Ok(state.exit_code())
 }
 
 /// Serve RPC peers accepted from a TCP address or Unix-domain pipe.
-pub fn run_listener(cli: &Cli, address: &str) -> Result<(), AppError> {
+/// Returns the process exit code requested by `:cquit` (0 otherwise).
+pub fn run_listener(cli: &Cli, address: &str) -> Result<i64, AppError> {
     let state = Rc::new(RefCell::new(AppState::new(cli)?));
     let runtime = Rc::new(RefCell::new(NetworkRuntime::new(state)));
     let mut uv_loop = UvLoop::new().map_err(|error| AppError::Server(error.to_string()))?;
@@ -769,7 +799,8 @@ pub fn run_listener(cli: &Cli, address: &str) -> Result<(), AppError> {
     if let Some(error) = runtime.borrow_mut().error.take() {
         return Err(AppError::Server(error));
     }
-    close_result
+    close_result?;
+    Ok(state.borrow().exit_code())
 }
 
 #[cfg(unix)]

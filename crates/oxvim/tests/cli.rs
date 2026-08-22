@@ -49,6 +49,30 @@ fn silent_ex_pipeline_prints_buffer_and_quits() {
     assert_eq!(output.stdout, b"x\n");
 }
 
+
+#[test]
+fn cquit_and_qall_exit_codes_follow_ex_docmd() {
+    // ex_cquit: no count means EXIT_FAILURE; a count is the status.
+    let default = oxvim().args(["-u", "NONE", "--headless", "+cquit"]).output().expect("spawn oxvim");
+    assert_eq!(default.status.code(), Some(1));
+    let coded = oxvim().args(["-u", "NONE", "--headless", "+cquit 7"]).output().expect("spawn oxvim");
+    assert_eq!(coded.status.code(), Some(7));
+
+    // ex_quitall: clean buffers exit 0, modified ones raise E37 unless !.
+    let clean = oxvim().args(["-u", "NONE", "--headless", "+qall"]).output().expect("spawn oxvim");
+    assert_eq!(clean.status.code(), Some(0));
+    let modified = oxvim()
+        .args(["-u", "NONE", "--headless", "+call setline(1, 'x')", "+qall"])
+        .output()
+        .expect("spawn oxvim");
+    assert_eq!(modified.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&modified.stderr).contains("E37"));
+    let forced = oxvim()
+        .args(["-u", "NONE", "--headless", "+call setline(1, 'x')", "+qall!"])
+        .output()
+        .expect("spawn oxvim");
+    assert_eq!(forced.status.code(), Some(0));
+}
 #[test]
 fn lua_entry_receives_script_and_trailing_arguments() {
     let path = std::env::temp_dir().join(format!("oxvim-args-{}.lua", std::process::id()));

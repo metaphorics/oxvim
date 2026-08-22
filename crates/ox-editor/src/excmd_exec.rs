@@ -47,8 +47,9 @@ pub enum ExecOutcome {
     Completed,
     /// `:finish` terminated the active sourced script.
     Finished,
-    /// `:quit` closed the final window or requested host termination.
-    Quit,
+    /// `:quit` closed the final window or requested host termination;
+    /// `:cquit [code]` carries its requested process exit code.
+    Quit(i64),
 }
 
 /// Classification of a catchable Vim exception.
@@ -447,7 +448,7 @@ enum Flow {
     Continue,
     Return(Typval),
     Finish,
-    Quit,
+    Quit(i64),
     Exception(VimException),
     NotImplemented(String),
 }
@@ -457,7 +458,7 @@ fn flow_to_result(flow: Flow) -> Result<ExecOutcome, ExecError> {
         Flow::Normal => Ok(ExecOutcome::Completed),
         Flow::Finish => Ok(ExecOutcome::Finished),
 
-        Flow::Quit => Ok(ExecOutcome::Quit),
+        Flow::Quit(code) => Ok(ExecOutcome::Quit(code)),
         Flow::Exception(exception) => Err(ExecError::Vim(exception)),
         Flow::NotImplemented(name) => Err(ExecError::NotImplemented(name)),
         Flow::Break => Err(ExecError::Editor("E587: :break without :while or :for".to_owned())),
@@ -764,7 +765,9 @@ fn dispatch<F: FileIO>(
         "split" => command_split(runtime, editor, command, false),
         "vsplit" => command_split(runtime, editor, command, true),
         "close" => command_close(runtime, editor, command, false),
-        "quit" | "qall" => command_close(runtime, editor, command, true),
+        "quit" => command_close(runtime, editor, command, true),
+        "qall" => command_qall(runtime, editor, command),
+        "cquit" => command_cquit(command),
         "bnext" => command_buffer_step(runtime, editor, command, 1),
         "bprevious" | "bprev" => command_buffer_step(runtime, editor, command, -1),
         "buffer" => command_buffer(runtime, editor, command),
@@ -2199,7 +2202,7 @@ fn command_split<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, com
 fn command_close<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand, quit: bool) -> Flow {
     let buffer = match editor.current_buffer() {
         Some(buffer) => buffer,
-        None => return if quit { Flow::Quit } else { error_flow(runtime, "E444", "Cannot close last window") },
+        None => return if quit { Flow::Quit(0) } else { error_flow(runtime, "E444", "Cannot close last window") },
     };
     if editor
         .buffer(buffer)
@@ -2210,19 +2213,46 @@ fn command_close<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command
     }
     let tab = match editor.current_tabpage() {
         Some(tab) => tab,
-        None => return Flow::Quit,
+        None => return Flow::Quit(0),
     };
     let window = match editor.current_window() {
         Some(window) => window,
-        None => return Flow::Quit,
+        None => return Flow::Quit(0),
     };
     if editor.windows().len() == 1 {
-        return if quit { Flow::Quit } else { error_flow(runtime, "E444", "Cannot close last window") };
+        return if quit { Flow::Quit(0) } else { error_flow(runtime, "E444", "Cannot close last window") };
     }
     match editor.close_window(tab, window, true) {
         Ok(_) => Flow::Normal,
         Err(error) => error_flow(runtime, "E444", error.to_string()),
     }
+}
+
+/// `:qall` (`ex_docmd.c` ex_quitall): quit all windows and the host
+/// process when no buffer has unwritten changes; the bang form always
+/// quits.  `check_changed_any` blocks on any modified buffer, hidden or
+/// displayed, matching upstream's process-wide guard.
+fn command_qall<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    if !command.bang
+        && editor
+            .buffers()
+            .into_iter()
+            .any(|buffer| editor.buffer(buffer).is_ok_and(|state| state.modified))
+    {
+        return error_flow(runtime, "E37", "No write since last change (add ! to override)");
+    }
+    Flow::Quit(0)
+}
+
+/// `:cquit [code]` (`ex_docmd.c` ex_cquit): terminate the host with
+/// `code`, defaulting to EXIT_FAILURE when no count is given.
+fn command_cquit(command: &ExCommand) -> Flow {
+    let code = command
+        .count
+        .and_then(|value| i64::try_from(value).ok())
+        .or_else(|| command.args.trim().parse::<i64>().ok())
+        .unwrap_or(1);
+    Flow::Quit(code)
 }
 
 fn command_buffer_step<F: FileIO>(
