@@ -14,7 +14,10 @@ ox-loop = { path = "../ox-loop" }
 ox-lua = { path = "../ox-lua" }
 ox-rpc = { path = "../ox-rpc" }
 ox-text = { path = "../ox-text" }
+ox-tui = { path = "../ox-tui" }
 ox-types = { path = "../ox-types" }
+ox-ui = { path = "../ox-ui" }
+ox-uv = { path = "../ox-uv" }
 
 [dev-dependencies]
 rmpv.workspace = true

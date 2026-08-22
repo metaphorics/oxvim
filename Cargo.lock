@@ -555,7 +555,10 @@ dependencies = [
  "ox-lua",
  "ox-rpc",
  "ox-text",
+ "ox-tui",
  "ox-types",
+ "ox-ui",
+ "ox-uv",
  "rmpv",
 ]
 

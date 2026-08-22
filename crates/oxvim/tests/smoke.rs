@@ -1,7 +1,11 @@
 //! End-to-end MessagePack smoke coverage for the embedded stdio server.
 
+use std::fs;
 use std::io::{BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmpv::Value;
 
@@ -14,10 +18,14 @@ struct Embedded {
 
 impl Embedded {
     fn spawn() -> Self {
+        Self::spawn_with(&[])
+    }
+
+    fn spawn_with(arguments: &[&str]) -> Self {
         let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_oxvim"))
-            .arg("--embed")
-            .env("OXVIM_RUNTIME", runtime)
+        let mut command = Command::new(env!("CARGO_BIN_EXE_oxvim"));
+        command.arg("--embed").args(arguments).env("OXVIM_RUNTIME", runtime);
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -49,13 +57,18 @@ impl Embedded {
         ]);
         rmpv::encode::write_value(&mut self.input, &request).expect("encode request");
         self.input.flush().expect("flush request");
-        let response = rmpv::decode::read_value(&mut self.output).expect("decode response");
-        let Value::Array(fields) = response else { panic!("response is not an array") };
-        assert_eq!(fields.len(), 4);
-        assert_eq!(fields[0], Value::from(1));
-        assert_eq!(fields[1], Value::from(id));
-        assert_eq!(fields[2], Value::Nil, "RPC error: {:?}", fields[2]);
-        fields[3].clone()
+        loop {
+            let response = rmpv::decode::read_value(&mut self.output).expect("decode response");
+            let Value::Array(fields) = response else { panic!("response is not an array") };
+            if fields.first() == Some(&Value::from(2)) {
+                continue;
+            }
+            assert_eq!(fields.len(), 4);
+            assert_eq!(fields[0], Value::from(1));
+            assert_eq!(fields[1], Value::from(id));
+            assert_eq!(fields[2], Value::Nil, "RPC error: {:?}", fields[2]);
+            return fields[3].clone();
+        }
     }
 
     fn next_message(&mut self) -> Value {
@@ -76,6 +89,51 @@ fn map_get<'a>(value: &'a Value, key: &str) -> &'a Value {
         .iter()
         .find_map(|(candidate, value)| (candidate.as_str() == Some(key)).then_some(value))
         .unwrap_or_else(|| panic!("missing map key {key}"))
+}
+
+fn redraw_names(value: &Value) -> Vec<&str> {
+    let Value::Array(fields) = value else { panic!("redraw is not an array") };
+    assert_eq!(fields[0], Value::from(2));
+    assert_eq!(fields[1], Value::from("redraw"));
+    let Value::Array(events) = &fields[2] else { panic!("redraw params are not an array") };
+    events
+        .iter()
+        .filter_map(|event| event.as_array()?.first()?.as_str())
+        .collect()
+}
+
+fn contains_string(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(value) => value.as_str() == Some(expected),
+        Value::Array(values) => values.iter().any(|value| contains_string(value, expected)),
+        Value::Map(entries) => entries
+            .iter()
+            .any(|(key, value)| contains_string(key, expected) || contains_string(value, expected)),
+        _ => false,
+    }
+}
+
+fn tcp_request(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    id: i64,
+    method: &str,
+    params: Vec<Value>,
+) -> Value {
+    let request = Value::Array(vec![
+        Value::from(0),
+        Value::from(id),
+        Value::from(method),
+        Value::Array(params),
+    ]);
+    rmpv::encode::write_value(writer, &request).expect("encode TCP request");
+    writer.flush().expect("flush TCP request");
+    let response = rmpv::decode::read_value(reader).expect("decode TCP response");
+    let Value::Array(fields) = response else { panic!("TCP response is not an array") };
+    assert_eq!(fields[0], Value::from(1));
+    assert_eq!(fields[1], Value::from(id));
+    assert_eq!(fields[2], Value::Nil);
+    fields[3].clone()
 }
 
 #[test]
@@ -111,6 +169,208 @@ fn embedded_stdio_serves_core_rpc_contracts() {
         oxvim.request("nvim_buf_get_lines", vec![Value::from(0), Value::from(0), Value::from(-1), Value::Boolean(true)]),
         Value::Array(vec![Value::from("vim")]),
     );
+}
+
+#[test]
+fn attached_ui_receives_flushed_initial_and_mutation_redraws() {
+    let mut oxvim = Embedded::spawn();
+    assert_eq!(
+        oxvim.request(
+            "nvim_buf_set_lines",
+            vec![
+                Value::from(0),
+                Value::from(0),
+                Value::from(-1),
+                Value::Boolean(true),
+                Value::Array(vec![Value::from("ox"), Value::from("vim")]),
+            ],
+        ),
+        Value::Nil,
+    );
+    assert_eq!(
+        oxvim.request(
+            "nvim_ui_attach",
+            vec![
+                Value::from(80),
+                Value::from(24),
+                Value::Map(vec![(Value::from("rgb"), Value::Boolean(true))]),
+            ],
+        ),
+        Value::Nil,
+    );
+    let initial = oxvim.next_message();
+    let initial_names = redraw_names(&initial);
+    assert_eq!(initial_names.last(), Some(&"flush"));
+    assert!(contains_string(&initial, "o"));
+
+    assert_eq!(
+        oxvim.request("nvim_command", vec![Value::from("normal! dd")]),
+        Value::Nil,
+    );
+    let mutation = oxvim.next_message();
+    let mutation_names = redraw_names(&mutation);
+    assert!(mutation_names.contains(&"grid_line"));
+    assert_eq!(mutation_names.last(), Some(&"flush"));
+    assert!(contains_string(&mutation, "v"));
+    assert!(!contains_string(&mutation, "o"));
+    assert_eq!(
+        oxvim.request("nvim_ui_try_resize", vec![Value::from(100), Value::from(30)]),
+        Value::Nil,
+    );
+    let resized = oxvim.next_message();
+    assert_eq!(redraw_names(&resized).last(), Some(&"flush"));
+    assert_eq!(oxvim.request("nvim_ui_detach", vec![]), Value::Nil);
+}
+
+#[test]
+fn startup_orders_pre_config_post_and_vimenter_lua_callback() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let path = std::env::temp_dir().join(format!("oxvim-startup-{}-{unique}.lua", std::process::id()));
+    fs::write(
+        &path,
+        r#"
+local function suffix(value)
+  local line = vim.api.nvim_buf_get_lines(0, 0, 1, true)[1]
+  vim.api.nvim_buf_set_lines(0, 0, 1, true, { line .. value })
+end
+suffix('-init')
+vim.api.nvim_create_autocmd('VimEnter', { callback = function() suffix('-enter') end })
+"#,
+    )
+    .unwrap();
+    let path_string = path.to_string_lossy().into_owned();
+    let mut oxvim = Embedded::spawn_with(&[
+        "--cmd",
+        "call setline(1, 'pre')",
+        "-u",
+        &path_string,
+        "+call setline(1, getline(1) . '-post')",
+    ]);
+    let lines = oxvim.request(
+        "nvim_buf_get_lines",
+        vec![Value::from(0), Value::from(0), Value::from(-1), Value::Boolean(true)],
+    );
+    assert_eq!(lines, Value::Array(vec![Value::from("pre-init-post-enter")]));
+
+    let mut clean = Embedded::spawn_with(&["--clean", "-u", &path_string]);
+    let clean_lines = clean.request(
+        "nvim_buf_get_lines",
+        vec![Value::from(0), Value::from(0), Value::from(-1), Value::Boolean(true)],
+    );
+    assert_eq!(clean_lines, Value::Array(vec![Value::from("")]));
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn tcp_listener_allocates_dynamic_channel_and_serves_api_info() {
+    let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve TCP address");
+    let address = reservation.local_addr().expect("reserved address");
+    drop(reservation);
+    let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_oxvim"))
+        .args(["--headless", "--listen", &address.to_string()])
+        .env("OXVIM_RUNTIME", runtime)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn TCP listener");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stream = loop {
+        match TcpStream::connect(address) {
+            Ok(stream) => break stream,
+            Err(error) if Instant::now() < deadline => {
+                let _ = error;
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("connect TCP listener: {error}"),
+        }
+    };
+    let mut first_writer = stream.try_clone().expect("clone first TCP stream");
+    let mut first_reader = BufReader::new(stream);
+    let first_info = tcp_request(&mut first_writer, &mut first_reader, 1, "nvim_get_api_info", vec![]);
+    let Value::Array(first_info) = first_info else { panic!("API info is not an array") };
+    assert_eq!(first_info[0], Value::from(3));
+
+    let second = TcpStream::connect(address).expect("connect second TCP peer");
+    let mut second_writer = second.try_clone().expect("clone second TCP stream");
+    let mut second_reader = BufReader::new(second);
+    let second_info = tcp_request(&mut second_writer, &mut second_reader, 1, "nvim_get_api_info", vec![]);
+    let Value::Array(second_info) = second_info else { panic!("API info is not an array") };
+    assert_eq!(second_info[0], Value::from(4));
+
+    assert_eq!(
+        tcp_request(
+            &mut first_writer,
+            &mut first_reader,
+            2,
+            "nvim_buf_set_lines",
+            vec![
+                Value::from(0),
+                Value::from(0),
+                Value::from(-1),
+                Value::Boolean(true),
+                Value::Array(vec![Value::from("shared")]),
+            ],
+        ),
+        Value::Nil,
+    );
+    assert_eq!(
+        tcp_request(
+            &mut second_writer,
+            &mut second_reader,
+            2,
+            "nvim_buf_get_lines",
+            vec![Value::from(0), Value::from(0), Value::from(-1), Value::Boolean(true)],
+        ),
+        Value::Array(vec![Value::from("shared")]),
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+#[test]
+fn pipe_listener_allocates_dynamic_channel_and_serves_api_info() {
+    use std::os::unix::net::UnixStream;
+
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let socket = std::env::temp_dir().join(format!("oxvim-listen-{}-{unique}.sock", std::process::id()));
+    let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_oxvim"))
+        .args(["--headless", "--listen", socket.to_str().unwrap()])
+        .env("OXVIM_RUNTIME", runtime)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn pipe listener");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stream = loop {
+        match UnixStream::connect(&socket) {
+            Ok(stream) => break stream,
+            Err(error) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+                let _ = error;
+            }
+            Err(error) => panic!("connect pipe listener: {error}"),
+        }
+    };
+    let request = Value::Array(vec![
+        Value::from(0),
+        Value::from(1),
+        Value::from("nvim_get_api_info"),
+        Value::Array(vec![]),
+    ]);
+    rmpv::encode::write_value(&mut stream, &request).expect("encode pipe request");
+    stream.flush().expect("flush pipe request");
+    let response = rmpv::decode::read_value(&mut BufReader::new(stream)).expect("decode pipe response");
+    let Value::Array(fields) = response else { panic!("pipe response is not an array") };
+    let Value::Array(info) = &fields[3] else { panic!("API info is not an array") };
+    assert_eq!(info[0], Value::from(3));
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_file(socket);
 }
 
 #[test]

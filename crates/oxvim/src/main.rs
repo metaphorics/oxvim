@@ -31,6 +31,8 @@ pub enum AppError {
     Lua(String),
     /// Embedded RPC server initialization or dispatch failed.
     Server(String),
+    /// Interactive terminal client failed.
+    Tui(String),
 }
 
 impl fmt::Display for AppError {
@@ -44,6 +46,7 @@ impl fmt::Display for AppError {
             Self::Ex(error) => write!(formatter, "oxvim: Ex command failed: {error}"),
             Self::Lua(error) => write!(formatter, "oxvim: Lua script failed: {error}"),
             Self::Server(error) => write!(formatter, "oxvim: RPC server failed: {error}"),
+            Self::Tui(error) => write!(formatter, "oxvim: terminal client failed: {error}"),
         }
     }
 }
@@ -76,11 +79,13 @@ fn run() -> Result<(), AppError> {
     if cli.batch.is_some() {
         return runtime::run_batch(&cli.pre_commands, &cli.commands);
     }
+    // A listening headless process must enter its network loop rather than the
+    // stdio server; --listen is therefore selected before --headless/embed.
+    if let Some(address) = &cli.listen {
+        return server::run_listener(&cli, address);
+    }
     if cli.embed || cli.headless {
-        return server::run_stdio();
+        return server::run_stdio(&cli);
     }
-    if cli.listen.is_some() {
-        return Err(AppError::NotWired("listen server"));
-    }
-    Err(AppError::NotWired("interactive client"))
+    runtime::run_interactive(&cli)
 }

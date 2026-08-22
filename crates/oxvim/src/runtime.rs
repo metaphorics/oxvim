@@ -3,14 +3,60 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::process::Command;
 use std::rc::Rc;
 
 use ox_editor::{Editor, ExExecutor, ExecOutcome, Geometry, MessageKind};
 use ox_lua::{BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work};
 use ox_types::{Object, OxStr, Typval};
 
-use crate::cli::LuaScript;
+use crate::cli::{Cli, LuaScript, ShadaConfig, UserConfig};
 use crate::AppError;
+
+/// Start the terminal client against a child copy of this executable in embed mode.
+pub fn run_interactive(cli: &Cli) -> Result<(), AppError> {
+    let executable = std::env::current_exe().map_err(AppError::Io)?;
+    let mut command = Command::new(executable);
+    command.arg("--embed");
+    for argument in interactive_child_arguments(cli) {
+        command.arg(argument);
+    }
+    ox_tui::run_command(command).map_err(|error| AppError::Tui(error.to_string()))
+}
+
+fn interactive_child_arguments(cli: &Cli) -> Vec<String> {
+    let mut arguments = Vec::new();
+    if cli.clean {
+        arguments.push("--clean".into());
+    } else {
+        match &cli.user_config {
+            UserConfig::Default => {}
+            UserConfig::None => arguments.extend(["-u".into(), "NONE".into()]),
+            UserConfig::NoRc => arguments.extend(["-u".into(), "NORC".into()]),
+            UserConfig::File(path) => arguments.extend(["-u".into(), path.clone()]),
+        }
+    }
+    match &cli.shada {
+        ShadaConfig::Default => {}
+        ShadaConfig::None => arguments.extend(["-i".into(), "NONE".into()]),
+        ShadaConfig::File(path) => arguments.extend(["-i".into(), path.clone()]),
+    }
+    for pre_command in &cli.pre_commands {
+        arguments.extend(["--cmd".into(), pre_command.clone()]);
+    }
+    for command in &cli.commands {
+        arguments.push(format!("+{command}"));
+    }
+    if let Some(verbose) = &cli.verbose {
+        let suffix = verbose.file.as_deref().unwrap_or_default();
+        arguments.push(format!("-V{}{suffix}", verbose.level));
+    }
+    if !cli.files.is_empty() {
+        arguments.push("--".into());
+        arguments.extend(cli.files.iter().cloned());
+    }
+    arguments
+}
 
 /// Resolve the runtime root in process startup order.
 pub fn runtime_root() -> Result<PathBuf, AppError> {
