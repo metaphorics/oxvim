@@ -305,6 +305,19 @@ fn enew_selects_a_distinct_empty_buffer() {
 
 // ── echo / echomsg / echon ─────────────────────────────────────────────
 
+#[test]
+fn global_menu_cleanup_succeeds_for_empty_menu_state() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&mut editor, "aunmenu *").unwrap();
+    exec.execute_line(&mut editor, "tlunmenu *").unwrap();
+    assert!(matches!(
+        exec.execute_line(&mut editor, "aunmenu File.Open"),
+        Err(crate::ExecError::NotImplemented(command)) if command == "aunmenu"
+    ));
+}
+
 // ex_docmd.c:ex_echo — `:echo "hello"` produces an Echo message without
 // retaining literal string quotes and without message history.
 #[test]

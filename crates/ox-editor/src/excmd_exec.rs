@@ -783,6 +783,7 @@ fn dispatch<F: FileIO>(
         "set" => command_set(runtime, editor, &command.args, SetLayer::Effective),
         "setlocal" => command_set(runtime, editor, &command.args, SetLayer::Local),
         "setglobal" => command_set(runtime, editor, &command.args, SetLayer::Global),
+        "aunmenu" | "tlunmenu" if command.args.trim() == "*" => Flow::Normal,
         "echo" | "echomsg" | "echon" | "echoerr" => {
             command_echo(runtime, editor, scope, name, &command.args)
         }
