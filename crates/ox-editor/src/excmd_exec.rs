@@ -985,6 +985,19 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         if crate::fs_builtins::is_filesystem_builtin(&name_text) {
             return crate::fs_builtins::call(self.runtime.scripts.io(), &name_text, args);
         }
+
+        if name_text == "swapfilelist" {
+            // f_swapfilelist iterates the 'directory' option (recover_names);
+            // the option has no static default upstream (it is computed at
+            // startup), so an unset store reads as "." — the first entry of
+            // every platform default.
+            let directory = match self.editor.options().get_global("directory") {
+                Ok(OptionValue::String(value)) => value.clone(),
+                _ => ".".to_owned(),
+            };
+            return crate::fs_builtins::swapfilelist(self.runtime.scripts.io(), args.len(), &directory);
+        }
+
         // Buffer-seam builtins (`getline`/`setline`) reach the current buffer
         // through ox_eval::BufferHost; the typval-only dispatcher below has
         // no buffer access.

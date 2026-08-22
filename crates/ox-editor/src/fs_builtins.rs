@@ -2,6 +2,7 @@
 //!
 //! Semantics follow Neovim `src/nvim/eval/fs.c`: `f_delete` (438-470),
 //! metadata functions (527-539, 834-887), `f_glob`/`f_globpath` (924-1014),
+//! `f_swapfilelist` (7200) via `recover_names` (memline.c 1303-1429),
 //! `f_mkdir` (1087-1140), `read_file_or_blob` (1299-1496), `f_rename`
 //! (1512-1521), and `f_writefile`/`write_list` (1714-1760, 1802-1906).
 
@@ -244,6 +245,41 @@ fn glob_result(matches: Vec<String>, list: bool) -> ox_eval::Result<Typval> {
     } else {
         Ok(text(matches.join("\n")))
     }
+}
+
+/// `swapfilelist()` — upstream `f_swapfilelist` (eval/funcs.c 7200) delegates
+/// to `recover_names(NULL, false, list)` (memline.c 1303): for every directory
+/// in the 'directory' option, expand `*.sw?`, `.*.sw?`, and `.sw?` and collect
+/// the matches. Each pattern's matches are appended in pattern order with
+/// duplicates kept across patterns — `EW_KEEPALL` only skips 'wildignore' and
+/// 'suffixes' filtering (path.c 2129-2141); there is no cross-pattern dedup.
+pub(crate) fn swapfilelist(io: &dyn FileIO, arg_count: usize, directory: &str) -> ox_eval::Result<Typval> {
+    check_arity("swapfilelist", arg_count)?;
+    let mut matches = Vec::new();
+    for dir in split_path_list(directory) {
+        if dir.is_empty() {
+            continue;
+        }
+        let patterns: Vec<String> = if dir == "." {
+            ["*.sw?", ".*.sw?", ".sw?"].map(str::to_owned).into()
+        } else {
+            // Upstream concat_fnames(dir, pattern, true) joins with one
+            // separator (memline.c 1350-1354).
+            let base = PathBuf::from(&dir);
+            ["*.sw?", ".*.sw?", ".sw?"]
+                .map(|pattern| base.join(pattern).to_string_lossy().into_owned())
+                .into()
+        };
+        for pattern in patterns {
+            matches.extend(expand_glob(io, &pattern, false).into_iter().map(|name| {
+                // Upstream expands the bare relative patterns of the "."
+                // branch, so names carry no "./" prefix (memline.c 1339-1343);
+                // our globber anchors at the current directory instead.
+                name.strip_prefix("./").map(str::to_owned).unwrap_or(name)
+            }));
+        }
+    }
+    Ok(Typval::list(matches.into_iter().map(text).collect()))
 }
 
 fn expand_glob(io: &dyn FileIO, pattern: &str, all_links: bool) -> Vec<String> {
@@ -517,5 +553,69 @@ mod tests {
         assert_eq!(call(&RealFileIO, "glob", vec![path(&pattern), number(0), number(1)]).unwrap(), expected);
         let paths = format!("{},{}", root.0.join("one").display(), root.0.join("two").display());
         assert_eq!(call(&RealFileIO, "globpath", vec![text(paths), text("*.vim"), number(0), number(1)]).unwrap(), Typval::list(vec![path(&root.0.join("one/a.vim")), path(&root.0.join("two/c.vim"))]));
+    }
+
+    #[test]
+    fn swapfilelist_collects_swap_files_from_every_directory_entry() {
+        let root = TempRoot::new("swapfilelist");
+        fs::write(root.0.join(".hidden.swp"), b"").unwrap();
+        fs::write(root.0.join(".hidden.swo"), b"").unwrap();
+        fs::write(root.0.join(".runtest.vim.swp"), b"").unwrap();
+        fs::write(root.0.join("plain"), b"").unwrap();
+        fs::write(root.0.join("plain.swp"), b"").unwrap();
+        let sub = root.0.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join(".nested.swp"), b"").unwrap();
+        // 'directory' entries are scanned in order; per pattern (*.sw?,
+        // .*.sw?, .sw?) matches follow sorted, and non-swap names never match.
+        let directories = format!("{},{}", root.0.display(), sub.display());
+        let expected = Typval::list(vec![
+            path(&root.0.join("plain.swp")),
+            path(&root.0.join(".hidden.swo")),
+            path(&root.0.join(".hidden.swp")),
+            path(&root.0.join(".runtest.vim.swp")),
+            path(&sub.join(".nested.swp")),
+        ]);
+        assert_eq!(swapfilelist(&RealFileIO, 0, &directories).unwrap(), expected);
+    }
+
+    #[test]
+    fn swapfilelist_current_directory_entry_yields_relative_names() {
+        static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CWD_GUARD.lock().unwrap_or_else(|poison| poison.into_inner());
+        let root = TempRoot::new("swapfilelist-dot");
+        fs::write(root.0.join(".one.swp"), b"").unwrap();
+        fs::write(root.0.join("plain"), b"").unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root.0).unwrap();
+        let result = swapfilelist(&RealFileIO, 0, ".");
+        std::env::set_current_dir(&previous).unwrap();
+        assert_eq!(result.unwrap(), Typval::list(vec![text(".one.swp")]));
+        // runtest.vim GetSwapFileList uses indexof()/remove()/delete() on the
+        // returned strings, so the "./"-free form matters.
+    }
+
+    #[test]
+    fn swapfilelist_rejects_arguments_and_reads_the_directory_option() {
+        assert_eq!(swapfilelist(&RealFileIO, 1, ".").unwrap_err().code, "E118");
+        let root = TempRoot::new("swapfilelist-option");
+        fs::write(root.0.join(".opt.swp"), b"").unwrap();
+        let mut editor = Editor::new();
+        let mut executor = ExExecutor::new();
+        executor
+            .execute_script(
+                &mut editor,
+                "<swapfilelist-test>",
+                &format!("let &directory = '{}'\nlet g:swaps = swapfilelist()", root.0.display()),
+            )
+            .unwrap();
+        let swaps = executor
+            .scope()
+            .global
+            .iter()
+            .find(|(name, _)| name.as_bytes() == b"swaps")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert_eq!(swaps, Typval::list(vec![path(&root.0.join(".opt.swp"))]));
     }
 }
