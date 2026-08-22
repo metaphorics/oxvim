@@ -8,6 +8,7 @@ pub mod editor;
 pub mod excmd_exec;
 pub mod extmark;
 pub mod fold;
+pub mod fs_builtins;
 pub mod layout;
 pub mod mapping;
 pub mod mode;
@@ -52,7 +53,7 @@ pub use mapping::{
 };
 pub use mode::{CmdlineKind, CmdlineState, InsertState, Mode, ModeError, ModeMachine, NormalState, OperatorPendingState, Step};
 pub use script::{
-    FileIO, LogicalLine, RealFileIO, RuntimeRoot, ScriptCtx, ScriptError, ScriptInfo, Sid,
+    FileEntry, FileIO, FileKind, FileMetadata, LogicalLine, RealFileIO, RuntimeRoot, ScriptCtx, ScriptError, ScriptInfo, Sid,
     SourceFrame,
 };
 pub use userfunc::{

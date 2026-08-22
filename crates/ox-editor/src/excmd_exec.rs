@@ -961,6 +961,9 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         if name_text == "system" {
             return call_system_builtin(args, scope);
         }
+        if crate::fs_builtins::is_filesystem_builtin(&name_text) {
+            return crate::fs_builtins::call(self.runtime.scripts.io(), &name_text, args);
+        }
         // Buffer-seam builtins (`getline`/`setline`) reach the current buffer
         // through ox_eval::BufferHost; the typval-only dispatcher below has
         // no buffer access.

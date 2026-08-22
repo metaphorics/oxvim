@@ -11,6 +11,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use ox_eval::scope::ScopeMap;
 use ox_eval::Scope;
@@ -22,15 +23,95 @@ pub type Sid = u64;
 /// Maximum length of one logical line after continuation joining.
 const MAX_LOGICAL_LINE: usize = 1_048_576;
 
-/// Filesystem seam for `:source`, autoload, `:edit`, and `:write`.
+/// Filesystem object kind exposed through [`FileIO`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileKind {
+    /// Regular file.
+    File,
+    /// Directory.
+    Directory,
+    /// Symbolic link.
+    Symlink,
+    /// Any other filesystem object.
+    Other,
+}
+
+/// Metadata needed by filesystem Vimscript builtins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileMetadata {
+    /// Object kind.
+    pub kind: FileKind,
+    /// Byte length.
+    pub len: u64,
+    /// Modification time, when available.
+    pub modified: Option<SystemTime>,
+    /// Unix permission bits, or zero on platforms without them.
+    pub mode: u32,
+}
+
+/// One directory entry returned by [`FileIO::read_dir`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileEntry {
+    /// Full entry path.
+    pub path: PathBuf,
+    /// Entry name.
+    pub name: std::ffi::OsString,
+}
+
+fn unsupported(operation: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, operation)
+}
+
+/// Filesystem seam for sourcing, editing, and filesystem builtins.
 pub trait FileIO {
     /// Reads a complete file as text. Invalid UTF-8 loses bytes to the
     /// replacement character, matching the editor's byte-tolerant default.
     fn read_to_string(&self, path: &Path) -> io::Result<String>;
+    /// Reads a complete file without decoding it.
+    fn read_bytes(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.read_to_string(path).map(String::into_bytes)
+    }
     /// Writes a complete file.
     fn write_string(&self, path: &Path, contents: &str) -> io::Result<()>;
+    /// Writes bytes, optionally appending to an existing file.
+    fn write_bytes(&self, path: &Path, contents: &[u8], append: bool) -> io::Result<()> {
+        if append {
+            return Err(unsupported("append is not supported by this FileIO"));
+        }
+        let contents = std::str::from_utf8(contents)
+            .map_err(|_| unsupported("binary writes are not supported by this FileIO"))?;
+        self.write_string(path, contents)
+    }
     /// Whether the path names a readable regular file.
     fn exists(&self, path: &Path) -> bool;
+    /// Returns metadata, following links when requested.
+    fn metadata(&self, _path: &Path, _follow_links: bool) -> io::Result<FileMetadata> {
+        Err(unsupported("metadata is not supported by this FileIO"))
+    }
+    /// Lists a directory.
+    fn read_dir(&self, _path: &Path) -> io::Result<Vec<FileEntry>> {
+        Err(unsupported("directory enumeration is not supported by this FileIO"))
+    }
+    /// Creates one directory or a complete parent chain.
+    fn create_dir(&self, _path: &Path, _recursive: bool, _mode: u32) -> io::Result<()> {
+        Err(unsupported("directory creation is not supported by this FileIO"))
+    }
+    /// Removes a file or symbolic link.
+    fn remove_file(&self, _path: &Path) -> io::Result<()> {
+        Err(unsupported("file removal is not supported by this FileIO"))
+    }
+    /// Removes an empty directory.
+    fn remove_dir(&self, _path: &Path) -> io::Result<()> {
+        Err(unsupported("directory removal is not supported by this FileIO"))
+    }
+    /// Removes a directory tree.
+    fn remove_dir_all(&self, _path: &Path) -> io::Result<()> {
+        Err(unsupported("recursive removal is not supported by this FileIO"))
+    }
+    /// Renames a filesystem object.
+    fn rename(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+        Err(unsupported("rename is not supported by this FileIO"))
+    }
     /// Canonical form used for the source-once registry. Implementations may
     /// fall back to the input path when canonicalization fails.
     fn canonicalize(&self, path: &Path) -> PathBuf;
@@ -46,13 +127,56 @@ impl FileIO for RealFileIO {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    fn read_bytes(&self, path: &Path) -> io::Result<Vec<u8>> {
+        fs::read(path)
+    }
+
     fn write_string(&self, path: &Path, contents: &str) -> io::Result<()> {
         fs::write(path, contents)
+    }
+
+    fn write_bytes(&self, path: &Path, contents: &[u8], append: bool) -> io::Result<()> {
+        use std::io::Write as _;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true);
+        if append { options.append(true); } else { options.truncate(true); }
+        options.open(path)?.write_all(contents)
     }
 
     fn exists(&self, path: &Path) -> bool {
         path.is_file()
     }
+
+    fn metadata(&self, path: &Path, follow_links: bool) -> io::Result<FileMetadata> {
+        let metadata = if follow_links { fs::metadata(path)? } else { fs::symlink_metadata(path)? };
+        let file_type = metadata.file_type();
+        let kind = if file_type.is_file() { FileKind::File }
+            else if file_type.is_dir() { FileKind::Directory }
+            else if file_type.is_symlink() { FileKind::Symlink }
+            else { FileKind::Other };
+        #[cfg(unix)]
+        let mode = { use std::os::unix::fs::PermissionsExt as _; metadata.permissions().mode() };
+        #[cfg(not(unix))]
+        let mode = if metadata.permissions().readonly() { 0o444 } else { 0o666 };
+        Ok(FileMetadata { kind, len: metadata.len(), modified: metadata.modified().ok(), mode })
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FileEntry>> {
+        fs::read_dir(path)?.map(|entry| entry.map(|entry| FileEntry { path: entry.path(), name: entry.file_name() })).collect()
+    }
+
+    fn create_dir(&self, path: &Path, recursive: bool, mode: u32) -> io::Result<()> {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(recursive);
+        #[cfg(unix)]
+        { use std::os::unix::fs::DirBuilderExt as _; builder.mode(mode); }
+        builder.create(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> { fs::remove_file(path) }
+    fn remove_dir(&self, path: &Path) -> io::Result<()> { fs::remove_dir(path) }
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> { fs::remove_dir_all(path) }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> { fs::rename(from, to) }
 
     fn canonicalize(&self, path: &Path) -> PathBuf {
         fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
