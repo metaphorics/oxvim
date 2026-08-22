@@ -26,7 +26,10 @@ use ox_types::{Object, OxStr, Typval};
 
 use crate::excmd_exec::{ExecError, ExecOutcome};
 use crate::register::RegisterContent;
-use crate::{Editor, ExExecutor, Geometry, LuaExec, LuaExecError, MessageKind, OptionValue, VimExceptionKind};
+use crate::{
+    vim_variable_is_writable, Editor, ExExecutor, Geometry, LuaExec, LuaExecError, MessageKind,
+    OptionValue, VimExceptionKind,
+};
 use ox_types::WinHandle;
 
 /// Build an editor with one listed buffer and a tabpage so window-local
@@ -866,4 +869,46 @@ fn put_expression_evaluates_and_inserts_expression_register() {
 
     let text = editor.buffer(buffer).unwrap().text().unwrap();
     assert_eq!(text.line(2).unwrap(), b"screen too small");
+}
+
+#[test]
+fn writable_vim_variables_match_upstream_table() {
+    for name in [
+        "errmsg",
+        "warningmsg",
+        "statusmsg",
+        "this_session",
+        "fcs_choice",
+        "scrollstart",
+        "swapchoice",
+        "char",
+        "mouse_win",
+        "mouse_winid",
+        "mouse_lnum",
+        "mouse_col",
+        "searchforward",
+        "hlsearch",
+        "oldfiles",
+        "completed_item",
+        "errors",
+        "testing",
+    ] {
+        assert!(vim_variable_is_writable(name.as_bytes()), "v:{name}");
+    }
+    for name in ["count", "count1", "dying", "register", "event", "servername"] {
+        assert!(!vim_variable_is_writable(name.as_bytes()), "v:{name}");
+    }
+}
+
+#[test]
+fn let_writes_upstream_writable_vim_variables_only() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&mut editor, "let v:testing = 1").unwrap();
+    assert_eq!(editor.vvars().get(&OxStr::from("testing")), Some(&Object::Integer(1)));
+
+    let error = exec.execute_line(&mut editor, "let v:count = 2").unwrap_err();
+    let ExecError::Vim(exception) = error else { panic!("expected E46") };
+    assert_eq!(exception.kind, VimExceptionKind::Error("E46".to_owned()));
 }

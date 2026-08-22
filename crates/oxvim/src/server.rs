@@ -11,9 +11,9 @@ use std::rc::Rc;
 use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
 use ox_api::{CommandExecutor, Registry};
 use ox_editor::{
-    AutocmdContext, AutocmdKind, CmdlineKind, Editor, Event, ExExecutor, ExecOutcome, Geometry,
-    LuaExec, LuaExecError, MappingAction, MessageKind, Mode, ModeMachine, Keys, OptionValue,
-    TypeaheadFlags,
+    vim_variable_is_writable, AutocmdContext, AutocmdKind, CmdlineKind, Editor, Event, ExExecutor,
+    ExecOutcome, Geometry, LuaExec, LuaExecError, MappingAction, MessageKind, Mode, ModeMachine, Keys,
+    OptionValue, TypeaheadFlags,
 };
 use ox_eval::{
     BufferHost, BuiltinHost as EvalBuiltinHost, Builtins, Scope, call_buffer_builtin,
@@ -1211,7 +1211,7 @@ impl VariableHost for EditorVariables {
         name: OxStr,
         value: Option<Object>,
     ) -> Result<(), String> {
-        if scope == VariableScope::Vim {
+        if scope == VariableScope::Vim && !vim_variable_is_writable(name.as_bytes()) {
             return Err(format!(
                 "E46: Cannot change read-only variable \"{}\"",
                 name.to_string_lossy()
@@ -1487,7 +1487,7 @@ fn with_scoped_editor_api<T>(
             scope.create_function_mut(move |lua, (scope, handle, name, value): (mlua::LuaString, i64, mlua::LuaString, Value)| {
                 let scope = parse_variable_scope(&scope)?;
                 let name = OxStr(name.as_bytes().to_vec());
-                if scope == VariableScope::Vim {
+                if scope == VariableScope::Vim && !vim_variable_is_writable(name.as_bytes()) {
                     return Err(mlua::Error::runtime(format!("E46: Cannot change read-only variable \"{}\"", name.to_string_lossy())));
                 }
                 let value = if value.is_nil() {

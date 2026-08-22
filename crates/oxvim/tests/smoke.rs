@@ -232,6 +232,8 @@ fn lua_variable_and_option_tables_use_editor_state() {
 
         vim.g.answer = nil
         assert(vim.g.answer == nil)
+        vim.v.testing = 1
+        assert(vim.v.testing == 1)
         local ok, error_message = pcall(function() vim.v.servername = 'changed' end)
         assert(not ok and tostring(error_message):find('E46', 1, true))
         assert(vim.v.servername == '')

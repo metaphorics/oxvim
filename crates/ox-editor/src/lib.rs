@@ -36,7 +36,8 @@ pub use buffer::{
 pub use decoration::Decorations;
 pub use editor::{BufferRelease, ChannelIds, Editor, EditorError, HighlightDefinition, Message, MessageKind};
 pub use excmd_exec::{
-    ExExecutor, ExecError, ExecOutcome, LuaExec, LuaExecError, UserCommand, VimException, VimExceptionKind,
+    vim_variable_is_writable, ExExecutor, ExecError, ExecOutcome, LuaExec, LuaExecError, UserCommand,
+    VimException, VimExceptionKind,
 };
 pub use extmark::{
     Extmark, ExtmarkAttributes, ExtmarkEnd, ExtmarkGravity, ExtmarkId, ExtmarkPlacement,

@@ -3112,8 +3112,40 @@ fn assign_target<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, sco
     }
     if let Some(option) = target.strip_prefix('&') { return assign_option(runtime, editor, scope, option, value); }
     let (kind, name) = parse_scope_name(target);
-    if let Some(kind) = kind { scope.set_scoped(kind, name.as_bytes(), 0, value).map_err(|error| eval_error_flow(runtime, error))?; } else { scope.set(name.as_bytes(), value); }
+    if kind == Some(ScopeKind::Vim) && vim_variable_is_writable(name.as_bytes()) {
+        replace_scope_pair(&mut scope.vim, &name, value);
+    } else if let Some(kind) = kind {
+        scope.set_scoped(kind, name.as_bytes(), 0, value).map_err(|error| eval_error_flow(runtime, error))?;
+    } else {
+        scope.set(name.as_bytes(), value);
+    }
     Ok(())
+}
+
+/// Whether upstream's `vimvars` table leaves a `v:` item writable (flags 0).
+#[must_use]
+pub fn vim_variable_is_writable(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"errmsg"
+            | b"warningmsg"
+            | b"statusmsg"
+            | b"this_session"
+            | b"fcs_choice"
+            | b"scrollstart"
+            | b"swapchoice"
+            | b"char"
+            | b"mouse_win"
+            | b"mouse_winid"
+            | b"mouse_lnum"
+            | b"mouse_col"
+            | b"searchforward"
+            | b"hlsearch"
+            | b"oldfiles"
+            | b"completed_item"
+            | b"errors"
+            | b"testing"
+    )
 }
 
 fn read_target<F: FileIO>(runtime: &ExRuntime<F>, editor: &Editor, scope: &Scope, target: &str) -> Result<Typval, Flow> {
