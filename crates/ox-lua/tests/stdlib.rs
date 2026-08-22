@@ -124,6 +124,34 @@ fn mpack_packer_and_unpacker_are_callable_streaming_sessions() {
 }
 
 #[test]
+fn mpack_session_frames_rpc_messages_and_correlates_responses() {
+    let host = host();
+    let result: (bool, bool, bool, bool, bool) = eval(
+        &host,
+        "local pack = vim.mpack.Packer(); \
+         local session = vim.mpack.Session({ unpack = vim.mpack.Unpacker() }); \
+         local callback = function() end; \
+         local request = session:request(callback) .. pack('method') .. pack({3}); \
+         local kind, id, method, args, request_pos = session:receive(request); \
+         local response = session:reply(id) .. pack(vim.NIL) .. pack(7); \
+         local rkind, registered, err, value, response_pos = session:receive(response); \
+         local notification = session:notify() .. pack('event') .. pack({4}); \
+         local first, _, _, _, fragment_pos = session:receive(notification:sub(1, 2)); \
+         local nkind, none, event, event_args, notification_pos = \
+           session:receive(notification:sub(3)); \
+         return kind == 'request' and id == 0 and method == 'method' and args[1] == 3, \
+           request_pos == #request + 1, \
+           rkind == 'response' and registered == callback and err == vim.NIL and value == 7 \
+             and response_pos == #response + 1, \
+           first == nil and fragment_pos == 3, \
+           nkind == 'notification' and none == nil and event == 'event' and event_args[1] == 4 \
+             and notification_pos == #notification - 1",
+    );
+
+    assert_eq!(result, (true, true, true, true, true));
+}
+
+#[test]
 fn json_encode_covers_shape_formatting_and_scalar_boundaries() {
     let host = host();
     let encoded: (String, String, String, String) = eval(

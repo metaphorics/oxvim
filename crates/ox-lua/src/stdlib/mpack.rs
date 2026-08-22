@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, ErrorKind};
 
-use mlua::{Function, Lua, LuaString, MetaMethod, Table, UserData, UserDataMethods, Value};
+use mlua::{AnyUserData, Function, Lua, LuaString, MetaMethod, Table, UserData, UserDataMethods, Value};
 use rmpv::Value as MpackValue;
 
 use crate::converter::{has_empty_dict_metatable, is_vim_nil};
@@ -51,54 +51,143 @@ struct Unpacker {
     ext: Table,
 }
 
+impl Unpacker {
+    fn decode_next(
+        &mut self,
+        input: &[u8],
+        start: usize,
+    ) -> mlua::Result<(Option<MpackValue>, usize)> {
+        if start == 0 || start > input.len() {
+            return Err(mlua::Error::runtime(
+                "start position must be between 1 and the input string length",
+            ));
+        }
+        let chunk = &input[start - 1..];
+        let previous_len = self.pending.len();
+        let mut combined = Vec::new();
+        let bytes = if previous_len == 0 {
+            chunk
+        } else {
+            combined.reserve(previous_len + chunk.len());
+            combined.extend_from_slice(&self.pending);
+            combined.extend_from_slice(chunk);
+            combined.as_slice()
+        };
+        let mut cursor = Cursor::new(bytes);
+        match rmpv::decode::read_value(&mut cursor) {
+            Ok(value) => {
+                let consumed = usize::try_from(cursor.position())
+                    .map_err(mlua::Error::external)?
+                    .saturating_sub(previous_len);
+                self.pending.clear();
+                Ok((Some(value), start + consumed))
+            }
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                if previous_len == 0 {
+                    self.pending.extend_from_slice(chunk);
+                } else {
+                    self.pending = combined;
+                }
+                Ok((None, input.len() + 1))
+            }
+            Err(error) => {
+                self.pending.clear();
+                Err(mlua::Error::runtime(format!("invalid msgpack: {error}")))
+            }
+        }
+    }
+}
+
 impl UserData for Unpacker {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method_mut(
             MetaMethod::Call,
             |lua, this, (input, start): (LuaString, Option<usize>)| {
                 let input = input.as_bytes();
-                let start = start.unwrap_or(1);
-                if start == 0 || start > input.len() {
-                    return Err(mlua::Error::runtime(
-                        "start position must be between 1 and the input string length",
-                    ));
-                }
+                let (value, next) = this.decode_next(&input, start.unwrap_or(1))?;
+                Ok((
+                    match value {
+                        Some(value) => mpack_to_lua_with_ext(lua, value, 0, Some(&this.ext))?,
+                        None => Value::Nil,
+                    },
+                    next,
+                ))
+            },
+        );
+    }
+}
 
-                let chunk = &input[start - 1..];
-                let previous_len = this.pending.len();
-                let mut combined = Vec::new();
-                let bytes = if previous_len == 0 {
-                    chunk
-                } else {
-                    combined.reserve(previous_len + chunk.len());
-                    combined.extend_from_slice(&this.pending);
-                    combined.extend_from_slice(chunk);
-                    combined.as_slice()
+#[derive(Debug)]
+struct Session {
+    unpacker: AnyUserData,
+    pending: HashMap<u32, Value>,
+    next_id: u32,
+}
+
+impl UserData for Session {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("request", |lua, this, data: Option<Value>| {
+            let first = this.next_id;
+            while this.pending.contains_key(&this.next_id) {
+                this.next_id = next_request_id(this.next_id);
+                if this.next_id == first {
+                    return Err(mlua::Error::runtime("no free msgpack-rpc request ids"));
+                }
+            }
+            let id = this.next_id;
+            this.next_id = next_request_id(id);
+            this.pending.insert(id, data.unwrap_or(Value::Nil));
+            lua.create_string(rpc_prefix(4, 0, Some(id))?)
+        });
+        methods.add_method("reply", |lua, _, id: u32| {
+            lua.create_string(rpc_prefix(4, 1, Some(id))?)
+        });
+        methods.add_method("notify", |lua, _, ()| {
+            lua.create_string(rpc_prefix(3, 2, None)?)
+        });
+        methods.add_method_mut(
+            "receive",
+            |lua, this, (input, start): (LuaString, Option<usize>)| {
+                let input = input.as_bytes();
+                let mut unpacker = this.unpacker.borrow_mut::<Unpacker>()?;
+                let (value, next) = unpacker.decode_next(&input, start.unwrap_or(1))?;
+                let Some(MpackValue::Array(mut fields)) = value else {
+                    if value.is_none() {
+                        return Ok((Value::Nil, Value::Nil, Value::Nil, Value::Nil, next));
+                    }
+                    return Err(mlua::Error::runtime("invalid msgpack-rpc string"));
                 };
-                let mut cursor = Cursor::new(bytes);
-                match rmpv::decode::read_value(&mut cursor) {
-                    Ok(value) => {
-                        let consumed = usize::try_from(cursor.position())
-                            .map_err(mlua::Error::external)?
-                            .saturating_sub(previous_len);
-                        this.pending.clear();
-                        Ok((
-                            mpack_to_lua_with_ext(lua, value, 0, Some(&this.ext))?,
-                            start + consumed,
-                        ))
+                if fields.is_empty() {
+                    return Err(mlua::Error::runtime("invalid msgpack-rpc string"));
+                }
+                let kind = rpc_u32(&fields[0])?;
+                let expected = if kind == 2 { 3 } else { 4 };
+                if fields.len() != expected {
+                    return Err(mlua::Error::runtime("invalid msgpack-rpc string"));
+                }
+                let ext = Some(&unpacker.ext);
+                match kind {
+                    0 => {
+                        let id = rpc_u32(&fields[1])?;
+                        let method = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
+                        let args = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
+                        Ok((Value::String(lua.create_string("request")?), Value::Integer(i64::from(id)), method, args, next))
                     }
-                    Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                        if previous_len == 0 {
-                            this.pending.extend_from_slice(chunk);
-                        } else {
-                            this.pending = combined;
-                        }
-                        Ok((Value::Nil, input.len() + 1))
+                    1 => {
+                        let id = rpc_u32(&fields[1])?;
+                        let callback = this.pending.remove(&id).ok_or_else(|| {
+                            mlua::Error::runtime("invalid msgpack-rpc response id")
+                        })?;
+                        let error = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
+                        let result = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
+                        Ok((Value::String(lua.create_string("response")?), callback, error, result, next))
                     }
-                    Err(error) => {
-                        this.pending.clear();
-                        Err(mlua::Error::runtime(format!("invalid msgpack: {error}")))
+                    2 => {
+                        let method = mpack_to_lua_with_ext(lua, fields.remove(1), 0, ext)?;
+                        let args = mpack_to_lua_with_ext(lua, fields.remove(1), 0, ext)?;
+                        Ok((Value::String(lua.create_string("notification")?), Value::Nil, method, args, next))
                     }
+                    _ => Err(mlua::Error::runtime("invalid msgpack-rpc string")),
                 }
             },
         );
@@ -155,7 +244,44 @@ pub(super) fn install(lua: &Lua, vim: &Table) -> mlua::Result<()> {
             mpack_to_lua(lua, value, 0)
         })?,
     )?;
-    vim.set("mpack", module)
+    module.set(
+        "Session",
+        lua.create_function(|lua, options: Option<Table>| {
+            let unpacker: AnyUserData = options
+                .ok_or_else(|| mlua::Error::runtime("expecting a table argument"))?
+                .get("unpack")?;
+            unpacker.borrow::<Unpacker>().map_err(|_| {
+                mlua::Error::runtime("\"unpack\" option must be a mpack.Unpacker instance")
+            })?;
+            lua.create_userdata(Session { unpacker, pending: HashMap::new(), next_id: 0 })
+        })?,
+    )?;
+    vim.set("mpack", module.clone())?;
+    let package: Table = lua.globals().get("package")?;
+    let loaded: Table = package.get("loaded")?;
+    loaded.set("mpack", module)
+}
+
+fn rpc_prefix(len: u32, kind: u32, id: Option<u32>) -> mlua::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(16);
+    output.push(0x90 | u8::try_from(len).map_err(mlua::Error::external)?);
+    rmpv::encode::write_value(&mut output, &MpackValue::from(kind))
+        .map_err(mlua::Error::external)?;
+    if let Some(id) = id {
+        rmpv::encode::write_value(&mut output, &MpackValue::from(id))
+            .map_err(mlua::Error::external)?;
+    }
+    Ok(output)
+}
+
+fn next_request_id(id: u32) -> u32 {
+    if id == u32::MAX - 1 { 0 } else { id + 1 }
+}
+
+fn rpc_u32(value: &MpackValue) -> mlua::Result<u32> {
+    value.as_u64().and_then(|value| u32::try_from(value).ok()).ok_or_else(|| {
+        mlua::Error::runtime("invalid msgpack-rpc string")
+    })
 }
 
 fn lua_to_mpack(
