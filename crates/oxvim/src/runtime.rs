@@ -186,7 +186,7 @@ pub fn run_lua(script: &LuaScript) -> Result<(), AppError> {
     }
     lua.globals().set("arg", arguments).map_err(|error| AppError::Lua(error.to_string()))?;
     lua.load(&source)
-        .set_name(&script.path)
+        .set_name(&format!("@{}", script.path))
         .exec()
         .map_err(|error| AppError::Lua(error.to_string()))
 }
