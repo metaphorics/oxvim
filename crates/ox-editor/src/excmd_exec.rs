@@ -366,7 +366,12 @@ impl<F: FileIO> ExExecutor<F> {
         let program = commands
             .iter()
             .cloned()
-            .map(|command| Instruction { command, line })
+            .map(|command| Instruction {
+                source: render_command(&command),
+                command: Some(command),
+                parse_error: None,
+                line,
+            })
             .collect::<Vec<_>>();
         sync_editor_into_scope(editor, &mut self.scope)?;
         let flow = run_program(
@@ -438,8 +443,20 @@ impl<F: FileIO> ExExecutor<F> {
 
 #[derive(Clone)]
 struct Instruction {
-    command: ExCommand,
+    command: Option<ExCommand>,
+    parse_error: Option<ParseError>,
+    source: String,
     line: usize,
+}
+
+impl Instruction {
+    fn command(&self) -> Result<&ExCommand, &ParseError> {
+        self.command.as_ref().ok_or_else(|| self.parse_error.as_ref().expect("deferred instruction has a parse error"))
+    }
+
+    fn name(&self) -> &str {
+        self.command.as_ref().map_or("", |command| command.command.name())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -494,6 +511,15 @@ fn parse_program(
             .map_or((line.text.as_str(), None), |(command, body)| (command, Some(body)));
         let commands = match parser.parse(command_text) {
             Ok(commands) => commands,
+            Err(error) if error.code == ox_excmd::ErrorCode::E492 => {
+                program.push(Instruction {
+                    command: None,
+                    parse_error: Some(error),
+                    source: command_text.to_owned(),
+                    line: line.first_line,
+                });
+                continue;
+            }
             Err(error) => parse_put_expression(&parser, command_text).ok_or(error)?,
         };
         for mut command in commands {
@@ -502,7 +528,9 @@ fn parse_program(
                 command.args.push_str(body);
             }
             program.push(Instruction {
-                command,
+                source: render_command(&command),
+                command: Some(command),
+                parse_error: None,
                 line: line.first_line,
             });
         }
@@ -547,7 +575,11 @@ fn run_program<F: FileIO>(
         let instruction = &program[pc];
         runtime.scripts.set_current_line(instruction.line);
         runtime.functions.set_current_line(instruction.line);
-        let name = instruction.command.command.name();
+        let command = match instruction.command() {
+            Ok(command) => command,
+            Err(error) => return exec_error_flow(runtime, ExecError::Parse(error.clone())),
+        };
+        let name = command.command.name();
         match name {
             "if" => {
                 let Some(block) = find_if(program, pc, end) else {
@@ -581,7 +613,7 @@ fn run_program<F: FileIO>(
                     return error_flow(runtime, "E170", "Missing :endwhile");
                 };
                 loop {
-                    match eval_condition(runtime, editor, scope, instruction.command.args.trim()) {
+                    match eval_condition(runtime, editor, scope, command.args.trim()) {
                         Ok(true) => {}
                         Ok(false) => break,
                         Err(flow) => return flow,
@@ -599,7 +631,7 @@ fn run_program<F: FileIO>(
                 let Some(block_end) = find_matching(program, pc, end, "for", "endfor") else {
                     return error_flow(runtime, "E170", "Missing :endfor");
                 };
-                let Some((target, expression)) = split_for(&instruction.command.args) else {
+                let Some((target, expression)) = split_for(&command.args) else {
                     return error_flow(runtime, "E690", "Missing \"in\" after :for");
                 };
                 let value = match eval_text(runtime, editor, scope, lua, expression) {
@@ -673,7 +705,7 @@ fn run_program<F: FileIO>(
                 let Some(block_end) = find_matching(program, pc, end, "function", "endfunction") else {
                     return error_flow(runtime, "E126", "Missing :endfunction");
                 };
-                let signature = match UserFunctions::parse_signature(&instruction.command.args) {
+                let signature = match UserFunctions::parse_signature(&command.args) {
                     Ok(signature) => signature,
                     Err(error) => return userfunc_error_flow(runtime, error),
                 };
@@ -683,14 +715,14 @@ fn run_program<F: FileIO>(
                 };
                 let body = program[pc + 1..block_end]
                     .iter()
-                    .map(|item| render_command(&item.command))
+                    .map(|item| item.source.clone())
                     .collect::<Vec<_>>();
                 let sid = runtime.scripts.current_sid().unwrap_or(0);
                 let canonical = match runtime.functions.define(
                     signature,
                     body,
                     sid,
-                    instruction.command.bang,
+                    command.bang,
                     scope,
                 ) {
                     Ok(name) => name,
@@ -724,7 +756,7 @@ fn run_program<F: FileIO>(
             _ => {}
         }
 
-        let flow = dispatch(runtime, editor, scope, lua, &instruction.command);
+        let flow = dispatch(runtime, editor, scope, lua, command);
         if !matches!(flow, Flow::Normal) {
             return flow;
         }
@@ -2869,15 +2901,15 @@ fn find_if(program: &[Instruction], open: usize, limit: usize) -> Option<IfBlock
     let mut markers = Vec::new();
     let mut index = open + 1;
     while index < limit {
-        match program[index].command.command.name() {
+        match program[index].name() {
             "if" => depth += 1,
             "endif" if depth == 0 => {
                 let mut branches = Vec::new();
-                let mut condition = Some(program[open].command.args.trim().to_owned());
+                let mut condition = Some(program[open].command.as_ref()?.args.trim().to_owned());
                 let mut start = open + 1;
                 for marker in markers {
                     branches.push(IfBranch { condition, start, end: marker });
-                    condition = match program[marker].command.command.name() { "elseif" => Some(program[marker].command.args.trim().to_owned()), _ => None };
+                    condition = match program[marker].name() { "elseif" => Some(program[marker].command.as_ref()?.args.trim().to_owned()), _ => None };
                     start = marker + 1;
                 }
                 branches.push(IfBranch { condition, start, end: index });
@@ -2900,7 +2932,7 @@ fn find_try(program: &[Instruction], open: usize, limit: usize) -> Option<TryBlo
     let mut markers = Vec::new();
     let mut index = open + 1;
     while index < limit {
-        match program[index].command.command.name() {
+        match program[index].name() {
             "try" => depth += 1,
             "endtry" if depth == 0 => {
                 let try_end = markers.first().copied().unwrap_or(index);
@@ -2908,8 +2940,12 @@ fn find_try(program: &[Instruction], open: usize, limit: usize) -> Option<TryBlo
                 let mut finally = None;
                 for (position, marker) in markers.iter().enumerate() {
                     let next = markers.get(position + 1).copied().unwrap_or(index);
-                    match program[*marker].command.command.name() {
-                        "catch" => catches.push(CatchBlock { pattern: parse_catch_pattern(&program[*marker].command.args), start: marker + 1, end: next }),
+                    match program[*marker].name() {
+                        "catch" => catches.push(CatchBlock {
+                            pattern: parse_catch_pattern(&program[*marker].command.as_ref()?.args),
+                            start: marker + 1,
+                            end: next,
+                        }),
                         "finally" => finally = Some((marker + 1, index)),
                         _ => {}
                     }
@@ -2928,7 +2964,7 @@ fn find_try(program: &[Instruction], open: usize, limit: usize) -> Option<TryBlo
 fn find_matching(program: &[Instruction], open: usize, limit: usize, opener: &str, closer: &str) -> Option<usize> {
     let mut depth = 0usize;
     for (index, instruction) in program.iter().enumerate().take(limit).skip(open + 1) {
-        let name = instruction.command.command.name();
+        let name = instruction.name();
         if name == opener { depth += 1; } else if name == closer { if depth == 0 { return Some(index); } depth -= 1; }
     }
     None

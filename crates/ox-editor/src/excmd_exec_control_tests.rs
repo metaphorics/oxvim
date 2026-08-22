@@ -253,6 +253,35 @@ fn inactive_if_branch_body_not_executed() {
 }
 
 #[test]
+fn inactive_function_branch_does_not_resolve_unknown_command() {
+    let mut executor = ExExecutor::new();
+    let mut editor = Editor::new();
+    executor
+        .execute_script(
+            &mut editor,
+            "test.vim",
+            "function Run()\nif 0\nechoconsole 'unreachable'\nendif\nlet g:inside = 3\nendfunction\ncall Run()\nlet g:after = 4",
+        )
+        .unwrap();
+
+    assert_eq!(gnum(&executor, "inside"), 3);
+    assert_eq!(gnum(&executor, "after"), 4);
+}
+
+#[test]
+fn selected_function_branch_resolves_unknown_command_to_e492() {
+    let mut executor = ExExecutor::new();
+    let mut editor = Editor::new();
+    let exception = vim_error(executor.execute_script(
+        &mut editor,
+        "test.vim",
+        "function Run()\nif 1\nechoconsole 'reached'\nendif\nendfunction\ncall Run()",
+    ));
+
+    assert_eq!(exception.kind, VimExceptionKind::Error("E492".to_owned()));
+}
+
+#[test]
 fn inactive_elseif_condition_not_evaluated() {
     // ex_docmd.c: once a truthy `:if`/`:elseif` branch is found, subsequent
     // `:elseif` conditions are NOT evaluated — referencing an undefined
