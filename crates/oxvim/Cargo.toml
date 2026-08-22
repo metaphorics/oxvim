@@ -15,6 +15,7 @@ ox-lua = { path = "../ox-lua" }
 ox-rpc = { path = "../ox-rpc" }
 ox-text = { path = "../ox-text" }
 ox-tui = { path = "../ox-tui" }
+ox-sys = { path = "../ox-sys" }
 ox-types = { path = "../ox-types" }
 ox-ui = { path = "../ox-ui" }
 ox-uv = { path = "../ox-uv" }

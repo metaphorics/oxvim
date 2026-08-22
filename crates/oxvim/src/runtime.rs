@@ -82,6 +82,30 @@ pub fn runtime_root() -> Result<PathBuf, AppError> {
     Ok(PathBuf::from("./runtime"))
 }
 
+/// Seeds `$VIM` and `$VIMRUNTIME` from the resolved runtime tree (env.c
+/// `vim_getenv`: the variables are derived from the executable location and
+/// cached with `os_setenv`, so `expand()` and `:set` value expansion see them
+/// on every later read). Explicitly exported values win, like upstream.
+/// `$VIM` strips a trailing `runtime` component (`remove_tail` on
+/// `RUNTIME_DIRNAME`); an unusual layout keeps the runtime path itself.
+pub fn export_vim_environment() -> Result<(), AppError> {
+    let runtime = runtime_root()?;
+    if std::env::var_os("VIMRUNTIME").is_none() {
+        ox_sys::set_env("VIMRUNTIME", &runtime);
+    }
+    if std::env::var_os("VIM").is_none() {
+        let vim = if runtime.file_name().is_some_and(|name| name == "runtime") {
+            runtime
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| runtime.clone())
+        } else {
+            runtime.clone()
+        };
+        ox_sys::set_env("VIM", vim);
+    }
+    Ok(())
+}
 /// Execute Ex source read from stdin, with `--cmd` before and `+cmd` after.
 pub fn run_batch(cli: &Cli) -> Result<(), AppError> {
     let mut input = String::new();

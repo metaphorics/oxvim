@@ -582,6 +582,7 @@ dependencies = [
  "ox-loop",
  "ox-lua",
  "ox-rpc",
+ "ox-sys",
  "ox-text",
  "ox-tui",
  "ox-types",

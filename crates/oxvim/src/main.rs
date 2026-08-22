@@ -71,6 +71,9 @@ fn process_code(code: i64) -> ExitCode {
 
 fn run() -> Result<ExitCode, AppError> {
     let cli = Cli::parse(std::env::args().skip(1)).map_err(AppError::Usage)?;
+    // env.c vim_getenv: derive and export $VIM/$VIMRUNTIME before any
+    // startup command or executor snapshots the environment.
+    runtime::export_vim_environment()?;
     if cli.api_info {
         let bytes = api_info::encoded().map_err(|error| AppError::Api(error.to_string()))?;
         io::stdout().lock().write_all(&bytes).map_err(AppError::Io)?;
