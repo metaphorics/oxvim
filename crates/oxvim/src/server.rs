@@ -169,6 +169,30 @@ impl AppState {
             }
         }
 
+        if let Some(path) = cli.files.first() {
+            self.execute_ex(&format!("edit {path}"))?;
+            let current = self.editor.borrow().current_buffer();
+            let placeholders = self
+                .editor
+                .borrow()
+                .buffers()
+                .into_iter()
+                .filter(|buffer| Some(*buffer) != current)
+                .filter(|buffer| {
+                    self.editor
+                        .borrow()
+                        .buffer(*buffer)
+                        .is_ok_and(|state| state.name().as_bytes().is_empty() && !state.modified)
+                })
+                .collect::<Vec<_>>();
+            for buffer in placeholders {
+                self.editor
+                    .borrow_mut()
+                    .wipe_buffer(buffer)
+                    .map_err(|error| AppError::Editor(error.to_string()))?;
+            }
+        }
+
         for command in &cli.commands {
             self.execute_ex(command)?;
         }
