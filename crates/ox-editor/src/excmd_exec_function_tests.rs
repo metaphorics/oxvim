@@ -531,6 +531,19 @@ fn lowercase_script_local_function_name_is_allowed() {
     assert_eq!(global_number(exec.scope(), "called_local"), Some(1));
 }
 
+#[test]
+fn same_script_function_call_keeps_live_script_scope() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    exec.execute_script(
+        &mut editor,
+        "plugin.vim",
+        "let s:state = {'value': 42}\nfunction! Main()\nlet g:from_script = s:state.value\nendfunction\ncall Main()",
+    )
+    .unwrap();
+    assert_eq!(global_number(exec.scope(), "from_script"), Some(42));
+}
+
 // ---------------------------------------------------------------------------
 // Family: continuation / comment joining
 // (ex_docmd.c: getline_equal; test_source.vim)

@@ -1072,15 +1072,16 @@ fn call_user_function<F: FileIO>(
         .functions
         .begin_call(name, sid, args, first_line, last_line, scope)
         .map_err(|error| userfunc_error_flow(runtime, error))?;
+    let switched_script = function.sid != 0 && runtime.scripts.current_sid() != Some(function.sid);
     let caller_script = scope.script.clone();
-    if function.sid != 0 {
+    if switched_script {
         runtime.scripts.load_script_scope(function.sid, scope);
     }
     let flow = run_program(runtime, editor, scope, lua, &parsed, 0, parsed.len());
-    if function.sid != 0 {
+    if switched_script {
         runtime.scripts.store_script_scope(function.sid, scope);
+        scope.script = caller_script;
     }
-    scope.script = caller_script;
     runtime.functions.end_call(scope);
     match flow {
         Flow::Normal => Ok(Typval::Number(0)),
