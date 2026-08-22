@@ -281,6 +281,26 @@ fn spawn_accepts_luv_stdio_environment_args_and_exit_callback() {
     assert!(host.lua().globals().get::<bool>("spawn_exited").unwrap());
 }
 
+#[cfg(unix)]
+#[test]
+fn abandoned_spawn_handles_do_not_keep_the_loop_alive() {
+    let (host, scheduler) = host();
+    host.lua()
+        .load(
+            r#"
+            do
+              local input = assert(vim.uv.new_pipe(false))
+              assert(vim.uv.spawn('/bin/cat', { stdio = { input, nil, nil } }, function() end))
+            end
+            collectgarbage('collect')
+            vim.uv.run('default')
+            "#,
+        )
+        .exec()
+        .unwrap();
+    scheduler.drain().unwrap();
+}
+
 #[test]
 fn tcp_loopback_accepts_reads_and_writes() {
     let (host, scheduler) = host();

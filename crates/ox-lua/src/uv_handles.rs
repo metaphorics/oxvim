@@ -338,6 +338,21 @@ impl LuaProcessPipe {
 }
 
 #[cfg(unix)]
+impl Drop for LuaProcessPipe {
+    fn drop(&mut self) {
+        if Rc::strong_count(&self.inner) != 1 || self.closing.replace(true) {
+            return;
+        }
+        let inner = self.inner.clone();
+        let _ = self.access.apply(Box::new(move |uv_loop| {
+            if let Some(pipe) = inner.borrow_mut().take() {
+                let _ = pipe.close(uv_loop);
+            }
+        }));
+    }
+}
+
+#[cfg(unix)]
 impl UserData for LuaProcessPipe {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("read_start", |_, this, callback: Function| { this.callbacks.borrow_mut().read = Some(callback); let inner = this.inner.clone(); this.access.apply(Box::new(move |uv_loop| if let Some(pipe) = inner.borrow_mut().as_mut() { let _ = pipe.read_start_current(uv_loop); }))?; Ok(true) });
@@ -400,6 +415,21 @@ impl UserData for LuaProcessPipe {
 
 #[derive(Clone)]
 struct LuaProcess { inner: Rc<RefCell<Option<Process>>>, access: LoopAccess, closing: Rc<Cell<bool>> }
+
+impl Drop for LuaProcess {
+    fn drop(&mut self) {
+        if Rc::strong_count(&self.inner) != 1 || self.closing.replace(true) {
+            return;
+        }
+        let inner = self.inner.clone();
+        let _ = self.access.apply(Box::new(move |uv_loop| {
+            if let Some(process) = inner.borrow_mut().take() {
+                let _ = process.close(uv_loop);
+            }
+        }));
+    }
+}
+
 impl UserData for LuaProcess {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("get_pid", |_, this, ()| Ok(this.inner.borrow().as_ref().map(Process::pid)));
