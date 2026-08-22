@@ -1,12 +1,14 @@
 //! C-side core of the global `vim` Lua table.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use mlua::{
     Function, Lua, MetaMethod, MultiValue, Table, UserData, UserDataMethods, Value, Variadic,
 };
-use ox_types::{ApiError, Object, OxStr, Typval};
+use ox_api::Registry;
+use ox_editor::Editor;
+use ox_types::{OxStr, Typval};
 
 use crate::converter::{lua_to_object, object_to_lua};
 use crate::typval_bridge::{lua_to_typval, typval_to_lua};
@@ -31,26 +33,41 @@ pub trait BuiltinHost {
     }
 }
 
-/// Metadata and dispatch pointer for one `vim.api` wrapper.
-#[derive(Clone, Copy)]
-pub struct ApiFunction {
-    /// Public function name.
-    pub name: &'static str,
-    /// Whether the function may run in a fast callback.
-    pub fast: bool,
-    /// Whether the function mutates text and is forbidden under textlock.
-    pub textlock: bool,
-    /// Generated API dispatcher.
-    pub dispatch: fn(&[Object]) -> Result<Object, ApiError>,
+/// Shared editor context captured by the generated `vim.api` Lua closures.
+#[derive(Clone)]
+pub struct ApiDispatchContext {
+    editor: Rc<RefCell<Editor>>,
+    textlock_depth: Rc<Cell<u32>>,
 }
 
-/// Registry view consumed by [`bind_api`].
-///
-/// `ox-api` can implement this trait for its concrete registry without making
-/// `ox-lua` depend on the editor API implementation crate.
-pub trait ApiRegistry {
-    /// Return the registry entries in public registration order.
-    fn functions(&self) -> Vec<ApiFunction>;
+impl ApiDispatchContext {
+    /// Create a dispatch context for one editor instance.
+    #[must_use]
+    pub fn new(editor: Rc<RefCell<Editor>>) -> Self {
+        Self { editor, textlock_depth: Rc::new(Cell::new(0)) }
+    }
+
+    /// Enter textlock until the returned guard is dropped.
+    #[must_use]
+    pub fn enter_textlock(&self) -> TextlockGuard {
+        self.textlock_depth.set(self.textlock_depth.get().saturating_add(1));
+        TextlockGuard { depth: self.textlock_depth.clone() }
+    }
+
+    fn text_locked(&self) -> bool {
+        self.textlock_depth.get() != 0
+    }
+}
+
+/// Scope guard returned by [`ApiDispatchContext::enter_textlock`].
+pub struct TextlockGuard {
+    depth: Rc<Cell<u32>>,
+}
+
+impl Drop for TextlockGuard {
+    fn drop(&mut self) {
+        self.depth.set(self.depth.get().saturating_sub(1));
+    }
 }
 
 /// Shared nesting counter for libuv-style fast callbacks.
@@ -222,28 +239,39 @@ fn install_schedule(lua: &Lua, vim: &Table, scheduler: Rc<dyn Scheduler>) -> mlu
     )
 }
 
-/// Populate `vim.api` from a generated API registry view.
-pub fn bind_api<R: ApiRegistry>(
+/// Populate `vim.api` from the concrete API registry.
+pub fn bind_api(
     lua: &Lua,
-    registry: &R,
+    registry: &Registry,
+    context: ApiDispatchContext,
     fast_state: FastCallbackState,
 ) -> mlua::Result<()> {
     let vim: Table = lua.globals().get("vim")?;
     let api: Table = vim.get("api")?;
 
-    for entry in registry.functions() {
+    for (metadata, dispatch) in registry.iter() {
+        let name = metadata.name;
+        let fast = metadata.fast;
+        let textlock = metadata.textlock;
         let state = fast_state.clone();
+        let context = context.clone();
         api.set(
-            entry.name,
+            name,
             lua.create_function(move |lua, args: Variadic<Value>| {
-                if state.in_fast_callback() && (!entry.fast || entry.textlock) {
-                    state.guard(entry.name)?;
+                if state.in_fast_callback() && !fast {
+                    state.guard(name)?;
+                }
+                if textlock && context.text_locked() {
+                    return Err(mlua::Error::runtime(
+                        "E565: Not allowed to change text or change window",
+                    ));
                 }
                 let args = args
                     .iter()
                     .map(|value| lua_to_object(lua, value).map_err(mlua::Error::external))
                     .collect::<Result<Vec<_>, _>>()?;
-                let result = (entry.dispatch)(&args).map_err(mlua::Error::external)?;
+                let result = dispatch(&mut context.editor.borrow_mut(), &args)
+                    .map_err(mlua::Error::external)?;
                 object_to_lua(lua, &result).map_err(mlua::Error::external)
             })?,
         )?;

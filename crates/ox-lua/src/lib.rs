@@ -17,6 +17,6 @@ pub use converter::{
 pub use host::{ExecError, HostError, LuaHost, RuntimeRoot};
 pub use typval_bridge::{lua_to_typval, typval_to_lua};
 pub use vim::{
-    bind_api, call_with_traceback, install_vim_core, ApiFunction, ApiRegistry, BuiltinHost,
-    FastCallbackGuard, FastCallbackState, Scheduler, Work,
+    bind_api, call_with_traceback, install_vim_core, ApiDispatchContext, BuiltinHost,
+    FastCallbackGuard, FastCallbackState, Scheduler, TextlockGuard, Work,
 };

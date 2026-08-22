@@ -7,12 +7,13 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use mlua::{Function, MultiValue, Value};
+use ox_editor::{Editor, Geometry};
 use ox_lua::{
     bind_api, call_with_traceback, lua_to_object, lua_to_typval, object_to_lua, typval_to_lua,
-    ApiFunction, ApiRegistry, BuiltinHost, ConversionError, ExecError, LuaHost, RuntimeRoot,
-    Scheduler, Work, CONVERSION_RECURSION_LIMIT,
+    ApiDispatchContext, BuiltinHost, ConversionError, ExecError, LuaHost, RuntimeRoot, Scheduler,
+    Work, CONVERSION_RECURSION_LIMIT,
 };
-use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, Special, TabHandle, Typval, WinHandle};
+use ox_types::{BufHandle, Dict, Object, OxStr, Special, TabHandle, Typval, WinHandle};
 
 struct TestUserdata(i64);
 
@@ -283,33 +284,38 @@ fn vim_call_and_fn_dispatch_through_builtin_host() {
     assert_eq!(calls[1].0, OxStr::from("Other"));
 }
 
-struct OneApi;
-
-#[allow(clippy::unnecessary_wraps)]
-fn nil_api(_: &[Object]) -> Result<Object, ApiError> {
-    Ok(Object::Nil)
-}
-
-impl ApiRegistry for OneApi {
-    fn functions(&self) -> Vec<ApiFunction> {
-        vec![ApiFunction { name: "nvim_guarded", fast: false, textlock: true, dispatch: nil_api }]
-    }
-}
-
 #[test]
-fn api_nil_uses_sentinel_and_fast_callback_raises_e5560() {
+fn api_registry_dispatches_against_editor_and_enforces_guards() {
     let (host, _, _) = host();
-    bind_api(host.lua(), &OneApi, host.fast_callbacks()).unwrap();
-    assert!(host.lua().load("return vim.api.nvim_guarded() == vim.NIL").eval::<bool>().unwrap());
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    let editor = Rc::new(RefCell::new(editor));
+    let context = ApiDispatchContext::new(editor.clone());
+    let registry = ox_api::core().unwrap();
+    bind_api(host.lua(), &registry, context.clone(), host.fast_callbacks()).unwrap();
+
+    assert_eq!(host.lua().load("return vim.api.nvim_get_current_buf()").eval::<i64>().unwrap(), i64::from(buffer));
+    assert!(host.lua().load("return vim.api.nvim_buf_set_lines(0, 0, -1, true, {'one', 'two'}) == vim.NIL").eval::<bool>().unwrap());
+    assert_eq!(
+        host.lua().load("return table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, true), ',')").eval::<String>().unwrap(),
+        "one,two",
+    );
 
     let state = host.fast_callbacks();
-    let guard = state.enter();
-    let error = host.lua().load("return vim.api.nvim_guarded()").eval::<Value>().unwrap_err();
+    let fast_guard = state.enter();
+    let error = host.lua().load("return vim.api.nvim_get_current_buf()").eval::<Value>().unwrap_err();
     assert!(error.to_string().contains("E5560"));
     let builtin_error = host.lua().load("return vim.call('Record')").eval::<Value>().unwrap_err();
     assert!(builtin_error.to_string().contains("E5560"));
-    drop(guard);
+    drop(fast_guard);
     assert!(!state.in_fast_callback());
+
+    let textlock_guard = context.enter_textlock();
+    let error = host.lua().load("return vim.api.nvim_buf_set_lines(0, 0, -1, true, {'blocked'})").eval::<Value>().unwrap_err();
+    assert!(error.to_string().contains("E565"));
+    drop(textlock_guard);
+    assert_eq!(editor.borrow().buffer(buffer).unwrap().text().unwrap().line_count(), 2);
 }
 
 #[test]

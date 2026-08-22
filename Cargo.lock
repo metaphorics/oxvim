@@ -460,6 +460,8 @@ version = "0.1.0"
 dependencies = [
  "libloading",
  "mlua",
+ "ox-api",
+ "ox-editor",
  "ox-regex",
  "ox-rpc",
  "ox-types",
