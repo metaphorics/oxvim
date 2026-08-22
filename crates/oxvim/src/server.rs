@@ -38,6 +38,18 @@ use crate::AppError;
 use crate::cli::{Cli, UserConfig};
 use crate::runtime::runtime_root;
 
+#[derive(Default)]
+struct TerminalChannelSink {
+    output: BTreeMap<u64, Vec<u8>>,
+}
+
+impl ox_api::ChannelSink for TerminalChannelSink {
+    fn send(&mut self, channel: u64, bytes: &[u8]) -> Result<(), String> {
+        self.output.entry(channel).or_default().extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
 /// All mutable state shared by every RPC transport.
 pub struct AppState {
     editor: Rc<RefCell<Editor>>,
@@ -84,6 +96,7 @@ impl AppState {
             lua.fast_callbacks(),
         )
         .map_err(|error| AppError::Lua(error.to_string()))?;
+        ox_api::set_channel_sink(&editor.borrow(), Box::new(TerminalChannelSink::default()));
 
         // Load the reachable embedded core prelude before user-controlled Ex startup commands.
         lua.exec("require('vim._core.shared')", Vec::new())
@@ -465,6 +478,7 @@ impl AppState {
         match message {
             Message::Request { msgid, method, params } => {
                 let is_input = method.as_bytes() == b"nvim_input" || method.as_bytes() == b"nvim_feedkeys";
+                let is_ui_attach = method.as_bytes() == b"nvim_ui_attach";
                 let dispatched = self.dispatch(channel, &method, &params);
                 let (result, mut redraws) = match dispatched {
                     Ok((result, redraws)) => (Ok(result), redraws),
@@ -488,8 +502,14 @@ impl AppState {
                         }
                     }
                 }
-                writes.push((channel.get(), Message::Response { msgid, result }.encode_bytes()));
-                writes.extend(redraws);
+                let response = (channel.get(), Message::Response { msgid, result }.encode_bytes());
+                if is_ui_attach {
+                    writes.extend(redraws);
+                    writes.push(response);
+                } else {
+                    writes.push(response);
+                    writes.extend(redraws);
+                }
             }
             Message::Notification { method, params } => {
                 let is_input = method.as_bytes() == b"nvim_input" || method.as_bytes() == b"nvim_feedkeys";

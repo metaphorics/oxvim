@@ -235,6 +235,29 @@ fn clearing_fallback_message_emits_blanking_grid_line() {
 }
 
 #[test]
+fn initial_redraw_emits_startup_metadata_once() {
+    let compositor = Compositor::new(8, 3);
+    let mut channels = UiChannels::new();
+    channels.attach(12, 8, 3, UiOptions { ext_linegrid: true, ..UiOptions::default() }).unwrap();
+    let mut emitter = Emitter::new();
+    let mut highlights = HlState::new();
+    let mut chrome = ChromeState::new();
+
+    let first = emitter.redraw(&mut channels, &compositor, &mut highlights, &mut chrome).unwrap();
+    let first_names = event_names(decode(&first[&12]).unwrap());
+    for required in ["option_set", "default_colors_set", "hl_attr_define", "mode_info_set"] {
+        assert!(first_names.contains(&required.to_owned()), "missing startup event {required}: {first_names:?}");
+    }
+    assert_eq!(first_names.last().map(String::as_str), Some("flush"));
+
+    let second = emitter.redraw(&mut channels, &compositor, &mut highlights, &mut chrome).unwrap();
+    let second_names = event_names(decode(&second[&12]).unwrap());
+    for startup in ["option_set", "default_colors_set", "mode_info_set"] {
+        assert!(!second_names.contains(&startup.to_owned()), "repeated startup event {startup}");
+    }
+}
+
+#[test]
 fn mode_events_emit_only_on_transition_and_preserve_order() {
     let mut chrome = ChromeState::new();
     chrome.set_mode_info(true, vec![ModeInfo {

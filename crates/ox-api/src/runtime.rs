@@ -92,6 +92,7 @@ pub(crate) struct ChannelInfo {
 pub(crate) struct RuntimeState {
     pub namespaces: BTreeMap<OxStr, u32>,
     pub next_namespace: u32,
+    pub next_channel: u64,
     pub ui_channels: UiChannels,
     pub chrome: ChromeState,
     /// Active highlight definitions used for rendering (the namespace selected
@@ -129,6 +130,7 @@ impl Default for RuntimeState {
         Self {
             namespaces: BTreeMap::new(),
             next_namespace: 1,
+            next_channel: 3,
             ui_channels: UiChannels::new(),
             chrome: ChromeState::new(),
             highlights: HlState::new(),

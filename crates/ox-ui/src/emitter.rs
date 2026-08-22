@@ -73,6 +73,7 @@ impl Emitter {
             let first_redraw = self.initialized.insert(channel_id);
             channel.begin();
             let options = channel.options();
+            if first_redraw { emit_startup_metadata(channel, options)?; }
             if options.ext_multigrid {
                 self.emit_highlights(channel_id, channel, highlights, options)?;
                 let (width, height) = channel.size();
@@ -176,6 +177,86 @@ impl Emitter {
         }
         Ok(())
     }
+}
+
+fn emit_startup_metadata(
+    channel: &mut crate::channel::UiChannel,
+    options: UiOptions,
+) -> Result<(), UiChannelError> {
+    for (name, value) in [
+        ("ambiwidth", Object::String(OxStr::from("single"))),
+        ("arabicshape", Object::Boolean(true)),
+        ("emoji", Object::Boolean(true)),
+        ("guifont", Object::String(OxStr::from("Source Code Pro,DejaVu Sans Mono,Courier New,monospace"))),
+        ("guifontwide", Object::String(OxStr::from(""))),
+        ("linespace", Object::Integer(0)),
+        ("mousefocus", Object::Boolean(false)),
+        ("mousehide", Object::Boolean(true)),
+        ("mousemoveevent", Object::Boolean(false)),
+        ("pumblend", Object::Integer(0)),
+        ("showtabline", Object::Integer(1)),
+        ("termguicolors", Object::Boolean(false)),
+        ("termsync", Object::Boolean(true)),
+        ("ttimeout", Object::Boolean(true)),
+        ("ttimeoutlen", Object::Integer(50)),
+        ("verbose", Object::Integer(0)),
+    ] {
+        channel.emit(UiEvent::new("option_set", vec![Object::String(OxStr::from(name)), value]))?;
+    }
+    for (name, enabled) in [
+        ("ext_linegrid", options.ext_linegrid),
+        ("ext_multigrid", options.ext_multigrid),
+        ("ext_hlstate", options.ext_hlstate),
+        ("ext_termcolors", options.ext_termcolors),
+    ] {
+        channel.emit(UiEvent::new("option_set", vec![
+            Object::String(OxStr::from(name)),
+            Object::Boolean(enabled),
+        ]))?;
+    }
+    channel.emit(UiEvent::new("default_colors_set", vec![
+        Object::Integer(14_738_154),
+        Object::Integer(1_316_379),
+        Object::Integer(-1),
+        Object::Integer(0),
+        Object::Integer(0),
+    ]))?;
+
+    let modes = [
+        ("normal", "n", "block", 0, 0, 0, 0),
+        ("visual", "v", "block", 0, 0, 0, 0),
+        ("insert", "i", "vertical", 25, 0, 0, 0),
+        ("replace", "r", "horizontal", 20, 0, 0, 0),
+        ("cmdline_normal", "c", "block", 0, 0, 0, 0),
+        ("cmdline_insert", "ci", "vertical", 25, 0, 0, 0),
+        ("cmdline_replace", "cr", "horizontal", 20, 0, 0, 0),
+        ("operator", "o", "block", 0, 0, 0, 0),
+        ("visual_select", "ve", "block", 0, 0, 0, 0),
+        ("cmdline_hover", "c", "block", 0, 0, 0, 0),
+        ("statusline_hover", "s", "block", 0, 0, 0, 0),
+        ("statusline_drag", "sd", "block", 0, 0, 0, 0),
+        ("vsep_hover", "vs", "block", 0, 0, 0, 0),
+        ("vsep_drag", "vd", "block", 0, 0, 0, 0),
+        ("more", "m", "block", 0, 0, 0, 0),
+        ("more_lastline", "ml", "block", 0, 0, 0, 0),
+        ("showmatch", "sm", "block", 0, 0, 0, 0),
+        ("terminal", "t", "block", 0, 500, 500, 0),
+    ].into_iter().map(|(name, short_name, cursor_shape, cell_percentage, blinkwait, blinkon, blinkoff)| {
+        Object::Dict(ox_types::Dict(vec![
+            (OxStr::from("name"), Object::String(OxStr::from(name))),
+            (OxStr::from("short_name"), Object::String(OxStr::from(short_name))),
+            (OxStr::from("cursor_shape"), Object::String(OxStr::from(cursor_shape))),
+            (OxStr::from("cell_percentage"), Object::Integer(cell_percentage)),
+            (OxStr::from("blinkwait"), Object::Integer(blinkwait)),
+            (OxStr::from("blinkon"), Object::Integer(blinkon)),
+            (OxStr::from("blinkoff"), Object::Integer(blinkoff)),
+            (OxStr::from("attr_id"), Object::Integer(0)),
+            (OxStr::from("attr_id_lm"), Object::Integer(0)),
+            (OxStr::from("hl_id"), Object::Integer(0)),
+            (OxStr::from("id_lm"), Object::Integer(0)),
+        ]))
+    }).collect();
+    channel.emit(UiEvent::new("mode_info_set", vec![Object::Boolean(true), Object::Array(modes)]))
 }
 
 fn emit_position(

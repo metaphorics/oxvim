@@ -6,6 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::VecDeque;
 
 use rmpv::Value;
 
@@ -14,6 +15,7 @@ struct Embedded {
     input: ChildStdin,
     output: BufReader<ChildStdout>,
     next_id: i64,
+    pending: VecDeque<Value>,
 }
 
 impl Embedded {
@@ -33,7 +35,7 @@ impl Embedded {
             .expect("spawn oxvim --embed");
         let input = child.stdin.take().expect("embedded stdin");
         let output = BufReader::new(child.stdout.take().expect("embedded stdout"));
-        Self { child, input, output, next_id: 1 }
+        Self { child, input, output, next_id: 1, pending: VecDeque::new() }
     }
 
     fn notify(&mut self, method: &str, params: Vec<Value>) {
@@ -61,6 +63,7 @@ impl Embedded {
             let response = rmpv::decode::read_value(&mut self.output).expect("decode response");
             let Value::Array(fields) = response else { panic!("response is not an array") };
             if fields.first() == Some(&Value::from(2)) {
+                self.pending.push_back(Value::Array(fields));
                 continue;
             }
             assert_eq!(fields.len(), 4);
@@ -72,7 +75,9 @@ impl Embedded {
     }
 
     fn next_message(&mut self) -> Value {
-        rmpv::decode::read_value(&mut self.output).expect("decode message")
+        self.pending.pop_front().unwrap_or_else(|| {
+            rmpv::decode::read_value(&mut self.output).expect("decode message")
+        })
     }
 
     fn request_error(&mut self, method: &str, params: Vec<Value>) -> Value {
@@ -90,6 +95,7 @@ impl Embedded {
             let response = rmpv::decode::read_value(&mut self.output).expect("decode response");
             let Value::Array(fields) = response else { panic!("response is not an array") };
             if fields.first() == Some(&Value::from(2)) {
+                self.pending.push_back(Value::Array(fields));
                 continue;
             }
             assert_eq!(fields.len(), 4);
@@ -209,6 +215,35 @@ fn embedded_stdio_serves_core_rpc_contracts() {
 }
 
 #[test]
+fn terminal_channels_allocate_and_accept_bytes() {
+    let mut oxvim = Embedded::spawn();
+    let value = oxvim.request(
+        "nvim_exec_lua",
+        vec![
+            Value::from("local c=vim.api.nvim_open_term(0, {}); local sent=vim.api.nvim_chan_send(c, 'echo'); return {c, sent, vim.api.nvim_get_chan_info(c)}"),
+            Value::Array(vec![]),
+        ],
+    );
+    let Value::Array(values) = value else { panic!("terminal result is not an array") };
+    assert_eq!(values[0], Value::from(3));
+    assert_eq!(values[1], Value::Nil);
+    assert_eq!(map_get(&values[2], "id"), &Value::from(3));
+    assert_eq!(map_get(&values[2], "mode"), &Value::from("terminal"));
+    assert_eq!(map_get(&values[2], "stream"), &Value::from("socket"));
+    assert_eq!(map_get(&values[2], "buffer"), &Value::from(1));
+
+    assert_eq!(
+        oxvim.request(
+            "nvim_exec_lua",
+            vec![Value::from("return vim.api.nvim_open_term(0, {})"), Value::Array(vec![])],
+        ),
+        Value::from(4),
+    );
+    let error = oxvim.request_error("nvim_chan_send", vec![Value::from(99), Value::from("bad")]);
+    assert!(contains_string(&error, "Invalid channel: 99"));
+}
+
+#[test]
 fn attached_ui_receives_flushed_initial_and_mutation_redraws() {
     let mut oxvim = Embedded::spawn();
     assert_eq!(
@@ -238,6 +273,10 @@ fn attached_ui_receives_flushed_initial_and_mutation_redraws() {
     let initial = oxvim.next_message();
     let initial_names = redraw_names(&initial);
     assert_eq!(initial_names.last(), Some(&"flush"));
+    assert!(initial_names.contains(&"option_set"));
+    assert!(initial_names.contains(&"default_colors_set"));
+    assert!(initial_names.contains(&"hl_attr_define"));
+    assert!(initial_names.contains(&"mode_info_set"));
     assert!(contains_string(&initial, "o"));
 
     assert_eq!(

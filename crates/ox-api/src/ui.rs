@@ -5,7 +5,7 @@ use ox_editor::{Editor, Keys, RegisterContent, Remap, TypeaheadFlags};
 use ox_text::Position;
 use ox_ui::{Highlight, HlAttrs, UiOptions};
 
-use crate::runtime::{with_state, with_state_mut, RuntimeState};
+use crate::runtime::{ChannelInfo, RuntimeState, with_state, with_state_mut};
 use crate::{api, ApiError, BufHandle, Dict, Object, OxStr, Registry, RegistryError};
 
 const CHANNEL_ID: u64 = 1;
@@ -161,8 +161,27 @@ pub fn nvim_create_buf(editor: &mut Editor, listed: bool, _scratch: bool) -> Res
 }
 
 #[api(since = 5)]
-pub fn nvim_open_term(_editor: &mut Editor, _buffer: BufHandle, _opts: Dict) -> Result<i64, ApiError> {
-    Err(ApiError::exception("NotImplemented: terminal job state is not connected"))
+pub fn nvim_open_term(editor: &mut Editor, buffer: BufHandle, _opts: Dict) -> Result<i64, ApiError> {
+    let buffer = if buffer.is_current() {
+        editor.current_buffer().ok_or_else(|| ApiError::validation("No current buffer"))?
+    } else {
+        editor.buffer(buffer).map_err(|error| ApiError::validation(error.to_string()))?;
+        buffer
+    };
+    with_state_mut(editor, |state| {
+        let channel = state.next_channel;
+        state.next_channel = state.next_channel.checked_add(1)
+            .ok_or_else(|| ApiError::exception("channel id space exhausted"))?;
+        state.channels.insert(channel, ChannelInfo {
+            id: channel,
+            stream: OxStr::from("socket"),
+            mode: OxStr::from("terminal"),
+            pty: None,
+            buffer: Some(i64::from(buffer)),
+            client: Dict(Vec::new()),
+        });
+        i64::try_from(channel).map_err(|_| ApiError::exception("channel id exceeds Integer range"))
+    })
 }
 
 fn queue(editor: &mut Editor, data: &[u8], remap: Remap) -> Result<(), ApiError> {
