@@ -5,5 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 description = "binary entry point (CLI parsing, startup, server/client fork)."
 
+[dependencies]
+mlua.workspace = true
+ox-api = { path = "../ox-api" }
+ox-editor = { path = "../ox-editor" }
+ox-lua = { path = "../ox-lua" }
+ox-rpc = { path = "../ox-rpc" }
+ox-types = { path = "../ox-types" }
+
+[dev-dependencies]
+rmpv.workspace = true
+
 [lints]
 workspace = true

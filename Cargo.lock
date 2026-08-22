@@ -544,6 +544,15 @@ dependencies = [
 [[package]]
 name = "oxvim"
 version = "0.1.0"
+dependencies = [
+ "mlua",
+ "ox-api",
+ "ox-editor",
+ "ox-lua",
+ "ox-rpc",
+ "ox-types",
+ "rmpv",
+]
 
 [[package]]
 name = "parking_lot"
