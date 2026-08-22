@@ -940,6 +940,9 @@ fn fnamemodify_obeys_filename_modifier_order() {
     assert_eq!(call("fnamemodify", vec![text("src/archive.tar.gz"), text(":t:r:r")]).unwrap(), text("archive"));
     assert_eq!(call("fnamemodify", vec![text("src/archive.tar.gz"), text(":e:e")]).unwrap(), text("tar.gz"));
     assert_eq!(call("fnamemodify", vec![text(".nvimrc"), text(":r")]).unwrap(), text(".nvimrc"));
+    assert_eq!(call("fnamemodify", vec![text("src/"), text(":h")]).unwrap(), text("src"));
+    assert_eq!(call("fnamemodify", vec![text("src/"), text(":t")]).unwrap(), text(""));
+    assert_eq!(call("fnamemodify", vec![text("src/x"), text(":8:t")]).unwrap(), text("x"));
     assert_eq!(call("fnamemodify", vec![text(""), text(":h")]).unwrap(), text("."));
 }
 

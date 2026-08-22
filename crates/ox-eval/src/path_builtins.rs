@@ -113,6 +113,7 @@ pub(crate) fn fnamemodify(
         };
         cursor += 1;
         match modifier {
+            b'8' => {}
             b'p' => name = absolute_name(&name),
             b'~' => name = relative_to_home(&name),
             b'.' => name = relative_to_current(&name),
@@ -420,21 +421,22 @@ fn path_head(name: &str) -> String {
     if name.is_empty() {
         return ".".to_owned();
     }
-    let trimmed = if name.len() > 1 {
-        name.trim_end_matches('/')
-    } else {
-        name
-    };
-    match trimmed.rfind('/') {
+    if name.len() > 1 && name.ends_with('/') {
+        return name.trim_end_matches('/').to_owned();
+    }
+    match name.rfind('/') {
         Some(0) => "/".to_owned(),
-        Some(index) => trimmed[..index].to_owned(),
+        Some(index) => name[..index].to_owned(),
         None => String::new(),
     }
 }
 
 fn path_tail(name: &str) -> String {
-    let trimmed = name.trim_end_matches('/');
-    trimmed.rsplit('/').next().unwrap_or(trimmed).to_owned()
+    if name.ends_with('/') {
+        String::new()
+    } else {
+        name.rsplit('/').next().unwrap_or(name).to_owned()
+    }
 }
 
 fn tail_dot(name: &str) -> Option<usize> {
