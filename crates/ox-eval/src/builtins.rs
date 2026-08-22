@@ -604,17 +604,29 @@ pub fn call_buffer_builtin(buffer: &mut dyn BufferHost, name: &str, args: Vec<Ty
     }
 }
 
-/// `tv_get_lnum` (`eval/typval.c`): numeric conversion first; the `"$"`
-/// special resolves to the last line through the seam. Other strings that
-/// upstream would translate through `var2fpos` (`.`, `'x`, `w0`) have no
-/// position state on this seam and degrade to 0.
-fn lnum_arg(value: &Typval, line_count: usize) -> Result<i64> {
+/// `tv_get_lnum` (`eval/typval.c`): numeric conversion first — a Number, or
+/// the parsed integer prefix of a String (`"5"` → 5). When that yields a
+/// non-positive value for a String, the address is translated like
+/// `var2fpos`: `"$"` resolves to the last line through the seam, `"."` and
+/// `"'x"` through [`BufferHost::address_line`]. An unresolvable address
+/// degrades to 0.
+fn lnum_arg(buffer: &dyn BufferHost, value: &Typval) -> Result<i64> {
+    let numeric = number_arg(value)?;
+    if numeric > 0 {
+        return Ok(numeric);
+    }
     if let Typval::String(text) = value {
-        if text.as_bytes() == b"$" {
-            return Ok(saturating_i64(line_count));
+        if !text.as_bytes().is_empty() {
+            let address = text.to_string_lossy();
+            if text.as_bytes() == b"$" {
+                return Ok(saturating_i64(buffer.line_count()?));
+            }
+            if let Some(line) = buffer.address_line(&address)? {
+                return Ok(line);
+            }
         }
     }
-    number_arg(value)
+    Ok(numeric)
 }
 
 /// `typval_tostring(value, false)` (`eval.c`): a String stays itself; any
@@ -632,7 +644,7 @@ fn line_text_arg(value: &Typval) -> Result<OxStr> {
 /// an empty List.
 fn get_buffer_lines(buffer: &mut dyn BufferHost, args: &[Typval]) -> Result<Typval> {
     let line_count = buffer.line_count()?;
-    let start = lnum_arg(&args[0], line_count)?;
+    let start = lnum_arg(buffer, &args[0])?;
     let Some(end_arg) = args.get(1) else {
         let line = if start >= 1 && start <= saturating_i64(line_count) {
             buffer.get_line(start as usize)?
@@ -641,7 +653,7 @@ fn get_buffer_lines(buffer: &mut dyn BufferHost, args: &[Typval]) -> Result<Typv
         };
         return Ok(Typval::String(line.unwrap_or_else(|| OxStr(Vec::new()))));
     };
-    let end = lnum_arg(end_arg, line_count)?;
+    let end = lnum_arg(buffer, end_arg)?;
     if start < 0 || end < start {
         return Ok(Typval::list(Vec::new()));
     }
@@ -659,8 +671,7 @@ fn get_buffer_lines(buffer: &mut dyn BufferHost, args: &[Typval]) -> Result<Typv
 /// onto consecutive lines, stops at the first line past `line_count + 1`,
 /// and reports failure as 1 — except an empty List, which always succeeds.
 fn set_buffer_lines(buffer: &mut dyn BufferHost, args: &[Typval]) -> Result<Typval> {
-    let line_count = buffer.line_count()?;
-    let mut lnum = lnum_arg(&args[0], line_count)?;
+    let mut lnum = lnum_arg(buffer, &args[0])?;
     if lnum < 1 {
         return Ok(Typval::Number(1));
     }

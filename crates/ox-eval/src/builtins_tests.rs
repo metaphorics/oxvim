@@ -739,11 +739,13 @@ fn string_callbacks_preserve_invalid_bytes() {
 #[derive(Default)]
 struct FakeBuffer {
     lines: Vec<String>,
+    cursor: Option<i64>,
+    marks: Vec<(char, i64)>,
 }
 
 impl FakeBuffer {
     fn new(lines: &[&str]) -> Self {
-        Self { lines: lines.iter().map(|line| (*line).to_owned()).collect() }
+        Self { lines: lines.iter().map(|line| (*line).to_owned()).collect(), cursor: None, marks: Vec::new() }
     }
 }
 
@@ -764,6 +766,17 @@ impl crate::eval::BufferHost for FakeBuffer {
     fn append_line(&mut self, text: &OxStr) -> crate::Result<()> {
         self.lines.push(text.to_string_lossy().into_owned());
         Ok(())
+    }
+
+    fn address_line(&self, address: &str) -> crate::Result<Option<i64>> {
+        let mut chars = address.chars();
+        match chars.next() {
+            Some('.') if chars.next().is_none() => Ok(self.cursor),
+            Some('\'') => Ok(chars.next().and_then(|name| {
+                self.marks.iter().find(|(mark, _)| *mark == name).map(|(_, line)| *line)
+            })),
+            _ => Ok(None),
+        }
     }
 }
 
@@ -919,6 +932,52 @@ fn getline_dollar_address_reads_last_line() {
     let (result, _) = buffer_call(&["a", "b", "c"], "getline", vec![number(2), text("$")]);
     let expected = Typval::list(vec![text("b"), text("c")]);
     assert_eq!(result.unwrap(), expected);
+}
+
+// tv_get_lnum: after a non-positive numeric conversion of a String, the
+// address translates through var2fpos — "." is the cursor, "'x" a mark.
+#[test]
+fn getline_dot_and_mark_addresses_translate_through_the_seam() {
+    let mut buffer = FakeBuffer::new(&["a", "b", "c"]);
+    buffer.cursor = Some(2);
+    buffer.marks = vec![('a', 3)];
+    let result = crate::builtins::call_buffer_builtin(&mut buffer, "getline", vec![text(".")]);
+    assert_eq!(result.unwrap(), text("b"));
+    let result = crate::builtins::call_buffer_builtin(&mut buffer, "getline", vec![text("'a")]);
+    assert_eq!(result.unwrap(), text("c"));
+    let result = crate::builtins::call_buffer_builtin(
+        &mut buffer,
+        "getline",
+        vec![text("'a"), text("$")],
+    );
+    assert_eq!(result.unwrap(), Typval::list(vec![text("c")]));
+}
+
+#[test]
+fn getline_unresolved_address_degrades_to_zero() {
+    // var2fpos returns NULL for an unset mark or an unknown address; the
+    // lnum stays 0 and getline("'z") reads no line.
+    let mut buffer = FakeBuffer::new(&["a", "b"]);
+    buffer.cursor = None;
+    let result = crate::builtins::call_buffer_builtin(&mut buffer, "getline", vec![text("'z")]);
+    assert_eq!(result.unwrap(), text(""));
+    let result = crate::builtins::call_buffer_builtin(&mut buffer, "getline", vec![text("w0")]);
+    assert_eq!(result.unwrap(), text(""));
+}
+
+#[test]
+fn setline_accepts_string_addresses() {
+    let mut buffer = FakeBuffer::new(&["a", "b", "c"]);
+    buffer.cursor = Some(2);
+    let result =
+        crate::builtins::call_buffer_builtin(&mut buffer, "setline", vec![text("."), text("x")]);
+    assert_eq!(result.unwrap(), number(0));
+    assert_eq!(buffer.lines, vec!["a", "x", "c"]);
+    // An unresolvable address keeps the failure result of lnum 0.
+    let result =
+        crate::builtins::call_buffer_builtin(&mut buffer, "setline", vec![text("'z"), text("y")]);
+    assert_eq!(result.unwrap(), number(1));
+    assert_eq!(buffer.lines, vec!["a", "x", "c"]);
 }
 
 #[test]

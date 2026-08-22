@@ -57,10 +57,7 @@ pub trait RegexEngine {
 /// Hosts that own a current buffer implement this seam and route the two
 /// buffer builtins through [`crate::builtins::call_buffer_builtin`] before
 /// generic dispatch; hosts without a buffer leave those names
-/// unimplemented. Line numbers are 1-based. The seam is deliberately
-/// minimal: cursor-, mark-, and window-dependent string addresses
-/// (`.`, `'x`, `w0`, `w$`) are not translated and degrade to 0 exactly
-/// like an unresolvable upstream `var2fpos` call.
+/// unimplemented. Line numbers are 1-based.
 pub trait BufferHost {
     /// Number of lines in the current buffer.
     fn line_count(&self) -> Result<usize>;
@@ -73,6 +70,15 @@ pub trait BufferHost {
 
     /// Append `text` as the new last line.
     fn append_line(&mut self, text: &OxStr) -> Result<()>;
+
+    /// Resolve a string line address (`.`, `'x`) to its 1-based line,
+    /// mirroring the `var2fpos` half of upstream `tv_get_lnum` for string
+    /// arguments. `None` when the address names no position (an unset
+    /// mark), which degrades to 0 exactly like upstream returning `NULL`.
+    /// The `"$"` last-line address stays with [`BufferHost::line_count`].
+    fn address_line(&self, _address: &str) -> Result<Option<i64>> {
+        Ok(None)
+    }
 }
 
 /// Host used when builtins have not been installed.
