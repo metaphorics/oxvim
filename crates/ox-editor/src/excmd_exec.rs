@@ -768,6 +768,8 @@ fn dispatch<F: FileIO>(
         "bnext" => command_buffer_step(runtime, editor, command, 1),
         "bprevious" | "bprev" => command_buffer_step(runtime, editor, command, -1),
         "buffer" => command_buffer(runtime, editor, command),
+        "bwipeout" | "bwipe" => command_buffer_remove(runtime, editor, command, true),
+        "bdelete" | "bdel" | "bunload" | "bun" => command_buffer_remove(runtime, editor, command, false),
         "put" => command_put(runtime, editor, command),
         "print" => command_print(runtime, editor, command),
         "delete" => command_delete(runtime, editor, command),
@@ -1193,6 +1195,43 @@ impl BufferHost for CurrentBuffer<'_> {
             .map(|_| ())
             .map_err(|error| EvalError::new("E16", 0, error.to_string()))
     }
+
+    /// `var2fpos` for string lnum arguments: `"."` is the current window's
+    /// cursor line, `"'x"` the mark position (buffer-local first, then the
+    /// uppercase/numbered global marks, like `getmark`).
+    fn address_line(&self, address: &str) -> ox_eval::Result<Option<i64>> {
+        let mut chars = address.chars();
+        match chars.next() {
+            Some('.') if chars.next().is_none() => {
+                Ok(Some(self.cursor_or(Position { lnum: 1, col: 0 }).lnum as i64))
+            }
+            Some('\'') => {
+                let Some(name) = chars.next() else { return Ok(None) };
+                let Some(buffer) = self.0.current_buffer() else { return Ok(None) };
+                let local = self
+                    .0
+                    .local_mark(buffer, name)
+                    .map_err(|error| EvalError::new("E749", 0, error.to_string()))?
+                    .map(|position| position.lnum);
+                if let Some(line) = local {
+                    return Ok(Some(line as i64));
+                }
+                let global = if name.is_ascii_uppercase() || name.is_ascii_digit() {
+                    self.0
+                        .global_marks()
+                        .get(name)
+                        .map_err(|error| EvalError::new("E749", 0, error.to_string()))?
+                        .and_then(|location| {
+                            (location.buffer() == Some(buffer)).then_some(location.position.lnum)
+                        })
+                } else {
+                    None
+                };
+                Ok(global.map(|line| line as i64))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 impl CurrentBuffer<'_> {
@@ -1546,7 +1585,10 @@ fn command_call<F: FileIO>(
     let Some(close) = text.rfind(')') else {
         return error_flow(runtime, "E107", "Missing parentheses: :call");
     };
-    if close + 1 != text.len() {
+    // ex_call: only text that `ends_excmd` rejects is trailing — a `"`
+    // comment (with or without leading whitespace) ends the command.
+    let trailing = text[close + 1..].trim_start();
+    if !trailing.is_empty() && !trailing.starts_with('"') {
         return error_flow(runtime, "E488", "Trailing characters");
     }
     let name = text[..open].trim();
@@ -1570,7 +1612,7 @@ fn command_call<F: FileIO>(
                     }
                 }
             }
-            if let Err(flow) = eval_text(runtime, editor, scope, lua, text) {
+            if let Err(flow) = eval_text(runtime, editor, scope, lua, &text[..=close]) {
                 return flow;
             }
         }
@@ -1975,7 +2017,6 @@ fn command_edit<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, comm
     }
     Flow::Normal
 }
-
 fn command_enew<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
     if let Some(current) = editor.current_buffer() {
         if editor.buffer(current).is_ok_and(|buffer| buffer.modified) && !command.bang {
@@ -1994,6 +2035,69 @@ fn command_enew<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, comm
         return error_flow(runtime, "E948", error.to_string());
     }
     Flow::Normal
+}
+
+/// `:bwipeout`/`:bdelete` (`ex_cmds.c` ex_bwipe/ex_bdelete): resolve the
+/// buffer from the count or argument (defaulting to the current buffer),
+/// move displaying windows onto another buffer, then wipe or unload it.
+/// The modified-buffer guard matches `do_buffer`'s E89.
+fn command_buffer_remove<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    command: &ExCommand,
+    wipe: bool,
+) -> Flow {
+    let requested = command
+        .count
+        .and_then(|value| i64::try_from(value).ok())
+        .or_else(|| command.args.trim().parse::<i64>().ok());
+    let target = match requested.and_then(|value| BufHandle::try_from(value).ok()) {
+        Some(handle) => handle,
+        None => match editor.current_buffer() {
+            Some(handle) => handle,
+            None => return error_flow(runtime, "E85", "There is no listed buffer"),
+        },
+    };
+    if editor.buffer(target).is_err() {
+        return error_flow(runtime, "E86", format!("Buffer {} does not exist", i64::from(target)));
+    }
+    if !command.bang && editor.buffer(target).is_ok_and(|state| state.modified) {
+        return error_flow(runtime, "E89", "No write since last change (add ! to override)");
+    }
+    let mut attached = Vec::new();
+    for window in editor.windows() {
+        if editor.window(window).is_ok_and(|state| state.buffer == target) {
+            attached.push(window);
+        }
+    }
+    if !attached.is_empty() {
+        let replacement = match editor.buffers().into_iter().find(|&buffer| buffer != target) {
+            Some(other) => other,
+            None => match editor.create_buffer(true) {
+                Ok(handle) => handle,
+                Err(error) => return error_flow(runtime, "E948", error.to_string()),
+            },
+        };
+        for window in attached {
+            if let Err(error) = editor.set_window_buffer(window, replacement, BufferRelease::KeepLoaded) {
+                return error_flow(runtime, "E948", error.to_string());
+            }
+        }
+    }
+    if !wipe {
+        // `:bdelete` keeps the buffer loaded but removes it from the list.
+        if let Ok(state) = editor.buffer_mut(target) {
+            state.listed = false;
+        }
+        return match editor.unload_buffer(target) {
+            Ok(()) => Flow::Normal,
+            Err(error) => error_flow(runtime, "E90", error.to_string()),
+        };
+    }
+    match editor.wipe_buffer(target) {
+        Ok(_) => Flow::Normal,
+        Err(error) => error_flow(runtime, "E90", error.to_string()),
+    }
 }
 
 fn command_write<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {

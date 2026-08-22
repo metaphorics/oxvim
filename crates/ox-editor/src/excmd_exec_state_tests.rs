@@ -495,6 +495,20 @@ fn e488_from_call_trailing_characters() {
     }
 }
 
+// ex_call: `ends_excmd` accepts a `"` after the closing parenthesis, so a
+// trailing comment is not "trailing characters" (userfunc.c:3615).
+#[test]
+fn call_allows_trailing_comment_after_closing_paren() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(&mut editor, "test", "function Store()\n  let g:stored = 1\nendfunction")
+        .unwrap();
+    exec.execute_line(&mut editor, "call Store()  \" comment here")
+        .unwrap();
+    exec.execute_line(&mut editor, "call Store()\"tight comment").unwrap();
+    assert!(exec.execute_line(&mut editor, "call Store()trailing").is_err());
+}
+
 // ── lua ────────────────────────────────────────────────────────────────
 
 use std::cell::RefCell;

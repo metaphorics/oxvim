@@ -687,6 +687,58 @@ fn setline_marks_buffer_modified() {
     assert!(editor.buffer(buffer).unwrap().modified);
 }
 
+/// String line addresses translate per `tv_get_lnum`: `"."` is the cursor
+/// line, `"'a"` the local mark, and an unset mark reads as line 0 → "".
+/// Upstream: `eval/typval.c` `tv_get_lnum` → `var2fpos`.
+#[test]
+fn getline_string_addresses_resolve_cursor_and_marks() {
+    let (mut editor, mut executor) = setup_with_content(&[
+        b"one".to_vec(),
+        b"two".to_vec(),
+        b"three".to_vec(),
+    ]);
+    let buffer = editor.current_buffer().unwrap();
+    editor.set_local_mark(buffer, 'a', ox_text::Position { lnum: 3, col: 1 }).unwrap();
+    executor.execute_line(&mut editor, "normal! 2G").unwrap();
+    executor.execute_line(&mut editor, "let g:dot = getline('.')").unwrap();
+    executor.execute_line(&mut editor, "let g:mark = getline(\"'a\")").unwrap();
+    executor.execute_line(&mut editor, "let g:unset = getline(\"'z\")").unwrap();
+    executor.execute_line(&mut editor, "let g:range = getline('.', '$')").unwrap();
+    let string_of = |value: ox_types::Typval| match value {
+        ox_types::Typval::String(text) => text.to_string_lossy().into_owned(),
+        other => panic!("expected String, got {other:?}"),
+    };
+    assert_eq!(global_value(&executor, "dot").map(string_of), Some("two".to_owned()));
+    assert_eq!(global_value(&executor, "mark").map(string_of), Some("three".to_owned()));
+    assert_eq!(global_value(&executor, "unset").map(string_of), Some(String::new()));
+    match global_value(&executor, "range") {
+        Some(ox_types::Typval::List(list)) => {
+            let items = list.borrow().items.clone();
+            assert_eq!(items.len(), 2);
+            assert_eq!(string_of(items[0].clone()), "two");
+            assert_eq!(string_of(items[1].clone()), "three");
+        }
+        other => panic!("expected List, got {other:?}"),
+    }
+}
+
+/// `:bwipeout!` moves the displaying window onto another buffer and
+/// removes the target; the modified guard fires without `!`.
+/// Upstream: `ex_cmds.c` ex_bwipe/do_buffer.
+#[test]
+fn bwipeout_replaces_window_buffer_and_wipes() {
+    let (mut editor, mut executor) = setup_with_content(&[b"first".to_vec()]);
+    executor.execute_line(&mut editor, "enew").unwrap();
+    executor.execute_line(&mut editor, "call setline(1, 'scratch')").unwrap();
+    let target = editor.current_buffer().unwrap();
+    executor.execute_line(&mut editor, "bwipeout").unwrap_err(); // E89: modified
+    executor.execute_line(&mut editor, "bwipeout!").unwrap();
+    assert!(editor.buffer(target).is_err());
+    let current = editor.current_buffer().unwrap();
+    assert_ne!(current, target);
+    assert_eq!(buffer_text(&editor), vec!["first"]);
+}
+
 // ---------------------------------------------------------------------------
 // :print / :p
 // Citations: src/nvim/ex_docmd.c ex_print; src/nvim/ex_cmds.c print_line,
