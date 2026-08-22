@@ -18,6 +18,65 @@ use ox_uv::process::{self, Process, ProcessPipe, SpawnOptions, StdioConfig};
 use ox_uv::thread;
 use ox_uv::{Async, CallbackError, Check, Handle, HandleId, Idle, Prepare, RunMode, Signal, UvLoop};
 
+#[cfg(unix)]
+const SIGNALS: &[(&str, i32)] = &[
+    ("sighup", signal_hook::consts::SIGHUP),
+    ("sigint", signal_hook::consts::SIGINT),
+    ("sigquit", signal_hook::consts::SIGQUIT),
+    ("sigill", signal_hook::consts::SIGILL),
+    ("sigtrap", signal_hook::consts::SIGTRAP),
+    ("sigabrt", signal_hook::consts::SIGABRT),
+    ("sigbus", signal_hook::consts::SIGBUS),
+    ("sigfpe", signal_hook::consts::SIGFPE),
+    ("sigkill", signal_hook::consts::SIGKILL),
+    ("sigusr1", signal_hook::consts::SIGUSR1),
+    ("sigsegv", signal_hook::consts::SIGSEGV),
+    ("sigusr2", signal_hook::consts::SIGUSR2),
+    ("sigpipe", signal_hook::consts::SIGPIPE),
+    ("sigalrm", signal_hook::consts::SIGALRM),
+    ("sigterm", signal_hook::consts::SIGTERM),
+    ("sigchld", signal_hook::consts::SIGCHLD),
+    ("sigcont", signal_hook::consts::SIGCONT),
+    ("sigstop", signal_hook::consts::SIGSTOP),
+    ("sigtstp", signal_hook::consts::SIGTSTP),
+    ("sigttin", signal_hook::consts::SIGTTIN),
+    ("sigttou", signal_hook::consts::SIGTTOU),
+    ("sigurg", signal_hook::consts::SIGURG),
+    ("sigxcpu", signal_hook::consts::SIGXCPU),
+    ("sigxfsz", signal_hook::consts::SIGXFSZ),
+    ("sigvtalrm", signal_hook::consts::SIGVTALRM),
+    ("sigprof", signal_hook::consts::SIGPROF),
+    ("sigwinch", signal_hook::consts::SIGWINCH),
+    ("sigio", signal_hook::consts::SIGIO),
+    ("sigsys", signal_hook::consts::SIGSYS),
+    ("sigiot", signal_hook::consts::SIGABRT),
+    ("sigpoll", signal_hook::consts::SIGIO),
+];
+
+fn signal_number(value: Value) -> mlua::Result<i32> {
+    match value {
+        Value::Integer(number) => i32::try_from(number)
+            .map_err(|_| mlua::Error::runtime(format!("invalid signal number: {number}"))),
+        Value::String(name) => {
+            let name = name.to_str()?;
+            #[cfg(unix)]
+            if let Some((_, number)) = SIGNALS.iter().find(|(candidate, _)| name == *candidate) {
+                return Ok(*number);
+            }
+            Err(mlua::Error::runtime(format!("invalid signal name: {name}")))
+        }
+        _ => Err(mlua::Error::runtime("signal must be a string or integer")),
+    }
+}
+
+fn signal_name(lua: &Lua, number: i32) -> mlua::Result<Value> {
+    #[cfg(unix)]
+    if let Some((name, _)) = SIGNALS.iter().find(|(_, candidate)| *candidate == number) {
+        return Ok(Value::String(lua.create_string(*name)?));
+    }
+    Ok(Value::Integer(i64::from(number)))
+}
+
 use crate::vim::{call_with_traceback, FastCallbackState, Scheduler};
 
 type DeferredOperation = Box<dyn FnOnce(&mut UvLoop)>;
@@ -418,12 +477,50 @@ impl UserData for LuaAsync {
         methods.add_method("close", |_, this, ()| { let handle = this.handle; this.access.apply(Box::new(move |uv_loop| { let _ = handle.close(uv_loop); }))?; Ok(()) });
     }
 }
+
 struct LuaSignal { handle: Signal, access: LoopAccess, lua: Lua, fast: FastCallbackState }
+
+impl LuaSignal {
+    fn start(&self, signum: Value, callback: Function, oneshot: bool) -> mlua::Result<i32> {
+        let signum = signal_number(signum)?;
+        let handle = self.handle;
+        let access = self.access.clone();
+        let event_access = access.clone();
+        let lua = self.lua.clone();
+        let fast = self.fast.clone();
+        access.apply(Box::new(move |uv_loop| {
+            let event_lua = lua.clone();
+            let event_fast = fast.clone();
+            let event_callback = move |loop_: &mut UvLoop, _: HandleId, delivered: i32| {
+                event_access.callback(loop_, || {
+                    let mut args = MultiValue::new();
+                    args.push_back(signal_name(&event_lua, delivered).unwrap_or(Value::Integer(i64::from(delivered))));
+                    invoke(&event_lua, &event_fast, &callback, args);
+                });
+                Ok(())
+            };
+            let _ = if oneshot {
+                handle.start_oneshot(uv_loop, signum, event_callback)
+            } else {
+                handle.start(uv_loop, signum, event_callback)
+            };
+        }))?;
+        Ok(0)
+    }
+
+    fn stop(&self) -> mlua::Result<i32> {
+        let handle = self.handle;
+        self.access.apply(Box::new(move |uv_loop| { let _ = handle.stop(uv_loop); }))?;
+        Ok(0)
+    }
+}
+
 impl UserData for LuaSignal {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("start", |_, this, (signum, callback): (i32, Function)| { let handle = this.handle; let access = this.access.clone(); let event_access = access.clone(); let lua = this.lua.clone(); let fast = this.fast.clone(); access.apply(Box::new(move |uv_loop| { let _ = handle.start(uv_loop, signum, move |loop_, _, delivered| { event_access.callback(loop_, || { let mut args=MultiValue::new(); args.push_back(Value::Integer(i64::from(delivered))); invoke(&lua,&fast,&callback,args); }); Ok(()) }); }))?; Ok(true) });
-        methods.add_method("start_oneshot", |_, this, (signum, callback): (i32, Function)| { let handle = this.handle; let access = this.access.clone(); let event_access = access.clone(); let lua = this.lua.clone(); let fast = this.fast.clone(); access.apply(Box::new(move |uv_loop| { let _ = handle.start_oneshot(uv_loop, signum, move |loop_, _, delivered| { event_access.callback(loop_, || { let mut args=MultiValue::new(); args.push_back(Value::Integer(i64::from(delivered))); invoke(&lua,&fast,&callback,args); }); Ok(()) }); }))?; Ok(true) });
-        methods.add_method("stop", |_, this, ()| { let handle=this.handle; this.access.apply(Box::new(move |uv_loop| { let _=handle.stop(uv_loop); }))?; Ok(true) });
+        methods.add_method("start", |_, this, (signum, callback): (Value, Function)| this.start(signum, callback, false));
+        methods.add_method("start_oneshot", |_, this, (signum, callback): (Value, Function)| this.start(signum, callback, true));
+        methods.add_method("stop", |_, this, ()| this.stop());
+        methods.add_method("is_closing", |_, this, ()| Ok(this.handle.is_closing(&this.access.uv_loop.borrow())));
         methods.add_method("close", |_, this, ()| { let handle=this.handle; this.access.apply(Box::new(move |uv_loop| { let _=handle.close(uv_loop); }))?; Ok(()) });
     }
 }
@@ -437,6 +534,9 @@ fn install_aux(lua: &Lua, uv: &Table, access: &LoopAccess, fast: &FastCallbackSt
     uv.set("new_async", lua.create_function(move |lua, callback: Function| { let event_access=async_access.clone(); let event_lua=async_lua.clone(); let event_fast=async_fast.clone(); let handle=Async::new(&mut async_access.uv_loop.borrow_mut(), move |loop_,_| { event_access.callback(loop_, || invoke(&event_lua,&event_fast,&callback,MultiValue::new())); Ok(()) }).map_err(mlua::Error::external)?; lua.create_userdata(LuaAsync { handle, access: async_access.clone() }) })?)?;
     let signal_access=access.clone(); let signal_lua=lua.clone(); let signal_fast=fast.clone();
     uv.set("new_signal", lua.create_function(move |lua, ()| { let handle=Signal::new(&mut signal_access.uv_loop.borrow_mut()).map_err(mlua::Error::external)?; lua.create_userdata(LuaSignal { handle, access:signal_access.clone(), lua:signal_lua.clone(), fast:signal_fast.clone() }) })?)?;
+    uv.set("signal_start", lua.create_function(|_, (signal, signum, callback): (AnyUserData, Value, Function)| signal.borrow::<LuaSignal>()?.start(signum, callback, false))?)?;
+    uv.set("signal_start_oneshot", lua.create_function(|_, (signal, signum, callback): (AnyUserData, Value, Function)| signal.borrow::<LuaSignal>()?.start(signum, callback, true))?)?;
+    uv.set("signal_stop", lua.create_function(|_, signal: AnyUserData| signal.borrow::<LuaSignal>()?.stop())?)?;
     Ok(())
 }
 

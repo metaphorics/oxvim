@@ -78,6 +78,32 @@ fn timer_callback_runs_through_the_scheduler() {
     assert!(host.lua().globals().get::<bool>("timer_fired").unwrap());
 }
 
+#[cfg(unix)]
+#[test]
+fn signal_binding_supports_luv_module_and_method_forms() {
+    let (host, _) = host();
+    host.lua()
+        .load(
+            r#"
+            local signal = assert(vim.uv.new_signal())
+            assert(vim.uv.signal_start(signal, 'sigpipe', function(signame)
+              assert(signame == 'sigpipe')
+            end) == 0)
+            assert(vim.uv.signal_stop(signal) == 0)
+            assert(signal:start_oneshot('sigpipe', function(signame)
+              assert(signame == 'sigpipe')
+            end) == 0)
+            assert(signal:stop() == 0)
+            assert(not signal:is_closing())
+            signal:close()
+            assert(signal:is_closing())
+            vim.uv.run('nowait')
+            "#,
+        )
+        .exec()
+        .unwrap();
+}
+
 #[test]
 fn callback_file_read_preserves_bytes_and_error_first_shape() {
     let path = temp_path("file-read");
