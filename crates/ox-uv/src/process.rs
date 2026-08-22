@@ -48,6 +48,8 @@ pub enum StdioConfig {
     /// Inherit the corresponding standard stream from the parent.
     #[default]
     Inherit,
+    /// Inherit an exact parent standard descriptor (0, 1, or 2).
+    InheritFd(u8),
     /// Connect the child stream to the platform null device.
     Ignore,
     /// Create a pipe and return its parent endpoint from [`spawn`].
@@ -897,9 +899,9 @@ where
     if let Some(cwd) = &options.cwd {
         command.current_dir(cwd);
     }
-    command.stdin(map_stdio(options.stdio[0]));
-    command.stdout(map_stdio(options.stdio[1]));
-    command.stderr(map_stdio(options.stdio[2]));
+    command.stdin(map_stdio(options.stdio[0])?);
+    command.stdout(map_stdio(options.stdio[1])?);
+    command.stderr(map_stdio(options.stdio[2])?);
     configure_platform_command(&mut command, &options);
 
     let prepared = prepare_extra_stdio(&options)?;
@@ -1633,12 +1635,38 @@ where
     })
 }
 
-fn map_stdio(config: StdioConfig) -> Stdio {
+fn map_stdio(config: StdioConfig) -> Result<Stdio, ProcessError> {
     match config {
-        StdioConfig::Inherit => Stdio::inherit(),
-        StdioConfig::Ignore => Stdio::null(),
-        StdioConfig::CreatePipe => Stdio::piped(),
+        StdioConfig::Inherit => Ok(Stdio::inherit()),
+        StdioConfig::InheritFd(fd) => duplicate_standard_descriptor(fd),
+        StdioConfig::Ignore => Ok(Stdio::null()),
+        StdioConfig::CreatePipe => Ok(Stdio::piped()),
     }
+}
+
+#[cfg(unix)]
+fn duplicate_standard_descriptor(fd: u8) -> Result<Stdio, ProcessError> {
+    let duplicate = match fd {
+        0 => rustix::io::dup(std::io::stdin()),
+        1 => rustix::io::dup(std::io::stdout()),
+        2 => rustix::io::dup(std::io::stderr()),
+        _ => {
+            return Err(ProcessError::Unsupported {
+                feature: "inherit standard descriptor",
+                reason: "only descriptors 0, 1, and 2 are standard streams",
+            });
+        }
+    }
+    .map_err(|error| ProcessError::io("duplicate inherited descriptor", error))?;
+    Ok(Stdio::from(duplicate))
+}
+
+#[cfg(not(unix))]
+fn duplicate_standard_descriptor(_fd: u8) -> Result<Stdio, ProcessError> {
+    Err(ProcessError::Unsupported {
+        feature: "inherit a different standard descriptor",
+        reason: "safe exact standard-descriptor duplication is unavailable on this platform",
+    })
 }
 
 #[cfg(unix)]

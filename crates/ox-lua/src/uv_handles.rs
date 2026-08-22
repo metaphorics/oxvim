@@ -607,7 +607,26 @@ pub(crate) fn install(lua: &Lua, uv: &Table, uv_loop: Rc<RefCell<UvLoop>>, sched
         let spawn_loop = uv_loop.clone(); let spawn_pending = pending_processes.clone(); let spawn_access = access.clone();
         uv.set("spawn", lua.create_function(move |lua, (program, options, callback): (String, Table, Function)| {
             let mut spawn_options = SpawnOptions::new(program);
-            if let Ok(args) = options.get::<Table>("args") { spawn_options.args = args.sequence_values::<String>().collect::<mlua::Result<Vec<_>>>()?.into_iter().map(OsString::from).collect(); }
+            if let Some(args) = options.get::<Option<Table>>("args")? {
+                spawn_options.args = args
+                    .sequence_values::<String>()
+                    .map(|argument| argument.map(OsString::from))
+                    .collect::<mlua::Result<Vec<_>>>()?;
+            }
+            if let Some(environment) = options.get::<Option<Table>>("env")? {
+                spawn_options.environment = Some(
+                    environment
+                        .sequence_values::<String>()
+                        .map(|entry| {
+                            let entry = entry?;
+                            let Some((name, value)) = entry.split_once('=') else {
+                                return Err(mlua::Error::runtime("environment entries must have the form NAME=VALUE"));
+                            };
+                            Ok((OsString::from(name), OsString::from(value)))
+                        })
+                        .collect::<mlua::Result<Vec<_>>>()?,
+                );
+            }
             spawn_options.cwd = options.get::<Option<String>>("cwd")?.map(PathBuf::from);
             spawn_options.detached = options.get::<Option<bool>>("detached")?.unwrap_or(false);
             spawn_options.uid = options.get::<Option<u32>>("uid")?;
@@ -615,7 +634,26 @@ pub(crate) fn install(lua: &Lua, uv: &Table, uv_loop: Rc<RefCell<UvLoop>>, sched
             let stdio = options.get::<Option<Table>>("stdio")?;
             let mut pipe_targets: [Option<LuaProcessPipe>; 3] = [None, None, None];
             if let Some(stdio) = stdio {
-                for index in 0..3 { match stdio.raw_get::<Value>(index + 1)? { Value::UserData(userdata) => { let pipe = userdata.borrow::<LuaProcessPipe>()?.clone(); spawn_options.stdio[index] = StdioConfig::CreatePipe; pipe_targets[index] = Some(pipe); }, Value::Nil => spawn_options.stdio[index] = StdioConfig::Ignore, _ => return Err(mlua::Error::runtime("stdio entries must be pipe handles or nil")) } }
+                for index in 0..3 {
+                    match stdio.raw_get::<Value>(index + 1)? {
+                        Value::UserData(userdata) => {
+                            let pipe = userdata.borrow::<LuaProcessPipe>()?.clone();
+                            spawn_options.stdio[index] = StdioConfig::CreatePipe;
+                            pipe_targets[index] = Some(pipe);
+                        }
+                        Value::Nil | Value::Boolean(false) => {
+                            spawn_options.stdio[index] = StdioConfig::Ignore;
+                        }
+                        Value::Integer(fd @ 0..=2) => {
+                            spawn_options.stdio[index] = StdioConfig::InheritFd(fd as u8);
+                        }
+                        _ => {
+                            return Err(mlua::Error::runtime(
+                                "stdio entries must be pipe handles, false, nil, or descriptors 0, 1, or 2",
+                            ));
+                        }
+                    }
+                }
             }
             let completion = Arc::new(ProcessCompletion::default()); let waiter = completion.clone();
             let spawned = process::spawn(&mut spawn_loop.borrow_mut(), spawn_options, move |_, result| { let value = result.map(|exit| (exit.code, exit.signal)).map_err(|error| error.to_string()); if let Ok(mut slot) = waiter.result.lock() { *slot = Some(value); } }).map_err(mlua::Error::external)?;

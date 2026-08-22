@@ -244,6 +244,43 @@ fn spawned_cat_echoes_through_created_stdio_pipe() {
     assert_eq!(host.lua().globals().get::<String>("cat_result").unwrap(), "cat echo\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn spawn_accepts_luv_stdio_environment_args_and_exit_callback() {
+    let (host, scheduler) = host();
+    host.lua()
+        .load(
+            r#"
+            spawn_result = ''
+            spawn_exited = false
+            local output = assert(vim.uv.new_pipe(false))
+            local process
+            process = assert(vim.uv.spawn('/bin/sh', {
+              stdio = { false, output, 2, nil },
+              args = { '-c', 'printf \"%s:%s:%s:%s\" \"$ONLY\" \"$#\" \"$1\" \"${HOME-unset}\"', 'shell-name', 'marker' },
+              env = { 'ONLY=exact' },
+            }, function(code, signal)
+              assert(code == 0 and signal == 0)
+              spawn_exited = true
+              process:close()
+            end))
+            output:read_start(function(err, chunk)
+              assert(err == nil)
+              if chunk then spawn_result = spawn_result .. chunk else output:close() end
+            end)
+            vim.uv.run('default')
+            "#,
+        )
+        .exec()
+        .unwrap();
+    scheduler.drain().unwrap();
+    assert_eq!(
+        host.lua().globals().get::<String>("spawn_result").unwrap(),
+        "exact:1:marker:unset",
+    );
+    assert!(host.lua().globals().get::<bool>("spawn_exited").unwrap());
+}
+
 #[test]
 fn tcp_loopback_accepts_reads_and_writes() {
     let (host, scheduler) = host();
