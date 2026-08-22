@@ -12,7 +12,7 @@ use std::io::{self, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ox_rpc::{DecodeError, IncrementalDecoder, Message, MsgidCounter, RedrawEvent};
 use ox_types::{ApiError, Dict, Object, OxStr};
@@ -344,18 +344,17 @@ impl Client {
     }
 
     fn eof_error(&mut self) -> ClientError {
-        let status = match self.child.try_wait() {
-            Ok(Some(status)) => Some(status),
-            Ok(None) => {
-                let _ = self.child.kill();
-                self.child.wait().ok()
-            }
-            Err(_) => {
-                terminate_child(&mut self.child);
-                None
+        self.stdin.take();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+                Ok(None) | Err(_) => { terminate_child(&mut self.child); break None; }
             }
         };
-        let _ = join_worker(&mut self.stderr_reader, "stderr");
+        let _ = join_worker(&mut self.reader, "RPC reader");
+        let _ = join_worker(&mut self.stderr_reader, "stderr reader");
         ClientError::Eof {
             exit_code: status.and_then(|status| status.code()),
             stderr: stderr_snapshot(&self.stderr),
@@ -393,11 +392,7 @@ fn read_messages(mut stdout: impl Read, sender: mpsc::Sender<ReaderEvent>) {
     loop {
         match stdout.read(&mut buffer) {
             Ok(0) => {
-                let event = if decoder.is_empty() {
-                    ReaderEvent::Eof
-                } else {
-                    ReaderEvent::Decode(DecodeError::Incomplete)
-                };
+                let event = if decoder.is_empty() { ReaderEvent::Eof } else { ReaderEvent::Decode(DecodeError::Incomplete) };
                 let _ = sender.send(event);
                 return;
             }

@@ -913,12 +913,14 @@ impl Screen {
     fn win_pos(&mut self, args: &[Object]) -> Result<(), ScreenError> {
         expect_arity("win_pos", args, 6)?;
         let grid = integer(args, 0, "win_pos", "grid")?;
-        self.require_grid("win_pos", grid)?;
         let window = window_id(args, 1, "win_pos")?;
         let row = integer(args, 2, "win_pos", "start_row")?;
         let column = integer(args, 3, "win_pos", "start_column")?;
         let width = unsigned(args, 4, "win_pos", "width")?;
         let height = unsigned(args, 5, "win_pos", "height")?;
+        if !self.grids.contains_key(&grid) {
+            self.grids.insert(grid, Grid::new(width, height)?);
+        }
         let sequence = self.sequence();
         self.windows.insert(
             grid,

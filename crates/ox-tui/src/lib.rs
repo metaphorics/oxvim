@@ -420,11 +420,12 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
                 }
             }
             Err(error) => {
-                let failure = process_failure(&error);
                 if mouse_capture_emitted {
                     let _ = apply_mouse_capture(&mut shared, false);
                 }
                 session.restore()?;
+                if clean_eof(&error) { return Ok(()); }
+                let failure = process_failure(&error);
                 failure.write_diagnostic(&mut io::stderr())?;
                 return Err(TuiError::Client(error));
             }
@@ -774,6 +775,10 @@ fn process_failure(error: &ClientError) -> ProcessFailure {
         },
         _ => ProcessFailure { kind: ProcessFailureKind::RpcEof, child_stderr: Vec::new(), exit_code: None },
     }
+}
+
+fn clean_eof(error: &ClientError) -> bool {
+    matches!(error, ClientError::Eof { exit_code: Some(0), .. })
 }
 
 fn duration_millis(duration: Duration) -> u64 {
