@@ -1062,6 +1062,12 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
             let mut seam = CurrentBuffer(self.editor);
             return call_buffer_builtin(&mut seam, &name_text, args);
         }
+        if name_text == "line" {
+            return call_line_builtin(self.editor, args);
+        }
+        if name_text == "append" {
+            return call_append_builtin(self.editor, args);
+        }
         let sid = self
             .runtime
             .functions
@@ -4816,4 +4822,56 @@ fn exists_with_editor<F: FileIO>(
         return exists_in_scope(&value, scope);
     };
     Ok(Typval::Number(result))
+}
+
+fn call_line_builtin(editor: &mut Editor, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    if args.is_empty() {
+        return Err(EvalError::new("E119", 0, "Not enough arguments for function: line"));
+    }
+    if args.len() > 2 {
+        return Err(EvalError::new("E118", 0, "Too many arguments for function: line"));
+    }
+    current_line_address(editor, &args[0]).map(|line| Typval::Number(line as i64))
+}
+
+fn call_append_builtin(editor: &mut Editor, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    if args.len() < 2 {
+        return Err(EvalError::new("E119", 0, "Not enough arguments for function: append"));
+    }
+    if args.len() > 2 {
+        return Err(EvalError::new("E118", 0, "Too many arguments for function: append"));
+    }
+    let after = current_line_address(editor, &args[0])?;
+    let lines = match &args[1] {
+        Typval::List(values) => values
+            .borrow()
+            .items
+            .iter()
+            .map(|value| typval_to_text(value).into_bytes())
+            .collect::<Vec<_>>(),
+        value => vec![typval_to_text(value).into_bytes()],
+    };
+    let buffer = editor
+        .current_buffer()
+        .ok_or_else(|| EvalError::new("E749", 0, "Empty buffer"))?;
+    let cursor = editor
+        .current_window()
+        .and_then(|window| editor.window(window).ok())
+        .map_or(Position { lnum: after.saturating_add(1), col: 0 }, |window| window.cursor);
+    editor
+        .append_buffer_lines(buffer, after, &lines, cursor, 0)
+        .map_err(|error| EvalError::new("E16", 0, error.to_string()))?;
+    Ok(Typval::Number(0))
+}
+
+fn current_line_address(editor: &mut Editor, value: &Typval) -> ox_eval::Result<usize> {
+    let seam = CurrentBuffer(editor);
+    let line = match value {
+        Typval::String(address) if address.as_bytes() == b"$" => seam.line_count()? as i64,
+        Typval::String(address) => seam
+            .address_line(&address.to_string_lossy())?
+            .unwrap_or(0),
+        _ => typval_number(value).unwrap_or(0),
+    };
+    Ok(usize::try_from(line.max(0)).unwrap_or(usize::MAX))
 }

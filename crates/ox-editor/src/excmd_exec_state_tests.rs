@@ -1082,3 +1082,23 @@ fn assertions_record_failures_in_writable_v_errors_and_messages() {
     exec.execute_line(&mut editor, "let v:errors = []").unwrap();
     assert_eq!(editor.vvars().get(&OxStr::from("errors")), Some(&Object::Array(Vec::new())));
 }
+
+#[test]
+fn line_last_and_append_support_oldtest_result_logging() {
+    let (mut editor, buffer, _) = editor_with_window();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_script(
+        &mut editor,
+        "<oldtest-log>",
+        "call setline(1, 'first')\ncall append(line('$'), ['second', 'third'])\nlet g:last = line('$')",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"last", 0),
+        Ok(&Typval::Number(3))
+    );
+    let text = editor.buffer(buffer).unwrap().text().unwrap();
+    assert_eq!(text.to_bytes(), b"first\nsecond\nthird");
+}
