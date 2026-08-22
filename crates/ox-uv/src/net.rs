@@ -20,7 +20,7 @@ use std::fs::File;
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
@@ -619,7 +619,7 @@ struct PipePending {
 #[cfg(unix)]
 struct PipeState {
     io: Option<PipeIo>,
-    path: Option<PathBuf>,
+    bound_path: Option<BoundPipePath>,
     listening: bool,
     reading: bool,
     connecting: bool,
@@ -628,6 +628,42 @@ struct PipeState {
     ipc: bool,
     pending: VecDeque<PipePending>,
     pending_instances: u32,
+}
+
+#[cfg(unix)]
+struct BoundPipePath {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn bind_pipe_path(path: &Path) -> io::Result<(UnixListener, BoundPipePath)> {
+    let listener = match UnixListener::bind(path) {
+        Ok(listener) => listener,
+        Err(error)
+            if matches!(error.kind(), io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied)
+                && UnixStream::connect(path).is_err() =>
+        {
+            std::fs::remove_file(path)?;
+            UnixListener::bind(path)?
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            drop(listener);
+            let _ = std::fs::remove_file(path);
+            return Err(error);
+        }
+    };
+    let bound_path = BoundPipePath {
+        path: path.to_path_buf(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    Ok((listener, bound_path))
 }
 
 #[cfg(unix)]
@@ -644,14 +680,14 @@ impl Pipe {
     /// Binds a pipe to `path`. See `uv.pipe_bind()` in `runtime/doc/luvref.txt`.
     pub fn bind<F>(uv_loop: &mut UvLoop, path: impl AsRef<Path>, callback: F) -> NetResult<Self>
     where F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static {
-        let path = path.as_ref().to_path_buf();
-        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Listener(UnixListener::bind(&path)?)), path: Some(path), listening: false, reading: false, connecting: false, writes: WriteQueue::new(), registered: false, ipc: false, pending: VecDeque::new(), pending_instances: 0 }, Rc::new(RefCell::new(Some(Box::new(callback)))))
+        let (listener, bound_path) = bind_pipe_path(path.as_ref())?;
+        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Listener(listener)), bound_path: Some(bound_path), listening: false, reading: false, connecting: false, writes: WriteQueue::new(), registered: false, ipc: false, pending: VecDeque::new(), pending_instances: 0 }, Rc::new(RefCell::new(Some(Box::new(callback)))))
     }
 
     /// Connects a pipe to `path`. See `uv.pipe_connect()` in `runtime/doc/luvref.txt`.
     pub fn connect<F>(uv_loop: &mut UvLoop, path: impl AsRef<Path>, callback: F) -> NetResult<Self>
     where F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static {
-        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Stream(UnixStream::connect(path.as_ref())?)), path: None, listening: false, reading: false, connecting: true, writes: WriteQueue::new(), registered: false, ipc: false, pending: VecDeque::new(), pending_instances: 0 }, Rc::new(RefCell::new(Some(Box::new(callback)))))
+        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Stream(UnixStream::connect(path.as_ref())?)), bound_path: None, listening: false, reading: false, connecting: true, writes: WriteQueue::new(), registered: false, ipc: false, pending: VecDeque::new(), pending_instances: 0 }, Rc::new(RefCell::new(Some(Box::new(callback)))))
     }
 
     fn attach(uv_loop: &mut UvLoop, state: PipeState, callback: CallbackCell) -> NetResult<Self> {
@@ -715,7 +751,7 @@ impl Pipe {
     /// Alters pipe permissions. See `uv.pipe_chmod()` in `runtime/doc/luvref.txt`.
     pub fn chmod(&self, readable: bool, writable: bool) -> NetResult<()> {
         let state = self.state.borrow();
-        let path = state.path.as_ref().ok_or(NetError::InvalidState("pipe has no bound pathname"))?;
+        let path = &state.bound_path.as_ref().ok_or(NetError::InvalidState("pipe has no bound pathname"))?.path;
         let metadata = std::fs::metadata(path)?;
         let mut mode = metadata.permissions().mode();
         if readable { mode |= 0o444; }
@@ -732,7 +768,7 @@ impl Pipe {
     /// combination in `runtime/doc/luvref.txt` (lines 2007-2032).
     pub fn from_stream<F>(uv_loop: &mut UvLoop, stream: mio::net::UnixStream, ipc: bool, callback: F) -> NetResult<Self>
     where F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static {
-        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Stream(stream)), path: None, listening: false, reading: false, connecting: true, writes: WriteQueue::new(), registered: false, ipc, pending: VecDeque::new(), pending_instances: 0 }, Rc::new(RefCell::new(Some(Box::new(callback)))))
+        Self::attach(uv_loop, PipeState { io: Some(PipeIo::Stream(stream)), bound_path: None, listening: false, reading: false, connecting: true, writes: WriteQueue::new(), registered: false, ipc, pending: VecDeque::new(), pending_instances: 0 }, Rc::new(RefCell::new(Some(Box::new(callback)))))
     }
 
     /// Sends `data` and passes `send_handle`'s descriptor over an IPC pipe.
@@ -933,7 +969,7 @@ fn deliver_pipe(uv_loop: &mut UvLoop, id: HandleId, token: Token, state: Rc<RefC
         let event = match event {
             PipeReadyEvent::Public(event) => event,
             PipeReadyEvent::Accepted(stream) => {
-                let child_state = PipeState { io: Some(PipeIo::Stream(stream)), path: None, listening: false, reading: false, connecting: false, writes: WriteQueue::new(), registered: false, ipc: state.borrow().ipc, pending: VecDeque::new(), pending_instances: 0 };
+                let child_state = PipeState { io: Some(PipeIo::Stream(stream)), bound_path: None, listening: false, reading: false, connecting: false, writes: WriteQueue::new(), registered: false, ipc: state.borrow().ipc, pending: VecDeque::new(), pending_instances: 0 };
                 match Pipe::attach(uv_loop, child_state, Rc::clone(&callback)) { Ok(child) => NetEvent::AcceptedPipe(Box::new(child)), Err(error) => NetEvent::Error(error) }
             }
         };
@@ -949,7 +985,20 @@ fn close_pipe(uv_loop: &mut UvLoop, handle: &Pipe) -> crate::Result<()> {
         if let Some(io) = state.io.as_mut() { match io { PipeIo::Listener(source) => uv_loop.inner_mut().reactor().deregister(source)?, PipeIo::Stream(source) => uv_loop.inner_mut().reactor().deregister(source)? } }
         state.registered = false;
     }
-    state.io = None; state.listening = false; state.reading = false; state.connecting = false; state.writes.clear(); state.pending.clear();
+    state.io = None;
+    let bound_path = state.bound_path.take();
+    state.listening = false; state.reading = false; state.connecting = false; state.writes.clear(); state.pending.clear();
+    drop(state);
+    if let Some(bound) = bound_path {
+        match std::fs::metadata(&bound.path) {
+            Ok(metadata) if metadata.dev() == bound.device && metadata.ino() == bound.inode => {
+                std::fs::remove_file(bound.path)?;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(crate::Error::Io(error)),
+        }
+    }
     Ok(())
 }
 

@@ -536,6 +536,43 @@ fn unix_pipe_loopback_echoes_payload() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn unix_pipe_replaces_stale_path_and_removes_owned_path_on_close() {
+    use crate::net::Pipe;
+
+    let mut uv_loop = UvLoop::new().expect("create loop");
+    let temp = TempDir::new();
+    let socket = temp.path().join("stale.sock");
+    std_fs::write(&socket, b"stale").expect("create stale path");
+
+    let listener = Pipe::bind(&mut uv_loop, &socket, |_, _, _| {})
+        .expect("replace stale pipe path");
+    assert_eq!(listener.local_name().expect("pipe local name"), Some(socket.clone()));
+    listener.close(&mut uv_loop).expect("close pipe listener");
+    assert!(!socket.exists(), "closing the listener must remove its socket path");
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_pipe_does_not_replace_an_active_listener() {
+    use crate::net::Pipe;
+
+    let mut first_loop = UvLoop::new().expect("create first loop");
+    let mut second_loop = UvLoop::new().expect("create second loop");
+    let temp = TempDir::new();
+    let socket = temp.path().join("active.sock");
+    let mut first = Pipe::bind(&mut first_loop, &socket, |_, _, _| {}).expect("bind first listener");
+    first.listen(&mut first_loop, 8).expect("listen on first listener");
+
+    let error = Pipe::bind(&mut second_loop, &socket, |_, _, _| {})
+        .err()
+        .expect("active listener must keep its address");
+    assert!(error.to_string().contains("Address already in use"), "unexpected bind error: {error}");
+
+    first.close(&mut first_loop).expect("close first listener");
+}
+
 #[test]
 fn udp_loopback_echoes_datagram() {
     let mut uv_loop = UvLoop::new().expect("create loop");
