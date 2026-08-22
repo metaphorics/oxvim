@@ -217,6 +217,27 @@ fn set_global_string_option() {
     );
 }
 
+// option.c:do_set — both `&` and `&vim` restore the option's Vim default.
+#[test]
+fn set_ampersand_forms_restore_declared_default() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&mut editor, "set background=light").unwrap();
+    exec.execute_line(&mut editor, "set background&vim").unwrap();
+    assert_eq!(
+        editor.options().get_global("background").unwrap(),
+        &crate::options::OptionValue::String("dark".into())
+    );
+
+    exec.execute_line(&mut editor, "set background=light").unwrap();
+    exec.execute_line(&mut editor, "set background&").unwrap();
+    assert_eq!(
+        editor.options().get_global("background").unwrap(),
+        &crate::options::OptionValue::String("dark".into())
+    );
+}
+
 // option.c:show_one — `:set number?` emits an Echo message with the
 // current effective value and no message history.
 #[test]
