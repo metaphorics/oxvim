@@ -4,6 +4,9 @@
 
 pub mod locale;
 
+pub use locale::{current_locale, set_locale, LocaleCategory};
+
+
 use std::ffi::OsStr;
 
 /// Sets a process environment variable.
