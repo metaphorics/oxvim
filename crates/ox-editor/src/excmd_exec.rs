@@ -3862,6 +3862,13 @@ fn parse_scope_name(target: &str) -> (Option<ScopeKind>, String) {
 fn canonical_target(target: &str) -> String { target.trim().to_owned() }
 
 fn apply_assignment_operator<F: FileIO>(runtime: &ExRuntime<F>, left: Typval, right: Typval, operator: &str) -> Result<Typval, Flow> {
+    if operator == "+=" {
+        if let (Typval::List(left_items), Typval::List(right_items)) = (&left, &right) {
+            let appended = right_items.borrow().items.clone();
+            left_items.borrow_mut().items.extend(appended);
+            return Ok(left);
+        }
+    }
     match operator {
         "+=" => Ok(Typval::Number(typval_number(&left).unwrap_or(0).saturating_add(typval_number(&right).unwrap_or(0)))),
         "-=" => Ok(Typval::Number(typval_number(&left).unwrap_or(0).saturating_sub(typval_number(&right).unwrap_or(0)))),

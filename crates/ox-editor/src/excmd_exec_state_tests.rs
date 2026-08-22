@@ -115,6 +115,35 @@ fn let_compound_addition_operator() {
     assert_eq!(*value, Typval::Number(15));
 }
 
+#[test]
+fn let_compound_assignment_reads_then_writes() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &mut editor,
+        "<list-plus-equal>",
+        "let g:items = [1, 2]\nlet g:alias = g:items\nlet g:items += [3, 4]",
+    )
+    .unwrap();
+    let items = exec
+        .scope()
+        .get_scoped(ScopeKind::Global, b"items", 0)
+        .unwrap();
+    let alias = exec
+        .scope()
+        .get_scoped(ScopeKind::Global, b"alias", 0)
+        .unwrap();
+
+    let expected = Typval::list(vec![
+        Typval::Number(1),
+        Typval::Number(2),
+        Typval::Number(3),
+        Typval::Number(4),
+    ]);
+    assert_eq!(*items, expected);
+    assert_eq!(*alias, expected);
+}
+
 // ex_docmd.c:ex_let, `b:` scope — `:let b:name = value` writes through
 // sync_scope_into_editor into the buffer's API variable dict.
 #[test]
