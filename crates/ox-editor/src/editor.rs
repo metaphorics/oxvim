@@ -197,7 +197,7 @@ impl Editor {
             mappings: Mappings::new(),
             typeahead: Typeahead::new(),
             gvars: Dict(Vec::new()),
-            vvars: Dict(Vec::new()),
+            vvars: Dict(vec![("errors".into(), Object::Array(Vec::new()))]),
             highlights: BTreeMap::new(),
             messages: Vec::new(),
             current_tab: None,

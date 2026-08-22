@@ -1033,3 +1033,52 @@ fn let_writes_upstream_writable_vim_variables_only() {
     let ExecError::Vim(exception) = error else { panic!("expected E46") };
     assert_eq!(exception.kind, VimExceptionKind::Error("E46".to_owned()));
 }
+
+#[test]
+fn assertions_record_failures_in_writable_v_errors_and_messages() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_script(
+        &mut editor,
+        "assertions.vim",
+        "let g:initial = len(v:errors)\n\
+         let g:success = assert_equal([1, 2], [1, 2])\n\
+         let g:failure = assert_equal('expected', 'actual', 'comparison')\n\
+         let g:true_ok = assert_true(1)\n\
+         let g:false_ok = assert_false(0)\n\
+         let g:notequal_ok = assert_notequal(1, 2)\n\
+         let g:match_ok = assert_match('^act', 'actual')\n\
+         let g:notmatch_ok = assert_notmatch('missing', 'actual')\n\
+         let g:after = len(v:errors)",
+    )
+    .unwrap();
+
+    for name in ["initial", "success", "true_ok", "false_ok", "notequal_ok", "match_ok", "notmatch_ok"] {
+        assert_eq!(
+            exec.scope().get_scoped(ScopeKind::Global, name.as_bytes(), 0),
+            Ok(&Typval::Number(0)),
+            "g:{name}"
+        );
+    }
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"failure", 0),
+        Ok(&Typval::Number(1))
+    );
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"after", 0),
+        Ok(&Typval::Number(1))
+    );
+    let Some(Object::Array(errors)) = editor.vvars().get(&OxStr::from("errors")) else {
+        panic!("v:errors must remain an Array");
+    };
+    assert_eq!(errors.len(), 1);
+    assert!(matches!(&errors[0], Object::String(text) if text.to_string_lossy().contains("comparison")));
+    assert!(editor.messages().iter().any(|message| {
+        message.kind == crate::MessageKind::Error
+            && matches!(&message.content, Object::String(text) if text.to_string_lossy().contains("comparison"))
+    }));
+
+    exec.execute_line(&mut editor, "let v:errors = []").unwrap();
+    assert_eq!(editor.vvars().get(&OxStr::from("errors")), Some(&Object::Array(Vec::new())));
+}

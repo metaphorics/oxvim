@@ -1014,6 +1014,21 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         if name_text == "expand" {
             return call_expand_builtin(self.runtime, self.editor, args);
         }
+        if matches!(
+            &*name_text,
+            "assert_equal"
+                | "assert_equalfile"
+                | "assert_exception"
+                | "assert_false"
+                | "assert_inrange"
+                | "assert_match"
+                | "assert_notequal"
+                | "assert_notmatch"
+                | "assert_report"
+                | "assert_true"
+        ) {
+            return call_assert_builtin(self.runtime, self.editor, &name_text, args, scope);
+        }
         if name_text == "system" {
             return call_system_builtin(args, scope);
         }
@@ -1213,6 +1228,143 @@ fn call_luaeval_builtin<F: FileIO>(
         (Ok(_), Err(error)) => Err(flow_to_eval_error(exec_error_flow(runtime, error), "luaeval")),
         (Ok(value), Ok(())) => Ok(value),
     }
+}
+
+fn call_assert_builtin<F: FileIO>(
+    runtime: &ExRuntime<F>,
+    editor: &mut Editor,
+    name: &str,
+    args: Vec<Typval>,
+    scope: &mut Scope,
+) -> ox_eval::Result<Typval> {
+    let spec = builtin_spec(name).expect("assert builtin metadata");
+    if args.len() < spec.min_args {
+        return Err(EvalError::new("E119", 0, format!("Not enough arguments for function: {name}")));
+    }
+    if spec.max_args.is_some_and(|maximum| args.len() > maximum) {
+        return Err(EvalError::new("E118", 0, format!("Too many arguments for function: {name}")));
+    }
+
+    let failure = match name {
+        "assert_equal" if args[0] != args[1] => Some(format!(
+            "Expected {} but got {}",
+            assertion_value(&args[0]),
+            assertion_value(&args[1])
+        )),
+        "assert_notequal" if args[0] == args[1] => {
+            Some(format!("Expected not equal to {}", assertion_value(&args[0])))
+        }
+        "assert_true" if !assertion_boolean(&args[0], true) => {
+            Some(format!("Expected True but got {}", assertion_value(&args[0])))
+        }
+        "assert_false" if !assertion_boolean(&args[0], false) => {
+            Some(format!("Expected False but got {}", assertion_value(&args[0])))
+        }
+        "assert_match" | "assert_notmatch" => {
+            let pattern_text = typval_to_text(&args[0]);
+            let actual_text = typval_to_text(&args[1]);
+            let pattern = OxStr::from(pattern_text.as_str());
+            let actual = OxStr::from(actual_text.as_str());
+            let matched = VimRegex.is_match(&actual, &pattern, false)?;
+            let fails = matched != (name == "assert_match");
+            fails.then(|| {
+                format!(
+                    "Pattern {} {} match {}",
+                    assertion_value(&args[0]),
+                    if name == "assert_match" { "does not" } else { "does" },
+                    assertion_value(&args[1])
+                )
+            })
+        }
+        "assert_inrange" => {
+            let lower = assertion_number(&args[0])?;
+            let upper = assertion_number(&args[1])?;
+            let actual = assertion_number(&args[2])?;
+            (actual < lower || actual > upper).then(|| {
+                format!("Expected range {lower} - {upper}, but got {actual}")
+            })
+        }
+        "assert_exception" => {
+            let expected = typval_to_text(&args[0]);
+            let actual = scope
+                .get_scoped(ScopeKind::Vim, b"exception", 0)
+                .ok()
+                .map(typval_to_text)
+                .unwrap_or_default();
+            (!actual.contains(&expected)).then(|| format!("Expected {expected} but got {actual}"))
+        }
+        "assert_equalfile" => {
+            let first = PathBuf::from(typval_to_text(&args[0]));
+            let second = PathBuf::from(typval_to_text(&args[1]));
+            let differs = match (
+                runtime.scripts.io().read_to_string(&first),
+                runtime.scripts.io().read_to_string(&second),
+            ) {
+                (Ok(first), Ok(second)) => first != second,
+                _ => true,
+            };
+            differs.then(|| {
+                format!("Files {} and {} differ", first.display(), second.display())
+            })
+        }
+        "assert_report" => Some(typval_to_text(&args[0])),
+        _ => None,
+    };
+
+    let Some(mut message) = failure else { return Ok(Typval::Number(0)) };
+    let message_index = match name {
+        "assert_equal" | "assert_notequal" | "assert_match" | "assert_notmatch" => 2,
+        "assert_true" | "assert_false" | "assert_exception" => 1,
+        "assert_inrange" => 3,
+        _ => usize::MAX,
+    };
+    if let Some(prefix) = args.get(message_index).map(typval_to_text).filter(|text| !text.is_empty()) {
+        message = format!("{prefix}: {message}");
+    }
+    let location = runtime.throwpoint();
+    if location != "command line" {
+        message = format!("{location}: {message}");
+    }
+    append_assertion_failure(scope, &message);
+    push_text_message(editor, message, true, true);
+    Ok(Typval::Number(1))
+}
+
+fn assertion_boolean(value: &Typval, expected: bool) -> bool {
+    match value {
+        Typval::Number(number) => (*number != 0) == expected,
+        Typval::Bool(boolean) => *boolean == expected,
+        _ => false,
+    }
+}
+
+fn assertion_number(value: &Typval) -> ox_eval::Result<f64> {
+    match value {
+        Typval::Number(number) => Ok(*number as f64),
+        Typval::Float(number) => Ok(*number),
+        _ => Err(EvalError::new("E1219", 0, "Float or Number required")),
+    }
+}
+
+fn assertion_value(value: &Typval) -> String {
+    match value {
+        Typval::String(text) => format!("'{}'", text.to_string_lossy().replace("'", "''")),
+        _ => typval_to_text(value),
+    }
+}
+
+fn append_assertion_failure(scope: &mut Scope, message: &str) {
+    if let Some(Typval::List(errors)) = scope.vim.iter().find_map(|(name, value)| {
+        (name.as_bytes() == b"errors").then_some(value)
+    }) {
+        errors.borrow_mut().items.push(Typval::String(OxStr::from(message.as_bytes())));
+        return;
+    }
+    replace_scope_pair(
+        &mut scope.vim,
+        "errors",
+        Typval::list(vec![Typval::String(OxStr::from(message.as_bytes()))]),
+    );
 }
 
 fn call_expand_builtin<F: FileIO>(
