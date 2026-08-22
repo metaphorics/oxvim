@@ -136,10 +136,15 @@ pub enum LuaExecError {
 /// Host seam used by Ex Lua commands without coupling `ox-editor` to `ox-lua`.
 pub trait LuaExec {
     /// Compile and execute one Lua chunk with varargs.
-    fn execute_chunk(&mut self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError>;
+    fn execute_chunk(
+        &mut self,
+        editor: &mut Editor,
+        code: &str,
+        args: Vec<Object>,
+    ) -> Result<Object, LuaExecError>;
 
     /// Load and execute one Lua file.
-    fn execute_file(&mut self, path: &Path) -> Result<(), LuaExecError>;
+    fn execute_file(&mut self, editor: &mut Editor, path: &Path) -> Result<(), LuaExecError>;
 }
 
 /// Definition created by `:command`.
@@ -641,7 +646,7 @@ fn dispatch<F: FileIO>(
     match name {
         "lua" => command_lua(runtime, editor, lua, command),
         "luado" => command_luado(runtime, editor, lua, command),
-        "luafile" => command_luafile(runtime, lua, command),
+        "luafile" => command_luafile(runtime, editor, lua, command),
         "let" => command_let(runtime, editor, scope, &command.args, false),
         "const" => command_let(runtime, editor, scope, &command.args, true),
         "unlet" => command_unlet(runtime, editor, scope, &command.args, command.bang),
@@ -2766,7 +2771,7 @@ fn flow_to_eval_error(flow: Flow, name: &str) -> EvalError {
     }
 }
 
-fn command_lua<F: FileIO>(runtime: &ExRuntime<F>, editor: &Editor, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
+fn command_lua<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
     let Some(lua) = lua else { return Flow::NotImplemented("lua".to_owned()) };
     let mut code = command.args.trim_start().to_owned();
     if code.is_empty() {
@@ -2784,19 +2789,19 @@ fn command_lua<F: FileIO>(runtime: &ExRuntime<F>, editor: &Editor, lua: Option<&
     } else if let Some(expression) = code.strip_prefix('=') {
         code = format!("vim._print(true, {expression})");
     }
-    match lua.borrow_mut().execute_chunk(&code, Vec::new()) {
+    match lua.borrow_mut().execute_chunk(editor, &code, Vec::new()) {
         Ok(_) => Flow::Normal,
         Err(error) => lua_error_flow(runtime, error, "E5107", "E5108"),
     }
 }
 
-fn command_luafile<F: FileIO>(runtime: &ExRuntime<F>, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
+fn command_luafile<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
     let Some(lua) = lua else { return Flow::NotImplemented("luafile".to_owned()) };
     let path = command.args.trim();
     if path.is_empty() {
         return error_flow(runtime, "E471", "Argument required");
     }
-    match lua.borrow_mut().execute_file(Path::new(path)) {
+    match lua.borrow_mut().execute_file(editor, Path::new(path)) {
         Ok(()) => Flow::Normal,
         Err(error) => lua_error_flow(runtime, error, "E5112", "E5113"),
     }
@@ -2828,6 +2833,7 @@ fn command_luado<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, lua: Op
         };
         let Some(line) = lines.get(lnum.saturating_sub(1)).cloned() else { break };
         let result = lua.borrow_mut().execute_chunk(
+            editor,
             &chunk,
             vec![Object::String(OxStr(line)), Object::Integer(lnum as i64)],
         );

@@ -476,7 +476,7 @@ struct FakeLua {
 }
 
 impl LuaExec for FakeLua {
-    fn execute_chunk(&mut self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError> {
+    fn execute_chunk(&mut self, _editor: &mut Editor, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError> {
         self.chunks.push((code.to_owned(), args.clone()));
         if let Some(error) = self.error.clone() {
             return Err(error);
@@ -489,7 +489,7 @@ impl LuaExec for FakeLua {
         }
     }
 
-    fn execute_file(&mut self, path: &Path) -> Result<(), LuaExecError> {
+    fn execute_file(&mut self, _editor: &mut Editor, path: &Path) -> Result<(), LuaExecError> {
         self.files.push(path.to_path_buf());
         self.error.clone().map_or(Ok(()), Err)
     }

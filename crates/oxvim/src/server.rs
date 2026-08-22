@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::rc::Rc;
 
-use mlua::{MultiValue, Value};
+use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
 use ox_api::Registry;
 use ox_editor::{
     AutocmdContext, AutocmdKind, CmdlineKind, Editor, Event, ExExecutor, ExecOutcome, Geometry,
@@ -19,8 +19,8 @@ use ox_eval::{
     is_buffer_builtin,
 };
 use ox_lua::{
-    ApiDispatchContext, BuiltinHost, ExecError as LuaHostExecError, LuaHost, RuntimeRoot, Scheduler, VariableHost, VariableScope, Work, bind_api,
-    bind_variables, call_with_traceback, object_to_lua,
+    ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, VariableHost, VariableScope, Work, bind_api,
+    bind_variables, call_with_traceback, lua_to_object, object_to_lua,
 };
 use ox_rpc::{
     CHAN_STDIO, ChannelId, ChannelIdAllocator, IncrementalDecoder, Message,
@@ -54,7 +54,7 @@ impl ox_api::ChannelSink for TerminalChannelSink {
 pub struct AppState {
     editor: Rc<RefCell<Editor>>,
     lua: Rc<RefCell<LuaHost>>,
-    registry: Registry,
+    registry: Rc<Registry>,
     ex: ExExecutor,
     mode: ModeMachine,
     exiting: bool,
@@ -85,7 +85,7 @@ impl AppState {
             Object::String(OxStr::from("")),
         );
         let editor = Rc::new(RefCell::new(editor));
-        let registry = ox_api::core().map_err(|error| AppError::Api(error.to_string()))?;
+        let registry = Rc::new(ox_api::core().map_err(|error| AppError::Api(error.to_string()))?);
         let lua_work = Rc::new(RefCell::new(VecDeque::new()));
         let mut lua = LuaHost::new(
             RuntimeRoot::new(runtime_root()?),
@@ -109,7 +109,10 @@ impl AppState {
             .map_err(|error| AppError::Lua(error.to_string()))?;
         let lua = Rc::new(RefCell::new(lua));
         let mut ex = ExExecutor::new();
-        ex.set_lua_exec(Rc::new(RefCell::new(ServerLuaExec { lua: lua.clone() })));
+        ex.set_lua_exec(Rc::new(RefCell::new(ServerLuaExec {
+            lua: lua.clone(),
+            registry: registry.clone(),
+        })));
 
         let mut state = Self {
             editor,
@@ -1031,23 +1034,154 @@ impl BufferHost for CurrentBuffer<'_> {
 
 struct ServerLuaExec {
     lua: Rc<RefCell<LuaHost>>,
+    registry: Rc<Registry>,
 }
 
 impl LuaExec for ServerLuaExec {
-    fn execute_chunk(&mut self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError> {
-        self.lua.borrow_mut().exec(code, args).map_err(map_lua_exec_error)
+    fn execute_chunk(
+        &mut self,
+        editor: &mut Editor,
+        code: &str,
+        args: Vec<Object>,
+    ) -> Result<Object, LuaExecError> {
+        let host = self.lua.borrow();
+        let lua = host.lua();
+        with_scoped_editor_api(lua, &self.registry, editor, || {
+            let function = lua
+                .load(code)
+                .set_name("<nvim>")
+                .into_function()
+                .map_err(|error| LuaExecError::Load(error.to_string()))?;
+            let lua_args = args
+                .iter()
+                .map(|arg| object_to_lua(lua, arg).map_err(|error| LuaExecError::Conversion(error.to_string())))
+                .collect::<Result<Vec<_>, _>>()?
+                .into();
+            let mut results = call_with_traceback(lua, &function, lua_args)
+                .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+            results.pop_front().map_or(Ok(Object::Nil), |value| {
+                lua_to_object(lua, &value).map_err(|error| LuaExecError::Conversion(error.to_string()))
+            })
+        })
     }
 
-    fn execute_file(&mut self, path: &Path) -> Result<(), LuaExecError> {
-        self.lua.borrow_mut().exec_file(path).map_err(map_lua_exec_error)
+    fn execute_file(&mut self, editor: &mut Editor, path: &Path) -> Result<(), LuaExecError> {
+        let host = self.lua.borrow();
+        let lua = host.lua();
+        with_scoped_editor_api(lua, &self.registry, editor, || {
+            let loadfile: Function = lua.globals().get("loadfile")
+                .map_err(|error| LuaExecError::Load(error.to_string()))?;
+            let arguments = MultiValue::from_vec(vec![Value::String(
+                lua.create_string(path.to_string_lossy().as_bytes())
+                    .map_err(|error| LuaExecError::Conversion(error.to_string()))?,
+            )]);
+            let mut loaded = call_with_traceback(lua, &loadfile, arguments)
+                .map_err(|error| LuaExecError::Load(error.to_string()))?;
+            match (loaded.pop_front(), loaded.pop_front()) {
+                (Some(Value::Function(chunk)), _) => {
+                    call_with_traceback(lua, &chunk, MultiValue::new())
+                        .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+                    Ok(())
+                }
+                (Some(Value::Nil), Some(Value::String(message))) => {
+                    Err(LuaExecError::Load(message.to_string_lossy()))
+                }
+                (Some(value), _) => Err(LuaExecError::Load(format!("loadfile returned {value:?}"))),
+                (None, _) => Err(LuaExecError::Load("loadfile returned no values".to_owned())),
+            }
+        })
     }
 }
 
-fn map_lua_exec_error(error: LuaHostExecError) -> LuaExecError {
-    match error {
-        LuaHostExecError::Load(message) => LuaExecError::Load(message),
-        LuaHostExecError::Runtime(message) => LuaExecError::Runtime(message),
-        LuaHostExecError::Conversion(error) => LuaExecError::Conversion(error.to_string()),
+fn with_scoped_editor_api<T>(
+    lua: &Lua,
+    registry: &Registry,
+    editor: &mut Editor,
+    run: impl FnOnce() -> Result<T, LuaExecError>,
+) -> Result<T, LuaExecError> {
+    let vim: Table = lua.globals().get("vim").map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+    let api: Table = vim.get("api").map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+    let original_getvar: Value = vim.get("_getvar").map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+    let original_setvar: Value = vim.get("_setvar").map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+    let originals = registry
+        .iter()
+        .map(|(metadata, _)| api.get::<Value>(metadata.name).map(|value| (metadata.name, value)))
+        .collect::<mlua::Result<Vec<_>>>()
+        .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+    let editor = Rc::new(RefCell::new(editor));
+    let result = lua.scope(|scope| {
+        let get_editor = editor.clone();
+        vim.set(
+            "_getvar",
+            scope.create_function_mut(move |lua, (scope, handle, name): (mlua::LuaString, i64, mlua::LuaString)| {
+                let scope = parse_variable_scope(&scope)?;
+                let name = OxStr(name.as_bytes().to_vec());
+                let editor = get_editor.borrow();
+                match variables(&editor, scope, handle).map_err(mlua::Error::runtime)?.get(&name) {
+                    Some(value) => object_to_lua(lua, value).map_err(mlua::Error::external),
+                    None => Ok(Value::Nil),
+                }
+            })?,
+        )?;
+        let set_editor = editor.clone();
+        vim.set(
+            "_setvar",
+            scope.create_function_mut(move |lua, (scope, handle, name, value): (mlua::LuaString, i64, mlua::LuaString, Value)| {
+                let scope = parse_variable_scope(&scope)?;
+                let name = OxStr(name.as_bytes().to_vec());
+                if scope == VariableScope::Vim {
+                    return Err(mlua::Error::runtime(format!("E46: Cannot change read-only variable \"{}\"", name.to_string_lossy())));
+                }
+                let value = if value.is_nil() {
+                    None
+                } else {
+                    Some(lua_to_object(lua, &value).map_err(mlua::Error::external)?)
+                };
+                let mut editor = set_editor.borrow_mut();
+                let variables = variables_mut(&mut editor, scope, handle).map_err(mlua::Error::runtime)?;
+                if let Some(value) = value {
+                    variables.insert(name, value);
+                } else {
+                    let index = variables.iter().position(|(key, _)| key == &name);
+                    if let Some(index) = index {
+                        variables.0.remove(index);
+                    }
+                }
+                Ok(())
+            })?,
+        )?;
+        for (metadata, dispatch) in registry.iter() {
+            let editor = editor.clone();
+            api.set(
+                metadata.name,
+                scope.create_function_mut(move |lua, args: Variadic<Value>| {
+                    let args = args
+                        .iter()
+                        .map(|value| lua_to_object(lua, value).map_err(mlua::Error::external))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let result = dispatch(&mut editor.borrow_mut(), &args).map_err(mlua::Error::external)?;
+                    object_to_lua(lua, &result).map_err(mlua::Error::external)
+                })?,
+            )?;
+        }
+        Ok(run())
+    });
+    for (name, value) in originals {
+        api.set(name, value).map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+    }
+    vim.set("_getvar", original_getvar).map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+    vim.set("_setvar", original_setvar).map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+    result.map_err(|error| LuaExecError::Runtime(error.to_string()))?
+}
+
+fn parse_variable_scope(scope: &mlua::LuaString) -> mlua::Result<VariableScope> {
+    match scope.as_bytes().as_ref() {
+        b"g" => Ok(VariableScope::Global),
+        b"b" => Ok(VariableScope::Buffer),
+        b"w" => Ok(VariableScope::Window),
+        b"t" => Ok(VariableScope::Tabpage),
+        b"v" => Ok(VariableScope::Vim),
+        _ => Err(mlua::Error::runtime("unknown variable scope")),
     }
 }
 

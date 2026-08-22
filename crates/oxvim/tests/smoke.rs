@@ -206,14 +206,6 @@ fn embedded_stdio_serves_core_rpc_contracts() {
         oxvim.request("nvim_exec_lua", vec![Value::from("return vim.fn.has('nvim-0.13')"), Value::Array(vec![])]),
         Value::from(1),
     );
-    assert_eq!(
-        oxvim.request("nvim_command", vec![Value::from("lua _G.oxvim_ex_value = 42")]),
-        Value::Nil,
-    );
-    assert_eq!(
-        oxvim.request("nvim_exec_lua", vec![Value::from("return _G.oxvim_ex_value"), Value::Array(vec![])]),
-        Value::from(42),
-    );
 
     assert_eq!(oxvim.request("nvim_command", vec![Value::from("normal! ggdd")]), Value::Nil);
     assert_eq!(
@@ -595,4 +587,19 @@ fn rejected_quit_on_modified_buffer_emits_error_and_redraw() {
     assert!(redraw_names.contains(&"cmdline_hide"), "cmdline_hide missing: {redraw_names:?}");
     assert!(redraw_names.contains(&"msg_show"), "msg_show missing: {redraw_names:?}");
     assert!(contains_string(&redraw, error_text), "redraw should contain the error text");
+}
+
+#[test]
+fn lua_integration_smoke() {
+    let mut oxvim = Embedded::spawn();
+
+    // Call a Lua function that uses vim.api against the current editor.
+    assert_eq!(
+        oxvim.request("nvim_command", vec![Value::from("lua _G.oxvim_ex_buffer = vim.api.nvim_get_current_buf(); vim.g.oxvim_ex_value = 42")]),
+        Value::Nil,
+    );
+    assert_eq!(
+        oxvim.request("nvim_exec_lua", vec![Value::from("return {_G.oxvim_ex_buffer, vim.g.oxvim_ex_value}"), Value::Array(vec![])]),
+        Value::Array(vec![Value::from(1), Value::from(42)]),
+    );
 }
