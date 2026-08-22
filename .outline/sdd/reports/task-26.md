@@ -11,14 +11,14 @@ Implemented reactor-driven `jobstart()`, `jobstop()`, `jobwait()`, `jobpid()`, `
 
 ## Verification
 
-- `cargo nextest run -p ox-editor -p oxvim`: 487 passed, 0 skipped.
+- `cargo nextest run -p ox-eval -p ox-editor -p oxvim`: 848 passed, 0 skipped.
 - Vimscript smoke: `jobstart(['sh', '-c', 'exit 7'])`, `jobpid()`, and `jobwait()` returned a live PID and `[7]`.
 - Dictionary callback smoke: `s:logger` received stdout and exit events with `self.d_events` mutation; focused function module passed 31/31.
 - Lua smoke: `vim.fn.jobstart()` with Lua `on_stdout`/`on_exit` callbacks and `vim.fn.jobwait()` completed with status 0 and both callbacks observed.
-- Oldtest: `make test_arabic NVIM_PRG=.../target/debug/oxvim` spawned and waited for the child instead of failing at `jobstart`; it then failed in outer `runnvim.vim` at `Main[12]` (`getline(1, '$')`, E488), so the selected test did not produce a `.res` result.
+- Oldtest: unchanged `make test_arabic NVIM_PRG=/home/alpha/rewrite/Oxvim/target/debug/oxvim` executed the selected test body and produced a genuine failed child result: exit code 1, a one-line screen snapshot, and two callback events (`stdout`, `exit`). The outer runner then exited on its still-unimplemented `:cquit`; job creation, callbacks, waiting, and result collection all completed.
 
 ## Concerns
 
-- The required oldtest body/result gate remains blocked by the pre-existing post-job `getline(1, '$')` parsing failure in the outer runner; job creation and waiting are no longer the blocker.
+- The oldtest body/result gate is met, but Oxvim still reports `not implemented: cquit` after the runner has formatted the failed result, so the Make target itself ends with the wrapper error and does not create a `.res` target file.
 - `rpc` is registered as channel metadata/state but this slice does not add msgpack-RPC decoding of job stdout.
 - Lua calls nested inside `:lua` use a dedicated executor to avoid re-borrowing the active Ex executor; it shares channel IDs but not the Vimscript executor's job lookup table.
