@@ -859,7 +859,7 @@ fn dispatch<F: FileIO>(
         }
         "execute" => command_execute(runtime, editor, scope, lua, &command.args),
         "source" => {
-            let path = PathBuf::from(command.args.trim());
+            let path = source_argument_path(editor, &command.args);
             match source_path(runtime, editor, scope, lua, &path, false) {
                 Ok(Flow::Finish) => Flow::Normal,
                 Ok(flow) => flow,
@@ -1237,6 +1237,17 @@ fn call_expand_builtin<F: FileIO>(
         _ => text.into_owned(),
     };
     Ok(Typval::String(OxStr(expanded.into_bytes())))
+}
+
+fn source_argument_path(editor: &Editor, argument: &str) -> PathBuf {
+    let argument = argument.trim();
+    if argument != "%" {
+        return PathBuf::from(argument);
+    }
+    editor
+        .current_buffer()
+        .and_then(|buffer| editor.buffer(buffer).ok())
+        .map_or_else(|| PathBuf::from(argument), |buffer| PathBuf::from(buffer.name().to_string_lossy().into_owned()))
 }
 
 fn normalize_job_options(args: &[Typval]) -> ox_eval::Result<JobStartOptions> {

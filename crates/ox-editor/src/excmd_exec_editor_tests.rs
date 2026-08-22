@@ -128,6 +128,33 @@ fn assert_vim_error(result: Result<ExecOutcome, ExecError>, expected_code: &str)
     }
 }
 
+#[test]
+fn source_percent_expands_to_current_buffer_name() {
+    let io = MemoryFileIO::new();
+    io.insert("dir/current file.vim", "let g:sourced_percent = 1");
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut executor = ExExecutor::with_io(io);
+
+    executor
+        .execute_line(&mut editor, "edit dir/current file.vim")
+        .unwrap();
+    executor.execute_line(&mut editor, "source %").unwrap();
+
+    assert_eq!(
+        executor
+            .scope()
+            .global
+            .iter()
+            .find(|(name, _)| name.as_bytes() == b"sourced_percent")
+            .map(|(_, value)| value),
+        Some(&ox_types::Typval::Number(1))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // :edit / :write via in-memory FileIO
 // Citations: ex_docmd.c ex_edit (E32, E484), ex_write (E32, E45, E212)
