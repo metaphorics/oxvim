@@ -27,8 +27,8 @@ pub fn runtime_root() -> Result<PathBuf, AppError> {
     Ok(PathBuf::from("./runtime"))
 }
 
-/// Execute Ex source read from stdin and write command messages.
-pub fn run_batch() -> Result<(), AppError> {
+/// Execute Ex source read from stdin, with `--cmd` before and `+cmd` after.
+pub fn run_batch(pre_commands: &[String], commands: &[String]) -> Result<(), AppError> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).map_err(AppError::Io)?;
 
@@ -38,16 +38,10 @@ pub fn run_batch() -> Result<(), AppError> {
         .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).map_err(|error| AppError::Editor(error.to_string()))?)
         .map_err(|error| AppError::Editor(error.to_string()))?;
     let mut executor = ExExecutor::new();
-    'input: for line in input.lines() {
-        for command in split_commands(line) {
-            let outcome = executor
-                .execute_line(&mut editor, command)
-                .map_err(|error| AppError::Ex(error.to_string()))?;
-            if outcome == ExecOutcome::Quit {
-                break 'input;
-            }
-        }
-    }
+
+    execute_lines(&mut executor, &mut editor, pre_commands)?;
+    execute_lines(&mut executor, &mut editor, input.lines().collect::<Vec<_>>().as_slice())?;
+    execute_lines(&mut executor, &mut editor, commands)?;
 
     let stdout = io::stdout();
     let stderr = io::stderr();
@@ -60,6 +54,24 @@ pub fn run_batch() -> Result<(), AppError> {
             value => write!(destination, "{value:?}").map_err(AppError::Io)?,
         }
         destination.write_all(b"\n").map_err(AppError::Io)?;
+    }
+    Ok(())
+}
+
+fn execute_lines<S: AsRef<str>>(
+    executor: &mut ExExecutor,
+    editor: &mut Editor,
+    lines: &[S],
+) -> Result<(), AppError> {
+    for line in lines {
+        for command in split_commands(line.as_ref()) {
+            let outcome = executor
+                .execute_line(editor, command)
+                .map_err(|error| AppError::Ex(error.to_string()))?;
+            if outcome == ExecOutcome::Quit {
+                return Ok(());
+            }
+        }
     }
     Ok(())
 }

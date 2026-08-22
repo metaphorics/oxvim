@@ -66,8 +66,11 @@ fn run() -> Result<(), AppError> {
     if let Some(script) = &cli.lua_script {
         return runtime::run_lua(script);
     }
+    if cli.scriptin.is_some() {
+        return Err(AppError::NotWired("normal-mode script"));
+    }
     if cli.batch.is_some() {
-        return runtime::run_batch();
+        return runtime::run_batch(&cli.pre_commands, &cli.commands);
     }
     if cli.embed {
         return Err(AppError::NotWired("embedded RPC"));

@@ -76,3 +76,45 @@ fn lua_failure_and_unknown_option_exit_one() {
     assert_eq!(usage.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&usage.stderr).contains("Unknown option: --unknown"));
 }
+
+#[test]
+fn batch_executes_pre_commands_before_stdin_and_post_commands_after() {
+    let mut child = oxvim()
+        .args(["-es", "--cmd", "let g:pre=1", "+echo g:pre"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxvim");
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(b"call setline(1, \"x\") | %print\n")
+        .expect("write Ex input");
+    let output = child.wait_with_output().expect("wait for oxvim");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"x\n1\n");
+}
+
+#[test]
+fn bare_script_option_exits_with_usage_error() {
+    let output = oxvim().arg("-s").output().expect("spawn oxvim");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Argument missing after: -s"));
+}
+
+#[test]
+fn script_input_is_not_yet_wired() {
+    let path = std::env::temp_dir().join(format!("oxvim-script-{}.in", std::process::id()));
+    std::fs::write(&path, "j").expect("write script input");
+    let output = oxvim()
+        .args(["-s", path.to_str().expect("UTF-8 temp path")])
+        .output()
+        .expect("spawn oxvim");
+    let _removed = std::fs::remove_file(&path);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("normal-mode script mode is not yet wired"));
+}

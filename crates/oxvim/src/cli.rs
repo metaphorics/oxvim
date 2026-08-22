@@ -33,8 +33,6 @@ pub enum BatchMode {
     Ex,
     /// Silent Ex mode (`-es`).
     SilentEx,
-    /// Script input mode (`-s`).
-    Script,
 }
 
 /// A Lua script and the arguments following it.
@@ -44,6 +42,15 @@ pub struct LuaScript {
     pub path: String,
     /// Arguments exposed as `arg[1]` onward.
     pub args: Vec<String>,
+}
+
+/// Verbosity configuration requested with `-V`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerboseConfig {
+    /// Numeric verbosity level.
+    pub level: u32,
+    /// Optional log file suffix.
+    pub file: Option<String>,
 }
 
 /// Parsed process arguments.
@@ -65,12 +72,14 @@ pub struct Cli {
     pub lua_script: Option<LuaScript>,
     /// Read Ex input from stdin.
     pub batch: Option<BatchMode>,
+    /// Read Normal-mode commands from this file (`-` means stdin).
+    pub scriptin: Option<String>,
     /// Commands executed before configuration.
     pub pre_commands: Vec<String>,
     /// Commands executed after configuration.
     pub commands: Vec<String>,
-    /// Verbosity level requested with `-V`.
-    pub verbose: Option<u32>,
+    /// Verbosity level and optional log file requested with `-V`.
+    pub verbose: Option<VerboseConfig>,
     /// Print API metadata and exit.
     pub api_info: bool,
     /// Files to edit.
@@ -88,6 +97,7 @@ impl Default for Cli {
             listen: None,
             lua_script: None,
             batch: None,
+            scriptin: None,
             pre_commands: Vec::new(),
             commands: Vec::new(),
             verbose: None,
@@ -164,18 +174,16 @@ impl Cli {
             } else if options && argument == "-e" {
                 set_batch_mode(&mut cli, BatchMode::Ex)?;
             } else if options && argument == "-s" {
-                set_batch_mode(&mut cli, BatchMode::Script)?;
+                if cli.scriptin.is_some() {
+                    return Err(UsageError::new("Only one -s script may be given"));
+                }
+                cli.scriptin = Some(required_value(&args, &mut index, "-s")?);
             } else if options && argument == "--cmd" {
                 cli.pre_commands.push(required_value(&args, &mut index, "--cmd")?);
             } else if options && argument == "--api-info" {
                 cli.api_info = true;
             } else if options && argument.starts_with("-V") {
-                let level = &argument[2..];
-                cli.verbose = Some(if level.is_empty() {
-                    10
-                } else {
-                    level.parse().map_err(|_| UsageError::new(format!("Invalid argument: {argument}")))?
-                });
+                cli.verbose = Some(parse_verbose(&argument[2..])?);
             } else if options && argument.starts_with('+') {
                 cli.commands.push(if argument.len() == 1 { "$".to_owned() } else { argument[1..].to_owned() });
             } else if options && argument.starts_with('-') && argument != "-" {
@@ -186,7 +194,7 @@ impl Cli {
             index += 1;
         }
 
-        if cli.embed && (cli.batch.is_some() || cli.lua_script.is_some()) {
+        if cli.embed && (cli.batch.is_some() || cli.lua_script.is_some() || cli.scriptin.is_some()) {
             return Err(UsageError::new("--embed conflicts with -e/-es/-s/-l"));
         }
         Ok(cli)
@@ -203,9 +211,24 @@ fn required_value(args: &[String], index: &mut usize, option: &str) -> Result<St
 
 fn set_batch_mode(cli: &mut Cli, mode: BatchMode) -> Result<(), UsageError> {
     if cli.batch.replace(mode).is_some() {
-        return Err(UsageError::new("Only one of -e, -es, and -s may be used"));
+        return Err(UsageError::new("Only one of -e and -es may be used"));
     }
     Ok(())
+}
+
+fn parse_verbose(suffix: &str) -> Result<VerboseConfig, UsageError> {
+    if suffix.is_empty() {
+        return Ok(VerboseConfig { level: 10, file: None });
+    }
+    let digits = suffix.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return Ok(VerboseConfig { level: 10, file: Some(suffix.to_owned()) });
+    }
+    let level = suffix[..digits]
+        .parse::<u32>()
+        .map_err(|_| UsageError::new(format!("Invalid argument: -V{suffix}")))?;
+    let file = &suffix[digits..];
+    Ok(VerboseConfig { level, file: if file.is_empty() { None } else { Some(file.to_owned()) } })
 }
 
 #[cfg(test)]
@@ -230,12 +253,15 @@ mod tests {
             Case { args: &["--listen", "127.0.0.1:7777"], check: |c| c.listen.as_deref() == Some("127.0.0.1:7777") },
             Case { args: &["-e"], check: |c| c.batch == Some(BatchMode::Ex) },
             Case { args: &["-es"], check: |c| c.batch == Some(BatchMode::SilentEx) },
-            Case { args: &["-s"], check: |c| c.batch == Some(BatchMode::Script) },
+            Case { args: &["-s", "script"], check: |c| c.scriptin.as_deref() == Some("script") },
+            Case { args: &["-s", "-"], check: |c| c.scriptin.as_deref() == Some("-") },
             Case { args: &["+set number"], check: |c| c.commands == ["set number"] },
             Case { args: &["+"], check: |c| c.commands == ["$"] },
             Case { args: &["--cmd", "set loadplugins"], check: |c| c.pre_commands == ["set loadplugins"] },
-            Case { args: &["-V"], check: |c| c.verbose == Some(10) },
-            Case { args: &["-V3"], check: |c| c.verbose == Some(3) },
+            Case { args: &["-V"], check: |c| c.verbose == Some(VerboseConfig { level: 10, file: None }) },
+            Case { args: &["-V3"], check: |c| c.verbose == Some(VerboseConfig { level: 3, file: None }) },
+            Case { args: &["-Vlog.txt"], check: |c| c.verbose == Some(VerboseConfig { level: 10, file: Some("log.txt".into()) }) },
+            Case { args: &["-V3log.txt"], check: |c| c.verbose == Some(VerboseConfig { level: 3, file: Some("log.txt".into()) }) },
             Case { args: &["--api-info"], check: |c| c.api_info },
             Case { args: &["one", "two"], check: |c| c.files == ["one", "two"] },
             Case { args: &["--", "-mystery"], check: |c| c.files == ["-mystery"] },
@@ -261,11 +287,13 @@ mod tests {
             vec!["-i"],
             vec!["--listen"],
             vec!["-l"],
-            vec!["-Vx"],
-            vec!["-e", "-s"],
+            vec!["-s"],
+            vec!["-s", "a", "-s", "b"],
+            vec!["-e", "-es"],
             vec!["--embed", "-es"],
+            vec!["--embed", "-s", "script"],
         ] {
-            assert!(Cli::parse(args).is_err());
+            assert!(Cli::parse(args.clone()).is_err(), "expected error for {args:?}");
         }
     }
 }
