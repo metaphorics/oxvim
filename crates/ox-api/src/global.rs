@@ -2,7 +2,8 @@
 
 use ox_editor::{
     BufferRelease, Editor, KE_FILLER, K_SPECIAL, KS_EXTRA, KS_SPECIAL, KS_ZERO, Keys, Message,
-    MessageKind, OptionScope, OptionValue, TypeaheadFlags,
+    MessageKind, OptionListKind, OptionMetadata, OptionScope, OptionType, OptionValue,
+    TypeaheadFlags,
 };
 use ox_eval::{BuiltinHost, Builtins, EvalError, EvalErrorKind, Evaluator, NoRegex, Parser as EvalParser, Scope};
 use ox_excmd::{ExCommand, Parser as CommandParser};
@@ -188,7 +189,8 @@ pub fn nvim_set_option(
     value: Object,
 ) -> Result<(), ApiError> {
     let name = option_name(&name)?;
-    let value = object_to_option_value(value)?;
+    let metadata = ox_editor::OptionStore::metadata(name).map_err(exception)?;
+    let value = object_to_legacy_option_value(metadata, name, value)?;
     editor.options_mut().set_global(name, value).map_err(exception)
 }
 
@@ -216,22 +218,17 @@ pub fn nvim_set_option_value(
     opts: Dict,
 ) -> Result<Object, ApiError> {
     let name = option_name(&name)?;
-    let value = object_to_option_value(value)?;
-    if dict_bool(&opts, "dry_run")? == Some(true) {
-        validate_option_at(editor, name, &value, option_target(editor, name, &opts)?)?;
-        return Ok(Object::Nil);
-    }
-    if let Some(operation) = dict_string(&opts, "operation")? {
-        if operation.as_bytes() != b"set" {
-            return Err(ApiError::validation(format!(
-                "Unsupported nvim_set_option_value operation: {}",
-                operation.to_string_lossy()
-            )));
-        }
-    }
+    validate_option_operation(&opts)?;
     let target = option_target(editor, name, &opts)?;
+    let metadata = ox_editor::OptionStore::metadata(name).map_err(exception)?;
+    let value = object_to_option_value(metadata, name, value)?;
+    if dict_bool(&opts, "dry_run")? == Some(true) {
+        validate_option_at(editor, name, &value, target)?;
+        return Ok(structured_option_value(metadata, &value));
+    }
+    let assigned = structured_option_value(metadata, &value);
     set_option_at(editor, name, value, target)?;
-    Ok(Object::Nil)
+    Ok(assigned)
 }
 
 #[api(since = 1, fast)]
@@ -459,14 +456,262 @@ fn option_name(name: &OxStr) -> Result<&str, ApiError> {
         .map_err(|_| ApiError::validation("Option name must be valid UTF-8"))
 }
 
-fn object_to_option_value(value: Object) -> Result<OptionValue, ApiError> {
+/// Mirrors upstream `api_typename()` for the option-value validation messages.
+fn api_typename(value: &Object) -> &'static str {
     match value {
-        Object::Boolean(value) => Ok(OptionValue::Boolean(value)),
-        Object::Integer(value) => Ok(OptionValue::Number(value)),
-        Object::String(value) => String::from_utf8(value.0)
-            .map(OptionValue::String)
-            .map_err(|_| ApiError::validation("Option string must be valid UTF-8")),
-        _ => Err(ApiError::validation("Option value must be Boolean, Integer, or String")),
+        Object::Nil => "Nil",
+        Object::Boolean(_) => "Boolean",
+        Object::Integer(_) => "Integer",
+        Object::Float(_) => "Float",
+        Object::String(_) => "String",
+        Object::Array(_) => "Array",
+        Object::Dict(_) => "Dict",
+        Object::LuaRef(_) => "LuaRef",
+        Object::Buffer(_) => "Buffer",
+        Object::Window(_) => "Window",
+        Object::Tabpage(_) => "Tabpage",
+    }
+}
+
+/// The lowercase `:set`-style type name used by upstream value errors.
+fn option_type_name(value_type: OptionType) -> &'static str {
+    match value_type {
+        OptionType::Boolean => "boolean",
+        OptionType::Number => "number",
+        OptionType::String => "string",
+    }
+}
+
+fn invalid_option_type(name: &str, value: &Object) -> ApiError {
+    ApiError::validation(format!(
+        "Invalid '{name}': expected a valid type, got {}",
+        api_typename(value)
+    ))
+}
+
+/// Options whose number type also accepts a numeric string, mirroring the
+/// 'wildchar'/'wildcharm' special case in upstream `optval_from_obj()`.
+fn accepts_numeric_string(name: &str) -> bool {
+    name == "wildchar" || name == "wildcharm"
+}
+
+fn option_string(value: OxStr) -> Result<String, ApiError> {
+    String::from_utf8(value.0)
+        .map_err(|_| ApiError::validation("Option string must be valid UTF-8"))
+}
+
+/// Converts an incoming value for `nvim_set_option_value`, accepting the
+/// structured Array/Dict forms for list options and producing upstream's
+/// `Invalid '<name>': expected a valid type, got <T>` validation errors.
+pub(crate) fn object_to_option_value(
+    metadata: &'static OptionMetadata,
+    name: &str,
+    value: Object,
+) -> Result<OptionValue, ApiError> {
+    match value {
+        Object::Boolean(value) if metadata.value_type == OptionType::Boolean => {
+            Ok(OptionValue::Boolean(value))
+        }
+        Object::Integer(value) if metadata.value_type == OptionType::Number => {
+            Ok(OptionValue::Number(value))
+        }
+        Object::String(value) => {
+            let text = option_string(value)?;
+            match metadata.value_type {
+                OptionType::String => Ok(OptionValue::String(text)),
+                OptionType::Number if accepts_numeric_string(name) => text
+                    .parse::<i64>()
+                    .map(OptionValue::Number)
+                    .map_err(|_| numeric_string_error(name, &text)),
+                _ => Err(invalid_option_type(name, &Object::String(OxStr::from(text.as_str())))),
+            }
+        }
+        Object::Array(items) => {
+            if metadata.list.is_none() {
+                return Err(invalid_option_type(name, &Object::Array(items)));
+            }
+            let mut parts: Vec<String> = Vec::with_capacity(items.len());
+            for item in items {
+                let Object::String(value) = item else {
+                    return Err(invalid_option_type(name, &Object::Array(Vec::new())));
+                };
+                let text = option_string(value)?;
+                if metadata.deny_duplicates && parts.contains(&text) {
+                    continue;
+                }
+                parts.push(text);
+            }
+            Ok(OptionValue::String(parts.join(",")))
+        }
+        Object::Dict(entries) => dict_to_option_string(metadata, name, entries)
+            .map(OptionValue::String),
+        other => Err(invalid_option_type(name, &other)),
+    }
+}
+
+fn numeric_string_error(name: &str, text: &str) -> ApiError {
+    ApiError::exception(format!(
+        "Invalid value for option '{name}': expected number, got string \"{text}\""
+    ))
+}
+
+/// Joins a structured Dict input into its canonical `:set` string following
+/// upstream `optval_from_obj()`: truthy keys for flag lists, `key:value`
+/// entries for colon maps, sorted where the result is a comma list or map.
+fn dict_to_option_string(
+    metadata: &'static OptionMetadata,
+    name: &str,
+    entries: Dict,
+) -> Result<String, ApiError> {
+    let truthy = |value: &Object| !matches!(value, Object::Nil | Object::Boolean(false));
+    let key_of = |entry: &(OxStr, Object)| entry.0.to_string_lossy().into_owned();
+    let parts: Vec<String> = match metadata.list {
+        Some(OptionListKind::Flags) => entries
+            .0
+            .iter()
+            .filter(|(_, value)| truthy(value))
+            .map(key_of)
+            .collect(),
+        Some(OptionListKind::FlagsComma) => {
+            let mut parts: Vec<String> = entries
+                .0
+                .iter()
+                .filter(|(_, value)| truthy(value))
+                .map(key_of)
+                .collect();
+            parts.sort();
+            parts
+        }
+        Some(OptionListKind::CommaColon | OptionListKind::OneCommaColon) => {
+            let mut parts = Vec::with_capacity(entries.0.len());
+            for (key, value) in entries.0 {
+                let key = key.to_string_lossy();
+                match value {
+                    Object::String(value) => {
+                        parts.push(format!("{key}:{}", option_string(value)?));
+                    }
+                    Object::Integer(value) => parts.push(format!("{key}:{value}")),
+                    Object::Boolean(true) | Object::Nil => parts.push(key.into_owned()),
+                    Object::Boolean(false) => {}
+                    other => {
+                        return Err(invalid_option_type(
+                            name,
+                            &Object::Dict(Dict(vec![(OxStr::from(key.as_ref()), other)])),
+                        ))
+                    }
+                }
+            }
+            parts.sort();
+            parts
+        }
+        _ => return Err(invalid_option_type(name, &Object::Dict(entries))),
+    };
+    let separator = match metadata.list {
+        Some(OptionListKind::Flags) => "",
+        _ => ",",
+    };
+    Ok(parts.join(separator))
+}
+
+/// Converts an incoming value for the deprecated setters, mirroring upstream
+/// `set_option_to()`: only scalars pass the type gate (with its
+/// `Invalid 'value': expected valid option type` validation error) and type
+/// mismatches surface the deep `Invalid value for option '<name>'` exception.
+pub(crate) fn object_to_legacy_option_value(
+    metadata: &'static OptionMetadata,
+    name: &str,
+    value: Object,
+) -> Result<OptionValue, ApiError> {
+    match &value {
+        Object::Nil | Object::Boolean(_) | Object::Integer(_) | Object::String(_) => {}
+        other => {
+            return Err(ApiError::validation(format!(
+                "Invalid 'value': expected valid option type, got {}",
+                api_typename(other)
+            )))
+        }
+    }
+    let mismatch = |value: &Object| {
+        let (type_name, repr) = match value {
+            Object::Boolean(value) => ("boolean", value.to_string()),
+            Object::Integer(value) => ("number", value.to_string()),
+            Object::String(value) => ("string", format!("\"{}\"", value.to_string_lossy())),
+            other => (api_typename(other), String::new()),
+        };
+        ApiError::exception(format!(
+            "Invalid value for option '{name}': expected {}, got {} {}",
+            option_type_name(metadata.value_type),
+            type_name,
+            repr
+        ))
+    };
+    match value {
+        Object::Nil => Err(ApiError::validation(
+            "Option value must be Boolean, Integer, or String",
+        )),
+        Object::Boolean(value) if metadata.value_type == OptionType::Boolean => {
+            Ok(OptionValue::Boolean(value))
+        }
+        Object::Integer(value) if metadata.value_type == OptionType::Number => {
+            Ok(OptionValue::Number(value))
+        }
+        Object::String(value) => match metadata.value_type {
+            OptionType::String => Ok(OptionValue::String(option_string(value)?)),
+            OptionType::Number if accepts_numeric_string(name) => {
+                let text = option_string(value.clone())?;
+                text.parse::<i64>()
+                    .map(OptionValue::Number)
+                    .map_err(|_| numeric_string_error(name, &text))
+            }
+            _ => Err(mismatch(&Object::String(value))),
+        },
+        other => Err(mismatch(&other)),
+    }
+}
+
+/// Converts a stored option value to upstream's structured return form for
+/// `nvim_set_option_value`: flag and colon lists decompose into Dicts, plain
+/// comma lists into Arrays, and scalars pass through unchanged.
+pub(crate) fn structured_option_value(
+    metadata: &'static OptionMetadata,
+    value: &OptionValue,
+) -> Object {
+    let OptionValue::String(text) = value else {
+        return option_value_to_object(value);
+    };
+    let Some(kind) = metadata.list else {
+        return Object::String(OxStr::from(text.as_str()));
+    };
+    match kind {
+        OptionListKind::Flags => {
+            let flags = text
+                .chars()
+                .map(|flag| {
+                    let mut buffer = [0u8; 4];
+                    let key: &str = flag.encode_utf8(&mut buffer);
+                    (OxStr::from(key), Object::Boolean(true))
+                })
+                .collect::<Vec<_>>();
+            Object::Dict(Dict(flags))
+        }
+        OptionListKind::FlagsComma => Object::Dict(Dict(
+            comma_items(text)
+                .map(|item| (OxStr::from(item), Object::Boolean(true)))
+                .collect::<Vec<_>>(),
+        )),
+        OptionListKind::Comma | OptionListKind::OneComma => Object::Array(
+            comma_items(text)
+                .map(|item| Object::String(OxStr::from(item)))
+                .collect::<Vec<_>>(),
+        ),
+        OptionListKind::CommaColon | OptionListKind::OneCommaColon => Object::Dict(Dict(
+            comma_items(text)
+                .map(|item| match item.split_once(':') {
+                    Some((key, value)) => (OxStr::from(key), Object::String(OxStr::from(value))),
+                    None => (OxStr::from(item), Object::Boolean(true)),
+                })
+                .collect::<Vec<_>>(),
+        )),
     }
 }
 
@@ -475,6 +720,26 @@ fn option_value_to_object(value: &OptionValue) -> Object {
         OptionValue::Boolean(value) => Object::Boolean(*value),
         OptionValue::Number(value) => Object::Integer(*value),
         OptionValue::String(value) => Object::String(OxStr::from(value.as_str())),
+    }
+}
+
+fn comma_items(text: &str) -> impl Iterator<Item = &str> {
+    text.split(',').filter(|item| !item.is_empty())
+}
+
+fn validate_option_operation(opts: &Dict) -> Result<(), ApiError> {
+    let Some(operation) = dict_string(opts, "operation")? else {
+        return Ok(());
+    };
+    match operation.as_bytes() {
+        b"set" => Ok(()),
+        b"append" | b"prepend" | b"remove" => Err(ApiError::validation(format!(
+            "Unsupported nvim_set_option_value operation: {}",
+            operation.to_string_lossy()
+        ))),
+        _ => Err(ApiError::validation(
+            "Invalid 'operation': expected 'set', 'append', 'prepend', or 'remove'",
+        )),
     }
 }
 

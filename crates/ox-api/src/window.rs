@@ -49,19 +49,6 @@ fn window_tabpage(editor: &Editor, window: WinHandle) -> Result<TabHandle, ApiEr
     editor.window_tabpage(window).map_err(exception)
 }
 
-fn object_to_option(value: Object) -> Result<OptionValue, ApiError> {
-    match value {
-        Object::Boolean(value) => Ok(OptionValue::Boolean(value)),
-        Object::Integer(value) => Ok(OptionValue::Number(value)),
-        Object::String(value) => String::from_utf8(value.0)
-            .map(OptionValue::String)
-            .map_err(|_| ApiError::validation("Option string must be valid UTF-8")),
-        _ => Err(ApiError::validation(
-            "Option value must be Boolean, Integer, or String",
-        )),
-    }
-}
-
 fn option_to_object(value: &OptionValue) -> Object {
     match value {
         OptionValue::Boolean(value) => Object::Boolean(*value),
@@ -805,7 +792,8 @@ pub fn nvim_win_set_option(
     let window = resolve_window(editor, window)?;
     let name = std::str::from_utf8(name.as_bytes())
         .map_err(|_| ApiError::validation("Option name must be valid UTF-8"))?;
-    let value = object_to_option(value)?;
+    let metadata = ox_editor::OptionStore::metadata(name).map_err(exception)?;
+    let value = crate::global::object_to_legacy_option_value(metadata, name, value)?;
     editor
         .options_mut()
         .set_window(window, name, value)

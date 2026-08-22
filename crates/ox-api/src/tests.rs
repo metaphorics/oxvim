@@ -870,3 +870,298 @@ fn set_client_info_accepts_msgpack_rpc_type() {
     assert_eq!(client.get(&OxStr::from("type")), Some(&Object::String(OxStr::from("msgpack-rpc"))));
     assert_eq!(client.get(&OxStr::from("name")), Some(&Object::String(OxStr::from("rpc"))));
 }
+
+fn set_option_value(
+    editor: &mut Editor,
+    name: &str,
+    value: Object,
+    opts: &[(&str, Object)],
+) -> Result<Object, ApiError> {
+    crate::global::nvim_set_option_value(
+        editor,
+        OxStr::from(name),
+        value,
+        dict(&opts.iter().map(|(key, value)| (*key, value.clone())).collect::<Vec<_>>()),
+    )
+}
+
+fn get_option_value(editor: &mut Editor, name: &str) -> Result<Object, ApiError> {
+    crate::global::nvim_get_option_value(editor, OxStr::from(name), Dict(Vec::new()))
+}
+
+fn object_dict(entries: &[(&str, Object)]) -> Object {
+    Object::Dict(dict(entries))
+}
+
+#[test]
+fn set_option_value_returns_assigned_scalars_like_upstream() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    // Upstream nvim_set_option_value returns the assigned value (v0.13-dev
+    // structured option returns); verified against the reference binary.
+    assert_eq!(
+        set_option_value(&mut editor, "number", Object::Boolean(true), &[]),
+        Ok(Object::Boolean(true))
+    );
+    assert_eq!(
+        set_option_value(&mut editor, "tabstop", Object::Integer(3), &[]),
+        Ok(Object::Integer(3))
+    );
+    assert_eq!(
+        set_option_value(&mut editor, "undolevels", Object::Integer(100), &[]),
+        Ok(Object::Integer(100))
+    );
+    assert_eq!(
+        set_option_value(&mut editor, "background", Object::String(OxStr::from("dark")), &[]),
+        Ok(Object::String(OxStr::from("dark")))
+    );
+    assert_eq!(
+        set_option_value(&mut editor, "wildcharm", Object::String(OxStr::from("23")), &[]),
+        Ok(Object::Integer(23))
+    );
+}
+
+#[test]
+fn set_option_value_returns_structured_list_forms_like_upstream() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    // Flag list ('shortmess', Flags): each character becomes a key.
+    assert_eq!(
+        set_option_value(&mut editor, "shortmess", Object::String(OxStr::from("ltToOCF")), &[]),
+        Ok(object_dict(&[
+            ("l", Object::Boolean(true)),
+            ("t", Object::Boolean(true)),
+            ("T", Object::Boolean(true)),
+            ("o", Object::Boolean(true)),
+            ("O", Object::Boolean(true)),
+            ("C", Object::Boolean(true)),
+            ("F", Object::Boolean(true)),
+        ]))
+    );
+    // Comma flag list ('whichwrap', FlagsComma): each item becomes a key.
+    assert_eq!(
+        set_option_value(&mut editor, "whichwrap", Object::String(OxStr::from("b,s")), &[]),
+        Ok(object_dict(&[
+            ("b", Object::Boolean(true)),
+            ("s", Object::Boolean(true)),
+        ]))
+    );
+    // Comma list ('wildignore', OneComma): items become an Array.
+    assert_eq!(
+        set_option_value(&mut editor, "wildignore", Object::String(OxStr::from("*.o,*.obj")), &[]),
+        Ok(Object::Array(vec![
+            Object::String(OxStr::from("*.o")),
+            Object::String(OxStr::from("*.obj")),
+        ]))
+    );
+    // 'matchpairs' is a plain OneComma list upstream: `(:)` items stay strings.
+    assert_eq!(
+        set_option_value(&mut editor, "matchpairs", Object::String(OxStr::from("(:),{:}")), &[]),
+        Ok(Object::Array(vec![
+            Object::String(OxStr::from("(:)")),
+            Object::String(OxStr::from("{:}")),
+        ]))
+    );
+    // Colon map ('listchars', OneCommaColon): items become key/value pairs.
+    assert_eq!(
+        set_option_value(&mut editor, "listchars", Object::String(OxStr::from("eol:~,tab:>-")), &[]),
+        Ok(object_dict(&[
+            ("eol", Object::String(OxStr::from("~"))),
+            ("tab", Object::String(OxStr::from(">-"))),
+        ]))
+    );
+    assert_eq!(
+        set_option_value(&mut editor, "fillchars", Object::String(OxStr::from("vert:|,fold:-")), &[]),
+        Ok(object_dict(&[
+            ("vert", Object::String(OxStr::from("|"))),
+            ("fold", Object::String(OxStr::from("-"))),
+        ]))
+    );
+}
+
+#[test]
+fn set_option_value_accepts_structured_inputs_like_upstream() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    // Array input joins into the canonical comma string and returns the
+    // structured form; duplicate items drop on NoDup lists ('wildignore').
+    assert_eq!(
+        set_option_value(
+            &mut editor,
+            "wildignore",
+            Object::Array(vec![
+                Object::String(OxStr::from("*.a")),
+                Object::String(OxStr::from("*.b")),
+            ]),
+            &[]
+        ),
+        Ok(Object::Array(vec![
+            Object::String(OxStr::from("*.a")),
+            Object::String(OxStr::from("*.b")),
+        ]))
+    );
+    assert_eq!(
+        set_option_value(
+            &mut editor,
+            "wildignore",
+            Object::Array(vec![
+                Object::String(OxStr::from("*.a")),
+                Object::String(OxStr::from("*.a")),
+            ]),
+            &[]
+        ),
+        Ok(Object::Array(vec![Object::String(OxStr::from("*.a"))]))
+    );
+    // Dict input for a flag list keeps truthy keys.
+    assert_eq!(
+        set_option_value(
+            &mut editor,
+            "shortmess",
+            object_dict(&[("a", Object::Boolean(true)), ("o", Object::Boolean(true))]),
+            &[]
+        ),
+        Ok(object_dict(&[
+            ("a", Object::Boolean(true)),
+            ("o", Object::Boolean(true)),
+        ]))
+    );
+    // Dict input for a colon map joins key:value pairs, bare flags stay bare,
+    // and the joined result is sorted like upstream optval_from_obj().
+    assert_eq!(
+        set_option_value(
+            &mut editor,
+            "fillchars",
+            object_dict(&[("vert", Object::String(OxStr::from("|"))), ("fold", Object::Boolean(true))]),
+            &[]
+        ),
+        Ok(object_dict(&[
+            ("fold", Object::Boolean(true)),
+            ("vert", Object::String(OxStr::from("|"))),
+        ]))
+    );
+}
+
+#[test]
+fn set_option_value_dry_run_returns_value_without_storing() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    assert_eq!(
+        set_option_value(
+            &mut editor,
+            "shortmess",
+            Object::String(OxStr::from("filnxtToOF")),
+            &[("dry_run", Object::Boolean(true))]
+        ),
+        Ok(object_dict(&[
+            ("f", Object::Boolean(true)),
+            ("i", Object::Boolean(true)),
+            ("l", Object::Boolean(true)),
+            ("n", Object::Boolean(true)),
+            ("x", Object::Boolean(true)),
+            ("t", Object::Boolean(true)),
+            ("T", Object::Boolean(true)),
+            ("o", Object::Boolean(true)),
+            ("O", Object::Boolean(true)),
+            ("F", Object::Boolean(true)),
+        ]))
+    );
+    // dry_run must not modify the stored value.
+    assert_eq!(
+        get_option_value(&mut editor, "shortmess"),
+        Ok(Object::String(OxStr::from("ltToOCF")))
+    );
+}
+
+#[test]
+fn legacy_option_setters_return_nil_like_upstream() {
+    let (mut editor, buffer, _, window) = editor_with_lines(&["one"]);
+    // The deprecated setters are void upstream; their RPC responses are nil.
+    assert_eq!(
+        crate::global::nvim_set_option(&mut editor, OxStr::from("ignorecase"), Object::Boolean(true)),
+        Ok(())
+    );
+    assert_eq!(
+        crate::buffer::nvim_buf_set_option(
+            &mut editor,
+            buffer,
+            OxStr::from("expandtab"),
+            Object::Boolean(false)
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        crate::window::nvim_win_set_option(
+            &mut editor,
+            window,
+            OxStr::from("cursorline"),
+            Object::Boolean(true)
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        get_option_value(&mut editor, "ignorecase"),
+        Ok(Object::Boolean(true))
+    );
+}
+
+#[test]
+fn option_setter_error_shapes_match_upstream() {
+    let (mut editor, buffer, _, _) = editor_with_lines(&["one"]);
+    // nvim_set_option_value reports validation errors in upstream's
+    // "Invalid '<name>': expected a valid type" shape.
+    assert_eq!(
+        set_option_value(&mut editor, "ignorecase", Object::Integer(3), &[]),
+        Err(ApiError::validation(
+            "Invalid 'ignorecase': expected a valid type, got Integer"
+        ))
+    );
+    assert_eq!(
+        set_option_value(&mut editor, "ignorecase", Object::Array(Vec::new()), &[]),
+        Err(ApiError::validation(
+            "Invalid 'ignorecase': expected a valid type, got Array"
+        ))
+    );
+    // The deprecated setters first reject non-scalar values, then report the
+    // deep "Invalid value for option" exception with the offending literal.
+    assert_eq!(
+        crate::global::nvim_set_option(&mut editor, OxStr::from("ignorecase"), Object::Array(Vec::new())),
+        Err(ApiError::validation("Invalid 'value': expected valid option type, got Array"))
+    );
+    assert_eq!(
+        crate::global::nvim_set_option(&mut editor, OxStr::from("ignorecase"), Object::Integer(3)),
+        Err(ApiError::exception(
+            "Invalid value for option 'ignorecase': expected boolean, got number 3"
+        ))
+    );
+    assert_eq!(
+        crate::buffer::nvim_buf_set_option(
+            &mut editor,
+            buffer,
+            OxStr::from("expandtab"),
+            Object::String(OxStr::from("x"))
+        ),
+        Err(ApiError::exception(
+            "Invalid value for option 'expandtab': expected boolean, got string \"x\""
+        ))
+    );
+    // Unknown operations use upstream's message; unimplemented merge
+    // operations keep an explicit unsupported error.
+    assert_eq!(
+        set_option_value(
+            &mut editor,
+            "wildignore",
+            Object::String(OxStr::from("*.x")),
+            &[("operation", Object::String(OxStr::from("bogus")))]
+        ),
+        Err(ApiError::validation(
+            "Invalid 'operation': expected 'set', 'append', 'prepend', or 'remove'"
+        ))
+    );
+    assert_eq!(
+        set_option_value(
+            &mut editor,
+            "wildignore",
+            Object::String(OxStr::from("*.x")),
+            &[("operation", Object::String(OxStr::from("append")))]
+        ),
+        Err(ApiError::validation(
+            "Unsupported nvim_set_option_value operation: append"
+        ))
+    );
+}

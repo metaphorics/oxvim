@@ -137,17 +137,6 @@ fn option_to_object(value: &OptionValue) -> Object {
     }
 }
 
-fn object_to_option(value: Object) -> Result<OptionValue, ApiError> {
-    match value {
-        Object::Boolean(value) => Ok(OptionValue::Boolean(value)),
-        Object::Integer(value) => Ok(OptionValue::Number(value)),
-        Object::String(value) => String::from_utf8(value.0)
-            .map(OptionValue::String)
-            .map_err(|_| ApiError::validation("Option string must be valid UTF-8")),
-        _ => Err(ApiError::validation("Option value has an unsupported type")),
-    }
-}
-
 fn cursor_at(line: usize, column: usize) -> Position {
     Position {
         lnum: line.max(1),
@@ -586,10 +575,12 @@ pub fn nvim_buf_set_option(
 ) -> Result<(), ApiError> {
     let buffer = resolve_buffer(editor, buffer)?;
     let name = option_name(&name)?.to_owned();
-    let value = object_to_option(value)?;
+    let metadata = ox_editor::OptionStore::metadata(name.as_str())
+        .map_err(|error| ApiError::validation(error.to_string()))?;
+    let value = crate::global::object_to_legacy_option_value(metadata, name.as_str(), value)?;
     editor
         .options_mut()
-        .set_buffer(buffer, &name, value)
+        .set_buffer(buffer, name.as_str(), value)
         .map_err(|error| ApiError::validation(error.to_string()))
 }
 
