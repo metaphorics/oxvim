@@ -90,6 +90,40 @@ fn mpack_distinguishes_arrays_maps_and_rejects_malformed_or_recursive_values() {
 }
 
 #[test]
+fn mpack_packer_and_unpacker_are_callable_streaming_sessions() {
+    let host = host();
+    let result: (bool, i64, i64, bool, i64, i64, bool, bool, bool) = eval(
+        &host,
+        "local pack = vim.mpack.Packer(); \
+         local handlers = { [0] = function(kind, payload) \
+           return kind == 0 and vim.mpack.decode(payload) \
+         end }; \
+         local unpack = vim.mpack.Unpacker({ ext = handlers }); \
+         handlers[0] = function() return -1 end; \
+         local encoded = pack({1, 'x'}); \
+         local first, pos1 = unpack(encoded:sub(1, 2)); \
+         local value, pos2 = unpack(encoded:sub(3)); \
+         local one, pos3 = unpack(string.char(1, 2), 1); \
+         local two, pos4 = unpack(string.char(1, 2), pos3); \
+         local ext = unpack(string.char(0xd4, 0, 2)); \
+         local raw_ext = vim.mpack.Unpacker()(string.char(0xd4, 7, 42)); \
+         local mt = {}; \
+         local ext_pack = vim.mpack.Packer({ \
+           ext = { [mt] = function() return 7, string.char(42) end }, \
+         }); \
+         local packed_ext = ext_pack(setmetatable({}, mt)); \
+         local packed_bin = vim.mpack.Packer({ is_bin = true })('x'); \
+         return encoded == vim.mpack.encode({1, 'x'}), pos1, pos2, \
+           first == nil and value[1] == 1 and value[2] == 'x' and ext == 2, \
+           one + two, pos4, raw_ext == string.char(42), \
+           packed_ext == string.char(0xd4, 7, 42), \
+           packed_bin == string.char(0xc4, 1, string.byte('x'))",
+    );
+
+    assert_eq!(result, (true, 3, 3, true, 3, 3, true, true, true));
+}
+
+#[test]
 fn json_encode_covers_shape_formatting_and_scalar_boundaries() {
     let host = host();
     let encoded: (String, String, String, String) = eval(
