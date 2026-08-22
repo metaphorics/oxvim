@@ -1685,7 +1685,7 @@ enum SetLayer {
 }
 
 fn command_set<F: FileIO>(
-    runtime: &ExRuntime<F>,
+    runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     args: &str,
     layer: SetLayer,
@@ -1702,12 +1702,40 @@ fn command_set<F: FileIO>(
         }
         return Flow::Normal;
     }
+    let mut touched_runtimepath = false;
     for raw in split_set_args(args) {
         if let Err((code, message)) = set_one(editor, &raw, layer) {
             return error_flow(runtime, code, message);
         }
+        touched_runtimepath |= set_arg_targets(&raw);
+    }
+    if touched_runtimepath {
+        sync_runtime_roots(runtime, editor);
     }
     Flow::Normal
+}
+
+/// Whether one `:set` argument names the 'runtimepath' option, so runtime
+/// searches must be re-derived from its value.
+fn set_arg_targets(raw: &str) -> bool {
+    let name = raw
+        .trim_end_matches(['?', '!'])
+        .split(['=', '+', '-', '^'])
+        .next()
+        .unwrap_or_default();
+    crate::option_metadata(name).is_some_and(|metadata| metadata.name == "runtimepath")
+}
+
+/// Re-derives the runtime search roots from the current 'runtimepath'
+/// value (runtime.c `did_set_runtimepackpath` keeps searches glued to
+/// `p_rtp`). An unset or empty value keeps the existing roots so
+/// embedders that inject roots without seeding the option keep working.
+fn sync_runtime_roots<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &Editor) {
+    if let Ok(OptionValue::String(rtp)) = editor.options().get_global("runtimepath") {
+        if !rtp.is_empty() {
+            runtime.scripts.set_runtime_roots_from_rtp(rtp);
+        }
+    }
 }
 
 fn command_echo<F: FileIO>(
@@ -3063,7 +3091,7 @@ fn sync_scope_into_editor(editor: &mut Editor, scope: &Scope) -> Result<(), Exec
     Ok(())
 }
 
-fn assign_target<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, target: &str, value: Typval, _constant: bool) -> Result<(), Flow> {
+fn assign_target<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, target: &str, value: Typval, _constant: bool) -> Result<(), Flow> {
     let target = target.trim();
     if let Some(register) = target.strip_prefix('@').and_then(|name| name.chars().next()) {
         let content = RegisterContent::characterwise(typval_to_text(&value).as_bytes()).map_err(|error| error_flow(runtime, "E354", error.to_string()))?;
@@ -3117,13 +3145,16 @@ fn remove_target(editor: &mut Editor, scope: &mut Scope, target: &str) -> bool {
     }
 }
 
-fn assign_option<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, option: &str, value: Typval) -> Result<(), Flow> {
+fn assign_option<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, option: &str, value: Typval) -> Result<(), Flow> {
     let (prefix, name) = if let Some(name) = option.strip_prefix("g:") { (SetLayer::Global, name) } else if let Some(name) = option.strip_prefix("l:") { (SetLayer::Local, name) } else { (SetLayer::Effective, option) };
     let metadata = crate::option_metadata(name).ok_or_else(|| error_flow(runtime, "E355", format!("Unknown option: {name}")))?;
     let converted = typval_to_option(&value, metadata.value_type).map_err(|message| error_flow(runtime, "E474", message))?;
     set_option_value(editor, metadata.name, converted, prefix).map_err(|(code, message)| error_flow(runtime, code, message))?;
     let eval_scope = if matches!(prefix, SetLayer::Global) { EvalOptionScope::Global } else { EvalOptionScope::Local };
     scope.set_option(eval_scope, metadata.name.as_bytes(), value);
+    if metadata.name == "runtimepath" {
+        sync_runtime_roots(runtime, editor);
+    }
     Ok(())
 }
 

@@ -54,7 +54,7 @@ pub use mapping::{
 pub use mode::{CmdlineKind, CmdlineState, InsertState, Mode, ModeError, ModeMachine, NormalState, OperatorPendingState, Step};
 pub use script::{
     FileEntry, FileIO, FileKind, FileMetadata, LogicalLine, RealFileIO, RuntimeRoot, ScriptCtx, ScriptError, ScriptInfo, Sid,
-    SourceFrame,
+    SourceFrame, default_runtimepath,
 };
 pub use userfunc::{
     CallFrame, FunctionSignature, UserFunc, UserFuncError, UserFuncFlags, UserFunctions,

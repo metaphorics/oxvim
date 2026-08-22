@@ -656,6 +656,49 @@ fn autoload_path_resolution_and_load_once() {
         .is_sourced_once(&PathBuf::from("/rt/autoload/mylib.vim")));
 }
 
+// option.c did_set_runtimepackpath — runtime searches are glued to the
+// 'runtimepath' option: `:set runtimepath=` re-roots them, and the
+// compound `let &runtimepath ..=` form appends new roots exactly like
+// oldtest runtest.vim does. test_autoload.vim / test_options.vim.
+#[test]
+fn runtime_lookups_follow_runtimepath_option() {
+    let io = MemoryFileIO::new();
+    io.insert("/first/colors/sample.vim", "let g:scheme_first = 1");
+    io.insert("/second/colors/other.vim", "let g:scheme_second = 1");
+    io.insert(
+        "/appended/autoload/extra.vim",
+        "function! extra#Ping()\nlet g:extra_ran = 1\nendfunction",
+    );
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+
+    // :set re-roots the search: /first only, /second unreachable.
+    exec.execute_line(&mut editor, "set runtimepath=/first").unwrap();
+    exec.execute_line(&mut editor, "colorscheme sample").unwrap();
+    assert_eq!(global_number(exec.scope(), "scheme_first"), Some(1));
+    let error = exec
+        .execute_line(&mut editor, "colorscheme other")
+        .unwrap_err();
+    assert_eq!(error_code(&error), "E185");
+
+    // `let &runtimepath ..=` appends a search root (runtest.vim:151).
+    exec.execute_line(&mut editor, "let &runtimepath ..= ',/appended'")
+        .unwrap();
+    assert_eq!(
+        editor.options().get_global("runtimepath").unwrap(),
+        &crate::options::OptionValue::String("/first,/appended".to_owned())
+    );
+    // Autoload resolution consults the appended root.
+    exec.execute_script(&mut editor, "<caller>", "call extra#Ping()")
+        .unwrap();
+    assert_eq!(global_number(exec.scope(), "extra_ran"), Some(1));
+
+    // A rewritten 'runtimepath' replaces the whole search list.
+    exec.execute_line(&mut editor, "set runtimepath=/second").unwrap();
+    exec.execute_line(&mut editor, "colorscheme other").unwrap();
+    assert_eq!(global_number(exec.scope(), "scheme_second"), Some(1));
+}
+
 #[test]
 fn colorscheme_sources_runtime_file_then_fires_matching_autocmd() {
     let io = MemoryFileIO::new();

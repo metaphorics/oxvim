@@ -341,6 +341,109 @@ impl From<&Path> for RuntimeRoot {
     }
 }
 
+/// Builds the startup default for `'runtimepath'` (and its `'packpath'`
+/// copy), per option.c `set_init_default_*` calling runtime.c
+/// `runtimepath_default`: XDG config entries, XDG data `site` entries,
+/// the runtime tree, then the mirrored `after` entries in reverse.
+/// `clean` mirrors `--clean`: user and system XDG entries are dropped so
+/// only the runtime tree remains. `vimruntime` is this build's runtime
+/// tree, upstream's `$VIMRUNTIME`.
+#[must_use]
+pub fn default_runtimepath(clean: bool, vimruntime: &Path) -> String {
+    let (config_home, config_dirs, data_home, data_dirs) = if clean {
+        (None, Vec::new(), None, Vec::new())
+    } else {
+        (
+            xdg_home_dir("XDG_CONFIG_HOME", "~/.config"),
+            xdg_dir_list("XDG_CONFIG_DIRS", "/etc/xdg"),
+            xdg_home_dir("XDG_DATA_HOME", "~/.local/share"),
+            xdg_dir_list("XDG_DATA_DIRS", "/usr/local/share:/usr/share"),
+        )
+    };
+    build_runtimepath(config_home.as_deref(), &config_dirs, data_home.as_deref(), &data_dirs, vimruntime)
+}
+
+/// Assembles the 'runtimepath' entry list from resolved XDG pieces and
+/// the runtime tree, in `runtimepath_default` order. Crate-visible for
+/// deterministic tests of the entry layout.
+pub(crate) fn build_runtimepath(
+    config_home: Option<&str>,
+    config_dirs: &[String],
+    data_home: Option<&str>,
+    data_dirs: &[String],
+    vimruntime: &Path,
+) -> String {
+    const APPNAME: &str = "nvim";
+    fn joined(base: &str, suffix: &str) -> String {
+        format!("{}/{}", base.trim_end_matches('/'), suffix)
+    }
+    let mut entries = Vec::new();
+    if let Some(home) = config_home {
+        entries.push(joined(home, APPNAME));
+    }
+    for dir in config_dirs {
+        entries.push(joined(dir, APPNAME));
+    }
+    if let Some(home) = data_home {
+        entries.push(joined(home, &format!("{APPNAME}/site")));
+    }
+    for dir in data_dirs {
+        entries.push(joined(dir, &format!("{APPNAME}/site")));
+    }
+    entries.push(vimruntime.to_string_lossy().trim_end_matches('/').to_owned());
+    for dir in data_dirs.iter().rev() {
+        entries.push(joined(dir, &format!("{APPNAME}/site/after")));
+    }
+    if let Some(home) = data_home {
+        entries.push(joined(home, &format!("{APPNAME}/site/after")));
+    }
+    for dir in config_dirs.iter().rev() {
+        entries.push(joined(dir, &format!("{APPNAME}/after")));
+    }
+    if let Some(home) = config_home {
+        entries.push(joined(home, &format!("{APPNAME}/after")));
+    }
+    entries.join(",")
+}
+
+/// Resolves one single-directory XDG variable, falling back to the
+/// upstream default with `~` expanded through `$HOME` (stdpaths.c
+/// `stdpaths_get_xdg_var` + `expand_env_save`). An unset-but-present
+/// empty variable contributes nothing, like upstream.
+fn xdg_home_dir(env: &str, fallback: &str) -> Option<String> {
+    match std::env::var_os(env) {
+        Some(value) => {
+            let text = value.to_string_lossy().into_owned();
+            (!text.is_empty()).then_some(text)
+        }
+        None => Some(expand_home(fallback)),
+    }
+}
+
+/// Resolves one colon-separated XDG list, dropping empty entries.
+fn xdg_dir_list(env: &str, fallback: &str) -> Vec<String> {
+    let raw = std::env::var_os(env)
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| fallback.to_owned());
+    raw.split(':')
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Expands a leading `~/` through `$HOME`, leaving other paths untouched.
+fn expand_home(path: &str) -> String {
+    path.strip_prefix("~/").map_or_else(
+        || path.to_owned(),
+        |rest| {
+            std::env::var_os("HOME").map_or_else(
+                || path.to_owned(),
+                |home| Path::new(&home).join(rest).to_string_lossy().into_owned(),
+            )
+        },
+    )
+}
+
 /// Sourcing state owned by the Ex executor.
 #[derive(Debug)]
 pub struct ScriptCtx<F: FileIO = RealFileIO> {
@@ -381,6 +484,16 @@ impl<F: FileIO> ScriptCtx<F> {
     /// Adds a runtime root searched before later roots.
     pub fn add_runtime_root(&mut self, root: impl Into<RuntimeRoot>) {
         self.runtime_roots.push(root.into());
+    }
+
+    /// Replaces every runtime search root with the comma-separated entries
+    /// of `'runtimepath'`, in order (runtime.c `do_in_runtimepath` walks
+    /// `p_rtp` entries left to right). Empty entries are skipped.
+    pub fn set_runtime_roots_from_rtp(&mut self, rtp: &str) {
+        self.runtime_roots = crate::options::CommaItems::new(rtp)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| RuntimeRoot::new(PathBuf::from(entry)))
+            .collect();
     }
 
     /// Allocates a fresh SID for one sourcing event. SIDs are monotone and

@@ -495,3 +495,48 @@ fn local_mark_name_validation_is_exact() {
     assert!(marks.set('A', position(1, 0)).is_err());
     assert!(marks.set('0', position(1, 0)).is_err());
 }
+
+// runtime.c runtimepath_default — the startup 'runtimepath' layout: XDG
+// config entries, XDG data site entries, the runtime tree, then the
+// mirrored after entries in reverse order.
+#[test]
+fn runtimepath_default_layout_matches_upstream_order() {
+    let config_dirs = vec!["/etc/one".to_owned(), "/etc/two".to_owned()];
+    let data_dirs = vec!["/d/one".to_owned(), "/d/two".to_owned()];
+    let built = crate::script::build_runtimepath(
+        Some("/cfg"),
+        &config_dirs,
+        Some("/dat"),
+        &data_dirs,
+        std::path::Path::new("/rt/"),
+    );
+    assert_eq!(
+        built,
+        "/cfg/nvim,\
+         /etc/one/nvim,/etc/two/nvim,\
+         /dat/nvim/site,/d/one/nvim/site,/d/two/nvim/site,\
+         /rt,\
+         /d/two/nvim/site/after,/d/one/nvim/site/after,/dat/nvim/site/after,\
+         /etc/two/nvim/after,/etc/one/nvim/after,/cfg/nvim/after"
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    // --clean shape: no XDG entries, only the runtime tree.
+    assert_eq!(
+        crate::script::build_runtimepath(None, &[], None, &[], std::path::Path::new("/rt")),
+        "/rt"
+    );
+}
+
+// runtime.c do_in_runtimepath — runtime search roots follow the
+// 'runtimepath' value, skipping empty entries.
+#[test]
+fn runtime_roots_follow_runtimepath_entries() {
+    let mut context = crate::script::ScriptCtx::<crate::script::RealFileIO>::new(
+        crate::script::RealFileIO,
+    );
+    context.set_runtime_roots_from_rtp("/first,,/second,");
+    let roots: Vec<&std::path::Path> = context.runtime_roots().iter().map(|root| root.path()).collect();
+    assert_eq!(roots, vec![std::path::Path::new("/first"), std::path::Path::new("/second")]);
+}
