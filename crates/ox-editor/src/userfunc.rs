@@ -388,14 +388,20 @@ fn validate_function_name(name: &str) -> Result<(), UserFuncError> {
             format!("Invalid function name: {name}"),
         ));
     }
-    let unqualified = name
-        .strip_prefix("s:")
-        .or_else(|| name.strip_prefix("<SID>"))
-        .unwrap_or(name);
-    if unqualified.starts_with('<') && name.starts_with("<SNR>") {
-        return Ok(());
-    }
-    if !unqualified.contains('#')
+    let (unqualified, script_local) = if let Some(local) = name.strip_prefix("s:") {
+        (local, true)
+    } else if let Some(local) = name.strip_prefix("<SID>") {
+        (local, true)
+    } else if let Some(local) = name
+        .strip_prefix("<SNR>")
+        .and_then(|local| local.split_once('_').map(|(_, name)| name))
+    {
+        (local, true)
+    } else {
+        (name, false)
+    };
+    if !script_local
+        && !unqualified.contains('#')
         && !unqualified
             .as_bytes()
             .first()

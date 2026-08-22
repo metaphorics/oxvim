@@ -509,6 +509,19 @@ fn lowercase_bare_function_name_still_yields_e128() {
     assert_eq!(error_code(&error), "E128");
 }
 
+#[test]
+fn lowercase_script_local_function_name_is_allowed() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    exec.execute_script(
+        &mut editor,
+        "plugin.vim",
+        "function! s:lowercase()\nlet g:called_local = 1\nendfunction\ncall s:lowercase()",
+    )
+    .unwrap();
+    assert_eq!(global_number(exec.scope(), "called_local"), Some(1));
+}
+
 // ---------------------------------------------------------------------------
 // Family: continuation / comment joining
 // (ex_docmd.c: getline_equal; test_source.vim)
