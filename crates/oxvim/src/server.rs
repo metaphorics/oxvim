@@ -21,7 +21,7 @@ use ox_eval::{
 };
 use ox_lua::{
     ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, VariableHost, VariableScope, Work, bind_api,
-    bind_variables, call_with_traceback, lua_to_object, object_to_lua,
+    bind_variables, call_with_traceback, free_lua_ref, lua_to_object, object_to_lua,
 };
 use ox_rpc::{CHAN_STDIO, ChannelId, IncrementalDecoder, Message};
 use ox_text::Buffer;
@@ -598,6 +598,20 @@ impl AppState {
         }
     }
 
+    /// Release the ephemeral Lua references owned by one reply payload.
+    ///
+    /// Upstream frees each `kObjectTypeLuaRef` while packing it
+    /// (`msgpack_rpc/packer.c`), making the encoded reply the reference's
+    /// final consumer, so a long-running session does not grow the
+    /// `ox-lua.refs` registry table without bound.  Only freshly allocated
+    /// result references may pass through here; references stored in the
+    /// editor (autocmd callbacks, variables, keymaps) are aliased and must
+    /// be released by their owners instead.
+    fn free_reply_refs(&self, object: &Object) {
+        let lua = self.lua.borrow();
+        free_object_refs(lua.lua(), object);
+    }
+
     fn process_message(
         &mut self,
         channel: ChannelId,
@@ -608,6 +622,7 @@ impl AppState {
             Message::Request { msgid, method, params } => {
                 let is_input = method.as_bytes() == b"nvim_input" || method.as_bytes() == b"nvim_feedkeys";
                 let is_ui_attach = method.as_bytes() == b"nvim_ui_attach";
+                let owns_result_refs = allocates_result_refs(method.as_bytes());
                 let dispatched = self.dispatch(channel, &method, &params);
                 let (result, mut redraws) = match dispatched {
                     Ok((result, redraws)) => (Ok(result), redraws),
@@ -625,13 +640,25 @@ impl AppState {
                             });
                             redraws = self.redraw().map_err(|error| AppError::Api(error.to_string()))?;
                             writes.push((channel.get(), Message::Response { msgid, result: Err(error) }.encode_bytes()));
+                            if owns_result_refs
+                                && let Ok(value) = &result
+                            {
+                                self.free_reply_refs(value);
+                            }
                             writes.extend(redraws);
                             self.drain_lua_work()?;
                             return Ok(writes);
                         }
                     }
                 }
-                let response = (channel.get(), Message::Response { msgid, result }.encode_bytes());
+                let response = Message::Response { msgid, result };
+                let encoded = response.encode_bytes();
+                if owns_result_refs
+                    && let Message::Response { result: Ok(value), .. } = &response
+                {
+                    self.free_reply_refs(value);
+                }
+                let response = (channel.get(), encoded);
                 if is_ui_attach {
                     writes.extend(redraws);
                     writes.push(response);
@@ -642,8 +669,15 @@ impl AppState {
             }
             Message::Notification { method, params } => {
                 let is_input = method.as_bytes() == b"nvim_input" || method.as_bytes() == b"nvim_feedkeys";
+                let owns_result_refs = allocates_result_refs(method.as_bytes());
                 match self.dispatch(channel, &method, &params) {
-                    Ok((_, mut redraws)) => {
+                    Ok((value, mut redraws)) => {
+                        // No reply is encoded for a fire-and-forget call, so
+                        // the ephemeral references in its result are released
+                        // here instead.
+                        if owns_result_refs {
+                            self.free_reply_refs(&value);
+                        }
                         if is_input {
                             match self.drive_input() {
                                 Ok(()) => redraws = self.redraw().map_err(|error| AppError::Api(error.to_string()))?,
@@ -697,6 +731,49 @@ fn read_startup_file(file: &str) -> Result<Buffer, AppError> {
         .ok()
         .filter(|value| *value > 0)
         .ok_or_else(|| ApiError::validation(format!("{name} must be positive")))
+}
+
+/// Methods whose dispatch allocates fresh Lua references inside the result.
+///
+/// `nvim_exec_lua`/`nvim_execute_lua` convert the chunk's first return value
+/// (`nlua_exec` parity), so every `Object::LuaRef` in their reply was created
+/// by that dispatch and is aliased nowhere else.  Registry results may borrow
+/// references stored in the editor (autocmd callbacks, variables, keymaps),
+/// which stay owned by their stores and must never be released here.
+fn allocates_result_refs(method: &[u8]) -> bool {
+    method == b"nvim_exec_lua" || method == b"nvim_execute_lua"
+}
+
+/// Collect every Lua reference id stored in `object`, recursing through
+/// arrays and dictionaries like upstream `api_luarefs_free_object`.
+fn collect_object_refs(object: &Object, out: &mut Vec<i32>) {
+    match object {
+        Object::LuaRef(reference) => out.push(*reference),
+        Object::Array(items) => {
+            for item in items {
+                collect_object_refs(item, out);
+            }
+        }
+        Object::Dict(Dict(entries)) => {
+            for (_, value) in entries {
+                collect_object_refs(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Release every Lua reference id collected from `object`.
+///
+/// Releasing an already-released slot is a no-op, so duplicate ids in one
+/// payload are safe; a failed release only leaves the slot pinned and cannot
+/// corrupt the registry.
+fn free_object_refs(lua: &Lua, object: &Object) {
+    let mut references = Vec::new();
+    collect_object_refs(object, &mut references);
+    for reference in references {
+        let _ = free_lua_ref(lua, reference);
+    }
 }
 
 fn method_is_mutating(method: &str) -> bool {
@@ -1280,7 +1357,14 @@ impl LuaExec for ServerLuaExec {
             let mut results = call_with_traceback(lua, &function, lua_args)
                 .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
             results.pop_front().map_or(Ok(Object::Nil), |value| {
-                lua_to_object(lua, &value).map_err(|error| LuaExecError::Conversion(error.to_string()))
+                let object = lua_to_object(lua, &value).map_err(|error| LuaExecError::Conversion(error.to_string()))?;
+                // The Ex executor discards non-scalar Lua results (`:lua`
+                // prints inside Lua through `vim._print`, and `:luado` only
+                // consumes strings and numbers — upstream passes kRetNilBool
+                // here), so the converted references are released at once
+                // instead of leaking one registry slot per call.
+                free_object_refs(lua, &object);
+                Ok(object)
             })
         })
     }

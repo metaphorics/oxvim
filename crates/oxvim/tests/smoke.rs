@@ -817,3 +817,68 @@ fn write_without_name_on_nameless_buffer_raises_e32() {
     let error = oxvim.request_error("nvim_command", vec![Value::from("write")]);
     assert!(format!("{error:?}").contains("E32"), "{error:?}");
 }
+
+#[test]
+fn exec_lua_reply_refs_are_freed_after_encoding() {
+    let mut oxvim = Embedded::spawn();
+    // The converter's `ox-lua.refs` registry table counts ever-issued slots
+    // (`__next`); freed slots are recycled, so the counter only grows while
+    // live references accumulate.
+    let probe = "local registry = debug.getregistry() \
+                 local refs = registry['ox-lua.refs'] \
+                 if refs == nil then \
+                   for _, value in pairs(registry) do \
+                     if type(value) == 'table' and rawget(value, '__next') ~= nil then refs = value end \
+                   end \
+                 end \
+                 return refs and refs.__next or -1";
+    let registry_next = |oxvim: &mut Embedded| match oxvim.request(
+        "nvim_exec_lua",
+        vec![Value::from(probe), Value::Array(vec![])],
+    ) {
+        Value::Integer(next) => next.as_i64().expect("registry slot count exceeds i64"),
+        other => panic!("registry probe returned {other:?}"),
+    };
+    // The refs table is created lazily by the first conversion that stores a
+    // reference, so warm it up before probing.
+    oxvim.request("nvim_exec_lua", vec![Value::from("return function() end"), Value::Array(vec![])]);
+    let base = registry_next(&mut oxvim);
+    assert!(base >= 1, "ox-lua.refs table was not found ({base})");
+
+    // Request replies: each converted function result is packed as a
+    // "<Lua n>" hint string; its registry slot must be released right after.
+    for index in 0..12_000 {
+        let reply = oxvim.request(
+            "nvim_exec_lua",
+            vec![Value::from("return function() end"), Value::Array(vec![])],
+        );
+        if index == 0 {
+            let Value::String(text) = &reply else {
+                panic!("first reply is not a Lua hint: {reply:?}")
+            };
+            assert!(text.as_bytes().starts_with(b"<Lua "), "unexpected hint {text:?}");
+        }
+    }
+
+    // Fire-and-forget exec still converts its result; with no reply to
+    // encode, the notification path owns the release.
+    for _ in 0..2_000 {
+        oxvim.notify(
+            "nvim_exec_lua",
+            vec![Value::from("return { hook = function() end }"), Value::Array(vec![])],
+        );
+    }
+
+    // Ex `:lua` chunks discard their results; those references must not
+    // accumulate either.
+    for _ in 0..1_000 {
+        oxvim.request("nvim_command", vec![Value::from("lua return function() end")]);
+    }
+
+    let settled = registry_next(&mut oxvim);
+    assert!(
+        settled - base <= 64,
+        "Lua registry slots grew by {} across the stress (base {base}, settled {settled})",
+        settled - base,
+    );
+}
