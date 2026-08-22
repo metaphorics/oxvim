@@ -22,6 +22,14 @@ functional: _guard_binary
 oldtest: _guard_binary
     make -C .references/neovim/test/old/testdir NVIM_PRG=$PWD/target/release/oxvim
 
-# Diff oxvim --api-info schema against upstream (test runner created by a later task).
+# Diff oxvim --api-info schema against upstream.
 apidiff: _guard_binary
     tests/differential/apidiff.sh
+
+# Replay all semantic RPC seed sessions against upstream and oxvim.
+replay: _guard_binary
+    cargo run --quiet -p differential --bin replay
+
+# Run the release-binary smoke and PTY differential checks.
+differential: _guard_binary
+    cargo nextest run -p differential

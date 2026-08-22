@@ -1,0 +1,10 @@
+- send: [0, 1, nvim_get_option_value, [number, {}]]
+- expect_response: 1
+- send: [0, 2, nvim_set_option_value, [number, true, {}]]
+- expect_response: 2
+- send: [0, 3, nvim_get_option_value, [number, {}]]
+- expect_response: 3
+- send: [0, 4, nvim_set_option_value, [tabstop, 3, {}]]
+- expect_response: 4
+- send: [0, 5, nvim_get_option_value, [tabstop, {}]]
+- expect_response: 5

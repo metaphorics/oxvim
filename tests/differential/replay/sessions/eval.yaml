@@ -1,0 +1,8 @@
+- send: [0, 1, nvim_eval, ["1 + 2 * 3"]]
+- expect_response: 1
+- send: [0, 2, nvim_eval, ["toupper('Oxvim')"]]
+- expect_response: 2
+- send: [0, 3, nvim_eval, ["[1, 2, 3][1]"]]
+- expect_response: 3
+- send: [0, 4, nvim_eval, ["{'name': 'ox'}.name"]]
+- expect_response: 4

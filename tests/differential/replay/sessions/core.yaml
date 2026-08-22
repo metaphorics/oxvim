@@ -1,0 +1,12 @@
+- send: [0, 1, nvim_get_api_info, []]
+- expect_response: 1
+- send: [0, 2, nvim_buf_set_lines, [0, 0, -1, true, [ox, vim]]]
+- expect_response: 2
+- send: [0, 3, nvim_buf_get_lines, [0, 0, -1, true]]
+- expect_response: 3
+- send: [0, 4, nvim_exec_lua, ["return vim.fn.has('nvim-0.13')", []]]
+- expect_response: 4
+- send: [0, 5, nvim_command, ["normal! ggdd"]]
+- expect_response: 5
+- send: [0, 6, nvim_buf_get_lines, [0, 0, -1, true]]
+- expect_response: 6

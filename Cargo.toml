@@ -16,6 +16,7 @@ members = [
     "crates/ox-ui",
     "crates/ox-tui",
     "crates/oxvim",
+    "tests/differential",
 ]
 
 [workspace.package]

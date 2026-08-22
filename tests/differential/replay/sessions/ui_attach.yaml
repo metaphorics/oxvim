@@ -1,0 +1,11 @@
+- send:
+  - 0
+  - 1
+  - nvim_ui_attach
+  - - 80
+    - 24
+    - {ext_linegrid: true, ext_multigrid: true, ext_cmdline: true, ext_messages: true, ext_popupmenu: true, ext_hlstate: true, rgb: true, ext_termcolors: true}
+- expect_response: 1
+- expect_notification: redraw
+- send: [0, 2, nvim_ui_detach, []]
+- expect_response: 2

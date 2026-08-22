@@ -1,0 +1,4 @@
+- send: [0, 1, nvim_exec_lua, ["local c=vim.api.nvim_open_term(0, {}); return vim.api.nvim_chan_send(c, 'echo')", []]]
+- expect_response: 1
+- send: [2, missing_differential_method, []]
+- expect_notification: nvim_error_event
