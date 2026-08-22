@@ -124,6 +124,7 @@ impl<'a> Builtins<'a> {
             "nr2char" => nr2char(&args),
             "or" => binary_number(&args, |left, right| left | right),
             "pow" => float_binary(&args, f64::powf),
+            "printf" => printf_builtin(&args),
             "range" => range(&args),
             "remove" => remove(args),
             "repeat" => repeat(&args),
@@ -573,7 +574,7 @@ fn is_implemented(name: &str) -> bool {
         "deepcopy" | "empty" | "escape" | "executable" | "extend" | "extendnew" | "filereadable" | "filter" | "flatten" |
         "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "get" | "getcwd" | "glob" | "globpath" | "has" | "has_key" | "index" | "insert" | "isdirectory" | "items" |
         "islocked" | "join" | "json_decode" | "json_encode" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
-        "match" | "matchend" | "matchstr" | "max" | "min" | "nr2char" | "or" | "pow" | "range" | "reduce" | "resolve" |
+        "match" | "matchend" | "matchstr" | "max" | "min" | "nr2char" | "or" | "pow" | "printf" | "range" | "reduce" | "resolve" |
         "remove" | "repeat" | "reverse" | "setenv" | "simplify" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
         "str2nr" | "strcharlen" | "strchars" | "stridx" | "string" | "strpart" | "strridx" |
         "substitute" | "tolower" | "toupper" | "trim" | "trunc" | "type" | "uniq" | "values" | "xor"
@@ -957,6 +958,176 @@ fn strpart(args: &[Typval]) -> Result<Typval> {
     Ok(Typval::String(OxStr(value.as_bytes()[start..end].to_vec())))
 }
 
+/// `f_printf` (`eval/strings.c`): C-style formatting over typvals. Handles
+/// `%s`, `%d`/`%i`/`%u`, `%x`/`%X`/`%o`/`%b`/`%B`, `%c`, `%f`/`%e`/`%g`
+/// families with `-`/`0`/`+` flags, width, and precision; `%%` is literal.
+/// Too few arguments is E766, leftovers are E767.
+fn printf_builtin(args: &[Typval]) -> Result<Typval> {
+    let format = match &args[0] {
+        Typval::String(text) => text.to_string_lossy().into_owned(),
+        other => vim_string(other, 0)?.to_string_lossy().into_owned(),
+    };
+    let mut pieces = String::new();
+    let mut arguments = args[1..].iter();
+    let mut source = format.chars().peekable();
+    while let Some(character) = source.next() {
+        if character != '%' {
+            pieces.push(character);
+            continue;
+        }
+        if source.peek() == Some(&'%') {
+            source.next();
+            pieces.push('%');
+            continue;
+        }
+        let mut flags = String::new();
+        while matches!(source.peek(), Some('-') | Some('0') | Some('+') | Some(' ') | Some('#')) {
+            flags.push(source.next().expect("peeked flag"));
+        }
+        let mut width = String::new();
+        while source.peek().is_some_and(|digit| digit.is_ascii_digit()) {
+            width.push(source.next().expect("peeked digit"));
+        }
+        let mut precision: Option<usize> = None;
+        if source.peek() == Some(&'.') {
+            source.next();
+            let mut digits = String::new();
+            while source.peek().is_some_and(|digit| digit.is_ascii_digit()) {
+                digits.push(source.next().expect("peeked digit"));
+            }
+            precision = Some(digits.parse().unwrap_or(0));
+        }
+        while matches!(source.peek(), Some('l') | Some('h') | Some('z')) {
+            source.next();
+        }
+        let Some(conversion) = source.next() else {
+            return Err(EvalError::new("E806", 0, "Invalid format specifier"));
+        };
+        let Some(value) = arguments.next() else {
+            return Err(EvalError::new(
+                "E766",
+                0,
+                format!("Insufficient arguments for printf() at {}", conversion),
+            ));
+        };
+        let left = flags.contains('-');
+        let zero = flags.contains('0') && !left;
+        let width: usize = width.parse().unwrap_or(0);
+        let rendered = match conversion {
+            'd' | 'i' | 'u' => {
+                let mut number = number_arg(value)?.to_string();
+                if flags.contains('+') && !number.starts_with('-') {
+                    number.insert(0, '+');
+                }
+                if let Some(digits) = precision {
+                    let magnitude = number.trim_start_matches(['-', '+']).len();
+                    if magnitude < digits {
+                        let sign = number.starts_with(['-', '+']);
+                        let insert_at = usize::from(sign);
+                        number.insert_str(insert_at, &"0".repeat(digits - magnitude));
+                    }
+                }
+                number
+            }
+            'x' | 'X' | 'o' | 'b' | 'B' => {
+                let number = number_arg(value)?;
+                let radix = match conversion {
+                    'x' | 'X' => 16,
+                    'o' => 8,
+                    _ => 2,
+                };
+                let mut digits = to_radix(number.unsigned_abs(), radix);
+                if conversion.is_ascii_uppercase() {
+                    digits = digits.to_uppercase();
+                }
+                if flags.contains('#') && number != 0 {
+                    let prefix = match conversion {
+                        'x' => "0x",
+                        'X' => "0X",
+                        'o' => "0",
+                        'b' => "0b",
+                        _ => "0B",
+                    };
+                    digits = format!("{prefix}{digits}");
+                }
+                if let Some(count) = precision {
+                    if digits.len() < count {
+                        digits = format!("{}{digits}", "0".repeat(count - digits.len()));
+                    }
+                }
+                digits
+            }
+            'c' => match value {
+                Typval::String(text) if !text.as_bytes().is_empty() => {
+                    char::from(text.as_bytes()[0]).to_string()
+                }
+                other => char::from_u32(number_arg(other)? as u32).unwrap_or('\0').to_string(),
+            },
+            'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
+                let number = float_arg(value)?;
+                let digits = precision.unwrap_or(6);
+                match conversion {
+                    'f' | 'F' | 'g' => format!("{number:.digits$}"),
+                    'e' => format!("{number:.digits$e}"),
+                    'E' => format!("{number:.digits$e}").to_uppercase(),
+                    _ => format!("{number:.digits$}").to_uppercase(),
+                }
+            }
+            's' => {
+                let mut text = match value {
+                    Typval::String(text) => text.to_string_lossy().into_owned(),
+                    other => vim_string(other, 0)?.to_string_lossy().into_owned(),
+                };
+                if let Some(count) = precision {
+                    text = text.chars().take(count).collect();
+                }
+                text
+            }
+            _ => {
+                return Err(EvalError::new(
+                    "E806",
+                    0,
+                    format!("Invalid format specifier: %{conversion}"),
+                ));
+            }
+        };
+        let padding = width.saturating_sub(rendered.chars().count());
+        if left {
+            pieces.push_str(&rendered);
+            pieces.push_str(&" ".repeat(padding));
+        } else if zero && matches!(conversion, 'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'b' | 'B' | 'c') {
+            let (sign, digits) = match rendered.strip_prefix(['-', '+']) {
+                Some(digits) => (rendered[..1].to_owned(), digits),
+                None => (String::new(), rendered.as_str()),
+            };
+            pieces.push_str(&sign);
+            pieces.push_str(&"0".repeat(padding));
+            pieces.push_str(digits);
+        } else {
+            pieces.push_str(&" ".repeat(padding));
+            pieces.push_str(&rendered);
+        }
+    }
+    if arguments.next().is_some() {
+        return Err(EvalError::new("E767", 0, "Too many arguments to printf()"));
+    }
+    Ok(Typval::String(OxStr(pieces.into_bytes())))
+}
+
+/// Digits of `value` in `radix`, lowercase, without prefix.
+fn to_radix(mut value: u64, radix: u64) -> String {
+    if value == 0 {
+        return "0".to_owned();
+    }
+    let mut digits = Vec::new();
+    while value > 0 {
+        let alphabet = b"0123456789abcdef";
+        digits.push(alphabet[(value % radix) as usize]);
+        value /= radix;
+    }
+    digits.reverse();
+    String::from_utf8(digits).expect("digit bytes")
+}
 fn escape(args: &[Typval]) -> Result<Typval> {
     let value = string_arg(&args[0])?;
     let chars = string_arg(&args[1])?;

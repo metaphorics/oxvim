@@ -1123,3 +1123,13 @@ fn executable_checks_mode_bits_for_explicit_paths() {
     assert_eq!(call("executable", vec![text("sh")]).unwrap(), number(1));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+// f_printf: strings.c C-style formatting with flags, width, precision.
+#[test]
+fn printf_formats_strings_numbers_and_radices() {
+    assert_eq!(call("printf", vec![text("Screen (%u lines)"), number(42)]).unwrap(), text("Screen (42 lines)"));
+    assert_eq!(call("printf", vec![text("<%x>"), number(255)]).unwrap(), text("<ff>"));
+    assert_eq!(call("printf", vec![text("%5.2d|%-5s|%05d"), number(3), text("ab"), number(42)]).unwrap(), text("   03|ab   |00042"));
+    assert_eq!(call("printf", vec![text("100%% and %s"), text("done")]).unwrap(), text("100% and done"));
+    assert!(call("printf", vec![text("%d %d"), number(1)]).is_err());
+}
