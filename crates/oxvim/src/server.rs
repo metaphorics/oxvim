@@ -168,6 +168,16 @@ impl AppState {
     }
 
     fn run_startup(&mut self, cli: &Cli) -> Result<(), AppError> {
+
+        // main.c fills the global argument list from the command line
+        // before any startup command runs, so argc()/argv() observe the
+        // pending files even inside --cmd and -S scripts.
+        if !cli.files.is_empty() {
+            self.editor
+                .borrow_mut()
+                .arglist_mut()
+                .set(cli.files.iter().map(|file| OxStr::from(file.as_str())).collect());
+        }
         for command in &cli.pre_commands {
             self.execute_ex(command)?;
             if self.exiting {

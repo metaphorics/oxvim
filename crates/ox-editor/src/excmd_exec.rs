@@ -893,6 +893,10 @@ fn dispatch<F: FileIO>(
         "buffer" => command_buffer(runtime, editor, command),
         "bwipeout" | "bwipe" => command_buffer_remove(runtime, editor, command, true),
         "bdelete" | "bdel" | "bunload" | "bun" => command_buffer_remove(runtime, editor, command, false),
+        "args" => command_args(runtime, editor, command),
+        "next" => command_next(runtime, editor, command),
+        "previous" | "Next" => command_previous(runtime, editor, command),
+        "argdo" => command_argdo(runtime, editor, scope, lua, command),
         "put" => command_put(runtime, editor, scope, lua, command),
         "print" => command_print(runtime, editor, command),
         "delete" => command_delete(runtime, editor, command),
@@ -1030,6 +1034,10 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
                 _ => ".".to_owned(),
             };
             return crate::fs_builtins::swapfilelist(self.runtime.scripts.io(), args.len(), &directory);
+        }
+
+        if crate::arglist::is_arglist_builtin(&name_text) {
+            return crate::arglist::call(self.editor, &name_text, args);
         }
 
         // Buffer-seam builtins (`getline`/`setline`) reach the current buffer
@@ -2856,6 +2864,240 @@ fn command_buffer<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, comman
         Ok(()) => Flow::Normal,
         Err(error) => error_flow(runtime, "E86", error.to_string()),
     }
+}
+
+/// `:args` (`ex_args`, arglist.c 502): with file arguments the list is
+/// redefined and the first entry edited, exactly like `:next`; without
+/// arguments the list is printed with the current entry in brackets.
+fn command_args<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    if !command.args.trim().is_empty() {
+        return command_next(runtime, editor, command);
+    }
+    let arglist = editor.arglist();
+    if arglist.is_empty() {
+        return Flow::Normal;
+    }
+    let current = arglist.index();
+    let mut line = String::new();
+    for (position, name) in arglist.names().iter().enumerate() {
+        if position > 0 {
+            line.push_str("  ");
+        }
+        if position == current {
+            line.push('[');
+            line.push_str(&name.to_string_lossy());
+            line.push(']');
+        } else {
+            line.push_str(&name.to_string_lossy());
+        }
+    }
+    push_text_message(editor, line, false, false);
+    Flow::Normal
+}
+
+/// `:next` (`ex_next`, arglist.c 670): with file arguments the argument
+/// list is redefined and its first entry edited; otherwise the count-th
+/// following entry is edited through `do_argfile`.
+fn command_next<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    let list = command.args.trim();
+    if list.is_empty() {
+        let step = command_step(command);
+        let target = editor.arglist().index() as i64 + step;
+        return do_argfile(runtime, editor, command.bang, target);
+    }
+    // The changed-buffer guard runs before the list is replaced (ex_next
+    // checks first so a failure leaves the old list intact).
+    if let Some(current) = editor.current_buffer() {
+        if editor.buffer(current).is_ok_and(|state| state.modified) && !command.bang {
+            return error_flow(runtime, "E37", "No write since last change (add ! to override)");
+        }
+    }
+    let mut names = Vec::new();
+    for name in crate::arglist::split_file_list(list) {
+        // expand_wildcards with EW_NOTFOUND (arglist.c 432): wildcard
+        // patterns expand to their sorted matches, and a pattern without
+        // matches stays as the literal name.
+        let matches = crate::fs_builtins::expand_glob(runtime.scripts.io(), &name, false);
+        if matches.is_empty() {
+            names.push(name);
+        } else {
+            names.extend(matches);
+        }
+    }
+    if names.is_empty() {
+        return error_flow(runtime, "E479", "No match");
+    }
+    editor
+        .arglist_mut()
+        .set(names.into_iter().map(|name| OxStr::from(name.as_str())).collect());
+    do_argfile(runtime, editor, command.bang, 0)
+}
+
+fn command_step(command: &ExCommand) -> i64 {
+    // EX_COUNT commands take their count either trailing or as the single
+    // leading number (do_one_cmd converts one numeric address to a count).
+    if let Some(count) = command.count.and_then(|value| i64::try_from(value).ok()) {
+        return count;
+    }
+    if let Some(range) = &command.range
+        && matches!(range.kind, RangeKind::Single)
+        && let Some(address) = &range.start
+        && let AddressBase::Line(line) = address.base
+        && address.offsets.is_empty()
+    {
+        if let Ok(value) = i64::try_from(line) {
+            return value;
+        }
+    }
+    1
+}
+fn command_previous<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    let step = command_step(command);
+    let arglist = editor.arglist();
+    let index = arglist.index() as i64;
+    let count = arglist.len() as i64;
+    let target = if index - step >= count { count - 1 } else { index - step };
+    do_argfile(runtime, editor, command.bang, target)
+}
+
+/// Edits entry `target` of the argument list (`do_argfile`, arglist.c
+/// 600): out-of-range targets fail with E163/E164/E165, and the index
+/// only advances when the edit succeeded.
+fn do_argfile<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, force: bool, target: i64) -> Flow {
+    let entry = match editor.arglist().check_target(target) {
+        Ok(entry) => entry,
+        Err(error) => return error_flow(runtime, error.code, error.message),
+    };
+    let name = editor
+        .arglist()
+        .name(entry)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let flow = edit_argument_file(runtime, editor, force, &name);
+    if matches!(flow, Flow::Normal) {
+        editor.arglist_mut().set_index(entry);
+    }
+    flow
+}
+
+/// Displays the argument's file: reuse the buffer already carrying the
+/// name (`alist_name` prefers the associated buffer), else load the file
+/// like `:edit` does, treating a missing file as an empty new buffer.
+fn edit_argument_file<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, force: bool, name: &str) -> Flow {
+    if !force {
+        if let Some(current) = editor.current_buffer() {
+            if editor.buffer(current).is_ok_and(|state| state.modified) {
+                return error_flow(runtime, "E37", "No write since last change (add ! to override)");
+            }
+        }
+    }
+    for handle in editor.buffers() {
+        if editor.buffer(handle).is_ok_and(|state| state.name().as_bytes() == name.as_bytes()) {
+            return match editor.set_current_buffer(handle, BufferRelease::KeepLoaded) {
+                Ok(()) => Flow::Normal,
+                Err(error) => error_flow(runtime, "E86", error.to_string()),
+            };
+        }
+    }
+    let text = match runtime.scripts.io().read_to_string(Path::new(name)) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return error_flow(runtime, "E484", format!("Can't open file {name}: {error}")),
+    };
+    let buffer_text = match Buffer::from_bytes(text.as_bytes()) {
+        Ok(buffer) => buffer,
+        Err(error) => return error_flow(runtime, "E474", error.to_string()),
+    };
+    let handle = match editor.create_buffer_with(buffer_text, true) {
+        Ok(handle) => handle,
+        Err(error) => return error_flow(runtime, "E948", error.to_string()),
+    };
+    if let Ok(state) = editor.buffer_mut(handle) {
+        state.set_name(OxStr::from(name));
+        state.mark_saved();
+    }
+    if editor.current_window().is_none() {
+        return match editor.create_tabpage(handle, crate::Geometry { row: 0, col: 0, width: 80, height: 24 }) {
+            Ok(_) => Flow::Normal,
+            Err(error) => error_flow(runtime, "E948", error.to_string()),
+        };
+    }
+    match editor.set_current_buffer(handle, BufferRelease::KeepLoaded) {
+        Ok(()) => Flow::Normal,
+        Err(error) => error_flow(runtime, "E86", error.to_string()),
+    }
+}
+
+/// `:argdo` (`ex_listdo` CMD_argdo, ex_cmds2.c 461): for every entry in
+/// the range switch to its buffer and execute the command tail; a failing
+/// switch or command aborts the loop. The entry already displayed is not
+/// re-edited (upstream avoids reloading it).
+fn command_argdo<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    command: &ExCommand,
+) -> Flow {
+    let nested = command.args.trim();
+    if nested.is_empty() {
+        return error_flow(runtime, "E471", "Argument required");
+    }
+    let count = editor.arglist().len();
+    if count == 0 {
+        return Flow::Normal;
+    }
+    let (start, end) = match resolve_arg_range(editor, command) {
+        Ok(range) => range,
+        Err(message) => return error_flow(runtime, "E16", message),
+    };
+    if start > count {
+        return Flow::Normal;
+    }
+    let logical = vec![LogicalLine { text: nested.to_owned(), first_line: runtime.scripts.current_line() }];
+    let program = match parse_program(&runtime.user_commands, &logical) {
+        Ok(program) => program,
+        Err(error) => return exec_error_flow(runtime, error),
+    };
+    for entry in start..=end.min(count) {
+        let index = entry - 1;
+        if editor.arglist().index() != index || !editing_argument(editor, index) {
+            let flow = do_argfile(runtime, editor, command.bang, index as i64);
+            if !matches!(flow, Flow::Normal) {
+                return flow;
+            }
+            if editor.arglist().index() != index {
+                break;
+            }
+        }
+        let flow = run_program(runtime, editor, scope, lua, &program, 0, program.len());
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
+    }
+    Flow::Normal
+}
+
+/// Whether the current buffer already displays argument `index`
+/// (`editing_arg_idx`, arglist.c 463).
+fn editing_argument(editor: &Editor, index: usize) -> bool {
+    let Some(name) = editor.arglist().name(index) else { return false };
+    editor
+        .current_buffer()
+        .is_some_and(|buffer| editor.buffer(buffer).is_ok_and(|state| state.name().as_bytes() == name.as_bytes()))
+}
+
+/// Resolves a `:argdo` range against the argument list itself (entries,
+/// not buffer lines); without a range the whole list is addressed.
+fn resolve_arg_range(editor: &Editor, command: &ExCommand) -> Result<(usize, usize), String> {
+    let count = editor.arglist().len();
+    let current = editor.arglist().index() + 1;
+    let Some(range) = &command.range else { return Ok((1, count)) };
+    if matches!(range.kind, RangeKind::WholeBuffer) { return Ok((1, count)) };
+    let start = range.start.as_ref().map_or(Ok(current), |address| resolve_address(editor, address, current, count))?;
+    let end = range.end.as_ref().map_or(Ok(start), |address| resolve_address(editor, address, current, count))?;
+    if start > end { return Err("Invalid range".to_owned()); }
+    Ok((start.max(1), end))
 }
 
 fn command_put<F: FileIO>(

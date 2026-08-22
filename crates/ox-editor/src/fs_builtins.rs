@@ -282,7 +282,7 @@ pub(crate) fn swapfilelist(io: &dyn FileIO, arg_count: usize, directory: &str) -
     Ok(Typval::list(matches.into_iter().map(text).collect()))
 }
 
-fn expand_glob(io: &dyn FileIO, pattern: &str, all_links: bool) -> Vec<String> {
+pub(crate) fn expand_glob(io: &dyn FileIO, pattern: &str, all_links: bool) -> Vec<String> {
     let expanded;
     let pattern = if (pattern == "~" || pattern.starts_with("~/")) && std::env::var_os("HOME").is_some() {
         expanded = format!("{}{}", PathBuf::from(std::env::var_os("HOME").expect("checked above")).to_string_lossy(), &pattern[1..]);

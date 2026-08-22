@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! Single-writer editor state, frame-tree layout, options, registers, and marks.
 
+pub mod arglist;
+
 pub mod autocmd;
 pub mod buffer;
 pub mod decoration;
@@ -26,6 +28,7 @@ pub mod register;
 pub mod userfunc;
 pub mod typeahead;
 
+pub use arglist::{ArgList, ArgRangeError};
 pub use autocmd::{
     AutocmdAction, AutocmdContext, AutocmdDefinition, AutocmdError, AutocmdKind, AutocmdOptions,
     AutocmdSink, Autocmds, AugroupId, DeleteAutocmds, Event, FiringPlan, PatternKind, EVENT_COUNT,

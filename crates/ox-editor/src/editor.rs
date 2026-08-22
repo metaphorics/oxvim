@@ -9,6 +9,7 @@ use ox_text::{Buffer, Position};
 use ox_types::{BufHandle, Dict, Object, TabHandle, WinHandle};
 use thiserror::Error;
 
+use crate::arglist::ArgList;
 use crate::autocmd::Autocmds;
 use crate::buffer::{BufferState, BufferStateError};
 use crate::decoration::Decorations;
@@ -145,6 +146,8 @@ pub struct Editor {
     jumplist: Jumplist,
     /// Buffer-separated change histories.
     changelists: Changelists,
+    /// Global argument list and its current entry (`arglist.c global_alist`).
+    arglist: ArgList,
     /// Registered autocmds and augroups.
     autocmds: Autocmds,
     /// Registered decoration providers and active redraw-scoped output.
@@ -188,6 +191,7 @@ impl Editor {
             global_marks: GlobalMarks::new(),
             jumplist: Jumplist::new(),
             changelists: Changelists::new(),
+            arglist: ArgList::new(),
             autocmds: Autocmds::new(),
             decorations: Decorations::new(),
             mappings: Mappings::new(),
@@ -462,6 +466,17 @@ impl Editor {
     /// Returns mutable register state.
     pub const fn registers_mut(&mut self) -> &mut Registers {
         &mut self.registers
+    }
+
+    /// Returns the global argument list.
+    #[must_use]
+    pub const fn arglist(&self) -> &ArgList {
+        &self.arglist
+    }
+
+    /// Returns mutable global argument list state.
+    pub const fn arglist_mut(&mut self) -> &mut ArgList {
+        &mut self.arglist
     }
 
     /// Sets a buffer-local named or special mark.
