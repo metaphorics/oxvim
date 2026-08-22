@@ -675,6 +675,34 @@ fn rejected_quit_on_modified_buffer_emits_error_and_redraw() {
 }
 
 #[test]
+fn lua_script_preserves_vimscript_globals_across_lua_commands() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "oxvim-lua-global-sync-{}-{unique}.vim",
+        std::process::id(),
+    ));
+    fs::write(
+        &path,
+        "let g:probe = 'before'\nlua vim.g.foo = 1\nlet g:after_lua = g:probe . '!'\n",
+    )
+    .unwrap();
+    let path_string = path.to_string_lossy().into_owned();
+    let mut oxvim = Embedded::spawn_with(&["-S", &path_string]);
+
+    assert_eq!(
+        oxvim.request(
+            "nvim_exec_lua",
+            vec![
+                Value::from("return {vim.g.probe, vim.g.foo, vim.g.after_lua}"),
+                Value::Array(vec![]),
+            ],
+        ),
+        Value::Array(vec![Value::from("before"), Value::from(1), Value::from("before!")]),
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn lua_integration_smoke() {
     let mut oxvim = Embedded::spawn();
 

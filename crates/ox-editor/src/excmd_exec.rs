@@ -2645,6 +2645,9 @@ fn command_colorscheme<F: FileIO>(
         }
     } else if let Some((path, true)) = scheme {
         let Some(lua) = lua else { return Flow::NotImplemented("luafile".to_owned()) };
+        if let Err(error) = sync_scope_into_editor(editor, scope) {
+            return exec_error_flow(runtime, error);
+        }
         let result = lua.borrow_mut().execute_file(editor, &path);
         let sync = sync_editor_into_scope(editor, scope);
         match (result, sync) {
@@ -3874,6 +3877,9 @@ fn command_lua<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, scope: &m
     } else if let Some(expression) = code.strip_prefix('=') {
         code = format!("vim._print(true, {expression})");
     }
+    if let Err(error) = sync_scope_into_editor(editor, scope) {
+        return exec_error_flow(runtime, error);
+    }
     let result = lua.borrow_mut().execute_chunk(editor, &code, Vec::new());
     let sync = sync_editor_into_scope(editor, scope);
     match (result, sync) {
@@ -3888,6 +3894,9 @@ fn command_luafile<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, scope
     let path = command.args.trim();
     if path.is_empty() {
         return error_flow(runtime, "E471", "Argument required");
+    }
+    if let Err(error) = sync_scope_into_editor(editor, scope) {
+        return exec_error_flow(runtime, error);
     }
     let result = lua.borrow_mut().execute_file(editor, Path::new(path));
     let sync = sync_editor_into_scope(editor, scope);
@@ -3917,6 +3926,9 @@ fn command_luado<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, scope: 
         }
     };
     let chunk = format!("return (function(line, linenr) {body} end)(...)");
+    if let Err(error) = sync_scope_into_editor(editor, scope) {
+        return exec_error_flow(runtime, error);
+    }
     for lnum in first..=last {
         let lines = match buffer_lines(editor, buffer) {
             Ok(lines) => lines,
