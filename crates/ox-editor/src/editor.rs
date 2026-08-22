@@ -129,6 +129,8 @@ pub struct Editor {
     mappings: Mappings,
     /// Encoded pending input stack.
     typeahead: Typeahead,
+    /// Editor-wide `g:` variables.
+    gvars: Dict,
     /// Editor-wide `v:` variables.
     vvars: Dict,
     /// Named highlight groups defined by `:highlight`.
@@ -165,6 +167,7 @@ impl Editor {
             decorations: Decorations::new(),
             mappings: Mappings::new(),
             typeahead: Typeahead::new(),
+            gvars: Dict(Vec::new()),
             vvars: Dict(Vec::new()),
             highlights: BTreeMap::new(),
             messages: Vec::new(),
@@ -519,6 +522,17 @@ impl Editor {
     /// Returns mutable queued encoded input.
     pub const fn typeahead_mut(&mut self) -> &mut Typeahead {
         &mut self.typeahead
+    }
+
+    /// Returns editor-wide `g:` variables.
+    #[must_use]
+    pub const fn gvars(&self) -> &Dict {
+        &self.gvars
+    }
+
+    /// Returns mutable editor-wide `g:` variables.
+    pub const fn gvars_mut(&mut self) -> &mut Dict {
+        &mut self.gvars
     }
 
     /// Returns editor-wide `v:` variables.

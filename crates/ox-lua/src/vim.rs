@@ -8,7 +8,7 @@ use mlua::{
 };
 use ox_api::Registry;
 use ox_editor::Editor;
-use ox_types::{OxStr, Typval};
+use ox_types::{Object, OxStr, Typval};
 
 use crate::converter::{lua_to_object, object_to_lua};
 use crate::typval_bridge::{lua_to_typval, typval_to_lua};
@@ -31,6 +31,54 @@ pub trait BuiltinHost {
     fn is_fast(&self, _name: &OxStr) -> bool {
         false
     }
+}
+
+/// Variable namespaces exposed by `vim.g`, `vim.b`, `vim.w`, `vim.t`, and `vim.v`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VariableScope {
+    /// Editor-global `g:` namespace.
+    Global,
+    /// Buffer-local `b:` namespace.
+    Buffer,
+    /// Window-local `w:` namespace.
+    Window,
+    /// Tabpage-local `t:` namespace.
+    Tabpage,
+    /// Internal `v:` namespace.
+    Vim,
+}
+
+impl VariableScope {
+    fn parse(scope: &[u8]) -> mlua::Result<Self> {
+        match scope {
+            b"g" => Ok(Self::Global),
+            b"b" => Ok(Self::Buffer),
+            b"w" => Ok(Self::Window),
+            b"t" => Ok(Self::Tabpage),
+            b"v" => Ok(Self::Vim),
+            _ => Err(mlua::Error::runtime("invalid scope")),
+        }
+    }
+}
+
+/// Editor-owned variable storage captured by the Lua magic accessors.
+pub trait VariableHost {
+    /// Return one variable, or `None` when the key does not exist.
+    fn get_var(
+        &self,
+        scope: VariableScope,
+        handle: i64,
+        name: &OxStr,
+    ) -> Result<Option<Object>, String>;
+
+    /// Set one variable, or delete it when `value` is `None`.
+    fn set_var(
+        &self,
+        scope: VariableScope,
+        handle: i64,
+        name: OxStr,
+        value: Option<Object>,
+    ) -> Result<(), String>;
 }
 
 /// Shared editor context captured by the generated `vim.api` Lua closures.
@@ -244,6 +292,44 @@ fn install_schedule(lua: &Lua, vim: &Table, scheduler: Rc<dyn Scheduler>) -> mlu
     )
 }
 
+/// Install the native variable functions used by the runtime's magic tables.
+pub fn bind_variables(lua: &Lua, host: Rc<dyn VariableHost>) -> mlua::Result<()> {
+    let vim: Table = lua.globals().get("vim")?;
+    let get_host = host.clone();
+    vim.set(
+        "_getvar",
+        lua.create_function(
+            move |lua, (scope, handle, name): (mlua::LuaString, i64, mlua::LuaString)| {
+                let scope = VariableScope::parse(&scope.as_bytes())?;
+                let name = OxStr(name.as_bytes().to_vec());
+                match get_host
+                    .get_var(scope, handle, &name)
+                    .map_err(mlua::Error::runtime)?
+                {
+                    Some(value) => object_to_lua(lua, &value).map_err(mlua::Error::external),
+                    None => Ok(Value::Nil),
+                }
+            },
+        )?,
+    )?;
+
+    vim.set(
+        "_setvar",
+        lua.create_function(
+            move |lua, (scope, handle, name, value): (mlua::LuaString, i64, mlua::LuaString, Value)| {
+                let scope = VariableScope::parse(&scope.as_bytes())?;
+                let name = OxStr(name.as_bytes().to_vec());
+                let value = if value.is_nil() {
+                    None
+                } else {
+                    Some(lua_to_object(lua, &value).map_err(mlua::Error::external)?)
+                };
+                host.set_var(scope, handle, name, value).map_err(mlua::Error::runtime)
+            },
+        )?,
+    )
+}
+
 /// Populate `vim.api` from the concrete API registry.
 pub fn bind_api(
     lua: &Lua,
@@ -271,10 +357,15 @@ pub fn bind_api(
                         "E565: Not allowed to change text or change window",
                     ));
                 }
-                let args = args
+                let mut args = args
                     .iter()
                     .map(|value| lua_to_object(lua, value).map_err(mlua::Error::external))
                     .collect::<Result<Vec<_>, _>>()?;
+                if (name == "nvim_get_option_value" && args.len() == 1)
+                    || (name == "nvim_set_option_value" && args.len() == 2)
+                {
+                    args.push(Object::Dict(ox_types::Dict(Vec::new())));
+                }
                 let result = dispatch(&mut context.editor.borrow_mut(), &args)
                     .map_err(mlua::Error::external)?;
                 object_to_lua(lua, &result).map_err(mlua::Error::external)

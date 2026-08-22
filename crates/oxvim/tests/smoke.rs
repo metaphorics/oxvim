@@ -215,6 +215,48 @@ fn embedded_stdio_serves_core_rpc_contracts() {
 }
 
 #[test]
+fn lua_variable_and_option_tables_use_editor_state() {
+    let mut oxvim = Embedded::spawn();
+    let source = r#"
+        assert(vim.v.servername == '')
+        assert(vim.g.missing == nil)
+
+        vim.g.answer = { value = 42, enabled = true }
+        assert(vim.g.answer.value == 42 and vim.g.answer.enabled)
+        vim.b.buffer_value = 'buffer'
+        vim.w.window_value = 'window'
+        vim.t.tab_value = 'tabpage'
+        assert(vim.b.buffer_value == 'buffer' and vim.b[1].buffer_value == 'buffer')
+        assert(vim.w.window_value == 'window' and vim.w[1].window_value == 'window')
+        assert(vim.t.tab_value == 'tabpage' and vim.t[1].tab_value == 'tabpage')
+
+        vim.g.answer = nil
+        assert(vim.g.answer == nil)
+        local ok, error_message = pcall(function() vim.v.servername = 'changed' end)
+        assert(not ok and tostring(error_message):find('E46', 1, true))
+        assert(vim.v.servername == '')
+
+        local background = vim.go.background
+        vim.o.background = background == 'dark' and 'light' or 'dark'
+        assert(vim.o.background == vim.go.background and vim.o.background ~= background)
+        local modifiable = vim.bo.modifiable
+        vim.bo.modifiable = not modifiable
+        assert(vim.bo[0].modifiable == not modifiable)
+        local number = vim.wo.number
+        vim.wo.number = not number
+        assert(vim.wo[0].number == not number)
+        return true
+    "#;
+    assert_eq!(
+        oxvim.request(
+            "nvim_exec_lua",
+            vec![Value::from(source), Value::Array(vec![])],
+        ),
+        Value::Boolean(true),
+    );
+}
+
+#[test]
 fn terminal_channels_allocate_and_accept_bytes() {
     let mut oxvim = Embedded::spawn();
     let value = oxvim.request(
@@ -352,7 +394,7 @@ fn tcp_listener_allocates_dynamic_channel_and_serves_api_info() {
         .spawn()
         .expect("spawn TCP listener");
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut stream = loop {
+    let stream = loop {
         match TcpStream::connect(address) {
             Ok(stream) => break stream,
             Err(error) if Instant::now() < deadline => {
@@ -367,6 +409,19 @@ fn tcp_listener_allocates_dynamic_channel_and_serves_api_info() {
     let first_info = tcp_request(&mut first_writer, &mut first_reader, 1, "nvim_get_api_info", vec![]);
     let Value::Array(first_info) = first_info else { panic!("API info is not an array") };
     assert_eq!(first_info[0], Value::from(3));
+    assert_eq!(
+        tcp_request(
+            &mut first_writer,
+            &mut first_reader,
+            2,
+            "nvim_exec_lua",
+            vec![
+                Value::from("return vim.v.servername"),
+                Value::Array(vec![]),
+            ],
+        ),
+        Value::from(address.to_string()),
+    );
 
     let second = TcpStream::connect(address).expect("connect second TCP peer");
     let mut second_writer = second.try_clone().expect("clone second TCP stream");
@@ -379,7 +434,7 @@ fn tcp_listener_allocates_dynamic_channel_and_serves_api_info() {
         tcp_request(
             &mut first_writer,
             &mut first_reader,
-            2,
+            3,
             "nvim_buf_set_lines",
             vec![
                 Value::from(0),
@@ -422,7 +477,7 @@ fn pipe_listener_allocates_dynamic_channel_and_serves_api_info() {
         .spawn()
         .expect("spawn pipe listener");
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut stream = loop {
+    let stream = loop {
         match UnixStream::connect(&socket) {
             Ok(stream) => break stream,
             Err(error) if Instant::now() < deadline => {

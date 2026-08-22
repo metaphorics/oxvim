@@ -4,16 +4,20 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use ox_editor::{Editor, ExExecutor, ExecOutcome, Geometry, MessageKind};
 use ox_eval::{Builtins, Scope};
 use ox_eval::BuiltinHost as EvalBuiltins;
-use ox_lua::{BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work};
+use ox_lua::{
+    ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work, bind_api, bind_variables,
+};
 use ox_types::{Object, OxStr, Typval};
 
 use crate::cli::{Cli, LuaScript, ShadaConfig, UserConfig};
 use crate::AppError;
+use crate::server::EditorVariables;
 
 /// Start the terminal client against a child copy of this executable in embed mode.
 pub fn run_interactive(cli: &Cli) -> Result<(), AppError> {
@@ -170,12 +174,38 @@ pub fn run_lua(script: &LuaScript) -> Result<(), AppError> {
     } else {
         fs::read(&script.path).map_err(AppError::Io)?
     };
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer(true)
+        .map_err(|error| AppError::Editor(error.to_string()))?;
+    editor
+        .create_tabpage(
+            buffer,
+            Geometry::new(0, 0, 80, 24)
+                .map_err(|error| AppError::Editor(error.to_string()))?,
+        )
+        .map_err(|error| AppError::Editor(error.to_string()))?;
+    editor.vvars_mut().insert(
+        OxStr::from("servername"),
+        Object::String(OxStr::from("")),
+    );
+    let editor = Rc::new(RefCell::new(editor));
+    let registry = ox_api::core().map_err(|error| AppError::Api(error.to_string()))?;
     let host = LuaHost::new(
         RuntimeRoot::new(runtime_root()?),
         Rc::new(ScriptBuiltins),
         Rc::new(ImmediateScheduler),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
+    bind_api(
+        host.lua(),
+        &registry,
+        ApiDispatchContext::new(editor.clone()),
+        host.fast_callbacks(),
+    )
+    .map_err(|error| AppError::Lua(error.to_string()))?;
+    bind_variables(host.lua(), Rc::new(EditorVariables { editor }))
+        .map_err(|error| AppError::Lua(error.to_string()))?;
     let lua = host.lua();
     let arguments = lua.create_table().map_err(|error| AppError::Lua(error.to_string()))?;
     arguments.set(0, script.path.as_str()).map_err(|error| AppError::Lua(error.to_string()))?;

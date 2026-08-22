@@ -19,13 +19,13 @@ use ox_eval::{
     is_buffer_builtin,
 };
 use ox_lua::{
-    ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work, bind_api,
-    call_with_traceback, object_to_lua,
+    ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, VariableHost, VariableScope, Work, bind_api,
+    bind_variables, call_with_traceback, object_to_lua,
 };
 use ox_rpc::{
     CHAN_STDIO, ChannelId, ChannelIdAllocator, IncrementalDecoder, Message,
 };
-use ox_types::{ApiError, Object, OxStr, Typval};
+use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, Typval, WinHandle};
 use ox_ui::{
     ChromeState, CmdlineState as UiCmdlineState, Compositor, ContentChunk, Emitter, HlState,
     MessageState, UiChannels, UiOptions,
@@ -80,6 +80,10 @@ impl AppState {
                     .map_err(|error| AppError::Editor(error.to_string()))?,
             )
             .map_err(|error| AppError::Editor(error.to_string()))?;
+        editor.vvars_mut().insert(
+            OxStr::from("servername"),
+            Object::String(OxStr::from("")),
+        );
         let editor = Rc::new(RefCell::new(editor));
         let registry = ox_api::core().map_err(|error| AppError::Api(error.to_string()))?;
         let lua_work = Rc::new(RefCell::new(VecDeque::new()));
@@ -96,6 +100,8 @@ impl AppState {
             lua.fast_callbacks(),
         )
         .map_err(|error| AppError::Lua(error.to_string()))?;
+        bind_variables(lua.lua(), Rc::new(EditorVariables { editor: editor.clone() }))
+            .map_err(|error| AppError::Lua(error.to_string()))?;
         ox_api::set_channel_sink(&editor.borrow(), Box::new(TerminalChannelSink::default()));
 
         // Load the reachable embedded core prelude before user-controlled Ex startup commands.
@@ -613,7 +619,7 @@ pub fn run_listener(cli: &Cli, address: &str) -> Result<(), AppError> {
         handle_network_event(&callback_runtime, uv_loop, id, event);
     };
 
-    let _listener = if let Ok(socket) = address.parse::<SocketAddr>() {
+    let listener = if let Ok(socket) = address.parse::<SocketAddr>() {
         let mut listener = Tcp::bind(&mut uv_loop, socket, callback)
             .map_err(|error| AppError::Server(error.to_string()))?;
         listener
@@ -623,6 +629,12 @@ pub fn run_listener(cli: &Cli, address: &str) -> Result<(), AppError> {
     } else {
         bind_pipe(&mut uv_loop, address, callback)?
     };
+    let servername = listener.servername()?;
+    let state = runtime.borrow().state.clone();
+    state.borrow().editor.borrow_mut().vvars_mut().insert(
+        OxStr::from("servername"),
+        Object::String(OxStr::from(servername.as_str())),
+    );
 
     uv_loop
         .run(RunMode::Default)
@@ -638,6 +650,23 @@ enum Listener {
     Tcp(Tcp),
     #[cfg(unix)]
     Pipe(Pipe),
+}
+
+impl Listener {
+    fn servername(&self) -> Result<String, AppError> {
+        match self {
+            Self::Tcp(listener) => listener
+                .local_addr()
+                .map(|address| address.to_string())
+                .map_err(|error| AppError::Server(error.to_string())),
+            #[cfg(unix)]
+            Self::Pipe(listener) => listener
+                .local_name()
+                .map_err(|error| AppError::Server(error.to_string()))?
+                .map(|path| path.to_string_lossy().into_owned())
+                .ok_or_else(|| AppError::Server("bound pipe has no local name".into())),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -830,6 +859,88 @@ impl BuiltinHost for EditorBuiltins {
         builtins
             .call(name, args, &mut Scope::new())
             .map_err(|error| error.to_string())
+    }
+}
+
+/// Lua variable access backed by the editor's canonical API dictionaries.
+pub(crate) struct EditorVariables {
+    pub(crate) editor: Rc<RefCell<Editor>>,
+}
+
+impl VariableHost for EditorVariables {
+    fn get_var(
+        &self,
+        scope: VariableScope,
+        handle: i64,
+        name: &OxStr,
+    ) -> Result<Option<Object>, String> {
+        let editor = self.editor.borrow();
+        let variables = variables(&editor, scope, handle)?;
+        Ok(variables.get(name).cloned())
+    }
+
+    fn set_var(
+        &self,
+        scope: VariableScope,
+        handle: i64,
+        name: OxStr,
+        value: Option<Object>,
+    ) -> Result<(), String> {
+        if scope == VariableScope::Vim {
+            return Err(format!(
+                "E46: Cannot change read-only variable \"{}\"",
+                name.to_string_lossy()
+            ));
+        }
+        let mut editor = self.editor.borrow_mut();
+        let variables = variables_mut(&mut editor, scope, handle)?;
+        if let Some(value) = value {
+            variables.insert(name, value);
+        } else {
+            let index = variables.iter().position(|(key, _)| key == &name);
+            if let Some(index) = index {
+                variables.0.remove(index);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn variables(editor: &Editor, scope: VariableScope, handle: i64) -> Result<&Dict, String> {
+    match scope {
+        VariableScope::Global => Ok(editor.gvars()),
+        VariableScope::Vim => Ok(editor.vvars()),
+        VariableScope::Buffer => editor
+            .buffer(BufHandle::try_from(handle).map_err(|error| error.to_string())?)
+            .map(|buffer| buffer.variables())
+            .map_err(|error| error.to_string()),
+        VariableScope::Window => editor
+            .window_variables(WinHandle::try_from(handle).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string()),
+        VariableScope::Tabpage => editor
+            .tabpage_variables(TabHandle::try_from(handle).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string()),
+    }
+}
+
+fn variables_mut(
+    editor: &mut Editor,
+    scope: VariableScope,
+    handle: i64,
+) -> Result<&mut Dict, String> {
+    match scope {
+        VariableScope::Global => Ok(editor.gvars_mut()),
+        VariableScope::Vim => Ok(editor.vvars_mut()),
+        VariableScope::Buffer => editor
+            .buffer_mut(BufHandle::try_from(handle).map_err(|error| error.to_string())?)
+            .map(|buffer| buffer.variables_mut())
+            .map_err(|error| error.to_string()),
+        VariableScope::Window => editor
+            .window_variables_mut(WinHandle::try_from(handle).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string()),
+        VariableScope::Tabpage => editor
+            .tabpage_variables_mut(TabHandle::try_from(handle).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string()),
     }
 }
 
