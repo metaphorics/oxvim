@@ -644,9 +644,9 @@ fn dispatch<F: FileIO>(
 ) -> Flow {
     let name = command.command.name();
     match name {
-        "lua" => command_lua(runtime, editor, lua, command),
-        "luado" => command_luado(runtime, editor, lua, command),
-        "luafile" => command_luafile(runtime, editor, lua, command),
+        "lua" => command_lua(runtime, editor, scope, lua, command),
+        "luado" => command_luado(runtime, editor, scope, lua, command),
+        "luafile" => command_luafile(runtime, editor, scope, lua, command),
         "let" => command_let(runtime, editor, scope, &command.args, false),
         "const" => command_let(runtime, editor, scope, &command.args, true),
         "unlet" => command_unlet(runtime, editor, scope, &command.args, command.bang),
@@ -2124,6 +2124,7 @@ fn command_map<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: 
 }
 
 fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Result<(), ExecError> {
+    scope.global = dict_to_scope(editor.gvars());
     if let Some(buffer) = editor.current_buffer() { scope.buffer = dict_to_scope(editor.buffer(buffer).map_err(|error| ExecError::Editor(error.to_string()))?.variables()); }
     if let Some(window) = editor.current_window() { scope.window = dict_to_scope(editor.window_variables(window).map_err(|error| ExecError::Editor(error.to_string()))?); }
     if let Some(tab) = editor.current_tabpage() { scope.tab = dict_to_scope(editor.tabpage_variables(tab).map_err(|error| ExecError::Editor(error.to_string()))?); }
@@ -2149,6 +2150,7 @@ fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Result<(), Exec
 }
 
 fn sync_scope_into_editor(editor: &mut Editor, scope: &Scope) -> Result<(), ExecError> {
+    *editor.gvars_mut() = scope_to_dict(&scope.global);
     if let Some(buffer) = editor.current_buffer() { *editor.buffer_mut(buffer).map_err(|error| ExecError::Editor(error.to_string()))?.variables_mut() = scope_to_dict(&scope.buffer); }
     if let Some(window) = editor.current_window() { *editor.window_variables_mut(window).map_err(|error| ExecError::Editor(error.to_string()))? = scope_to_dict(&scope.window); }
     if let Some(tab) = editor.current_tabpage() { *editor.tabpage_variables_mut(tab).map_err(|error| ExecError::Editor(error.to_string()))? = scope_to_dict(&scope.tab); }
@@ -2771,7 +2773,7 @@ fn flow_to_eval_error(flow: Flow, name: &str) -> EvalError {
     }
 }
 
-fn command_lua<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
+fn command_lua<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
     let Some(lua) = lua else { return Flow::NotImplemented("lua".to_owned()) };
     let mut code = command.args.trim_start().to_owned();
     if code.is_empty() {
@@ -2789,25 +2791,31 @@ fn command_lua<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, lua: Opti
     } else if let Some(expression) = code.strip_prefix('=') {
         code = format!("vim._print(true, {expression})");
     }
-    match lua.borrow_mut().execute_chunk(editor, &code, Vec::new()) {
-        Ok(_) => Flow::Normal,
-        Err(error) => lua_error_flow(runtime, error, "E5107", "E5108"),
+    let result = lua.borrow_mut().execute_chunk(editor, &code, Vec::new());
+    let sync = sync_editor_into_scope(editor, scope);
+    match (result, sync) {
+        (Err(error), _) => lua_error_flow(runtime, error, "E5107", "E5108"),
+        (Ok(_), Err(error)) => exec_error_flow(runtime, error),
+        (Ok(_), Ok(())) => Flow::Normal,
     }
 }
 
-fn command_luafile<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
+fn command_luafile<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
     let Some(lua) = lua else { return Flow::NotImplemented("luafile".to_owned()) };
     let path = command.args.trim();
     if path.is_empty() {
         return error_flow(runtime, "E471", "Argument required");
     }
-    match lua.borrow_mut().execute_file(editor, Path::new(path)) {
-        Ok(()) => Flow::Normal,
-        Err(error) => lua_error_flow(runtime, error, "E5112", "E5113"),
+    let result = lua.borrow_mut().execute_file(editor, Path::new(path));
+    let sync = sync_editor_into_scope(editor, scope);
+    match (result, sync) {
+        (Err(error), _) => lua_error_flow(runtime, error, "E5112", "E5113"),
+        (Ok(()), Err(error)) => exec_error_flow(runtime, error),
+        (Ok(()), Ok(())) => Flow::Normal,
     }
 }
 
-fn command_luado<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
+fn command_luado<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
     let Some(lua) = lua else { return Flow::NotImplemented("luado".to_owned()) };
     let body = command.args.trim_start();
     if body.is_empty() {
@@ -2854,7 +2862,10 @@ fn command_luado<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, lua: Op
             }
         }
     }
-    Flow::Normal
+    match sync_editor_into_scope(editor, scope) {
+        Ok(()) => Flow::Normal,
+        Err(error) => exec_error_flow(runtime, error),
+    }
 }
 
 fn lua_error_flow<F: FileIO>(runtime: &ExRuntime<F>, error: LuaExecError, load_code: &'static str, runtime_code: &'static str) -> Flow {

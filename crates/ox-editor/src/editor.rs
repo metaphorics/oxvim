@@ -557,6 +557,14 @@ impl Editor {
         self.messages.push(message);
     }
 
+    /// Discards messages appended at or after `len`.
+    ///
+    /// Command-output capture uses this after copying newly emitted messages,
+    /// matching Neovim's behavior where captured output is not also displayed.
+    pub fn truncate_messages(&mut self, len: usize) {
+        self.messages.truncate(len);
+    }
+
     /// Returns tabpage-local variables.
     pub fn tabpage_variables(&self, tab: TabHandle) -> Result<&Dict, EditorError> {
         Ok(self.tabpage(tab)?.variables())

@@ -53,8 +53,47 @@ pub fn nvim_ui_try_resize(editor: &mut Editor, width: i64, height: i64) -> Resul
 }
 
 fn color(value: &Object, name: &str) -> Result<u32, ApiError> {
-    let Object::Integer(value) = value else { return Err(ApiError::validation(format!("{name} must be an Integer"))); };
-    u32::try_from(*value).map_err(|_| ApiError::validation(format!("{name} out of range")))
+    match value {
+        Object::Integer(value) => u32::try_from(*value)
+            .map_err(|_| ApiError::validation(format!("{name} out of range"))),
+        Object::String(value) => named_color(value)
+            .ok_or_else(|| ApiError::validation(format!("{name} has an invalid color name"))),
+        _ => Err(ApiError::validation(format!("{name} must be an Integer or String"))),
+    }
+}
+
+fn named_color(value: &OxStr) -> Option<u32> {
+    let name = std::str::from_utf8(value.as_bytes()).ok()?;
+    if let Some(hex) = name.strip_prefix('#') {
+        return (hex.len() == 6).then(|| u32::from_str_radix(hex, 16).ok()).flatten();
+    }
+    Some(match name.to_ascii_lowercase().as_str() {
+        "black" => 0x000000,
+        "darkblue" => 0x000080,
+        "darkgreen" => 0x008000,
+        "darkcyan" => 0x008080,
+        "darkred" => 0x800000,
+        "darkmagenta" => 0x800080,
+        "brown" | "darkyellow" => 0x808000,
+        "lightgrey" | "lightgray" | "grey" | "gray" => 0xc0c0c0,
+        "darkgrey" | "darkgray" => 0x808080,
+        "blue" => 0x0000ff,
+        "lightgreen" | "green" => 0x00ff00,
+        "lightcyan" | "cyan" => 0x00ffff,
+        "lightred" | "red" => 0xff0000,
+        "lightmagenta" | "magenta" => 0xff00ff,
+        "yellow" | "lightyellow" => 0xffff00,
+        "white" => 0xffffff,
+        "orange" => 0xffa500,
+        "lightblue" => 0xadd8e6,
+        "grey90" | "gray90" => 0xe5e5e5,
+        "grey40" | "gray40" => 0x666666,
+        "seagreen" => 0x2e8b57,
+        "slateblue" => 0x6a5acd,
+        "dodgerblue" => 0x1e90ff,
+        "limegreen" => 0x32cd32,
+        _ => return None,
+    })
 }
 
 fn attrs(dict: &Dict) -> Result<HlAttrs, ApiError> {
@@ -78,7 +117,7 @@ fn attrs(dict: &Dict) -> Result<HlAttrs, ApiError> {
                     b"overline" => attrs.overline = *enabled, _ => {},
                 }
             }
-            b"cterm" | b"link" | b"default" | b"force" => {},
+            b"cterm" | b"ctermfg" | b"ctermbg" | b"link" | b"default" | b"force" => {},
             _ => return Err(ApiError::validation(format!("Invalid highlight key: {}", key.to_string_lossy()))),
         }
     }

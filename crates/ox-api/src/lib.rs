@@ -23,9 +23,10 @@ mod window;
 mod tests;
 
 pub use convert::{FromObject, IntoObject, LuaRef, Nil};
-pub use global::{CommandExecutor, execute_command};
+pub use global::{CommandExecutor, execute_command, execute_nvim_cmd};
 pub use metadata::{ApiType, FunctionMetadata, TypeRef};
 pub use ox_api_macros::api;
+pub use ox_excmd::ExCommand;
 pub use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, WinHandle};
 pub use registry::{core, DispatchFn, Registry, RegistryError};
 pub use runtime::{AutocmdExecutor, ChannelSink, FileIO, StdFileIO, set_autocmd_executor, set_channel_sink, set_runtime_files};

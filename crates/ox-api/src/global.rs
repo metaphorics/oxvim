@@ -32,6 +32,239 @@ pub fn execute_command(
     executor.execute(editor, &commands)
 }
 
+/// Decode and execute one structured Ex command through an explicit host.
+///
+/// `addr`, `nargs`, and `nextcmd` are accepted but ignored, matching
+/// `nvim_cmd()` rather than `nvim_parse_cmd()`.
+pub fn execute_nvim_cmd(
+    editor: &mut Editor,
+    cmd: &Dict,
+    opts: &Dict,
+    executor: &mut dyn CommandExecutor,
+) -> Result<OxStr, ApiError> {
+    let (command, output) = build_nvim_cmd(cmd, opts)?;
+    let message_start = editor.messages().len();
+    let result = execute_command(editor, &OxStr(command.into_bytes()), executor);
+    if !output {
+        result?;
+        return Ok(OxStr::from(""));
+    }
+    if let Err(error) = result {
+        editor.truncate_messages(message_start);
+        return Err(error);
+    }
+
+    let captured = editor.messages()[message_start..]
+        .iter()
+        .filter(|message| message.kind == MessageKind::Echo)
+        .filter_map(|message| match &message.content {
+            Object::String(text) => Some(text.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    editor.truncate_messages(message_start);
+    Ok(OxStr(captured.into_bytes()))
+}
+
+fn build_nvim_cmd(cmd: &Dict, opts: &Dict) -> Result<(String, bool), ApiError> {
+    reject_keys(cmd, &["cmd", "args", "bang", "count", "range", "reg", "mods", "magic", "addr", "nargs", "nextcmd"])?;
+    reject_keys(opts, &["output"])?;
+
+    let name = required_string(cmd, "cmd")?;
+    let name = std::str::from_utf8(name.as_bytes())
+        .map_err(|_| ApiError::validation("'cmd' must be valid UTF-8"))?;
+    if name.is_empty() || name.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err(ApiError::validation("'cmd' must be a non-empty command name"));
+    }
+
+    let output = optional_bool(opts, "output")?.unwrap_or(false);
+    let mut line = String::new();
+    if let Some(mods) = optional_dict(cmd, "mods")? {
+        append_modifiers(&mut line, mods)?;
+    }
+    if let Some(range) = field(cmd, "range") {
+        let Object::Array(range) = range else {
+            return Err(ApiError::validation("'range' must be an Array"));
+        };
+        if range.len() > 2 {
+            return Err(ApiError::validation("'range' must contain at most two elements"));
+        }
+        for (index, value) in range.iter().enumerate() {
+            let Object::Integer(value) = value else {
+                return Err(ApiError::validation("range elements must be Integers"));
+            };
+            if *value < 0 {
+                return Err(ApiError::validation("range elements must be non-negative"));
+            }
+            if index != 0 {
+                line.push(',');
+            }
+            line.push_str(&value.to_string());
+        }
+    }
+    line.push_str(name);
+    if optional_bool(cmd, "bang")?.unwrap_or(false) {
+        line.push('!');
+    }
+    if let Some(Object::Integer(count)) = field(cmd, "count") {
+        if *count < 0 {
+            return Err(ApiError::validation("'count' must be non-negative"));
+        }
+        line.push(' ');
+        line.push_str(&count.to_string());
+    } else if field(cmd, "count").is_some() {
+        return Err(ApiError::validation("'count' must be an Integer"));
+    }
+    if let Some(reg) = optional_string(cmd, "reg")? {
+        let reg = std::str::from_utf8(reg.as_bytes())
+            .map_err(|_| ApiError::validation("'reg' must be valid UTF-8"))?;
+        if reg.chars().count() != 1 || reg == "=" {
+            return Err(ApiError::validation("'reg' must be one non-'=' character"));
+        }
+        line.push(' ');
+        line.push('"');
+        line.push_str(reg);
+    }
+
+    let magic_bar = optional_dict(cmd, "magic")?
+        .map(|magic| {
+            reject_keys(magic, &["file", "bar"])?;
+            optional_bool(magic, "bar").map(|value| value.unwrap_or(true))
+        })
+        .transpose()?
+        .unwrap_or(true);
+    if let Some(args) = field(cmd, "args") {
+        let Object::Array(args) = args else {
+            return Err(ApiError::validation("'args' must be an Array"));
+        };
+        for arg in args {
+            let text = match arg {
+                Object::String(text) => {
+                    let text = std::str::from_utf8(text.as_bytes())
+                        .map_err(|_| ApiError::validation("command arguments must be valid UTF-8"))?;
+                    if text.bytes().all(|byte| byte.is_ascii_whitespace()) {
+                        return Err(ApiError::validation("command arguments must not be whitespace-only"));
+                    }
+                    text.to_owned()
+                }
+                Object::Integer(value) => value.to_string(),
+                Object::Boolean(value) => i32::from(*value).to_string(),
+                _ => return Err(ApiError::validation("command arguments must be Strings, Integers, or Booleans")),
+            };
+            line.push(' ');
+            if magic_bar {
+                line.push_str(&text);
+            } else {
+                line.push_str(&text.replace('|', "\\|"));
+            }
+        }
+    }
+    Ok((line, output))
+}
+
+fn append_modifiers(line: &mut String, mods: &Dict) -> Result<(), ApiError> {
+    const FLAGS: &[(&str, &str)] = &[
+        ("silent", "silent"), ("emsg_silent", "silent!"), ("unsilent", "unsilent"),
+        ("sandbox", "sandbox"), ("noautocmd", "noautocmd"), ("browse", "browse"),
+        ("confirm", "confirm"), ("hide", "hide"), ("keepalt", "keepalt"),
+        ("keepjumps", "keepjumps"), ("keepmarks", "keepmarks"),
+        ("keeppatterns", "keeppatterns"), ("lockmarks", "lockmarks"),
+        ("noswapfile", "noswapfile"),
+    ];
+    reject_keys(mods, &[
+        "silent", "emsg_silent", "unsilent", "sandbox", "noautocmd",
+        "browse", "confirm", "hide", "keepalt", "keepjumps", "keepmarks",
+        "keeppatterns", "lockmarks", "noswapfile", "tab", "verbose", "vertical",
+        "horizontal", "split",
+    ])?;
+    append_count_modifier(line, mods, "tab")?;
+    append_count_modifier(line, mods, "verbose")?;
+    if let Some(split) = optional_string(mods, "split")? {
+        let split = std::str::from_utf8(split.as_bytes())
+            .map_err(|_| ApiError::validation("'mods.split' must be valid UTF-8"))?;
+        if !split.is_empty() {
+            let canonical = match split {
+                "aboveleft" | "leftabove" => "aboveleft",
+                "belowright" | "rightbelow" => "belowright",
+                "topleft" => "topleft",
+                "botright" => "botright",
+                _ => return Err(ApiError::validation("invalid 'mods.split' value")),
+            };
+            line.push_str(canonical);
+            line.push(' ');
+        }
+    }
+    for (key, spelling) in [("vertical", "vertical"), ("horizontal", "horizontal")] {
+        if optional_bool(mods, key)?.unwrap_or(false) {
+            line.push_str(spelling);
+            line.push(' ');
+        }
+    }
+    for (key, spelling) in FLAGS {
+        if optional_bool(mods, key)?.unwrap_or(false) {
+            line.push_str(spelling);
+            line.push(' ');
+        }
+    }
+    Ok(())
+}
+
+fn append_count_modifier(line: &mut String, mods: &Dict, key: &str) -> Result<(), ApiError> {
+    let Some(value) = field(mods, key) else { return Ok(()) };
+    let Object::Integer(value) = value else {
+        return Err(ApiError::validation(format!("'mods.{key}' must be an Integer")));
+    };
+    if *value >= 0 {
+        line.push_str(&value.to_string());
+        line.push_str(key);
+        line.push(' ');
+    }
+    Ok(())
+}
+
+fn field<'a>(dict: &'a Dict, name: &str) -> Option<&'a Object> {
+    dict.iter().find(|(key, _)| key.as_bytes() == name.as_bytes()).map(|(_, value)| value)
+}
+
+fn required_string<'a>(dict: &'a Dict, name: &str) -> Result<&'a OxStr, ApiError> {
+    optional_string(dict, name)?.ok_or_else(|| ApiError::validation(format!("'{name}' is required")))
+}
+
+fn optional_string<'a>(dict: &'a Dict, name: &str) -> Result<Option<&'a OxStr>, ApiError> {
+    match field(dict, name) {
+        None => Ok(None),
+        Some(Object::String(value)) => Ok(Some(value)),
+        Some(_) => Err(ApiError::validation(format!("'{name}' must be a String"))),
+    }
+}
+
+fn optional_dict<'a>(dict: &'a Dict, name: &str) -> Result<Option<&'a Dict>, ApiError> {
+    match field(dict, name) {
+        None => Ok(None),
+        Some(Object::Dict(value)) => Ok(Some(value)),
+        Some(Object::Array(value)) if value.is_empty() => Ok(None),
+        Some(_) => Err(ApiError::validation(format!("'{name}' must be a Dict"))),
+    }
+}
+
+fn optional_bool(dict: &Dict, name: &str) -> Result<Option<bool>, ApiError> {
+    match field(dict, name) {
+        None => Ok(None),
+        Some(Object::Boolean(value)) => Ok(Some(*value)),
+        Some(_) => Err(ApiError::validation(format!("'{name}' must be a Boolean"))),
+    }
+}
+
+fn reject_keys(dict: &Dict, allowed: &[&str]) -> Result<(), ApiError> {
+    for (key, _) in dict.iter() {
+        if !allowed.iter().any(|allowed| key.as_bytes() == allowed.as_bytes()) {
+            return Err(ApiError::validation(format!("Invalid key: {}", key.to_string_lossy())));
+        }
+    }
+    Ok(())
+}
+
 fn exception(error: impl std::fmt::Display) -> ApiError {
     ApiError::exception(error.to_string())
 }

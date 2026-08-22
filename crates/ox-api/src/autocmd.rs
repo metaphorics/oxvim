@@ -67,7 +67,7 @@ pub fn nvim_create_autocmd(editor: &mut Editor, event: Object, opts: Dict) -> Re
         (Some(Object::String(command)), None) => AutocmdKind::ExString(text(command, "command")?),
         (None, Some(Object::LuaRef(callback))) => AutocmdKind::LuaCallback(u64::try_from(*callback).map_err(|_| ApiError::validation("invalid callback"))?),
         (None, Some(Object::String(callback))) => AutocmdKind::ExString(text(callback, "callback")?),
-        (Some(_), Some(_)) => return Err(ApiError::validation("Cannot use both 'callback' and 'command'")),
+        (Some(_), Some(_)) => return Err(ApiError::validation("Conflict: 'callback' not allowed with 'command'")),
         _ => return Err(ApiError::validation("Required: 'command' or 'callback'")),
     };
     let group = group(editor, opts.get(&OxStr::from("group")))?;

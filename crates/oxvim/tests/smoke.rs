@@ -602,4 +602,31 @@ fn lua_integration_smoke() {
         oxvim.request("nvim_exec_lua", vec![Value::from("return {_G.oxvim_ex_buffer, vim.g.oxvim_ex_value}"), Value::Array(vec![])]),
         Value::Array(vec![Value::from(1), Value::from(42)]),
     );
+
+    // The runtime dynamic wrapper builds nvim_cmd({ cmd = 'highlight', ... }).
+    assert_eq!(
+        oxvim.request("nvim_command", vec![Value::from("lua vim.cmd.highlight('clear')")]),
+        Value::Nil,
+    );
+
+    let command = Value::Map(vec![
+        (Value::from("cmd"), Value::from("echo")),
+        (Value::from("args"), Value::Array(vec![Value::from("'structured output'")])),
+    ]);
+    let options = Value::Map(vec![(Value::from("output"), Value::Boolean(true))]);
+    assert_eq!(
+        oxvim.request("nvim_cmd", vec![command, options]),
+        Value::from("structured output"),
+    );
+
+    let autocmd = Value::Map(vec![
+        (Value::from("pattern"), Value::from("*.py,*.pyi")),
+        (Value::from("command"), Value::from("echo 'Should Have Errored")),
+        (Value::from("callback"), Value::from("NotAllowed")),
+    ]);
+    let error = oxvim.request_error(
+        "nvim_create_autocmd",
+        vec![Value::from("BufReadPost"), autocmd],
+    );
+    assert!(contains_string(&error, "Conflict: 'callback' not allowed with 'command'"), "{error:?}");
 }

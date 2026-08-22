@@ -12,6 +12,89 @@ fn dict(entries: &[(&str, Object)]) -> Dict {
     Dict(entries.iter().map(|(key, value)| (OxStr::from(*key), value.clone())).collect())
 }
 
+#[derive(Default)]
+struct RecordingExecutor {
+    commands: Vec<crate::ExCommand>,
+    message: Option<&'static str>,
+}
+
+impl crate::CommandExecutor for RecordingExecutor {
+    fn execute(&mut self, editor: &mut Editor, commands: &[crate::ExCommand]) -> Result<(), ApiError> {
+        self.commands.extend_from_slice(commands);
+        if let Some(message) = self.message {
+            editor.push_message(ox_editor::Message {
+                kind: ox_editor::MessageKind::Echo,
+                content: Object::String(OxStr::from(message)),
+                history: true,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn nvim_cmd_decodes_structure_and_captures_output() {
+    let mut editor = Editor::new();
+    let mut executor = RecordingExecutor { commands: Vec::new(), message: Some("captured") };
+    let command = dict(&[
+        ("cmd", Object::String(OxStr::from("delete"))),
+        ("count", Object::Integer(3)),
+        ("mods", Object::Dict(dict(&[
+            ("silent", Object::Boolean(true)),
+            ("keepjumps", Object::Boolean(true)),
+            ("vertical", Object::Boolean(true)),
+            ("verbose", Object::Integer(2)),
+        ]))),
+    ]);
+    let result = crate::execute_nvim_cmd(
+        &mut editor,
+        &command,
+        &dict(&[("output", Object::Boolean(true))]),
+        &mut executor,
+    )
+    .unwrap();
+
+    assert_eq!(result, OxStr::from("captured"));
+    assert!(editor.messages().is_empty());
+    let parsed = executor.commands.first().expect("one parsed command");
+    assert!(!parsed.bang);
+    assert_eq!(parsed.count, None);
+    assert_eq!(parsed.args, "");
+    assert!(parsed.range.is_none());
+    assert_eq!(parsed.modifiers.len(), 4);
+
+    let edit = dict(&[
+        ("cmd", Object::String(OxStr::from("edit"))),
+        ("bang", Object::Boolean(true)),
+        ("args", Object::Array(vec![Object::String(OxStr::from("file.txt"))])),
+    ]);
+    crate::execute_nvim_cmd(&mut editor, &edit, &Dict(Vec::new()), &mut executor).unwrap();
+    let parsed = executor.commands.last().expect("parsed edit command");
+    assert!(parsed.bang);
+    assert_eq!(parsed.args, "file.txt");
+
+    let ranged = dict(&[
+        ("cmd", Object::String(OxStr::from("delete"))),
+        ("range", Object::Array(vec![Object::Integer(2), Object::Integer(4)])),
+    ]);
+    crate::execute_nvim_cmd(&mut editor, &ranged, &Dict(Vec::new()), &mut executor).unwrap();
+    assert!(executor.commands.last().expect("parsed ranged command").range.is_some());
+}
+
+#[test]
+fn nvim_cmd_rejects_invalid_structured_fields() {
+    let mut editor = Editor::new();
+    let mut executor = RecordingExecutor::default();
+    for command in [
+        dict(&[]),
+        dict(&[("cmd", Object::String(OxStr::from("echo"))), ("range", Object::Array(vec![Object::Integer(-1)]))]),
+        dict(&[("cmd", Object::String(OxStr::from("echo"))), ("mods", Object::Dict(dict(&[("split", Object::String(OxStr::from("sideways")))])))]),
+        dict(&[("cmd", Object::String(OxStr::from("echo"))), ("mystery", Object::Boolean(true))]),
+    ] {
+        assert!(crate::execute_nvim_cmd(&mut editor, &command, &Dict(Vec::new()), &mut executor).is_err());
+    }
+}
+
 fn editor_with_lines(lines: &[&str]) -> (Editor, crate::BufHandle, crate::TabHandle, crate::WinHandle) {
     let mut editor = Editor::new();
     let lines = lines.iter().map(|line| line.as_bytes().to_vec()).collect::<Vec<_>>();
@@ -326,6 +409,20 @@ fn context_channel_and_ui_round_trip() {
     crate::ui::nvim_set_hl(&mut editor, 0, OxStr::from("Task11b"), dict(&[("fg", Object::Integer(0x112233)), ("bold", Object::Boolean(true))])).unwrap();
     let highlight = crate::ui::nvim_get_hl(&mut editor, 0, dict(&[("name", Object::String(OxStr::from("Task11b")))])).unwrap();
     assert_eq!(highlight.get(&OxStr::from("foreground")), Some(&Object::Integer(0x112233)));
+    crate::ui::nvim_set_hl(
+        &mut editor,
+        0,
+        OxStr::from("Named"),
+        dict(&[
+            ("fg", Object::String(OxStr::from("LightGrey"))),
+            ("bg", Object::String(OxStr::from("DarkGrey"))),
+            ("ctermfg", Object::String(OxStr::from("White"))),
+        ]),
+    )
+    .unwrap();
+    let named = crate::ui::nvim_get_hl(&mut editor, 0, dict(&[("name", Object::String(OxStr::from("Named")))])).unwrap();
+    assert_eq!(named.get(&OxStr::from("foreground")), Some(&Object::Integer(0xc0c0c0)));
+    assert_eq!(named.get(&OxStr::from("background")), Some(&Object::Integer(0x808080)));
     crate::ui::nvim_set_hl_ns(&mut editor, 9).unwrap();
     assert_eq!(crate::ui::nvim_get_hl_ns(&mut editor, dict(&[])), Ok(9));
 }

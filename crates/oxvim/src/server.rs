@@ -9,7 +9,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
-use ox_api::Registry;
+use ox_api::{CommandExecutor, Registry};
 use ox_editor::{
     AutocmdContext, AutocmdKind, CmdlineKind, Editor, Event, ExExecutor, ExecOutcome, Geometry,
     LuaExec, LuaExecError, MappingAction, MessageKind, Mode, ModeMachine, Keys, TypeaheadFlags,
@@ -209,6 +209,7 @@ impl AppState {
             "nvim_input" => self.dispatch_input(params),
             "nvim_exec_lua" | "nvim_execute_lua" => self.dispatch_lua(params),
             "nvim_command" => self.dispatch_command(params),
+            "nvim_cmd" => self.dispatch_nvim_cmd(params),
             "nvim_ui_attach" => self.ui_attach(channel, params),
             "nvim_ui_detach" => self.ui_detach(channel, params),
             "nvim_ui_try_resize" => self.ui_resize(channel, params),
@@ -336,10 +337,23 @@ impl AppState {
         };
         let command = std::str::from_utf8(command.as_bytes())
             .map_err(|_| ApiError::validation("Ex command must be valid UTF-8"))?;
-        self.ex
+        let outcome = self.ex
             .execute_line(&mut self.editor.borrow_mut(), command)
             .map_err(|error| ApiError::exception(error.to_string()))?;
+        if outcome == ExecOutcome::Quit {
+            self.exiting = true;
+        }
         Ok(Object::Nil)
+    }
+
+    fn dispatch_nvim_cmd(&mut self, params: &[Object]) -> Result<Object, ApiError> {
+        let (cmd, opts) = nvim_cmd_args(params)?;
+        let mut executor = ExApiExecutor { executor: &mut self.ex, outcome: ExecOutcome::Completed };
+        let result = ox_api::execute_nvim_cmd(&mut self.editor.borrow_mut(), cmd, opts, &mut executor)?;
+        if executor.outcome == ExecOutcome::Quit {
+            self.exiting = true;
+        }
+        Ok(Object::String(result))
     }
 
     fn ui_attach(&mut self, channel: ChannelId, params: &[Object]) -> Result<Object, ApiError> {
@@ -1093,6 +1107,20 @@ impl LuaExec for ServerLuaExec {
     }
 }
 
+struct ExApiExecutor<'a> {
+    executor: &'a mut ExExecutor,
+    outcome: ExecOutcome,
+}
+
+impl CommandExecutor for ExApiExecutor<'_> {
+    fn execute(&mut self, editor: &mut Editor, commands: &[ox_api::ExCommand]) -> Result<(), ApiError> {
+        self.outcome = self.executor
+            .execute_commands(editor, commands)
+            .map_err(|error| ApiError::exception(error.to_string()))?;
+        Ok(())
+    }
+}
+
 fn with_scoped_editor_api<T>(
     lua: &Lua,
     registry: &Registry,
@@ -1152,13 +1180,42 @@ fn with_scoped_editor_api<T>(
         )?;
         for (metadata, dispatch) in registry.iter() {
             let editor = editor.clone();
+            if metadata.name == "nvim_cmd" {
+                api.set(
+                    metadata.name,
+                    scope.create_function_mut(move |lua, args: Variadic<Value>| {
+                        let args = args
+                            .iter()
+                            .map(|value| lua_to_object(lua, value).map_err(mlua::Error::external))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let (cmd, opts) = nvim_cmd_args(&args).map_err(mlua::Error::external)?;
+                        let mut nested = ExExecutor::new();
+                        let mut executor = ExApiExecutor {
+                            executor: &mut nested,
+                            outcome: ExecOutcome::Completed,
+                        };
+                        let result = ox_api::execute_nvim_cmd(
+                            &mut editor.borrow_mut(),
+                            cmd,
+                            opts,
+                            &mut executor,
+                        )
+                        .map_err(mlua::Error::external)?;
+                        object_to_lua(lua, &Object::String(result)).map_err(mlua::Error::external)
+                    })?,
+                )?;
+                continue;
+            }
             api.set(
                 metadata.name,
                 scope.create_function_mut(move |lua, args: Variadic<Value>| {
-                    let args = args
+                    let mut args = args
                         .iter()
                         .map(|value| lua_to_object(lua, value).map_err(mlua::Error::external))
                         .collect::<Result<Vec<_>, _>>()?;
+                    if metadata.name == "nvim_get_option_value" && args.len() == 1 {
+                        args.push(Object::Dict(Dict(Vec::new())));
+                    }
                     let result = dispatch(&mut editor.borrow_mut(), &args).map_err(mlua::Error::external)?;
                     object_to_lua(lua, &result).map_err(mlua::Error::external)
                 })?,
@@ -1182,6 +1239,17 @@ fn parse_variable_scope(scope: &mlua::LuaString) -> mlua::Result<VariableScope> 
         b"t" => Ok(VariableScope::Tabpage),
         b"v" => Ok(VariableScope::Vim),
         _ => Err(mlua::Error::runtime("unknown variable scope")),
+    }
+}
+
+fn nvim_cmd_args(params: &[Object]) -> Result<(&Dict, &Dict), ApiError> {
+    static EMPTY: std::sync::OnceLock<Dict> = std::sync::OnceLock::new();
+    let empty = EMPTY.get_or_init(|| Dict(Vec::new()));
+    match params {
+        [Object::Dict(cmd)] => Ok((cmd, empty)),
+        [Object::Dict(cmd), Object::Dict(opts)] => Ok((cmd, opts)),
+        [Object::Dict(cmd), Object::Array(opts)] if opts.is_empty() => Ok((cmd, empty)),
+        _ => Err(ApiError::validation("nvim_cmd expects (Dict, optional Dict)")),
     }
 }
 

@@ -476,8 +476,11 @@ struct FakeLua {
 }
 
 impl LuaExec for FakeLua {
-    fn execute_chunk(&mut self, _editor: &mut Editor, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError> {
+    fn execute_chunk(&mut self, editor: &mut Editor, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError> {
         self.chunks.push((code.to_owned(), args.clone()));
+        if code == "set-test-global" {
+            editor.gvars_mut().insert(OxStr::from("lua_global"), Object::Integer(42));
+        }
         if let Some(error) = self.error.clone() {
             return Err(error);
         }
@@ -507,6 +510,16 @@ fn lua_executes_exact_chunk() {
     let host = Rc::new(RefCell::new(FakeLua::default()));
     lua_executor(host.clone()).execute_line(&mut editor, "lua local x = 1 | 2").unwrap();
     assert_eq!(host.borrow().chunks[0], ("local x = 1 | 2".to_owned(), Vec::new()));
+}
+
+#[test]
+fn lua_global_mutation_is_visible_to_following_ex_command() {
+    let mut editor = Editor::new();
+    let host = Rc::new(RefCell::new(FakeLua::default()));
+    let mut executor = lua_executor(host);
+    executor.execute_line(&mut editor, "lua set-test-global").unwrap();
+    executor.execute_line(&mut editor, "unlet g:lua_global").unwrap();
+    assert!(editor.gvars().get(&OxStr::from("lua_global")).is_none());
 }
 
 #[test]
