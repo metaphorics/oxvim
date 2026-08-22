@@ -178,6 +178,7 @@ impl AppState {
         let name = method.to_string_lossy();
         let result = match name.as_ref() {
             "nvim_get_api_info" => self.dispatch_api_info(channel, params),
+            "nvim_call_atomic" => self.dispatch_call_atomic(channel, params),
             "nvim_input" => self.dispatch_input(params),
             "nvim_exec_lua" | "nvim_execute_lua" => self.dispatch_lua(params),
             "nvim_command" => self.dispatch_command(params),
@@ -219,6 +220,48 @@ impl AppState {
         };
         *id = Object::Integer(channel.get() as i64);
         Ok(result)
+    }
+
+    fn dispatch_call_atomic(
+        &mut self,
+        channel: ChannelId,
+        params: &[Object],
+    ) -> Result<Object, ApiError> {
+        let [Object::Array(calls)] = params else {
+            return Err(ApiError::validation("nvim_call_atomic expects one Array argument"));
+        };
+        let mut results = Vec::with_capacity(calls.len());
+        for (index, call) in calls.iter().enumerate() {
+            let Object::Array(call) = call else {
+                return Err(ApiError::validation("each call must be an Array"));
+            };
+            let (Some(Object::String(name)), Some(Object::Array(args))) = (call.first(), call.get(1)) else {
+                return Err(ApiError::validation("each call must contain name and arguments"));
+            };
+            let name = name.to_string_lossy();
+            let result = match name.as_ref() {
+                "nvim_get_api_info" => self.dispatch_api_info(channel, args),
+                "nvim_call_atomic" => self.dispatch_call_atomic(channel, args),
+                _ => match self.registry.get(&name) {
+                    Some((_, dispatch)) => dispatch(&mut self.editor.borrow_mut(), args),
+                    None => Err(ApiError::validation(format!("Invalid method: {name}"))),
+                },
+            };
+            match result {
+                Ok(value) => results.push(value),
+                Err(error) => {
+                    return Ok(Object::Array(vec![
+                        Object::Array(results),
+                        Object::Array(vec![
+                            Object::Integer(i64::try_from(index).unwrap_or(i64::MAX)),
+                            Object::Integer(error.error_type()),
+                            Object::String(OxStr::from(error.message())),
+                        ]),
+                    ]));
+                }
+            }
+        }
+        Ok(Object::Array(vec![Object::Array(results), Object::Nil]))
     }
 
     fn dispatch_input(&mut self, params: &[Object]) -> Result<Object, ApiError> {

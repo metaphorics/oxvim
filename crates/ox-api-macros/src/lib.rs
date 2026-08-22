@@ -328,9 +328,10 @@ fn expand(args: ApiArgs, function: ItemFn) -> Result<TokenStream2, Error> {
                 method: #method,
                 fast: #fast,
                 textlock: #textlock,
+                textlock_allow: false,
                 returns: <#return_type as ::ox_api::ApiType>::TYPE,
                 params: &[
-                    #((#parameter_name_strings, <#parameter_types as ::ox_api::ApiType>::TYPE)),*
+                    #((#parameter_name_strings, <#parameter_types as ::ox_api::ApiType>::TYPE, false)),*
                 ],
             }
         }

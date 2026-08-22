@@ -172,6 +172,18 @@ fn embedded_stdio_serves_core_rpc_contracts() {
         version.iter().find_map(|(key, value)| (key.as_str() == Some("api_level")).then_some(value))
     }), Some(&Value::from(15)));
 
+    let atomic = oxvim.request(
+        "nvim_call_atomic",
+        vec![Value::Array(vec![Value::Array(vec![
+            Value::from("nvim_get_api_info"),
+            Value::Array(vec![]),
+        ])])],
+    );
+    let Value::Array(atomic) = atomic else { panic!("atomic result is not an array") };
+    let Value::Array(results) = &atomic[0] else { panic!("atomic results are not an array") };
+    let Value::Array(nested_info) = &results[0] else { panic!("nested API info is not an array") };
+    assert_eq!(nested_info[0], Value::from(1));
+
     assert_eq!(
         oxvim.request(
             "nvim_buf_set_lines",

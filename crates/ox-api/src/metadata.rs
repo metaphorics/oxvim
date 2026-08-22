@@ -35,6 +35,8 @@ pub enum TypeRef {
     ArrayOf(&'static TypeRef),
     /// Dictionary whose values have a declared API type.
     DictOf(&'static TypeRef),
+    /// An exact upstream type expression not covered by the typed variants.
+    Named(&'static str),
 }
 
 impl fmt::Display for TypeRef {
@@ -55,6 +57,7 @@ impl fmt::Display for TypeRef {
             Self::Void => formatter.write_str("void"),
             Self::ArrayOf(element) => write!(formatter, "ArrayOf({element})"),
             Self::DictOf(value) => write!(formatter, "DictOf({value})"),
+            Self::Named(name) => formatter.write_str(name),
         }
     }
 }
@@ -80,8 +83,10 @@ pub struct FunctionMetadata {
     pub fast: bool,
     /// Whether the function is forbidden while text is locked.
     pub textlock: bool,
+    /// Whether the function may run while text is locked despite the default restriction.
+    pub textlock_allow: bool,
     /// Public return type.
     pub returns: TypeRef,
-    /// Public positional parameter names and types.
-    pub params: &'static [(&'static str, TypeRef)],
+    /// Public positional parameter names, types, and optionality.
+    pub params: &'static [(&'static str, TypeRef, bool)],
 }

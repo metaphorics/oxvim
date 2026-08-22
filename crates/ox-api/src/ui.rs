@@ -220,16 +220,6 @@ pub fn nvim_select_popupmenu_item(editor: &mut Editor, item: i64, _insert: bool,
     with_state_mut(editor, |state| state.chrome.select_popupmenu(item)); Ok(())
 }
 
-#[api(since = 3)]
-pub fn nvim__stats(editor: &mut Editor) -> Result<Dict, ApiError> {
-    Ok(Dict(vec![
-        (OxStr::from("fsync"), Object::Integer(0)),
-        (OxStr::from("redraw"), Object::Integer(0)),
-        (OxStr::from("arena_alloc_count"), Object::Integer(0)),
-        (OxStr::from("ui_count"), Object::Integer(i64::try_from(with_state(editor, |state| state.ui_channels.len())).unwrap_or(i64::MAX))),
-    ]))
-}
-
 pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(nvim_list_uis__API_META(), nvim_list_uis__API_DISPATCH)?;
     registry.register(nvim_ui_attach__API_META(), nvim_ui_attach__API_DISPATCH)?;
@@ -247,6 +237,5 @@ pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(nvim_put__API_META(), nvim_put__API_DISPATCH)?;
     registry.register(nvim_feedkeys__API_META(), nvim_feedkeys__API_DISPATCH)?;
     registry.register(nvim_select_popupmenu_item__API_META(), nvim_select_popupmenu_item__API_DISPATCH)?;
-    registry.register(nvim__stats__API_META(), nvim__stats__API_DISPATCH)?;
     Ok(())
 }

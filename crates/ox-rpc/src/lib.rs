@@ -24,5 +24,5 @@ pub use channel::{
 };
 pub use codec::{decode, encode, DecodeError, IncrementalDecoder};
 pub use message::{Message, MsgidCounter};
-pub use metadata::ApiMetadata;
+pub use metadata::{ApiMetadata, canonical_metadata};
 pub use redraw::{RedrawBatch, RedrawEvent};

@@ -4,6 +4,7 @@
 extern crate self as ox_api;
 
 mod autocmd;
+mod api_function_names;
 mod buffer;
 mod channel;
 mod context;

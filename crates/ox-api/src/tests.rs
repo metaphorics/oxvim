@@ -181,12 +181,12 @@ fn option_value_scope_distinguishes_global_and_local() {
 #[test]
 fn core_registry_metadata_matches_cross_family_sample() {
     let registry = crate::core().unwrap();
-    assert_eq!(registry.len(), 147);
+    assert_eq!(registry.len(), 262);
     let expected = [
         ("nvim_buf_get_lines", 1, TypeRef::ArrayOf(&TypeRef::String)),
         ("nvim_buf_get_text", 9, TypeRef::ArrayOf(&TypeRef::String)),
         ("nvim_buf_get_changedtick", 2, TypeRef::Integer),
-        ("nvim_win_get_cursor", 1, TypeRef::ArrayOf(&TypeRef::Integer)),
+        ("nvim_win_get_cursor", 1, TypeRef::Named("ArrayOf(Integer, 2)")),
         ("nvim_open_win", 6, TypeRef::Window),
         ("nvim_win_set_hl_ns", 10, TypeRef::Void),
         ("nvim_tabpage_list_wins", 1, TypeRef::ArrayOf(&TypeRef::Window)),

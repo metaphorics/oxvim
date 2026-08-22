@@ -87,18 +87,18 @@ fn generated_metadata_matches_the_rust_signature() {
     assert_eq!(
         metadata.params,
         &[
-            ("buf", TypeRef::Buffer),
-            ("boolean", TypeRef::Boolean),
-            ("integer", TypeRef::Integer),
-            ("float", TypeRef::Float),
-            ("string", TypeRef::String),
-            ("array", TypeRef::ArrayOf(&TypeRef::Integer)),
-            ("dict", TypeRef::Dict),
-            ("lua_ref", TypeRef::LuaRef),
-            ("window", TypeRef::Window),
-            ("tabpage", TypeRef::Tabpage),
-            ("nil", TypeRef::Nil),
-            ("object", TypeRef::Object),
+            ("buf", TypeRef::Buffer, false),
+            ("boolean", TypeRef::Boolean, false),
+            ("integer", TypeRef::Integer, false),
+            ("float", TypeRef::Float, false),
+            ("string", TypeRef::String, false),
+            ("array", TypeRef::ArrayOf(&TypeRef::Integer), false),
+            ("dict", TypeRef::Dict, false),
+            ("lua_ref", TypeRef::LuaRef, false),
+            ("window", TypeRef::Window, false),
+            ("tabpage", TypeRef::Tabpage, false),
+            ("nil", TypeRef::Nil, false),
+            ("object", TypeRef::Object, false),
         ]
     );
 
@@ -110,7 +110,7 @@ fn generated_metadata_matches_the_rust_signature() {
 
     let contextual = nvim_context_create_buffer__API_META();
     assert_eq!(contextual.returns, TypeRef::Buffer);
-    assert_eq!(contextual.params, &[("listed", TypeRef::Boolean)]);
+    assert_eq!(contextual.params, &[("listed", TypeRef::Boolean, false)]);
 }
 
 #[test]

@@ -10,8 +10,7 @@ use ox_types::{Special, Typval};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    api, ApiError, BufHandle, Dict, FunctionMetadata, Object, OxStr, Registry, RegistryError,
-    TabHandle, WinHandle,
+    api, ApiError, BufHandle, Dict, Object, OxStr, Registry, RegistryError, TabHandle, WinHandle,
 };
 
 const MAX_CONVERSION_DEPTH: usize = 100;
@@ -106,16 +105,9 @@ pub fn nvim_list_tabpages(editor: &mut Editor) -> Result<Vec<TabHandle>, ApiErro
 
 #[api(since = 1, fast)]
 pub fn nvim_get_api_info(_editor: &mut Editor) -> Result<Vec<Object>, ApiError> {
-    let registry = crate::registry::core().map_err(exception)?;
-    let mut api_metadata = ox_rpc::ApiMetadata::new();
-    for (metadata, _) in registry.iter() {
-        api_metadata.add_function(Object::Dict(function_metadata(metadata)));
-    }
-    // Dispatch has no RPC channel context; zero is the documented anonymous channel id.
-    let Object::Array(info) = api_metadata.api_info_object() else {
-        return Err(ApiError::exception("invalid API metadata response"));
-    };
-    Ok(info)
+    let metadata = ox_rpc::canonical_metadata()
+        .map_err(|error| ApiError::exception(format!("invalid API metadata: {error}")))?;
+    Ok(vec![Object::Integer(0), metadata])
 }
 
 #[api(since = 1)]
@@ -560,35 +552,6 @@ fn map_eval_error(error: EvalError) -> ApiError {
         }
         EvalErrorKind::Vim => ApiError::exception(error.to_string()),
     }
-}
-
-fn function_metadata(metadata: &FunctionMetadata) -> Dict {
-    let parameters = metadata
-        .params
-        .iter()
-        .map(|(name, ty)| {
-            Object::Array(vec![
-                Object::String(OxStr::from(ty.to_string().as_str())),
-                Object::String(OxStr::from(*name)),
-            ])
-        })
-        .collect();
-    let mut fields = vec![
-        (OxStr::from("name"), Object::String(OxStr::from(metadata.name))),
-        (OxStr::from("parameters"), Object::Array(parameters)),
-        (
-            OxStr::from("return_type"),
-            Object::String(OxStr::from(metadata.returns.to_string().as_str())),
-        ),
-        (OxStr::from("since"), Object::Integer(i64::from(metadata.since))),
-        (OxStr::from("method"), Object::Boolean(metadata.method)),
-        (OxStr::from("fast"), Object::Boolean(metadata.fast)),
-        (OxStr::from("textlock"), Object::Boolean(metadata.textlock)),
-    ];
-    if let Some(since) = metadata.deprecated_since {
-        fields.push((OxStr::from("deprecated_since"), Object::Integer(i64::from(since))));
-    }
-    Dict(fields)
 }
 
 /// Appends one literal byte, quoting NUL and `K_SPECIAL` the way key sequences

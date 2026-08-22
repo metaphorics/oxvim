@@ -22,6 +22,15 @@
 
 use ox_types::{Dict, Object, OxStr};
 
+/// Decode the canonical Neovim 0.13 API-level-15 metadata table.
+///
+/// The checked-in value is generated from the reference binary's `--api-info`
+/// output so function inventory, optional parameters, flags, UI events, and
+/// top-level key presence remain one indivisible protocol contract.
+pub fn canonical_metadata() -> Result<Object, crate::DecodeError> {
+    crate::decode(include_bytes!("api_metadata.msgpack"))
+}
+
 /// The API level the metadata advertises (`NVIM_API_LEVEL` for 0.13).
 pub const API_LEVEL: i64 = 15;
 /// The lowest API level this build is backward-compatible with.
@@ -282,5 +291,17 @@ mod tests {
             }
             _ => panic!("api info must be a 2-tuple"),
         }
+    }
+
+    #[test]
+    fn canonical_metadata_preserves_oracle_shape() {
+        let metadata = canonical_metadata().unwrap();
+        let Object::Dict(root) = &metadata else { panic!("metadata must be a dictionary") };
+        let keys: Vec<_> = root.0.iter().map(|(key, _)| key.to_string_lossy()).collect();
+        assert_eq!(keys, ["version", "functions", "ui_events", "ui_options", "error_types", "types"]);
+        let Object::Array(functions) = get(&metadata, "functions") else { panic!("functions must be an array") };
+        assert_eq!(functions.len(), 262);
+        let Object::Array(parameters) = get(&functions[0], "parameters") else { panic!("parameters must be an array") };
+        assert!(matches!(parameters[0], Object::Array(ref fields) if fields.len() == 3));
     }
 }
