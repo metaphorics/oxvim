@@ -1572,7 +1572,7 @@ fn call_user_function_with_self<F: FileIO>(
     scope: &mut Scope,
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     name: &str,
-    args: Vec<Typval>,
+    mut args: Vec<Typval>,
     first_line: usize,
     last_line: usize,
     receiver: Option<DictRef>,
@@ -1599,6 +1599,19 @@ fn call_user_function_with_self<F: FileIO>(
         .functions
         .resolve(name, sid)
         .ok_or_else(|| error_flow(runtime, "E117", format!("Unknown function: {name}")))?;
+    // call_user_func: defaulted parameters omitted by the caller are filled
+    // by evaluating their expressions in the *caller's* scope, before the
+    // frame's l:/a: maps replace it. Arity errors stay in begin_call, so the
+    // defaults are only evaluated when the call is otherwise well-formed.
+    let required = preview.args.len() - preview.default_args.len();
+    if args.len() >= required && args.len() < preview.args.len() {
+        for expression in &preview.default_args[args.len() - required..] {
+            match eval_text(runtime, editor, scope, lua, expression) {
+                Ok(value) => args.push(value),
+                Err(flow) => return Err(flow),
+            }
+        }
+    }
     let logical = preview
         .body
         .iter()

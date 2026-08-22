@@ -36,6 +36,9 @@ pub struct UserFunc {
     pub name: String,
     /// Positional parameter names.
     pub args: Vec<String>,
+    /// Source text of trailing default expressions, aligned with the last
+    /// `default_args.len()` entries of `args` (userfunc.c `uf_def_args`).
+    pub default_args: Vec<String>,
     /// Whether `...` was present.
     pub varargs: bool,
     /// Definition flags.
@@ -96,6 +99,9 @@ pub struct FunctionSignature {
     pub name: String,
     /// Ordered positional parameter names.
     pub args: Vec<String>,
+    /// Source text of trailing default expressions (`name = expr`), aligned
+    /// with the last `default_args.len()` entries of `args`.
+    pub default_args: Vec<String>,
     /// Whether the final parameter is `...`.
     pub varargs: bool,
     /// Definition flags.
@@ -123,43 +129,92 @@ impl UserFunctions {
             .find('(')
             .ok_or_else(|| UserFuncError::new("E124", "Missing '(': function declaration"))?;
         let close = source[open + 1..]
-            .find(')')
+            .find_top_level(b')')
             .map(|offset| open + 1 + offset)
             .ok_or_else(|| UserFuncError::new("E125", "Illegal argument: missing ')'"))?;
         let name = source[..open].trim();
         validate_function_name(name)?;
 
-        let mut args = Vec::new();
+        let mut args: Vec<String> = Vec::new();
+        let mut default_args: Vec<String> = Vec::new();
         let mut varargs = false;
         let arg_text = &source[open + 1..close];
-        for (index, raw) in arg_text.split(',').enumerate() {
+        let pieces = split_argument_ranges(arg_text);
+        let last = pieces.len() - 1;
+        for (index, (start, end)) in pieces.into_iter().enumerate() {
+            let raw = &arg_text[start..end];
             let argument = raw.trim();
             if argument.is_empty() {
+                if index == last {
+                    // `F(a,)`: upstream tolerates a trailing comma.
+                    break;
+                }
                 if arg_text.trim().is_empty() {
                     break;
                 }
-                return Err(UserFuncError::new("E475", "Invalid argument: empty parameter"));
+                return Err(UserFuncError::new(
+                    "E475",
+                    format!("Invalid argument: {arg_text}"),
+                ));
+            }
+            if varargs {
+                // `...` sets mustend upstream; anything after it is invalid.
+                return Err(UserFuncError::new(
+                    "E475",
+                    format!("Invalid argument: {}", &source[open + 1..]),
+                ));
             }
             if argument == "..." {
-                if index + 1 != arg_text.split(',').count() {
-                    return Err(UserFuncError::new("E125", "Illegal argument: ... must be last"));
-                }
                 varargs = true;
                 continue;
             }
-            if !is_identifier(argument) {
+            if index != last && raw.trim_end().len() != raw.len() {
+                // get_function_args: no white space allowed before the
+                // separating comma.
+                let rest = &arg_text[start + raw.trim_end().len()..];
+                return Err(UserFuncError::new(
+                    "E1068",
+                    format!("No white space allowed before ',': {rest}"),
+                ));
+            }
+            let (parameter, default) = match argument.split_once('=') {
+                Some((parameter, rest)) => (parameter.trim(), Some(rest.trim())),
+                None => (argument, None),
+            };
+            if !is_identifier(parameter) || parameter == "firstline" || parameter == "lastline" {
                 return Err(UserFuncError::new(
                     "E125",
                     format!("Illegal argument: {argument}"),
                 ));
             }
-            if args.iter().any(|existing| existing == argument) {
+            if args.iter().any(|existing| existing == parameter) {
                 return Err(UserFuncError::new(
                     "E853",
-                    format!("Duplicate argument name: {argument}"),
+                    format!("Duplicate argument name: {parameter}"),
                 ));
             }
-            args.push(argument.to_owned());
+            match default {
+                Some(expression) => {
+                    // get_function_args syntax-checks the default with eval1
+                    // (parse without evaluation) at definition time.
+                    if ox_eval::Parser::new(expression.as_bytes()).parse().is_err() {
+                        return Err(UserFuncError::new(
+                            "E475",
+                            format!("Invalid argument: {}", &source[open + 1..]),
+                        ));
+                    }
+                    default_args.push(expression.to_owned());
+                }
+                None => {
+                    if !default_args.is_empty() {
+                        return Err(UserFuncError::new(
+                            "E989",
+                            "Non-default argument follows default argument",
+                        ));
+                    }
+                }
+            }
+            args.push(parameter.to_owned());
         }
 
         let mut flags = UserFuncFlags::default();
@@ -180,6 +235,7 @@ impl UserFunctions {
         Ok(FunctionSignature {
             name: name.to_owned(),
             args,
+            default_args,
             varargs,
             flags,
         })
@@ -223,6 +279,7 @@ impl UserFunctions {
             UserFunc {
                 name: name.clone(),
                 args: signature.args,
+                default_args: signature.default_args,
                 varargs: signature.varargs,
                 flags: signature.flags,
                 body,
@@ -283,16 +340,18 @@ impl UserFunctions {
         let function = self.resolve(name, sid).ok_or_else(|| {
             UserFuncError::new("E117", format!("Unknown function: {name}"))
         })?;
-        if values.len() < function.args.len()
-            || (!function.varargs && values.len() > function.args.len())
+        // check_user_func_argcount: required = uf_args - uf_def_args;
+        // calls may omit any trailing defaulted parameters.
+        let required = function.args.len() - function.default_args.len();
+        if values.len() < required || (!function.varargs && values.len() > function.args.len())
         {
-            let relation = if values.len() < function.args.len() {
+            let relation = if values.len() < required {
                 "Not enough"
             } else {
                 "Too many"
             };
             return Err(UserFuncError::new(
-                if values.len() < function.args.len() { "E119" } else { "E118" },
+                if values.len() < required { "E119" } else { "E118" },
                 format!("{relation} arguments for function: {}", function.name),
             ));
         }
@@ -434,4 +493,74 @@ fn is_identifier(text: &str) -> bool {
     };
     (first.is_ascii_alphabetic() || first == b'_')
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Byte-scanner used by [`UserFunctions::parse_signature`].
+///
+/// `get_function_args` walks the argument list with `eval1`, which steps over
+/// nested `()`/`[]`/`{}` and quoted strings; comma and closing-paren
+/// detection must do the same so default expressions may contain commas,
+/// strings, and calls.
+trait FindTopLevel {
+    fn find_top_level(&self, needle: u8) -> Option<usize>;
+}
+
+impl FindTopLevel for str {
+    fn find_top_level(&self, needle: u8) -> Option<usize> {
+        let bytes = self.as_bytes();
+        let mut depth = 0usize;
+        let mut index = 0usize;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\'' | b'"' => skip_quoted(bytes, &mut index),
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                    index += 1;
+                }
+                close @ (b')' | b']' | b'}') => {
+                    if close == needle && depth == 0 {
+                        return Some(index);
+                    }
+                    depth = depth.saturating_sub(1);
+                    index += 1;
+                }
+                b',' if needle == b',' && depth == 0 => return Some(index),
+                _ => index += 1,
+            }
+        }
+        None
+    }
+}
+
+/// Advances `index` past one Vim single- or double-quoted string.
+fn skip_quoted(bytes: &[u8], index: &mut usize) {
+    let quote = bytes[*index];
+    *index += 1;
+    while *index < bytes.len() {
+        if quote == b'"' && bytes[*index] == b'\\' && *index + 1 < bytes.len() {
+            *index += 2;
+            continue;
+        }
+        if bytes[*index] == quote {
+            if quote == b'\'' && bytes.get(*index + 1) == Some(&b'\'') {
+                *index += 2;
+                continue;
+            }
+            *index += 1;
+            return;
+        }
+        *index += 1;
+    }
+}
+
+/// Splits `text` into `(start, end)` byte ranges at top-level commas.
+fn split_argument_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut offset = 0usize;
+    while let Some(position) = text[offset..].find_top_level(b',') {
+        ranges.push((offset, offset + position));
+        offset += position + 1;
+    }
+    ranges.push((offset, text.len()));
+    ranges
 }

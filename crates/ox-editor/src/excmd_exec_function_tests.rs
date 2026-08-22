@@ -304,6 +304,189 @@ fn not_enough_args_yields_e119() {
 }
 
 // ---------------------------------------------------------------------------
+// Family: default arguments
+// (eval/userfunc.c get_function_args / call_user_func; test_user_func.vim
+//  Test_default_arg, Test_default_argument_expression_error_while_inside_of_
+//  a_try_block)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_args_fill_omitted_positionals() {
+    // call_user_func: omitted defaulted parameters are bound to the value of
+    // their expression; supplied values win. test_user_func.vim: Log().
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &mut editor,
+        "function! Sum(x, y = 2)\nreturn a:x + a:y\nendfunction",
+    );
+    script(&mut exec, &mut editor, "let g:a = Sum(40)");
+    script(&mut exec, &mut editor, "let g:b = Sum(40, 3)");
+    assert_eq!(global_number(exec.scope(), "a"), Some(42));
+    assert_eq!(global_number(exec.scope(), "b"), Some(43));
+}
+
+#[test]
+fn default_args_do_not_count_toward_a0() {
+    // call_user_func: a:0 is max(argcount - uf_args, 0); defaults fill
+    // positionals and never count as varargs. test_user_func.vim: Args().
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &mut editor,
+        "function! Args(mandatory, optional = v:null, ...)\nreturn deepcopy(a:)\nendfunction",
+    );
+    script(&mut exec, &mut editor, "let g:one = Args(1)");
+    script(&mut exec, &mut editor, "let g:three = Args(1, 2, 3)");
+    let value = |scope: &Scope, name: &str| {
+        scope
+            .global
+            .iter()
+            .find(|(key, _)| key.as_bytes() == name.as_bytes())
+            .map(|(_, value)| value.clone())
+    };
+    let entry = |scope: &Scope, name: &str, key: &[u8]| match value(scope, name) {
+        Some(Typval::Dict(cell)) => {
+            let data = cell.borrow();
+            data.entries
+                .iter()
+                .find(|(entry, _)| entry.as_bytes() == key)
+                .map(|(_, value)| value.clone())
+        }
+        _ => panic!("expected dict for {name}"),
+    };
+    assert_eq!(
+        entry(exec.scope(), "one", b"mandatory"),
+        Some(Typval::Number(1))
+    );
+    assert_eq!(
+        entry(exec.scope(), "one", b"optional"),
+        Some(Typval::Special(ox_types::Special::Null))
+    );
+    assert_eq!(entry(exec.scope(), "one", b"0"), Some(Typval::Number(0)));
+    assert_eq!(
+        entry(exec.scope(), "three", b"optional"),
+        Some(Typval::Number(2))
+    );
+    assert_eq!(entry(exec.scope(), "three", b"0"), Some(Typval::Number(1)));
+    assert_eq!(entry(exec.scope(), "three", b"1"), Some(Typval::Number(3)));
+}
+
+#[test]
+fn default_args_still_e118_when_exceeding_total() {
+    // check_user_func_argcount: too many arguments still applies to the full
+    // positional count. test_user_func.vim: `call Log(1,2,3)` → E118.
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &mut editor,
+        "function! Sum2(x, y = 2)\nreturn a:x + a:y\nendfunction",
+    );
+    let err = exec
+        .execute_script(&mut editor, "<test>", "call Sum2(1, 2, 3)")
+        .unwrap_err();
+    assert_eq!(error_code(&err), "E118");
+}
+
+#[test]
+fn default_args_still_e119_below_required() {
+    // check_user_func_argcount: required = uf_args - uf_def_args.
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &mut editor,
+        "function! Req(a, b, c = 1)\nreturn a:c\nendfunction",
+    );
+    let err = exec
+        .execute_script(&mut editor, "<test>", "call Req(1)")
+        .unwrap_err();
+    assert_eq!(error_code(&err), "E119");
+}
+
+#[test]
+fn non_default_argument_after_default_is_e989() {
+    // get_function_args: E989. test_user_func.vim: MakeBadFunc().
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    let err = exec
+        .execute_script(&mut editor, "<test>", "function Bad(a, b=1, c)\nendfunction")
+        .unwrap_err();
+    assert_eq!(error_code(&err), "E989");
+}
+
+#[test]
+fn white_space_before_comma_is_e1068() {
+    // get_function_args: E1068. test_user_func.vim:
+    // `fu F(a=1 ,) | endf` → E1068.
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    let err = exec
+        .execute_script(&mut editor, "<test>", "function W(a=1 ,)\nendfunction")
+        .unwrap_err();
+    assert_eq!(error_code(&err), "E1068");
+}
+
+#[test]
+fn default_expression_may_contain_commas_strings_and_nesting() {
+    // get_function_args walks the default expression like eval1, so commas
+    // inside strings/lists/dicts and parens inside strings do not split the
+    // argument list or end it early.
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &mut editor,
+        "function! L(x, y = [1, 2, 3])\nreturn len(a:y) + a:x\nendfunction",
+    );
+    script(&mut exec, &mut editor, "let g:list = L(1)");
+    assert_eq!(global_number(exec.scope(), "list"), Some(4));
+    script(
+        &mut exec,
+        &mut editor,
+        "function! S(x, y = \"a,b)\")\nreturn len(a:y)\nendfunction",
+    );
+    script(&mut exec, &mut editor, "let g:str = S(0)");
+    assert_eq!(global_number(exec.scope(), "str"), Some(4));
+}
+
+#[test]
+fn default_expression_evaluates_in_caller_scope_and_aborts_call() {
+    // call_user_func evaluates defaults before entering the frame; an error
+    // surfaces from the call site and the body never runs.
+    // test_user_func.vim:
+    // Test_default_argument_expression_error_while_inside_of_a_try_block.
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &mut editor,
+        concat!(
+            "function! s:f(v = s:undefined_variable)\n",
+            "let s:entered_fn_body = 1\n",
+            "return a:v\n",
+            "endfunction\n",
+            "let g:caught = 0\n",
+            "try\n",
+            "call s:f()\n",
+            "catch\n",
+            "let g:caught = 1\n",
+            "let g:msg = v:exception\n",
+            "endtry\n",
+            "let g:entered = exists('s:entered_fn_body')"
+        ),
+    );
+    assert_eq!(global_number(exec.scope(), "caught"), Some(1));
+    assert!(global_string(exec.scope(), "msg")
+        .unwrap()
+        .starts_with("E121: Undefined variable: s:undefined_variable"));
+    assert_eq!(global_number(exec.scope(), "entered"), Some(0));
+}
+
+// ---------------------------------------------------------------------------
 // Family: l: / a: scope isolation and restoration
 // (eval/userfunc.c: call_def_function saves/restores caller l: and a:;
 //  test_user_func.vim)
