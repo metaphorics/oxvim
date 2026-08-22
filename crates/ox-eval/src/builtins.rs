@@ -90,7 +90,6 @@ impl<'a> Builtins<'a> {
             "executable" => path_builtins::executable(&args[0]),
             "exists" => exists(&args[0], scope),
             "extend" | "extendnew" => extend(args),
-            "filereadable" => path_builtins::filereadable(&args[0]),
             "filter" => self.filter_or_map(args, scope, CollectionOp::Filter),
             "flatten" => flatten(&args, true),
             "flattennew" => flatten(&args, false),
@@ -99,13 +98,10 @@ impl<'a> Builtins<'a> {
             "fnamemodify" => path_builtins::fnamemodify(self.regex, &args[0], &args[1]),
             "get" => get(&args),
             "getcwd" => path_builtins::getcwd(&args),
-            "glob" => path_builtins::glob(&args),
-            "globpath" => path_builtins::globpath(&args),
             "has" => has_feature(&args),
             "has_key" => has_key(&args),
             "index" => index(&args),
             "insert" => insert(args),
-            "isdirectory" => path_builtins::isdirectory(&args[0]),
             "islocked" => is_locked_value(&args[0]),
             "items" => dict_projection(&args[0], Projection::Items),
             "join" => join(&args),
@@ -572,8 +568,8 @@ fn check_arity(spec: &BuiltinSpec, count: usize) -> Result<()> {
 fn is_implemented(name: &str) -> bool {
     matches!(name,
         "abs" | "add" | "and" | "blob2list" | "ceil" | "char2nr" | "copy" | "count" |
-        "deepcopy" | "empty" | "escape" | "executable" | "exists" | "extend" | "extendnew" | "filereadable" | "filter" | "flatten" |
-        "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "get" | "getcwd" | "glob" | "globpath" | "has" | "has_key" | "index" | "insert" | "isdirectory" | "items" |
+        "deepcopy" | "empty" | "escape" | "executable" | "exists" | "extend" | "extendnew" | "filter" | "flatten" |
+        "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "get" | "getcwd" | "has" | "has_key" | "index" | "insert" | "items" |
         "islocked" | "join" | "json_decode" | "json_encode" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
         "match" | "matchend" | "matchstr" | "max" | "min" | "nr2char" | "or" | "pow" | "printf" | "range" | "reduce" | "resolve" |
         "remove" | "repeat" | "reverse" | "setenv" | "simplify" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |

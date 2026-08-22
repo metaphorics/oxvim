@@ -166,8 +166,8 @@ fn readfile(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
         for byte in &mut line { if *byte == 0 { *byte = b'\n'; } }
         line
     }).collect();
-    if !binary && ended_in_newline { lines.pop(); }
-    if bytes.is_empty() && !binary { lines.clear(); }
+    if bytes.is_empty() { lines.clear(); }
+    else if !binary && ended_in_newline { lines.pop(); }
     if let Some(maximum) = maximum {
         if maximum >= 0 {
             lines.truncate(maximum as usize);
@@ -247,6 +247,13 @@ fn glob_result(matches: Vec<String>, list: bool) -> ox_eval::Result<Typval> {
 }
 
 fn expand_glob(io: &dyn FileIO, pattern: &str, all_links: bool) -> Vec<String> {
+    let expanded;
+    let pattern = if (pattern == "~" || pattern.starts_with("~/")) && std::env::var_os("HOME").is_some() {
+        expanded = format!("{}{}", PathBuf::from(std::env::var_os("HOME").expect("checked above")).to_string_lossy(), &pattern[1..]);
+        expanded.as_str()
+    } else {
+        pattern
+    };
     let path = Path::new(pattern);
     let absolute = path.is_absolute();
     let components: Vec<String> = path.components().filter_map(|component| match component {
@@ -292,6 +299,7 @@ fn expand_components(io: &dyn FileIO, base: &Path, components: &[String], index:
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     for entry in entries {
         let filename = entry.name.to_string_lossy();
+        if filename.starts_with('.') && !component.starts_with('.') { continue; }
         if wildcard_match(component.as_bytes(), filename.as_bytes()) {
             expand_components(io, &entry.path, components, index + 1, all_links, output);
         }
