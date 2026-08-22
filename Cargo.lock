@@ -440,6 +440,7 @@ dependencies = [
  "ox-regex",
  "ox-text",
  "ox-types",
+ "ox-uv",
  "thiserror 2.0.20",
 ]
 

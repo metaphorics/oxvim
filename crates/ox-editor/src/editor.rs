@@ -1,6 +1,8 @@
 //! The single-writer root for all editor state.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ox_text::{Buffer, Position};
@@ -19,6 +21,28 @@ use crate::register::{put_content, RegisterError, Registers};
 use crate::typeahead::Typeahead;
 
 static NEXT_API_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Cloneable allocator for the process-wide dynamic channel key space.
+#[derive(Clone, Debug)]
+pub struct ChannelIds(Rc<Cell<u64>>);
+
+impl Default for ChannelIds {
+    fn default() -> Self { Self::new() }
+}
+
+impl ChannelIds {
+    /// Start after the reserved stdio and stderr channel ids.
+    #[must_use]
+    pub fn new() -> Self { Self(Rc::new(Cell::new(3))) }
+
+    /// Allocate one monotonically increasing dynamic channel id.
+    #[must_use]
+    pub fn allocate(&self) -> u64 {
+        let id = self.0.get();
+        self.0.set(id.checked_add(1).expect("channel id space exhausted"));
+        id
+    }
+}
 
 /// Classification retained with a message submitted to the editor sink.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,6 +165,7 @@ pub struct Editor {
     next_buffer: i64,
     next_window: i64,
     next_tabpage: i64,
+    channel_ids: ChannelIds,
 }
 
 impl Default for Editor {
@@ -175,8 +200,17 @@ impl Editor {
             next_buffer: 1,
             next_window: 1,
             next_tabpage: 1,
+            channel_ids: ChannelIds::new(),
         }
     }
+
+    /// Allocate a dynamic channel id. Values 1 and 2 are reserved for stdio and stderr.
+    #[must_use]
+    pub fn allocate_channel_id(&self) -> u64 { self.channel_ids.allocate() }
+
+    /// Return the allocator shared by every dynamic channel owner.
+    #[must_use]
+    pub fn channel_ids(&self) -> ChannelIds { self.channel_ids.clone() }
 
     /// Stable identity for state owned by API and UI host layers.
     #[must_use]

@@ -5,6 +5,7 @@
 //! narrow host adapters needed by `ox-eval` and `ox-regex`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::cell::RefCell;
@@ -34,7 +35,10 @@ use crate::register::RegisterContent;
 use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid};
 use crate::typeahead::Keys;
 use crate::userfunc::{UserFuncError, UserFunctions};
-use crate::{BufferRelease, Editor, Message, MessageKind, ModeMachine, Geometry};
+use crate::{
+    BufferRelease, ChannelIds, Editor, Geometry, JobCallbacks, JobEvent, JobManager, JobStartOptions, Message,
+    MessageKind, ModeMachine,
+};
 
 /// Result of one public execution entry point.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,6 +149,16 @@ pub trait LuaExec {
 
     /// Load and execute one Lua file.
     fn execute_file(&mut self, editor: &mut Editor, path: &Path) -> Result<(), LuaExecError>;
+
+    /// Invoke a Lua registry callback with values converted by the host.
+    fn invoke_callback(
+        &mut self,
+        _editor: &mut Editor,
+        _reference: usize,
+        _args: Vec<Object>,
+    ) -> Result<(), LuaExecError> {
+        Err(LuaExecError::Runtime("Lua callbacks are not installed".to_owned()))
+    }
 }
 
 /// Definition created by `:command`.
@@ -197,6 +211,8 @@ struct ExRuntime<F: FileIO> {
     functions: UserFunctions,
     user_commands: UserCommandRegistry,
     const_vars: BTreeSet<String>,
+    channel_ids: ChannelIds,
+    jobs: Option<JobManager>,
     current_augroup: AugroupId,
 }
 
@@ -207,6 +223,8 @@ impl<F: FileIO> ExRuntime<F> {
             functions: UserFunctions::new(),
             user_commands: UserCommandRegistry::default(),
             const_vars: BTreeSet::new(),
+            channel_ids: ChannelIds::new(),
+            jobs: None,
             current_augroup: AugroupId::default(),
         }
     }
@@ -277,6 +295,11 @@ impl<F: FileIO> ExExecutor<F> {
         self.lua = Some(lua);
     }
 
+    /// Share the host editor's dynamic channel key space with jobs.
+    pub fn set_channel_ids(&mut self, channel_ids: ChannelIds) {
+        self.runtime.channel_ids = channel_ids;
+    }
+
     /// Script/SID/runtime-root state.
     #[must_use]
     pub fn scripts(&self) -> &ScriptCtx<F> {
@@ -298,6 +321,21 @@ impl<F: FileIO> ExExecutor<F> {
     #[must_use]
     pub fn scope(&self) -> &Scope {
         &self.scope
+    }
+
+    /// Call a stateful builtin through this executor's persistent runtime.
+    pub fn call_builtin(
+        &mut self,
+        editor: &mut Editor,
+        name: &OxStr,
+        args: Vec<Typval>,
+    ) -> Result<Typval, ExecError> {
+        let lua = self.lua.clone();
+        call_job_builtin(
+            &mut self.runtime, editor, &mut self.scope, lua.as_ref(),
+            &name.to_string_lossy(), args,
+        )
+        .map_err(ExecError::Eval)
     }
 
     /// Executes one command line, including bar-separated commands.
@@ -815,6 +853,11 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         scope: &mut Scope,
     ) -> ox_eval::Result<Typval> {
         let name_text = name.to_string_lossy();
+        if matches!(&*name_text, "jobstart" | "jobstop" | "jobwait" | "jobpid" | "chansend" | "jobsend") {
+            return call_job_builtin(
+                self.runtime, self.editor, scope, self.lua, &name_text, args,
+            );
+        }
         if name_text == "eval" {
             let [Typval::String(source)] = args.as_slice() else {
                 return Err(EvalError::new("E119", 0, "One string argument required"));
@@ -861,6 +904,231 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
     fn closure_registry(&self) -> Option<ox_eval::eval::ClosureRegistry> {
         Some(self.builtins.closure_registry().clone())
     }
+}
+
+fn call_job_builtin<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    name: &str,
+    args: Vec<Typval>,
+) -> ox_eval::Result<Typval> {
+    match name {
+        "jobstart" => {
+            let options = normalize_job_options(&args)?;
+            let id = runtime.channel_ids.allocate();
+            let mut manager = match runtime.jobs.take() {
+                Some(manager) => manager,
+                None => match JobManager::new() {
+                    Ok(manager) => manager,
+                    Err(_) => return Ok(Typval::Number(-1)),
+                },
+            };
+            let started = manager.start(id, options);
+            runtime.jobs = Some(manager);
+            Ok(Typval::Number(if started.is_ok() { id as i64 } else { -1 }))
+        }
+        "jobstop" => {
+            let id = job_id(args.first())?;
+            let Some(manager) = runtime.jobs.as_mut() else { return Ok(Typval::Number(0)); };
+            manager.stop(id)
+                .map(|stopped| Typval::Number(i64::from(stopped)))
+                .map_err(|message| EvalError::new("E900", 0, message))
+        }
+        "jobpid" => {
+            let id = job_id(args.first())?;
+            Ok(Typval::Number(runtime.jobs.as_ref().and_then(|jobs| jobs.pid(id)).map_or(0, i64::from)))
+        }
+        "chansend" | "jobsend" => {
+            let id = job_id(args.first())?;
+            let data = channel_bytes(args.get(1))?;
+            let Some(manager) = runtime.jobs.as_mut() else { return Ok(Typval::Number(0)); };
+            manager.send(id, data)
+                .map(|sent| Typval::Number(i64::from(sent)))
+                .map_err(|message| EvalError::new("E900", 0, message))
+        }
+        "jobwait" => {
+            let ids = job_ids(args.first())?;
+            let timeout = match args.get(1) {
+                Some(value) => value_number(value).ok_or_else(|| EvalError::new("E474", 0, "Invalid argument"))?,
+                None => -1,
+            };
+            let Some(mut manager) = runtime.jobs.take() else {
+                return Ok(Typval::list(ids.iter().map(|_| Typval::Number(-3)).collect()));
+            };
+            let waited = manager.wait(&ids, timeout);
+            runtime.jobs = Some(manager);
+            let (statuses, events) = waited.map_err(|message| EvalError::new("E900", 0, message))?;
+            invoke_job_events(runtime, editor, scope, lua, events)?;
+            Ok(Typval::list(statuses.into_iter().map(Typval::Number).collect()))
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn normalize_job_options(args: &[Typval]) -> ox_eval::Result<JobStartOptions> {
+    let (program, command_args) = job_command(args.first())?;
+    let options = match args.get(1) {
+        None => Typval::dict(Vec::new()),
+        Some(Typval::Dict(options)) => Typval::Dict(options.clone()),
+        Some(_) => return Err(EvalError::new("E1206", 0, "Dictionary required")),
+    };
+    let Typval::Dict(options_ref) = options else { unreachable!() };
+    let get = |key: &str| {
+        options_ref.borrow().entries.iter().find(|(name, _)| name.as_bytes() == key.as_bytes()).map(|(_, value)| value.clone())
+    };
+    let callbacks = JobCallbacks {
+        options: options_ref.clone(),
+        stdout: callback_option(get("on_stdout"))?,
+        stderr: callback_option(get("on_stderr"))?,
+        exit: callback_option(get("on_exit"))?,
+    };
+    let environment = match get("env") {
+        None => None,
+        Some(Typval::Dict(values)) => {
+            let mut environment = std::env::vars_os().collect::<Vec<_>>();
+            for (name, value) in &values.borrow().entries {
+                let value = value_text(value)?;
+                let name = OsString::from(name.to_string_lossy().into_owned());
+                if let Some((_, current)) = environment.iter_mut().find(|(current, _)| current == &name) {
+                    *current = OsString::from(value);
+                } else {
+                    environment.push((name, OsString::from(value)));
+                }
+            }
+            Some(environment)
+        }
+        Some(_) => return Err(EvalError::new("E1206", 0, "env must be a Dictionary")),
+    };
+    let cwd = get("cwd").map(|value| value_text(&value).map(PathBuf::from)).transpose()?;
+    let stdin_pipe = match get("stdin") {
+        Some(value) => value_text(&value)? != "null",
+        None => true,
+    };
+    Ok(JobStartOptions {
+        program,
+        args: command_args,
+        environment,
+        cwd,
+        detached: get("detach").is_some_and(|value| value_bool(&value)),
+        pty: get("pty").is_some_and(|value| value_bool(&value)) || get("term").is_some_and(|value| value_bool(&value)),
+        rpc: get("rpc").is_some_and(|value| value_bool(&value)),
+        stdin_pipe,
+        stdout_buffered: get("stdout_buffered").is_some_and(|value| value_bool(&value)),
+        stderr_buffered: get("stderr_buffered").is_some_and(|value| value_bool(&value)),
+        callbacks,
+    })
+}
+
+fn job_command(value: Option<&Typval>) -> ox_eval::Result<(PathBuf, Vec<OsString>)> {
+    match value {
+        Some(Typval::String(command)) if !command.as_bytes().is_empty() => {
+            let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("sh"));
+            Ok((PathBuf::from(shell), vec![OsString::from("-c"), OsString::from(command.to_string_lossy().into_owned())]))
+        }
+        Some(Typval::List(items)) => {
+            let items = items.borrow();
+            let mut values = items.items.iter().map(value_text).collect::<ox_eval::Result<Vec<_>>>()?;
+            if values.first().is_none_or(String::is_empty) {
+                return Err(EvalError::new("E474", 0, "Invalid argument"));
+            }
+            let program = PathBuf::from(values.remove(0));
+            Ok((program, values.into_iter().map(OsString::from).collect()))
+        }
+        _ => Err(EvalError::new("E474", 0, "Invalid argument")),
+    }
+}
+
+fn callback_option(value: Option<Typval>) -> ox_eval::Result<Option<Typval>> {
+    match value {
+        None | Some(Typval::Special(Special::Null)) => Ok(None),
+        Some(value @ (Typval::String(_) | Typval::Funcref(_) | Typval::Partial(_))) => Ok(Some(value)),
+        Some(_) => Err(EvalError::new("E921", 0, "Invalid callback argument")),
+    }
+}
+
+fn invoke_job_events<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    events: Vec<JobEvent>,
+) -> ox_eval::Result<()> {
+    for event in events {
+        let name = match event.callback {
+            Typval::Funcref(funcref) | Typval::Partial(funcref) if funcref.registry.is_some() => {
+                let reference = funcref.registry.expect("guarded Lua callback reference");
+                let Some(lua) = lua else {
+                    return Err(EvalError::new("E5108", 0, "Lua callback host is not installed"));
+                };
+                let args = event.args.iter().map(typval_to_object).collect();
+                lua.borrow_mut()
+                    .invoke_callback(editor, reference, args)
+                    .map_err(|error| EvalError::new("E5108", 0, format!("{error:?}")))?;
+                continue;
+            }
+            Typval::String(name) => name,
+            Typval::Funcref(funcref) | Typval::Partial(funcref) => funcref.name,
+            _ => continue,
+        };
+        call_user_function_with_self(
+            runtime, editor, scope, lua, &name.to_string_lossy(), event.args, 1, 1,
+            Some(event.receiver),
+        )
+        .map_err(|flow| flow_to_eval_error(flow, &name.to_string_lossy()))?;
+    }
+    Ok(())
+}
+
+fn job_id(value: Option<&Typval>) -> ox_eval::Result<u64> {
+    let value = value.and_then(value_number).ok_or_else(|| EvalError::new("E475", 0, "Invalid argument: expected job id"))?;
+    u64::try_from(value).map_err(|_| EvalError::new("E475", 0, "Invalid argument: expected job id"))
+}
+
+fn job_ids(value: Option<&Typval>) -> ox_eval::Result<Vec<u64>> {
+    let Some(Typval::List(values)) = value else { return Err(EvalError::new("E714", 0, "List required")); };
+    values.borrow().items.iter().map(|value| job_id(Some(value))).collect()
+}
+
+fn channel_bytes(value: Option<&Typval>) -> ox_eval::Result<Vec<u8>> {
+    match value {
+        Some(Typval::String(value)) => Ok(value.as_bytes().to_vec()),
+        Some(Typval::Blob(value)) => Ok(value.clone()),
+        Some(Typval::List(values)) => {
+            let values = values.borrow();
+            let mut bytes = Vec::new();
+            for value in &values.items {
+                bytes.extend_from_slice(value_text(value)?.as_bytes());
+                bytes.push(b'\n');
+            }
+            Ok(bytes)
+        }
+        Some(value) => Ok(value_text(value)?.into_bytes()),
+        None => Err(EvalError::new("E119", 0, "Not enough arguments")),
+    }
+}
+
+fn value_text(value: &Typval) -> ox_eval::Result<String> {
+    match value {
+        Typval::String(value) => Ok(value.to_string_lossy().into_owned()),
+        Typval::Number(value) => Ok(value.to_string()),
+        Typval::Bool(value) => Ok(i64::from(*value).to_string()),
+        _ => Err(EvalError::new("E730", 0, "Using a non-String as a String")),
+    }
+}
+
+fn value_number(value: &Typval) -> Option<i64> {
+    match value {
+        Typval::Number(value) => Some(*value),
+        Typval::Bool(value) => Some(i64::from(*value)),
+        Typval::Job(value) | Typval::Channel(value) => i64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn value_bool(value: &Typval) -> bool {
+    value_number(value).is_some_and(|value| value != 0)
 }
 
 /// [`BufferHost`] adapter over the editor's current buffer, mapping the
@@ -1039,6 +1307,22 @@ fn call_user_function<F: FileIO>(
     first_line: usize,
     last_line: usize,
 ) -> Result<Typval, Flow> {
+    call_user_function_with_self(
+        runtime, editor, scope, lua, name, args, first_line, last_line, None,
+    )
+}
+
+fn call_user_function_with_self<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    name: &str,
+    args: Vec<Typval>,
+    first_line: usize,
+    last_line: usize,
+    receiver: Option<DictRef>,
+) -> Result<Typval, Flow> {
     let mut sid = runtime.scripts.current_sid().unwrap_or(0);
     if !runtime.functions.contains(name, sid) && name.contains('#') {
         let path = runtime.scripts.resolve_autoload(name).ok_or_else(|| {
@@ -1072,6 +1356,9 @@ fn call_user_function<F: FileIO>(
         .functions
         .begin_call(name, sid, args, first_line, last_line, scope)
         .map_err(|error| userfunc_error_flow(runtime, error))?;
+    if let Some(receiver) = receiver {
+        scope.local.push((OxStr::from("self"), Typval::Dict(receiver)));
+    }
     let switched_script = function.sid != 0 && runtime.scripts.current_sid() != Some(function.sid);
     let caller_script = scope.script.clone();
     if switched_script {

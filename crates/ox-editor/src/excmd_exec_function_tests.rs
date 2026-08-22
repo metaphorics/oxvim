@@ -640,3 +640,17 @@ fn autoload_path_resolution_and_load_once() {
         .scripts()
         .is_sourced_once(&PathBuf::from("/rt/autoload/mylib.vim")));
 }
+
+#[test]
+fn job_callbacks_bind_the_options_dictionary_as_self() {
+    let mut editor = editor_with_lines(&[""]);
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &mut editor,
+        "let s:logger = {'events': []}\nfunction s:logger.on_stdout(id, data, event)\ncall add(self.events, a:event)\nendfunction\nlet s:logger.on_stderr = s:logger.on_stdout\nfunction s:logger.on_exit(id, data, event)\ncall add(self.events, a:event)\nendfunction\nlet g:job = jobstart(['sh', '-c', 'printf job-output'], s:logger)\nlet g:pid_ok = jobpid(g:job) > 0\nlet g:statuses = jobwait([g:job], 2000)\nlet g:exit_code = g:statuses[0]\nlet g:event_count = len(s:logger.events)",
+    );
+    assert_eq!(global_number(exec.scope(), "pid_ok"), Some(1));
+    assert_eq!(global_number(exec.scope(), "exit_code"), Some(0));
+    assert!(global_number(exec.scope(), "event_count").is_some_and(|count| count >= 2));
+}

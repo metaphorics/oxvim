@@ -18,6 +18,7 @@ pub mod textobject;
 pub mod script;
 pub mod visual;
 pub mod insert;
+pub mod job;
 pub mod marks;
 pub mod options;
 pub mod register;
@@ -32,7 +33,7 @@ pub use buffer::{
     BufferAttachSubscription, BufferState, BufferStateError, UserCommandDefinition,
 };
 pub use decoration::Decorations;
-pub use editor::{BufferRelease, Editor, EditorError, HighlightDefinition, Message, MessageKind};
+pub use editor::{BufferRelease, ChannelIds, Editor, EditorError, HighlightDefinition, Message, MessageKind};
 pub use excmd_exec::{
     ExExecutor, ExecError, ExecOutcome, LuaExec, LuaExecError, UserCommand, VimException, VimExceptionKind,
 };
@@ -62,6 +63,7 @@ pub use motion::{FindDirection, FindMotion, Motion, MotionKind};
 pub use ops::{EditRange, Operator, OperatorError, OperatorResult};
 pub use search::{SearchDirection, SearchError, SearchOffset, SearchResult, SearchState};
 pub use visual::{VisualKind, VisualState};
+pub use job::{JobCallbacks, JobEvent, JobManager, JobStartOptions};
 pub use marks::{
     Changelists, GlobalMarks, Jumplist, LocalMarks, MarkError, MarkLocation, MarkTarget,
     HISTORY_CAPACITY,

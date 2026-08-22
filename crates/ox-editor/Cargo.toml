@@ -11,6 +11,7 @@ ox-text = { path = "../ox-text" }
 ox-excmd = { path = "../ox-excmd" }
 ox-eval = { path = "../ox-eval" }
 ox-regex = { path = "../ox-regex" }
+ox-uv = { path = "../ox-uv" }
 thiserror.workspace = true
 
 [lints]
