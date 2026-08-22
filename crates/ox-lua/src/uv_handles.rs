@@ -82,14 +82,22 @@ use crate::vim::{call_with_traceback, FastCallbackState, Scheduler};
 type DeferredOperation = Box<dyn FnOnce(&mut UvLoop)>;
 
 #[derive(Clone)]
-struct LoopAccess {
-    uv_loop: Rc<RefCell<UvLoop>>,
+pub(crate) struct LoopAccess {
+    pub(crate) uv_loop: Rc<RefCell<UvLoop>>,
     in_callback: Rc<Cell<bool>>,
     deferred: Rc<RefCell<VecDeque<DeferredOperation>>>,
 }
 
 impl LoopAccess {
-    fn apply(&self, operation: DeferredOperation) -> mlua::Result<()> {
+    pub(crate) fn new(uv_loop: Rc<RefCell<UvLoop>>) -> Self {
+        Self {
+            uv_loop,
+            in_callback: Rc::new(Cell::new(false)),
+            deferred: Rc::new(RefCell::new(VecDeque::new())),
+        }
+    }
+
+    pub(crate) fn apply(&self, operation: DeferredOperation) -> mlua::Result<()> {
         if self.in_callback.get() {
             self.deferred.borrow_mut().push_back(operation);
             return Ok(());
@@ -98,7 +106,7 @@ impl LoopAccess {
         Ok(())
     }
 
-    fn callback<R>(&self, uv_loop: &mut UvLoop, callback: impl FnOnce() -> R) -> R {
+    pub(crate) fn callback<R>(&self, uv_loop: &mut UvLoop, callback: impl FnOnce() -> R) -> R {
         let nested = self.in_callback.replace(true);
         let result = callback();
         self.in_callback.set(nested);
@@ -541,7 +549,7 @@ fn install_aux(lua: &Lua, uv: &Table, access: &LoopAccess, fast: &FastCallbackSt
 }
 
 pub(crate) fn install(lua: &Lua, uv: &Table, uv_loop: Rc<RefCell<UvLoop>>, scheduler: Rc<dyn Scheduler>, fast: FastCallbackState) -> mlua::Result<()> {
-    let access = LoopAccess { uv_loop: uv_loop.clone(), in_callback: Rc::new(Cell::new(false)), deferred: Rc::new(RefCell::new(VecDeque::new())) };
+    let access = LoopAccess::new(uv_loop.clone());
     let tcp_context = Rc::new(TcpContext { lua: lua.clone(), fast: fast.clone(), access: access.clone(), routes: RefCell::new(HashMap::new()) });
     let pending_processes: Rc<RefCell<Vec<PendingProcess>>> = Rc::new(RefCell::new(Vec::new()));
     let pending_works: Rc<RefCell<Vec<PendingWork>>> = Rc::new(RefCell::new(Vec::new()));

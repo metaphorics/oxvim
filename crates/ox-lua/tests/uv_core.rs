@@ -32,6 +32,14 @@ impl Scheduler for TestScheduler {
     }
 }
 
+struct ImmediateScheduler;
+
+impl Scheduler for ImmediateScheduler {
+    fn schedule_deferred(&self, work: Work) -> Result<(), String> {
+        work().map_err(|error| error.to_string())
+    }
+}
+
 struct TestBuiltins;
 
 impl BuiltinHost for TestBuiltins {
@@ -78,6 +86,27 @@ fn timer_callback_runs_through_the_scheduler() {
     assert!(host.lua().globals().get::<bool>("timer_fired").unwrap());
 }
 
+#[test]
+fn immediate_timer_callback_can_close_its_handle() {
+    let runtime = RuntimeRoot::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime"));
+    let host = LuaHost::new(runtime, Rc::new(TestBuiltins), Rc::new(ImmediateScheduler)).unwrap();
+    host.lua()
+        .load(
+            r#"
+            local timer = vim.uv.new_timer()
+            timer:start(0, 0, function()
+              assert(not timer:is_closing())
+              timer:stop()
+              timer:close()
+            end)
+            vim.uv.run('default')
+            assert(timer:is_closing())
+            "#,
+        )
+        .exec()
+        .unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn signal_binding_supports_luv_module_and_method_forms() {
@@ -102,6 +131,29 @@ fn signal_binding_supports_luv_module_and_method_forms() {
         )
         .exec()
         .unwrap();
+}
+
+#[test]
+fn wait_primitives_poll_the_owned_uv_loop() {
+    let (host, scheduler) = host();
+    host.lua()
+        .load(
+            r#"
+            poll_fired = false
+            local timer = vim.uv.new_timer()
+            timer:start(1, 0, function()
+              poll_fired = true
+            end)
+            vim._core.ui_flush()
+            assert(vim._core.check_interrupt() == false)
+            vim._core.loop_poll(5, false)
+            timer:close()
+            "#,
+        )
+        .exec()
+        .unwrap();
+    scheduler.drain().unwrap();
+    assert!(host.lua().globals().get::<bool>("poll_fired").unwrap());
 }
 
 #[test]

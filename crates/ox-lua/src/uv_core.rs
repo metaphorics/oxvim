@@ -1,6 +1,6 @@
 //! Behavior-critical `vim.uv` bindings shared by the complete UV adapter.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io;
 use std::rc::Rc;
@@ -17,6 +17,7 @@ use ox_uv::misc;
 use ox_uv::{CallbackError, Handle, RunMode, Timer, UvLoop};
 
 use crate::host::RuntimeRoot;
+use crate::uv_handles::LoopAccess;
 use crate::vim::{call_with_traceback, BuiltinHost, FastCallbackState, Scheduler};
 
 struct CoreState {
@@ -46,7 +47,8 @@ impl CoreState {
 #[derive(Clone)]
 struct LuaTimer {
     timer: Timer,
-    uv_loop: Rc<RefCell<UvLoop>>,
+    access: LoopAccess,
+    closing: Rc<Cell<bool>>,
 }
 
 impl UserData for LuaTimer {
@@ -61,60 +63,70 @@ impl UserData for LuaTimer {
                 let scheduler = context.scheduler.clone();
                 let fast = context.fast.clone();
                 drop(context);
-                this.timer
-                    .start(&mut this.uv_loop.borrow_mut(), timeout, repeat, move |_, _| {
-                        schedule_callback(
-                            &scheduler,
-                            &lua,
-                            callback.clone(),
-                            MultiValue::new(),
-                            &fast,
-                        )
-                        .map_err(CallbackError::new)
-                    })
-                    .map_err(mlua::Error::external)?;
+                let timer = this.timer;
+                let access = this.access.clone();
+                let event_access = access.clone();
+                access.apply(Box::new(move |uv_loop| {
+                    let _ = timer.start(uv_loop, timeout, repeat, move |loop_, _| {
+                        event_access
+                            .callback(loop_, || {
+                                schedule_callback(
+                                    &scheduler,
+                                    &lua,
+                                    callback.clone(),
+                                    MultiValue::new(),
+                                    &fast,
+                                )
+                            })
+                            .map_err(CallbackError::new)
+                    });
+                }))?;
                 Ok(true)
             },
         );
         methods.add_method("stop", |_, this, ()| {
-            this.timer.stop(&mut this.uv_loop.borrow_mut()).map_err(mlua::Error::external)?;
+            let timer = this.timer;
+            this.access.apply(Box::new(move |uv_loop| { let _ = timer.stop(uv_loop); }))?;
             Ok(true)
         });
         methods.add_method("again", |_, this, ()| {
-            this.timer.again(&mut this.uv_loop.borrow_mut()).map_err(mlua::Error::external)?;
+            let timer = this.timer;
+            this.access.apply(Box::new(move |uv_loop| { let _ = timer.again(uv_loop); }))?;
             Ok(true)
         });
         methods.add_method("set_repeat", |_, this, repeat: u64| {
-            this.timer
-                .set_repeat(&mut this.uv_loop.borrow_mut(), repeat)
-                .map_err(mlua::Error::external)?;
+            let timer = this.timer;
+            this.access.apply(Box::new(move |uv_loop| { let _ = timer.set_repeat(uv_loop, repeat); }))?;
             Ok(())
         });
         methods.add_method("get_repeat", |_, this, ()| {
-            this.timer.get_repeat(&this.uv_loop.borrow()).map_err(mlua::Error::external)
+            let uv_loop = this.access.uv_loop.try_borrow().map_err(|_| mlua::Error::runtime("timer repeat is unavailable during its callback"))?;
+            this.timer.get_repeat(&uv_loop).map_err(mlua::Error::external)
         });
         methods.add_method("ref", |_, this, ()| {
-            this.timer.ref_(&mut this.uv_loop.borrow_mut()).map_err(mlua::Error::external)?;
+            let timer = this.timer;
+            this.access.apply(Box::new(move |uv_loop| { let _ = timer.ref_(uv_loop); }))?;
             Ok(this.clone())
         });
         methods.add_method("unref", |_, this, ()| {
-            this.timer.unref(&mut this.uv_loop.borrow_mut()).map_err(mlua::Error::external)?;
+            let timer = this.timer;
+            this.access.apply(Box::new(move |uv_loop| { let _ = timer.unref(uv_loop); }))?;
             Ok(this.clone())
         });
         methods.add_method("has_ref", |_, this, ()| {
-            Ok(this.timer.has_ref(&this.uv_loop.borrow()))
+            Ok(this.access.uv_loop.try_borrow().map_or(true, |uv_loop| this.timer.has_ref(&uv_loop)))
         });
         methods.add_method("is_active", |_, this, ()| {
-            Ok(this.timer.is_active(&this.uv_loop.borrow()))
+            Ok(this.access.uv_loop.try_borrow().map_or(!this.closing.get(), |uv_loop| this.timer.is_active(&uv_loop)))
         });
         methods.add_method("is_closing", |_, this, ()| {
-            Ok(this.timer.is_closing(&this.uv_loop.borrow()))
+            Ok(this.closing.get() || this.access.uv_loop.try_borrow().is_ok_and(|uv_loop| this.timer.is_closing(&uv_loop)))
         });
         methods.add_method("close", |lua, this, callback: Option<Function>| {
-            // Closing twice is a harmless no-op, like the Option-backed stream handles.
-            if this.timer.is_closing(&this.uv_loop.borrow()) {
+            if this.closing.replace(true) {
                 return Ok(());
             }
+            let timer = this.timer;
             match callback {
                 Some(callback) => {
                     let lua = lua.clone();
@@ -124,25 +136,14 @@ impl UserData for LuaTimer {
                     let scheduler = context.scheduler.clone();
                     let fast = context.fast.clone();
                     drop(context);
-                    this.timer
-                        .close_with(&mut this.uv_loop.borrow_mut(), move |_, _| {
-                            schedule_callback(
-                                &scheduler,
-                                &lua,
-                                callback.clone(),
-                                MultiValue::new(),
-                                &fast,
-                            )
-                            .map_err(CallbackError::new)
-                        })
-                        .map_err(mlua::Error::external)?;
+                    this.access.apply(Box::new(move |uv_loop| {
+                        let _ = timer.close_with(uv_loop, move |_, _| {
+                            schedule_callback(&scheduler, &lua, callback.clone(), MultiValue::new(), &fast)
+                                .map_err(CallbackError::new)
+                        });
+                    }))?;
                 }
-                None => match this.timer.close(&mut this.uv_loop.borrow_mut()) {
-                    // A handle whose close already completed no longer names a
-                    // registry entry; treat it as another close request.
-                    Ok(()) | Err(ox_uv::Error::InvalidHandle(_) | ox_uv::Error::AlreadyClosing(_)) => {}
-                    Err(error) => return Err(mlua::Error::external(error)),
-                },
+                None => this.access.apply(Box::new(move |uv_loop| { let _ = timer.close(uv_loop); }))?,
             }
             Ok(())
         });
@@ -174,6 +175,30 @@ pub(crate) fn install(
     let uv_loop = Rc::new(RefCell::new(UvLoop::new().map_err(mlua::Error::external)?));
     let state = Rc::new(CoreState::new());
     let vim: Table = lua.globals().get("vim")?;
+    let core: Table = vim.get("_core")?;
+    core.set("ui_flush", lua.create_function(|_, ()| Ok(()))?)?;
+    core.set("check_interrupt", lua.create_function(|_, ()| Ok(false))?)?;
+
+    let loop_for_poll = uv_loop.clone();
+    core.set("loop_poll", lua.create_function(move |_, (timeout, _fast_only): (i64, bool)| {
+        let mut uv_loop = loop_for_poll.borrow_mut();
+        let timeout_timer = if timeout >= 0 {
+            let timer = Timer::new(&mut uv_loop).map_err(mlua::Error::external)?;
+            timer
+                .start(&mut uv_loop, timeout as u64, 0, |_, _| Ok(()))
+                .map_err(mlua::Error::external)?;
+            Some(timer)
+        } else {
+            None
+        };
+        uv_loop.run(RunMode::Once).map_err(mlua::Error::external)?;
+        if let Some(timer) = timeout_timer {
+            timer.close(&mut uv_loop).map_err(mlua::Error::external)?;
+            uv_loop.run(RunMode::NoWait).map_err(mlua::Error::external)?;
+        }
+        Ok(())
+    })?)?;
+
     let uv = lua.create_table()?;
 
     let loop_for_run = uv_loop.clone();
@@ -206,9 +231,14 @@ pub(crate) fn install(
     })?)?;
 
     let loop_for_timer = uv_loop.clone();
+    let timer_access = LoopAccess::new(uv_loop.clone());
     uv.set("new_timer", lua.create_function(move |lua, ()| {
         let timer = Timer::new(&mut loop_for_timer.borrow_mut()).map_err(mlua::Error::external)?;
-        lua.create_userdata(LuaTimer { timer, uv_loop: loop_for_timer.clone() })
+        lua.create_userdata(LuaTimer {
+            timer,
+            access: timer_access.clone(),
+            closing: Rc::new(Cell::new(false)),
+        })
     })?)?;
 
     install_misc(lua, &uv)?;
