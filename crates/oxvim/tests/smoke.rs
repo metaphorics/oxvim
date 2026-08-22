@@ -74,6 +74,31 @@ impl Embedded {
     fn next_message(&mut self) -> Value {
         rmpv::decode::read_value(&mut self.output).expect("decode message")
     }
+
+    fn request_error(&mut self, method: &str, params: Vec<Value>) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = Value::Array(vec![
+            Value::from(0),
+            Value::from(id),
+            Value::from(method),
+            Value::Array(params),
+        ]);
+        rmpv::encode::write_value(&mut self.input, &request).expect("encode request");
+        self.input.flush().expect("flush request");
+        loop {
+            let response = rmpv::decode::read_value(&mut self.output).expect("decode response");
+            let Value::Array(fields) = response else { panic!("response is not an array") };
+            if fields.first() == Some(&Value::from(2)) {
+                continue;
+            }
+            assert_eq!(fields.len(), 4);
+            assert_eq!(fields[0], Value::from(1));
+            assert_eq!(fields[1], Value::from(id));
+            assert!(!matches!(fields[2], Value::Nil), "RPC did not return an error");
+            return fields[2].clone();
+        }
+    }
 }
 
 impl Drop for Embedded {
@@ -401,4 +426,59 @@ fn valid_notification_produces_no_response() {
     let info = oxvim.request("nvim_get_api_info", vec![]);
     let Value::Array(info) = info else { panic!("api info is not an array") };
     assert_eq!(info[0], Value::from(1));
+}
+
+#[test]
+fn rejected_quit_on_modified_buffer_emits_error_and_redraw() {
+    let mut oxvim = Embedded::spawn();
+    assert_eq!(
+        oxvim.request(
+            "nvim_buf_set_lines",
+            vec![
+                Value::from(0),
+                Value::from(0),
+                Value::from(-1),
+                Value::Boolean(true),
+                Value::Array(vec![Value::from("changed")]),
+            ],
+        ),
+        Value::Nil,
+    );
+    assert_eq!(
+        oxvim.request(
+            "nvim_ui_attach",
+            vec![
+                Value::from(80),
+                Value::from(24),
+                Value::Map(vec![
+                    (Value::from("rgb"), Value::Boolean(true)),
+                    (Value::from("ext_messages"), Value::Boolean(true)),
+                ]),
+            ],
+        ),
+        Value::Nil,
+    );
+    let _initial = oxvim.next_message();
+
+    // Enter the command line with :q (no <CR> yet).
+    assert_eq!(oxvim.request("nvim_input", vec![Value::from(":q")]), Value::from(2));
+    let cmdline = oxvim.next_message();
+    let cmdline_names = redraw_names(&cmdline);
+    assert_eq!(cmdline_names.last(), Some(&"flush"));
+    assert!(cmdline_names.contains(&"cmdline_show"), "cmdline_show missing: {cmdline_names:?}");
+
+    // Press <CR>. The quit is rejected because the buffer is modified.
+    let error = oxvim.request_error("nvim_input", vec![Value::from("\r")]);
+    let Value::Array(error_fields) = error else { panic!("error response is not an array") };
+    assert_eq!(error_fields.len(), 2);
+    assert_eq!(error_fields[0], Value::from(0));
+    let error_text = error_fields[1].as_str().expect("error text is not a string");
+    assert!(error_text.contains("E37"), "expected E37, got {error_text}");
+
+    let redraw = oxvim.next_message();
+    let redraw_names = redraw_names(&redraw);
+    assert_eq!(redraw_names.last(), Some(&"flush"));
+    assert!(redraw_names.contains(&"cmdline_hide"), "cmdline_hide missing: {redraw_names:?}");
+    assert!(redraw_names.contains(&"msg_show"), "msg_show missing: {redraw_names:?}");
+    assert!(contains_string(&redraw, error_text), "redraw should contain the error text");
 }

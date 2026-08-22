@@ -431,7 +431,15 @@ impl AppState {
                     match self.drive_input() {
                         Ok(()) => redraws = self.redraw().map_err(|error| AppError::Api(error.to_string()))?,
                         Err(error) => {
+                            let message = error.message().to_owned();
+                            self.editor.borrow_mut().push_message(ox_editor::Message {
+                                kind: MessageKind::Error,
+                                content: Object::String(OxStr::from(message.as_str())),
+                                history: true,
+                            });
+                            redraws = self.redraw().map_err(|error| AppError::Api(error.to_string()))?;
                             writes.push((channel.get(), Message::Response { msgid, result: Err(error) }.encode_bytes()));
+                            writes.extend(redraws);
                             self.drain_lua_work()?;
                             return Ok(writes);
                         }
@@ -448,7 +456,15 @@ impl AppState {
                             match self.drive_input() {
                                 Ok(()) => redraws = self.redraw().map_err(|error| AppError::Api(error.to_string()))?,
                                 Err(error) => {
+                                    let message = error.message().to_owned();
+                                    self.editor.borrow_mut().push_message(ox_editor::Message {
+                                        kind: MessageKind::Error,
+                                        content: Object::String(OxStr::from(message.as_str())),
+                                        history: true,
+                                    });
+                                    redraws = self.redraw().map_err(|error| AppError::Api(error.to_string()))?;
                                     writes.push((channel.get(), ox_rpc::nvim_error_event(&error)));
+                                    writes.extend(redraws);
                                     self.drain_lua_work()?;
                                     return Ok(writes);
                                 }
