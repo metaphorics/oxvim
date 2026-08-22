@@ -20,6 +20,7 @@ ox-ui = { path = "../ox-ui" }
 ox-uv = { path = "../ox-uv" }
 
 [dev-dependencies]
+portable-pty = "0.9.0"
 rmpv.workspace = true
 
 [lints]

@@ -11,7 +11,8 @@ use std::rc::Rc;
 use mlua::{MultiValue, Value};
 use ox_api::Registry;
 use ox_editor::{
-    AutocmdContext, AutocmdKind, Editor, Event, ExExecutor, Geometry,
+    AutocmdContext, AutocmdKind, CmdlineKind, Editor, Event, ExExecutor, ExecOutcome, Geometry,
+    MappingAction, MessageKind, Mode, ModeMachine, Keys, TypeaheadFlags,
 };
 use ox_eval::{
     BufferHost, BuiltinHost as EvalBuiltinHost, Builtins, Scope, call_buffer_builtin,
@@ -25,7 +26,10 @@ use ox_rpc::{
     CHAN_STDIO, ChannelId, ChannelIdAllocator, IncrementalDecoder, Message,
 };
 use ox_types::{ApiError, Object, OxStr, Typval};
-use ox_ui::{ChromeState, Compositor, Emitter, HlState, UiChannels, UiOptions};
+use ox_ui::{
+    ChromeState, CmdlineState as UiCmdlineState, Compositor, ContentChunk, Emitter, HlState,
+    MessageState, UiChannels, UiOptions,
+};
 use ox_uv::{Handle, HandleId, NetEvent, RunMode, Tcp, UvLoop};
 #[cfg(unix)]
 use ox_uv::net::Pipe;
@@ -40,6 +44,9 @@ pub struct AppState {
     lua: LuaHost,
     registry: Registry,
     ex: ExExecutor,
+    mode: ModeMachine,
+    exiting: bool,
+    rendered_messages: usize,
     lua_work: Rc<RefCell<VecDeque<Work>>>,
     ui_channels: UiChannels,
     emitter: Emitter,
@@ -87,6 +94,9 @@ impl AppState {
             lua,
             registry,
             ex: ExExecutor::new(),
+            mode: ModeMachine::default(),
+            exiting: false,
+            rendered_messages: 0,
             lua_work,
             ui_channels: UiChannels::new(),
             emitter: Emitter::new(),
@@ -168,6 +178,7 @@ impl AppState {
         let name = method.to_string_lossy();
         let result = match name.as_ref() {
             "nvim_get_api_info" => self.dispatch_api_info(channel, params),
+            "nvim_input" => self.dispatch_input(params),
             "nvim_exec_lua" | "nvim_execute_lua" => self.dispatch_lua(params),
             "nvim_command" => self.dispatch_command(params),
             "nvim_ui_attach" => self.ui_attach(channel, params),
@@ -208,6 +219,33 @@ impl AppState {
         };
         *id = Object::Integer(channel.get() as i64);
         Ok(result)
+    }
+
+    fn dispatch_input(&mut self, params: &[Object]) -> Result<Object, ApiError> {
+        let [Object::String(input)] = params else {
+            return Err(ApiError::validation("nvim_input expects one String argument"));
+        };
+        let count = i64::try_from(input.as_bytes().len())
+            .map_err(|_| ApiError::exception("Input length exceeds Integer range"))?;
+        let Some((_, replace)) = self.registry.get("nvim_replace_termcodes") else {
+            return Err(ApiError::exception("nvim_replace_termcodes is not registered"));
+        };
+        let replaced = replace(
+            &mut self.editor.borrow_mut(),
+            &[
+                Object::String(input.clone()),
+                Object::Boolean(false),
+                Object::Boolean(true),
+                Object::Boolean(true),
+            ],
+        )?;
+        let Object::String(encoded) = replaced else {
+            return Err(ApiError::exception("nvim_replace_termcodes returned a non-string"));
+        };
+        let keys = Keys::from_encoded(encoded.as_bytes().to_vec())
+            .map_err(|error| ApiError::exception(error.to_string()))?;
+        self.editor.borrow_mut().typeahead_mut().append(&keys, TypeaheadFlags::default());
+        Ok(Object::Integer(count))
     }
 
     fn dispatch_lua(&mut self, params: &[Object]) -> Result<Object, ApiError> {
@@ -280,6 +318,7 @@ impl AppState {
     }
 
     fn redraw(&mut self) -> Result<BTreeMap<u64, Vec<u8>>, ApiError> {
+        self.sync_chrome();
         let (width, height) = self
             .ui_channels
             .iter()
@@ -299,6 +338,73 @@ impl AppState {
             .map_err(|error| ApiError::exception(error.to_string()))
     }
 
+    fn sync_chrome(&mut self) {
+        match self.mode.mode() {
+            Mode::Cmdline(state) => {
+                let first_char = match state.kind {
+                    CmdlineKind::Search(ox_editor::SearchDirection::Forward) => "/",
+                    CmdlineKind::Search(ox_editor::SearchDirection::Backward) => "?",
+                    CmdlineKind::Ex => ":",
+                };
+                self.chrome.show_cmdline(UiCmdlineState {
+                    content: vec![ContentChunk::new(0, state.text.as_str())],
+                    position: state.text.len(),
+                    first_char: OxStr::from(first_char),
+                    prompt: OxStr::from(""),
+                    indent: 0,
+                    level: 1,
+                    hl_id: 0,
+                });
+            }
+            _ => self.chrome.hide_cmdline(1, false),
+        }
+
+        let editor = self.editor.borrow();
+        for message in &editor.messages()[self.rendered_messages..] {
+            let text = match &message.content {
+                Object::String(text) => text.clone(),
+                value => OxStr::from(format!("{value:?}").as_bytes()),
+            };
+            self.chrome.show_message(MessageState {
+                kind: OxStr::from(if message.kind == MessageKind::Error { "emsg" } else { "echo" }),
+                content: vec![ContentChunk::new(0, text)],
+                replace_last: false,
+                history: message.history,
+                append: false,
+                id: Object::Nil,
+                trigger: OxStr::from(""),
+            });
+        }
+        self.rendered_messages = editor.messages().len();
+    }
+
+    fn drive_input(&mut self) -> Result<(), ApiError> {
+        loop {
+            let ready = self.mode.run_once(&mut self.editor.borrow_mut())
+                .map_err(|error| ApiError::exception(error.to_string()))?;
+            if !ready { break; }
+
+            if let Some(command) = self.mode.take_ex_command() {
+                let outcome = self.ex.execute_line(&mut self.editor.borrow_mut(), &command)
+                    .map_err(|error| ApiError::exception(error.to_string()))?;
+                if outcome == ExecOutcome::Quit { self.exiting = true; }
+            }
+            if let Some(action) = self.mode.take_mapping_action() {
+                let outcome = match action {
+                    MappingAction::ExCommands(commands) => self.ex.execute_commands(&mut self.editor.borrow_mut(), &commands)
+                        .map_err(|error| ApiError::exception(error.to_string()))?,
+                    MappingAction::Expr(id) | MappingAction::Callback(id) => {
+                        return Err(ApiError::exception(format!("mapping callback {id} has no registered host evaluator")));
+                    }
+                    MappingAction::Keys(_) | MappingAction::Nop => ExecOutcome::Completed,
+                };
+                if outcome == ExecOutcome::Quit { self.exiting = true; }
+            }
+            if self.exiting { break; }
+        }
+        Ok(())
+    }
+
     fn drain_lua_work(&mut self) -> Result<(), AppError> {
         loop {
             let work = self.lua_work.borrow_mut().pop_front();
@@ -315,23 +421,51 @@ impl AppState {
         let mut writes = Vec::new();
         match message {
             Message::Request { msgid, method, params } => {
+                let is_input = method.as_bytes() == b"nvim_input" || method.as_bytes() == b"nvim_feedkeys";
                 let dispatched = self.dispatch(channel, &method, &params);
-                let (result, redraws) = match dispatched {
+                let (result, mut redraws) = match dispatched {
                     Ok((result, redraws)) => (Ok(result), redraws),
                     Err(error) => (Err(error), BTreeMap::new()),
                 };
+                if result.is_ok() && is_input {
+                    match self.drive_input() {
+                        Ok(()) => redraws = self.redraw().map_err(|error| AppError::Api(error.to_string()))?,
+                        Err(error) => {
+                            writes.push((channel.get(), Message::Response { msgid, result: Err(error) }.encode_bytes()));
+                            self.drain_lua_work()?;
+                            return Ok(writes);
+                        }
+                    }
+                }
                 writes.push((channel.get(), Message::Response { msgid, result }.encode_bytes()));
                 writes.extend(redraws);
             }
-            Message::Notification { method, params } => match self.dispatch(channel, &method, &params) {
-                Ok((_, redraws)) => writes.extend(redraws),
-                Err(error) => writes.push((channel.get(), ox_rpc::nvim_error_event(&error))),
-            },
+            Message::Notification { method, params } => {
+                let is_input = method.as_bytes() == b"nvim_input" || method.as_bytes() == b"nvim_feedkeys";
+                match self.dispatch(channel, &method, &params) {
+                    Ok((_, mut redraws)) => {
+                        if is_input {
+                            match self.drive_input() {
+                                Ok(()) => redraws = self.redraw().map_err(|error| AppError::Api(error.to_string()))?,
+                                Err(error) => {
+                                    writes.push((channel.get(), ox_rpc::nvim_error_event(&error)));
+                                    self.drain_lua_work()?;
+                                    return Ok(writes);
+                                }
+                            }
+                        }
+                        writes.extend(redraws);
+                    }
+                    Err(error) => writes.push((channel.get(), ox_rpc::nvim_error_event(&error))),
+                }
+            }
             Message::Response { .. } => {}
         }
         self.drain_lua_work()?;
         Ok(writes)
     }
+
+    fn should_exit(&self) -> bool { self.exiting }
 }
 
 fn positive_dimension(value: i64, name: &str) -> Result<usize, ApiError> {
@@ -385,6 +519,7 @@ pub fn run_stdio(cli: &Cli) -> Result<(), AppError> {
             }
         }
         output.flush().map_err(AppError::Io)?;
+        if state.should_exit() { break; }
     }
     Ok(())
 }
@@ -551,6 +686,7 @@ impl NetworkRuntime {
                     self.remove_peer(uv_loop, target_id);
                 }
             }
+            if self.state.borrow().should_exit() { uv_loop.stop(); }
         }
         Ok(())
     }
