@@ -488,11 +488,19 @@ fn parse_program(
     let parser = ExParser::with_user_commands(users);
     let mut program = Vec::new();
     for line in logical {
-        let commands = match parser.parse(&line.text) {
+        let (command_text, heredoc_body) = line
+            .text
+            .split_once('\n')
+            .map_or((line.text.as_str(), None), |(command, body)| (command, Some(body)));
+        let commands = match parser.parse(command_text) {
             Ok(commands) => commands,
-            Err(error) => parse_put_expression(&parser, &line.text).ok_or(error)?,
+            Err(error) => parse_put_expression(&parser, command_text).ok_or(error)?,
         };
-        for command in commands {
+        for mut command in commands {
+            if let Some(body) = heredoc_body {
+                command.args.push('\n');
+                command.args.push_str(body);
+            }
             program.push(Instruction {
                 command,
                 line: line.first_line,
@@ -1512,9 +1520,25 @@ fn command_let<F: FileIO>(
     let Some((target, operator, expression)) = split_assignment(args) else {
         return error_flow(runtime, "E121", format!("Undefined variable: {}", args.trim()));
     };
-    let value = match eval_text(runtime, editor, scope, None, expression) {
-        Ok(value) => value,
-        Err(flow) => return flow,
+    let value = if let Some((header, body)) = expression.split_once('\n') {
+        if !header.trim_start().starts_with("<<") {
+            return error_flow(runtime, "E15", "Invalid expression");
+        }
+        let items = if body.is_empty() {
+            Vec::new()
+        } else {
+            body.strip_suffix('\n')
+                .unwrap_or(body)
+                .split('\n')
+                .map(|line| Typval::String(OxStr::from(line.as_bytes())))
+                .collect()
+        };
+        Typval::list(items)
+    } else {
+        match eval_text(runtime, editor, scope, None, expression) {
+            Ok(value) => value,
+            Err(flow) => return flow,
+        }
     };
     let key = canonical_target(target);
     if runtime.const_vars.contains(&key) {
@@ -3351,7 +3375,14 @@ fn flow_to_eval_error(flow: Flow, name: &str) -> EvalError {
 fn command_lua<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
     let Some(lua) = lua else { return Flow::NotImplemented("lua".to_owned()) };
     let mut code = command.args.trim_start().to_owned();
-    if code.is_empty() {
+    let mut heredoc = false;
+    if let Some((header, body)) = code.split_once('\n') {
+        if header.starts_with("<<") {
+            heredoc = true;
+            code = body.to_owned();
+        }
+    }
+    if code.is_empty() && !heredoc {
         if command.range.is_none() {
             return error_flow(runtime, "E471", "Argument required");
         }

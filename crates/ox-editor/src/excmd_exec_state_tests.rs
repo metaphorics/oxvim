@@ -560,6 +560,122 @@ fn lua_executes_exact_chunk() {
 }
 
 #[test]
+fn sourced_lua_heredoc_preserves_body_and_resumes_after_marker() {
+    let mut editor = Editor::new();
+    let host = Rc::new(RefCell::new(FakeLua::default()));
+    let mut executor = lua_executor(host.clone());
+
+    executor
+        .execute_script(
+            &mut editor,
+            "test.vim",
+            "lua << END\n-- body comment\n END\n  trailing spaces  \nEND\nlet g:after_heredoc = 9",
+        )
+        .unwrap();
+
+    assert_eq!(
+        host.borrow().chunks[0],
+        ("-- body comment\n END\n  trailing spaces  \n".to_owned(), Vec::new()),
+    );
+    assert_eq!(
+        executor.scope().get_scoped(ScopeKind::Global, b"after_heredoc", 0).unwrap(),
+        &Typval::Number(9),
+    );
+}
+
+#[test]
+fn sourced_lua_trim_uses_first_nonempty_body_indent() {
+    let mut editor = Editor::new();
+    let host = Rc::new(RefCell::new(FakeLua::default()));
+    let mut executor = lua_executor(host.clone());
+
+    executor
+        .execute_script(
+            &mut editor,
+            "test.vim",
+            "  :  lua << trim END\n\n      first\n    second\n  END",
+        )
+        .unwrap();
+
+    assert_eq!(host.borrow().chunks[0], ("\nfirst\nsecond\n".to_owned(), Vec::new()));
+}
+
+#[test]
+fn sourced_lua_heredoc_accepts_empty_body_and_default_dot_marker() {
+    let mut editor = Editor::new();
+    let host = Rc::new(RefCell::new(FakeLua::default()));
+    let mut executor = lua_executor(host.clone());
+
+    executor.execute_script(&mut editor, "test.vim", "lua << END\nEND").unwrap();
+    executor
+        .execute_script(&mut editor, "test.vim", "lua << \" default marker\nreturn 1\n.")
+        .unwrap();
+
+    assert_eq!(host.borrow().chunks[0].0, "");
+    assert_eq!(host.borrow().chunks[1].0, "return 1\n");
+}
+
+#[test]
+fn let_heredoc_assigns_trimmed_lines_as_list() {
+    let mut editor = Editor::new();
+    let mut executor = ExExecutor::new();
+    executor
+        .execute_script(
+            &mut editor,
+            "test.vim",
+            "  let g:lines =<< trim END\n\n      alpha\n    beta\n      \" text, not an Ex comment\n  END",
+        )
+        .unwrap();
+
+    let Typval::List(lines) = executor.scope().get_scoped(ScopeKind::Global, b"lines", 0).unwrap() else {
+        panic!("expected heredoc List");
+    };
+    let values = lines.borrow().items.clone();
+    assert_eq!(
+        values,
+        vec![
+            Typval::String(OxStr::from("")),
+            Typval::String(OxStr::from("alpha")),
+            Typval::String(OxStr::from("beta")),
+            Typval::String(OxStr::from("\" text, not an Ex comment")),
+        ],
+    );
+}
+
+#[test]
+fn let_heredoc_requires_end_marker() {
+    let mut editor = Editor::new();
+    let mut executor = ExExecutor::new();
+    let error = executor
+        .execute_script(&mut editor, "test.vim", "let g:lines =<< END\nmissing")
+        .unwrap_err();
+    assert!(error.to_string().contains("E990"));
+    assert!(error.to_string().contains("END"));
+}
+
+#[test]
+fn let_expression_containing_heredoc_text_does_not_consume_source_lines() {
+    let mut editor = Editor::new();
+    let mut executor = ExExecutor::new();
+    executor
+        .execute_script(
+            &mut editor,
+            "test.vim",
+            "let g:literal = 'a=<<b'\nlet g:after_literal = 4",
+        )
+        .unwrap();
+
+    assert_eq!(
+        executor.scope().get_scoped(ScopeKind::Global, b"literal", 0).unwrap(),
+        &Typval::String(OxStr::from("a=<<b")),
+    );
+    assert_eq!(
+        executor.scope().get_scoped(ScopeKind::Global, b"after_literal", 0).unwrap(),
+        &Typval::Number(4),
+    );
+}
+
+#[test]
 fn lua_global_mutation_is_visible_to_following_ex_command() {
     let mut editor = Editor::new();
     let host = Rc::new(RefCell::new(FakeLua::default()));

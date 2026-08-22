@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use ox_eval::scope::ScopeMap;
 use ox_eval::Scope;
+use ox_excmd::Parser as ExParser;
 
 /// Stable identifier assigned to one sourcing event.
 pub type Sid = u64;
@@ -66,6 +67,81 @@ pub struct LogicalLine {
     pub text: String,
     /// One-based physical line where this logical line started.
     pub first_line: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeredocKind {
+    Script,
+    Let,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HeredocSpec<'a> {
+    kind: HeredocKind,
+    marker: String,
+    trim: bool,
+    command_indent: &'a str,
+}
+
+fn heredoc_spec(line: &str) -> Result<Option<HeredocSpec<'_>>, (&'static str, String)> {
+    let Ok(commands) = ExParser::new().parse(line) else {
+        return Ok(None);
+    };
+    let [command] = commands.as_slice() else {
+        return Ok(None);
+    };
+    let name = command.command.name();
+    let args = command.args.trim_start_matches([' ', '\t']);
+    let (kind, modifiers) = if name == "lua" {
+        let Some(modifiers) = args.strip_prefix("<<") else {
+            return Ok(None);
+        };
+        (HeredocKind::Script, modifiers)
+    } else if matches!(name, "let" | "const") {
+        let Some(assignment) = args.find('=') else {
+            return Ok(None);
+        };
+        let Some(modifiers) = args[assignment + 1..].strip_prefix("<<") else {
+            return Ok(None);
+        };
+        (HeredocKind::Let, modifiers)
+    } else {
+        return Ok(None);
+    };
+
+    let mut words = modifiers.trim_start_matches([' ', '\t']);
+    let mut trim = false;
+    if words == "trim" || words.starts_with("trim ") || words.starts_with("trim\t") {
+        trim = true;
+        words = words[4..].trim_start_matches([' ', '\t']);
+    }
+    let marker_end = words
+        .find(|character: char| character.is_ascii_whitespace())
+        .unwrap_or(words.len());
+    let marker = &words[..marker_end];
+    let trailing = words[marker_end..].trim_start_matches([' ', '\t']);
+    if !marker.starts_with('\"') && !trailing.is_empty() && !trailing.starts_with('\"') {
+        return Err(("E488", "Trailing characters".to_owned()));
+    }
+    let marker = if marker.is_empty() || marker.starts_with('\"') {
+        if kind == HeredocKind::Script {
+            "."
+        } else {
+            return Err(("E172", "Missing marker".to_owned()));
+        }
+    } else {
+        marker
+    };
+    if kind == HeredocKind::Let && marker.as_bytes()[0].is_ascii_lowercase() {
+        return Err(("E221", "Marker cannot start with lower case letter".to_owned()));
+    }
+    let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+    Ok(Some(HeredocSpec {
+        kind,
+        marker: marker.to_owned(),
+        trim,
+        command_indent: &line[..indent_len],
+    }))
 }
 
 /// Error raised while joining continuation lines.
@@ -354,19 +430,88 @@ impl<F: FileIO> ScriptCtx<F> {
     /// * A control character in the text terminates the script, mirroring
     ///   upstream treating NUL as end-of-file.
     pub fn join_logical_lines(&self, text: &str) -> Result<Vec<LogicalLine>, ScriptError> {
+        let physical = text.split('\n').collect::<Vec<_>>();
         let mut logical: Vec<LogicalLine> = Vec::new();
         let mut first_line_of_script = true;
-        for (index, raw) in text.split('\n').enumerate() {
+        let mut index = 0;
+        while index < physical.len() {
             let number = index.saturating_add(1);
+            let raw = physical[index];
             let content = raw.strip_suffix('\r').unwrap_or(raw);
             if first_line_of_script && content.starts_with("#!") {
                 first_line_of_script = false;
+                index += 1;
                 continue;
             }
             first_line_of_script = false;
+
+            let spec = heredoc_spec(content).map_err(|(code, message)| ScriptError {
+                code,
+                message,
+                line: Some(number),
+            })?;
+            if let Some(spec) = spec {
+                let mut joined = content.trim_end().to_owned();
+                joined.push('\n');
+                let mut text_indent: Option<&str> = None;
+                let mut found_marker = false;
+                index += 1;
+                while index < physical.len() {
+                    let body_raw = physical[index];
+                    if body_raw.is_empty() && index + 1 == physical.len() && text.ends_with('\n') {
+                        break;
+                    }
+                    let body = body_raw.strip_suffix('\r').unwrap_or(body_raw);
+                    let marker_line = if spec.trim {
+                        body.strip_prefix(spec.command_indent).unwrap_or(body)
+                    } else {
+                        body
+                    };
+                    if marker_line == spec.marker {
+                        found_marker = true;
+                        index += 1;
+                        break;
+                    }
+                    if spec.trim && text_indent.is_none() && !body.is_empty() {
+                        let indent_len = body
+                            .find(|character: char| !character.is_ascii_whitespace())
+                            .unwrap_or(body.len());
+                        text_indent = Some(&body[..indent_len]);
+                    }
+                    let body = text_indent.map_or(body, |indent| {
+                        let matching = body
+                            .bytes()
+                            .zip(indent.bytes())
+                            .take_while(|(left, right)| left == right)
+                            .count();
+                        &body[matching..]
+                    });
+                    if joined.len().saturating_add(body.len()).saturating_add(1) > MAX_LOGICAL_LINE {
+                        return Err(ScriptError {
+                            code: "E1389",
+                            message: "continued line too long".to_owned(),
+                            line: Some(index.saturating_add(1)),
+                        });
+                    }
+                    joined.push_str(body);
+                    joined.push('\n');
+                    index += 1;
+                }
+                if !found_marker && spec.kind == HeredocKind::Let {
+                    return Err(ScriptError {
+                        code: "E990",
+                        message: format!("Missing end marker '{}'", spec.marker),
+                        line: Some(number),
+                    });
+                }
+                logical.push(LogicalLine { text: joined, first_line: number });
+                continue;
+            }
+
             let trimmed_start = content.trim_start_matches([' ', '\t']);
             // Comment lines are skipped and never break a continuation.
-            if trimmed_start.starts_with('"') {
+            if trimmed_start.starts_with('\"') {
+                index += 1;
                 continue;
             }
             if let Some(continuation) = trimmed_start.strip_prefix('\\') {
@@ -390,12 +535,14 @@ impl<F: FileIO> ScriptCtx<F> {
                         });
                     }
                 }
+                index += 1;
                 continue;
             }
             logical.push(LogicalLine {
                 text: content.trim_end().to_owned(),
                 first_line: number,
             });
+            index += 1;
         }
         Ok(logical)
     }
