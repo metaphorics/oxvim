@@ -715,3 +715,105 @@ fn lua_integration_smoke() {
     );
     assert!(contains_string(&error, "Conflict: 'callback' not allowed with 'command'"), "{error:?}");
 }
+
+#[test]
+fn startup_file_arguments_become_named_buffers_with_first_current() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let first = std::env::temp_dir().join(format!(
+        "oxvim-startup-files-{}-{unique}-first.txt",
+        std::process::id()
+    ));
+    let second = std::env::temp_dir().join(format!(
+        "oxvim-startup-files-{}-{unique}-second.txt",
+        std::process::id()
+    ));
+    fs::write(&first, "first buffer\n").unwrap();
+    let _ = fs::remove_file(&second);
+
+    let first_string = first.to_string_lossy().into_owned();
+    let second_string = second.to_string_lossy().into_owned();
+    let mut oxvim = Embedded::spawn_with(&[&first_string, &second_string]);
+
+    // main.c create_windows()/edit_buffers(): one named buffer per file
+    let buffers = oxvim.request("nvim_list_bufs", vec![]);
+    let Value::Array(handles) = buffers else { panic!("buffer list is not an array") };
+    assert_eq!(handles.len(), 2, "one buffer per file argument: {handles:?}");
+    let current = oxvim.request("nvim_get_current_buf", vec![]);
+    assert_eq!(current, handles[0].clone(), "first file is the current buffer");
+    assert_eq!(
+        oxvim.request("nvim_buf_get_name", vec![Value::from(0)]),
+        Value::from(first_string.clone()),
+    );
+    assert_eq!(
+        oxvim.request(
+            "nvim_buf_get_lines",
+            vec![Value::from(0), Value::from(0), Value::from(-1), Value::Boolean(true)],
+        ),
+        Value::Array(vec![Value::from("first buffer")]),
+    );
+    // A missing file still gets a named empty buffer, like upstream's
+    // buffer creation during argument-list setup.
+    assert_eq!(
+        oxvim.request("nvim_buf_get_name", vec![Value::from(2)]),
+        Value::from(second_string.clone()),
+    );
+    assert_eq!(
+        oxvim.request(
+            "nvim_buf_get_lines",
+            vec![Value::from(2), Value::from(0), Value::from(-1), Value::Boolean(true)],
+        ),
+        Value::Array(vec![Value::from("")]),
+    );
+
+    let _ = fs::remove_file(&first);
+}
+
+#[test]
+fn write_without_name_targets_current_buffers_file() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let target = std::env::temp_dir().join(format!(
+        "oxvim-write-target-{}-{unique}.txt",
+        std::process::id()
+    ));
+    fs::write(&target, "original\n").unwrap();
+    let target_string = target.to_string_lossy().into_owned();
+
+    let mut oxvim = Embedded::spawn_with(&[&target_string]);
+    // The oldtest runner pattern: replace the file buffer with a scratch
+    // buffer, wipe the scratch, then `:write` must fall back onto the
+    // remaining named buffer's file rather than raising E32.
+    assert_eq!(oxvim.request("nvim_command", vec![Value::from("enew")]), Value::Nil);
+    assert_eq!(oxvim.request("nvim_command", vec![Value::from("bwipeout!")]), Value::Nil);
+    let remaining = oxvim.request("nvim_list_bufs", vec![]);
+    let Value::Array(remaining) = remaining else { panic!("buffer list is not an array") };
+    assert_eq!(remaining.len(), 1, "only the file buffer survives: {remaining:?}");
+    assert_eq!(
+        oxvim.request("nvim_get_current_buf", vec![]),
+        remaining[0].clone(),
+        "wiping the scratch buffer falls back onto the file buffer",
+    );
+    assert_eq!(
+        oxvim.request(
+            "nvim_buf_set_lines",
+            vec![
+                Value::from(0),
+                Value::from(0),
+                Value::from(-1),
+                Value::Boolean(false),
+                Value::Array(vec![Value::from("rewritten by write")]),
+            ],
+        ),
+        Value::Nil,
+    );
+    assert_eq!(oxvim.request("nvim_command", vec![Value::from("write")]), Value::Nil);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "rewritten by write\n");
+
+    let _ = fs::remove_file(&target);
+}
+
+#[test]
+fn write_without_name_on_nameless_buffer_raises_e32() {
+    let mut oxvim = Embedded::spawn();
+    let error = oxvim.request_error("nvim_command", vec![Value::from("write")]);
+    assert!(format!("{error:?}").contains("E32"), "{error:?}");
+}

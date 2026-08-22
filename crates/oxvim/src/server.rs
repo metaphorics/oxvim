@@ -23,9 +23,8 @@ use ox_lua::{
     ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, VariableHost, VariableScope, Work, bind_api,
     bind_variables, call_with_traceback, lua_to_object, object_to_lua,
 };
-use ox_rpc::{
-    CHAN_STDIO, ChannelId, IncrementalDecoder, Message,
-};
+use ox_rpc::{CHAN_STDIO, ChannelId, IncrementalDecoder, Message};
+use ox_text::Buffer;
 use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, Typval, WinHandle};
 use ox_ui::{
     ChromeState, CmdlineState as UiCmdlineState, Compositor, ContentChunk, Emitter, HlState,
@@ -169,30 +168,14 @@ impl AppState {
             }
         }
 
-        if let Some(path) = cli.files.first() {
-            self.execute_ex(&format!("edit {path}"))?;
-            let current = self.editor.borrow().current_buffer();
-            let placeholders = self
-                .editor
-                .borrow()
-                .buffers()
-                .into_iter()
-                .filter(|buffer| Some(*buffer) != current)
-                .filter(|buffer| {
-                    self.editor
-                        .borrow()
-                        .buffer(*buffer)
-                        .is_ok_and(|state| state.name().as_bytes().is_empty() && !state.modified)
-                })
-                .collect::<Vec<_>>();
-            for buffer in placeholders {
-                self.editor
-                    .borrow_mut()
-                    .wipe_buffer(buffer)
-                    .map_err(|error| AppError::Editor(error.to_string()))?;
-            }
+        // main.c create_windows()/edit_buffers(), single-window form:
+        // every positional file becomes a named buffer loaded from disk
+        // (upstream also names a buffer when the file does not exist
+        // yet), and the first file is displayed in the startup window.
+        if !cli.files.is_empty() {
+            self.open_startup_files(&cli.files)?;
         }
-
+ 
         for command in &cli.commands {
             self.execute_ex(command)?;
         }
@@ -204,6 +187,52 @@ impl AppState {
             .borrow_mut()
             .execute_line(&mut self.editor.borrow_mut(), command)
             .map_err(|error| AppError::Ex(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Opens every positional file argument as a named buffer, mirroring
+    /// `main.c` `create_windows()`/`edit_buffers()` for the single-window
+    /// case: `open_buffer(false, ...)` reads the first file into the
+    /// startup buffer itself, so buffer numbers match `nvim a b c`, and
+    /// each remaining file becomes a loaded hidden buffer without
+    /// stealing the current window.  When a startup script has already
+    /// replaced or modified the startup buffer, every file, the first
+    /// included, is opened as a background buffer instead.
+    fn open_startup_files(&mut self, files: &[String]) -> Result<(), AppError> {
+        let first_into_current = self
+            .editor
+            .borrow()
+            .current_buffer()
+            .is_some_and(|current| {
+                self.editor
+                    .borrow()
+                    .buffer(current)
+                    .is_ok_and(|state| state.name().as_bytes().is_empty() && !state.modified)
+            });
+        for (index, file) in files.iter().enumerate() {
+            let text = read_startup_file(file)?;
+            if index == 0 && first_into_current {
+                let current = self
+                    .editor
+                    .borrow()
+                    .current_buffer()
+                    .ok_or_else(|| AppError::Editor("no current buffer at startup".into()))?;
+                if let Ok(state) = self.editor.borrow_mut().buffer_mut(current) {
+                    state.load(text);
+                    state.set_name(OxStr::from(file.as_str()));
+                }
+                continue;
+            }
+            let handle = self
+                .editor
+                .borrow_mut()
+                .create_buffer_with(text, true)
+                .map_err(|error| AppError::Editor(error.to_string()))?;
+            if let Ok(state) = self.editor.borrow_mut().buffer_mut(handle) {
+                state.set_name(OxStr::from(file.as_str()));
+                state.mark_saved();
+            }
+        }
         Ok(())
     }
 
@@ -622,7 +651,20 @@ impl AppState {
     fn should_exit(&self) -> bool { self.exiting }
 }
 
-fn positive_dimension(value: i64, name: &str) -> Result<usize, ApiError> {
+/// Reads one startup file argument into buffer text.  A file that does
+/// not exist yet still opens as a named empty buffer, like upstream's
+/// buffer creation during argument-list setup; other read failures are
+/// `E484`, matching `:edit`'s error for unreadable files.
+fn read_startup_file(file: &str) -> Result<Buffer, AppError> {
+    let text = match fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(AppError::Ex(format!("E484: Can't open file {file}: {error}"))),
+    };
+    Buffer::from_bytes(text.as_bytes()).map_err(|error| AppError::Ex(format!("E474: {error}")))
+}
+
+ fn positive_dimension(value: i64, name: &str) -> Result<usize, ApiError> {
     usize::try_from(value)
         .ok()
         .filter(|value| *value > 0)
