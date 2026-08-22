@@ -9,8 +9,8 @@ use std::rc::Rc;
 use mlua::{Function, MultiValue, Value};
 use ox_lua::{
     bind_api, call_with_traceback, lua_to_object, lua_to_typval, object_to_lua, typval_to_lua,
-    ApiFunction, ApiRegistry, BuiltinHost, ConversionError, LuaHost, RuntimeRoot, Scheduler, Work,
-    CONVERSION_RECURSION_LIMIT,
+    ApiFunction, ApiRegistry, BuiltinHost, ConversionError, ExecError, LuaHost, RuntimeRoot,
+    Scheduler, Work, CONVERSION_RECURSION_LIMIT,
 };
 use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, Special, TabHandle, Typval, WinHandle};
 
@@ -180,6 +180,7 @@ fn lua_refs_round_trip_functions_and_userdata() {
 }
 
 #[test]
+#[allow(clippy::cast_precision_loss)]
 fn numeric_conversion_follows_luajit_double_precision() {
     let (host, _, _) = host();
     let lua = host.lua();
@@ -284,6 +285,7 @@ fn vim_call_and_fn_dispatch_through_builtin_host() {
 
 struct OneApi;
 
+#[allow(clippy::unnecessary_wraps)]
 fn nil_api(_: &[Object]) -> Result<Object, ApiError> {
     Ok(Object::Nil)
 }
@@ -341,4 +343,119 @@ fn schedule_defers_until_scheduler_drains() {
     assert!(!host.lua().globals().get::<bool>("scheduled").unwrap());
     scheduler.drain().unwrap();
     assert!(host.lua().globals().get::<bool>("scheduled").unwrap());
+}
+
+#[test]
+fn exec_args_reachable_via_varargs() {
+    let (mut host, _, _) = host();
+    assert_eq!(
+        host.exec("local a, b = ...; return a + b", vec![Object::Integer(3), Object::Integer(4)])
+            .unwrap(),
+        Object::Integer(7)
+    );
+}
+
+#[test]
+fn exec_converts_each_object_kind() {
+    let (mut host, _, _) = host();
+    let cases: Vec<(Object, Object)> = vec![
+        (Object::Nil, Object::Nil),
+        (Object::Boolean(true), Object::Boolean(true)),
+        (Object::Integer(42), Object::Integer(42)),
+        (Object::Float(1.5), Object::Float(1.5)),
+        (
+            Object::String(OxStr(vec![0, 0xff, b'x'])),
+            Object::String(OxStr(vec![0, 0xff, b'x'])),
+        ),
+        (
+            Object::Array(vec![Object::Integer(1), Object::Nil]),
+            Object::Array(vec![Object::Integer(1), Object::Nil]),
+        ),
+        (
+            Object::Dict(Dict(vec![(OxStr::from("key"), Object::Boolean(false))])),
+            Object::Dict(Dict(vec![(OxStr::from("key"), Object::Boolean(false))])),
+        ),
+        (Object::Dict(Dict(Vec::new())), Object::Dict(Dict(Vec::new()))),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(host.exec("return ...", vec![input]).unwrap(), expected);
+    }
+
+    for object in [
+        Object::Buffer(BufHandle::try_from(3).unwrap()),
+        Object::Window(WinHandle::try_from(4).unwrap()),
+        Object::Tabpage(TabHandle::try_from(5).unwrap()),
+    ] {
+        let expected = match object {
+            Object::Buffer(value) => Object::Integer(i64::from(value)),
+            Object::Window(value) => Object::Integer(i64::from(value)),
+            Object::Tabpage(value) => Object::Integer(i64::from(value)),
+            _ => unreachable!(),
+        };
+        assert_eq!(host.exec("return ...", vec![object]).unwrap(), expected);
+    }
+
+    let reference = {
+        let lua = host.lua();
+        let function: Function = lua.load("return function(x) return x + 1 end").eval().unwrap();
+        let Object::LuaRef(reference) = lua_to_object(lua, &Value::Function(function)).unwrap() else {
+            unreachable!()
+        };
+        reference
+    };
+    let result = host.exec("return ...", vec![Object::LuaRef(reference)]).unwrap();
+    let call_result = {
+        let lua = host.lua();
+        let Object::LuaRef(reference) = result else { unreachable!() };
+        let Value::Function(round_trip) = object_to_lua(lua, &Object::LuaRef(reference)).unwrap()
+        else {
+            unreachable!()
+        };
+        round_trip.call::<i64>(4).unwrap()
+    };
+    assert_eq!(call_result, 5);
+}
+
+#[test]
+fn exec_error_contains_lua_message_and_traceback() {
+    let (mut host, _, _) = host();
+    let error = host
+        .exec("local function inner() error('boom') end inner()", vec![])
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("boom"), "{text}");
+    assert!(text.contains("stack traceback"), "{text}");
+    assert!(text.contains("inner"), "{text}");
+    assert!(matches!(error, ExecError::Runtime(_)));
+}
+
+struct TempFile(PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn exec_file_runs_lua_file() {
+    let (mut host, _, _) = host();
+    let path = std::env::temp_dir().join("ox-lua-exec-file-test.lua");
+    std::fs::write(&path, "exec_file_global = 42\nreturn 1").unwrap();
+    let _guard = TempFile(path.clone());
+    host.exec_file(&path).unwrap();
+    let value: i64 = host.lua().globals().get("exec_file_global").unwrap();
+    assert_eq!(value, 42);
+}
+
+#[test]
+fn exec_file_error_contains_message() {
+    let (mut host, _, _) = host();
+    let path = std::env::temp_dir().join("ox-lua-exec-file-error-test.lua");
+    std::fs::write(&path, "error('file boom')").unwrap();
+    let _guard = TempFile(path.clone());
+    let error = host.exec_file(&path).unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("file boom"), "{text}");
+    assert!(matches!(error, ExecError::Load(_)));
 }
