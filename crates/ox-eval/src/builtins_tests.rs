@@ -63,6 +63,16 @@ case!(trim_default, "trim", [text("  a \n")], text("a"));
 case!(trim_mask, "trim", [text("xxabcxx"), text("x")], text("abc"));
 case!(trim_left, "trim", [text("xxabcxx"), text("x"), number(1)], text("abcxx"));
 case!(trim_right, "trim", [text("xxabcxx"), text("x"), number(2)], text("xxabc"));
+
+#[test]
+fn setenv_sets_numeric_value_and_null_unsets() {
+    const NAME: &str = "OXVIM_TEST_EVAL_SETENV";
+    assert_eq!(call("setenv", vec![text(NAME), number(123)]).unwrap(), number(0));
+    assert_eq!(std::env::var_os(NAME).as_deref(), Some(std::ffi::OsStr::new("123")));
+    assert_eq!(call("setenv", vec![text(NAME), Typval::Special(Special::Null)]).unwrap(), number(0));
+    assert_eq!(std::env::var_os(NAME), None);
+}
+
 case!(join_default, "join", [Typval::list(vec![text("a"), text("b")])], text("a b"));
 case!(join_custom, "join", [Typval::list(vec![text("a"), text("b")]), text(",")], text("a,b"));
 case!(repeat_string, "repeat", [text("ab"), number(3)], text("ababab"));

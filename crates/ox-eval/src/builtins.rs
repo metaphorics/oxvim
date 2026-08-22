@@ -129,6 +129,7 @@ impl<'a> Builtins<'a> {
             "repeat" => repeat(&args),
             "resolve" => path_builtins::resolve(&args[0]),
             "reverse" => reverse(args),
+            "setenv" => setenv(&args),
             "simplify" => path_builtins::simplify(&args[0]),
             "sort" => self.sort(args, scope),
             "split" => self.regex_split(&args),
@@ -573,7 +574,7 @@ fn is_implemented(name: &str) -> bool {
         "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "get" | "getcwd" | "glob" | "globpath" | "has" | "has_key" | "index" | "insert" | "isdirectory" | "items" |
         "islocked" | "join" | "json_decode" | "json_encode" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
         "match" | "matchend" | "matchstr" | "max" | "min" | "nr2char" | "or" | "pow" | "range" | "reduce" | "resolve" |
-        "remove" | "repeat" | "reverse" | "simplify" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
+        "remove" | "repeat" | "reverse" | "setenv" | "simplify" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
         "str2nr" | "strcharlen" | "strchars" | "stridx" | "string" | "strpart" | "strridx" |
         "substitute" | "tolower" | "toupper" | "trim" | "trunc" | "type" | "uniq" | "values" | "xor"
     )
@@ -735,6 +736,17 @@ fn string_arg(value: &Typval) -> Result<OxStr> {
         Typval::Dict(_) => Err(EvalError::new("E731", 0, "Using a Dictionary as a String")),
         _ => Err(EvalError::new("E729", 0, "Using invalid value as a String")),
     }
+}
+
+fn setenv(args: &[Typval]) -> Result<Typval> {
+    let name = string_arg(&args[0])?.to_string_lossy().into_owned();
+    if args[1] == Typval::Special(Special::Null) {
+        ox_sys::unset_env(name);
+    } else {
+        let value = string_arg(&args[1])?.to_string_lossy().into_owned();
+        ox_sys::set_env(name, value);
+    }
+    Ok(Typval::Number(0))
 }
 
 fn borrow_error() -> EvalError { EvalError::new("E742", 0, "Cannot change value during recursive container access") }

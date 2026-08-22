@@ -193,27 +193,19 @@ pub fn os_get_passwd() -> Result<Passwd> {
 
 /// Sets an environment variable in the current process.
 ///
-/// See `uv.os_setenv()` in `runtime/doc/luvref.txt` (lines 4406-4417). This
-/// operation is not safely expressible with the crate's pure-safe surface:
-/// `std::env::set_var` is `unsafe` in edition 2024 and rustix exposes no safe
-/// setter, so an [`Error::Unsupported`] is returned.
-pub fn os_setenv(_name: impl AsRef<OsStr>, _value: impl AsRef<OsStr>) -> Result<()> {
-    Err(Error::Unsupported {
-        feature: "os_setenv",
-        reason: "no safe (non-unsafe) process-environment setter is available in std or rustix",
-    })
+/// See `uv.os_setenv()` in `runtime/doc/luvref.txt` (lines 4406-4417). Process
+/// environment mutation is centralized in the audited `ox-sys` boundary.
+pub fn os_setenv(name: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Result<()> {
+    ox_sys::set_env(name, value);
+    Ok(())
 }
 
 /// Unsets an environment variable in the current process.
 ///
-/// See `uv.os_unsetenv()` in `runtime/doc/luvref.txt` (lines 4419-4427). For
-/// the same safety reason as [`os_setenv`], this returns
-/// [`Error::Unsupported`].
-pub fn os_unsetenv(_name: impl AsRef<OsStr>) -> Result<()> {
-    Err(Error::Unsupported {
-        feature: "os_unsetenv",
-        reason: "no safe (non-unsafe) process-environment unsetter is available in std or rustix",
-    })
+/// See `uv.os_unsetenv()` in `runtime/doc/luvref.txt` (lines 4419-4427).
+pub fn os_unsetenv(name: impl AsRef<OsStr>) -> Result<()> {
+    ox_sys::unset_env(name);
+    Ok(())
 }
 
 /// Resource-usage snapshot corresponding to `uv.getrusage()` in

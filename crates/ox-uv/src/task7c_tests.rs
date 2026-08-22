@@ -446,10 +446,11 @@ fn misc_surface_returns_sane_values() {
     assert!(!passwd.username.is_empty(), "username present");
     assert!(!passwd.homedir.is_empty(), "homedir present");
 
-    let unsupported = misc::os_setenv("OX_TEST", "1");
-    assert!(unsupported.is_err(), "os_setenv is typed unsupported (no safe setter)");
-    let unsupported = misc::os_unsetenv("OX_TEST");
-    assert!(unsupported.is_err(), "os_unsetenv is typed unsupported");
+    const ENV_NAME: &str = "OXVIM_TEST_UV_OS_SETENV";
+    misc::os_setenv(ENV_NAME, "value").expect("uv.os_setenv");
+    assert_eq!(std::env::var_os(ENV_NAME).as_deref(), Some(std::ffi::OsStr::new("value")));
+    misc::os_unsetenv(ENV_NAME).expect("uv.os_unsetenv");
+    assert_eq!(std::env::var_os(ENV_NAME), None);
 
     let rusage = misc::getrusage().expect("uv.getrusage");
     assert!(rusage.nvcsw > 0 || rusage.stime.0 > 0 || rusage.utime.0 > 0, "some rusage populated");
