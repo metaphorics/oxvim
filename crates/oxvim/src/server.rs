@@ -12,14 +12,14 @@ use mlua::{MultiValue, Value};
 use ox_api::Registry;
 use ox_editor::{
     AutocmdContext, AutocmdKind, CmdlineKind, Editor, Event, ExExecutor, ExecOutcome, Geometry,
-    MappingAction, MessageKind, Mode, ModeMachine, Keys, TypeaheadFlags,
+    LuaExec, LuaExecError, MappingAction, MessageKind, Mode, ModeMachine, Keys, TypeaheadFlags,
 };
 use ox_eval::{
     BufferHost, BuiltinHost as EvalBuiltinHost, Builtins, Scope, call_buffer_builtin,
     is_buffer_builtin,
 };
 use ox_lua::{
-    ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, VariableHost, VariableScope, Work, bind_api,
+    ApiDispatchContext, BuiltinHost, ExecError as LuaHostExecError, LuaHost, RuntimeRoot, Scheduler, VariableHost, VariableScope, Work, bind_api,
     bind_variables, call_with_traceback, object_to_lua,
 };
 use ox_rpc::{
@@ -53,7 +53,7 @@ impl ox_api::ChannelSink for TerminalChannelSink {
 /// All mutable state shared by every RPC transport.
 pub struct AppState {
     editor: Rc<RefCell<Editor>>,
-    lua: LuaHost,
+    lua: Rc<RefCell<LuaHost>>,
     registry: Registry,
     ex: ExExecutor,
     mode: ModeMachine,
@@ -107,12 +107,15 @@ impl AppState {
         // Load the reachable embedded core prelude before user-controlled Ex startup commands.
         lua.exec("require('vim._core.shared')", Vec::new())
             .map_err(|error| AppError::Lua(error.to_string()))?;
+        let lua = Rc::new(RefCell::new(lua));
+        let mut ex = ExExecutor::new();
+        ex.set_lua_exec(Rc::new(RefCell::new(ServerLuaExec { lua: lua.clone() })));
 
         let mut state = Self {
             editor,
             lua,
             registry,
-            ex: ExExecutor::new(),
+            ex,
             mode: ModeMachine::default(),
             exiting: false,
             rendered_messages: 0,
@@ -137,6 +140,7 @@ impl AppState {
         if !cli.clean && let UserConfig::File(path) = &cli.user_config {
             if Path::new(path).extension().is_some_and(|extension| extension == "lua") {
                 self.lua
+                    .borrow_mut()
                     .exec_file(Path::new(path))
                     .map_err(|error| AppError::Lua(error.to_string()))?;
             } else {
@@ -173,14 +177,15 @@ impl AppState {
             match action.kind {
                 AutocmdKind::ExString(command) => self.execute_ex(&command)?,
                 AutocmdKind::LuaCallback(reference) => {
+                    let lua = self.lua.borrow();
                     let reference = i32::try_from(reference)
                         .map_err(|_| AppError::Lua("autocmd Lua reference is out of range".into()))?;
-                    let value = object_to_lua(self.lua.lua(), &Object::LuaRef(reference))
+                    let value = object_to_lua(lua.lua(), &Object::LuaRef(reference))
                         .map_err(|error| AppError::Lua(error.to_string()))?;
                     let Value::Function(function) = value else {
                         return Err(AppError::Lua("autocmd Lua reference is not a function".into()));
                     };
-                    call_with_traceback(self.lua.lua(), &function, MultiValue::new())
+                    call_with_traceback(lua.lua(), &function, MultiValue::new())
                         .map_err(|error| AppError::Lua(error.to_string()))?;
                 }
             }
@@ -317,6 +322,7 @@ impl AppState {
         let code = std::str::from_utf8(code.as_bytes())
             .map_err(|_| ApiError::validation("Lua source must be valid UTF-8"))?;
         self.lua
+            .borrow_mut()
             .exec(code, args.clone())
             .map_err(|error| ApiError::exception(error.to_string()))
     }
@@ -1020,6 +1026,28 @@ impl BufferHost for CurrentBuffer<'_> {
             )
             .map(|_| ())
             .map_err(|error| ox_eval::EvalError::new("E86", 0, error.to_string()))
+    }
+}
+
+struct ServerLuaExec {
+    lua: Rc<RefCell<LuaHost>>,
+}
+
+impl LuaExec for ServerLuaExec {
+    fn execute_chunk(&mut self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError> {
+        self.lua.borrow_mut().exec(code, args).map_err(map_lua_exec_error)
+    }
+
+    fn execute_file(&mut self, path: &Path) -> Result<(), LuaExecError> {
+        self.lua.borrow_mut().exec_file(path).map_err(map_lua_exec_error)
+    }
+}
+
+fn map_lua_exec_error(error: LuaHostExecError) -> LuaExecError {
+    match error {
+        LuaHostExecError::Load(message) => LuaExecError::Load(message),
+        LuaHostExecError::Runtime(message) => LuaExecError::Runtime(message),
+        LuaHostExecError::Conversion(error) => LuaExecError::Conversion(error.to_string()),
     }
 }
 
