@@ -94,6 +94,9 @@ pub struct OptionMetadata {
     pub list: Option<OptionListKind>,
     /// Whether repeated comma-list items are rejected.
     pub deny_duplicates: bool,
+    /// `:set` expands environment variables and `~` in string values
+    /// (option.c `kOptFlagExpand`, the `expand` key in options.lua).
+    pub expand: bool,
 }
 
 include!(concat!(env!("OUT_DIR"), "/options_metadata.rs"));

@@ -58,6 +58,9 @@ struct ParsedOption {
     default: ParsedDefault,
     list: Option<String>,
     deny_duplicates: bool,
+    /// `expand` key present (`true` or `'nodefault'`): `:set` expands
+    /// environment variables and `~` in the value (option.c `kOptFlagExpand`).
+    expand: bool,
 }
 
 #[derive(Debug)]
@@ -159,6 +162,7 @@ fn parse_option(fields: BTreeMap<String, String>, ordinal: usize) -> Result<Pars
         default,
         list,
         deny_duplicates: fields.get("deny_duplicates").is_some_and(|value| value.trim() == "true"),
+        expand: fields.get("expand").is_some(),
     })
 }
 
@@ -575,8 +579,8 @@ fn render(options: &[ParsedOption]) -> Result<String, String> {
             Some(other) => return Err(format!("unsupported list kind `{other}` during rendering")),
         });
         output.push_str(&format!(
-            ",\n        deny_duplicates: {},\n    }},\n",
-            option.deny_duplicates
+            ",\n        deny_duplicates: {},\n        expand: {},\n    }},\n",
+            option.deny_duplicates, option.expand
         ));
     }
     output.push_str("];\n\n/// Number of generated upstream options.\npub const OPTION_COUNT: usize = OPTION_METADATA.len();\n\n");

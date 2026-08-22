@@ -699,6 +699,40 @@ fn runtime_lookups_follow_runtimepath_option() {
     assert_eq!(global_number(exec.scope(), "scheme_second"), Some(1));
 }
 
+// option.c stropt_expand_envvar + assign_option parity: a `:set` write is
+// visible to `&opt` reads inside the same command batch (the eval scope
+// mirror), and expand-flag options expand `$VAR`/`${VAR}` in the value.
+// setup.vim:85 (`set rtp=$VIM/vimfiles,$VIMRUNTIME,...`) needs both.
+#[test]
+fn set_write_is_scope_visible_and_expands_env_vars() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+
+    exec.execute_script(&mut editor, "<set>", "set runtimepath=/plain\nlet g:seen = &runtimepath")
+        .unwrap();
+    assert_eq!(global_string(exec.scope(), "seen").as_deref(), Some("/plain"));
+
+    ox_sys::set_env("OXVIM_TEST_SET_EXPAND", "/expanded");
+    exec.execute_script(
+        &mut editor,
+        "<set>",
+        "set runtimepath=$OXVIM_TEST_SET_EXPAND,${OXVIM_TEST_SET_EXPAND}/after\nlet g:expanded = &runtimepath",
+    )
+    .unwrap();
+    assert_eq!(
+        global_string(exec.scope(), "expanded").as_deref(),
+        Some("/expanded,/expanded/after")
+    );
+
+    // An unset variable stays literal, like upstream vim_getenv returning
+    // NULL (option_expand leaves the text unchanged).
+    exec.execute_script(&mut editor, "<set>", "set runtimepath=$OXVIM_TEST_UNSET_VAR/x\nlet g:literal = &runtimepath")
+        .unwrap();
+    assert_eq!(
+        global_string(exec.scope(), "literal").as_deref(),
+        Some("$OXVIM_TEST_UNSET_VAR/x")
+    );
+}
 #[test]
 fn colorscheme_sources_runtime_file_then_fires_matching_autocmd() {
     let io = MemoryFileIO::new();

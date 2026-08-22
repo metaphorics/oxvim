@@ -781,9 +781,9 @@ fn dispatch<F: FileIO>(
         "let" => command_let(runtime, editor, scope, &command.args, false),
         "const" => command_let(runtime, editor, scope, &command.args, true),
         "unlet" => command_unlet(runtime, editor, scope, &command.args, command.bang),
-        "set" => command_set(runtime, editor, &command.args, SetLayer::Effective),
-        "setlocal" => command_set(runtime, editor, &command.args, SetLayer::Local),
-        "setglobal" => command_set(runtime, editor, &command.args, SetLayer::Global),
+        "set" => command_set(runtime, editor, scope, &command.args, SetLayer::Effective),
+        "setlocal" => command_set(runtime, editor, scope, &command.args, SetLayer::Local),
+        "setglobal" => command_set(runtime, editor, scope, &command.args, SetLayer::Global),
         "aunmenu" | "tlunmenu" if command.args.trim() == "*" => Flow::Normal,
         "echo" | "echomsg" | "echon" | "echoerr" => {
             command_echo(runtime, editor, scope, name, &command.args)
@@ -1687,6 +1687,7 @@ enum SetLayer {
 fn command_set<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
+    scope: &mut Scope,
     args: &str,
     layer: SetLayer,
 ) -> Flow {
@@ -1704,7 +1705,7 @@ fn command_set<F: FileIO>(
     }
     let mut touched_runtimepath = false;
     for raw in split_set_args(args) {
-        if let Err((code, message)) = set_one(editor, &raw, layer) {
+        if let Err((code, message)) = set_one(editor, scope, &raw, layer) {
             return error_flow(runtime, code, message);
         }
         touched_runtimepath |= set_arg_targets(&raw);
@@ -3538,15 +3539,85 @@ fn set_option_value(editor: &mut Editor, name: &str, value: OptionValue, layer: 
     result.map_err(|error| ("E474", error.to_string()))
 }
 
-fn set_one(editor: &mut Editor, raw: &str, layer: SetLayer) -> Result<(), (&'static str, String)> {
+fn set_one(editor: &mut Editor, scope: &mut Scope, raw: &str, layer: SetLayer) -> Result<(), (&'static str, String)> {
     let raw = raw.trim();
     if let Some(name) = raw.strip_suffix('?') { if let Some(text) = display_option(editor, name, layer) { editor.push_message(Message { kind: MessageKind::Echo, content: Object::String(OxStr(text.into_bytes())), history: false }); return Ok(()); } return Err(("E518", format!("Unknown option: {name}"))); }
-    if let Some(name) = raw.strip_suffix("&vim").or_else(|| raw.strip_suffix('&')) { let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?; let value = metadata.default.value.map(OptionValue::from).ok_or_else(|| ("E474", format!("No literal default for {name}")))?; return set_option_value(editor, metadata.name, value, layer); }
-    for operator in ["+=", "-=", "^=", "="] { if let Some((name, value)) = raw.split_once(operator) { let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?; let mut next = match metadata.value_type { OptionType::Boolean => OptionValue::Boolean(matches!(value, "1" | "true" | "on")), OptionType::Number => OptionValue::Number(value.parse().map_err(|_| ("E521", format!("Number required after =: {value}")))?), OptionType::String => OptionValue::String(value.to_owned()) }; if operator != "=" { let current = option_value(editor, metadata.name, layer).cloned().unwrap_or_else(|| metadata.default.value.map(OptionValue::from).unwrap_or(OptionValue::String(String::new()))); next = modify_option(current, next, operator, metadata.list)?; } return set_option_value(editor, metadata.name, next, layer); } }
+    if let Some(name) = raw.strip_suffix("&vim").or_else(|| raw.strip_suffix('&')) { let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?; let value = metadata.default.value.map(OptionValue::from).ok_or_else(|| ("E474", format!("No literal default for {name}")))?; return set_and_mirror(editor, scope, metadata.name, value, layer); }
+    for operator in ["+=", "-=", "^=", "="] { if let Some((name, value)) = raw.split_once(operator) { let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?; let mut next = match metadata.value_type { OptionType::Boolean => OptionValue::Boolean(matches!(value, "1" | "true" | "on")), OptionType::Number => OptionValue::Number(value.parse().map_err(|_| ("E521", format!("Number required after =: {value}")))?), OptionType::String => OptionValue::String(if metadata.expand { expand_set_value(value) } else { value.to_owned() }) }; if operator != "=" { let current = option_value(editor, metadata.name, layer).cloned().unwrap_or_else(|| metadata.default.value.map(OptionValue::from).unwrap_or(OptionValue::String(String::new()))); next = modify_option(current, next, operator, metadata.list)?; } return set_and_mirror(editor, scope, metadata.name, next, layer); } }
     let (name, value) = if let Some(name) = raw.strip_prefix("no") { (name, false) } else if let Some(name) = raw.strip_prefix("inv") { let current = option_value(editor, name, layer).and_then(|value| match value { OptionValue::Boolean(value) => Some(*value), _ => None }).unwrap_or(false); (name, !current) } else if let Some(name) = raw.strip_suffix('!') { let current = option_value(editor, name, layer).and_then(|value| match value { OptionValue::Boolean(value) => Some(*value), _ => None }).unwrap_or(false); (name, !current) } else { (raw, true) };
     let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?;
     if metadata.value_type != OptionType::Boolean { if let Some(text) = display_option(editor, name, layer) { editor.push_message(Message { kind: MessageKind::Echo, content: Object::String(OxStr(text.into_bytes())), history: false }); return Ok(()); } }
-    set_option_value(editor, metadata.name, OptionValue::Boolean(value), layer)
+    set_and_mirror(editor, scope, metadata.name, OptionValue::Boolean(value), layer)
+}
+
+/// Writes one option to the editor and mirrors it into the eval scope, the
+/// same dual write `:let &opt` performs through `assign_option`. Without the
+/// mirror, `&opt` reads inside the same command batch would keep observing
+/// the pre-`:set` snapshot until the next editor→scope sync.
+fn set_and_mirror(editor: &mut Editor, scope: &mut Scope, name: &'static str, value: OptionValue, layer: SetLayer) -> Result<(), (&'static str, String)> {
+    set_option_value(editor, name, value.clone(), layer)?;
+    let eval_scope = if matches!(layer, SetLayer::Global) { EvalOptionScope::Global } else { EvalOptionScope::Local };
+    scope.set_option(eval_scope, name.as_bytes(), option_to_typval(&value));
+    Ok(())
+}
+
+/// `:set` value expansion for `expand`-flag options (option.c
+/// `stropt_expand_envvar` → `expand_env_esc`): a leading `~` resolves through
+/// `$HOME`, and each `$NAME`/`${NAME}` resolves through the process
+/// environment. An unset variable stays literal, matching upstream
+/// `vim_getenv` returning NULL; substituted text is never rescanned.
+fn expand_set_value(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    if bytes.first() == Some(&b'~') && (bytes.len() == 1 || bytes[1] == b'/') {
+        if let Some(home) = std::env::var_os("HOME") {
+            output.extend_from_slice(home.to_string_lossy().as_bytes());
+            index = 1;
+        }
+    }
+    while index < bytes.len() {
+        if bytes[index] != b'$' || index + 1 >= bytes.len() {
+            output.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let (name, next) = if bytes[index + 1] == b'{' {
+            match bytes[index + 2..].iter().position(|&byte| byte == b'}') {
+                Some(close) => (&value[index + 2..index + 2 + close], index + 2 + close + 1),
+                None => {
+                    output.push(b'$');
+                    index += 1;
+                    continue;
+                }
+            }
+        } else {
+            let end = bytes[index + 1..]
+                .iter()
+                .position(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+                .map_or(bytes.len(), |offset| index + 1 + offset);
+            (&value[index + 1..end], end)
+        };
+        if name.is_empty() {
+            output.push(b'$');
+            index += 1;
+            continue;
+        }
+        match std::env::var_os(name) {
+            Some(text) => output.extend_from_slice(text.to_string_lossy().as_bytes()),
+            // Unset stays literal, like upstream `vim_getenv` returning NULL.
+            None => {
+                output.push(b'$');
+                output.extend_from_slice(if bytes[index + 1] == b'{' {
+                    format!("{{{name}}}")
+                } else {
+                    name.to_owned()
+                }.as_bytes());
+            }
+        }
+        index = next;
+    }
+    String::from_utf8_lossy(&output).into_owned()
 }
 
 fn modify_option(current: OptionValue, next: OptionValue, operator: &str, list: Option<OptionListKind>) -> Result<OptionValue, (&'static str, String)> {
