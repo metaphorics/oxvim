@@ -4,6 +4,7 @@
 mod api_info;
 mod cli;
 mod runtime;
+mod server;
 
 use std::fmt;
 use std::io::{self, Write};
@@ -28,6 +29,8 @@ pub enum AppError {
     Ex(String),
     /// Lua initialization or execution failed.
     Lua(String),
+    /// Embedded RPC server initialization or dispatch failed.
+    Server(String),
 }
 
 impl fmt::Display for AppError {
@@ -40,6 +43,7 @@ impl fmt::Display for AppError {
             Self::Editor(error) => write!(formatter, "oxvim: cannot initialize editor: {error}"),
             Self::Ex(error) => write!(formatter, "oxvim: Ex command failed: {error}"),
             Self::Lua(error) => write!(formatter, "oxvim: Lua script failed: {error}"),
+            Self::Server(error) => write!(formatter, "oxvim: RPC server failed: {error}"),
         }
     }
 }
@@ -72,14 +76,11 @@ fn run() -> Result<(), AppError> {
     if cli.batch.is_some() {
         return runtime::run_batch(&cli.pre_commands, &cli.commands);
     }
-    if cli.embed {
-        return Err(AppError::NotWired("embedded RPC"));
+    if cli.embed || cli.headless {
+        return server::run_stdio();
     }
     if cli.listen.is_some() {
         return Err(AppError::NotWired("listen server"));
-    }
-    if cli.headless {
-        return Err(AppError::NotWired("headless"));
     }
     Err(AppError::NotWired("interactive client"))
 }

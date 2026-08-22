@@ -9,8 +9,11 @@ description = "binary entry point (CLI parsing, startup, server/client fork)."
 mlua.workspace = true
 ox-api = { path = "../ox-api" }
 ox-editor = { path = "../ox-editor" }
+ox-eval = { path = "../ox-eval" }
+ox-loop = { path = "../ox-loop" }
 ox-lua = { path = "../ox-lua" }
 ox-rpc = { path = "../ox-rpc" }
+ox-text = { path = "../ox-text" }
 ox-types = { path = "../ox-types" }
 
 [dev-dependencies]
