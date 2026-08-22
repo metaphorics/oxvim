@@ -372,6 +372,22 @@ fn validate_function_name(name: &str) -> Result<(), UserFuncError> {
     if name.is_empty() {
         return Err(UserFuncError::new("E129", "Function name required"));
     }
+    if let Some((dictionary, member)) = name.rsplit_once('.') {
+        let dictionary = dictionary
+            .get(2..)
+            .filter(|_| dictionary.as_bytes().get(1) == Some(&b':'))
+            .unwrap_or(dictionary);
+        if is_identifier(member)
+            && !dictionary.is_empty()
+            && dictionary.split('.').all(is_identifier)
+        {
+            return Ok(());
+        }
+        return Err(UserFuncError::new(
+            "E128",
+            format!("Invalid function name: {name}"),
+        ));
+    }
     let unqualified = name
         .strip_prefix("s:")
         .or_else(|| name.strip_prefix("<SID>"))

@@ -484,6 +484,31 @@ fn s_function_canonical_name_and_snr_resolution() {
     assert_eq!(global_number(exec.scope(), "helped"), Some(1));
 }
 
+#[test]
+fn script_local_dictionary_member_function_can_be_defined_and_called() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+
+    exec.execute_script(
+        &mut editor,
+        "plugin.vim",
+        "let s:logger = {}\nfunction! s:logger.on_stdout()\nlet g:called = 1\nendfunction\ncall s:logger.on_stdout()",
+    )
+    .unwrap();
+
+    assert_eq!(global_number(exec.scope(), "called"), Some(1));
+}
+
+#[test]
+fn lowercase_bare_function_name_still_yields_e128() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    let error = exec
+        .execute_script(&mut editor, "plugin.vim", "function! lowercase()\nendfunction")
+        .unwrap_err();
+    assert_eq!(error_code(&error), "E128");
+}
+
 // ---------------------------------------------------------------------------
 // Family: continuation / comment joining
 // (ex_docmd.c: getline_equal; test_source.vim)

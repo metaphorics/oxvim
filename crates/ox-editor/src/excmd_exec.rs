@@ -24,7 +24,7 @@ use ox_regex::{
     Text as RegexText,
 };
 use ox_text::{Buffer, Position};
-use ox_types::{BufHandle, Dict, Object, OxStr, Special, Typval};
+use ox_types::{BufHandle, Dict, DictRef, Funcref, Object, OxStr, Special, Typval};
 
 use crate::autocmd::{AutocmdKind, AutocmdOptions, AugroupId, DeleteAutocmds, Event};
 use crate::extmark::{ExtmarkAttributes, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, NamespaceId};
@@ -602,19 +602,42 @@ fn run_program<F: FileIO>(
                     Ok(signature) => signature,
                     Err(error) => return userfunc_error_flow(runtime, error),
                 };
+                let dictionary_target = match dictionary_function_target(scope, &signature.name) {
+                    Ok(target) => target,
+                    Err((code, message)) => return error_flow(runtime, code, message),
+                };
                 let body = program[pc + 1..block_end]
                     .iter()
                     .map(|item| render_command(&item.command))
                     .collect::<Vec<_>>();
                 let sid = runtime.scripts.current_sid().unwrap_or(0);
-                if let Err(error) = runtime.functions.define(
+                let canonical = match runtime.functions.define(
                     signature,
                     body,
                     sid,
                     instruction.command.bang,
                     scope,
                 ) {
-                    return userfunc_error_flow(runtime, error);
+                    Ok(name) => name,
+                    Err(error) => return userfunc_error_flow(runtime, error),
+                };
+                if let Some((dictionary, key)) = dictionary_target {
+                    let mut data = match dictionary.try_borrow_mut() {
+                        Ok(data) if !data.lock.locked => data,
+                        Ok(_) => return error_flow(runtime, "E741", "Value is locked"),
+                        Err(_) => return error_flow(runtime, "E742", "Cannot change value"),
+                    };
+                    let value = Typval::Funcref(Funcref {
+                        name: OxStr::from(canonical.as_str()),
+                        args: Vec::new(),
+                        dict: None,
+                        registry: None,
+                    });
+                    if let Some((_, current)) = data.entries.iter_mut().find(|(name, _)| name == &key) {
+                        *current = value;
+                    } else {
+                        data.entries.push((key, value));
+                    }
                 }
                 pc = block_end + 1;
                 continue;
@@ -2519,6 +2542,43 @@ fn parse_number_prefix(text: &str) -> i64 {
 }
 
 fn option_to_typval(value: &OptionValue) -> Typval { match value { OptionValue::Boolean(value) => Typval::Number(i64::from(*value)), OptionValue::Number(value) => Typval::Number(*value), OptionValue::String(value) => Typval::String(OxStr::from(value.as_str())) } }
+
+fn dictionary_function_target(scope: &Scope, name: &str) -> Result<Option<(DictRef, OxStr)>, (&'static str, String)> {
+    let Some((dictionary, member)) = name.rsplit_once('.') else { return Ok(None); };
+    let mut path = dictionary.split('.');
+    let root = path.next().expect("a dotted function name has a dictionary root");
+    let root_value = if root.as_bytes().get(1) == Some(&b':') {
+        let kind = ScopeKind::from_byte(root.as_bytes()[0]).ok_or_else(|| ("E128", format!("Invalid function name: {name}")))?;
+        if kind == ScopeKind::Global {
+            return Err(("E862", "Cannot use g: here".to_owned()));
+        }
+        scope.get_scoped(kind, &root.as_bytes()[2..], 0)
+    } else {
+        scope.get(root.as_bytes(), 0)
+    }
+    .map_err(|error| (error.code, error.message))?
+    .clone();
+
+    let mut current = match root_value {
+        Typval::Dict(dictionary) => dictionary,
+        _ => return Err(("E715", "Dictionary required".to_owned())),
+    };
+    for key in path {
+        let value = current
+            .try_borrow()
+            .map_err(|_| ("E724", "Unable to correctly dump variable with self-referencing container".to_owned()))?
+            .entries
+            .iter()
+            .find(|(name, _)| name.as_bytes() == key.as_bytes())
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| ("E716", format!("Key not present in Dictionary: {key}")))?;
+        current = match value {
+            Typval::Dict(dictionary) => dictionary,
+            _ => return Err(("E715", "Dictionary required".to_owned())),
+        };
+    }
+    Ok(Some((current, OxStr::from(member))))
+}
 
 fn typval_to_option(value: &Typval, value_type: OptionType) -> Result<OptionValue, String> { match value_type { OptionType::Boolean => typval_number(value).map(|value| OptionValue::Boolean(value != 0)).ok_or_else(|| "Number required".to_owned()), OptionType::Number => typval_number(value).map(OptionValue::Number).ok_or_else(|| "Number required".to_owned()), OptionType::String => Ok(OptionValue::String(typval_to_text(value))) } }
 
