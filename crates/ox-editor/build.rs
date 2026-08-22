@@ -214,6 +214,9 @@ fn parse_literal(value: &str) -> Option<Literal> {
         // &columns < 80`) relies on.
         "macros('DFLT_COLS', 'number')" => Some(Literal::Number(80)),
         "macros('DFLT_ROWS', 'number')" => Some(Literal::Number(24)),
+        "macros('DFLT_GREPFORMAT', 'string')" => {
+            Some(Literal::String("%f:%l:%m,%f:%l%m,%f  %l%m".to_owned()))
+        }
         _ => parse_string(value)
             .map(Literal::String)
             .or_else(|| value.parse::<i64>().ok().map(Literal::Number)),

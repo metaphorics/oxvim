@@ -253,6 +253,20 @@ fn set_query_produces_echo_message() {
     assert_eq!(message_text(&msgs[0]), "nonumber");
 }
 
+#[test]
+fn set_reset_restores_macro_backed_grepformat_default() {
+    let (mut editor, _, _) = editor_with_window();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&mut editor, "set grepformat=custom").unwrap();
+    exec.execute_line(&mut editor, "set grepformat&").unwrap();
+
+    assert_eq!(
+        editor.options().get_global("grepformat").unwrap(),
+        &crate::OptionValue::String("%f:%l:%m,%f:%l%m,%f  %l%m".to_owned())
+    );
+}
+
 // option.c:set_option_value, E518 — `:set` on an unknown option name
 // raises E518 "Unknown option".
 #[test]
