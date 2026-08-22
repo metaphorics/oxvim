@@ -25,6 +25,7 @@ use ox_regex::{
     compile as compile_regex, exec_at as regex_exec_at, Magic, Position as RegexPosition,
     Text as RegexText,
 };
+use ox_sys::LocaleCategory;
 use ox_text::{Buffer, Position};
 use ox_types::{BufHandle, Dict, DictRef, Funcref, Object, OxStr, Special, Typval};
 
@@ -852,6 +853,7 @@ fn dispatch<F: FileIO>(
         "marks" => command_marks(runtime, editor),
         "registers" | "display" => command_registers(runtime, editor, &command.args),
         "colorscheme" => command_colorscheme(runtime, editor, scope, lua, command),
+        "language" => command_language(runtime, editor, scope, command),
         "highlight" => command_highlight(runtime, editor, command),
         "augroup" => command_augroup(runtime, editor, command),
         "autocmd" => command_autocmd(runtime, editor, command),
@@ -2674,6 +2676,120 @@ fn command_colorscheme<F: FileIO>(
         }
     }
     Flow::Normal
+}
+
+/// `:language` (`os/lang.c` `ex_language`): inspect or set the process
+/// locale. The optional leading keyword `messages`, `ctype`, `time`, or
+/// `collate` selects the category and accepts any unambiguous prefix of at
+/// least three characters, case-insensitively; without one, the argument is
+/// a locale name applied to `LC_ALL`, and an empty argument reports the
+/// current setting as a message. Setting a locale that the C library
+/// rejects raises E197. A successful set resets `$LC_ALL` to the empty
+/// string so it cannot override the category variables, propagates
+/// `LANG`/`LANGUAGE`/`LC_MESSAGES` exactly where upstream does, pins
+/// `LC_NUMERIC` to "C", and republishes `v:lang`, `v:ctype`, `v:lc_time`,
+/// and `v:collate` from the final locale state (`set_lang_var`). Upstream
+/// also seeds the 'helplang' option default and bumps the gettext catalog
+/// counter here; neither is observable in this port (no 'helplang' option
+/// model entry, and translations are out of scope).
+fn command_language<F: FileIO>(
+    runtime: &ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    command: &ExCommand,
+) -> Flow {
+    let arg = command.args.trim();
+    let token_end = arg.find([' ', '\t']).unwrap_or(arg.len());
+    let token = &arg[..token_end];
+    let mut what = LocaleCategory::All;
+    let mut whatstr = "";
+    let mut name = arg;
+    // At least three characters, so a two-letter language name such as "me"
+    // cannot be mistaken for the keyword prefix (upstream comment).
+    if token.len() >= 3 {
+        if is_command_prefix(token, "messages") {
+            what = LocaleCategory::Messages;
+            whatstr = "messages ";
+            name = arg[token_end..].trim_start_matches([' ', '\t']);
+        } else if is_command_prefix(token, "ctype") {
+            what = LocaleCategory::CType;
+            whatstr = "ctype ";
+            name = arg[token_end..].trim_start_matches([' ', '\t']);
+        } else if is_command_prefix(token, "time") {
+            what = LocaleCategory::Time;
+            whatstr = "time ";
+            name = arg[token_end..].trim_start_matches([' ', '\t']);
+        } else if is_command_prefix(token, "collate") {
+            what = LocaleCategory::Collate;
+            whatstr = "collate ";
+            name = arg[token_end..].trim_start_matches([' ', '\t']);
+        }
+    }
+
+    if name.is_empty() {
+        // Upstream reports "Unknown" when the query yields NULL or "".
+        let current = ox_sys::current_locale(what)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "Unknown".to_owned());
+        push_text_message(
+            editor,
+            format!("Current {whatstr}language: \"{current}\""),
+            false,
+            false,
+        );
+        return Flow::Normal;
+    }
+
+    if ox_sys::set_locale(what, name).is_none() {
+        return error_flow(runtime, "E197", format!("Cannot set language to \"{name}\""));
+    }
+    // Keep number parsing on decimal points, as upstream re-pins LC_NUMERIC
+    // after every successful setlocale.
+    ox_sys::set_locale(LocaleCategory::Numeric, "C");
+
+    set_language_env(scope, "LC_ALL", "");
+    if !matches!(what, LocaleCategory::Time | LocaleCategory::Collate) {
+        if what == LocaleCategory::All {
+            set_language_env(scope, "LANG", name);
+            set_language_env(scope, "LANGUAGE", "");
+        }
+        if what != LocaleCategory::CType {
+            set_language_env(scope, "LC_MESSAGES", name);
+        }
+    }
+    refresh_lang_vars(scope);
+    Flow::Normal
+}
+
+/// Case-insensitive prefix match of the whole argument token against a
+/// command keyword, mirroring upstream's `STRNICMP(arg, keyword, len)` with
+/// the token's length: a token longer than the keyword never matches because
+/// the comparison would run past the keyword's terminator.
+fn is_command_prefix(token: &str, keyword: &str) -> bool {
+    token.len() <= keyword.len() && keyword[..token.len()].eq_ignore_ascii_case(token)
+}
+
+/// One `os_setenv` pair from `ex_language`, applied through the audited
+/// seam and mirrored into the executor's `$` scope so `$LC_ALL`-style reads
+/// observe the new value.
+fn set_language_env(scope: &mut Scope, name: &str, value: &str) {
+    ox_sys::set_env(name, value);
+    scope.set_env(name.as_bytes(), Typval::String(OxStr::from(value)));
+}
+
+/// Republishes `v:ctype`, `v:lang`, `v:lc_time`, and `v:collate` from the
+/// process's current locale state, mirroring `set_lang_var`. A missing
+/// query becomes the empty string, as `set_vim_var_string` does with NULL.
+fn refresh_lang_vars(scope: &mut Scope) {
+    for (name, category) in [
+        ("ctype", LocaleCategory::CType),
+        ("lang", LocaleCategory::Messages),
+        ("lc_time", LocaleCategory::Time),
+        ("collate", LocaleCategory::Collate),
+    ] {
+        let value = ox_sys::current_locale(category).unwrap_or_default();
+        replace_scope_pair(&mut scope.vim, name, Typval::String(OxStr::from(value.as_str())));
+    }
 }
 
 fn command_highlight<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {

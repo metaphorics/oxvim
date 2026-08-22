@@ -909,3 +909,101 @@ fn expand_builtin_reads_current_buffer_and_preserves_paths() {
         Some((_, Typval::String(value))) if value.as_bytes() == b"/tmp/build"
     ));
 }
+
+// ---------------------------------------------------------------------------
+// :language (os/lang.c ex_language; oldtest test_excmd.vim Test_language_cmd)
+// ---------------------------------------------------------------------------
+
+fn vim_string(scope: &Scope, name: &str) -> Option<String> {
+    scope
+        .vim
+        .iter()
+        .find(|(key, _)| key.as_bytes() == name.as_bytes())
+        .and_then(|(_, value)| match value {
+            Typval::String(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+}
+
+#[test]
+fn language_messages_sets_env_and_vim_vars() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+
+    // `lang mess C` exercises the abbreviated keyword form oldtest's
+    // runtest.vim uses ("Output all messages in English").
+    exec.execute_line(&mut editor, "lang mess C").unwrap();
+
+    assert_eq!(vim_string(exec.scope(), "lang").as_deref(), Some("C"));
+    assert_eq!(vim_string(exec.scope(), "ctype").as_deref(), Some("C"));
+    assert_eq!(vim_string(exec.scope(), "lc_time").as_deref(), Some("C"));
+    assert_eq!(vim_string(exec.scope(), "collate").as_deref(), Some("C"));
+    assert_eq!(std::env::var_os("LC_ALL").as_deref(), Some(std::ffi::OsStr::new("")));
+    assert_eq!(std::env::var_os("LC_MESSAGES").as_deref(), Some(std::ffi::OsStr::new("C")));
+}
+
+#[test]
+fn language_without_keyword_sets_lang_and_language_env() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+
+    exec.execute_line(&mut editor, "language C").unwrap();
+
+    assert_eq!(vim_string(exec.scope(), "lang").as_deref(), Some("C"));
+    assert_eq!(std::env::var_os("LANG").as_deref(), Some(std::ffi::OsStr::new("C")));
+    assert_eq!(std::env::var_os("LANGUAGE").as_deref(), Some(std::ffi::OsStr::new("")));
+    assert_eq!(std::env::var_os("LC_ALL").as_deref(), Some(std::ffi::OsStr::new("")));
+    assert_eq!(std::env::var_os("LC_MESSAGES").as_deref(), Some(std::ffi::OsStr::new("C")));
+}
+
+#[test]
+fn language_ctype_leaves_lang_and_messages_env_untouched() {
+    ox_sys::set_env("LANG", "ox-language-sentinel");
+    ox_sys::set_env("LC_MESSAGES", "ox-language-sentinel");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+
+    exec.execute_line(&mut editor, "language ctype C").unwrap();
+
+    assert_eq!(vim_string(exec.scope(), "ctype").as_deref(), Some("C"));
+    assert_eq!(
+        std::env::var_os("LANG").as_deref(),
+        Some(std::ffi::OsStr::new("ox-language-sentinel"))
+    );
+    assert_eq!(
+        std::env::var_os("LC_MESSAGES").as_deref(),
+        Some(std::ffi::OsStr::new("ox-language-sentinel"))
+    );
+}
+
+#[test]
+fn language_rejected_locale_is_e197_for_ctype_and_time() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+
+    for keyword in ["ctype", "time"] {
+        let error = exec
+            .execute_line(&mut editor, &format!("language {keyword} non_existing_lang.bad"))
+            .unwrap_err();
+        assert_eq!(error_code(&error), "E197");
+        assert!(
+            error.to_string().contains("Cannot set language to \"non_existing_lang.bad\""),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn language_without_name_reports_current_locale() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    exec.execute_line(&mut editor, "language C").unwrap();
+
+    exec.execute_line(&mut editor, "language messages").unwrap();
+    let last = editor.messages().last().unwrap();
+    assert_eq!(last.content, Object::String(OxStr::from("Current messages language: \"C\"")));
+
+    exec.execute_line(&mut editor, "language").unwrap();
+    let last = editor.messages().last().unwrap();
+    assert_eq!(last.content, Object::String(OxStr::from("Current language: \"C\"")));
+}
