@@ -26,7 +26,7 @@ use ox_types::{Object, OxStr, Typval};
 
 use crate::excmd_exec::{ExecError, ExecOutcome};
 use crate::register::RegisterContent;
-use crate::{Editor, ExExecutor, Geometry, MessageKind, OptionValue, VimExceptionKind};
+use crate::{Editor, ExExecutor, Geometry, LuaExec, LuaExecError, MessageKind, OptionValue, VimExceptionKind};
 use ox_types::WinHandle;
 
 /// Build an editor with one listed buffer and a tabpage so window-local
@@ -459,5 +459,96 @@ fn e488_from_call_trailing_characters() {
             assert_eq!(exc.throwpoint, "command line");
         }
         other => panic!("expected Vim E488, got {other:?}"),
+    }
+}
+
+// ── lua ────────────────────────────────────────────────────────────────
+
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+#[derive(Default)]
+struct FakeLua {
+    chunks: Vec<(String, Vec<Object>)>,
+    files: Vec<PathBuf>,
+    error: Option<LuaExecError>,
+}
+
+impl LuaExec for FakeLua {
+    fn execute_chunk(&mut self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError> {
+        self.chunks.push((code.to_owned(), args.clone()));
+        if let Some(error) = self.error.clone() {
+            return Err(error);
+        }
+        match args.as_slice() {
+            [Object::String(line), Object::Integer(lnum)] => Ok(Object::String(OxStr::from(
+                format!("{}:{lnum}", line.to_string_lossy()).as_str(),
+            ))),
+            _ => Ok(Object::Nil),
+        }
+    }
+
+    fn execute_file(&mut self, path: &Path) -> Result<(), LuaExecError> {
+        self.files.push(path.to_path_buf());
+        self.error.clone().map_or(Ok(()), Err)
+    }
+}
+
+fn lua_executor(host: Rc<RefCell<FakeLua>>) -> ExExecutor {
+    let mut executor = ExExecutor::new();
+    executor.set_lua_exec(host);
+    executor
+}
+
+#[test]
+fn lua_executes_exact_chunk() {
+    let mut editor = Editor::new();
+    let host = Rc::new(RefCell::new(FakeLua::default()));
+    lua_executor(host.clone()).execute_line(&mut editor, "lua local x = 1 | 2").unwrap();
+    assert_eq!(host.borrow().chunks[0], ("local x = 1 | 2".to_owned(), Vec::new()));
+}
+
+#[test]
+fn luafile_executes_named_file() {
+    let mut editor = Editor::new();
+    let host = Rc::new(RefCell::new(FakeLua::default()));
+    lua_executor(host.clone()).execute_line(&mut editor, "luafile runtime/colors/vim.lua").unwrap();
+    assert_eq!(host.borrow().files, [PathBuf::from("runtime/colors/vim.lua")]);
+}
+
+#[test]
+fn luado_transforms_every_line_with_line_number() {
+    let (mut editor, buffer, _) = editor_with_window();
+    editor.replace_buffer_lines(
+        buffer,
+        1,
+        1,
+        &[b"alpha".to_vec(), b"beta".to_vec()],
+        ox_text::Position { lnum: 1, col: 0 },
+        ox_text::Position { lnum: 1, col: 0 },
+        0,
+    ).unwrap();
+    let host = Rc::new(RefCell::new(FakeLua::default()));
+    lua_executor(host.clone()).execute_line(&mut editor, "luado return line").unwrap();
+    let lines = (1..=2).map(|lnum| editor.buffer(buffer).unwrap().text().unwrap().line(lnum).unwrap()).collect::<Vec<_>>();
+    assert_eq!(lines, [b"alpha:1".to_vec(), b"beta:2".to_vec()]);
+    assert_eq!(host.borrow().chunks.len(), 2);
+}
+
+#[test]
+fn lua_runtime_error_is_catchable_vim_error() {
+    let mut editor = Editor::new();
+    let host = Rc::new(RefCell::new(FakeLua {
+        error: Some(LuaExecError::Runtime("boom".to_owned())),
+        ..FakeLua::default()
+    }));
+    let error = lua_executor(host).execute_line(&mut editor, "lua error('boom')").unwrap_err();
+    match error {
+        ExecError::Vim(exception) => {
+            assert_eq!(exception.kind, VimExceptionKind::Error("E5108".to_owned()));
+            assert!(exception.message().contains("boom"));
+        }
+        other => panic!("expected Vim error, got {other:?}"),
     }
 }

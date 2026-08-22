@@ -7,6 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use ox_eval::scope::{OptionScope as EvalOptionScope, ScopeMap};
 use ox_eval::{
@@ -120,6 +122,26 @@ impl From<ParseError> for ExecError {
     }
 }
 
+/// Error returned by the host-independent Lua execution seam.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LuaExecError {
+    /// Lua source could not be compiled or loaded.
+    Load(String),
+    /// Lua source raised an error while running.
+    Runtime(String),
+    /// A value could not cross the Lua/Object boundary.
+    Conversion(String),
+}
+
+/// Host seam used by Ex Lua commands without coupling `ox-editor` to `ox-lua`.
+pub trait LuaExec {
+    /// Compile and execute one Lua chunk with varargs.
+    fn execute_chunk(&mut self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError>;
+
+    /// Load and execute one Lua file.
+    fn execute_file(&mut self, path: &Path) -> Result<(), LuaExecError>;
+}
+
 /// Definition created by `:command`.
 #[derive(Clone, Debug)]
 pub struct UserCommand {
@@ -210,6 +232,7 @@ impl<F: FileIO> ExRuntime<F> {
 pub struct ExExecutor<F: FileIO = RealFileIO> {
     runtime: ExRuntime<F>,
     scope: Scope,
+    lua: Option<Rc<RefCell<dyn LuaExec>>>,
 }
 
 impl ExExecutor<RealFileIO> {
@@ -240,7 +263,13 @@ impl<F: FileIO> ExExecutor<F> {
         Self {
             runtime: ExRuntime::new(io),
             scope,
+            lua: None,
         }
+    }
+
+    /// Installs the Lua host used by `:lua`, `:luafile`, and `:luado`.
+    pub fn set_lua_exec(&mut self, lua: Rc<RefCell<dyn LuaExec>>) {
+        self.lua = Some(lua);
     }
 
     /// Script/SID/runtime-root state.
@@ -278,7 +307,7 @@ impl<F: FileIO> ExExecutor<F> {
         }];
         let program = parse_program(&self.runtime.user_commands, &logical)?;
         sync_editor_into_scope(editor, &mut self.scope)?;
-        let flow = run_program(&mut self.runtime, editor, &mut self.scope, &program, 0, program.len());
+        let flow = run_program(&mut self.runtime, editor, &mut self.scope, self.lua.as_ref(), &program, 0, program.len());
         sync_scope_into_editor(editor, &self.scope)?;
         flow_to_result(flow)
     }
@@ -299,6 +328,7 @@ impl<F: FileIO> ExExecutor<F> {
             &mut self.runtime,
             editor,
             &mut self.scope,
+            self.lua.as_ref(),
             &program,
             0,
             program.len(),
@@ -330,6 +360,7 @@ impl<F: FileIO> ExExecutor<F> {
                         &mut self.runtime,
                         editor,
                         &mut self.scope,
+                        self.lua.as_ref(),
                         &program,
                         0,
                         program.len(),
@@ -355,7 +386,7 @@ impl<F: FileIO> ExExecutor<F> {
         editor: &mut Editor,
         path: &Path,
     ) -> Result<ExecOutcome, ExecError> {
-        source_path(&mut self.runtime, editor, &mut self.scope, path, false)
+        source_path(&mut self.runtime, editor, &mut self.scope, self.lua.as_ref(), path, false)
             .and_then(flow_to_result)
     }
 }
@@ -426,6 +457,7 @@ fn run_program<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     program: &[Instruction],
     start: usize,
     end: usize,
@@ -456,7 +488,7 @@ fn run_program<F: FileIO>(
                     }
                 }
                 if let Some((branch_start, branch_end)) = chosen {
-                    let flow = run_program(runtime, editor, scope, program, branch_start, branch_end);
+                    let flow = run_program(runtime, editor, scope, lua, program, branch_start, branch_end);
                     if !matches!(flow, Flow::Normal) {
                         return flow;
                     }
@@ -474,7 +506,7 @@ fn run_program<F: FileIO>(
                         Ok(false) => break,
                         Err(flow) => return flow,
                     }
-                    match run_program(runtime, editor, scope, program, pc + 1, block_end) {
+                    match run_program(runtime, editor, scope, lua, program, pc + 1, block_end) {
                         Flow::Normal | Flow::Continue => {}
                         Flow::Break => break,
                         flow => return flow,
@@ -490,7 +522,7 @@ fn run_program<F: FileIO>(
                 let Some((target, expression)) = split_for(&instruction.command.args) else {
                     return error_flow(runtime, "E690", "Missing \"in\" after :for");
                 };
-                let value = match eval_text(runtime, editor, scope, expression) {
+                let value = match eval_text(runtime, editor, scope, lua, expression) {
                     Ok(value) => value,
                     Err(flow) => return flow,
                 };
@@ -502,7 +534,7 @@ fn run_program<F: FileIO>(
                     if let Err(flow) = assign_target(runtime, editor, scope, target, value, false) {
                         return flow;
                     }
-                    match run_program(runtime, editor, scope, program, pc + 1, block_end) {
+                    match run_program(runtime, editor, scope, lua, program, pc + 1, block_end) {
                         Flow::Normal | Flow::Continue => {}
                         Flow::Break => break,
                         flow => return flow,
@@ -515,7 +547,7 @@ fn run_program<F: FileIO>(
                 let Some(block) = find_try(program, pc, end) else {
                     return error_flow(runtime, "E600", "Missing :endtry");
                 };
-                let mut pending = run_program(runtime, editor, scope, program, pc + 1, block.try_end);
+                let mut pending = run_program(runtime, editor, scope, lua, program, pc + 1, block.try_end);
                 if let Flow::Exception(exception) = &pending {
                     let message = exception.message();
                     let throwpoint = exception.throwpoint.clone();
@@ -538,7 +570,7 @@ fn run_program<F: FileIO>(
                                 "throwpoint",
                                 Typval::String(OxStr::from(throwpoint.as_str())),
                             );
-                            pending = run_program(runtime, editor, scope, program, catch.start, catch.end);
+                            pending = run_program(runtime, editor, scope, lua, program, catch.start, catch.end);
                             restore_scope_pair(&mut scope.vim, "exception", saved_exception);
                             restore_scope_pair(&mut scope.vim, "throwpoint", saved_throwpoint);
                             break;
@@ -546,7 +578,7 @@ fn run_program<F: FileIO>(
                     }
                 }
                 if let Some((finally_start, finally_end)) = block.finally {
-                    let final_flow = run_program(runtime, editor, scope, program, finally_start, finally_end);
+                    let final_flow = run_program(runtime, editor, scope, lua, program, finally_start, finally_end);
                     if !matches!(final_flow, Flow::Normal) {
                         pending = final_flow;
                     }
@@ -589,7 +621,7 @@ fn run_program<F: FileIO>(
             _ => {}
         }
 
-        let flow = dispatch(runtime, editor, scope, &instruction.command, program, pc);
+        let flow = dispatch(runtime, editor, scope, lua, &instruction.command);
         if !matches!(flow, Flow::Normal) {
             return flow;
         }
@@ -602,12 +634,14 @@ fn dispatch<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
-    _program: &[Instruction],
-    _pc: usize,
 ) -> Flow {
     let name = command.command.name();
     match name {
+        "lua" => command_lua(runtime, editor, lua, command),
+        "luado" => command_luado(runtime, editor, lua, command),
+        "luafile" => command_luafile(runtime, lua, command),
         "let" => command_let(runtime, editor, scope, &command.args, false),
         "const" => command_let(runtime, editor, scope, &command.args, true),
         "unlet" => command_unlet(runtime, editor, scope, &command.args, command.bang),
@@ -619,7 +653,7 @@ fn dispatch<F: FileIO>(
         }
         "break" => Flow::Break,
         "continue" => Flow::Continue,
-        "throw" => match eval_text(runtime, editor, scope, command.args.trim()) {
+        "throw" => match eval_text(runtime, editor, scope, lua, command.args.trim()) {
             Ok(value) => Flow::Exception(VimException {
                 kind: VimExceptionKind::Throw,
                 value,
@@ -627,29 +661,29 @@ fn dispatch<F: FileIO>(
             }),
             Err(flow) => flow,
         },
-        "call" => command_call(runtime, editor, scope, command),
+        "call" => command_call(runtime, editor, scope, lua, command),
         "return" => {
             if command.args.trim().is_empty() {
                 Flow::Return(Typval::Number(0))
             } else {
-                match eval_text(runtime, editor, scope, command.args.trim()) {
+                match eval_text(runtime, editor, scope, lua, command.args.trim()) {
                     Ok(value) => Flow::Return(value),
                     Err(flow) => flow,
                 }
             }
         }
-        "execute" => command_execute(runtime, editor, scope, &command.args),
+        "execute" => command_execute(runtime, editor, scope, lua, &command.args),
         "source" => {
             let path = PathBuf::from(command.args.trim());
-            match source_path(runtime, editor, scope, &path, false) {
+            match source_path(runtime, editor, scope, lua, &path, false) {
                 Ok(flow) => flow,
                 Err(error) => exec_error_flow(runtime, error),
             }
         }
         "finish" => Flow::Finish,
         "normal" => command_normal(runtime, editor, &command.args),
-        "global" => command_global(runtime, editor, scope, command, false),
-        "vglobal" => command_global(runtime, editor, scope, command, true),
+        "global" => command_global(runtime, editor, scope, lua, command, false),
+        "vglobal" => command_global(runtime, editor, scope, lua, command, true),
         "substitute" => command_substitute(runtime, editor, scope, command),
         "edit" => command_edit(runtime, editor, command),
         "write" | "wq" | "xit" => {
@@ -690,7 +724,7 @@ fn dispatch<F: FileIO>(
             command_map(runtime, editor, command)
         }
         _ => match &command.command {
-            ResolvedCommand::User(user_name) => command_invoke_user(runtime, editor, scope, user_name, command),
+            ResolvedCommand::User(user_name) => command_invoke_user(runtime, editor, scope, lua, user_name, command),
             ResolvedCommand::Builtin(spec) => Flow::NotImplemented(spec.name.to_owned()),
         },
     }
@@ -700,6 +734,7 @@ fn eval_text<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     text: &str,
 ) -> Result<Typval, Flow> {
     let expression = ExprParser::new(text.as_bytes())
@@ -709,6 +744,7 @@ fn eval_text<F: FileIO>(
     let mut host = EvalHost {
         runtime,
         editor,
+        lua,
         builtins: Builtins::new(&regex),
         submatches: None,
     };
@@ -723,7 +759,7 @@ fn eval_condition<F: FileIO>(
     scope: &mut Scope,
     text: &str,
 ) -> Result<bool, Flow> {
-    let value = eval_text(runtime, editor, scope, text)?;
+    let value = eval_text(runtime, editor, scope, None, text)?;
     match value {
         Typval::Number(number) => Ok(number != 0),
         Typval::Bool(value) => Ok(value),
@@ -737,6 +773,7 @@ fn eval_condition<F: FileIO>(
 struct EvalHost<'a, F: FileIO> {
     runtime: &'a mut ExRuntime<F>,
     editor: &'a mut Editor,
+    lua: Option<&'a Rc<RefCell<dyn LuaExec>>>,
     builtins: Builtins<'a>,
     submatches: Option<Vec<String>>,
 }
@@ -768,7 +805,17 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         }
         let sid = self.runtime.scripts.current_sid().unwrap_or(0);
         if self.runtime.functions.contains(&name_text, sid) || name_text.contains('#') {
-            return call_user_function(self.runtime, self.editor, scope, &name_text, args, 1, 1)
+            let (first, last) = current_line_pair(self.editor);
+            return call_user_function(
+                self.runtime,
+                self.editor,
+                scope,
+                self.lua,
+                &name.to_string_lossy(),
+                args,
+                first,
+                last,
+            )
                 .map_err(|flow| flow_to_eval_error(flow, &name_text));
         }
         self.builtins.call(name, args, scope)
@@ -949,6 +996,7 @@ fn call_user_function<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     name: &str,
     args: Vec<Typval>,
     first_line: usize,
@@ -960,7 +1008,7 @@ fn call_user_function<F: FileIO>(
             error_flow(runtime, "E117", format!("Unknown function: {name}"))
         })?;
         if !runtime.scripts.is_sourced_once(&path) {
-            let flow = source_path(runtime, editor, scope, &path, true)
+            let flow = source_path(runtime, editor, scope, lua, &path, true)
                 .map_err(|error| exec_error_flow(runtime, error))?;
             if !matches!(flow, Flow::Normal | Flow::Finish) {
                 return Err(flow);
@@ -991,7 +1039,7 @@ fn call_user_function<F: FileIO>(
     if function.sid != 0 {
         runtime.scripts.load_script_scope(function.sid, scope);
     }
-    let flow = run_program(runtime, editor, scope, &parsed, 0, parsed.len());
+    let flow = run_program(runtime, editor, scope, lua, &parsed, 0, parsed.len());
     if function.sid != 0 {
         runtime.scripts.store_script_scope(function.sid, scope);
     }
@@ -1008,6 +1056,7 @@ fn source_path<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     path: &Path,
     load_once: bool,
 ) -> Result<Flow, ExecError> {
@@ -1035,7 +1084,7 @@ fn source_path<F: FileIO>(
     }
     let program = parse_program(&runtime.user_commands, &lines);
     let flow = match program {
-        Ok(program) => run_program(runtime, editor, scope, &program, 0, program.len()),
+        Ok(program) => run_program(runtime, editor, scope, lua, &program, 0, program.len()),
         Err(error) => exec_error_flow(runtime, error),
     };
     runtime.scripts.store_script_scope(sid, scope);
@@ -1054,7 +1103,7 @@ fn command_let<F: FileIO>(
     let Some((target, operator, expression)) = split_assignment(args) else {
         return error_flow(runtime, "E121", format!("Undefined variable: {}", args.trim()));
     };
-    let value = match eval_text(runtime, editor, scope, expression) {
+    let value = match eval_text(runtime, editor, scope, None, expression) {
         Ok(value) => value,
         Err(flow) => return flow,
     };
@@ -1146,7 +1195,7 @@ fn command_echo<F: FileIO>(
     let expressions = split_expressions(args);
     let mut pieces = Vec::new();
     for expression in expressions {
-        let value = match eval_text(runtime, editor, scope, expression) {
+        let value = match eval_text(runtime, editor, scope, None, expression) {
             Ok(value) => value,
             Err(flow) => return flow,
         };
@@ -1162,6 +1211,7 @@ fn command_call<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
 ) -> Flow {
     let text = command.args.trim();
@@ -1195,7 +1245,7 @@ fn command_call<F: FileIO>(
                     }
                 }
             }
-            if let Err(flow) = eval_text(runtime, editor, scope, text) {
+            if let Err(flow) = eval_text(runtime, editor, scope, lua, text) {
                 return flow;
             }
         }
@@ -1206,7 +1256,7 @@ fn command_call<F: FileIO>(
         if arg.trim().is_empty() {
             continue;
         }
-        match eval_text(runtime, editor, scope, arg) {
+        match eval_text(runtime, editor, scope, lua, arg) {
             Ok(value) => values.push(value),
             Err(flow) => return flow,
         }
@@ -1217,7 +1267,7 @@ fn command_call<F: FileIO>(
         .get(name, sid)
         .is_some_and(|function| function.flags.range);
     if command.range.is_none() || accepts_range {
-        return match call_user_function(runtime, editor, scope, name, values, first, last) {
+        return match call_user_function(runtime, editor, scope, lua, name, values, first, last) {
             Ok(_) => Flow::Normal,
             Err(flow) => flow,
         };
@@ -1233,6 +1283,7 @@ fn command_call<F: FileIO>(
             runtime,
             editor,
             scope,
+            lua,
             name,
             values.clone(),
             lnum,
@@ -1248,11 +1299,12 @@ fn command_execute<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     args: &str,
 ) -> Flow {
     let mut pieces = Vec::new();
     for expression in split_expressions(args) {
-        match eval_text(runtime, editor, scope, expression) {
+        match eval_text(runtime, editor, scope, lua, expression) {
             Ok(value) => pieces.push(typval_to_text(&value)),
             Err(flow) => return flow,
         }
@@ -1263,7 +1315,7 @@ fn command_execute<F: FileIO>(
         Ok(program) => program,
         Err(error) => return exec_error_flow(runtime, error),
     };
-    run_program(runtime, editor, scope, &program, 0, program.len())
+    run_program(runtime, editor, scope, lua, &program, 0, program.len())
 }
 
 fn command_normal<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, args: &str) -> Flow {
@@ -1278,6 +1330,7 @@ fn command_global<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
     invert: bool,
 ) -> Flow {
@@ -1369,7 +1422,7 @@ fn command_global<F: FileIO>(
                 return exec_error_flow(runtime, error);
             }
         };
-        let flow = run_program(runtime, editor, scope, &program, 0, program.len());
+        let flow = run_program(runtime, editor, scope, lua, &program, 0, program.len());
         if !matches!(flow, Flow::Normal) {
             cleanup_global_marks(editor, buffer, namespace, &marked);
             return flow;
@@ -1550,6 +1603,7 @@ fn eval_substitute_expression<F: FileIO>(
     let mut host = EvalHost {
         runtime,
         editor,
+        lua: None,
         builtins: Builtins::new(&regex),
         submatches: Some(groups),
     };
@@ -1969,7 +2023,7 @@ fn command_delcommand<F: FileIO>(runtime: &mut ExRuntime<F>, command: &ExCommand
     Flow::Normal
 }
 
-fn command_invoke_user<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, name: &str, command: &ExCommand) -> Flow {
+fn command_invoke_user<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, lua: Option<&Rc<RefCell<dyn LuaExec>>>, name: &str, command: &ExCommand) -> Flow {
     let Some(definition) = runtime.user_commands.commands.get(name).cloned() else { return error_flow(runtime, "E492", format!("Not an editor command: {name}")) };
     let args = command.args.trim();
     let count = count_ex_arguments(args);
@@ -1989,7 +2043,7 @@ fn command_invoke_user<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Edito
         .replace("<reg>", &command.register.map_or(String::new(), |value| value.to_string()));
     let logical = vec![LogicalLine { text: expanded, first_line: runtime.scripts.current_line() }];
     let program = match parse_program(&runtime.user_commands, &logical) { Ok(program) => program, Err(error) => return exec_error_flow(runtime, error) };
-    run_program(runtime, editor, scope, &program, 0, program.len())
+    run_program(runtime, editor, scope, lua, &program, 0, program.len())
 }
 
 fn count_ex_arguments(args: &str) -> usize {
@@ -2709,5 +2763,97 @@ fn flow_to_eval_error(flow: Flow, name: &str) -> EvalError {
         }
         Flow::NotImplemented(name) => EvalError::not_implemented(OxStr(name.into_bytes())),
         _ => EvalError::new("E117", 0, format!("Unknown function: {name}")),
+    }
+}
+
+fn command_lua<F: FileIO>(runtime: &ExRuntime<F>, editor: &Editor, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
+    let Some(lua) = lua else { return Flow::NotImplemented("lua".to_owned()) };
+    let mut code = command.args.trim_start().to_owned();
+    if code.is_empty() {
+        if command.range.is_none() {
+            return error_flow(runtime, "E471", "Argument required");
+        }
+        let buffer = match editor.current_buffer() { Some(buffer) => buffer, None => return error_flow(runtime, "E749", "Empty buffer") };
+        let lines = match buffer_lines(editor, buffer) { Ok(lines) => lines, Err(message) => return error_flow(runtime, "E749", message) };
+        let (first, last) = match resolve_range(editor, command) { Ok(range) => range, Err(message) => return error_flow(runtime, "E16", message) };
+        code = lines[first.saturating_sub(1)..last.min(lines.len())]
+            .iter()
+            .map(|line| String::from_utf8_lossy(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+    } else if let Some(expression) = code.strip_prefix('=') {
+        code = format!("vim._print(true, {expression})");
+    }
+    match lua.borrow_mut().execute_chunk(&code, Vec::new()) {
+        Ok(_) => Flow::Normal,
+        Err(error) => lua_error_flow(runtime, error, "E5107", "E5108"),
+    }
+}
+
+fn command_luafile<F: FileIO>(runtime: &ExRuntime<F>, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
+    let Some(lua) = lua else { return Flow::NotImplemented("luafile".to_owned()) };
+    let path = command.args.trim();
+    if path.is_empty() {
+        return error_flow(runtime, "E471", "Argument required");
+    }
+    match lua.borrow_mut().execute_file(Path::new(path)) {
+        Ok(()) => Flow::Normal,
+        Err(error) => lua_error_flow(runtime, error, "E5112", "E5113"),
+    }
+}
+
+fn command_luado<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
+    let Some(lua) = lua else { return Flow::NotImplemented("luado".to_owned()) };
+    let body = command.args.trim_start();
+    if body.is_empty() {
+        return error_flow(runtime, "E471", "Argument required");
+    }
+    let buffer = match editor.current_buffer() { Some(buffer) => buffer, None => return error_flow(runtime, "E749", "Empty buffer") };
+    let (first, last) = if command.range.is_none() {
+        match buffer_lines(editor, buffer) {
+            Ok(lines) => (1, lines.len()),
+            Err(message) => return error_flow(runtime, "E749", message),
+        }
+    } else {
+        match resolve_range(editor, command) {
+            Ok(range) => range,
+            Err(message) => return error_flow(runtime, "E16", message),
+        }
+    };
+    let chunk = format!("return (function(line, linenr) {body} end)(...)");
+    for lnum in first..=last {
+        let lines = match buffer_lines(editor, buffer) {
+            Ok(lines) => lines,
+            Err(_) => break,
+        };
+        let Some(line) = lines.get(lnum.saturating_sub(1)).cloned() else { break };
+        let result = lua.borrow_mut().execute_chunk(
+            &chunk,
+            vec![Object::String(OxStr(line)), Object::Integer(lnum as i64)],
+        );
+        let replacement = match result {
+            Ok(Object::String(value)) => Some(value.as_bytes().to_vec()),
+            Ok(Object::Integer(value)) => Some(value.to_string().into_bytes()),
+            Ok(Object::Float(value)) => Some(value.to_string().into_bytes()),
+            Ok(_) => None,
+            Err(error) => return lua_error_flow(runtime, error, "E5109", "E5111"),
+        };
+        if let Some(replacement) = replacement {
+            if editor.current_buffer() != Some(buffer) { break; }
+            let cursor = editor.current_window().and_then(|window| editor.window(window).ok()).map_or(Position { lnum, col: 0 }, |window| window.cursor);
+            if let Err(error) = editor.replace_buffer_lines(buffer, lnum, lnum, &[replacement], cursor, cursor, 0) {
+                return error_flow(runtime, "E16", error.to_string());
+            }
+        }
+    }
+    Flow::Normal
+}
+
+fn lua_error_flow<F: FileIO>(runtime: &ExRuntime<F>, error: LuaExecError, load_code: &'static str, runtime_code: &'static str) -> Flow {
+    match error {
+        LuaExecError::Load(message) => error_flow(runtime, load_code, message),
+        LuaExecError::Runtime(message) | LuaExecError::Conversion(message) => {
+            error_flow(runtime, runtime_code, message)
+        }
     }
 }
