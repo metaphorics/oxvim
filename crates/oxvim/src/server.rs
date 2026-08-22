@@ -13,7 +13,7 @@ use ox_api::{CommandExecutor, Registry};
 use ox_editor::{
     AutocmdContext, AutocmdKind, CmdlineKind, Editor, Event, ExExecutor, ExecOutcome, Geometry,
     LuaExec, LuaExecError, MappingAction, MessageKind, Mode, ModeMachine, Keys, OptionValue,
-    RuntimeRoot as EditorRuntimeRoot, TypeaheadFlags,
+    TypeaheadFlags,
 };
 use ox_eval::{
     BufferHost, BuiltinHost as EvalBuiltinHost, Builtins, Scope, call_buffer_builtin,
@@ -88,23 +88,33 @@ impl AppState {
             OxStr::from("servername"),
             Object::String(OxStr::from("")),
         );
+        // option.c set_init_default for 'runtimepath'/'packpath': the
+        // runtimepath_default layout over the resolved runtime tree,
+        // before any user startup command runs.
+        let runtime_path = runtime_root()?;
+        let default_rtp = ox_editor::default_runtimepath(cli.clean, &runtime_path);
         editor
             .options_mut()
-            .set_global("loadplugins", OptionValue::Boolean(cli.loadplugins))
+            .set_global("runtimepath", OptionValue::String(default_rtp.clone()))
+            .map_err(|error| AppError::Editor(error.to_string()))?;
+        editor
+            .options_mut()
+            .set_global("packpath", OptionValue::String(default_rtp.clone()))
             .map_err(|error| AppError::Editor(error.to_string()))?;
         let editor = Rc::new(RefCell::new(editor));
         let registry = Rc::new(ox_api::core().map_err(|error| AppError::Api(error.to_string()))?);
         let lua_work = Rc::new(RefCell::new(VecDeque::new()));
         let ex = Rc::new(RefCell::new(ExExecutor::new()));
         let nested_ex = Rc::new(RefCell::new(ExExecutor::new()));
-        let runtime_path = runtime_root()?;
+        // Runtime searches follow &runtimepath (the seeded default includes
+        // the runtime tree, matching the previous single-root setup).
         ex.borrow_mut()
             .scripts_mut()
-            .add_runtime_root(EditorRuntimeRoot::new(runtime_path.clone()));
+            .set_runtime_roots_from_rtp(&default_rtp);
         nested_ex
             .borrow_mut()
             .scripts_mut()
-            .add_runtime_root(EditorRuntimeRoot::new(runtime_path.clone()));
+            .set_runtime_roots_from_rtp(&default_rtp);
         let channel_ids = editor.borrow().channel_ids();
         ex.borrow_mut().set_channel_ids(channel_ids.clone());
         nested_ex.borrow_mut().set_channel_ids(channel_ids);

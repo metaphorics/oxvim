@@ -96,7 +96,21 @@ pub fn run_batch(cli: &Cli) -> Result<(), AppError> {
         .options_mut()
         .set_global("loadplugins", OptionValue::Boolean(cli.loadplugins))
         .map_err(|error| AppError::Editor(error.to_string()))?;
+    // option.c set_init_default for 'runtimepath'/'packpath' before any
+    // user command runs (option.c runtimepath_default layout).
+    let default_rtp = ox_editor::default_runtimepath(cli.clean, &runtime_root()?);
+    editor
+        .options_mut()
+        .set_global("runtimepath", OptionValue::String(default_rtp.clone()))
+        .map_err(|error| AppError::Editor(error.to_string()))?;
+    editor
+        .options_mut()
+        .set_global("packpath", OptionValue::String(default_rtp.clone()))
+        .map_err(|error| AppError::Editor(error.to_string()))?;
     let mut executor = ExExecutor::new();
+    executor
+        .scripts_mut()
+        .set_runtime_roots_from_rtp(&default_rtp);
     executor.set_channel_ids(editor.channel_ids());
 
     execute_lines(&mut executor, &mut editor, &cli.pre_commands)?;
