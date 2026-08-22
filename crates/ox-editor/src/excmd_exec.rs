@@ -868,6 +868,7 @@ fn dispatch<F: FileIO>(
             }
         }
         "execute" => command_execute(runtime, editor, scope, lua, &command.args),
+        "cd" => command_cd(runtime, &command.args),
         "source" => {
             let path = source_argument_path(editor, &command.args);
             match source_path(runtime, editor, scope, lua, &path, false) {
@@ -2493,6 +2494,17 @@ fn command_execute<F: FileIO>(
         Err(error) => return exec_error_flow(runtime, error),
     };
     run_program(runtime, editor, scope, lua, &program, 0, program.len())
+}
+
+fn command_cd<F: FileIO>(runtime: &ExRuntime<F>, args: &str) -> Flow {
+    let path = args.trim();
+    if path.is_empty() {
+        return error_flow(runtime, "E471", "Argument required");
+    }
+    match std::env::set_current_dir(path) {
+        Ok(()) => Flow::Normal,
+        Err(error) => error_flow(runtime, "E344", format!("Can't find directory {path}: {error}")),
+    }
 }
 
 fn command_normal<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, args: &str) -> Flow {

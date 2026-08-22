@@ -532,6 +532,25 @@ fn execute_keeps_spaced_operators_inside_each_expression() {
     );
 }
 
+#[test]
+fn cd_changes_the_directory_observed_by_getcwd() {
+    static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = CWD_GUARD.lock().unwrap_or_else(|poison| poison.into_inner());
+    let original = std::env::current_dir().unwrap();
+    let target = std::env::temp_dir().join(format!("ox-editor-cd-{}", std::process::id()));
+    std::fs::create_dir_all(&target).unwrap();
+
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    let result = exec.execute_line(&mut editor, &format!("cd {}", target.display()));
+    let changed = std::env::current_dir();
+    std::env::set_current_dir(&original).unwrap();
+    std::fs::remove_dir(&target).unwrap();
+
+    result.unwrap();
+    assert_eq!(changed.unwrap(), target);
+}
+
 // ── normal ─────────────────────────────────────────────────────────────
 
 // ex_docmd.c:ex_normal — `:normal` requires keys and completes after queuing them.
