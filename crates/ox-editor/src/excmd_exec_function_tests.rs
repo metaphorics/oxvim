@@ -38,15 +38,15 @@ use crate::{
 // Deterministic in-memory FileIO for source/autoload tests.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct MemoryFileIO {
-    files: RefCell<BTreeMap<PathBuf, String>>,
+    files: Rc<RefCell<BTreeMap<PathBuf, String>>>,
 }
 
 impl MemoryFileIO {
     fn new() -> Self {
         Self {
-            files: RefCell::new(BTreeMap::new()),
+            files: Rc::new(RefCell::new(BTreeMap::new())),
         }
     }
     fn insert(&self, path: impl Into<PathBuf>, contents: impl Into<String>) {
@@ -64,6 +64,17 @@ impl FileIO for MemoryFileIO {
     }
     fn write_string(&self, path: &Path, contents: &str) -> io::Result<()> {
         self.files.borrow_mut().insert(path.to_path_buf(), contents.to_owned());
+        Ok(())
+    }
+    fn write_bytes(&self, path: &Path, contents: &[u8], append: bool) -> io::Result<()> {
+        let contents = std::str::from_utf8(contents)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid UTF-8"))?;
+        let mut files = self.files.borrow_mut();
+        if append {
+            files.entry(path.to_path_buf()).or_default().push_str(contents);
+        } else {
+            files.insert(path.to_path_buf(), contents.to_owned());
+        }
         Ok(())
     }
     fn exists(&self, path: &Path) -> bool {
@@ -121,6 +132,10 @@ fn editor_with_lines(lines: &[&str]) -> Editor {
         .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
         .unwrap();
     editor
+}
+
+fn register_text(editor: &Editor, name: char) -> String {
+    String::from_utf8(editor.registers().get(name).unwrap().unwrap().to_bytes()).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -1266,4 +1281,94 @@ fn language_without_name_reports_current_locale() {
     exec.execute_line(&mut editor, "language").unwrap();
     let last = editor.messages().last().unwrap();
     assert_eq!(last.content, Object::String(OxStr::from("Current language: \"C\"")));
+}
+
+#[test]
+fn redir_silent_function_pattern_lists_matching_signatures() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &mut editor,
+        "function Test_Alpha(required, optional = {'x': 1}) abort\nendfunction\nfunction Test_Beta(...) range\nendfunction\nfunction Other()\nendfunction",
+    );
+
+    script(&mut exec, &mut editor, "redir @q\nsilent function /^Test_\nredir END");
+
+    assert!(editor.messages().is_empty());
+    assert_eq!(
+        register_text(&editor, 'q'),
+        "function Test_Alpha(required, optional = {'x': 1}) abort\nfunction Test_Beta(...) range"
+    );
+}
+
+#[test]
+fn redir_register_replaces_appends_and_keeps_unsilenced_output_visible() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+
+    exec.execute_line(&mut editor, "let @q = 'old'").unwrap();
+    exec.execute_line(&mut editor, "redir @q").unwrap();
+    assert_eq!(register_text(&editor, 'q'), "");
+    exec.execute_line(&mut editor, "echo 'first'").unwrap();
+    assert_eq!(register_text(&editor, 'q'), "first");
+    exec.execute_line(&mut editor, "redir END").unwrap();
+    assert_eq!(register_text(&editor, 'q'), "first");
+    assert_eq!(editor.messages().len(), 1);
+
+    script(&mut exec, &mut editor, "redir @q>>\nsilent echo 'second'\nredir END");
+    assert_eq!(register_text(&editor, 'q'), "firstsecond");
+    assert_eq!(editor.messages().len(), 1);
+
+    script(&mut exec, &mut editor, "redir @w\nsilent echon 'a'\nsilent echon 'b'\nredir END");
+    assert_eq!(register_text(&editor, 'w'), "ab");
+}
+
+#[test]
+fn redir_variable_replaces_then_appends() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+
+    exec.execute_line(&mut editor, "let g:captured = 'old'").unwrap();
+    exec.execute_line(&mut editor, "redir => g:captured").unwrap();
+    assert_eq!(global_string(exec.scope(), "captured").as_deref(), Some(""));
+    exec.execute_line(&mut editor, "silent echo 'one'").unwrap();
+    assert_eq!(global_string(exec.scope(), "captured").as_deref(), Some(""));
+    exec.execute_line(&mut editor, "redir END").unwrap();
+    assert_eq!(global_string(exec.scope(), "captured").as_deref(), Some("one"));
+
+    script(&mut exec, &mut editor, "redir =>> g:captured\nsilent echo 'two'\nredir END");
+    assert_eq!(global_string(exec.scope(), "captured").as_deref(), Some("onetwo"));
+}
+
+#[test]
+fn redir_file_replaces_then_appends() {
+    let io = MemoryFileIO::new();
+    io.insert("capture.txt", "old");
+    let files = Rc::clone(&io.files);
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+
+    exec.execute_line(&mut editor, "redir > capture.txt").unwrap();
+    assert_eq!(files.borrow().get(Path::new("capture.txt")).map(String::as_str), Some(""));
+    exec.execute_line(&mut editor, "silent echo 'one'").unwrap();
+    assert_eq!(files.borrow().get(Path::new("capture.txt")).map(String::as_str), Some("one"));
+    exec.execute_line(&mut editor, "redir END").unwrap();
+    assert_eq!(files.borrow().get(Path::new("capture.txt")).map(String::as_str), Some("one"));
+    script(&mut exec, &mut editor, "redir >> capture.txt\nsilent echo 'two'\nredir END");
+}
+
+#[test]
+fn nested_redir_is_e930_and_preserves_active_target() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    exec.execute_line(&mut editor, "redir @q").unwrap();
+
+    let error = exec.execute_line(&mut editor, "redir @w").unwrap_err();
+    assert_eq!(error_code(&error), "E930");
+
+    exec.execute_line(&mut editor, "silent echo 'still active'").unwrap();
+    exec.execute_line(&mut editor, "redir END").unwrap();
+    assert_eq!(register_text(&editor, 'q'), "still active");
+    assert!(editor.registers().get('w').unwrap().is_none());
 }

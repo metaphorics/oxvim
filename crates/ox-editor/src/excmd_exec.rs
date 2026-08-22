@@ -18,8 +18,8 @@ use ox_eval::{
     Scope, ScopeKind,
 };
 use ox_excmd::{
-    resolve_command, Address, AddressBase, ExCommand, ParseError, Parser as ExParser, Range,
-    RangeKind, ResolveError, ResolvedCommand, UserCommandMatch, UserCommandProvider,
+    resolve_command, Address, AddressBase, ExCommand, ModifierKind, ParseError, Parser as ExParser,
+    Range, RangeKind, ResolveError, ResolvedCommand, UserCommandMatch, UserCommandProvider,
 };
 use ox_regex::{
     compile as compile_regex, exec_at as regex_exec_at, Magic, Position as RegexPosition,
@@ -223,6 +223,20 @@ impl UserCommandProvider for UserCommandRegistry {
     }
 }
 
+#[derive(Clone, Debug)]
+enum RedirTarget {
+    Register { name: char },
+    Variable { name: String, append: bool },
+    File { path: PathBuf },
+}
+
+#[derive(Clone, Debug)]
+struct Redirection {
+    target: RedirTarget,
+    output: String,
+    seen_messages: usize,
+}
+
 struct ExRuntime<F: FileIO> {
     scripts: ScriptCtx<F>,
     functions: UserFunctions,
@@ -231,6 +245,7 @@ struct ExRuntime<F: FileIO> {
     channel_ids: ChannelIds,
     jobs: Option<JobManager>,
     current_augroup: AugroupId,
+    redirection: Option<Redirection>,
 }
 
 impl<F: FileIO> ExRuntime<F> {
@@ -243,6 +258,7 @@ impl<F: FileIO> ExRuntime<F> {
             channel_ids: ChannelIds::new(),
             jobs: None,
             current_augroup: AugroupId::default(),
+            redirection: None,
         }
     }
 
@@ -717,6 +733,19 @@ fn run_program<F: FileIO>(
                 continue;
             }
             "function" => {
+                let listed = command.args.trim().is_empty() || command.args.trim_start().starts_with('/');
+                if listed {
+                    let message_start = editor.messages().len();
+                    let flow = command_function_list(runtime, editor, command);
+                    if let Err(capture_flow) = capture_command_messages(runtime, editor, scope, command, message_start) {
+                        return capture_flow;
+                    }
+                    if !matches!(flow, Flow::Normal) {
+                        return flow;
+                    }
+                    pc += 1;
+                    continue;
+                }
                 let Some(block_end) = find_matching(program, pc, end, "function", "endfunction") else {
                     return error_flow(runtime, "E126", "Missing :endfunction");
                 };
@@ -771,7 +800,11 @@ fn run_program<F: FileIO>(
             _ => {}
         }
 
+        let message_start = editor.messages().len();
         let flow = dispatch(runtime, editor, scope, lua, command);
+        if let Err(capture_flow) = capture_command_messages(runtime, editor, scope, command, message_start) {
+            return capture_flow;
+        }
         if !matches!(flow, Flow::Normal) {
             return flow;
         }
@@ -802,6 +835,7 @@ fn dispatch<F: FileIO>(
         "echo" | "echomsg" | "echon" | "echoerr" => {
             command_echo(runtime, editor, scope, lua, name, &command.args)
         }
+        "redir" => command_redir(runtime, editor, scope, command),
         "break" => Flow::Break,
         "continue" => Flow::Continue,
         "throw" => match eval_text(runtime, editor, scope, lua, command.args.trim()) {
@@ -1866,6 +1900,237 @@ fn command_echo<F: FileIO>(
     let text = pieces.join(separator);
     push_text_message(editor, text, name == "echoerr", name == "echomsg");
     Flow::Normal
+}
+
+fn command_function_list<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    command: &ExCommand,
+) -> Flow {
+    let argument = command.args.trim();
+    let pattern = if argument.is_empty() {
+        None
+    } else {
+        let source = &argument[1..];
+        let (pattern, trailing) = match take_delimited(argument, '/') {
+            Some((pattern, trailing)) => (pattern, trailing.trim()),
+            None => (source.to_owned(), ""),
+        };
+        if !trailing.is_empty() {
+            return error_flow(runtime, "E488", "Trailing characters");
+        }
+        let compiled = match compile_regex(&pattern, Magic::Magic) {
+            Ok(compiled) => compiled,
+            Err(error) => return error_flow(runtime, "E54", error.to_string()),
+        };
+        Some(compiled)
+    };
+
+    for (name, function) in runtime.functions.iter() {
+        if name.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+            continue;
+        }
+        if pattern.as_ref().is_some_and(|compiled| {
+            ox_regex::exec(compiled, &RegexText::new(name.to_owned())).is_none()
+        }) {
+            continue;
+        }
+        let required = function.args.len().saturating_sub(function.default_args.len());
+        let mut arguments = Vec::with_capacity(function.args.len() + usize::from(function.varargs));
+        for (index, argument) in function.args.iter().enumerate() {
+            if index < required {
+                arguments.push(argument.clone());
+            } else {
+                arguments.push(format!("{argument} = {}", function.default_args[index - required]));
+            }
+        }
+        if function.varargs {
+            arguments.push("...".to_owned());
+        }
+        let mut signature = format!("function {name}({})", arguments.join(", "));
+        if function.flags.abort { signature.push_str(" abort"); }
+        if function.flags.range { signature.push_str(" range"); }
+        if function.flags.dict { signature.push_str(" dict"); }
+        if function.flags.closure { signature.push_str(" closure"); }
+        push_text_message(editor, signature, false, false);
+    }
+    Flow::Normal
+}
+
+fn command_redir<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    command: &ExCommand,
+) -> Flow {
+    let argument = command.args.trim();
+    if argument.eq_ignore_ascii_case("END") {
+        let Some(redirection) = runtime.redirection.take() else { return Flow::Normal };
+        return finish_redirection(runtime, editor, scope, redirection);
+    }
+    if runtime.redirection.is_some() {
+        return error_flow(runtime, "E930", "Cannot use :redir while redirection is active");
+    }
+
+    let target = if let Some(register) = argument.strip_prefix('@') {
+        let mut chars = register.chars();
+        let Some(written_name) = chars.next() else { return error_flow(runtime, "E474", "Invalid argument") };
+        let suffix = chars.as_str();
+        if !matches!(suffix, "" | ">" | ">>") || written_name == '_' {
+            return error_flow(runtime, "E474", format!("Invalid argument: {argument}"));
+        }
+        let append = written_name.is_ascii_uppercase() || suffix == ">>";
+        let name = written_name.to_ascii_lowercase();
+        if editor.registers().get(name).is_err() {
+            return error_flow(runtime, "E474", format!("Invalid argument: {argument}"));
+        }
+        if !append {
+            let empty = match RegisterContent::characterwise(&[]) {
+                Ok(content) => content,
+                Err(error) => return error_flow(runtime, "E354", error.to_string()),
+            };
+            if let Err(error) = editor.registers_mut().set(name, empty) {
+                return error_flow(runtime, "E354", error.to_string());
+            }
+            scope.set_register(&[name as u8], Typval::String(OxStr::from("")));
+        }
+        RedirTarget::Register { name }
+    } else if let Some(variable) = argument.strip_prefix("=>>").map(str::trim) {
+        if variable.is_empty() || variable.starts_with(['@', '$', '&']) {
+            return error_flow(runtime, "E474", "Invalid argument");
+        }
+        match read_target(runtime, editor, scope, variable) {
+            Ok(Typval::String(_)) => {}
+            Ok(_) => return error_flow(runtime, "E734", "Wrong variable type for .="),
+            Err(flow) => return flow,
+        }
+        RedirTarget::Variable { name: variable.to_owned(), append: true }
+    } else if let Some(variable) = argument.strip_prefix("=>").map(str::trim) {
+        if variable.is_empty() || variable.starts_with(['@', '$', '&']) {
+            return error_flow(runtime, "E474", "Invalid argument");
+        }
+        if let Err(flow) = assign_target(runtime, editor, scope, variable, Typval::String(OxStr::from("")), false) {
+            return flow;
+        }
+        RedirTarget::Variable { name: variable.to_owned(), append: false }
+    } else if let Some(file) = argument.strip_prefix(">>").map(str::trim) {
+        if file.is_empty() { return error_flow(runtime, "E474", "Invalid argument") }
+        let path = PathBuf::from(expand_set_value(file));
+        if let Err(error) = runtime.scripts.io().write_bytes(&path, &[], true) {
+            return error_flow(runtime, "E484", format!("{}: {error}", path.display()));
+        }
+        RedirTarget::File { path }
+    } else if let Some(file) = argument.strip_prefix('>').map(str::trim) {
+        if file.is_empty() { return error_flow(runtime, "E474", "Invalid argument") }
+        let path = PathBuf::from(expand_set_value(file));
+        if let Err(error) = runtime.scripts.io().write_bytes(&path, &[], false) {
+            return error_flow(runtime, "E484", format!("{}: {error}", path.display()));
+        }
+        RedirTarget::File { path }
+    } else {
+        return error_flow(runtime, "E474", format!("Invalid argument: {argument}"));
+    };
+
+    runtime.redirection = Some(Redirection {
+        target,
+        output: String::new(),
+        seen_messages: editor.messages().len(),
+    });
+    Flow::Normal
+}
+
+fn finish_redirection<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    redirection: Redirection,
+) -> Flow {
+    match redirection.target {
+        RedirTarget::Register { .. } | RedirTarget::File { .. } => Flow::Normal,
+        RedirTarget::Variable { name, append } => {
+            let output = if append {
+                match read_target(runtime, editor, scope, &name) {
+                    Ok(Typval::String(current)) => {
+                        let mut value = current.to_string_lossy().into_owned();
+                        value.push_str(&redirection.output);
+                        value
+                    }
+                    Ok(_) => return error_flow(runtime, "E734", "Wrong variable type for .="),
+                    Err(flow) => return flow,
+                }
+            } else {
+                redirection.output
+            };
+            match assign_target(runtime, editor, scope, &name, Typval::String(OxStr::from(output.as_str())), false) {
+                Ok(()) => Flow::Normal,
+                Err(flow) => flow,
+            }
+        }
+    }
+}
+
+fn capture_command_messages<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    command: &ExCommand,
+    command_start: usize,
+) -> Result<(), Flow> {
+    let silent = command.modifiers.iter().any(|modifier| modifier.kind == ModifierKind::Silent);
+    let mut write = None;
+    if let Some(redirection) = runtime.redirection.as_mut() {
+        let start = redirection.seen_messages.max(command_start).min(editor.messages().len());
+        let mut chunk = String::new();
+        for (index, message) in editor.messages()[start..].iter().enumerate() {
+            let Object::String(text) = &message.content else { continue };
+            if (!redirection.output.is_empty() || !chunk.is_empty())
+                && (command.command.name() != "echon" || index > 0)
+            {
+                chunk.push('\n');
+            }
+            chunk.push_str(&text.to_string_lossy());
+        }
+        redirection.output.push_str(&chunk);
+        redirection.seen_messages = editor.messages().len();
+        if !chunk.is_empty() {
+            write = Some((redirection.target.clone(), chunk));
+        }
+    }
+
+    if let Some((target, chunk)) = write {
+        match target {
+            RedirTarget::Register { name } => {
+                let mut bytes = editor
+                    .registers()
+                    .get(name)
+                    .ok()
+                    .flatten()
+                    .map_or_else(Vec::new, RegisterContent::to_bytes);
+                bytes.extend_from_slice(chunk.as_bytes());
+                let content = RegisterContent::characterwise(&bytes)
+                    .map_err(|error| error_flow(runtime, "E354", error.to_string()))?;
+                editor
+                    .registers_mut()
+                    .set(name, content)
+                    .map_err(|error| error_flow(runtime, "E354", error.to_string()))?;
+                scope.set_register(&[name as u8], Typval::String(OxStr(bytes)));
+            }
+            RedirTarget::File { path } => runtime
+                .scripts
+                .io()
+                .write_bytes(&path, chunk.as_bytes(), true)
+                .map_err(|error| error_flow(runtime, "E484", format!("{}: {error}", path.display())))?,
+            RedirTarget::Variable { .. } => {}
+        }
+    }
+
+    if silent {
+        editor.truncate_messages(command_start);
+        if let Some(redirection) = runtime.redirection.as_mut() {
+            redirection.seen_messages = editor.messages().len();
+        }
+    }
+    Ok(())
 }
 
 fn command_call<F: FileIO>(
