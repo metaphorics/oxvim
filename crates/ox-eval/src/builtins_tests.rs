@@ -94,6 +94,36 @@ case!(get_blob, "get", [Typval::Blob(vec![8]), number(0)], number(8));
 case!(get_dict, "get", [Typval::dict(vec![(OxStr::from("k"), number(9))]), text("k")], number(9));
 case!(has_key_true, "has_key", [Typval::dict(vec![(OxStr::from("k"), number(1))]), text("k")], number(1));
 case!(has_key_false, "has_key", [Typval::dict(vec![]), text("k")], number(0));
+// `runtime/doc/builtin.txt` `has()`: the `nvim-X.Y[.Z]` probe compares
+// against the version this build targets (0.13.0, matching
+// `ox_rpc::metadata::API_LEVEL = 15`); anything beyond that target is 0.
+case!(has_nvim_current_minor, "has", [text("nvim-0.13")], number(1));
+case!(has_nvim_current_patch, "has", [text("nvim-0.13.0")], number(1));
+case!(has_nvim_older_release, "has", [text("nvim-0.10")], number(1));
+case!(has_nvim_newer_minor, "has", [text("nvim-0.14")], number(0));
+case!(has_nvim_newer_patch, "has", [text("nvim-0.13.1")], number(0));
+case!(has_nvim_newer_major, "has", [text("nvim-1.0")], number(0));
+case!(has_nvim_extra_component, "has", [text("nvim-0.13.0.1")], number(0));
+case!(has_nvim_not_a_version, "has", [text("nvim-dev")], number(0));
+case!(has_multi_byte, "has", [text("multi_byte")], number(1));
+case!(has_unknown_feature, "has", [text("bogus-feature")], number(0));
+
+/// `has("unix")`/`has("win32")`/`has("macunix")` mirror the target family the
+/// binary was compiled for (`f_has` in eval/funcs.c).
+#[test]
+fn has_platform_matches_target_family() {
+    assert_eq!(call("has", vec![text("unix")]).unwrap(), number(i64::from(cfg!(unix))));
+    assert_eq!(call("has", vec![text("win32")]).unwrap(), number(i64::from(cfg!(windows))));
+    assert_eq!(call("has", vec![text("macunix")]).unwrap(), number(i64::from(cfg!(target_os = "macos"))));
+}
+
+/// `has()` rejects a zero-argument call with E119 per its eval.lua arity row.
+#[test]
+fn has_rejects_missing_argument() {
+    let error = call("has", vec![]).unwrap_err();
+    assert_eq!(error.kind, EvalErrorKind::Vim);
+    assert_eq!(error.code, "E119");
+}
 case!(index_found, "index", [list(&[4, 5, 4]), number(5)], number(1));
 case!(index_missing, "index", [list(&[4, 5]), number(9)], number(-1));
 case!(insert_front, "insert", [list(&[2, 3]), number(1)], list(&[1, 2, 3]));

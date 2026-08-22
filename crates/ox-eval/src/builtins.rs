@@ -93,6 +93,7 @@ impl<'a> Builtins<'a> {
             "float2nr" | "trunc" => float_to_number(&args[0]),
             "floor" => float_unary(&args[0], f64::floor),
             "get" => get(&args),
+            "has" => has_feature(&args),
             "has_key" => has_key(&args),
             "index" => index(&args),
             "insert" => insert(args),
@@ -559,7 +560,7 @@ fn is_implemented(name: &str) -> bool {
     matches!(name,
         "abs" | "add" | "and" | "blob2list" | "ceil" | "char2nr" | "copy" | "count" |
         "deepcopy" | "empty" | "escape" | "extend" | "extendnew" | "filter" | "flatten" |
-        "flattennew" | "foreach" | "float2nr" | "floor" | "get" | "has_key" | "index" | "insert" | "items" |
+        "flattennew" | "foreach" | "float2nr" | "floor" | "get" | "has" | "has_key" | "index" | "insert" | "items" |
         "islocked" | "join" | "json_decode" | "json_encode" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
         "match" | "matchend" | "matchstr" | "max" | "min" | "nr2char" | "or" | "pow" | "range" | "reduce" |
         "remove" | "repeat" | "reverse" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
@@ -872,6 +873,29 @@ fn get(args: &[Typval]) -> Result<Typval> {
         }
         _ => Err(EvalError::new("E896", 0, "List, Dictionary or Blob required")),
     }
+}
+
+/// `"has"` — feature probe. Mirrors `f_has` in `eval/funcs.c`: the
+/// `"nvim-X.Y[.Z]"` form compares against the Neovim version this build
+/// targets (0.13.0, matching `ox_rpc`'s `API_LEVEL = 15`); everything else
+/// answers from a small compile-time-honest table and defaults to 0, which is
+/// what upstream returns for features the build does not provide.
+fn has_feature(args: &[Typval]) -> Result<Typval> {
+    let feature = string_arg(&args[0])?.to_string_lossy().into_owned();
+    let supported = if let Some(version) = feature.strip_prefix("nvim-") {
+        let mut parts = version.split('.').map(|part| part.parse::<u64>().unwrap_or(u64::MAX));
+        let requested = (parts.next().unwrap_or(0), parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+        requested <= (0, 13, 0) && parts.next().is_none()
+    } else {
+        match feature.as_str() {
+            "unix" => cfg!(unix),
+            "win32" | "win64" => cfg!(windows),
+            "macunix" => cfg!(target_os = "macos"),
+            "multi_byte" => true,
+            _ => false,
+        }
+    };
+    Ok(Typval::Number(i64::from(supported)))
 }
 
 fn has_key(args: &[Typval]) -> Result<Typval> {
