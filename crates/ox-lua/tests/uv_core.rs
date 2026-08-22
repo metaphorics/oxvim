@@ -368,3 +368,281 @@ fn timer_close_is_idempotent() {
     scheduler.drain().unwrap();
     assert!(host.lua().globals().get::<bool>("closed_twice").unwrap());
 }
+
+fn fresh_dir(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("oxvim-uvfs-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn drive(host: &LuaHost, scheduler: &Rc<TestScheduler>, script: &str) {
+    host.lua().load(script).exec().unwrap();
+    scheduler.drain().unwrap();
+}
+
+#[test]
+fn fs_metadata_surface_round_trips_on_a_real_file() {
+    let dir = fresh_dir("meta");
+    let (host, scheduler) = host();
+    host.lua().globals().set("test_dir", dir.to_string_lossy().as_ref()).unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        local uv = vim.uv
+        local path = test_dir .. '/data.txt'
+        local fd = assert(uv.fs_open(path, 'w', tonumber('644', 8)))
+        assert(uv.fs_write(fd, 'hello uv', 0) == 8)
+        local st = assert(uv.fs_fstat(fd))
+        assert(st.size == 8 and st.type == 'file' and st.ino > 0 and st.mtime.sec > 0)
+        assert(uv.fs_ftruncate(fd, 5))
+        assert(uv.fs_fdatasync(fd))
+        assert(uv.fs_fsync(fd))
+        assert(uv.fs_close(fd))
+
+        local st2 = assert(uv.fs_stat(path))
+        assert(st2.size == 5 and st2.type == 'file' and st2.blksize > 0)
+        assert(uv.fs_realpath(path) == path)
+        assert(uv.fs_access(path, 'rw') == true)
+        local denied, _, denied_name = uv.fs_access(path, 'x')
+        assert(denied == nil and denied_name == 'EACCES', denied_name)
+
+        assert(uv.fs_chmod(path, tonumber('600', 8)))
+        local st3 = assert(uv.fs_stat(path))
+        assert(st3.mode % 512 == tonumber('600', 8), st3.mode)
+
+        assert(uv.fs_utime(path, 1000000000, 1000000000))
+        assert(assert(uv.fs_stat(path)).mtime.sec == 1000000000)
+        assert(uv.fs_utime(path, 'now', 'omit'))
+        assert(assert(uv.fs_stat(path)).mtime.sec == 1000000000)
+
+        local fd2 = assert(uv.fs_open(path, 'r+', 0))
+        assert(uv.fs_fchmod(fd2, tonumber('640', 8)))
+        assert(uv.fs_futime(fd2, 1234567890, 1234567890))
+        assert(assert(uv.fs_fstat(fd2)).mtime.sec == 1234567890)
+        assert(uv.fs_truncate(path, 2))
+        assert(assert(uv.fs_stat(path)).size == 2)
+        assert(uv.fs_close(fd2))
+        "#,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn fs_directory_surface_round_trips_through_scandir_and_links() {
+    let dir = fresh_dir("dirs");
+    std::fs::write(dir.join("a.txt"), b"aa").unwrap();
+    std::fs::write(dir.join("b.txt"), b"bbbb").unwrap();
+    let (host, scheduler) = host();
+    host.lua().globals().set("test_dir", dir.to_string_lossy().as_ref()).unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        local uv = vim.uv
+
+        -- mkdir / rmdir
+        assert(uv.fs_mkdir(test_dir .. '/sub', tonumber('755', 8)))
+        assert(uv.fs_mkdir(test_dir .. '/sub/deep', tonumber('755', 8)))
+        assert(uv.fs_rmdir(test_dir .. '/sub/deep'))
+        assert(uv.fs_rmdir(test_dir .. '/sub'))
+
+        -- scandir + scandir_next
+        local scan = assert(uv.fs_scandir(test_dir))
+        local names, types = {}, {}
+        local name, ftype = uv.fs_scandir_next(scan)
+        while name do
+          names[#names + 1] = name
+          types[name] = ftype
+          name, ftype = uv.fs_scandir_next(scan)
+        end
+        table.sort(names)
+        assert(#names == 2 and names[1] == 'a.txt' and names[2] == 'b.txt', table.concat(names, ','))
+        assert(types['a.txt'] == 'file')
+
+        -- mkdtemp / mkstemp
+        local made = assert(uv.fs_mkdtemp(test_dir .. '/mkXXXXXX'))
+        assert(vim.startswith(made, test_dir .. '/mk') and #made == #test_dir + 9)
+        assert(uv.fs_rmdir(made))
+        local fd, tmp = assert(uv.fs_mkstemp(test_dir .. '/stXXXXXX'))
+        assert(type(fd) == 'number' and vim.startswith(tmp, test_dir .. '/st'))
+        assert(uv.fs_write(fd, 'temp') == 4)
+        assert(uv.fs_close(fd))
+
+        -- rename / link / symlink / readlink / lstat
+        assert(uv.fs_rename(tmp, test_dir .. '/renamed'))
+        assert(uv.fs_link(test_dir .. '/renamed', test_dir .. '/hard'))
+        assert(uv.fs_unlink(test_dir .. '/hard'))
+        assert(uv.fs_symlink(test_dir .. '/renamed', test_dir .. '/soft', { dir = false }))
+        assert(uv.fs_readlink(test_dir .. '/soft') == test_dir .. '/renamed')
+        assert(assert(uv.fs_lstat(test_dir .. '/soft')).type == 'link')
+        assert(assert(uv.fs_stat(test_dir .. '/soft')).type == 'file')
+        assert(uv.fs_lutime(test_dir .. '/soft', 1000000001, 1000000001))
+        assert(assert(uv.fs_lstat(test_dir .. '/soft')).mtime.sec == 1000000001)
+
+        -- copyfile, with the exclusive flag failing on an existing destination
+        assert(uv.fs_copyfile(test_dir .. '/renamed', test_dir .. '/copy'))
+        assert(assert(uv.fs_stat(test_dir .. '/copy')).size == 4)
+        local clash, _, clash_name = uv.fs_copyfile(test_dir .. '/copy', test_dir .. '/copy', { excl = true })
+        assert(clash == nil and clash_name == 'EEXIST', clash_name)
+
+        -- statfs
+        local stats = assert(uv.fs_statfs(test_dir))
+        assert(stats.bsize > 0 and stats.blocks > 0 and stats.bavail <= stats.blocks)
+
+        -- sendfile
+        local in_fd = assert(uv.fs_open(test_dir .. '/copy', 'r', 0))
+        local out_fd = assert(uv.fs_open(test_dir .. '/sent', 'w', tonumber('644', 8)))
+        assert(uv.fs_sendfile(out_fd, in_fd, 0, 4) == 4)
+        assert(uv.fs_close(in_fd))
+        assert(uv.fs_close(out_fd))
+        assert(assert(uv.fs_stat(test_dir .. '/sent')).size == 4)
+        "#,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn fs_failures_report_luv_shapes_sync_and_async() {
+    let dir = fresh_dir("fail");
+    let (host, scheduler) = host();
+    host.lua().globals().set("test_dir", dir.to_string_lossy().as_ref()).unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        local uv = vim.uv
+
+        -- Sync fail shape: nil, err, name
+        local ok, err, name = uv.fs_stat(test_dir .. '/missing')
+        assert(ok == nil and name == 'ENOENT' and type(err) == 'string')
+
+        ok, err, name = uv.fs_open(test_dir .. '/missing', 'r', 0)
+        assert(ok == nil and name == 'ENOENT')
+
+        -- Unknown descriptor
+        ok, err, name = uv.fs_close(4242)
+        assert(ok == nil and name == 'EBADF')
+
+        ok, err, name = uv.fs_read(4242, 4, 0)
+        assert(ok == nil and name == 'EBADF')
+
+        -- Invalid flags string raises, as luv's luaL_error does
+        local raised = select(2, pcall(uv.fs_open, test_dir .. '/x', 'q', 0))
+        assert(string.find(tostring(raised), 'invalid open flags'), tostring(raised))
+
+        -- Async convention: error is the first and only leading argument
+        async_stat_error = nil
+        async_realpath_error = nil
+        uv.fs_stat(test_dir .. '/missing', function(stat_error, stat)
+          assert(stat == nil)
+          async_stat_error = stat_error
+        end)
+        uv.fs_realpath(test_dir .. '/missing', function(path_error, resolved)
+          assert(resolved == nil)
+          async_realpath_error = path_error
+        end)
+        "#,
+    );
+    let error = host.lua().globals().get::<String>("async_stat_error").unwrap();
+    assert!(error.contains("ENOENT"), "unexpected error string: {error}");
+    let error = host.lua().globals().get::<String>("async_realpath_error").unwrap();
+    assert!(error.contains("ENOENT"), "unexpected error string: {error}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn fs_async_callbacks_receive_results_after_the_scheduler_drains() {
+    let dir = fresh_dir("async");
+    std::fs::write(dir.join("payload.bin"), b"round-trip").unwrap();
+    let (host, scheduler) = host();
+    host.lua().globals().set("test_dir", dir.to_string_lossy().as_ref()).unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        local uv = vim.uv
+        async_result = ''
+        uv.fs_open(test_dir .. '/payload.bin', 'r', 0, function(err, fd)
+          assert(err == nil and type(fd) == 'number')
+          uv.fs_fstat(fd, function(stat_err, stat)
+            assert(stat_err == nil and stat.size == 10)
+            uv.fs_read(fd, 10, 0, function(read_err, data)
+              assert(read_err == nil and data == 'round-trip')
+              uv.fs_close(fd, function(close_err, success)
+                assert(close_err == nil and success == true)
+                async_result = async_result .. 'done'
+              end)
+            end)
+          end)
+        end)
+        uv.fs_scandir(test_dir, function(err, handle)
+          assert(err == nil and handle ~= nil)
+          local name = uv.fs_scandir_next(handle)
+          assert(name == 'payload.bin', name)
+          async_result = async_result .. 'scanned'
+        end)
+        "#,
+    );
+    assert_eq!(host.lua().globals().get::<String>("async_result").unwrap(), "scanneddone");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn misc_surface_reports_process_and_system_state() {
+    let (host, scheduler) = host();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        local uv = vim.uv
+        assert(type(uv.cwd()) == 'string' and vim.startswith(uv.cwd(), '/'))
+        assert(type(uv.os_tmpdir()) == 'string' and #uv.os_tmpdir() > 0)
+        assert(type(uv.os_homedir()) == 'string' and #uv.os_homedir() > 0)
+        assert(type(uv.exepath()) == 'string' and #uv.exepath() > 0)
+        local uname = assert(uv.os_uname())
+        assert(type(uname.sysname) == 'string' and type(uname.release) == 'string'
+          and type(uname.version) == 'string' and type(uname.machine) == 'string')
+        assert(uv.getpid() > 0 and uv.os_getpid() == uv.getpid())
+        local before = uv.hrtime()
+        assert(uv.hrtime() >= before)
+        local sec, usec = uv.gettimeofday()
+        assert(sec > 1500000000 and usec >= 0 and usec < 1000000)
+        assert(type(uv.uptime()) == 'number' and uv.uptime() > 0)
+        local one, five, fifteen = uv.loadavg()
+        assert(one >= 0 and five >= 0 and fifteen >= 0)
+        assert(uv.get_total_memory() > 0)
+        assert(uv.get_free_memory() > 0 and uv.get_free_memory() <= uv.get_total_memory())
+        assert(type(uv.os_getenv('PATH')) == 'string')
+        local missing, missing_err, missing_name = uv.os_getenv('OXVIM_UNSET_ENV_VAR_12345')
+        assert(missing == nil and missing_name == 'ENOENT' and type(missing_err) == 'string')
+        misc_ok = true
+        "#,
+    );
+    assert!(host.lua().globals().get::<bool>("misc_ok").unwrap());
+}
+
+#[test]
+fn chdir_round_trips_through_the_process_working_directory() {
+    let dir = fresh_dir("chdir");
+    let (host, scheduler) = host();
+    host.lua().globals().set("test_dir", dir.to_string_lossy().as_ref()).unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        local uv = vim.uv
+        local before = assert(uv.cwd())
+        assert(uv.chdir(test_dir) == 0)
+        assert(assert(uv.cwd()) == test_dir)
+        local ok, err, name = uv.chdir('/definitely/not/a/directory')
+        assert(ok == nil and name == 'ENOENT')
+        assert(uv.chdir(before) == 0)
+        assert(assert(uv.cwd()) == before)
+        chdir_ok = true
+        "#,
+    );
+    assert!(host.lua().globals().get::<bool>("chdir_ok").unwrap());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

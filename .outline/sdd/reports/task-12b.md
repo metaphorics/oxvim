@@ -207,3 +207,32 @@ Verification: `cargo nextest run -p ox-lua` → 45 passed, 0 failed (44
 pre-existing + 1 new); `cargo nextest run -p oxvim` → 22 passed (glue crate).
 Plain `cargo build --all-targets` warning set identical to HEAD (10
 pre-existing, none introduced).
+
+## Follow-up: complete vim.uv fs + misc binding surface
+
+`crates/ox-lua/src/uv_core.rs` now binds the full ox-uv `fs` and `misc`
+surface per `runtime/doc/luvref.txt` instead of the local `std::fs`
+re-implementation: fs_open/close/read/write plus realpath, stat/lstat/
+fstat, scandir(+next), mkdir/rmdir/rename/unlink/link/symlink/readlink,
+chmod/fchmod, access, truncate/ftruncate, statfs, copyfile, mkdtemp,
+mkstemp, utime/lutime/futime (number/`"now"`/`"omit"` forms), fsync,
+fdatasync, sendfile; misc: cwd, chdir, os_homedir, os_tmpdir, os_uname,
+getpid/os_getpid, hrtime, gettimeofday, exepath, uptime, loadavg,
+get_free_memory/get_total_memory, os_getenv. Sync failures return the luv
+`nil, err, name` shape; callback forms follow the error-first 12b
+convention. `fs_scandir` returns its handle synchronously and passes the
+same handle to the callback, as luvref documents. Six behavioral tests
+added (metadata round-trip, directory/link round-trip, failure shapes,
+async chaining, misc surface, chdir).
+
+Verification: `cargo nextest run -p ox-lua` → 51 passed, 0 failed
+(45 pre-existing + 6 new); `cargo build -p ox-lua --all-targets` → zero
+warnings (also fixed 7 pre-existing `mlua::String` deprecation warnings
+in tests/stdlib.rs).
+
+Runner probe (`target/debug/oxvim -l .references/neovim/test/runner.lua`):
+still stops at runner.lua:6 — `assert(vim.startswith(source, '@'))` in
+`repo_root()` fails because the `-l` chunk's `debug.getinfo().source`
+lacks the `@file` prefix (chunk is named via `set_name(path)` without
+`@` in crates/oxvim/src/runtime.rs:189, outside ox-lua). With that fixed,
+line 7's `uv.fs_realpath` is now bound and working (verified live).

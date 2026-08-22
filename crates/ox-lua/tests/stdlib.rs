@@ -45,14 +45,14 @@ fn eval<R: FromLuaMulti>(host: &LuaHost, source: &str) -> R {
 #[test]
 fn mpack_uses_fixed_vectors_and_preserves_nil_binary_and_extensions() {
     let host = host();
-    let nil: mlua::String = eval(&host, "return vim.mpack.encode(vim.NIL)");
+    let nil: mlua::LuaString = eval(&host, "return vim.mpack.encode(vim.NIL)");
     assert_eq!(nil.as_bytes().as_ref(), [0xc0]);
 
-    let array: mlua::String = eval(&host, "return vim.mpack.encode({'a'})");
+    let array: mlua::LuaString = eval(&host, "return vim.mpack.encode({'a'})");
     assert_eq!(array.as_bytes().as_ref(), [0x91, 0xa1, b'a']);
 
     host.lua().globals().set("binary_value", host.lua().create_string([0, 255]).unwrap()).unwrap();
-    let roundtrip: (bool, mlua::String) = eval(
+    let roundtrip: (bool, mlua::LuaString) = eval(
         &host,
         "local v = vim.mpack.decode(vim.mpack.encode({vim.NIL, binary_value})); \
          return v[1] == vim.NIL, v[2]",
@@ -61,14 +61,14 @@ fn mpack_uses_fixed_vectors_and_preserves_nil_binary_and_extensions() {
     assert_eq!(roundtrip.1.as_bytes().as_ref(), [0, 255]);
 
     host.lua().globals().set("raw_ext", host.lua().create_string([0xd4, 42, 0xff]).unwrap()).unwrap();
-    let extension: mlua::String = eval(&host, "return vim.mpack.encode(vim.mpack.decode(raw_ext))");
+    let extension: mlua::LuaString = eval(&host, "return vim.mpack.encode(vim.mpack.decode(raw_ext))");
     assert_eq!(extension.as_bytes().as_ref(), [0xd4, 42, 0xff]);
 }
 
 #[test]
 fn mpack_distinguishes_arrays_maps_and_rejects_malformed_or_recursive_values() {
     let host = host();
-    let vectors: (mlua::String, mlua::String) = eval(
+    let vectors: (mlua::LuaString, mlua::LuaString) = eval(
         &host,
         "local dict = setmetatable({}, vim._empty_dict_mt); \
          return vim.mpack.encode({}), vim.mpack.encode(dict)",
@@ -192,7 +192,7 @@ fn diff_supports_context_callbacks_and_option_errors() {
 #[test]
 fn base64_matches_rfc_vectors_binary_boundaries_and_errors() {
     let host = host();
-    let vectors: (String, String, String, String, mlua::String) = eval(
+    let vectors: (String, String, String, String, mlua::LuaString) = eval(
         &host,
         "return vim.base64.encode(''), vim.base64.encode('f'), vim.base64.encode('fo'), \
          vim.base64.encode('foo'), vim.base64.decode('AP+A')",
