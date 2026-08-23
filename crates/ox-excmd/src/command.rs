@@ -23,6 +23,10 @@ impl CommandFlags {
     pub const COUNT: Self = Self(0x400);
     /// A double quote in the argument is not a trailing comment.
     pub const NOTRLCOM: Self = Self(0x800);
+    /// A digit run at the argument start may be a buffer name, not a count.
+    pub const BUFNAME: Self = Self(0x8000);
+    /// Line 0 is a valid address, and a zero count is accepted.
+    pub const ZEROR: Self = Self(0x1000);
 
     /// Returns whether all bits in `other` are present.
     #[must_use]

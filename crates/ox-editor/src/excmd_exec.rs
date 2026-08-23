@@ -943,6 +943,11 @@ fn dispatch<F: FileIO>(
         "undo" => command_undo(runtime, editor, command),
         "redo" => command_redo(runtime, editor),
         "retab" => command_retab(runtime, editor, scope, command),
+        "hide" => command_hide(runtime, editor, command),
+        "sleep" => command_sleep(runtime, editor, command),
+        "scriptencoding" => command_scriptencoding(runtime, command),
+        "argdelete" => command_argdelete(runtime, editor, command),
+        "z" => command_z(runtime, editor, command),
         "resize" => command_resize(runtime, editor, command),
         "wincmd" => command_wincmd(runtime, editor, command),
         "echohl" => command_echohl(runtime, editor, command),
@@ -3371,6 +3376,305 @@ fn buffer_number_option(editor: &Editor, buffer: BufHandle, name: &str) -> Optio
 
 fn buffer_bool_option(editor: &Editor, buffer: BufHandle, name: &str) -> bool {
     matches!(editor.options().get_buffer(buffer, name), Ok(OptionValue::Boolean(true)))
+}
+
+/// `:hide` (`ex_docmd.c` `ex_hide`:5369): close a window without freeing its
+/// buffer.
+///
+/// Without an address this is the current window; with one it is that window
+/// number in the current tabpage, falling back to the last window when the
+/// number is past the end (`win_find_nr`). A bare `:hide` is this command,
+/// while `:hide {cmd}` is the modifier the parser already separates.
+fn command_hide<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    let Some(tab) = editor.current_tabpage() else {
+        return error_flow(runtime, "E749", "No current tabpage");
+    };
+    let windows = editor.tabpage_windows(tab).unwrap_or_default();
+    let target = match (&command.range, command.count) {
+        (None, None) => editor.current_window(),
+        (_, Some(count)) => window_by_number(&windows, count as usize),
+        (Some(_), None) => match resolve_range_raw(editor, command) {
+            Ok((_, end)) => window_by_number(&windows, end),
+            Err(message) => return error_flow(runtime, "E16", message),
+        },
+    };
+    let Some(window) = target else {
+        return error_flow(runtime, "E749", "No current window");
+    };
+    if windows.len() == 1 {
+        return error_flow(runtime, "E444", "Cannot close last window");
+    }
+    match editor.close_window(tab, window, true) {
+        Ok(_) => Flow::Normal,
+        Err(error) => error_flow(runtime, "E444", error.to_string()),
+    }
+}
+
+/// `win_find_nr`: the Nth window of a tabpage, or its last window when `N` is
+/// past the end.
+fn window_by_number(windows: &[WinHandle], number: usize) -> Option<WinHandle> {
+    if number == 0 {
+        return windows.first().copied();
+    }
+    windows.get(number - 1).copied().or_else(|| windows.last().copied())
+}
+
+/// `:sleep` (`ex_docmd.c` `ex_sleep`:6459): pause for the count, in seconds by
+/// default or milliseconds with an `m` suffix.
+///
+/// The count defaults to 1 and anything other than `m` or an empty tail is
+/// `E475` reporting the *remaining* argument, not the whole one. A zero count
+/// is `E939` from the shared count parse, since `sleep` carries no `ZEROR`.
+fn command_sleep<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    let amount = match (&command.range, command.count) {
+        (_, Some(count)) => count,
+        (Some(_), None) => match resolve_range_raw(editor, command) {
+            Ok((_, end)) => end as u64,
+            Err(message) => return error_flow(runtime, "E16", message),
+        },
+        (None, None) => 1,
+    };
+    let tail = command.args.trim();
+    let milliseconds = match tail {
+        "" => amount.saturating_mul(1000),
+        "m" => amount,
+        other => return error_flow(runtime, "E475", format!("Invalid argument: {other}")),
+    };
+    std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+    Flow::Normal
+}
+
+/// `:scriptencoding` (`runtime.c` `ex_scriptencoding`:2946).
+///
+/// Outside a sourced file this is `E167`. Inside one, upstream sets up a
+/// conversion from the named encoding to `'encoding'`.
+///
+/// Named gap: that conversion needs an encoding converter this port does not
+/// have (`convert_setup`, `mbyte.c`), so a valid `:scriptencoding` inside a
+/// script is accepted and the name recorded, with no re-decoding of the
+/// remaining lines. Every script this port sources is already read as UTF-8,
+/// which is what `:scriptencoding utf-8` — the only form in the runtime files
+/// — asks for anyway.
+fn command_scriptencoding<F: FileIO>(runtime: &mut ExRuntime<F>, command: &ExCommand) -> Flow {
+    if runtime.scripts.current_sid().is_none() {
+        return error_flow(runtime, "E167", ":scriptencoding used outside of a sourced file");
+    }
+    let _ = command;
+    Flow::Normal
+}
+
+/// `:argdelete` (`arglist.c` `ex_argdelete`:759).
+///
+/// With an address, or with no argument at all, entries are removed by
+/// position: no argument means the current one, and a bare `:argdelete` with
+/// the index past the end is `E610`. With a name argument the matching entries
+/// are removed and a name that matches nothing is `E480`. Supplying both an
+/// address and an argument is `E475`.
+fn command_argdelete<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    let argument = command.args.trim().to_owned();
+    let addressed = command.range.is_some();
+    if addressed && !argument.is_empty() {
+        return error_flow(runtime, "E475", "Invalid argument");
+    }
+    if !addressed && !argument.is_empty() {
+        // arglist_del_files (arglist.c:352-392) treats each argument as a file
+        // pattern and drops every entry it matches; no match is E480.
+        let names = editor.arglist().names().to_vec();
+        let index = editor.arglist().index();
+        let mut kept = Vec::with_capacity(names.len());
+        let mut new_index = index;
+        for (position, name) in names.iter().enumerate() {
+            if crate::fs_builtins::wildcard_match(argument.as_bytes(), name.as_bytes()) {
+                if position < index {
+                    new_index = new_index.saturating_sub(1);
+                }
+                continue;
+            }
+            kept.push(name.clone());
+        }
+        if kept.len() == names.len() {
+            return error_flow(runtime, "E480", format!("No match: {argument}"));
+        }
+        editor.arglist_mut().set(kept);
+        clamp_arglist_index(editor, new_index);
+        return Flow::Normal;
+    }
+    let count = editor.arglist().len();
+    let (first, last) = if addressed {
+        match resolve_range_raw(editor, command) {
+            Ok((first, last)) => (first, last.min(count)),
+            Err(message) => return error_flow(runtime, "E16", message),
+        }
+    } else {
+        let index = editor.arglist().index();
+        if index >= count {
+            return error_flow(runtime, "E610", "No argument to delete");
+        }
+        (index + 1, index + 1)
+    };
+    if last < first {
+        // ":%argdel" on an empty list is deliberately not an error.
+        if !(first == 1 && last == 0) {
+            return error_flow(runtime, "E16", "Invalid range");
+        }
+        return Flow::Normal;
+    }
+    let names = editor.arglist().names().to_vec();
+    let index = editor.arglist().index();
+    let kept: Vec<_> = names
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| position + 1 < first || position + 1 > last)
+        .map(|(_, name)| name.clone())
+        .collect();
+    // arglist.c:797-801, in the same one-based terms upstream uses.
+    let removed = last + 1 - first;
+    let new_index = if index + 1 >= last {
+        (index + 1).saturating_sub(removed).saturating_sub(1)
+    } else if index + 1 > first {
+        first - 1
+    } else {
+        index
+    };
+    editor.arglist_mut().set(kept);
+    clamp_arglist_index(editor, new_index);
+    Flow::Normal
+}
+
+/// `alist_check_arg_idx` (arglist.c:806-810): an empty list resets the index
+/// and an index past the end lands on the last entry.
+fn clamp_arglist_index(editor: &mut Editor, requested: usize) {
+    let count = editor.arglist().len();
+    let index = if count == 0 { 0 } else { requested.min(count - 1) };
+    editor.arglist_mut().set_index(index);
+}
+
+/// `:z` (`ex_cmds.c` `ex_z`:3154): print a window of lines around the
+/// addressed one.
+///
+/// The argument's leading `-`, `+`, `=`, `^` or `.` selects which side of the
+/// address the window falls on, repeated `-`/`+` multiply the distance, and a
+/// trailing number sets its size. Without a number the size is `'scroll'`
+/// doubled for a lone window, the window height less three otherwise, and the
+/// screen height less one for `:z!`. A non-numeric size is `E144`.
+///
+/// The `=` form brackets the addressed line with `'columns'`-wide rules, and
+/// leaves the cursor on it; the other forms leave the cursor on the last
+/// printed line.
+fn command_z<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    let Some(buffer) = editor.current_buffer() else {
+        return error_flow(runtime, "E749", "Empty buffer");
+    };
+    let lines = match buffer_lines(editor, buffer) {
+        Ok(lines) => lines,
+        Err(message) => return error_flow(runtime, "E749", message),
+    };
+    let addressed = command.range.is_some();
+    let lnum = match resolve_range(editor, command) {
+        Ok((_, end)) => end,
+        Err(message) => return error_flow(runtime, "E16", message),
+    };
+
+    let argument = command.args.trim();
+    let mut rest = argument;
+    let kind = match argument.as_bytes().first() {
+        Some(byte @ (b'-' | b'+' | b'=' | b'^' | b'.')) => {
+            rest = &argument[1..];
+            *byte
+        }
+        _ => b'+',
+    };
+    // Repeated signs multiply the distance; count them before the digits.
+    let repeats = 1 + rest.bytes().take_while(|byte| *byte == kind).count();
+    if matches!(kind, b'-' | b'+') {
+        rest = &rest[repeats - 1..];
+    }
+
+    let mut bigness = if command.bang {
+        screen_number_option(editor, "lines").saturating_sub(1)
+    } else if current_tabpage_window_count(editor) == 1 {
+        screen_number_option(editor, "scroll").saturating_mul(2)
+    } else {
+        editor
+            .current_window()
+            .and_then(|window| editor.window_geometry(window).ok())
+            .map_or(1, |geometry| geometry.height.saturating_sub(3))
+    }
+    .max(1);
+    if !rest.is_empty() {
+        let Ok(value) = rest.parse::<usize>() else {
+            return error_flow(runtime, "E144", "non-numeric argument to :z");
+        };
+        bigness = value.min(lines.len().saturating_mul(2));
+        if kind == b'=' {
+            bigness += 2;
+        }
+    }
+
+    let signed = |value: isize| -> isize { value };
+    let big = bigness as isize;
+    let base = lnum as isize;
+    let (start, end, cursor, ruled) = match kind {
+        b'-' => {
+            let start = base - big * repeats as isize + 1;
+            (start, start + big - 1, start + big - 1, false)
+        }
+        b'=' => (base - (big + 1) / 2 + 1, base + (big + 1) / 2 - 1, base, true),
+        b'^' => (base - big * 2, base - big, base - big, false),
+        b'.' => {
+            let start = base - (big + 1) / 2 + 1;
+            (start, base + (big + 1) / 2 - 1, base + (big + 1) / 2 - 1, false)
+        }
+        _ => {
+            let mut start = base;
+            if argument.starts_with('+') {
+                start += big * signed(repeats as isize - 1) + 1;
+            } else if !addressed {
+                start += 1;
+            }
+            (start, start + big - 1, start + big - 1, false)
+        }
+    };
+    let first = start.max(1) as usize;
+    let last = (end.min(lines.len() as isize)).max(0) as usize;
+    let cursor = cursor.clamp(1, lines.len() as isize) as usize;
+
+    let number = matches!(option_value(editor, "number", SetLayer::Effective), Some(OptionValue::Boolean(true)));
+    let width = lines.len().to_string().len();
+    let rule = "-".repeat(screen_number_option(editor, "columns").saturating_sub(1));
+    for index in first..=last {
+        let Some(line) = lines.get(index - 1) else { continue };
+        if ruled && index == lnum {
+            push_text_message(editor, rule.clone(), false, false);
+        }
+        let text = String::from_utf8_lossy(line).into_owned();
+        push_text_message(editor, if number { format!("{index:>width$} {text}") } else { text }, false, false);
+        if ruled && index == lnum {
+            push_text_message(editor, rule.clone(), false, false);
+        }
+    }
+    if let Some(window) = editor.current_window() {
+        if let Err(error) = editor.set_window_cursor(window, Position { lnum: cursor, col: 0 }) {
+            return error_flow(runtime, "E16", error.to_string());
+        }
+    }
+    Flow::Normal
+}
+
+/// The number of windows in the current tabpage, upstream's `ONE_WINDOW` test.
+fn current_tabpage_window_count(editor: &Editor) -> usize {
+    editor
+        .current_tabpage()
+        .and_then(|tab| editor.tabpage_windows(tab).ok())
+        .map_or(1, |windows| windows.len())
+}
+
+/// A screen-geometry option (`'lines'`, `'columns'`, `'scroll'`) as a count.
+fn screen_number_option(editor: &Editor, name: &str) -> usize {
+    match option_value(editor, name, SetLayer::Effective) {
+        Some(OptionValue::Number(value)) if *value > 0 => usize::try_from(*value).unwrap_or(1),
+        _ => 1,
+    }
 }
 
 fn command_only<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> Flow {

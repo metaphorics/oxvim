@@ -1789,3 +1789,210 @@ fn retab_only_touches_the_addressed_lines() {
     executor.execute_line(&mut editor, "1retab 4").unwrap();
     assert_eq!(buffer_text(&editor), vec!["\t\tone", "\ttwo"]);
 }
+
+// ---------------------------------------------------------------------------
+// :hide / :sleep / :z / :scriptencoding / :argdelete
+// Citations: ex_docmd.c ex_hide:5369, ex_sleep:6459, parse_count:1395,
+// ex_cmds.c ex_z:3154, runtime.c ex_scriptencoding:2946,
+// arglist.c ex_argdelete:759, arglist_del_files:352.
+// ---------------------------------------------------------------------------
+
+/// `:hide` closes the current window and keeps its buffer loaded. `:hid` is
+/// the abbreviation.
+///
+/// Oracle: `split` then `hide` takes `winnr('$')` from 2 back to 1.
+#[test]
+fn hide_closes_the_current_window() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    let buffer = editor.current_buffer().unwrap();
+    executor.execute_line(&mut editor, "split").unwrap();
+    assert_eq!(editor.windows().len(), 2);
+    executor.execute_line(&mut editor, "hid").unwrap();
+    assert_eq!(editor.windows().len(), 1);
+    // The buffer survives: :hide is win_close(win, false, ...).
+    assert!(editor.buffer(buffer).is_ok());
+}
+
+/// The last window cannot be hidden.
+#[test]
+fn hide_refuses_the_last_window() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    assert_vim_error(executor.execute_line(&mut editor, "hide"), "E444");
+}
+
+/// `:sleep` accepts a count with an `m` suffix, which is what the shared count
+/// parse had to stop rejecting: upstream takes the digits greedily and leaves
+/// the suffix in the argument (`parse_count`, ex_docmd.c:1401).
+#[test]
+fn sleep_accepts_a_millisecond_suffix() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "sleep 1m").unwrap();
+    executor.execute_line(&mut editor, "sl 1m").unwrap();
+}
+
+/// A suffix other than `m` is E475 reporting the *remaining* argument, not the
+/// whole one.
+///
+/// Oracle: `sleep 5x` → `Vim(sleep):E475: Invalid argument: x`.
+#[test]
+fn sleep_rejects_an_unknown_suffix_with_e475() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    let error = executor.execute_line(&mut editor, "sleep 5x").unwrap_err();
+    assert_vim_error(Err(error), "E475");
+    // The message carries only the tail after the count, as upstream does.
+    let error = executor.execute_line(&mut editor, "sleep 5x").unwrap_err();
+    let ExecError::Vim(exception) = &error else { panic!("expected a Vim error: {error:?}") };
+    assert_eq!(exception.message(), "E475: Invalid argument: x");
+}
+
+/// A zero count is E939, because `sleep` carries no ZEROR
+/// (`parse_count`, ex_docmd.c:1420-1425).
+///
+/// Oracle: `sleep 0m` → `Vim(sleep):E939: Positive count required`.
+#[test]
+fn sleep_rejects_a_zero_count_with_e939() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    assert_vim_error(executor.execute_line(&mut editor, "sleep 0m"), "E939");
+    // A ZEROR command still accepts zero.
+    executor.scripts().io().insert("in.txt", "x\n");
+    executor.execute_line(&mut editor, "0read in.txt").unwrap();
+}
+
+/// `:scriptencoding` outside a sourced file is E167.
+#[test]
+fn scriptencoding_outside_a_script_raises_e167() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    assert_vim_error(
+        executor.execute_line(&mut editor, "scriptencoding utf-8"),
+        "E167",
+    );
+}
+
+/// `:z` prints a window of lines after the addressed one and leaves the cursor
+/// on the last of them; a trailing number sets the window size.
+///
+/// Oracle, `scroll=3` and ten lines: `5z` prints l5..l10 with cursor 10, and
+/// `5z3` prints l5..l7 with cursor 7.
+#[test]
+fn z_prints_a_window_of_lines() {
+    let (mut editor, mut executor) = setup_with_content(&z_lines());
+    executor.execute_line(&mut editor, "set scroll=3").unwrap();
+    executor.execute_line(&mut editor, "5z").unwrap();
+    assert_eq!(echo_messages(&editor), vec!["l5", "l6", "l7", "l8", "l9", "l10"]);
+    let window = editor.current_window().unwrap();
+    assert_eq!(editor.window(window).unwrap().cursor.lnum, 10);
+}
+
+/// Each leading kind character picks a different window around the address.
+///
+/// Oracle: `5z3` → l5..l7 cursor 7; `5z-3` → l3..l5 cursor 5; `5z.3` →
+/// l4..l6 cursor 6; `5z^3` → l1..l2 cursor 2; `5z+3` → l6..l8 cursor 8.
+#[test]
+fn z_kind_characters_select_the_window() {
+    for (command, expected, cursor) in [
+        ("5z3", vec!["l5", "l6", "l7"], 7),
+        ("5z-3", vec!["l3", "l4", "l5"], 5),
+        ("5z.3", vec!["l4", "l5", "l6"], 6),
+        ("5z^3", vec!["l1", "l2"], 2),
+        ("5z+3", vec!["l6", "l7", "l8"], 8),
+    ] {
+        let (mut editor, mut executor) = setup_with_content(&z_lines());
+        executor.execute_line(&mut editor, "set scroll=3").unwrap();
+        executor.execute_line(&mut editor, command).unwrap();
+        assert_eq!(echo_messages(&editor), expected, "{command}");
+        let window = editor.current_window().unwrap();
+        assert_eq!(editor.window(window).unwrap().cursor.lnum, cursor, "{command}");
+    }
+}
+
+/// The `=` form brackets the addressed line with rules and leaves the cursor
+/// on it, and its window is two lines wider than the count asks for
+/// (`ex_cmds.c:3195-3197`).
+///
+/// Oracle: `5z=3` prints l3, l4, a rule, l5, a rule, l6, l7, cursor 5.
+#[test]
+fn z_equals_form_brackets_the_addressed_line() {
+    let (mut editor, mut executor) = setup_with_content(&z_lines());
+    executor.execute_line(&mut editor, "set scroll=3 columns=80").unwrap();
+    executor.execute_line(&mut editor, "5z=3").unwrap();
+    let rule = "-".repeat(79);
+    assert_eq!(
+        echo_messages(&editor),
+        vec!["l3", "l4", rule.as_str(), "l5", rule.as_str(), "l6", "l7"]
+    );
+    let window = editor.current_window().unwrap();
+    assert_eq!(editor.window(window).unwrap().cursor.lnum, 5);
+}
+
+/// A non-numeric size is E144.
+#[test]
+fn z_rejects_a_non_numeric_size_with_e144() {
+    let (mut editor, mut executor) = setup_with_content(&z_lines());
+    assert_vim_error(executor.execute_line(&mut editor, "5z=x"), "E144");
+}
+
+fn z_lines() -> Vec<Vec<u8>> {
+    (1..=10).map(|index| format!("l{index}").into_bytes()).collect()
+}
+
+/// `:argdelete {name}` drops matching entries, and a wildcard matches several.
+///
+/// Oracle: `args a.txt b.txt c.txt` + `argdelete b.txt` → `['a.txt','c.txt']`;
+/// `args a.txt b.txt` + `argdelete *.txt` → `[]`.
+#[test]
+fn argdelete_removes_entries_by_name_and_pattern() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "args a.txt b.txt c.txt").unwrap();
+    executor.execute_line(&mut editor, "argdelete b.txt").unwrap();
+    assert_eq!(arglist_names(&editor), vec!["a.txt", "c.txt"]);
+    executor.execute_line(&mut editor, "argd *.txt").unwrap();
+    assert!(arglist_names(&editor).is_empty());
+}
+
+/// An address removes entries by position instead.
+///
+/// Oracle: `args a.txt b.txt c.txt d.txt` + `2,3argdelete` →
+/// `['a.txt','d.txt']`.
+#[test]
+fn argdelete_removes_the_addressed_entries() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor
+        .execute_line(&mut editor, "args a.txt b.txt c.txt d.txt")
+        .unwrap();
+    executor.execute_line(&mut editor, "2,3argdelete").unwrap();
+    assert_eq!(arglist_names(&editor), vec!["a.txt", "d.txt"]);
+}
+
+/// A name matching nothing is E480, and a bare `:argdelete` with no current
+/// entry is E610. They are different errors and both leave the list alone.
+///
+/// Oracle: `argdelete zzz` → `Vim(argdelete):E480: No match: zzz`; a bare
+/// `argdelete` on an empty list → `Vim(argdelete):E610: No argument to delete`.
+#[test]
+fn argdelete_reports_no_match_and_no_argument_separately() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "args a.txt").unwrap();
+    assert_vim_error(executor.execute_line(&mut editor, "argdelete zzz"), "E480");
+    assert_eq!(arglist_names(&editor), vec!["a.txt"]);
+    executor.execute_line(&mut editor, "argdelete").unwrap();
+    assert!(arglist_names(&editor).is_empty());
+    assert_vim_error(executor.execute_line(&mut editor, "argdelete"), "E610");
+}
+
+/// An address and a name argument together are E475.
+#[test]
+fn argdelete_rejects_an_address_with_an_argument() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "args a.txt b.txt").unwrap();
+    assert_vim_error(executor.execute_line(&mut editor, "1argdelete a.txt"), "E475");
+    assert_eq!(arglist_names(&editor), vec!["a.txt", "b.txt"]);
+}
+
+fn arglist_names(editor: &Editor) -> Vec<String> {
+    editor
+        .arglist()
+        .names()
+        .iter()
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect()
+}

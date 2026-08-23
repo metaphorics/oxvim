@@ -360,7 +360,8 @@ fn has_wildcard(component: &str) -> bool {
     component.bytes().any(|byte| matches!(byte, b'*' | b'?' | b'['))
 }
 
-fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
+/// Matches one file-name wildcard pattern (`*`, `?`, `[...]`) against a name.
+pub(crate) fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
     fn matches_at(pattern: &[u8], value: &[u8], pi: usize, vi: usize) -> bool {
         if pi == pattern.len() { return vi == value.len(); }
         match pattern[pi] {

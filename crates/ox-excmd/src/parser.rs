@@ -21,6 +21,8 @@ pub enum ErrorCode {
     E488,
     /// E471: Argument required.
     E471,
+    /// E939: Positive count required.
+    E939,
 }
 
 impl ErrorCode {
@@ -32,6 +34,7 @@ impl ErrorCode {
             Self::E481 => "E481",
             Self::E488 => "E488",
             Self::E471 => "E471",
+            Self::E939 => "E939",
         }
     }
 }
@@ -313,7 +316,14 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
             None
         };
         let count = if flags.contains(CommandFlags::COUNT) {
-            take_count(&mut args)
+            let count = take_count(&mut args, flags.contains(CommandFlags::BUFNAME));
+            // "n <= 0" is rejected unless the command accepts zero
+            // (ex_docmd.c:1420-1425), so `:sleep 0m` is E939 while `:0read`
+            // is fine.
+            if count == Some(0) && !flags.contains(CommandFlags::ZEROR) {
+                return Err(error(ErrorCode::E939, args_start, "Positive count required"));
+            }
+            count
         } else {
             None
         };
@@ -886,11 +896,26 @@ fn is_register(character: char) -> bool {
     character.is_ascii_alphanumeric() || "\"-:.%#=*+_/@".contains(character)
 }
 
-fn take_count(args: &mut String) -> Option<u64> {
+/// `parse_count` (`ex_docmd.c:1395-1430`): a leading digit run on a `COUNT`
+/// command is the count.
+///
+/// The digits are taken greedily and whatever follows stays in the argument,
+/// which is what `:sleep 100m` needs. Only a `BUFNAME` command insists the
+/// digits end at whitespace or end-of-argument, so that `:buffer 123foo`
+/// stays a buffer name rather than becoming count 123 plus "foo".
+fn take_count(args: &mut String, buffer_name: bool) -> Option<u64> {
     let trimmed = args.trim_start();
     let skipped = args.len() - trimmed.len();
     let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
-    if digits == 0 || trimmed.as_bytes().get(digits).is_some_and(|byte| !byte.is_ascii_whitespace()) {
+    if digits == 0 {
+        return None;
+    }
+    if buffer_name
+        && trimmed
+            .as_bytes()
+            .get(digits)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
         return None;
     }
     let count = trimmed[..digits].parse::<u64>().ok()?;
