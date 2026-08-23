@@ -1055,7 +1055,7 @@ fn change_case(value: &Typval, upper: bool) -> Result<Typval> {
 
 fn trim(args: &[Typval]) -> Result<Typval> {
     let value = string_arg(&args[0])?;
-    let mask = args.get(1).map(string_arg).transpose()?;
+    let mask = args.get(1).map(|value| strict_string_arg(value, 2)).transpose()?;
     let direction = args.get(2).map(number_arg).transpose()?.unwrap_or(0);
     if !(0..=2).contains(&direction) {
         return Err(EvalError::new("E475", 0, "Invalid argument"));
