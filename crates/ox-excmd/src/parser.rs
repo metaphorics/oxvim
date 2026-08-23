@@ -21,6 +21,8 @@ pub enum ErrorCode {
     E488,
     /// E471: Argument required.
     E471,
+    /// E477: No ! allowed.
+    E477,
     /// E939: Positive count required.
     E939,
 }
@@ -34,6 +36,7 @@ impl ErrorCode {
             Self::E481 => "E481",
             Self::E488 => "E488",
             Self::E471 => "E471",
+            Self::E477 => "E477",
             Self::E939 => "E939",
         }
     }
@@ -47,8 +50,9 @@ pub struct ParseError {
     pub code: ErrorCode,
     /// Zero-based byte offset in the original command line.
     pub offset: usize,
-    /// Human-readable detail.
-    pub message: &'static str,
+    /// Human-readable detail, which may name the offending text the way
+    /// upstream's `%s` messages do.
+    pub message: String,
 }
 
 /// Base of one Ex address.
@@ -266,11 +270,11 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
         let command_offset = cursor;
         let (typed, after_name) = parse_command_name(input, cursor);
         if typed.is_empty() {
-            return Err(error(ErrorCode::E492, command_offset, "not an editor command"));
+            return Err(error(ErrorCode::E492, command_offset, "Not an editor command"));
         }
         let command = resolve_command(typed, self.users).map_err(|resolve_error| {
             let message = match resolve_error {
-                ResolveError::NotFound => "not an editor command",
+                ResolveError::NotFound => "Not an editor command",
                 ResolveError::AmbiguousUserCommand => "ambiguous user command",
             };
             error(ErrorCode::E492, command_offset, message)
@@ -285,7 +289,7 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
         let mut bang = input.as_bytes().get(cursor) == Some(&b'!');
         if bang {
             if !flags.contains(CommandFlags::BANG) {
-                return Err(error(ErrorCode::E488, bang_offset, "trailing characters"));
+                return Err(error(ErrorCode::E477, bang_offset, "No ! allowed"));
             }
             cursor += 1;
         }
@@ -329,13 +333,18 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
         };
 
         if flags.contains(CommandFlags::NEEDARG) && args.trim().is_empty() {
-            return Err(error(ErrorCode::E471, args_start, "argument required"));
+            return Err(error(ErrorCode::E471, args_start, "Argument required"));
         }
         if !flags.contains(CommandFlags::EXTRA)
             && !matches!(command.name(), "append" | "change" | "insert")
             && !args.trim().is_empty()
         {
-            return Err(error(ErrorCode::E488, args_start, "trailing characters"));
+            // e_trailing_arg (errors.h:123) names the offending text.
+            return Err(error(
+                ErrorCode::E488,
+                args_start,
+                format!("Trailing characters: {}", args.trim()),
+            ));
         }
 
         Ok((
@@ -949,6 +958,6 @@ fn trim_ascii_space(input: &str, start: &mut usize, end: &mut usize) {
     }
 }
 
-fn error(code: ErrorCode, offset: usize, message: &'static str) -> ParseError {
-    ParseError { code, offset, message }
+fn error(code: ErrorCode, offset: usize, message: impl Into<String>) -> ParseError {
+    ParseError { code, offset, message: message.into() }
 }

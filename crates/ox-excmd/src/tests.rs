@@ -733,10 +733,30 @@ error_case!(error_forced_ho_abbreviation, "ho", ErrorCode::E492);
 error_case!(error_forced_def_abbreviation, "def", ErrorCode::E492);
 error_case!(error_range_not_allowed, "2echo hi", ErrorCode::E481);
 error_case!(error_percent_not_allowed, "%echo hi", ErrorCode::E481);
-error_case!(error_bang_not_allowed, "print!", ErrorCode::E488);
+error_case!(error_bang_not_allowed, "print!", ErrorCode::E477);
 error_case!(error_trailing_characters, "undo extra", ErrorCode::E488);
 error_case!(error_argument_required, "badd", ErrorCode::E471);
 error_case!(error_unterminated_search, "/open print", ErrorCode::E488);
+
+/// Every parser error carries upstream's message text, capitals included.
+///
+/// These are plugin-observable through `v:exception`, and the codes are too:
+/// a disallowed bang is `e_nobang` (E477), not a trailing-characters error,
+/// and `e_trailing_arg` (errors.h:123) names the offending text.
+#[test]
+fn parser_error_texts_match_upstream() {
+    for (input, code, message) in [
+        ("print!", ErrorCode::E477, "No ! allowed"),
+        ("print zz", ErrorCode::E488, "Trailing characters: zz"),
+        ("badd", ErrorCode::E471, "Argument required"),
+        ("doesnotexist", ErrorCode::E492, "Not an editor command"),
+        ("sleep 0m", ErrorCode::E939, "Positive count required"),
+    ] {
+        let error = Parser::new().parse(input).expect_err("input must fail");
+        assert_eq!(error.code, code, "{input}");
+        assert_eq!(error.message, message, "{input}");
+    }
+}
 
 /// The E481 message text matches upstream's `e_norange` byte for byte.
 ///

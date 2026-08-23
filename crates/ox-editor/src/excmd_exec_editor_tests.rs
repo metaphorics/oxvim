@@ -952,12 +952,15 @@ fn redraw_abbreviation_and_bang_leave_a_valid_cursor_alone() {
     assert_eq!(editor.window(window).unwrap().cursor.lnum, 1);
 }
 
-/// `:redrawtabline` takes no bang (`ex_cmds.lua` omits BANG), so `!`
-/// is trailing garbage: E488.
+/// `:redrawtabline` takes no bang (`ex_cmds.lua` omits BANG), and a
+/// disallowed bang is upstream's `e_nobang`: E477, not a trailing-characters
+/// error.
+///
+/// Oracle: `redrawtabline!` → `Vim(redrawtabline):E477: No ! allowed`.
 #[test]
-fn redrawtabline_rejects_a_bang_with_e488() {
+fn redrawtabline_rejects_a_bang_with_e477() {
     let (mut editor, mut executor) = setup();
-    assert_vim_error(executor.execute_line(&mut editor, "redrawtabline!"), "E488");
+    assert_vim_error(executor.execute_line(&mut editor, "redrawtabline!"), "E477");
 }
 
 // ---------------------------------------------------------------------------
