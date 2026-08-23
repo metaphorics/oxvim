@@ -24,22 +24,50 @@ functional: _guard_binary
 #
 # The suite deletes whatever $HOME points to. setup.vim sandboxes it with
 # `let $HOME = .../XfakeHOME`, and runtest.vim cleans up with `rm -rf` over
-# names that the shell word-splits, one of which expands `~`. Running with an
+# names the shell word-splits, one of which expands `~`. Running with an
 # inherited HOME once destroyed this checkout, ~/.cargo, ~/.rustup and
-# ~/.local. So: refuse to start unless HOME is a throwaway directory, and run
-# against a copy of testdir so the reference tree stays untouched.
-oldtest: _guard_binary
+# ~/.local, so this recipe allocates its own HOME and never trusts the
+# caller's. It also runs against a copied testdir, because the suite writes
+# into its own directory and .references is read-only. The copy needs the
+# sibling src/ and runtime/ the Makefile reaches for, so they are symlinked.
+oldtest *targets: _guard_binary
     #!/usr/bin/env bash
     set -euo pipefail
-    case "${HOME:?}" in
-      /tmp/*|/var/tmp/*) ;;
-      *) echo "refusing to run: HOME is ${HOME}, which this suite can delete." >&2
-         echo "run as: HOME=\$(mktemp -d) just oldtest" >&2
-         exit 1 ;;
-    esac
+    ref="{{justfile_directory()}}/.references/neovim"
+    out="{{justfile_directory()}}/target/oldtest"
     scratch="$(mktemp -d)"
-    cp -a "{{justfile_directory()}}/.references/neovim/test/old/testdir" "${scratch:?}/testdir"
-    make -C "${scratch:?}/testdir" NVIM_PRG="{{justfile_directory()}}/target/release/oxvim"
+    mkdir -p "${scratch:?}/test/old" "${scratch:?}/home" "${out:?}"
+    cp -a "${ref:?}/src" "${scratch:?}/src"
+    ln -s "${ref:?}/runtime" "${scratch:?}/runtime"
+    cp -a "${ref:?}/test/old/testdir" "${scratch:?}/test/old/testdir"
+    rm -f -- "${scratch:?}/test/old/testdir/messages" \
+             "${scratch:?}/test/old/testdir/test.log" \
+             "${scratch:?}/test/old/testdir/test.res"
+    # make's exit status does not track per-test failures here: runtest.vim
+    # writes .res as a pass marker and the results land in `messages`. So keep
+    # going, then decide from the messages file itself.
+    set +e
+    HOME="${scratch:?}/home" make -C "${scratch:?}/test/old/testdir" \
+        NVIM_PRG="{{justfile_directory()}}/target/release/oxvim" {{targets}}
+    set -e
+    msg="${scratch:?}/test/old/testdir/messages"
+    if [[ ! -s "${msg}" ]]; then
+      echo "oldtest produced no messages file: the harness never reported." >&2
+      cp -a "${scratch:?}/test/old/testdir" "${out:?}/failed-run" 2>/dev/null || true
+      rm -rf -- "${scratch:?}"
+      exit 1
+    fi
+    cp -f "${msg}" "${out:?}/messages"
+    cp -f "${scratch:?}/test/old/testdir/test.log" "${out:?}/test.log" 2>/dev/null || true
+    rm -rf -- "${scratch:?}"
+    # grep exits 1 when it finds nothing, and a clean run has no FAILED line,
+    # so each capture must tolerate no match or `set -e` aborts the summary.
+    executed=$(grep -aoE '^Executed [0-9]+ tests?' "${out:?}/messages" | grep -oE '[0-9]+' | tail -1 || true)
+    failed=$(grep -aoE '^[0-9]+ FAILED:' "${out:?}/messages" | grep -oE '[0-9]+' | tail -1 || true)
+    skipped=$(grep -ac '^SKIPPED' "${out:?}/messages" || true)
+    echo "oldtest: executed=${executed:-0} failed=${failed:-0} skipped=${skipped:-0}"
+    echo "results: ${out:?}/messages"
+    [[ "${failed:-0}" -eq 0 ]] || exit 1
 
 # Diff oxvim --api-info schema against upstream.
 apidiff: _guard_binary
