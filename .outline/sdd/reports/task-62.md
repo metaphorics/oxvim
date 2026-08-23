@@ -138,8 +138,8 @@ Test suites, `-- --test-threads=1`, zero failures everywhere:
 
 | crate | baseline | now |
 | --- | --- | --- |
-| `ox-eval` | 394 | **409** |
-| `ox-editor` | 742 | 755 (includes Task61's landings; 5 of the new tests are mine) |
+| `ox-eval` | 394 | **410** |
+| `ox-editor` | 742 | 758 (includes Task61's landings; 5 of the new tests are mine) |
 | `ox-excmd` | 160 | 160 |
 | `ox-text` | 18 | 18 |
 
@@ -225,19 +225,26 @@ rather than a silent rider on this one. It is the single highest-leverage follow
   script, which is why `check.vim` works under `runtest.vim` but not in a single-file repro. This
   inflates the E492 census rank (83 files) by an unknown amount and is worth measuring before anyone
   attacks E492. Reported to Task61Regressions, who owns `crates/ox-editor/`.
-- **`setenv()` was checked against the `let $VAR` sandbox defect and is clean.**
-  `crates/ox-eval/src/builtins.rs:1155-1165` already routes both branches through
-  `ox_sys::set_env`/`ox_sys::unset_env`, and `setenv_sets_numeric_value_and_null_unsets`
-  (`builtins_tests.rs:91-97`) asserts through `std::env::var_os` rather than the script scope, so it
-  cannot pass vacuously. `Scope::set_env` (`scope.rs:415-418`) is an in-process map and correctly so;
-  the leak was only the Ex assignment path, which Task61Regressions is fixing at
-  `excmd_exec.rs:5283-5295`. Worth someone confirming `crates/ox-uv/src/misc.rs:199-207` is the
-  libuv-facing env API and not a third path that can diverge.
+- **`setenv()` was half-wrong, and is now fixed** (`ab2b9b2`). Checking it against the `let $VAR`
+  sandbox defect at Main's request showed the process-environment side was already correct — both
+  branches route through `ox_sys::set_env`/`ox_sys::unset_env`, so children always inherited the
+  value and the `$HOME` sandbox was never at risk from this path. The read side was not:
+  `Scope::env` is a snapshot of `std::env::vars_os()` taken once at startup
+  (`excmd_exec.rs:345-346`) and every `$VAR` read comes from it, so `call setenv('X', 'v')` followed
+  by `echo $X` returned the empty string where upstream prints `v`. Upstream has no snapshot:
+  `f_setenv` is `os_setenv` and each read is an `os_getenv`. `:let $VAR` already wrote both sides;
+  `setenv()` wrote one. Both are updated now, with the `v:null` branch removing the snapshot entry
+  through a new `Scope::unset_env` so a stale value cannot outlive `os_unsetenv`. Found by
+  Task61Regressions while tracing the sandbox escape. The pre-existing test asserted only through
+  `std::env::var_os` and still passes with the fix reverted, so a new test drives a parsed `$NAME`
+  expression through the same scope; it was mutation-checked by reverting the mirror and confirming
+  it fails. Worth someone confirming `crates/ox-uv/src/misc.rs:199-207` is the libuv-facing env API
+  and not a third path that can diverge.
 - **`#{a: 1` gives E723 where upstream gives E722** ("Missing comma in Dictionary"). Noticed while
   probing literal dictionaries; left alone because it is the unterminated-dictionary construct, not
   the key construct, and `test_listdict.vim` already tracks it at `Test_dict[14]`.
 - **`->99()` is a valid method call upstream** (`E117: Unknown function: 99`, because `get_name_len`
   accepts digits) and is E260 in oxvim. Left alone: accepting it would change what reaches the
   evaluator for a case no census file exercises.
-- **`ox-editor`'s 755 is not all mine.** Task61Regressions was landing commits in the same tree
-  throughout. `ox-eval` 394 → 409 is entirely this task.
+- **`ox-editor`'s count is not all mine.** Task61Regressions was landing commits in the same tree
+  throughout. `ox-eval` 394 → 410 is entirely this task.
