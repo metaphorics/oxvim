@@ -42,6 +42,7 @@ target/
 !.outline/sdd/oldtest-blockers-2.md
 !.outline/sdd/oldtest-census-3.tsv
 !.outline/sdd/oldtest-blockers-3.md
+!.outline/sdd/plugin-probe.md
 .plan/
 PLAN.md
 TASKS.md
