@@ -740,22 +740,41 @@ fn is_name_continue(byte: u8) -> bool {
 }
 
 fn decode_special_key(name: &[u8], offset: usize) -> Result<Vec<u8>, EvalError> {
+    const SPECIAL: u8 = 0x80;
+    const EXTRA: u8 = 0xfd;
+    const MODIFIER: u8 = 0xfc;
+    let mut name = name;
+    if name.first() == Some(&b'*') { name = &name[1..]; }
+    let mut modifiers = 0u8;
+    loop {
+        if name.len() < 2 || name[1] != b'-' { break; }
+        modifiers |= match name[0].to_ascii_lowercase() { b's' => 1, b'c' => 2, b'm' | b'a' => 4, _ => break };
+        name = &name[2..];
+    }
     let lower: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
-    let value = match lower.as_slice() {
-        b"bs" => Some(0x08),
-        b"tab" => Some(b'\t'),
-        b"nl" => Some(b'\n'),
-        b"cr" | b"return" | b"enter" => Some(b'\r'),
-        b"esc" => Some(0x1b),
-        b"space" => Some(b' '),
-        b"lt" => Some(b'<'),
-        b"bslash" => Some(b'\\'),
-        b"bar" => Some(b'|'),
-        b"del" => Some(0x7f),
-        [b'c', b'-', key] => Some(if *key == b'?' { 0x7f } else { key & 0x1f }),
+    let named = match lower.as_slice() {
+        b"bs" => Some((b'B', 0x08)),
+        b"tab" => Some((b'T', b'\t')),
+        b"nl" => Some((b'N', b'\n')),
+        b"cr" | b"return" | b"enter" => Some((b'R', b'\r')),
+        b"esc" => Some((b'E', 0x1b)),
+        b"space" => Some((b'S', b' ')),
+        b"lt" => Some((b'L', b'<')),
+        b"bslash" => Some((b'\\', b'\\')),
+        b"bar" => Some((b'|', b'|')),
+        b"del" => Some((b'D', 0x7f)),
+        b"home" => Some((b'H', 0)),
         _ => None,
     };
-    value
-        .map(|byte| vec![byte])
-        .ok_or_else(|| EvalError::new("E114", offset, "unsupported special key escape"))
+    let mut output = Vec::new();
+    if modifiers != 0 { output.extend_from_slice(&[SPECIAL, MODIFIER, modifiers]); }
+    if let Some((code, literal)) = named {
+        if modifiers == 0 || code == b'H' { output.extend_from_slice(&[SPECIAL, EXTRA, code]); } else { output.push(literal); }
+        return Ok(output);
+    }
+    if !name.is_empty() {
+        output.extend_from_slice(name);
+        return Ok(output);
+    }
+    Err(EvalError::new("E114", offset, "unsupported special key escape"))
 }

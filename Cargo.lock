@@ -453,6 +453,7 @@ dependencies = [
  "ox-types",
  "serde_json",
  "thiserror 2.0.20",
+ "unicode-width",
 ]
 
 [[package]]

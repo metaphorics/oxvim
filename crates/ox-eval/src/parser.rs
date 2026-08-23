@@ -665,7 +665,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             if matches!(self.current().kind, TokenKind::RParen) {
-                return Err(EvalError::new("E116", self.current().span.start, "trailing comma in argument list"));
+                break;
             }
         }
         let close = self.require(|kind| matches!(kind, TokenKind::RParen), "E116", "missing ')' after arguments")?;

@@ -136,7 +136,14 @@ impl Scope {
     /// Create an empty scope set.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        let mut scope = Self::default();
+        scope.vim.extend([
+            (OxStr::from("_null_string"), Typval::String(OxStr::from(""))),
+            (OxStr::from("_null_list"), Typval::list(Vec::new())),
+            (OxStr::from("_null_dict"), Typval::dict(Vec::new())),
+            (OxStr::from("_null_blob"), Typval::Blob(Vec::new())),
+        ]);
+        scope
     }
 
     /// Clone the full scope table into an independent snapshot.

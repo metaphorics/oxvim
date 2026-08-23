@@ -63,6 +63,29 @@ case!(trim_default, "trim", [text("  a \n")], text("a"));
 case!(trim_mask, "trim", [text("xxabcxx"), text("x")], text("abc"));
 case!(trim_left, "trim", [text("xxabcxx"), text("x"), number(1)], text("abcxx"));
 case!(trim_right, "trim", [text("xxabcxx"), text("x"), number(2)], text("xxabc"));
+case!(trim_unicode_mask, "trim", [text("你好RESERVE好你"), text("你好")], text("RESERVE"));
+case!(trim_default_control_and_nbsp, "trim", [text("\u{000b}\u{00a0}x\u{00a0}\u{000b}")], text("x"));
+case!(toupper_uses_simple_case_mapping, "toupper", [text("ẖǰŉẗẘẙ")], text("ẖǰŉẗẘẙ"));
+case!(tolower_dotted_i_is_single_character, "tolower", [text("İ")], text("i"));
+case!(translate_unicode_characters, "tr", [text("cab"), text("abc"), text("xyz")], text("zxy"));
+case!(strwidth_counts_wide_and_combining, "strwidth", [text("a界e\u{301}")], number(4));
+case!(strtrans_control_and_zero_width, "strtrans", [text("a\tb\u{200b}")], text("a^Ib<200b>"));
+case!(strutf16len_ignores_composing_by_default, "strutf16len", [text("-a\u{301}-b\u{301}")], number(4));
+case!(strutf16len_counts_composing_when_requested, "strutf16len", [text("-a\u{301}-b\u{301}"), Typval::Bool(true)], number(6));
+case!(charidx_groups_composing_marks, "charidx", [text("xa\u{301}b\u{301}y"), number(3)], number(1));
+case!(charidx_counts_composing_when_requested, "charidx", [text("xa\u{301}b\u{301}y"), number(4), number(1)], number(3));
+case!(charidx_accepts_utf16_offsets, "charidx", [text("a😊b"), number(2), Typval::Bool(false), Typval::Bool(true)], number(1));
+case!(utf16idx_maps_byte_inside_supplementary, "utf16idx", [text("a😊b"), number(3)], number(1));
+case!(utf16idx_maps_character_offsets, "utf16idx", [text("a😊b"), number(2), Typval::Bool(false), Typval::Bool(true)], number(3));
+case!(pathshorten_preserves_prefixes, "pathshorten", [text("~.foo/bar/baz"), number(2)], text("~.fo/ba/baz"));
+case!(keytrans_printable_names, "keytrans", [text(" <|\\")], text("<Space><lt><Bar><Bslash>"));
+
+#[test]
+fn keytrans_preserves_named_and_modified_escapes() {
+    let expression = Parser::new(r#"keytrans("\<Tab>\<C-V>\<M-π>")"#.as_bytes()).parse().unwrap();
+    let mut builtins = Builtins::without_regex();
+    assert_eq!(Evaluator::new(&mut builtins, &NoRegex).eval(&expression, &mut Scope::new()).unwrap(), text("<Tab><C-V><M-π>"));
+}
 
 #[test]
 fn setenv_sets_numeric_value_and_null_unsets() {
@@ -1167,4 +1190,13 @@ fn indexof_matches_upstream_string_callback_and_startidx() {
     // Callback errors abort the search and surface (upstream did_emsg check).
     assert_eq!(call("indexof", vec![strings, text("v:val == 'b'")]).unwrap(), number(1));
     assert_eq!(call("indexof", vec![Typval::list(vec![]), text("v:val == 1")]).unwrap(), number(-1));
+}
+
+#[test]
+fn matchstrpos_and_matchlist_shape_results() {
+    let regex = LiteralRegex { calls: Cell::new(0) };
+    let mut builtins = Builtins::new(&regex);
+    assert_eq!(builtins.call(&OxStr::from("matchstrpos"), vec![text("testing"), text("ing")], &mut Scope::new()).unwrap(), Typval::list(vec![text("ing"), number(4), number(7)]));
+    assert_eq!(builtins.call(&OxStr::from("matchstrpos"), vec![Typval::list(vec![text("vim"), text("testing")]), text("ing")], &mut Scope::new()).unwrap(), Typval::list(vec![text("ing"), number(1), number(4), number(7)]));
+    assert_eq!(builtins.call(&OxStr::from("matchlist"), vec![text("acd"), text("acd")], &mut Scope::new()).unwrap(), Typval::list(vec![text("acd"), text(""), text(""), text(""), text(""), text(""), text(""), text(""), text(""), text("")]));
 }

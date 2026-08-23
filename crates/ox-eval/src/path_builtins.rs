@@ -35,6 +35,17 @@ pub(crate) fn executable(value: &Typval) -> Result<Typval> {
     Ok(boolean(found))
 }
 
+pub(crate) fn exepath(value: &Typval) -> Result<Typval> {
+    let program = string_arg(value)?.to_string_lossy().into_owned();
+    if program.is_empty() { return Ok(text("")); }
+    let path = Path::new(&program);
+    if path.components().count() > 1 {
+        return Ok(if is_executable(path) { text(fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy()) } else { text("") });
+    }
+    let found = std::env::var_os("PATH").and_then(|search| std::env::split_paths(&search).map(|directory| directory.join(&program)).find(|candidate| is_executable(candidate)));
+    Ok(found.map_or_else(|| text(""), |candidate| text(fs::canonicalize(&candidate).unwrap_or(candidate).to_string_lossy())))
+}
+
 pub(crate) fn simplify(value: &Typval) -> Result<Typval> {
     let input = string_arg(value)?;
     Ok(text(simplify_name(&input.to_string_lossy())))

@@ -29,6 +29,17 @@ pub trait BuiltinHost {
     fn closure_registry(&self) -> Option<ClosureRegistry> { None }
 }
 
+/// A regex match range plus capture groups one through nine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegexMatch {
+    /// Inclusive match byte offset.
+    pub start: usize,
+    /// Exclusive match byte offset.
+    pub end: usize,
+    /// Capture byte ranges; unmatched groups are `None`.
+    pub captures: Vec<Option<(usize, usize)>>,
+}
+
 /// Regular-expression integration point for operators and pure regex builtins.
 pub trait RegexEngine {
     /// Match `text` against a Vim regular expression.
@@ -42,6 +53,11 @@ pub trait RegexEngine {
     /// Return the byte range of the first match at or after `start`.
     fn find(&self, _text: &OxStr, _pattern: &OxStr, _start: usize) -> Result<Option<(usize, usize)>> {
         Err(EvalError::new("E54", 0, "regular-expression search is not supported by this engine"))
+    }
+
+    /// Return the first match and its capture groups at or after `start`.
+    fn find_captures(&self, text: &OxStr, pattern: &OxStr, start: usize) -> Result<Option<RegexMatch>> {
+        self.find(text, pattern, start).map(|matched| matched.map(|(start, end)| RegexMatch { start, end, captures: Vec::new() }))
     }
 
     /// Replace matches according to Vim's substitute flags.

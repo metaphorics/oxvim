@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use ox_types::{Funcref, OxStr, Special, Typval};
 use serde_json::Value as JsonValue;
+use unicode_width::UnicodeWidthChar;
 
 use crate::error::{EvalError, Result};
 use crate::eval::{compare_bytes, BuiltinHost, BufferHost, ClosureRegistry, Evaluator, RegexEngine};
@@ -43,19 +44,27 @@ pub fn builtin_spec(name: &str) -> Option<&'static BuiltinSpec> {
 pub struct Builtins<'a> {
     regex: Option<&'a dyn RegexEngine>,
     closures: ClosureRegistry,
+    ambiguous_wide: bool,
 }
 
 impl<'a> Builtins<'a> {
     /// Create a dispatcher with regex-backed builtins enabled through `regex`.
     #[must_use]
     pub fn new(regex: &'a dyn RegexEngine) -> Self {
-        Self { regex: Some(regex), closures: ClosureRegistry::new() }
+        Self { regex: Some(regex), closures: ClosureRegistry::new(), ambiguous_wide: false }
     }
 
     /// Create a dispatcher whose regex-backed operations return a typed error.
     #[must_use]
     pub fn without_regex() -> Self {
-        Self { regex: None, closures: ClosureRegistry::new() }
+        Self { regex: None, closures: ClosureRegistry::new(), ambiguous_wide: false }
+    }
+
+    /// Use double-cell widths for East-Asian ambiguous characters.
+    #[must_use]
+    pub fn with_ambiguous_width(mut self, wide: bool) -> Self {
+        self.ambiguous_wide = wide;
+        self
     }
 
     /// Reuse the evaluator's closure registry for callback-capable builtins.
@@ -88,6 +97,7 @@ impl<'a> Builtins<'a> {
             "empty" => Ok(Typval::Number(i64::from(is_empty(&args[0])))),
             "escape" => escape(&args),
             "executable" => path_builtins::executable(&args[0]),
+            "exepath" => path_builtins::exepath(&args[0]),
             "exists" => exists(&args[0], scope),
             "extend" | "extendnew" => extend(args),
             "filter" => self.filter_or_map(args, scope, CollectionOp::Filter),
@@ -106,6 +116,7 @@ impl<'a> Builtins<'a> {
             "islocked" => is_locked_value(&args[0]),
             "items" => dict_projection(&args[0], Projection::Items),
             "join" => join(&args),
+            "keytrans" => keytrans(&args[0]),
             "json_decode" => json_decode(&args[0]),
             "json_encode" => json_encode(&args[0]),
             "keys" => dict_projection(&args[0], Projection::Keys),
@@ -117,6 +128,7 @@ impl<'a> Builtins<'a> {
             "foreach" => self.filter_or_map(args, scope, CollectionOp::ForEach),
             "reduce" => self.reduce(args, scope),
             "match" | "matchend" | "matchstr" => self.regex_match(name, &args),
+            "matchlist" | "matchstrpos" => self.regex_result(name, &args),
             "max" => extremum(&args[0], true),
             "min" => extremum(&args[0], false),
             "nr2char" => nr2char(&args),
@@ -127,6 +139,7 @@ impl<'a> Builtins<'a> {
             "remove" => remove(args),
             "repeat" => repeat(&args),
             "resolve" => path_builtins::resolve(&args[0]),
+            "pathshorten" => pathshorten(&args),
             "reverse" => reverse(args),
             "setenv" => setenv(&args),
             "simplify" => path_builtins::simplify(&args[0]),
@@ -137,6 +150,9 @@ impl<'a> Builtins<'a> {
             "str2list" => str2list(&args),
             "str2nr" => str2nr(&args),
             "strcharlen" | "strchars" => strcharlen(&args[0]),
+            "strtrans" => strtrans(&args[0]),
+            "strutf16len" => strutf16len(&args),
+            "strwidth" => strwidth(&args[0], self.ambiguous_wide),
             "stridx" => string_index(&args, false),
             "string" => Ok(Typval::String(vim_string(&args[0], 0)?)),
             "strpart" => strpart(&args),
@@ -145,6 +161,9 @@ impl<'a> Builtins<'a> {
             "tolower" => change_case(&args[0], false),
             "toupper" => change_case(&args[0], true),
             "trim" => trim(&args),
+            "tr" => translate(&args),
+            "utf16idx" => utf16idx(&args),
+            "charidx" => charidx(&args),
             "type" => Ok(Typval::Number(i64::from(args[0].vartype()))),
             "uniq" => uniq(args),
             "values" => dict_projection(&args[0], Projection::Values),
@@ -212,6 +231,42 @@ impl<'a> Builtins<'a> {
                     (_, None) => Typval::Number(-1),
                     _ => Typval::Number(-1),
                 })
+            }
+        }
+    }
+
+    fn regex_result(&self, name: &str, args: &[Typval]) -> Result<Typval> {
+        let pattern = string_arg(&args[1])?;
+        let start_number = args.get(2).map(number_arg).transpose()?.unwrap_or(0).max(0);
+        match &args[0] {
+            Typval::List(values) if name == "matchstrpos" => {
+                let values = list_items(values)?;
+                for (index, value) in values.iter().enumerate().skip(usize::try_from(start_number).unwrap_or(usize::MAX)) {
+                    let text = string_arg(value)?;
+                    if let Some(found) = self.regex()?.find_captures(&text, &pattern, 0)? {
+                        return Ok(Typval::list(vec![Typval::String(OxStr(text.as_bytes()[found.start..found.end].to_vec())), Typval::Number(saturating_i64(index)), Typval::Number(saturating_i64(found.start)), Typval::Number(saturating_i64(found.end))]));
+                    }
+                }
+                Ok(Typval::list(vec![Typval::String(OxStr(Vec::new())), Typval::Number(-1), Typval::Number(-1), Typval::Number(-1)]))
+            }
+            Typval::List(_) => Err(EvalError::new("E730", 0, "Using a List as a String")),
+            value => {
+                let text = string_arg(value)?;
+                let found = self.regex()?.find_captures(&text, &pattern, usize::try_from(start_number).unwrap_or(usize::MAX))?;
+                if name == "matchstrpos" {
+                    return Ok(match found {
+                        Some(found) => Typval::list(vec![Typval::String(OxStr(text.as_bytes()[found.start..found.end].to_vec())), Typval::Number(saturating_i64(found.start)), Typval::Number(saturating_i64(found.end))]),
+                        None => Typval::list(vec![Typval::String(OxStr(Vec::new())), Typval::Number(-1), Typval::Number(-1)]),
+                    });
+                }
+                let Some(found) = found else { return Ok(Typval::list(Vec::new())); };
+                let mut result = Vec::with_capacity(10);
+                result.push(Typval::String(OxStr(text.as_bytes()[found.start..found.end].to_vec())));
+                for capture in found.captures.into_iter().take(9) {
+                    result.push(Typval::String(capture.map_or_else(|| OxStr(Vec::new()), |(start, end)| OxStr(text.as_bytes()[start..end].to_vec()))));
+                }
+                while result.len() < 10 { result.push(Typval::String(OxStr(Vec::new()))); }
+                Ok(Typval::list(result))
             }
         }
     }
@@ -617,6 +672,9 @@ impl RegexEngine for RegexRef<'_> {
     fn find(&self, text: &OxStr, pattern: &OxStr, start: usize) -> Result<Option<(usize, usize)>> {
         self.0.ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?.find(text, pattern, start)
     }
+    fn find_captures(&self, text: &OxStr, pattern: &OxStr, start: usize) -> Result<Option<crate::eval::RegexMatch>> {
+        self.0.ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?.find_captures(text, pattern, start)
+    }
     fn substitute(&self, text: &OxStr, pattern: &OxStr, replacement: &OxStr, flags: &OxStr) -> Result<OxStr> {
         self.0.ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?.substitute(text, pattern, replacement, flags)
     }
@@ -635,13 +693,13 @@ fn check_arity(spec: &BuiltinSpec, count: usize) -> Result<()> {
 fn is_implemented(name: &str) -> bool {
     matches!(name,
         "abs" | "add" | "and" | "blob2list" | "ceil" | "char2nr" | "copy" | "count" |
-        "deepcopy" | "empty" | "escape" | "executable" | "exists" | "extend" | "extendnew" | "filter" | "flatten" |
+        "deepcopy" | "empty" | "escape" | "executable" | "exepath" | "exists" | "extend" | "extendnew" | "filter" | "flatten" |
         "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "get" | "getcwd" | "has" | "has_key" | "index" | "insert" | "items" |
-        "indexof" | "islocked" | "join" | "json_decode" | "json_encode" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
-        "match" | "matchend" | "matchstr" | "max" | "min" | "nr2char" | "or" | "pow" | "printf" | "range" | "reduce" | "resolve" |
+        "indexof" | "islocked" | "join" | "json_decode" | "json_encode" | "keytrans" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
+        "match" | "matchend" | "matchstr" | "matchlist" | "matchstrpos" | "max" | "min" | "nr2char" | "or" | "pathshorten" | "pow" | "printf" | "range" | "reduce" | "resolve" |
         "remove" | "repeat" | "reverse" | "setenv" | "simplify" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
-        "str2nr" | "strcharlen" | "strchars" | "stridx" | "string" | "strpart" | "strridx" |
-        "substitute" | "tolower" | "toupper" | "trim" | "trunc" | "type" | "uniq" | "values" | "xor"
+        "str2nr" | "strcharlen" | "strchars" | "stridx" | "string" | "strpart" | "strridx" | "strtrans" | "strutf16len" | "strwidth" |
+        "substitute" | "tolower" | "toupper" | "tr" | "trim" | "trunc" | "type" | "uniq" | "utf16idx" | "charidx" | "values" | "xor"
     )
 }
 
@@ -970,7 +1028,19 @@ fn string_elements(mut bytes: &[u8]) -> Vec<OxStr> {
 fn change_case(value: &Typval, upper: bool) -> Result<Typval> {
     let value = string_arg(value)?;
     let text = String::from_utf8_lossy(value.as_bytes());
-    let changed = if upper { text.to_uppercase() } else { text.to_lowercase() };
+    let mut changed = String::with_capacity(text.len());
+    for character in text.chars() {
+        let mapped = if upper {
+            let mut values = character.to_uppercase();
+            let first = values.next().unwrap_or(character);
+            if values.next().is_none() { first } else { character }
+        } else {
+            let mut values = character.to_lowercase();
+            let first = values.next().unwrap_or(character);
+            if values.next().is_none() { first } else if character == '\u{0130}' { 'i' } else { character }
+        };
+        changed.push(mapped);
+    }
     Ok(Typval::String(OxStr(changed.into_bytes())))
 }
 
@@ -978,13 +1048,183 @@ fn trim(args: &[Typval]) -> Result<Typval> {
     let value = string_arg(&args[0])?;
     let mask = args.get(1).map(string_arg).transpose()?;
     let direction = args.get(2).map(number_arg).transpose()?.unwrap_or(0);
+    if !(0..=2).contains(&direction) {
+        return Err(EvalError::new("E475", 0, "Invalid argument"));
+    }
+    let text = String::from_utf8_lossy(value.as_bytes());
+    let mask_text = mask.as_ref().map(|value| String::from_utf8_lossy(value.as_bytes()));
+    let removable = |character: char| mask_text.as_ref().map_or(character <= '\u{20}' || character == '\u{a0}', |mask| mask.contains(character));
+    let start = if direction != 2 { text.char_indices().find(|(_, character)| !removable(*character)).map_or(text.len(), |(index, _)| index) } else { 0 };
+    let end = if direction != 1 { text.char_indices().rev().find(|(_, character)| !removable(*character)).map_or(start, |(index, character)| index + character.len_utf8()) } else { text.len() };
+    Ok(Typval::String(OxStr(text.as_bytes()[start.min(end)..end].to_vec())))
+}
+
+fn translate(args: &[Typval]) -> Result<Typval> {
+    let input = string_arg(&args[0])?;
+    let from = string_arg(&args[1])?;
+    let to = string_arg(&args[2])?;
+    let from_chars = String::from_utf8_lossy(from.as_bytes()).chars().collect::<Vec<_>>();
+    let to_chars = String::from_utf8_lossy(to.as_bytes()).chars().collect::<Vec<_>>();
+    if from_chars.len() != to_chars.len() {
+        return Err(EvalError::new("E475", 0, "Invalid argument: fromstr and tostr have different number of characters"));
+    }
+    let replacements = from_chars.into_iter().zip(to_chars).collect::<HashMap<_, _>>();
+    let mut output = String::new();
+    for character in String::from_utf8_lossy(input.as_bytes()).chars() {
+        output.push(replacements.get(&character).copied().unwrap_or(character));
+    }
+    Ok(Typval::String(OxStr(output.into_bytes())))
+}
+
+fn strwidth(value: &Typval, ambiguous_wide: bool) -> Result<Typval> {
+    let value = string_arg(value)?;
+    let width = String::from_utf8_lossy(value.as_bytes()).chars().map(|character| match character { '\t' => 1, _ if ambiguous_wide => UnicodeWidthChar::width_cjk(character).unwrap_or(0), _ => UnicodeWidthChar::width(character).unwrap_or(0) }).sum::<usize>();
+    Ok(Typval::Number(saturating_i64(width)))
+}
+
+fn strtrans(value: &Typval) -> Result<Typval> {
+    let value = string_arg(value)?;
+    let mut output = String::new();
+    for element in string_elements(value.as_bytes()) {
+        let bytes = element.as_bytes();
+        if bytes.len() == 1 {
+            match bytes[0] {
+                0x00..=0x1f => { output.push('^'); output.push(char::from(bytes[0] + b'@')); }
+                0x7f => output.push_str("^?"),
+                0x80..=0xff => output.push_str(&format!("<{:02x}>", bytes[0])),
+                byte => output.push(char::from(byte)),
+            }
+            continue;
+        }
+        let character = std::str::from_utf8(bytes).ok().and_then(|text| text.chars().next());
+        match character {
+            Some(character @ ('\u{80}'..='\u{9f}' | '\u{200b}' | '\u{feff}')) => output.push_str(&format!("<{:x}>", character as u32)),
+            Some(character) => output.push(character),
+            None => for byte in bytes { output.push_str(&format!("<{byte:02x}>")); },
+        }
+    }
+    Ok(Typval::String(OxStr(output.into_bytes())))
+}
+
+fn strutf16len(args: &[Typval]) -> Result<Typval> {
+    let value = strict_string_arg(&args[0], 1)?;
+    let count_composing = bool_number_arg(args.get(1))?;
+    let mut units = 0usize;
+    for character in String::from_utf8_lossy(value.as_bytes()).chars() {
+        if count_composing || UnicodeWidthChar::width(character).unwrap_or(0) != 0 { units += character.len_utf16(); }
+    }
+    Ok(Typval::Number(saturating_i64(units)))
+}
+
+fn charidx(args: &[Typval]) -> Result<Typval> {
+    let value = strict_string_arg(&args[0], 1)?;
+    let index = strict_number_arg(&args[1], 2)?;
+    let count_composing = bool_number_arg(args.get(2))?;
+    let utf16_index = bool_number_arg(args.get(3))?;
+    if index < 0 { return Ok(Typval::Number(-1)); }
+    let target = usize::try_from(index).unwrap_or(usize::MAX);
+    let text = String::from_utf8_lossy(value.as_bytes());
+    let limit = if utf16_index { text.encode_utf16().count() } else { value.as_bytes().len() };
+    if target > limit { return Ok(Typval::Number(-1)); }
+    let mut position = 0usize;
+    let mut characters = 0usize;
+    for character in text.chars() {
+        let next = position + if utf16_index { character.len_utf16() } else { character.len_utf8() };
+        if target < next {
+            let index = if !count_composing && UnicodeWidthChar::width(character).unwrap_or(0) == 0 { characters.saturating_sub(1) } else { characters };
+            return Ok(Typval::Number(saturating_i64(index)));
+        }
+        position = next;
+        if count_composing || UnicodeWidthChar::width(character).unwrap_or(0) != 0 { characters += 1; }
+    }
+    Ok(Typval::Number(if target == position { saturating_i64(characters) } else { -1 }))
+}
+
+fn utf16idx(args: &[Typval]) -> Result<Typval> {
+    let value = strict_string_arg(&args[0], 1)?;
+    let index = strict_number_arg(&args[1], 2)?;
+    let count_composing = bool_number_arg(args.get(2))?;
+    let char_index = bool_number_arg(args.get(3))?;
+    if index < 0 { return Ok(Typval::Number(-1)); }
+    let target = usize::try_from(index).unwrap_or(usize::MAX);
+    let text = String::from_utf8_lossy(value.as_bytes());
+    let limit = if char_index { text.chars().filter(|character| count_composing || UnicodeWidthChar::width(*character).unwrap_or(0) != 0).count() } else { value.as_bytes().len() };
+    if target > limit { return Ok(Typval::Number(-1)); }
+    let mut source_position = 0usize;
+    let mut units = 0usize;
+    let mut cluster_start = 0usize;
+    for character in text.chars() {
+        let composing = UnicodeWidthChar::width(character).unwrap_or(0) == 0;
+        let source_width = if char_index { usize::from(count_composing || !composing) } else { character.len_utf8() };
+        if target < source_position + source_width {
+            let result = if !count_composing && composing { cluster_start } else { units };
+            return Ok(Typval::Number(saturating_i64(result)));
+        }
+        source_position += source_width;
+        if count_composing || !composing {
+            cluster_start = units;
+            units += character.len_utf16();
+        }
+    }
+    Ok(Typval::Number(if target == source_position { saturating_i64(units) } else { -1 }))
+}
+
+fn bool_number_arg(value: Option<&Typval>) -> Result<bool> {
+    match value { None => Ok(false), Some(Typval::Bool(value)) => Ok(*value), Some(Typval::Number(0)) => Ok(false), Some(Typval::Number(1)) => Ok(true), Some(_) => Err(EvalError::new("E1212", 0, "Bool required")) }
+}
+
+fn strict_string_arg(value: &Typval, argument: usize) -> Result<OxStr> {
+    match value { Typval::String(value) => Ok(value.clone()), _ => Err(EvalError::new("E1174", 0, format!("String required for argument {argument}"))) }
+}
+
+fn strict_number_arg(value: &Typval, argument: usize) -> Result<i64> {
+    match value { Typval::Number(value) => Ok(*value), _ => Err(EvalError::new("E1210", 0, format!("Number required for argument {argument}"))) }
+}
+
+fn pathshorten(args: &[Typval]) -> Result<Typval> {
+    let value = string_arg(&args[0])?;
+    let keep = args.get(1).map(number_arg).transpose()?.unwrap_or(1).max(1) as usize;
+    let source = String::from_utf8_lossy(value.as_bytes());
+    let mut components = source.split('/').collect::<Vec<_>>();
+    let last = if source.ends_with('/') { components.len().saturating_sub(1) } else { components.iter().rposition(|component| !component.is_empty()).unwrap_or(0) };
+    for (index, component) in components.iter_mut().enumerate() {
+        if index == last || component.is_empty() { continue; }
+        let prefix = component.chars().take_while(|character| matches!(character, '.' | '~')).count();
+        let end = component.char_indices().nth(prefix + keep).map_or(component.len(), |(index, _)| index);
+        *component = &component[..end];
+    }
+    Ok(Typval::String(OxStr(components.join("/").into_bytes())))
+}
+
+fn keytrans(value: &Typval) -> Result<Typval> {
+    let Typval::String(value) = value else { return Err(EvalError::new("E1174", 0, "String required for argument 1")); };
     let bytes = value.as_bytes();
-    let removable = |byte: u8| mask.as_ref().map_or(byte.is_ascii_whitespace(), |mask| mask.as_bytes().contains(&byte));
-    let mut start = 0;
-    let mut end = bytes.len();
-    if direction != 2 { while start < end && removable(bytes[start]) { start += 1; } }
-    if direction != 1 { while end > start && removable(bytes[end - 1]) { end -= 1; } }
-    Ok(Typval::String(OxStr(bytes[start..end].to_vec())))
+    let mut output = String::new();
+    let mut index = 0usize;
+    let mut modifiers = 0u8;
+    while index < bytes.len() {
+        if bytes.get(index..index + 3).is_some_and(|value| value[0] == 0x80 && value[1] == 0xfc) { modifiers = bytes[index + 2]; index += 3; continue; }
+        let (name, consumed) = if bytes.get(index..index + 3).is_some_and(|value| value[0] == 0x80 && value[1] == 0xfd) {
+            (match bytes[index + 2] { b'B' => "BS".to_owned(), b'T' => "Tab".to_owned(), b'N' => "NL".to_owned(), b'R' => "CR".to_owned(), b'E' => "Esc".to_owned(), b'S' => "Space".to_owned(), b'L' => "lt".to_owned(), b'\\' => "Bslash".to_owned(), b'|' => "Bar".to_owned(), b'D' => "Del".to_owned(), b'H' => "Home".to_owned(), other => char::from(other).to_string() }, 3)
+        } else {
+            let width = match bytes[index] { 0x00..=0x7f => 1, 0xc2..=0xdf => 2, 0xe0..=0xef => 3, 0xf0..=0xf4 => 4, _ => 1 }.min(bytes.len() - index);
+            let raw = &bytes[index..index + width];
+            let name = match raw { b" " => "Space".to_owned(), b"<" => "lt".to_owned(), b"|" => "Bar".to_owned(), b"\\" => "Bslash".to_owned(), [0x08] => "BS".to_owned(), [b'\t'] => "C-I".to_owned(), [b'\r'] => "CR".to_owned(), [0x1b] => "Esc".to_owned(), [0x7f] => "Del".to_owned(), [control @ 1..=26] => format!("C-{}", char::from(control + b'@')), _ => String::from_utf8_lossy(raw).into_owned() };
+            (name, width)
+        };
+        index += consumed;
+        let requires_brackets = modifiers != 0 || name.chars().count() != 1 || matches!(name.as_str(), "Space" | "lt" | "Bar" | "Bslash");
+        if requires_brackets {
+            output.push('<');
+            if modifiers & 2 != 0 && !name.starts_with("C-") { output.push_str("C-"); }
+            if modifiers & 1 != 0 { output.push_str("S-"); }
+            if modifiers & 4 != 0 { output.push_str("M-"); }
+            output.push_str(&name);
+            output.push('>');
+        } else { output.push_str(&name); }
+        modifiers = 0;
+    }
+    Ok(Typval::String(OxStr(output.into_bytes())))
 }
 
 fn join(args: &[Typval]) -> Result<Typval> {

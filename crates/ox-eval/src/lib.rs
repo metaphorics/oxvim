@@ -14,7 +14,7 @@ pub use builtins::{
     Builtins, BUILTINS,
 };
 pub use error::{EvalError, EvalErrorKind, Result};
-pub use eval::{BuiltinHost, BufferHost, Evaluator, NoBuiltins, NoRegex, RegexEngine};
+pub use eval::{BuiltinHost, BufferHost, Evaluator, NoBuiltins, NoRegex, RegexEngine, RegexMatch};
 pub use parser::{Expr, Parser};
 pub use scope::{Scope, ScopeKind};
 
