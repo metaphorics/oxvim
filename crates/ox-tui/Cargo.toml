@@ -13,5 +13,8 @@ thiserror.workspace = true
 mio.workspace = true
 signal-hook.workspace = true
 
+[dev-dependencies]
+portable-pty = "0.9.0"
+
 [lints]
 workspace = true
