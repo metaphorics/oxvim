@@ -149,7 +149,7 @@ impl<'a> Builtins<'a> {
             "resolve" => path_builtins::resolve(&args[0]),
             "pathshorten" => pathshorten(&args),
             "reverse" => reverse(args),
-            "setenv" => setenv(&args),
+            "setenv" => setenv(&args, scope),
             "simplify" => path_builtins::simplify(&args[0]),
             "slice" => slice(&args),
             "sort" => self.sort(args, scope),
@@ -1155,13 +1155,22 @@ fn string_arg(value: &Typval) -> Result<OxStr> {
     }
 }
 
-fn setenv(args: &[Typval]) -> Result<Typval> {
+/// `f_setenv` (`eval/funcs.c`) is `os_setenv`/`os_unsetenv`, so the assignment
+/// changes the process environment. oxvim additionally keeps a snapshot of the
+/// environment in `Scope::env`, taken once at startup, and `$VAR` reads come
+/// from that snapshot; upstream has no snapshot and reads the live environment
+/// through `os_getenv` every time. Writing only the process environment
+/// therefore left `setenv('X', 'v')` invisible to `echo $X` in the same
+/// session, so both are updated here, exactly as `:let $VAR` does.
+fn setenv(args: &[Typval], scope: &mut Scope) -> Result<Typval> {
     let name = string_arg(&args[0])?.to_string_lossy().into_owned();
     if args[1] == Typval::Special(Special::Null) {
-        ox_sys::unset_env(name);
+        ox_sys::unset_env(&name);
+        scope.unset_env(name.as_bytes());
     } else {
         let value = string_arg(&args[1])?.to_string_lossy().into_owned();
-        ox_sys::set_env(name, value);
+        ox_sys::set_env(&name, &value);
+        scope.set_env(name.as_bytes(), Typval::String(OxStr::from(value.as_str())));
     }
     Ok(Typval::Number(0))
 }

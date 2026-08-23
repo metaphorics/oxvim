@@ -96,6 +96,41 @@ fn setenv_sets_numeric_value_and_null_unsets() {
     assert_eq!(std::env::var_os(NAME), None);
 }
 
+/// `setenv()` must also be visible to `$VAR` in the same session. Upstream has
+/// no environment snapshot: `f_setenv` is `os_setenv` and every `$VAR` read is
+/// an `os_getenv`, so `call setenv('X', 'v')` then `echo $X` prints `v`. oxvim
+/// reads `$VAR` out of `Scope::env`, a snapshot taken at startup, so the
+/// builtin has to update both. Verified against nvim v0.13.0-dev-1390.
+#[test]
+fn setenv_is_visible_to_environment_reads_in_the_same_scope() {
+    const NAME: &str = "OXVIM_TEST_EVAL_SETENV_READBACK";
+    let mut builtins = Builtins::without_regex();
+    let mut scope = Scope::new();
+    let read = Parser::new(format!("${NAME}").as_bytes()).parse().unwrap();
+
+    // Absent to begin with: `$UNSET` is the empty string, not an error.
+    assert_eq!(
+        Evaluator::new(&mut builtins, &NoRegex).eval(&read, &mut scope).unwrap(),
+        text("")
+    );
+
+    builtins.call(&OxStr::from("setenv"), vec![text(NAME), text("live")], &mut scope).unwrap();
+    assert_eq!(
+        Evaluator::new(&mut builtins, &NoRegex).eval(&read, &mut scope).unwrap(),
+        text("live")
+    );
+
+    // Unsetting clears the snapshot too, so a stale value cannot survive.
+    builtins
+        .call(&OxStr::from("setenv"), vec![text(NAME), Typval::Special(Special::Null)], &mut scope)
+        .unwrap();
+    assert_eq!(
+        Evaluator::new(&mut builtins, &NoRegex).eval(&read, &mut scope).unwrap(),
+        text("")
+    );
+    assert_eq!(std::env::var_os(NAME), None);
+}
+
 case!(join_default, "join", [Typval::list(vec![text("a"), text("b")])], text("a b"));
 case!(join_custom, "join", [Typval::list(vec![text("a"), text("b")]), text(",")], text("a,b"));
 case!(repeat_string, "repeat", [text("ab"), number(3)], text("ababab"));

@@ -417,6 +417,14 @@ impl Scope {
         assign(&mut self.env, name, value);
     }
 
+    /// Remove an environment variable, so `$VAR` reads fall back to the empty
+    /// string the way `os_unsetenv` leaves them.
+    pub fn unset_env(&mut self, name: &[u8]) {
+        if let Some(index) = find_index(&self.env, name) {
+            self.env.remove(index);
+        }
+    }
+
     /// Read a register (`@r`).
     ///
     /// Missing registers return an empty string.
