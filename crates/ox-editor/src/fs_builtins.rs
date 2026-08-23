@@ -23,6 +23,11 @@ pub(crate) fn is_filesystem_builtin(name: &str) -> bool {
     )
 }
 
+/// Routes one filesystem builtin that needs nothing but the [`FileIO`] seam.
+///
+/// `writefile` is not here: its `D` flag registers a deferred delete against
+/// the enclosing function frame, so it is called from
+/// [`crate::builtins::filesystem`] with that context.
 pub(crate) fn call(io: &dyn FileIO, name: &str, args: Vec<Typval>) -> ox_eval::Result<Typval> {
     check_arity(name, args.len())?;
     match name {
@@ -32,7 +37,6 @@ pub(crate) fn call(io: &dyn FileIO, name: &str, args: Vec<Typval>) -> ox_eval::R
         "glob" => glob(io, &args),
         "globpath" => globpath(io, &args),
         "readfile" => readfile(io, &args),
-        "writefile" => writefile(io, &args),
         "filereadable" => filereadable(io, &args[0]),
         "isdirectory" => isdirectory(io, &args[0]),
         "getftime" => getftime(io, &args[0]),
@@ -42,6 +46,10 @@ pub(crate) fn call(io: &dyn FileIO, name: &str, args: Vec<Typval>) -> ox_eval::R
         "setfperm" => setfperm(io, &args),
         _ => unreachable!("filesystem builtin predicate and dispatcher disagree"),
     }
+}
+
+pub(crate) fn check_writefile_arity(count: usize) -> ox_eval::Result<()> {
+    check_arity("writefile", count)
 }
 
 fn check_arity(name: &str, count: usize) -> ox_eval::Result<()> {
@@ -194,23 +202,80 @@ fn readfile(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
     Ok(Typval::list(lines.into_iter().map(|line| Typval::String(OxStr(line))).collect()))
 }
 
-fn writefile(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
+/// Flags `f_writefile` accepts (`eval/fs.c` 1835-1860).
+///
+/// `s`/`S` force and suppress the `fsync` that `file_close(&fp, do_fsync)`
+/// performs (1902). This port writes through [`FileIO`], which has no
+/// durability control to force or suppress, so both letters are accepted and
+/// change nothing observable — the bytes are already in the file either way.
+/// Rejecting them would be the only observable difference, and it is the wrong
+/// one.
+struct WriteFlags {
+    binary: bool,
+    append: bool,
+    defer: bool,
+    mkdir: bool,
+}
+
+fn write_flags(flags: &str) -> ox_eval::Result<WriteFlags> {
+    let mut parsed = WriteFlags { binary: false, append: false, defer: false, mkdir: false };
+    for (offset, flag) in flags.char_indices() {
+        match flag {
+            'b' => parsed.binary = true,
+            'a' => parsed.append = true,
+            'D' => parsed.defer = true,
+            's' | 'S' => {}
+            'p' => parsed.mkdir = true,
+            // `semsg(_("E5060: Unknown flag: %s"), p)` prints the rest of the
+            // string from the offending byte, not just that one character, so
+            // a multibyte flag survives the message intact.
+            _ => return Err(EvalError::new("E5060", 0, format!("Unknown flag: {}", &flags[offset..]))),
+        }
+    }
+    Ok(parsed)
+}
+
+/// `f_writefile` (`eval/fs.c` 1802-1907).
+///
+/// `deferred` reports the absolute path a `D` flag asked to have deleted when
+/// the enclosing function returns; `in_function` is `can_add_defer()`
+/// (`eval/userfunc.c` 3457-3464), which is checked before the file is opened.
+pub(crate) fn writefile(
+    io: &dyn FileIO,
+    args: &[Typval],
+    in_function: bool,
+    deferred: &mut Option<PathBuf>,
+) -> ox_eval::Result<Typval> {
+    // Upstream reads the flags (1835) before the file name (1863).
+    let flags = write_flags(&optional_string(args.get(2))?.unwrap_or_default())?;
     let path = path_arg(&args[1])?;
     if path.as_os_str().is_empty() {
         return Err(EvalError::new("E482", 0, "Can't open file with an empty name"));
     }
-    let flags = optional_string(args.get(2))?.unwrap_or_default();
-    for flag in flags.chars() {
-        if !matches!(flag, 'b' | 'a' | 's' | 'S') {
-            return Err(EvalError::new("E5060", 0, format!("Unknown flag: {flag}")));
+    // `can_add_defer` runs before `file_open` (1868-1870), so a `D` outside a
+    // function leaves no file behind.
+    if flags.defer && !in_function {
+        return Err(EvalError::new("E193", 0, "defer not inside a function"));
+    }
+    // `kFileMkDir` creates the parent chain as part of the open, so a `p`
+    // failure is reported as the open failure it is.
+    if flags.mkdir {
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            io.create_dir(parent, true, 0o755).map_err(|error| {
+                EvalError::new("E482", 0, format!("Can't open file {path:?} for writing: {error}"))
+            })?;
         }
     }
-    let binary = flags.contains('b');
-    let append = flags.contains('a');
-    let bytes = write_data(&args[0], binary)?;
-    io.write_bytes(&path, &bytes, append)
-        .map(|()| number(0))
-        .map_err(|error| EvalError::new("E482", 0, format!("Can't open file {path:?} for writing: {error}")))
+    let bytes = write_data(&args[0], flags.binary)?;
+    io.write_bytes(&path, &bytes, flags.append)
+        .map_err(|error| EvalError::new("E482", 0, format!("Can't open file {path:?} for writing: {error}")))?;
+    if flags.defer {
+        // `add_defer("delete", 1, &tv)` with `FullName_save(fname, false)`
+        // (1882-1889): the path is absolutized now, so a later `:cd` cannot
+        // move the deletion target.
+        *deferred = Some(io.canonicalize(&path));
+    }
+    Ok(number(0))
 }
 
 fn write_data(value: &Typval, binary: bool) -> ox_eval::Result<Vec<u8>> {
@@ -473,6 +538,13 @@ mod tests {
 
     fn path(path: &Path) -> Typval { text(path.to_string_lossy()) }
 
+    /// `writefile` at top-level script scope: no function frame, so `D` is
+    /// `E193` here and the deferred path is discarded.
+    fn write(args: Vec<Typval>) -> ox_eval::Result<Typval> {
+        check_writefile_arity(args.len())?;
+        writefile(&RealFileIO, &args, false, &mut None)
+    }
+
     #[test]
     fn executor_routes_filesystem_builtins_through_fileio() {
         let root = TempRoot::new("executor");
@@ -533,14 +605,14 @@ mod tests {
         let root = TempRoot::new("content");
         let file = root.0.join("file");
         let lines = Typval::list(vec![text("one"), text("two")]);
-        assert_eq!(call(&RealFileIO, "writefile", vec![lines, path(&file)]).unwrap(), number(0));
+        assert_eq!(write(vec![lines, path(&file)]).unwrap(), number(0));
         assert_eq!(fs::read(&file).unwrap(), b"one\ntwo\n");
         assert_eq!(call(&RealFileIO, "readfile", vec![path(&file)]).unwrap(), Typval::list(vec![text("one"), text("two")]));
-        assert_eq!(call(&RealFileIO, "writefile", vec![Typval::list(vec![text("three")]), path(&file), text("ab")]).unwrap(), number(0));
+        assert_eq!(write(vec![Typval::list(vec![text("three")]), path(&file), text("ab")]).unwrap(), number(0));
         assert_eq!(fs::read(&file).unwrap(), b"one\ntwo\nthree");
         assert_eq!(call(&RealFileIO, "readfile", vec![path(&file), text("b")]).unwrap(), Typval::list(vec![text("one"), text("two"), text("three")]));
         let bytes = root.0.join("bytes");
-        assert_eq!(call(&RealFileIO, "writefile", vec![Typval::Blob(vec![0, 0xff, b'\n']), path(&bytes)]).unwrap(), number(0));
+        assert_eq!(write(vec![Typval::Blob(vec![0, 0xff, b'\n']), path(&bytes)]).unwrap(), number(0));
         assert_eq!(fs::read(bytes).unwrap(), vec![0, 0xff, b'\n']);
     }
 
@@ -549,10 +621,80 @@ mod tests {
         let root = TempRoot::new("write-errors");
         let directory = root.0.join("directory");
         fs::create_dir(&directory).unwrap();
-        let error = call(&RealFileIO, "writefile", vec![Typval::list(vec![text("x")]), path(&directory)]).unwrap_err();
+        let error = write(vec![Typval::list(vec![text("x")]), path(&directory)]).unwrap_err();
         assert_eq!(error.code, "E482");
-        let error = call(&RealFileIO, "writefile", vec![Typval::list(Vec::new()), path(&root.0.join("file")), text("z")]).unwrap_err();
+        let error = write(vec![Typval::list(Vec::new()), path(&root.0.join("file")), text("z")]).unwrap_err();
         assert_eq!(error.code, "E5060");
+    }
+
+    // eval/fs.c f_writefile 1835-1860 — every documented flag is accepted, and
+    // `E5060` names the rest of the flag string from the offending byte.
+    //
+    // `D` and `p` were rejected outright before this, and `E5060: Unknown
+    // flag: D` accounted for 39 oldtest files in census 3.
+    //
+    // One case per letter, each arranged so the other letters would give the
+    // wrong answer: `p` is the only letter that creates the missing parent (the
+    // same write without it must fail), `a` is the only letter that keeps the
+    // previous bytes, `b` is the only letter that drops the trailing newline,
+    // `s`/`S` must change nothing at all, and `D` is the only letter that needs
+    // a function frame.
+    #[test]
+    fn writefile_accepts_every_documented_flag() {
+        let root = TempRoot::new("write-flags");
+
+        // `p` creates the parent chain; without it the same write fails.
+        let deep = root.0.join("a/b/deep");
+        assert_eq!(write(vec![Typval::list(vec![text("x")]), path(&deep), text("p")]).unwrap(), number(0));
+        assert_eq!(fs::read(&deep).unwrap(), b"x\n");
+        let deeper = root.0.join("c/d/deep");
+        assert_eq!(write(vec![Typval::list(vec![text("x")]), path(&deeper)]).unwrap_err().code, "E482");
+
+        // `a` appends, and only `a`.
+        let file = root.0.join("file");
+        assert_eq!(write(vec![Typval::list(vec![text("one")]), path(&file)]).unwrap(), number(0));
+        assert_eq!(write(vec![Typval::list(vec![text("two")]), path(&file), text("a")]).unwrap(), number(0));
+        assert_eq!(fs::read(&file).unwrap(), b"one\ntwo\n");
+        assert_eq!(write(vec![Typval::list(vec![text("three")]), path(&file)]).unwrap(), number(0));
+        assert_eq!(fs::read(&file).unwrap(), b"three\n");
+
+        // `b` drops the final newline; `s` and `S` are durability controls this
+        // port has no seam for and must leave the bytes exactly as `b` alone
+        // would.
+        let binary = root.0.join("binary");
+        assert_eq!(write(vec![Typval::list(vec![text("x"), text("y")]), path(&binary), text("b")]).unwrap(), number(0));
+        assert_eq!(fs::read(&binary).unwrap(), b"x\ny");
+        for flags in ["s", "S", "bs", "bS"] {
+            assert_eq!(write(vec![Typval::list(vec![text("x"), text("y")]), path(&binary), text(flags)]).unwrap(), number(0));
+            let expected: &[u8] = if flags.contains('b') { b"x\ny" } else { b"x\ny\n" };
+            assert_eq!(fs::read(&binary).unwrap(), expected, "flags {flags:?}");
+        }
+
+        // `D` needs a function frame (`can_add_defer`) and reports the path to
+        // delete when it has one. The check runs before the file is opened.
+        let deferred_path = root.0.join("deferred");
+        let error = write(vec![Typval::list(vec![text("x")]), path(&deferred_path), text("D")]).unwrap_err();
+        assert_eq!(error.code, "E193");
+        assert!(!deferred_path.exists(), "E193 must leave no file behind");
+        let mut deferred = None;
+        assert_eq!(
+            writefile(
+                &RealFileIO,
+                &[Typval::list(vec![text("x")]), path(&deferred_path), text("D")],
+                true,
+                &mut deferred,
+            )
+            .unwrap(),
+            number(0)
+        );
+        assert!(deferred_path.exists());
+        assert_eq!(deferred.as_deref(), Some(fs::canonicalize(&deferred_path).unwrap().as_path()));
+
+        // An unknown letter names the remainder of the flag string, not the
+        // single character: `semsg("...%s", p)`.
+        let error = write(vec![Typval::list(Vec::new()), path(&file), text("bxa")]).unwrap_err();
+        assert_eq!(error.code, "E5060");
+        assert_eq!(error.message, "Unknown flag: xa");
     }
 
     #[test]

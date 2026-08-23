@@ -1777,3 +1777,63 @@ fn function_builtin_reports_name_and_binding_errors() {
         assert_eq!(error_code(&error), code, "{line}");
     }
 }
+
+// eval/userfunc.c handle_defer_one 3487-3524, called from call_user_func's
+// cleanup (1272) — `writefile(..., 'D')` deletes its file when the enclosing
+// function returns, whatever the outcome was, and the nesting is per frame.
+//
+// Four cases, each isolating one part of the contract so no part can be
+// dropped: the file must exist *inside* the frame (so a defer that deletes
+// immediately fails), be gone *after* it (so a defer that never runs fails), an
+// inner frame's defer must not take the outer frame's file with it (so a single
+// shared list fails), and a frame that aborts must still delete (so running the
+// deletes only on the success path fails).
+#[test]
+fn writefile_defer_flag_deletes_per_frame_on_return_and_on_abort() {
+    let root = std::env::temp_dir().join(format!("ox-editor-defer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let base = root.display().to_string();
+
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &mut editor,
+        "defer.vim",
+        &format!(
+            "func Inner()\n\
+             call writefile(['i'], '{base}/inner', 'D')\n\
+             let g:inner_inside = filereadable('{base}/inner')\n\
+             endfunc\n\
+             func Outer()\n\
+             call writefile(['o'], '{base}/outer', 'D')\n\
+             call Inner()\n\
+             let g:inner_after = filereadable('{base}/inner')\n\
+             let g:outer_inside = filereadable('{base}/outer')\n\
+             endfunc\n\
+             call Outer()\n\
+             let g:outer_after = filereadable('{base}/outer')\n\
+             func Aborts()\n\
+             call writefile(['a'], '{base}/aborted', 'D')\n\
+             throw 'boom'\n\
+             endfunc\n\
+             try\n\
+             call Aborts()\n\
+             catch\n\
+             let g:caught = v:exception\n\
+             endtry\n\
+             let g:aborted_after = filereadable('{base}/aborted')"
+        ),
+    )
+    .unwrap();
+
+    let flag = |name: &[u8]| exec.scope().get_scoped(ScopeKind::Global, name, 0).cloned();
+    assert_eq!(flag(b"inner_inside"), Ok(Typval::Number(1)), "file missing inside its own frame");
+    assert_eq!(flag(b"inner_after"), Ok(Typval::Number(0)), "inner frame's defer did not run");
+    assert_eq!(flag(b"outer_inside"), Ok(Typval::Number(1)), "inner frame took the outer frame's file");
+    assert_eq!(flag(b"outer_after"), Ok(Typval::Number(0)), "outer frame's defer did not run");
+    assert!(matches!(&flag(b"caught"), Ok(Typval::String(text)) if text.to_string_lossy().contains("boom")));
+    assert_eq!(flag(b"aborted_after"), Ok(Typval::Number(0)), "an aborted frame's defer did not run");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

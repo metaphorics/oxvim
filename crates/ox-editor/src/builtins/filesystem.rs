@@ -26,5 +26,23 @@ pub(crate) fn call<F: FileIO>(
         };
         return crate::fs_builtins::swapfilelist(host.runtime.scripts.io(), args.len(), &directory);
     }
+    if name == "writefile" {
+        // The `D` flag is `add_defer("delete", ...)` against the enclosing
+        // function frame, so this one needs the runtime and not just the
+        // `FileIO` seam.
+        crate::fs_builtins::check_writefile_arity(args.len())?;
+        let mut deferred = None;
+        let in_function = host.runtime.can_add_defer();
+        let result = crate::fs_builtins::writefile(
+            host.runtime.scripts.io(),
+            &args,
+            in_function,
+            &mut deferred,
+        );
+        if let Some(path) = deferred {
+            host.runtime.push_deferred_delete(path);
+        }
+        return result;
+    }
     crate::fs_builtins::call(host.runtime.scripts.io(), name, args)
 }

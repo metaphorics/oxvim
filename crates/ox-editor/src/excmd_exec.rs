@@ -329,6 +329,14 @@ pub(crate) struct ExRuntime<F: FileIO> {
     /// Threading it instead would mean touching several hundred `error_flow`
     /// call sites and would still miss the next one.
     pub(crate) executing: ExecutingCommand,
+    /// One entry per active user-function frame, holding the paths that frame's
+    /// `writefile(..., 'D')` calls asked to have deleted when it returns.
+    ///
+    /// This is upstream's `funccall_T.fc_defer` (`eval/userfunc.c` 3469-3484)
+    /// narrowed to the only deferred call this port can produce. An empty stack
+    /// is `get_current_funccal() == NULL`, which is what `can_add_defer`
+    /// (3457-3464) reports as `E193`.
+    pub(crate) deferred_deletes: Vec<Vec<PathBuf>>,
 }
 
 impl<F: FileIO> ExRuntime<F> {
@@ -347,6 +355,34 @@ impl<F: FileIO> ExRuntime<F> {
             filetype: FiletypeState::default(),
             exiting: false,
             executing: ExecutingCommand::default(),
+            deferred_deletes: Vec::new(),
+        }
+    }
+
+    /// `can_add_defer` (`eval/userfunc.c` 3457-3464): whether a deferred call
+    /// has a frame to attach to.
+    pub(crate) fn can_add_defer(&self) -> bool {
+        !self.deferred_deletes.is_empty()
+    }
+
+    /// `add_defer` for the `delete` this port can produce.
+    pub(crate) fn push_deferred_delete(&mut self, path: PathBuf) {
+        if let Some(frame) = self.deferred_deletes.last_mut() {
+            frame.push(path);
+        }
+    }
+
+    /// `handle_defer_one` (`eval/userfunc.c` 3487-3524): pops the frame and runs
+    /// its deferred deletes in reverse registration order. It runs whatever the
+    /// function's outcome was — upstream invokes it from `call_user_func`'s
+    /// cleanup (1272) and deliberately saves and restores the exception state
+    /// around it, so an aborted function still gets its files removed.
+    pub(crate) fn run_deferred_deletes(&mut self) {
+        let Some(frame) = self.deferred_deletes.pop() else { return };
+        for path in frame.into_iter().rev() {
+            // `delete(name)` reports failure through its return value, which
+            // `add_defer`'s deferred call discards.
+            let _ignored = self.scripts.io().remove_file(&path);
         }
     }
 
@@ -1855,6 +1891,9 @@ pub(crate) fn call_user_function_with_self<F: FileIO>(
     if let Some(receiver) = receiver {
         scope.local.push((OxStr::from("self"), Typval::Dict(receiver)));
     }
+    // `call_user_func` gives every frame its own `fc_defer` list, and pops it
+    // in the cleanup after the body regardless of how the body ended.
+    runtime.deferred_deletes.push(Vec::new());
     let sid = function.context.sid;
     let switched_script = sid != 0 && runtime.scripts.current_sid() != Some(sid);
     let caller_script = scope.script.clone();
@@ -1866,6 +1905,7 @@ pub(crate) fn call_user_function_with_self<F: FileIO>(
         runtime.scripts.store_script_scope(sid, scope);
         scope.script = caller_script;
     }
+    runtime.run_deferred_deletes();
     let flow = match flow {
         Flow::NotImplemented(name) => {
             error_flow(runtime, "E117", format!("not implemented: {name}"))
