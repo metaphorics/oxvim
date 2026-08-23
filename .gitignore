@@ -19,7 +19,18 @@ target/
 
 # === AI TOOLING ===
 # AI agent scratch / plan artifacts (safe to ignore in all repos)
-.outline/
+# Durable project records live under .outline and must be tracked: they are the
+# only account of what each task changed and why, and a lost checkout took the
+# untracked ones with it. Ignore the directory's contents rather than the
+# directory, so the exceptions below can be reached.
+.outline/*
+!.outline/sdd/
+.outline/sdd/*
+!.outline/sdd/reports/
+!.outline/sdd/briefs/
+!.outline/sdd/progress.md
+!.outline/sdd/oldtest-census.tsv
+!.outline/sdd/oldtest-blockers.md
 .plan/
 PLAN.md
 TASKS.md
