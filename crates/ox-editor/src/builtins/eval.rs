@@ -17,7 +17,7 @@ use crate::autocmd::Event;
 use crate::typeahead::Keys;
 use crate::{Editor, ModeMachine};
 
-use crate::excmd_exec::{EvalHost, ExRuntime, Flow, LuaExec, LuaExecError, VimRegex, exec_error_flow, flow_to_eval_error, parse_program, run_program, sync_editor_into_scope, sync_scope_into_editor, typval_number, typval_to_text};
+use crate::excmd_exec::{EvalHost, ExRuntime, Flow, LuaExec, LuaExecError, VimRegex, exec_error_flow, expand_env_esc, flow_to_eval_error, parse_program, run_program, sync_editor_into_scope, sync_scope_into_editor, typval_number, typval_to_text};
 use super::{input_string_arg};
 
 /// Routes one expression- or script-evaluating builtin.
@@ -163,6 +163,18 @@ fn call_luaeval_builtin<F: FileIO>(
     }
 }
 
+/// `expand()` (`f_expand`).
+///
+/// `%`, `#` and a `<...>` keyword go to `eval_vars`; anything else is a file
+/// pattern handed to `ExpandOne`, which resolves `~` and `$NAME` through
+/// `expand_env_esc` before matching. Returning such a pattern verbatim leaves
+/// `expand('~')` as the literal `~`, and callers that hand the result to a
+/// shell -- `runtest.vim`'s `system('rm -rf  ' .. file)` -- then let the
+/// *shell* expand it against its own environment.
+///
+/// Named gap: the wildcard half of `ExpandOne` is not here, so a pattern with
+/// `*` or `?` still comes back as itself; `glob()` is where this port matches
+/// files.
 fn call_expand_builtin<F: FileIO>(
     runtime: &ExRuntime<F>,
     editor: &Editor,
@@ -182,7 +194,7 @@ fn call_expand_builtin<F: FileIO>(
             .active_sid()
             .or_else(|| runtime.scripts.current_sid())
             .map_or_else(String::new, |sid| format!("<SNR>{sid}_")),
-        _ => text.into_owned(),
+        pattern => expand_env_esc(pattern),
     };
     Ok(Typval::String(OxStr(expanded.into_bytes())))
 }

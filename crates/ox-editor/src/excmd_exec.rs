@@ -1903,14 +1903,14 @@ fn command_redir<F: FileIO>(
         RedirTarget::Variable { name: variable.to_owned(), append: false }
     } else if let Some(file) = argument.strip_prefix(">>").map(str::trim) {
         if file.is_empty() { return error_flow(runtime, "E474", "Invalid argument") }
-        let path = PathBuf::from(expand_set_value(file));
+        let path = PathBuf::from(expand_env_esc(file));
         if let Err(error) = runtime.scripts.io().write_bytes(&path, &[], true) {
             return error_flow(runtime, "E484", format!("{}: {error}", path.display()));
         }
         RedirTarget::File { path }
     } else if let Some(file) = argument.strip_prefix('>').map(str::trim) {
         if file.is_empty() { return error_flow(runtime, "E474", "Invalid argument") }
-        let path = PathBuf::from(expand_set_value(file));
+        let path = PathBuf::from(expand_env_esc(file));
         if let Err(error) = runtime.scripts.io().write_bytes(&path, &[], false) {
             return error_flow(runtime, "E484", format!("{}: {error}", path.display()));
         }
@@ -5937,7 +5937,7 @@ fn set_one(editor: &mut Editor, scope: &mut Scope, raw: &str, layer: SetLayer) -
     let raw = raw.trim();
     if let Some(name) = raw.strip_suffix('?') { if let Some(text) = display_option(editor, name, layer) { push_info_text_message(editor, text); return Ok(()); } return Err(("E518", format!("Unknown option: {name}"))); }
     if let Some(name) = raw.strip_suffix("&vim").or_else(|| raw.strip_suffix('&')) { let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?; let value = metadata.default.value.map(OptionValue::from).ok_or_else(|| ("E474", format!("No literal default for {name}")))?; return set_and_mirror(editor, scope, metadata.name, value, layer); }
-    for operator in ["+=", "-=", "^=", "="] { if let Some((name, value)) = raw.split_once(operator) { let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?; let mut next = match metadata.value_type { OptionType::Boolean => OptionValue::Boolean(matches!(value, "1" | "true" | "on")), OptionType::Number => OptionValue::Number(value.parse().map_err(|_| ("E521", format!("Number required after =: {value}")))?), OptionType::String => OptionValue::String(if metadata.expand { expand_set_value(value) } else { value.to_owned() }) }; if operator != "=" { let current = option_value(editor, metadata.name, layer).cloned().unwrap_or_else(|| metadata.default.value.map(OptionValue::from).unwrap_or(OptionValue::String(String::new()))); next = modify_option(current, next, operator, metadata.list)?; } return set_and_mirror(editor, scope, metadata.name, next, layer); } }
+    for operator in ["+=", "-=", "^=", "="] { if let Some((name, value)) = raw.split_once(operator) { let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?; let mut next = match metadata.value_type { OptionType::Boolean => OptionValue::Boolean(matches!(value, "1" | "true" | "on")), OptionType::Number => OptionValue::Number(value.parse().map_err(|_| ("E521", format!("Number required after =: {value}")))?), OptionType::String => OptionValue::String(if metadata.expand { expand_env_esc(value) } else { value.to_owned() }) }; if operator != "=" { let current = option_value(editor, metadata.name, layer).cloned().unwrap_or_else(|| metadata.default.value.map(OptionValue::from).unwrap_or(OptionValue::String(String::new()))); next = modify_option(current, next, operator, metadata.list)?; } return set_and_mirror(editor, scope, metadata.name, next, layer); } }
     let (name, value) = if let Some(name) = raw.strip_prefix("no") { (name, false) } else if let Some(name) = raw.strip_prefix("inv") { let current = option_value(editor, name, layer).and_then(|value| match value { OptionValue::Boolean(value) => Some(*value), _ => None }).unwrap_or(false); (name, !current) } else if let Some(name) = raw.strip_suffix('!') { let current = option_value(editor, name, layer).and_then(|value| match value { OptionValue::Boolean(value) => Some(*value), _ => None }).unwrap_or(false); (name, !current) } else { (raw, true) };
     let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?;
     if metadata.value_type != OptionType::Boolean { if let Some(text) = display_option(editor, name, layer) { push_info_text_message(editor, text); return Ok(()); } }
@@ -5955,12 +5955,13 @@ fn set_and_mirror(editor: &mut Editor, scope: &mut Scope, name: &'static str, va
     Ok(())
 }
 
-/// `:set` value expansion for `expand`-flag options (option.c
-/// `stropt_expand_envvar` → `expand_env_esc`): a leading `~` resolves through
+/// `expand_env_esc` (`os/env.c`), reached from `:set` value expansion for
+/// `expand`-flag options (`option.c` `stropt_expand_envvar`) and from
+/// `expand()`'s file path (`ExpandOne`): a leading `~` resolves through
 /// `$HOME`, and each `$NAME`/`${NAME}` resolves through the process
 /// environment. An unset variable stays literal, matching upstream
 /// `vim_getenv` returning NULL; substituted text is never rescanned.
-fn expand_set_value(value: &str) -> String {
+pub(crate) fn expand_env_esc(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut output = Vec::with_capacity(bytes.len());
     let mut index = 0;

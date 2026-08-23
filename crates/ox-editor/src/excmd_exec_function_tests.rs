@@ -1362,6 +1362,58 @@ fn expand_builtin_reads_current_buffer_and_preserves_paths() {
     ));
 }
 
+/// `expand()` resolves `~` and `$NAME` the way `ExpandOne` does, through
+/// `expand_env_esc` (`os/env.c`).
+///
+/// Returning the pattern verbatim is not a smaller answer: `setup.vim`:115
+/// builds its sandbox with `expand(getcwd() . '/XfakeHOME')`, and a caller that
+/// hands an unexpanded `~` to a shell lets the *shell* expand it against its
+/// own environment instead. HOME is a throwaway path here and nothing is
+/// written to it.
+#[test]
+fn expand_builtin_resolves_home_and_environment_variables() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    let mut exec = ExExecutor::new();
+    let sandbox = std::env::temp_dir().join(format!("ox-editor-expand-{}", std::process::id()));
+    let sandbox = sandbox.to_string_lossy().into_owned();
+    let restore = std::env::var_os("HOME");
+    ox_sys::set_env("HOME", &sandbox);
+    ox_sys::set_env("OXVIM_TEST_EXPAND_DIR", "/sentinel");
+
+    exec.execute_script(
+        &mut editor,
+        "<expand>",
+        "let g:tilde = expand('~')\n\
+         let g:tilde_path = expand('~/XfakeHOME')\n\
+         let g:dollar = expand('$OXVIM_TEST_EXPAND_DIR/x')\n\
+         let g:braced = expand('${OXVIM_TEST_EXPAND_DIR}/y')\n\
+         let g:unset = expand('$OXVIM_TEST_EXPAND_MISSING/z')\n\
+         let g:interior = expand('/keep/~/as-is')",
+    )
+    .unwrap();
+
+    let values: Vec<Option<String>> = ["tilde", "tilde_path", "dollar", "braced", "unset", "interior"]
+        .iter()
+        .map(|name| global_string(exec.scope(), name))
+        .collect();
+    match restore {
+        Some(home) => ox_sys::set_env("HOME", home),
+        None => ox_sys::unset_env("HOME"),
+    }
+    ox_sys::unset_env("OXVIM_TEST_EXPAND_DIR");
+
+    assert_eq!(values[0].as_deref(), Some(sandbox.as_str()));
+    assert_eq!(values[1].as_deref(), Some(format!("{sandbox}/XfakeHOME").as_str()));
+    assert_eq!(values[2].as_deref(), Some("/sentinel/x"));
+    assert_eq!(values[3].as_deref(), Some("/sentinel/y"));
+    // An unset variable stays literal, as `vim_getenv` returning NULL leaves it.
+    assert_eq!(values[4].as_deref(), Some("$OXVIM_TEST_EXPAND_MISSING/z"));
+    // Only a leading `~` is a home reference.
+    assert_eq!(values[5].as_deref(), Some("/keep/~/as-is"));
+}
+
 // ---------------------------------------------------------------------------
 // :language (os/lang.c ex_language; oldtest test_excmd.vim Test_language_cmd)
 // ---------------------------------------------------------------------------
