@@ -1059,6 +1059,9 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         if name_text == "getbufvar" {
             return call_getbufvar_builtin(self.editor, scope, args);
         }
+        if name_text == "setbufvar" {
+            return call_setbufvar_builtin(self.editor, scope, args);
+        }
         if name_text == "fullcommand" {
             return call_fullcommand_builtin(self.runtime, args);
         }
@@ -1546,6 +1549,49 @@ fn call_getbufvar_builtin(editor: &Editor, scope: &Scope, args: Vec<Typval>) -> 
         return Ok(scope.buffer.iter().find(|(key, _)| key.as_bytes() == name.as_bytes()).map_or(fallback, |(_, value)| value.clone()));
     }
     Ok(state.variables().0.iter().find(|(key, _)| key.as_bytes() == name.as_bytes()).map_or(fallback, |(_, value)| object_to_typval(value)))
+}
+
+fn call_setbufvar_builtin(editor: &mut Editor, scope: &mut Scope, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    if args.len() != 3 {
+        return Err(EvalError::new(
+            if args.len() < 3 { "E119" } else { "E118" },
+            0,
+            "Invalid arguments for setbufvar",
+        ));
+    }
+    let buffer = resolve_buffer_argument(editor, args.first())
+        .ok_or_else(|| EvalError::new("E86", 0, "Buffer does not exist"))?;
+    let name = typval_to_text(&args[1]);
+    let value = args[2].clone();
+
+    if let Some(option) = name.strip_prefix('&') {
+        let metadata = crate::option_metadata(option)
+            .ok_or_else(|| EvalError::new("E518", 0, format!("Unknown option: {option}")))?;
+        if !metadata.scopes.contains(&OptionScope::Buffer) {
+            return Err(EvalError::new("E355", 0, format!("Unknown option: {option}")));
+        }
+        let converted = typval_to_option(&value, metadata.value_type)
+            .map_err(|message| EvalError::new("E474", 0, message))?;
+        editor
+            .options_mut()
+            .set_buffer(buffer, metadata.name, converted)
+            .map_err(|error| EvalError::new("E474", 0, error.to_string()))?;
+        if editor.current_buffer() == Some(buffer) {
+            scope.set_option(EvalOptionScope::Local, metadata.name.as_bytes(), value);
+        }
+        return Ok(Typval::Number(0));
+    }
+
+    if editor.current_buffer() == Some(buffer) {
+        replace_scope_pair(&mut scope.buffer, &name, value.clone());
+    }
+    let variables = editor
+        .buffer_mut(buffer)
+        .map_err(|error| EvalError::new("E86", 0, error.to_string()))?
+        .variables_mut();
+    variables.0.retain(|(key, _)| key.as_bytes() != name.as_bytes());
+    variables.0.push((OxStr::from(name.as_str()), typval_to_object(&value)));
+    Ok(Typval::Number(0))
 }
 
 fn call_fullcommand_builtin<F: FileIO>(runtime: &ExRuntime<F>, args: Vec<Typval>) -> ox_eval::Result<Typval> {

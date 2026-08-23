@@ -1258,6 +1258,48 @@ fn feedkeys_builtin_queues_input_consumed_by_getchar() {
 }
 
 #[test]
+fn progpath_is_seeded_from_the_running_executable() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&mut editor, "let g:progpath = v:progpath").unwrap();
+    let expected = std::env::current_exe().unwrap();
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"progpath", 0),
+        Ok(&Typval::String(OxStr(expected.to_string_lossy().into_owned().into_bytes())))
+    );
+}
+
+#[test]
+fn setbufvar_updates_variables_and_buffer_options() {
+    let (mut editor, buffer, _) = editor_with_window();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &mut editor,
+        "setbufvar.vim",
+        "call setbufvar(bufnr('%'), 'answer', [42])\ncall setbufvar(bufnr('%'), '&tabstop', 3)\nlet g:answer = getbufvar(bufnr('%'), 'answer')\nlet g:tabstop = getbufvar(bufnr('%'), '&tabstop')",
+    ).unwrap();
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"answer", 0),
+        Ok(&Typval::list(vec![Typval::Number(42)]))
+    );
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"tabstop", 0), Ok(&Typval::Number(3)));
+    assert_eq!(editor.options().get_buffer(buffer, "tabstop").unwrap(), &OptionValue::Number(3));
+}
+
+#[test]
+fn setbufvar_unknown_option_reports_e518() {
+    let (mut editor, _, _) = editor_with_window();
+    let mut exec = ExExecutor::new();
+    let error = exec.execute_line(&mut editor, "call setbufvar(bufnr('%'), '&missing_option', 1)").unwrap_err();
+    assert!(matches!(
+        error,
+        ExecError::Vim(ref exception)
+            if exception.kind == VimExceptionKind::Error("E518".to_owned())
+                && exception.message().contains("Unknown option")
+    ));
+}
+
+#[test]
 fn feedkeys_x_executes_through_mode_machine() {
     let (mut editor, _buffer, window) = editor_with_window();
     let mut exec = ExExecutor::new();

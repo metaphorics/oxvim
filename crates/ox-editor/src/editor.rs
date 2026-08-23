@@ -199,6 +199,15 @@ impl Editor {
             gvars: Dict(Vec::new()),
             vvars: Dict(vec![
                 ("errors".into(), Object::Array(Vec::new())),
+                (
+                    "progpath".into(),
+                    Object::String(OxStr(
+                        std::env::current_exe().map_or_else(
+                            |_| Vec::new(),
+                            |path| path.to_string_lossy().into_owned().into_bytes(),
+                        ),
+                    )),
+                ),
                 ("_null_string".into(), Object::String(OxStr::from(""))),
                 ("_null_list".into(), Object::Array(Vec::new())),
                 ("_null_dict".into(), Object::Dict(Dict(Vec::new()))),
