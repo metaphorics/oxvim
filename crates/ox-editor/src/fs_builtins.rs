@@ -19,7 +19,7 @@ pub(crate) fn is_filesystem_builtin(name: &str) -> bool {
         name,
         "mkdir" | "delete" | "rename" | "glob" | "globpath" | "readfile" | "writefile"
             | "filereadable" | "isdirectory" | "getftime" | "getfsize" | "getfperm"
-            | "filewritable"
+            | "filewritable" | "setfperm"
     )
 }
 
@@ -39,6 +39,7 @@ pub(crate) fn call(io: &dyn FileIO, name: &str, args: Vec<Typval>) -> ox_eval::R
         "getfsize" => getfsize(io, &args[0]),
         "getfperm" => getfperm(io, &args[0]),
         "filewritable" => filewritable(io, &args[0]),
+        "setfperm" => setfperm(io, &args),
         _ => unreachable!("filesystem builtin predicate and dispatcher disagree"),
     }
 }
@@ -148,6 +149,19 @@ fn filewritable(io: &dyn FileIO, value: &Typval) -> ox_eval::Result<Typval> {
         else { 0 }
     });
     Ok(number(writable))
+}
+
+fn setfperm(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
+    let path = path_arg(&args[0])?;
+    let permission = string_arg(&args[1])?;
+    if permission.len() != 9 { return Ok(number(0)); }
+    let expected = [b'r', b'w', b'x'];
+    let mut mode = 0u32;
+    for (index, byte) in permission.bytes().enumerate() {
+        if byte == expected[index % 3] { mode |= 1 << (8 - index); }
+        else if byte != b'-' { return Ok(number(0)); }
+    }
+    Ok(boolean(io.set_permissions(&path, mode).is_ok()))
 }
 
 fn readfile(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {

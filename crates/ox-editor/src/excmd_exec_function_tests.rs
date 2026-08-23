@@ -510,7 +510,7 @@ fn evaluator_error_inside_user_function_enters_caller_catch_frame() {
         &mut editor,
         concat!(
             "function! BrokenBuiltin()\n",
-            "return exepath('oxvim')\n",
+            "return virtcol('.')\n",
             "endfunction\n",
             "let g:caught = 0\n",
             "let g:finalized = 0\n",
@@ -527,7 +527,7 @@ fn evaluator_error_inside_user_function_enters_caller_catch_frame() {
     );
     assert_eq!(global_number(exec.scope(), "caught"), Some(1));
     assert_eq!(global_number(exec.scope(), "finalized"), Some(1));
-    assert_eq!(global_string(exec.scope(), "exception").as_deref(), Some("E117: not implemented: exepath"));
+    assert_eq!(global_string(exec.scope(), "exception").as_deref(), Some("E117: not implemented: virtcol"));
     assert_eq!(global_string(exec.scope(), "throwpoint").as_deref(), Some("function BrokenBuiltin[1]..script <test>[1]"));
 }
 
@@ -785,6 +785,25 @@ fn same_script_function_call_keeps_live_script_scope() {
     )
     .unwrap();
     assert_eq!(global_number(exec.scope(), "from_script"), Some(42));
+}
+
+#[test]
+fn delfunction_removes_registry_entries_and_bang_ignores_missing() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    exec.execute_script(&mut editor, "delete.vim", "function! DeleteMe()\nreturn 1\nendfunction\ndelfunction DeleteMe\ndelfunction! DeleteMe").unwrap();
+    let error = exec.execute_line(&mut editor, "call DeleteMe()").unwrap_err();
+    assert_eq!(error_code(&error), "E117");
+    let error = exec.execute_line(&mut editor, "delfunction DeleteMe").unwrap_err();
+    assert_eq!(error_code(&error), "E130");
+}
+
+#[test]
+fn delfunction_rejects_the_active_function() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    let error = exec.execute_script(&mut editor, "active.vim", "function! Active()\ndelfunction Active\nendfunction\ncall Active()").unwrap_err();
+    assert_eq!(error_code(&error), "E131");
 }
 
 // ---------------------------------------------------------------------------

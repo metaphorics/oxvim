@@ -1206,3 +1206,20 @@ fn line_last_and_append_support_oldtest_result_logging() {
     let text = editor.buffer(buffer).unwrap().text().unwrap();
     assert_eq!(text.to_bytes(), b"first\nsecond\nthird\0continued");
 }
+
+#[test]
+fn assert_fails_executes_commands_and_consumes_expected_errors() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &mut editor,
+        "assert_fails.vim",
+        "let g:before = len(v:errors)\nlet g:ok = assert_fails('call Missing()', 'E117:')\nlet g:bad = assert_fails('let g:ran = 1', 'E121:', 'must fail')\nlet g:after = len(v:errors)",
+    ).unwrap();
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"before", 0), Ok(&Typval::Number(0)));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"ok", 0), Ok(&Typval::Number(0)));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"bad", 0), Ok(&Typval::Number(1)));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"after", 0), Ok(&Typval::Number(1)));
+    let Some(Object::Array(errors)) = editor.vvars().get(&OxStr::from("errors")) else { panic!("v:errors must remain an Array") };
+    assert!(matches!(&errors[0], Object::String(text) if text.to_string_lossy().contains("must fail")));
+}

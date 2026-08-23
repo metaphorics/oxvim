@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ox_text::{Buffer, Position};
-use ox_types::{BufHandle, Dict, Object, TabHandle, WinHandle};
+use ox_types::{BufHandle, Dict, Object, OxStr, TabHandle, WinHandle};
 use thiserror::Error;
 
 use crate::arglist::ArgList;
@@ -197,7 +197,12 @@ impl Editor {
             mappings: Mappings::new(),
             typeahead: Typeahead::new(),
             gvars: Dict(Vec::new()),
-            vvars: Dict(vec![("errors".into(), Object::Array(Vec::new()))]),
+            vvars: Dict(vec![
+                ("errors".into(), Object::Array(Vec::new())),
+                ("_null_string".into(), Object::String(OxStr::from(""))),
+                ("_null_list".into(), Object::Array(Vec::new())),
+                ("_null_dict".into(), Object::Dict(Dict(Vec::new()))),
+            ]),
             highlights: BTreeMap::new(),
             messages: Vec::new(),
             current_tab: None,
@@ -248,6 +253,12 @@ impl Editor {
     #[must_use]
     pub fn buffers(&self) -> Vec<BufHandle> {
         self.buffers.keys().copied().collect()
+    }
+
+    /// Returns the highest buffer number ever allocated.
+    #[must_use]
+    pub fn last_buffer_nr(&self) -> i64 {
+        self.next_buffer.saturating_sub(1)
     }
 
     /// Returns live window handles in allocation order.

@@ -837,6 +837,7 @@ fn dispatch<F: FileIO>(
         "let" => command_let(runtime, editor, scope, lua, &command.args, false),
         "const" => command_let(runtime, editor, scope, lua, &command.args, true),
         "unlet" => command_unlet(runtime, editor, scope, &command.args, command.bang),
+        "delfunction" => command_delfunction(runtime, command),
         "set" => command_set(runtime, editor, scope, &command.args, SetLayer::Effective),
         "setlocal" => command_set(runtime, editor, scope, &command.args, SetLayer::Local),
         "setglobal" => command_set(runtime, editor, scope, &command.args, SetLayer::Global),
@@ -954,11 +955,12 @@ fn eval_text<F: FileIO>(
         .parse()
         .map_err(|error| eval_error_flow(runtime, error))?;
     let regex = VimRegex;
+    let ambiguous_wide = matches!(editor.options().get_global("ambiwidth"), Ok(OptionValue::String(value)) if value == "double");
     let mut host = EvalHost {
         runtime,
         editor,
         lua,
-        builtins: Builtins::new(&regex),
+        builtins: Builtins::new(&regex).with_ambiguous_width(ambiguous_wide),
         submatches: None,
     };
     Evaluator::new(&mut host, &regex)
@@ -1032,6 +1034,9 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         if name_text == "expand" {
             return call_expand_builtin(self.runtime, self.editor, args);
         }
+        if name_text == "assert_fails" {
+            return call_assert_fails_builtin(self.runtime, self.editor, scope, self.lua, args);
+        }
         if matches!(
             &*name_text,
             "assert_equal"
@@ -1083,6 +1088,12 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         if name_text == "line" {
             return call_line_builtin(self.editor, args);
         }
+        if name_text == "last_buffer_nr" {
+            if !args.is_empty() {
+                return Err(EvalError::new("E118", 0, "Too many arguments for function: last_buffer_nr"));
+            }
+            return Ok(Typval::Number(self.editor.last_buffer_nr()));
+        }
         if name_text == "append" {
             return call_append_builtin(self.editor, args);
         }
@@ -1109,6 +1120,9 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
             }
             let buffer = resolve_buffer_argument(self.editor, args.first());
             if name_text == "bufnr" {
+                if args.first().is_some_and(|value| typval_to_text(value) == "$") {
+                    return Ok(Typval::Number(self.editor.last_buffer_nr()));
+                }
                 return Ok(Typval::Number(buffer.map_or(-1, i64::from)));
             }
             let name = buffer
@@ -1441,6 +1455,67 @@ fn call_assert_builtin<F: FileIO>(
         _ => usize::MAX,
     };
     if let Some(prefix) = args.get(message_index).map(typval_to_text).filter(|text| !text.is_empty()) {
+        message = format!("{prefix}: {message}");
+    }
+    let location = runtime.throwpoint();
+    if location != "command line" {
+        message = format!("{location}: {message}");
+    }
+    append_assertion_failure(scope, &message);
+    push_text_message(editor, message, true, true);
+    Ok(Typval::Number(1))
+}
+
+fn call_assert_fails_builtin<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    args: Vec<Typval>,
+) -> ox_eval::Result<Typval> {
+    let spec = builtin_spec("assert_fails").expect("assert_fails metadata");
+    if args.len() < spec.min_args {
+        return Err(EvalError::new("E119", 0, "Not enough arguments for function: assert_fails"));
+    }
+    if spec.max_args.is_some_and(|maximum| args.len() > maximum) {
+        return Err(EvalError::new("E118", 0, "Too many arguments for function: assert_fails"));
+    }
+    let command = match &args[0] {
+        Typval::String(value) => value.to_string_lossy().into_owned(),
+        _ => return Err(EvalError::new("E1174", 0, "String required for argument 1")),
+    };
+    let expected = match &args[1] {
+        Typval::String(value) => vec![value.to_string_lossy().into_owned()],
+        Typval::List(values) => values
+            .try_borrow()
+            .map_err(|_| EvalError::new("E742", 0, "Cannot change value during recursive container access"))?
+            .items
+            .iter()
+            .map(typval_to_text)
+            .collect(),
+        _ => return Err(EvalError::new("E1174", 0, "String required for argument 2")),
+    };
+    let logical = vec![LogicalLine { text: command, first_line: runtime.scripts.current_line() }];
+    let flow = match parse_program(&runtime.user_commands, &logical) {
+        Ok(program) => run_program(runtime, editor, scope, lua, &program, 0, program.len()),
+        Err(error) => exec_error_flow(runtime, error),
+    };
+    let actual = match flow {
+        Flow::Exception(exception) => exception.message(),
+        Flow::NotImplemented(name) => format!("E117: not implemented: {name}"),
+        Flow::Normal => String::new(),
+        other => format!("{other:?}"),
+    };
+    let matched = !actual.is_empty() && expected.iter().any(|candidate| actual.contains(candidate));
+    if matched {
+        return Ok(Typval::Number(0));
+    }
+    let mut message = if actual.is_empty() {
+        format!("command did not fail: {}", typval_to_text(&args[0]))
+    } else {
+        format!("Expected {} but got {actual}", expected.join(", "))
+    };
+    if let Some(prefix) = args.get(2).map(typval_to_text).filter(|text| !text.is_empty()) {
         message = format!("{prefix}: {message}");
     }
     let location = runtime.throwpoint();
@@ -1848,6 +1923,24 @@ impl RegexEngine for VimRegex {
         Ok(found.map(|matched| (matched.start.byte, matched.end.byte)))
     }
 
+    fn find_captures(
+        &self,
+        text: &OxStr,
+        pattern: &OxStr,
+        start: usize,
+    ) -> ox_eval::Result<Option<ox_eval::RegexMatch>> {
+        let source = text.to_string_lossy().into_owned();
+        let program = compile_regex(&pattern.to_string_lossy(), Magic::Magic)
+            .map_err(|error| EvalError::new("E54", 0, error.to_string()))?;
+        let text = RegexText::new(source);
+        let Some(position) = text.position(start) else { return Ok(None) };
+        Ok(regex_exec_at(&program, &text, position).map(|matched| ox_eval::RegexMatch {
+            start: matched.start.byte,
+            end: matched.end.byte,
+            captures: matched.captures.into_iter().map(|capture| capture.map(|capture| (capture.start.byte, capture.end.byte))).collect(),
+        }))
+    }
+
     fn split(
         &self,
         text: &OxStr,
@@ -2129,6 +2222,18 @@ fn command_unlet<F: FileIO>(
         }
     }
     Flow::Normal
+}
+
+fn command_delfunction<F: FileIO>(runtime: &mut ExRuntime<F>, command: &ExCommand) -> Flow {
+    let name = command.args.trim();
+    if name.is_empty() { return error_flow(runtime, "E471", "Argument required"); }
+    if name.split_whitespace().count() != 1 { return error_flow(runtime, "E488", "Trailing characters"); }
+    let sid = runtime.functions.active_sid().or_else(|| runtime.scripts.current_sid()).unwrap_or(0);
+    if runtime.functions.is_active(name, sid) {
+        return error_flow(runtime, "E131", format!("Cannot delete function {name}: It is in use"));
+    }
+    if runtime.functions.remove(name, sid) || command.bang { Flow::Normal }
+    else { error_flow(runtime, "E130", format!("Unknown function: {name}")) }
 }
 
 #[derive(Clone, Copy)]

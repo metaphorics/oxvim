@@ -313,6 +313,13 @@ impl UserFunctions {
         self.get(name, sid).is_some()
     }
 
+    /// Whether the named function is present on the active call stack.
+    #[must_use]
+    pub fn is_active(&self, name: &str, sid: Sid) -> bool {
+        let canonical = Self::canonical_name(name, sid);
+        self.call_stack.iter().any(|frame| frame.name == canonical)
+    }
+
     /// All functions in canonical name order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &UserFunc)> {
         self.functions

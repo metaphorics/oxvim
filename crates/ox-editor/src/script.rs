@@ -115,6 +115,10 @@ pub trait FileIO {
     /// Canonical form used for the source-once registry. Implementations may
     /// fall back to the input path when canonicalization fails.
     fn canonicalize(&self, path: &Path) -> PathBuf;
+    /// Replaces Unix permission bits (or readonly state on non-Unix hosts).
+    fn set_permissions(&self, _path: &Path, _mode: u32) -> io::Result<()> {
+        Err(unsupported("permission mutation is not supported by this FileIO"))
+    }
 }
 
 /// Filesystem-backed [`FileIO`].
@@ -159,6 +163,20 @@ impl FileIO for RealFileIO {
         #[cfg(not(unix))]
         let mode = if metadata.permissions().readonly() { 0o444 } else { 0o666 };
         Ok(FileMetadata { kind, len: metadata.len(), modified: metadata.modified().ok(), mode })
+    }
+
+    fn set_permissions(&self, path: &Path, mode: u32) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        }
+        #[cfg(not(unix))]
+        {
+            let mut permissions = fs::metadata(path)?.permissions();
+            permissions.set_readonly(mode & 0o222 == 0);
+            fs::set_permissions(path, permissions)
+        }
     }
 
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FileEntry>> {
