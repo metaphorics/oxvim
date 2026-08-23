@@ -735,3 +735,32 @@ fn method_call_without_parentheses_is_e107() {
     assert_eq!(error(b"'t'->{x -> x}").message, "Missing parentheses: lambda");
     assert_eq!(error(b"[1, 2, 3]->").message, "Missing name after ->");
 }
+
+// ---------------------------------------------------------------------------
+// E15 message text
+// Upstream: `e_invexpr2` (errors.h:38) is `E15: Invalid expression: "%s"` and
+// is handed the whole expression, not the token that failed.
+// ---------------------------------------------------------------------------
+
+/// Documented error: an expression that cannot be parsed at all is quoted back
+/// whole, wherever inside it the parser gave up.
+#[test]
+fn unparsable_expressions_quote_the_whole_expression() {
+    for source in [&b"1 +"[..], b"(", b"!", b"*3"] {
+        let failure = error(source);
+        assert_eq!(failure.code, "E15", "{}", String::from_utf8_lossy(source));
+        assert_eq!(
+            failure.message,
+            format!("Invalid expression: \"{}\"", String::from_utf8_lossy(source))
+        );
+    }
+}
+
+/// Boundary: the empty expression is the same failure, and a construct that has
+/// its own diagnostic keeps it rather than being flattened into E15.
+#[test]
+fn unparsable_expression_boundaries_keep_specific_diagnostics() {
+    assert_eq!(error(b"").code, "E15");
+    assert_eq!(error(b"").message, "Invalid expression: \"\"");
+    assert_eq!(error(b"1 ? 2").code, "E109");
+}

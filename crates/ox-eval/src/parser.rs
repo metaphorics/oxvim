@@ -436,9 +436,18 @@ impl<'a> Parser<'a> {
             TokenKind::HashLBrace => self.parse_literal_dict(token.span.start),
             TokenKind::LBrace if self.brace_is_lambda() => self.parse_lambda(token.span.start),
             TokenKind::LBrace => self.parse_dict(token.span.start),
-            TokenKind::Eof => Err(EvalError::new("E15", token.span.start, "expression expected")),
-            _ => Err(EvalError::new("E15", token.span.start, "expression expected")),
+            // Nothing here can begin an expression. Upstream does not describe
+            // the offending token; `e_invexpr2` (errors.h:38) quotes the whole
+            // expression back: `E15: Invalid expression: "%s"`.
+            _ => Err(self.invalid_expression()),
         }
+    }
+
+    /// `e_invexpr2` (errors.h:38): `E15: Invalid expression: "%s"`, quoting the
+    /// whole expression rather than the token that could not be parsed.
+    fn invalid_expression(&self) -> EvalError {
+        let source = String::from_utf8_lossy(self.source);
+        EvalError::new("E15", 0, format!("Invalid expression: \"{source}\""))
     }
 
     fn parse_variable(&mut self, mut name: Vec<u8>, mut span: Span) -> Result<Expr, EvalError> {
