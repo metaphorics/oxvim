@@ -601,6 +601,72 @@ fn autocmd_bang_clears_builtin_popupmenu_group() {
 }
 
 // ---------------------------------------------------------------------------
+// The exit sequence: VimLeavePre then VimLeave
+// Citations: main.c getout:753-882 (VimLeavePre at 828, VimLeave at 851),
+// test/old/testdir/runtest.vim:324 `au VimLeavePre * call EarlyExit(...)`.
+// ---------------------------------------------------------------------------
+
+/// A command that ends the process runs `VimLeavePre` and then `VimLeave`
+/// before it goes, which is how `runtest.vim` keeps its record when a test
+/// function quits: `au VimLeavePre * call EarlyExit(g:testfunc)`.
+///
+/// The order is asserted rather than just the firing, because upstream
+/// separates the two events by the ShaDa write and handlers rely on running
+/// before it (`main.c`:828 and :851).
+#[test]
+fn quit_runs_vimleavepre_then_vimleave() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor
+        .execute_line(&mut editor, "autocmd VimLeavePre * let g:pre = 1")
+        .unwrap();
+    // Reading g:pre here is what pins the order: VimLeave first would leave
+    // g:leave unset, since g:pre would not exist yet.
+    executor
+        .execute_line(&mut editor, "autocmd VimLeave * let g:leave = g:pre + 1")
+        .unwrap();
+    assert_eq!(
+        executor.execute_line(&mut editor, "quit").unwrap(),
+        ExecOutcome::Quit(0)
+    );
+    assert_eq!(global_value(&executor, "pre"), Some(ox_types::Typval::Number(1)));
+    assert_eq!(global_value(&executor, "leave"), Some(ox_types::Typval::Number(2)));
+}
+
+/// `:qall` and `:cquit` are the same exit, so they carry the same events, and
+/// the sequence runs once per process however many quits follow.
+#[test]
+fn the_exit_sequence_runs_once_for_qall_and_cquit() {
+    for command in ["qall", "cquit 3"] {
+        let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+        executor
+            .execute_line(&mut editor, "autocmd VimLeave * let g:count = get(g:, 'count', 0) + 1")
+            .unwrap();
+        executor.execute_line(&mut editor, command).unwrap();
+        assert_eq!(global_value(&executor, "count"), Some(ox_types::Typval::Number(1)), "{command}");
+        // A second quit is past `getout`, so nothing fires again.
+        executor.execute_line(&mut editor, "qall").unwrap();
+        assert_eq!(global_value(&executor, "count"), Some(ox_types::Typval::Number(1)), "{command}");
+    }
+}
+
+/// A quit reached from inside a sourced script still runs the sequence: this is
+/// `runtest.vim`'s own shape, where the `quit` is inside a function called by a
+/// sourced file.
+#[test]
+fn a_quit_inside_a_sourced_script_runs_the_exit_sequence() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor
+        .execute_line(&mut editor, "autocmd VimLeavePre * let g:early = 1")
+        .unwrap();
+    let script = "func Ender()\n  quit\nendfunc\ncall Ender()\n";
+    assert_eq!(
+        executor.execute_script(&mut editor, "ender.vim", script).unwrap(),
+        ExecOutcome::Quit(0)
+    );
+    assert!(global_flag(&executor, "early"));
+}
+
+// ---------------------------------------------------------------------------
 // :command definition / bang replacement / execution / deletion
 // Citations: ex_docmd.c ex_command (E174, E183), test_usercommands.vim
 // ---------------------------------------------------------------------------

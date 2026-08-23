@@ -272,6 +272,8 @@ pub(crate) struct ExRuntime<F: FileIO> {
     /// `filetype_detect`/`filetype_plugin`/`filetype_indent`
     /// (`ex_docmd.c:7860-7884`): unset, enabled, or explicitly disabled.
     pub(crate) filetype: FiletypeState,
+    /// `getout` (`main.c`:753) has begun, so `VimLeavePre`/`VimLeave` are done.
+    pub(crate) exiting: bool,
 }
 
 impl<F: FileIO> ExRuntime<F> {
@@ -288,6 +290,7 @@ impl<F: FileIO> ExRuntime<F> {
             previous_dir: None,
             local_dir: None,
             filetype: FiletypeState::default(),
+            exiting: false,
         }
     }
 
@@ -413,6 +416,7 @@ impl<F: FileIO> ExExecutor<F> {
         let program = parse_program(&self.runtime.user_commands, &logical)?;
         sync_editor_into_scope(editor, &mut self.scope)?;
         let flow = run_program(&mut self.runtime, editor, &mut self.scope, self.lua.as_ref(), &program, 0, program.len());
+        self.finish_quit(editor, &flow);
         sync_scope_into_editor(editor, &self.scope)?;
         flow_to_result(flow)
     }
@@ -443,6 +447,7 @@ impl<F: FileIO> ExExecutor<F> {
             0,
             program.len(),
         );
+        self.finish_quit(editor, &flow);
         sync_scope_into_editor(editor, &self.scope)?;
         flow_to_result(flow)
     }
@@ -475,6 +480,7 @@ impl<F: FileIO> ExExecutor<F> {
                         0,
                         program.len(),
                     );
+                    self.finish_quit(editor, &flow);
                     match sync_scope_into_editor(editor, &self.scope) {
                         Ok(()) => flow_to_result(flow),
                         Err(error) => Err(error),
@@ -496,8 +502,20 @@ impl<F: FileIO> ExExecutor<F> {
         editor: &mut Editor,
         path: &Path,
     ) -> Result<ExecOutcome, ExecError> {
-        source_path(&mut self.runtime, editor, &mut self.scope, self.lua.as_ref(), path, false)
-            .and_then(flow_to_result)
+        let flow = source_path(&mut self.runtime, editor, &mut self.scope, self.lua.as_ref(), path, false)?;
+        self.finish_quit(editor, &flow);
+        flow_to_result(flow)
+    }
+
+    /// `getout` (`main.c`:753): the exit sequence, run when a flow ends the
+    /// process. It happens before the scope is synced back, so a `VimLeave`
+    /// handler sees the state the quitting command left behind.
+    fn finish_quit(&mut self, editor: &mut Editor, flow: &Flow) {
+        if !matches!(flow, Flow::Quit(_)) {
+            return;
+        }
+        let lua = self.lua.clone();
+        fire_exit_autocmds(&mut self.runtime, editor, &mut self.scope, lua.as_ref());
     }
 }
 
@@ -4736,6 +4754,38 @@ fn run_autocmd_plan<F: FileIO>(
         }
     }
     Flow::Normal
+}
+
+/// `getout` (`main.c`:753-882), the exit sequence: `VimLeavePre` runs first,
+/// then the ShaDa write this port does not have, then `VimLeave`, and only
+/// then does the process go away. Both events fire once per process, which is
+/// what `apply_autocmds` guarantees upstream by never returning to the Ex loop
+/// afterwards; here the flag on the runtime says the same thing, since a
+/// `:quit` inside a `VimLeave` handler must not restart the sequence.
+///
+/// An autocmd that fails does not cancel the exit: upstream reports it through
+/// `emsg` and carries on to `os_exit`, so the text is recorded as a message and
+/// the requested status survives.
+fn fire_exit_autocmds<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+) {
+    if runtime.exiting {
+        return;
+    }
+    runtime.exiting = true;
+    for event in [Event::VimLeavePre, Event::VimLeave] {
+        let plan = editor.autocmds_mut().plan(event, AutocmdContext::default());
+        if plan.ready.is_empty() {
+            continue;
+        }
+        let flow = run_autocmd_plan(runtime, editor, scope, lua, plan);
+        if let Flow::Exception(exception) = flow {
+            push_text_message(editor, exception.message(), true, true);
+        }
+    }
 }
 
 /// `:language` (`os/lang.c` `ex_language`): inspect or set the process
