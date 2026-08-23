@@ -80,11 +80,29 @@ fn call_execute_builtin<F: FileIO>(
     if args.len() > 2 {
         return Err(EvalError::new("E118", 0, "Too many arguments for function: execute"));
     }
-    let command = typval_to_text(&args[0]);
-    let logical = vec![LogicalLine {
-        text: command,
-        first_line: runtime.scripts.current_line(),
-    }];
+    // A List argument is not stringified: `execute_common` (`eval/funcs.c`
+    // 1206-1216) hands `do_cmdline` a `get_list_line` cookie, so every item is
+    // its own source line and multi-line constructs such as `:if`/`:endif`
+    // work. Only the non-list form goes through `do_cmdline_cmd` as one line.
+    let logical = match &args[0] {
+        Typval::List(items) => {
+            let text = items
+                .borrow()
+                .items
+                .iter()
+                .map(typval_to_text)
+                .collect::<Vec<String>>()
+                .join("\n");
+            runtime
+                .scripts
+                .join_logical_lines(&text)
+                .map_err(|error| EvalError::new("E488", 0, error.to_string()))?
+        }
+        command => vec![LogicalLine {
+            text: typval_to_text(command),
+            first_line: runtime.scripts.current_line(),
+        }],
+    };
     let program = parse_program(&runtime.user_commands, &logical)
         .map_err(|error| EvalError::new("E488", 0, error.to_string()))?;
     let message_start = editor.messages().len();
