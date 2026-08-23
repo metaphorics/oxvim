@@ -564,13 +564,29 @@ fn startuptime_writes_a_timing_log() {
     assert_eq!(std::fs::read_to_string(quiet.text()).expect("read scratch"), "");
 }
 
-/// `-w{number}` sets `'window'`; the option is the whole observable effect
-/// upstream produces at scan time.
+/// `-w{number}` and `-w {number}` are the same option: `main.c` line 1473
+/// takes the separate argument as the `'window'` value whenever it starts
+/// with a digit, and only a non-numeric argument is the script-recording
+/// file that oxvim has no subsystem for.
 #[test]
 fn window_height_flag_sets_the_window_option() {
-    let output = batch(&["-w42"], "set window?\n");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "window=42");
+    for arguments in [vec!["-w42"], vec!["-w", "42"]] {
+        let output = batch(&arguments, "set window?\n");
+        assert!(
+            output.status.success(),
+            "{arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "window=42", "{arguments:?}");
+    }
+    // A non-numeric argument still names the missing subsystem.
+    let output = oxvim().args(["-w", "keys.log"]).output().expect("spawn oxvim");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("script recording of typed keys"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Upstream accepts these and does nothing with them, so accepting them is

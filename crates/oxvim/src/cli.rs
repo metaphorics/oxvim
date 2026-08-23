@@ -574,7 +574,19 @@ impl Cli {
             }
             // "-U {gvimrc}" is accepted and ignored, like upstream.
             'U' => {}
-            'w' | 'W' => {
+            // main.c line 1473: "-w {nr}" is the 'window' value whenever the
+            // separate argument starts with a digit; anything else is the
+            // script-recording file, which needs a subsystem oxvim lacks.
+            'w' => {
+                let value = value.expect("a missing -w argument already failed");
+                if !value.starts_with(|c: char| c.is_ascii_digit()) {
+                    return Err(unsupported(option, "script recording of typed keys"));
+                }
+                let mut cursor = 0;
+                let number = number_argument(&value, &mut cursor, 10);
+                self.window_height = Some(i64::try_from(number).unwrap_or(i64::MAX));
+            }
+            'W' => {
                 return Err(unsupported(option, "script recording of typed keys"));
             }
             '-' => {
