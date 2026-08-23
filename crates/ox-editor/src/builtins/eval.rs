@@ -10,7 +10,7 @@ use ox_eval::Evaluator;
 use ox_eval::Parser as ExprParser;
 use ox_eval::EvalError;
 use ox_eval::Scope;
-use ox_excmd::{resolve_command, ResolveError};
+use ox_excmd::{resolve_command, ResolveError, ResolvedCommand};
 use ox_types::{Funcref, Object, OxStr, Special, Typval};
 use crate::script::{FileIO, LogicalLine};
 use crate::autocmd::Event;
@@ -312,9 +312,10 @@ fn exists_with_editor<F: FileIO>(
         i64::from(crate::options::OptionStore::metadata(option).is_ok())
     } else if let Some(name) = operand.strip_prefix('*') {
         let sid = runtime.functions.active_sid().or_else(|| runtime.scripts.current_sid()).unwrap_or(0);
-        i64::from(builtin_spec(name).is_some() || runtime.functions.contains(name, sid))
+        i64::from(is_callable_function(name) || runtime.functions.contains(name, sid))
     } else if let Some(name) = operand.strip_prefix(':') {
         match resolve_command(name, &runtime.user_commands) {
+            Ok(ResolvedCommand::Builtin(spec)) if !is_executed_command(spec.name) => 0,
             Ok(command) => if command.name() == name { 2 } else { 1 },
             Err(ResolveError::AmbiguousUserCommand) => 3,
             Err(ResolveError::NotFound) => 0,
@@ -327,4 +328,67 @@ fn exists_with_editor<F: FileIO>(
         return exists_in_scope(&value, scope);
     };
     Ok(Typval::Number(result))
+}
+
+/// Whether a builtin function name can actually be *called* here.
+///
+/// `f_exists`'s `*` form asks `function_exists`, not the metadata table, so the
+/// answer is the union of the two dispatchers that serve builtins: the
+/// typval-only one in `ox-eval` ([`ox_eval::is_builtin_implemented`]) and the
+/// editor-stateful families in [`crate::builtins::route`]. Every other name in
+/// the generated `eval.lua` table resolves to an `E117: not implemented` arm,
+/// and answering 1 for those makes `check.vim`'s `CheckFunction` inert: the
+/// guarded file runs code that cannot work instead of skipping honestly.
+fn is_callable_function(name: &str) -> bool {
+    ox_eval::is_builtin_implemented(name) || crate::builtins::route(name).is_some()
+}
+
+/// Whether this port executes the Ex command `name`, as opposed to merely
+/// resolving it out of the 564-entry generated `COMMANDS` table.
+///
+/// `cmd_exists` (`ex_docmd.c:3226`) answers from upstream's own table, where
+/// resolving and executing are the same question. Here they are not: an
+/// unhandled name reaches `Flow::NotImplemented` (`excmd_exec.rs:1037`), so
+/// `exists(':wshada')` answering 2 makes `CheckCommand` inert the same way.
+///
+/// The three arms below are the three places a command name is served, and each
+/// is derived from that place — re-derive them there when it changes:
+///  * `dispatch` (`excmd_exec.rs:903-1034`), one arm per name;
+///  * `run_program` (`excmd_exec.rs:682-872`), the control-flow openers it
+///    interprets before `dispatch` is reached, plus the closers it consumes;
+///  * [`ox_excmd::ModifierKind`], the modifiers the Ex parser recognises.
+///    Upstream answers for modifiers out of `cmdmods` before it consults the
+///    command table, and a modifier has no execution separate from the command
+///    it decorates, so recognition is the whole question for them.
+fn is_executed_command(name: &str) -> bool {
+    matches!(name,
+        "Next" | "argdelete" | "argdo" | "args" | "augroup" | "aunmenu" | "autocmd" |
+        "bdelete" | "bnext" | "bprevious" | "break" | "buffer" | "bunload" | "bwipeout" |
+        "call" | "cd" | "close" | "cmap" | "cmapclear" | "cnoremap" | "colorscheme" |
+        "comclear" | "command" | "const" | "continue" | "cquit" | "cunmap" | "delcommand" |
+        "delete" | "delfunction" | "display" | "echo" | "echoerr" | "echohl" | "echomsg" |
+        "echon" | "edit" | "enew" | "eval" | "execute" | "filetype" | "finish" | "fold" |
+        "foldclose" | "foldopen" | "global" | "hide" | "highlight" | "imap" | "imapclear" |
+        "inoremap" | "insert" | "iunmap" | "k" | "language" | "lcd" | "let" | "lmap" |
+        "lmapclear" | "lnoremap" | "lockvar" | "lua" | "luado" | "luafile" | "lunmap" | "map" |
+        "mapclear" | "mark" | "marks" | "new" | "next" | "nmap" | "nmapclear" | "nnoremap" |
+        "noremap" | "normal" | "nunmap" | "omap" | "omapclear" | "only" | "onoremap" |
+        "ounmap" | "previous" | "print" | "put" | "qall" | "quit" | "read" | "redir" | "redo" |
+        "redraw" | "redrawstatus" | "redrawtabline" | "registers" | "resize" | "retab" |
+        "return" | "scriptencoding" | "set" | "setglobal" | "setlocal" | "sleep" | "smap" |
+        "smapclear" | "snoremap" | "source" | "split" | "substitute" | "sunmap" | "swapname" |
+        "syntax" | "tabedit" | "tabnew" | "tabonly" | "throw" | "tlunmenu" | "tmap" |
+        "tmapclear" | "tnoremap" | "tunmap" | "undo" | "undojoin" | "unlet" | "unlockvar" |
+        "unmap" | "vglobal" | "vmap" | "vmapclear" | "vnew" | "vnoremap" | "vsplit" |
+        "vunmap" | "wincmd" | "wq" | "write" | "xit" | "xmap" | "xmapclear" | "xnoremap" |
+        "xunmap" | "yank" | "z"
+    ) || matches!(name,
+        "catch" | "else" | "elseif" | "endfor" | "endfunction" | "endif" | "endtry" |
+        "endwhile" | "finally" | "for" | "function" | "if" | "try" | "while"
+    ) || matches!(name,
+        "aboveleft" | "belowright" | "botright" | "browse" | "confirm" | "filter" |
+        "horizontal" | "keepalt" | "keepjumps" | "keepmarks" | "keeppatterns" | "leftabove" |
+        "lockmarks" | "noautocmd" | "noswapfile" | "rightbelow" | "sandbox" | "silent" |
+        "tab" | "topleft" | "unsilent" | "verbose" | "vertical"
+    )
 }

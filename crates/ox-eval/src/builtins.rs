@@ -135,7 +135,7 @@ impl<'a> Builtins<'a> {
 
     fn dispatch(&mut self, name: &str, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
         let spec = builtin_spec(name).ok_or_else(|| EvalError::not_implemented(OxStr::from(name)))?;
-        if !is_implemented(name) {
+        if !is_builtin_implemented(name) {
             return Err(EvalError::not_implemented(OxStr::from(name)));
         }
         check_arity(spec, args.len())?;
@@ -993,7 +993,18 @@ fn check_arity(spec: &BuiltinSpec, count: usize) -> Result<()> {
     Ok(())
 }
 
-fn is_implemented(name: &str) -> bool {
+/// Whether this port implements `name`, as opposed to merely carrying its
+/// entry in the generated `eval.lua` metadata table.
+///
+/// [`builtin_spec`] answers the *inventory* question — arity, method
+/// eligibility, the name upstream declares — for every builtin Neovim has.
+/// [`Builtins::dispatch`] serves only the subset below and reports `E117` for
+/// the rest, so this predicate, not `builtin_spec`, is what `exists('*name')`
+/// has to key on. `check.vim`'s `CheckFunction` is `exists('*' .. name)`, so a
+/// name that answers 1 and then reports `not implemented` turns an honest skip
+/// into a wall of failures.
+#[must_use]
+pub fn is_builtin_implemented(name: &str) -> bool {
     matches!(name,
         "abs" | "add" | "and" | "blob2list" | "ceil" | "char2nr" | "copy" | "count" |
         "deepcopy" | "empty" | "escape" | "executable" | "exepath" | "exists" | "extend" | "extendnew" | "filter" | "flatten" |
@@ -1020,9 +1031,12 @@ pub fn exists(value: &Typval, scope: &Scope) -> Result<Typval> {
                 || std::env::var_os(String::from_utf8_lossy(name).as_ref()).is_some()
         }
         Some(b'&' | b'+') => option_exists(scope, &bytes[1..]),
+        // `f_exists` calls `function_exists`, which asks whether the function
+        // can be *called* — so the answer is the implemented subset, not the
+        // generated inventory (see [`is_builtin_implemented`]).
         Some(b'*') => std::str::from_utf8(&bytes[1..])
             .ok()
-            .is_some_and(|name| builtin_spec(name).is_some()),
+            .is_some_and(is_builtin_implemented),
         Some(b':' | b'#') | None => false,
         _ => matches!(bytes, b"v:true" | b"v:false" | b"v:null" | b"v:none")
             || vim_type_var(bytes).is_some()

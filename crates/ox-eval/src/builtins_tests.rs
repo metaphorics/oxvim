@@ -1863,3 +1863,44 @@ fn assignment_to_a_locked_variable_is_refused_with_upstream_errors() {
     scope.set(b"fresh", number(1)).unwrap();
     assert_eq!(scope.set(b"n", number(3)).unwrap_err().code, "E1122");
 }
+
+// `exists('*name')` is what `check.vim`'s `CheckFunction` is built on, so it
+// has to answer for callability, not for the generated inventory. Oracle:
+// `f_exists` (`eval/funcs.c:1270`) → `function_exists`.
+#[test]
+fn exists_star_answers_only_for_builtins_this_port_can_call() {
+    for (query, expected) in [("*strlen", 1), ("*printf", 1), ("*setqflist", 0), ("*foldtextresult", 0), ("*timer_start", 0), ("*DefinitelyMissing", 0)] {
+        assert_eq!(call("exists", vec![text(query)]).unwrap(), number(expected), "exists('{query}')");
+    }
+
+    // Not tautological: the three zeroes above are all *in* the generated
+    // table, so the 0 comes from the dispatch arm being absent and not from
+    // the name being unknown. `*DefinitelyMissing` is the unknown-name case.
+    for name in ["setqflist", "foldtextresult", "timer_start"] {
+        assert!(crate::builtins::builtin_spec(name).is_some(), "{name} left the generated table");
+        assert!(matches!(call(name, vec![]).unwrap_err().kind, EvalErrorKind::NotImplemented(_)), "{name}");
+    }
+    assert!(crate::builtins::builtin_spec("DefinitelyMissing").is_none());
+}
+
+// Guards the other direction: a name this predicate claims must reach a real
+// dispatch arm, because the arm-less fallthrough is also `NotImplemented`
+// (`builtins.rs` `dispatch`) and `exists()` would then over-claim again.
+#[test]
+fn every_builtin_claimed_implemented_reaches_a_dispatch_arm() {
+    for spec in BUILTINS {
+        if !crate::builtins::is_builtin_implemented(spec.name) {
+            continue;
+        }
+        // A Dict argument is refused by every conversion, so no builtin here
+        // does any work; only the arm lookup is exercised.
+        let args = vec![Typval::dict(vec![]); spec.min_args];
+        if let Err(error) = call(spec.name, args) {
+            assert!(
+                !matches!(error.kind, EvalErrorKind::NotImplemented(_)),
+                "{} is claimed implemented but has no dispatch arm",
+                spec.name,
+            );
+        }
+    }
+}
