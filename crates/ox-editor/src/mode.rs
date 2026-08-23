@@ -164,6 +164,7 @@ impl ModeMachine {
                     }
                 }
             }
+            self.may_sync_undo(editor, flags);
             let Some(key) = editor.typeahead_mut().pop()? else { return Ok(Step::Idle); };
             return match key {
                 Key::Byte(byte) => Ok(Step::Key(char::from(byte))),
@@ -174,6 +175,27 @@ impl ModeMachine {
                 Key::Special(_, _) => Ok(Step::ProcessEvents),
             };
         }
+    }
+
+    /// `may_sync_undo` (`input.c:1294-1306`): consuming a *typed* key closes
+    /// the open undo block, so everything one command does lands in one block
+    /// and the next thing the user types starts another.
+    ///
+    /// Keys a mapping produced are exempt because upstream only reports the
+    /// bytes past `typebuf.tb_maplen` through `gotchars`
+    /// (`input.c:2495-2497`), which is what calls this. Insert and command-line
+    /// mode are exempt so one insert session, and one typed Ex command line,
+    /// stay single blocks.
+    ///
+    /// Named gap: upstream also syncs inside Insert mode once a cursor key has
+    /// moved the caret (`Ins.moved != kInsNone`). This port's insert mode has
+    /// no cursor-key handling to set that state, so there is nothing here to
+    /// read; when it gains one, this is the predicate to extend.
+    fn may_sync_undo(&mut self, editor: &mut Editor, flags: TypeaheadFlags) {
+        if flags.mapped || matches!(self.mode, Mode::Insert(_) | Mode::Cmdline(_)) {
+            return;
+        }
+        editor.sync_current_undo();
     }
 
     /// Executes the action classified by [`Self::check`].

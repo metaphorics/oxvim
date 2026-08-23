@@ -270,13 +270,24 @@ fn edit(label: &str) -> LineEdit {
     }
 }
 
+/// Records `edit` as its own undo block: the tree only starts a new header
+/// when the previous one is closed, so a test about *branches* has to close
+/// each one the way a typed key would.
+fn record_block(tree: &mut UndoTree, label: &str, timestamp: i64) -> u64 {
+    tree.sync();
+    tree.record(edit(label), timestamp)
+}
+
 #[test]
 fn undo_tree_preserves_and_navigates_branches() {
     let mut tree = UndoTree::new();
-    let first = tree.record(edit("one"), 10);
-    let second = tree.record(edit("two"), 20);
-    assert_eq!(tree.undo().unwrap(), UndoStep::Undo(UndoEntry { seq: second, timestamp: 20, edit: edit("two") }));
-    let third = tree.record(edit("branch"), 30);
+    let first = record_block(&mut tree, "one", 10);
+    let second = record_block(&mut tree, "two", 20);
+    assert_eq!(
+        tree.undo().unwrap(),
+        UndoStep::Undo(UndoEntry { seq: second, timestamp: 20, edits: vec![edit("two")] })
+    );
+    let third = record_block(&mut tree, "branch", 30);
     assert_eq!(tree.current_seq(), third);
     tree.undo().unwrap();
     assert_eq!(tree.branches(), vec![second, third]);
@@ -285,6 +296,105 @@ fn undo_tree_preserves_and_navigates_branches() {
     assert_eq!(steps.len(), 2);
     assert_eq!(tree.current_seq(), third);
     assert_eq!(tree.undo_to_seq(first).unwrap().len(), 1);
+}
+
+/// Edits recorded without a sync between them are one header, and one undo
+/// step takes the whole block back (`u_savecommon`, `undo.c:388-500`).
+#[test]
+fn unsynced_edits_join_one_undo_block() {
+    let mut tree = UndoTree::new();
+    let first = tree.record(edit("one"), 10);
+    let joined = tree.record(edit("two"), 20);
+    let also_joined = tree.record(edit("three"), 30);
+    assert_eq!(joined, first, "an open block must not allocate a sequence");
+    assert_eq!(also_joined, first);
+    assert_eq!(tree.current_seq(), first);
+    assert_eq!(tree.current_block_len(), 3);
+    assert!(!tree.is_synced());
+    assert_eq!(tree.summary().seq_last, first, "no extra header was created");
+
+    let UndoStep::Undo(entry) = tree.undo().unwrap() else {
+        panic!("expected an undo step");
+    };
+    assert_eq!(entry.edits, vec![edit("one"), edit("two"), edit("three")]);
+    assert!(tree.is_synced(), "undoing closes the block");
+    assert_eq!(tree.current_seq(), 0);
+    assert!(tree.undo().is_err(), "one block, one step");
+}
+
+/// A sync between two edits makes two headers, which is the boundary a typed
+/// key installs (`may_sync_undo`, `input.c:1300`).
+#[test]
+fn a_sync_between_edits_starts_a_new_undo_block() {
+    let mut tree = UndoTree::new();
+    let first = tree.record(edit("one"), 10);
+    tree.sync();
+    let second = tree.record(edit("two"), 20);
+    assert_ne!(second, first);
+    assert_eq!(tree.summary().seq_last, second);
+    assert_eq!(tree.current_block_len(), 1);
+    tree.undo().unwrap();
+    assert_eq!(tree.current_seq(), first);
+    tree.undo().unwrap();
+    assert_eq!(tree.current_seq(), 0);
+}
+
+/// `:undojoin` reopens the newest block, is a no-op when one is already open,
+/// and is `E790` after an undo (`ex_undojoin`, `undo.c:2800-2816`).
+#[test]
+fn undojoin_reopens_the_newest_block_but_never_after_an_undo() {
+    let mut tree = UndoTree::new();
+    // Nothing recorded yet: silent no-op, and the next edit still starts a
+    // block of its own.
+    tree.undojoin().unwrap();
+    let first = tree.record(edit("one"), 10);
+    // Already open: also a no-op, and the flag stays open.
+    tree.undojoin().unwrap();
+    assert!(!tree.is_synced());
+
+    tree.sync();
+    tree.undojoin().unwrap();
+    let joined = tree.record(edit("two"), 20);
+    assert_eq!(joined, first, "undojoin put the edit in the existing header");
+    assert_eq!(tree.current_block_len(), 2);
+
+    tree.undo().unwrap();
+    assert_eq!(tree.undojoin(), Err(UndoError::JoinAfterUndo));
+
+    // The other rejecting shape: an undo that stopped on an earlier header
+    // rather than at the original state.
+    let mut tree = UndoTree::new();
+    record_block(&mut tree, "one", 10);
+    record_block(&mut tree, "two", 20);
+    tree.undo().unwrap();
+    assert_ne!(tree.current_seq(), 0, "stopped on a header, not at the root");
+    assert_eq!(tree.undojoin(), Err(UndoError::JoinAfterUndo));
+}
+
+/// The header list `undotree()` reports: oldest first along the active
+/// branch, with the abandoned branch nested under `alt`
+/// (`u_eval_tree`, `undo.c:3193-3221`).
+#[test]
+fn undotree_entries_report_the_active_branch_and_its_alternates() {
+    let mut tree = UndoTree::new();
+    let first = record_block(&mut tree, "one", 10);
+    let second = record_block(&mut tree, "two", 20);
+    tree.undo().unwrap();
+    let branch = record_block(&mut tree, "branch", 30);
+
+    let entries = tree.entries();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].seq, first);
+    assert!(entries[0].alt.is_empty());
+    assert_eq!(entries[1].seq, branch);
+    assert!(entries[1].newhead, "the branch tip is b_u_newhead");
+    assert!(!entries[1].curhead);
+    assert_eq!(entries[1].alt.len(), 1);
+    assert_eq!(entries[1].alt[0].seq, second);
+
+    tree.undo().unwrap();
+    let entries = tree.entries();
+    assert!(entries[1].curhead, "the undone header is b_u_curhead");
 }
 
 #[test]
@@ -402,11 +512,15 @@ fn ox_text_writes_undo_history_real_nvim_undoes_forward() {
     let mut buffer = Buffer::from_bytes(b"a\nb\n").unwrap();
     let mut tree = UndoTree::new();
 
-    // Three sequential edits: line 2 b->c, c->d, then append "e".
+    // Three sequential edits, each its own undo block: line 2 b->c, c->d,
+    // then append "e". Without the syncs they would be one header, which is
+    // what a scripted run of three mutations actually produces.
     tree.record(edit_at(2, &bytes(&["b"]), &bytes(&["c"])), 1710000001);
     buffer.replace_lines(2, 2, &bytes(&["c"])).unwrap();
+    tree.sync();
     tree.record(edit_at(2, &bytes(&["c"]), &bytes(&["d"])), 1710000002);
     buffer.replace_lines(2, 2, &bytes(&["d"])).unwrap();
+    tree.sync();
     tree.record(edit_at(3, &[], &bytes(&["e"])), 1710000003);
     buffer.append_lines(2, &bytes(&["e"])).unwrap();
 
@@ -435,9 +549,11 @@ fn ox_text_writes_branching_history_real_nvim_follows_active_branch() {
     let mut buffer = Buffer::from_bytes(b"a\nb\n").unwrap();
     let mut tree = UndoTree::new();
 
-    // E1 b->c, E2 c->d, then abandon E2 (undo) and branch fresh edit E3.
+    // E1 b->c, E2 c->d, then abandon E2 (undo) and branch fresh edit E3, each
+    // in its own undo block.
     tree.record(edit_at(2, &bytes(&["b"]), &bytes(&["c"])), 1710000001);
     buffer.replace_lines(2, 2, &bytes(&["c"])).unwrap();
+    tree.sync();
     tree.record(edit_at(2, &bytes(&["c"]), &bytes(&["d"])), 1710000002);
     buffer.replace_lines(2, 2, &bytes(&["d"])).unwrap();
     buffer.replace_lines(2, 2, &bytes(&["c"])).unwrap(); // sync buffer to E1 state
@@ -459,6 +575,44 @@ fn ox_text_writes_branching_history_real_nvim_follows_active_branch() {
     assert_eq!(fs::read_to_string(&dumps[1]).unwrap(), "a\nb\n");
     assert_eq!(fs::read_to_string(&dumps[2]).unwrap(), "a\nb\n");
     assert_eq!(fs::read_to_string(&dumps[3]).unwrap(), "a\nb\n");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A header holding several edits must read back as one undoable unit in real
+/// Neovim: one `:undo` puts every line the block touched back at once.
+///
+/// This is the file-format half of the grouping change — a header carries an
+/// entry list upstream (`uh_entry`, `undo.c:610-611`), and this proves our
+/// writer emits that list in an order Neovim replays correctly.
+#[test]
+fn ox_text_writes_a_grouped_block_real_nvim_undoes_it_in_one_step() {
+    if !Path::new(nvim()).exists() {
+        return;
+    }
+    let dir = oracle_dir("fwd-grouped");
+    let mut buffer = Buffer::from_bytes(b"a\nb\nc\n").unwrap();
+    let mut tree = UndoTree::new();
+
+    // One block whose edits are order-sensitive: delete line 1 twice, as
+    // `:g/^[ab]$/d` does. Undoing has to reinsert "b" before "a", so a
+    // wrongly ordered entry list produces "b\na\nc\n" instead.
+    for gone in ["a", "b"] {
+        tree.record(edit_at(1, &bytes(&[gone]), &[]), 1710000001);
+        buffer.replace_lines(1, 1, &[]).unwrap();
+    }
+    assert_eq!(buffer.to_bytes(), b"c\n");
+
+    let undo = UndoFile::from_tree(&buffer, &tree);
+    undo.verify_buffer(&buffer).unwrap();
+    let mut undo_bytes = Vec::new();
+    undo.write(&mut undo_bytes).unwrap();
+    assert_eq!(written_header_count(&undo_bytes), 1, "two edits, one header");
+
+    let dumps = forward_undo_dumps(&dir, b"c\n", &undo_bytes);
+    // The first undo restores both lines in their original order, and there
+    // is nothing older.
+    assert_eq!(fs::read_to_string(&dumps[0]).unwrap(), "a\nb\nc\n");
+    assert_eq!(fs::read_to_string(&dumps[1]).unwrap(), "a\nb\nc\n");
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -597,6 +751,7 @@ fn undo_file_header_seq_validation() {
     let buffer = Buffer::from_bytes(b"a\nb\n").unwrap();
     let mut tree = UndoTree::new();
     tree.record(edit_at(2, &bytes(&["b"]), &bytes(&["c"])), 1710000001);
+    tree.sync();
     tree.record(edit_at(2, &bytes(&["c"]), &bytes(&["d"])), 1710000002);
     let undo = UndoFile::from_tree(&buffer, &tree);
     let mut valid = Vec::new();

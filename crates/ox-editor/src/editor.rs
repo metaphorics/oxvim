@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ox_text::{Buffer, Position};
+use ox_text::{Buffer, Position, UndoTree};
 use ox_types::{BufHandle, Dict, Object, OxStr, TabHandle, WinHandle};
 use thiserror::Error;
 
@@ -513,6 +513,10 @@ impl Editor {
         if old_buffer == buffer {
             return Ok(());
         }
+        // `win_enter_ext` syncs undo before leaving the current buffer so the
+        // block cannot be joined by a later edit made after coming back
+        // (`window.c:5275-5279`, `buffer.c:1743-1750`).
+        self.sync_buffer_undo(old_buffer);
         if let Some(state) = self.buffers.get_mut(&buffer) {
             state.attach()?;
         }
@@ -1278,8 +1282,9 @@ impl Editor {
         let Some(replayed) = state.undo()? else {
             return Ok(None);
         };
-        self.finish_replay(buffer, replayed);
-        Ok(Some(replayed.seq))
+        let seq = replayed.first().map(|edit| edit.seq);
+        self.finish_replay(buffer, &replayed);
+        Ok(seq)
     }
 
     /// Redoes a buffer's next change, replaying its stored edit through every
@@ -1293,8 +1298,9 @@ impl Editor {
         let Some(replayed) = state.redo()? else {
             return Ok(None);
         };
-        self.finish_replay(buffer, replayed);
-        Ok(Some(replayed.seq))
+        let seq = replayed.first().map(|edit| edit.seq);
+        self.finish_replay(buffer, &replayed);
+        Ok(seq)
     }
 
     /// Navigates a buffer's undo tree to sequence `seq`, replaying every step
@@ -1314,8 +1320,8 @@ impl Editor {
             .ok_or(EditorError::UnknownBuffer(buffer))?;
         let replayed = state.undo_to_seq(seq)?;
         let count = replayed.len();
-        for edit in replayed {
-            self.finish_replay(buffer, edit);
+        for block in replayed {
+            self.finish_replay(buffer, &block);
         }
         Ok(count)
     }
@@ -1328,6 +1334,43 @@ impl Editor {
             .ok_or(EditorError::UnknownBuffer(buffer))?
             .undo
             .current_seq())
+    }
+
+    /// Closes a buffer's open undo block, so the next edit starts a new one.
+    ///
+    /// This is upstream's `u_sync` (`undo.c:2704-2717`) and the only way to
+    /// move an undo-block boundary from outside `BufferState`. An unknown or
+    /// unloaded buffer has no block to close, so it is a no-op rather than an
+    /// error: upstream's `u_sync` likewise has nothing to do when the buffer
+    /// carries no entries.
+    pub fn sync_buffer_undo(&mut self, buffer: BufHandle) {
+        if let Some(state) = self.buffers.get_mut(&buffer) {
+            state.sync_undo();
+        }
+    }
+
+    /// Closes the current buffer's open undo block.
+    pub fn sync_current_undo(&mut self) {
+        if let Some(buffer) = self.current_buffer() {
+            self.sync_buffer_undo(buffer);
+        }
+    }
+
+    /// Reopens a buffer's newest undo block so the next edit joins it
+    /// (`:undojoin`, `undo.c:2800-2816`).
+    pub fn buffer_undojoin(&mut self, buffer: BufHandle) -> Result<(), EditorError> {
+        self.buffer_mut(buffer)?.undojoin()?;
+        Ok(())
+    }
+
+    /// Returns a buffer's undo tree for reads that need the whole shape,
+    /// which is what `undotree()` reports.
+    pub fn buffer_undo_tree(&self, buffer: BufHandle) -> Result<&UndoTree, EditorError> {
+        Ok(&self
+            .buffers
+            .get(&buffer)
+            .ok_or(EditorError::UnknownBuffer(buffer))?
+            .undo)
     }
 
     /// Opens one containing fold, corresponding to `zo`.
@@ -1385,9 +1428,16 @@ impl Editor {
         Ok(self.buffer_mut(buffer)?.folds.close_all())
     }
 
-    fn finish_replay(&mut self, buffer: BufHandle, replayed: crate::buffer::ReplayedEdit) {
-        self.splice_positions(buffer, replayed.start, replayed.old_count, replayed.new_count);
-        self.changelists.push(buffer, replayed.cursor);
+    /// Adjusts the editor-wide position-bearing subsystems for one replayed
+    /// undo block: every edit splices, and the block leaves one changelist
+    /// entry, matching the one entry a recorded block leaves.
+    fn finish_replay(&mut self, buffer: BufHandle, replayed: &[crate::buffer::ReplayedEdit]) {
+        for edit in replayed {
+            self.splice_positions(buffer, edit.start, edit.old_count, edit.new_count);
+        }
+        if let Some(last) = replayed.last() {
+            self.changelists.push(buffer, last.cursor);
+        }
     }
 
     /// Puts a stored register through the buffer mutation pipeline.

@@ -74,8 +74,9 @@ pub struct BufferState {
     pub marks: LocalMarks,
     /// Buffer-relative extmarks and their decoration attributes.
     pub extmarks: Extmarks,
-    /// Compact extmark position deltas keyed by undo sequence.
-    extmark_undo: BTreeMap<u64, ExtmarkSpliceUndo>,
+    /// Compact extmark position deltas per undo header, one per grouped edit
+    /// in application order.
+    extmark_undo: BTreeMap<u64, Vec<ExtmarkSpliceUndo>>,
     /// Lazily computed and manual buffer folds.
     pub folds: Folds,
     /// Whether resident text differs from the last saved undo state.
@@ -86,8 +87,12 @@ pub struct BufferState {
     saved_changedtick: u64,
     /// Final-EOL state at the last save.
     saved_has_eol: bool,
-    /// Undo-tree state corresponding to the last saved contents.
-    saved_undo_seq: u64,
+    /// Undo-tree state corresponding to the last saved contents, as the
+    /// header sequence and how many edits that header held. The edit count is
+    /// part of it because a header keeps growing while its block is open, so
+    /// the sequence alone cannot tell a saved state from a later edit that
+    /// joined the same block.
+    saved_undo_state: (u64, usize),
     /// Whether the buffer appears in the buffer list.
     pub listed: bool,
     /// Whether text and undo state are resident.
@@ -145,7 +150,7 @@ impl BufferState {
             readonly: false,
             saved_changedtick,
             saved_has_eol,
-            saved_undo_seq: 0,
+            saved_undo_state: (0, 0),
             listed,
             loaded: true,
             hidden: true,
@@ -223,7 +228,7 @@ impl BufferState {
     pub fn mark_saved(&mut self) {
         self.saved_changedtick = self.changedtick();
         self.saved_has_eol = self.text.has_eol();
-        self.saved_undo_seq = self.undo.current_seq();
+        self.saved_undo_state = self.undo_state();
         self.modified = false;
     }
 
@@ -246,7 +251,7 @@ impl BufferState {
         self.modified = false;
         self.saved_changedtick = self.text.changedtick();
         self.saved_has_eol = self.text.has_eol();
-        self.saved_undo_seq = 0;
+        self.saved_undo_state = (0, 0);
         self.loaded = true;
         self.hidden = self.attachments == 0;
     }
@@ -287,7 +292,8 @@ impl BufferState {
         Ok(())
     }
 
-    /// Replaces an inclusive line range and records one undo header.
+    /// Replaces an inclusive line range, joining the open undo block or
+    /// starting a new one.
     pub fn replace_lines(
         &mut self,
         start: usize,
@@ -320,13 +326,14 @@ impl BufferState {
             },
             timestamp,
         );
-        self.extmark_undo.insert(seq, extmark_undo);
+        self.extmark_undo.entry(seq).or_default().push(extmark_undo);
         self.refresh_modified();
         self.bump_derived_ticks();
         Ok(seq)
     }
 
-    /// Inserts logical lines after `lnum` and records one undo header.
+    /// Inserts logical lines after `lnum`, joining the open undo block or
+    /// starting a new one.
     pub fn append_lines(
         &mut self,
         lnum: usize,
@@ -355,13 +362,14 @@ impl BufferState {
             },
             timestamp,
         );
-        self.extmark_undo.insert(seq, extmark_undo);
+        self.extmark_undo.entry(seq).or_default().push(extmark_undo);
         self.refresh_modified();
         self.bump_derived_ticks();
         Ok(seq)
     }
 
-    /// Deletes an inclusive logical-line range and records one undo header.
+    /// Deletes an inclusive logical-line range, joining the open undo block
+    /// or starting a new one.
     pub fn delete_lines(
         &mut self,
         start: usize,
@@ -372,20 +380,21 @@ impl BufferState {
         self.replace_lines(start, end, &[], cursor, cursor, timestamp)
     }
 
-    /// Undoes the most recent change, replaying its inverse edit through the
-    /// text and mark pipeline with the changedtick advanced. Returns the
-    /// undone header's sequence, or `None` when already at the oldest change.
-    pub fn undo(&mut self) -> Result<Option<ReplayedEdit>, BufferStateError> {
+    /// Undoes the most recent undo block, replaying the inverse of every edit
+    /// it grouped through the text and mark pipeline with the changedtick
+    /// advanced. Returns one entry per replayed edit, or `None` when already
+    /// at the oldest change.
+    pub fn undo(&mut self) -> Result<Option<Vec<ReplayedEdit>>, BufferStateError> {
         let Ok(step) = self.undo.undo() else {
             return Ok(None);
         };
         self.apply_undo_step(&step).map(Some)
     }
 
-    /// Redoes the next change, replaying its stored edit through the text and
-    /// mark pipeline with the changedtick advanced. Returns the redone
-    /// header's sequence, or `None` when already at the newest change.
-    pub fn redo(&mut self) -> Result<Option<ReplayedEdit>, BufferStateError> {
+    /// Redoes the next undo block, replaying each of its stored edits through
+    /// the text and mark pipeline with the changedtick advanced. Returns one
+    /// entry per replayed edit, or `None` when already at the newest change.
+    pub fn redo(&mut self) -> Result<Option<Vec<ReplayedEdit>>, BufferStateError> {
         let Ok(step) = self.undo.redo() else {
             return Ok(None);
         };
@@ -393,7 +402,8 @@ impl BufferState {
     }
 
     /// Navigates the undo tree to sequence `seq`, replaying every step the
-    /// route needs, and returns them in application order.
+    /// route needs, and returns them in application order, one inner vector
+    /// per undo block.
     ///
     /// This is what `:undo {N}` needs (`undo_time` with `absolute`,
     /// `undo.c:1975`): the target may be behind *or* ahead of the current
@@ -402,7 +412,7 @@ impl BufferState {
     pub fn undo_to_seq(
         &mut self,
         seq: u64,
-    ) -> Result<Vec<ReplayedEdit>, BufferStateError> {
+    ) -> Result<Vec<Vec<ReplayedEdit>>, BufferStateError> {
         let steps = self.undo.undo_to_seq(seq)?;
         let mut replayed = Vec::with_capacity(steps.len());
         for step in steps {
@@ -411,56 +421,90 @@ impl BufferState {
         Ok(replayed)
     }
 
+    /// Reopens the newest undo block so the next edit joins it (`:undojoin`).
+    pub fn undojoin(&mut self) -> Result<(), BufferStateError> {
+        self.require_loaded()?;
+        self.undo.undojoin().map_err(Into::into)
+    }
+
+    /// Closes the open undo block so the next edit starts a new one.
+    ///
+    /// This is `u_sync` (`undo.c:2704`). It is deliberately the only way for
+    /// anything outside this module to move the boundary.
+    pub fn sync_undo(&mut self) {
+        self.undo.sync();
+    }
+
+    /// The buffer's undo position: the current header and how many edits it
+    /// has collected so far.
+    fn undo_state(&self) -> (u64, usize) {
+        (self.undo.current_seq(), self.undo.current_block_len())
+    }
+
     /// Replays one undo-tree step through text, marks, folds and extmarks.
     ///
     /// One owner for the direction-dependent parts so `undo`, `redo` and
-    /// `undo_to_seq` cannot drift: an undo swaps `after` for `before` and
-    /// lands on the edit's *pre* cursor, a redo does the reverse.
+    /// `undo_to_seq` cannot drift: an undo swaps `after` for `before`,
+    /// walks the block's edits backwards and lands on the block's *pre*
+    /// cursor, a redo does the reverse in recording order.
     fn apply_undo_step(
         &mut self,
         step: &UndoStep,
-    ) -> Result<ReplayedEdit, BufferStateError> {
+    ) -> Result<Vec<ReplayedEdit>, BufferStateError> {
         let (entry, undoing) = match step {
             UndoStep::Undo(entry) => (entry, true),
             UndoStep::Redo(entry) => (entry, false),
         };
-        let edit = &entry.edit;
-        let (remove, apply) = if undoing {
-            (&edit.after, &edit.before)
-        } else {
-            (&edit.before, &edit.after)
-        };
-        self.replay_text(edit.start, remove, apply)?;
-        self.marks.splice(edit.start, remove.len(), apply.len());
-        if undoing {
-            self.splice_folds(edit.start, remove.len(), apply.len())?;
-            if let Some(extmark_undo) = self.extmark_undo.get(&entry.seq) {
-                self.extmarks.undo_splice(
-                    extmark_undo,
-                    ExtmarkPosition::new(edit.start.saturating_sub(1), 0),
-                    TextExtent::new(apply.len(), 0),
-                    TextExtent::new(remove.len(), 0),
-                )?;
+        let count = entry.edits.len();
+        let mut replayed = Vec::with_capacity(count);
+        for offset in 0..count {
+            // Undoing walks the block backwards, so the inverse of the last
+            // edit applied is the first one undone.
+            let index = if undoing { count - 1 - offset } else { offset };
+            let edit = &entry.edits[index];
+            let (remove, apply) = if undoing {
+                (&edit.after, &edit.before)
             } else {
-                self.extmarks.splice(
-                    ExtmarkPosition::new(edit.start.saturating_sub(1), 0),
-                    TextExtent::new(remove.len(), 0),
-                    TextExtent::new(apply.len(), 0),
-                )?;
+                (&edit.before, &edit.after)
+            };
+            self.replay_text(edit.start, remove, apply)?;
+            self.marks.splice(edit.start, remove.len(), apply.len());
+            if undoing {
+                self.splice_folds(edit.start, remove.len(), apply.len())?;
+                let recorded = self
+                    .extmark_undo
+                    .get(&entry.seq)
+                    .and_then(|undos| undos.get(index))
+                    .cloned();
+                if let Some(extmark_undo) = recorded {
+                    self.extmarks.undo_splice(
+                        &extmark_undo,
+                        ExtmarkPosition::new(edit.start.saturating_sub(1), 0),
+                        TextExtent::new(apply.len(), 0),
+                        TextExtent::new(remove.len(), 0),
+                    )?;
+                } else {
+                    self.extmarks.splice(
+                        ExtmarkPosition::new(edit.start.saturating_sub(1), 0),
+                        TextExtent::new(remove.len(), 0),
+                        TextExtent::new(apply.len(), 0),
+                    )?;
+                }
+            } else {
+                let _ = self.splice_derived_state(edit.start, remove.len(), apply.len())?;
             }
-        } else {
-            let _ = self.splice_derived_state(edit.start, remove.len(), apply.len())?;
+            let cursor = if undoing { edit.cursor_before } else { edit.cursor_after };
+            replayed.push(ReplayedEdit {
+                seq: entry.seq,
+                start: edit.start,
+                old_count: remove.len(),
+                new_count: apply.len(),
+                cursor: Position { lnum: cursor.lnum, col: cursor.col },
+            });
         }
         self.refresh_modified();
         self.bump_derived_ticks();
-        let cursor = if undoing { edit.cursor_before } else { edit.cursor_after };
-        Ok(ReplayedEdit {
-            seq: entry.seq,
-            start: edit.start,
-            old_count: remove.len(),
-            new_count: apply.len(),
-            cursor: Position { lnum: cursor.lnum, col: cursor.col },
-        })
+        Ok(replayed)
     }
 
     /// Applies `apply` in place of the `remove` lines currently at `start`,
@@ -520,7 +564,7 @@ impl BufferState {
         self.modified = false;
         self.saved_changedtick = self.text.changedtick();
         self.saved_has_eol = self.text.has_eol();
-        self.saved_undo_seq = 0;
+        self.saved_undo_state = (0, 0);
         self.subscriptions.clear();
     }
 
@@ -552,7 +596,7 @@ impl BufferState {
     }
 
     fn refresh_modified(&mut self) {
-        self.modified = self.undo.current_seq() != self.saved_undo_seq
+        self.modified = self.undo_state() != self.saved_undo_state
             || self.text.has_eol() != self.saved_has_eol;
     }
 
