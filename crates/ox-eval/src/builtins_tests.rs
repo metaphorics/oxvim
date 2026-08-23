@@ -192,6 +192,12 @@ case!(has_vimscript_1, "has", [text("vimscript-1")], number(1));
 case!(has_modify_fname, "has", [text("modify_fname")], number(1));
 case!(has_file_in_path, "has", [text("file_in_path")], number(1));
 case!(has_path_extra, "has", [text("path_extra")], number(1));
+case!(has_user_commands, "has", [text("user_commands")], number(1));
+case!(has_user_commands_legacy_spelling, "has", [text("user-commands")], number(1));
+case!(has_windows, "has", [text("windows")], number(1));
+case!(has_vertsplit, "has", [text("vertsplit")], number(1));
+case!(has_visual, "has", [text("visual")], number(1));
+case!(has_textobjects, "has", [text("textobjects")], number(1));
 case!(has_nvim, "has", [text("nvim")], number(1));
 case!(has_startuptime, "has", [text("startuptime")], number(1));
 
@@ -253,12 +259,15 @@ fn has_answers_every_feature_it_claims() {
 // `has("file_in_path")` and `has("path_extra")` are proven by
 // `findfile_and_finddir_match_upstream_over_the_oldtest_tree` below, which
 // pins comma-separated 'path' entries, `**`, `**{count}` and upward `;`
-// search against the oracle.
+// search against the oracle. The editor-side names (`user_commands`,
+// `windows`, `vertsplit`, `visual`, `textobjects`) are proven at process
+// level in `crates/oxvim/tests/cli.rs`.
 
 /// `has("eval")`, `has("lambda")` and `has("vimscript-1")`: the expression
 /// evaluator parses and runs Vimscript, including a lambda applied to
 /// arguments. `eval()` itself needs the evaluating host rather than the
-/// typval-only dispatcher.
+/// typval-only dispatcher, so it is proven at process level in
+/// `crates/oxvim/tests/cli.rs`.
 #[test]
 fn eval_and_lambda_capabilities_back_their_feature_answers() {
     let mut builtins = Builtins::without_regex();

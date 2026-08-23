@@ -1869,7 +1869,13 @@ pub(crate) const FEATURES: &[&str] = &[
     "nvim",                // this build targets Neovim 0.13 (ox_rpc API_LEVEL 15)
     "path_extra",          // ox-eval/find_file.rs: `**` downward and `dir;` upward search
     "startuptime",         // oxvim/cli.rs implements `--startuptime`
+    "textobjects",         // ox-editor: `daw` deletes a word with its white space
+    "user-commands",       // the spelling upstream keeps for 5.4 compatibility
+    "user_commands",       // ox-editor/excmd_exec.rs: `:command! -nargs=1` plus `<f-args>`
+    "vertsplit",           // ox-editor/layout.rs: `:vsplit` yields two windows
     "vimscript-1",         // legacy Vimscript is the dialect ox-eval implements
+    "visual",              // ox-editor: `v2ld` deletes the Visual selection
+    "windows",             // ox-editor/layout.rs: `:split` yields two windows
 ];
 
 /// `"has"` — feature probe. Mirrors `f_has` in `eval/funcs.c`: the

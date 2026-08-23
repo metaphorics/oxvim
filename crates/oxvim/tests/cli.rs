@@ -564,6 +564,62 @@ fn startuptime_writes_a_timing_log() {
     assert_eq!(std::fs::read_to_string(quiet.text()).expect("read scratch"), "");
 }
 
+/// Every feature `has()` answers 1 for must have the capability behind it: a
+/// truthful 1 stops an oldtest skipping, and a 1 with nothing behind it turns
+/// that skip into a wall of failures. The eval-layer names are proven in
+/// `crates/ox-eval/src/builtins_tests.rs`; these are the ones that need a real
+/// editor, so they are exercised here through the process the tests run.
+///
+/// `user_commands` is checked inside a function because a user command in a
+/// script body is resolved when the line is parsed, which is the separate
+/// defect recorded in `.outline/sdd/reports/task-62.md`; `check.vim` reaches
+/// `CheckFeature` through a function call, so this is the path that matters.
+#[test]
+fn features_reported_present_have_their_capability() {
+    let cases: &[(&str, &str, &str)] = &[
+        // has("eval"): the eval() builtin evaluates its string argument.
+        ("eval", "let r = eval('1 + 2')", "3"),
+        // has("user_commands"): :command with <f-args> defines and dispatches.
+        (
+            "user_commands",
+            "command! -nargs=1 Ufeat let g:seen = <f-args>\n\
+             function! Probe()\n\
+             \x20 Ufeat kept\n\
+             endfunction\n\
+             call Probe()\n\
+             let r = g:seen",
+            "kept",
+        ),
+        // has("windows")/has("vertsplit"): both splits add a window.
+        ("windows", "split\nlet r = winnr('$')", "2"),
+        ("vertsplit", "vsplit\nlet r = winnr('$')", "2"),
+        // has("visual"): a Visual selection is the operator's range.
+        ("visual", "call setline(1, 'abcdef')\nnormal! ggv2ld\nlet r = getline(1)", "def"),
+        // has("textobjects"): `aw` covers the word and its trailing space.
+        ("textobjects", "call setline(1, 'one two three')\nnormal! ggwdaw\nlet r = getline(1)", "one three"),
+    ];
+    for (feature, script, expected) in cases {
+        // A sourced script aborts on the first failing line, so the probe
+        // either prints `1|<expected>` or the process reports the command
+        // that could not run.
+        let probe = TempFile::new(".vim", &format!("{script}\necho has('{feature}') .. '|' .. r\nqall!\n"));
+        let output = oxvim()
+            .args(["-u", "NONE", "-i", "NONE", "--noplugin", "--headless", "-S", probe.text()])
+            .output()
+            .expect("spawn oxvim");
+        assert!(
+            output.status.success(),
+            "has('{feature}') probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            format!("1|{expected}"),
+            "has('{feature}') and the capability behind it must agree"
+        );
+    }
+}
+
 /// `-w{number}` and `-w {number}` are the same option: `main.c` line 1473
 /// takes the separate argument as the `'window'` value whenever it starts
 /// with a digit, and only a non-numeric argument is the script-recording
