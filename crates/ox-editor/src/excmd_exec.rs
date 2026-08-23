@@ -3270,10 +3270,11 @@ fn command_retab<F: FileIO>(
         Ok(lines) => lines,
         Err(message) => return error_flow(runtime, "E749", message),
     };
+    let mut too_long = false;
     for lnum in first..=last.min(lines.len()) {
         let Some(line) = lines.get(lnum - 1) else { continue };
-        let rebuilt = retab_line(line, old_tabstop, target_tabstop, expandtab, command.bang, indent_only);
-        if let Some(rebuilt) = rebuilt {
+        let retabbed = retab_line(line, old_tabstop, target_tabstop, expandtab, command.bang, indent_only);
+        if let Some(rebuilt) = retabbed.line {
             let cursor = editor
                 .current_window()
                 .and_then(|window| editor.window(window).ok())
@@ -3281,6 +3282,15 @@ fn command_retab<F: FileIO>(
             if let Err(error) = editor.replace_buffer_lines(buffer, lnum, lnum, &[rebuilt], cursor, cursor, 0) {
                 return error_flow(runtime, "E749", error.to_string());
             }
+        }
+        if retabbed.too_long {
+            // `emsg_text_too_long` (`indent.c:1425-1433`) breaks the scan, and
+            // outside a `:try` it also sets `got_int` so the enclosing loop
+            // ends. This port carries no interrupt state, so the error itself
+            // is what leaves the loop; the `'tabstop'` write below still
+            // happens, as it does after upstream's `got_int` path.
+            too_long = true;
+            break;
         }
     }
 
@@ -3294,10 +3304,37 @@ fn command_retab<F: FileIO>(
             return error_flow(runtime, code, message);
         }
     }
+    if too_long {
+        return error_flow(runtime, "E1240", "Resulting text too long");
+    }
     Flow::Normal
 }
 
-/// Rewrites one line's whitespace runs, or `None` when nothing changed.
+/// `MAXCOL` (`pos_defs.h:19`), the ceiling both of `ex_retab`'s guards test.
+const MAXCOL: usize = 0x7fff_ffff;
+
+/// One line's retab result.
+struct RetabbedLine {
+    /// The rebuilt bytes, when they differ from the line as it stood.
+    line: Option<Vec<u8>>,
+    /// `emsg_text_too_long` (`indent.c:1425-1433`) fired, so E1240 follows.
+    too_long: bool,
+}
+
+/// The rewrite would push the line past `MAXCOL`, so the run keeps the bytes
+/// it had (`indent.c:1522-1526`).
+struct TextTooLong;
+
+/// Rewrites one line's whitespace runs.
+///
+/// Both of upstream's ceilings are here, because without them the command is
+/// unbounded: each `:retab` against a larger `'tabstop'` multiplies the
+/// whitespace it rebuilds, so `while 1 / set ts=4000 / retab 4` grows the line
+/// a thousandfold per pass until the process dies. `ex_retab` stops that with
+/// `vcol >= MAXCOL` while scanning (`indent.c:1563-1567`) and with a
+/// `new_len >= MAXCOL` test on the line the rewrite would produce
+/// (`indent.c:1522-1526`). Either one abandons the rest of the line, keeping
+/// the runs already rebuilt, and reports E1240.
 fn retab_line(
     line: &[u8],
     old_tabstop: usize,
@@ -3305,14 +3342,16 @@ fn retab_line(
     expandtab: bool,
     forceit: bool,
     indent_only: bool,
-) -> Option<Vec<u8>> {
+) -> RetabbedLine {
     let text = String::from_utf8_lossy(line);
     let mut output: Vec<u8> = Vec::with_capacity(line.len());
     let mut run = String::new();
     let mut run_start_vcol = 0usize;
     let mut vcol = 0usize;
+    let mut scanned = 0usize;
     let mut changed = false;
     let mut done = false;
+    let mut too_long = false;
 
     for character in text.chars() {
         if !done && matches!(character, ' ' | '\t') {
@@ -3320,11 +3359,34 @@ fn retab_line(
                 run_start_vcol = vcol;
             }
             run.push(character);
+            scanned += character.len_utf8();
             vcol += cell_width(character, vcol, old_tabstop);
+            if vcol >= MAXCOL {
+                too_long = true;
+                break;
+            }
             continue;
         }
         if !run.is_empty() {
-            changed |= flush_retab_run(&mut output, &run, run_start_vcol, vcol, new_tabstop, expandtab, forceit);
+            // The bytes past this run survive the rewrite, so they count
+            // towards the length upstream measures against MAXCOL.
+            let tail = text.len() - scanned;
+            match flush_retab_run(
+                &mut output,
+                &run,
+                run_start_vcol,
+                vcol,
+                new_tabstop,
+                expandtab,
+                forceit,
+                tail,
+            ) {
+                Ok(run_changed) => changed |= run_changed,
+                Err(TextTooLong) => {
+                    too_long = true;
+                    break;
+                }
+            }
             run.clear();
         }
         if !done && indent_only {
@@ -3333,15 +3395,34 @@ fn retab_line(
         }
         let mut encoded = [0_u8; 4];
         output.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+        scanned += character.len_utf8();
         vcol += cell_width(character, vcol, old_tabstop);
+        if vcol >= MAXCOL {
+            too_long = true;
+            break;
+        }
     }
-    if !run.is_empty() {
-        changed |= flush_retab_run(&mut output, &run, run_start_vcol, vcol, new_tabstop, expandtab, forceit);
+    if too_long {
+        // Upstream's break leaves the line as it stands from here on: the run
+        // it gave up on keeps its own bytes, and so does everything after it.
+        output.extend_from_slice(run.as_bytes());
+        output.extend_from_slice(&text.as_bytes()[scanned..]);
+    } else if !run.is_empty() {
+        match flush_retab_run(&mut output, &run, run_start_vcol, vcol, new_tabstop, expandtab, forceit, 0) {
+            Ok(run_changed) => changed |= run_changed,
+            Err(TextTooLong) => {
+                too_long = true;
+                output.extend_from_slice(run.as_bytes());
+            }
+        }
     }
-    changed.then_some(output)
+    RetabbedLine { line: changed.then_some(output), too_long }
 }
 
 /// Emits one whitespace run, rebuilt when upstream would rebuild it.
+///
+/// `tail` is the byte count that follows the run in the line, which upstream
+/// carries in `old_len - col` when it sizes the replacement.
 ///
 /// Returns whether the emitted bytes differ from the run as it stood.
 fn flush_retab_run(
@@ -3352,14 +3433,15 @@ fn flush_retab_run(
     new_tabstop: usize,
     expandtab: bool,
     forceit: bool,
-) -> bool {
+    tail: usize,
+) -> Result<bool, TextTooLong> {
     let had_tab = run.contains('\t');
     let spaces = run.chars().filter(|character| *character == ' ').count();
     // indent.c:1495: a run without a tab is left alone unless `!` was given
     // and it is more than a single space.
     if !had_tab && !(forceit && spaces > 1) {
         output.extend_from_slice(run.as_bytes());
-        return false;
+        return Ok(false);
     }
     let width = end_vcol - start_vcol;
     let (tabs, remainder) = if expandtab {
@@ -3370,15 +3452,20 @@ fn flush_retab_run(
     // indent.c:1509: keep the original unless the rewrite is not longer.
     if !expandtab && !had_tab && tabs + remainder >= run.chars().count() {
         output.extend_from_slice(run.as_bytes());
-        return false;
+        return Ok(false);
     }
-    let rebuilt: Vec<u8> = std::iter::repeat(b'\t')
-        .take(tabs)
-        .chain(std::iter::repeat(b' ').take(remainder))
+    // indent.c:1522: `new_len` is the whole line the rewrite would produce,
+    // plus upstream's terminating NUL.
+    let new_len = output.len() + tabs + remainder + tail + 1;
+    if new_len >= MAXCOL {
+        return Err(TextTooLong);
+    }
+    let rebuilt: Vec<u8> = std::iter::repeat_n(b'\t', tabs)
+        .chain(std::iter::repeat_n(b' ', remainder))
         .collect();
     let changed = rebuilt != run.as_bytes();
     output.extend_from_slice(&rebuilt);
-    changed
+    Ok(changed)
 }
 
 /// `tabstop_fromto` (`indent.c:220-243`) without `'vartabstop'`: the tabs and

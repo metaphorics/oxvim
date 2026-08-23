@@ -1822,6 +1822,40 @@ fn retab_rejects_a_non_numeric_argument_with_e475() {
     assert_eq!(buffer_text(&editor), vec!["\tone"]);
 }
 
+/// A scan that carries the line past `MAXCOL` is E1240, upstream's
+/// `emsg_text_too_long` (`indent.c:1425-1433`, `1563-1567`), and the line keeps
+/// the bytes it had from the point the scan gave up.
+///
+/// This is the ceiling `test_retab.vim`'s `RetabLoop()` relies on. The columns
+/// are measured with the *old* `'tabstop'`, so the ceiling does not depend on
+/// the value being installed: at `'tabstop'` 4000 a run of 536_871 tabs is
+/// 2_147_484_000 columns wide, past `MAXCOL`, whatever `:retab` is given.
+/// Without it `retab 4` rebuilds such a run a thousand times larger on every
+/// pass, so `while 1 / set ts=4000 / retab 4` never returns.
+#[test]
+fn retab_past_maxcol_is_e1240_and_leaves_the_line_alone() {
+    let wide = vec![b'\t'; 536_871];
+    let (mut editor, mut executor) = setup_with_content(&[wide.clone(), b"\tsecond".to_vec()]);
+    executor.execute_line(&mut editor, "set noexpandtab tabstop=4000").unwrap();
+    assert_vim_error(executor.execute_line(&mut editor, "%retab 4000"), "E1240");
+    let text = buffer_text(&editor);
+    assert_eq!(text[0].len(), wide.len());
+    // Upstream's break abandons the rest of the buffer too.
+    assert_eq!(text[1], "\tsecond");
+}
+
+/// One column below the ceiling is rewritten as usual, so this is a column
+/// ceiling and not a size limit on `:retab`.
+#[test]
+fn retab_just_below_maxcol_still_rebuilds() {
+    // 536_870 tabs at 'tabstop' 4000 is 2_147_480_000 columns, under MAXCOL.
+    let wide = vec![b'\t'; 536_870];
+    let (mut editor, mut executor) = setup_with_content(&[wide]);
+    executor.execute_line(&mut editor, "set noexpandtab tabstop=4000").unwrap();
+    executor.execute_line(&mut editor, "retab 4000").unwrap();
+    assert_eq!(buffer_text(&editor)[0].len(), 536_870);
+}
+
 /// A `'vartabstop'` list is reported rather than silently reduced to one of
 /// its values: this port has no `'vartabstop'` option at all.
 #[test]
