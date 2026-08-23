@@ -99,3 +99,13 @@ The crash count of 1 in census 3 was `unlet $` reaching `std::env::remove_var(""
 ## The deletion, for the record
 
 The suite deletes whatever `$HOME` points to, by design: `setup.vim` sandboxes it, and `runtest.vim` cleans up with `rm -rf` over names the shell word-splits, one of which expands `~`. Oxvim did not export a vim-level `let $VAR` to child processes, so the sandbox never reached the shell and `~` resolved to the real home. That is what destroyed this checkout, `~/.cargo`, `~/.rustup` and `~/.local`, and with them 21 unpushed commits. The export defect is fixed and the behavior now matches the oracle exactly, which I verified by running the same chain on both binaries. The `just oldtest` recipe now refuses to start unless `HOME` is a throwaway path, and copies the testdir rather than running in the reference tree.
+
+## Correction: apidiff green does not mean the API works
+
+The functional census (task 75) proved that `oxvim --api-info` is byte-identical to the oracle's, 32701 bytes and 262 functions, while a dispatch probe finds 114 of those functions undispatched. `just apidiff` therefore reports clean on a binary that cannot answer 114 of the calls it advertises, and the earlier "apidiff zero-diff" milestone in this ledger should be read as "the metadata matches", not "the API is implemented".
+
+That is worth stating plainly because the metadata is generated from the same declarative tables that generate the dispatch, so the two agreeing feels like corroboration when it is really one source of truth reported twice. A schema check cannot see an unimplemented arm.
+
+The functional suite is the instrument that can: 930 passes against the oracle control's 9652 on the same 484 files, with 373 files executing and passing nothing. Unlike the oldtest corpus, which was gated by a handful of registry-level defects, this one is broadly short of behavior.
+
+Task 75 also refuted its own ranking by experiment, which is the part worth keeping: shimming the top blocker by file count (`nvim_get_color_map`, gating 171 files) produced 4 additional passes and lost 743 executions to 11 new hangs. File counts rank what is reached first, not what is worth fixing first.
