@@ -749,6 +749,11 @@ impl<F: FileIO> ScriptCtx<F> {
     /// * A `#!` interpreter line at the very start of a script is ignored.
     /// * A control character in the text terminates the script, mirroring
     ///   upstream treating NUL as end-of-file.
+    /// * A trailing CR stays in the line. `get_one_sourceline`
+    ///   (`runtime.c:2891-2905`) removes it only when the source file is
+    ///   `EOL_DOS`, and that whole branch sits under `#ifdef USE_CRNL`, which
+    ///   is a Windows-only define — so on this platform a sourced
+    ///   `let g:v = 4<CR>` keeps its CR and reaches `eval0` as E488.
     pub fn join_logical_lines(&self, text: &str) -> Result<Vec<LogicalLine>, ScriptError> {
         let physical = text.split('\n').collect::<Vec<_>>();
         let mut logical: Vec<LogicalLine> = Vec::new();
@@ -756,8 +761,7 @@ impl<F: FileIO> ScriptCtx<F> {
         let mut index = 0;
         while index < physical.len() {
             let number = index.saturating_add(1);
-            let raw = physical[index];
-            let content = raw.strip_suffix('\r').unwrap_or(raw);
+            let content = physical[index];
             if first_line_of_script && content.starts_with("#!") {
                 first_line_of_script = false;
                 index += 1;
@@ -771,17 +775,16 @@ impl<F: FileIO> ScriptCtx<F> {
                 line: Some(number),
             })?;
             if let Some(spec) = spec {
-                let mut joined = content.trim_end().to_owned();
+                let mut joined = content.trim_end_matches([' ', '\t']).to_owned();
                 joined.push('\n');
                 let mut text_indent: Option<&str> = None;
                 let mut found_marker = false;
                 index += 1;
                 while index < physical.len() {
-                    let body_raw = physical[index];
-                    if body_raw.is_empty() && index + 1 == physical.len() && text.ends_with('\n') {
+                    let body = physical[index];
+                    if body.is_empty() && index + 1 == physical.len() && text.ends_with('\n') {
                         break;
                     }
-                    let body = body_raw.strip_suffix('\r').unwrap_or(body_raw);
                     let marker_line = if spec.trim {
                         body.strip_prefix(spec.command_indent).unwrap_or(body)
                     } else {
@@ -859,7 +862,7 @@ impl<F: FileIO> ScriptCtx<F> {
                 continue;
             }
             logical.push(LogicalLine {
-                text: content.trim_end().to_owned(),
+                text: content.trim_end_matches([' ', '\t']).to_owned(),
                 first_line: number,
             });
             index += 1;
