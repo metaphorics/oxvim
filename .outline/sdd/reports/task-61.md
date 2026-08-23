@@ -208,10 +208,12 @@ unmeasured here.
 ## Left for someone else
 
 - `has()` returns 0 for features Neovim always compiles in; already dispatched by Main.
-- ox-eval evaluates `$VAR` out of `Scope::env`, so a variable set by the `setenv()` builtin
-  (`ox-eval/src/builtins.rs`:1158, which calls `ox_sys::set_env` and never touches the scope) is
-  invisible to `echo $VAR`. Upstream reads the real environment through `vim_getenv` every time.
-  Reported to Task62ExprParse.
+- `$VAR` reads came from `Scope::env`, a snapshot of `std::env::vars_os()` taken once at startup
+  (`excmd_exec.rs`:345-346), so `call setenv('X', 'v')` then `echo $X` read empty. Reported to
+  Task62ExprParse and fixed by it in `ab2b9b2`: `setenv()` now writes both sides the way `let $VAR`
+  does, and its `v:null` branch drops the snapshot entry. Children were never affected, since
+  `setenv()` always called `ox_sys::set_env`, so the `$HOME` sandbox was never at risk through that
+  path.
 - `getcwd()` raises E472 when the working directory has been deleted; upstream's `f_getcwd` returns the
   empty string. Same crate boundary as above.
 - `~` and `$VAR` expansion now exists in four places: `expand_env_esc` (`ox-editor`), `expand_env`
