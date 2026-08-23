@@ -561,6 +561,22 @@ impl AppState {
         Ok(())
     }
 
+    /// `getout` (`main.c`:753) for an exit this host decided on rather than a
+    /// command: the peer closed its write side, or the loop was stopped. The
+    /// executor's own sequence is idempotent, so an exit a `:quit` already
+    /// carried through fires nothing a second time. Anything the handlers emit
+    /// is published, as upstream's exit messages are.
+    fn run_exit(&mut self) -> Result<(), AppError> {
+        {
+            let mut editor = self.editor.borrow_mut();
+            self.ex
+                .borrow_mut()
+                .run_exit_sequence(&mut editor)
+                .map_err(|error| AppError::Ex(error.to_string()))?;
+        }
+        self.publish_messages()
+    }
+
     fn show_in_chrome(&mut self, message: &ox_editor::Message) {
         let text = match &message.content {
             Object::String(text) => text.clone(),
@@ -821,6 +837,7 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
     // the input loop starts, so `--headless -c 'echo x' -c 'qall!'` never
     // waits for a peer to close stdin.
     if state.should_exit() {
+        state.run_exit()?;
         return Ok(state.exit_code());
     }
 
@@ -840,6 +857,7 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
         output.flush().map_err(AppError::Io)?;
         if state.should_exit() { break; }
     }
+    state.run_exit()?;
     Ok(state.exit_code())
 }
 
@@ -894,6 +912,7 @@ pub fn run_listener(cli: &Cli, address: &str, timer: &mut StartupTimer) -> Resul
         return Err(AppError::Server(error));
     }
     close_result?;
+    state.borrow_mut().run_exit()?;
     Ok(state.borrow().exit_code())
 }
 

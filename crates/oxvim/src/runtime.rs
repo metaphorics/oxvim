@@ -414,6 +414,13 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
         }
     }
 
+    // `main.c` finishes every exit through `getout`, including the one where
+    // the Ex loop simply runs out of input, so the exit autocommands run here
+    // too. Before the flush, since what they emit is routed with the rest.
+    executor
+        .run_exit_sequence(&mut editor)
+        .map_err(|error| AppError::Ex(error.to_string()))?;
+
     let mut sink = PrintfSink::default();
     for (message, destination) in editor.messages().iter().zip(editor.message_destinations()) {
         sink.write(*destination, message).map_err(AppError::Io)?;

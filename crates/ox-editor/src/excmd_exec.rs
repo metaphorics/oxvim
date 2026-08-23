@@ -517,6 +517,17 @@ impl<F: FileIO> ExExecutor<F> {
         let lua = self.lua.clone();
         fire_exit_autocmds(&mut self.runtime, editor, &mut self.scope, lua.as_ref());
     }
+
+    /// Runs `getout`'s autocommands for an exit the host decided on rather
+    /// than a command: the Ex loop reaching the end of its input, which
+    /// `main.c` also finishes through `getout(0)`. Idempotent, so a host that
+    /// calls it after a `:quit` has already exited fires nothing twice.
+    pub fn run_exit_sequence(&mut self, editor: &mut Editor) -> Result<(), ExecError> {
+        sync_editor_into_scope(editor, &mut self.scope)?;
+        let lua = self.lua.clone();
+        fire_exit_autocmds(&mut self.runtime, editor, &mut self.scope, lua.as_ref());
+        sync_scope_into_editor(editor, &self.scope)
+    }
 }
 
 #[derive(Clone)]
@@ -2161,18 +2172,33 @@ fn directory_target<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &Editor, path
     Ok(direct)
 }
 
+/// `:cd`/`:lcd` and `chdir()`/`haslocaldir()`'s shared move
+/// (`changedir_func`, `ex_docmd.c`:6290-6340).
+///
+/// Upstream remembers the directory it is leaving with `os_dirname` and, when
+/// that fails, records no previous directory at all: `dir_differs` treats a
+/// missing one as "differs" and the move still happens. Reading the old
+/// directory must therefore never be able to refuse the move -- otherwise a
+/// script that deleted its own working directory can no longer `:cd` back out
+/// of it, and every later relative path resolves against a directory that is
+/// gone. That is how `test_alot.vim` and `test_expand.vim` lost every result
+/// they had collected: `runtest.vim`'s `exe 'cd ' . save_cwd` was refused, and
+/// `FinishTesting`'s write of the relative `test.log` died with E212.
+///
+/// Returns the directory left behind, empty when it could not be read, which
+/// is what `f_chdir` returns in that case (`eval/funcs.c`).
 pub(crate) fn change_directory<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &Editor, path: &str, local: bool) -> ox_eval::Result<PathBuf> {
-    let previous = std::env::current_dir().map_err(|error| EvalError::new("E472", 0, error.to_string()))?;
+    let previous = std::env::current_dir().ok();
     let target = directory_target(runtime, editor, path)?;
     std::env::set_current_dir(&target).map_err(|error| EvalError::new("E344", 0, format!("Can't find directory {path}: {error}")))?;
-    runtime.previous_dir = Some(previous.clone());
+    runtime.previous_dir = previous.clone();
     if local {
         let window = editor.current_window().ok_or_else(|| EvalError::new("E16", 0, "No current window"))?;
-        runtime.local_dir = Some((window, previous.clone()));
+        runtime.local_dir = previous.clone().map(|directory| (window, directory));
     } else {
         runtime.local_dir = None;
     }
-    Ok(previous)
+    Ok(previous.unwrap_or_default())
 }
 
 fn command_normal<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, args: &str) -> Flow {

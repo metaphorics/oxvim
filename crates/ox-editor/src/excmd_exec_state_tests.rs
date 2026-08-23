@@ -572,6 +572,51 @@ fn cd_minus_toggles_and_returns_previous_directory() {
     std::fs::remove_dir(&target).unwrap();
 }
 
+/// `:cd` back out of a working directory that has been deleted underneath the
+/// process still works, and the directory it left behind is reported as empty.
+///
+/// `changedir_func` (`ex_docmd.c`:6308-6312) reads the old directory with
+/// `os_dirname` purely to record it, and carries on when that fails. Refusing
+/// the move instead strands the process: `runtest.vim` saves `getcwd()`, runs a
+/// test that deletes its own directory, and restores with
+/// `exe 'cd ' . save_cwd`. When that restore is refused, `FinishTesting`'s
+/// write of the relative `test.log` dies with E212 and the whole file's results
+/// go with it, which is what `test_alot.vim` and `test_expand.vim` did.
+#[test]
+fn cd_out_of_a_deleted_directory_still_moves() {
+    let _guard = CWD_GUARD.lock().unwrap_or_else(|poison| poison.into_inner());
+    let original = std::env::current_dir().unwrap();
+    let target = std::env::temp_dir().join(format!("ox-editor-cd-gone-{}", std::process::id()));
+    std::fs::create_dir_all(&target).unwrap();
+
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&mut editor, &format!("cd {}", target.display())).unwrap();
+    // The process is now standing in a directory that no longer exists.
+    std::fs::remove_dir(&target).unwrap();
+    let result = exec.execute_line(&mut editor, &format!("cd {}", original.display()));
+    let restored = std::env::current_dir();
+    // Put the process back before asserting, whatever happened.
+    std::env::set_current_dir(&original).unwrap();
+
+    result.unwrap();
+    assert_eq!(restored.unwrap(), original);
+
+    // `chdir()` reports the directory it left, and an unreadable one is the
+    // empty string rather than a refusal (`f_chdir`).
+    std::fs::create_dir_all(&target).unwrap();
+    exec.execute_line(&mut editor, &format!("cd {}", target.display())).unwrap();
+    std::fs::remove_dir(&target).unwrap();
+    exec
+        .execute_line(&mut editor, &format!("let g:left = chdir('{}')", original.display()))
+        .unwrap();
+    std::env::set_current_dir(&original).unwrap();
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"left", 0),
+        Ok(&Typval::String(OxStr::from(""))),
+    );
+}
+
 #[test]
 fn buffer_identity_builtins_resolve_current_and_named_buffers() {
     let (mut editor, buffer, _) = editor_with_window();
