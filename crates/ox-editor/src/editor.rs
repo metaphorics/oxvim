@@ -17,7 +17,7 @@ use crate::fold::{FoldError, Position as FoldPosition};
 use crate::layout::{Geometry, Layout, LayoutError, TabpageState, WinConfig, WindowState};
 use crate::mapping::Mappings;
 use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError};
-use crate::options::OptionStore;
+use crate::options::{OptionStore, OptionValue};
 use crate::register::{put_content, RegisterError, Registers};
 use crate::typeahead::Typeahead;
 
@@ -52,6 +52,39 @@ pub enum MessageKind {
     Error,
     /// General echo output.
     Echo,
+}
+
+/// Where the message sink sends one message's text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageDestination {
+    /// Written to standard error (`message.c` `msg_puts_printf`, line 3049).
+    Stderr,
+    /// Written to standard output, upstream's `info_message` stream
+    /// (`message.c` line 3047).
+    Stdout,
+    /// Handed to an attached UI (`message.c` `msg_puts_display`, line 2448).
+    Ui,
+    /// Dropped: batch mode with `'verbose'` zero (`message.c` line 3038).
+    Suppressed,
+}
+
+/// Process-level state that decides where message output goes.
+///
+/// `message.c` `msg_use_printf` (line 3013) prints to stdout/stderr whenever
+/// nothing else can display the text: no `--embed` peer, no attached UI and
+/// no `ext_messages` UI. `main.c` starts a UI only when a terminal is
+/// available and none of `--headless`, `--embed`, `-es`/`-Es` was requested
+/// (line 332), so those modes reach the printf branch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MessageRouting {
+    /// `--embed`: an RPC peer owns the message stream (`embedded_mode`).
+    pub embedded: bool,
+    /// `-es`, `-Es`, `-e -` batch mode (`silent_mode`); it both suppresses
+    /// output while `'verbose'` is zero and keeps `main.c` from starting a UI
+    /// (line 332, together with `--headless` and `--embed`).
+    pub silent: bool,
+    /// A UI has attached over RPC (`ui_active()`).
+    pub ui_attached: bool,
 }
 
 /// Attributes retained for one `:highlight` group.
@@ -174,7 +207,20 @@ pub struct Editor {
     /// Named highlight groups defined by `:highlight`.
     highlights: BTreeMap<String, HighlightDefinition>,
     /// Messages waiting for a UI or server consumer.
+    ///
+    /// `message.c` `msg_puts_len` (line 2406) writes to the capture and
+    /// redirection sinks before it decides where the text is displayed, so a
+    /// message stays retained for `execute()`, `:redir` and `:silent` even
+    /// when its destination is [`MessageDestination::Suppressed`].
     messages: Vec<Message>,
+    /// Sink decision recorded for each entry of `messages`, index for index.
+    ///
+    /// Both vectors are only ever pushed by [`Editor::push_message`] and
+    /// [`Editor::push_info_message`] and truncated by
+    /// [`Editor::truncate_messages`], so they stay the same length.
+    message_destinations: Vec<MessageDestination>,
+    /// Process modes deciding where message output goes.
+    pub message_routing: MessageRouting,
     current_tab: Option<TabHandle>,
     next_buffer: i64,
     next_window: i64,
@@ -226,6 +272,8 @@ impl Editor {
             ]),
             highlights: BTreeMap::new(),
             messages: Vec::new(),
+            message_destinations: Vec::new(),
+            message_routing: MessageRouting::default(),
             current_tab: None,
             next_buffer: 1,
             next_window: 1,
@@ -655,9 +703,63 @@ impl Editor {
         &self.messages
     }
 
-    /// Stores a message without claiming that a UI has rendered it.
+    /// Returns the sink decision recorded for each retained message.
+    ///
+    /// Index for index with [`Editor::messages`].
+    #[must_use]
+    pub fn message_destinations(&self) -> &[MessageDestination] {
+        &self.message_destinations
+    }
+
+    /// Where a message produced now is sent.
+    ///
+    /// `message.c` `msg_use_printf` (line 3013) sends output to stdout or
+    /// stderr unless an `--embed` peer or an attached UI can display it;
+    /// `msg_puts_printf` then drops the text while `silent_mode` is set and
+    /// `'verbose'` is zero (line 3038), and otherwise writes it to stderr
+    /// (line 3049).
+    #[must_use]
+    pub fn message_destination(&self) -> MessageDestination {
+        if self.message_routing.embedded || self.message_routing.ui_attached {
+            return MessageDestination::Ui;
+        }
+        if self.message_routing.silent && self.verbose_level() == 0 {
+            return MessageDestination::Suppressed;
+        }
+        MessageDestination::Stderr
+    }
+
+    /// `'verbose'` (`p_verbose`), zero when the option holds no number.
+    #[must_use]
+    fn verbose_level(&self) -> i64 {
+        match self.options.get_global("verbose") {
+            Ok(OptionValue::Number(level)) => *level,
+            _ => 0,
+        }
+    }
+
+    /// Stores a message without claiming that a UI has rendered it, together
+    /// with the sink decision that applies to it.
     pub fn push_message(&mut self, message: Message) {
+        let destination = self.message_destination();
         self.messages.push(message);
+        self.message_destinations.push(destination);
+    }
+
+    /// Stores output produced by an informative listing command.
+    ///
+    /// `print_line` (`ex_cmds.c` line 1701, `:print`/`:number`/`:list`) and
+    /// `showoneopt` (`option.c` line 4851, `:set` display) clear
+    /// `silent_mode` and set `info_message` around their own output, so that
+    /// output survives `-es` and goes to stdout rather than stderr. Only the
+    /// printf branch differs: with a UI attached it is an ordinary message.
+    pub fn push_info_message(&mut self, message: Message) {
+        let destination = match self.message_destination() {
+            MessageDestination::Ui => MessageDestination::Ui,
+            _ => MessageDestination::Stdout,
+        };
+        self.messages.push(message);
+        self.message_destinations.push(destination);
     }
 
     /// Discards messages appended at or after `len`.
@@ -666,6 +768,7 @@ impl Editor {
     /// matching Neovim's behavior where captured output is not also displayed.
     pub fn truncate_messages(&mut self, len: usize) {
         self.messages.truncate(len);
+        self.message_destinations.truncate(len);
     }
 
     /// Returns tabpage-local variables.

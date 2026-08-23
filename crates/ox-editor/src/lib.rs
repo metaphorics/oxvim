@@ -39,7 +39,10 @@ pub use buffer::{
     BufferAttachSubscription, BufferState, BufferStateError, UserCommandDefinition,
 };
 pub use decoration::Decorations;
-pub use editor::{BufferRelease, ChannelIds, Editor, EditorError, HighlightDefinition, Message, MessageKind};
+pub use editor::{
+    BufferRelease, ChannelIds, Editor, EditorError, HighlightDefinition, Message, MessageDestination,
+    MessageKind, MessageRouting,
+};
 pub use excmd_exec::{
     vim_variable_is_writable, ExExecutor, ExecError, ExecOutcome, LuaExec, LuaExecError, UserCommand,
     VimException, VimExceptionKind,

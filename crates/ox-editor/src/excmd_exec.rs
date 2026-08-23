@@ -1679,7 +1679,7 @@ fn command_set<F: FileIO>(
                 continue;
             }
             if let Some(text) = display_option(editor, metadata.name, layer) {
-                push_text_message(editor, text, false, false);
+                push_info_text_message(editor, text);
             }
         }
         return Flow::Normal;
@@ -3849,12 +3849,12 @@ fn command_z<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command
     for index in first..=last {
         let Some(line) = lines.get(index - 1) else { continue };
         if ruled && index == lnum {
-            push_text_message(editor, rule.clone(), false, false);
+            push_info_text_message(editor, rule.clone());
         }
         let text = String::from_utf8_lossy(line).into_owned();
-        push_text_message(editor, if number { format!("{index:>width$} {text}") } else { text }, false, false);
+        push_info_text_message(editor, if number { format!("{index:>width$} {text}") } else { text });
         if ruled && index == lnum {
-            push_text_message(editor, rule.clone(), false, false);
+            push_info_text_message(editor, rule.clone());
         }
     }
     if let Some(window) = editor.current_window() {
@@ -4277,7 +4277,7 @@ fn command_print<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, com
     for lnum in start..=last {
         let text = String::from_utf8_lossy(&lines[lnum - 1]).into_owned();
         let message = if number { format!("{lnum:>width$} {text}") } else { text };
-        push_text_message(editor, message, false, false);
+        push_info_text_message(editor, message);
     }
     if let Some(window) = editor.current_window() {
         if let Err(error) = editor.set_window_cursor(window, Position { lnum: last, col: 0 }) {
@@ -5664,12 +5664,12 @@ fn set_option_value(editor: &mut Editor, name: &str, value: OptionValue, layer: 
 
 fn set_one(editor: &mut Editor, scope: &mut Scope, raw: &str, layer: SetLayer) -> Result<(), (&'static str, String)> {
     let raw = raw.trim();
-    if let Some(name) = raw.strip_suffix('?') { if let Some(text) = display_option(editor, name, layer) { editor.push_message(Message { kind: MessageKind::Echo, content: Object::String(OxStr(text.into_bytes())), history: false }); return Ok(()); } return Err(("E518", format!("Unknown option: {name}"))); }
+    if let Some(name) = raw.strip_suffix('?') { if let Some(text) = display_option(editor, name, layer) { push_info_text_message(editor, text); return Ok(()); } return Err(("E518", format!("Unknown option: {name}"))); }
     if let Some(name) = raw.strip_suffix("&vim").or_else(|| raw.strip_suffix('&')) { let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?; let value = metadata.default.value.map(OptionValue::from).ok_or_else(|| ("E474", format!("No literal default for {name}")))?; return set_and_mirror(editor, scope, metadata.name, value, layer); }
     for operator in ["+=", "-=", "^=", "="] { if let Some((name, value)) = raw.split_once(operator) { let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?; let mut next = match metadata.value_type { OptionType::Boolean => OptionValue::Boolean(matches!(value, "1" | "true" | "on")), OptionType::Number => OptionValue::Number(value.parse().map_err(|_| ("E521", format!("Number required after =: {value}")))?), OptionType::String => OptionValue::String(if metadata.expand { expand_set_value(value) } else { value.to_owned() }) }; if operator != "=" { let current = option_value(editor, metadata.name, layer).cloned().unwrap_or_else(|| metadata.default.value.map(OptionValue::from).unwrap_or(OptionValue::String(String::new()))); next = modify_option(current, next, operator, metadata.list)?; } return set_and_mirror(editor, scope, metadata.name, next, layer); } }
     let (name, value) = if let Some(name) = raw.strip_prefix("no") { (name, false) } else if let Some(name) = raw.strip_prefix("inv") { let current = option_value(editor, name, layer).and_then(|value| match value { OptionValue::Boolean(value) => Some(*value), _ => None }).unwrap_or(false); (name, !current) } else if let Some(name) = raw.strip_suffix('!') { let current = option_value(editor, name, layer).and_then(|value| match value { OptionValue::Boolean(value) => Some(*value), _ => None }).unwrap_or(false); (name, !current) } else { (raw, true) };
     let metadata = crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?;
-    if metadata.value_type != OptionType::Boolean { if let Some(text) = display_option(editor, name, layer) { editor.push_message(Message { kind: MessageKind::Echo, content: Object::String(OxStr(text.into_bytes())), history: false }); return Ok(()); } }
+    if metadata.value_type != OptionType::Boolean { if let Some(text) = display_option(editor, name, layer) { push_info_text_message(editor, text); return Ok(()); } }
     set_and_mirror(editor, scope, metadata.name, OptionValue::Boolean(value), layer)
 }
 
@@ -5937,6 +5937,18 @@ pub(crate) fn push_text_message(editor: &mut Editor, text: String, error: bool, 
         kind: if error { MessageKind::Error } else { MessageKind::Echo },
         content: Object::String(OxStr(text.into_bytes())),
         history,
+    });
+}
+
+/// Output of an informative listing command (`:print`, `:number`, `:list`,
+/// `:set` display), upstream's `info_message` messages: `print_line`
+/// (`ex_cmds.c` line 1701) and `showoneopt` (`option.c` line 4851) clear
+/// `silent_mode` and write to stdout instead of stderr.
+pub(crate) fn push_info_text_message(editor: &mut Editor, text: String) {
+    editor.push_info_message(Message {
+        kind: MessageKind::Echo,
+        content: Object::String(OxStr(text.into_bytes())),
+        history: false,
     });
 }
 
