@@ -25,7 +25,7 @@ use ox_regex::{
 };
 use ox_sys::LocaleCategory;
 use ox_text::{Buffer, Position};
-use ox_types::{BufHandle, Dict, DictRef, Funcref, Object, OxStr, Special, Typval, WinHandle};
+use ox_types::{BufHandle, Dict, DictRef, Funcref, Object, OxStr, Special, TabHandle, Typval, WinHandle};
 
 use crate::autocmd::{AutocmdContext, AutocmdKind, AutocmdOptions, AugroupId, DeleteAutocmds, Event, FiringPlan};
 use crate::extmark::{ExtmarkAttributes, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, NamespaceId};
@@ -936,7 +936,9 @@ fn dispatch<F: FileIO>(
             }
         }
         "split" | "new" => command_split(runtime, editor, command, false),
-        "vsplit" => command_split(runtime, editor, command, true),
+        "vsplit" | "vnew" => command_split(runtime, editor, command, true),
+        "tabnew" | "tabedit" => command_tabnew(runtime, editor, command),
+        "tabonly" => command_tabonly(runtime, editor, command),
         "resize" => command_resize(runtime, editor, command),
         "wincmd" => command_wincmd(runtime, editor, command),
         "echohl" => command_echohl(runtime, editor, command),
@@ -2437,6 +2439,46 @@ fn eval_substitute_expression<F: FileIO>(
         .map_err(|error| eval_error_flow(host.runtime, error))
 }
 
+/// The tabpage geometry every command that has to create one uses.
+///
+/// This port has no screen model to ask, so the size is fixed. It is one
+/// constant rather than a literal repeated per command arm.
+const DEFAULT_TABPAGE_GEOMETRY: crate::Geometry =
+    crate::Geometry { row: 0, col: 0, width: 80, height: 24 };
+
+/// Loads `path` into a fresh listed buffer named after it, saved-clean.
+///
+/// A missing file is not an error: upstream's `:edit`/`:split`/`:tabedit` open
+/// an empty buffer for a name that does not exist yet. Shared by every command
+/// that opens a file into a new buffer so the read, the name, and the
+/// saved-state marking have one owner.
+fn buffer_from_file<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    path: &std::path::Path,
+) -> Result<BufHandle, Flow> {
+    let text = match runtime.scripts.io().read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error_flow(runtime, "E484", format!("Can't open file {}: {error}", path.display())));
+        }
+    };
+    let buffer_text = match Buffer::from_bytes(text.as_bytes()) {
+        Ok(buffer) => buffer,
+        Err(error) => return Err(error_flow(runtime, "E474", error.to_string())),
+    };
+    let handle = match editor.create_buffer_with(buffer_text, true) {
+        Ok(handle) => handle,
+        Err(error) => return Err(error_flow(runtime, "E948", error.to_string())),
+    };
+    if let Ok(buffer) = editor.buffer_mut(handle) {
+        buffer.set_name(OxStr::from(path.to_string_lossy().as_ref()));
+        buffer.mark_saved();
+    }
+    Ok(handle)
+}
+
 fn command_edit<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
     let path = PathBuf::from(command.args.trim());
     if path.as_os_str().is_empty() {
@@ -2447,25 +2489,12 @@ fn command_edit<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, comm
             return error_flow(runtime, "E37", "No write since last change (add ! to override)");
         }
     }
-    let text = match runtime.scripts.io().read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return error_flow(runtime, "E484", format!("Can't open file {}: {error}", path.display())),
-    };
-    let buffer_text = match Buffer::from_bytes(text.as_bytes()) {
-        Ok(buffer) => buffer,
-        Err(error) => return error_flow(runtime, "E474", error.to_string()),
-    };
-    let handle = match editor.create_buffer_with(buffer_text, true) {
+    let handle = match buffer_from_file(runtime, editor, &path) {
         Ok(handle) => handle,
-        Err(error) => return error_flow(runtime, "E948", error.to_string()),
+        Err(flow) => return flow,
     };
-    if let Ok(buffer) = editor.buffer_mut(handle) {
-        buffer.set_name(OxStr::from(path.to_string_lossy().as_ref()));
-        buffer.mark_saved();
-    }
     if editor.current_window().is_none() {
-        match editor.create_tabpage(handle, crate::Geometry { row: 0, col: 0, width: 80, height: 24 }) {
+        match editor.create_tabpage(handle, DEFAULT_TABPAGE_GEOMETRY) {
             Ok(_) => {}
             Err(error) => return error_flow(runtime, "E948", error.to_string()),
         }
@@ -2881,33 +2910,22 @@ fn command_split<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, com
         Some(window) => window,
         None => return error_flow(runtime, "E749", "No current window"),
     };
-    let new_buffer = if command.command.name() == "new" && command.args.trim().is_empty() {
-        match editor.create_buffer(true) {
-            Ok(handle) => handle,
-            Err(error) => return error_flow(runtime, "E948", error.to_string()),
+    // `:new` and `:vnew` open an empty buffer; `:split`/`:vsplit` without an
+    // argument keep showing the current one (`ex_splitview`, do_exedit).
+    let new_buffer = if command.args.trim().is_empty() {
+        if matches!(command.command.name(), "new" | "vnew") {
+            match editor.create_buffer(true) {
+                Ok(handle) => handle,
+                Err(error) => return error_flow(runtime, "E948", error.to_string()),
+            }
+        } else {
+            buffer
         }
-    } else if command.args.trim().is_empty() {
-        buffer
     } else {
-        let path = PathBuf::from(command.args.trim());
-        let text = match runtime.scripts.io().read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return error_flow(runtime, "E484", format!("Can't open file {}: {error}", path.display())),
-        };
-        let buffer_text = match Buffer::from_bytes(text.as_bytes()) {
-            Ok(buffer) => buffer,
-            Err(error) => return error_flow(runtime, "E474", error.to_string()),
-        };
-        let handle = match editor.create_buffer_with(buffer_text, true) {
+        match buffer_from_file(runtime, editor, &PathBuf::from(command.args.trim())) {
             Ok(handle) => handle,
-            Err(error) => return error_flow(runtime, "E948", error.to_string()),
-        };
-        if let Ok(state) = editor.buffer_mut(handle) {
-            state.set_name(OxStr::from(path.to_string_lossy().as_ref()));
-            state.mark_saved();
+            Err(flow) => return flow,
         }
-        handle
     };
     let created = if vertical {
         editor.split_vertical(tab, window, new_buffer)
@@ -2931,6 +2949,128 @@ fn command_split<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, com
         return error_flow(runtime, "E36", error.to_string());
     }
     Flow::Normal
+}
+
+/// `:tabnew` and `:tabedit` (`ex_docmd.c` `ex_splitview`:5637 with
+/// `use_tab`): open a new tabpage at the addressed position, showing either a
+/// new empty buffer or the file argument.
+///
+/// The position is upstream's `win_new_tabpage(after)` argument: no address
+/// means `0`, "after the current tabpage", and an address `{n}` means `n + 1`,
+/// which inserts *before* tabpage `n + 1` — so `:0tabnew` becomes the first
+/// tabpage and `:$tabnew` the last.
+///
+/// `:tabnew` and `:tabedit` differ only in name upstream; both open an empty
+/// buffer without an argument and the named file with one.
+fn command_tabnew<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    let after = match &command.range {
+        None => 0,
+        Some(_) => match resolve_range_raw(editor, command) {
+            Ok((_, end)) => end + 1,
+            Err(message) => return error_flow(runtime, "E16", message),
+        },
+    };
+    let name = command.args.trim();
+    let buffer = if name.is_empty() {
+        match editor.create_buffer(true) {
+            Ok(handle) => handle,
+            Err(error) => return error_flow(runtime, "E948", error.to_string()),
+        }
+    } else {
+        match buffer_from_file(runtime, editor, &argument_path(editor, name)) {
+            Ok(handle) => handle,
+            Err(flow) => return flow,
+        }
+    };
+    match editor.create_tabpage_at(buffer, DEFAULT_TABPAGE_GEOMETRY, after) {
+        Ok(_) => Flow::Normal,
+        Err(error) => {
+            let _ = editor.wipe_buffer(buffer);
+            error_flow(runtime, "E948", error.to_string())
+        }
+    }
+}
+
+/// `:tabonly` (`ex_docmd.c` `ex_tabonly`:5238): make one tabpage current and
+/// close every other one.
+///
+/// A single tabpage is not an error, it reports "Already only one tab page"
+/// (`ex_docmd.c:5241`). Which tabpage survives comes from `get_tabpage_arg`.
+///
+/// The bang is upstream's `forceit`, which reaches `ex_win_close` and only
+/// matters when a modified buffer would be *unloaded*. Closing a tabpage
+/// leaves its buffers loaded and hidden here, as it does upstream under
+/// Neovim's default `'hidden'`, so both forms close the same tabpages. That
+/// was checked against the oracle rather than assumed.
+fn command_tabonly<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    if editor.tabpages().len() <= 1 {
+        push_text_message(editor, "Already only one tab page".to_owned(), false, false);
+        return Flow::Normal;
+    }
+    let argument = command.args.trim();
+    let keep = match tabpage_arg(editor, command) {
+        Ok(target) => target,
+        Err(()) => return error_flow(runtime, "E475", format!("Invalid argument: {argument}")),
+    };
+    if let Err(error) = editor.set_current_tabpage(keep) {
+        return error_flow(runtime, "E475", error.to_string());
+    }
+    for tab in editor.tabpages() {
+        if tab != keep {
+            if let Err(error) = editor.close_tabpage(tab) {
+                return error_flow(runtime, "E444", error.to_string());
+            }
+        }
+    }
+    Flow::Normal
+}
+
+/// `get_tabpage_arg` (`ex_docmd.c`:4398-4488) for the commands that reject a
+/// zero argument, resolved to the surviving tabpage handle.
+///
+/// Accepts a plain number, `+N`/`-N` relative to the current tabpage, `$` for
+/// the last, and `#` for the last-used one. Without an argument an address is
+/// used, and without either the current tabpage is the answer. Every rejection
+/// is upstream's `e_invarg2`, so the failure carries no message of its own.
+fn tabpage_arg(editor: &Editor, command: &ExCommand) -> Result<TabHandle, ()> {
+    let tabs = editor.tabpages();
+    let last = tabs.len();
+    let current = editor
+        .current_tabpage()
+        .and_then(|tab| editor.tabpage_index(tab))
+        .unwrap_or(1);
+    let argument = command.args.trim();
+
+    let number = if argument.is_empty() {
+        match &command.range {
+            // ":0tabonly" is rejected: this family sets unaccept_arg0.
+            Some(_) => resolve_range_raw(editor, command).map(|(_, end)| end).map_err(|_| ())?,
+            None => current,
+        }
+    } else {
+        let (relative, rest) = match argument.as_bytes().first() {
+            Some(b'-') => (-1_isize, &argument[1..]),
+            Some(b'+') => (1_isize, &argument[1..]),
+            _ => (0_isize, argument),
+        };
+        if relative == 0 {
+            match rest {
+                "$" => last,
+                // No last-used tabpage is tracked, so upstream's
+                // valid_tabpage guard always fails and this is its error path.
+                "#" => return Err(()),
+                digits => digits.parse::<usize>().map_err(|_| ())?,
+            }
+        } else {
+            let step = if rest.is_empty() { 1 } else { rest.parse::<isize>().map_err(|_| ())? };
+            usize::try_from(step * relative + isize::try_from(current).map_err(|_| ())?).map_err(|_| ())?
+        }
+    };
+
+    if number < 1 || number > last {
+        return Err(());
+    }
+    tabs.get(number - 1).copied().ok_or(())
 }
 
 fn command_close<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand, quit: bool) -> Flow {
@@ -4326,7 +4466,7 @@ fn iterable_values(value: Typval) -> Result<Vec<Typval>, &'static str> {
 }
 
 fn resolve_range(editor: &Editor, command: &ExCommand) -> Result<(usize, usize), String> {
-    let last = buffer_last_line(editor);
+    let (_, last) = address_domain_bounds(editor, effective_addr_type(&command.command));
     let (start, end) = resolve_range_raw(editor, command)?;
     Ok((start.max(1), end.min(last)))
 }
@@ -4335,8 +4475,7 @@ fn resolve_range(editor: &Editor, command: &ExCommand) -> Result<(usize, usize),
 /// ZEROR command (`:0read`, `:0put`) can address line 0 — upstream's "before
 /// the first line" position (`ex_docmd.c` `EX_ZEROR`).
 fn resolve_range_raw(editor: &Editor, command: &ExCommand) -> Result<(usize, usize), String> {
-    let current = editor.current_window().and_then(|window| editor.window(window).ok()).map_or(1, |window| window.cursor.lnum);
-    let last = buffer_last_line(editor);
+    let (current, last) = address_domain_bounds(editor, effective_addr_type(&command.command));
     let Some(range) = &command.range else {
         // EX_DFLALL: no address means the whole buffer for these commands,
         // not the cursor line (ex_docmd.c:2100-2107 "default is 1,$").
@@ -4349,6 +4488,72 @@ fn resolve_range_raw(editor: &Editor, command: &ExCommand) -> Result<(usize, usi
     let end = range.end.as_ref().map_or(Ok(start), |address| resolve_address(editor, address, current, last))?;
     if start > end { return Err("Invalid range".to_owned()); }
     Ok((start, end))
+}
+
+/// The `.` and `$` values for one address domain.
+///
+/// `get_address` resolves both per `addr_type` (`ex_docmd.c:3435-3470` for
+/// `$`, and the `.` case just above it), so `:$tabnew` means the last tabpage
+/// and not the last buffer line. `invalid_range` bounds the same domains
+/// against the same upper value, so both callers read it from here.
+///
+/// `LoadedBuffers`, `QuickFix` and `QuickFixValid` fall back to lines: this
+/// port has neither a number-ordered buffer load state nor a quickfix list.
+fn address_domain_bounds(editor: &Editor, addr_type: AddrType) -> (usize, usize) {
+    match addr_type {
+        AddrType::Windows => {
+            let windows = editor
+                .current_tabpage()
+                .and_then(|tab| editor.tabpage_windows(tab).ok())
+                .unwrap_or_default();
+            let current = editor
+                .current_window()
+                .and_then(|window| windows.iter().position(|entry| *entry == window))
+                .map_or(1, |index| index + 1);
+            (current, windows.len())
+        }
+        AddrType::Tabs => {
+            let current = editor
+                .current_tabpage()
+                .and_then(|tab| editor.tabpage_index(tab))
+                .unwrap_or(1);
+            (current, editor.tabpages().len())
+        }
+        AddrType::Arguments => {
+            let arglist = editor.arglist();
+            // "add 1 if ARGCOUNT is 0", so ":0argdelete" on an empty list is
+            // not an error (ex_docmd.c:3751-3756).
+            let count = arglist.len();
+            (arglist.index().saturating_add(1), if count == 0 { 1 } else { count })
+        }
+        AddrType::Buffers => {
+            let current = editor.current_buffer().map_or(1, |buffer| {
+                usize::try_from(i64::from(buffer)).unwrap_or(1)
+            });
+            let last = editor
+                .buffers()
+                .into_iter()
+                .map(i64::from)
+                .max()
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(0);
+            (current, last)
+        }
+        AddrType::Lines
+        | AddrType::Other
+        | AddrType::Unsigned
+        | AddrType::None
+        | AddrType::TabsRelative
+        | AddrType::LoadedBuffers
+        | AddrType::QuickFix
+        | AddrType::QuickFixValid => {
+            let current = editor
+                .current_window()
+                .and_then(|window| editor.window(window).ok())
+                .map_or(1, |window| window.cursor.lnum);
+            (current, buffer_last_line(editor))
+        }
+    }
 }
 
 /// Bounds a resolved range against its address domain, upstream's
@@ -4372,31 +4577,17 @@ fn check_address_domain(editor: &Editor, command: &ExCommand) -> Result<(), Stri
     if command.range.is_none() {
         return Ok(());
     }
+    let addr_type = effective_addr_type(&command.command);
+    // Upstream accepts any range in these domains, so there is nothing to
+    // bound even though the values resolve.
+    if matches!(addr_type, AddrType::Other | AddrType::TabsRelative | AddrType::Unsigned | AddrType::None) {
+        return Ok(());
+    }
     let (start, end) = resolve_range_raw(editor, command)?;
-    let limit = match effective_addr_type(&command.command) {
-        AddrType::Lines => buffer_last_line(editor),
-        // "add 1 if ARGCOUNT is 0", so ":0argdelete" on an empty list is not
-        // an error (ex_docmd.c:3751-3756).
-        AddrType::Arguments => {
-            let count = editor.arglist().len();
-            if count == 0 { 1 } else { count }
-        }
-        AddrType::Windows => editor.windows().len(),
-        AddrType::Tabs => editor.tabpages().len(),
-        AddrType::Buffers => {
-            if start < 1 {
-                return Err("Invalid range".to_owned());
-            }
-            editor.buffers().into_iter().map(i64::from).max().unwrap_or(0).try_into().unwrap_or(usize::MAX)
-        }
-        AddrType::None
-        | AddrType::Other
-        | AddrType::TabsRelative
-        | AddrType::Unsigned
-        | AddrType::LoadedBuffers
-        | AddrType::QuickFix
-        | AddrType::QuickFixValid => return Ok(()),
-    };
+    if matches!(addr_type, AddrType::Buffers) && start < 1 {
+        return Err("Invalid range".to_owned());
+    }
+    let (_, limit) = address_domain_bounds(editor, addr_type);
     if end > limit {
         return Err("Invalid range".to_owned());
     }

@@ -86,6 +86,9 @@ pub enum EditorError {
     /// An operation requiring a current tabpage was requested in an empty editor.
     #[error("no current tabpage")]
     NoCurrentTabpage,
+    /// The only remaining tabpage cannot be closed.
+    #[error("cannot close last tab page")]
+    LastTabpage,
     /// A displayed buffer cannot be wiped.
     #[error("cannot wipe buffer {buffer:?} attached to {windows} window(s)")]
     BufferInUse {
@@ -134,8 +137,16 @@ pub struct Editor {
     buffers: BTreeMap<BufHandle, BufferState>,
     /// Tabpage owning each live window handle.
     windows: BTreeMap<WinHandle, TabHandle>,
-    /// Live tabpages and their tiled/floating layouts.
+    /// Live tabpages and their tiled/floating layouts, keyed for lookup.
     tabpages: BTreeMap<TabHandle, TabpageState>,
+    /// Tabpage order of record.
+    ///
+    /// Upstream keeps tabpages in an explicitly ordered linked list
+    /// (`tp_next`), walks it in `tabpage_index`, and reorders it with
+    /// `:tabmove`, so position is independent of when a tabpage was created.
+    /// `tabpages` is keyed by handle and cannot express that, so this is the
+    /// order every caller sees and `tabpages` is storage only.
+    tab_order: Vec<TabHandle>,
     /// Global and scoped option values.
     options: OptionStore,
     /// Named, numbered, special, and provider-backed registers.
@@ -186,6 +197,7 @@ impl Editor {
             buffers: BTreeMap::new(),
             windows: BTreeMap::new(),
             tabpages: BTreeMap::new(),
+            tab_order: Vec::new(),
             options: OptionStore::new(),
             registers: Registers::new(),
             global_marks: GlobalMarks::new(),
@@ -276,10 +288,17 @@ impl Editor {
         self.windows.keys().copied().collect()
     }
 
-    /// Returns live tabpage handles in allocation order.
+    /// Returns live tabpage handles in tab order.
     #[must_use]
     pub fn tabpages(&self) -> Vec<TabHandle> {
-        self.tabpages.keys().copied().collect()
+        self.tab_order.clone()
+    }
+
+    /// Returns a live tabpage's one-based position, upstream's
+    /// `tabpage_index` (`window.c`).
+    #[must_use]
+    pub fn tabpage_index(&self, tab: TabHandle) -> Option<usize> {
+        self.tab_order.iter().position(|entry| *entry == tab).map(|index| index + 1)
     }
 
     /// Returns the tabpage that owns a live window.
@@ -874,11 +893,87 @@ impl Editor {
         Ok(())
     }
 
-    /// Creates a tabpage with one tiled window displaying `buffer`.
+    /// Creates a tabpage with one tiled window displaying `buffer`, appended
+    /// after every existing tabpage.
     pub fn create_tabpage(
         &mut self,
         buffer: BufHandle,
         geometry: Geometry,
+    ) -> Result<TabHandle, EditorError> {
+        let index = self.tab_order.len();
+        self.insert_tabpage(buffer, geometry, index)
+    }
+
+    /// Creates a tabpage at upstream's `win_new_tabpage(after)` position
+    /// (`window.c:4484-4539`).
+    ///
+    /// `after` is one-based: `1` makes the new tabpage the first, a larger
+    /// value inserts it *before* tabpage `after`, and a value past the end
+    /// appends. `0` inserts directly after the current tabpage, which is what
+    /// an addressless `:tabnew` passes.
+    pub fn create_tabpage_at(
+        &mut self,
+        buffer: BufHandle,
+        geometry: Geometry,
+        after: usize,
+    ) -> Result<TabHandle, EditorError> {
+        let index = if after == 0 {
+            self.current_tab
+                .and_then(|tab| self.tabpage_index(tab))
+                .unwrap_or(self.tab_order.len())
+        } else {
+            (after - 1).min(self.tab_order.len())
+        };
+        self.insert_tabpage(buffer, geometry, index)
+    }
+
+    /// Closes a tabpage and every window it owns.
+    ///
+    /// This is the sole owner of tabpage removal. The window path cannot take
+    /// that job: `Layout::close` refuses `LastWindow`, so `close_window` is
+    /// structurally unable to empty a tabpage and never removes one. Upstream
+    /// puts removal in `win_close` instead (`window.c`), which it can because
+    /// its layout permits closing a tabpage's last window.
+    ///
+    /// Refuses the last remaining tabpage, upstream's `E784`.
+    pub fn close_tabpage(&mut self, tab: TabHandle) -> Result<(), EditorError> {
+        let tab = self.resolve_tabpage_handle(tab)?;
+        self.require_tabpage(tab)?;
+        if self.tab_order.len() <= 1 {
+            return Err(EditorError::LastTabpage);
+        }
+        // Close every window but the last through the normal path so buffers
+        // detach and window options are dropped; the last one goes with the
+        // tabpage below, since the layout will not close it.
+        let windows = self.tabpage(tab)?.windows();
+        for window in windows.iter().skip(1) {
+            self.close_window(tab, *window, true)?;
+        }
+        let removed = self
+            .tabpages
+            .remove(&tab)
+            .ok_or(EditorError::UnknownTabpage(tab))?;
+        for window in removed.windows() {
+            self.windows.remove(&window);
+            self.options.remove_window(window);
+            if let Ok(state) = removed.window(window) {
+                if let Some(buffer_state) = self.buffers.get_mut(&state.buffer) {
+                    buffer_state.detach(true);
+                }
+            }
+        }
+        self.tab_order.retain(|entry| *entry != tab);
+        if self.current_tab == Some(tab) {
+            self.current_tab = self.tab_order.first().copied();
+        }
+        Ok(())
+    }
+
+    fn insert_tabpage(
+        &mut self,
+        buffer: BufHandle,
+        geometry: Geometry,
+        index: usize,
     ) -> Result<TabHandle, EditorError> {
         let buffer = self.resolve_buffer_handle(buffer)?;
         self.require_buffer(buffer)?;
@@ -891,6 +986,7 @@ impl Editor {
         }
         self.windows.insert(window, tab);
         self.tabpages.insert(tab, TabpageState::new(layout));
+        self.tab_order.insert(index.min(self.tab_order.len()), tab);
         self.current_tab = Some(tab);
         Ok(tab)
     }

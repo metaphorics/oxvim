@@ -1383,3 +1383,156 @@ fn write_filter_fires_shell_filter_post_only() {
     assert!(global_flag(&executor, "shell"));
     assert!(!global_flag(&executor, "unexpected_read"));
 }
+
+// ---------------------------------------------------------------------------
+// :tabnew / :tabedit / :tabonly / :vnew
+// Citations: ex_docmd.c ex_splitview:5637, ex_tabonly:5238,
+// get_tabpage_arg:4398, window.c win_new_tabpage:4484.
+// ---------------------------------------------------------------------------
+
+fn tab_count(editor: &Editor) -> usize {
+    editor.tabpages().len()
+}
+
+fn current_tab_index(editor: &Editor) -> usize {
+    editor
+        .current_tabpage()
+        .and_then(|tab| editor.tabpage_index(tab))
+        .unwrap_or(0)
+}
+
+/// `:tabnew` opens a tabpage after the current one, showing a new empty
+/// buffer, and makes it current.
+///
+/// Oracle: from one tabpage, `tabnew` twice gives tabs=3 cur=3 and
+/// `bufname('%')` is empty in the new tabpage.
+#[test]
+fn tabnew_opens_a_tabpage_after_the_current_one() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    assert_eq!((tab_count(&editor), current_tab_index(&editor)), (2, 2));
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    assert_eq!((tab_count(&editor), current_tab_index(&editor)), (3, 3));
+    let buffer = editor.current_buffer().unwrap();
+    assert_eq!(editor.buffer(buffer).unwrap().name().to_string_lossy(), "");
+}
+
+/// The address is upstream's `win_new_tabpage(after)` position, so `:0tabnew`
+/// becomes the first tabpage, `:$tabnew` the last, and `:{n}tabnew` lands at
+/// position `n + 1`.
+///
+/// Oracle, from three tabpages with the third current: `0tabnew` → tabs=4
+/// cur=1; a bare `tabnew` from there → tabs=5 cur=2; `$tabnew` → tabs=6
+/// cur=6; `2tabnew` → tabs=7 cur=3.
+#[test]
+fn tabnew_honors_the_addressed_position() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    executor.execute_line(&mut editor, "0tabnew").unwrap();
+    assert_eq!((tab_count(&editor), current_tab_index(&editor)), (4, 1));
+    // Now current is tab 1 of 4, so an addressless :tabnew lands at 2.
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    assert_eq!((tab_count(&editor), current_tab_index(&editor)), (5, 2));
+    executor.execute_line(&mut editor, "$tabnew").unwrap();
+    assert_eq!((tab_count(&editor), current_tab_index(&editor)), (6, 6));
+    executor.execute_line(&mut editor, "2tabnew").unwrap();
+    assert_eq!((tab_count(&editor), current_tab_index(&editor)), (7, 3));
+}
+
+/// `$` in an ADDR_TABS address is the last *tabpage*, not the last buffer
+/// line: `get_address` resolves it per `addr_type` (`ex_docmd.c:3435-3463`).
+/// With a one-line buffer and three tabpages the two readings differ, so this
+/// pins the domain rather than a coincidence.
+#[test]
+fn tab_addresses_resolve_in_the_tabpage_domain() {
+    let (mut editor, mut executor) = setup_with_content(&[b"only line".to_vec()]);
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    assert_eq!(tab_count(&editor), 3);
+    executor.execute_line(&mut editor, "$tabnew").unwrap();
+    // Reading `$` as the buffer's last line (1) would have inserted at 2.
+    assert_eq!((tab_count(&editor), current_tab_index(&editor)), (4, 4));
+}
+
+/// `:tabedit {file}` opens the file in a new tabpage, and `:tabe` is its
+/// abbreviation.
+#[test]
+fn tabedit_opens_a_file_in_a_new_tabpage() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.scripts().io().insert("in.txt", "filetext\n");
+    executor.execute_line(&mut editor, "tabe in.txt").unwrap();
+    assert_eq!(tab_count(&editor), 2);
+    assert_eq!(buffer_text(&editor), vec!["filetext"]);
+    let buffer = editor.current_buffer().unwrap();
+    assert_eq!(editor.buffer(buffer).unwrap().name().to_string_lossy(), "in.txt");
+}
+
+/// `:tabonly` keeps the current tabpage and closes the rest; `:tabo` is its
+/// abbreviation. A single tabpage is a message, not an error
+/// (`ex_docmd.c:5241`).
+#[test]
+fn tabonly_closes_every_other_tabpage() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    assert_eq!(tab_count(&editor), 3);
+    executor.execute_line(&mut editor, "tabo").unwrap();
+    assert_eq!((tab_count(&editor), current_tab_index(&editor)), (1, 1));
+    executor.execute_line(&mut editor, "tabonly").unwrap();
+    assert_eq!(echo_messages(&editor).last().map(String::as_str), Some("Already only one tab page"));
+}
+
+/// `:tabonly {n}` keeps tabpage `n` instead of the current one, which is
+/// `get_tabpage_arg`'s numeric form.
+#[test]
+fn tabonly_argument_selects_the_surviving_tabpage() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    let first = editor.current_tabpage().unwrap();
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    executor.execute_line(&mut editor, "tabonly 1").unwrap();
+    assert_eq!(tab_count(&editor), 1);
+    assert_eq!(editor.current_tabpage(), Some(first));
+}
+
+/// A non-numeric `:tabonly` argument is E475 and closes nothing.
+///
+/// Oracle: `tabonly xyz` → `Vim(tabonly):E475: Invalid argument: xyz`, with
+/// the tabpage count unchanged.
+#[test]
+fn tabonly_rejects_a_non_numeric_argument_with_e475() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    assert_vim_error(executor.execute_line(&mut editor, "tabonly xyz"), "E475");
+    assert_eq!(tab_count(&editor), 3);
+}
+
+/// An out-of-domain tabpage address is E16, from the shared ADDR_TABS bound,
+/// and is distinct from the E475 an out-of-range *argument* gets.
+#[test]
+fn tabonly_rejects_an_out_of_range_address_with_e16() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    assert_vim_error(executor.execute_line(&mut editor, "99tabonly"), "E16");
+    assert_vim_error(executor.execute_line(&mut editor, "tabonly 99"), "E475");
+    assert_eq!(tab_count(&editor), 2);
+}
+
+/// `:vnew` splits vertically onto a new empty buffer, unlike `:vsplit` which
+/// keeps showing the current one. `:vne` is its abbreviation.
+#[test]
+fn vnew_splits_onto_a_new_empty_buffer() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    let original = editor.current_buffer().unwrap();
+    let before = editor.windows().len();
+    executor.execute_line(&mut editor, "vne").unwrap();
+    assert_eq!(editor.windows().len(), before + 1);
+    let created = editor.current_buffer().unwrap();
+    assert_ne!(created, original);
+    assert_eq!(editor.buffer(created).unwrap().name().to_string_lossy(), "");
+    // :vsplit, by contrast, keeps the current buffer.
+    executor.execute_line(&mut editor, "vsplit").unwrap();
+    assert_eq!(editor.current_buffer(), Some(created));
+}
