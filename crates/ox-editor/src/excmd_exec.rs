@@ -3437,14 +3437,7 @@ fn command_lockvar<F: FileIO>(
 fn current_fold_method<F: FileIO>(runtime: &ExRuntime<F>, editor: &Editor) -> FoldMethod {
     let _ = runtime;
     match option_value(editor, "foldmethod", SetLayer::Effective) {
-        Some(OptionValue::String(value)) => match value.as_str() {
-            "indent" => FoldMethod::Indent,
-            "expr" => FoldMethod::Expr,
-            "marker" => FoldMethod::Marker,
-            "syntax" => FoldMethod::Syntax,
-            "diff" => FoldMethod::Diff,
-            _ => FoldMethod::Manual,
-        },
+        Some(OptionValue::String(value)) => FoldMethod::from_option_value(value),
         _ => FoldMethod::Manual,
     }
 }
