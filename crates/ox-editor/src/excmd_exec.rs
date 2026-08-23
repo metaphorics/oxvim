@@ -2419,7 +2419,7 @@ fn command_let<F: FileIO>(
         };
         Typval::list(items)
     } else {
-        match eval_text(runtime, editor, scope, lua, expression) {
+        match eval_text(runtime, editor, scope, lua, strip_expression_comment(expression)) {
             Ok(value) => value,
             Err(flow) => return flow,
         }
@@ -4500,8 +4500,19 @@ fn sync_scope_into_editor(editor: &mut Editor, scope: &Scope) -> Result<(), Exec
     Ok(())
 }
 
-fn assign_target<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, target: &str, value: Typval, _constant: bool) -> Result<(), Flow> {
+fn assign_target<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, target: &str, value: Typval, constant: bool) -> Result<(), Flow> {
     let target = target.trim();
+    if let Some(inner) = target.strip_prefix('[').and_then(|target| target.strip_suffix(']')) {
+        let targets = split_comma_args(inner);
+        let Typval::List(values) = value else { return Err(error_flow(runtime, "E714", "List required")); };
+        let values = values.borrow().items.clone();
+        if targets.len() < values.len() { return Err(error_flow(runtime, "E687", "Less targets than List items")); }
+        if targets.len() > values.len() { return Err(error_flow(runtime, "E688", "More targets than List items")); }
+        for (target, value) in targets.into_iter().zip(values) {
+            assign_target(runtime, editor, scope, target, value, constant)?;
+        }
+        return Ok(());
+    }
     if let Some(register) = target.strip_prefix('@').and_then(|name| name.chars().next()) {
         let content = RegisterContent::characterwise(typval_to_text(&value).as_bytes()).map_err(|error| error_flow(runtime, "E354", error.to_string()))?;
         editor.registers_mut().set(register, content).map_err(|error| error_flow(runtime, "E354", error.to_string()))?;
@@ -4602,6 +4613,34 @@ fn assign_option<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, sco
 fn read_option(editor: &Editor, option: &str) -> Typval {
     let (layer, name) = if let Some(name) = option.strip_prefix("g:") { (SetLayer::Global, name) } else if let Some(name) = option.strip_prefix("l:") { (SetLayer::Local, name) } else { (SetLayer::Effective, option) };
     option_value(editor, name, layer).map_or(Typval::Number(0), option_to_typval)
+}
+
+fn strip_expression_comment(expression: &str) -> &str {
+    let bytes = expression.as_bytes();
+    let mut quote = None;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if let Some(active) = quote {
+            if byte == active && (index == 0 || bytes[index - 1] != b'\\') {
+                quote = None;
+            }
+            continue;
+        }
+        if byte == b'\'' {
+            quote = Some(byte);
+            continue;
+        }
+        if byte != b'"' {
+            continue;
+        }
+        let previous = bytes[..index].iter().rposition(|byte| !byte.is_ascii_whitespace());
+        if index > 0 && bytes[index - 1].is_ascii_whitespace() && previous.is_some_and(|previous| {
+            bytes[previous].is_ascii_alphanumeric() || matches!(bytes[previous], b'\'' | b'"' | b']' | b')' | b'}')
+        }) {
+            return expression[..index].trim_end();
+        }
+        quote = Some(byte);
+    }
+    expression
 }
 
 fn split_assignment(args: &str) -> Option<(&str, &str, &str)> {

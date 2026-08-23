@@ -165,6 +165,22 @@ fn for_loop_sums_list_elements() {
 }
 
 #[test]
+fn list_targets_destructure_let_and_for_values() {
+    let mut editor = Editor::new();
+    let mut executor = ExExecutor::new();
+    executor
+        .execute_script(
+            &mut editor,
+            "test.vim",
+            "let g:commented = 'ok' \" inline comment\nlet [x, y] = [3, 4]\nlet g:sum = x + y\nfor [left, right] in [[1, 2], [5, 8]]\nlet g:last = left + right\nendfor",
+        )
+        .unwrap();
+    assert_eq!(gstr(&executor, "commented"), "ok");
+    assert_eq!(gnum(&executor, "sum"), 7);
+    assert_eq!(gnum(&executor, "last"), 13);
+}
+
+#[test]
 fn for_loop_sets_last_element_as_string() {
     // ex_docmd.c: `:for` over a string list assigns each Typval::String to
     // the loop variable; the last value persists after the loop.
