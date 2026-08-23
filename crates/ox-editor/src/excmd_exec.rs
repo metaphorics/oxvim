@@ -22,7 +22,7 @@ use ox_excmd::{
     Range, RangeKind, ResolveError, ResolvedCommand, UserCommandMatch, UserCommandProvider,
 };
 use ox_regex::{
-    compile as compile_regex, exec_at as regex_exec_at, Magic, Text as RegexText,
+    compile as compile_regex, exec_at as regex_exec_at, CompileError as RegexCompileError, Magic, Text as RegexText,
 };
 use ox_sys::LocaleCategory;
 use ox_text::{Buffer, Position};
@@ -2230,7 +2230,12 @@ impl RegexEngine for VimRegex {
     ) -> ox_eval::Result<Option<ox_eval::RegexMatch>> {
         let source = text.to_string_lossy().into_owned();
         let program = compile_regex(&pattern.to_string_lossy(), Magic::Magic)
-            .map_err(|error| EvalError::new("E54", 0, error.to_string()))?;
+            .map_err(|error| match error {
+                RegexCompileError::Syntax { message: "lookaround suffix follows nothing", .. } => {
+                    EvalError::new("E866", 0, "(NFA regexp) Misplaced @")
+                }
+                other => EvalError::new("E54", 0, other.to_string()),
+            })?;
         let text = RegexText::new(source);
         let Some(position) = text.position(start) else { return Ok(None) };
         Ok(regex_exec_at(&program, &text, position).map(|matched| ox_eval::RegexMatch {

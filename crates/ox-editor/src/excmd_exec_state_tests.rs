@@ -1331,6 +1331,19 @@ fn setbufvar_unknown_option_reports_e518() {
 }
 
 #[test]
+fn matchstrlist_misplaced_lookaround_reports_e866() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    let error = exec.execute_line(&mut editor, r#"call matchstrlist(['abc'], '\@=')"#).unwrap_err();
+    assert!(matches!(
+        error,
+        ExecError::Vim(ref exception)
+            if exception.kind == VimExceptionKind::Error("E866".to_owned())
+                && exception.message().contains("Misplaced @")
+    ));
+}
+
+#[test]
 fn feedkeys_x_executes_through_mode_machine() {
     let (mut editor, _buffer, window) = editor_with_window();
     let mut exec = ExExecutor::new();
