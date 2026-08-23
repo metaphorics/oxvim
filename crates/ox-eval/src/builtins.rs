@@ -1297,10 +1297,18 @@ fn ensure_unlocked(lock: ox_types::LockState) -> Result<()> {
     if lock.locked { Err(locked_error()) } else { Ok(()) }
 }
 
+/// `f_abs` (`funcs.c:424-441`): a Float goes to `fabs`, everything else to
+/// `tv_get_number_chk` and then `n > 0 ? n : -n`. That negation is plain,
+/// not saturating, so `VARNUMBER_MIN` negates back to itself and
+/// `abs('-9223372036854775808')` is -9223372036854775808 on the oracle. A
+/// saturating negation answered `VARNUMBER_MAX` here.
 fn absolute(value: &Typval) -> Result<Typval> {
     match value {
         Typval::Float(value) => Ok(Typval::Float(value.abs())),
-        _ => Ok(Typval::Number(number_arg(value)?.saturating_abs())),
+        _ => {
+            let number = number_arg(value)?;
+            Ok(Typval::Number(if number > 0 { number } else { number.wrapping_neg() }))
+        }
     }
 }
 

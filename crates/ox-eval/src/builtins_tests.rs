@@ -2067,6 +2067,9 @@ fn a_string_reaches_a_number_context_through_vim_str2nr() {
     assert_eq!(call("abs", vec![Typval::dict(vec![])]).unwrap_err().code, "E728");
     assert_eq!(call("abs", vec![funcref("string")]).unwrap_err().code, "E703");
     assert_eq!(call("abs", vec![Typval::Blob(vec![0x10])]).unwrap_err().code, "E974");
+    // `-n` is a plain negation, so `VARNUMBER_MIN` negates back to itself.
+    assert_eq!(call("abs", vec![text("-9223372036854775808")]).unwrap(), number(i64::MIN));
+    assert_eq!(call("abs", vec![number(i64::MIN)]).unwrap(), number(i64::MIN));
     // The Float path is untouched and still answers with a Float.
     assert_eq!(call("abs", vec![Typval::Float(-1.23)]).unwrap(), Typval::Float(1.23));
 
