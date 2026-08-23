@@ -372,7 +372,19 @@ A second defect fell out of the same probe: `expand('~')` returns the literal `~
 directory. Upstream expands it in `.references/neovim/src/nvim/os/env.c` (`expand_env_esc`, with
 `home_replace` for the reverse direction).
 
-Both are left unfixed here: this leaf is measurement only, and `crates/ox-editor` belongs to peers.
+Scope of the defect, so this entry is not misread later. The `rm -rf` at `runtest.vim:472` is the
+suite's own design and not an oxvim defect. Main verified the identical probe against the oracle at
+`.references/neovim/build/bin/nvim`: upstream also deletes the sandbox `HOME` and leaves the literal
+`Xdir ~ dir` directory behind. The defect was only step 2, the sandbox never reaching the child, which
+redirected that deletion from `XfakeHOME` to the real home directory. Fixed in `4edc886`, after which
+oxvim reproduces the oracle's behavior exactly.
+
+The invariant this leaves behind outlives the fix: the suite will delete whatever `$HOME` points to.
+Every oldtest run therefore needs a fresh throwaway `HOME` created for that run and a scratch copy of
+the testdir, both parts, every run.
+
+`expand('~')` is still open at the time of writing. Both defects belong to peers; this leaf is
+measurement only and does not touch `crates/`.
 
 ### Line attribution is off in tracebacks
 
@@ -396,12 +408,11 @@ comparison favours pass 2 slightly and the timeout delta should not be read as a
 
 ## Harness caveats
 
-- No oldtest run of any kind is permitted until the `let $VAR` export defect (D4) is fixed and its
-  regression test is green. That covers `runtest.vim` invocations, single-file measurements and
-  quick checks. When the ban lifts, two parts are mandatory together: `HOME` set to a fresh throwaway
-  directory created per run, and the testdir copied to scratch so nothing runs inside
-  `.references`. Two files (`test_expand.vim`, and `test_alot.vim` which sources it) recursively
-  delete whatever `HOME` names.
+- Every oldtest run needs two things together, not either: `HOME` set to a fresh throwaway directory
+  created for that run, and the testdir copied to a scratch location so nothing runs inside
+  `.references`. The suite deletes whatever `$HOME` points to, by its own design and matching the
+  oracle. `test_expand.vim` does it and `test_alot.vim` sources that file. The temporary ban on all
+  oldtest runs was lifted once `4edc886` landed; this requirement is permanent.
 - Relocating the binary breaks runtime discovery. `runtime_root()`
   (`crates/oxvim/src/runtime.rs:75-87`) resolves `$OXVIM_RUNTIME`, else `<exe dir>/../../runtime`, else
   `./runtime`. A copy under `/tmp` finds none of them, so every file dies at `setup.vim:121` with

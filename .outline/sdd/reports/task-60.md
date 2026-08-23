@@ -50,6 +50,11 @@ Three new whole-file abort mechanisms cost more executed tests than the new buil
 aborted file contributes zero regardless of how far it got. They are itemised in
 `.outline/sdd/oldtest-blockers-2.md` as D1 to D4; the load-bearing one is D1.
 
+These numbers are a snapshot of `ed44788`, and work landing after the census has already moved them:
+`4edc886` fixed D4's export defect, and Task 62's `<f-args>` fix unblocked 38 files that were
+setup-blocked on one construct, taking executed across the `E15` set from 355 to 408. Read the tables
+as the baseline a pass 3 should be measured against, not as current state.
+
 ## D1, the regression worth a ticket
 
 `command_close` (`crates/ox-editor/src/excmd_exec.rs:3090-3117`) tests for "last window" with
@@ -147,13 +152,12 @@ comparable; a stricter `E<nnn>:` extraction gives lower absolute counts on both.
 
 ## Harness caveats
 
-- No oldtest run of any kind is permitted until the `let $VAR` export defect (D4) is fixed and its
-  regression test is green; that covers `runtest.vim` invocations, single-file measurements and quick
-  checks, and it suspends any brief's acceptance criterion that asks for a census file to be re-run.
-  When the ban lifts, two parts are mandatory together, not either: `HOME` set to a fresh throwaway
-  directory created per run, and the testdir copied to a scratch location so nothing runs inside
-  `.references`. `.references/neovim/test/old/testdir` currently holds a stale `test.log` recording
-  in-repo paths, so the suite has already been run in place at least once.
+- Every oldtest run needs two things together, not either: `HOME` set to a fresh throwaway directory
+  created for that run, and the testdir copied to a scratch location so nothing runs inside
+  `.references`. The suite deletes whatever `$HOME` points to, which Main confirmed is also true of
+  the oracle, so this is permanent and not a workaround for D4. The temporary ban on all oldtest runs
+  was lifted once `4edc886` landed. `.references/neovim/test/old/testdir` holds a stale `test.log`
+  recording in-repo paths, so the suite has been run in place at least once.
 - The timeout budget was 150 s here against pass 1's 120 s, so the timeout delta slightly favours
   pass 2 and should not be read as a pure speed win.
 - stdin must be `/dev/null`, as pass 1 established: with an inherited open stdin the headless process
