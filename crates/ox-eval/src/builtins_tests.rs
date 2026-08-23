@@ -1966,6 +1966,83 @@ fn builtins_coerce_a_float_to_its_percent_g_rendering() {
     assert_eq!(call("len", vec![list(&[1, 2])]).unwrap(), number(2));
 }
 
+// Oracle: `test/old/testdir/test_float_func.vim` `Test_str2float`, plus the
+// spellings measured directly on nvim v0.13.0-dev-1390. `f_str2float`
+// (`funcs.c:7042-7056`) and `string2float` (`eval.c:4611-4630`) are the spec.
+#[test]
+fn str2float_parses_what_string2float_parses() {
+    for (input, expected) in [
+        ("1", 1.0),
+        (" 1 ", 1.0),
+        (" 1.0 ", 1.0),
+        ("1.23", 1.23),
+        ("1.23abc", 1.23),
+        ("1e40", 1.0e40),
+        ("-1.23", -1.23),
+        (" + 1.23 ", 1.23),
+        ("+1", 1.0),
+        (" +1 ", 1.0),
+        (" + 1 ", 1.0),
+        ("-1", -1.0),
+        (" -1 ", -1.0),
+        (" - 1 ", -1.0),
+        ("+0.0", 0.0),
+        ("1e1000", f64::INFINITY),
+        // The three spellings `string2float` matches ahead of `strtod`,
+        // case-insensitively and as a three-byte prefix.
+        ("inf", f64::INFINITY),
+        ("-inf", f64::NEG_INFINITY),
+        ("+inf", f64::INFINITY),
+        ("Inf", f64::INFINITY),
+        ("INF", f64::INFINITY),
+        ("  +inf  ", f64::INFINITY),
+        ("  -inf", f64::NEG_INFINITY),
+        ("infinity", f64::INFINITY),
+        ("inf3", f64::INFINITY),
+        // `strtod`'s own grammar, reached only when none of the three match.
+        (".5", 0.5),
+        ("12.", 12.0),
+        ("1e3", 1000.0),
+        ("0x10", 16.0),
+        ("0x1p3", 8.0),
+        ("0x1.8p1", 3.0),
+        ("abc", 0.0),
+        ("", 0.0),
+        ("  ", 0.0),
+        ("1e", 1.0),
+        (" + 1e2 ", 100.0),
+        ("\t 3.5", 3.5),
+    ] {
+        let Typval::Float(answer) = call("str2float", vec![text(input)]).unwrap() else {
+            panic!("str2float({input:?}) is not a Float");
+        };
+        assert_eq!(answer, expected, "str2float({input:?})");
+    }
+
+    // NaN never compares equal, so these two are checked by shape. `-nan` is
+    // still a NaN because upstream multiplies by -1 rather than branching.
+    for input in ["nan", "NaN", "  nan  ", "-nan", "nanx"] {
+        let Typval::Float(answer) = call("str2float", vec![text(input)]).unwrap() else {
+            panic!("str2float({input:?}) is not a Float");
+        };
+        assert!(answer.is_nan(), "str2float({input:?}) = {answer}");
+    }
+
+    // A sign with nothing behind it keeps its sign on the zero, which
+    // `string()` shows and `==` does not.
+    assert_eq!(call("string", vec![call("str2float", vec![text("-0.0")]).unwrap()]).unwrap(), text("-0.0"));
+    assert_eq!(call("string", vec![call("str2float", vec![text("-")]).unwrap()]).unwrap(), text("-0.0"));
+    assert_eq!(call("string", vec![call("str2float", vec![text("+0.0")]).unwrap()]).unwrap(), text("0.0"));
+
+    // `Test_str2float`'s type cases: a Float argument coerces through
+    // `tv_get_string`, and the container types raise their String errors.
+    assert_eq!(call("str2float", vec![Typval::Float(1.2)]).unwrap(), Typval::Float(1.2));
+    assert_eq!(call("str2float", vec![number(12)]).unwrap(), Typval::Float(12.0));
+    assert_eq!(call("str2float", vec![list(&[])]).unwrap_err().code, "E730");
+    assert_eq!(call("str2float", vec![Typval::dict(vec![])]).unwrap_err().code, "E731");
+    assert_eq!(call("str2float", vec![funcref("string")]).unwrap_err().code, "E729");
+}
+
 // Oracle: `test/old/testdir/test_expr.vim` `Test_printf_float`, which is the
 // spec for `vim_snprintf`'s float conversions (`strings.c:2075-2196`).
 #[test]

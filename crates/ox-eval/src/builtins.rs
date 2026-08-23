@@ -2577,11 +2577,126 @@ fn str2nr(args: &[Typval]) -> Result<Typval> {
     Ok(Typval::Number(number))
 }
 
+/// `f_str2float` (`funcs.c:7042-7056`): leading white space is skipped, then
+/// an optional sign — after which white space is skipped *again*, so
+/// `str2float('- 1.5')` is `-1.5` — and the rest goes to `string2float`. Only
+/// a leading `-` sets the sign; a `+` is consumed and ignored.
 fn str2float(value: &Typval) -> Result<Typval> {
-    let value = string_arg(value)?;
-    let text = String::from_utf8_lossy(value.as_bytes());
-    let prefix: String = text.trim_start().chars().take_while(|character| character.is_ascii_digit() || matches!(character, '+' | '-' | '.' | 'e' | 'E')).collect();
-    Ok(Typval::Float(prefix.parse().unwrap_or(0.0)))
+    let text = string_arg(value)?;
+    let mut bytes = skip_white(text.as_bytes());
+    let negative = bytes.first() == Some(&b'-');
+    if matches!(bytes.first(), Some(b'-' | b'+')) {
+        bytes = skip_white(&bytes[1..]);
+    }
+    let number = string2float(bytes);
+    // Upstream multiplies by -1, which flips the sign of a zero and leaves a
+    // NaN a NaN: `str2float('-')` is `-0.0` and `str2float('-nan')` is `nan`.
+    Ok(Typval::Float(if negative { number * -1.0 } else { number }))
+}
+
+/// `skipwhite` (`charset.c`), where `ascii_iswhite` is a space or a tab and
+/// nothing else — a newline or a form feed stops it.
+fn skip_white(bytes: &[u8]) -> &[u8] {
+    let end = bytes.iter().position(|byte| !matches!(byte, b' ' | b'\t')).unwrap_or(bytes.len());
+    &bytes[end..]
+}
+
+/// `string2float` (`eval.c:4611-4630`): the three spellings MS-Windows'
+/// `strtod` gets wrong are matched case-insensitively ahead of it, so
+/// `str2float('INF')` is infinity and `str2float('infinity')` is too — the
+/// check is a three-byte prefix, not a whole word. `-inf` is unreachable from
+/// `f_str2float`, which strips the sign first, but `string2float` is also the
+/// number literal scanner (`eval.c:3490`) and is kept whole.
+fn string2float(bytes: &[u8]) -> f64 {
+    if bytes.len() >= 3 && bytes[..3].eq_ignore_ascii_case(b"inf") {
+        return f64::INFINITY;
+    }
+    if bytes.len() >= 4 && bytes[..4].eq_ignore_ascii_case(b"-inf") {
+        return f64::NEG_INFINITY;
+    }
+    if bytes.len() >= 3 && bytes[..3].eq_ignore_ascii_case(b"nan") {
+        return f64::NAN;
+    }
+    strtod(bytes)
+}
+
+/// The `strtod` `string2float` falls back to, under the C locale upstream
+/// pins with `setlocale(LC_NUMERIC, "C")`. It takes the longest valid prefix
+/// and answers 0.0 when there is none, which is why `str2float('abc')` is
+/// 0.0 and `str2float('1.5abc')` is 1.5. A `0x` significand with a binary
+/// exponent is part of the grammar, so `str2float('0x10')` is 16.0.
+fn strtod(bytes: &[u8]) -> f64 {
+    let (negative, rest) = match bytes.first() {
+        Some(b'-') => (true, &bytes[1..]),
+        Some(b'+') => (false, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    let hexadecimal = rest.len() > 2 && rest[0] == b'0' && matches!(rest[1], b'x' | b'X');
+    let magnitude = if hexadecimal { hex_float_prefix(&rest[2..]) } else { None }
+        .or_else(|| decimal_float_prefix(rest))
+        .unwrap_or(0.0);
+    if negative { -magnitude } else { magnitude }
+}
+
+/// `[0-9]*(\.[0-9]*)?([eE][+-]?[0-9]+)?` with at least one significand digit,
+/// handed to Rust's parser, which accepts the same shapes (`1.`, `.5`, `1e3`)
+/// and saturates the exponent the way `strtod` does.
+fn decimal_float_prefix(bytes: &[u8]) -> Option<f64> {
+    let mut end = 0;
+    let mut digits = 0;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) { end += 1; digits += 1; }
+    if bytes.get(end) == Some(&b'.') {
+        end += 1;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) { end += 1; digits += 1; }
+    }
+    if digits == 0 { return None; }
+    if matches!(bytes.get(end), Some(b'e' | b'E')) {
+        let mut cursor = end + 1;
+        if matches!(bytes.get(cursor), Some(b'+' | b'-')) { cursor += 1; }
+        let exponent = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) { cursor += 1; }
+        // An `e` with no digits after it is not part of the number.
+        if cursor > exponent { end = cursor; }
+    }
+    std::str::from_utf8(&bytes[..end]).ok()?.parse().ok()
+}
+
+/// `0x` already consumed: `[0-9a-f]*(\.[0-9a-f]*)?([pP][+-]?[0-9]+)?` with at
+/// least one significand digit. The value is assembled by scaling rather than
+/// parsed, since Rust has no hexadecimal float literal.
+fn hex_float_prefix(bytes: &[u8]) -> Option<f64> {
+    let mut cursor = 0;
+    let mut value = 0.0_f64;
+    let mut digits = 0;
+    while let Some(digit) = bytes.get(cursor).and_then(|byte| (*byte as char).to_digit(16)) {
+        value = value * 16.0 + f64::from(digit);
+        cursor += 1;
+        digits += 1;
+    }
+    let mut exponent = 0i32;
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        while let Some(digit) = bytes.get(cursor).and_then(|byte| (*byte as char).to_digit(16)) {
+            value = value * 16.0 + f64::from(digit);
+            cursor += 1;
+            digits += 1;
+            exponent -= 4;
+        }
+    }
+    if digits == 0 { return None; }
+    if matches!(bytes.get(cursor), Some(b'p' | b'P')) {
+        let mut scan = cursor + 1;
+        let negative = bytes.get(scan) == Some(&b'-');
+        if matches!(bytes.get(scan), Some(b'+' | b'-')) { scan += 1; }
+        let start = scan;
+        let mut binary = 0i32;
+        while let Some(digit) = bytes.get(scan).and_then(|byte| (*byte as char).to_digit(10)) {
+            binary = binary.saturating_mul(10).saturating_add(digit as i32);
+            scan += 1;
+        }
+        if scan > start { exponent += if negative { -binary } else { binary }; }
+    }
+    Some(value * 2.0_f64.powi(exponent))
 }
 
 /// "str2nr()" digit conversion following upstream `vim_str2nr`
