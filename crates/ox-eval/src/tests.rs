@@ -255,7 +255,7 @@ fn unary_not_float_nonzero() {
 fn same_variable_preserves_list_identity() {
     // runtime/doc/vimeval.txt:1049-1053.
     let mut scope = Scope::new();
-    scope.set(b"xs", Typval::list(vec![Typval::Number(1)]));
+    scope.set(b"xs", Typval::list(vec![Typval::Number(1)])).unwrap();
     assert_eq!(value_in(b"xs is xs", &mut scope), Typval::Number(1));
 }
 
@@ -263,7 +263,7 @@ fn same_variable_preserves_list_identity() {
 fn repeated_list_index_preserves_nested_identity() {
     // runtime/doc/vimeval.txt:1049-1053 and 1182-1211.
     let mut scope = Scope::new();
-    scope.set(b"xs", Typval::list(vec![Typval::list(vec![Typval::Number(1)])]));
+    scope.set(b"xs", Typval::list(vec![Typval::list(vec![Typval::Number(1)])])).unwrap();
     assert_eq!(value_in(b"xs[0] is xs[0]", &mut scope), Typval::Number(1));
 }
 
@@ -271,7 +271,7 @@ fn repeated_list_index_preserves_nested_identity() {
 fn repeated_dict_member_preserves_nested_identity() {
     // runtime/doc/vimeval.txt:1049-1053 and 1266-1280.
     let mut scope = Scope::new();
-    scope.set(b"d", Typval::dict(vec![(OxStr::from("x"), Typval::list(vec![]))]));
+    scope.set(b"d", Typval::dict(vec![(OxStr::from("x"), Typval::list(vec![]))])).unwrap();
     assert_eq!(value_in(b"d.x is d.x", &mut scope), Typval::Number(1));
 }
 
@@ -353,14 +353,14 @@ fn closure_captures_snapshot() {
     // runtime/doc/vimeval.txt:1627-1639.
     let expression = Parser::new(b"{x -> x + captured}").parse().unwrap();
     let mut scope = Scope::new();
-    scope.set(b"captured", Typval::Number(4));
+    scope.set(b"captured", Typval::Number(4)).unwrap();
     let mut host = Host;
     let regex = Regex;
     let mut evaluator = Evaluator::new(&mut host, &regex);
     let closure = evaluator.eval(&expression, &mut scope).unwrap();
-    scope.set(b"captured", Typval::Number(100));
+    scope.set(b"captured", Typval::Number(100)).unwrap();
     let mut call_scope = Scope::new();
-    call_scope.set(b"f", closure);
+    call_scope.set(b"f", closure).unwrap();
     let call = Parser::new(b"f(6)").parse().unwrap();
     assert_eq!(evaluator.eval(&call, &mut call_scope).unwrap(), Typval::Number(10));
 }
@@ -369,7 +369,7 @@ fn closure_captures_snapshot() {
 fn lambda_parameter_shadows_captured_local() {
     // runtime/doc/vimeval.txt:1611-1639.
     let mut scope = Scope::new();
-    scope.set(b"x", Typval::Number(99));
+    scope.set(b"x", Typval::Number(99)).unwrap();
     assert_eq!(value_in(b"{x -> x}(1)", &mut scope), Typval::Number(1));
 }
 
@@ -458,7 +458,7 @@ fn variadic_lambda_partial_binds_leading_args() {
         dict: None,
     });
     let mut scope = Scope::new();
-    scope.set(b"cb", bound);
+    scope.set(b"cb", bound).unwrap();
     let call = Parser::new(b"cb('three')").parse().unwrap();
     let mut call_host = Host;
     let registry = evaluator.closure_registry().clone();
@@ -511,10 +511,10 @@ fn closure_resolves_across_evaluator_sharing_registry() {
     // Define `{x -> x + base}` and keep the Partial in a scope.
     let define = Parser::new(b"{x -> x + base}").parse().unwrap();
     let mut scope = Scope::new();
-    scope.set(b"base", Typval::Number(40));
+    scope.set(b"base", Typval::Number(40)).unwrap();
     let closure = creator.eval(&define, &mut scope).unwrap();
     let mut store = Scope::new();
-    store.set(b"f", closure);
+    store.set(b"f", closure).unwrap();
     let call = Parser::new(b"f(2)").parse().unwrap();
 
     // A second evaluator that shares the registry resolves the stored Partial
@@ -539,7 +539,7 @@ fn closure_from_isolated_evaluator_is_not_callable() {
     // Ensure caller's registry also has a closure at index 0.
     let _closure_b = caller.eval(&define_b, &mut Scope::new()).unwrap();
     let mut store = Scope::new();
-    store.set(b"f", closure_a);
+    store.set(b"f", closure_a).unwrap();
     let call = Parser::new(b"f(5)").parse().unwrap();
     assert_eq!(caller.eval(&call, &mut store).unwrap_err().code, "E117");
 }

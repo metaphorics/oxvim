@@ -214,7 +214,7 @@ impl ModeMachine {
         if state.prefix == "g" {
             state.prefix.clear();
             if key == 'v' {
-                if let Some(visual) = self.last_visual.clone() { editor.set_window_cursor(context(editor)?.window, visual.cursor)?; return Ok(Mode::Visual(visual)); }
+                if let Some(visual) = self.last_visual.clone() { let window = context(editor)?.window; editor.set_window_cursor(window, visual.cursor)?; return Ok(Mode::Visual(visual)); }
                 return Ok(Mode::default());
             }
             if key == 'u' || key == 'U' { return Ok(Mode::OperatorPending(OperatorPendingState { operator: if key == 'u' { Operator::Lowercase } else { Operator::Uppercase }, count: state.count.max(1), count_was_set: state.count != 0, motion_count: 0, register: state.register, prefix: String::new() })); }
@@ -370,11 +370,20 @@ fn extend_visual(state: &mut VisualState, target: Position, from: Position) {
     if state.kind == VisualKind::Block { state.extend_block(target, from); } else { state.extend(target); }
 }
 
-fn context(editor: &Editor) -> Result<Context, ModeError> {
+/// Snapshots the editor state one mode operation reads.
+///
+/// The window cursor is validated first, the way `check_cursor_lnum`
+/// (`cursor.c`) validates it before upstream runs a normal-mode command: a
+/// window keeps its cursor when its buffer is replaced or shortened, so
+/// `w_cursor.lnum` can point past the last line, and every caller below
+/// indexes `lines` with it.
+fn context(editor: &mut Editor) -> Result<Context, ModeError> {
     let tab = editor.current_tabpage().ok_or(EditorError::UnknownTabpage(ox_types::TabHandle::CURRENT))?;
     let tabpage = editor.tabpage(tab)?; let window = tabpage.current_window(); let height = tabpage.layout().window_geometry(window).map_err(EditorError::from)?.height;
-    let state = editor.window(window)?; let buffer = state.buffer; let cursor = state.cursor; let topline = state.topline; let text = editor.buffer(buffer)?.text()?;
+    let state = editor.window(window)?; let buffer = state.buffer; let mut cursor = state.cursor; let topline = state.topline; let text = editor.buffer(buffer)?.text()?;
     let lines = (1..=text.line_count()).map(|lnum| text.line(lnum)).collect::<Result<Vec<_>, _>>().map_err(BufferStateError::from)?;
+    let valid = cursor.lnum.clamp(1, lines.len().max(1));
+    if valid != cursor.lnum { cursor.lnum = valid; editor.set_window_cursor(window, cursor)?; }
     let bottomline = topline.saturating_add(height.saturating_sub(1)).min(lines.len().max(1));
     Ok(Context { buffer, window, cursor, lines, topline, bottomline })
 }

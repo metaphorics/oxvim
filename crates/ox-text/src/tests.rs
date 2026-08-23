@@ -3,7 +3,7 @@ use std::io::Cursor as IoCursor;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmpv::Value;
 
@@ -142,6 +142,106 @@ fn randomized_buffer_matches_vec_model() {
             offset += expected.len() + usize::from(index + 1 != model.len() || buffer.has_eol());
         }
     }
+}
+
+/// Differential oracle for the in-place ranged mutators. Unlike
+/// [`randomized_buffer_matches_vec_model`] this also drives `append_lines`,
+/// `delete_lines`, and `set_eol`, so every branch of the rope splice (interior
+/// insert, append past a terminated and an unterminated final line, deletion
+/// through the final line, and total deletion) is compared against a `Vec`
+/// model that tracks end-of-line state alongside the lines.
+#[test]
+fn randomized_mixed_mutations_match_vec_model() {
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        usize::try_from(state >> 33).unwrap()
+    };
+    let mut buffer = Buffer::new();
+    let mut model = vec![Vec::new()];
+    let mut has_eol = false;
+    for expected_tick in 1..=1200_u64 {
+        let mut replacement = Vec::new();
+        for index in 0..next() % 3 {
+            replacement.push(format!("{}-{index}", next()).into_bytes());
+        }
+        match next() % 4 {
+            0 => {
+                let lnum = next() % (model.len() + 1);
+                buffer.append_lines(lnum, &replacement).unwrap();
+                model.splice(lnum..lnum, replacement);
+            }
+            1 => {
+                let start = next() % model.len();
+                let span = next() % (model.len() - start) + 1;
+                buffer.delete_lines(start + 1, start + span).unwrap();
+                model.drain(start..start + span);
+            }
+            2 => {
+                let start = next() % model.len();
+                let span = next() % (model.len() - start) + 1;
+                buffer
+                    .replace_lines(start + 1, start + span, &replacement)
+                    .unwrap();
+                model.splice(start..start + span, replacement);
+            }
+            _ => {
+                has_eol = next() % 2 == 1;
+                buffer.set_eol(has_eol);
+            }
+        }
+        if model.is_empty() {
+            // Deleting every line leaves the canonical empty Vim buffer.
+            model.push(Vec::new());
+            has_eol = false;
+        }
+        assert_eq!(buffer.changedtick(), expected_tick);
+        assert_eq!(buffer.has_eol(), has_eol, "eol at tick {expected_tick}");
+        assert_eq!(buffer.line_count(), model.len(), "count at tick {expected_tick}");
+        let mut serialized = model.join(&b'\n');
+        if has_eol {
+            serialized.push(b'\n');
+        }
+        assert_eq!(buffer.to_bytes(), serialized, "bytes at tick {expected_tick}");
+        let mut offset = 0;
+        for (index, expected) in model.iter().enumerate() {
+            assert_eq!(buffer.line(index + 1).unwrap(), *expected);
+            assert_eq!(buffer.byte_of_line(index + 1).unwrap(), offset);
+            offset += expected.len() + usize::from(index + 1 != model.len() || has_eol);
+        }
+        assert_eq!(buffer.byte_of_line(model.len() + 1).unwrap(), offset);
+    }
+}
+
+/// Appending one line at a time must cost the edit, not the buffer.
+///
+/// The superseded implementation materialized every logical line into a `Vec`
+/// and rebuilt the entire rope on each call, making an N-line insert O(N^2);
+/// this loop measured 497.3s against it (a debug build on this workstation)
+/// and pushed upstream's `test_window_cmd.vim` past a 120s timeout. The ranged
+/// rope splice runs the same loop in 84ms. The one-second bound leaves an
+/// order of magnitude of headroom over that, so a loaded machine cannot make
+/// it flaky, yet it still fails hard against any return of the quadratic shape.
+#[test]
+fn appending_ten_thousand_lines_costs_the_edit_not_the_buffer() {
+    let mut buffer = Buffer::new();
+    let started = Instant::now();
+    for index in 0..10_000_usize {
+        let last = buffer.line_count();
+        buffer
+            .append_lines(last, &[format!("line {index}").into_bytes()])
+            .unwrap();
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(buffer.line_count(), 10_001);
+    assert_eq!(buffer.line(1).unwrap(), b"");
+    assert_eq!(buffer.line(10_001).unwrap(), b"line 9999");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "10000 single-line appends took {elapsed:?}, expected well under 1s"
+    );
 }
 
 #[test]

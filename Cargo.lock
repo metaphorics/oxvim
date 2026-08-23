@@ -449,6 +449,7 @@ dependencies = [
 name = "ox-eval"
 version = "0.1.0"
 dependencies = [
+ "ox-regex",
  "ox-sys",
  "ox-types",
  "serde_json",

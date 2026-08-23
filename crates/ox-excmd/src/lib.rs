@@ -15,7 +15,7 @@ pub use command::{
 pub use expand::{CmdlineContext, CmdlineSpecial, ExpansionPart, expand_with, scan_expansions};
 pub use parser::{
     Address, AddressBase, CommandModifier, ErrorCode, ExCommand, ModifierKind, ParseError, Parser,
-    Range, RangeKind, RangeSeparator,
+    Range, RangeKind, RangeSeparator, effective_flags,
 };
 
 impl ExCommand {

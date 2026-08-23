@@ -11,6 +11,8 @@ impl CommandFlags {
     pub const BANG: Self = Self(0x002);
     /// Command accepts arguments.
     pub const EXTRA: Self = Self(0x004);
+    /// Command defaults to the whole buffer when no range is given.
+    pub const DFLALL: Self = Self(0x020);
     /// Command requires an argument.
     pub const NEEDARG: Self = Self(0x080);
     /// A bar may terminate this command.

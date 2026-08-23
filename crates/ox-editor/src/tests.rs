@@ -239,6 +239,55 @@ fn split_uses_immediate_parent_axis_not_deepest_matching_ancestor() {
 }
 
 #[test]
+fn same_axis_split_three_containers_deep_joins_its_immediate_parent() {
+    // The root-to-leaf child path used to be collected leaf-first, so from the
+    // third container down the descent followed the wrong branch and reached a
+    // leaf where a container was required. test_window_cmd.vim crashed the
+    // process there. Upstream `win_split_ins` inserts the new frame next to
+    // the target inside the target's own parent row.
+    let w1 = window_handle(1);
+    let w2 = window_handle(2);
+    let w3 = window_handle(3);
+    let w4 = window_handle(4);
+    let w5 = window_handle(5);
+    let buffer = buffer_handle(1);
+    let geometry = Geometry::new(0, 0, 9, 7).unwrap();
+    let mut layout = Layout::new(w1, WindowState::new(buffer, position(1, 0)), geometry).unwrap();
+
+    layout
+        .split_vertical(w1, w2, WindowState::new(buffer, position(1, 0)))
+        .unwrap();
+    layout
+        .split_horizontal(w2, w3, WindowState::new(buffer, position(1, 0)))
+        .unwrap();
+    layout
+        .split_vertical(w3, w4, WindowState::new(buffer, position(1, 0)))
+        .unwrap();
+    layout
+        .split_vertical(w3, w5, WindowState::new(buffer, position(1, 0)))
+        .unwrap();
+
+    match layout.root() {
+        Frame::Row { children, .. } => match &children[1] {
+            Frame::Column { children, .. } => match &children[1] {
+                Frame::Row { children, .. } => {
+                    assert_eq!(children.len(), 3);
+                    assert!(matches!(&children[0], Frame::Leaf(leaf) if leaf.window == w3));
+                    assert!(matches!(&children[1], Frame::Leaf(leaf) if leaf.window == w5));
+                    assert!(matches!(&children[2], Frame::Leaf(leaf) if leaf.window == w4));
+                }
+                _ => panic!("expected the Row holding w3 to absorb the same-axis split"),
+            },
+            _ => panic!("expected Column wrapping w2 and the nested Row"),
+        },
+        _ => panic!("expected root Row"),
+    }
+    assert_eq!(layout.winnr(w3).unwrap(), 3);
+    assert_eq!(layout.winnr(w5).unwrap(), 4);
+    assert_eq!(layout.winnr(w4).unwrap(), 5);
+}
+
+#[test]
 fn failed_window_creation_on_unloaded_buffer_is_atomic() {
     let mut editor = Editor::new();
     let loaded = editor.create_buffer(true).unwrap();

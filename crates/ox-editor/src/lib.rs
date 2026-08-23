@@ -3,6 +3,8 @@
 
 pub mod arglist;
 
+mod builtins;
+
 pub mod autocmd;
 pub mod buffer;
 pub mod decoration;

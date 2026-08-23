@@ -1355,40 +1355,41 @@ fn geometry_with_extent(
 fn collect_container_path(frame: &Frame, wanted: WinHandle, path: &mut Vec<usize>) -> bool {
     match frame {
         Frame::Leaf(leaf) => leaf.window == wanted,
-        Frame::Row { children, .. } | Frame::Column { children, .. } => children
-            .iter()
-            .enumerate()
-            .find_map(|(index, child)| {
-                collect_container_path(child, wanted, path).then_some(index)
-            })
-            .is_some_and(|index| {
+        Frame::Row { children, .. } | Frame::Column { children, .. } => {
+            children.iter().enumerate().any(|(index, child)| {
                 path.push(index);
-                true
-            }),
+                if collect_container_path(child, wanted, path) {
+                    return true;
+                }
+                path.pop();
+                false
+            })
+        }
     }
 }
 
-/// Returns the frame reached by descending `path` from `frame`.
-fn container_at<'a>(frame: &'a Frame, path: &[usize]) -> &'a Frame {
+/// Returns the frame reached by descending `path` from `frame`, or `None` when
+/// the path leaves the container tree.
+fn container_at<'a>(frame: &'a Frame, path: &[usize]) -> Option<&'a Frame> {
     let mut current = frame;
     for &index in path {
         current = match current {
-            Frame::Leaf(_) => unreachable!("split path descends only through containers"),
-            Frame::Row { children, .. } | Frame::Column { children, .. } => &children[index],
+            Frame::Leaf(_) => return None,
+            Frame::Row { children, .. } | Frame::Column { children, .. } => children.get(index)?,
         };
     }
-    current
+    Some(current)
 }
 
-fn container_at_mut<'a>(frame: &'a mut Frame, path: &[usize]) -> &'a mut Frame {
+fn container_at_mut<'a>(frame: &'a mut Frame, path: &[usize]) -> Option<&'a mut Frame> {
     let mut current = frame;
     for &index in path {
         current = match current {
-            Frame::Leaf(_) => unreachable!("split path descends only through containers"),
-            Frame::Row { children, .. } | Frame::Column { children, .. } => &mut children[index],
+            Frame::Leaf(_) => return None,
+            Frame::Row { children, .. } | Frame::Column { children, .. } => children.get_mut(index)?,
         };
     }
-    current
+    Some(current)
 }
 
 /// Whether `frame` stacks its children along `axis` (columns for a Row of
@@ -1420,7 +1421,7 @@ fn insert_into_matching_container(
         return Err(new_leaf);
     }
     let parent_path = &path[..path.len() - 1];
-    if !matches_axis(container_at(root, parent_path), axis) {
+    if !container_at(root, parent_path).is_some_and(|parent| matches_axis(parent, axis)) {
         return Err(new_leaf);
     }
     let target_index = path[path.len() - 1];
@@ -1429,10 +1430,10 @@ fn insert_into_matching_container(
         SplitPlacement::Before => target_index,
     };
     match container_at_mut(root, parent_path) {
-        Frame::Leaf(_) => unreachable!("split path ends in a container"),
-        Frame::Row { children, .. } | Frame::Column { children, .. } => {
+        Some(Frame::Row { children, .. } | Frame::Column { children, .. }) => {
             children.insert(insert_at.min(children.len()), new_leaf);
         }
+        Some(Frame::Leaf(_)) | None => return Err(new_leaf),
     }
     Ok(())
 }

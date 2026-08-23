@@ -180,6 +180,9 @@ impl Buffer {
     ///
     /// An empty replacement deletes the range. Deleting every line leaves the
     /// canonical empty Vim buffer: one empty line without end-of-line state.
+    ///
+    /// The rope is spliced over the replaced span only, so the cost tracks the
+    /// edited region instead of the buffer size.
     pub fn replace_lines(
         &mut self,
         start: usize,
@@ -188,30 +191,55 @@ impl Buffer {
     ) -> Result<(), BufferError> {
         self.check_range(start, end)?;
         validate_lines(lines)?;
-        let mut model = self.lines()?;
-        model.splice(start - 1..end, lines.iter().cloned());
-        if model.is_empty() {
-            model.push(Vec::new());
-            self.has_eol = false;
+        let line_count = self.line_count();
+        let mut text = join_lines(lines)?;
+        if !lines.is_empty() && (end < line_count || self.has_eol) {
+            // The replacement is followed by more text, or by end-of-line
+            // state, so it keeps a terminator of its own.
+            text.push('\n');
         }
-        self.rebuild(&model)?;
+        let mut from = self.char_of_line(start);
+        let to = self.char_of_line(end + 1);
+        if lines.is_empty() && end == line_count {
+            if start == 1 {
+                self.has_eol = false;
+            } else if !self.has_eol {
+                // The final line carries no terminator of its own, so the
+                // deletion has to swallow the one before `start` instead.
+                from -= 1;
+            }
+        }
+        self.rope.remove(from..to);
+        if !text.is_empty() {
+            self.rope.insert(from, &text);
+        }
         self.changedtick = self.changedtick.wrapping_add(1);
         Ok(())
     }
 
     /// Inserts logical lines after `lnum`; zero inserts before the first line.
     pub fn append_lines(&mut self, lnum: usize, lines: &[Vec<u8>]) -> Result<(), BufferError> {
-        if lnum > self.line_count() {
+        let line_count = self.line_count();
+        if lnum > line_count {
             return Err(BufferError::LineRange {
                 start: lnum,
                 end: lnum,
-                line_count: self.line_count(),
+                line_count,
             });
         }
         validate_lines(lines)?;
-        let mut model = self.lines()?;
-        model.splice(lnum..lnum, lines.iter().cloned());
-        self.rebuild(&model)?;
+        if !lines.is_empty() {
+            let mut text = join_lines(lines)?;
+            if lnum == line_count && !self.has_eol {
+                // Appending past an unterminated final line: the block brings
+                // the separator that line lacks ahead of itself.
+                text.insert(0, '\n');
+            } else {
+                text.push('\n');
+            }
+            let at = self.char_of_line(lnum + 1);
+            self.rope.insert(at, &text);
+        }
         self.changedtick = self.changedtick.wrapping_add(1);
         Ok(())
     }
@@ -224,26 +252,27 @@ impl Buffer {
     /// Changes final-EOL state and counts it as one mutation.
     pub fn set_eol(&mut self, has_eol: bool) {
         if self.has_eol != has_eol {
-            let mut text = self.rope.to_string();
+            let len = self.rope.len_chars();
             if has_eol {
-                text.push('\n');
-            } else {
-                text.pop();
+                self.rope.insert(len, "\n");
+            } else if len != 0 {
+                self.rope.remove(len - 1..len);
             }
-            self.rope = Rope::from_str(&text);
             self.has_eol = has_eol;
         }
         self.changedtick = self.changedtick.wrapping_add(1);
     }
 
-    fn lines(&self) -> Result<Vec<Vec<u8>>, BufferError> {
-        (1..=self.line_count()).map(|lnum| self.line(lnum)).collect()
-    }
-
-    fn rebuild(&mut self, lines: &[Vec<u8>]) -> Result<(), BufferError> {
-        let replacement = Self::from_lines(lines, self.has_eol)?;
-        self.rope = replacement.rope;
-        Ok(())
+    /// Returns the char offset at which one-based logical line `lnum` begins.
+    ///
+    /// One past the logical line count maps to the rope end, so an insertion
+    /// after the final line and a deletion through it share one address space.
+    fn char_of_line(&self, lnum: usize) -> usize {
+        if lnum > self.rope.len_lines() {
+            self.rope.len_chars()
+        } else {
+            self.rope.line_to_char(lnum - 1)
+        }
     }
 
     fn check_line(&self, lnum: usize) -> Result<(), BufferError> {
@@ -277,4 +306,16 @@ fn validate_lines(lines: &[Vec<u8>]) -> Result<(), BufferError> {
         return Err(BufferError::InvalidUtf8);
     }
     Ok(())
+}
+
+/// Joins validated newline-free logical lines with line-feed separators.
+fn join_lines(lines: &[Vec<u8>]) -> Result<String, BufferError> {
+    let mut text = String::with_capacity(lines.iter().map(|line| line.len() + 1).sum());
+    for (index, line) in lines.iter().enumerate() {
+        if index != 0 {
+            text.push('\n');
+        }
+        text.push_str(std::str::from_utf8(line).map_err(|_| BufferError::InvalidUtf8)?);
+    }
+    Ok(text)
 }

@@ -4,6 +4,8 @@
 pub mod builtins;
 pub mod error;
 pub mod eval;
+mod find_file;
+mod fuzzy;
 pub mod lexer;
 pub mod parser;
 mod path_builtins;

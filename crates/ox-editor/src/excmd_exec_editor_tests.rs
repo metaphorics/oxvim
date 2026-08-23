@@ -914,3 +914,316 @@ fn global_nested_print_outputs_matches() {
     executor.execute_line(&mut editor, "%g/o/p").unwrap();
     assert_eq!(echo_messages(&editor), vec!["one", "two"]);
 }
+
+// ---------------------------------------------------------------------------
+// :redraw / :redrawstatus / :redrawtabline
+// Citations: ex_docmd.c ex_redraw/ex_redrawstatus/ex_redrawtabline,
+// cursor.c:310-323 check_cursor_lnum.
+// ---------------------------------------------------------------------------
+
+/// `:redraw` completes and, through `ex_redraw`'s `validate_cursor` call,
+/// clamps a cursor left past the end of the buffer onto the last line.
+/// Upstream: `ex_docmd.c` `ex_redraw` → `validate_cursor` →
+/// `check_cursor_lnum` (`cursor.c:310-323`).
+#[test]
+fn redraw_clamps_cursor_past_end_of_buffer() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"one".to_vec(), b"two".to_vec()]);
+    let window = editor.current_window().unwrap();
+    editor
+        .set_window_cursor(window, ox_text::Position { lnum: 99, col: 2 })
+        .unwrap();
+    executor.execute_line(&mut editor, "redraw").unwrap();
+    assert_eq!(editor.window(window).unwrap().cursor.lnum, 2);
+    assert_eq!(editor.window(window).unwrap().cursor.col, 2);
+}
+
+/// `:redr` is the shortest abbreviation of `:redraw`; `:red` is `:redo`
+/// and `:redi` is `:redir`, so the abbreviation must not shift.
+/// Upstream: `ex_cmds.lua` table order redo/redir/redraw.
+#[test]
+fn redraw_abbreviation_and_bang_leave_a_valid_cursor_alone() {
+    let (mut editor, mut executor) = setup_with_content(&[b"one".to_vec()]);
+    let window = editor.current_window().unwrap();
+    executor.execute_line(&mut editor, "redr").unwrap();
+    executor.execute_line(&mut editor, "redraw!").unwrap();
+    executor.execute_line(&mut editor, "redrawstatus").unwrap();
+    executor.execute_line(&mut editor, "redrawt").unwrap();
+    assert_eq!(editor.window(window).unwrap().cursor.lnum, 1);
+}
+
+/// `:redrawtabline` takes no bang (`ex_cmds.lua` omits BANG), so `!`
+/// is trailing garbage: E488.
+#[test]
+fn redrawtabline_rejects_a_bang_with_e488() {
+    let (mut editor, mut executor) = setup();
+    assert_vim_error(executor.execute_line(&mut editor, "redrawtabline!"), "E488");
+}
+
+// ---------------------------------------------------------------------------
+// :filetype
+// Citations: ex_docmd.c ex_filetype:7886-7949, globals.h:37-60 file names,
+// runtime.c do_in_path:430-515.
+// ---------------------------------------------------------------------------
+
+/// Installs one runtime root holding the six `:filetype` scripts, each
+/// recording that it ran in a distinct global.
+fn setup_filetype() -> (Editor, ExExecutor<MemoryFileIO>) {
+    let (editor, mut executor) = setup();
+    let io = executor.scripts().io().clone();
+    io.insert("rt/filetype.vim", "let g:ran_filetype = 1");
+    io.insert("rt/ftplugin.vim", "let g:ran_ftplugin = 1");
+    io.insert("rt/indent.vim", "let g:ran_indent = 1");
+    io.insert("rt/ftoff.vim", "let g:ran_ftoff = 1");
+    io.insert("rt/ftplugof.vim", "let g:ran_ftplugof = 1");
+    io.insert("rt/indoff.vim", "let g:ran_indoff = 1");
+    executor.scripts_mut().add_runtime_root(PathBuf::from("rt"));
+    (editor, executor)
+}
+
+fn global_flag(executor: &ExExecutor<MemoryFileIO>, name: &str) -> bool {
+    global_value(executor, name) == Some(ox_types::Typval::Number(1))
+}
+
+/// Bare `:filetype` reports the three enablement states in upstream's
+/// exact wording, and starts out entirely off.
+/// Upstream: `ex_filetype` — `smsg(0, "filetype detection:%s  plugin:%s  indent:%s", ...)`.
+#[test]
+fn filetype_reports_state() {
+    let (mut editor, mut executor) = setup_filetype();
+    executor.execute_line(&mut editor, "filetype").unwrap();
+    assert_eq!(
+        echo_messages(&editor),
+        vec!["filetype detection:OFF  plugin:OFF  indent:OFF"]
+    );
+}
+
+/// `:filetype plugin indent on` sources filetype, ftplugin, and indent
+/// from 'runtimepath' and flips all three states on; the report then shows
+/// `ON` for each.
+#[test]
+fn filetype_plugin_indent_on_sources_all_three() {
+    let (mut editor, mut executor) = setup_filetype();
+    executor
+        .execute_line(&mut editor, "filetype plugin indent on")
+        .unwrap();
+    assert!(global_flag(&executor, "ran_filetype"));
+    assert!(global_flag(&executor, "ran_ftplugin"));
+    assert!(global_flag(&executor, "ran_indent"));
+    editor.truncate_messages(0);
+    executor.execute_line(&mut editor, "filetype").unwrap();
+    assert_eq!(
+        echo_messages(&editor),
+        vec!["filetype detection:ON  plugin:ON  indent:ON"]
+    );
+}
+
+/// `:filetype plugin on` without detection enabled reports `(on)` for the
+/// plugin column, upstream's marker for "requested but detection is off".
+/// Reached by turning detection off again after enabling the plugin part.
+#[test]
+fn filetype_plugin_without_detection_reports_parenthesised_on() {
+    let (mut editor, mut executor) = setup_filetype();
+    executor
+        .execute_line(&mut editor, "filetype plugin on")
+        .unwrap();
+    executor.execute_line(&mut editor, "filetype off").unwrap();
+    assert!(global_flag(&executor, "ran_ftoff"));
+    editor.truncate_messages(0);
+    executor.execute_line(&mut editor, "filetype").unwrap();
+    assert_eq!(
+        echo_messages(&editor),
+        vec!["filetype detection:OFF  plugin:(on)  indent:OFF"]
+    );
+}
+
+/// `:filetype indent off` sources only `indoff.vim` and leaves detection
+/// alone, unlike the bare `:filetype off` which sources `ftoff.vim`.
+#[test]
+fn filetype_indent_off_sources_only_indoff() {
+    let (mut editor, mut executor) = setup_filetype();
+    executor
+        .execute_line(&mut editor, "filetype indent off")
+        .unwrap();
+    assert!(global_flag(&executor, "ran_indoff"));
+    assert!(!global_flag(&executor, "ran_ftoff"));
+}
+
+/// `:filet` is the shortest abbreviation of `:filetype` (`:filte`/`:filt`
+/// belong to `:filter`), and it drives the same command.
+#[test]
+fn filetype_abbreviation_sources_filetype_script() {
+    let (mut editor, mut executor) = setup_filetype();
+    executor.execute_line(&mut editor, "filet on").unwrap();
+    assert!(global_flag(&executor, "ran_filetype"));
+}
+
+/// `:filetype detect` re-fires the `filetypedetect` group's BufRead
+/// autocommands, and only that group's.
+/// Upstream: `ex_filetype` — `do_doautocmd("filetypedetect BufRead", true, NULL)`.
+#[test]
+fn filetype_detect_refires_the_filetypedetect_group() {
+    let (mut editor, mut executor) = setup_filetype();
+    executor
+        .execute_line(&mut editor, "augroup filetypedetect")
+        .unwrap();
+    executor
+        .execute_line(&mut editor, "autocmd BufRead * let g:detected = 1")
+        .unwrap();
+    executor.execute_line(&mut editor, "augroup END").unwrap();
+    executor
+        .execute_line(&mut editor, "autocmd BufRead * let g:other = 1")
+        .unwrap();
+    executor.execute_line(&mut editor, "filetype detect").unwrap();
+    assert!(global_flag(&executor, "detected"));
+    assert!(!global_flag(&executor, "other"));
+}
+
+/// An argument that is neither `on`, `off`, nor `detect` raises E475 with
+/// the offending text.
+/// Upstream: `ex_filetype` — `semsg(_(e_invarg2), arg)`, `errors.h:34`.
+#[test]
+fn filetype_rejects_unknown_argument_with_e475() {
+    let (mut editor, mut executor) = setup_filetype();
+    assert_vim_error(executor.execute_line(&mut editor, "filetype nope"), "E475");
+}
+
+// ---------------------------------------------------------------------------
+// :read / :read !cmd / :write !cmd
+// Citations: ex_docmd.c ex_read:6163-6195, ex_cmds.c do_filter:1430-1436,
+// ex_docmd.c:2256-2275 usefilter.
+// ---------------------------------------------------------------------------
+
+/// `:2read {file}` inserts the file after line 2 and leaves the cursor on
+/// the first inserted line, at its first non-blank column.
+/// Oracle: `nvim --headless` on `['a','b','c']` + `2read` → a b x y c,
+/// cursor line 3.
+#[test]
+fn read_inserts_file_after_addressed_line() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.scripts().io().insert("in.txt", "x\ny\n");
+    executor.execute_line(&mut editor, "2read in.txt").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "b", "x", "y", "c"]);
+    let window = editor.current_window().unwrap();
+    assert_eq!(editor.window(window).unwrap().cursor.lnum, 3);
+}
+
+/// `:0read {file}` prepends, which only works because `read` carries ZEROR
+/// and line 0 survives address resolution.
+/// Oracle: `['a','b']` + `0read` → x y a b, cursor line 1.
+#[test]
+fn read_zero_address_prepends() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec(), b"b".to_vec()]);
+    executor.scripts().io().insert("in.txt", "x\ny\n");
+    executor.execute_line(&mut editor, "0read in.txt").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["x", "y", "a", "b"]);
+    let window = editor.current_window().unwrap();
+    assert_eq!(editor.window(window).unwrap().cursor.lnum, 1);
+}
+
+/// `:r` is the shortest abbreviation of `:read` and reads the same file.
+#[test]
+fn read_abbreviation_inserts_file() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.scripts().io().insert("in.txt", "x\n");
+    executor.execute_line(&mut editor, "r in.txt").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "x"]);
+}
+
+/// A cursor column lands on the first non-blank of the inserted line
+/// (`beginline(BL_WHITE | BL_FIX)`).
+/// Oracle: `1read` of "    indented" leaves cursor col 5 (one-based).
+#[test]
+fn read_cursor_lands_on_first_non_blank() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor
+        .scripts()
+        .io()
+        .insert("in.txt", "    indented\nsecond\n");
+    executor.execute_line(&mut editor, "1read in.txt").unwrap();
+    let window = editor.current_window().unwrap();
+    assert_eq!(editor.window(window).unwrap().cursor.lnum, 2);
+    assert_eq!(editor.window(window).unwrap().cursor.col, 4);
+}
+
+/// An unreadable file raises E484.
+/// Oracle: `read nosuchfile` → `Vim(read):E484: Can't open file nosuchfile`.
+#[test]
+fn read_missing_file_raises_e484() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    assert_vim_error(
+        executor.execute_line(&mut editor, "read nosuchfile"),
+        "E484",
+    );
+}
+
+/// Bare `:read` in a buffer with no name raises E32.
+/// Oracle: `enew | read` → `Vim(read):E32: No file name`.
+#[test]
+fn read_without_argument_or_name_raises_e32() {
+    let (mut editor, mut executor) = setup();
+    assert_vim_error(executor.execute_line(&mut editor, "read"), "E32");
+}
+
+/// `:read !cmd` inserts the command's standard output after the addressed
+/// line and leaves the cursor on the *last* inserted line, unlike the file
+/// form. Upstream: `do_filter`:1430-1433 "Put cursor on last new line".
+#[test]
+fn read_filter_inserts_command_output_and_lands_on_last_line() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec(), b"b".to_vec()]);
+    executor
+        .execute_line(&mut editor, "1read !printf 'p\\nq\\n'")
+        .unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "p", "q", "b"]);
+    let window = editor.current_window().unwrap();
+    assert_eq!(editor.window(window).unwrap().cursor.lnum, 3);
+}
+
+/// A `|` inside `:read !cmd` belongs to the shell, not to the Ex parser, so
+/// the whole pipeline runs as one command.
+#[test]
+fn read_filter_keeps_the_shell_pipeline() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor
+        .execute_line(&mut editor, "1read !printf 'z\\n' | tr z Z")
+        .unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "Z"]);
+}
+
+/// A failing filter publishes its exit status in `v:shell_error`.
+#[test]
+fn read_filter_publishes_shell_error() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "1read !exit 3").unwrap();
+    assert_eq!(
+        executor
+            .scope()
+            .vim
+            .iter()
+            .find(|(name, _)| name.as_bytes() == b"shell_error")
+            .map(|(_, value)| value),
+        Some(&ox_types::Typval::Number(3))
+    );
+}
+
+/// `:write !cmd` pipes the addressed lines into the command instead of
+/// writing a file named after it, and leaves the buffer alone. The default
+/// range is the whole buffer (EX_DFLALL).
+#[test]
+fn write_filter_pipes_lines_into_the_command() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec(), b"b".to_vec()]);
+    let path = std::env::temp_dir().join(format!("oxvim-write-filter-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    executor
+        .execute_line(
+            &mut editor,
+            &format!("write !cat > {}", path.to_string_lossy()),
+        )
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\n");
+    let _ = std::fs::remove_file(&path);
+    // The buffer keeps its (empty) name: no file called "cat > ..." is made.
+    let buffer = editor.current_buffer().unwrap();
+    assert_eq!(editor.buffer(buffer).unwrap().name().to_string_lossy(), "");
+}

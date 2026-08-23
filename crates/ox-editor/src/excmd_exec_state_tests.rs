@@ -711,9 +711,11 @@ fn highlight_default_and_link_forms_retain_definitions() {
 fn unimplemented_builtin_returns_not_implemented() {
     let mut editor = Editor::new();
     let mut exec = ExExecutor::new();
-    let err = exec.execute_line(&mut editor, "redraw").unwrap_err();
+    // ":redraw" used to stand in here; it is dispatched now, so the probe
+    // moved to ":sort", which the handler table still does not carry.
+    let err = exec.execute_line(&mut editor, "sort").unwrap_err();
     match err {
-        ExecError::NotImplemented(name) => assert_eq!(name, "redraw"),
+        ExecError::NotImplemented(name) => assert_eq!(name, "sort"),
         other => panic!("expected NotImplemented, got {other:?}"),
     }
 }
@@ -1243,6 +1245,27 @@ fn assert_fails_executes_commands_and_consumes_expected_errors() {
     assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"after", 0), Ok(&Typval::Number(1)));
     let Some(Object::Array(errors)) = editor.vvars().get(&OxStr::from("errors")) else { panic!("v:errors must remain an Array") };
     assert!(matches!(&errors[0], Object::String(text) if text.to_string_lossy().contains("must fail")));
+}
+
+#[test]
+fn assert_fails_without_an_expected_error_only_requires_the_command_to_fail() {
+    // f_assert_fails takes 1 to 5 arguments: with no {error} the assertion is
+    // satisfied by any failure, and only a command that ran cleanly is
+    // reported. test_assert.vim:368 (`assert_fails('throw "error"')`) crashed
+    // the process while the second argument was read unconditionally.
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &mut editor,
+        "assert_fails_one_arg.vim",
+        "let g:threw = assert_fails('throw \"error\"')\nlet g:missing = assert_fails('call Missing()')\nlet g:clean = assert_fails('let g:ran = 1')\nlet g:after = len(v:errors)",
+    ).unwrap();
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"threw", 0), Ok(&Typval::Number(0)));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"missing", 0), Ok(&Typval::Number(0)));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"clean", 0), Ok(&Typval::Number(1)));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"after", 0), Ok(&Typval::Number(1)));
+    let Some(Object::Array(errors)) = editor.vvars().get(&OxStr::from("errors")) else { panic!("v:errors must remain an Array") };
+    assert!(matches!(&errors[0], Object::String(text) if text.to_string_lossy().contains("command did not fail: let g:ran = 1")));
 }
 
 #[test]

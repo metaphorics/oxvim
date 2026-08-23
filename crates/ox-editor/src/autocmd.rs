@@ -588,11 +588,36 @@ impl Autocmds {
     /// acknowledges execution with `consume_once`, so abandoned plans leave
     /// `++once` definitions intact.
     pub fn plan(&mut self, event: Event, context: AutocmdContext<'_>) -> FiringPlan {
+        self.plan_filtered(event, None, context)
+    }
+
+    /// Builds the firing plan for one event occurrence restricted to one
+    /// augroup, the shape `:doautocmd {group} {event}` needs
+    /// (`autocmd.c` `do_doautocmd` → `apply_autocmds_group` with
+    /// `group != AUGROUP_ALL`). Definitions outside `group` never match;
+    /// matching order is unchanged.
+    pub fn plan_in_group(
+        &mut self,
+        event: Event,
+        group: AugroupId,
+        context: AutocmdContext<'_>,
+    ) -> FiringPlan {
+        self.plan_filtered(event, Some(group), context)
+    }
+
+    fn plan_filtered(
+        &mut self,
+        event: Event,
+        group: Option<AugroupId>,
+        context: AutocmdContext<'_>,
+    ) -> FiringPlan {
         if self.ignored.contains(&event) || !context.nested {
             return FiringPlan::default();
         }
         let mut matched: Vec<&Entry> = self.entries.iter().filter(|entry| {
-            entry.event == event && pattern_matches(&entry.pattern, context.buffer, context.file_name)
+            entry.event == event
+                && group.is_none_or(|group| entry.options.group == group)
+                && pattern_matches(&entry.pattern, context.buffer, context.file_name)
         }).collect();
         matched.sort_by_key(|entry| entry.sequence);
         let ready: Vec<AutocmdAction> = matched.into_iter().map(|entry| self.action(entry)).collect();

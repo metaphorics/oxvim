@@ -8,7 +8,7 @@ use crate::builtins::{Builtins, BUILTINS};
 use crate::error::EvalErrorKind;
 use crate::eval::{BuiltinHost, Evaluator, NoRegex, RegexEngine};
 use crate::parser::Parser;
-use crate::scope::Scope;
+use crate::scope::{Scope, ScopeKind};
 
 fn text(value: &str) -> Typval { Typval::String(OxStr::from(value)) }
 fn number(value: i64) -> Typval { Typval::Number(value) }
@@ -416,7 +416,7 @@ fn sort_callback_stops_after_first_failure_and_retains_first_error() {
     // pairs, and the original error must be returned rather than overwritten.
     let mut scope = Scope::new();
     let counter = Typval::list(vec![]);
-    scope.set(b"counter", counter.clone());
+    scope.set(b"counter", counter.clone()).unwrap();
     let values = Typval::list(vec![number(3), number(1), number(2)]);
     let callback = text("add(counter, 1) + missing");
     let mut builtins = Builtins::without_regex();
@@ -569,8 +569,8 @@ fn eval_builtin(source: &[u8], mut scope: Scope) -> (Typval, Scope) {
 fn assignment_clone_shares_list_mutation() {
     let shared = list(&[1]);
     let mut scope = Scope::new();
-    scope.set(b"a", shared.clone());
-    scope.set(b"b", shared);
+    scope.set(b"a", shared.clone()).unwrap();
+    scope.set(b"b", shared).unwrap();
     let (result, scope) = eval_builtin(b"add(a, 2)", scope);
     assert_eq!(result, list(&[1, 2]));
     assert_eq!(scope.get(b"b", 0).unwrap(), &list(&[1, 2]));
@@ -580,9 +580,9 @@ fn assignment_clone_shares_list_mutation() {
 fn identity_and_equality_distinguish_shared_lists() {
     let mut scope = Scope::new();
     let shared = list(&[1]);
-    scope.set(b"a", shared.clone());
-    scope.set(b"alias", shared);
-    scope.set(b"equal", list(&[1]));
+    scope.set(b"a", shared.clone()).unwrap();
+    scope.set(b"alias", shared).unwrap();
+    scope.set(b"equal", list(&[1])).unwrap();
     assert_eq!(eval_builtin(b"a is alias", scope.clone()).0, number(1));
     assert_eq!(eval_builtin(b"a is equal", scope.clone()).0, number(0));
     assert_eq!(eval_builtin(b"a == equal", scope).0, number(1));
@@ -621,8 +621,8 @@ fn cycle_equality_terminates_coinductively() {
     call("add", vec![left.clone(), left.clone()]).unwrap();
     call("add", vec![right.clone(), right.clone()]).unwrap();
     let mut scope = Scope::new();
-    scope.set(b"left", left);
-    scope.set(b"right", right);
+    scope.set(b"left", left).unwrap();
+    scope.set(b"right", right).unwrap();
     assert_eq!(eval_builtin(b"left == right", scope).0, number(1));
 }
 
@@ -630,14 +630,14 @@ fn cycle_equality_terminates_coinductively() {
 fn shallow_and_deep_locks_enforce_mutation_and_report_state() {
     let nested = list(&[1]);
     let shallow = Typval::list(vec![nested.clone()]);
-    crate::lock_value(&shallow, false).unwrap();
+    crate::lock_value(&shallow, 1, true).unwrap();
     assert_eq!(crate::is_locked_value(&shallow).unwrap(), number(2));
     assert_eq!(call("add", vec![shallow, number(2)]).unwrap_err().code, "E741");
     assert_eq!(crate::is_locked_value(&nested).unwrap(), number(0));
 
     let deep_nested = list(&[1]);
     let deep = Typval::list(vec![deep_nested.clone()]);
-    crate::lock_value(&deep, true).unwrap();
+    crate::lock_value(&deep, -1, true).unwrap();
     assert_eq!(crate::is_locked_value(&deep).unwrap(), number(3));
     assert_eq!(crate::is_locked_value(&deep_nested).unwrap(), number(3));
     assert_eq!(call("add", vec![deep_nested, number(2)]).unwrap_err().code, "E741");
@@ -656,7 +656,7 @@ fn lambda_callbacks_cover_map_filter_sort_foreach_reduce() {
 fn mapnew_and_flattennew_do_not_mutate_inputs() {
     let source = list(&[1, 2]);
     let mut scope = Scope::new();
-    scope.set(b"xs", source.clone());
+    scope.set(b"xs", source.clone()).unwrap();
     assert_eq!(eval_builtin(b"mapnew(xs, {k, v -> v + 10})", scope).0, list(&[11, 12]));
     assert_eq!(source, list(&[1, 2]));
 
@@ -675,7 +675,7 @@ fn string_expression_and_funcref_callbacks_use_shared_dispatch() {
 #[test]
 fn callback_structural_mutation_is_rejected_and_lock_restored() {
     let mut scope = Scope::new();
-    scope.set(b"xs", list(&[1, 2]));
+    scope.set(b"xs", list(&[1, 2])).unwrap();
     let expression = Parser::new(b"map(xs, {k, v -> add(xs, 9)})").parse().unwrap();
     let regex = NoRegex;
     let mut builtins = Builtins::without_regex();
@@ -711,13 +711,13 @@ fn scope_lockvar_facade_reports_all_container_lock_states() {
     let Typval::List(reference) = &direct else { panic!("List expected") };
     reference.borrow_mut().lock.locked = true;
     let mut scope = Scope::new();
-    scope.set(b"direct", direct);
-    scope.set(b"shallow", list(&[]));
-    scope.set(b"deep", list(&[]));
+    scope.set(b"direct", direct).unwrap();
+    scope.set(b"shallow", list(&[])).unwrap();
+    scope.set(b"deep", list(&[])).unwrap();
     assert_eq!(scope.islocked(b"missing", 0).unwrap_err().code, "E121");
     assert_eq!(scope.islocked(b"direct", 0).unwrap(), 1);
-    scope.lockvar(b"shallow", false, 0).unwrap();
-    scope.lockvar(b"deep", true, 0).unwrap();
+    scope.lockvar(b"shallow", 1).unwrap();
+    scope.lockvar(b"deep", -1).unwrap();
     assert_eq!(scope.islocked(b"shallow", 0).unwrap(), 2);
     assert_eq!(scope.islocked(b"deep", 0).unwrap(), 3);
 }
@@ -747,12 +747,12 @@ fn reduce_supports_blob_and_string_inputs() {
 fn map_exposes_prior_mutations_and_keeps_them_after_later_error() {
     let shared = list(&[1, 2]);
     let mut scope = Scope::new();
-    scope.set(b"xs", shared.clone());
+    scope.set(b"xs", shared.clone()).unwrap();
     assert_eq!(eval_builtin(b"map(xs, {k, v -> k ? xs[0] : 9})", scope).0, list(&[9, 9]));
 
     let partial = list(&[1, 2]);
     let mut scope = Scope::new();
-    scope.set(b"xs", partial.clone());
+    scope.set(b"xs", partial.clone()).unwrap();
     let expression = Parser::new(b"map(xs, {k, v -> k ? missing : 9})").parse().unwrap();
     let regex = NoRegex;
     let mut builtins = Builtins::without_regex();
@@ -1256,4 +1256,372 @@ fn measured_string_semantics_match_oldtest_cases() {
     assert_eq!(call("reverse", vec![text("🇦🇧🇨")]).unwrap(), text("🇨🇦🇧"));
     assert_eq!(call("strpart", vec![text("abcdefg"), number(-2), number(4)]).unwrap(), text("ab"));
     assert_eq!(call("strpart", vec![text("co\u{301}mposed"), number(1), number(1), number(1)]).unwrap(), text("o\u{301}"));
+}
+
+fn strings(values: &[&str]) -> Typval {
+    Typval::list(values.iter().map(|value| text(value)).collect())
+}
+
+/// Oracle: `.references/neovim/build/bin/nvim` (v0.13.0-dev-1375+g8e0e19c08b)
+/// evaluating the same expressions, plus `runtime/doc/builtin.txt`
+/// `matchfuzzy()`.
+#[test]
+fn matchfuzzy_ranks_by_upstream_fzy_score() {
+    assert_eq!(call("matchfuzzy", vec![strings(&["clay", "crow", "hello"]), text("cay")]).unwrap(), strings(&["clay"]));
+    // Space-separated words are matched independently unless "matchseq".
+    assert_eq!(
+        call("matchfuzzy", vec![strings(&["hello world", "world hello"]), text("wo he")]).unwrap(),
+        strings(&["hello world", "world hello"])
+    );
+    assert_eq!(
+        call("matchfuzzy", vec![
+            strings(&["hello world", "world hello"]),
+            text("wo he"),
+            Typval::dict(vec![(OxStr::from("matchseq"), number(1))]),
+        ]).unwrap(),
+        strings(&["world hello"])
+    );
+    // Path- and word-separator bonuses order these three.
+    assert_eq!(
+        call("matchfuzzy", vec![strings(&["foo/bar", "foobar", "fooxbar"]), text("fb")]).unwrap(),
+        strings(&["foo/bar", "foobar", "fooxbar"])
+    );
+}
+
+#[test]
+fn matchfuzzypos_reports_positions_and_scores() {
+    assert_eq!(
+        call("matchfuzzypos", vec![strings(&["clay", "crow", "hello"]), text("cay")]).unwrap(),
+        Typval::list(vec![strings(&["clay"]), Typval::list(vec![list(&[0, 2, 3])]), list(&[1890])])
+    );
+    assert_eq!(
+        call("matchfuzzypos", vec![strings(&["curdir/curfile"]), text("cf")]).unwrap(),
+        Typval::list(vec![strings(&["curdir/curfile"]), Typval::list(vec![list(&[7, 10])]), list(&[830])])
+    );
+    // An exact ignoring-case match short-circuits to the maximum score.
+    assert_eq!(
+        call("matchfuzzypos", vec![strings(&["ab"]), text("ab")]).unwrap(),
+        Typval::list(vec![strings(&["ab"]), Typval::list(vec![list(&[0, 1])]), list(&[i64::from(i32::MAX)])])
+    );
+    // Boundary: an empty pattern matches nothing, but the three lists exist.
+    assert_eq!(
+        call("matchfuzzypos", vec![strings(&["x"]), text("")]).unwrap(),
+        Typval::list(vec![Typval::list(vec![]), Typval::list(vec![]), Typval::list(vec![])])
+    );
+}
+
+#[test]
+fn matchfuzzy_reads_dict_items_through_key_and_limits_matches() {
+    let items = Typval::list(vec![
+        Typval::dict(vec![(OxStr::from("n"), text("clay"))]),
+        Typval::dict(vec![(OxStr::from("n"), text("crow"))]),
+    ]);
+    let options = Typval::dict(vec![(OxStr::from("key"), text("n"))]);
+    assert_eq!(
+        call("matchfuzzy", vec![items, text("cay"), options]).unwrap(),
+        Typval::list(vec![Typval::dict(vec![(OxStr::from("n"), text("clay"))])])
+    );
+    // Items that yield no string are skipped, not rejected.
+    assert_eq!(call("matchfuzzy", vec![Typval::list(vec![number(1), number(2), text("a1")]), text("1")]).unwrap(), strings(&["a1"]));
+    let limited = Typval::dict(vec![(OxStr::from("limit"), number(2))]);
+    assert_eq!(call("matchfuzzy", vec![strings(&["ab", "abc", "abcd"]), text("ab"), limited]).unwrap(), strings(&["ab", "abc"]));
+}
+
+#[test]
+fn matchfuzzy_rejects_bad_arguments_with_upstream_codes() {
+    assert_eq!(call("matchfuzzy", vec![text("abc"), text("a")]).unwrap_err().message, "Argument of matchfuzzy() must be a List");
+    assert_eq!(call("matchfuzzypos", vec![text("abc"), text("a")]).unwrap_err().code, "E686");
+    assert_eq!(call("matchfuzzy", vec![list(&[1, 2]), number(3)]).unwrap_err().message, "Invalid argument: 3");
+    assert_eq!(call("matchfuzzy", vec![list(&[1, 2]), list(&[])]).unwrap_err().code, "E730");
+    assert_eq!(call("matchfuzzy", vec![strings(&["a"]), text("a"), number(3)]).unwrap_err().code, "E1206");
+    let bad_key = Typval::dict(vec![(OxStr::from("key"), number(3))]);
+    assert_eq!(call("matchfuzzy", vec![strings(&["a"]), text("a"), bad_key]).unwrap_err().message, "Invalid value for argument key: 3");
+    let bad_cb = Typval::dict(vec![(OxStr::from("text_cb"), number(0))]);
+    assert_eq!(call("matchfuzzy", vec![strings(&["a"]), text("a"), bad_cb]).unwrap_err().code, "E6000");
+    let bad_limit = Typval::dict(vec![(OxStr::from("limit"), text("x"))]);
+    assert_eq!(call("matchfuzzy", vec![strings(&["a"]), text("a"), bad_limit]).unwrap_err().message, "Invalid value for argument limit");
+    assert_eq!(call("matchfuzzy", vec![strings(&["a"])]).unwrap_err().code, "E119");
+    assert_eq!(
+        call("matchfuzzy", vec![strings(&["a"]), text("a"), Typval::dict(vec![]), Typval::dict(vec![])]).unwrap_err().code,
+        "E118"
+    );
+}
+
+/// Every row was produced by `.references/neovim/build/bin/nvim`
+/// (v0.13.0-dev-1375+g8e0e19c08b) evaluating
+/// `matchfuzzypos({items}, {pattern})` and rendering it with `string()`.
+/// These pin the fzy weights, the separator and capital bonuses, the leading
+/// and trailing gap penalties, and the non-ASCII character indexing.
+#[test]
+fn matchfuzzypos_matches_upstream_scores_verbatim() {
+    let cases: &[(&[&str], &str, &str)] = &[
+        (&["ab"], "ab", "[['ab'], [[0, 1]], [2147483647]]"),
+        (&["Xy"], "xy", "[['Xy'], [[0, 1]], [2147483647]]"),
+        (
+            &["hello-world", "hello_world", "hello.world", "HelloWorld"],
+            "hw",
+            "[['hello-world', 'hello_world', 'HelloWorld', 'hello.world'], [[0, 6], [0, 6], [0, 5], [0, 6]], [1630, 1630, 1540, 1430]]",
+        ),
+        (&["a/b/c/d"], "abcd", "[['a/b/c/d'], [[0, 2, 4, 6]], [3570]]"),
+        (&["xxxxxxxxxxab"], "ab", "[['xxxxxxxxxxab'], [[10, 11]], [950]]"),
+        (&["abxxxxxxxxxx"], "ab", "[['abxxxxxxxxxx'], [[0, 1]], [1850]]"),
+        (&["Ünïcödé"], "nc", "[['Ünïcödé'], [[1, 3]], [-30]]"),
+        (&["café"], "cf", "[['café'], [[0, 2]], [885]]"),
+        (&["ababab"], "ab", "[['ababab'], [[0, 1]], [1880]]"),
+    ];
+    for (items, pattern, expected) in cases {
+        let list = Typval::list(items.iter().map(|value| text(value)).collect());
+        let matched = call("matchfuzzypos", vec![list, text(pattern)]).unwrap();
+        assert_eq!(call("string", vec![matched]).unwrap(), text(expected), "pattern {pattern}");
+    }
+}
+
+/// Oracle: `nvim -u NONE --headless -c 'echo tempname()'` yields
+/// `/tmp/nvim.<user>/<random>/0` then `.../1`, with the parent directory
+/// present at mode 0700 and the name itself not created.
+#[test]
+fn tempname_returns_unique_names_inside_a_private_directory() {
+    let Typval::String(first) = call("tempname", vec![]).unwrap() else { panic!("String expected") };
+    let Typval::String(second) = call("tempname", vec![]).unwrap() else { panic!("String expected") };
+    assert_ne!(first, second);
+
+    let first = std::path::PathBuf::from(first.to_string_lossy().into_owned());
+    let second = std::path::PathBuf::from(second.to_string_lossy().into_owned());
+    assert!(!first.exists(), "tempname() must not create the file");
+    assert_eq!(first.parent(), second.parent());
+    let parent = first.parent().expect("a tempname is never a filesystem root");
+    assert!(parent.is_dir(), "the containing directory is created");
+
+    // Boundary: the last component is a decimal counter that advances by one.
+    let counter = |path: &std::path::Path| {
+        path.file_name().expect("a trailing name").to_string_lossy().parse::<u64>().expect("a decimal counter")
+    };
+    assert_eq!(counter(&second), counter(&first) + 1);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = parent.metadata().expect("a readable directory").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "only this user may read the temporary directory");
+    }
+
+    // Documented error: tempname() takes no arguments.
+    assert_eq!(call("tempname", vec![number(1)]).unwrap_err().code, "E118");
+}
+
+/// A real Vim regex, so the glob-to-regex conversion inside the path search
+/// is exercised by the engine the editor installs rather than by a stub.
+struct VimRegex;
+
+impl RegexEngine for VimRegex {
+    fn is_match(&self, text: &OxStr, pattern: &OxStr, ignore_case: bool) -> crate::Result<bool> {
+        let source = if ignore_case {
+            format!("\\c{}", pattern.to_string_lossy())
+        } else {
+            pattern.to_string_lossy().into_owned()
+        };
+        let program = ox_regex::compile(&source, ox_regex::Magic::Magic)
+            .map_err(|error| crate::EvalError::new("E54", 0, error.to_string()))?;
+        Ok(ox_regex::exec(&program, &ox_regex::Text::new(text.to_string_lossy().into_owned())).is_some())
+    }
+}
+
+/// The `test_findfile.vim` tree, rebuilt from scratch so the test does not
+/// depend on leftovers, at an absolute root so it is independent of the
+/// process-wide current directory.
+fn findfile_fixture() -> std::path::PathBuf {
+    let root = std::env::temp_dir().join("ox-eval-findfile-fixture");
+    let _ = std::fs::remove_dir_all(&root);
+    let base = root.join("Xfinddir1");
+    std::fs::create_dir_all(base.join("Xdir2/Xdir3/Xdir2")).expect("a writable temporary directory");
+    for name in ["foo", "bar", "Xdir2/foo", "Xdir2/foobar", "Xdir2/Xdir3/bar", "Xdir2/Xdir3/barfoo"] {
+        std::fs::write(base.join(name), b"").expect("a writable fixture file");
+    }
+    root
+}
+
+/// Every expectation came from `.references/neovim/build/bin/nvim`
+/// (v0.13.0-dev-1375+g8e0e19c08b) evaluating the same call over the same
+/// tree from a current directory outside it, so results stay absolute.
+#[test]
+fn findfile_and_finddir_match_upstream_over_the_oldtest_tree() {
+    let root = findfile_fixture();
+    let directory = root.join("Xfinddir1").to_string_lossy().into_owned();
+    let cases: &[(&str, &str, &str, i64, &str)] = &[
+        ("findfile", "foo", "{d}", 1, "'{d}/foo'"),
+        ("findfile", "bar", "{d}", 1, "'{d}/bar'"),
+        ("findfile", "foobar", "{d}", 1, "''"),
+        // A directory is never a findfile() result; finddir() finds it.
+        ("findfile", "Xdir2", "{d}", 1, "''"),
+        ("finddir", "Xdir2", "{d}", 1, "'{d}/Xdir2'"),
+        ("findfile", "foo", "{d}/*", 1, "'{d}/Xdir2/foo'"),
+        ("findfile", "bar", "{d}/*", 1, "''"),
+        ("findfile", "bar", "{d}/*/*", 1, "'{d}/Xdir2/Xdir3/bar'"),
+        ("findfile", "bar", "{d}/**", 1, "'{d}/bar'"),
+        ("findfile", "bar", "{d}/**/Xdir3", 1, "'{d}/Xdir2/Xdir3/bar'"),
+        // The count after "**" caps the descent.
+        ("findfile", "barfoo", "{d}/**2", 1, "'{d}/Xdir2/Xdir3/barfoo'"),
+        ("findfile", "barfoo", "{d}/**1", 1, "''"),
+        ("findfile", "foobar", "{d}/**1", 1, "'{d}/Xdir2/foobar'"),
+        // {count}: 0 and 1 both mean the first match; too large yields none.
+        ("findfile", "bar", "{d}/**", 0, "'{d}/bar'"),
+        ("findfile", "bar", "{d}/**", 2, "'{d}/Xdir2/Xdir3/bar'"),
+        ("findfile", "bar", "{d}/**", 3, "''"),
+        ("findfile", "bar", "{d}/**", -1, "['{d}/bar', '{d}/Xdir2/Xdir3/bar']"),
+        ("finddir", "Xdir2", "{d}/**", -1, "['{d}/Xdir2', '{d}/Xdir2/Xdir3/Xdir2']"),
+        // The fixed part ends at the first '*', so "Xdir*" leaves an
+        // absolute start directory that does not exist and finds nothing.
+        ("findfile", "bar", "{d}/Xdir*/Xdir3", 1, "''"),
+        ("findfile", "bar", "{d}/*2/*3", 1, "'{d}/Xdir2/Xdir3/bar'"),
+        ("findfile", "foo", "{d},{d}/Xdir2", -1, "['{d}/foo', '{d}/Xdir2/foo']"),
+        // Upward search, with and without a stop directory.
+        ("findfile", "bar", "{d}/Xdir2/Xdir3;{d}", -1, "['{d}/Xdir2/Xdir3/bar', '{d}/bar']"),
+        ("findfile", "bar", "{d}/Xdir2/Xdir3;", -1, "['{d}/Xdir2/Xdir3/bar', '{d}/bar']"),
+    ];
+
+    let regex = VimRegex;
+    for (function, name, path, count, expected) in cases {
+        let mut builtins = Builtins::new(&regex);
+        let arguments = vec![text(name), text(&path.replace("{d}", &directory)), number(*count)];
+        let found = builtins
+            .call(&OxStr::from(*function), arguments, &mut Scope::new())
+            .unwrap_or_else(|error| panic!("{function}({name}, {path}, {count}): {error}"));
+        let rendered = call("string", vec![found]).unwrap();
+        assert_eq!(rendered, text(&expected.replace("{d}", &directory)), "{function}({name}, {path}, {count})");
+    }
+
+    // Documented error: a "**" count must end the entry or precede a '/'.
+    let mut builtins = Builtins::new(&regex);
+    let bad = vec![text("bar"), text(&format!("{directory}/**2x"))];
+    assert_eq!(builtins.call(&OxStr::from("findfile"), bad, &mut Scope::new()).unwrap_err().code, "E343");
+    // Boundary: an empty name finds nothing, and a negative count still
+    // returns a List.
+    assert_eq!(call("findfile", vec![text("")]).unwrap(), text(""));
+    assert_eq!(call("findfile", vec![text(""), text("."), number(-1)]).unwrap(), Typval::list(vec![]));
+}
+
+/// Oracle: `nvim -u NONE --headless` evaluating `findfile('bår.txt', d)` and
+/// `finddir('café', d)` over the same tree; both match.
+///
+/// Regression: `expand_env` must copy the bytes it does not expand
+/// unchanged. Re-encoding each byte as its Latin-1 scalar turns `café` into
+/// `cafÃ©`, and every non-ASCII name then misses.
+#[test]
+fn findfile_and_finddir_preserve_non_ascii_name_bytes() {
+    let root = std::env::temp_dir().join("ox-eval-findfile-non-ascii");
+    let _ = std::fs::remove_dir_all(&root);
+    let directory = root.join("café");
+    std::fs::create_dir_all(&directory).expect("a writable temporary directory");
+    std::fs::write(directory.join("bår.txt"), b"").expect("a writable fixture file");
+    let regex = VimRegex;
+
+    let arguments = vec![text("bår.txt"), text(&directory.to_string_lossy())];
+    let found = Builtins::new(&regex).call(&OxStr::from("findfile"), arguments, &mut Scope::new()).unwrap();
+    assert_eq!(found, text(&directory.join("bår.txt").to_string_lossy()));
+
+    let arguments = vec![text("café"), text(&root.to_string_lossy())];
+    let found = Builtins::new(&regex).call(&OxStr::from("finddir"), arguments, &mut Scope::new()).unwrap();
+    assert_eq!(found, text(&directory.to_string_lossy()));
+}
+
+/// Oracle: `nvim -u NONE --headless` running `:lockvar`, `:lockvar!`,
+/// `:lockvar 1`, `:unlockvar!` and `islocked()` over the same values, and
+/// `let` on a locked variable, which reports `E741: Value is locked: g:n`.
+/// `E1122` is `var_check_lock`'s text for the variable-name check.
+#[test]
+fn lockvar_and_unlockvar_apply_depth_and_report_upstream_errors() {
+    let nested = list(&[2]);
+    let mut scope = Scope::new();
+    scope.set(b"one", Typval::list(vec![number(1), nested.clone()])).unwrap();
+    scope.set(b"deep", Typval::list(vec![number(1), nested.clone()])).unwrap();
+
+    // Depth 1 locks only the outer container.
+    scope.lockvar(b"one", 1).unwrap();
+    assert_eq!(scope.islocked(b"one", 0).unwrap(), 2);
+    assert_eq!(crate::is_locked_value(&nested).unwrap(), number(0));
+
+    // A negative depth reaches every nested container, and unlocking with
+    // the same depth reverses it.
+    scope.lockvar(b"deep", -1).unwrap();
+    assert_eq!(crate::is_locked_value(&nested).unwrap(), number(3));
+    assert_eq!(call("add", vec![nested.clone(), number(9)]).unwrap_err().code, "E741");
+    scope.unlockvar(b"deep", -1).unwrap();
+    assert_eq!(scope.islocked(b"deep", 0).unwrap(), 0);
+    assert_eq!(crate::is_locked_value(&nested).unwrap(), number(0));
+    assert_eq!(call("add", vec![nested, number(9)]).unwrap(), list(&[2, 9]));
+
+    // Depth 0 changes nothing at all.
+    scope.set(b"untouched", list(&[1])).unwrap();
+    scope.lockvar(b"untouched", 0).unwrap();
+    assert_eq!(scope.islocked(b"untouched", 0).unwrap(), 0);
+
+    // The variable-name lock is reported separately from the value lock.
+    scope.set(b"scalar", number(1)).unwrap();
+    scope.lockvar(b"scalar", 2).unwrap();
+    let error = scope.check_variable_lock(b"scalar").unwrap_err();
+    assert_eq!((error.code, error.message.as_str()), ("E1122", "Variable is locked: scalar"));
+    let error = scope.check_value_lock(b"one", 0).unwrap_err();
+    assert_eq!((error.code, error.message.as_str()), ("E741", "Value is locked: one"));
+    scope.unlockvar(b"scalar", 2).unwrap();
+    assert!(scope.check_variable_lock(b"scalar").is_ok());
+
+    // Boundary: an unknown name is silently ignored, as `do_lock_var` is.
+    assert!(scope.lockvar(b"missing", 2).is_ok());
+    assert!(scope.unlockvar(b"missing", 2).is_ok());
+    // Documented error: islocked() still reports an unknown name as E121.
+    assert_eq!(scope.islocked(b"missing", 0).unwrap_err().code, "E121");
+}
+
+/// Oracle: `nvim -u NONE --headless` running `:lockvar`, `:lockvar 0` and
+/// `:unlockvar` and then assigning to the same variable:
+///
+/// - `lockvar g:n`   then `let g:n = 2`   — `E741: Value is locked: g:n`
+/// - `lockvar g:l`   then `let g:l = [2]` — `E741: Value is locked: g:l`
+/// - `lockvar s`     then `let s = 6`     — `E741: Value is locked: s`
+/// - `lockvar 0 g:n` then `let g:n = 8`   — `E1122: Variable is locked: g:n`
+/// - `lockvar 0 g:d` then `add(g:d, 5)`   — accepted, the value is unlocked
+/// - `unlockvar g:n` then `let g:n = 7`   — accepted
+#[test]
+fn assignment_to_a_locked_variable_is_refused_with_upstream_errors() {
+    let mut scope = Scope::new();
+    scope.set_scoped(ScopeKind::Global, b"n", 0, number(1)).unwrap();
+    scope.set_scoped(ScopeKind::Global, b"l", 0, list(&[1])).unwrap();
+    scope.set(b"s", number(5)).unwrap();
+
+    // The default depth locks the value too, whatever the value's type, so
+    // the value check answers first for all three.
+    scope.lockvar(b"g:n", 2).unwrap();
+    scope.lockvar(b"g:l", 2).unwrap();
+    scope.lockvar(b"s", 2).unwrap();
+    let error = scope.set_scoped(ScopeKind::Global, b"n", 0, number(2)).unwrap_err();
+    assert_eq!((error.code, error.message.as_str()), ("E741", "Value is locked: g:n"));
+    let error = scope.set_scoped(ScopeKind::Global, b"l", 0, list(&[2])).unwrap_err();
+    assert_eq!((error.code, error.message.as_str()), ("E741", "Value is locked: g:l"));
+    let error = scope.set(b"s", number(6)).unwrap_err();
+    assert_eq!((error.code, error.message.as_str()), ("E741", "Value is locked: s"));
+
+    // A refused assignment leaves the old value in place.
+    assert_eq!(scope.get_scoped(ScopeKind::Global, b"n", 0).unwrap(), &number(1));
+    assert_eq!(scope.get(b"s", 0).unwrap(), &number(5));
+
+    scope.unlockvar(b"g:n", 2).unwrap();
+    scope.set_scoped(ScopeKind::Global, b"n", 0, number(7)).unwrap();
+    assert_eq!(scope.get_scoped(ScopeKind::Global, b"n", 0).unwrap(), &number(7));
+
+    // Depth 0 marks the variable without locking its value: the assignment
+    // is refused as E1122, and the value itself still accepts add().
+    scope.lockvar(b"g:n", 0).unwrap();
+    let error = scope.set_scoped(ScopeKind::Global, b"n", 0, number(8)).unwrap_err();
+    assert_eq!((error.code, error.message.as_str()), ("E1122", "Variable is locked: g:n"));
+    scope.set_scoped(ScopeKind::Global, b"d", 0, list(&[1])).unwrap();
+    scope.lockvar(b"g:d", 0).unwrap();
+    let target = scope.get_scoped(ScopeKind::Global, b"d", 0).unwrap().clone();
+    assert_eq!(call("add", vec![target, number(5)]).unwrap(), list(&[1, 5]));
+
+    // Boundary: a name with no dict item yet carries neither flag, so it
+    // assigns; an unqualified name resolves the way `get` does, so the
+    // locked `g:n` is what an unqualified `n` would replace.
+    assert!(scope.check_assignable(b"fresh", 0).is_ok());
+    scope.set(b"fresh", number(1)).unwrap();
+    assert_eq!(scope.set(b"n", number(3)).unwrap_err().code, "E1122");
 }

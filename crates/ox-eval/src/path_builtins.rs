@@ -5,11 +5,16 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ox_types::{OxStr, Typval};
 
 use crate::error::{EvalError, Result};
 use crate::eval::RegexEngine;
+use crate::find_file::{FindSearch, FindWhat};
+use crate::scope::{OptionScope, Scope};
 
 pub(crate) fn getcwd(args: &[Typval]) -> Result<Typval> {
     for argument in args {
@@ -157,6 +162,214 @@ pub(crate) fn fnamemodify(
     }
 
     Ok(text(name))
+}
+
+/// `tempname()` — `f_tempname` (`eval/fs.c:1701-1705`) calling
+/// `vim_tempname` (`fileio.c:3588-3603`): a unique, not-yet-created name
+/// inside a private directory this process owns, numbered from 0.
+///
+/// Errors when no candidate root yields a private directory, which is
+/// upstream's `vim_gettempdir() == NULL`; upstream returns an empty string
+/// there, but it has already logged the reason, so the reason is reported.
+pub(crate) fn tempname() -> Result<Typval> {
+    static TEMPDIR: LazyLock<Option<PathBuf>> = LazyLock::new(make_tempdir);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+
+    let Some(directory) = TEMPDIR.as_ref() else {
+        return Err(EvalError::new("E5431", 0, "cannot create a temporary directory"));
+    };
+    let count = COUNT.fetch_add(1, Ordering::Relaxed);
+    // `vim_settempdir` stores the directory with a trailing separator and
+    // `vim_tempname` concatenates the counter directly onto it.
+    Ok(text(directory.join(count.to_string()).to_string_lossy()))
+}
+
+/// `vim_mktempdir` (`fileio.c:3303-3396`) followed by `vim_settempdir`:
+/// walk `TEMP_DIR_NAMES`, create `nvim.<user>` mode 0700 under the first
+/// existing root, drop the `<user>` component when that directory is not a
+/// private directory we own, then `mkdtemp` inside it.
+fn make_tempdir() -> Option<PathBuf> {
+    let user = tempdir_user();
+    for root in temp_dir_names() {
+        if !root.is_dir() {
+            continue;
+        }
+        let owned_root = root.join(format!("nvim.{user}"));
+        // Always create, to avoid a race, then verify it is ours.
+        create_private_dir(&owned_root);
+        let parent = if is_private_dir(&owned_root) { owned_root } else { root };
+        let Some(created) = mkdtemp(&parent) else { continue };
+        // `vim_FullName` so a later `:cd` cannot change the meaning.
+        return Some(fs::canonicalize(&created).unwrap_or(created));
+    }
+    None
+}
+
+/// `TEMP_DIR_NAMES` (`os/unix_defs.h:17`) with `expand_env` applied.
+fn temp_dir_names() -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(4);
+    if let Some(value) = std::env::var_os("TMPDIR") {
+        roots.push(PathBuf::from(value));
+    }
+    roots.push(PathBuf::from("/tmp"));
+    roots.push(PathBuf::from("."));
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home));
+    }
+    roots
+}
+
+/// `os_get_username` (`os/users.c`): the `/etc/passwd` name of the real uid,
+/// or the uid rendered as a decimal number when it has none. Upstream then
+/// replaces path separators, because a user name may contain them.
+fn tempdir_user() -> String {
+    let uid = current_uid();
+    let name = uid.and_then(passwd_name).unwrap_or_else(|| uid.map_or_else(|| "0".to_owned(), |uid| uid.to_string()));
+    name.replace(['/', '\\'], "_")
+}
+
+/// The real uid from `/proc/self/status`, which is how this crate already
+/// reads process and kernel state (see `hostname()`).
+fn current_uid() -> Option<u32> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    let field = status.lines().find_map(|line| line.strip_prefix("Uid:"))?;
+    field.split_whitespace().next()?.parse().ok()
+}
+
+/// The `getpwuid` name for `uid`, read from `/etc/passwd`.
+fn passwd_name(uid: u32) -> Option<String> {
+    let passwd = fs::read_to_string("/etc/passwd").ok()?;
+    for line in passwd.lines() {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        let _password = fields.next();
+        if fields.next().and_then(|value| value.parse::<u32>().ok()) == Some(uid) && !name.is_empty() {
+            return Some(name.to_owned());
+        }
+    }
+    None
+}
+
+/// `os_mkdir(path, 0700)`. Upstream lowers the umask around the whole of
+/// `vim_mktempdir` instead; setting the mode explicitly reaches the same
+/// permissions without touching process-wide state.
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> bool {
+    use std::os::unix::fs::DirBuilderExt as _;
+    fs::DirBuilder::new().mode(0o700).create(path).is_ok()
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> bool {
+    fs::create_dir(path).is_ok()
+}
+
+/// `isdir && os_file_owned() && 0700 == (perm & 0777)` (`fileio.c:3342-3346`).
+#[cfg(unix)]
+fn is_private_dir(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(metadata) = fs::metadata(path) else { return false };
+    metadata.is_dir()
+        && current_uid() == Some(metadata.uid())
+        && metadata.permissions().mode() & 0o777 == 0o700
+}
+
+#[cfg(not(unix))]
+fn is_private_dir(path: &Path) -> bool {
+    path.is_dir()
+}
+
+/// `os_mkdtemp(parent/XXXXXX)`: create a fresh private directory, retrying
+/// on collision. The candidate name follows `ox_uv::fs`'s scheme so the two
+/// temporary-path generators stay recognizably the same shape.
+fn mkdtemp(parent: &Path) -> Option<PathBuf> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..1024 {
+        let sequence = u128::from(SEQUENCE.fetch_add(1, Ordering::Relaxed));
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_nanos();
+        let name = format!("{:06x}", (stamp ^ sequence ^ u128::from(std::process::id())) & 0xff_ffff);
+        let candidate = parent.join(name);
+        if create_private_dir(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// `findfile()`/`finddir()` — `findfilendir` (`eval/fs.c:542-605`).
+///
+/// `{path}` defaults to the buffer-local `'path'`, then the global one, then
+/// upstream's compiled default `.,,`; `'suffixesadd'` is consulted for files
+/// only. A negative `{count}` collects every match into a List, and any
+/// other value returns the `{count}`-th match as a String, where 0 and 1
+/// both mean the first.
+pub(crate) fn findfilendir(
+    regex: Option<&dyn RegexEngine>,
+    args: &[Typval],
+    scope: &Scope,
+    find_what: FindWhat,
+) -> Result<Typval> {
+    let name = string_arg(&args[0])?.to_string_lossy().into_owned();
+    let mut path = option_list(scope, b"path", ".,,");
+    let mut count = 1i64;
+    if let Some(value) = args.get(1) {
+        let given = string_arg(value)?.to_string_lossy().into_owned();
+        if !given.is_empty() {
+            path = given;
+        }
+        if let Some(value) = args.get(2) {
+            count = number_arg(value)?;
+        }
+    }
+    let as_list = count < 0;
+    if name.is_empty() {
+        return Ok(if as_list { Typval::list(Vec::new()) } else { text("") });
+    }
+
+    let suffixes = match find_what {
+        FindWhat::Dir => String::new(),
+        FindWhat::File => option_list(scope, b"suffixesadd", ""),
+    };
+    let regex = regex.ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?;
+    let mut search = FindSearch::new(regex, &name, &path, &suffixes, find_what);
+
+    if as_list {
+        let mut found = Vec::new();
+        while let Some(result) = search.next_match()? {
+            found.push(text(result));
+        }
+        return Ok(Typval::list(found));
+    }
+    // Upstream keeps only the last result of the loop, so asking for more
+    // matches than exist yields an empty string rather than an earlier hit.
+    let mut result;
+    let mut remaining = count;
+    loop {
+        result = search.next_match()?;
+        remaining -= 1;
+        if remaining <= 0 || result.is_none() {
+            break;
+        }
+    }
+    Ok(result.map_or_else(|| text(""), text))
+}
+
+/// A comma-separated option value: the buffer-local value when it is not
+/// empty, else the global one, else upstream's compiled default. A `Scope`
+/// with no entry for the option is a host that never set it.
+fn option_list(scope: &Scope, name: &[u8], default: &str) -> String {
+    for option_scope in [OptionScope::Local, OptionScope::Global] {
+        if !scope.contains_option(option_scope, name) {
+            continue;
+        }
+        if let Typval::String(value) = scope.get_option(option_scope, name) {
+            if !value.as_bytes().is_empty() {
+                return value.to_string_lossy().into_owned();
+            }
+        }
+    }
+    default.to_owned()
 }
 
 fn boolean(value: bool) -> Typval {
@@ -328,7 +541,7 @@ fn shell_escape(name: &str) -> String {
     format!("'{}'", name.replace('\'', "'\\''"))
 }
 
-fn simplify_name(name: &str) -> String {
+pub(crate) fn simplify_name(name: &str) -> String {
     if name.is_empty() {
         return String::new();
     }

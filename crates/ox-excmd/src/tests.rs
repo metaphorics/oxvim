@@ -509,14 +509,52 @@ fn insert_owns_argument_bar() {
     assert_eq!(parse_one("insert |text").args, "|text");
 }
 
+/// ":write !cmd" and ":read !cmd" spend the "!" on `usefilter` and keep the
+/// rest of the line as one shell command (ex_docmd.c:2256-2275, 2291-2313).
 #[test]
 fn write_filter_owns_shell_pipeline() {
-    assert_eq!(parse_one("write !cat | sed s/a/b/").args, "!cat | sed s/a/b/");
+    let command = parse_one("write !cat | sed s/a/b/");
+    assert!(command.usefilter);
+    assert!(!command.bang);
+    assert_eq!(command.args, "cat | sed s/a/b/");
 }
 
 #[test]
 fn read_filter_owns_shell_pipeline() {
-    assert_eq!(parse_one("read !printf a|b").args, "!printf a|b");
+    let command = parse_one("read !printf a|b");
+    assert!(command.usefilter);
+    assert_eq!(command.args, "printf a|b");
+}
+
+/// ":r!cmd" is the same filter form: the bang is consumed by `usefilter`
+/// rather than left as a force flag (ex_docmd.c:2269-2271).
+#[test]
+fn read_bang_selects_the_filter_and_clears_the_bang() {
+    let command = parse_one("read!printf a|b");
+    assert!(command.usefilter);
+    assert!(!command.bang);
+    assert_eq!(command.args, "printf a|b");
+}
+
+/// ":read file" is an ordinary TRLBAR command: no filter, and a bar still
+/// separates the next command.
+#[test]
+fn read_file_is_not_a_filter_and_splits_at_bar() {
+    let commands = Parser::new().parse("read one.txt | print").unwrap_or_default();
+    assert_eq!(commands.len(), 2);
+    assert!(!commands[0].usefilter);
+    assert_eq!(commands[0].args, "one.txt");
+    assert_eq!(commands[1].command.name(), "print");
+}
+
+/// ":w!" is still a forced write, not a filter (only ":r!" maps its bang
+/// onto `usefilter`).
+#[test]
+fn write_bang_stays_a_force_flag() {
+    let command = parse_one("write! out.txt");
+    assert!(!command.usefilter);
+    assert!(command.bang);
+    assert_eq!(command.args, "out.txt");
 }
 
 #[test]

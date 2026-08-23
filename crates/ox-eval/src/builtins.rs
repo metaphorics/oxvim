@@ -103,6 +103,8 @@ impl<'a> Builtins<'a> {
             "filter" => self.filter_or_map(args, scope, CollectionOp::Filter),
             "flatten" => flatten(&args, true),
             "flattennew" => flatten(&args, false),
+            "findfile" => path_builtins::findfilendir(self.regex, &args, scope, crate::find_file::FindWhat::File),
+            "finddir" => path_builtins::findfilendir(self.regex, &args, scope, crate::find_file::FindWhat::Dir),
             "float2nr" | "trunc" => float_to_number(&args[0]),
             "floor" => float_unary(&args[0], f64::floor),
             "fnamemodify" => path_builtins::fnamemodify(self.regex, &args[0], &args[1]),
@@ -134,6 +136,7 @@ impl<'a> Builtins<'a> {
             "match" | "matchend" | "matchstr" => self.regex_match(name, &args),
             "matchlist" | "matchstrpos" => self.regex_result(name, &args),
             "matchstrlist" => self.matchstrlist(&args),
+            "matchfuzzy" | "matchfuzzypos" => self.matchfuzzy(name, &args, scope),
             "max" => extremum(&args[0], true),
             "min" => extremum(&args[0], false),
             "nr2char" => nr2char(&args),
@@ -168,6 +171,7 @@ impl<'a> Builtins<'a> {
             "tolower" => change_case(&args[0], false),
             "toupper" => change_case(&args[0], true),
             "trim" => trim(&args),
+            "tempname" => path_builtins::tempname(),
             "tr" => translate(&args),
             "utf16idx" => utf16idx(&args),
             "charidx" => charidx(&args),
@@ -332,6 +336,117 @@ impl<'a> Builtins<'a> {
             matches.push(Typval::dict(entry));
         }
         Ok(Typval::list(matches))
+    }
+
+    /// `matchfuzzy()`/`matchfuzzypos()` — `do_fuzzymatch` (`fuzzy.c:349-417`)
+    /// driving `fuzzy_match_in_list` (`fuzzy.c:200-345`). Scoring lives in
+    /// [`crate::fuzzy`]; this method owns argument validation, the `key` /
+    /// `text_cb` / `limit` / `matchseq` options, the tie-break sort, and the
+    /// two return shapes.
+    fn matchfuzzy(&mut self, name: &str, args: &[Typval], scope: &mut Scope) -> Result<Typval> {
+        let retmatchpos = name == "matchfuzzypos";
+        let Typval::List(reference) = &args[0] else {
+            return Err(EvalError::new("E686", 0, format!("Argument of {name}() must be a List")));
+        };
+        let pattern = match &args[1] {
+            Typval::String(value) => value.clone(),
+            other => {
+                let rendered = string_arg(other)?;
+                return Err(EvalError::new("E475", 0, format!("Invalid argument: {}", rendered.to_string_lossy())));
+            }
+        };
+
+        let options = fuzzy_options(args.get(2))?;
+
+        let pattern_chars = crate::fuzzy::composed_chars(pattern.as_bytes());
+        let mut found: Vec<FuzzyItem> = Vec::new();
+        for (index, item) in list_items(reference)?.into_iter().enumerate() {
+            if options.limit > 0 && saturating_i64(found.len()) >= options.limit {
+                break;
+            }
+            let Some(text) = self.fuzzy_item_text(&item, options.key.as_ref(), options.text_cb.as_ref(), scope)? else {
+                continue;
+            };
+            let haystack = crate::fuzzy::composed_chars(text.as_bytes());
+            let Some(matched) = crate::fuzzy::fuzzy_match(&haystack, &pattern_chars, options.matchseq) else {
+                continue;
+            };
+            found.push(FuzzyItem { index, item, score: matched.score, positions: matched.positions, text });
+        }
+
+        // `fuzzy_match_item_compare` (`fuzzy.c:162-189`): score descending,
+        // then an exact prefix match at the first matched position wins, then
+        // the original order. Upstream indexes `itemstr` with the character
+        // position `matches[0]` as if it were a byte offset; that quirk is
+        // observable, so it is reproduced.
+        found.sort_by(|left, right| {
+            right.score.cmp(&left.score).then_with(|| {
+                let exact = |item: &FuzzyItem| {
+                    let offset = item.positions.first().copied().unwrap_or(0);
+                    item.text.as_bytes().get(offset..).is_some_and(|tail| tail.starts_with(pattern.as_bytes()))
+                };
+                exact(right).cmp(&exact(left)).then_with(|| left.index.cmp(&right.index))
+            })
+        });
+
+        let items = found.iter().map(|entry| entry.item.clone()).collect();
+        if !retmatchpos {
+            return Ok(Typval::list(items));
+        }
+        let positions = found
+            .iter()
+            .map(|entry| {
+                // `fuzzy.c:264-276`: one position per pattern character,
+                // skipping blanks unless "matchseq" was given.
+                let mut slot = 0usize;
+                let mut values = Vec::new();
+                for character in &pattern_chars {
+                    if slot >= crate::fuzzy::MATCH_MAX_LEN {
+                        break;
+                    }
+                    if options.matchseq || !matches!(character, ' ' | '\t') {
+                        values.push(Typval::Number(saturating_i64(entry.positions.get(slot).copied().unwrap_or(0))));
+                        slot += 1;
+                    }
+                }
+                Typval::list(values)
+            })
+            .collect();
+        let scores = found.iter().map(|entry| Typval::Number(i64::from(entry.score))).collect();
+        Ok(Typval::list(vec![Typval::list(items), Typval::list(positions), Typval::list(scores)]))
+    }
+
+    /// The string a `matchfuzzy()` list item contributes: the item itself for
+    /// a String, the `key` entry or the `text_cb` result for a Dict, and
+    /// nothing for anything else, so the item is skipped (`fuzzy.c:224-254`).
+    fn fuzzy_item_text(
+        &mut self,
+        item: &Typval,
+        key: Option<&OxStr>,
+        text_cb: Option<&Typval>,
+        scope: &Scope,
+    ) -> Result<Option<OxStr>> {
+        match item {
+            Typval::String(text) => Ok(Some(text.clone())),
+            Typval::Dict(entries) => {
+                if let Some(key) = key {
+                    return dict_entries(entries)?
+                        .iter()
+                        .find(|(candidate, _)| candidate == key)
+                        .map(|(_, value)| string_arg(value))
+                        .transpose();
+                }
+                let Some(callback) = text_cb else { return Ok(None) };
+                let regex = RegexRef(self.regex);
+                let result = Evaluator::new(self, &regex)
+                    .invoke(callback.clone(), vec![item.clone()], &mut scope.snapshot())?;
+                Ok(match result {
+                    Typval::String(text) => Some(text),
+                    _ => None,
+                })
+            }
+            _ => Ok(None),
+        }
     }
 
     fn regex_substitute(&self, args: &[Typval]) -> Result<Typval> {
@@ -630,6 +745,76 @@ impl<'a> Builtins<'a> {
 
 }
 
+/// `fuzzyItem_T` (`fuzzy.c:56-65`), reduced to the fields the two return
+/// shapes and the tie-break comparator need.
+struct FuzzyItem {
+    index: usize,
+    item: Typval,
+    score: i32,
+    positions: Vec<usize>,
+    text: OxStr,
+}
+
+/// The optional third argument of `matchfuzzy()`/`matchfuzzypos()`.
+#[derive(Default)]
+struct FuzzyOptions {
+    key: Option<OxStr>,
+    text_cb: Option<Typval>,
+    limit: i64,
+    matchseq: bool,
+}
+
+/// Parse the `{dict}` argument of `matchfuzzy()` (`fuzzy.c:363-399`).
+/// `text_cb` is consulted only when `key` is absent, and `matchseq` is keyed
+/// on presence rather than value.
+fn fuzzy_options(value: Option<&Typval>) -> Result<FuzzyOptions> {
+    let Some(value) = value else { return Ok(FuzzyOptions::default()) };
+    let Typval::Dict(value) = value else {
+        return Err(EvalError::new("E1206", 0, "Dictionary required for argument 3"));
+    };
+    let entries = dict_entries(value)?;
+    let entry = |wanted: &[u8]| {
+        entries.iter().find(|(candidate, _)| candidate.as_bytes() == wanted).map(|(_, value)| value)
+    };
+    let mut options = FuzzyOptions::default();
+    if let Some(value) = entry(b"key") {
+        match value {
+            Typval::String(text) if !text.as_bytes().is_empty() => options.key = Some(text.clone()),
+            _ => {
+                let rendered = string_arg(value)?;
+                return Err(EvalError::new("E475", 0, format!("Invalid value for argument key: {}", rendered.to_string_lossy())));
+            }
+        }
+    } else if let Some(value) = entry(b"text_cb") {
+        // `tv_dict_get_callback` (`typval.c:2506-2529`) rejects a
+        // non-function, non-String value with E6000; then
+        // `callback_from_typval` rejects a String starting with a digit with
+        // E921. An empty String leaves no callback at all.
+        options.text_cb = match value {
+            Typval::Funcref(_) | Typval::Partial(_) => Some(value.clone()),
+            Typval::String(function) => match function.as_bytes().first() {
+                None => None,
+                Some(b'0'..=b'9') => return Err(EvalError::new("E921", 0, "Invalid callback argument")),
+                Some(_) => Some(Typval::Funcref(Funcref {
+                    name: function.clone(),
+                    args: Vec::new(),
+                    dict: None,
+                    registry: None,
+                })),
+            },
+            _ => return Err(EvalError::new("E6000", 0, "Argument is not a function or function name")),
+        };
+    }
+    if let Some(value) = entry(b"limit") {
+        let Typval::Number(value) = value else {
+            return Err(EvalError::new("E475", 0, "Invalid value for argument limit"));
+        };
+        options.limit = *value;
+    }
+    options.matchseq = entry(b"matchseq").is_some();
+    Ok(options)
+}
+
 #[derive(Clone, Copy)]
 enum CollectionOp { Map, Filter, MapNew, ForEach }
 
@@ -757,12 +942,13 @@ fn is_implemented(name: &str) -> bool {
     matches!(name,
         "abs" | "add" | "and" | "blob2list" | "ceil" | "char2nr" | "copy" | "count" |
         "deepcopy" | "empty" | "escape" | "executable" | "exepath" | "exists" | "extend" | "extendnew" | "filter" | "flatten" |
-        "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "get" | "gettext" | "getcwd" | "getpid" | "has" | "has_key" | "hostname" | "index" | "insert" | "items" |
+        "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "finddir" | "findfile" | "get" | "gettext" | "getcwd" | "getpid" | "has" | "has_key" | "hostname" | "index" | "insert" | "items" |
         "indexof" | "isabsolutepath" | "islocked" | "join" | "json_decode" | "json_encode" | "keytrans" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
-        "match" | "matchend" | "matchstr" | "matchlist" | "matchstrpos" | "matchstrlist" | "max" | "min" | "nr2char" | "or" | "pathshorten" | "pow" | "printf" | "range" | "reduce" | "resolve" |
+        "match" | "matchend" | "matchstr" | "matchlist" | "matchstrpos" | "matchstrlist" | "matchfuzzy" | "matchfuzzypos" |
+        "max" | "min" | "nr2char" | "or" | "pathshorten" | "pow" | "printf" | "range" | "reduce" | "resolve" |
         "remove" | "repeat" | "reverse" | "setenv" | "simplify" | "slice" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
         "str2nr" | "strcharlen" | "strchars" | "stridx" | "string" | "strpart" | "strridx" | "strtrans" | "strutf16len" | "strwidth" |
-        "substitute" | "tolower" | "toupper" | "tr" | "trim" | "trunc" | "type" | "uniq" | "utf16idx" | "charidx" | "values" | "xor"
+        "substitute" | "tempname" | "tolower" | "toupper" | "tr" | "trim" | "trunc" | "type" | "uniq" | "utf16idx" | "charidx" | "values" | "xor"
     )
 }
 
@@ -1932,35 +2118,51 @@ fn deep_copy(value: &Typval) -> Result<Typval> {
     copy(value, &mut HashMap::new(), &mut HashMap::new(), 0)
 }
 
-/// Lock a container shallowly or through every reachable container.
-pub fn lock_value(value: &Typval, deep: bool) -> Result<()> {
-    fn lock(value: &Typval, scope: ox_types::LockScope, seen: &mut HashSet<(usize, u8)>) -> Result<()> {
+/// `tv_item_lock` (`eval/typval.c`): lock or unlock a container `depth`
+/// levels down, where `depth` 0 changes nothing and a negative `depth`
+/// reaches every nested container. `:lockvar` uses 2, `:lockvar!` uses -1.
+///
+/// The recorded [`ox_types::LockScope`] is what `islocked()` reports:
+/// `Shallow` for a single level, `Deep` for anything that recurses.
+///
+/// # Errors
+/// `E742` when a container in the traversal is already borrowed.
+pub fn lock_value(value: &Typval, depth: i32, lock: bool) -> Result<()> {
+    fn apply(value: &Typval, depth: i32, lock: bool, seen: &mut HashSet<(usize, u8)>) -> Result<()> {
+        if depth == 0 {
+            return Ok(());
+        }
+        let recurse = depth < 0 || depth > 1;
+        let state = ox_types::LockState {
+            scope: if recurse { ox_types::LockScope::Deep } else { ox_types::LockScope::Shallow },
+            locked: lock,
+        };
         match value {
             Typval::List(reference) => {
                 let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_LIST);
                 if !seen.insert(key) { return Ok(()); }
                 let items = {
                     let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
-                    data.lock = ox_types::LockState { scope, locked: true };
+                    data.lock = state;
                     data.items.clone()
                 };
-                if scope == ox_types::LockScope::Deep { for item in &items { lock(item, scope, seen)?; } }
+                if recurse { for item in &items { apply(item, depth - 1, lock, seen)?; } }
             }
             Typval::Dict(reference) => {
                 let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_DICT);
                 if !seen.insert(key) { return Ok(()); }
                 let entries = {
                     let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
-                    data.lock = ox_types::LockState { scope, locked: true };
+                    data.lock = state;
                     data.entries.clone()
                 };
-                if scope == ox_types::LockScope::Deep { for (_, item) in &entries { lock(item, scope, seen)?; } }
+                if recurse { for (_, item) in &entries { apply(item, depth - 1, lock, seen)?; } }
             }
             _ => {}
         }
         Ok(())
     }
-    lock(value, if deep { ox_types::LockScope::Deep } else { ox_types::LockScope::Shallow }, &mut HashSet::new())
+    apply(value, depth, lock, &mut HashSet::new())
 }
 
 /// Return the encoded lock state: 0 unlocked, 1 direct, 2 shallow, 3 deep.

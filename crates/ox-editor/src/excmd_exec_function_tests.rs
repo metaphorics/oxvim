@@ -596,7 +596,7 @@ fn closure_captures_defining_local_scope() {
     // test_user_func.vim: closure captures.
     let mut funcs = UserFunctions::new();
     let mut scope = Scope::new();
-    scope.set(b"captured", Typval::Number(123));
+    scope.set(b"captured", Typval::Number(123)).unwrap();
     let sig = UserFunctions::parse_signature("Clo() closure").unwrap();
     funcs
         .define(sig, vec!["return l:captured".to_owned()], 0, false, &scope)

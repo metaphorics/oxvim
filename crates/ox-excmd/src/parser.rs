@@ -187,6 +187,11 @@ pub struct ExCommand {
     pub range: Option<Range>,
     /// Command bang.
     pub bang: bool,
+    /// `eap->usefilter` (`ex_docmd.c:2256-2275`): `:read !cmd`, `:read!cmd`,
+    /// and `:write !cmd` hand their whole tail to the shell. The `!` that
+    /// selected the filter is consumed, so `args` is the shell command and
+    /// is never split at `|`.
+    pub usefilter: bool,
     /// Post-command count.
     pub count: Option<u64>,
     /// Post-command register.
@@ -274,7 +279,7 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
 
         cursor = after_name;
         let bang_offset = cursor;
-        let bang = input.as_bytes().get(cursor) == Some(&b'!');
+        let mut bang = input.as_bytes().get(cursor) == Some(&b'!');
         if bang {
             if !flags.contains(CommandFlags::BANG) {
                 return Err(error(ErrorCode::E488, bang_offset, "trailing characters"));
@@ -282,7 +287,21 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
             cursor += 1;
         }
         cursor = skip_ascii_space(input, cursor);
-        let end = command_end(input, cursor, &command, flags, bang);
+        // ":r!cmd" spends its bang on the filter, and a "!" standing where
+        // ":read"/":write" expect a file name selects the filter too
+        // (ex_docmd.c:2256-2275). Either way the "!" is consumed here so the
+        // remaining line is one shell command.
+        let mut usefilter = false;
+        if command.name() == "read" && bang {
+            usefilter = true;
+            bang = false;
+        } else if matches!(command.name(), "read" | "write")
+            && input.as_bytes().get(cursor) == Some(&b'!')
+        {
+            usefilter = true;
+            cursor += 1;
+        }
+        let end = command_end(input, cursor, flags, usefilter, command.name());
         let mut args_start = cursor;
         let mut args_end = end;
         trim_ascii_space(input, &mut args_start, &mut args_end);
@@ -315,6 +334,7 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
                 modifiers,
                 range,
                 bang,
+                usefilter,
                 count,
                 register,
                 args: args.trim_end().to_owned(),
@@ -325,7 +345,10 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
     }
 }
 
-fn effective_flags(command: &ResolvedCommand) -> CommandFlags {
+/// The argument flags that govern one resolved command: a built-in's table
+/// entry, or the fixed set upstream gives user commands.
+#[must_use]
+pub fn effective_flags(command: &ResolvedCommand) -> CommandFlags {
     match command {
         ResolvedCommand::Builtin(spec) => spec.flags,
         ResolvedCommand::User(_) => CommandFlags(
@@ -701,17 +724,17 @@ fn parse_pattern(input: &str, start: usize, delimiter: u8) -> Result<(String, us
 fn command_end(
     input: &str,
     args_start: usize,
-    command: &ResolvedCommand,
     flags: CommandFlags,
-    bang: bool,
+    usefilter: bool,
+    name: &str,
 ) -> usize {
-    let name = command.name();
     if matches!(name, "append" | "change" | "insert") {
         return input.len();
     }
-    if matches!(name, "read" | "write")
-        && (input[args_start..].starts_with('!') || (name == "read" && bang))
-    {
+    // ":read !cmd" and ":write !cmd" own the rest of the line: upstream skips
+    // separate_nextcmd for them (ex_docmd.c:2291-2313), so a "|" inside the
+    // shell command is not a command separator.
+    if usefilter {
         return input.len();
     }
     if matches!(name, "execute" | "echo" | "echon" | "echomsg" | "echoerr") {

@@ -5,7 +5,7 @@
 
 use ox_text::{Buffer, Position};
 
-use crate::{Editor, Geometry, Keys, MapMode, MappingAction, MappingOptions, Mode, ModeMachine, TypeaheadFlags};
+use crate::{BufferRelease, Editor, Geometry, Keys, MapMode, MappingAction, MappingOptions, Mode, ModeMachine, TypeaheadFlags};
 
 fn position(lnum: usize, col: usize) -> Position { Position { lnum, col } }
 
@@ -258,4 +258,27 @@ fn run_once_expands_mapped_keys_before_mode_execution() {
 
     assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), b"X");
     assert!(matches!(machine.mode(), Mode::Normal(_)));
+}
+
+#[test]
+fn append_runs_after_the_window_buffer_shrank_under_the_cursor() {
+    // A window keeps its cursor across a buffer switch, so switching to a
+    // shorter buffer leaves `w_cursor.lnum` past the last line. Upstream pulls
+    // it back with `check_cursor_lnum` (cursor.c) before the command runs;
+    // indexing the line list with the stale value crashed the process on
+    // test_visual.vim.
+    let mut editor = Editor::new();
+    let long = editor.create_buffer_with(Buffer::from_bytes(b"one\ntwo\nthree").unwrap(), true).unwrap();
+    let tab = editor.create_tabpage(long, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.set_window_cursor(window, position(3, 0)).unwrap();
+
+    let short = editor.create_buffer_with(Buffer::from_bytes(b"x").unwrap(), true).unwrap();
+    editor.set_window_buffer(window, short, BufferRelease::KeepLoaded).unwrap();
+
+    let mut machine = ModeMachine::default();
+    machine.feed_keys(&mut editor, "aY\u{1b}").unwrap();
+
+    assert_eq!(editor.buffer(short).unwrap().text().unwrap().to_bytes(), b"xY");
+    assert_eq!(editor.window(window).unwrap().cursor, position(1, 1));
 }
