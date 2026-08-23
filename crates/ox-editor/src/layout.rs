@@ -51,6 +51,15 @@ pub struct WindowState {
     pub cursor: Position,
     /// One-based first buffer line displayed by the window.
     pub topline: usize,
+    /// Upstream `w_curswant`: the zero-based virtual column the cursor wants
+    /// to keep across vertical motions (`move.c`).
+    pub curswant: i64,
+    /// Upstream `w_set_curswant`: whether [`Self::curswant`] must be
+    /// recomputed from the cursor before it is next read.
+    pub set_curswant: bool,
+    /// Upstream `pos_T.coladd`: virtual cells past the cursor's character,
+    /// used by `'virtualedit'`.
+    pub coladd: i64,
 }
 
 impl WindowState {
@@ -61,6 +70,9 @@ impl WindowState {
             buffer,
             cursor,
             topline: 1,
+            curswant: 0,
+            set_curswant: true,
+            coladd: 0,
         }
     }
 }

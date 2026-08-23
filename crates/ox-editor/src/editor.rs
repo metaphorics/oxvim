@@ -346,6 +346,21 @@ impl Editor {
         Ok(self.tabpage(tab)?.window(resolved)?)
     }
 
+    /// Returns mutable viewport state for a live window.
+    pub fn window_mut(&mut self, window: WinHandle) -> Result<&mut WindowState, EditorError> {
+        let resolved = self.resolve_window_handle(window)?;
+        let tab = self
+            .windows
+            .get(&resolved)
+            .copied()
+            .ok_or(EditorError::UnknownWindow(resolved))?;
+        Ok(self
+            .tabpages
+            .get_mut(&tab)
+            .ok_or(EditorError::UnknownTabpage(tab))?
+            .window_mut(resolved)?)
+    }
+
     /// Makes a live window and its owning tabpage current.
     pub fn set_current_window(&mut self, window: WinHandle) -> Result<(), EditorError> {
         let resolved = if window.is_current() {

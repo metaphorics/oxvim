@@ -35,7 +35,6 @@ pub(crate) fn call<F: FileIO>(
         "bufname" | "bufnr" => call_buffer_identity_builtin(host.editor, name, &args),
         "getbufvar" => call_getbufvar_builtin(host.editor, scope, args),
         "last_buffer_nr" => call_last_buffer_nr_builtin(host.editor, &args),
-        "line" => call_line_builtin(host.editor, args),
         "setbufvar" => call_setbufvar_builtin(host.editor, scope, args),
         _ => unreachable!("buffer builtin route and dispatcher disagree"),
     }
@@ -206,16 +205,6 @@ fn call_append_builtin(editor: &mut Editor, args: Vec<Typval>) -> ox_eval::Resul
         .append_buffer_lines(buffer, after, &lines, cursor, 0)
         .map_err(|error| EvalError::new("E16", 0, error.to_string()))?;
     Ok(Typval::Number(0))
-}
-
-fn call_line_builtin(editor: &mut Editor, args: Vec<Typval>) -> ox_eval::Result<Typval> {
-    if args.is_empty() {
-        return Err(EvalError::new("E119", 0, "Not enough arguments for function: line"));
-    }
-    if args.len() > 2 {
-        return Err(EvalError::new("E118", 0, "Too many arguments for function: line"));
-    }
-    current_line_address(editor, &args[0]).map(|line| Typval::Number(line as i64))
 }
 
 fn current_line_address(editor: &mut Editor, value: &Typval) -> ox_eval::Result<usize> {

@@ -54,7 +54,7 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         "assert_equal" | "assert_equalfile" | "assert_exception" | "assert_fails"
         | "assert_false" | "assert_inrange" | "assert_match" | "assert_notequal"
         | "assert_notmatch" | "assert_report" | "assert_true" => Family::Assert,
-        "append" | "bufexists" | "bufname" | "bufnr" | "getbufvar" | "last_buffer_nr" | "line"
+        "append" | "bufexists" | "bufname" | "bufnr" | "getbufvar" | "last_buffer_nr"
         | "setbufvar" => Family::Buffer,
         "chdir" | "eventhandler" | "highlight_exists" | "hlexists" | "strftime" => {
             Family::Environment
@@ -63,7 +63,10 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         | "function" | "luaeval" | "submatch" => Family::Eval,
         "swapfilelist" => Family::FileSystem,
         "getchar" | "getcharstr" | "input" | "inputdialog" | "inputlist" => Family::Input,
-        "getcurpos" | "setpos" | "virtcol" => Family::Position,
+        "charcol" | "col" | "cursor" | "getcharpos" | "getcurpos" | "getcursorcharpos"
+        | "getpos" | "line" | "setcharpos" | "setcursorcharpos" | "setpos" | "virtcol" => {
+            Family::Position
+        }
         "chansend" | "jobpid" | "jobsend" | "jobstart" | "jobstop" | "jobwait" | "system"
         | "systemlist" => Family::Process,
         "screenattr" | "screenchar" | "screenchars" | "screenstring" | "tabpagenr" | "win_getid"

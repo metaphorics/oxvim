@@ -103,6 +103,8 @@ mod input_tests;
 #[cfg(test)]
 mod mode_tests;
 #[cfg(test)]
+mod position_tests;
+#[cfg(test)]
 mod task09d_tests;
 #[cfg(test)]
 mod tests;

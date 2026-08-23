@@ -443,6 +443,7 @@ dependencies = [
  "ox-types",
  "ox-uv",
  "thiserror 2.0.20",
+ "unicode-width",
 ]
 
 [[package]]

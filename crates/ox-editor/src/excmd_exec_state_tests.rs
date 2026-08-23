@@ -1407,7 +1407,11 @@ fn position_builtins_round_trip_and_expand_tabs() {
     let mut exec = ExExecutor::new();
     exec.execute_script(&mut editor, "position.vim", "call setline(1, \"the\tquick\")\ncall setpos('.', [0, 1, 4, 0])\nlet g:position = getcurpos()\nlet g:column = virtcol('.')\nlet g:span = virtcol('.', v:true)").unwrap();
     assert_eq!(editor.window(window).unwrap().cursor, Position { lnum: 1, col: 3 });
-    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"position", 0), Ok(&Typval::list(vec![Typval::Number(0), Typval::Number(1), Typval::Number(4), Typval::Number(0), Typval::Number(4)])));
+    // move.c:update_curswant — the wanted column is the cursor's virtual
+    // column, and plines.c:getvcol puts the Normal-mode cursor on a tab's
+    // last cell: 'ts'=8 spans the tab over virtual columns 4-8, so
+    // w_curswant is 7 and getcurpos() answers 8.
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"position", 0), Ok(&Typval::list(vec![Typval::Number(0), Typval::Number(1), Typval::Number(4), Typval::Number(0), Typval::Number(8)])));
     assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"column", 0), Ok(&Typval::Number(8)));
     assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"span", 0), Ok(&Typval::list(vec![Typval::Number(4), Typval::Number(8)])));
 }
