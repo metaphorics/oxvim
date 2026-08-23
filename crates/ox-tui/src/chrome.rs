@@ -14,6 +14,14 @@ use thiserror::Error;
 pub const EPHEMERAL_LIFETIME_MS: u64 = 4_000;
 /// At most five ordinary messages are shown outside the history float.
 pub const MAX_VISIBLE_MESSAGES: usize = 5;
+/// The narrowest a client float may be and still show text: a one-cell frame
+/// on each side plus six columns of content.
+///
+/// Only the popup-menu documentation preview is sized from leftover space, so
+/// it is the only surface that can fall below this. It is dropped rather than
+/// clipped: at 20 columns a full-width completion menu leaves nothing beside
+/// it, and a two-column strip of border would be worse than no preview.
+pub const MIN_FLOAT_COLUMNS: usize = 8;
 
 /// A deterministic monotonic timestamp supplied by the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1079,7 +1087,7 @@ fn popup_layout(
     let y = popup.anchor.row.saturating_add(1).min(rows.saturating_sub(height));
     let menu = Rect { x, y, width, height };
 
-    let documentation = popup.documentation().map(|info| {
+    let documentation = popup.documentation().and_then(|info| {
         let desired = String::from_utf8_lossy(info)
             .lines()
             .map(str::len)
@@ -1088,13 +1096,25 @@ fn popup_layout(
             .saturating_add(4);
         let available_right = columns.saturating_sub(menu.x.saturating_add(menu.width));
         let available_left = menu.x;
-        let doc_width = desired.min(available_right.max(available_left));
-        let doc_x = if available_right >= available_left {
+        // The preview takes the roomier side. Neither side wide enough is the
+        // narrow-terminal case: the preview is dropped so the completion menu
+        // keeps its columns, instead of clipping the preview to a strip of
+        // border with no text in it.
+        let (available, on_right) = if available_right >= available_left {
+            (available_right, true)
+        } else {
+            (available_left, false)
+        };
+        if available < MIN_FLOAT_COLUMNS {
+            return None;
+        }
+        let doc_width = desired.min(available);
+        let doc_x = if on_right {
             menu.x.saturating_add(menu.width)
         } else {
             menu.x.saturating_sub(doc_width)
         };
-        Rect { x: doc_x, y: menu.y, width: doc_width, height: height.min(rows.saturating_sub(menu.y)) }
+        Some(Rect { x: doc_x, y: menu.y, width: doc_width, height: height.min(rows.saturating_sub(menu.y)) })
     });
     (Some(menu), documentation)
 }
@@ -1611,5 +1631,74 @@ mod tests {
         assert_eq!(chrome.messages.len(), 1);
         chrome.advance_time(TimeMs(4_010));
         assert!(chrome.messages.is_empty());
+    }
+
+    /// A completion menu anchored at `column` with an item wide enough to make
+    /// the menu `word.len() + 8` columns, and a one-line documentation body.
+    fn popup_with_documentation(word: &str, column: usize) -> Chrome {
+        let mut chrome = Chrome::default();
+        chrome.popupmenu_show(
+            vec![PopupItem::new(word, "", "", "doc body")],
+            Some(0),
+            0,
+            column,
+            1,
+        );
+        chrome
+    }
+
+    // Two promises: the preview takes the roomier side, and it is dropped when
+    // that side cannot hold `MIN_FLOAT_COLUMNS`. Each case is arranged so the
+    // other promise gives the wrong answer on its own — a placement-only rule
+    // would still return a rect at 20 columns, and a suppression-only rule
+    // would put every preview on the same side.
+    #[test]
+    fn the_documentation_preview_picks_the_roomier_side_or_is_dropped() {
+        // Room on the right: the preview starts where the menu ends. A
+        // left-preferring rule would answer x < menu.x here.
+        let chrome = popup_with_documentation("word", 0);
+        let layout = chrome.layout(80, 24, None);
+        let menu = layout.insert_popup.expect("menu");
+        let documentation = layout.documentation.expect("preview beside a wide menu");
+        assert_eq!(documentation.x, menu.x + menu.width);
+        assert!(documentation.width >= MIN_FLOAT_COLUMNS);
+
+        // Menu pushed to the right edge: the left side is roomier, so the
+        // preview ends exactly where the menu starts. A right-preferring rule
+        // would run off the screen.
+        let chrome = popup_with_documentation("word", 60);
+        let layout = chrome.layout(80, 24, None);
+        let menu = layout.insert_popup.expect("menu");
+        let documentation = layout.documentation.expect("preview left of the menu");
+        assert_eq!(documentation.x + documentation.width, menu.x);
+
+        // Twenty columns: a menu that fills the width leaves neither side
+        // anything, so the preview is dropped and the menu keeps its columns.
+        // A clipping rule would answer Some with width 0.
+        let chrome = popup_with_documentation("a-long-completion", 0);
+        let layout = chrome.layout(20, 24, None);
+        let menu = layout.insert_popup.expect("menu survives a narrow terminal");
+        assert_eq!(menu.width, 20);
+        assert_eq!(layout.documentation, None);
+    }
+
+    // The threshold itself, one case on each side of it: a rule that used `<=`
+    // or a different constant answers the other way on one of these.
+    #[test]
+    fn the_preview_threshold_admits_exactly_min_float_columns() {
+        // A menu of width `columns - MIN_FLOAT_COLUMNS` leaves exactly the
+        // minimum on the right.
+        let chrome = popup_with_documentation("wordwordwo", 0);
+        let layout = chrome.layout(18 + MIN_FLOAT_COLUMNS, 24, None);
+        assert_eq!(layout.insert_popup.map(|menu| menu.width), Some(18));
+        assert_eq!(
+            layout.documentation.map(|rect| rect.width),
+            Some(MIN_FLOAT_COLUMNS),
+            "exactly the minimum is admitted"
+        );
+
+        let layout = chrome.layout(18 + MIN_FLOAT_COLUMNS - 1, 24, None);
+        assert_eq!(layout.insert_popup.map(|menu| menu.width), Some(18));
+        assert_eq!(layout.documentation, None, "one column short is dropped");
     }
 }
