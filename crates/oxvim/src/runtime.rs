@@ -350,7 +350,13 @@ fn create_startup_windows(
 /// input, so every startup command is already done by the first input line.
 /// `-E`/`-Es` set upstream's `input_istext`, which instead reads standard
 /// input as buffer text during startup, before the `-c`/`+cmd` arguments.
-pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<(), AppError> {
+///
+/// A startup command that quits ends the process there (`main.c` `getout`):
+/// the remaining startup work and the whole Ex input loop are skipped, and
+/// the requested status is the process status.
+///
+/// Returns the exit code the last executed command asked for.
+pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).map_err(AppError::Io)?;
 
@@ -377,23 +383,35 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<(), AppError> {
         .set_runtime_roots_from_rtp(&default_rtp);
     executor.set_channel_ids(editor.channel_ids());
 
-    execute_lines(&mut executor, &mut editor, &cli.pre_commands)?;
-    timer.mark("sourcing vimrc file(s)");
-    let input_is_text = cli.batch.is_some_and(|batch| batch.input_is_text);
-    if input_is_text {
-        let text = Buffer::from_bytes(input.as_bytes())
-            .map_err(|error| AppError::Ex(format!("E474: {error}")))?;
-        editor
-            .buffer_mut(buffer)
-            .map_err(|error| AppError::Editor(error.to_string()))?
-            .load(text);
-    } else {
-        open_startup_buffers(&mut editor, cli)?;
-    }
-    timer.mark("opening buffers");
-    execute_lines(&mut executor, &mut editor, &cli.commands)?;
-    if !input_is_text {
-        execute_lines(&mut executor, &mut editor, input.lines().collect::<Vec<_>>().as_slice())?;
+    let mut exit_code = 0;
+    'startup: {
+        if let Some(code) = execute_lines(&mut executor, &mut editor, &cli.pre_commands)? {
+            exit_code = code;
+            break 'startup;
+        }
+        timer.mark("sourcing vimrc file(s)");
+        let input_is_text = cli.batch.is_some_and(|batch| batch.input_is_text);
+        if input_is_text {
+            let text = Buffer::from_bytes(input.as_bytes())
+                .map_err(|error| AppError::Ex(format!("E474: {error}")))?;
+            editor
+                .buffer_mut(buffer)
+                .map_err(|error| AppError::Editor(error.to_string()))?
+                .load(text);
+        } else {
+            open_startup_buffers(&mut editor, cli)?;
+        }
+        timer.mark("opening buffers");
+        if let Some(code) = execute_lines(&mut executor, &mut editor, &cli.commands)? {
+            exit_code = code;
+            break 'startup;
+        }
+        if !input_is_text {
+            let lines = input.lines().collect::<Vec<_>>();
+            if let Some(code) = execute_lines(&mut executor, &mut editor, &lines)? {
+                exit_code = code;
+            }
+        }
     }
 
     let mut sink = PrintfSink::default();
@@ -401,25 +419,27 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<(), AppError> {
         sink.write(*destination, message).map_err(AppError::Io)?;
     }
     sink.finish(editor.message_routing).map_err(AppError::Io)?;
-    Ok(())
+    Ok(exit_code)
 }
 
+/// Runs each line, stopping at the first command that quits and reporting the
+/// exit status it asked for.
 fn execute_lines<S: AsRef<str>>(
     executor: &mut ExExecutor,
     editor: &mut Editor,
     lines: &[S],
-) -> Result<(), AppError> {
+) -> Result<Option<i64>, AppError> {
     for line in lines {
         for command in split_commands(line.as_ref()) {
             let outcome = executor
                 .execute_line(editor, command)
                 .map_err(|error| AppError::Ex(error.to_string()))?;
-            if let ExecOutcome::Quit(_) = outcome {
-                return Ok(());
+            if let ExecOutcome::Quit(code) = outcome {
+                return Ok(Some(code));
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn split_commands(line: &str) -> Vec<&str> {

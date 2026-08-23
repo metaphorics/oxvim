@@ -589,6 +589,26 @@ fn window_height_flag_sets_the_window_option() {
     );
 }
 
+/// `main.c` `getout()`: a startup command that quits ends the process there,
+/// before the Ex input loop reads a line, and the status it asked for is the
+/// process status.
+#[test]
+fn a_startup_quit_skips_the_ex_input_loop() {
+    let marker = TempFile::new(".txt", "");
+    let script = format!("call writefile([\"ran\"], \"{}\")\n", marker.text());
+    let output = batch_verbose(&["-c", "qa!"], &script);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(marker.text()).expect("read marker"),
+        "",
+        "piped Ex input ran after a startup quit"
+    );
+
+    // The requested status travels with the quit (`:cquit 7`).
+    let coded = batch(&["-c", "cquit 7"], &script);
+    assert_eq!(coded.status.code(), Some(7));
+}
+
 /// Upstream accepts these and does nothing with them, so accepting them is
 /// parity rather than a silent no-op: `--literal` because file names are
 /// always literal, `-N`/`-X`/`-f` because they are compatibility stubs, and

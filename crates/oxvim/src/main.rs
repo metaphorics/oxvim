@@ -125,7 +125,7 @@ fn run_editor(
     timer: &mut startuptime::StartupTimer,
 ) -> Result<ExitCode, AppError> {
     if cli.batch.is_some() {
-        return runtime::run_batch(cli, timer).map(|()| ExitCode::SUCCESS);
+        return runtime::run_batch(cli, timer).map(process_code);
     }
     // A listening headless process must enter its network loop rather than the
     // stdio server; --listen is therefore selected before --headless/embed.
