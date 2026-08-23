@@ -2941,7 +2941,12 @@ fn buffer_from_file<F: FileIO>(
 }
 
 fn command_edit<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
-    let path = PathBuf::from(command.args.trim());
+    // `ea.arg` is the file name as written: the parser already skipped leading
+    // space/tab and, because `:edit` is EX_TRLBAR without EX_NOTRLCOM, ran
+    // `del_trailing_spaces` over it. Trimming again here would drop control
+    // bytes upstream keeps, so `:edit Xa<CR>` really does name a buffer
+    // ending in a CR.
+    let path = PathBuf::from(command.args.as_str());
     if path.as_os_str().is_empty() {
         return error_flow(runtime, "E32", "No file name");
     }
@@ -5501,7 +5506,11 @@ fn command_delcommand<F: FileIO>(runtime: &mut ExRuntime<F>, command: &ExCommand
 
 fn command_invoke_user<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, lua: Option<&Rc<RefCell<dyn LuaExec>>>, name: &str, command: &ExCommand) -> Flow {
     let Some(definition) = runtime.user_commands.commands.get(name).cloned() else { return error_flow(runtime, "E492", format!("Not an editor command: {name}")) };
-    let args = command.args.trim();
+    // `<args>`/`<q-args>` expand `ea.arg` as written (`uc_check_code`), so
+    // the argument is not trimmed again here: the parser already skipped
+    // leading space/tab and removed unescaped trailing space/tab, and a CR
+    // upstream keeps must survive into the expansion.
+    let args = command.args.as_str();
     let count = count_ex_arguments(args);
     let valid = match definition.nargs { '0' => count == 0, '1' => count == 1, '?' => count <= 1, '+' => count >= 1, '*' => true, _ => false };
     if !valid { return error_flow(runtime, "E471", "Argument required") }
@@ -5697,10 +5706,25 @@ fn command_map<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope
     let local_leader = map_leader(scope, "maplocalleader");
     let map_scope = if flags.buffer { MapScope::Buffer(editor.current_buffer().unwrap_or(BufHandle::CURRENT)) } else { MapScope::Global };
     if name.ends_with("clear") { editor.mappings_mut().mapclear(modes, map_scope); return Flow::Normal; }
-    let mut split = args.splitn(2, char::is_whitespace).filter(|part| !part.is_empty());
-    let Some(lhs) = split.next() else { return Flow::Normal };
-    let lhs = Keys::parse_notation(lhs, &leader, &local_leader);
-    if name.ends_with("unmap") {
+    // `str_to_mapargs` (`mapping.c:463-475`): the lhs runs to the next space
+    // or tab, with a CTRL-V or backslash pulling the following byte in even
+    // when it is whitespace; `:unmap` takes literal whitespace so the whole
+    // rest is its lhs. The rhs is `skipwhite(lhs_end)` to the end of the
+    // argument — never trimmed, so a trailing space or CR is part of it.
+    let is_unmap = name.ends_with("unmap");
+    let bytes = args.as_bytes();
+    let mut lhs_end = 0;
+    while lhs_end < bytes.len() && (is_unmap || !matches!(bytes[lhs_end], b' ' | b'\t')) {
+        if matches!(bytes[lhs_end], 0x16 | b'\\') && lhs_end + 1 < bytes.len() {
+            lhs_end += 1;
+        }
+        lhs_end += 1;
+    }
+    if lhs_end == 0 {
+        return Flow::Normal;
+    }
+    let lhs = Keys::parse_notation(&args[..lhs_end], &leader, &local_leader);
+    if is_unmap {
         // `do_map`'s `retval = 2` (`mapping.c`): unmapping something that is
         // not mapped is an error, not a silent no-op.
         return if editor.mappings_mut().unmap(&lhs, modes, map_scope) == 0 {
@@ -5709,8 +5733,10 @@ fn command_map<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope
             Flow::Normal
         };
     }
-    let Some(rhs) = split.next() else { return error_flow(runtime, "E474", "Invalid argument") };
-    let rhs = rhs.trim();
+    let rhs = &args[lhs_end + args[lhs_end..].bytes().take_while(|byte| matches!(byte, b' ' | b'\t')).count()..];
+    if rhs.is_empty() {
+        return error_flow(runtime, "E474", "Invalid argument");
+    }
     if flags.unique && editor.mappings().conflicts(&lhs, modes, map_scope) {
         return error_flow(runtime, "E227", format!("Mapping already exists for {}", String::from_utf8_lossy(lhs.as_bytes())));
     }

@@ -309,9 +309,23 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
             cursor += 1;
         }
         let end = command_end(input, cursor, flags, usefilter, command.name());
-        let mut args_start = cursor;
-        let mut args_end = end;
-        trim_ascii_space(input, &mut args_start, &mut args_end);
+        // `ea.arg = skipwhite(p)` (`ex_docmd.c`): space and tab only, so a CR
+        // or a newline that ends the argument stays in it.
+        let args_start = skip_ascii_space(input, cursor).min(end);
+        // Trailing whitespace is removed by `separate_nextcmd`, which runs
+        // only for an `EX_TRLBAR` command that is not a filter, and only calls
+        // `del_trailing_spaces` when `EX_NOTRLCOM` is absent
+        // (`ex_docmd.c:4162-4164`). So `:normal`, `:let`, `:execute` and
+        // `:map` keep every trailing byte, and `:edit` loses only unescaped
+        // spaces and tabs.
+        let args_end = if flags.contains(CommandFlags::TRLBAR)
+            && !flags.contains(CommandFlags::NOTRLCOM)
+            && !usefilter
+        {
+            del_trailing_spaces(input, args_start, end)
+        } else {
+            end
+        };
 
         let mut args = input[args_start..args_end].to_owned();
         let register = if flags.contains(CommandFlags::REGSTR) {
@@ -356,7 +370,7 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
                 usefilter,
                 count,
                 register,
-                args: args.trim_end().to_owned(),
+                args,
                 span: start..end,
             },
             end,
@@ -944,18 +958,27 @@ fn skip_space_and_colons(input: &str, mut cursor: usize) -> usize {
     }
 }
 
+/// `skipwhite` (`charset.c`): `ascii_iswhite` is space and tab only
+/// (`ascii_defs.h:84-87`), so CR, NL and every other control byte stop it.
 fn skip_ascii_space(input: &str, mut cursor: usize) -> usize {
-    while input.as_bytes().get(cursor).is_some_and(u8::is_ascii_whitespace) {
+    while matches!(input.as_bytes().get(cursor), Some(b' ' | b'\t')) {
         cursor += 1;
     }
     cursor
 }
 
-fn trim_ascii_space(input: &str, start: &mut usize, end: &mut usize) {
-    *start = skip_ascii_space(input, *start);
-    while *end > *start && input.as_bytes()[*end - 1].is_ascii_whitespace() {
-        *end -= 1;
+/// `del_trailing_spaces` (`strings.c:429-436`): removes trailing spaces and
+/// tabs, stops at one escaped with `\` or CTRL-V, and never removes the
+/// first byte of the argument.
+fn del_trailing_spaces(input: &str, start: usize, mut end: usize) -> usize {
+    let bytes = input.as_bytes();
+    while end > start + 1
+        && matches!(bytes[end - 1], b' ' | b'\t')
+        && !matches!(bytes[end - 2], b'\\' | 0x16)
+    {
+        end -= 1;
     }
+    end
 }
 
 fn error(code: ErrorCode, offset: usize, message: impl Into<String>) -> ParseError {

@@ -396,11 +396,19 @@ fn hide_is_a_modifier_when_a_command_follows() {
 // src/nvim/ex_docmd.c:4112-4165 (separate_nextcmd): EX_TRLBAR gates generic
 // bar splitting; commands such as :normal and :global own their remaining
 // argument text.
+//
+// The trailing space before the bar is part of the argument for every command
+// below, and that is upstream: `del_trailing_spaces` runs only from inside
+// `separate_nextcmd`, so it is reached only by an EX_TRLBAR command, and then
+// only when EX_NOTRLCOM is absent. `:substitute` and `:echo` have no
+// EX_TRLBAR at all (they find their own bar in `do_sub`/`ex_echo`) and the
+// vimgrep family has EX_NOTRLCOM, so none of them is ever trimmed.
+// `write_splits_at_bar` below is the other side of that rule.
 #[test]
 fn substitute_splits_at_trailing_bar() {
     let commands = Parser::new().parse("s/a/b/ | echo done").unwrap_or_default();
     assert_eq!(commands.len(), 2);
-    assert_eq!(commands[0].args, "/a/b/");
+    assert_eq!(commands[0].args, "/a/b/ ");
     assert_eq!(commands[1].command.name(), "echo");
 }
 
@@ -413,7 +421,7 @@ fn vimgrep_pattern_bar_is_not_a_separator() {
     let commands = Parser::new().parse("vimgrep /foo|bar/ f | copen").unwrap_or_default();
     assert_eq!(commands.len(), 2);
     assert_eq!(commands[0].command.name(), "vimgrep");
-    assert_eq!(commands[0].args, "/foo|bar/ f");
+    assert_eq!(commands[0].args, "/foo|bar/ f ");
     assert_eq!(commands[1].command.name(), "copen");
 }
 
@@ -422,7 +430,7 @@ fn vimgrepadd_pattern_bar_is_not_a_separator() {
     let commands = Parser::new().parse("vimgrepadd /a|b/ file | echo x").unwrap_or_default();
     assert_eq!(commands.len(), 2);
     assert_eq!(commands[0].command.name(), "vimgrepadd");
-    assert_eq!(commands[0].args, "/a|b/ file");
+    assert_eq!(commands[0].args, "/a|b/ file ");
     assert_eq!(commands[1].command.name(), "echo");
 }
 
@@ -431,14 +439,14 @@ fn lvimgrep_pattern_with_flags_splits_after_files() {
     let commands = Parser::new().parse("lvimgrep /a|b/g file | print").unwrap_or_default();
     assert_eq!(commands.len(), 2);
     assert_eq!(commands[0].command.name(), "lvimgrep");
-    assert_eq!(commands[0].args, "/a|b/g file");
+    assert_eq!(commands[0].args, "/a|b/g file ");
 }
 
 #[test]
 fn substitute_pattern_may_contain_bar() {
     let commands = Parser::new().parse(r"s/a\|b/c/ | print").unwrap_or_default();
     assert_eq!(commands.len(), 2);
-    assert_eq!(commands[0].args, r"/a\|b/c/");
+    assert_eq!(commands[0].args, "/a\\|b/c/ ");
 }
 
 #[test]
@@ -484,14 +492,60 @@ fn write_splits_at_bar() {
 fn echo_splits_at_top_level_bar() {
     let commands = Parser::new().parse("echo 'a|b' | print").unwrap_or_default();
     assert_eq!(commands.len(), 2);
-    assert_eq!(commands[0].args, "'a|b'");
+    assert_eq!(commands[0].args, "'a|b' ");
 }
 
 #[test]
 fn echo_boolean_or_is_not_a_separator() {
     let commands = Parser::new().parse("echo left || right | print").unwrap_or_default();
     assert_eq!(commands.len(), 2);
-    assert_eq!(commands[0].args, "left || right");
+    assert_eq!(commands[0].args, "left || right ");
+}
+
+/// A trailing CR belongs to the argument of *every* command. Nothing in
+/// `do_one_cmd` removes it: `ea.arg = skipwhite(p)` skips space and tab only
+/// (`ascii_iswhite`, `ascii_defs.h:84-87`), and the one trimmer,
+/// `del_trailing_spaces` (`strings.c:429-436`), also takes space and tab only
+/// — and is reached only from `separate_nextcmd`.
+///
+/// Oracle, v0.13.0-dev-1390: `execute("normal! :let g:a=1\r")` sets `g:a`;
+/// `execute("let g:c = 4\r")` is `E488: Trailing characters`;
+/// `execute("edit Xa\r")` gives a buffer literally named `Xa\r`.
+#[test]
+fn a_trailing_cr_is_part_of_every_command_argument() {
+    for line in [
+        "normal! :let g:a=1\r",
+        "let g:c = 4\r",
+        "echo 'z'\r",
+        "execute 'let g:d = 5'\r",
+        "nnoremap ,x :let g:b=3\r",
+        "command! -nargs=1 Foo let g:f = <q-args>\r",
+        "edit Xt69a\r",
+        "print\r",
+    ] {
+        let command = parse_one(line);
+        assert!(
+            command.args.ends_with('\r'),
+            "{line:?} lost its CR: args = {:?}",
+            command.args
+        );
+    }
+}
+
+/// The trailing space rule, both sides. `:edit` and `:print` are EX_TRLBAR
+/// without EX_NOTRLCOM, so `del_trailing_spaces` reaches them; `:map`,
+/// `:normal`, `:let` and `:execute` keep every trailing byte. An escaped
+/// space survives even where trimming applies, and the argument's first byte
+/// is never removed (`--q > ptr`).
+#[test]
+fn trailing_spaces_are_removed_only_where_del_trailing_spaces_runs() {
+    assert_eq!(parse_one("edit Xfile   ").args, "Xfile");
+    assert_eq!(parse_one(r"edit Xfile\ ").args, r"Xfile\ ");
+    assert_eq!(parse_one("edit \t").args, "");
+    assert_eq!(parse_one("nnoremap ,y :let g:e=6   ").args, ",y :let g:e=6   ");
+    assert_eq!(parse_one("normal! ix  ").args, "ix  ");
+    assert_eq!(parse_one("let g:x = 1  ").args, "g:x = 1  ");
+    assert_eq!(parse_one("execute 'echo 1'  ").args, "'echo 1'  ");
 }
 
 #[test]

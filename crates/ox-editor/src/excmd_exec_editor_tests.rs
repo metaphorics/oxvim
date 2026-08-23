@@ -3002,3 +3002,62 @@ fn maxmapdepth_bounds_how_far_a_mapping_chain_expands() {
     executor.execute_line(&mut editor, "normal ,c").unwrap();
     assert_eq!(global_text(&executor, "hit").as_deref(), Some("yes"));
 }
+
+/// Nothing in `do_one_cmd` strips a trailing CR from an Ex argument, and
+/// `str_to_mapargs` (`mapping.c:463-475`) takes the mapping rhs verbatim from
+/// `skipwhite(lhs_end)` to the end. So a right-hand side that ends in a bare
+/// CR — the shape `execute("nnoremap ,x :let g:b=3\r")` produces — runs its
+/// command line instead of being abandoned by the implicit ESC.
+///
+/// Oracle, v0.13.0-dev-1390: all three `g:` values below are set.
+#[test]
+fn a_trailing_cr_survives_into_normal_and_a_mapping_rhs() {
+    let (mut editor, mut executor) = setup();
+    executor.execute_line(&mut editor, "normal! :let g:direct = 'one'\r").unwrap();
+    assert_eq!(global_text(&executor, "direct").as_deref(), Some("one"));
+
+    executor.execute_line(&mut editor, "nnoremap ,x :let g:mapped = 'two'\r").unwrap();
+    executor.execute_line(&mut editor, "normal ,x").unwrap();
+    assert_eq!(global_text(&executor, "mapped").as_deref(), Some("two"));
+
+    // The `<CR>` notation form must keep working alongside the raw byte.
+    executor.execute_line(&mut editor, "nnoremap ,y :let g:noted = 'three'<CR>").unwrap();
+    executor.execute_line(&mut editor, "normal ,y").unwrap();
+    assert_eq!(global_text(&executor, "noted").as_deref(), Some("three"));
+
+    // `<q-args>` expands `ea.arg` as written. Oracle: `execute("T69Q \rhi")`
+    // gives `"\rhi"` and `execute("T69R hi\r")` gives `"hi\r"`, so neither end
+    // of a user command's argument is trimmed of anything but space and tab.
+    executor
+        .execute_line(&mut editor, "command! -nargs=1 T69Q let g:qargs = <q-args>")
+        .unwrap();
+    executor.execute_line(&mut editor, "T69Q \rhi").unwrap();
+    assert_eq!(global_text(&executor, "qargs").as_deref(), Some("\rhi"));
+    executor.execute_line(&mut editor, "T69Q hi\r").unwrap();
+    assert_eq!(global_text(&executor, "qargs").as_deref(), Some("hi\r"));
+}
+
+/// The trailing-space half of the same rule. `:map` is EX_TRLBAR *with*
+/// EX_NOTRLCOM, so `del_trailing_spaces` never reaches it and the spaces stay
+/// in the right-hand side — the rhs below still executes with three spaces
+/// and a CR after it. `:edit` has no EX_NOTRLCOM, so its file name loses
+/// them.
+#[test]
+fn a_map_keeps_trailing_spaces_and_edit_does_not() {
+    let (mut editor, mut executor) = setup();
+    executor.execute_line(&mut editor, "nnoremap ,z :let g:spaced = 'a'   \r").unwrap();
+    executor.execute_line(&mut editor, "normal ,z").unwrap();
+    assert_eq!(global_text(&executor, "spaced").as_deref(), Some("a"));
+
+    executor.execute_line(&mut editor, "edit Xt69trail   ").unwrap();
+    let buffer = editor.current_buffer().expect("a buffer is current");
+    assert_eq!(
+        editor
+            .buffer(buffer)
+            .expect("buffer exists")
+            .name()
+            .to_string_lossy(),
+        "Xt69trail",
+        "an unescaped trailing space is removed for a TRLBAR command"
+    );
+}
