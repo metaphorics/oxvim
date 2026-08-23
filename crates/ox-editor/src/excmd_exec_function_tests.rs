@@ -1333,6 +1333,31 @@ fn redir_silent_function_pattern_lists_matching_signatures() {
 }
 
 #[test]
+fn redirected_function_list_global_substitute_rewrites_every_signature() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &mut editor,
+        "function Test_Alpha()\nendfunction\nfunction Test_Beta()\nendfunction\nfunction Test_Gamma()\nendfunction",
+    );
+    script(
+        &mut exec,
+        &mut editor,
+        concat!(
+            "redir @q\n",
+            "silent function /^Test_\n",
+            "redir END\n",
+            "let g:listed = substitute(@q, 'function \\(\\k*()\\)', '\\1', 'g')"
+        ),
+    );
+    assert_eq!(
+        global_string(exec.scope(), "listed").as_deref(),
+        Some("Test_Alpha()\nTest_Beta()\nTest_Gamma()")
+    );
+}
+
+#[test]
 fn redir_register_replaces_appends_and_keeps_unsilenced_output_visible() {
     let mut editor = Editor::new();
     let mut exec = ExExecutor::with_io(MemoryFileIO::new());

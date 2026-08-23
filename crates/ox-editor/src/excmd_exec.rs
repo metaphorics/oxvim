@@ -22,8 +22,7 @@ use ox_excmd::{
     Range, RangeKind, ResolveError, ResolvedCommand, UserCommandMatch, UserCommandProvider,
 };
 use ox_regex::{
-    compile as compile_regex, exec_at as regex_exec_at, Magic, Position as RegexPosition,
-    Text as RegexText,
+    compile as compile_regex, exec_at as regex_exec_at, Magic, Text as RegexText,
 };
 use ox_sys::LocaleCategory;
 use ox_text::{Buffer, Position};
@@ -1839,14 +1838,12 @@ impl RegexEngine for VimRegex {
         let source = text.to_string_lossy().into_owned();
         let program = compile_regex(&pattern.to_string_lossy(), Magic::Magic)
             .map_err(|error| EvalError::new("E54", 0, error.to_string()))?;
+        let text = RegexText::new(source);
+        let Some(position) = text.position(start) else { return Ok(None) };
         let found = regex_exec_at(
             &program,
-            &RegexText::new(source),
-            RegexPosition {
-                lnum: 1,
-                col: start,
-                byte: start,
-            },
+            &text,
+            position,
         );
         Ok(found.map(|matched| (matched.start.byte, matched.end.byte)))
     }
@@ -1865,10 +1862,11 @@ impl RegexEngine for VimRegex {
         let mut previous = 0;
         let mut cursor = 0;
         while cursor <= source.len() {
+            let Some(position) = regex_text.position(cursor) else { break };
             let Some(matched) = regex_exec_at(
                 &program,
                 &regex_text,
-                RegexPosition { lnum: 1, col: cursor, byte: cursor },
+                position,
             ) else {
                 break;
             };
@@ -2832,10 +2830,11 @@ fn substitute_line<F: FileIO>(
     let mut cursor = 0;
     let mut changed = false;
     while cursor <= source.len() {
+        let Some(position) = text.position(cursor) else { break };
         let Some(matched) = regex_exec_at(
             program,
             &text,
-            RegexPosition { lnum: 1, col: cursor, byte: cursor },
+            position,
         ) else {
             break;
         };
@@ -4438,7 +4437,7 @@ fn expand_replacement(replacement: &str, groups: &[String]) -> String {
 fn substitute_plain(source: &str, pattern: &str, replacement: &str, global: bool) -> Result<String, String> {
     let program = compile_regex(pattern, Magic::Magic).map_err(|error| error.to_string())?;
     let text = RegexText::new(source.to_owned()); let mut output = String::new(); let mut previous = 0usize; let mut cursor = 0usize;
-    while cursor <= source.len() { let Some(matched) = regex_exec_at(&program, &text, RegexPosition { lnum: 1, col: cursor, byte: cursor }) else { break; }; output.push_str(&source[previous..matched.start.byte]); let mut groups = vec![source[matched.start.byte..matched.end.byte].to_owned()]; for capture in &matched.captures { groups.push(capture.as_ref().map_or_else(String::new, |capture| source[capture.start.byte..capture.end.byte].to_owned())); } output.push_str(&expand_replacement(replacement, &groups)); previous = matched.end.byte; if !global { break; } cursor = if matched.start.byte == matched.end.byte { next_boundary(source, matched.end.byte) } else { matched.end.byte }; if cursor > source.len() { break; } }
+    while cursor <= source.len() { let Some(position) = text.position(cursor) else { break }; let Some(matched) = regex_exec_at(&program, &text, position) else { break; }; output.push_str(&source[previous..matched.start.byte]); let mut groups = vec![source[matched.start.byte..matched.end.byte].to_owned()]; for capture in &matched.captures { groups.push(capture.as_ref().map_or_else(String::new, |capture| source[capture.start.byte..capture.end.byte].to_owned())); } output.push_str(&expand_replacement(replacement, &groups)); previous = matched.end.byte; if !global { break; } cursor = if matched.start.byte == matched.end.byte { next_boundary(source, matched.end.byte) } else { matched.end.byte }; if cursor > source.len() { break; } }
     output.push_str(&source[previous..]); Ok(output)
 }
 
