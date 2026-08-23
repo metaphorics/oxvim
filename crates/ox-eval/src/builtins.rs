@@ -181,7 +181,7 @@ impl<'a> Builtins<'a> {
             "flattennew" => flatten(&args, false),
             "findfile" => path_builtins::findfilendir(self.regex, &args, scope, crate::find_file::FindWhat::File),
             "finddir" => path_builtins::findfilendir(self.regex, &args, scope, crate::find_file::FindWhat::Dir),
-            "float2nr" | "trunc" => float_to_number(&args[0]),
+            "float2nr" => float_to_number(&args[0]),
             "floor" => float_unary(&args[0], f64::floor),
             "fnamemodify" => path_builtins::fnamemodify(self.regex, &args[0], &args[1]),
             "get" => get(&args),
@@ -249,6 +249,10 @@ impl<'a> Builtins<'a> {
             "trim" => trim(&args),
             "tempname" => path_builtins::tempname(),
             "tr" => translate(&args),
+            // `trunc` is `float_op_wrapper` over libm's `trunc` (`eval.lua`),
+            // so it answers with a Float: `trunc(4.8)` is `4.0`, not `4`. It
+            // shared `float2nr`'s arm here and answered a Number.
+            "trunc" => float_unary(&args[0], f64::trunc),
             "utf16idx" => utf16idx(&args),
             "charidx" => charidx(&args),
             "type" => Ok(Typval::Number(type_constant(&args[0]))),
@@ -1323,9 +1327,34 @@ fn float_infinity_sign(value: &Typval) -> i64 {
     }
 }
 
+/// `f_float2nr` (`funcs.c:1484-1500`). The bounds are
+/// `f <= (float_T)(-VARNUMBER_MAX) + DBL_EPSILON` and
+/// `f >= (float_T)VARNUMBER_MAX - DBL_EPSILON`, and the two `DBL_EPSILON`
+/// terms do nothing: `(double)VARNUMBER_MAX` is exactly 2^63, whose
+/// neighbouring doubles are 1024 apart, so 2.2e-16 is absorbed and both
+/// comparisons are against ±2^63. Inside that range the C cast truncates
+/// toward zero.
+///
+/// The saturation value is `±VARNUMBER_MAX`, so the low end is
+/// -9223372036854775807 and not `VARNUMBER_MIN` — the off-by-one this fixes.
+/// NaN fails both comparisons, since every comparison with a NaN is false,
+/// and reaches the cast, which on x86-64 gives `INT64_MIN`. Measured on the
+/// oracle: `float2nr(-1.0/0.0)` is -9223372036854775807 and
+/// `float2nr(0.0/0.0)` is -9223372036854775808.
 fn float_to_number(value: &Typval) -> Result<Typval> {
     let value = float_arg(value)?;
-    let number = if value.is_nan() { 0 } else if value >= i64::MAX as f64 { i64::MAX } else if value <= i64::MIN as f64 { i64::MIN } else { value.trunc() as i64 };
+    // `i64::MAX as f64` rounds up to 2^63, which is the bound upstream
+    // compares against after its own `(float_T)` conversion does the same.
+    let limit = i64::MAX as f64;
+    let number = if value <= -limit {
+        -i64::MAX
+    } else if value >= limit {
+        i64::MAX
+    } else if value.is_nan() {
+        i64::MIN
+    } else {
+        value.trunc() as i64
+    };
     Ok(Typval::Number(number))
 }
 

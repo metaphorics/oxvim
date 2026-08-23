@@ -43,8 +43,11 @@ case!(sqrt_square, "sqrt", [number(9)], Typval::Float(3.0));
 case!(pow_integer_inputs, "pow", [number(2), number(3)], Typval::Float(8.0));
 case!(float2nr_positive, "float2nr", [Typval::Float(3.9)], number(3));
 case!(float2nr_negative, "float2nr", [Typval::Float(-3.9)], number(-3));
-case!(trunc_positive, "trunc", [Typval::Float(4.8)], number(4));
-case!(trunc_negative, "trunc", [Typval::Float(-4.8)], number(-4));
+// `Test_trunc` (`test_float_func.vim:305-308`) is `string(trunc(2.1)) ==
+// '2.0'`, so the answer is a Float. These two asserted a Number, which is
+// what `trunc` gave while it shared `float2nr`'s dispatch arm.
+case!(trunc_positive, "trunc", [Typval::Float(4.8)], Typval::Float(4.0));
+case!(trunc_negative, "trunc", [Typval::Float(-4.8)], Typval::Float(-4.0));
 case!(empty_zero, "empty", [number(0)], number(1));
 case!(empty_nonzero, "empty", [number(1)], number(0));
 case!(empty_string, "empty", [text("")], number(1));
@@ -2103,6 +2106,53 @@ fn a_string_reaches_a_number_context_through_vim_str2nr() {
     ] {
         assert_eq!(call("and", vec![text(input), number(-1)]).unwrap(), number(expected), "str2nr-all({input:?})");
     }
+}
+
+// Oracle: `test/old/testdir/test_float_func.vim` `Test_float2nr`, whose
+// `max_number`/`min_number` are `1/0` and `-(1/0)`, so it asks for
+// ±VARNUMBER_MAX at the bounds and `min_number/2-1` just inside the low one.
+// Every value below was also measured directly on v0.13.0-dev-1390.
+#[test]
+fn float2nr_saturates_at_plus_and_minus_varnumber_max() {
+    // The boundary is ±2^63, and it saturates to ±VARNUMBER_MAX — the low end
+    // is -9223372036854775807, one short of `i64::MIN`.
+    for (value, expected) in [
+        (1.234, 1),
+        (1.234e2, 123),
+        (123.4e-1, 12),
+        (-1.5, -1),
+        (-0.5, 0),
+        (0.0, 0),
+        (-0.0, 0),
+        // `Test_float2nr`'s `pow(2, 62)` / `pow(2, 63)` / `pow(2, 64)` rows.
+        (4_611_686_018_427_387_904.0, 4_611_686_018_427_387_904),
+        (9_223_372_036_854_775_808.0, i64::MAX),
+        (18_446_744_073_709_551_616.0, i64::MAX),
+        (-4_611_686_018_427_387_904.0, -4_611_686_018_427_387_904),
+        (-9_223_372_036_854_775_808.0, -i64::MAX),
+        (-18_446_744_073_709_551_616.0, -i64::MAX),
+        (1.0e19, i64::MAX),
+        (-1.0e19, -i64::MAX),
+        (f64::INFINITY, i64::MAX),
+        (f64::NEG_INFINITY, -i64::MAX),
+        // The largest magnitudes strictly inside ±2^63 are exact, so they
+        // pass the bounds and come out of the cast unchanged. This is the
+        // pair that pins the boundary itself rather than just the clamp.
+        (9_223_372_036_854_774_784.0, 9_223_372_036_854_774_784),
+        (-9_223_372_036_854_774_784.0, -9_223_372_036_854_774_784),
+        // NaN fails both comparisons and reaches the cast.
+        (f64::NAN, i64::MIN),
+    ] {
+        assert_eq!(call("float2nr", vec![Typval::Float(value)]).unwrap(), number(expected), "float2nr({value})");
+    }
+
+    // `trunc` is a Float function and no longer shares the arm above.
+    for (value, expected) in [(2.1, 2.0), (2.5, 2.0), (2.9, 2.0), (-2.1, -2.0), (-2.9, -2.0)] {
+        assert_eq!(call("trunc", vec![Typval::Float(value)]).unwrap(), Typval::Float(expected), "trunc({value})");
+    }
+    assert_eq!(call("trunc", vec![number(4)]).unwrap(), Typval::Float(4.0));
+    assert_eq!(call("string", vec![call("trunc", vec![Typval::Float(2.1)]).unwrap()]).unwrap(), text("2.0"));
+    assert_eq!(call("trunc", vec![text("")]).unwrap_err().code, "E808");
 }
 
 // Oracle: `test/old/testdir/test_expr.vim` `Test_printf_float`, which is the
