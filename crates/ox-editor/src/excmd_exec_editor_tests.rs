@@ -2221,10 +2221,12 @@ fn sleep_rejects_an_unknown_suffix_with_e475() {
     let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
     let error = executor.execute_line(&mut editor, "sleep 5x").unwrap_err();
     assert_vim_error(Err(error), "E475");
-    // The message carries only the tail after the count, as upstream does.
+    // The message carries only the tail after the count, as upstream does, and
+    // the `Vim(sleep):` prefix `get_exception_string` adds.
+    // Oracle: `sleep 1x` → `Vim(sleep):E475: Invalid argument: x`.
     let error = executor.execute_line(&mut editor, "sleep 5x").unwrap_err();
     let ExecError::Vim(exception) = &error else { panic!("expected a Vim error: {error:?}") };
-    assert_eq!(exception.message(), "E475: Invalid argument: x");
+    assert_eq!(exception.message(), "Vim(sleep):E475: Invalid argument: x");
 }
 
 /// A zero count is E939, because `sleep` carries no ZEROR

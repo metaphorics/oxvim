@@ -81,16 +81,30 @@ pub struct VimException {
     pub value: Typval,
     /// Upstream-style source/call chain.
     pub throwpoint: String,
+    /// `get_exception_string`'s `cmdname` argument (`ex_eval.c:383-401`): the
+    /// Ex command the error escaped from, which is what `v:exception` is
+    /// prefixed with. `None` is upstream's NULL `cmdname` — a user command, an
+    /// unresolvable command name, or no command at all — and prefixes `Vim:`.
+    pub command: Option<String>,
 }
 
 impl VimException {
-    /// String matched by a `:catch` pattern.
+    /// String matched by a `:catch` pattern, and the value of `v:exception`.
+    ///
+    /// `get_exception_string` (`ex_eval.c:383-401`) builds an error
+    /// exception's value as `Vim({cmdname}):{message}`, or `Vim:{message}`
+    /// with no command name. Without the prefix a `:catch /^Vim(/` pattern —
+    /// which is how a script distinguishes an editor error from its own
+    /// `:throw` — never matches, and `v:exception` names no command.
     #[must_use]
     pub fn message(&self) -> String {
         let value = typval_to_display(&self.value, false);
         match &self.kind {
             VimExceptionKind::Throw => value,
-            VimExceptionKind::Error(code) => format!("{code}: {value}"),
+            VimExceptionKind::Error(code) => match &self.command {
+                Some(command) => format!("Vim({command}):{code}: {value}"),
+                None => format!("Vim:{code}: {value}"),
+            },
         }
     }
 }
@@ -258,6 +272,34 @@ pub(crate) struct FiletypeState {
     pub(crate) indent: Option<bool>,
 }
 
+/// The command line `do_one_cmd` is executing, and the name it will report an
+/// error against.
+///
+/// `command` is `Some` only for a resolved builtin: `cmdnames[ea.cmdidx].cmd_name`
+/// (`ex_docmd.c:2385-2387`), which is the *canonical* name, so `:foldo` reports
+/// `Vim(foldopen):`. A user command and an unresolvable name both pass NULL
+/// there and report `Vim:`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ExecutingCommand {
+    pub(crate) command: Option<String>,
+    pub(crate) line: String,
+}
+
+/// Whether `code` is one `do_one_cmd` raises while reading the command line
+/// itself, which is what reaches `append_command` (`ex_docmd.c:2375-2384`) and
+/// therefore ends with the line it was reading.
+///
+/// Only the address codes are decided here: range resolution is the port's
+/// equivalent of `get_address`, and E16/E493 are the only codes it produces.
+/// The parse-time codes are decided at [`ExRuntime::parse_exception`] instead,
+/// because a command *implementation* emits some of the same codes and must
+/// not get the suffix — checked against the oracle, `:undojoin xyz` is
+/// `Vim(undojoin):E488: Trailing characters: xyz:   undojoin xyz` while
+/// `:call Foo()trailing` is `Vim(call):E488: Trailing characters: trailing`.
+const fn reports_command_line(code: &str) -> bool {
+    matches!(code.as_bytes(), b"E16" | b"E493")
+}
+
 pub(crate) struct ExRuntime<F: FileIO> {
     pub(crate) scripts: ScriptCtx<F>,
     pub(crate) functions: UserFunctions,
@@ -274,6 +316,18 @@ pub(crate) struct ExRuntime<F: FileIO> {
     pub(crate) filetype: FiletypeState,
     /// `getout` (`main.c`:753) has begun, so `VimLeavePre`/`VimLeave` are done.
     pub(crate) exiting: bool,
+    /// `do_one_cmd`'s view of the command it is running, which
+    /// `do_errthrow`'s `cmdname` argument (`ex_docmd.c:2385-2387`) and
+    /// `append_command` (`ex_docmd.c:2993`) both read.
+    ///
+    /// This is runtime state rather than a parameter threaded through the
+    /// dispatcher for the same reason it is a global upstream: an error can be
+    /// raised anywhere below the command — inside expression evaluation, a
+    /// nested function, a buffer mutation — and every one of those has to
+    /// produce the same `Vim({cmdname}):` prefix without knowing it exists.
+    /// Threading it instead would mean touching several hundred `error_flow`
+    /// call sites and would still miss the next one.
+    pub(crate) executing: ExecutingCommand,
 }
 
 impl<F: FileIO> ExRuntime<F> {
@@ -291,6 +345,7 @@ impl<F: FileIO> ExRuntime<F> {
             local_dir: None,
             filetype: FiletypeState::default(),
             exiting: false,
+            executing: ExecutingCommand::default(),
         }
     }
 
@@ -307,11 +362,50 @@ impl<F: FileIO> ExRuntime<F> {
     }
 
     fn exception(&self, code: &'static str, message: impl Into<String>) -> VimException {
-        let message = message.into();
+        let mut message = message.into();
+        if reports_command_line(code) {
+            self.append_command(&mut message);
+        }
+        self.error(code.to_owned(), message, self.executing.command.clone())
+    }
+
+    /// `do_one_cmd`'s parse-time failure (`ex_docmd.c:2120-2124`): the command
+    /// line is appended, and there is no `cmdidx` yet, so upstream reports
+    /// `Vim:E492: Not an editor command:   nosuchthing`.
+    ///
+    /// Named gap: upstream keeps the `cmdidx` for a failure *after* the name
+    /// resolved, so `:undojoin xyz` is `Vim(undojoin):E488: ...`. This port's
+    /// `ParseError` does not carry the command it had already resolved, so
+    /// those report `Vim:` too.
+    fn parse_exception(&self, error: &ParseError) -> VimException {
+        let mut message = error.message.clone();
+        self.append_command(&mut message);
+        self.error(error.code.as_str().to_owned(), message, None)
+    }
+
+    /// A block whose closer never arrived. Upstream detects these after
+    /// `do_cmdline`'s loop, where no command is current, so it reports
+    /// `Vim:E171: Missing :endif` and not `Vim(if):`. `:function` is the
+    /// exception and keeps its name, because it consumes the rest of the input
+    /// itself; that one goes through [`Self::exception`].
+    fn unterminated_block(&self, code: &'static str, message: impl Into<String>) -> VimException {
+        self.error(code.to_owned(), message.into(), None)
+    }
+
+    /// `append_command` (`ex_docmd.c:2993-3019`): `": "` and then the command
+    /// line, so an error about a range or an unreadable name shows what it was
+    /// reading, whitespace and quoting included.
+    fn append_command(&self, message: &mut String) {
+        message.push_str(": ");
+        message.push_str(&self.executing.line);
+    }
+
+    fn error(&self, code: String, message: String, command: Option<String>) -> VimException {
         VimException {
-            kind: VimExceptionKind::Error(code.to_owned()),
+            kind: VimExceptionKind::Error(code),
             value: Typval::String(OxStr(message.into_bytes())),
             throwpoint: self.throwpoint(),
+            command,
         }
     }
 }
@@ -347,6 +441,7 @@ pub(crate) fn program_from_commands(commands: &[ExCommand], line: usize) -> Vec<
         .cloned()
         .map(|command| Instruction {
             source: render_command(&command),
+            raw: render_command(&command),
             command: Some(command),
             parse_error: None,
             line,
@@ -670,6 +765,13 @@ pub(crate) struct Instruction {
     command: Option<ExCommand>,
     parse_error: Option<ParseError>,
     source: String,
+    /// The command line as written, from where `do_one_cmd` started reading it
+    /// to the end of the line — upstream's `*ea.cmdlinep`, which
+    /// `append_command` echoes verbatim, leading whitespace included.
+    ///
+    /// Distinct from `source`, which is a re-render used to rebuild a
+    /// `:function` body and therefore normalizes whitespace away.
+    raw: String,
     line: usize,
 }
 
@@ -743,13 +845,22 @@ pub(crate) fn parse_program(
                         command: None,
                         parse_error: Some(error),
                         source: command_text.to_owned(),
+                        raw: command_text.to_owned(),
                         line: line.first_line,
                     });
                     continue;
                 }
             }
         };
+        // `*ea.cmdlinep` is where `do_one_cmd` started reading: the whole line
+        // for the first command, and the text just past the `|` for each one
+        // after it. `append_command` echoes from there to the end of the line,
+        // so the indentation of `  99print` inside a `:try` shows up in the
+        // message exactly as written.
+        let mut read_from = 0;
         for mut command in commands {
+            let raw = command_text[read_from..].to_owned();
+            read_from = command.span.end.min(command_text.len());
             if let Some(body) = heredoc_body {
                 command.args.push('\n');
                 command.args.push_str(body);
@@ -758,6 +869,7 @@ pub(crate) fn parse_program(
                 source: render_command(&command),
                 command: Some(command),
                 parse_error: None,
+                raw,
                 line: line.first_line,
             });
         }
@@ -797,11 +909,41 @@ pub(crate) fn run_program<F: FileIO>(
     start: usize,
     end: usize,
 ) -> Flow {
+    let outer = std::mem::take(&mut runtime.executing);
+    let flow = run_instructions(runtime, editor, scope, lua, program, start, end);
+    runtime.executing = outer;
+    flow
+}
+
+/// `do_cmdline`'s loop over one program (`ex_docmd.c:321-...`).
+///
+/// Split from [`run_program`] only so the `executing` command state, which
+/// every `error_flow` below reads to build `Vim({cmdname}):`, is saved and
+/// restored on *every* exit path rather than at two dozen `return`s.
+fn run_instructions<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    program: &[Instruction],
+    start: usize,
+    end: usize,
+) -> Flow {
     let mut pc = start;
     while pc < end {
         let instruction = &program[pc];
         runtime.scripts.set_current_line(instruction.line);
         runtime.functions.set_current_line(instruction.line);
+        // `do_errthrow(cstack, cmdidx != CMD_SIZE && !IS_USER_CMDIDX ? name : NULL)`
+        // (`ex_docmd.c:2385-2387`): the canonical builtin name, or nothing for
+        // a user command and for a line that did not parse.
+        runtime.executing = ExecutingCommand {
+            command: instruction.command.as_ref().and_then(|command| match &command.command {
+                ResolvedCommand::Builtin(spec) => Some(spec.name.to_owned()),
+                ResolvedCommand::User(_) => None,
+            }),
+            line: instruction.raw.clone(),
+        };
         let command = match instruction.command() {
             Ok(command) => command,
             Err(error) => return exec_error_flow(runtime, ExecError::Parse(error.clone())),
@@ -810,7 +952,7 @@ pub(crate) fn run_program<F: FileIO>(
         match name {
             "if" => {
                 let Some(block) = find_if(program, pc, end) else {
-                    return error_flow(runtime, "E171", "Missing :endif");
+                    return Flow::Exception(runtime.unterminated_block("E171", "Missing :endif"));
                 };
                 let mut chosen = None;
                 for branch in &block.branches {
@@ -837,7 +979,7 @@ pub(crate) fn run_program<F: FileIO>(
             }
             "while" => {
                 let Some(block_end) = find_matching(program, pc, end, "while", "endwhile") else {
-                    return error_flow(runtime, "E170", "Missing :endwhile");
+                    return Flow::Exception(runtime.unterminated_block("E170", "Missing :endwhile"));
                 };
                 loop {
                     match eval_condition(runtime, editor, scope, lua, command.args.trim()) {
@@ -856,7 +998,7 @@ pub(crate) fn run_program<F: FileIO>(
             }
             "for" => {
                 let Some(block_end) = find_matching(program, pc, end, "for", "endfor") else {
-                    return error_flow(runtime, "E170", "Missing :endfor");
+                    return Flow::Exception(runtime.unterminated_block("E170", "Missing :endfor"));
                 };
                 let Some((target, expression)) = split_for(&command.args) else {
                     return error_flow(runtime, "E690", "Missing \"in\" after :for");
@@ -884,7 +1026,7 @@ pub(crate) fn run_program<F: FileIO>(
             }
             "try" => {
                 let Some(block) = find_try(program, pc, end) else {
-                    return error_flow(runtime, "E600", "Missing :endtry");
+                    return Flow::Exception(runtime.unterminated_block("E600", "Missing :endtry"));
                 };
                 let mut pending = run_program(runtime, editor, scope, lua, program, pc + 1, block.try_end);
                 if let Flow::Exception(exception) = &pending {
@@ -1055,6 +1197,9 @@ fn dispatch<F: FileIO>(
                 kind: VimExceptionKind::Throw,
                 value,
                 throwpoint: runtime.throwpoint(),
+                // `:throw` produces the value verbatim, with no `Vim(...)`
+                // prefix (`get_exception_string`'s ET_USER branch).
+                command: None,
             }),
             Err(flow) => flow,
         },
@@ -6567,7 +6712,7 @@ pub(crate) fn exec_error_flow<F: FileIO>(runtime: &ExRuntime<F>, error: ExecErro
         ExecError::Vim(exception) => Flow::Exception(exception),
         ExecError::NotImplemented(name) => Flow::NotImplemented(name),
         ExecError::Eval(error) => eval_error_flow(runtime, error),
-        ExecError::Parse(error) => error_flow(runtime, error.code.as_str(), error.message),
+        ExecError::Parse(error) => Flow::Exception(runtime.parse_exception(&error)),
         ExecError::Io { path, message } => error_flow(runtime, "E484", format!("{}: {message}", path.display())),
         ExecError::Editor(message) => error_flow(runtime, "E605", message),
     }

@@ -495,9 +495,11 @@ fn default_expression_evaluates_in_caller_scope_and_aborts_call() {
         ),
     );
     assert_eq!(global_number(exec.scope(), "caught"), Some(1));
+    // Oracle: an error raised while evaluating a default argument escapes
+    // through `:call`, so `v:exception` is `Vim(call):E121: ...`.
     assert!(global_string(exec.scope(), "msg")
         .unwrap()
-        .starts_with("E121: Undefined variable: s:undefined_variable"));
+        .starts_with("Vim(call):E121: Undefined variable: s:undefined_variable"));
     assert_eq!(global_number(exec.scope(), "entered"), Some(0));
 }
 
@@ -527,7 +529,7 @@ fn evaluator_error_inside_user_function_enters_caller_catch_frame() {
     );
     assert_eq!(global_number(exec.scope(), "caught"), Some(1));
     assert_eq!(global_number(exec.scope(), "finalized"), Some(1));
-    assert_eq!(global_string(exec.scope(), "exception").as_deref(), Some("E117: not implemented: screenrow"));
+    assert_eq!(global_string(exec.scope(), "exception").as_deref(), Some("Vim(call):E117: not implemented: screenrow"));
     assert_eq!(global_string(exec.scope(), "throwpoint").as_deref(), Some("function BrokenBuiltin[1]..script <test>[1]"));
 }
 

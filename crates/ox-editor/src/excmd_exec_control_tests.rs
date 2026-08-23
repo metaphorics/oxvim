@@ -568,13 +568,15 @@ fn script_throw_has_script_throwpoint_with_line_number() {
 
 #[test]
 fn missing_endif_produces_e171_error() {
-    // ex_docmd.c: `:if` without a matching `:endif` raises E171.
+    // ex_docmd.c: `:if` without a matching `:endif` raises E171. The oracle
+    // reports `Vim:E171` and not `Vim(if):`, because `do_cmdline` notices the
+    // missing closer after its loop, where no command is current.
     let mut executor = ExExecutor::new();
     let mut editor = Editor::new();
     let result = executor.execute_script(&mut editor, "test.vim", "if 1\necho \"hi\"");
     let exception = vim_error(result.map(|_| ()));
     assert_eq!(exception.kind, VimExceptionKind::Error("E171".to_owned()));
-    assert_eq!(exception.message(), "E171: Missing :endif");
+    assert_eq!(exception.message(), "Vim:E171: Missing :endif");
 }
 
 #[test]
@@ -585,5 +587,120 @@ fn missing_endtry_produces_e600_error() {
     let result = executor.execute_script(&mut editor, "test.vim", "try\nthrow \"x\"");
     let exception = vim_error(result.map(|_| ()));
     assert_eq!(exception.kind, VimExceptionKind::Error("E600".to_owned()));
-    assert_eq!(exception.message(), "E600: Missing :endtry");
+    assert_eq!(exception.message(), "Vim:E600: Missing :endtry");
+}
+
+// ===========================================================================
+// `v:exception`'s `Vim({cmdname}):` prefix and `append_command` suffix
+// (ex_eval.c:383-401 get_exception_string, ex_docmd.c:2375-2384,2993-3019
+//  append_command). Every string below was read from
+// `.references/neovim/build/bin/nvim` first.
+// ===========================================================================
+
+/// An error escaping a builtin Ex command is prefixed with that command's
+/// *canonical* name, so an abbreviation still reports the full name, and a
+/// command implementation's own error carries no command line after it.
+#[test]
+fn an_error_is_prefixed_with_the_command_it_escaped_from() {
+    let mut executor = ExExecutor::new();
+    let mut editor = Editor::new();
+
+    // Oracle: `Vim(echo):E121: Undefined variable: g:nope`.
+    let exception = vim_error(executor.execute_line(&mut editor, "echo g:nope").map(|_| ()));
+    assert_eq!(exception.message(), "Vim(echo):E121: Undefined variable: g:nope");
+
+    // Oracle: `:unm` resolves to `unmap`, and the prefix names the canonical
+    // command, not what was typed — `Vim(unmap):E31: No such mapping`.
+    let exception = vim_error(executor.execute_line(&mut editor, "unm ,zzz").map(|_| ()));
+    assert_eq!(exception.message(), "Vim(unmap):E31: No such mapping");
+}
+
+/// `:throw` is a user exception: its value is reported verbatim, with no
+/// prefix at all (`get_exception_string`'s ET_USER branch).
+#[test]
+fn an_explicit_throw_keeps_its_value_unprefixed() {
+    let mut executor = ExExecutor::new();
+    let mut editor = Editor::new();
+    let exception = vim_error(executor.execute_line(&mut editor, "throw 'boom'").map(|_| ()));
+    assert_eq!(exception.message(), "boom");
+}
+
+/// `append_command` echoes the command line verbatim after the message — but
+/// only for the errors `do_one_cmd` raises while reading it. Leading
+/// whitespace, quotes and bars all survive, because it copies bytes.
+#[test]
+fn a_command_line_error_echoes_the_line_it_could_not_read() {
+    // Oracle: `Vim(print):E16: Invalid range:   99print` — the two spaces of
+    // indent are part of the line and are echoed.
+    let (mut editor, mut executor) = editor_with_buffer();
+    executor
+        .execute_script(&mut editor, "t.vim", "try\n  99print\ncatch\n  let g:e = v:exception\nendtry")
+        .unwrap();
+    assert_eq!(
+        global_string(&executor, "e").as_deref(),
+        Some("Vim(print):E16: Invalid range:   99print")
+    );
+
+    // Oracle: `Vim:E492: Not an editor command:   definitelynotacommand`. An
+    // unresolvable name has no `cmdidx`, so upstream prefixes `Vim:`.
+    let (mut editor, mut executor) = editor_with_buffer();
+    executor
+        .execute_script(&mut editor, "t.vim", "try\n  definitelynotacommand\ncatch\n  let g:e = v:exception\nendtry")
+        .unwrap();
+    assert_eq!(
+        global_string(&executor, "e").as_deref(),
+        Some("Vim:E492: Not an editor command:   definitelynotacommand")
+    );
+
+    // Oracle: `Vim(print):E16: Invalid range: 99print " q | b"` — a quote and
+    // a bar inside the line are echoed as written, neither escaped nor used as
+    // a separator.
+    let (mut editor, mut executor) = editor_with_buffer();
+    executor
+        .execute_script(
+            &mut editor,
+            "t.vim",
+            "try\nexecute '99print \" q | b\"'\ncatch\nlet g:e = v:exception\nendtry",
+        )
+        .unwrap();
+    assert_eq!(
+        global_string(&executor, "e").as_deref(),
+        Some("Vim(print):E16: Invalid range: 99print \" q | b\"")
+    );
+}
+
+/// An error a command *implementation* emits reaches `emsg` directly, so
+/// `append_command` never runs on it. Oracle: `Vim(foldopen):E490: No fold
+/// found` — the prefix is there and nothing follows the message.
+#[test]
+fn a_command_implementation_error_does_not_echo_the_line() {
+    let (mut editor, mut executor) = editor_with_buffer();
+    executor
+        .execute_script(&mut editor, "t.vim", "try\n  foldopen\ncatch\n  let g:e = v:exception\nendtry")
+        .unwrap();
+    assert_eq!(global_string(&executor, "e").as_deref(), Some("Vim(foldopen):E490: No fold found"));
+}
+
+/// An editor with one listed buffer shown in one window, which the commands
+/// above need in order to reach their own error rather than E749.
+fn editor_with_buffer() -> (Editor, ExExecutor) {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, crate::Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    (editor, ExExecutor::new())
+}
+
+/// Reads a global as a plain string.
+fn global_string(executor: &ExExecutor, name: &str) -> Option<String> {
+    executor
+        .scope()
+        .global
+        .iter()
+        .find(|(key, _)| key.as_bytes() == name.as_bytes())
+        .and_then(|(_, value)| match value {
+            ox_types::Typval::String(text) => Some(text.to_string_lossy().into_owned()),
+            _ => None,
+        })
 }

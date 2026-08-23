@@ -801,7 +801,12 @@ fn e488_from_call_trailing_characters() {
     match err {
         ExecError::Vim(exc) => {
             assert_eq!(exc.kind, VimExceptionKind::Error("E488".to_owned()));
-            assert_eq!(exc.message(), "E488: Trailing characters");
+            // Oracle: `Vim(call):E488: Trailing characters: trailing`. The
+            // prefix matches; naming the offending text in the message is a
+            // separate gap in `:call`'s own argument check — `ex_call` emits
+            // this itself, so `append_command` does not run on it and the
+            // command line is *not* echoed.
+            assert_eq!(exc.message(), "Vim(call):E488: Trailing characters");
             assert_eq!(exc.throwpoint, "command line");
         }
         other => panic!("expected Vim E488, got {other:?}"),
