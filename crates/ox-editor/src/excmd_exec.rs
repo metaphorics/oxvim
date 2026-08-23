@@ -26,7 +26,7 @@ use ox_regex::{
 };
 use ox_sys::LocaleCategory;
 use ox_text::{Buffer, Position};
-use ox_types::{BufHandle, Dict, DictRef, Funcref, Object, OxStr, Special, Typval};
+use ox_types::{BufHandle, Dict, DictRef, Funcref, Object, OxStr, Special, Typval, WinHandle};
 
 use crate::autocmd::{AutocmdContext, AutocmdKind, AutocmdOptions, AugroupId, DeleteAutocmds, Event};
 use crate::extmark::{ExtmarkAttributes, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, NamespaceId};
@@ -247,6 +247,8 @@ struct ExRuntime<F: FileIO> {
     jobs: Option<JobManager>,
     current_augroup: AugroupId,
     redirection: Option<Redirection>,
+    previous_dir: Option<PathBuf>,
+    local_dir: Option<(WinHandle, PathBuf)>,
 }
 
 impl<F: FileIO> ExRuntime<F> {
@@ -260,6 +262,8 @@ impl<F: FileIO> ExRuntime<F> {
             jobs: None,
             current_augroup: AugroupId::default(),
             redirection: None,
+            previous_dir: None,
+            local_dir: None,
         }
     }
 
@@ -869,7 +873,8 @@ fn dispatch<F: FileIO>(
             }
         }
         "execute" => command_execute(runtime, editor, scope, lua, &command.args),
-        "cd" => command_cd(runtime, &command.args),
+        "cd" => command_cd(runtime, editor, &command.args, false),
+        "lcd" => command_cd(runtime, editor, &command.args, true),
         "swapname" => {
             push_text_message(editor, "No swap file".to_owned(), false, false);
             Flow::Normal
@@ -1021,6 +1026,12 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         }
         if name_text == "feedkeys" {
             return call_feedkeys_builtin(self.editor, args);
+        }
+        if name_text == "chdir" {
+            return call_chdir_builtin(self.runtime, self.editor, args);
+        }
+        if matches!(&*name_text, "function" | "funcref") {
+            return call_function_builtin(self.runtime, &name_text, args);
         }
         if matches!(&*name_text, "getchar" | "getcharstr") {
             return call_getchar_builtin(self.editor, &name_text, args);
@@ -2701,18 +2712,66 @@ fn command_execute<F: FileIO>(
     run_program(runtime, editor, scope, lua, &program, 0, program.len())
 }
 
-fn command_cd<F: FileIO>(runtime: &ExRuntime<F>, args: &str) -> Flow {
+fn command_cd<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &Editor, args: &str, local: bool) -> Flow {
     let path = args.trim();
     if path.is_empty() {
         return error_flow(runtime, "E471", "Argument required");
     }
-    match std::env::set_current_dir(path) {
-        Ok(()) => Flow::Normal,
-        Err(error) => error_flow(runtime, "E344", format!("Can't find directory {path}: {error}")),
+    match change_directory(runtime, editor, path, local) {
+        Ok(_) => Flow::Normal,
+        Err(error) => error_flow(runtime, error.code, error.message),
     }
 }
 
-fn command_normal<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, args: &str) -> Flow {
+fn directory_target<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &Editor, path: &str) -> ox_eval::Result<PathBuf> {
+    if path == "-" {
+        return runtime.previous_dir.clone().ok_or_else(|| EvalError::new("E186", 0, "No previous directory"));
+    }
+    let direct = PathBuf::from(path);
+    if direct.is_absolute() || direct.is_dir() { return Ok(direct); }
+    if let Ok(OptionValue::String(cdpath)) = editor.options().get_global("cdpath") {
+        for entry in cdpath.split(',') {
+            let base = if entry.is_empty() { Path::new(".") } else { Path::new(entry) };
+            let candidate = base.join(path);
+            if candidate.is_dir() { return Ok(candidate); }
+        }
+    }
+    Ok(direct)
+}
+
+fn change_directory<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &Editor, path: &str, local: bool) -> ox_eval::Result<PathBuf> {
+    let previous = std::env::current_dir().map_err(|error| EvalError::new("E472", 0, error.to_string()))?;
+    let target = directory_target(runtime, editor, path)?;
+    std::env::set_current_dir(&target).map_err(|error| EvalError::new("E344", 0, format!("Can't find directory {path}: {error}")))?;
+    runtime.previous_dir = Some(previous.clone());
+    if local {
+        let window = editor.current_window().ok_or_else(|| EvalError::new("E16", 0, "No current window"))?;
+        runtime.local_dir = Some((window, previous.clone()));
+    } else {
+        runtime.local_dir = None;
+    }
+    Ok(previous)
+}
+
+fn call_chdir_builtin<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &Editor, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(EvalError::new(if args.is_empty() { "E119" } else { "E118" }, 0, "Invalid arguments for chdir"));
+    }
+    let Typval::String(path) = &args[0] else { return Ok(Typval::String(OxStr::from(""))); };
+    let local = match args.get(1) {
+        None => runtime.local_dir.is_some(),
+        Some(Typval::String(scope)) => match scope.as_bytes() {
+            b"global" => false,
+            b"window" | b"tabpage" | b"buffer" => true,
+            _ => return Err(EvalError::new("E475", 0, format!("Invalid argument: scope {}", scope.to_string_lossy()))),
+        },
+        Some(other) => { input_string_arg(other)?; unreachable!("non-string conversion always errors above") }
+    };
+    let previous = change_directory(runtime, editor, &path.to_string_lossy(), local)?;
+    Ok(Typval::String(OxStr::from(previous.to_string_lossy().as_ref())))
+}
+
+fn command_normal<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, args: &str) -> Flow {
     let mut machine = ModeMachine::default();
     match machine.feed_keys(editor, args.trim_start()) {
         Ok(()) => Flow::Normal,
@@ -3123,7 +3182,12 @@ fn command_buffer_remove<F: FileIO>(
         };
     }
     match editor.wipe_buffer(target) {
-        Ok(_) => Flow::Normal,
+        Ok(_) => {
+            if runtime.local_dir.as_ref().is_some_and(|(window, _)| Some(*window) == editor.current_window()) {
+                if let Some((_, directory)) = runtime.local_dir.take() { let _ = std::env::set_current_dir(directory); }
+            }
+            Flow::Normal
+        }
         Err(error) => error_flow(runtime, "E90", error.to_string()),
     }
 }
@@ -3229,7 +3293,7 @@ fn command_split<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, com
     Flow::Normal
 }
 
-fn command_close<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand, quit: bool) -> Flow {
+fn command_close<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand, quit: bool) -> Flow {
     let buffer = match editor.current_buffer() {
         Some(buffer) => buffer,
         None => return if quit { Flow::Quit(0) } else { error_flow(runtime, "E444", "Cannot close last window") },
@@ -3258,7 +3322,7 @@ fn command_close<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command
     }
 }
 
-fn command_only<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor) -> Flow {
+fn command_only<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> Flow {
     let Some(tab) = editor.current_tabpage() else {
         return error_flow(runtime, "E749", "No current tabpage");
     };
@@ -3326,7 +3390,7 @@ fn command_buffer_step<F: FileIO>(
     }
 }
 
-fn command_buffer<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+fn command_buffer<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
     let requested = command
         .count
         .and_then(|value| i64::try_from(value).ok())
@@ -3613,7 +3677,7 @@ fn command_put<F: FileIO>(
     }
 }
 
-fn command_delete<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+fn command_delete<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
     let buffer = match editor.current_buffer() { Some(buffer) => buffer, None => return error_flow(runtime, "E749", "Empty buffer") };
     let (start, end) = match resolve_range(editor, command) { Ok(range) => range, Err(message) => return error_flow(runtime, "E16", message) };
     let lines = match buffer_lines(editor, buffer) { Ok(lines) => lines, Err(message) => return error_flow(runtime, "E749", message) };
@@ -3628,7 +3692,7 @@ fn command_delete<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, comman
     }
 }
 
-fn command_yank<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+fn command_yank<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
     let buffer = match editor.current_buffer() { Some(buffer) => buffer, None => return error_flow(runtime, "E749", "Empty buffer") };
     let (start, end) = match resolve_range(editor, command) { Ok(range) => range, Err(message) => return error_flow(runtime, "E16", message) };
     let lines = match buffer_lines(editor, buffer) { Ok(lines) => lines, Err(message) => return error_flow(runtime, "E749", message) };
@@ -3643,7 +3707,7 @@ fn command_yank<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command:
 /// line with its right-aligned line number padded to the width of the last
 /// line number (`number_width`). An empty buffer raises E749 first, and the
 /// cursor lands on the last printed line.
-fn command_print<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+fn command_print<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
     let buffer = match editor.current_buffer() { Some(buffer) => buffer, None => return error_flow(runtime, "E749", "Empty buffer") };
     let lines = match buffer_lines(editor, buffer) { Ok(lines) => lines, Err(message) => return error_flow(runtime, "E749", message) };
     if lines.len() == 1 && lines[0].is_empty() { return error_flow(runtime, "E749", "Empty buffer"); }
@@ -3664,14 +3728,14 @@ fn command_print<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command
     Flow::Normal
 }
 
-fn command_mark<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+fn command_mark<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
     let Some(name) = command.args.trim().chars().next() else { return error_flow(runtime, "E191", "Argument must be a letter or forward/backward quote") };
     let buffer = match editor.current_buffer() { Some(buffer) => buffer, None => return error_flow(runtime, "E20", "Mark not set") };
     let position = editor.current_window().and_then(|window| editor.window(window).ok()).map_or(Position { lnum: 1, col: 0 }, |window| window.cursor);
     match editor.set_local_mark(buffer, name, position) { Ok(_) => Flow::Normal, Err(error) => error_flow(runtime, "E191", error.to_string()) }
 }
 
-fn command_marks<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor) -> Flow {
+fn command_marks<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> Flow {
     let buffer = match editor.current_buffer() { Some(buffer) => buffer, None => return error_flow(runtime, "E20", "Mark not set") };
     let marks = match editor.buffer(buffer) {
         Ok(state) => state.marks.iter().collect::<Vec<_>>(),
@@ -3684,7 +3748,7 @@ fn command_marks<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor) -> Flow
     Flow::Normal
 }
 
-fn command_registers<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, args: &str) -> Flow {
+fn command_registers<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, args: &str) -> Flow {
     let requested = args.trim();
     let names = if requested.is_empty() { "0123456789abcdefghijklmnopqrstuvwxyz\"-:.%#=*+_/@" } else { requested };
     let mut messages = Vec::new();
@@ -3824,7 +3888,7 @@ fn command_colorscheme<F: FileIO>(
 /// counter here; neither is observable in this port (no 'helplang' option
 /// model entry, and translations are out of scope).
 fn command_language<F: FileIO>(
-    runtime: &ExRuntime<F>,
+    runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     scope: &mut Scope,
     command: &ExCommand,
@@ -3923,7 +3987,7 @@ fn refresh_lang_vars(scope: &mut Scope) {
     }
 }
 
-fn command_highlight<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+fn command_highlight<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
     let args = command.args.trim();
     if args.is_empty() {
         let messages = editor
@@ -4257,7 +4321,7 @@ pub fn vim_variable_is_writable(name: &[u8]) -> bool {
     )
 }
 
-fn read_target<F: FileIO>(runtime: &ExRuntime<F>, editor: &Editor, scope: &Scope, target: &str) -> Result<Typval, Flow> {
+fn read_target<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &Editor, scope: &Scope, target: &str) -> Result<Typval, Flow> {
     let target = target.trim();
     if let Some(register) = target.strip_prefix('@').and_then(|name| name.chars().next()) { return Ok(scope.get_register(&[register as u8])); }
     if let Some(environment) = target.strip_prefix('$') { return Ok(scope.get_env(environment.as_bytes())); }
@@ -4345,7 +4409,7 @@ fn parse_scope_name(target: &str) -> (Option<ScopeKind>, String) {
 
 fn canonical_target(target: &str) -> String { target.trim().to_owned() }
 
-fn apply_assignment_operator<F: FileIO>(runtime: &ExRuntime<F>, left: Typval, right: Typval, operator: &str) -> Result<Typval, Flow> {
+fn apply_assignment_operator<F: FileIO>(runtime: &mut ExRuntime<F>, left: Typval, right: Typval, operator: &str) -> Result<Typval, Flow> {
     if operator == "+=" {
         if let (Typval::List(left_items), Typval::List(right_items)) = (&left, &right) {
             let appended = right_items.borrow().items.clone();
@@ -4367,7 +4431,7 @@ fn apply_assignment_operator<F: FileIO>(runtime: &ExRuntime<F>, left: Typval, ri
 /// `ex_let_option`: `.`/`..` operators concatenate and are rejected on
 /// number and boolean options, while `+`/`-` do arithmetic and are
 /// rejected on string options — both rejections raise E734.
-fn apply_option_assignment_operator<F: FileIO>(runtime: &ExRuntime<F>, current: Typval, operand: Typval, operator: &str) -> Result<Typval, Flow> {
+fn apply_option_assignment_operator<F: FileIO>(runtime: &mut ExRuntime<F>, current: Typval, operand: Typval, operator: &str) -> Result<Typval, Flow> {
     let concatenate = operator.starts_with('.');
     match (current, concatenate) {
         (Typval::String(current), true) => Ok(Typval::String(OxStr(
@@ -4996,7 +5060,7 @@ fn flow_to_eval_error(flow: Flow, name: &str) -> EvalError {
     }
 }
 
-fn command_lua<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
+fn command_lua<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
     let Some(lua) = lua else { return Flow::NotImplemented("lua".to_owned()) };
     let mut code = command.args.trim_start().to_owned();
     let mut heredoc = false;
@@ -5033,7 +5097,7 @@ fn command_lua<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, scope: &m
     }
 }
 
-fn command_luafile<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
+fn command_luafile<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
     let Some(lua) = lua else { return Flow::NotImplemented("luafile".to_owned()) };
     let path = command.args.trim();
     if path.is_empty() {
@@ -5051,7 +5115,7 @@ fn command_luafile<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, scope
     }
 }
 
-fn command_luado<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
+fn command_luado<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
     let Some(lua) = lua else { return Flow::NotImplemented("luado".to_owned()) };
     let body = command.args.trim_start();
     if body.is_empty() {
@@ -5107,7 +5171,7 @@ fn command_luado<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, scope: 
     }
 }
 
-fn lua_error_flow<F: FileIO>(runtime: &ExRuntime<F>, error: LuaExecError, load_code: &'static str, runtime_code: &'static str) -> Flow {
+fn lua_error_flow<F: FileIO>(runtime: &mut ExRuntime<F>, error: LuaExecError, load_code: &'static str, runtime_code: &'static str) -> Flow {
     match error {
         LuaExecError::Load(message) => error_flow(runtime, load_code, message),
         LuaExecError::Runtime(message) | LuaExecError::Conversion(message) => {
@@ -5243,6 +5307,54 @@ fn input_string_arg(value: &Typval) -> ox_eval::Result<OxStr> {
         Typval::Float(_) => Err(EvalError::new("E806", 0, "Using a Float as a String")),
         _ => Err(EvalError::new("E729", 0, "Using invalid value as a String")),
     }
+}
+
+fn call_function_builtin<F: FileIO>(runtime: &ExRuntime<F>, kind: &str, mut args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(EvalError::new(if args.is_empty() { "E119" } else { "E118" }, 0, format!("Invalid arguments for {kind}")));
+    }
+    let first = args.remove(0);
+    let mut function = match first {
+        Typval::Funcref(function) | Typval::Partial(function) => function,
+        Typval::String(name) => {
+            let text = name.to_string_lossy();
+            if text.is_empty() || text.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+                return Err(EvalError::new("E475", 0, format!("Invalid argument: {text}")));
+            }
+            let sid = runtime.functions.active_sid().or_else(|| runtime.scripts.current_sid()).unwrap_or(0);
+            if builtin_spec(&text).is_none() && !runtime.functions.contains(&text, sid) && !text.contains('#') {
+                return Err(EvalError::new("E700", 0, format!("Unknown function: {text}")));
+            }
+            Funcref { name, args: Vec::new(), dict: None, registry: None }
+        }
+        other => {
+            let name = input_string_arg(&other)?;
+            return Err(EvalError::new("E475", 0, format!("Invalid argument: {}", name.to_string_lossy())));
+        }
+    };
+
+    let mut bound = None;
+    let mut dictionary = None;
+    if let Some(second) = args.first() {
+        match second {
+            Typval::List(reference) => {
+                bound = Some(reference.try_borrow().map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?.items.clone());
+            }
+            Typval::Dict(reference) if args.len() == 1 => {
+                dictionary = Some(reference.try_borrow().map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?.entries.clone());
+            }
+            Typval::Dict(_) => return Err(EvalError::new("E923", 0, "Second argument of function() must be a list or a dict")),
+            _ => return Err(EvalError::new("E923", 0, "Second argument of function() must be a list or a dict")),
+        }
+    }
+    if let Some(third) = args.get(1) {
+        let Typval::Dict(reference) = third else { return Err(EvalError::new("E922", 0, "Expected a dict")); };
+        dictionary = Some(reference.try_borrow().map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?.entries.clone());
+    }
+    if let Some(mut values) = bound { function.args.append(&mut values); }
+    if dictionary.is_some() { function.dict = dictionary; }
+    let partial = kind == "funcref" || !function.args.is_empty() || function.dict.is_some();
+    Ok(if partial { Typval::Partial(function) } else { Typval::Funcref(function) })
 }
 
 fn call_feedkeys_builtin(editor: &mut Editor, args: Vec<Typval>) -> ox_eval::Result<Typval> {

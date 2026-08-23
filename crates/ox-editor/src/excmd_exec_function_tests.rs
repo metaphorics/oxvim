@@ -23,7 +23,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use ox_eval::Scope;
+use ox_eval::{Scope, ScopeKind};
 use ox_text::Buffer;
 use ox_types::{Object, OxStr, Typval};
 
@@ -1445,4 +1445,34 @@ fn nested_redir_is_e930_and_preserves_active_target() {
     exec.execute_line(&mut editor, "redir END").unwrap();
     assert_eq!(register_text(&editor, 'q'), "still active");
     assert!(editor.registers().get('w').unwrap().is_none());
+}
+
+#[test]
+fn function_builtin_constructs_named_and_bound_references() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &mut editor,
+        "function-ref.vim",
+        "let g:plain = function('extend')\nlet g:bound = function('extend', [1], {'answer': 42})",
+    ).unwrap();
+    let Typval::Funcref(plain) = exec.scope().get_scoped(ScopeKind::Global, b"plain", 0).unwrap() else { panic!("expected plain Funcref") };
+    assert_eq!(plain.name, OxStr::from("extend"));
+    let Typval::Partial(bound) = exec.scope().get_scoped(ScopeKind::Global, b"bound", 0).unwrap() else { panic!("expected bound Partial") };
+    assert_eq!(bound.args, vec![Typval::Number(1)]);
+    assert!(matches!(bound.dict.as_deref(), Some([(key, Typval::Number(42))]) if key == &OxStr::from("answer")));
+}
+
+#[test]
+fn function_builtin_reports_name_and_binding_errors() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    for (line, code) in [
+        ("call function('MissingFunction')", "E700"),
+        ("call function('extend', [], 1)", "E922"),
+        ("call function('extend', 1)", "E923"),
+    ] {
+        let error = exec.execute_line(&mut editor, line).unwrap_err();
+        assert_eq!(error_code(&error), code, "{line}");
+    }
 }

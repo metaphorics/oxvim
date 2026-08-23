@@ -32,6 +32,8 @@ use crate::{
 };
 use ox_types::WinHandle;
 
+static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Build an editor with one listed buffer and a tabpage so window-local
 /// and buffer-local options are accessible.
 fn editor_with_window() -> (Editor, ox_types::BufHandle, WinHandle) {
@@ -534,7 +536,6 @@ fn execute_keeps_spaced_operators_inside_each_expression() {
 
 #[test]
 fn cd_changes_the_directory_observed_by_getcwd() {
-    static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = CWD_GUARD.lock().unwrap_or_else(|poison| poison.into_inner());
     let original = std::env::current_dir().unwrap();
     let target = std::env::temp_dir().join(format!("ox-editor-cd-{}", std::process::id()));
@@ -549,6 +550,26 @@ fn cd_changes_the_directory_observed_by_getcwd() {
 
     result.unwrap();
     assert_eq!(changed.unwrap(), target);
+}
+
+#[test]
+fn cd_minus_toggles_and_returns_previous_directory() {
+    let _guard = CWD_GUARD.lock().unwrap_or_else(|poison| poison.into_inner());
+    let original = std::env::current_dir().unwrap();
+    let target = std::env::temp_dir().join(format!("ox-editor-cd-{}", std::process::id()));
+    std::fs::create_dir_all(&target).unwrap();
+
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&mut editor, &format!("cd {}", target.display())).unwrap();
+    assert_eq!(std::env::current_dir().unwrap(), target);
+    exec.execute_line(&mut editor, "let g:before = chdir('-')").unwrap();
+    assert_eq!(std::env::current_dir().unwrap(), original);
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"before", 0),
+        Ok(&Typval::String(OxStr::from(target.to_string_lossy().as_ref()))),
+    );
+    std::fs::remove_dir(&target).unwrap();
 }
 
 #[test]
