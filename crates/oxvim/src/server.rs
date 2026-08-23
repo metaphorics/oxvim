@@ -12,13 +12,9 @@ use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
 use ox_api::{CommandExecutor, Registry};
 use ox_editor::{
     vim_variable_is_writable, AutocmdContext, AutocmdKind, CmdlineKind, Editor, Event, ExExecutor,
-    ExecOutcome, Geometry, LuaExec, LuaExecError, MessageDestination, MessageKind,
+    ExecError, ExecOutcome, Geometry, LuaExec, LuaExecError, MessageDestination, MessageKind,
     Mode, ModeMachine, Keys,
     OptionValue, TypeaheadFlags,
-};
-use ox_eval::{
-    BufferHost, BuiltinHost as EvalBuiltinHost, Builtins, Scope, call_buffer_builtin,
-    is_buffer_builtin,
 };
 use ox_lua::{
     ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot as LuaRuntimeRoot, Scheduler, VariableHost, VariableScope, Work, bind_api,
@@ -126,7 +122,12 @@ impl AppState {
         nested_ex.borrow_mut().set_channel_ids(channel_ids);
         let mut lua = LuaHost::new(
             LuaRuntimeRoot::new(runtime_path),
-            Rc::new(EditorBuiltins { editor: editor.clone(), ex: ex.clone(), nested_ex: nested_ex.clone() }),
+            Rc::new(EditorBuiltins {
+                editor: editor.clone(),
+                ex: ex.clone(),
+                nested_ex: nested_ex.clone(),
+                nested_editor: Rc::new(RefCell::new(Editor::new())),
+            }),
             Rc::new(LuaScheduler { queue: lua_work.clone() }),
         )
         .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -1160,31 +1161,47 @@ struct EditorBuiltins {
     editor: Rc<RefCell<Editor>>,
     ex: Rc<RefCell<ExExecutor>>,
     nested_ex: Rc<RefCell<ExExecutor>>,
+    nested_editor: Rc<RefCell<Editor>>,
+}
+
+impl EditorBuiltins {
+    /// Serve `name` through the outermost executor and editor that are free.
+    ///
+    /// The first tier is the real pair, and it is the tier `vim.fn` reaches
+    /// from a Lua config file, an RPC request, a scheduled callback or an
+    /// autocommand -- everywhere a plugin runs. The inner tiers exist because
+    /// Lua can also be reached from *inside* Ex execution (`:lua`, `lua <<EOF`
+    /// in an init.vim), which already holds both; a nested executor over a
+    /// scratch editor still answers every builtin that needs no editor state,
+    /// and the alternative here was a `RefCell already borrowed` panic.
+    fn dispatch(&self, name: &OxStr, args: Vec<Typval>) -> Result<Typval, ExecError> {
+        if let Ok(mut ex) = self.ex.try_borrow_mut() {
+            if let Ok(mut editor) = self.editor.try_borrow_mut() {
+                return ex.call_builtin(&mut editor, name, args);
+            }
+        }
+        if let Ok(mut ex) = self.nested_ex.try_borrow_mut() {
+            if let Ok(mut editor) = self.nested_editor.try_borrow_mut() {
+                return ex.call_builtin(&mut editor, name, args);
+            }
+        }
+        ExExecutor::new().call_builtin(&mut Editor::new(), name, args)
+    }
 }
 
 impl BuiltinHost for EditorBuiltins {
+    /// One route for every name, because `vim.fn.X()` and `:echo X()` have to
+    /// answer the same thing.
+    ///
+    /// This replaces a three-branch dispatch that sent six job names to the Ex
+    /// executor, `getline`/`setline` to a buffer seam, and *everything else* to
+    /// `Builtins::without_regex()` -- a stateless table with no editor, no file
+    /// IO and no regex engine. 24 builtins that work in Vimscript answered
+    /// `E117` from Lua and every regex builtin answered `E54: regular-
+    /// expression engine is not installed`, so the same function gave two
+    /// answers depending on which language called it.
     fn call(&self, name: &OxStr, args: Vec<Typval>) -> Result<Typval, String> {
-        let name_text = name.to_string_lossy();
-        if matches!(&*name_text, "jobstart" | "jobstop" | "jobwait" | "jobpid" | "chansend" | "jobsend") {
-            let mut fallback = Editor::new();
-            let result = match (self.editor.try_borrow_mut(), self.ex.try_borrow_mut()) {
-                (Ok(mut editor), Ok(mut ex)) => ex.call_builtin(&mut editor, name, args),
-                _ => self.nested_ex.borrow_mut().call_builtin(&mut fallback, name, args),
-            };
-            return result.map_err(|error| error.to_string());
-        }
-        if is_buffer_builtin(&name_text) {
-            return call_buffer_builtin(
-                &mut CurrentBuffer(&mut self.editor.borrow_mut()),
-                &name_text,
-                args,
-            )
-            .map_err(|error| error.to_string());
-        }
-        let mut builtins = Builtins::without_regex();
-        builtins
-            .call(name, args, &mut Scope::new())
-            .map_err(|error| error.to_string())
+        self.dispatch(name, args).map_err(|error| error.to_string())
     }
 }
 
@@ -1267,85 +1284,6 @@ fn variables_mut(
         VariableScope::Tabpage => editor
             .tabpage_variables_mut(TabHandle::try_from(handle).map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string()),
-    }
-}
-
-struct CurrentBuffer<'a>(&'a mut Editor);
-
-impl BufferHost for CurrentBuffer<'_> {
-    fn line_count(&self) -> ox_eval::Result<usize> {
-        let buffer = self
-            .0
-            .current_buffer()
-            .ok_or_else(|| ox_eval::EvalError::new("E86", 0, "Buffer not found"))?;
-        self.0
-            .buffer(buffer)
-            .and_then(|state| state.text().map_err(Into::into))
-            .map(|text| text.line_count())
-            .map_err(|error: ox_editor::EditorError| {
-                ox_eval::EvalError::new("E86", 0, error.to_string())
-            })
-    }
-
-    fn get_line(&self, lnum: usize) -> ox_eval::Result<Option<OxStr>> {
-        let buffer = self
-            .0
-            .current_buffer()
-            .ok_or_else(|| ox_eval::EvalError::new("E86", 0, "Buffer not found"))?;
-        let state = self
-            .0
-            .buffer(buffer)
-            .map_err(|error| ox_eval::EvalError::new("E86", 0, error.to_string()))?;
-        let text = state
-            .text()
-            .map_err(|error| ox_eval::EvalError::new("E86", 0, error.to_string()))?;
-        if lnum == 0 || lnum > text.line_count() { return Ok(None); }
-        text.line(lnum)
-            .map(|line| Some(OxStr(line)))
-            .map_err(|error| ox_eval::EvalError::new("E86", 0, error.to_string()))
-    }
-
-    fn replace_line(&mut self, lnum: usize, text: &OxStr) -> ox_eval::Result<()> {
-        let buffer = self
-            .0
-            .current_buffer()
-            .ok_or_else(|| ox_eval::EvalError::new("E86", 0, "Buffer not found"))?;
-        let state = self
-            .0
-            .buffer_mut(buffer)
-            .map_err(|error| ox_eval::EvalError::new("E86", 0, error.to_string()))?;
-        state
-            .replace_lines(
-                lnum,
-                lnum,
-                &[text.as_bytes().to_vec()],
-                ox_text::Position { lnum, col: 0 },
-                ox_text::Position { lnum, col: 0 },
-                0,
-            )
-            .map(|_| ())
-            .map_err(|error| ox_eval::EvalError::new("E86", 0, error.to_string()))
-    }
-
-    fn append_line(&mut self, text: &OxStr) -> ox_eval::Result<()> {
-        let count = self.line_count()?;
-        let buffer = self
-            .0
-            .current_buffer()
-            .ok_or_else(|| ox_eval::EvalError::new("E86", 0, "Buffer not found"))?;
-        let state = self
-            .0
-            .buffer_mut(buffer)
-            .map_err(|error| ox_eval::EvalError::new("E86", 0, error.to_string()))?;
-        state
-            .append_lines(
-                count,
-                &[text.as_bytes().to_vec()],
-                ox_text::Position { lnum: count, col: 0 },
-                0,
-            )
-            .map(|_| ())
-            .map_err(|error| ox_eval::EvalError::new("E86", 0, error.to_string()))
     }
 }
 

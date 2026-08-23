@@ -709,3 +709,79 @@ fn flags_without_their_subsystem_are_rejected_by_name() {
         assert!(stderr.contains(requirement), "{arguments:?}: {stderr}");
     }
 }
+
+/// `vim.fn.X()` and `:echo X()` must answer the same thing.
+///
+/// The Lua bridge used to dispatch in three branches -- six job names to the
+/// Ex executor, `getline`/`setline` to a buffer seam, everything else to
+/// `Builtins::without_regex()`, which has no editor, no file IO and no regex
+/// engine. So 24 builtins that work in Vimscript answered `E117` from Lua and
+/// every regex builtin answered `E54: regular-expression engine is not
+/// installed`: the same function, two answers, chosen by the caller's
+/// language. One row below per branch of that dispatch, each arranged so that
+/// only its own route being wrong changes its line: the job branch, the buffer
+/// branch, the fallback's file IO, its regex engine, its shell, and an
+/// editor-stateful family the fallback never reached at all.
+///
+/// Both sides render through `string()`, so the two outputs are byte-compared
+/// rather than eyeballed; every line here also matches `nvim` of the same
+/// build.
+#[test]
+fn lua_and_vimscript_answer_the_same_builtin_identically() {
+    let scratch = TempFile::new(".txt", "");
+    let calls: [(&str, String); 7] = [
+        ("jobwait([9999])", "vim.fn.jobwait({9999})".to_owned()),
+        ("getline(1)", "vim.fn.getline(1)".to_owned()),
+        ("writefile(['x'],'@')", "vim.fn.writefile({'x'},'@')".to_owned()),
+        ("readfile('@')", "vim.fn.readfile('@')".to_owned()),
+        ("substitute('aXbXc','X','-','g')", "vim.fn.substitute('aXbXc','X','-','g')".to_owned()),
+        ("system('printf hi')", "vim.fn.system('printf hi')".to_owned()),
+        ("bufnr('%')", "vim.fn.bufnr('%')".to_owned()),
+    ];
+    let path = scratch.text();
+    let vimscript = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (call, _))| format!("echo '{index} ' . string({})", call.replace('@', path)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lua = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (_, call))| format!("print('{index} ' .. vim.fn.string({}))", call.replace('@', path)))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // `:echo` reaches stderr under --headless and Lua's `print` reaches
+    // stdout, so each side is read from both streams and reduced to its
+    // numbered answer lines.
+    let answers = |config: &TempFile| {
+        let output = oxvim()
+            .args(["-i", "NONE", "--headless", "-u", config.text(), "-c", "qall!"])
+            .output()
+            .expect("spawn oxvim");
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        text.lines()
+            .filter(|line| line.starts_with(|first: char| first.is_ascii_digit()))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    let from_vimscript = answers(&TempFile::new(".vim", &vimscript));
+    let from_lua = answers(&TempFile::new(".lua", &lua));
+    assert_eq!(from_vimscript.len(), calls.len(), "vimscript: {from_vimscript:?}");
+    assert_eq!(from_lua, from_vimscript);
+    assert_eq!(
+        from_lua,
+        [
+            "0 [-3]",
+            "1 ''",
+            "2 0",
+            "3 ['x']",
+            "4 'a-b-c'",
+            "5 'hi'",
+            "6 1",
+        ],
+    );
+}
