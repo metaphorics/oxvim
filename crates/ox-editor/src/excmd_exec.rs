@@ -5559,21 +5559,71 @@ fn command_autocmd<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, c
         }
     }
     let mut words = args.splitn(3, char::is_whitespace).filter(|word| !word.is_empty());
-    let Some(event_name) = words.next() else { return Flow::Normal };
-    let event = match Event::from_name(event_name) { Some(event) => event, None => return error_flow(runtime, "E216", format!("No such group or event: {event_name}")) };
-    let pattern = words.next().unwrap_or("*");
+    let Some(event_names) = words.next() else { return Flow::Normal };
+    // `arg_event_skip` (`autocmd.c:2374-2392`) scans a comma-separated event
+    // list and rejects the whole command if any name is unknown, so the names
+    // are all resolved before anything is registered. `runtime/plugin/gzip.vim`
+    // opens with `autocmd BufReadPre,FileReadPre`, so without this every
+    // plain startup failed on the first bundled plugin it sourced.
+    let mut events = Vec::new();
+    for event_name in event_names.split(',').filter(|name| !name.is_empty()) {
+        match Event::from_name(event_name) {
+            Some(event) => events.push(event),
+            None => return error_flow(runtime, "E216", format!("No such group or event: {event_name}")),
+        }
+    }
+    let patterns = split_autocmd_patterns(words.next().unwrap_or("*"));
     if command.bang {
-        return match editor.autocmds_mut().delete(DeleteAutocmds { group: Some(runtime.current_augroup), event: Some(event), pattern: Some(pattern) }) {
-            Ok(_) => Flow::Normal,
-            Err(error) => error_flow(runtime, "E216", error.to_string()),
-        };
+        for event in events {
+            for pattern in &patterns {
+                if let Err(error) = editor.autocmds_mut().delete(DeleteAutocmds {
+                    group: Some(runtime.current_augroup),
+                    event: Some(event),
+                    pattern: Some(pattern),
+                }) {
+                    return error_flow(runtime, "E216", error.to_string());
+                }
+            }
+        }
+        return Flow::Normal;
     }
     let body = words.next().unwrap_or("");
     if body.is_empty() { return Flow::Normal; }
-    match editor.autocmds_mut().register(event, pattern, AutocmdKind::ExString(body.to_owned()), AutocmdOptions { group: runtime.current_augroup, ..AutocmdOptions::default() }) {
-        Ok(_) => Flow::Normal,
-        Err(error) => error_flow(runtime, "E216", error.to_string()),
+    // `aucmd_span_pattern` (`autocmd.c:956`) walks the comma-separated pattern
+    // list too, so one `:autocmd` registers one entry per event-pattern pair.
+    for event in events {
+        for pattern in &patterns {
+            if let Err(error) = editor.autocmds_mut().register(
+                event,
+                pattern,
+                AutocmdKind::ExString(body.to_owned()),
+                AutocmdOptions { group: runtime.current_augroup, ..AutocmdOptions::default() },
+            ) {
+                return error_flow(runtime, "E216", error.to_string());
+            }
+        }
     }
+    Flow::Normal
+}
+
+/// Splits an `:autocmd` pattern list on its unescaped commas, upstream's
+/// `aucmd_span_pattern` (`autocmd.c`). A `\,` belongs to the pattern.
+fn split_autocmd_patterns(text: &str) -> Vec<String> {
+    let mut patterns = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for character in text.chars() {
+        match character {
+            '\\' if !escaped => { escaped = true; current.push('\\'); }
+            ',' if !escaped => {
+                if !current.is_empty() { patterns.push(std::mem::take(&mut current)); }
+            }
+            _ => { escaped = false; current.push(character); }
+        }
+    }
+    if !current.is_empty() { patterns.push(current); }
+    if patterns.is_empty() { patterns.push("*".to_owned()); }
+    patterns
 }
 
 fn command_user_command<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {

@@ -51,6 +51,37 @@ impl ox_api::ChannelSink for TerminalChannelSink {
     }
 }
 
+/// Every `plugin/**/*.vim` then every `plugin/**/*.lua` under one
+/// `'runtimepath'` entry, in the order `load_plugins` sources them.
+///
+/// `gen_expand_wildcards` sorts each pattern's matches, and
+/// `source_callback_vim_lua` (runtime.c:371-396) then walks the whole match
+/// list twice -- `.vim` first, `.lua` second -- so a `plugin/a.lua` is sourced
+/// after a `plugin/z.vim`. Files with any other extension are not sourced by
+/// this path at all.
+fn plugin_scripts(root: &Path) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        let mut entries: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, found);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&root.join("plugin"), &mut found);
+    let extension = |path: &Path, wanted: &str| {
+        path.extension().is_some_and(|value| value == wanted)
+    };
+    let mut ordered: Vec<_> = found.iter().filter(|path| extension(path, "vim")).cloned().collect();
+    ordered.extend(found.iter().filter(|path| extension(path, "lua")).cloned());
+    ordered
+}
+
 /// All mutable state shared by every RPC transport.
 pub struct AppState {
     editor: Rc<RefCell<Editor>>,
@@ -195,24 +226,36 @@ impl AppState {
             }
         }
 
-        // No user-config discovery contract is exported yet.  Explicit files
-        // are real and deterministic; NONE/NORC/--clean intentionally source
-        // nothing rather than guessing platform paths.
-        if !cli.clean && let UserConfig::File(path) = &cli.user_config {
-            if Path::new(path).extension().is_some_and(|extension| extension == "lua") {
-                self.lua
-                    .borrow_mut()
-                    .exec_file(Path::new(path))
-                    .map_err(|error| AppError::Lua(error.to_string()))?;
-            } else {
-                let source = fs::read_to_string(path).map_err(AppError::Io)?;
-                self.ex
-                    .borrow_mut()
-                    .execute_script(&mut self.editor.borrow_mut(), path, &source)
-                    .map_err(|error| AppError::Ex(error.to_string()))?;
+        // main.c `source_startup_scripts` (2229-2249): an explicit `-u` file
+        // replaces discovery entirely, `NONE` and `NORC` source nothing at
+        // all, and otherwise the user's config is discovered. `-es` skips the
+        // whole step upstream (`else if (!silent_mode)`).
+        //
+        // `--clean` is not a separate case: it *is* `-u NONE`
+        // (main.c:1193-1197), so a later `-u <file>` on the same command line
+        // overwrites it and is honoured. Gating this on `!cli.clean` made
+        // `--clean -u file` ignore the file, which the oracle sources.
+        match &cli.user_config {
+            UserConfig::File(path) => self.source_config_file(Path::new(path))?,
+            UserConfig::None | UserConfig::NoRc => {}
+            UserConfig::Default => {
+                if !cli.batch.is_some_and(|batch| batch.silent) {
+                    self.discover_user_config()?;
+                }
             }
         }
         timer.mark("sourcing vimrc file(s)");
+        if self.exiting {
+            return Ok(());
+        }
+
+        // main.c:489 `load_plugins`, after the user config and before the
+        // window layout. 'loadplugins' already carries the `--noplugin` and
+        // `-u NONE`-unless-`--clean` rules from cli.rs.
+        if cli.loadplugins {
+            self.load_plugins()?;
+        }
+        timer.mark("loading plugins");
 
         // main.c create_windows()/edit_buffers(): the requested window or
         // tab-page layout is built first, then every positional file becomes
@@ -230,6 +273,128 @@ impl AppState {
             }
         }
         self.fire_vim_enter()
+    }
+
+    /// Sources one config file, choosing the host by extension the way
+    /// `do_source` picks between `nlua_exec_file` and the Ex parser.
+    fn source_config_file(&mut self, path: &Path) -> Result<(), AppError> {
+        if path.extension().is_some_and(|extension| extension == "lua") {
+            return self
+                .lua
+                .borrow_mut()
+                .exec_file(path)
+                .map_err(|error| AppError::Lua(error.to_string()));
+        }
+        let source = fs::read_to_string(path).map_err(AppError::Io)?;
+        let name = path.to_string_lossy().into_owned();
+        self.ex
+            .borrow_mut()
+            .execute_script(&mut self.editor.borrow_mut(), &name, &source)
+            .map_err(|error| AppError::Ex(error.to_string()))?;
+        Ok(())
+    }
+
+    /// `do_user_initialization` (main.c:2108-2210), in its order:
+    ///
+    /// 1. `$VIMINIT` as Ex commands, and nothing else if it ran.
+    /// 2. `stdpath('config')/init.lua`, then `init.vim`. Only one is sourced;
+    ///    when the Lua one wins and the Vim one also exists, upstream reports
+    ///    `E5422: Conflicting configs` (errors.h:233) and keeps going.
+    /// 3. The same pair under each `stdpath('config_dirs')` entry, in order.
+    /// 4. `$EXINIT` as Ex commands.
+    ///
+    /// This is the step whose absence meant nothing a user wrote ever ran:
+    /// before it, only an explicit `-u` was read.
+    fn discover_user_config(&mut self) -> Result<(), AppError> {
+        if self.execute_env("VIMINIT")? {
+            return Ok(());
+        }
+        let mut bases = ox_editor::stdpath(ox_editor::StdPath::Config);
+        bases.extend(ox_editor::stdpath(ox_editor::StdPath::ConfigDirs));
+        for base in bases {
+            let lua = Path::new(&base).join("init.lua");
+            let vim = Path::new(&base).join("init.vim");
+            if lua.is_file() {
+                self.source_config_file(&lua)?;
+                if vim.is_file() {
+                    self.editor.borrow_mut().push_message(ox_editor::Message {
+                        kind: MessageKind::Error,
+                        content: Object::String(OxStr::from(
+                            format!(
+                                "E5422: Conflicting configs: \"{}\" \"{}\"",
+                                lua.display(),
+                                vim.display()
+                            )
+                            .as_str(),
+                        )),
+                        history: true,
+                    });
+                }
+                return Ok(());
+            }
+            if vim.is_file() {
+                return self.source_config_file(&vim);
+            }
+        }
+        self.execute_env("EXINIT").map(|_| ())
+    }
+
+    /// `execute_env` (main.c:2257-...): a non-empty environment variable is run
+    /// as Ex command lines. Reports whether it ran.
+    fn execute_env(&mut self, name: &str) -> Result<bool, AppError> {
+        let Some(value) = std::env::var_os(name) else { return Ok(false) };
+        let value = value.to_string_lossy().into_owned();
+        if value.is_empty() {
+            return Ok(false);
+        }
+        self.execute_ex(&value)?;
+        Ok(true)
+    }
+
+    /// `load_plugins` (runtime.c:1397-1424): `plugin/**/*` under every
+    /// `'runtimepath'` entry, with the `after/` entries held back to the end
+    /// (`DIP_NOAFTER` then `DIP_AFTER`).
+    ///
+    /// Within one entry every `.vim` file is sourced before every `.lua` file,
+    /// which is `source_callback_vim_lua`'s two passes (runtime.c:371-396) and
+    /// not an accident of directory order.
+    ///
+    /// Packages (`pack/*/start/*`) are not sourced here: upstream's
+    /// `add_pack_start_dirs`/`load_start_packages` also rewrite
+    /// `'runtimepath'`, which is a separate mechanism from this one.
+    fn load_plugins(&mut self) -> Result<(), AppError> {
+        let rtp = match self.editor.borrow().options().get_global("runtimepath") {
+            Ok(OptionValue::String(value)) => value.clone(),
+            _ => return Ok(()),
+        };
+        let (after, plain): (Vec<&str>, Vec<&str>) = rtp
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .partition(|entry| Path::new(entry).file_name().is_some_and(|name| name == "after"));
+        for entry in plain.into_iter().chain(after) {
+            for script in plugin_scripts(Path::new(entry)) {
+                // `source_callback_vim_lua` (runtime.c:371-396) discards
+                // `do_source`'s result and sources the next file, so an error
+                // inside one plugin ends that plugin and nothing else. One
+                // broken plugin must not be able to stop startup -- with the
+                // error propagated instead, `runtime/plugin/gzip.vim` took the
+                // whole editor down on every plain startup.
+                if let Err(error) = self.source_config_file(&script) {
+                    self.editor.borrow_mut().push_message(ox_editor::Message {
+                        kind: MessageKind::Error,
+                        content: Object::String(OxStr::from(
+                            format!("{}: {error}", script.display()).as_str(),
+                        )),
+                        history: true,
+                    });
+                }
+                if self.exiting {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 
     fn execute_ex(&mut self, command: &str) -> Result<(), AppError> {

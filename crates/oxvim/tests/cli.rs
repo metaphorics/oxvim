@@ -785,3 +785,76 @@ fn lua_and_vimscript_answer_the_same_builtin_identically() {
         ],
     );
 }
+
+/// `do_user_initialization` (main.c:2108-2210) and `load_plugins`
+/// (runtime.c:1397-1424), and the flags that switch them off.
+///
+/// Before this, `crates/oxvim/src/server.rs` sourced a config only when `-u`
+/// named one and never sourced `plugin/` at all, so nothing a user wrote ever
+/// ran. Each row is one branch of that decision, arranged so that only its own
+/// branch being wrong changes its answer:
+///
+/// | run | discovery | plugins |
+/// | --- | --- | --- |
+/// | plain | yes | yes |
+/// | `-u NONE` | no | no |
+/// | `-u NORC` | no | yes |
+/// | `--clean` | no | **yes** (`p_lpl = vimrc_none ? clean : p_lpl`, main.c:462) |
+/// | `--noplugin` | yes | no |
+/// | `--clean -u file` | the file | yes |
+///
+/// The order string also pins two things a per-flag check would miss: the
+/// config runs before any plugin, and `plugin/zz.vim` runs before
+/// `plugin/aa.lua` even though `aa` sorts first -- `source_callback_vim_lua`
+/// (runtime.c:371-396) walks the match list twice, `.vim` then `.lua`. And
+/// `plugin/broken.vim` fails between them without stopping the rest, because
+/// upstream discards `do_source`'s result.
+///
+/// Every expected value here was produced by `nvim` of the same build against
+/// the same tree in the same throwaway `XDG_CONFIG_HOME`.
+#[test]
+fn user_config_and_plugin_directories_are_discovered_and_gated_by_their_flags() {
+    let root = std::env::temp_dir().join(format!("oxvim-t78-discovery-{}", std::process::id()));
+    let config = root.join("cfg/nvim");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(config.join("plugin")).expect("create config tree");
+    std::fs::write(config.join("init.lua"), "vim.g.order = 'init'\n").expect("write init.lua");
+    std::fs::write(config.join("plugin/zz.vim"), "let g:order = get(g:, 'order', '') . ',zz.vim'\n").expect("write zz.vim");
+    std::fs::write(config.join("plugin/broken.vim"), "this is not a command\n").expect("write broken.vim");
+    std::fs::write(config.join("plugin/aa.lua"), "vim.g.order = (vim.g.order or '') .. ',aa.lua'\n").expect("write aa.lua");
+    let explicit = root.join("explicit.lua");
+    std::fs::write(&explicit, "vim.g.order = 'explicit'\n").expect("write explicit.lua");
+
+    let order = |flags: &[&str]| {
+        let output = oxvim()
+            .args(["--headless", "-i", "NONE"])
+            .args(flags)
+            .args(["-c", "lua print('ORDER=' .. tostring(vim.g.order))", "-c", "qall!"])
+            .env("HOME", root.join("home"))
+            .env("XDG_CONFIG_HOME", root.join("cfg"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env("XDG_CONFIG_DIRS", root.join("etc"))
+            .env("XDG_DATA_DIRS", root.join("share"))
+            .output()
+            .expect("spawn oxvim");
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        text.lines()
+            .find_map(|line| line.strip_prefix("ORDER=").map(str::to_owned))
+            .unwrap_or_else(|| panic!("no ORDER line for {flags:?} in:\n{text}"))
+    };
+
+    assert_eq!(order(&[]), "init,zz.vim,aa.lua");
+    assert_eq!(order(&["-u", "NONE"]), "nil");
+    // NORC skips the config but keeps 'loadplugins', so the plugins run with
+    // no `init` prefix -- which is why the two flags cannot share a row.
+    assert_eq!(order(&["-u", "NORC"]), ",zz.vim,aa.lua");
+    assert_eq!(order(&["--clean"]), "nil");
+    assert_eq!(order(&["--noplugin"]), "init");
+    assert_eq!(order(&["--clean", "-u", &explicit.to_string_lossy()]), "explicit");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
