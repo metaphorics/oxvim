@@ -32,6 +32,7 @@ use crate::extmark::{ExtmarkAttributes, ExtmarkId, ExtmarkPlacement, ExtmarkPosi
 use crate::mapping::{MapMode, MapModes, MapScope, MappingAction, MappingOptions};
 use crate::options::{find_unescaped, CommaItems, OptionListKind, OptionScope, OptionType, OptionValue, OPTION_METADATA};
 use crate::builtins::position::cell_width;
+use crate::fold::{FoldMethod, Position as FoldPosition};
 use crate::register::RegisterContent;
 use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid};
 use crate::typeahead::Keys;
@@ -950,6 +951,8 @@ fn dispatch<F: FileIO>(
         "z" => command_z(runtime, editor, command),
         "lockvar" => command_lockvar(runtime, scope, command, true),
         "unlockvar" => command_lockvar(runtime, scope, command, false),
+        "fold" => command_fold(runtime, editor, command),
+        "foldopen" | "foldclose" => command_foldopen(runtime, editor, command),
         "resize" => command_resize(runtime, editor, command),
         "wincmd" => command_wincmd(runtime, editor, command),
         "echohl" => command_echohl(runtime, editor, command),
@@ -3419,6 +3422,169 @@ fn command_lockvar<F: FileIO>(
         if let Err(error) = result {
             return eval_error_flow(runtime, error);
         }
+    }
+    Flow::Normal
+}
+
+/// The current window's `'foldmethod'`, as a [`FoldMethod`].
+///
+/// Named gap: `'foldmethod'` is a window option and upstream's fold tree is
+/// per-window (`wp->w_folds`), but this port keeps one [`Folds`] per buffer.
+/// Two windows on one buffer with different `'foldmethod'` therefore cannot
+/// both be honoured; the current window's value wins. Reading the option here
+/// is still what makes the `E350` guard read real state rather than a field
+/// nothing ever assigns.
+fn current_fold_method<F: FileIO>(runtime: &ExRuntime<F>, editor: &Editor) -> FoldMethod {
+    let _ = runtime;
+    match option_value(editor, "foldmethod", SetLayer::Effective) {
+        Some(OptionValue::String(value)) => match value.as_str() {
+            "indent" => FoldMethod::Indent,
+            "expr" => FoldMethod::Expr,
+            "marker" => FoldMethod::Marker,
+            "syntax" => FoldMethod::Syntax,
+            "diff" => FoldMethod::Diff,
+            _ => FoldMethod::Manual,
+        },
+        _ => FoldMethod::Manual,
+    }
+}
+
+/// `:fold` (`ex_docmd.c` `ex_fold`:8019): create a fold over the addressed
+/// lines.
+///
+/// `foldManualAllowed` (`fold.c:522-533`) permits only `'foldmethod'` of
+/// `manual` or `marker`; anything else is `E350`. Under `manual` the fold is
+/// recorded and starts closed (`foldCreate`); under `marker` upstream instead
+/// writes `'foldmarker'` into the text and lets the marker scan find it
+/// (`foldCreateMarkers`, `fold.c:1554`).
+fn command_fold<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    let Some(buffer) = editor.current_buffer() else {
+        return error_flow(runtime, "E749", "Empty buffer");
+    };
+    let (first, last) = match resolve_range(editor, command) {
+        Ok(range) => range,
+        Err(message) => return error_flow(runtime, "E16", message),
+    };
+    let method = current_fold_method(runtime, editor);
+    match method {
+        FoldMethod::Manual => {}
+        FoldMethod::Marker => return fold_create_markers(runtime, editor, buffer, first, last),
+        FoldMethod::Indent | FoldMethod::Expr | FoldMethod::Syntax | FoldMethod::Diff => {
+            return error_flow(runtime, "E350", "Cannot create fold with current 'foldmethod'");
+        }
+    }
+    let folds = match editor.buffer_mut(buffer) {
+        Ok(state) => &mut state.folds,
+        Err(error) => return error_flow(runtime, "E749", error.to_string()),
+    };
+    folds.set_method(FoldMethod::Manual);
+    match folds.create_manual(FoldPosition::new(first - 1, 0), FoldPosition::new(last, 0)) {
+        Ok(_) => Flow::Normal,
+        // An identical fold already exists, which upstream tolerates: foldCreate
+        // simply nests another entry and the visible result is unchanged.
+        Err(crate::fold::FoldError::DuplicateRange) => Flow::Normal,
+        Err(error) => error_flow(runtime, "E350", error.to_string()),
+    }
+}
+
+/// `foldCreateMarkers` (`fold.c:1554-1575`): append the `'foldmarker'` pair to
+/// the first and last addressed lines so the marker scan finds a fold there.
+///
+/// Named gap: upstream wraps each marker in `'commentstring'` unless the line
+/// already ends inside a comment (`foldAddMarker`, `fold.c:1579-1609`). The
+/// wrap is implemented; the "already a comment" refinement needs `skip_comment`
+/// and a comment parser this port does not have, so a marker added to a line
+/// that already ends in an open comment is wrapped where upstream would not.
+fn fold_create_markers<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    buffer: BufHandle,
+    first: usize,
+    last: usize,
+) -> Flow {
+    let markers = match option_value(editor, "foldmarker", SetLayer::Effective) {
+        Some(OptionValue::String(value)) => value.clone(),
+        _ => "{{{,}}}".to_owned(),
+    };
+    let (start_marker, end_marker) = match markers.split_once(',') {
+        Some((start, end)) => (start.to_owned(), end.to_owned()),
+        None => return error_flow(runtime, "E536", "comma required"),
+    };
+    let comment = match option_value(editor, "commentstring", SetLayer::Effective) {
+        Some(OptionValue::String(value)) => value.clone(),
+        _ => String::new(),
+    };
+    let lines = match buffer_lines(editor, buffer) {
+        Ok(lines) => lines,
+        Err(message) => return error_flow(runtime, "E749", message),
+    };
+    // Applied last line first so the earlier replacement cannot shift the
+    // later one, and skipped when both markers land on the same line.
+    let mut targets = vec![(last, end_marker), (first, start_marker)];
+    targets.dedup_by_key(|(lnum, _)| *lnum);
+    for (lnum, marker) in targets {
+        let Some(line) = lines.get(lnum - 1) else { continue };
+        let mut rebuilt = line.clone();
+        match comment.split_once("%s") {
+            Some((before, after)) => {
+                rebuilt.extend_from_slice(before.as_bytes());
+                rebuilt.extend_from_slice(marker.as_bytes());
+                rebuilt.extend_from_slice(after.as_bytes());
+            }
+            None => rebuilt.extend_from_slice(marker.as_bytes()),
+        }
+        let cursor = editor
+            .current_window()
+            .and_then(|window| editor.window(window).ok())
+            .map_or(Position { lnum, col: 0 }, |state| state.cursor);
+        if let Err(error) = editor.replace_buffer_lines(buffer, lnum, lnum, &[rebuilt], cursor, cursor, 0) {
+            return error_flow(runtime, "E749", error.to_string());
+        }
+    }
+    Flow::Normal
+}
+
+/// `:foldopen` and `:foldclose` (`ex_docmd.c` `ex_foldopen`:8028 →
+/// `opFoldRange`, `fold.c:386-415`).
+///
+/// Every addressed line is opened or closed; `!` makes it recursive. `E490` is
+/// reported only when *no* line in the range had a fold at all — a fold that
+/// was already in the requested state counts as found (`setManualFoldWin`
+/// sets `DONE_FOLD` without `DONE_ACTION`).
+fn command_foldopen<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    let Some(buffer) = editor.current_buffer() else {
+        return error_flow(runtime, "E749", "Empty buffer");
+    };
+    let (first, last) = match resolve_range(editor, command) {
+        Ok(range) => range,
+        Err(message) => return error_flow(runtime, "E16", message),
+    };
+    let opening = command.command.name() == "foldopen";
+    let recurse = command.bang;
+    let method = current_fold_method(runtime, editor);
+    let mut found = false;
+    for lnum in first..=last {
+        let position = FoldPosition::new(lnum - 1, 0);
+        let outcome = match editor.buffer_mut(buffer) {
+            Ok(state) => {
+                state.folds.set_method(method);
+                match (opening, recurse) {
+                    (true, false) => state.folds.open(position).map(|_| ()),
+                    (true, true) => state.folds.open_recursive(position).map(|_| ()),
+                    (false, false) => state.folds.close(position).map(|_| ()),
+                    (false, true) => state.folds.close_recursive(position).map(|_| ()),
+                }
+            }
+            Err(error) => return error_flow(runtime, "E749", error.to_string()),
+        };
+        match outcome {
+            Ok(()) => found = true,
+            Err(crate::fold::FoldError::NoFold) => {}
+            Err(error) => return error_flow(runtime, "E490", error.to_string()),
+        }
+    }
+    if !found {
+        return error_flow(runtime, "E490", "No fold found");
     }
     Flow::Normal
 }

@@ -2079,3 +2079,161 @@ fn lockvar_without_a_name_raises_e471() {
     let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
     assert_vim_error(executor.execute_line(&mut editor, "lockvar"), "E471");
 }
+
+// ---------------------------------------------------------------------------
+// :fold / :foldopen / :foldclose
+// Citations: ex_docmd.c ex_fold:8019, ex_foldopen:8028, fold.c
+// foldManualAllowed:522, foldCreate:538, foldCreateMarkers:1554,
+// opFoldRange:386.
+// ---------------------------------------------------------------------------
+
+fn fold_ranges(editor: &Editor) -> Vec<(usize, usize)> {
+    let buffer = editor.current_buffer().unwrap();
+    editor
+        .buffer(buffer)
+        .unwrap()
+        .folds
+        .folds()
+        .iter()
+        .map(|fold| (fold.range.start.row, fold.range.end.row))
+        .collect()
+}
+
+fn fold_states(editor: &Editor) -> Vec<crate::fold::FoldState> {
+    let buffer = editor.current_buffer().unwrap();
+    editor
+        .buffer(buffer)
+        .unwrap()
+        .folds
+        .folds()
+        .iter()
+        .map(|fold| fold.state)
+        .collect()
+}
+
+/// `:{range}fold` records a closed fold over the addressed lines, and `:fo` is
+/// the abbreviation. The range is inclusive one-based, the fold half-open
+/// zero-based.
+///
+/// Oracle: `2,4fold` on six lines gives `foldclosed(3) == 2` and
+/// `foldlevel(3) == 1`.
+#[test]
+fn fold_creates_a_closed_manual_fold() {
+    let (mut editor, mut executor) = setup_with_content(&fold_lines());
+    executor.execute_line(&mut editor, "set foldmethod=manual").unwrap();
+    executor.execute_line(&mut editor, "2,4fo").unwrap();
+    assert_eq!(fold_ranges(&editor), vec![(1, 4)]);
+    assert_eq!(fold_states(&editor), vec![crate::fold::FoldState::Closed]);
+}
+
+/// A `'foldmethod'` that is neither `manual` nor `marker` is E350, and the
+/// buffer is left alone.
+///
+/// Oracle: with `foldmethod=indent`, `1,2fold` →
+/// `Vim(fold):E350: Cannot create fold with current 'foldmethod'`, text
+/// unchanged. Same for `expr`.
+#[test]
+fn fold_rejects_a_computed_foldmethod_with_e350() {
+    for method in ["indent", "expr", "syntax", "diff"] {
+        let (mut editor, mut executor) = setup_with_content(&fold_lines());
+        executor
+            .execute_line(&mut editor, &format!("set foldmethod={method}"))
+            .unwrap();
+        assert_vim_error(executor.execute_line(&mut editor, "1,2fold"), "E350");
+        assert_eq!(buffer_text(&editor).len(), 6, "{method}");
+    }
+}
+
+/// The guard reads the real option, so switching back to `manual` lets the
+/// same command through. Without that wiring the E350 branch could never fire
+/// and this pair would be indistinguishable.
+#[test]
+fn fold_guard_follows_the_foldmethod_option() {
+    let (mut editor, mut executor) = setup_with_content(&fold_lines());
+    executor.execute_line(&mut editor, "set foldmethod=indent").unwrap();
+    assert_vim_error(executor.execute_line(&mut editor, "1,2fold"), "E350");
+    executor.execute_line(&mut editor, "set foldmethod=manual").unwrap();
+    executor.execute_line(&mut editor, "1,2fold").unwrap();
+    assert_eq!(fold_ranges(&editor), vec![(0, 2)]);
+}
+
+/// Under `'foldmethod'` of `marker`, `:fold` writes the `'foldmarker'` pair
+/// into the text instead of recording a range.
+///
+/// Oracle: `1,3fold` with `foldmethod=marker` gives
+/// `a1{{{`, `a2`, `a3}}}`.
+#[test]
+fn fold_under_marker_writes_the_markers() {
+    let (mut editor, mut executor) = setup_with_content(&fold_lines());
+    executor.execute_line(&mut editor, "set foldmethod=marker").unwrap();
+    executor.execute_line(&mut editor, "1,3fold").unwrap();
+    assert_eq!(
+        buffer_text(&editor),
+        vec!["a1{{{", "a2", "a3}}}", "a4", "a5", "a6"]
+    );
+    // No manual range was recorded: the markers are the fold.
+    assert!(fold_ranges(&editor).is_empty());
+}
+
+/// `:foldopen` opens a fold over the addressed lines and `:foldclose` closes
+/// it again.
+///
+/// Oracle: after `2,4fold`, `3foldopen` gives `foldclosed(3) == -1` and
+/// `3foldclose` gives 2 again.
+#[test]
+fn foldopen_and_foldclose_toggle_the_fold() {
+    let (mut editor, mut executor) = setup_with_content(&fold_lines());
+    executor.execute_line(&mut editor, "set foldmethod=manual").unwrap();
+    executor.execute_line(&mut editor, "2,4fold").unwrap();
+    executor.execute_line(&mut editor, "3foldopen").unwrap();
+    assert_eq!(fold_states(&editor), vec![crate::fold::FoldState::Open]);
+    executor.execute_line(&mut editor, "3foldclose").unwrap();
+    assert_eq!(fold_states(&editor), vec![crate::fold::FoldState::Closed]);
+}
+
+/// A line with no fold is E490, for both directions.
+///
+/// Oracle: `5foldopen` and `5foldclose` with no fold there both report
+/// `E490: No fold found`.
+#[test]
+fn foldopen_without_a_fold_raises_e490() {
+    let (mut editor, mut executor) = setup_with_content(&fold_lines());
+    executor.execute_line(&mut editor, "set foldmethod=manual").unwrap();
+    assert_vim_error(executor.execute_line(&mut editor, "5foldopen"), "E490");
+    assert_vim_error(executor.execute_line(&mut editor, "5foldclose"), "E490");
+}
+
+/// A fold already in the requested state is *not* an error: upstream's
+/// `setManualFoldWin` records `DONE_FOLD` without `DONE_ACTION`, and E490
+/// needs `DONE_NOTHING`.
+///
+/// Oracle: two `4foldopen` in a row on one fold both succeed silently.
+#[test]
+fn foldopen_on_an_already_open_fold_is_not_an_error() {
+    let (mut editor, mut executor) = setup_with_content(&fold_lines());
+    executor.execute_line(&mut editor, "set foldmethod=manual").unwrap();
+    executor.execute_line(&mut editor, "4,5fold").unwrap();
+    executor.execute_line(&mut editor, "4foldopen").unwrap();
+    executor.execute_line(&mut editor, "4foldopen").unwrap();
+    assert_eq!(fold_states(&editor), vec![crate::fold::FoldState::Open]);
+}
+
+/// `:foldopen!` is the recursive form, so a nested fold opens too where the
+/// plain form leaves it closed.
+#[test]
+fn foldopen_bang_opens_nested_folds() {
+    let (mut editor, mut executor) = setup_with_content(&fold_lines());
+    executor.execute_line(&mut editor, "set foldmethod=manual").unwrap();
+    executor.execute_line(&mut editor, "2,3fold").unwrap();
+    executor.execute_line(&mut editor, "1,6fold").unwrap();
+    assert_eq!(fold_ranges(&editor), vec![(0, 6), (1, 3)]);
+    executor.execute_line(&mut editor, "2foldopen!").unwrap();
+    assert_eq!(
+        fold_states(&editor),
+        vec![crate::fold::FoldState::Open, crate::fold::FoldState::Open]
+    );
+}
+
+fn fold_lines() -> Vec<Vec<u8>> {
+    (1..=6).map(|index| format!("a{index}").into_bytes()).collect()
+}
