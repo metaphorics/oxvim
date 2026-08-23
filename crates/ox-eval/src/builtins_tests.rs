@@ -484,6 +484,24 @@ fn split_uses_regex_engine_seam() {
 }
 
 #[test]
+fn split_without_pattern_uses_whitespace_runs() {
+    let regex = LiteralRegex { calls: Cell::new(0) };
+    let mut builtins = Builtins::new(&regex);
+    let result = builtins
+        .call(
+            &OxStr::from("split"),
+            vec![text("  alpha\nbeta\t gamma  " )],
+            &mut Scope::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        Typval::list(vec![text("alpha"), text("beta"), text("gamma")]),
+    );
+    assert_eq!(regex.calls.get(), 0);
+}
+
+#[test]
 fn match_family_uses_regex_engine_seam() {
     let regex = LiteralRegex { calls: Cell::new(0) };
     let mut builtins = Builtins::new(&regex);
@@ -512,7 +530,7 @@ fn substitute_uses_regex_engine_seam() {
 
 #[test]
 fn regex_builtin_without_engine_is_typed_error() {
-    assert_eq!(call("split", vec![text("a b")]).unwrap_err().code, "E54");
+    assert_eq!(call("split", vec![text("a b"), text(" ")]).unwrap_err().code, "E54");
 }
 
 

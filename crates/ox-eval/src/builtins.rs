@@ -159,7 +159,16 @@ impl<'a> Builtins<'a> {
 
     fn regex_split(&self, args: &[Typval]) -> Result<Typval> {
         let text = string_arg(&args[0])?;
-        let pattern = args.get(1).map_or_else(|| Ok(OxStr::from("\\s\\+")), string_arg)?;
+        if args.len() == 1 {
+            let parts = text
+                .as_bytes()
+                .split(u8::is_ascii_whitespace)
+                .filter(|part| !part.is_empty())
+                .map(|part| Typval::String(OxStr(part.to_vec())))
+                .collect();
+            return Ok(Typval::list(parts));
+        }
+        let pattern = string_arg(&args[1])?;
         let keep_empty = args.get(2).is_some_and(Typval::is_truthy);
         self.regex()?.split(&text, &pattern, keep_empty).map(|parts| {
             Typval::list(parts.into_iter().map(Typval::String).collect())

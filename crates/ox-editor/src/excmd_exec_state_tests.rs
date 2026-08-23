@@ -563,7 +563,7 @@ fn buffer_identity_builtins_resolve_current_and_named_buffers() {
     exec.execute_script(
         &mut editor,
         "<buffer-identity>",
-        "let g:current_name = bufname()\nlet g:named_number = bufnr('named.vim')",
+        "let g:current_name = bufname()\nlet g:named_number = bufnr('named.vim')\nlet g:named_exists = bufexists('named.vim')\nlet g:missing_exists = bufexists('missing.vim')",
     )
     .unwrap();
 
@@ -574,6 +574,14 @@ fn buffer_identity_builtins_resolve_current_and_named_buffers() {
     assert_eq!(
         exec.scope().get_scoped(ScopeKind::Global, b"named_number", 0),
         Ok(&Typval::Number(i64::from(buffer))),
+    );
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"named_exists", 0),
+        Ok(&Typval::Number(1)),
+    );
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"missing_exists", 0),
+        Ok(&Typval::Number(0)),
     );
 }
 
@@ -1187,7 +1195,7 @@ fn line_last_and_append_support_oldtest_result_logging() {
     exec.execute_script(
         &mut editor,
         "<oldtest-log>",
-        "call setline(1, 'first')\ncall append(line('$'), ['second', 'third'])\nlet g:last = line('$')",
+        "call setline(1, 'first')\ncall append(line('$'), ['second', 'third' . nr2char(10) . 'continued'])\nlet g:last = line('$')",
     )
     .unwrap();
 
@@ -1196,5 +1204,5 @@ fn line_last_and_append_support_oldtest_result_logging() {
         Ok(&Typval::Number(3))
     );
     let text = editor.buffer(buffer).unwrap().text().unwrap();
-    assert_eq!(text.to_bytes(), b"first\nsecond\nthird");
+    assert_eq!(text.to_bytes(), b"first\nsecond\nthird\0continued");
 }

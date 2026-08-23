@@ -897,9 +897,10 @@ fn dispatch<F: FileIO>(
                 flow
             }
         }
-        "split" => command_split(runtime, editor, command, false),
+        "split" | "new" => command_split(runtime, editor, command, false),
         "vsplit" => command_split(runtime, editor, command, true),
         "close" => command_close(runtime, editor, command, false),
+        "only" => command_only(runtime, editor),
         "quit" => command_close(runtime, editor, command, true),
         "qall" => command_qall(runtime, editor, command),
         "cquit" => command_cquit(command),
@@ -1085,6 +1086,19 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         }
         if name_text == "append" {
             return call_append_builtin(self.editor, args);
+        }
+        if name_text == "bufexists" {
+            if args.len() != 1 {
+                let (code, message) = if args.is_empty() {
+                    ("E119", "Not enough arguments for function: bufexists")
+                } else {
+                    ("E118", "Too many arguments for function: bufexists")
+                };
+                return Err(EvalError::new(code, 0, message));
+            }
+            let exists = !matches!(args.first(), Some(Typval::Number(0)))
+                && resolve_buffer_argument(self.editor, args.first()).is_some();
+            return Ok(Typval::Number(i64::from(exists)));
         }
         if matches!(&*name_text, "bufname" | "bufnr") {
             if args.len() > 1 {
@@ -3046,7 +3060,12 @@ fn command_split<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, com
         Some(window) => window,
         None => return error_flow(runtime, "E749", "No current window"),
     };
-    let new_buffer = if command.args.trim().is_empty() {
+    let new_buffer = if command.command.name() == "new" && command.args.trim().is_empty() {
+        match editor.create_buffer(true) {
+            Ok(handle) => handle,
+            Err(error) => return error_flow(runtime, "E948", error.to_string()),
+        }
+    } else if command.args.trim().is_empty() {
         buffer
     } else {
         let path = PathBuf::from(command.args.trim());
@@ -3120,6 +3139,23 @@ fn command_close<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command
         Ok(_) => Flow::Normal,
         Err(error) => error_flow(runtime, "E444", error.to_string()),
     }
+}
+
+fn command_only<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor) -> Flow {
+    let Some(tab) = editor.current_tabpage() else {
+        return error_flow(runtime, "E749", "No current tabpage");
+    };
+    let Some(current) = editor.current_window() else {
+        return error_flow(runtime, "E749", "No current window");
+    };
+    for window in editor.windows() {
+        if window != current {
+            if let Err(error) = editor.close_window(tab, window, true) {
+                return error_flow(runtime, "E445", error.to_string());
+            }
+        }
+    }
+    Flow::Normal
 }
 
 /// `:qall` (`ex_docmd.c` ex_quitall): quit all windows and the host
@@ -5011,14 +5047,23 @@ fn call_append_builtin(editor: &mut Editor, args: Vec<Typval>) -> ox_eval::Resul
         return Err(EvalError::new("E118", 0, "Too many arguments for function: append"));
     }
     let after = current_line_address(editor, &args[0])?;
+    let to_line = |value: &Typval| {
+        let mut line = typval_to_text(value).into_bytes();
+        for byte in &mut line {
+            if *byte == b'\n' {
+                *byte = 0;
+            }
+        }
+        line
+    };
     let lines = match &args[1] {
         Typval::List(values) => values
             .borrow()
             .items
             .iter()
-            .map(|value| typval_to_text(value).into_bytes())
+            .map(to_line)
             .collect::<Vec<_>>(),
-        value => vec![typval_to_text(value).into_bytes()],
+        value => vec![to_line(value)],
     };
     let buffer = editor
         .current_buffer()

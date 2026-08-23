@@ -296,6 +296,29 @@ fn split_creates_second_window() {
     assert_eq!(editor.windows().len(), 2);
 }
 
+#[test]
+fn new_creates_second_window_with_fresh_buffer() {
+    let (mut editor, mut executor) = setup();
+    let original = editor.current_buffer().unwrap();
+
+    executor.execute_line(&mut editor, "new").unwrap();
+
+    assert_eq!(editor.windows().len(), 2);
+    assert_ne!(editor.current_buffer(), Some(original));
+    assert!(editor
+        .buffer(editor.current_buffer().unwrap())
+        .unwrap()
+        .name()
+        .as_bytes()
+        .is_empty());
+    let current = editor.current_buffer();
+
+    executor.execute_line(&mut editor, "only").unwrap();
+
+    assert_eq!(editor.windows().len(), 1);
+    assert_eq!(editor.current_buffer(), current);
+}
+
 /// `:vsplit` creates a second tiled window with a vertical split.
 /// Upstream: `ex_docmd.c` `ex_splitview` with `WSP_VSPLIT`.
 #[test]
