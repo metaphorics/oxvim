@@ -5281,10 +5281,17 @@ fn assign_target<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, sco
         return Ok(());
     }
     if let Some(environment) = target.strip_prefix('$') {
-        scope.set_env(
-            environment.as_bytes(),
-            Typval::String(OxStr(typval_to_text(&value).into_bytes())),
-        );
+        // `ex_let_env` (`eval/vars.c`:1349-1351) hands the value straight to
+        // `vim_setenv_ext`, which is `os_setenv`: the assignment *is* a change
+        // to the process environment, so every child inherits it. Recording it
+        // only in the script scope leaves children with the value oxvim was
+        // started with, which is how `setup.vim`'s
+        // `let $HOME = expand(getcwd() . '/XfakeHOME')` sandbox failed to
+        // reach `system('rm -rf ...')` and a suite cleanup deleted the real
+        // home directory instead of the sandbox.
+        let text = typval_to_text(&value);
+        ox_sys::set_env(environment, &text);
+        scope.set_env(environment.as_bytes(), Typval::String(OxStr(text.into_bytes())));
         return Ok(());
     }
     if let Some(option) = target.strip_prefix('&') { return assign_option(runtime, editor, scope, option, value); }
@@ -5328,7 +5335,20 @@ pub fn vim_variable_is_writable(name: &[u8]) -> bool {
 fn read_target<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &Editor, scope: &Scope, target: &str) -> Result<Typval, Flow> {
     let target = target.trim();
     if let Some(register) = target.strip_prefix('@').and_then(|name| name.chars().next()) { return Ok(scope.get_register(&[register as u8])); }
-    if let Some(environment) = target.strip_prefix('$') { return Ok(scope.get_env(environment.as_bytes())); }
+    if let Some(environment) = target.strip_prefix('$') {
+        // The scope copy is seeded from the process environment at startup and
+        // kept by `let $VAR`, but the process environment is what `vim_getenv`
+        // reads, so a variable set through it alone -- `setenv()`, a locale
+        // change -- is visible here too. An unset one is the empty string, as
+        // upstream's expression evaluation gives.
+        if scope.contains_env(environment.as_bytes()) {
+            return Ok(scope.get_env(environment.as_bytes()));
+        }
+        return Ok(Typval::String(
+            std::env::var_os(environment)
+                .map_or_else(|| OxStr::from(""), |value| OxStr::from(value.to_string_lossy().as_ref())),
+        ));
+    }
     if let Some(option) = target.strip_prefix('&') { return Ok(read_option(editor, option)); }
     let (kind, name) = parse_scope_name(target);
     let value = if let Some(kind) = kind { scope.get_scoped(kind, name.as_bytes(), 0) } else { scope.get(name.as_bytes(), 0) };
@@ -5343,7 +5363,16 @@ fn remove_target(editor: &mut Editor, scope: &mut Scope, target: &str) -> bool {
         };
         return editor.registers_mut().set(register, content).is_ok();
     }
-    if let Some(environment) = target.strip_prefix('$') { return remove_scope_pair(&mut scope.env, environment); }
+    if let Some(environment) = target.strip_prefix('$') {
+        // `do_unlet_var` (`eval/vars.c`:1653-1654) is `vim_unsetenv_ext`, the
+        // process-wide unset, for the same reason the assignment is a
+        // process-wide set. It reports no failure upstream, and a variable
+        // that was never recorded in the scope copy is still unset in the
+        // environment the children see.
+        ox_sys::unset_env(environment);
+        remove_scope_pair(&mut scope.env, environment);
+        return true;
+    }
     if target.starts_with('&') { return false; }
     let (kind, name) = parse_scope_name(target);
     match kind {

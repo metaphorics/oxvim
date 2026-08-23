@@ -980,6 +980,81 @@ fn set_write_is_scope_visible_and_expands_env_vars() {
         Some("$OXVIM_TEST_UNSET_VAR/x")
     );
 }
+
+/// `let $VAR = value` changes the *process* environment, so a child process
+/// sees it.
+///
+/// `ex_let_env` (`eval/vars.c`:1349-1351) assigns through `vim_setenv_ext`,
+/// which is `os_setenv`. Recording the value only in the script scope is not a
+/// smaller version of that, it is a different behavior with teeth:
+/// `setup.vim:115` sandboxes the home directory with
+/// `let $HOME = expand(getcwd() . '/XfakeHOME')`, and `runtest.vim:472` cleans
+/// up with `call system('rm -rf  ' .. file)`. A file named `Xdir ~ dir`
+/// word-splits there, so the shell expands `~` against the child's HOME. With
+/// the assignment kept out of the environment the child inherits the real home
+/// directory and the cleanup deletes it.
+///
+/// The child here is the shell `system()` uses, and HOME is a throwaway path
+/// that is never written to.
+#[test]
+fn let_env_assignment_reaches_child_processes() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    let sandbox = std::env::temp_dir().join(format!("ox-editor-fakehome-{}", std::process::id()));
+    let sandbox = sandbox.to_string_lossy().into_owned();
+    let restore = std::env::var_os("HOME");
+
+    exec.execute_script(
+        &mut editor,
+        "<let-env>",
+        &format!(
+            "let $HOME = '{sandbox}'\n\
+             let g:vim_side = $HOME\n\
+             let g:child_side = substitute(system('printf %s \"$HOME\"'), '\\n', '', 'g')\n\
+             let g:child_tilde = substitute(system('printf %s ~'), '\\n', '', 'g')"
+        ),
+    )
+    .unwrap();
+
+    let vim_side = global_string(exec.scope(), "vim_side");
+    let child_side = global_string(exec.scope(), "child_side");
+    let child_tilde = global_string(exec.scope(), "child_tilde");
+    // Put the process back before asserting, whatever happened.
+    match restore {
+        Some(home) => ox_sys::set_env("HOME", home),
+        None => ox_sys::unset_env("HOME"),
+    }
+
+    assert_eq!(vim_side.as_deref(), Some(sandbox.as_str()));
+    assert_eq!(child_side.as_deref(), Some(sandbox.as_str()));
+    // The shell's own `~` is the sandbox too, which is the expansion that
+    // `rm -rf ~` in a suite cleanup lands on.
+    assert_eq!(child_tilde.as_deref(), Some(sandbox.as_str()));
+}
+
+/// `unlet $VAR` is the process-wide unset (`vim_unsetenv_ext`), so a child no
+/// longer sees it either.
+#[test]
+fn unlet_env_removes_the_variable_from_child_processes() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+
+    exec.execute_script(
+        &mut editor,
+        "<unlet-env>",
+        "let $OXVIM_TEST_UNLET = 'present'\n\
+         let g:before = substitute(system('printf %s \"$OXVIM_TEST_UNLET\"'), '\\n', '', 'g')\n\
+         unlet $OXVIM_TEST_UNLET\n\
+         let g:after = substitute(system('printf %s \"$OXVIM_TEST_UNLET\"'), '\\n', '', 'g')\n\
+         let g:read_back = $OXVIM_TEST_UNLET",
+    )
+    .unwrap();
+
+    assert_eq!(global_string(exec.scope(), "before").as_deref(), Some("present"));
+    assert_eq!(global_string(exec.scope(), "after").as_deref(), Some(""));
+    assert_eq!(global_string(exec.scope(), "read_back").as_deref(), Some(""));
+    assert!(std::env::var_os("OXVIM_TEST_UNLET").is_none());
+}
 #[test]
 fn colorscheme_sources_runtime_file_then_fires_matching_autocmd() {
     let io = MemoryFileIO::new();
