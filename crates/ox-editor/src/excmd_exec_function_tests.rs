@@ -1141,10 +1141,10 @@ fn let_env_assignment_reaches_child_processes() {
     let child_side = global_string(exec.scope(), "child_side");
     let child_tilde = global_string(exec.scope(), "child_tilde");
     // Put the process back before asserting, whatever happened.
-    match restore {
+    assert!(match restore {
         Some(home) => ox_sys::set_env("HOME", home),
         None => ox_sys::unset_env("HOME"),
-    }
+    });
 
     assert_eq!(vim_side.as_deref(), Some(sandbox.as_str()));
     assert_eq!(child_side.as_deref(), Some(sandbox.as_str()));
@@ -1519,10 +1519,10 @@ fn expand_builtin_resolves_home_and_environment_variables() {
         .iter()
         .map(|name| global_string(exec.scope(), name))
         .collect();
-    match restore {
+    assert!(match restore {
         Some(home) => ox_sys::set_env("HOME", home),
         None => ox_sys::unset_env("HOME"),
-    }
+    });
     ox_sys::unset_env("OXVIM_TEST_EXPAND_DIR");
 
     assert_eq!(values[0].as_deref(), Some(sandbox.as_str()));

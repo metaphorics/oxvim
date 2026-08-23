@@ -1952,6 +1952,16 @@ fn command_let<F: FileIO>(
             Err(flow) => return flow,
         }
     };
+    // `ex_let_env` (eval/vars.c 1323-1330) parses the name with `get_env_len`
+    // and reports `E475` naming the whole remaining argument when it is empty.
+    // The value is evaluated first upstream (`ex_let` fills `tv` before
+    // `ex_let_one`), so `let $ = g:nope` is `E121`, not `E475`; the guard sits
+    // after the evaluation to keep that order.
+    if let Some(name) = target.trim_start().strip_prefix('$') {
+        if env_name_len(name) == 0 {
+            return error_flow(runtime, "E475", format!("Invalid argument: {}", args.trim()));
+        }
+    }
     let key = canonical_target(target);
     if runtime.const_vars.contains(&key) {
         return error_flow(runtime, "E46", format!("Cannot change read-only variable \"{target}\""));
@@ -1989,7 +1999,25 @@ fn command_unlet<F: FileIO>(
     args: &str,
     bang: bool,
 ) -> Flow {
-    for target in args.split_ascii_whitespace() {
+    // `ex_unletlock` (eval/vars.c 1587-1600) parses a `$` target with
+    // `get_env_len` before it ever reaches the unset: an empty name is `E475`
+    // naming the whole remaining argument, and a name followed by anything
+    // other than white space or a command end is `E488`. Without this the
+    // empty name reached `std::env::remove_var("")` and killed the process.
+    let mut rest = args;
+    while let Some(start) = rest.find(|character: char| !character.is_ascii_whitespace()) {
+        rest = &rest[start..];
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (target, tail) = rest.split_at(end);
+        if let Some(name) = target.strip_prefix('$') {
+            let length = env_name_len(name);
+            if length == 0 {
+                return error_flow(runtime, "E475", format!("Invalid argument: {rest}"));
+            }
+            if length < name.len() {
+                return error_flow(runtime, "E488", format!("Trailing characters: {}", &name[length..]));
+            }
+        }
         let key = canonical_target(target);
         if runtime.const_vars.contains(&key) {
             return error_flow(runtime, "E46", format!("Cannot change read-only variable \"{target}\""));
@@ -1998,6 +2026,7 @@ fn command_unlet<F: FileIO>(
         if !removed && !bang {
             return error_flow(runtime, "E108", format!("No such variable: \"{target}\""));
         }
+        rest = tail;
     }
     Flow::Normal
 }
@@ -5967,6 +5996,17 @@ fn read_target<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &Editor, scope: &S
     let (kind, name) = parse_scope_name(target);
     let value = if let Some(kind) = kind { scope.get_scoped(kind, name.as_bytes(), 0) } else { scope.get(name.as_bytes(), 0) };
     value.cloned().map_err(|error| eval_error_flow(runtime, error))
+}
+
+/// Length of the leading environment-variable name in `text`, upstream
+/// `get_env_len` (`eval.c` 5569-5575) scanning `vim_isIDc` bytes. The default
+/// `'isident'` accepts ASCII letters, digits and `_`; the 192-255 range it also
+/// lists cannot be expressed byte-wise over a UTF-8 `str`, so this is that
+/// default's ASCII subset.
+fn env_name_len(text: &str) -> usize {
+    text.bytes()
+        .position(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
+        .unwrap_or(text.len())
 }
 
 fn remove_target(editor: &mut Editor, scope: &mut Scope, target: &str) -> bool {

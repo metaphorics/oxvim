@@ -105,6 +105,70 @@ fn unlet_removes_variable_and_bang_suppresses_e108() {
     assert!(result.is_ok());
 }
 
+// eval/vars.c:ex_unletlock 1587-1600, ex_let_env 1323-1330 — a `$` target is
+// measured with `get_env_len` before the unset or set runs. Before this guard
+// `unlet $` reached `std::env::remove_var("")`, which panics and takes the
+// whole editor with it (`test_unlet.vim:23`, oldtest rc 101).
+//
+// Each case fails exactly one part of the compound rule, so no part can be
+// dropped without flipping one line:
+//   `unlet $`      — empty name, E475 naming the remaining argument
+//   `unlet $ tail` — empty name with a remainder, pinning that the message is
+//                    the whole rest and not just the token
+//   `unlet $A=B`   — non-empty name with garbage after it, E488, which the
+//                    empty-name branch alone would answer E475
+//   `unlet $HOME`  — a wholly valid name, which both error branches must let
+//                    through
+#[test]
+fn unlet_env_target_measures_the_name_before_unsetting() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+
+    for (line, code, message) in [
+        ("unlet $", "E475", "Invalid argument: $"),
+        ("unlet $ tail", "E475", "Invalid argument: $ tail"),
+        ("unlet $OX_UNLET_A=B", "E488", "Trailing characters: =B"),
+    ] {
+        let error = exec.execute_line(&mut editor, line).unwrap_err();
+        let ExecError::Vim(exception) = error else { panic!("expected a Vim error for {line:?}") };
+        assert_eq!(exception.kind, VimExceptionKind::Error(code.to_owned()), "{line:?}");
+        assert!(exception.message().contains(message), "{line:?}: {}", exception.message());
+    }
+
+    // `unlet!` skips E108, not the name check: upstream reports E475 before it
+    // ever consults `eap->forceit`.
+    let error = exec.execute_line(&mut editor, "unlet! $").unwrap_err();
+    let ExecError::Vim(exception) = error else { panic!("expected a Vim error") };
+    assert_eq!(exception.kind, VimExceptionKind::Error("E475".to_owned()));
+
+    // A well-formed name still reaches the unset.
+    exec.execute_line(&mut editor, "let $OX_UNLET_KEEP = 'v'").unwrap();
+    assert_eq!(std::env::var("OX_UNLET_KEEP").as_deref(), Ok("v"));
+    exec.execute_line(&mut editor, "unlet $OX_UNLET_KEEP").unwrap();
+    assert_eq!(std::env::var_os("OX_UNLET_KEEP"), None);
+}
+
+// eval/vars.c:ex_let_env 1323-1330 — `:let $` reports E475 naming the whole
+// remaining argument, and only after the value expression has been evaluated,
+// so a bad expression is still reported first.
+#[test]
+fn let_env_target_reports_e475_after_evaluating_the_value() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+
+    for (line, message) in [("let $=1", "Invalid argument: $=1"), ("let $ = 'x'", "Invalid argument: $ = 'x'")] {
+        let error = exec.execute_line(&mut editor, line).unwrap_err();
+        let ExecError::Vim(exception) = error else { panic!("expected a Vim error for {line:?}") };
+        assert_eq!(exception.kind, VimExceptionKind::Error("E475".to_owned()), "{line:?}");
+        assert!(exception.message().contains(message), "{line:?}: {}", exception.message());
+    }
+
+    // Ordering: the value is evaluated first, so this is E121 and not E475.
+    let error = exec.execute_line(&mut editor, "let $ = g:no_such_variable").unwrap_err();
+    let ExecError::Vim(exception) = error else { panic!("expected a Vim error") };
+    assert_eq!(exception.kind, VimExceptionKind::Error("E121".to_owned()));
+}
+
 // eval.c:set_var, `+=` compound assignment — reads the current value,
 // applies the operator, and writes back the result.
 #[test]
