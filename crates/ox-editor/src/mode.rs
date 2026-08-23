@@ -10,7 +10,7 @@ use crate::ops::{self, EditRange, Operator};
 use crate::search::{SearchDirection, SearchState};
 use crate::textobject;
 use crate::{BufferStateError, Editor, EditorError, Key, KeyDecodeError, MarkLocation, MotionKind, OptionValue, SearchError, VisualKind, VisualState};
-use crate::{Lookup, MapMode, MappingAction, Remap, TypeaheadError, TypeaheadFlags, KS_EXTRA};
+use crate::{Lookup, MapMode, MappingAction, MappingOptions, Remap, TypeaheadError, TypeaheadFlags, KS_EXTRA};
 
 /// Kind of command line currently being edited.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,7 +117,7 @@ pub struct ModeMachine {
     last_find: Option<FindMotion>,
     last_visual: Option<VisualState>,
     completed_ex_command: Option<String>,
-    pending_mapping_action: Option<MappingAction>,
+    pending_mapping_action: Option<(MappingAction, MappingOptions)>,
     timestamp: i64,
 }
 
@@ -130,8 +130,9 @@ impl ModeMachine {
     #[must_use] pub const fn search_state(&self) -> &SearchState { &self.search }
     /// Takes an Ex command completed with Enter.
     pub fn take_ex_command(&mut self) -> Option<String> { self.completed_ex_command.take() }
-    /// Takes a non-key mapping action for execution by the embedding host.
-    pub fn take_mapping_action(&mut self) -> Option<MappingAction> { self.pending_mapping_action.take() }
+    /// Takes a non-key mapping action, with the flags it was registered with,
+    /// for execution by the embedding host.
+    pub fn take_mapping_action(&mut self) -> Option<(MappingAction, MappingOptions)> { self.pending_mapping_action.take() }
 
     /// `state.c:34-106`: checking consumes mappings and input but performs no buffer mutation.
     pub fn check(&mut self, editor: &mut Editor) -> Result<Step, ModeError> {
@@ -147,21 +148,10 @@ impl ModeMachine {
                     Lookup::None => None,
                 };
                 if let Some((action, options, width)) = resolved {
-                    editor.typeahead_mut().consume(width);
-                    match action {
-                        MappingAction::Keys(keys) => {
-                            editor.typeahead_mut().push(&keys, 0, TypeaheadFlags {
-                                remap: if options.remap { Remap::Yes } else { Remap::No },
-                                modes: options.modes,
-                                buffer,
-                                mapped: true,
-                                silent: options.silent,
-                            })?;
-                            continue;
-                        }
-                        MappingAction::Nop => continue,
-                        action => { self.pending_mapping_action = Some(action); return Ok(Step::ProcessEvents); }
+                    if self.apply_mapping(editor, action, options, width)? {
+                        return Ok(Step::ProcessEvents);
                     }
+                    continue;
                 }
             }
             self.may_sync_undo(editor, flags);
@@ -174,6 +164,77 @@ impl ModeMachine {
                 Key::Special(KS_EXTRA, b'B') => Ok(Step::Key('\u{8}')),
                 Key::Special(_, _) => Ok(Step::ProcessEvents),
             };
+        }
+    }
+
+    /// `vgetorpeek`'s mapping timeout (`getchar.c`), for the case where the
+    /// wait is already over: inside `:normal`, or under `feedkeys()`'s `x`
+    /// flag, no further key can arrive, so an incomplete mapping "behaves like
+    /// it timed out". The longest *complete* match already queued wins; with
+    /// no complete match the queued keys are used literally, which upstream
+    /// arranges by clearing one byte of `typebuf.tb_noremap` and returning it.
+    ///
+    /// [`Self::check`] deliberately keeps waiting instead, because the
+    /// interactive path really can receive another key. Returns whether the
+    /// queue changed, so a caller draining it knows to keep going.
+    pub fn timeout_pending_mapping(&mut self, editor: &mut Editor) -> Result<bool, ModeError> {
+        let Some(flags) = editor.typeahead().front_flags() else { return Ok(false) };
+        if flags.remap != Remap::Yes {
+            return Ok(false);
+        }
+        let mode = map_mode(&self.mode);
+        let buffer = editor.current_buffer();
+        let resolved = match editor.mappings().lookup_typeahead(editor.typeahead(), mode, buffer) {
+            Lookup::Prefix(Some(mapping)) => {
+                Some((mapping.action.clone(), mapping.options.clone(), mapping.lhs.len()))
+            }
+            Lookup::Prefix(None) => None,
+            Lookup::Exact(_, _) | Lookup::None => return Ok(false),
+        };
+        match resolved {
+            Some((action, options, width)) => {
+                self.apply_mapping(editor, action, options, width)?;
+                Ok(true)
+            }
+            None => {
+                editor.typeahead_mut().deny_front_remap();
+                Ok(true)
+            }
+        }
+    }
+
+    /// Consumes a matched mapping's left-hand side and installs its
+    /// right-hand side: replacement keys go back onto the typeahead as
+    /// not-typed input (`ins_typebuf`), and anything only a host can run is
+    /// parked for [`Self::take_mapping_action`].
+    ///
+    /// Reports whether an action was parked, which is the caller's cue to
+    /// leave the input loop so the host can run it.
+    fn apply_mapping(
+        &mut self,
+        editor: &mut Editor,
+        action: MappingAction,
+        options: MappingOptions,
+        width: usize,
+    ) -> Result<bool, ModeError> {
+        editor.typeahead_mut().consume(width);
+        match action {
+            MappingAction::Keys(keys) => {
+                let buffer = editor.current_buffer();
+                editor.typeahead_mut().push(&keys, 0, TypeaheadFlags {
+                    remap: if options.remap { Remap::Yes } else { Remap::No },
+                    modes: options.modes,
+                    buffer,
+                    mapped: true,
+                    silent: options.silent,
+                })?;
+                Ok(false)
+            }
+            MappingAction::Nop => Ok(false),
+            action => {
+                self.pending_mapping_action = Some((action, options));
+                Ok(true)
+            }
         }
     }
 

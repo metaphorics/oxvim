@@ -88,6 +88,104 @@ impl Keys {
         }
         Ok(result)
     }
+
+    /// Decodes `<...>` key notation into key bytes (`replace_termcodes`,
+    /// `keycodes.c:830-1000`), the translation every `:map` left- and
+    /// right-hand side goes through before it is stored.
+    ///
+    /// Without it a mapping is only usable when both sides are literal text:
+    /// `nnoremap ,q ix<Esc>` inserted the seven characters `x<Esc>` instead of
+    /// leaving Insert mode, and `<Leader>` never resolved.
+    ///
+    /// Only notation that names a **byte** is decoded — the ASCII control and
+    /// named keys, `<C-x>`, and `<Leader>`/`<LocalLeader>`. Notation naming an
+    /// internal three-byte key (`<F2>`, `<Up>`, …) is left literal on purpose:
+    /// that encoding is also produced by `ox-eval`'s `\<Key>` string escape
+    /// and by the RPC input decoder, the three do not agree yet, and decoding
+    /// it here alone would make such a mapping match a sequence nothing
+    /// produces. Unrecognized notation is likewise left exactly as written,
+    /// which is what upstream does with an unknown `<...>` name.
+    #[must_use]
+    pub fn parse_notation(text: &str, leader: &str, local_leader: &str) -> Self {
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != b'<' {
+                out.push(bytes[index]);
+                index += 1;
+                continue;
+            }
+            let Some(close) = bytes[index + 1..].iter().position(|byte| *byte == b'>') else {
+                out.push(bytes[index]);
+                index += 1;
+                continue;
+            };
+            let name = &text[index + 1..index + 1 + close];
+            match named_key_bytes(name, leader, local_leader) {
+                Some(decoded) => out.extend_from_slice(&decoded),
+                None => {
+                    out.push(bytes[index]);
+                    index += 1;
+                    continue;
+                }
+            }
+            index += close + 2;
+        }
+        Self::encode(&out)
+    }
+}
+
+/// One `<...>` key name's byte expansion, or `None` when the name is not one
+/// this port can represent as bytes.
+///
+/// Names are matched case-insensitively, as `find_special_key` does.
+fn named_key_bytes(name: &str, leader: &str, local_leader: &str) -> Option<Vec<u8>> {
+    // `<Leader>`/`<LocalLeader>` expand to text, not to one byte
+    // (`replace_termcodes`'s `REPTERM_SPECIAL` pass over "mapleader").
+    if name.eq_ignore_ascii_case("leader") {
+        return Some(leader.as_bytes().to_vec());
+    }
+    if name.eq_ignore_ascii_case("localleader") {
+        return Some(local_leader.as_bytes().to_vec());
+    }
+    let single = match name.to_ascii_lowercase().as_str() {
+        "lt" => b'<',
+        "bslash" => b'\\',
+        "bar" => b'|',
+        "space" => b' ',
+        "tab" => 0x09,
+        "cr" | "return" | "enter" => 0x0d,
+        "nl" | "newline" | "linefeed" | "lf" => 0x0a,
+        "esc" | "escape" => 0x1b,
+        "bs" | "backspace" => 0x08,
+        "del" | "delete" => 0x7f,
+        "nul" => 0x00,
+        rest => return control_key_byte(rest),
+    };
+    Some(vec![single])
+}
+
+/// `<C-x>` and its `<Char->`-free aliases (`Ctrl_chr`, `keycodes.h`).
+///
+/// `<S-x>` and `<M-x>`/`<A-x>` are deliberately absent: a shifted letter is
+/// already writable literally, and this port has no meta-key input path to
+/// produce the byte `<M-x>` would name.
+fn control_key_byte(name: &str) -> Option<Vec<u8>> {
+    let rest = name.strip_prefix("c-").or_else(|| name.strip_prefix("ctrl-"))?;
+    let mut chars = rest.chars();
+    let key = chars.next()?;
+    if chars.next().is_some() || !key.is_ascii() {
+        return None;
+    }
+    let upper = key.to_ascii_uppercase() as u8;
+    // `Ctrl_chr` is defined over '@'..'_' plus '?'; anything else is not a
+    // control byte and stays literal.
+    match upper {
+        b'?' => Some(vec![0x7f]),
+        b'@'..=b'_' => Some(vec![upper & 0x1f]),
+        _ => None,
+    }
 }
 
 impl From<&str> for Keys {
@@ -267,6 +365,17 @@ impl Typeahead {
     #[must_use]
     pub fn front_flags(&self) -> Option<TypeaheadFlags> {
         self.flags.first().copied()
+    }
+
+    /// Marks the front byte un-remappable, so mapping lookup skips it.
+    ///
+    /// `vgetorpeek` clears one byte of `typebuf.tb_noremap` when an
+    /// incomplete mapping times out with no complete match behind it, which is
+    /// what releases the queued keys literally.
+    pub fn deny_front_remap(&mut self) {
+        if let Some(flags) = self.flags.first_mut() {
+            flags.remap = Remap::No;
+        }
     }
 
     /// Decodes the next logical key without consuming it.

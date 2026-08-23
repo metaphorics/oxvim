@@ -2709,3 +2709,254 @@ fn f_args_carries_check_vim_style_dispatch() {
         });
     assert_eq!(seen.as_deref(), Some("arabic"));
 }
+
+// ---------------------------------------------------------------------------
+// Mapping execution: `:normal[!]`, `feedkeys()` and the map modifiers.
+// Citations: `src/nvim/ex_docmd.c` `ex_normal`/`exec_normal_cmd`/`exec_normal`
+// (7133-7291), `src/nvim/mapping.c` `str_to_mapargs` (400-451) and `do_map`'s
+// `<unique>` rejection (802), `src/nvim/keycodes.c` `replace_termcodes`,
+// `src/nvim/getchar.c` `vgetorpeek`'s `ex_normal_busy` escape and mapping
+// timeout.
+// ---------------------------------------------------------------------------
+
+/// Reads a global set by a mapping, as a plain string.
+fn global_text(executor: &ExExecutor<MemoryFileIO>, name: &str) -> Option<String> {
+    match global_value(executor, name) {
+        Some(ox_types::Typval::String(text)) => Some(text.to_string_lossy().into_owned()),
+        _ => None,
+    }
+}
+
+/// `ins_typebuf(cmd, REMAP_YES, ...)` (`ex_docmd.c:7266`): `:normal` puts its
+/// argument through the typeahead, so mapping lookup sees it. Before this the
+/// argument bypassed typeahead entirely and `,x` ran as the two literal keys.
+#[test]
+fn normal_applies_a_mapping_and_normal_bang_does_not() {
+    let (mut editor, mut executor) = setup();
+    executor.execute_line(&mut editor, "nnoremap ,x :let g:hit = 'yes'<CR>").unwrap();
+
+    executor.execute_line(&mut editor, "normal ,x").unwrap();
+    assert_eq!(global_text(&executor, "hit").as_deref(), Some("yes"));
+
+    executor.execute_line(&mut editor, "let g:hit = 'no'").unwrap();
+    executor.execute_line(&mut editor, "normal! ,x").unwrap();
+    assert_eq!(global_text(&executor, "hit").as_deref(), Some("no"));
+}
+
+/// A key right-hand side reaches the buffer through the same path, including
+/// the `<Esc>` that ends the insert: `replace_termcodes` turns the notation
+/// into one byte before the mapping is stored.
+#[test]
+fn normal_applies_a_mapping_to_keys_with_decoded_notation() {
+    let (mut editor, mut executor) = setup_with_content(&[b"aaa".to_vec(), b"bbb".to_vec()]);
+    executor.execute_line(&mut editor, "nnoremap ,q ix<Esc>").unwrap();
+
+    executor.execute_line(&mut editor, "normal ,q").unwrap();
+
+    assert_eq!(buffer_text(&editor), vec!["xaaa".to_owned(), "bbb".to_owned()]);
+}
+
+/// `nmap` expands the produced keys again, `nnoremap` does not
+/// (`ins_typebuf`'s `noremap` argument).
+#[test]
+fn normal_honors_the_recursion_flag_of_the_mapping_it_ran() {
+    let (mut editor, mut executor) = setup();
+    executor.execute_line(&mut editor, "nnoremap ,m :let g:deep = 'ran'<CR>").unwrap();
+    executor.execute_line(&mut editor, "nmap ,n ,m").unwrap();
+    executor.execute_line(&mut editor, "normal ,n").unwrap();
+    assert_eq!(global_text(&executor, "deep").as_deref(), Some("ran"));
+
+    executor.execute_line(&mut editor, "let g:deep = 'not'").unwrap();
+    executor.execute_line(&mut editor, "nnoremap ,p ,m").unwrap();
+    executor.execute_line(&mut editor, "normal ,p").unwrap();
+    assert_eq!(global_text(&executor, "deep").as_deref(), Some("not"));
+}
+
+/// `save_typeahead`/`restore_typeahead` (`ex_docmd.c:7096,7103`): `:normal`
+/// must neither consume nor lose input that was already queued.
+#[test]
+fn normal_leaves_previously_queued_input_alone() {
+    let (mut editor, mut executor) = setup_with_content(&[b"aaa".to_vec()]);
+    executor.execute_line(&mut editor, "call feedkeys('x', 't')").unwrap();
+    let queued = editor.typeahead().len();
+    assert_eq!(queued, 1, "feedkeys() without 'x' only queues");
+
+    executor.execute_line(&mut editor, "normal! $").unwrap();
+
+    assert_eq!(editor.typeahead().len(), queued, "the queued key survived");
+    assert_eq!(buffer_text(&editor), vec!["aaa".to_owned()], "and was not executed");
+}
+
+/// `vgetorpeek`'s `ex_normal_busy` escape: an argument that ends inside Insert
+/// or Cmdline mode gets ESC, so it cannot hang and cannot leak the mode.
+/// Insert's ESC also moves the caret left, which is what makes the following
+/// `x` delete `o` rather than the character after it.
+#[test]
+fn normal_escapes_out_of_a_half_finished_insert_or_command_line() {
+    let (mut editor, mut executor) = setup_with_content(&[b"aaa".to_vec()]);
+    executor.execute_line(&mut editor, "normal! ihello").unwrap();
+    executor.execute_line(&mut editor, "normal! x").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["hellaaa".to_owned()]);
+
+    // A command line with no terminating CR is abandoned, not executed.
+    executor.execute_line(&mut editor, "normal! :let g:never = 1").unwrap();
+    assert!(global_value(&executor, "never").is_none());
+}
+
+/// `ex_normal`'s per-line loop (`ex_docmd.c:7189-7198`): with a range the
+/// argument runs once for each addressed line, from column zero.
+#[test]
+fn normal_with_a_range_repeats_once_per_addressed_line() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"aaa".to_vec(), b"bbb".to_vec(), b"ccc".to_vec()]);
+
+    executor.execute_line(&mut editor, "2,3normal! Ax").unwrap();
+
+    assert_eq!(
+        buffer_text(&editor),
+        vec!["aaa".to_owned(), "bbbx".to_owned(), "cccx".to_owned()]
+    );
+}
+
+/// `str_to_mapargs` (`mapping.c:400-451`) strips the modifier prefix before
+/// reading the left-hand side. Scanning the whole argument for the modifiers
+/// and leaving them in place made the modifier itself the left-hand side, so
+/// `nnoremap <silent> ,x :cmd<CR>` registered `<silent>` and `,x` did nothing.
+#[test]
+fn map_modifiers_are_stripped_before_the_left_hand_side() {
+    for modifiers in ["<silent>", "<nowait>", "<unique>", "<special>", "<buffer> <silent>", "<silent><nowait>"] {
+        let (mut editor, mut executor) = setup();
+        executor
+            .execute_line(&mut editor, &format!("nnoremap {modifiers} ,x :let g:hit = 'yes'<CR>"))
+            .unwrap();
+        executor.execute_line(&mut editor, "normal ,x").unwrap();
+        assert_eq!(
+            global_text(&executor, "hit").as_deref(),
+            Some("yes"),
+            "mapping with {modifiers} did not run"
+        );
+    }
+}
+
+/// `<unique>` rejects a second definition of the same left-hand side
+/// (`do_map`'s `retval = 5`, `mapping.c:802`), and the first one survives.
+#[test]
+fn unique_rejects_a_second_definition_of_the_same_lhs() {
+    let (mut editor, mut executor) = setup();
+    executor.execute_line(&mut editor, "nnoremap <unique> ,x :let g:hit = 'first'<CR>").unwrap();
+
+    assert_vim_error(
+        executor.execute_line(&mut editor, "nnoremap <unique> ,x :let g:hit = 'second'<CR>"),
+        "E227",
+    );
+
+    executor.execute_line(&mut editor, "normal ,x").unwrap();
+    assert_eq!(global_text(&executor, "hit").as_deref(), Some("first"));
+}
+
+/// `<expr>`'s right-hand side is an expression re-evaluated on every use, and
+/// its *result* is the key sequence (`eval_map_expr`, `mapping.c`).
+#[test]
+fn expr_mapping_evaluates_its_right_hand_side_into_keys() {
+    let (mut editor, mut executor) = setup_with_content(&[b"aaa".to_vec()]);
+    executor.execute_line(&mut editor, "let g:pick = 'i1'").unwrap();
+    executor.execute_line(&mut editor, "nnoremap <expr> ,e g:pick . \"\\x1b\"").unwrap();
+
+    executor.execute_line(&mut editor, "normal ,e").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["1aaa".to_owned()]);
+
+    // Re-evaluated, not captured at definition time.
+    executor.execute_line(&mut editor, "let g:pick = 'i2'").unwrap();
+    executor.execute_line(&mut editor, "normal ,e").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["21aaa".to_owned()]);
+}
+
+/// `<Leader>` expands to `mapleader`'s text, read from the live scope: a
+/// script that sets `g:mapleader` and defines the mapping on the next line
+/// must see the new value, not the one it started with.
+#[test]
+fn leader_expands_from_the_value_set_earlier_in_the_same_script() {
+    let (mut editor, mut executor) = setup();
+
+    executor
+        .execute_script(
+            &mut editor,
+            "leader.vim",
+            "let g:mapleader = ','\nnnoremap <Leader>z :let g:hit = 'yes'<CR>\nnormal ,z",
+        )
+        .unwrap();
+
+    assert_eq!(global_text(&executor, "hit").as_deref(), Some("yes"));
+}
+
+/// `vgetorpeek`'s mapping timeout: with the queue exhausted an incomplete
+/// mapping behaves as if it timed out. The longest *complete* match already
+/// queued wins; with no complete match the keys are released literally rather
+/// than dropped.
+#[test]
+fn an_incomplete_mapping_times_out_at_the_end_of_the_queue() {
+    let (mut editor, mut executor) = setup();
+    executor.execute_line(&mut editor, "nnoremap ,x :let g:hit = 'short'<CR>").unwrap();
+    executor.execute_line(&mut editor, "nnoremap ,xy :let g:hit = 'long'<CR>").unwrap();
+
+    executor.execute_line(&mut editor, "normal ,x").unwrap();
+    assert_eq!(global_text(&executor, "hit").as_deref(), Some("short"));
+
+    executor.execute_line(&mut editor, "normal ,xy").unwrap();
+    assert_eq!(global_text(&executor, "hit").as_deref(), Some("long"));
+
+    // Prefix with no complete match behind it: the keys run as themselves.
+    let (mut editor, mut executor) = setup_with_content(&[b"aaa".to_vec()]);
+    executor.execute_line(&mut editor, "nnoremap zzq ix<Esc>").unwrap();
+    executor.execute_line(&mut editor, "normal zzx").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["aa".to_owned()], "`x` deleted a character");
+}
+
+/// A buffer-local mapping wins over a global one with the same left-hand side
+/// and is invisible from another buffer (`input.c:2319-2438`).
+#[test]
+fn a_buffer_local_mapping_shadows_the_global_one_under_normal() {
+    let (mut editor, mut executor) = setup();
+    executor.execute_line(&mut editor, "nnoremap ,b :let g:hit = 'global'<CR>").unwrap();
+    executor.execute_line(&mut editor, "nnoremap <buffer> ,b :let g:hit = 'local'<CR>").unwrap();
+
+    executor.execute_line(&mut editor, "normal ,b").unwrap();
+    assert_eq!(global_text(&executor, "hit").as_deref(), Some("local"));
+
+    executor.execute_line(&mut editor, "enew").unwrap();
+    executor.execute_line(&mut editor, "normal ,b").unwrap();
+    assert_eq!(global_text(&executor, "hit").as_deref(), Some("global"));
+}
+
+/// `:unmap` of a left-hand side that is not mapped is `E31`
+/// (`do_map`'s `retval = 2`, `mapping.c`), not a silent success.
+#[test]
+fn unmap_without_a_mapping_is_e31() {
+    let (mut editor, mut executor) = setup();
+    assert_vim_error(executor.execute_line(&mut editor, "nunmap ,zzz"), "E31");
+
+    executor.execute_line(&mut editor, "nnoremap ,zzz :let g:hit = 1<CR>").unwrap();
+    executor.execute_line(&mut editor, "nunmap ,zzz").unwrap();
+    assert_vim_error(executor.execute_line(&mut editor, "nunmap ,zzz"), "E31");
+}
+
+/// Task 64's typed-versus-mapped distinction must survive `:normal` going
+/// through the typeahead: `ins_typebuf`'s `nottyped` argument is true, so the
+/// keys never reach `may_sync_undo` and everything one `:normal` does is one
+/// undo block.
+#[test]
+fn a_mapping_run_by_normal_stays_one_undo_block() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"aa".to_vec(), b"bb".to_vec(), b"cc".to_vec()]);
+    executor.execute_line(&mut editor, "nnoremap ,q ddx").unwrap();
+
+    executor.execute_line(&mut editor, "normal ,q").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["b".to_owned(), "cc".to_owned()]);
+
+    executor.execute_line(&mut editor, "undo").unwrap();
+    assert_eq!(
+        buffer_text(&editor),
+        vec!["aa".to_owned(), "bb".to_owned(), "cc".to_owned()],
+        "one undo restored both changes"
+    );
+}

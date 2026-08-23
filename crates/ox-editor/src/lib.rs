@@ -58,7 +58,7 @@ pub use layout::{
 };
 pub use mapping::{
     Abbreviation, Lookup, MapMode, MapModes, MapScope, Mapping, MappingAction, MappingError,
-    MappingExprSink, MappingOptions, Mappings,
+    MappingOptions, Mappings,
 };
 pub use mode::{CmdlineKind, CmdlineState, InsertState, Mode, ModeError, ModeMachine, NormalState, OperatorPendingState, Step};
 pub use script::{

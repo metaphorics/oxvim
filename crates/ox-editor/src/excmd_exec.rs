@@ -35,11 +35,11 @@ use crate::builtins::position::cell_width;
 use crate::fold::{FoldMethod, Position as FoldPosition};
 use crate::register::RegisterContent;
 use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid};
-use crate::typeahead::Keys;
+use crate::typeahead::{Keys, Remap, TypeaheadFlags};
 use crate::userfunc::{UserFuncError, UserFunctions};
 use crate::builtins::process::call_job_builtin;
 use crate::{
-    BufferRelease, ChannelIds, Editor, Geometry, JobManager, Message, MessageKind, ModeMachine,
+    BufferRelease, ChannelIds, Editor, Geometry, JobManager, Message, MessageKind, Mode, ModeMachine,
 };
 
 /// `FILETYPE_FILE` … `INDOFF_FILE` (`globals.h:37-60`): the runtime files
@@ -354,6 +354,111 @@ pub(crate) fn program_from_commands(commands: &[ExCommand], line: usize) -> Vec<
         .collect()
 }
 
+/// `ins_typebuf`'s flags for keys a mapping or `:normal` produced
+/// (`input.c:922-1027`).
+///
+/// `nottyped` is what matters: upstream reports only the bytes past
+/// `typebuf.tb_maplen` through `gotchars` (`input.c:2495-2497`), so these keys
+/// never reach `may_sync_undo` and everything they do stays in one undo block.
+fn mapped_flags(buffer: Option<BufHandle>, remap: bool, modes: MapModes) -> TypeaheadFlags {
+    TypeaheadFlags {
+        remap: if remap { Remap::Yes } else { Remap::No },
+        modes,
+        buffer,
+        mapped: true,
+        silent: false,
+    }
+}
+
+/// Drains queued input through `machine`, running whatever each consumed key
+/// produces before the next one is read.
+///
+/// This is `exec_normal`'s loop (`ex_docmd.c:7274-7291`) and the main loop's
+/// `state_enter` (`state.c:34-106`) in one place, because three callers need
+/// it: `:normal`, `feedkeys()`, and the host's input loop. A mapping whose
+/// right-hand side is keys is expanded inside [`ModeMachine::check`], but an
+/// Ex-command or `<expr>` right-hand side can only leave a *pending action*
+/// there — nothing below the host can run a command. Duplicating that
+/// handling per caller is what made a mapping execute under `feedkeys()` and
+/// do nothing at all under `:normal`.
+pub(crate) fn drain_typeahead<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    machine: &mut ModeMachine,
+) -> Flow {
+    while !editor.typeahead().is_empty() {
+        match machine.run_once(editor) {
+            Ok(true) => {}
+            // Nothing is ready but input is still queued: the front of the
+            // queue is the prefix of a longer mapping, and `check` is waiting
+            // for a key that cannot arrive here. Time it out.
+            Ok(false) => match machine.timeout_pending_mapping(editor) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => return error_flow(runtime, "E523", error.to_string()),
+            },
+            Err(error) => return error_flow(runtime, "E523", error.to_string()),
+        }
+        if let Some(command) = machine.take_ex_command() {
+            let logical = vec![LogicalLine {
+                text: command,
+                first_line: runtime.scripts.current_line().max(1),
+            }];
+            let program = match parse_program(&runtime.user_commands, &logical) {
+                Ok(program) => program,
+                Err(error) => return exec_error_flow(runtime, error),
+            };
+            let flow = run_program(runtime, editor, scope, lua, &program, 0, program.len());
+            if !matches!(flow, Flow::Normal) {
+                return flow;
+            }
+        }
+        if let Some((action, options)) = machine.take_mapping_action() {
+            let flow = run_mapping_action(runtime, editor, scope, lua, action, &options);
+            if !matches!(flow, Flow::Normal) {
+                return flow;
+            }
+        }
+    }
+    Flow::Normal
+}
+
+/// Runs the mapping right-hand sides [`ModeMachine::check`] cannot.
+fn run_mapping_action<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    action: MappingAction,
+    options: &MappingOptions,
+) -> Flow {
+    match action {
+        MappingAction::ExCommands(commands) => {
+            let program = program_from_commands(&commands, runtime.scripts.current_line().max(1));
+            run_program(runtime, editor, scope, lua, &program, 0, program.len())
+        }
+        // `<expr>` (`eval_map_expr`, `mapping.c`): the right-hand side is an
+        // expression re-evaluated on every use, and its result *is* the key
+        // sequence, inserted under the mapping's own remap flag.
+        MappingAction::Expr(expression) => {
+            let value = match eval_text(runtime, editor, scope, lua, &expression) {
+                Ok(value) => value,
+                Err(flow) => return flow,
+            };
+            let keys = Keys::from(typval_to_text(&value).as_str());
+            let flags = mapped_flags(editor.current_buffer(), options.remap, options.modes);
+            match editor.typeahead_mut().push(&keys, 0, flags) {
+                Ok(()) => Flow::Normal,
+                Err(error) => error_flow(runtime, "E523", error.to_string()),
+            }
+        }
+        MappingAction::Callback(id) => Flow::NotImplemented(format!("mapping callback {id}")),
+        MappingAction::Keys(_) | MappingAction::Nop => Flow::Normal,
+    }
+}
+
 impl<F: FileIO> ExExecutor<F> {
     /// Creates an executor using an injected IO seam.
     #[must_use]
@@ -459,6 +564,29 @@ impl<F: FileIO> ExExecutor<F> {
         flow_to_result(flow)
     }
 
+    /// Consumes queued input through `machine` until nothing is left, running
+    /// finished command lines and mapping right-hand sides as they appear.
+    ///
+    /// The host's input loop, `:normal` and `feedkeys()` all reach the same
+    /// [`drain_typeahead`] through this, so a mapping behaves the same however
+    /// its left-hand side arrived.
+    pub fn run_typeahead(
+        &mut self,
+        editor: &mut Editor,
+        machine: &mut ModeMachine,
+    ) -> Result<ExecOutcome, ExecError> {
+        sync_editor_into_scope(editor, &mut self.scope)?;
+        let flow = drain_typeahead(
+            &mut self.runtime,
+            editor,
+            &mut self.scope,
+            self.lua.as_ref(),
+            machine,
+        );
+        self.finish_quit(editor, &flow);
+        sync_scope_into_editor(editor, &self.scope)?;
+        flow_to_result(flow)
+    }
 
     /// Executes source text with a fresh stable SID and isolated `s:` scope.
     pub fn execute_script(
@@ -958,7 +1086,7 @@ fn dispatch<F: FileIO>(
         }
         "finish" if runtime.scripts.current_sid().is_some() => Flow::Finish,
         "finish" => error_flow(runtime, "E168", ":finish used outside of a sourced file"),
-        "normal" => command_normal(runtime, editor, &command.args),
+        "normal" => command_normal(runtime, editor, scope, lua, command),
         "global" => command_global(runtime, editor, scope, lua, command, false),
         "vglobal" => command_global(runtime, editor, scope, lua, command, true),
         "substitute" => command_substitute(runtime, editor, scope, command),
@@ -1030,7 +1158,7 @@ fn dispatch<F: FileIO>(
         | "ounmap" | "iunmap" | "cunmap" | "lunmap" | "tunmap" | "mapclear"
         | "nmapclear" | "vmapclear" | "xmapclear" | "smapclear" | "omapclear"
         | "imapclear" | "cmapclear" | "lmapclear" | "tmapclear" => {
-            command_map(runtime, editor, command)
+            command_map(runtime, editor, scope, command)
         }
         _ => match &command.command {
             ResolvedCommand::User(user_name) => command_invoke_user(runtime, editor, scope, lua, user_name, command),
@@ -2209,11 +2337,97 @@ pub(crate) fn change_directory<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &E
     Ok(previous.unwrap_or_default())
 }
 
-fn command_normal<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, args: &str) -> Flow {
+/// `:normal[!] {commands}` (`ex_normal`, `ex_docmd.c:7133-7210`).
+///
+/// The argument is *stuffed into the typeahead buffer* and then consumed by
+/// the normal-mode loop (`exec_normal_cmd`, `ex_docmd.c:7263-7268`); it is not
+/// fed straight to the mode machine. That is the whole reason `:normal` obeys
+/// mappings while `:normal!` does not — `ins_typebuf`'s `remap` argument is
+/// `REMAP_NONE` for the bang and `REMAP_YES` otherwise, and nothing else in
+/// the two paths differs. Feeding the keys past typeahead, as this used to,
+/// skips mapping lookup entirely: `nnoremap ,x :cmd<CR>` then `:normal ,x` ran
+/// `,` and `x` as literal normal-mode keys.
+///
+/// The keys are inserted as *not typed*, so they do not close an undo block
+/// (`may_sync_undo`); one `:normal` is one undo step.
+fn command_normal<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    command: &ExCommand,
+) -> Flow {
+    let keys = Keys::from(command.args.trim_start());
+    if keys.is_empty() {
+        return error_flow(runtime, "E471", "Argument required");
+    }
+    let range = match &command.range {
+        None => None,
+        Some(_) => match resolve_range(editor, command) {
+            Ok(range) => Some(range),
+            Err(message) => return error_flow(runtime, "E16", message),
+        },
+    };
+    // `save_typeahead`/`restore_typeahead` (`ex_docmd.c:7096,7103`): whatever
+    // was already queued must not be consumed by this command, and must still
+    // be there afterwards.
+    let saved = std::mem::take(editor.typeahead_mut());
+    let flow = run_normal_keys(runtime, editor, scope, lua, &keys, command.bang, range);
+    *editor.typeahead_mut() = saved;
+    flow
+}
+
+/// `ex_normal`'s per-line loop: with a range the argument runs once for each
+/// addressed line, from column zero (`ex_docmd.c:7189-7198`).
+fn run_normal_keys<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    keys: &Keys,
+    bang: bool,
+    range: Option<(usize, usize)>,
+) -> Flow {
     let mut machine = ModeMachine::default();
-    match machine.feed_keys(editor, args.trim_start()) {
-        Ok(()) => Flow::Normal,
-        Err(error) => error_flow(runtime, "E523", error.to_string()),
+    let (first, last) = range.unwrap_or((0, 0));
+    let mut lnum = first;
+    loop {
+        if range.is_some() {
+            if let Some(window) = editor.current_window() {
+                if let Err(error) = editor.set_window_cursor(window, Position { lnum, col: 0 }) {
+                    return error_flow(runtime, "E16", error.to_string());
+                }
+            }
+        }
+        let flags = mapped_flags(editor.current_buffer(), !bang, MapModes::ALL);
+        if let Err(error) = editor.typeahead_mut().push(keys, 0, flags) {
+            return error_flow(runtime, "E523", error.to_string());
+        }
+        let flow = drain_typeahead(runtime, editor, scope, lua, &mut machine);
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
+        // `vgetorpeek`'s `ex_normal_busy` escape (`getchar.c`): a mode that is
+        // still asking for a character with the typeahead empty gets ESC, so
+        // an argument ending half-way through an insert or a command line
+        // cannot hang. Only Insert and Cmdline ask; `exec_normal`'s loop just
+        // stops for the others, which is why `:normal v` leaves a selection
+        // active. The ESC is returned directly there, never remapped.
+        if matches!(machine.mode(), Mode::Insert(_) | Mode::Cmdline(_)) {
+            let escape = Keys::from("\u{1b}");
+            let flags = mapped_flags(editor.current_buffer(), false, MapModes::ALL);
+            if let Err(error) = editor.typeahead_mut().push(&escape, 0, flags) {
+                return error_flow(runtime, "E523", error.to_string());
+            }
+            let flow = drain_typeahead(runtime, editor, scope, lua, &mut machine);
+            if !matches!(flow, Flow::Normal) {
+                return flow;
+            }
+        }
+        if range.is_none() || lnum >= last {
+            return Flow::Normal;
+        }
+        lnum += 1;
     }
 }
 
@@ -5240,19 +5454,101 @@ fn count_ex_arguments(args: &str) -> usize {
     count + usize::from(in_argument)
 }
 
-fn command_map<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+/// The `<buffer>`/`<nowait>`/`<silent>`/`<special>`/`<script>`/`<expr>`/`<unique>`
+/// prefix of a `:map` argument (`str_to_mapargs`, `mapping.c:400-451`).
+///
+/// They are only recognized at the *front*, in any order, each followed by
+/// optional whitespace, and they are removed before the left-hand side is
+/// read. Scanning the whole argument for them instead — and leaving them in
+/// place — made the modifier itself the left-hand side, so
+/// `nnoremap <silent> ,x :cmd<CR>` registered `<silent>`.
+#[derive(Default)]
+struct MapModifiers {
+    buffer: bool,
+    nowait: bool,
+    silent: bool,
+    script: bool,
+    expr: bool,
+    unique: bool,
+}
+
+fn split_map_modifiers(args: &str) -> (MapModifiers, &str) {
+    let mut flags = MapModifiers::default();
+    let mut rest = args.trim_start();
+    loop {
+        let matched = [
+            ("<buffer>", &mut flags.buffer),
+            ("<nowait>", &mut flags.nowait),
+            ("<silent>", &mut flags.silent),
+            ("<script>", &mut flags.script),
+            ("<expr>", &mut flags.expr),
+            ("<unique>", &mut flags.unique),
+        ]
+        .into_iter()
+        .find_map(|(name, flag)| {
+            rest.strip_prefix(name).map(|tail| {
+                *flag = true;
+                tail
+            })
+        })
+        // "<special>" is accepted and ignored, as upstream does.
+        .or_else(|| rest.strip_prefix("<special>"));
+        match matched {
+            Some(tail) => rest = tail.trim_start(),
+            None => return (flags, rest),
+        }
+    }
+}
+
+/// `mapleader`/`maplocalleader`, defaulting to a backslash
+/// (`replace_termcodes`, `keycodes.c`).
+///
+/// Read from the live `Scope` rather than the editor's `g:` dictionary,
+/// because the two are only synced at the end of a program: a script that sets
+/// `g:mapleader` and then defines a `<Leader>` mapping on the next line would
+/// otherwise see the value it had on entry.
+fn map_leader(scope: &Scope, name: &str) -> String {
+    scope
+        .get_scoped(ScopeKind::Global, name.as_bytes(), 0)
+        .map_or_else(|_| "\\".to_owned(), typval_to_text)
+}
+
+fn command_map<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope: &Scope, command: &ExCommand) -> Flow {
     let name = command.command.name();
     let modes = map_modes(name, command.bang);
-    let scope = if command.args.contains("<buffer>") { MapScope::Buffer(editor.current_buffer().unwrap_or(BufHandle::CURRENT)) } else { MapScope::Global };
-    if name.ends_with("clear") { editor.mappings_mut().mapclear(modes, scope); return Flow::Normal; }
-    let args = command.args.replace("<buffer>", "");
-    let mut split = args.trim().splitn(2, char::is_whitespace).filter(|part| !part.is_empty());
+    let (flags, args) = split_map_modifiers(&command.args);
+    let leader = map_leader(scope, "mapleader");
+    let local_leader = map_leader(scope, "maplocalleader");
+    let map_scope = if flags.buffer { MapScope::Buffer(editor.current_buffer().unwrap_or(BufHandle::CURRENT)) } else { MapScope::Global };
+    if name.ends_with("clear") { editor.mappings_mut().mapclear(modes, map_scope); return Flow::Normal; }
+    let mut split = args.splitn(2, char::is_whitespace).filter(|part| !part.is_empty());
     let Some(lhs) = split.next() else { return Flow::Normal };
-    if name.ends_with("unmap") { editor.mappings_mut().unmap(&Keys::from(lhs), modes, scope); return Flow::Normal; }
+    let lhs = Keys::parse_notation(lhs, &leader, &local_leader);
+    if name.ends_with("unmap") {
+        // `do_map`'s `retval = 2` (`mapping.c`): unmapping something that is
+        // not mapped is an error, not a silent no-op.
+        return if editor.mappings_mut().unmap(&lhs, modes, map_scope) == 0 {
+            error_flow(runtime, "E31", "No such mapping")
+        } else {
+            Flow::Normal
+        };
+    }
     let Some(rhs) = split.next() else { return error_flow(runtime, "E474", "Invalid argument") };
-    let action = match MappingAction::parse_rhs(rhs.trim()) { Ok(action) => action, Err(error) => return error_flow(runtime, "E474", error.to_string()) };
-    let options = MappingOptions { modes, scope, remap: !name.contains("nore"), nowait: command.args.contains("<nowait>"), silent: command.args.contains("<silent>"), description: None };
-    let result = if name.contains("nore") { editor.mappings_mut().noremap(Keys::from(lhs), action, options) } else { editor.mappings_mut().map(Keys::from(lhs), action, options) };
+    let rhs = rhs.trim();
+    if flags.unique && editor.mappings().conflicts(&lhs, modes, map_scope) {
+        return error_flow(runtime, "E227", format!("Mapping already exists for {}", String::from_utf8_lossy(lhs.as_bytes())));
+    }
+    let action = if flags.expr {
+        MappingAction::Expr(rhs.to_owned())
+    } else {
+        match MappingAction::parse_rhs(rhs, &leader, &local_leader) { Ok(action) => action, Err(error) => return error_flow(runtime, "E474", error.to_string()) }
+    };
+    // `<script>` is upstream's `REMAP_SCRIPT`: only `<SID>` mappings may be
+    // used in the right-hand side. There are no script-local mappings in this
+    // port, so the reachable set is empty and no-remap is the same behavior.
+    let remap = !name.contains("nore") && !flags.script;
+    let options = MappingOptions { modes, scope: map_scope, remap, nowait: flags.nowait, silent: flags.silent, description: None };
+    let result = if remap { editor.mappings_mut().map(lhs, action, options) } else { editor.mappings_mut().noremap(lhs, action, options) };
     match result { Ok(()) => Flow::Normal, Err(error) => error_flow(runtime, "E474", error.to_string()) }
 }
 

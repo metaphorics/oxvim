@@ -842,20 +842,20 @@ fn map_and_map_bang_mode_sets_match_command_families() {
 
 #[test]
 fn mapping_rhs_parses_nop_case_insensitively() {
-    assert_eq!(MappingAction::parse_rhs("<NoP>").unwrap(), MappingAction::Nop);
+    assert_eq!(MappingAction::parse_rhs("<NoP>", "\\", "\\").unwrap(), MappingAction::Nop);
 }
 
 #[test]
 fn mapping_rhs_encodes_plain_keys() {
     assert_eq!(
-        MappingAction::parse_rhs("abc").unwrap(),
+        MappingAction::parse_rhs("abc", "\\", "\\").unwrap(),
         MappingAction::Keys(keys("abc"))
     );
 }
 
 #[test]
 fn mapping_rhs_parses_cmd_form_with_ex_parser() {
-    let MappingAction::ExCommands(commands) = MappingAction::parse_rhs("<Cmd>echo hi<CR>").unwrap() else {
+    let MappingAction::ExCommands(commands) = MappingAction::parse_rhs("<Cmd>echo hi<CR>", "\\", "\\").unwrap() else {
         panic!("expected parsed Ex commands");
     };
     assert_eq!(commands.len(), 1);
@@ -863,7 +863,7 @@ fn mapping_rhs_parses_cmd_form_with_ex_parser() {
 
 #[test]
 fn mapping_rhs_parses_colon_command_form() {
-    let MappingAction::ExCommands(commands) = MappingAction::parse_rhs(":echo hi<CR>").unwrap() else {
+    let MappingAction::ExCommands(commands) = MappingAction::parse_rhs(":echo hi<CR>", "\\", "\\").unwrap() else {
         panic!("expected parsed Ex commands");
     };
     assert_eq!(commands.len(), 1);
@@ -872,9 +872,51 @@ fn mapping_rhs_parses_colon_command_form() {
 #[test]
 fn mapping_rhs_rejects_unknown_ex_command() {
     assert!(matches!(
-        MappingAction::parse_rhs("<Cmd>definitelynotacommand<CR>"),
+        MappingAction::parse_rhs("<Cmd>definitelynotacommand<CR>", "\\", "\\"),
         Err(MappingError::ExCommand(_))
     ));
+}
+
+/// `replace_termcodes` (`keycodes.c`): a key right-hand side is notation, not
+/// literal text. `nnoremap ,q ix<Esc>` used to insert the six characters
+/// `<Esc>` writes instead of leaving Insert mode.
+#[test]
+fn mapping_rhs_decodes_key_notation_into_bytes() {
+    assert_eq!(
+        MappingAction::parse_rhs("ix<Esc>", "\\", "\\").unwrap(),
+        MappingAction::Keys(keys("ix\u{1b}"))
+    );
+    assert_eq!(
+        MappingAction::parse_rhs("o<Tab><CR><BS><Space><lt><Bar>", "\\", "\\").unwrap(),
+        MappingAction::Keys(keys("o\t\r\u{8} <|"))
+    );
+    assert_eq!(
+        MappingAction::parse_rhs("<C-u><C-A><C-?>", "\\", "\\").unwrap(),
+        MappingAction::Keys(keys("\u{15}\u{1}\u{7f}"))
+    );
+}
+
+/// `<Leader>`/`<LocalLeader>` expand to `mapleader`'s *text*, so they can be
+/// several bytes, and the two leaders are independent.
+#[test]
+fn mapping_notation_expands_both_leaders() {
+    assert_eq!(
+        Keys::parse_notation("<Leader>x<LocalLeader>y", ",,", "-"),
+        keys(",,x-y")
+    );
+}
+
+/// Notation this port cannot represent as bytes stays exactly as written,
+/// which is also what upstream does with an unknown `<...>` name. Decoding
+/// `<F2>` here alone would make the mapping match a sequence no input path
+/// produces.
+#[test]
+fn mapping_notation_leaves_unrepresentable_names_literal() {
+    assert_eq!(Keys::parse_notation("<F2>", "\\", "\\"), keys("<F2>"));
+    assert_eq!(Keys::parse_notation("<Up>", "\\", "\\"), keys("<Up>"));
+    assert_eq!(Keys::parse_notation("<M-x>", "\\", "\\"), keys("<M-x>"));
+    assert_eq!(Keys::parse_notation("<C-", "\\", "\\"), keys("<C-"));
+    assert_eq!(Keys::parse_notation("a<b", "\\", "\\"), keys("a<b"));
 }
 
 #[test]

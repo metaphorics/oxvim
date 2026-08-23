@@ -12,7 +12,7 @@ use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
 use ox_api::{CommandExecutor, Registry};
 use ox_editor::{
     vim_variable_is_writable, AutocmdContext, AutocmdKind, CmdlineKind, Editor, Event, ExExecutor,
-    ExecOutcome, Geometry, LuaExec, LuaExecError, MappingAction, MessageDestination, MessageKind,
+    ExecOutcome, Geometry, LuaExec, LuaExecError, MessageDestination, MessageKind,
     Mode, ModeMachine, Keys,
     OptionValue, TypeaheadFlags,
 };
@@ -593,39 +593,22 @@ impl AppState {
         });
     }
 
+    /// One turn of `state_enter`'s input handling (`state.c:34-106`).
+    ///
+    /// Everything a consumed key produces — a finished `:` command line, a
+    /// mapping's Ex-command or `<expr>` right-hand side — is run by
+    /// `ExExecutor::run_typeahead`, the same entry point `:normal` and
+    /// `feedkeys()` use, so a mapping cannot behave differently depending on
+    /// how its left-hand side arrived.
     fn drive_input(&mut self) -> Result<(), ApiError> {
-        loop {
-            let ready = self.mode.run_once(&mut self.editor.borrow_mut())
-                .map_err(|error| ApiError::exception(error.to_string()))?;
-            if !ready { break; }
-
-            if let Some(command) = self.mode.take_ex_command() {
-                let outcome = self.ex
-                    .borrow_mut()
-                    .execute_line(&mut self.editor.borrow_mut(), &command)
-                    .map_err(|error| ApiError::exception(error.to_string()))?;
-                if let ExecOutcome::Quit(code) = outcome {
-                    self.exiting = true;
-                    self.exit_code = code;
-                }
-            }
-            if let Some(action) = self.mode.take_mapping_action() {
-                let outcome = match action {
-                    MappingAction::ExCommands(commands) => self.ex
-                        .borrow_mut()
-                        .execute_commands(&mut self.editor.borrow_mut(), &commands)
-                        .map_err(|error| ApiError::exception(error.to_string()))?,
-                    MappingAction::Expr(id) | MappingAction::Callback(id) => {
-                        return Err(ApiError::exception(format!("mapping callback {id} has no registered host evaluator")));
-                    }
-                    MappingAction::Keys(_) | MappingAction::Nop => ExecOutcome::Completed,
-                };
-                if let ExecOutcome::Quit(code) = outcome {
-                    self.exiting = true;
-                    self.exit_code = code;
-                }
-            }
-            if self.exiting { break; }
+        let outcome = self
+            .ex
+            .borrow_mut()
+            .run_typeahead(&mut self.editor.borrow_mut(), &mut self.mode)
+            .map_err(|error| ApiError::exception(error.to_string()))?;
+        if let ExecOutcome::Quit(code) = outcome {
+            self.exiting = true;
+            self.exit_code = code;
         }
         Ok(())
     }

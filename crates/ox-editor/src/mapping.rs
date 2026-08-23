@@ -129,17 +129,22 @@ pub enum MappingAction {
     Keys(Keys),
     /// Parsed `<Cmd>...<CR>` or `:...<CR>` Ex commands.
     ExCommands(Vec<ExCommand>),
-    /// Expression identity evaluated by the host.
-    Expr(u64),
+    /// `<expr>` right-hand side, re-evaluated into replacement keys on every
+    /// use (`str_to_mapargs`'s `expr` flag, `mapping.c:439-443`).
+    Expr(String),
     /// Host callback identity.
     Callback(u64),
     /// `<Nop>` consumes the lhs without producing input.
     Nop,
 }
-
 impl MappingAction {
-    /// Parses command-shaped mapping right-hand sides and encodes all others as keys.
-    pub fn parse_rhs(rhs: &str) -> Result<Self, MappingError> {
+    /// Parses command-shaped mapping right-hand sides and decodes all others
+    /// as key notation ([`Keys::parse_notation`]).
+    ///
+    /// The `<Cmd>`/`:` forms are recognized *before* the notation pass, so the
+    /// `<CR>` that terminates them stays a terminator rather than becoming a
+    /// carriage return inside the command text.
+    pub fn parse_rhs(rhs: &str, leader: &str, local_leader: &str) -> Result<Self, MappingError> {
         if rhs.eq_ignore_ascii_case("<nop>") {
             return Ok(Self::Nop);
         }
@@ -153,7 +158,7 @@ impl MappingAction {
                 .map(Self::ExCommands)
                 .map_err(MappingError::ExCommand);
         }
-        Ok(Self::Keys(Keys::from(rhs)))
+        Ok(Self::Keys(Keys::parse_notation(rhs, leader, local_leader)))
     }
 }
 
@@ -208,14 +213,6 @@ pub enum Lookup<'a> {
     Prefix(Option<&'a Mapping>),
     /// No mapping shares the queued prefix.
     None,
-}
-
-/// Host seam for `<expr>` mappings.
-pub trait MappingExprSink {
-    /// Host evaluation failure.
-    type Error;
-    /// Evaluates the callback identity into replacement keys.
-    fn evaluate(&mut self, callback: u64) -> Result<Keys, Self::Error>;
 }
 
 /// One insert-mode abbreviation.
@@ -285,6 +282,22 @@ impl Mappings {
     /// Updates timeout data without starting a timer.
     pub const fn set_timeout_len_ms(&mut self, value: u32) {
         self.timeout_len_ms = value;
+    }
+
+    /// Whether a mapping with exactly this lhs already covers any of `modes`
+    /// in `scope`.
+    ///
+    /// `<unique>`'s rejection (`do_map`'s `retval = 5`, `mapping.c:802`, which
+    /// becomes `E227`). Upstream also rejects a *prefix* overlap and a
+    /// buffer-local definition shadowed by a global one; this answers the
+    /// exact-lhs case, which is the one `:map <unique>` is written for.
+    #[must_use]
+    pub fn conflicts(&self, lhs: &Keys, modes: MapModes, scope: MapScope) -> bool {
+        self.mappings.iter().any(|mapping| {
+            &mapping.lhs == lhs
+                && mapping.options.scope == scope
+                && mapping.options.modes.intersects(modes)
+        })
     }
 
     /// Defines or replaces overlapping mode bits for one lhs and scope.

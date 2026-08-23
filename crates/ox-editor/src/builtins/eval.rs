@@ -15,10 +15,9 @@ use ox_types::{Funcref, Object, OxStr, Special, Typval};
 use crate::script::{FileIO, LogicalLine};
 use crate::autocmd::Event;
 use crate::typeahead::Keys;
-use crate::mapping::MappingAction;
 use crate::{Editor, ModeMachine};
 
-use crate::excmd_exec::{EvalHost, program_from_commands, ExRuntime, Flow, LuaExec, LuaExecError, VimRegex, exec_error_flow, expand_env_esc, flow_to_eval_error, parse_program, run_program, sync_editor_into_scope, sync_scope_into_editor, typval_number, typval_to_text};
+use crate::excmd_exec::{EvalHost, drain_typeahead, ExRuntime, Flow, LuaExec, LuaExecError, VimRegex, exec_error_flow, expand_env_esc, flow_to_eval_error, parse_program, run_program, sync_editor_into_scope, sync_scope_into_editor, typval_number, typval_to_text};
 use super::{input_string_arg};
 
 /// Routes one expression- or script-evaluating builtin.
@@ -270,30 +269,9 @@ fn call_feedkeys_builtin<F: FileIO>(
     let execute = editor.typeahead_mut().feedkeys(&Keys::from_encoded(keys.as_bytes().to_vec()).map_err(|error| EvalError::new("E475", 0, error.to_string()))?, &mode.to_string_lossy()).map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
     if execute {
         let mut machine = ModeMachine::default();
-        while !editor.typeahead().is_empty() {
-            if !machine.run_once(editor).map_err(|error| EvalError::new("E523", 0, error.to_string()))? { break; }
-            if let Some(command) = machine.take_ex_command() {
-                let logical = vec![LogicalLine { text: command, first_line: runtime.scripts.current_line().max(1) }];
-                let program = parse_program(&runtime.user_commands, &logical)
-                    .map_err(|error| EvalError::new("E488", 0, error.to_string()))?;
-                if let Flow::Exception(exception) = run_program(runtime, editor, scope, lua, &program, 0, program.len()) {
-                    return Err(EvalError::new("E605", 0, exception.message()));
-                }
-            }
-            // A mapping whose right-hand side is an Ex command reaches the
-            // host as a pending action rather than as keys, so it has to be
-            // run here too; without this the mapping is silently dropped and
-            // `feedkeys()` cannot observe a mapped `:call`. `oxvim`'s server
-            // loop does the same at `server.rs:612-627`.
-            if let Some(MappingAction::ExCommands(commands)) = machine.take_mapping_action() {
-                let program =
-                    program_from_commands(&commands, runtime.scripts.current_line().max(1));
-                if let Flow::Exception(exception) =
-                    run_program(runtime, editor, scope, lua, &program, 0, program.len())
-                {
-                    return Err(EvalError::new("E605", 0, exception.message()));
-                }
-            }
+        let flow = drain_typeahead(runtime, editor, scope, lua, &mut machine);
+        if !matches!(flow, Flow::Normal) {
+            return Err(flow_to_eval_error(flow, "feedkeys"));
         }
     }
     Ok(Typval::Number(0))
