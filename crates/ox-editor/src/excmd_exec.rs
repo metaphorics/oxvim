@@ -869,6 +869,10 @@ fn dispatch<F: FileIO>(
         }
         "execute" => command_execute(runtime, editor, scope, lua, &command.args),
         "cd" => command_cd(runtime, &command.args),
+        "swapname" => {
+            push_text_message(editor, "No swap file".to_owned(), false, false);
+            Flow::Normal
+        }
         "source" => {
             let path = source_argument_path(editor, &command.args);
             match source_path(runtime, editor, scope, lua, &path, false) {
@@ -1008,6 +1012,9 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
             let expression = ExprParser::new(source.as_bytes()).parse()?;
             let regex = VimRegex;
             return Evaluator::new(self, &regex).eval(&expression, scope);
+        }
+        if name_text == "execute" {
+            return call_execute_builtin(self.runtime, self.editor, scope, self.lua, args);
         }
         if name_text == "submatch" {
             let index = args.first().and_then(typval_number).unwrap_or(0).max(0) as usize;
@@ -1216,6 +1223,41 @@ fn call_job_builtin<F: FileIO>(
         }
         _ => unreachable!(),
     }
+}
+
+fn call_execute_builtin<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    args: Vec<Typval>,
+) -> ox_eval::Result<Typval> {
+    if args.is_empty() {
+        return Err(EvalError::new("E119", 0, "Not enough arguments for function: execute"));
+    }
+    if args.len() > 2 {
+        return Err(EvalError::new("E118", 0, "Too many arguments for function: execute"));
+    }
+    let command = typval_to_text(&args[0]);
+    let logical = vec![LogicalLine {
+        text: command,
+        first_line: runtime.scripts.current_line(),
+    }];
+    let program = parse_program(&runtime.user_commands, &logical)
+        .map_err(|error| EvalError::new("E488", 0, error.to_string()))?;
+    let message_start = editor.messages().len();
+    let flow = run_program(runtime, editor, scope, lua, &program, 0, program.len());
+    if !matches!(flow, Flow::Normal) {
+        return Err(flow_to_eval_error(flow, "execute"));
+    }
+    let mut output = String::new();
+    for message in &editor.messages()[message_start..] {
+        let Object::String(text) = &message.content else { continue };
+        output.push('\n');
+        output.push_str(&text.to_string_lossy());
+    }
+    editor.truncate_messages(message_start);
+    Ok(Typval::String(OxStr(output.into_bytes())))
 }
 
 fn call_system_builtin(args: Vec<Typval>, scope: &mut Scope) -> ox_eval::Result<Typval> {

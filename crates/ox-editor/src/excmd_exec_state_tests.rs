@@ -577,6 +577,21 @@ fn buffer_identity_builtins_resolve_current_and_named_buffers() {
     );
 }
 
+#[test]
+fn execute_builtin_captures_nested_command_output() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&mut editor, "let g:swap = execute('swapname')")
+        .unwrap();
+
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"swap", 0),
+        Ok(&Typval::String(OxStr::from("\nNo swap file"))),
+    );
+    assert!(editor.messages().is_empty());
+}
+
 // ── normal ─────────────────────────────────────────────────────────────
 
 // ex_docmd.c:ex_normal — `:normal` requires keys and completes after queuing them.
