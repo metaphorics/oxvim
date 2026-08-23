@@ -11,6 +11,7 @@ pub(crate) mod buffer;
 pub(crate) mod environment;
 pub(crate) mod eval;
 pub(crate) mod filesystem;
+pub(crate) mod fold;
 pub(crate) mod input;
 pub(crate) mod position;
 pub(crate) mod process;
@@ -37,6 +38,8 @@ pub(crate) enum Family {
     Eval,
     /// Paths and files, served by [`crate::fs_builtins`].
     FileSystem,
+    /// Fold queries, served by [`fold`].
+    Fold,
     /// Prompts that read a reply.
     Input,
     /// Cursor position reads and writes.
@@ -62,6 +65,7 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         "eval" | "execute" | "exists" | "expand" | "feedkeys" | "fullcommand" | "funcref"
         | "function" | "luaeval" | "submatch" => Family::Eval,
         "swapfilelist" => Family::FileSystem,
+        "foldclosed" | "foldclosedend" | "foldlevel" => Family::Fold,
         "getchar" | "getcharstr" | "input" | "inputdialog" | "inputlist" => Family::Input,
         "charcol" | "col" | "cursor" | "getcharpos" | "getcurpos" | "getcursorcharpos"
         | "getpos" | "line" | "setcharpos" | "setcursorcharpos" | "setpos" | "virtcol" => {
@@ -105,6 +109,7 @@ pub(crate) fn call<F: FileIO>(
         Family::Environment => environment::call(host, name, args),
         Family::Eval => eval::call(host, name, args, scope),
         Family::FileSystem => filesystem::call(host, name, args),
+        Family::Fold => fold::call(host, name, args),
         Family::Input => input::call(host, name, args),
         Family::Position => position::call(host, name, args),
         Family::Process => process::call(host, name, args, scope),

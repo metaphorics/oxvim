@@ -996,6 +996,18 @@ fn get_lnum(editor: &Editor, value: &Typval, win: &PosWin) -> ox_eval::Result<i6
     Ok(pos.map_or(lnum, |pos| pos.lnum))
 }
 
+/// `typval.c:tv_get_lnum` resolved against the current window, for the
+/// builtins outside this module that take a `{lnum}` argument. Answers `0`,
+/// which every caller treats as out of range, when there is no window whose
+/// cursor and marks the expression forms could name.
+pub(super) fn current_lnum_arg(editor: &Editor, value: &Typval) -> ox_eval::Result<i64> {
+    let Some(window) = editor.current_window() else {
+        return Ok(0);
+    };
+    let win = PosWin::new(editor, window)?;
+    get_lnum(editor, value, &win)
+}
+
 /// `window.c:win_id2wp_tp`: a window id names a window, and `0` names none.
 fn resolve_window_id(editor: &Editor, value: &Typval) -> ox_eval::Result<Option<WinHandle>> {
     let id = number_value(value)?;
