@@ -1999,3 +1999,83 @@ fn arglist_names(editor: &Editor) -> Vec<String> {
         .map(|name| name.to_string_lossy().into_owned())
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// :lockvar / :unlockvar
+// Citation: eval/vars.c ex_lockvar:1554.
+// ---------------------------------------------------------------------------
+
+/// `:lockvar` marks a variable and `:unlockvar` releases it; assigning to a
+/// locked one is E741. `:lockv` and `:unlo` are the abbreviations.
+///
+/// Oracle: `let g:v = 1 | lockvar g:v` then `let g:v = 2` →
+/// `Vim(let):E741: Value is locked: g:v`, and the value stays 1.
+#[test]
+fn lockvar_blocks_assignment_until_unlocked() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "let g:v = 1").unwrap();
+    executor.execute_line(&mut editor, "lockv g:v").unwrap();
+    assert_vim_error(executor.execute_line(&mut editor, "let g:v = 2"), "E741");
+    assert_eq!(global_value(&executor, "v"), Some(ox_types::Typval::Number(1)));
+    executor.execute_line(&mut editor, "unlo g:v").unwrap();
+    executor.execute_line(&mut editor, "let g:v = 3").unwrap();
+    assert_eq!(global_value(&executor, "v"), Some(ox_types::Typval::Number(3)));
+}
+
+/// The bang is upstream's depth of -1 rather than the default 2, and
+/// `:unlockvar!` releases it again.
+#[test]
+fn lockvar_bang_locks_and_unlocks() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "let g:d = {'a': [1]}").unwrap();
+    executor.execute_line(&mut editor, "lockvar! g:d").unwrap();
+    assert_vim_error(executor.execute_line(&mut editor, "let g:d = {}"), "E741");
+    executor.execute_line(&mut editor, "unlockvar! g:d").unwrap();
+    executor.execute_line(&mut editor, "let g:d = {}").unwrap();
+}
+
+/// A leading digit run is the depth, not a variable name, and the depth is
+/// passed through: depth 0 locks the *variable* (E1122) while any deeper value
+/// locks its *value* (E741).
+///
+/// Oracle, on `[1]`: `lockvar 0` then reassigning gives
+/// `Vim(let):E1122: Variable is locked: g:l0`, while `lockvar 1` and
+/// `lockvar 2` give `Vim(let):E741: Value is locked: g:lN`. That difference is
+/// what proves the digits reached the engine as a depth.
+#[test]
+fn lockvar_passes_the_explicit_depth_through() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    for (depth, code) in [("0", "E1122"), ("1", "E741"), ("2", "E741")] {
+        let name = format!("g:l{depth}");
+        executor
+            .execute_line(&mut editor, &format!("let {name} = [1]"))
+            .unwrap();
+        executor
+            .execute_line(&mut editor, &format!("lockvar {depth} {name}"))
+            .unwrap();
+        assert_vim_error(
+            executor.execute_line(&mut editor, &format!("let {name} = [9]")),
+            code,
+        );
+    }
+}
+
+/// Several names in one command are all locked, as `ex_unletlock` walks them.
+#[test]
+fn lockvar_locks_every_named_variable() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "let g:p = 1").unwrap();
+    executor.execute_line(&mut editor, "let g:q = 1").unwrap();
+    executor.execute_line(&mut editor, "lockvar g:p g:q").unwrap();
+    assert_vim_error(executor.execute_line(&mut editor, "let g:p = 2"), "E741");
+    assert_vim_error(executor.execute_line(&mut editor, "let g:q = 2"), "E741");
+}
+
+/// `:lockvar` needs a name (NEEDARG), so a bare one is E471.
+///
+/// Oracle: `lockvar` → `Vim(lockvar):E471: Argument required`.
+#[test]
+fn lockvar_without_a_name_raises_e471() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    assert_vim_error(executor.execute_line(&mut editor, "lockvar"), "E471");
+}

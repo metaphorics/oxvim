@@ -948,6 +948,8 @@ fn dispatch<F: FileIO>(
         "scriptencoding" => command_scriptencoding(runtime, command),
         "argdelete" => command_argdelete(runtime, editor, command),
         "z" => command_z(runtime, editor, command),
+        "lockvar" => command_lockvar(runtime, scope, command, true),
+        "unlockvar" => command_lockvar(runtime, scope, command, false),
         "resize" => command_resize(runtime, editor, command),
         "wincmd" => command_wincmd(runtime, editor, command),
         "echohl" => command_echohl(runtime, editor, command),
@@ -3376,6 +3378,49 @@ fn buffer_number_option(editor: &Editor, buffer: BufHandle, name: &str) -> Optio
 
 fn buffer_bool_option(editor: &Editor, buffer: BufHandle, name: &str) -> bool {
     matches!(editor.options().get_buffer(buffer, name), Ok(OptionValue::Boolean(true)))
+}
+
+/// `:lockvar` and `:unlockvar` (`eval/vars.c` `ex_lockvar`:1554).
+///
+/// The depth defaults to 2, `!` means "everything" (-1), and a leading digit
+/// run overrides it. The names that follow are handled one per whitespace-
+/// separated word, as `ex_unletlock` walks them, and the lock itself is
+/// `Scope::lockvar`/`unlockvar`.
+fn command_lockvar<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    scope: &mut Scope,
+    command: &ExCommand,
+    lock: bool,
+) -> Flow {
+    let mut argument = command.args.trim();
+    let depth = if command.bang {
+        -1
+    } else {
+        let digits = argument.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            2
+        } else {
+            let Ok(value) = argument[..digits].parse::<i32>() else {
+                return error_flow(runtime, "E475", format!("Invalid argument: {argument}"));
+            };
+            argument = argument[digits..].trim_start();
+            value
+        }
+    };
+    if argument.is_empty() {
+        return error_flow(runtime, "E471", "Argument required");
+    }
+    for name in argument.split_whitespace() {
+        let result = if lock {
+            scope.lockvar(name.as_bytes(), depth)
+        } else {
+            scope.unlockvar(name.as_bytes(), depth)
+        };
+        if let Err(error) = result {
+            return eval_error_flow(runtime, error);
+        }
+    }
+    Flow::Normal
 }
 
 /// `:hide` (`ex_docmd.c` `ex_hide`:5369): close a window without freeing its
