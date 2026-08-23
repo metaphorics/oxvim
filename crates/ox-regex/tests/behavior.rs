@@ -135,6 +135,7 @@ case!(octal_class, "pattern.txt:519-536", "\\o\\+", Magic::Magic, "89 701", Some
 case!(space_class_excludes_newline, "pattern.txt:519-539", "\\s\\+", Magic::Magic, "a\n \tb", Some(" \t"));
 case!(ident_without_digit, "pattern.txt:511-518", "\\I\\+", Magic::Magic, "2_name", Some("_name"));
 case!(keyword_without_digit, "pattern.txt:511-518", "\\K\\+", Magic::Magic, "7word", Some("word"));
+case!(keyword_matches_non_ascii_default_iskeyword, "test_functions.vim:Test_matchstrlist", "\\k\\+", Magic::Magic, "😊😊", Some("😊😊"));
 case!(print_without_digit, "pattern.txt:511-518", "\\P\\+", Magic::Magic, "2abc", Some("abc"));
 case!(decimal_character_atom, "pattern.txt:574-579", "\\%d65", Magic::Magic, "A", Some("A"));
 case!(hex_character_atom, "pattern.txt:574-579", "\\%x2a", Magic::Magic, "*", Some("*"));
@@ -243,6 +244,12 @@ fn automatic_engine_routes_pathological_range_to_bt() {
 fn malformed_group_is_typed_compile_error() {
     let _spec = "pattern.txt:371-380";
     assert!(compile("\\(abc", Magic::Magic).is_err());
+}
+
+#[test]
+fn lookaround_suffix_without_atom_is_compile_error() {
+    let _spec = "test_functions.vim:Test_matchstrlist";
+    assert!(compile("\\@=", Magic::Magic).is_err());
 }
 
 #[test]

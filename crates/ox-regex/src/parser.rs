@@ -222,6 +222,9 @@ impl<'a> Parser<'a> {
 
     fn parse_atom(&mut self) -> Result<Expr, CompileError> {
         let start = self.pos;
+        if self.starts_with("\\@") {
+            return Err(self.error("lookaround suffix follows nothing"));
+        }
         if self.consume_mode_switch() {
             return Ok(Expr::Empty);
         }
