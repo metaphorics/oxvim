@@ -1997,6 +1997,12 @@ fn call_user_function_with_self<F: FileIO>(
         runtime.scripts.store_script_scope(function.sid, scope);
         scope.script = caller_script;
     }
+    let flow = match flow {
+        Flow::NotImplemented(name) => {
+            error_flow(runtime, "E117", format!("not implemented: {name}"))
+        }
+        flow => flow,
+    };
     runtime.functions.end_call(scope);
     match flow {
         Flow::Normal => Ok(Typval::Number(0)),

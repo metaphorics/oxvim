@@ -501,6 +501,36 @@ fn default_expression_evaluates_in_caller_scope_and_aborts_call() {
     assert_eq!(global_number(exec.scope(), "entered"), Some(0));
 }
 
+#[test]
+fn evaluator_error_inside_user_function_enters_caller_catch_frame() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &mut editor,
+        concat!(
+            "function! BrokenBuiltin()\n",
+            "return exepath('oxvim')\n",
+            "endfunction\n",
+            "let g:caught = 0\n",
+            "let g:finalized = 0\n",
+            "try\n",
+            "call BrokenBuiltin()\n",
+            "catch\n",
+            "let g:caught = 1\n",
+            "let g:exception = v:exception\n",
+            "let g:throwpoint = v:throwpoint\n",
+            "finally\n",
+            "let g:finalized = 1\n",
+            "endtry"
+        ),
+    );
+    assert_eq!(global_number(exec.scope(), "caught"), Some(1));
+    assert_eq!(global_number(exec.scope(), "finalized"), Some(1));
+    assert_eq!(global_string(exec.scope(), "exception").as_deref(), Some("E117: not implemented: exepath"));
+    assert_eq!(global_string(exec.scope(), "throwpoint").as_deref(), Some("function BrokenBuiltin[1]..script <test>[1]"));
+}
+
 // ---------------------------------------------------------------------------
 // Family: l: / a: scope isolation and restoration
 // (eval/userfunc.c: call_def_function saves/restores caller l: and a:;
