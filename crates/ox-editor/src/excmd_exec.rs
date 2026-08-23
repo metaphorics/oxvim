@@ -494,6 +494,10 @@ pub(crate) fn drain_typeahead<F: FileIO>(
                 Ok(false) => break,
                 Err(error) => return error_flow(runtime, "E523", error.to_string()),
             },
+            // `emsg(e_recursive_mapping)` (`vgetorpeek`, `getchar.c`).
+            Err(crate::ModeError::RecursiveMapping) => {
+                return error_flow(runtime, "E223", "recursive mapping")
+            }
             Err(error) => return error_flow(runtime, "E523", error.to_string()),
         }
         if let Some(command) = machine.take_ex_command() {

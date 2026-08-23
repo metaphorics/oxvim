@@ -2962,3 +2962,43 @@ fn a_mapping_run_by_normal_stays_one_undo_block() {
         "one undo restored both changes"
     );
 }
+
+/// `if (++mapdepth >= p_mmd) { emsg(e_recursive_mapping) }`
+/// (`vgetorpeek`, `getchar.c`): a mapping whose right-hand side re-triggers it
+/// must stop, not expand forever. This only became reachable once `:normal`
+/// started applying mappings at all, and it hung the process.
+///
+/// Named divergence: upstream reports E223 as a message and lets the rest of
+/// the script run; this raises it, which a `:catch` sees.
+#[test]
+fn a_self_recursive_mapping_stops_at_maxmapdepth() {
+    let (mut editor, mut executor) = setup();
+    executor.execute_line(&mut editor, "nmap ,x ,x").unwrap();
+
+    assert_vim_error(executor.execute_line(&mut editor, "normal ,x"), "E223");
+
+    // The depth counter is per key consumed, not cumulative: a mapping that
+    // does terminate still works afterwards.
+    executor.execute_line(&mut editor, "nunmap ,x").unwrap();
+    executor.execute_line(&mut editor, "nnoremap ,y :let g:hit = 'yes'<CR>").unwrap();
+    executor.execute_line(&mut editor, "normal ,y").unwrap();
+    assert_eq!(global_text(&executor, "hit").as_deref(), Some("yes"));
+}
+
+/// A low `'maxmapdepth'` makes the limit observable rather than inferred.
+/// Every mapping application counts, including the one that installs the Ex
+/// command, so with a limit of 2 the one-hop `,c` runs and the three-hop `,a`
+/// does not.
+#[test]
+fn maxmapdepth_bounds_how_far_a_mapping_chain_expands() {
+    let (mut editor, mut executor) = setup();
+    executor.execute_line(&mut editor, "set maxmapdepth=2").unwrap();
+    executor.execute_line(&mut editor, "nnoremap ,c :let g:hit = 'yes'<CR>").unwrap();
+    executor.execute_line(&mut editor, "nmap ,b ,c").unwrap();
+    executor.execute_line(&mut editor, "nmap ,a ,b").unwrap();
+
+    assert_vim_error(executor.execute_line(&mut editor, "normal ,a"), "E223");
+
+    executor.execute_line(&mut editor, "normal ,c").unwrap();
+    assert_eq!(global_text(&executor, "hit").as_deref(), Some("yes"));
+}

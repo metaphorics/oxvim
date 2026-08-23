@@ -106,6 +106,9 @@ pub enum ModeError {
     /// A named special key has no behavior in the current mode.
     #[error("non-character input is not supported in this modal state")]
     UnsupportedKey,
+    /// `'maxmapdepth'` mapping expansions happened without consuming a key.
+    #[error("recursive mapping")]
+    RecursiveMapping,
 }
 
 /// Stateful modal command processor.
@@ -118,6 +121,9 @@ pub struct ModeMachine {
     last_visual: Option<VisualState>,
     completed_ex_command: Option<String>,
     pending_mapping_action: Option<(MappingAction, MappingOptions)>,
+    /// `mapdepth` (`getchar.c`): mapping expansions since the last key was
+    /// consumed. `nmap ,x ,x` re-expands forever without it.
+    map_depth: u32,
     timestamp: i64,
 }
 
@@ -155,6 +161,10 @@ impl ModeMachine {
                 }
             }
             self.may_sync_undo(editor, flags);
+            // `mapdepth = 0` once a character is actually returned
+            // (`vgetorpeek`, `getchar.c`): the limit counts expansions that
+            // produced no input, not expansions overall.
+            self.map_depth = 0;
             let Some(key) = editor.typeahead_mut().pop()? else { return Ok(Step::Idle); };
             return match key {
                 Key::Byte(byte) => Ok(Step::Key(char::from(byte))),
@@ -217,6 +227,14 @@ impl ModeMachine {
         options: MappingOptions,
         width: usize,
     ) -> Result<bool, ModeError> {
+        // `if (++mapdepth >= p_mmd) { emsg(e_recursive_mapping) }`
+        // (`vgetorpeek`, `getchar.c`): without this `nmap ,x ,x` re-expands
+        // its own right-hand side forever and never returns a key.
+        self.map_depth = self.map_depth.saturating_add(1);
+        if u64::from(self.map_depth) >= max_map_depth(editor) {
+            editor.typeahead_mut().flush();
+            return Err(ModeError::RecursiveMapping);
+        }
         editor.typeahead_mut().consume(width);
         match action {
             MappingAction::Keys(keys) => {
@@ -478,6 +496,13 @@ fn next_boundary(line: &[u8], col: usize) -> usize {
     let mut next = col.saturating_add(1).min(line.len());
     while next < line.len() && std::str::from_utf8(line).map_or(false, |text| !text.is_char_boundary(next)) { next += 1; }
     next
+}
+/// `'maxmapdepth'` (`p_mmd`), upstream's default 1000.
+fn max_map_depth(editor: &Editor) -> u64 {
+    match editor.options().get_global("maxmapdepth") {
+        Ok(OptionValue::Number(value)) if *value > 0 => u64::try_from(*value).unwrap_or(1000),
+        _ => 1000,
+    }
 }
 fn option_bool(editor: &Editor, name: &str, fallback: bool) -> bool { match editor.options().get_global(name) { Ok(OptionValue::Boolean(value)) => *value, _ => fallback } }
 fn option_contains(editor: &Editor, name: &str, item: &str, fallback: bool) -> bool { match editor.options().get_global(name) { Ok(OptionValue::String(value)) => value.split(',').any(|candidate| candidate == item), _ => fallback } }
