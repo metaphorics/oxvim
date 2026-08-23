@@ -797,8 +797,8 @@ fn getvcol(line: &[u8], col: i64, tabstop: usize) -> (usize, usize) {
 }
 
 /// Display cells one character cluster occupies
-/// (`plines.c:charsize_fast_impl`).
-fn cell_width(character: char, vcol: usize, tabstop: usize) -> usize {
+/// (`plines.c:charsize_fast_impl`), upstream's `win_chartabsize`.
+pub(crate) fn cell_width(character: char, vcol: usize, tabstop: usize) -> usize {
     match character {
         '\t' => tabstop - (vcol % tabstop),
         control if (control as u32) < 0x20 || control as u32 == 0x7f => 2,

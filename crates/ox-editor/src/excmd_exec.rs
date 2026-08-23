@@ -31,6 +31,7 @@ use crate::autocmd::{AutocmdContext, AutocmdKind, AutocmdOptions, AugroupId, Del
 use crate::extmark::{ExtmarkAttributes, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, NamespaceId};
 use crate::mapping::{MapMode, MapModes, MapScope, MappingAction, MappingOptions};
 use crate::options::{find_unescaped, CommaItems, OptionListKind, OptionScope, OptionType, OptionValue, OPTION_METADATA};
+use crate::builtins::position::cell_width;
 use crate::register::RegisterContent;
 use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid};
 use crate::typeahead::Keys;
@@ -941,6 +942,7 @@ fn dispatch<F: FileIO>(
         "tabonly" => command_tabonly(runtime, editor, command),
         "undo" => command_undo(runtime, editor, command),
         "redo" => command_redo(runtime, editor),
+        "retab" => command_retab(runtime, editor, scope, command),
         "resize" => command_resize(runtime, editor, command),
         "wincmd" => command_wincmd(runtime, editor, command),
         "echohl" => command_echohl(runtime, editor, command),
@@ -3168,6 +3170,207 @@ fn command_redo<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> F
         }
         Err(error) => error_flow(runtime, "E749", error.to_string()),
     }
+}
+
+/// `:retab` (`indent.c` `ex_retab`:1436-1617): rewrite whitespace runs in the
+/// addressed lines for a (possibly new) `'tabstop'`.
+///
+/// A run is rewritten only when it *contains* a tab, or when `!` is given and
+/// it is more than one space (`indent.c:1495`), and only when the rewrite is
+/// no longer than what was there — so `:retab!` leaves two spaces alone
+/// because a tab would render differently. With `'expandtab'` the run becomes
+/// all spaces; otherwise `tabstop_fromto` (`indent.c:220-243`) splits it into
+/// tabs plus a spare-space remainder.
+///
+/// Widths are measured with the *old* `'tabstop'` and rebuilt with the new
+/// one, which is why `:retab 4` doubles a single tab that spanned eight
+/// columns. `-indentonly` stops after the leading run.
+///
+/// The argument is a single tabstop value and becomes the buffer's
+/// `'tabstop'`. Named gap: upstream also accepts a comma list and writes it to
+/// `'vartabstop'` (`indent.c:1597-1613`); this port has no `'vartabstop'`
+/// option at all, so that form reports NotImplemented rather than silently
+/// keeping one of the values.
+fn command_retab<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    command: &ExCommand,
+) -> Flow {
+    let Some(buffer) = editor.current_buffer() else {
+        return error_flow(runtime, "E749", "Empty buffer");
+    };
+    let (first, last) = match resolve_range(editor, command) {
+        Ok(range) => range,
+        Err(message) => return error_flow(runtime, "E16", message),
+    };
+
+    let mut argument = command.args.trim();
+    let indent_only = match argument.strip_prefix("-indentonly") {
+        Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => {
+            argument = rest.trim_start();
+            true
+        }
+        _ => false,
+    };
+    if argument.contains(',') {
+        return Flow::NotImplemented("retab with a 'vartabstop' list".to_owned());
+    }
+    let new_tabstop = if argument.is_empty() {
+        None
+    } else {
+        match argument.parse::<usize>() {
+            Ok(value) if value > 0 => Some(value),
+            _ => return error_flow(runtime, "E475", format!("Invalid argument: {argument}")),
+        }
+    };
+
+    let old_tabstop = buffer_number_option(editor, buffer, "tabstop").unwrap_or(8);
+    let expandtab = buffer_bool_option(editor, buffer, "expandtab");
+    let target_tabstop = new_tabstop.unwrap_or(old_tabstop);
+
+    let lines = match buffer_lines(editor, buffer) {
+        Ok(lines) => lines,
+        Err(message) => return error_flow(runtime, "E749", message),
+    };
+    for lnum in first..=last.min(lines.len()) {
+        let Some(line) = lines.get(lnum - 1) else { continue };
+        let rebuilt = retab_line(line, old_tabstop, target_tabstop, expandtab, command.bang, indent_only);
+        if let Some(rebuilt) = rebuilt {
+            let cursor = editor
+                .current_window()
+                .and_then(|window| editor.window(window).ok())
+                .map_or(Position { lnum, col: 0 }, |state| state.cursor);
+            if let Err(error) = editor.replace_buffer_lines(buffer, lnum, lnum, &[rebuilt], cursor, cursor, 0) {
+                return error_flow(runtime, "E749", error.to_string());
+            }
+        }
+    }
+
+    if let Some(value) = new_tabstop {
+        // The dual write `:set` uses, so `&tabstop` reads inside the same batch
+        // see the new value instead of the pre-command snapshot.
+        let written = i64::try_from(value).unwrap_or(i64::MAX);
+        if let Err((code, message)) =
+            set_and_mirror(editor, scope, "tabstop", OptionValue::Number(written), SetLayer::Local)
+        {
+            return error_flow(runtime, code, message);
+        }
+    }
+    Flow::Normal
+}
+
+/// Rewrites one line's whitespace runs, or `None` when nothing changed.
+fn retab_line(
+    line: &[u8],
+    old_tabstop: usize,
+    new_tabstop: usize,
+    expandtab: bool,
+    forceit: bool,
+    indent_only: bool,
+) -> Option<Vec<u8>> {
+    let text = String::from_utf8_lossy(line);
+    let mut output: Vec<u8> = Vec::with_capacity(line.len());
+    let mut run = String::new();
+    let mut run_start_vcol = 0usize;
+    let mut vcol = 0usize;
+    let mut changed = false;
+    let mut done = false;
+
+    for character in text.chars() {
+        if !done && matches!(character, ' ' | '\t') {
+            if run.is_empty() {
+                run_start_vcol = vcol;
+            }
+            run.push(character);
+            vcol += cell_width(character, vcol, old_tabstop);
+            continue;
+        }
+        if !run.is_empty() {
+            changed |= flush_retab_run(&mut output, &run, run_start_vcol, vcol, new_tabstop, expandtab, forceit);
+            run.clear();
+        }
+        if !done && indent_only {
+            // `-indentonly`: everything past the leading run is copied as-is.
+            done = true;
+        }
+        let mut encoded = [0_u8; 4];
+        output.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+        vcol += cell_width(character, vcol, old_tabstop);
+    }
+    if !run.is_empty() {
+        changed |= flush_retab_run(&mut output, &run, run_start_vcol, vcol, new_tabstop, expandtab, forceit);
+    }
+    changed.then_some(output)
+}
+
+/// Emits one whitespace run, rebuilt when upstream would rebuild it.
+///
+/// Returns whether the emitted bytes differ from the run as it stood.
+fn flush_retab_run(
+    output: &mut Vec<u8>,
+    run: &str,
+    start_vcol: usize,
+    end_vcol: usize,
+    new_tabstop: usize,
+    expandtab: bool,
+    forceit: bool,
+) -> bool {
+    let had_tab = run.contains('\t');
+    let spaces = run.chars().filter(|character| *character == ' ').count();
+    // indent.c:1495: a run without a tab is left alone unless `!` was given
+    // and it is more than a single space.
+    if !had_tab && !(forceit && spaces > 1) {
+        output.extend_from_slice(run.as_bytes());
+        return false;
+    }
+    let width = end_vcol - start_vcol;
+    let (tabs, remainder) = if expandtab {
+        (0, width)
+    } else {
+        tabstop_fromto(start_vcol, end_vcol, new_tabstop)
+    };
+    // indent.c:1509: keep the original unless the rewrite is not longer.
+    if !expandtab && !had_tab && tabs + remainder >= run.chars().count() {
+        output.extend_from_slice(run.as_bytes());
+        return false;
+    }
+    let rebuilt: Vec<u8> = std::iter::repeat(b'\t')
+        .take(tabs)
+        .chain(std::iter::repeat(b' ').take(remainder))
+        .collect();
+    let changed = rebuilt != run.as_bytes();
+    output.extend_from_slice(&rebuilt);
+    changed
+}
+
+/// `tabstop_fromto` (`indent.c:220-243`) without `'vartabstop'`: the tabs and
+/// spare spaces that advance from `start_vcol` to `end_vcol`.
+fn tabstop_fromto(start_vcol: usize, end_vcol: usize, tabstop: usize) -> (usize, usize) {
+    if tabstop == 0 {
+        return (0, end_vcol - start_vcol);
+    }
+    let mut spaces = end_vcol - start_vcol;
+    let mut tabs = 0;
+    let initial = tabstop - (start_vcol % tabstop);
+    if spaces >= initial {
+        spaces -= initial;
+        tabs += 1;
+    }
+    tabs += spaces / tabstop;
+    spaces -= (spaces / tabstop) * tabstop;
+    (tabs, spaces)
+}
+
+fn buffer_number_option(editor: &Editor, buffer: BufHandle, name: &str) -> Option<usize> {
+    match editor.options().get_buffer(buffer, name) {
+        Ok(OptionValue::Number(value)) if *value > 0 => usize::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn buffer_bool_option(editor: &Editor, buffer: BufHandle, name: &str) -> bool {
+    matches!(editor.options().get_buffer(buffer, name), Ok(OptionValue::Boolean(true)))
 }
 
 fn command_only<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> Flow {

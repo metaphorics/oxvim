@@ -1663,3 +1663,129 @@ fn winnr_numbers_the_current_window_within_its_tabpage() {
     executor.execute_line(&mut editor, "let g:nr = winnr()").unwrap();
     assert_eq!(global_value(&executor, "nr"), Some(ox_types::Typval::Number(1)));
 }
+
+// ---------------------------------------------------------------------------
+// :retab
+// Citations: indent.c ex_retab:1436-1617, tabstop_fromto:220-243.
+// ---------------------------------------------------------------------------
+
+/// A whitespace run containing a tab is rebuilt for the new `'tabstop'`,
+/// measured with the old one: a single tab spanning eight columns becomes two
+/// tabs at `ts=4`. Runs of spaces alone are left untouched without `!`.
+///
+/// Oracle: `["\tone", "        two", "a\t\tb"]` at ts=8 + `retab 4` →
+/// `["\t\tone", "        two", "a\t\t\t\tb"]`, ts=4.
+#[test]
+fn retab_rebuilds_tab_runs_for_the_new_tabstop() {
+    let (mut editor, mut executor) = setup_with_content(&[
+        b"\tone".to_vec(),
+        b"        two".to_vec(),
+        b"a\t\tb".to_vec(),
+    ]);
+    executor.execute_line(&mut editor, "set noexpandtab tabstop=8").unwrap();
+    executor.execute_line(&mut editor, "retab 4").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["\t\tone", "        two", "a\t\t\t\tb"]);
+    executor.execute_line(&mut editor, "let g:ts = &tabstop").unwrap();
+    assert_eq!(global_value(&executor, "ts"), Some(ox_types::Typval::Number(4)));
+}
+
+/// Without a new value `:retab` normalises against the current `'tabstop'`,
+/// which leaves already-correct text alone. `:ret` is the abbreviation.
+#[test]
+fn retab_without_an_argument_keeps_the_tabstop() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"\tone".to_vec(), b"    three".to_vec()]);
+    executor.execute_line(&mut editor, "set noexpandtab tabstop=8").unwrap();
+    executor.execute_line(&mut editor, "ret").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["\tone", "    three"]);
+    executor.execute_line(&mut editor, "let g:ts = &tabstop").unwrap();
+    assert_eq!(global_value(&executor, "ts"), Some(ox_types::Typval::Number(8)));
+}
+
+/// `'expandtab'` turns every rebuilt run into spaces.
+///
+/// Oracle: `"\tone"` at ts=8 with `expandtab` + `retab` → eight spaces.
+#[test]
+fn retab_expands_to_spaces_under_expandtab() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"\tone".to_vec(), b"a\t\tb".to_vec()]);
+    executor.execute_line(&mut editor, "set expandtab tabstop=8").unwrap();
+    executor.execute_line(&mut editor, "retab").unwrap();
+    assert_eq!(
+        buffer_text(&editor),
+        vec!["        one", &format!("a{}b", " ".repeat(15))]
+    );
+}
+
+/// `!` also rebuilds runs of more than one space, but only when the rewrite is
+/// no longer than the original: eight spaces become a tab while two spaces
+/// stay two spaces, because a tab there would render differently
+/// (`indent.c:1495,1509`).
+///
+/// Oracle: `["        eight", "a        b", "  x", "   y"]` at ts=8 + `retab!`
+/// → `["\teight", "a\t b", "  x", "   y"]`.
+#[test]
+fn retab_bang_rebuilds_space_runs_that_can_shorten() {
+    let (mut editor, mut executor) = setup_with_content(&[
+        b"        eight".to_vec(),
+        b"a        b".to_vec(),
+        b"  x".to_vec(),
+        b"   y".to_vec(),
+    ]);
+    executor.execute_line(&mut editor, "set noexpandtab tabstop=8").unwrap();
+    executor.execute_line(&mut editor, "retab!").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["\teight", "a\t b", "  x", "   y"]);
+}
+
+/// Without `!` a run of spaces is never touched, even one that could shorten.
+#[test]
+fn retab_without_bang_leaves_space_runs_alone() {
+    let (mut editor, mut executor) = setup_with_content(&[b"        eight".to_vec()]);
+    executor.execute_line(&mut editor, "set noexpandtab tabstop=8").unwrap();
+    executor.execute_line(&mut editor, "retab").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["        eight"]);
+}
+
+/// `-indentonly` stops after the leading run, so an interior tab survives.
+///
+/// Oracle: `"\tone\ttwo"` at ts=8 + `retab -indentonly 4` → `"\t\tone\ttwo"`.
+#[test]
+fn retab_indentonly_leaves_interior_whitespace() {
+    let (mut editor, mut executor) = setup_with_content(&[b"\tone\ttwo".to_vec()]);
+    executor.execute_line(&mut editor, "set noexpandtab tabstop=8").unwrap();
+    executor.execute_line(&mut editor, "retab -indentonly 4").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["\t\tone\ttwo"]);
+}
+
+/// A non-numeric argument is E475 and changes nothing.
+///
+/// Oracle: `retab xyz` → `Vim(retab):E475: Invalid argument: xyz`.
+#[test]
+fn retab_rejects_a_non_numeric_argument_with_e475() {
+    let (mut editor, mut executor) = setup_with_content(&[b"\tone".to_vec()]);
+    assert_vim_error(executor.execute_line(&mut editor, "retab xyz"), "E475");
+    assert_eq!(buffer_text(&editor), vec!["\tone"]);
+}
+
+/// A `'vartabstop'` list is reported rather than silently reduced to one of
+/// its values: this port has no `'vartabstop'` option at all.
+#[test]
+fn retab_reports_the_vartabstop_form() {
+    let (mut editor, mut executor) = setup_with_content(&[b"\tone".to_vec()]);
+    let error = executor.execute_line(&mut editor, "retab 4,8").unwrap_err();
+    assert!(
+        matches!(&error, ExecError::NotImplemented(name) if name.contains("vartabstop")),
+        "unexpected error: {error:?}"
+    );
+}
+
+/// Only the addressed lines are rebuilt; `:retab`'s default range is the whole
+/// buffer (EX_DFLALL), so an explicit range has to be what narrows it.
+#[test]
+fn retab_only_touches_the_addressed_lines() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"\tone".to_vec(), b"\ttwo".to_vec()]);
+    executor.execute_line(&mut editor, "set noexpandtab tabstop=8").unwrap();
+    executor.execute_line(&mut editor, "1retab 4").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["\t\tone", "\ttwo"]);
+}
