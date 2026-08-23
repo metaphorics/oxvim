@@ -662,25 +662,43 @@ impl<'a> Parser<'a> {
 
     fn parse_method_call(&mut self, receiver: Expr) -> Result<Expr, EvalError> {
         let arrow_end = self.previous_span().end;
-        let method = if matches!(self.current().kind, TokenKind::LBrace) {
+        // `eval_method` (eval.c:2996-3016) does not skip white space before the
+        // method name, so a gap after `->` leaves the rest of the expression
+        // unparsed and the caller reports the remainder as invalid rather than
+        // complaining about the arrow.
+        // Tested on the raw byte rather than the next token span, so a trailing
+        // `-> ` at the end of the source is caught too.
+        if matches!(self.source.get(arrow_end), Some(b' ' | b'\t')) {
+            let rest = String::from_utf8_lossy(&self.source[arrow_end..]);
+            return Err(EvalError::new("E15", arrow_end, format!("Invalid expression: \"{rest}\"")));
+        }
+        let is_lambda = matches!(self.current().kind, TokenKind::LBrace);
+        let method = if is_lambda {
             let open = self.advance().clone();
             if !self.brace_is_lambda() {
-                return Err(EvalError::new("E260", open.span.start, "lambda expected after '->'"));
+                return Err(EvalError::new("E260", open.span.start, "Missing name after ->"));
             }
             self.parse_lambda(open.span.start)?
         } else {
             let token = self.advance().clone();
             let TokenKind::Identifier(name) = token.kind else {
-                return Err(EvalError::new("E260", token.span.start, "method name expected"));
+                return Err(EvalError::new("E260", token.span.start, "Missing name after ->"));
             };
             Expr::new(ExprKind::Variable(OxStr(name)), token.span)
         };
-        if method.span.start != arrow_end {
-            return Err(EvalError::new("E274", method.span.start, "white space is not allowed after '->'"));
+        if !matches!(self.current().kind, TokenKind::LParen) {
+            // `e_missingparen` is "E107: Missing parentheses: %s" (errors.h:131);
+            // `eval_lambda` passes the literal "lambda" for the `{...}` form.
+            let name = if is_lambda {
+                "lambda".to_owned()
+            } else {
+                String::from_utf8_lossy(&self.source[method.span.start..method.span.end]).into_owned()
+            };
+            return Err(EvalError::new("E107", method.span.start, format!("Missing parentheses: {name}")));
         }
-        let open = self.require(|kind| matches!(kind, TokenKind::LParen), "E274", "method name must be followed by '('")?;
+        let open = self.advance().clone();
         if method.span.end != open.span.start {
-            return Err(EvalError::new("E274", open.span.start, "white space is not allowed before method arguments"));
+            return Err(EvalError::new("E274", open.span.start, "No white space allowed before parenthesis"));
         }
         let (args, end) = self.parse_arguments()?;
         let span = Span::new(receiver.span.start, end);

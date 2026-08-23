@@ -679,3 +679,59 @@ fn literal_dictionary_missing_colon_stays_e720() {
     assert_eq!(failure.message, "Missing colon in Dictionary: 1}");
     assert_eq!(error(b"#{a.b: 1}").message, "Missing colon in Dictionary: .b: 1}");
 }
+
+// ---------------------------------------------------------------------------
+// White space around `->` method calls
+// Upstream: `eval_method` (eval.c:2990-3104). The method name is read straight
+// after the arrow with no skipwhite, `e_missingparen` is "E107: Missing
+// parentheses: %s" (errors.h:131) and `e_nowhitespace` is "E274: No white space
+// allowed before parenthesis" (eval.c:99-100).
+// Exercised by `test_method.vim` `Test_method_syntax`.
+// ---------------------------------------------------------------------------
+
+/// Normal case: white space before the arrow is fine and the chain still
+/// resolves, including inside the argument list.
+#[test]
+fn method_call_allows_white_space_before_the_arrow() {
+    assert_eq!(value(b"[1, 2, 3]->len()"), Typval::Number(3));
+    assert_eq!(value(b"[1, 2, 3]  ->len( )"), Typval::Number(3));
+    assert_eq!(value(b"[1]->len()->id()"), Typval::Number(1));
+}
+
+/// Documented error: a gap between `->` and the method name is not an arrow
+/// complaint. `eval_method` never skips white space, so the remainder is left
+/// unparsed and reported whole, quoted from the byte after the arrow.
+#[test]
+fn method_call_white_space_after_the_arrow_is_e15() {
+    let failure = error(b"[1, 2, 3]-> len()");
+    assert_eq!(failure.code, "E15");
+    assert_eq!(failure.message, "Invalid expression: \" len()\"");
+
+    // The quoted remainder runs to the end of the source, not to the call.
+    assert_eq!(error(b"[1, 2, 3]-> len() + 1").message, "Invalid expression: \" len() + 1\"");
+    // A bare trailing arrow with a gap behaves the same way.
+    assert_eq!(error(b"[1, 2, 3]-> ").message, "Invalid expression: \" \"");
+}
+
+/// Boundary: the gap moves the error, it does not merely rename it. White space
+/// on the *other* side of the name — between the name and its `(` — is E274,
+/// and that holds for the lambda form too.
+#[test]
+fn method_call_white_space_before_the_parenthesis_is_e274() {
+    let failure = error(b"[1, 2, 3]->len ()");
+    assert_eq!(failure.code, "E274");
+    assert_eq!(failure.message, "No white space allowed before parenthesis");
+    assert_eq!(error(b"'t'->{x -> x} ()").code, "E274");
+}
+
+/// A malformed variant upstream rejects differently again: a method name with
+/// no argument list at all is E107, naming the method, and the `{...}` form
+/// reports the literal "lambda".
+#[test]
+fn method_call_without_parentheses_is_e107() {
+    let failure = error(b"[1, 2, 3]->len");
+    assert_eq!(failure.code, "E107");
+    assert_eq!(failure.message, "Missing parentheses: len");
+    assert_eq!(error(b"'t'->{x -> x}").message, "Missing parentheses: lambda");
+    assert_eq!(error(b"[1, 2, 3]->").message, "Missing name after ->");
+}
