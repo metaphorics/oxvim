@@ -176,6 +176,146 @@ case!(has_nvim_not_a_version, "has", [text("nvim-dev")], number(0));
 case!(has_multi_byte, "has", [text("multi_byte")], number(1));
 case!(has_unknown_feature, "has", [text("bogus-feature")], number(0));
 
+// Feature probes. `has()` must answer for *this* build, so each name below is
+// pinned in the direction the capability was observed in, against
+// `.references/neovim/build/bin/nvim` as the oracle for the question and
+// against oxvim itself for the answer. `f_has` compares with `STRICMP`, so the
+// probe is case-insensitive.
+case!(has_is_case_insensitive, "has", [text("EVAL")], number(1));
+case!(has_nvim_prefix_is_case_insensitive, "has", [text("NVIM-0.13")], number(1));
+case!(has_eval, "has", [text("eval")], number(1));
+case!(has_lambda, "has", [text("lambda")], number(1));
+case!(has_float, "has", [text("float")], number(1));
+case!(has_num64, "has", [text("num64")], number(1));
+case!(has_multi_byte_encoding, "has", [text("multi_byte_encoding")], number(1));
+case!(has_vimscript_1, "has", [text("vimscript-1")], number(1));
+case!(has_modify_fname, "has", [text("modify_fname")], number(1));
+case!(has_file_in_path, "has", [text("file_in_path")], number(1));
+case!(has_path_extra, "has", [text("path_extra")], number(1));
+case!(has_nvim, "has", [text("nvim")], number(1));
+case!(has_startuptime, "has", [text("startuptime")], number(1));
+
+// Subsystems upstream always compiles in that this build does not have. Each
+// name stays 0 because a test that stopped skipping would run against a
+// missing subsystem; the omission is recorded in
+// `.outline/sdd/reports/task-63.md` with the call that reports
+// `not implemented`.
+case!(has_quickfix_absent, "has", [text("quickfix")], number(0));
+case!(has_conceal_absent, "has", [text("conceal")], number(0));
+case!(has_spell_absent, "has", [text("spell")], number(0));
+case!(has_syntax_absent, "has", [text("syntax")], number(0));
+case!(has_signs_absent, "has", [text("signs")], number(0));
+case!(has_timers_absent, "has", [text("timers")], number(0));
+case!(has_reltime_absent, "has", [text("reltime")], number(0));
+case!(has_profile_absent, "has", [text("profile")], number(0));
+case!(has_menu_absent, "has", [text("menu")], number(0));
+case!(has_mksession_absent, "has", [text("mksession")], number(0));
+case!(has_digraphs_absent, "has", [text("digraphs")], number(0));
+case!(has_cmdline_hist_absent, "has", [text("cmdline_hist")], number(0));
+case!(has_langmap_absent, "has", [text("langmap")], number(0));
+case!(has_vartabs_absent, "has", [text("vartabs")], number(0));
+case!(has_arabic_absent, "has", [text("arabic")], number(0));
+case!(has_folding_absent, "has", [text("folding")], number(0));
+case!(has_diff_absent, "has", [text("diff")], number(0));
+case!(has_iconv_absent, "has", [text("iconv")], number(0));
+case!(has_libcall_absent, "has", [text("libcall")], number(0));
+case!(has_byte_offset_absent, "has", [text("byte_offset")], number(0));
+case!(has_persistent_undo_absent, "has", [text("persistent_undo")], number(0));
+case!(has_packages_absent, "has", [text("packages")], number(0));
+case!(has_autocmd_absent, "has", [text("autocmd")], number(0));
+case!(has_gettext_absent, "has", [text("gettext")], number(0));
+case!(has_shada_absent, "has", [text("shada")], number(0));
+case!(has_python3_absent, "has", [text("python3")], number(0));
+
+/// `has("linux")`/`has("fname_case")` are the `#ifdef __linux__` and
+/// `#ifndef CASE_INSENSITIVE_FILENAME` rows of `has_list`.
+#[test]
+fn has_platform_traits_match_the_target() {
+    assert_eq!(call("has", vec![text("linux")]).unwrap(), number(i64::from(cfg!(target_os = "linux"))));
+    assert_eq!(
+        call("has", vec![text("fname_case")]).unwrap(),
+        number(i64::from(cfg!(not(any(target_os = "macos", windows)))))
+    );
+}
+
+/// The table `has()` answers from must stay sorted: the lookup is a
+/// `binary_search`, so an out-of-order entry silently answers 0.
+#[test]
+fn has_answers_every_feature_it_claims() {
+    for spec in crate::builtins::FEATURES {
+        assert_eq!(call("has", vec![text(spec)]).unwrap(), number(1), "has({spec:?})");
+    }
+}
+
+// Capability proofs for the features answered 1 above: `has()` returning 1
+// with nothing behind it is the defect these guard against.
+//
+// `has("file_in_path")` and `has("path_extra")` are proven by
+// `findfile_and_finddir_match_upstream_over_the_oldtest_tree` below, which
+// pins comma-separated 'path' entries, `**`, `**{count}` and upward `;`
+// search against the oracle.
+
+/// `has("eval")`, `has("lambda")` and `has("vimscript-1")`: the expression
+/// evaluator parses and runs Vimscript, including a lambda applied to
+/// arguments. `eval()` itself needs the evaluating host rather than the
+/// typval-only dispatcher.
+#[test]
+fn eval_and_lambda_capabilities_back_their_feature_answers() {
+    let mut builtins = Builtins::without_regex();
+    let mut scope = Scope::new();
+    let mut run = |source: &[u8]| {
+        let program = Parser::new(source).parse().unwrap();
+        Evaluator::new(&mut builtins, &NoRegex).eval(&program, &mut scope).unwrap()
+    };
+    assert_eq!(run(b"1 + 2"), number(3));
+    assert_eq!(run(b"{a, b -> a * b}(6, 7)"), number(42));
+}
+
+/// `has("float")`: the float type exists and arithmetic, conversion and the
+/// float builtins operate on it.
+#[test]
+fn float_capability_backs_its_feature_answer() {
+    let mut builtins = Builtins::without_regex();
+    let mut scope = Scope::new();
+    let program = Parser::new(b"1.5 * 2.0").parse().unwrap();
+    assert_eq!(Evaluator::new(&mut builtins, &NoRegex).eval(&program, &mut scope).unwrap(), Typval::Float(3.0));
+    assert_eq!(call("str2float", vec![text("2.5e1")]).unwrap(), Typval::Float(25.0));
+    assert_eq!(call("float2nr", vec![Typval::Float(3.9)]).unwrap(), number(3));
+    assert_eq!(call("sqrt", vec![Typval::Float(2.0)]).unwrap(), Typval::Float(std::f64::consts::SQRT_2));
+}
+
+/// `has("num64")`: numbers are 64-bit, so a value past 2^31 survives
+/// arithmetic instead of wrapping.
+#[test]
+fn num64_capability_backs_its_feature_answer() {
+    let mut builtins = Builtins::without_regex();
+    let mut scope = Scope::new();
+    let program = Parser::new(b"4611686018427387904 + 1").parse().unwrap();
+    assert_eq!(
+        Evaluator::new(&mut builtins, &NoRegex).eval(&program, &mut scope).unwrap(),
+        number(4_611_686_018_427_387_905)
+    );
+}
+
+/// `has("multi_byte")`/`has("multi_byte_encoding")`: text is UTF-8 and the
+/// character and byte lengths of the same string differ accordingly.
+#[test]
+fn multi_byte_capability_backs_its_feature_answer() {
+    assert_eq!(call("strchars", vec![text("héllo")]).unwrap(), number(5));
+    assert_eq!(call("strlen", vec![text("héllo")]).unwrap(), number(6));
+    assert_eq!(call("char2nr", vec![text("é")]).unwrap(), number(233));
+    assert_eq!(call("nr2char", vec![number(233)]).unwrap(), text("é"));
+}
+
+/// `has("modify_fname")`: `fnamemodify()` applies the `:h`/`:t`/`:r`
+/// modifiers rather than returning its argument.
+#[test]
+fn modify_fname_capability_backs_its_feature_answer() {
+    assert_eq!(call("fnamemodify", vec![text("/a/b/c.txt"), text(":t:r")]).unwrap(), text("c"));
+    assert_eq!(call("fnamemodify", vec![text("/a/b/c.txt"), text(":h")]).unwrap(), text("/a/b"));
+    assert_eq!(call("fnamemodify", vec![text("/a/b/c.txt"), text(":e")]).unwrap(), text("txt"));
+}
+
 /// `has("unix")`/`has("win32")`/`has("macunix")` mirror the target family the
 /// binary was compiled for (`f_has` in eval/funcs.c).
 #[test]

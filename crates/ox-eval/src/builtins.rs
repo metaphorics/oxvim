@@ -1841,13 +1841,45 @@ fn get(args: &[Typval]) -> Result<Typval> {
     }
 }
 
+/// Feature names this build genuinely provides, answered by `has()`.
+///
+/// Upstream's `has_list` (`eval/funcs.c:2532-2667`) is a compile-time list of
+/// everything *Neovim* provides, so copying it wholesale would make `has()`
+/// lie: a test that stops skipping runs code paths this rewrite does not have,
+/// which turns an honest skip into a wall of noise. Every entry below was
+/// admitted only after the capability it names was exercised against the
+/// oracle and matched; the subsystem that answers for it is cited. Names
+/// upstream lists but this build does not implement are deliberately absent,
+/// so they keep returning 0 — see `.outline/sdd/reports/task-63.md` for the
+/// per-name evidence and for what each omission is still missing.
+///
+/// Sorted for `binary_search`; `f_has` compares with `STRICMP`, so lookups
+/// lowercase the query first. The trailing comment on each line names the
+/// module that answers for the feature, or the probe that proved it.
+pub(crate) const FEATURES: &[&str] = &[
+    "eval",                // ox-eval/eval.rs: `eval("1+2")` == 3
+    "file_in_path",        // ox-eval/find_file.rs: `findfile()` honours 'path'
+    "float",               // ox-eval Typval::Float: arithmetic, str2float, float2nr, sqrt, floor
+    "fork",                // ox-uv/process.rs forks for `system()`
+    "lambda",              // ox-eval/parser.rs: `{a, b -> a * b}(6, 7)` == 42
+    "modify_fname",        // ox-eval/path_builtins.rs: `fnamemodify()` modifiers
+    "multi_byte",          // ox-eval: strchars/strlen agree on multi-byte input
+    "multi_byte_encoding", // ox-eval: char2nr/nr2char round-trip; upstream is unconditional
+    "num64",               // ox-eval Typval::Number is i64
+    "nvim",                // this build targets Neovim 0.13 (ox_rpc API_LEVEL 15)
+    "path_extra",          // ox-eval/find_file.rs: `**` downward and `dir;` upward search
+    "startuptime",         // oxvim/cli.rs implements `--startuptime`
+    "vimscript-1",         // legacy Vimscript is the dialect ox-eval implements
+];
+
 /// `"has"` — feature probe. Mirrors `f_has` in `eval/funcs.c`: the
 /// `"nvim-X.Y[.Z]"` form compares against the Neovim version this build
 /// targets (0.13.0, matching `ox_rpc`'s `API_LEVEL = 15`); everything else
-/// answers from a small compile-time-honest table and defaults to 0, which is
-/// what upstream returns for features the build does not provide.
+/// answers from [`FEATURES`], which lists only capabilities this build was
+/// observed to provide, and defaults to 0, which is what upstream returns for
+/// features the build does not provide.
 fn has_feature(args: &[Typval]) -> Result<Typval> {
-    let feature = string_arg(&args[0])?.to_string_lossy().into_owned();
+    let feature = string_arg(&args[0])?.to_string_lossy().to_ascii_lowercase();
     let supported = if let Some(version) = feature.strip_prefix("nvim-") {
         let mut parts = version.split('.').map(|part| part.parse::<u64>().unwrap_or(u64::MAX));
         let requested = (parts.next().unwrap_or(0), parts.next().unwrap_or(0), parts.next().unwrap_or(0));
@@ -1857,8 +1889,10 @@ fn has_feature(args: &[Typval]) -> Result<Typval> {
             "unix" => cfg!(unix),
             "win32" | "win64" => cfg!(windows),
             "macunix" => cfg!(target_os = "macos"),
-            "multi_byte" => true,
-            _ => false,
+            // `#ifndef CASE_INSENSITIVE_FILENAME` and `#ifdef __linux__`.
+            "fname_case" => cfg!(not(any(target_os = "macos", windows))),
+            "linux" => cfg!(target_os = "linux"),
+            name => FEATURES.binary_search(&name).is_ok(),
         }
     };
     Ok(Typval::Number(i64::from(supported)))
