@@ -1,14 +1,14 @@
 //! Non-interactive process entry points.
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::Command;
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use ox_editor::{
-    Editor, EditorError, ExExecutor, ExecOutcome, Geometry, MessageKind, OptionError, OptionValue,
+    Editor, EditorError, ExExecutor, ExecOutcome, Geometry, MessageRouting, OptionError, OptionValue,
 };
 use ox_eval::{Builtins, Scope};
 use ox_eval::BuiltinHost as EvalBuiltins;
@@ -20,6 +20,7 @@ use ox_types::{BufHandle, Object, OxStr, Typval};
 
 use crate::cli::{Cli, LuaScript, ShadaConfig, UserConfig, WindowLayout};
 use crate::AppError;
+use crate::messages::PrintfSink;
 use crate::server::EditorVariables;
 use crate::startuptime::StartupTimer;
 
@@ -119,6 +120,21 @@ pub fn export_vim_environment() -> Result<(), AppError> {
 /// buffer that exists at this point (upstream's `curbuf`).
 pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppError> {
     let editor_error = |error: OptionError| AppError::Editor(error.to_string());
+    // message.c msg_use_printf/msg_puts_printf read these process modes for
+    // every message; main.c sets them while scanning the command line.
+    editor.message_routing = MessageRouting {
+        embedded: cli.embed,
+        silent: cli.batch.is_some_and(|batch| batch.silent),
+        ui_attached: false,
+    };
+    // "-V{level}" is 'verbose' (option.lua varname p_verbose), and a nonzero
+    // 'verbose' is what keeps batch mode from dropping message output.
+    if let Some(verbose) = &cli.verbose {
+        editor
+            .options_mut()
+            .set_global("verbose", OptionValue::Number(i64::from(verbose.level)))
+            .map_err(editor_error)?;
+    }
     editor
         .options_mut()
         .set_global("loadplugins", OptionValue::Boolean(cli.loadplugins))
@@ -335,18 +351,11 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<(), AppError> {
         execute_lines(&mut executor, &mut editor, input.lines().collect::<Vec<_>>().as_slice())?;
     }
 
-    let stdout = io::stdout();
-    let stderr = io::stderr();
-    let mut out = stdout.lock();
-    let mut err = stderr.lock();
-    for message in editor.messages() {
-        let destination: &mut dyn Write = if message.kind == MessageKind::Error { &mut err } else { &mut out };
-        match &message.content {
-            Object::String(text) => destination.write_all(text.as_bytes()).map_err(AppError::Io)?,
-            value => write!(destination, "{value:?}").map_err(AppError::Io)?,
-        }
-        destination.write_all(b"\n").map_err(AppError::Io)?;
+    let mut sink = PrintfSink::default();
+    for (message, destination) in editor.messages().iter().zip(editor.message_destinations()) {
+        sink.write(*destination, message).map_err(AppError::Io)?;
     }
+    sink.finish(editor.message_routing).map_err(AppError::Io)?;
     Ok(())
 }
 

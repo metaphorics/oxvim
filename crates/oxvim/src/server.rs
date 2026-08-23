@@ -12,7 +12,8 @@ use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
 use ox_api::{CommandExecutor, Registry};
 use ox_editor::{
     vim_variable_is_writable, AutocmdContext, AutocmdKind, CmdlineKind, Editor, Event, ExExecutor,
-    ExecOutcome, Geometry, LuaExec, LuaExecError, MappingAction, MessageKind, Mode, ModeMachine, Keys,
+    ExecOutcome, Geometry, LuaExec, LuaExecError, MappingAction, MessageDestination, MessageKind,
+    Mode, ModeMachine, Keys,
     OptionValue, TypeaheadFlags,
 };
 use ox_eval::{
@@ -39,6 +40,7 @@ use ox_uv::net::Pipe;
 use crate::AppError;
 use crate::cli::{Cli, UserConfig};
 use crate::runtime::{apply_startup_options, open_startup_buffers, runtime_root};
+use crate::messages::PrintfSink;
 use crate::startuptime::StartupTimer;
 
 #[derive(Default)]
@@ -64,6 +66,8 @@ pub struct AppState {
     /// Process exit code requested by `:cquit` (0 for plain quits).
     exit_code: i64,
     rendered_messages: usize,
+    /// Stdout/stderr message output for the modes with no attached UI.
+    printf: PrintfSink,
     lua_work: Rc<RefCell<VecDeque<Work>>>,
     ui_channels: UiChannels,
     emitter: Emitter,
@@ -158,6 +162,7 @@ impl AppState {
             exiting: false,
             exit_code: 0,
             rendered_messages: 0,
+            printf: PrintfSink::default(),
             lua_work,
             ui_channels: UiChannels::new(),
             emitter: Emitter::new(),
@@ -165,6 +170,9 @@ impl AppState {
             chrome: ChromeState::new(),
         };
         state.run_startup(cli, timer)?;
+        // main.c writes startup message output before the process waits on
+        // its input, and --headless/-es exit without ever attaching a UI.
+        state.publish_messages()?;
         Ok(state)
     }
 
@@ -447,6 +455,7 @@ impl AppState {
         self.ui_channels
             .attach(channel.get(), width, height, UiOptions::from_dict(&options))
             .map_err(|error| ApiError::exception(error.to_string()))?;
+        self.sync_ui_active();
         Ok(Object::Nil)
     }
 
@@ -458,7 +467,16 @@ impl AppState {
             .detach(channel.get())
             .map_err(|error| ApiError::exception(error.to_string()))?;
         self.emitter.detach(channel.get());
+        self.sync_ui_active();
         Ok(Object::Nil)
+    }
+
+    /// Mirrors `ui_active()` into the message sink: `msg_use_printf`
+    /// (`message.c` line 3013) stops printing as soon as a UI can display the
+    /// text, and starts again when the last one detaches.
+    fn sync_ui_active(&mut self) {
+        let attached = self.ui_channels.iter().next().is_some();
+        self.editor.borrow_mut().message_routing.ui_attached = attached;
     }
 
     fn ui_resize(&mut self, channel: ChannelId, params: &[Object]) -> Result<Object, ApiError> {
@@ -477,6 +495,8 @@ impl AppState {
 
     fn redraw(&mut self) -> Result<BTreeMap<u64, Vec<u8>>, ApiError> {
         self.sync_chrome();
+        self.publish_messages()
+            .map_err(|error| ApiError::exception(error.to_string()))?;
         let (width, height) = self
             .ui_channels
             .iter()
@@ -516,24 +536,45 @@ impl AppState {
             }
             _ => self.chrome.hide_cmdline(1, false),
         }
+    }
 
-        let editor = self.editor.borrow();
-        for message in &editor.messages()[self.rendered_messages..] {
-            let text = match &message.content {
-                Object::String(text) => text.clone(),
-                value => OxStr::from(format!("{value:?}").as_bytes()),
-            };
-            self.chrome.show_message(MessageState {
-                kind: OxStr::from(if message.kind == MessageKind::Error { "emsg" } else { "echo" }),
-                content: vec![ContentChunk::new(0, text)],
-                replace_last: false,
-                history: message.history,
-                append: false,
-                id: Object::Nil,
-                trigger: OxStr::from(""),
-            });
+    /// Sends every newly retained message where the editor sink decided it
+    /// goes: an attached UI, stdout, stderr, or nowhere.
+    fn publish_messages(&mut self) -> Result<(), AppError> {
+        let pending: Vec<(ox_editor::Message, MessageDestination)> = {
+            let editor = self.editor.borrow();
+            let from = self.rendered_messages;
+            editor.messages()[from..]
+                .iter()
+                .cloned()
+                .zip(editor.message_destinations()[from..].iter().copied())
+                .collect()
+        };
+        self.rendered_messages += pending.len();
+        for (message, destination) in &pending {
+            if *destination == MessageDestination::Ui {
+                self.show_in_chrome(message);
+            } else {
+                self.printf.write(*destination, message).map_err(AppError::Io)?;
+            }
         }
-        self.rendered_messages = editor.messages().len();
+        Ok(())
+    }
+
+    fn show_in_chrome(&mut self, message: &ox_editor::Message) {
+        let text = match &message.content {
+            Object::String(text) => text.clone(),
+            value => OxStr::from(format!("{value:?}").as_bytes()),
+        };
+        self.chrome.show_message(MessageState {
+            kind: OxStr::from(if message.kind == MessageKind::Error { "emsg" } else { "echo" }),
+            content: vec![ContentChunk::new(0, text)],
+            replace_last: false,
+            history: message.history,
+            append: false,
+            id: Object::Nil,
+            trigger: OxStr::from(""),
+        });
     }
 
     fn drive_input(&mut self) -> Result<(), ApiError> {
@@ -775,6 +816,13 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     let mut bytes = [0_u8; 8192];
+
+    // main.c getout(): a startup command that quits ends the process before
+    // the input loop starts, so `--headless -c 'echo x' -c 'qall!'` never
+    // waits for a peer to close stdin.
+    if state.should_exit() {
+        return Ok(state.exit_code());
+    }
 
     loop {
         let count = input.read(&mut bytes).map_err(AppError::Io)?;

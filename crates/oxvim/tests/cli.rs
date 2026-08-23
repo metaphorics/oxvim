@@ -13,11 +13,25 @@ fn oxvim() -> Command {
 
 /// Runs a silent Ex batch session and returns its captured output.
 ///
-/// `-es` is the only startup mode whose message stream reaches stdout today,
-/// so it is the channel every observable-effect assertion below reads.
+/// `-es` is `silent_mode`: `message.c` `msg_puts_printf` (line 3038) drops
+/// message text while `'verbose'` is zero, but the informative listing
+/// commands (`:print` through `print_line`, `:set` display through
+/// `showoneopt`) clear `silent_mode` and write to stdout, so those are the
+/// observable channel here.  Use [`batch_verbose`] to observe `:echo`.
 fn batch(arguments: &[&str], input: &str) -> std::process::Output {
+    spawn_batch(&["-es", "-u", "NONE", "-i", "NONE"], arguments, input)
+}
+
+/// Runs a silent Ex batch session with `'verbose'` at 1, which is what keeps
+/// `msg_puts_printf` from dropping ordinary message output; it then reaches
+/// stderr.
+fn batch_verbose(arguments: &[&str], input: &str) -> std::process::Output {
+    spawn_batch(&["-es", "-V1", "-u", "NONE", "-i", "NONE"], arguments, input)
+}
+
+fn spawn_batch(mode: &[&str], arguments: &[&str], input: &str) -> std::process::Output {
     let mut child = oxvim()
-        .args(["-es", "-u", "NONE", "-i", "NONE"])
+        .args(mode)
         .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -94,6 +108,65 @@ fn silent_ex_pipeline_prints_buffer_and_quits() {
     let output = child.wait_with_output().expect("wait for oxvim");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(output.stdout, b"x\n");
+}
+
+/// `message.c` decides where message text goes, per message:
+/// `msg_use_printf` (line 3013) prints when no UI or `--embed` peer can
+/// display it, and `msg_puts_printf` then drops it while `silent_mode` is set
+/// and `'verbose'` is zero (line 3038), else writes it to stderr (line 3049).
+/// Each case below is byte-compared against `nvim` of the same build.
+#[test]
+fn message_output_follows_the_process_mode() {
+    // --headless: no UI, not silent, so :echo reaches stderr.
+    let headless = oxvim()
+        .args(["-u", "NONE", "-i", "NONE", "--headless", "-c", "echo \"HELLO\"", "-c", "qall!"])
+        .output()
+        .expect("spawn oxvim");
+    assert!(headless.status.success());
+    assert_eq!(headless.stderr, b"HELLO", "--headless :echo belongs on stderr");
+    assert!(headless.stdout.is_empty());
+
+    // -es: silent_mode with 'verbose' zero drops the same message entirely.
+    let silent = batch(&[], "echo \"HELLO\"\n");
+    assert!(silent.status.success());
+    assert!(silent.stdout.is_empty(), "-es :echo must not reach stdout");
+    assert!(silent.stderr.is_empty(), "-es :echo must not reach stderr");
+
+    // -es -V1: a nonzero 'verbose' defeats that suppression, and batch mode
+    // ends its output with a newline (`ex_cmds.c` line 1721).
+    let verbose = batch_verbose(&[], "echo \"HELLO\"\n");
+    assert!(verbose.status.success());
+    assert_eq!(verbose.stderr, b"HELLO\n");
+    assert!(verbose.stdout.is_empty());
+}
+
+/// Informative listing output keeps its own stream: `print_line`
+/// (`ex_cmds.c` line 1701) and `showoneopt` (`option.c` line 4851) clear
+/// `silent_mode` and set `info_message`, so `:print` and `:set` display
+/// survive `-es` on stdout while a neighbouring `:echo` is dropped, and a
+/// message that follows them separates with a newline in their stream.
+#[test]
+fn informative_listings_keep_stdout_in_batch_mode() {
+    let listing = batch(&[], "call setline(1, \"one\")\n%print\nset number?\necho \"gone\"\n");
+    assert!(listing.status.success(), "{}", String::from_utf8_lossy(&listing.stderr));
+    assert_eq!(String::from_utf8_lossy(&listing.stdout), "one\nnonumber\n");
+    assert!(listing.stderr.is_empty(), "{}", String::from_utf8_lossy(&listing.stderr));
+
+    // Under --headless nothing is silent, so the separator lands in the
+    // stream of the message it follows: stderr after :echo, stdout between
+    // two printed lines, and no trailing newline at exit.
+    let headless = oxvim()
+        .args([
+            "-u", "NONE", "-i", "NONE", "--headless",
+            "-c", "echo \"E\"",
+            "-c", "set number?",
+            "-c", "qall!",
+        ])
+        .output()
+        .expect("spawn oxvim");
+    assert!(headless.status.success());
+    assert_eq!(headless.stdout, b"nonumber");
+    assert_eq!(headless.stderr, b"E\n");
 }
 
 
@@ -277,7 +350,7 @@ fn help_and_version_print_and_exit_zero() {
 /// post-startup commands stay in argv order regardless of how they spell.
 #[test]
 fn post_commands_keep_argv_order_after_every_pre_command() {
-    let output = batch(
+    let output = batch_verbose(
         &[
             "-c",
             "call setline(1, \"one\")",
@@ -291,7 +364,10 @@ fn post_commands_keep_argv_order_after_every_pre_command() {
         "%print\necho g:pre\n",
     );
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "one\ntwo\nthree\nfirst+second\n");
+    // `:print` is informative listing output (stdout); `:echo` is an ordinary
+    // message, which only escapes batch mode because `-V1` set 'verbose'.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "one\ntwo\nthree\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "first+second\n");
 }
 
 /// Every usage failure is observable: `mainerr` prints `{prog}: {msg}` with a
@@ -371,10 +447,10 @@ fn window_and_tab_openers_build_the_startup_layout() {
     ] {
         let mut arguments = vec![flag];
         arguments.extend(files);
-        let output = batch(&arguments, "echo winnr(\"$\") tabpagenr(\"$\") winnr()\n");
+        let output = batch_verbose(&arguments, "echo winnr(\"$\") tabpagenr(\"$\") winnr()\n");
         assert!(output.status.success(), "{flag}: {}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
             format!("{windows} {tabs} 1"),
             "{flag}"
         );
@@ -382,16 +458,16 @@ fn window_and_tab_openers_build_the_startup_layout() {
     // Every window shows the next file, in argv order (edit_buffers).
     let mut arguments = vec!["-o"];
     arguments.extend(files);
-    let output = batch(&arguments, "echo bufname(\"%\")\n2wincmd w\necho bufname(\"%\")\n");
+    let output = batch_verbose(&arguments, "echo bufname(\"%\")\n2wincmd w\necho bufname(\"%\")\n");
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
         format!("{}\n{}\n", one.text(), two.text())
     );
     // Without a layout flag there is still exactly one window.
     let mut arguments = vec!["--literal"];
     arguments.extend(files);
-    let output = batch(&arguments, "echo winnr(\"$\") tabpagenr(\"$\")\n");
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1 1");
+    let output = batch_verbose(&arguments, "echo winnr(\"$\") tabpagenr(\"$\")\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "1 1");
 }
 
 /// `-E`/`-Es` set upstream's `input_istext`: standard input becomes buffer

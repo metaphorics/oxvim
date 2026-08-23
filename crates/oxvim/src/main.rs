@@ -3,6 +3,7 @@
 
 mod api_info;
 mod cli;
+mod messages;
 mod runtime;
 mod server;
 mod startuptime;
