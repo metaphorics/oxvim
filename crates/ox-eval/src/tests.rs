@@ -619,6 +619,66 @@ fn trailing_input_boundary_is_one_byte() {
     assert_eq!(error(b"5)").message, "Trailing characters: )");
 }
 
+/// A byte no token can start with, sitting *after* a complete expression, is
+/// trailing garbage — not a lexing failure. `eval0` (`eval.c:1234-1252`) parses
+/// `4`, stops, and reports the remainder; it never looks at the `\r`, so E15
+/// would be this port lexing further ahead than upstream ever does.
+///
+/// This is the half of the fix that lives in the lexer. Whitespace handling
+/// alone cannot produce it: hand `eval0` the same bytes with an eager
+/// tokenizer and the answer is E15 with no remainder.
+#[test]
+fn a_byte_the_lexer_refuses_after_a_complete_expression_is_e488() {
+    let carriage_return = error(b"4\r");
+    assert_eq!(carriage_return.code, "E488");
+    assert_eq!(carriage_return.message, "Trailing characters: \r");
+
+    // Vertical tab and form feed are not white space to `skipwhite` either.
+    assert_eq!(error(b"4\x0b").message, "Trailing characters: \x0b");
+    assert_eq!(error(b"4\x0c").message, "Trailing characters: \x0c");
+
+    // Tolerance is not special-cased to the unknown-byte arm: a token that
+    // starts legally and then fails to close is remainder just the same.
+    assert_eq!(error(b"4 'ab").message, "Trailing characters: 'ab");
+}
+
+/// The other side of the same rule: when the expression actually needed the
+/// refused byte, the lexer's own error is the answer, because upstream's lazy
+/// lexer would have reached it too. Reporting E488 here — the remainder rule
+/// applied unconditionally — would be wrong in both directions.
+#[test]
+fn a_refused_byte_the_expression_needed_keeps_the_lexer_error() {
+    // The `+` has no right operand, so `eval1` demands another token.
+    assert_eq!(error(b"1 + \r").code, "E15");
+    // The refusal is the whole expression.
+    assert_eq!(error(b"\r").code, "E15");
+    assert_eq!(error(b"'ab").code, "E115");
+}
+
+/// The comparison that decides between the two is the offset the lexer *stopped
+/// at*, not the offset inside the error it produced. `$"moo}"` refuses at byte
+/// 0 and reports E1278 against byte 5, so comparing against the error's own
+/// offset silently reinstates the parser's E15.
+#[test]
+fn refusal_is_resolved_against_the_stop_offset_not_the_error_offset() {
+    assert_eq!(error(br#"$"moo}""#).code, "E1278");
+    assert_eq!(error(br#"$"{1 + 2""#).code, "E1279");
+}
+
+/// `:execute`, `:echo` and `:echomsg` loop `eval1` until the text is spent
+/// (`eval.c:1846`), so they do reach the refused byte and answer E15 — the
+/// oracle agrees: `echo 'z'<CR>` is `E15`, not `E488`.
+#[test]
+fn parse_many_reaches_the_refused_byte_and_reports_e15() {
+    let refused = Parser::new(b"'z' \r").parse_many().unwrap_err();
+    assert_eq!(refused.code, "E15");
+
+    // The tolerant lexer must not have broken the ordinary multi-expression
+    // path: two clean expressions still parse, and neither is dropped.
+    assert_eq!(Parser::new(b"1 2").parse_many().unwrap().len(), 2);
+    assert_eq!(Parser::new(b"'a' 'b' 'c'").parse_many().unwrap().len(), 3);
+}
+
 // ---------------------------------------------------------------------------
 // White space between a bare name and its argument list
 // Upstream: `eval.c:2783-2786` (name at the head of an expression: white space

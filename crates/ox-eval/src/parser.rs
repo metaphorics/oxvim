@@ -160,6 +160,22 @@ pub struct Parser<'a> {
     nesting: usize,
 }
 
+/// Choose between a parse failure and the byte the lexer refused.
+///
+/// [`Lexer::tokenize_tolerant`] leaves a synthetic `Eof` at `stop`, the offset
+/// it refused to read past, so a parser that ran out of tokens fails *there*
+/// while really having needed the refused byte. Upstream lexes lazily and
+/// would have hit the byte itself, so its own error is the honest one. A parse
+/// failure before `stop` is unrelated and stands. The refusal's own offset is
+/// not the comparison point: it can sit inside the token that failed to lex,
+/// past the offset the parser reports.
+fn resolve_refusal(error: EvalError, refused: &Option<EvalError>, stop: usize) -> EvalError {
+    match refused {
+        Some(refusal) if error.offset >= stop => refusal.clone(),
+        _ => error,
+    }
+}
+
 impl<'a> Parser<'a> {
     /// Create a parser using [`DEFAULT_MAX_NESTING`].
     #[must_use]
@@ -182,12 +198,17 @@ impl<'a> Parser<'a> {
 
     /// Parse one complete expression and reject trailing tokens.
     pub fn parse(mut self) -> Result<Expr, EvalError> {
-        self.tokens = Lexer::new(self.source).tokenize()?;
-        let expression = self.parse_expr1()?;
-        if !matches!(self.current().kind, TokenKind::Eof) {
+        let (tokens, refused) = Lexer::new(self.source).tokenize_tolerant();
+        let stop = tokens.last().map_or(0, |token| token.span.start);
+        self.tokens = tokens;
+        let expression = self.parse_expr1().map_err(|error| resolve_refusal(error, &refused, stop))?;
+        if !matches!(self.current().kind, TokenKind::Eof) || refused.is_some() {
             // Upstream reports the unconsumed remainder verbatim:
             // `e_trailing_arg` is "E488: Trailing characters: %s" (errors.h:123),
             // raised from `eval.c:1251` once `eval0` stops short of the end.
+            // A byte the lexer refused counts as remainder too, because
+            // `eval0` never looked at it: the expression in front of it was
+            // already complete.
             let start = self.current().span.start;
             let rest = String::from_utf8_lossy(&self.source[start..]);
             return Err(EvalError::new("E488", start, format!("Trailing characters: {rest}")));
@@ -197,7 +218,9 @@ impl<'a> Parser<'a> {
 
     /// Parse whitespace-separated expressions, as consumed by `:execute`.
     pub fn parse_many(mut self) -> Result<Vec<Expr>, EvalError> {
-        self.tokens = Lexer::new(self.source).tokenize()?;
+        let (tokens, refused) = Lexer::new(self.source).tokenize_tolerant();
+        let stop = tokens.last().map_or(0, |token| token.span.start);
+        self.tokens = tokens;
         let mut expressions: Vec<Expr> = Vec::new();
         while !matches!(self.current().kind, TokenKind::Eof) {
             if let Some(previous) = expressions.last() {
@@ -210,9 +233,15 @@ impl<'a> Parser<'a> {
                     ));
                 }
             }
-            expressions.push(self.parse_expr1()?);
+            expressions.push(self.parse_expr1().map_err(|error| resolve_refusal(error, &refused, stop))?);
         }
-        Ok(expressions)
+        // `:echo`, `:echomsg` and `:execute` loop `eval1` until the line is
+        // spent (`eval.c:1846` and `ex_docmd`'s echo handlers), so they do
+        // reach a byte the lexer refused and answer E15, not E488.
+        match refused {
+            Some(error) => Err(error),
+            None => Ok(expressions),
+        }
     }
 
     fn parse_expr1(&mut self) -> Result<Expr, EvalError> {

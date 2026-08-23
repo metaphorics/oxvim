@@ -132,12 +132,53 @@ impl<'a> Lexer<'a> {
     }
 
     /// Tokenize the complete expression, including one trailing [`TokenKind::Eof`].
-    pub fn tokenize(mut self) -> Result<Vec<Token>, EvalError> {
+    ///
+    /// Fails on the first byte no token can start with.
+    pub fn tokenize(self) -> Result<Vec<Token>, EvalError> {
+        match self.tokenize_tolerant() {
+            (_, Some(error)) => Err(error),
+            (tokens, None) => Ok(tokens),
+        }
+    }
+
+    /// Tokenize as far as the bytes allow, reporting the first refusal separately.
+    ///
+    /// Upstream never lexes past the expression it is parsing: `eval0`
+    /// (`eval.c:1234-1252`) parses one expression, stops, and reports
+    /// `E488: Trailing characters: %s` for whatever is left. An eager lexer
+    /// cannot answer that, because a trailing `\r` fails lexing before the
+    /// parser has finished the expression in front of it, turning upstream's
+    /// E488 into E15. So stop at the first byte that cannot start a token,
+    /// keep the error, and hand back the tokens so far with an
+    /// [`TokenKind::Eof`] sitting on the refused offset. The parser then
+    /// decides which answer is upstream's: the expression completed before the
+    /// refused byte, so the remainder is trailing garbage (E488), or the
+    /// expression needed that byte, so the lexer's own error stands.
+    pub fn tokenize_tolerant(mut self) -> (Vec<Token>, Option<EvalError>) {
         let mut tokens = Vec::new();
         loop {
             self.skip_layout();
             let start = self.offset;
-            let kind = match self.peek(0) {
+            let kind = match self.next_kind() {
+                Ok(kind) => kind,
+                Err(error) => {
+                    tokens.push(Token { kind: TokenKind::Eof, span: Span::new(start, start) });
+                    return (tokens, Some(error));
+                }
+            };
+            let eof = matches!(kind, TokenKind::Eof);
+            tokens.push(Token { kind, span: Span::new(start, self.offset) });
+            if eof {
+                return (tokens, None);
+            }
+            self.at_line_start = false;
+        }
+    }
+
+    /// Lex one token at the current offset, which layout skipping already reached.
+    fn next_kind(&mut self) -> Result<TokenKind, EvalError> {
+        let start = self.offset;
+        Ok(match self.peek(0) {
                 None => TokenKind::Eof,
                 Some(b'\n') => TokenKind::Eof,
                 Some(b'0') if matches!(self.peek(1), Some(b'z' | b'Z')) => self.lex_blob()?,
@@ -232,14 +273,7 @@ impl<'a> Lexer<'a> {
                         format!("invalid character 0x{byte:02x} in expression"),
                     ));
                 }
-            };
-            let eof = matches!(kind, TokenKind::Eof);
-            tokens.push(Token { kind, span: Span::new(start, self.offset) });
-            if eof {
-                return Ok(tokens);
-            }
-            self.at_line_start = false;
-        }
+        })
     }
 
     fn peek(&self, ahead: usize) -> Option<u8> {
