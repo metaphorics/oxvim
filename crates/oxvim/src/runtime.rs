@@ -35,6 +35,12 @@ pub fn run_interactive(cli: &Cli) -> Result<(), AppError> {
     ox_tui::run_command(command).map_err(|error| AppError::Tui(error.to_string()))
 }
 
+/// Rebuilds the parsed command line for the embedded child process.
+///
+/// The child is the editor, so every option the scanner parsed has its
+/// effect there: a flag missing here is a flag with no effect at all in the
+/// default mode. `-` is deliberately absent, because the child's standard
+/// input is the RPC channel and has no buffer text to read.
 fn interactive_child_arguments(cli: &Cli) -> Vec<String> {
     let mut arguments = Vec::new();
     if cli.clean {
@@ -64,6 +70,33 @@ fn interactive_child_arguments(cli: &Cli) -> Vec<String> {
     }
     if !cli.loadplugins {
         arguments.push("--noplugin".into());
+    }
+    for (requested, flag) in [
+        (cli.readonly, "-R"),
+        (cli.no_modifiable, "-M"),
+        (cli.no_write && !cli.no_modifiable, "-m"),
+        (cli.no_swap_file, "-n"),
+        (cli.binary, "-b"),
+    ] {
+        if requested {
+            arguments.push(flag.into());
+        }
+    }
+    if let Some(height) = cli.window_height {
+        arguments.push(format!("-w{height}"));
+    }
+    if let Some(flag) = match cli.window_layout {
+        WindowLayout::Single => None,
+        WindowLayout::Horizontal => Some("-o"),
+        WindowLayout::Vertical => Some("-O"),
+        WindowLayout::Tabs => Some("-p"),
+    } {
+        // An explicit count belongs to the flag; zero means one per file.
+        if cli.window_count == 0 {
+            arguments.push(flag.into());
+        } else {
+            arguments.push(format!("{flag}{}", cli.window_count));
+        }
     }
     if !cli.files.is_empty() {
         arguments.push("--".into());
