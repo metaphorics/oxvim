@@ -1084,6 +1084,8 @@ fn simplify_preserves_relative_and_trailing_separators() {
     // vimfn.txt simplify(): simplify("./dir/.././/file/") == "./file/".
     assert_eq!(call("simplify", vec![text("./dir/.././/file/")]).unwrap(), text("./file/"));
     assert_eq!(call("simplify", vec![text("///one//two/../three")]).unwrap(), text("/one/three"));
+    assert_eq!(call("simplify", vec![text("//path")]).unwrap(), text("//path"));
+    assert_eq!(call("simplify", vec![text("dir/.././file")]).unwrap(), text("./file"));
 }
 
 #[test]
@@ -1223,4 +1225,13 @@ fn slice_uses_exclusive_bounds_and_clamps_negative_indices() {
 fn insert_rejects_negative_list_indices() {
     let values = Typval::list(vec![number(1)]);
     assert_eq!(call("insert", vec![values, number(2), number(-1)]).unwrap_err().code, "E686");
+}
+
+#[test]
+fn measured_string_semantics_match_oldtest_cases() {
+    assert_eq!(call("str2nr", vec![text("1'000''000"), number(10), number(1)]).unwrap(), number(1000));
+    assert_eq!(call("reverse", vec![text("a\u{301}b")]).unwrap(), text("ba\u{301}"));
+    assert_eq!(call("reverse", vec![text("🇦🇧🇨")]).unwrap(), text("🇨🇦🇧"));
+    assert_eq!(call("strpart", vec![text("abcdefg"), number(-2), number(4)]).unwrap(), text("ab"));
+    assert_eq!(call("strpart", vec![text("co\u{301}mposed"), number(1), number(1), number(1)]).unwrap(), text("o\u{301}"));
 }

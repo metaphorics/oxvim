@@ -1270,7 +1270,21 @@ fn repeat(args: &[Typval]) -> Result<Typval> {
 
 fn reverse(mut args: Vec<Typval>) -> Result<Typval> {
     match args.pop() {
-        Some(Typval::String(value)) => Ok(Typval::String(OxStr(String::from_utf8_lossy(value.as_bytes()).chars().rev().collect::<String>().into_bytes()))),
+        Some(Typval::String(value)) => {
+            let text = String::from_utf8_lossy(value.as_bytes());
+            let mut clusters: Vec<String> = Vec::new();
+            for character in text.chars() {
+                if is_combining(character) {
+                    if let Some(cluster) = clusters.last_mut() { cluster.push(character); } else { clusters.push(character.to_string()); }
+                } else if is_regional_indicator(character) && clusters.last().is_some_and(|cluster| cluster.chars().count() == 1 && cluster.chars().next().is_some_and(is_regional_indicator)) {
+                    clusters.last_mut().expect("checked above").push(character);
+                } else {
+                    clusters.push(character.to_string());
+                }
+            }
+            clusters.reverse();
+            Ok(Typval::String(OxStr(clusters.concat().into_bytes())))
+        }
         Some(container @ Typval::List(_)) => {
             let Typval::List(reference) = &container else { return Err(EvalError::new("E714", 0, "List required")); };
             let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
@@ -1302,13 +1316,33 @@ fn string_index(args: &[Typval], reverse: bool) -> Result<Typval> {
 
 fn strpart(args: &[Typval]) -> Result<Typval> {
     let value = string_arg(&args[0])?;
-    let start = number_arg(&args[1])?;
-    let length = args.get(2).map(number_arg).transpose()?.unwrap_or(i64::MAX);
-    let start = usize::try_from(start.max(0)).unwrap_or(usize::MAX).min(value.as_bytes().len());
+    let mut start = number_arg(&args[1])?;
+    let mut length = args.get(2).map(number_arg).transpose()?.unwrap_or(i64::MAX);
+    if start < 0 { length = length.saturating_add(start); start = 0; }
+    let start = usize::try_from(start).unwrap_or(usize::MAX).min(value.as_bytes().len());
+    if args.get(3).is_some_and(Typval::is_truthy) {
+        let suffix = String::from_utf8_lossy(&value.as_bytes()[start..]);
+        let mut base_count = 0i64;
+        let mut end = 0usize;
+        for (offset, character) in suffix.char_indices() {
+            if !is_combining(character) {
+                if base_count >= length.max(0) { break; }
+                base_count += 1;
+            }
+            end = offset + character.len_utf8();
+        }
+        return Ok(Typval::String(OxStr(suffix.as_bytes()[..end].to_vec())));
+    }
     let length = usize::try_from(length.max(0)).unwrap_or(usize::MAX);
     let end = start.saturating_add(length).min(value.as_bytes().len());
     Ok(Typval::String(OxStr(value.as_bytes()[start..end].to_vec())))
 }
+
+fn is_combining(character: char) -> bool {
+    matches!(character as u32, 0x0300..=0x036f | 0x1ab0..=0x1aff | 0x1dc0..=0x1dff | 0x20d0..=0x20ff | 0xfe20..=0xfe2f)
+}
+
+fn is_regional_indicator(character: char) -> bool { matches!(character as u32, 0x1f1e6..=0x1f1ff) }
 
 /// `f_printf` (`eval/strings.c`): C-style formatting over typvals. Handles
 /// `%s`, `%d`/`%i`/`%u`, `%x`/`%X`/`%o`/`%b`/`%B`, `%c`, `%f`/`%e`/`%g`
@@ -1976,7 +2010,6 @@ fn parse_vim_number(bytes: &[u8], base: i64, quoted: bool) -> Result<i64> {
         digits.drain(..1);
         while digits.first().is_some_and(u8::is_ascii_whitespace) { digits.remove(0); }
     }
-    if quoted { digits.retain(|byte| *byte != b'\''); }
     let digits: &[u8] = &digits;
     // STR2NR_FORCE: skip the base marker only when a valid digit follows it.
     let digits = match base {
@@ -1985,6 +2018,20 @@ fn parse_vim_number(bytes: &[u8], base: i64, quoted: bool) -> Result<i64> {
         8 if digits.len() > 2 && (digits.starts_with(b"0o") || digits.starts_with(b"0O")) && matches!(digits[2], b'0'..=b'7') => &digits[2..],
         _ => digits,
     };
+    let normalized;
+    let digits = if quoted {
+        normalized = {
+            let mut output = Vec::with_capacity(digits.len());
+            let mut index = 0;
+            while index < digits.len() {
+                if digits[index] == b'\'' && !output.is_empty() && digits.get(index + 1).is_some_and(|byte| (*byte as char).to_digit(base as u32).is_some()) { index += 1; continue; }
+                output.push(digits[index]);
+                index += 1;
+            }
+            output
+        };
+        normalized.as_slice()
+    } else { digits };
     let magnitude = parse_integer_prefix(digits, base as u32).unwrap_or(0);
     Ok(if negative { magnitude.saturating_neg() } else { magnitude })
 }

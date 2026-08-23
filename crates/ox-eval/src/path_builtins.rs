@@ -333,14 +333,17 @@ fn simplify_name(name: &str) -> String {
         return String::new();
     }
     let absolute = name.starts_with('/');
+    let double_root = name.starts_with("//") && !name.starts_with("///");
     let leading_dot = name.starts_with("./");
     let trailing_separator = name.ends_with('/');
+    let mut collapsed_to_current = false;
     let mut parts: Vec<&str> = Vec::new();
     for component in name.split('/') {
         match component {
             "" | "." => {}
             ".." if parts.last().is_some_and(|part| *part != "..") => {
                 parts.pop();
+                collapsed_to_current |= parts.is_empty();
             }
             ".." if !absolute => parts.push(component),
             ".." => {}
@@ -349,8 +352,8 @@ fn simplify_name(name: &str) -> String {
     }
     let mut output = parts.join("/");
     if absolute {
-        output.insert(0, '/');
-    } else if leading_dot && !output.starts_with("../") {
+        output.insert_str(0, if double_root { "//" } else { "/" });
+    } else if (leading_dot || collapsed_to_current) && !output.is_empty() && !output.starts_with("../") && output != ".." {
         output.insert_str(0, "./");
     }
     if output.is_empty() {
