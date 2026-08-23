@@ -1420,6 +1420,58 @@ fn tabnew_opens_a_tabpage_after_the_current_one() {
     assert_eq!(editor.buffer(buffer).unwrap().name().to_string_lossy(), "");
 }
 
+/// `:quit` on the last window of a *non-last* tabpage closes the tabpage; it
+/// neither refuses with E444 nor exits the editor.
+///
+/// `win_close` (`window.c`:2798) reserves E444 for `last_window`, which is one
+/// window in the current tabpage *and* one tabpage in the editor. Anything
+/// else routes into `close_last_window_tabpage` (`window.c`:2678-2725).
+///
+/// Oracle, after `tabnew` twice: `quit!` gives tabs=2 cur=2, another gives
+/// tabs=1 cur=1, and neither reports an error; the third exits.
+#[test]
+fn quit_on_the_last_window_of_a_tabpage_closes_the_tabpage() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    assert_eq!(
+        executor.execute_line(&mut editor, "quit!").unwrap(),
+        ExecOutcome::Completed
+    );
+    assert_eq!((tab_count(&editor), current_tab_index(&editor)), (2, 2));
+    assert_eq!(
+        executor.execute_line(&mut editor, "quit!").unwrap(),
+        ExecOutcome::Completed
+    );
+    assert_eq!((tab_count(&editor), current_tab_index(&editor)), (1, 1));
+    // Only now is this the last window of the last tabpage.
+    assert_eq!(
+        executor.execute_line(&mut editor, "quit!").unwrap(),
+        ExecOutcome::Quit(0)
+    );
+}
+
+/// `:close` takes the same tabpage path, and E444 survives only for the last
+/// window of the last tabpage. `alt_tabpage` (`window.c`:3719) enters the
+/// *next* tabpage when one follows, so closing the first of three lands on the
+/// tabpage that was second.
+#[test]
+fn close_of_a_tabpages_last_window_enters_the_alternate_tabpage() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    // `:0tabnew` makes the new tabpage both the first and the current one.
+    executor.execute_line(&mut editor, "0tabnew").unwrap();
+    assert_eq!((tab_count(&editor), current_tab_index(&editor)), (4, 1));
+    let survivor = editor.tabpages()[1];
+    executor.execute_line(&mut editor, "close!").unwrap();
+    assert_eq!(tab_count(&editor), 3);
+    assert_eq!(editor.current_tabpage(), Some(survivor));
+    executor.execute_line(&mut editor, "tabonly").unwrap();
+    assert_eq!(tab_count(&editor), 1);
+    assert_vim_error(executor.execute_line(&mut editor, "close!"), "E444");
+}
+
 /// The address is upstream's `win_new_tabpage(after)` position, so `:0tabnew`
 /// becomes the first tabpage, `:$tabnew` the last, and `:{n}tabnew` lands at
 /// position `n + 1`.

@@ -3031,8 +3031,8 @@ fn command_tabonly<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, c
     }
     for tab in editor.tabpages() {
         if tab != keep {
-            if let Err(error) = editor.close_tabpage(tab) {
-                return error_flow(runtime, "E444", error.to_string());
+            if editor.close_tabpage(tab).is_err() {
+                return error_flow(runtime, "E444", "Cannot close last window");
             }
         }
     }
@@ -3107,13 +3107,40 @@ fn command_close<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, com
         Some(window) => window,
         None => return Flow::Quit(0),
     };
-    if editor.windows().len() == 1 {
-        return if quit { Flow::Quit(0) } else { error_flow(runtime, "E444", "Cannot close last window") };
+    // `win_close` (`window.c`:2791-2847). Upstream's `last_window` is one
+    // window in the *current tabpage* and one tabpage in the editor, and only
+    // that reaches E444; `:quit` there is `getout(0)`. The last window of any
+    // other tabpage goes to `close_last_window_tabpage` (`window.c`:2678),
+    // which enters `alt_tabpage()` and removes the tabpage instead of
+    // refusing. `editor.windows()` is the whole editor, so testing it here
+    // made every one-window tabpage look like the last window in the editor.
+    if current_tabpage_window_count(editor) <= 1 {
+        let tabs = editor.tabpages();
+        if tabs.len() <= 1 {
+            return if quit { Flow::Quit(0) } else { error_flow(runtime, "E444", "Cannot close last window") };
+        }
+        let alternate = alt_tabpage(&tabs, tab);
+        if editor.close_tabpage(tab).is_err() {
+            return error_flow(runtime, "E444", "Cannot close last window");
+        }
+        if let Some(alternate) = alternate {
+            let _ = editor.set_current_tabpage(alternate);
+        }
+        return Flow::Normal;
     }
     match editor.close_window(tab, window, true) {
         Ok(_) => Flow::Normal,
-        Err(error) => error_flow(runtime, "E444", error.to_string()),
+        Err(_) => error_flow(runtime, "E444", "Cannot close last window"),
     }
+}
+
+/// `alt_tabpage` (`window.c`:3719-3740): the tabpage entered when the current
+/// one goes away. With a default `'tabclose'` that is the next tabpage, or the
+/// previous one when the closing tabpage is the last. `'tabclose'` is not
+/// carried by this port, so neither of its flags is honoured here.
+fn alt_tabpage(tabs: &[TabHandle], closing: TabHandle) -> Option<TabHandle> {
+    let index = tabs.iter().position(|tab| *tab == closing)?;
+    tabs.get(index + 1).or_else(|| index.checked_sub(1).and_then(|prev| tabs.get(prev))).copied()
 }
 
 /// `:undo` (`ex_docmd.c` `ex_undo`:6729).
@@ -3610,7 +3637,7 @@ fn command_hide<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, comm
     }
     match editor.close_window(tab, window, true) {
         Ok(_) => Flow::Normal,
-        Err(error) => error_flow(runtime, "E444", error.to_string()),
+        Err(_) => error_flow(runtime, "E444", "Cannot close last window"),
     }
 }
 
