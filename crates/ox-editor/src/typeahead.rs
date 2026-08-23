@@ -200,6 +200,66 @@ impl From<Vec<u8>> for Keys {
     }
 }
 
+/// `str2specialbuf` (`message.c:2173-2187`), which drives `str2special`
+/// (`message.c:2084-2166`) over a whole encoded key string: control bytes and
+/// named special keys become `<>` notation and everything else passes through.
+///
+/// `replace_spaces` and `replace_lt` are upstream's two flags. `maparg()`'s
+/// `lhs` key uses `(true, false)` and its `rhs` key and string form use
+/// `(false, false)`; `:map`'s listing uses `(true, false)` for the lhs and
+/// `(false, false)` for the rhs (`mapping.c:2096,2116,2206`, `showmap`
+/// `mapping.c:236,262`).
+///
+/// Named gap: this port's [`Keys::parse_notation`] decodes `<BS>`, `<Del>`,
+/// `<NL>` and `<Nul>` to plain bytes where upstream builds the special keys
+/// `K_BS`, `K_DEL`, `K_NL` and `K_ZERO`, so those four render here as
+/// `<C-H>`, a raw `0x7f`, `<NL>` and `<Nul>`. `<CR>`, `<Tab>`, `<Esc>` and
+/// every `<C-x>` agree with upstream because they *are* plain bytes there too.
+#[must_use]
+pub fn special_notation(bytes: &[u8], replace_spaces: bool, replace_lt: bool) -> String {
+    // Bytes, not chars: a multi-byte character passes through one byte at a
+    // time, so pushing `char::from(byte)` would re-encode each of its bytes as
+    // a separate code point.
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut offset = 0;
+    while offset < bytes.len() {
+        // `mb_unescape` runs first in `str2special`, so a quoted literal byte
+        // is rendered as the byte it stands for, not as a special key.
+        let (byte, width) = match bytes[offset..] {
+            [K_SPECIAL, KS_ZERO, KE_FILLER, ..] => (0u8, 3),
+            [K_SPECIAL, KS_SPECIAL, KE_FILLER, ..] => (K_SPECIAL, 3),
+            [K_SPECIAL, second, third, ..] => {
+                // A named special key this port cannot name; upstream prints
+                // its termcap pair as `<t_xx>` (`keycodes.c:324-327`).
+                out.extend_from_slice(b"<t_");
+                out.extend_from_slice(&[second, third, b'>']);
+                offset += 3;
+                continue;
+            }
+            [byte, ..] => (byte, 1),
+            [] => break,
+        };
+        offset += width;
+        match byte {
+            b' ' if replace_spaces => out.extend_from_slice(b"<Space>"),
+            b'<' if replace_lt => out.extend_from_slice(b"<lt>"),
+            0x00 => out.extend_from_slice(b"<Nul>"),
+            0x09 => out.extend_from_slice(b"<Tab>"),
+            0x0a => out.extend_from_slice(b"<NL>"),
+            0x0d => out.extend_from_slice(b"<CR>"),
+            0x1b => out.extend_from_slice(b"<Esc>"),
+            // `get_special_key` (`keycodes.c:292-297`): a control byte with no
+            // table entry becomes `<C-` plus the byte offset by `@`.
+            0x01..=0x1f => {
+                out.extend_from_slice(b"<C-");
+                out.extend_from_slice(&[byte | 0x40, b'>']);
+            }
+            other => out.push(other),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// One decoded logical key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Key {

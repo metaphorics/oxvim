@@ -11,7 +11,7 @@ use ox_eval::scope::ScopeMap;
 use ox_eval::Scope;
 use ox_types::{OxStr, Typval};
 
-use crate::script::Sid;
+use crate::script::{Sid, SourceContext};
 
 /// Upstream's default `'maxfuncdepth'`.
 pub const MAX_FUNC_DEPTH: usize = 100;
@@ -45,12 +45,11 @@ pub struct UserFunc {
     pub flags: UserFuncFlags,
     /// Logical source lines forming the body.
     pub body: Vec<String>,
-    /// SID of the defining script, or zero for command-line definitions.
-    pub sid: Sid,
-    /// Sourcing sequence in force when the function was defined, upstream's
-    /// `uf_script_ctx.sc_seq`. Only a *different* sequence under the same
-    /// SID is a reload the definition may replace without `!`.
-    pub seq: u64,
+    /// Script context the `:function` was written in, upstream's
+    /// `uf_script_ctx`. `map_add` adds the body-relative line to its `lnum`
+    /// (`mapping.c:534-535`), which is what makes `maparg()`'s `lnum` point at
+    /// the `:map` inside a function body rather than at the body's own line 1.
+    pub context: SourceContext,
     /// Optional defining local-scope snapshot for `closure` functions.
     pub captured: ScopeMap,
 }
@@ -60,14 +59,16 @@ pub struct UserFunc {
 pub struct CallFrame {
     /// Canonical function name.
     pub name: String,
-    /// SID whose `s:` scope is visible in the function.
-    pub sid: Sid,
     /// Caller-local scope restored after the call.
     caller_local: ScopeMap,
     /// Caller argument scope restored after the call.
     caller_argument: ScopeMap,
     /// One-based function-body line currently executing.
     pub current_line: usize,
+    /// The defining function's [`UserFunc::context`], carried so the script
+    /// context of a command inside the body can be answered without a
+    /// registry lookup.
+    context: SourceContext,
 }
 
 /// User-function definition/call failure.
@@ -262,12 +263,11 @@ impl UserFunctions {
         &mut self,
         signature: FunctionSignature,
         body: Vec<String>,
-        sid: Sid,
-        seq: u64,
+        context: SourceContext,
         replace: bool,
         scope: &Scope,
     ) -> Result<String, UserFuncError> {
-        let name = Self::canonical_name(&signature.name, sid);
+        let name = Self::canonical_name(&signature.name, context.sid);
         if self.functions.contains_key(&name) && !replace {
             return Err(UserFuncError::new(
                 "E122",
@@ -288,8 +288,7 @@ impl UserFunctions {
                 varargs: signature.varargs,
                 flags: signature.flags,
                 body,
-                sid,
-                seq,
+                context,
                 captured,
             },
         );
@@ -400,7 +399,7 @@ impl UserFunctions {
 
         self.call_stack.push(CallFrame {
             name: function.name.clone(),
-            sid: function.sid,
+            context: function.context,
             caller_local,
             caller_argument,
             current_line: 0,
@@ -432,7 +431,22 @@ impl UserFunctions {
     /// SID visible to `s:` names in the active function body.
     #[must_use]
     pub fn active_sid(&self) -> Option<Sid> {
-        self.call_stack.last().map(|frame| frame.sid).filter(|sid| *sid != 0)
+        self.call_stack.last().map(|frame| frame.context.sid).filter(|sid| *sid != 0)
+    }
+
+    /// `current_sctx` while a function body runs (`call_user_func` sets it
+    /// from `uf_script_ctx`): the defining script and its `sc_lnum` plus the
+    /// body-relative line being executed, which is upstream's
+    /// `sc_lnum + SOURCING_LNUM` (`mapping.c:534-535`).
+    ///
+    /// `None` when no function body is running, in which case the caller's own
+    /// script stack is the context.
+    #[must_use]
+    pub fn script_context(&self) -> Option<SourceContext> {
+        self.call_stack.last().map(|frame| SourceContext {
+            lnum: frame.context.lnum.saturating_add(frame.current_line),
+            ..frame.context
+        })
     }
 
     /// Upstream-style call-stack throwpoint prefix.

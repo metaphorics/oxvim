@@ -3105,3 +3105,292 @@ fn a_map_keeps_trailing_spaces_and_edit_does_not() {
         "an unescaped trailing space is removed for a TRLBAR command"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `maparg()` and `:map {lhs}`, which read the same mapping state.
+// Citations: `src/nvim/mapping.c` `get_maparg` (2148-2227),
+// `mapblock_fill_dict` (2090-2146), `check_map` (2010-2061), `showmap`
+// (211-275), `do_map`'s listing passes (698-793) and `map_add`'s script
+// context (501-537); `src/nvim/message.c` `str2special` (2084-2166).
+// Every expectation below is the observed answer of
+// `.references/neovim/build/bin/nvim`, v0.13.0-dev-1390.
+// ---------------------------------------------------------------------------
+
+/// The messages a listing added, in order, starting at `from`. Slicing rather
+/// than clearing keeps every assertion in one editor, so a later listing
+/// cannot be fooled by state a reset would have discarded.
+fn listing_rows(editor: &Editor, from: usize) -> Vec<String> {
+    editor.messages()[from..]
+        .iter()
+        .map(|message| match &message.content {
+            ox_types::Object::String(text) => text.to_string_lossy().into_owned(),
+            other => panic!("expected a string message, got {other:?}"),
+        })
+        .collect()
+}
+
+/// Reads one key out of `maparg({lhs}, {mode}, 0, 1)`.
+fn maparg_key(
+    editor: &mut Editor,
+    executor: &mut ExExecutor<MemoryFileIO>,
+    lhs: &str,
+    mode: &str,
+    key: &str,
+) -> Option<ox_types::Typval> {
+    executor
+        .execute_line(editor, &format!("let g:t71 = maparg('{lhs}', '{mode}', 0, 1)"))
+        .unwrap();
+    let dict = match global_value(executor, "t71") {
+        Some(ox_types::Typval::Dict(dict)) => dict,
+        other => panic!("maparg did not answer a dictionary: {other:?}"),
+    };
+    let entries = dict.borrow();
+    entries
+        .entries
+        .iter()
+        .find(|(name, _)| name.as_bytes() == key.as_bytes())
+        .map(|(_, value)| value.clone())
+}
+
+/// `maparg()`'s compatible `rhs` is `m_orig_str`, the right-hand side *as
+/// written*, while its string form is `str2special` of `m_str`, the replaced
+/// form (`mapping.c:2114-2117,2200-2210`).
+///
+/// For a `:`-shaped right-hand side those are two different strings held in
+/// two different places: parsing the command text into `Vec<ExCommand>` cannot
+/// print back to either, so both have to be recorded at registration.
+#[test]
+fn maparg_answers_the_right_hand_side_as_written_and_as_replaced() {
+    let (mut editor, mut executor) = setup();
+    executor.execute_line(&mut editor, "nnoremap ,a :let g:hit=1<CR>").unwrap();
+    // `<lt>` decodes to `<`, so the two forms differ here as well.
+    executor.execute_line(&mut editor, "nnoremap ,b a<lt>b").unwrap();
+    executor.execute_line(&mut editor, "nnoremap ,c <Nop>").unwrap();
+
+    // Oracle: `maparg(',a','n',0,1).rhs` is ':let g:hit=1<CR>' — the notation,
+    // not the carriage return it decodes to.
+    assert_eq!(
+        maparg_key(&mut editor, &mut executor, ",a", "n", "rhs"),
+        Some(ox_types::Typval::String(ox_types::OxStr::from(":let g:hit=1<CR>")))
+    );
+    assert_eq!(
+        maparg_key(&mut editor, &mut executor, ",b", "n", "rhs"),
+        Some(ox_types::Typval::String(ox_types::OxStr::from("a<lt>b")))
+    );
+    assert_eq!(
+        maparg_key(&mut editor, &mut executor, ",c", "n", "rhs"),
+        Some(ox_types::Typval::String(ox_types::OxStr::from("<Nop>")))
+    );
+
+    // The string form renders the replaced bytes instead. Oracle:
+    // ':let g:hit=1<CR>', 'a<b' and '<Nop>'.
+    executor
+        .execute_line(&mut editor, "let g:s = maparg(',a','n') . '|' . maparg(',b','n') . '|' . maparg(',c','n')")
+        .unwrap();
+    assert_eq!(
+        global_text(&executor, "s").as_deref(),
+        Some(":let g:hit=1<CR>|a<b|<Nop>")
+    );
+
+    // A left-hand side nothing defines answers the empty string and, for the
+    // dictionary form, an empty dictionary (`mapping.c:2219-2222`).
+    executor.execute_line(&mut editor, "let g:miss = maparg(',zz','n')").unwrap();
+    assert_eq!(global_text(&executor, "miss").as_deref(), Some(""));
+    executor.execute_line(&mut editor, "let g:missd = len(maparg(',zz','n',0,1))").unwrap();
+    assert_eq!(global_value(&executor, "missd"), Some(ox_types::Typval::Number(0)));
+}
+
+/// Each flag `mapblock_fill_dict` reports comes from a *different* field, so
+/// each one is exercised on its own mapping: a test that set several at once
+/// would pass with any single flag wired and the rest constant.
+#[test]
+fn maparg_reports_each_recorded_flag_independently() {
+    let (mut editor, mut executor) = setup();
+    for line in [
+        "nnoremap ,plain yy",
+        "nmap ,remap yy",
+        "nnoremap <silent> ,silent yy",
+        "nnoremap <nowait> ,nowait yy",
+        "nnoremap <buffer> ,buffer yy",
+        "nnoremap <expr> ,expr 'yy'",
+        "nmap <script> ,script yy",
+        "vnoremap ,visual yy",
+        "inoremap ,insert yy",
+        "noremap ,all yy",
+    ] {
+        executor.execute_line(&mut editor, line).unwrap();
+    }
+
+    // Oracle for `,plain`: every flag zero except `noremap`.
+    for key in ["silent", "nowait", "buffer", "expr", "script", "abbr", "replace_keycodes"] {
+        assert_eq!(
+            maparg_key(&mut editor, &mut executor, ",plain", "n", key),
+            Some(ox_types::Typval::Number(0)),
+            "{key} should be 0 for a plain :nnoremap"
+        );
+    }
+    let one = Some(ox_types::Typval::Number(1));
+    assert_eq!(maparg_key(&mut editor, &mut executor, ",plain", "n", "noremap"), one);
+    assert_eq!(
+        maparg_key(&mut editor, &mut executor, ",remap", "n", "noremap"),
+        Some(ox_types::Typval::Number(0)),
+        ":nmap remaps, so noremap is 0"
+    );
+    assert_eq!(maparg_key(&mut editor, &mut executor, ",silent", "n", "silent"), one);
+    assert_eq!(maparg_key(&mut editor, &mut executor, ",nowait", "n", "nowait"), one);
+    assert_eq!(maparg_key(&mut editor, &mut executor, ",buffer", "n", "buffer"), one);
+    assert_eq!(maparg_key(&mut editor, &mut executor, ",expr", "n", "expr"), one);
+    // `<script>` is `REMAP_SCRIPT`: `script` is 1 *and* the compatible
+    // `noremap` is 1, which is the pair that tells it from `:noremap`.
+    assert_eq!(maparg_key(&mut editor, &mut executor, ",script", "n", "script"), one);
+    assert_eq!(maparg_key(&mut editor, &mut executor, ",script", "n", "noremap"), one);
+    assert_eq!(
+        maparg_key(&mut editor, &mut executor, ",plain", "n", "script"),
+        Some(ox_types::Typval::Number(0)),
+        ":noremap without <script> reports script 0 with the same noremap 1"
+    );
+    // `scriptversion` is hard-coded to 1 upstream as well.
+    assert_eq!(maparg_key(&mut editor, &mut executor, ",plain", "n", "scriptversion"), one);
+
+    // `mode` and `mode_bits` are `map_mode_to_chars` and the raw `MODE_*` set.
+    // Oracle: 'n'/1, 'v'/66, 'i'/16, ' '/71.
+    for (lhs, mode, chars, bits) in [
+        (",plain", "n", "n", 1),
+        (",visual", "v", "v", 66),
+        (",insert", "i", "i", 16),
+        (",all", "n", " ", 71),
+    ] {
+        assert_eq!(
+            maparg_key(&mut editor, &mut executor, lhs, mode, "mode"),
+            Some(ox_types::Typval::String(ox_types::OxStr::from(chars))),
+            "mode chars for {lhs}"
+        );
+        assert_eq!(
+            maparg_key(&mut editor, &mut executor, lhs, mode, "mode_bits"),
+            Some(ox_types::Typval::Number(bits)),
+            "mode bits for {lhs}"
+        );
+    }
+}
+
+/// `map_add` copies `current_sctx` and adds `SOURCING_LNUM` to its line
+/// (`mapping.c:530-537`). Inside a function body those are two different
+/// numbers — the `:function`'s own line and the body-relative line — so the
+/// test puts the `:map` on body line two of a function defined on line three,
+/// where neither addend alone produces the answer.
+#[test]
+fn maparg_lnum_inside_a_function_adds_the_body_line_to_the_definition_line() {
+    let (mut editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &mut editor,
+            "t71.vim",
+            "let g:one = 1\nlet g:two = 2\nfunc! T71M()\n  let g:three = 3\n  nnoremap ,f qq\nendfunc\ncall T71M()\nnnoremap ,g qq",
+        )
+        .unwrap();
+
+    // Oracle: definition line 3 plus body line 2 is 5.
+    assert_eq!(
+        maparg_key(&mut editor, &mut executor, ",f", "n", "lnum"),
+        Some(ox_types::Typval::Number(5))
+    );
+    // At script level the physical line is the whole answer.
+    assert_eq!(
+        maparg_key(&mut editor, &mut executor, ",g", "n", "lnum"),
+        Some(ox_types::Typval::Number(8))
+    );
+}
+
+/// `do_map` prints instead of defining when the right-hand side is missing
+/// (`mapping.c:873-883`), and `showmap` lays each row out as three mode
+/// columns, the lhs padded past twelve, the remap marker, the buffer-local
+/// marker, then the rhs.
+#[test]
+fn map_lists_matching_mappings_and_says_so_when_none_match() {
+    let (mut editor, mut executor) = setup();
+    executor.execute_line(&mut editor, "nnoremap ,a :let g:hit=1<CR>").unwrap();
+    executor.execute_line(&mut editor, "nmap ,b ,a").unwrap();
+    executor.execute_line(&mut editor, "nmap <script> ,c qq").unwrap();
+    executor.execute_line(&mut editor, "nnoremap ,d <Nop>").unwrap();
+
+    // Oracle: `execute('nmap ,a')` is "\n\nn  ,a          * :let g:hit=1<CR>",
+    // which is one blank leading row and one mapping row.
+    let mut seen = editor.messages().len();
+    executor.execute_line(&mut editor, "nmap ,a").unwrap();
+    assert_eq!(
+        listing_rows(&editor, seen),
+        vec![String::new(), "n  ,a          * :let g:hit=1<CR>".to_owned()]
+    );
+
+    // A remapping mapping has a blank where `*` was; `<script>` has `&`;
+    // `<Nop>` prints as the literal `<Nop>` because `m_str` is empty.
+    for (lhs, expected) in [
+        (",b", "n  ,b            ,a"),
+        (",c", "n  ,c          & qq"),
+        (",d", "n  ,d          * <Nop>"),
+    ] {
+        seen = editor.messages().len();
+        executor.execute_line(&mut editor, &format!("nmap {lhs}")).unwrap();
+        assert_eq!(listing_rows(&editor, seen)[1], expected);
+    }
+
+    // `msg`, not `emsg` (`mapping.c:879`): no match is a message, and the
+    // command still succeeds.
+    seen = editor.messages().len();
+    executor.execute_line(&mut editor, "nmap ,zz").unwrap();
+    assert_eq!(
+        listing_rows(&editor, seen),
+        vec![String::new(), "No mapping found".to_owned()]
+    );
+
+    // A shorter lhs matches every mapping it prefixes, because upstream
+    // compares only `min(keylen, len)` bytes (`mapping.c:769`).
+    seen = editor.messages().len();
+    executor.execute_line(&mut editor, "nmap ,").unwrap();
+    assert_eq!(listing_rows(&editor, seen).len(), 5, "four mappings and the blank row");
+}
+
+/// The listing order is two independent rules — the buffer-local table is
+/// walked before the global one (`mapping.c:698-726`), and within a table a
+/// bucket is newest-first because `map_add` pushes onto its head
+/// (`mapping.c:545-547`) — plus the buckets themselves ascending by first lhs
+/// byte. Each is exercised where the others cannot decide it.
+#[test]
+fn map_lists_buffer_local_mappings_first_and_each_bucket_newest_first() {
+    // Newest-first, with every mapping in one scope and one bucket so neither
+    // locality nor bucket order decides anything.
+    let (mut editor, mut executor) = setup();
+    for lhs in [",p", ",q", ",r"] {
+        executor.execute_line(&mut editor, &format!("nnoremap {lhs} qq")).unwrap();
+    }
+    let mut seen = editor.messages().len();
+    executor.execute_line(&mut editor, "nmap ,").unwrap();
+    let rows = listing_rows(&editor, seen);
+    assert_eq!(
+        rows[1..].iter().map(|row| row[3..5].to_owned()).collect::<Vec<_>>(),
+        vec![",r".to_owned(), ",q".to_owned(), ",p".to_owned()]
+    );
+
+    // Locality, with the *oldest* mapping buffer-local so newest-first alone
+    // would put it last.
+    let (mut editor, mut executor) = setup();
+    executor.execute_line(&mut editor, "nnoremap <buffer> ,p qq").unwrap();
+    executor.execute_line(&mut editor, "nnoremap ,q qq").unwrap();
+    seen = editor.messages().len();
+    executor.execute_line(&mut editor, "nmap ,").unwrap();
+    let rows = listing_rows(&editor, seen);
+    assert_eq!(rows[1], "n  ,p          *@qq", "the local mapping comes first and is marked @");
+    assert_eq!(rows[2], "n  ,q          * qq");
+
+    // Buckets ascend by first lhs byte. `+z` is defined *first*, so the
+    // newest-first rule on its own would put `,z` ahead of it; only the bucket
+    // key produces this order.
+    let (mut editor, mut executor) = setup();
+    executor.execute_line(&mut editor, "nnoremap +z qq").unwrap();
+    executor.execute_line(&mut editor, "nnoremap ,z qq").unwrap();
+    seen = editor.messages().len();
+    executor.execute_line(&mut editor, "nmap").unwrap();
+    let rows = listing_rows(&editor, seen);
+    assert_eq!(rows[1][3..5], *"+z");
+    assert_eq!(rows[2][3..5], *",z");
+}

@@ -13,6 +13,7 @@ pub(crate) mod eval;
 pub(crate) mod filesystem;
 pub(crate) mod fold;
 pub(crate) mod input;
+pub(crate) mod mapping;
 pub(crate) mod position;
 pub(crate) mod process;
 pub(crate) mod window;
@@ -42,6 +43,8 @@ pub(crate) enum Family {
     Fold,
     /// Prompts that read a reply.
     Input,
+    /// Mapping and abbreviation queries, served by [`mapping`].
+    Mapping,
     /// Cursor position reads and writes.
     Position,
     /// Jobs, channels, and the shell.
@@ -67,6 +70,7 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         "swapfilelist" => Family::FileSystem,
         "foldclosed" | "foldclosedend" | "foldlevel" => Family::Fold,
         "getchar" | "getcharstr" | "input" | "inputdialog" | "inputlist" => Family::Input,
+        "maparg" => Family::Mapping,
         "charcol" | "col" | "cursor" | "getcharpos" | "getcurpos" | "getcursorcharpos"
         | "getpos" | "line" | "setcharpos" | "setcursorcharpos" | "setpos" | "virtcol" => {
             Family::Position
@@ -111,6 +115,7 @@ pub(crate) fn call<F: FileIO>(
         Family::FileSystem => filesystem::call(host, name, args),
         Family::Fold => fold::call(host, name, args),
         Family::Input => input::call(host, name, args),
+        Family::Mapping => mapping::call(host, name, args, scope),
         Family::Position => position::call(host, name, args),
         Family::Process => process::call(host, name, args, scope),
         Family::Window => window::call(host, name, args),

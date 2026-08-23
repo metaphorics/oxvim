@@ -27,7 +27,7 @@ use ox_eval::{Scope, ScopeKind};
 use ox_text::Buffer;
 use ox_types::{Object, OxStr, Typval};
 
-use crate::script::{FileIO, ScriptCtx};
+use crate::script::{FileIO, ScriptCtx, SourceContext};
 use crate::userfunc::{UserFunctions, MAX_FUNC_DEPTH};
 use crate::{
     AutocmdKind, AutocmdOptions, Editor, Event, ExecError, ExExecutor, Geometry, LuaExec,
@@ -601,7 +601,7 @@ fn closure_captures_defining_local_scope() {
     scope.set(b"captured", Typval::Number(123)).unwrap();
     let sig = UserFunctions::parse_signature("Clo() closure").unwrap();
     funcs
-        .define(sig, vec!["return l:captured".to_owned()], 0, 0, false, &scope)
+        .define(sig, vec!["return l:captured".to_owned()], SourceContext::default(), false, &scope)
         .unwrap();
     let func = funcs.get("Clo", 0).unwrap();
     assert!(func.flags.closure);
@@ -646,7 +646,7 @@ fn recursion_exceeds_maxfuncdepth_e132() {
     let mut funcs = UserFunctions::new();
     let sig = UserFunctions::parse_signature("Recurse()").unwrap();
     funcs
-        .define(sig, vec![], 0, 0, false, &Scope::new())
+        .define(sig, vec![], SourceContext::default(), false, &Scope::new())
         .unwrap();
     let mut scope = Scope::new();
     for _ in 0..MAX_FUNC_DEPTH {

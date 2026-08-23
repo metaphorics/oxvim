@@ -29,13 +29,13 @@ use ox_types::{BufHandle, Dict, DictRef, Funcref, Object, OxStr, Special, TabHan
 
 use crate::autocmd::{AutocmdContext, AutocmdKind, AutocmdOptions, AugroupId, DeleteAutocmds, Event, FiringPlan};
 use crate::extmark::{ExtmarkAttributes, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, NamespaceId};
-use crate::mapping::{MapMode, MapModes, MapScope, MappingAction, MappingOptions};
+use crate::mapping::{MapMode, MapModes, MapScope, Mapping, MappingAction, MappingOptions};
 use crate::options::{find_unescaped, CommaItems, OptionListKind, OptionScope, OptionType, OptionValue, OPTION_METADATA};
 use crate::builtins::position::cell_width;
 use crate::fold::{FoldMethod, Position as FoldPosition};
 use crate::register::RegisterContent;
-use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid};
-use crate::typeahead::{Keys, Remap, TypeaheadFlags};
+use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid, SourceContext};
+use crate::typeahead::{special_notation, Keys, Remap, TypeaheadFlags};
 use crate::userfunc::{UserFuncError, UserFunctions};
 use crate::builtins::process::call_job_builtin;
 use crate::{
@@ -540,7 +540,7 @@ fn run_mapping_action<F: FileIO>(
     options: &MappingOptions,
 ) -> Flow {
     match action {
-        MappingAction::ExCommands(commands) => {
+        MappingAction::ExCommands { commands, .. } => {
             let program = program_from_commands(&commands, runtime.scripts.current_line().max(1));
             run_program(runtime, editor, scope, lua, &program, 0, program.len())
         }
@@ -1136,20 +1136,24 @@ fn run_instructions<F: FileIO>(
                     .iter()
                     .map(|item| item.source.clone())
                     .collect::<Vec<_>>();
-                let sid = runtime.scripts.current_sid().unwrap_or(0);
-                let seq = runtime.scripts.current_seq();
+                let context = SourceContext {
+                    sid: runtime.scripts.current_sid().unwrap_or(0),
+                    seq: runtime.scripts.current_seq(),
+                    lnum: program[pc].line,
+                };
                 // "Function can be replaced with function! and when sourcing
                 // the same script again, but only once"
                 // (`eval/userfunc.c:2856-2863`).
                 let same_script_reload = runtime
                     .functions
-                    .get(&signature.name, sid)
-                    .is_some_and(|existing| existing.sid == sid && existing.seq != seq);
+                    .get(&signature.name, context.sid)
+                    .is_some_and(|existing| {
+                        existing.context.sid == context.sid && existing.context.seq != context.seq
+                    });
                 let canonical = match runtime.functions.define(
                     signature,
                     body,
-                    sid,
-                    seq,
+                    context,
                     command.bang || same_script_reload,
                     scope,
                 ) {
@@ -1851,14 +1855,15 @@ pub(crate) fn call_user_function_with_self<F: FileIO>(
     if let Some(receiver) = receiver {
         scope.local.push((OxStr::from("self"), Typval::Dict(receiver)));
     }
-    let switched_script = function.sid != 0 && runtime.scripts.current_sid() != Some(function.sid);
+    let sid = function.context.sid;
+    let switched_script = sid != 0 && runtime.scripts.current_sid() != Some(sid);
     let caller_script = scope.script.clone();
     if switched_script {
-        runtime.scripts.load_script_scope(function.sid, scope);
+        runtime.scripts.load_script_scope(sid, scope);
     }
     let flow = run_program(runtime, editor, scope, lua, &parsed, 0, parsed.len());
     if switched_script {
-        runtime.scripts.store_script_scope(function.sid, scope);
+        runtime.scripts.store_script_scope(sid, scope);
         scope.script = caller_script;
     }
     let flow = match flow {
@@ -5697,7 +5702,7 @@ fn split_map_modifiers(args: &str) -> (MapModifiers, &str) {
 /// because the two are only synced at the end of a program: a script that sets
 /// `g:mapleader` and then defines a `<Leader>` mapping on the next line would
 /// otherwise see the value it had on entry.
-fn map_leader(scope: &Scope, name: &str) -> String {
+pub(crate) fn map_leader(scope: &Scope, name: &str) -> String {
     scope
         .get_scoped(ScopeKind::Global, name.as_bytes(), 0)
         .map_or_else(|_| "\\".to_owned(), typval_to_text)
@@ -5725,11 +5730,11 @@ fn command_map<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope
         }
         lhs_end += 1;
     }
-    if lhs_end == 0 {
-        return Flow::Normal;
-    }
     let lhs = Keys::parse_notation(&args[..lhs_end], &leader, &local_leader);
     if is_unmap {
+        if lhs_end == 0 {
+            return error_flow(runtime, "E474", "Invalid argument");
+        }
         // `do_map`'s `retval = 2` (`mapping.c`): unmapping something that is
         // not mapped is an error, not a silent no-op.
         return if editor.mappings_mut().unmap(&lhs, modes, map_scope) == 0 {
@@ -5739,8 +5744,11 @@ fn command_map<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope
         };
     }
     let rhs = &args[lhs_end + args[lhs_end..].bytes().take_while(|byte| matches!(byte, b' ' | b'\t')).count()..];
+    // `do_map` prints instead of defining whenever either half is missing
+    // (`mapping.c:873-883`), so a bare `:nmap` lists every mapping and
+    // `:nmap ,a` lists the ones whose lhs and `,a` share a prefix.
     if rhs.is_empty() {
-        return error_flow(runtime, "E474", "Invalid argument");
+        return list_mappings(editor, &lhs, modes, flags.buffer);
     }
     if flags.unique && editor.mappings().conflicts(&lhs, modes, map_scope) {
         return error_flow(runtime, "E227", format!("Mapping already exists for {}", String::from_utf8_lossy(lhs.as_bytes())));
@@ -5752,11 +5760,84 @@ fn command_map<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope
     };
     // `<script>` is upstream's `REMAP_SCRIPT`: only `<SID>` mappings may be
     // used in the right-hand side. There are no script-local mappings in this
-    // port, so the reachable set is empty and no-remap is the same behavior.
+    // port, so the reachable set is empty and no-remap is the same behavior —
+    // but the flag is recorded, because `maparg()`'s `script` key is the only
+    // thing that distinguishes `<script>` from `:noremap`.
     let remap = !name.contains("nore") && !flags.script;
-    let options = MappingOptions { modes, scope: map_scope, remap, nowait: flags.nowait, silent: flags.silent, description: None };
+    // `map_add` receives sid 0 and lnum 0 and copies `current_sctx`, adding
+    // `SOURCING_LNUM` to its line (`mapping.c:501-505,530-537,890-894`).
+    // Inside a function body that is the `:function`'s own line plus the body
+    // line; at script level it is the physical line being executed.
+    let script_context = runtime.functions.script_context().unwrap_or(SourceContext {
+        sid: runtime.scripts.current_sid().unwrap_or(0),
+        seq: runtime.scripts.current_seq(),
+        lnum: runtime.scripts.current_line(),
+    });
+    let options = MappingOptions { modes, scope: map_scope, remap, nowait: flags.nowait, silent: flags.silent, description: None, script: flags.script, orig_rhs: rhs.to_owned(), script_context };
     let result = if remap { editor.mappings_mut().map(lhs, action, options) } else { editor.mappings_mut().noremap(lhs, action, options) };
     match result { Ok(()) => Flow::Normal, Err(error) => error_flow(runtime, "E474", error.to_string()) }
+}
+
+/// `do_map`'s listing passes and `showmap` (`mapping.c:698-793,211-275`).
+///
+/// `showmap` starts each row with a newline whenever the message column is
+/// past zero or output is being captured, which is why a captured listing
+/// begins with a blank line: `msg_start` supplies one and the first row
+/// supplies another.
+fn list_mappings(editor: &mut Editor, lhs: &Keys, modes: MapModes, buffer_only: bool) -> Flow {
+    let buffer = editor.current_buffer();
+    let rows: Vec<String> = editor
+        .mappings()
+        .matching(lhs.as_bytes(), modes, buffer)
+        .into_iter()
+        .filter(|(mapping, local)| !buffer_only || (*local && matches!(mapping.options.scope, MapScope::Buffer(_))))
+        .map(|(mapping, local)| showmap_row(mapping, local))
+        .collect();
+    push_info_text_message(editor, String::new());
+    if rows.is_empty() {
+        // `msg`, not `emsg` (`mapping.c:879`): nothing to report is not an error.
+        push_info_text_message(editor, "No mapping found".to_owned());
+        return Flow::Normal;
+    }
+    for row in rows {
+        push_info_text_message(editor, row);
+    }
+    Flow::Normal
+}
+
+/// One `showmap` row (`mapping.c:220-266`): the mode characters padded to
+/// three columns, the lhs padded to at least twelve with one trailing blank
+/// guaranteed, the `*`/`&`/blank remap marker, the `@`/blank buffer-local
+/// marker, then the right-hand side.
+fn showmap_row(mapping: &Mapping, local: bool) -> String {
+    let mut row = mapping.options.modes.to_chars();
+    while row.len() < 3 {
+        row.push(' ');
+    }
+    let shown = special_notation(mapping.lhs.as_bytes(), true, false);
+    let mut width = shown.chars().count();
+    row.push_str(&shown);
+    loop {
+        row.push(' ');
+        width += 1;
+        if width >= 12 {
+            break;
+        }
+    }
+    row.push(if mapping.options.script { '&' } else if mapping.options.remap { ' ' } else { '*' });
+    row.push(if local { '@' } else { ' ' });
+    match mapping.action {
+        MappingAction::Callback(id) => row.push_str(&format!("<Callback {id}>")),
+        ref action => match action.replaced_keys().unwrap_or_default() {
+            [] => row.push_str("<Nop>"),
+            keys => row.push_str(&special_notation(keys, false, false)),
+        },
+    }
+    if let Some(description) = &mapping.options.description {
+        row.push_str("\n                 ");
+        row.push_str(description);
+    }
+    row
 }
 
 pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Result<(), ExecError> {

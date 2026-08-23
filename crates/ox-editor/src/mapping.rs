@@ -10,28 +10,34 @@ use ox_excmd::{ExCommand, ParseError, Parser};
 use ox_types::BufHandle;
 use thiserror::Error;
 
+use crate::script::SourceContext;
 use crate::typeahead::{Keys, Typeahead};
 
 /// One mapping mode accepted by the `:map` family.
+///
+/// The discriminants are upstream's `MODE_*` bits (`state_defs.h:21-28`), not a
+/// private numbering: `maparg()`'s `mode_bits` key reports them verbatim
+/// (`mapblock_fill_dict`, `mapping.c:2143`), so any other assignment would
+/// need a translation table beside them that can drift.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u16)]
 pub enum MapMode {
-    /// Normal mode (`n`).
-    Normal = 1 << 0,
-    /// Visual mode (`v`).
-    Visual = 1 << 1,
-    /// Select mode (`s`).
-    Select = 1 << 2,
-    /// Operator-pending mode (`o`).
-    OperatorPending = 1 << 3,
-    /// Insert mode (`i`).
-    Insert = 1 << 4,
-    /// Command-line mode (`c`).
-    CommandLine = 1 << 5,
-    /// Language-argument mode (`l`).
-    LangArg = 1 << 6,
-    /// Terminal mode (`t`).
-    Terminal = 1 << 7,
+    /// Normal mode (`n`), `MODE_NORMAL`.
+    Normal = 0x01,
+    /// Visual mode (`x`), `MODE_VISUAL`.
+    Visual = 0x02,
+    /// Operator-pending mode (`o`), `MODE_OP_PENDING`.
+    OperatorPending = 0x04,
+    /// Command-line mode (`c`), `MODE_CMDLINE`.
+    CommandLine = 0x08,
+    /// Insert mode (`i`), `MODE_INSERT`.
+    Insert = 0x10,
+    /// Language-argument mode (`l`), `MODE_LANGMAP`.
+    LangArg = 0x20,
+    /// Select mode (`s`), `MODE_SELECT`.
+    Select = 0x40,
+    /// Terminal mode (`t`), `MODE_TERMINAL`.
+    Terminal = 0x80,
 }
 
 /// Compact set of mapping modes.
@@ -82,6 +88,88 @@ impl MapModes {
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
+
+    /// The raw `MODE_*` bit set, which `maparg()` reports as `mode_bits`
+    /// (`mapping.c:2143`).
+    #[must_use]
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+
+    /// `map_mode_to_chars` (`mapping.c:170-208`): the mode characters
+    /// `:map`'s listing and `maparg()`'s `mode` key show. Never longer than
+    /// six characters, hence upstream's seven-byte buffer.
+    #[must_use]
+    pub fn to_chars(self) -> String {
+        let mut out = String::with_capacity(6);
+        if self.contains(MapMode::Insert) && self.contains(MapMode::CommandLine) {
+            out.push('!');
+        } else if self.contains(MapMode::Insert) {
+            out.push('i');
+        } else if self.contains(MapMode::LangArg) {
+            out.push('l');
+        } else if self.contains(MapMode::CommandLine) {
+            out.push('c');
+        } else if Self(self.0 & Self::MAP.0) == Self::MAP {
+            out.push(' ');
+        } else {
+            if self.contains(MapMode::Normal) {
+                out.push('n');
+            }
+            if self.contains(MapMode::OperatorPending) {
+                out.push('o');
+            }
+            if self.contains(MapMode::Terminal) {
+                out.push('t');
+            }
+            if self.contains(MapMode::Visual) && self.contains(MapMode::Select) {
+                out.push('v');
+            } else {
+                if self.contains(MapMode::Visual) {
+                    out.push('x');
+                }
+                if self.contains(MapMode::Select) {
+                    out.push('s');
+                }
+            }
+        }
+        out
+    }
+
+    /// `get_map_mode` (`mapping.c:988-1023`) over a mode string rather than a
+    /// command name: only the first character decides, an unrecognized or
+    /// empty string means `:map`, and `n` followed by `o` is `:noremap`
+    /// rather than `:nmap`.
+    #[must_use]
+    pub fn from_mode_string(mode: &str) -> Self {
+        let bytes = mode.as_bytes();
+        match bytes.first().copied() {
+            Some(b'i') => Self::one(MapMode::Insert),
+            Some(b'l') => Self::one(MapMode::LangArg),
+            Some(b'c') => Self::one(MapMode::CommandLine),
+            Some(b'n') if bytes.get(1) != Some(&b'o') => Self::one(MapMode::Normal),
+            Some(b'v') => Self::one(MapMode::Visual) | Self::one(MapMode::Select),
+            Some(b'x') => Self::one(MapMode::Visual),
+            Some(b's') => Self::one(MapMode::Select),
+            Some(b'o') => Self::one(MapMode::OperatorPending),
+            Some(b't') => Self::one(MapMode::Terminal),
+            _ => Self::MAP,
+        }
+    }
+
+    /// `MAP_HASH` (`mapping.c:75-78`): the `maphash[]` bucket a mapping with
+    /// this mode set and first lhs byte lives in. `:map`'s listing walks the
+    /// buckets in ascending order, so this is the primary sort key of every
+    /// listing.
+    #[must_use]
+    pub const fn hash_bucket(self, first: u8) -> u16 {
+        const HASHED: u16 = MapMode::Normal as u16
+            | MapMode::Visual as u16
+            | MapMode::Select as u16
+            | MapMode::OperatorPending as u16
+            | MapMode::Terminal as u16;
+        if self.0 & HASHED != 0 { first as u16 } else { first as u16 ^ 0x80 }
+    }
 }
 
 impl From<MapMode> for MapModes {
@@ -128,7 +216,17 @@ pub enum MappingAction {
     /// Encoded replacement keys.
     Keys(Keys),
     /// Parsed `<Cmd>...<CR>` or `:...<CR>` Ex commands.
-    ExCommands(Vec<ExCommand>),
+    ///
+    /// `keys` is the same right-hand side as `commands` before it was parsed —
+    /// upstream's `m_str`, which `maparg()`'s string form and `:map`'s listing
+    /// both render. Parsing loses it (a `Vec<ExCommand>` does not print back
+    /// to its source text), so it is carried here rather than reconstructed.
+    ExCommands {
+        /// The right-hand side after `replace_termcodes`, upstream's `m_str`.
+        keys: Keys,
+        /// The same text parsed into the Ex commands the mapping runs.
+        commands: Vec<ExCommand>,
+    },
     /// `<expr>` right-hand side, re-evaluated into replacement keys on every
     /// use (`str_to_mapargs`'s `expr` flag, `mapping.c:439-443`).
     Expr(String),
@@ -155,14 +253,40 @@ impl MappingAction {
         if let Some(command) = command {
             return Parser::new()
                 .parse(command)
-                .map(Self::ExCommands)
+                .map(|commands| Self::ExCommands {
+                    keys: Keys::parse_notation(rhs, leader, local_leader),
+                    commands,
+                })
                 .map_err(MappingError::ExCommand);
         }
         Ok(Self::Keys(Keys::parse_notation(rhs, leader, local_leader)))
     }
+
+    /// The right-hand side after `replace_termcodes`, upstream's
+    /// `mapblock_T.m_str`, which `maparg()`'s string form and `:map`'s listing
+    /// render through `str2special`.
+    ///
+    /// `None` is upstream's `m_luaref != LUA_NOREF`: a callback has no key
+    /// string at all.
+    #[must_use]
+    pub fn replaced_keys(&self) -> Option<&[u8]> {
+        match self {
+            Self::Keys(keys) | Self::ExCommands { keys, .. } => Some(keys.as_bytes()),
+            // `<expr>` stores the expression itself as `m_str` (`do_map` runs
+            // `replace_termcodes` over every right-hand side before
+            // `map_add`), so it renders the same way.
+            Self::Expr(text) => Some(text.as_bytes()),
+            // `<Nop>` is an empty `m_str`, which is what makes `showmap` and
+            // `get_maparg` print the literal `<Nop>` for it.
+            Self::Nop => Some(&[]),
+            Self::Callback(_) => None,
+        }
+    }
 }
 
-/// Registration flags preserved for the input loop.
+/// Everything `:map` recorded about one mapping besides its lhs and its
+/// decoded action: the flags the input loop reads, and the text and script
+/// context `maparg()` and `:map`'s listing report.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MappingOptions {
     /// Active modes.
@@ -177,6 +301,22 @@ pub struct MappingOptions {
     pub silent: bool,
     /// Optional user-facing description.
     pub description: Option<String>,
+    /// Whether `<script>` was given (`REMAP_SCRIPT`, `mapping.c:2108,2129`).
+    ///
+    /// It restricts remapping to `<SID>` mappings, and this port has no
+    /// script-local mappings, so execution folds it into [`Self::remap`] being
+    /// false. The flag is still recorded because `maparg()`'s `script` key is
+    /// the only thing that can tell `<script>` from `:noremap` apart.
+    pub script: bool,
+    /// The right-hand side exactly as written, before `<>` notation was
+    /// decoded (`mapblock_T.m_orig_str`), which is what `maparg()`'s `rhs`
+    /// key reports in its compatible form (`mapping.c:2114-2117`).
+    pub orig_rhs: String,
+    /// Script context of the `:map` that defined this mapping
+    /// (`mapblock_T.m_script_ctx`), reported as `maparg()`'s `sid` and `lnum`.
+    /// All zeroes when no script was sourcing, as upstream's `current_sctx` is
+    /// then at the command line.
+    pub script_context: SourceContext,
 }
 
 impl Default for MappingOptions {
@@ -188,6 +328,9 @@ impl Default for MappingOptions {
             nowait: false,
             silent: false,
             description: None,
+            script: false,
+            orig_rhs: String::new(),
+            script_context: SourceContext::default(),
         }
     }
 }
@@ -371,6 +514,82 @@ impl Mappings {
         self.mappings
             .retain(|mapping| !mapping.options.modes.is_empty());
         changed
+    }
+
+    /// `check_map` with `exact` set (`mapping.c:2010-2061`): the mapping whose
+    /// lhs is exactly `lhs` and whose mode set overlaps `modes`, buffer-local
+    /// table searched before the global one. The `bool` is upstream's
+    /// `local_ptr`, which `maparg()` reports as `buffer`.
+    ///
+    /// Upstream returns the *first* hit in hash order rather than the longest
+    /// or newest; with an exact length test at most one entry per scope can
+    /// match, because [`Self::map`] never keeps two entries with the same lhs,
+    /// scope and overlapping modes.
+    #[must_use]
+    pub fn find_exact(
+        &self,
+        lhs: &[u8],
+        modes: MapModes,
+        buffer: Option<BufHandle>,
+    ) -> Option<(&Mapping, bool)> {
+        buffer
+            .and_then(|buffer| {
+                self.exact_in_scope(lhs, modes, MapScope::Buffer(buffer))
+                    .map(|mapping| (mapping, true))
+            })
+            .or_else(|| {
+                self.exact_in_scope(lhs, modes, MapScope::Global)
+                    .map(|mapping| (mapping, false))
+            })
+    }
+
+    /// `do_map`'s listing passes (`mapping.c:698-726,746-793`): every mapping
+    /// whose mode set overlaps `modes` and whose lhs and `lhs` are a prefix of
+    /// one another — upstream compares only `min(keylen, len)` bytes, so an
+    /// empty `lhs` matches everything.
+    ///
+    /// The order is the order upstream prints in: the buffer-local table
+    /// first, then within each table the `maphash[]` buckets ascending
+    /// ([`MapModes::hash_bucket`]) and, inside one bucket, newest first
+    /// because `map_add` pushes onto the bucket head (`mapping.c:545-547`).
+    #[must_use]
+    pub fn matching(
+        &self,
+        lhs: &[u8],
+        modes: MapModes,
+        buffer: Option<BufHandle>,
+    ) -> Vec<(&Mapping, bool)> {
+        let mut found: Vec<(&Mapping, bool)> = self
+            .mappings
+            .iter()
+            .filter(|mapping| mapping.options.modes.intersects(modes))
+            .filter(|mapping| {
+                let keys = mapping.lhs.as_bytes();
+                let shared = keys.len().min(lhs.len());
+                keys[..shared] == lhs[..shared]
+            })
+            .filter_map(|mapping| match mapping.options.scope {
+                MapScope::Global => Some((mapping, false)),
+                MapScope::Buffer(handle) => (Some(handle) == buffer).then_some((mapping, true)),
+            })
+            .collect();
+        found.sort_by_key(|(mapping, local)| {
+            let bucket = mapping
+                .lhs
+                .as_bytes()
+                .first()
+                .map_or(0, |first| mapping.options.modes.hash_bucket(*first));
+            (!*local, bucket, u64::MAX - mapping.sequence)
+        });
+        found
+    }
+
+    fn exact_in_scope(&self, lhs: &[u8], modes: MapModes, scope: MapScope) -> Option<&Mapping> {
+        self.mappings.iter().find(|mapping| {
+            mapping.options.scope == scope
+                && mapping.options.modes.intersects(modes)
+                && mapping.lhs.as_bytes() == lhs
+        })
     }
 
     /// Looks up the typeahead bytes using local-first, longest-prefix rules.

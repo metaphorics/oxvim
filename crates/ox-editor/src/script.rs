@@ -20,6 +20,21 @@ use ox_excmd::Parser as ExParser;
 /// Stable identifier assigned to one sourcing event.
 pub type Sid = u64;
 
+/// Upstream's `sctx_T`: the script context in force when something was
+/// defined. A definition records it so later queries — `maparg()`'s `sid` and
+/// `lnum`, the `:function` reload rule — can report where it came from.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SourceContext {
+    /// Defining script id (`sc_sid`), zero at the command line.
+    pub sid: Sid,
+    /// Sourcing sequence in force (`sc_seq`). Only a *different* sequence
+    /// under the same `sid` is a reload.
+    pub seq: u64,
+    /// Physical line within the defining script (`sc_lnum`). Zero for a whole
+    /// script, whose executing line is tracked separately.
+    pub lnum: usize,
+}
+
 /// Maximum length of one logical line after continuation joining.
 const MAX_LOGICAL_LINE: usize = 1_048_576;
 
