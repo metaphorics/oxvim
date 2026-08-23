@@ -74,3 +74,28 @@ The push token is still invalid. Nothing since `b05106f` is on the remote, so hi
 - `.outline/` was gitignored in full, so the reports and this ledger were untracked and a deleted checkout took them with it. Now tracked; do not un-track them.
 - Three separate destructive operations cost real work: a `git stash` that swept every dirty file in a shared tree, the directory deletion itself, and `git checkout -- crates/` used as mutation-check undo, which reverted a peer's uncommitted edits twice. All three had a blast radius wider than the author's model of it. Mutation checks now copy the single owned file to /tmp and restore from that copy, then touch it so cargo does not serve a stale binary.
 - Parallel workers sharing one tree need file-level ownership stated up front and a named owner for every shared file, or they overwrite each other silently.
+
+## Measured state at the end of this arc
+
+Workspace: 2004 tests passing, zero failures, verified independently at the top level rather than taken from worker reports.
+
+Third census (`8ff70b1`) against the first two:
+
+| metric | census 1 | census 2 | census 3 |
+| --- | --- | --- | --- |
+| executed | 2556 | 2510 | 3077 |
+| failed | 2339 | 2314 | 2267 |
+| skipped | 77 | 72 | 579 |
+| setup-blocked files | 60 | 70 | 54 |
+| timeouts | 6 | 3 | 1 |
+| crashes | 3 | 0 | 1 |
+
+Of the skip growth, 384 tests moved from failing to skipping honestly, because `has()` and `exists()` stopped over-claiming: a test that skips on a genuinely absent capability is correct, and the census separates that from the 53 lost executions it also found. Blockers: `E492` fell 49 files, `E15` went 46 to 7, `E444` 12 to 1, while `E117` rose 20 as newly running files reached further.
+
+The single largest unblock was not a feature. `push_source` allocated a new script ID per source, so `s:` variables died between sources, `setup.vim`'s load guard never fired, and its `comclear` wiped every user command before every oldtest. Fixing that converted 460 failures into 231 across 20 files.
+
+The crash count of 1 in census 3 was `unlet $` reaching `std::env::remove_var("")`; it is fixed, and the file it killed now runs 7 tests.
+
+## The deletion, for the record
+
+The suite deletes whatever `$HOME` points to, by design: `setup.vim` sandboxes it, and `runtest.vim` cleans up with `rm -rf` over names the shell word-splits, one of which expands `~`. Oxvim did not export a vim-level `let $VAR` to child processes, so the sandbox never reached the shell and `~` resolved to the real home. That is what destroyed this checkout, `~/.cargo`, `~/.rustup` and `~/.local`, and with them 21 unpushed commits. The export defect is fixed and the behavior now matches the oracle exactly, which I verified by running the same chain on both binaries. The `just oldtest` recipe now refuses to start unless `HOME` is a throwaway path, and copies the testdir rather than running in the reference tree.
