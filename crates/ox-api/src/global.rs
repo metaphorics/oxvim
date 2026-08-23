@@ -13,6 +13,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     api, ApiError, BufHandle, Dict, Object, OxStr, Registry, RegistryError, TabHandle, WinHandle,
 };
+use crate::option_merge::SetOp;
 
 const MAX_CONVERSION_DEPTH: usize = 100;
 
@@ -451,10 +452,27 @@ pub fn nvim_set_option_value(
     opts: Dict,
 ) -> Result<Object, ApiError> {
     let name = option_name(&name)?;
-    validate_option_operation(&opts)?;
-    let target = option_target(editor, name, &opts)?;
     let metadata = ox_editor::OptionStore::metadata(name).map_err(exception)?;
+    let operation = match dict_string(&opts, "operation")? {
+        Some(text) => SetOp::parse(text.as_bytes())?,
+        None => SetOp::Set,
+    };
+    operation.check_supported(metadata)?;
+    let target = option_target(editor, name, &opts)?;
     let value = object_to_option_value(metadata, name, value)?;
+    let value = match value {
+        // option.c stropt_get_newval expands `$VAR` and `~` before merging.
+        OptionValue::String(text) => {
+            OptionValue::String(crate::option_merge::expand_value(metadata, operation, &text))
+        }
+        other => other,
+    };
+    let value = crate::option_merge::merge(
+        metadata,
+        &current_option_value(editor, name, target)?,
+        value,
+        operation,
+    )?;
     if dict_bool(&opts, "dry_run")? == Some(true) {
         validate_option_at(editor, name, &value, target)?;
         return Ok(structured_option_value(metadata, &value));
@@ -960,20 +978,23 @@ fn comma_items(text: &str) -> impl Iterator<Item = &str> {
     text.split(',').filter(|item| !item.is_empty())
 }
 
-fn validate_option_operation(opts: &Dict) -> Result<(), ApiError> {
-    let Some(operation) = dict_string(opts, "operation")? else {
-        return Ok(());
+/// The option's value at `target`, which `nvim_set_option_value`'s merges fold
+/// the incoming value into (upstream reads it through `get_varp_from`).
+fn current_option_value(
+    editor: &Editor,
+    name: &str,
+    target: OptionTarget,
+) -> Result<OptionValue, ApiError> {
+    let value = match target {
+        OptionTarget::Global => editor.options().get_global(name),
+        OptionTarget::Buffer(buffer) | OptionTarget::GlobalAndBuffer(buffer) => {
+            editor.options().get_buffer(buffer, name)
+        }
+        OptionTarget::Window(window) | OptionTarget::GlobalAndWindow(window) => {
+            editor.options().get_window(window, name)
+        }
     };
-    match operation.as_bytes() {
-        b"set" => Ok(()),
-        b"append" | b"prepend" | b"remove" => Err(ApiError::validation(format!(
-            "Unsupported nvim_set_option_value operation: {}",
-            operation.to_string_lossy()
-        ))),
-        _ => Err(ApiError::validation(
-            "Invalid 'operation': expected 'set', 'append', 'prepend', or 'remove'",
-        )),
-    }
+    value.cloned().map_err(exception)
 }
 
 fn parse_command(command: &OxStr) -> Result<Vec<ExCommand>, ApiError> {

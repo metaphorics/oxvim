@@ -13,6 +13,7 @@ mod deprecated;
 mod extmark;
 mod global;
 mod metadata;
+mod option_merge;
 mod registry;
 mod runtime;
 mod tabpage;

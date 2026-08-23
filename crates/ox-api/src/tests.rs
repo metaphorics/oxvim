@@ -1237,8 +1237,8 @@ fn option_setter_error_shapes_match_upstream() {
             "Invalid value for option 'expandtab': expected boolean, got string \"x\""
         ))
     );
-    // Unknown operations use upstream's message; unimplemented merge
-    // operations keep an explicit unsupported error.
+    // api/options.c validate_option_value_args rejects an unknown operation by
+    // name and a merge into a boolean option as a conflict.
     assert_eq!(
         set_option_value(
             &mut editor,
@@ -1253,13 +1253,11 @@ fn option_setter_error_shapes_match_upstream() {
     assert_eq!(
         set_option_value(
             &mut editor,
-            "wildignore",
-            Object::String(OxStr::from("*.x")),
+            "ignorecase",
+            Object::Boolean(true),
             &[("operation", Object::String(OxStr::from("append")))]
         ),
-        Err(ApiError::validation(
-            "Unsupported nvim_set_option_value operation: append"
-        ))
+        Err(ApiError::validation("Conflict: 'append' not allowed with boolean options"))
     );
 }
 
@@ -1498,4 +1496,161 @@ fn lua_lookup_probes_literal_paths_in_order() {
     assert_eq!(get_named(&editor, &["lua/onlya.lua", "lua/shared.lua"], false, true), ["/a/lua/onlya.lua"]);
     assert_eq!(get_named(&editor, &["lua/*.lua"], true, true), Vec::<String>::new());
     assert_eq!(get_named(&editor, &["lua"], true, true), Vec::<String>::new());
+}
+
+// ---------------------------------------------------------------------------
+// vim.opt append / prepend / remove
+// ---------------------------------------------------------------------------
+
+fn merge_option(editor: &mut Editor, name: &str, value: &str, operation: &str) -> Result<Object, ApiError> {
+    set_option_value(
+        editor,
+        name,
+        Object::String(OxStr::from(value)),
+        &[("operation", Object::String(OxStr::from(operation)))],
+    )
+}
+
+fn option_text(editor: &mut Editor, name: &str) -> String {
+    match get_option_value(editor, name) {
+        Ok(Object::String(value)) => value.to_string_lossy().into_owned(),
+        other => panic!("expected a string option, got {other:?}"),
+    }
+}
+
+// option.c get_option_newval — the comma-list merges `vim.opt.rtp:append()`,
+// `:prepend()` and `:remove()` compile to, checked against the reference
+// binary: appending an entry already present is a no-op, and removing one that
+// is absent leaves the value alone.
+#[test]
+fn comma_list_options_append_prepend_and_remove() {
+    let mut editor = runtime_editor("/a,/b", "", &[]);
+    assert_eq!(
+        merge_option(&mut editor, "runtimepath", "/c", "append"),
+        Ok(Object::Array(vec![
+            Object::String(OxStr::from("/a")),
+            Object::String(OxStr::from("/b")),
+            Object::String(OxStr::from("/c")),
+        ]))
+    );
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/a,/b,/c");
+    merge_option(&mut editor, "runtimepath", "/z", "prepend").expect("prepend succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/z,/a,/b,/c");
+    merge_option(&mut editor, "runtimepath", "/b", "remove").expect("remove succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/z,/a,/c");
+    merge_option(&mut editor, "runtimepath", "/a", "append").expect("duplicate append succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/z,/a,/c");
+    merge_option(&mut editor, "runtimepath", "/nope", "remove").expect("absent remove succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/z,/a,/c");
+    // Removing the first and the last item each take exactly one comma with them.
+    merge_option(&mut editor, "runtimepath", "/z", "remove").expect("remove succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/a,/c");
+    merge_option(&mut editor, "runtimepath", "/c", "remove").expect("remove succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/a");
+}
+
+// option.c stropt_concat_with_comma — an empty original value takes no
+// separator, and a flag-list option is not comma separated at all.
+#[test]
+fn merge_adds_a_separator_only_where_the_option_has_one() {
+    let mut editor = runtime_editor("", "", &[]);
+    merge_option(&mut editor, "runtimepath", "/only", "append").expect("append succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/only");
+
+    editor
+        .options_mut()
+        .set_global("shortmess", ox_editor::OptionValue::String("filnx".to_owned()))
+        .expect("option is settable");
+    merge_option(&mut editor, "shortmess", "tI", "append").expect("append succeeds");
+    assert_eq!(option_text(&mut editor, "shortmess"), "filnxtI");
+    merge_option(&mut editor, "shortmess", "l", "remove").expect("remove succeeds");
+    assert_eq!(option_text(&mut editor, "shortmess"), "finxtI");
+}
+
+// option.c get_option_newval — a number option adds, multiplies and subtracts
+// rather than concatenating, so `prepend` on 'scrolloff' is a product.
+#[test]
+fn number_options_merge_arithmetically() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    let mut apply = |operation: &str, start: i64, value: i64| {
+        // 'scrolloff' is global-local, so reset it through the same target the
+        // merge reads its old value from.
+        set_option_value(&mut editor, "scrolloff", Object::Integer(start), &[]).expect("reset succeeds");
+        set_option_value(
+            &mut editor,
+            "scrolloff",
+            Object::Integer(value),
+            &[("operation", Object::String(OxStr::from(operation)))],
+        )
+    };
+    assert_eq!(apply("append", 5, 3), Ok(Object::Integer(8)));
+    assert_eq!(apply("prepend", 5, 3), Ok(Object::Integer(15)));
+    assert_eq!(apply("remove", 5, 3), Ok(Object::Integer(2)));
+}
+
+// option.c stropt_handle_keymatch — for a `key:value` comma list, an appended
+// item replaces the entry with the same key instead of adding a second one,
+// and a removal matches on the key. A plain comma-list merge would leave
+// `fold:-` in place beside `fold:.`.
+#[test]
+fn key_value_options_merge_on_the_key() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    editor
+        .options_mut()
+        .set_global("fillchars", ox_editor::OptionValue::String("vert:|,fold:-".to_owned()))
+        .expect("option is settable");
+    merge_option(&mut editor, "fillchars", "fold:.", "append").expect("append succeeds");
+    assert_eq!(option_text(&mut editor, "fillchars"), "vert:|,fold:.");
+    merge_option(&mut editor, "fillchars", "vert:|", "remove").expect("remove succeeds");
+    assert_eq!(option_text(&mut editor, "fillchars"), "fold:.");
+}
+
+// option.c option_expand — an option flagged `expand` substitutes `$VAR` and a
+// leading `~` before the merge, so `vim.opt.rtp:prepend('~/x')` stores an
+// absolute path. An unset variable is left standing.
+#[test]
+fn expand_flagged_options_substitute_home_and_environment() {
+    // Read from the ambient environment rather than mutating it: `set_var` is
+    // unsafe, and this crate forbids unsafe code.
+    let home = std::env::var("HOME").expect("HOME is set for the test process");
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
+    let mut editor = runtime_editor("/a", "", &[]);
+
+    merge_option(&mut editor, "runtimepath", "~/tp", "prepend").expect("prepend succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), format!("{home}/tp,/a"));
+    merge_option(&mut editor, "runtimepath", "$CARGO_MANIFEST_DIR/x", "append").expect("append succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), format!("{home}/tp,/a,{manifest}/x"));
+    merge_option(&mut editor, "runtimepath", "${CARGO_MANIFEST_DIR}/y", "append").expect("append succeeds");
+    assert_eq!(
+        option_text(&mut editor, "runtimepath"),
+        format!("{home}/tp,/a,{manifest}/x,{manifest}/y")
+    );
+    // An unset variable and a `~` that does not open a path component both
+    // stay literal, and an option without the expand flag is never touched.
+    merge_option(&mut editor, "runtimepath", "$OXVIM_TEST_RTP_UNSET/z", "append").expect("append succeeds");
+    assert!(option_text(&mut editor, "runtimepath").ends_with(",$OXVIM_TEST_RTP_UNSET/z"));
+    merge_option(&mut editor, "runtimepath", "~tilde", "append").expect("append succeeds");
+    assert!(option_text(&mut editor, "runtimepath").ends_with(",~tilde"));
+    merge_option(&mut editor, "wildignore", "~/w", "append").expect("append succeeds");
+    assert_eq!(option_text(&mut editor, "wildignore"), "~/w");
+}
+
+// api/options.c nvim_set_option_value — `dry_run` still merges and returns the
+// result, but leaves the option where it was.
+#[test]
+fn dry_run_merges_without_storing() {
+    let mut editor = runtime_editor("/a", "", &[]);
+    assert_eq!(
+        set_option_value(
+            &mut editor,
+            "runtimepath",
+            Object::String(OxStr::from("/b")),
+            &[
+                ("operation", Object::String(OxStr::from("append"))),
+                ("dry_run", Object::Boolean(true)),
+            ]
+        ),
+        Ok(Object::Array(vec![Object::String(OxStr::from("/a")), Object::String(OxStr::from("/b"))]))
+    );
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/a");
 }
