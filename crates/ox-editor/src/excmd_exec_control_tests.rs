@@ -704,3 +704,208 @@ fn global_string(executor: &ExExecutor, name: &str) -> Option<String> {
             _ => None,
         })
 }
+
+// ===========================================================================
+// Trailing garbage after an expression argument
+//
+// Two rules meet here, and either one alone gives the wrong answer:
+//
+//   1. White space is what `skipwhite`/`del_trailing_spaces` call white space
+//      (`strings.c:429-446`, `ascii_defs.h:84-87`): ASCII space and tab. Rust's
+//      `str::trim` also removes CR, VT, FF, NL and every Unicode space, and
+//      `u8::is_ascii_whitespace` also removes CR, NL and FF, so both silently
+//      eat the bytes upstream keeps.
+//   2. The remaining bytes have to reach `eval0`'s trailing check as
+//      *remainder*, not as a lexing failure (`eval.c:1234-1252`,
+//      `errors.h:123` `e_trailing_arg`).
+//
+// Every expectation below was read off `nvim` v0.13.0-dev-1390 one probe per
+// process, the error taken from `v:exception`.
+// ===========================================================================
+
+/// Assert one Ex line raises `code`, and hand back the message.
+fn line_error(line: &str, code: &str) -> String {
+    let mut editor = Editor::new();
+    let mut executor = ExExecutor::new();
+    let exception = vim_error(executor.execute_line(&mut editor, line));
+    assert_eq!(exception.kind, VimExceptionKind::Error(code.to_owned()), "for {line:?}");
+    exception.message()
+}
+
+/// The whole class in one assertion, and the reason it takes both rules: with
+/// only the white-space rule the CR reaches an eager lexer and the answer is
+/// E15; with only a tolerant lexer the CR never survives `str::trim` and there
+/// is no error at all. Oracle: `Vim(let):E488: Trailing characters: <CR>`.
+#[test]
+fn trailing_carriage_return_after_a_let_expression_is_e488() {
+    assert_eq!(line_error("let g:v = 4\r", "E488"), "Vim(let):E488: Trailing characters: \r");
+}
+
+/// The white-space rule on its own: a form feed is `is_ascii_whitespace` and a
+/// vertical tab is Unicode white space, so an "ASCII white space" or a
+/// `str::trim` spelling of the rule swallows one or both. Neither is
+/// `skipwhite`. Oracle: both are `E488: Trailing characters:`.
+#[test]
+fn vertical_tab_and_form_feed_are_not_white_space_to_skipwhite() {
+    assert_eq!(line_error("let g:v = 4\x0b", "E488"), "Vim(let):E488: Trailing characters: \x0b");
+    assert_eq!(line_error("let g:v = 4\x0c", "E488"), "Vim(let):E488: Trailing characters: \x0c");
+}
+
+/// The tolerant-lexer rule on its own: `'ab` is not white space under any
+/// spelling of rule 1, so only rule 2 decides. An eager lexer answers E115 for
+/// the unterminated string it had no business reading.
+/// Oracle: `Vim(let):E488: Trailing characters: 'ab`.
+#[test]
+fn an_unterminated_string_after_a_complete_expression_is_remainder() {
+    assert_eq!(line_error("let g:v = 4 'ab", "E488"), "Vim(let):E488: Trailing characters: 'ab");
+}
+
+/// And the rule is still `skipwhite`, not "no trimming": space and tab around
+/// the target, the operator and the expression are still white space, and a
+/// compound operator still survives the split intact.
+#[test]
+fn space_and_tab_around_an_assignment_are_still_white_space() {
+    let mut editor = Editor::new();
+    let mut executor = ExExecutor::new();
+    executor.execute_line(&mut editor, "let g:v\t=  4 \t").unwrap();
+    assert_eq!(gnum(&executor, "v"), 4);
+    executor.execute_line(&mut editor, "let g:v  +=\t3").unwrap();
+    assert_eq!(gnum(&executor, "v"), 7);
+}
+
+/// One row per dispatch arm that hands an expression to `eval_text`, because
+/// each arm trimmed its own argument and so each one has to be pinned: putting
+/// `str::trim` back at any single call site fails exactly one of these.
+#[test]
+fn every_expression_command_rejects_a_trailing_carriage_return() {
+    assert_eq!(line_error("const g:c = 4\r", "E488"), "Vim(const):E488: Trailing characters: \r");
+    assert_eq!(line_error("eval 4\r", "E488"), "Vim(eval):E488: Trailing characters: \r");
+    assert_eq!(line_error("throw 'a'\r", "E488"), "Vim(throw):E488: Trailing characters: \r");
+    assert_eq!(line_error("call len('a')\r", "E488"), "Vim(call):E488: Trailing characters: \r");
+    assert_eq!(line_error("unlet g:z\r", "E488"), "Vim(unlet):E488: Trailing characters: \r");
+}
+
+/// Two sites whose argument is only *tested* for emptiness or cut at a
+/// comment, so the rows above leave them free: `:return`'s "did I get an
+/// expression at all" check, and the `" comment` cut that runs before the
+/// expression reaches `eval0`. Under `str::trim` a bare `:return<CR>` looks
+/// like a plain `:return` and quietly returns 0, and `4<CR> "c"` loses the CR
+/// with the comment.
+#[test]
+fn the_emptiness_test_and_the_comment_cut_see_the_carriage_return_too() {
+    // Oracle: `Vim(return):E15: Invalid expression:` — an argument was given.
+    let mut editor = Editor::new();
+    let mut executor = ExExecutor::new();
+    let exception = vim_error(executor.execute_script(
+        &mut editor,
+        "t.vim",
+        "function! F()\nreturn \r\nendfunction\ncall F()",
+    ));
+    assert_eq!(exception.kind, VimExceptionKind::Error("E15".to_owned()));
+
+    // A bare `:return` with nothing after it is still a bare `:return`.
+    executor
+        .execute_script(&mut editor, "t.vim", "function! G()\nreturn \nendfunction\nlet g:r = G()")
+        .unwrap();
+    assert_eq!(gnum(&executor, "r"), 0);
+
+    // Oracle: `Vim(let):E488: Trailing characters: <CR> "c"`. This port names
+    // only the CR, because the comment is cut before `eval0` sees it.
+    assert_eq!(line_error("let g:v = 4\r \"c\"", "E488"), "Vim(let):E488: Trailing characters: \r");
+    // ...and an ordinary trailing comment is still a comment.
+    let mut editor = Editor::new();
+    let mut executor = ExExecutor::new();
+    executor.execute_line(&mut editor, "let g:v = 4 \"c\"").unwrap();
+    assert_eq!(gnum(&executor, "v"), 4);
+}
+
+/// The block-opening commands read their condition from a different place
+/// (`find_if`, the `:while` loop head, `split_for`), so they need their own
+/// rows. Oracle: `Vim(if)`, `Vim(while)` and `Vim(for)` all raise E488.
+#[test]
+fn block_openers_reject_a_trailing_carriage_return_in_the_condition() {
+    let mut editor = Editor::new();
+    let mut executor = ExExecutor::new();
+    let exception = vim_error(executor.execute_script(&mut editor, "t.vim", "if 1\r\nendif"));
+    assert_eq!(exception.kind, VimExceptionKind::Error("E488".to_owned()));
+
+    let exception = vim_error(executor.execute_script(&mut editor, "t.vim", "while 0\r\nendwhile"));
+    assert_eq!(exception.kind, VimExceptionKind::Error("E488".to_owned()));
+
+    let exception = vim_error(executor.execute_script(&mut editor, "t.vim", "for i in [1]\r\nendfor"));
+    assert_eq!(exception.kind, VimExceptionKind::Error("E488".to_owned()));
+
+    let exception = vim_error(executor.execute_script(
+        &mut editor,
+        "t.vim",
+        "function! F()\nreturn 4\r\nendfunction\ncall F()",
+    ));
+    assert_eq!(exception.kind, VimExceptionKind::Error("E488".to_owned()));
+}
+
+/// `:echo`, `:echomsg` and `:execute` loop `eval1` until the line is spent, so
+/// they do reach the refused byte and answer E15 rather than E488
+/// (`eval.c:1846`). A blanket "refused byte means E488" would break this row.
+/// Oracle: `Vim(echo):E15: Invalid expression: ...`.
+#[test]
+fn echo_family_reports_e15_not_e488_for_a_trailing_carriage_return() {
+    line_error("echo 'z'\r", "E15");
+    line_error("echomsg 'q'\r", "E15");
+    line_error("execute 'let g:v = 5'\r", "E15");
+}
+
+/// A `-nargs=0` user command clears `EX_EXTRA`, so `do_one_cmd` rejects any
+/// argument text at all before the body runs (`ex_docmd.c:4542`). The port
+/// answered E471 "Argument required", which is the opposite complaint.
+/// Oracle: `Vim:E488: Trailing characters: x`; `-nargs=1` with no argument
+/// stays E471.
+#[test]
+fn a_nargs_zero_user_command_rejects_any_argument_with_e488() {
+    let mut editor = Editor::new();
+    let mut executor = ExExecutor::new();
+    executor.execute_line(&mut editor, "command! -nargs=0 T73D let g:v = 4").unwrap();
+    executor.execute_line(&mut editor, "command! -nargs=1 T73N let g:v = 4").unwrap();
+
+    let exception = vim_error(executor.execute_line(&mut editor, "T73D x"));
+    assert_eq!(exception.kind, VimExceptionKind::Error("E488".to_owned()));
+    let exception = vim_error(executor.execute_line(&mut editor, "T73D\r"));
+    assert_eq!(exception.kind, VimExceptionKind::Error("E488".to_owned()));
+    let exception = vim_error(executor.execute_line(&mut editor, "T73N"));
+    assert_eq!(exception.kind, VimExceptionKind::Error("E471".to_owned()));
+}
+
+/// The sourced-line reader stripped a trailing CR from every line, which hid
+/// the whole class from any file-based probe. `get_one_sourceline`
+/// (`runtime.c:2891-2905`) strips it only for an `EOL_DOS` file, and that
+/// branch is inside `#ifdef USE_CRNL` — a Windows-only define. Oracle on this
+/// platform: even a wholly CRLF script is `E488` on the first line.
+#[test]
+fn a_sourced_line_keeps_its_trailing_carriage_return() {
+    let mut editor = Editor::new();
+    let mut executor = ExExecutor::new();
+    let exception = vim_error(executor.execute_script(&mut editor, "t.vim", "let g:v = 4\r\n"));
+    assert_eq!(exception.kind, VimExceptionKind::Error("E488".to_owned()));
+
+    // A script with no stray CR is untouched by the change.
+    executor.execute_script(&mut editor, "t.vim", "let g:w = 7\n").unwrap();
+    assert_eq!(gnum(&executor, "w"), 7);
+}
+
+/// `execute()` with a List runs each item as its own source line
+/// (`execute_common` hands `do_cmdline` a `get_list_line` cookie,
+/// `eval/funcs.c:1206-1216`). Stringifying the list instead made every
+/// multi-line construct `E492: Not an editor command: ['if 1', ...]`, which is
+/// also what stopped `:if`/`:while`/`:for` from being measurable at all.
+#[test]
+fn execute_runs_a_list_argument_line_by_line() {
+    let mut editor = Editor::new();
+    let mut executor = ExExecutor::new();
+    executor
+        .execute_line(&mut editor, "call execute(['if 1', 'let g:v = 9', 'endif'])")
+        .unwrap();
+    assert_eq!(gnum(&executor, "v"), 9);
+
+    // The single-string form still runs as one command line.
+    executor.execute_line(&mut editor, "call execute('let g:s = 3')").unwrap();
+    assert_eq!(gnum(&executor, "s"), 3);
+}

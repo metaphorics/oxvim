@@ -1055,7 +1055,7 @@ fn run_instructions<F: FileIO>(
                     return Flow::Exception(runtime.unterminated_block("E170", "Missing :endwhile"));
                 };
                 loop {
-                    match eval_condition(runtime, editor, scope, lua, command.args.trim()) {
+                    match eval_condition(runtime, editor, scope, lua, skipwhite_trim(&command.args)) {
                         Ok(true) => {}
                         Ok(false) => break,
                         Err(flow) => return flow,
@@ -1269,11 +1269,11 @@ fn dispatch<F: FileIO>(
         "echo" | "echomsg" | "echon" | "echoerr" => {
             command_echo(runtime, editor, scope, lua, name, &command.args)
         }
-        "eval" => match eval_text(runtime, editor, scope, lua, command.args.trim()) { Ok(_) => Flow::Normal, Err(flow) => flow },
+        "eval" => match eval_text(runtime, editor, scope, lua, skipwhite_trim(&command.args)) { Ok(_) => Flow::Normal, Err(flow) => flow },
         "redir" => command_redir(runtime, editor, scope, command),
         "break" => Flow::Break,
         "continue" => Flow::Continue,
-        "throw" => match eval_text(runtime, editor, scope, lua, command.args.trim()) {
+        "throw" => match eval_text(runtime, editor, scope, lua, skipwhite_trim(&command.args)) {
             Ok(value) => Flow::Exception(VimException {
                 kind: VimExceptionKind::Throw,
                 value,
@@ -1286,10 +1286,10 @@ fn dispatch<F: FileIO>(
         },
         "call" => command_call(runtime, editor, scope, lua, command),
         "return" => {
-            if command.args.trim().is_empty() {
+            if skipwhite_trim(&command.args).is_empty() {
                 Flow::Return(Typval::Number(0))
             } else {
-                match eval_text(runtime, editor, scope, lua, command.args.trim()) {
+                match eval_text(runtime, editor, scope, lua, skipwhite_trim(&command.args)) {
                     Ok(value) => Flow::Return(value),
                     Err(flow) => flow,
                 }
@@ -2045,9 +2045,9 @@ fn command_unlet<F: FileIO>(
     // other than white space or a command end is `E488`. Without this the
     // empty name reached `std::env::remove_var("")` and killed the process.
     let mut rest = args;
-    while let Some(start) = rest.find(|character: char| !character.is_ascii_whitespace()) {
+    while let Some(start) = rest.find(|character: char| !matches!(character, ' ' | '\t')) {
         rest = &rest[start..];
-        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let end = rest.find([' ', '\t']).unwrap_or(rest.len());
         let (target, tail) = rest.split_at(end);
         if let Some(name) = target.strip_prefix('$') {
             let length = env_name_len(name);
@@ -2057,6 +2057,8 @@ fn command_unlet<F: FileIO>(
             if length < name.len() {
                 return error_flow(runtime, "E488", format!("Trailing characters: {}", &name[length..]));
             }
+        } else if let Some(garbage) = unlet_name_garbage(target) {
+            return error_flow(runtime, "E488", format!("Trailing characters: {garbage}"));
         }
         let key = canonical_target(target);
         if runtime.const_vars.contains(&key) {
@@ -2424,7 +2426,7 @@ fn command_call<F: FileIO>(
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
 ) -> Flow {
-    let text = command.args.trim();
+    let text = skipwhite_trim(&command.args);
     let Some(open) = text.find('(') else {
         return error_flow(runtime, "E107", "Missing parentheses: :call");
     };
@@ -2433,9 +2435,9 @@ fn command_call<F: FileIO>(
     };
     // ex_call: only text that `ends_excmd` rejects is trailing — a `"`
     // comment (with or without leading whitespace) ends the command.
-    let trailing = text[close + 1..].trim_start();
+    let trailing = text[close + 1..].trim_start_matches([' ', '\t']);
     if !trailing.is_empty() && !trailing.starts_with('"') {
-        return error_flow(runtime, "E488", "Trailing characters");
+        return error_flow(runtime, "E488", format!("Trailing characters: {trailing}"));
     }
     let name = text[..open].trim();
     let sid = runtime.scripts.current_sid().unwrap_or(0);
@@ -5592,6 +5594,12 @@ fn command_invoke_user<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Edito
     let args = command.args.as_str();
     let count = count_ex_arguments(args);
     let valid = match definition.nargs { '0' => count == 0, '1' => count == 1, '?' => count <= 1, '+' => count >= 1, '*' => true, _ => false };
+    // `-nargs=0` clears EX_EXTRA, so `do_one_cmd` rejects any argument text
+    // before the command body runs (`ex_docmd.c:4542`). E471 belongs to the
+    // forms that require an argument and did not get one.
+    if definition.nargs == '0' && !args.is_empty() {
+        return error_flow(runtime, "E488", format!("Trailing characters: {args}"));
+    }
     if !valid { return error_flow(runtime, "E471", "Argument required") }
     if command.bang && !definition.accepts_bang { return error_flow(runtime, "E477", "No ! allowed") }
     if command.range.is_some() && !definition.accepts_range { return error_flow(runtime, "E481", "No range allowed") }
@@ -6099,6 +6107,56 @@ fn read_option(editor: &Editor, option: &str) -> Typval {
     option_value(editor, name, layer).map_or(Typval::Number(0), option_to_typval)
 }
 
+/// Trim the white space `skipwhite` trims, and nothing else.
+///
+/// `str::trim` removes CR, VT, FF, NL and every Unicode space. Upstream's
+/// `skipwhite` and `del_trailing_spaces` (`strings.c:429-436`,
+/// `ascii_defs.h:84-87`) remove ASCII space and tab only, so everything else
+/// stays part of the argument -- and for an expression argument that means
+/// `eval0` sees it and answers `E488: Trailing characters` (`eval.c:1251`).
+fn skipwhite_trim(text: &str) -> &str {
+    text.trim_matches([' ', '\t'])
+}
+
+/// The end of one `:unlet` target name, and whatever garbage follows it.
+///
+/// `ex_unletlock` (`eval/vars.c:1600-1617`) takes the name `get_lval`
+/// accepted and requires the next byte to be white space or `ends_excmd` --
+/// NUL, `|`, `"` or newline. Anything else is trailing garbage and raises
+/// E488 with the remainder. `eval_isnamec` is alphanumeric, `_`, `:` and `#`;
+/// `find_name_end` walks past a `[...]` index and a `.` key on top of that.
+/// The `$ENV` form never reaches here: `ex_unletlock` measures that one with
+/// `get_env_len` first.
+fn unlet_name_garbage(target: &str) -> Option<&str> {
+    let bytes = target.as_bytes();
+    let mut index = 0usize;
+    let mut depth = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if depth > 0 {
+            match byte {
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                _ => {}
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'[' {
+            depth += 1;
+            index += 1;
+            continue;
+        }
+        let name_char = byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'#');
+        if !name_char && !(byte == b'.' && index + 1 < bytes.len()) {
+            break;
+        }
+        index += 1;
+    }
+    let rest = &target[index..];
+    if rest.is_empty() || rest.starts_with(['|', '"', '\n']) { None } else { Some(rest) }
+}
+
 fn strip_expression_comment(expression: &str) -> &str {
     let bytes = expression.as_bytes();
     let mut quote = None;
@@ -6120,7 +6178,7 @@ fn strip_expression_comment(expression: &str) -> &str {
         if index > 0 && bytes[index - 1].is_ascii_whitespace() && previous.is_some_and(|previous| {
             bytes[previous].is_ascii_alphanumeric() || matches!(bytes[previous], b'\'' | b'"' | b']' | b')' | b'}')
         }) {
-            return expression[..index].trim_end();
+            return expression[..index].trim_end_matches([' ', '\t']);
         }
         quote = Some(byte);
     }
@@ -6148,13 +6206,13 @@ fn split_assignment(args: &str) -> Option<(&str, &str, &str)> {
             } else {
                 index
             };
-            return Some((args[..start].trim(), args[start..=index].trim(), args[index + 1..].trim()));
+            return Some((skipwhite_trim(&args[..start]), skipwhite_trim(&args[start..=index]), skipwhite_trim(&args[index + 1..])));
         }
     }
     None
 }
 
-fn split_for(args: &str) -> Option<(&str, &str)> { args.split_once(" in ").map(|(target, expression)| (target.trim(), expression.trim())) }
+fn split_for(args: &str) -> Option<(&str, &str)> { args.split_once(" in ").map(|(target, expression)| (skipwhite_trim(target), skipwhite_trim(expression))) }
 
 fn parse_scope_name(target: &str) -> (Option<ScopeKind>, String) {
     let bytes = target.as_bytes();
@@ -6368,11 +6426,11 @@ fn find_if(program: &[Instruction], open: usize, limit: usize) -> Option<IfBlock
             "if" => depth += 1,
             "endif" if depth == 0 => {
                 let mut branches = Vec::new();
-                let mut condition = Some(program[open].command.as_ref()?.args.trim().to_owned());
+                let mut condition = Some(skipwhite_trim(&program[open].command.as_ref()?.args).to_owned());
                 let mut start = open + 1;
                 for marker in markers {
                     branches.push(IfBranch { condition, start, end: marker });
-                    condition = match program[marker].name() { "elseif" => Some(program[marker].command.as_ref()?.args.trim().to_owned()), _ => None };
+                    condition = match program[marker].name() { "elseif" => Some(skipwhite_trim(&program[marker].command.as_ref()?.args).to_owned()), _ => None };
                     start = marker + 1;
                 }
                 branches.push(IfBranch { condition, start, end: index });
