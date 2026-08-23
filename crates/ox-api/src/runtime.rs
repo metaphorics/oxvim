@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ox_editor::{AutocmdAction, Editor, OptionValue};
-use ox_types::{Dict, OxStr};
+use ox_types::{ApiError, Dict, Object, OxStr};
 use ox_ui::{ChromeState, HlState, UiChannels};
 
 /// Byte sink used by `nvim_chan_send`.
@@ -18,6 +18,16 @@ pub trait ChannelSink {
 pub trait AutocmdExecutor {
     /// Executes one planned definition.
     fn execute(&mut self, action: &AutocmdAction) -> Result<(), String>;
+}
+
+/// Host Lua evaluator behind `nvim_exec_lua`.
+///
+/// The chunk this runs calls back into the API, so a host must reach its
+/// editor through the `editor` it is handed rather than taking a second
+/// borrow of the one it shares with its Lua bindings.
+pub trait LuaExecutor {
+    /// Compiles and runs one Lua chunk with `args` bound to `...`.
+    fn exec(&mut self, editor: &mut Editor, code: &str, args: Vec<Object>) -> Result<Object, String>;
 }
 
 /// What a wildcard expansion may match, mirroring the `EW_DIR`/`EW_FILE` pair
@@ -326,6 +336,8 @@ pub(crate) struct RuntimeState {
     pub subscriptions: BTreeMap<u64, BTreeSet<OxStr>>,
     pub channel_sink: Option<Box<dyn ChannelSink>>,
     pub autocmd_executor: Option<Box<dyn AutocmdExecutor>>,
+    pub command_executor: Option<Box<dyn crate::CommandExecutor>>,
+    pub lua_executor: Option<Box<dyn LuaExecutor>>,
     pub file_io: Box<dyn FileIO>,
     /// The expanded runtime search path, keyed by the ('runtimepath',
     /// 'packpath') pair it was built from.
@@ -359,6 +371,8 @@ impl Default for RuntimeState {
             subscriptions: BTreeMap::new(),
             channel_sink: None,
             autocmd_executor: None,
+            command_executor: None,
+            lua_executor: None,
             file_io: Box::new(StdFileIO),
             search_path: None,
             saved_context: None,
@@ -402,4 +416,43 @@ pub fn set_file_io(editor: &Editor, file_io: Box<dyn FileIO>) {
         state.file_io = file_io;
         state.search_path = None;
     });
+}
+
+/// Installs the Ex-command host `nvim_exec2`, `nvim_cmd` and `nvim_command`
+/// run through.
+pub fn set_command_executor(editor: &Editor, executor: Box<dyn crate::CommandExecutor>) {
+    with_state_mut(editor, |state| state.command_executor = Some(executor));
+}
+
+/// Installs the Lua host `nvim_exec_lua` runs through.
+pub fn set_lua_executor(editor: &Editor, executor: Box<dyn LuaExecutor>) {
+    with_state_mut(editor, |state| state.lua_executor = Some(executor));
+}
+
+/// Runs `operation` with the installed command host. The host is moved out for
+/// the call and put back afterwards, because executing a command needs the
+/// editor and the host's slot lives in state keyed by that same editor.
+pub(crate) fn with_command_executor<R>(
+    editor: &mut Editor,
+    operation: impl FnOnce(&mut Editor, &mut dyn crate::CommandExecutor) -> Result<R, ApiError>,
+) -> Result<R, ApiError> {
+    let Some(mut executor) = with_state_mut(editor, |state| state.command_executor.take()) else {
+        return Err(ApiError::exception("no Ex-command host is installed"));
+    };
+    let result = operation(editor, executor.as_mut());
+    with_state_mut(editor, |state| state.command_executor = Some(executor));
+    result
+}
+
+/// The `nvim_exec_lua` counterpart of [`with_command_executor`].
+pub(crate) fn with_lua_executor<R>(
+    editor: &mut Editor,
+    operation: impl FnOnce(&mut Editor, &mut dyn LuaExecutor) -> Result<R, ApiError>,
+) -> Result<R, ApiError> {
+    let Some(mut executor) = with_state_mut(editor, |state| state.lua_executor.take()) else {
+        return Err(ApiError::exception("no Lua host is installed"));
+    };
+    let result = operation(editor, executor.as_mut());
+    with_state_mut(editor, |state| state.lua_executor = Some(executor));
+    result
 }

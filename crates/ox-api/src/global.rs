@@ -346,9 +346,74 @@ pub fn nvim_get_api_info(_editor: &mut Editor) -> Result<Vec<Object>, ApiError> 
 }
 
 #[api(since = 1)]
-pub fn nvim_command(_editor: &mut Editor, command: OxStr) -> Result<(), ApiError> {
-    let _commands = parse_command(&command)?;
-    Err(ApiError::exception("Not implemented: nvim_command executor"))
+pub fn nvim_command(editor: &mut Editor, command: OxStr) -> Result<(), ApiError> {
+    crate::runtime::with_command_executor(editor, |editor, executor| {
+        execute_command(editor, &command, executor)
+    })
+}
+
+/// api/vim.c `nvim_exec2`: run Vimscript, returning `{ output = ... }` only
+/// when the caller asked for it.
+#[api(since = 11)]
+pub fn nvim_exec2(editor: &mut Editor, src: OxStr, opts: Dict) -> Result<Dict, ApiError> {
+    reject_keys(&opts, &["output"])?;
+    let output = optional_bool(&opts, "output")?.unwrap_or(false);
+    let captured = exec_capturing(editor, &src, output)?;
+    Ok(Dict(if output {
+        vec![(OxStr::from("output"), Object::String(captured))]
+    } else {
+        Vec::new()
+    }))
+}
+
+/// api/vim.c `nvim_cmd`: the structured command form, which decodes to a
+/// command line and runs through the same host.
+#[api(since = 10)]
+pub fn nvim_cmd(editor: &mut Editor, cmd: Dict, opts: Dict) -> Result<OxStr, ApiError> {
+    crate::runtime::with_command_executor(editor, |editor, executor| {
+        execute_nvim_cmd(editor, &cmd, &opts, executor)
+    })
+}
+
+/// api/vim.c `nvim_exec_lua`: `luaeval`-style execution of one chunk with
+/// `args` bound to `...`.
+#[api(since = 7)]
+pub fn nvim_exec_lua(editor: &mut Editor, code: OxStr, args: Vec<Object>) -> Result<Object, ApiError> {
+    let code = std::str::from_utf8(code.as_bytes())
+        .map_err(|_| ApiError::validation("Lua chunk must be valid UTF-8"))?
+        .to_owned();
+    crate::runtime::with_lua_executor(editor, |editor, executor| {
+        executor.exec(editor, &code, args).map_err(ApiError::exception)
+    })
+}
+
+/// Runs one script through the command host, collecting the `:echo` messages
+/// it produced when `capture` is set, the way `nvim_exec2`'s `output` option
+/// and `nvim_cmd`'s already do.
+fn exec_capturing(editor: &mut Editor, src: &OxStr, capture: bool) -> Result<OxStr, ApiError> {
+    crate::runtime::with_command_executor(editor, |editor, executor| {
+        let message_start = editor.messages().len();
+        let result = execute_command(editor, src, executor);
+        if !capture {
+            result?;
+            return Ok(OxStr::from(""));
+        }
+        if let Err(error) = result {
+            editor.truncate_messages(message_start);
+            return Err(error);
+        }
+        let captured = editor.messages()[message_start..]
+            .iter()
+            .filter(|message| message.kind == MessageKind::Echo)
+            .filter_map(|message| match &message.content {
+                Object::String(text) => Some(text.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.truncate_messages(message_start);
+        Ok(OxStr(captured.into_bytes()))
+    })
 }
 
 #[api(since = 1)]
@@ -1372,6 +1437,9 @@ pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(nvim_list_tabpages__API_META(), nvim_list_tabpages__API_DISPATCH)?;
     registry.register(nvim_get_api_info__API_META(), nvim_get_api_info__API_DISPATCH)?;
     registry.register(nvim_command__API_META(), nvim_command__API_DISPATCH)?;
+    registry.register(nvim_exec2__API_META(), nvim_exec2__API_DISPATCH)?;
+    registry.register(nvim_cmd__API_META(), nvim_cmd__API_DISPATCH)?;
+    registry.register(nvim_exec_lua__API_META(), nvim_exec_lua__API_DISPATCH)?;
     registry.register(nvim_eval__API_META(), nvim_eval__API_DISPATCH)?;
     registry.register(nvim_call_function__API_META(), nvim_call_function__API_DISPATCH)?;
     registry.register(nvim_get_vvar__API_META(), nvim_get_vvar__API_DISPATCH)?;

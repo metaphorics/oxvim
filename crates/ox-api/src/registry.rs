@@ -111,6 +111,7 @@ pub fn core() -> Result<Registry, RegistryError> {
     crate::context::register(&mut implemented)?;
     crate::deprecated::register(&mut implemented)?;
     crate::extmark::register(&mut implemented)?;
+    crate::keymap::register(&mut implemented)?;
     crate::window::register(&mut implemented)?;
     crate::tabpage::register(&mut implemented)?;
     crate::ui::register(&mut implemented)?;

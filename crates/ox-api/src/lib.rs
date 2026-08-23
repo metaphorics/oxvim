@@ -11,6 +11,7 @@ mod context;
 mod convert;
 mod deprecated;
 mod extmark;
+mod keymap;
 mod global;
 mod metadata;
 mod option_merge;
@@ -30,4 +31,7 @@ pub use ox_api_macros::api;
 pub use ox_excmd::ExCommand;
 pub use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, WinHandle};
 pub use registry::{core, DispatchFn, Registry, RegistryError};
-pub use runtime::{AutocmdExecutor, ChannelSink, FileIO, MatchKind, StdFileIO, runtime_get_named, set_autocmd_executor, set_channel_sink, set_file_io};
+pub use runtime::{
+    AutocmdExecutor, ChannelSink, FileIO, LuaExecutor, MatchKind, StdFileIO, runtime_get_named,
+    set_autocmd_executor, set_channel_sink, set_command_executor, set_file_io, set_lua_executor,
+};

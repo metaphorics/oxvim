@@ -1654,3 +1654,229 @@ fn dry_run_merges_without_storing() {
     );
     assert_eq!(option_text(&mut editor, "runtimepath"), "/a");
 }
+
+// ---------------------------------------------------------------------------
+// Mappings and the Ex-command / Lua hosts
+// ---------------------------------------------------------------------------
+
+fn set_keymap(editor: &mut Editor, mode: &str, lhs: &str, rhs: &str, opts: &[(&str, Object)]) -> Result<(), ApiError> {
+    crate::keymap::nvim_set_keymap(editor, OxStr::from(mode), OxStr::from(lhs), OxStr::from(rhs), dict(opts))
+}
+
+fn keymaps(editor: &mut Editor, mode: &str) -> Vec<Dict> {
+    crate::keymap::nvim_get_keymap(editor, OxStr::from(mode))
+        .expect("listing succeeds")
+        .into_iter()
+        .map(|entry| match entry {
+            Object::Dict(entry) => entry,
+            other => panic!("expected a dictionary, got {other:?}"),
+        })
+        .collect()
+}
+
+fn field(entry: &Dict, key: &str) -> Option<Object> {
+    entry.get(&OxStr::from(key)).cloned()
+}
+
+// mapping.c mapblock_fill_dict — a mapping set through the API comes back with
+// upstream's key set and values, read off the reference binary. `noremap`
+// tracks the option rather than the default, `desc` appears only when given,
+// and `<Leader>` in the lhs is replaced by the default backslash.
+#[test]
+fn set_keymap_round_trips_through_get_keymap() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    set_keymap(&mut editor, "n", "<Leader>x", ":echo \"hi\"<CR>", &[
+        ("noremap", Object::Boolean(true)),
+        ("silent", Object::Boolean(true)),
+        ("desc", Object::String(OxStr::from("probe cmd"))),
+    ])
+    .expect("set succeeds");
+    set_keymap(&mut editor, "n", "gp", "gP", &[]).expect("set succeeds");
+
+    let maps = keymaps(&mut editor, "n");
+    assert_eq!(maps.len(), 2);
+    let leader = maps.iter().find(|entry| field(entry, "lhs") == Some(Object::String(OxStr::from("\\x")))).expect("leader mapping");
+    assert_eq!(field(leader, "rhs"), Some(Object::String(OxStr::from(":echo \"hi\"<CR>"))));
+    assert_eq!(field(leader, "noremap"), Some(Object::Integer(1)));
+    assert_eq!(field(leader, "silent"), Some(Object::Integer(1)));
+    assert_eq!(field(leader, "desc"), Some(Object::String(OxStr::from("probe cmd"))));
+    assert_eq!(field(leader, "mode"), Some(Object::String(OxStr::from("n"))));
+    assert_eq!(field(leader, "mode_bits"), Some(Object::Integer(1)));
+    assert_eq!(field(leader, "buffer"), Some(Object::Integer(0)));
+    assert_eq!(field(leader, "buf"), Some(Object::Integer(0)));
+    assert_eq!(field(leader, "abbr"), Some(Object::Integer(0)));
+    assert_eq!(field(leader, "scriptversion"), Some(Object::Integer(1)));
+
+    let plain = maps.iter().find(|entry| field(entry, "lhs") == Some(Object::String(OxStr::from("gp")))).expect("plain mapping");
+    assert_eq!(field(plain, "noremap"), Some(Object::Integer(0)));
+    assert_eq!(field(plain, "silent"), Some(Object::Integer(0)));
+    assert_eq!(field(plain, "desc"), None);
+
+    crate::keymap::nvim_del_keymap(&mut editor, OxStr::from("n"), OxStr::from("gp")).expect("del succeeds");
+    assert_eq!(keymaps(&mut editor, "n").len(), 1);
+}
+
+// mapping.c modify_keymap/keymap_array — the mode string selects the mode set,
+// so a mapping set in one mode is invisible in another and the `:map` modes
+// (the empty string) see it while a single unrelated mode does not.
+#[test]
+fn keymap_modes_select_which_mappings_are_visible() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    set_keymap(&mut editor, "n", "za", "zA", &[]).expect("set succeeds");
+    set_keymap(&mut editor, "i", "zb", "zB", &[]).expect("set succeeds");
+    set_keymap(&mut editor, "!", "zc", "zC", &[]).expect("set succeeds");
+
+    assert_eq!(keymaps(&mut editor, "n").len(), 1);
+    // 'i' sees its own mapping and the `:map!` one, which covers insert.
+    assert_eq!(keymaps(&mut editor, "i").len(), 2);
+    assert_eq!(keymaps(&mut editor, "c").len(), 1);
+    assert_eq!(keymaps(&mut editor, "o").len(), 0);
+    // The empty mode is `:map`: normal, visual, select and operator-pending.
+    assert_eq!(keymaps(&mut editor, "").len(), 1);
+    let bang = keymaps(&mut editor, "c").first().cloned().expect("cmdline mapping");
+    assert_eq!(field(&bang, "mode"), Some(Object::String(OxStr::from("!"))));
+    assert_eq!(field(&bang, "mode_bits"), Some(Object::Integer(24)));
+}
+
+// mapping.c modify_keymap — the rejections, each with upstream's own message.
+#[test]
+fn keymap_rejections_match_upstream() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    assert_eq!(
+        set_keymap(&mut editor, "zz", "a", "b", &[]),
+        Err(ApiError::validation("Invalid mode shortname: \"zz\""))
+    );
+    assert_eq!(
+        set_keymap(&mut editor, "nv", "a", "b", &[]),
+        Err(ApiError::validation("Invalid mode shortname: \"nv\""))
+    );
+    assert_eq!(set_keymap(&mut editor, "n", "", "b", &[]), Err(ApiError::validation("Invalid (empty) LHS")));
+    assert_eq!(
+        set_keymap(&mut editor, "n", "a", "b", &[("bogus", Object::Boolean(true))]),
+        Err(ApiError::validation("invalid key: bogus"))
+    );
+    assert_eq!(
+        set_keymap(&mut editor, "n", "a", "b", &[("replace_keycodes", Object::Boolean(true))]),
+        Err(ApiError::validation("\"replace_keycodes\" requires \"expr\""))
+    );
+    assert_eq!(
+        crate::keymap::nvim_del_keymap(&mut editor, OxStr::from("n"), OxStr::from("nosuch")),
+        Err(ApiError::exception("E31: No such mapping"))
+    );
+    set_keymap(&mut editor, "n", "zr", "zR", &[]).expect("set succeeds");
+    assert_eq!(
+        set_keymap(&mut editor, "n", "zr", "zR", &[("unique", Object::Boolean(true))]),
+        Err(ApiError::exception("E227: Mapping already exists for zr"))
+    );
+}
+
+// api/buffer.c nvim_buf_set_keymap/nvim_buf_get_keymap — a buffer-local
+// mapping is reported by the buffer listing with its handle, and never by the
+// global one, which is the distinction between the two scopes.
+#[test]
+fn buffer_keymaps_stay_out_of_the_global_listing() {
+    let (mut editor, buffer, _, _) = editor_with_lines(&["one"]);
+    set_keymap(&mut editor, "n", "gg", "gG", &[]).expect("global set succeeds");
+    crate::keymap::nvim_buf_set_keymap(
+        &mut editor,
+        buffer,
+        OxStr::from("n"),
+        OxStr::from("gb"),
+        OxStr::from("gB"),
+        dict(&[("desc", Object::String(OxStr::from("buffer local")))]),
+    )
+    .expect("buffer set succeeds");
+
+    let global = keymaps(&mut editor, "n");
+    assert_eq!(global.len(), 1);
+    assert_eq!(field(&global[0], "lhs"), Some(Object::String(OxStr::from("gg"))));
+
+    let local = crate::keymap::nvim_buf_get_keymap(&mut editor, buffer, OxStr::from("n"))
+        .expect("buffer listing succeeds");
+    assert_eq!(local.len(), 1);
+    let Object::Dict(entry) = &local[0] else { panic!("expected a dictionary") };
+    assert_eq!(field(entry, "lhs"), Some(Object::String(OxStr::from("gb"))));
+    assert_eq!(field(entry, "buffer"), Some(Object::Integer(1)));
+    assert_eq!(field(entry, "buf"), Some(Object::Integer(i64::from(buffer))));
+    assert_eq!(field(entry, "desc"), Some(Object::String(OxStr::from("buffer local"))));
+
+    crate::keymap::nvim_buf_del_keymap(&mut editor, buffer, OxStr::from("n"), OxStr::from("gb"))
+        .expect("buffer del succeeds");
+    assert!(crate::keymap::nvim_buf_get_keymap(&mut editor, buffer, OxStr::from("n")).expect("listing").is_empty());
+    assert_eq!(keymaps(&mut editor, "n").len(), 1);
+}
+
+// api/vim.c nvim_exec2 / nvim_cmd / nvim_command run through the installed
+// Ex-command host, and `output` decides whether the messages the script
+// produced come back. Without a host installed they say so rather than
+// claiming the function does not exist.
+#[test]
+fn exec_functions_run_through_the_installed_command_host() {
+    let mut editor = Editor::new();
+    assert_eq!(
+        crate::global::nvim_command(&mut editor, OxStr::from("write")),
+        Err(ApiError::exception("no Ex-command host is installed"))
+    );
+
+    crate::set_command_executor(
+        &editor,
+        Box::new(RecordingExecutor { commands: Vec::new(), message: Some("captured") }),
+    );
+    assert_eq!(crate::global::nvim_command(&mut editor, OxStr::from("write")), Ok(()));
+    assert_eq!(
+        crate::global::nvim_exec2(&mut editor, OxStr::from("echo 'x'"), Dict(Vec::new())),
+        Ok(Dict(Vec::new()))
+    );
+    assert_eq!(
+        crate::global::nvim_exec2(
+            &mut editor,
+            OxStr::from("echo 'x'"),
+            dict(&[("output", Object::Boolean(true))])
+        ),
+        Ok(dict(&[("output", Object::String(OxStr::from("captured")))]))
+    );
+    assert_eq!(
+        crate::global::nvim_cmd(
+            &mut editor,
+            dict(&[("cmd", Object::String(OxStr::from("write")))]),
+            dict(&[("output", Object::Boolean(true))])
+        ),
+        Ok(OxStr::from("captured"))
+    );
+    // The host is put back after every call, so a second one still finds it.
+    assert_eq!(crate::global::nvim_command(&mut editor, OxStr::from("write")), Ok(()));
+}
+
+struct EchoingLua;
+
+impl crate::LuaExecutor for EchoingLua {
+    fn exec(&mut self, editor: &mut Editor, code: &str, args: Vec<Object>) -> Result<Object, String> {
+        // Prove the host receives the editor as well as the chunk.
+        editor.push_message(ox_editor::Message {
+            kind: ox_editor::MessageKind::Echo,
+            content: Object::String(OxStr::from(code)),
+            history: false,
+        });
+        Ok(Object::Array(args))
+    }
+}
+
+// api/vim.c nvim_exec_lua hands the chunk and its arguments to the Lua host
+// and returns what the host produced.
+#[test]
+fn exec_lua_runs_through_the_installed_lua_host() {
+    let mut editor = Editor::new();
+    assert_eq!(
+        crate::global::nvim_exec_lua(&mut editor, OxStr::from("return 1"), Vec::new()),
+        Err(ApiError::exception("no Lua host is installed"))
+    );
+    crate::set_lua_executor(&editor, Box::new(EchoingLua));
+    assert_eq!(
+        crate::global::nvim_exec_lua(&mut editor, OxStr::from("return ..."), vec![Object::Integer(7)]),
+        Ok(Object::Array(vec![Object::Integer(7)]))
+    );
+    assert_eq!(
+        editor.messages().last().map(|message| message.content.clone()),
+        Some(Object::String(OxStr::from("return ...")))
+    );
+}
