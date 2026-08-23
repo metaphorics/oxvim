@@ -133,6 +133,7 @@ impl<'a> Builtins<'a> {
             "reduce" => self.reduce(args, scope),
             "match" | "matchend" | "matchstr" => self.regex_match(name, &args),
             "matchlist" | "matchstrpos" => self.regex_result(name, &args),
+            "matchstrlist" => self.matchstrlist(&args),
             "max" => extremum(&args[0], true),
             "min" => extremum(&args[0], false),
             "nr2char" => nr2char(&args),
@@ -275,6 +276,62 @@ impl<'a> Builtins<'a> {
                 Ok(Typval::list(result))
             }
         }
+    }
+
+    fn matchstrlist(&self, args: &[Typval]) -> Result<Typval> {
+        let items = match &args[0] {
+            Typval::List(reference) => list_items(reference)?,
+            Typval::Special(Special::Null) => Vec::new(),
+            _ => return Err(EvalError::new("E1211", 0, "List required for argument 1")),
+        };
+        let pattern = match &args[1] {
+            Typval::String(pattern) => pattern.clone(),
+            Typval::Special(Special::Null) => OxStr(Vec::new()),
+            _ => return Err(EvalError::new("E1174", 0, "String required for argument 2")),
+        };
+        let include_submatches = match args.get(2) {
+            None | Some(Typval::Special(Special::Null)) => false,
+            Some(Typval::Dict(reference)) => {
+                let value = dict_entries(reference)?
+                    .into_iter()
+                    .find(|(key, _)| key.as_bytes() == b"submatches")
+                    .map(|(_, value)| value);
+                match value {
+                    None => false,
+                    Some(Typval::Bool(value)) => value,
+                    Some(Typval::Number(value)) if matches!(value, 0 | 1) => value != 0,
+                    Some(_) => return Err(EvalError::new("E475", 0, "Invalid value for argument submatches")),
+                }
+            }
+            Some(_) => return Err(EvalError::new("E1206", 0, "Dictionary required for argument 3")),
+        };
+
+        let mut matches = Vec::new();
+        for (index, value) in items.iter().enumerate() {
+            let text = match value {
+                Typval::String(text) => text.clone(),
+                Typval::Special(Special::Null) => OxStr(Vec::new()),
+                _ => string_arg(value)?,
+            };
+            let Some(found) = self.regex()?.find_captures(&text, &pattern, 0)? else { continue };
+            let mut entry = vec![
+                (OxStr::from("idx"), Typval::Number(saturating_i64(index))),
+                (OxStr::from("byteidx"), Typval::Number(saturating_i64(found.start))),
+                (OxStr::from("text"), Typval::String(OxStr(text.as_bytes()[found.start..found.end].to_vec()))),
+            ];
+            if include_submatches {
+                let mut captures = found.captures.into_iter().take(9).map(|range| {
+                    Typval::String(range.map_or_else(
+                        || OxStr(Vec::new()),
+                        |(start, end)| OxStr(text.as_bytes()[start..end].to_vec()),
+                    ))
+                }).collect::<Vec<_>>();
+                captures.resize(9, Typval::String(OxStr(Vec::new())));
+                entry.push((OxStr::from("submatches"), Typval::list(captures)));
+            }
+            matches.push(Typval::dict(entry));
+        }
+        Ok(Typval::list(matches))
     }
 
     fn regex_substitute(&self, args: &[Typval]) -> Result<Typval> {
@@ -702,7 +759,7 @@ fn is_implemented(name: &str) -> bool {
         "deepcopy" | "empty" | "escape" | "executable" | "exepath" | "exists" | "extend" | "extendnew" | "filter" | "flatten" |
         "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "get" | "gettext" | "getcwd" | "getpid" | "has" | "has_key" | "hostname" | "index" | "insert" | "items" |
         "indexof" | "isabsolutepath" | "islocked" | "join" | "json_decode" | "json_encode" | "keytrans" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
-        "match" | "matchend" | "matchstr" | "matchlist" | "matchstrpos" | "max" | "min" | "nr2char" | "or" | "pathshorten" | "pow" | "printf" | "range" | "reduce" | "resolve" |
+        "match" | "matchend" | "matchstr" | "matchlist" | "matchstrpos" | "matchstrlist" | "max" | "min" | "nr2char" | "or" | "pathshorten" | "pow" | "printf" | "range" | "reduce" | "resolve" |
         "remove" | "repeat" | "reverse" | "setenv" | "simplify" | "slice" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
         "str2nr" | "strcharlen" | "strchars" | "stridx" | "string" | "strpart" | "strridx" | "strtrans" | "strutf16len" | "strwidth" |
         "substitute" | "tolower" | "toupper" | "tr" | "trim" | "trunc" | "type" | "uniq" | "utf16idx" | "charidx" | "values" | "xor"

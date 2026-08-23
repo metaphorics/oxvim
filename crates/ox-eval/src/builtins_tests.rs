@@ -1204,6 +1204,28 @@ fn matchstrpos_and_matchlist_shape_results() {
 }
 
 #[test]
+fn matchstrlist_reports_each_matching_string_and_validates_options() {
+    let regex = LiteralRegex { calls: Cell::new(0) };
+    let mut builtins = Builtins::new(&regex);
+    let result = builtins.call(
+        &OxStr::from("matchstrlist"),
+        vec![Typval::list(vec![text("about"), text("above"), text("other")]), text("bo")],
+        &mut Scope::new(),
+    ).unwrap();
+    assert_eq!(result, Typval::list(vec![
+        Typval::dict(vec![(OxStr::from("idx"), number(0)), (OxStr::from("byteidx"), number(1)), (OxStr::from("text"), text("bo"))]),
+        Typval::dict(vec![(OxStr::from("idx"), number(1)), (OxStr::from("byteidx"), number(1)), (OxStr::from("text"), text("bo"))]),
+    ]));
+
+    let error = builtins.call(
+        &OxStr::from("matchstrlist"),
+        vec![Typval::list(vec![text("abc")]), text("a"), Typval::list(vec![])],
+        &mut Scope::new(),
+    ).unwrap_err();
+    assert_eq!(error.code, "E1206");
+}
+
+#[test]
 fn small_process_and_path_builtins_match_vim_contracts() {
     assert_eq!(call("getpid", vec![]).unwrap(), number(i64::from(std::process::id())));
     let Typval::String(hostname) = call("hostname", vec![]).unwrap() else { panic!("hostname must return a String") };
