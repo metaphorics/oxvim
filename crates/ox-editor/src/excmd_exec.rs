@@ -925,10 +925,10 @@ fn dispatch<F: FileIO>(
         "vglobal" => command_global(runtime, editor, scope, lua, command, true),
         "substitute" => command_substitute(runtime, editor, scope, command),
         "edit" => command_edit(runtime, editor, command),
-        "read" => command_read(runtime, editor, scope, command),
+        "read" => command_read(runtime, editor, scope, lua, command),
         "enew" => command_enew(runtime, editor, command),
         "write" | "wq" | "xit" => {
-            let flow = command_write(runtime, editor, scope, command);
+            let flow = command_write(runtime, editor, scope, lua, command);
             if matches!(flow, Flow::Normal) && matches!(name, "wq" | "xit") {
                 command_close(runtime, editor, command, true)
             } else {
@@ -2572,12 +2572,21 @@ fn command_buffer_remove<F: FileIO>(
 /// the first non-blank column (`beginline(BL_WHITE | BL_FIX)`). An unreadable
 /// file is E484 and a bare `:read` in a nameless buffer is E32.
 ///
+/// `:read` reaches the buffer through `readfile`, so it carries `readfile`'s
+/// autocommands. The file form fires `FileReadCmd` first, and a matching
+/// definition *replaces* the read (`fileio.c:336-340`); otherwise
+/// `FileReadPre` runs before the insert (`fileio.c:640`) and `FileReadPost`
+/// after it (`fileio.c:1925`). The filter form reads with `READ_FILTER`, so it
+/// fires `FilterReadPre`/`FilterReadPost` instead (`fileio.c:631,1914`), and
+/// `do_bang` adds `ShellFilterPost` (`ex_cmds.c:1236`).
+///
 /// Upstream's `"name" 2L, 4B` file report is not emitted: no command in this
 /// port has a file-message model, `:edit` included.
 fn command_read<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
 ) -> Flow {
     let Some(buffer) = editor.current_buffer() else {
@@ -2588,11 +2597,19 @@ fn command_read<F: FileIO>(
         Err(message) => return error_flow(runtime, "E16", message),
     };
 
+    let mut matched = None;
     let lines = if command.usefilter {
-        match filter_output(runtime, scope, &command.args) {
+        let output = match filter_output(runtime, scope, &command.args) {
             Ok(lines) => lines,
             Err(flow) => return flow,
+        };
+        // readfile(READ_FILTER) fires FilterReadPre once the shell has produced
+        // its output and before the lines land.
+        let flow = fire_read_autocmd(runtime, editor, scope, lua, Event::FilterReadPre, None);
+        if !matches!(flow, Flow::Normal) {
+            return flow;
         }
+        output
     } else {
         let name = command.args.trim();
         let path = if name.is_empty() {
@@ -2607,34 +2624,108 @@ fn command_read<F: FileIO>(
         } else {
             argument_path(editor, name)
         };
-        match runtime.scripts.io().read_bytes(&path) {
-            Ok(bytes) => split_read_lines(&bytes),
+        let name = path.to_string_lossy().into_owned();
+        // FileReadCmd intercepts: when a definition matches, it does the read
+        // itself and this command performs none of its own work.
+        let plan = editor.autocmds_mut().plan(
+            Event::FileReadCmd,
+            AutocmdContext { buffer: None, file_name: Some(&name), ..AutocmdContext::default() },
+        );
+        if !plan.ready.is_empty() {
+            return run_autocmd_plan(runtime, editor, scope, lua, plan);
+        }
+        let flow = fire_read_autocmd(runtime, editor, scope, lua, Event::FileReadPre, Some(&name));
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
+        let bytes = match runtime.scripts.io().read_bytes(&path) {
+            Ok(bytes) => bytes,
             Err(_) => {
                 return error_flow(runtime, "E484", format!("Can't open file {}", path.display()));
             }
-        }
+        };
+        matched = Some(name);
+        split_read_lines(&bytes)
     };
-    if lines.is_empty() {
-        return Flow::Normal;
-    }
 
-    let window = editor.current_window();
-    let cursor = window
-        .and_then(|window| editor.window(window).ok())
-        .map_or(Position { lnum: after.max(1), col: 0 }, |state| state.cursor);
-    if let Err(error) = editor.append_buffer_lines(buffer, after, &lines, cursor, 0) {
-        return error_flow(runtime, "E484", error.to_string());
-    }
-    let target = if command.usefilter { after + lines.len() } else { after + 1 };
-    let column = lines
-        .get(if command.usefilter { lines.len() - 1 } else { 0 })
-        .map_or(0, |line| line.iter().take_while(|byte| matches!(byte, b' ' | b'\t')).count());
-    if let Some(window) = window {
-        if let Err(error) = editor.set_window_cursor(window, Position { lnum: target, col: column }) {
+    if !lines.is_empty() {
+        let window = editor.current_window();
+        let cursor = window
+            .and_then(|window| editor.window(window).ok())
+            .map_or(Position { lnum: after.max(1), col: 0 }, |state| state.cursor);
+        if let Err(error) = editor.append_buffer_lines(buffer, after, &lines, cursor, 0) {
             return error_flow(runtime, "E484", error.to_string());
         }
+        let target = if command.usefilter { after + lines.len() } else { after + 1 };
+        let column = lines
+            .get(if command.usefilter { lines.len() - 1 } else { 0 })
+            .map_or(0, |line| line.iter().take_while(|byte| matches!(byte, b' ' | b'\t')).count());
+        if let Some(window) = window {
+            if let Err(error) = editor.set_window_cursor(window, Position { lnum: target, col: column }) {
+                return error_flow(runtime, "E484", error.to_string());
+            }
+        }
     }
-    Flow::Normal
+
+    // Both post events fire even for an empty read: upstream's readfile runs
+    // them on the way out regardless of how many lines arrived.
+    let post = if command.usefilter { Event::FilterReadPost } else { Event::FileReadPost };
+    let flow = fire_read_autocmd(runtime, editor, scope, lua, post, matched.as_deref());
+    if !matches!(flow, Flow::Normal) || !command.usefilter {
+        return flow;
+    }
+    fire_shell_filter_post(runtime, editor, scope, lua)
+}
+
+/// Runs one `readfile` autocommand event.
+///
+/// `matched` is the file name upstream matches the pattern against for the
+/// `FileRead*` events, which pass `sfname` with a null buffer
+/// (`fileio.c:336,640,1925`). The `Filter*` events pass a null name and
+/// `curbuf` instead, so they match the current buffer's name, as
+/// `:help FilterReadPre` documents.
+fn fire_read_autocmd<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    event: Event,
+    matched: Option<&str>,
+) -> Flow {
+    let (buffer, name) = match matched {
+        Some(name) => (None, name.to_owned()),
+        None => (editor.current_buffer(), current_buffer_name(editor)),
+    };
+    let plan = editor.autocmds_mut().plan(
+        event,
+        AutocmdContext { buffer, file_name: Some(&name), ..AutocmdContext::default() },
+    );
+    run_autocmd_plan(runtime, editor, scope, lua, plan)
+}
+
+/// `ShellFilterPost`, which `do_bang` applies after every ranged `do_filter`
+/// run whether or not the filter produced output (`ex_cmds.c:1236`).
+fn fire_shell_filter_post<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+) -> Flow {
+    let name = current_buffer_name(editor);
+    let buffer = editor.current_buffer();
+    let plan = editor.autocmds_mut().plan(
+        Event::ShellFilterPost,
+        AutocmdContext { buffer, file_name: Some(&name), ..AutocmdContext::default() },
+    );
+    run_autocmd_plan(runtime, editor, scope, lua, plan)
+}
+
+fn current_buffer_name(editor: &Editor) -> String {
+    editor
+        .current_buffer()
+        .and_then(|buffer| editor.buffer(buffer).ok())
+        .map(|state| state.name().to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Splits read bytes into buffer lines. A trailing newline terminates the last
@@ -2672,9 +2763,9 @@ fn filter_output<F: FileIO>(
     Ok(split_read_lines(&output.stdout))
 }
 
-fn command_write<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, command: &ExCommand) -> Flow {
+fn command_write<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope: &mut Scope, lua: Option<&Rc<RefCell<dyn LuaExec>>>, command: &ExCommand) -> Flow {
     if command.usefilter {
-        return command_write_filter(runtime, editor, scope, command);
+        return command_write_filter(runtime, editor, scope, lua, command);
     }
     let buffer = match editor.current_buffer() {
         Some(buffer) => buffer,
@@ -2717,10 +2808,15 @@ fn command_write<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, sco
 /// and its modified state untouched. The addressed range defaults to the
 /// whole buffer (`EX_DFLALL`), and the command's exit status lands in
 /// `v:shell_error`.
+///
+/// `do_bang` applies `ShellFilterPost` after the filter returns
+/// (`ex_cmds.c:1236`). This form reads nothing back, so it fires no
+/// `FilterRead*` events.
 fn command_write_filter<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
 ) -> Flow {
     let shell_command = command.args.trim();
@@ -2769,7 +2865,7 @@ fn command_write_filter<F: FileIO>(
         }
     };
     replace_scope_pair(&mut scope.vim, "shell_error", Typval::Number(i64::from(status)));
-    Flow::Normal
+    fire_shell_filter_post(runtime, editor, scope, lua)
 }
 
 fn command_split<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand, vertical: bool) -> Flow {

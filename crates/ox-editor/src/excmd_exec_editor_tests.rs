@@ -1291,3 +1291,95 @@ fn each_address_domain_gets_its_own_limit() {
     assert_vim_error(executor.execute_line(&mut editor, "99close"), "E16");
     assert_vim_error(executor.execute_line(&mut editor, "99buffer"), "E16");
 }
+
+// ---------------------------------------------------------------------------
+// :read carries readfile()'s autocommands.
+// Citations: fileio.c:336-340 FileReadCmd, fileio.c:631,640 the Pre events,
+// fileio.c:1914,1925 the Post events, ex_cmds.c:1236 ShellFilterPost.
+// ---------------------------------------------------------------------------
+
+/// `:read {file}` fires `FileReadPre` before the lines land and
+/// `FileReadPost` after, both matched against the file name rather than the
+/// buffer name.
+#[test]
+fn read_file_fires_the_file_read_events() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.scripts().io().insert("in.txt", "x\n");
+    executor
+        .execute_line(&mut editor, "autocmd FileReadPre *.txt let g:pre = line('$')")
+        .unwrap();
+    executor
+        .execute_line(&mut editor, "autocmd FileReadPost *.txt let g:post = line('$')")
+        .unwrap();
+    executor.execute_line(&mut editor, "1read in.txt").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "x"]);
+    // Pre runs while the buffer is still one line, Post once it is two: the
+    // events straddle the insert instead of both landing on one side.
+    assert_eq!(global_value(&executor, "pre"), Some(ox_types::Typval::Number(1)));
+    assert_eq!(global_value(&executor, "post"), Some(ox_types::Typval::Number(2)));
+}
+
+/// A matching `FileReadCmd` definition replaces the read: the command does
+/// none of its own work, so the file's contents never reach the buffer
+/// (`fileio.c:336-340`).
+#[test]
+fn read_file_read_cmd_replaces_the_read() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.scripts().io().insert("in.txt", "x\n");
+    executor
+        .execute_line(&mut editor, "autocmd FileReadCmd *.txt let g:intercepted = 1")
+        .unwrap();
+    executor
+        .execute_line(&mut editor, "autocmd FileReadPre *.txt let g:unexpected_pre = 1")
+        .unwrap();
+    executor.execute_line(&mut editor, "1read in.txt").unwrap();
+    assert!(global_flag(&executor, "intercepted"));
+    // Interception happens before FileReadPre and before the insert.
+    assert!(!global_flag(&executor, "unexpected_pre"));
+    assert_eq!(buffer_text(&editor), vec!["a"]);
+}
+
+/// `:read !cmd` reads with `READ_FILTER`, so it fires the `FilterRead`
+/// events rather than the `FileRead` ones, and `do_bang` adds
+/// `ShellFilterPost` on the way out.
+#[test]
+fn read_filter_fires_the_filter_and_shell_events() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor
+        .execute_line(&mut editor, "autocmd FilterReadPre * let g:pre = line('$')")
+        .unwrap();
+    executor
+        .execute_line(&mut editor, "autocmd FilterReadPost * let g:post = line('$')")
+        .unwrap();
+    executor
+        .execute_line(&mut editor, "autocmd ShellFilterPost * let g:shell = 1")
+        .unwrap();
+    executor
+        .execute_line(&mut editor, "autocmd FileReadPost * let g:unexpected_file = 1")
+        .unwrap();
+    executor
+        .execute_line(&mut editor, "1read !printf 'p\\n'")
+        .unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "p"]);
+    assert_eq!(global_value(&executor, "pre"), Some(ox_types::Typval::Number(1)));
+    assert_eq!(global_value(&executor, "post"), Some(ox_types::Typval::Number(2)));
+    assert!(global_flag(&executor, "shell"));
+    // The filter form is not a file read.
+    assert!(!global_flag(&executor, "unexpected_file"));
+}
+
+/// `:write !cmd` reads nothing back, so it fires `ShellFilterPost` and no
+/// `FilterRead*` events.
+#[test]
+fn write_filter_fires_shell_filter_post_only() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor
+        .execute_line(&mut editor, "autocmd ShellFilterPost * let g:shell = 1")
+        .unwrap();
+    executor
+        .execute_line(&mut editor, "autocmd FilterReadPost * let g:unexpected_read = 1")
+        .unwrap();
+    executor.execute_line(&mut editor, "write !cat >/dev/null").unwrap();
+    assert!(global_flag(&executor, "shell"));
+    assert!(!global_flag(&executor, "unexpected_read"));
+}
