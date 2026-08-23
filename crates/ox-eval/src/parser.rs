@@ -534,29 +534,40 @@ impl<'a> Parser<'a> {
             return Ok(Expr::new(ExprKind::Dict(entries), Span::new(start, close.span.end)));
         }
         loop {
+            // `get_literal_key` (eval.c:4458-4472) scans raw bytes, not tokens:
+            // the key is a run of ASCII alphanumerics, `_` and `-`, and white
+            // space may follow it before the colon.
             let key_start = self.current().span.start;
             let mut key_end = key_start;
-            while !matches!(self.current().kind, TokenKind::Colon | TokenKind::Eof | TokenKind::RBrace) {
-                if self.current().span.start != key_end && key_end != key_start {
-                    return Err(EvalError::new("E720", self.current().span.start, "white space in literal dictionary key"));
-                }
-                key_end = self.current().span.end;
-                self.advance();
+            while self
+                .source
+                .get(key_end)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                key_end += 1;
             }
             if key_end == key_start {
-                return Err(EvalError::new("E720", key_start, "literal dictionary key is missing"));
-            }
-            let key_bytes = &self.source[key_start..key_end];
-            if key_bytes
-                .iter()
-                .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
-            {
-                return Err(EvalError::new("E720", key_start, "invalid literal dictionary key"));
+                // The key is not a literal key at all, so upstream abandons the
+                // dictionary entirely and reports the whole expression as
+                // invalid (`eval_dict` FAIL -> `e_invexpr2`, eval.c:4512-4514).
+                let rest = String::from_utf8_lossy(&self.source[start..]);
+                return Err(EvalError::new("E15", start, format!("Invalid expression: \"{rest}\"")));
             }
             let key = Expr::new(
-                ExprKind::Literal(Typval::String(OxStr(key_bytes.to_vec()))),
+                ExprKind::Literal(Typval::String(OxStr(self.source[key_start..key_end].to_vec()))),
                 Span::new(key_start, key_end),
             );
+            let mut colon = key_end;
+            while matches!(self.source.get(colon), Some(b' ' | b'\t')) {
+                colon += 1;
+            }
+            if self.source.get(colon) != Some(&b':') {
+                let rest = String::from_utf8_lossy(&self.source[colon..]);
+                return Err(EvalError::new("E720", colon, format!("Missing colon in Dictionary: {rest}")));
+            }
+            while self.current().span.start < colon && !matches!(self.current().kind, TokenKind::Eof) {
+                self.advance();
+            }
             self.require(|kind| matches!(kind, TokenKind::Colon), "E720", "missing ':' in dictionary")?;
             let value = self.parse_expr1()?;
             entries.push((key, value));

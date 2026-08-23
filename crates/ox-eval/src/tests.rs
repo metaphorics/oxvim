@@ -626,3 +626,56 @@ fn white_space_before_call_parenthesis_stays_an_error_in_the_subscript_chain() {
     assert_eq!(error(b"[1, 2][0] (1)").code, "E488");
     assert_eq!(error(b"len([1]) (1)").code, "E488");
 }
+
+// ---------------------------------------------------------------------------
+// Literal dictionary keys
+// Upstream: `get_literal_key` (eval.c:4458-4472) accepts a run of ASCII
+// alphanumerics, `_` and `-`, then skips white space; `eval_dict`
+// (eval.c:4512-4519) turns a failed key into E15 for the whole expression and
+// a missing colon into E720. Exercised by `test_listdict.vim` `Test_dict`.
+// ---------------------------------------------------------------------------
+
+/// Normal case: a bare key, a key holding `-` and digits, and white space
+/// between the key and its colon all parse.
+#[test]
+fn literal_dictionary_accepts_upstream_key_characters() {
+    assert_eq!(value(b"#{a: 1}"), value(b"{'a': 1}"));
+    assert_eq!(value(b"#{a-b_2: 1}"), value(b"{'a-b_2': 1}"));
+    assert_eq!(value(b"#{a : 1}"), value(b"{'a': 1}"));
+}
+
+/// Boundary: a digit-leading key is still a literal key, and `#{}` is the empty
+/// dictionary rather than a key error.
+#[test]
+fn literal_dictionary_key_boundary_cases() {
+    assert_eq!(value(b"#{1: 'x'}"), value(b"{'1': 'x'}"));
+    assert_eq!(value(b"#{-: 1}"), value(b"{'-': 1}"));
+    assert_eq!(value(b"#{}"), value(b"{}"));
+}
+
+/// Documented error: a first byte that cannot start a literal key makes
+/// upstream abandon the dictionary and report the *whole* expression as
+/// invalid, quoting it. A quoted key is the same failure — `#{'a': 1}` is not
+/// a literal dictionary, however reasonable it looks.
+#[test]
+fn literal_dictionary_rejects_a_non_literal_key_with_e15() {
+    for source in [&b"#{++ : 10}"[..], b"#{: 1}", b"#{'a': 1}"] {
+        let failure = error(source);
+        assert_eq!(failure.code, "E15", "{}", String::from_utf8_lossy(source));
+        assert_eq!(
+            failure.message,
+            format!("Invalid expression: \"{}\"", String::from_utf8_lossy(source))
+        );
+    }
+}
+
+/// A malformed variant that upstream rejects differently: the key is valid but
+/// no colon follows, which stays E720 and quotes the remainder from the first
+/// byte after the skipped white space.
+#[test]
+fn literal_dictionary_missing_colon_stays_e720() {
+    let failure = error(b"#{a 1}");
+    assert_eq!(failure.code, "E720");
+    assert_eq!(failure.message, "Missing colon in Dictionary: 1}");
+    assert_eq!(error(b"#{a.b: 1}").message, "Missing colon in Dictionary: .b: 1}");
+}
