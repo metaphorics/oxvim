@@ -907,6 +907,9 @@ fn dispatch<F: FileIO>(
         }
         "split" | "new" => command_split(runtime, editor, command, false),
         "vsplit" => command_split(runtime, editor, command, true),
+        "resize" => command_resize(runtime, editor, command),
+        "wincmd" => command_wincmd(runtime, editor, command),
+        "echohl" => command_echohl(runtime, editor, command),
         "close" => command_close(runtime, editor, command, false),
         "only" => command_only(runtime, editor),
         "quit" => command_close(runtime, editor, command, true),
@@ -1046,6 +1049,21 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         }
         if name_text == "virtcol" {
             return call_virtcol_builtin(self.editor, args);
+        }
+        if matches!(&*name_text, "winwidth" | "winheight" | "win_getid") {
+            return call_window_builtin(self.editor, &name_text, args);
+        }
+        if matches!(&*name_text, "screenattr" | "screenchar" | "screenchars" | "screenstring") {
+            return call_screen_builtin(self.editor, &name_text, args);
+        }
+        if name_text == "getbufvar" {
+            return call_getbufvar_builtin(self.editor, scope, args);
+        }
+        if name_text == "fullcommand" {
+            return call_fullcommand_builtin(self.runtime, args);
+        }
+        if name_text == "eventhandler" {
+            return Ok(Typval::Number(0));
         }
         if matches!(&*name_text, "getchar" | "getcharstr") {
             return call_getchar_builtin(self.editor, &name_text, args);
@@ -1390,6 +1408,153 @@ fn call_systemlist_builtin<F: FileIO>(
     Ok(Typval::list(lines))
 }
 
+fn call_window_builtin(editor: &Editor, name: &str, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    if name == "win_getid" {
+        let window_number = args.first().and_then(typval_number).unwrap_or(0);
+        let tab_number = args.get(1).and_then(typval_number).unwrap_or(0);
+        let tab = if tab_number <= 0 {
+            editor.current_tabpage()
+        } else {
+            usize::try_from(tab_number - 1).ok().and_then(|index| editor.tabpages().get(index).copied())
+        };
+        let window = tab.and_then(|tab| {
+            let windows = editor.tabpage_windows(tab).ok()?;
+            if window_number <= 0 {
+                editor.current_window().filter(|window| windows.contains(window))
+            } else {
+                usize::try_from(window_number - 1).ok().and_then(|index| windows.get(index).copied())
+            }
+        });
+        return Ok(Typval::Number(window.map_or(0, i64::from)));
+    }
+
+    let number = args.first().and_then(typval_number).unwrap_or(-1);
+    let Some(tab) = editor.current_tabpage() else { return Ok(Typval::Number(-1)); };
+    let windows = editor.tabpage_windows(tab).unwrap_or_default();
+    let window = if number == 0 {
+        editor.current_window()
+    } else {
+        usize::try_from(number - 1).ok().and_then(|index| windows.get(index).copied())
+    };
+    let value = window
+        .and_then(|window| editor.window_geometry(window).ok())
+        .map_or(-1, |geometry| i64::try_from(if name == "winwidth" { geometry.width } else { geometry.height }).unwrap_or(i64::MAX));
+    Ok(Typval::Number(value))
+}
+
+fn command_resize<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    let height = command.args.trim().parse::<usize>().unwrap_or(1).max(1);
+    let Some(window) = editor.current_window() else { return error_flow(runtime, "E443", "Cannot rotate when another window is split"); };
+    match editor.set_window_height(window, height) {
+        Ok(()) => Flow::Normal,
+        Err(error) => error_flow(runtime, "E36", error.to_string()),
+    }
+}
+
+fn command_wincmd<F: FileIO>(runtime: &ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    let Some(key) = command.args.trim().chars().next() else { return error_flow(runtime, "E474", "Invalid argument"); };
+    let Some(tab) = editor.current_tabpage() else { return Flow::Normal; };
+    let windows = editor.tabpage_windows(tab).unwrap_or_default();
+    let Some(current) = editor.current_window() else { return Flow::Normal; };
+    let next = match key {
+        'w' => windows.iter().position(|window| *window == current).and_then(|index| windows.get((index + 1) % windows.len())).copied(),
+        'W' => windows.iter().position(|window| *window == current).and_then(|index| windows.get((index + windows.len() - 1) % windows.len())).copied(),
+        'h' | 'j' | 'k' | 'l' => directional_window(editor, current, &windows, key),
+        _ => return error_flow(runtime, "E474", format!("Invalid argument: {key}")),
+    };
+    match next.map(|window| editor.set_current_window(window)) {
+        None | Some(Ok(())) => Flow::Normal,
+        Some(Err(error)) => error_flow(runtime, "E957", error.to_string()),
+    }
+}
+
+fn directional_window(editor: &Editor, current: WinHandle, windows: &[WinHandle], key: char) -> Option<WinHandle> {
+    let origin = editor.window_geometry(current).ok()?;
+    windows.iter().copied().filter(|window| *window != current).filter_map(|window| {
+        let geometry = editor.window_geometry(window).ok()?;
+        let distance = match key {
+            'h' if geometry.col < origin.col => origin.col - geometry.col,
+            'l' if geometry.col > origin.col => geometry.col - origin.col,
+            'k' if geometry.row < origin.row => origin.row - geometry.row,
+            'j' if geometry.row > origin.row => geometry.row - origin.row,
+            _ => return None,
+        };
+        Some((distance, window))
+    }).min_by_key(|(distance, _)| *distance).map(|(_, window)| window)
+}
+
+fn command_echohl<F: FileIO>(_runtime: &ExRuntime<F>, _editor: &mut Editor, _command: &ExCommand) -> Flow {
+    Flow::Normal
+}
+
+fn call_screen_builtin(editor: &Editor, name: &str, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    let row = args.first().and_then(typval_number).unwrap_or(0);
+    let column = args.get(1).and_then(typval_number).unwrap_or(0);
+    let cell = screen_cell(editor, row, column);
+    Ok(match name {
+        "screenattr" => Typval::Number(if cell.is_some() { 0 } else { -1 }),
+        "screenchar" => Typval::Number(cell.as_ref().and_then(|text| text.chars().next()).map_or(-1, |character| i64::from(character as u32))),
+        "screenchars" => Typval::list(cell.as_ref().and_then(|text| text.chars().next()).map(|character| vec![Typval::Number(i64::from(character as u32))]).unwrap_or_default()),
+        "screenstring" => Typval::String(OxStr::from(cell.as_deref().unwrap_or(""))),
+        _ => unreachable!(),
+    })
+}
+
+fn screen_cell(editor: &Editor, row: i64, column: i64) -> Option<String> {
+    let row = usize::try_from(row.checked_sub(1)?).ok()?;
+    let column = usize::try_from(column.checked_sub(1)?).ok()?;
+    for window in editor.windows() {
+        let geometry = editor.window_geometry(window).ok()?;
+        if row < geometry.row || row >= geometry.row + geometry.height || column < geometry.col || column >= geometry.col + geometry.width {
+            continue;
+        }
+        let state = editor.window(window).ok()?;
+        let line = state.topline + row - geometry.row;
+        let bytes = editor.buffer(state.buffer).ok()?.text().ok()?.line(line).ok()?;
+        let text = String::from_utf8_lossy(&bytes);
+        let cell = text.chars().nth(column - geometry.col).map(|character| character.to_string()).unwrap_or_else(|| " ".to_owned());
+        return Some(cell);
+    }
+    None
+}
+
+fn call_getbufvar_builtin(editor: &Editor, scope: &Scope, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    let fallback = args.get(2).cloned().unwrap_or_else(|| Typval::String(OxStr(Vec::new())));
+    let Some(buffer) = resolve_buffer_argument(editor, args.first()) else { return Ok(fallback); };
+    let name = args.get(1).map(typval_to_text).unwrap_or_default();
+    let state = editor.buffer(buffer).map_err(|error| EvalError::new("E86", 0, error.to_string()))?;
+    if let Some(option) = name.strip_prefix('&') {
+        let Some(metadata) = crate::option_metadata(option) else { return Ok(fallback); };
+        let value = if metadata.scopes.contains(&OptionScope::Buffer) {
+            editor.options().get_buffer(buffer, metadata.name).ok()
+        } else {
+            editor.options().get_global(metadata.name).ok()
+        };
+        return Ok(value.map_or(fallback, option_to_typval));
+    }
+    if name.is_empty() {
+        let mut entries = if editor.current_buffer() == Some(buffer) {
+            scope.buffer.clone()
+        } else {
+            state.variables().0.iter().map(|(key, value)| (key.clone(), object_to_typval(value))).collect::<Vec<_>>()
+        };
+        entries.retain(|(key, _)| key.as_bytes() != b"changedtick");
+        entries.push((OxStr::from("changedtick"), Typval::Number(i64::try_from(state.changedtick()).unwrap_or(i64::MAX))));
+        return Ok(Typval::dict(entries));
+    }
+    if editor.current_buffer() == Some(buffer) {
+        return Ok(scope.buffer.iter().find(|(key, _)| key.as_bytes() == name.as_bytes()).map_or(fallback, |(_, value)| value.clone()));
+    }
+    Ok(state.variables().0.iter().find(|(key, _)| key.as_bytes() == name.as_bytes()).map_or(fallback, |(_, value)| object_to_typval(value)))
+}
+
+fn call_fullcommand_builtin<F: FileIO>(runtime: &ExRuntime<F>, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    let Some(Typval::String(command)) = args.first() else { return Ok(Typval::String(OxStr(Vec::new()))); };
+    let command = command.to_string_lossy();
+    let resolved = resolve_command(&command, &runtime.user_commands).ok().map_or_else(String::new, |command| command.name().to_owned());
+    Ok(Typval::String(OxStr::from(resolved.as_str())))
+}
+
 /// `luaeval({expr}[, {arg}])`: eval/funcs.c `f_luaeval` → lua/executor.c
 /// `nlua_call_luaeval`. The host compiles `local _A=select(1,...) return
 /// (<expr>)` and converts the argument and result with typval semantics.
@@ -1452,7 +1617,7 @@ fn call_luaeval_builtin<F: FileIO>(
 }
 
 fn call_assert_builtin<F: FileIO>(
-    runtime: &ExRuntime<F>,
+    runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     name: &str,
     args: Vec<Typval>,
@@ -1691,7 +1856,7 @@ fn resolve_buffer_argument(editor: &Editor, argument: Option<&Typval>) -> Option
         Some(Typval::Number(number)) => BufHandle::try_from(*number)
             .ok()
             .filter(|buffer| editor.buffer(*buffer).is_ok()),
-        Some(Typval::String(name)) if name.as_bytes().is_empty() => editor.current_buffer(),
+        Some(Typval::String(name)) if name.as_bytes().is_empty() || name.as_bytes() == b"%" => editor.current_buffer(),
         Some(Typval::String(name)) => editor
             .buffers()
             .into_iter()
@@ -5376,7 +5541,7 @@ fn input_string_arg(value: &Typval) -> ox_eval::Result<OxStr> {
     }
 }
 
-fn call_function_builtin<F: FileIO>(runtime: &ExRuntime<F>, kind: &str, mut args: Vec<Typval>) -> ox_eval::Result<Typval> {
+fn call_function_builtin<F: FileIO>(runtime: &mut ExRuntime<F>, kind: &str, mut args: Vec<Typval>) -> ox_eval::Result<Typval> {
     if args.is_empty() || args.len() > 3 {
         return Err(EvalError::new(if args.is_empty() { "E119" } else { "E118" }, 0, format!("Invalid arguments for {kind}")));
     }

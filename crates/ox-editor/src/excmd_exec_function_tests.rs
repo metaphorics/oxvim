@@ -510,7 +510,7 @@ fn evaluator_error_inside_user_function_enters_caller_catch_frame() {
         &mut editor,
         concat!(
             "function! BrokenBuiltin()\n",
-            "return screenattr(1, 1)\n",
+            "return screenrow()\n",
             "endfunction\n",
             "let g:caught = 0\n",
             "let g:finalized = 0\n",
@@ -527,7 +527,7 @@ fn evaluator_error_inside_user_function_enters_caller_catch_frame() {
     );
     assert_eq!(global_number(exec.scope(), "caught"), Some(1));
     assert_eq!(global_number(exec.scope(), "finalized"), Some(1));
-    assert_eq!(global_string(exec.scope(), "exception").as_deref(), Some("E117: not implemented: screenattr"));
+    assert_eq!(global_string(exec.scope(), "exception").as_deref(), Some("E117: not implemented: screenrow"));
     assert_eq!(global_string(exec.scope(), "throwpoint").as_deref(), Some("function BrokenBuiltin[1]..script <test>[1]"));
 }
 
@@ -1228,6 +1228,42 @@ fn systemlist_uses_job_channels_for_shell_and_argv_forms() {
     assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"kept", 0).unwrap(), &Typval::list(vec![Typval::String(OxStr::from("x")), Typval::String(OxStr::from(""))]));
     assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"failed", 0).unwrap(), &Typval::list(vec![Typval::String(OxStr::from("bad"))]));
     assert_eq!(exec.scope().get_scoped(ScopeKind::Vim, b"shell_error", 0).unwrap(), &Typval::Number(7));
+}
+
+#[test]
+fn window_screen_and_state_builtins_use_editor_state() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    let window = editor.create_tabpage(buffer, Geometry::new(0, 0, 20, 6).unwrap()).unwrap();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_script(&mut editor, "builtins.vim", concat!(
+        "call setline(1, '口x')\n",
+        "let b:answer = 42\n",
+        "let g:id = win_getid()\n",
+        "let g:width = winwidth(0)\n",
+        "let g:height = winheight(0)\n",
+        "let g:attr = screenattr(1, 1)\n",
+        "let g:char = screenchar(1, 1)\n",
+        "let g:chars = screenchars(1, 1)\n",
+        "let g:text = screenstring(1, 1)\n",
+        "let g:missing = screenchar(-1, -1)\n",
+        "let g:bufvar = getbufvar(bufnr('%'), 'answer')\n",
+        "let g:command = fullcommand('res')\n",
+        "let g:event = eventhandler()\n",
+    )).unwrap();
+
+    assert_eq!(global_number(exec.scope(), "id"), Some(i64::from(window)));
+    assert_eq!(global_number(exec.scope(), "width"), Some(20));
+    assert_eq!(global_number(exec.scope(), "height"), Some(6));
+    assert_eq!(global_number(exec.scope(), "attr"), Some(0));
+    assert_eq!(global_number(exec.scope(), "char"), Some(i64::from('口' as u32)));
+    assert_eq!(global_number(exec.scope(), "missing"), Some(-1));
+    assert_eq!(global_number(exec.scope(), "bufvar"), Some(42));
+    assert_eq!(global_string(exec.scope(), "command").as_deref(), Some("resize"));
+    assert_eq!(global_number(exec.scope(), "event"), Some(0));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"chars", 0).unwrap(), &Typval::list(vec![Typval::Number(i64::from('口' as u32))]));
+    assert_eq!(global_string(exec.scope(), "text").as_deref(), Some("口"));
 }
 
 #[test]

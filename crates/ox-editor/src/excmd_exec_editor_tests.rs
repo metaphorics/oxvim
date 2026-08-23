@@ -330,6 +330,26 @@ fn vsplit_creates_second_window() {
     assert_eq!(editor.windows().len(), 2);
 }
 
+#[test]
+fn resize_wincmd_and_echohl_mutate_existing_editor_state() {
+    let (mut editor, mut executor) = setup();
+    let original = editor.current_window().unwrap();
+    executor.execute_line(&mut editor, "split").unwrap();
+    let split = editor.current_window().unwrap();
+    assert_ne!(split, original);
+
+    executor.execute_line(&mut editor, "resize 2").unwrap();
+    assert_eq!(editor.window_geometry(split).unwrap().height, 2);
+    executor.execute_line(&mut editor, "wincmd w").unwrap();
+    assert_eq!(editor.current_window(), Some(original));
+    executor.execute_line(&mut editor, "echohl Search").unwrap();
+    executor.execute_line(&mut editor, "echo 'visible'").unwrap();
+    executor.execute_line(&mut editor, "echohl None").unwrap();
+    assert!(editor.messages().iter().any(|message| {
+        matches!(&message.content, ox_types::Object::String(text) if text.as_bytes() == b"visible")
+    }));
+}
+
 /// `:close` on an unmodified buffer in a multi-window tabpage closes the
 /// current window and reduces the window count.
 /// Upstream: `ex_docmd.c` `ex_close` → `win_close`.
