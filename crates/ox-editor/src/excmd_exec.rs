@@ -5741,6 +5741,24 @@ fn call_virtcol_builtin(editor: &Editor, args: Vec<Typval>) -> ox_eval::Result<T
         end = if byte == b'\t' { ((end / tabstop) + 1) * tabstop } else { end.saturating_add(1) };
         if index >= position.col { break; }
     }
+    let showbreak_width = match editor.options().get_window(window, "showbreak") {
+        Ok(OptionValue::String(value)) => value.chars().count(),
+        _ => 0,
+    };
+    if showbreak_width > 0 {
+        let width = editor.window_geometry(window).map(|geometry| geometry.width).unwrap_or(0);
+        let continuation = width.saturating_sub(showbreak_width).max(1);
+        let wrapped_column = |column: usize| {
+            if column <= width {
+                column
+            } else {
+                let wraps = 1 + (column - width - 1) / continuation;
+                column.saturating_add(wraps.saturating_mul(showbreak_width))
+            }
+        };
+        start = wrapped_column(start);
+        end = wrapped_column(end);
+    }
     let start = Typval::Number(i64::try_from(start).unwrap_or(i64::MAX));
     let end = Typval::Number(i64::try_from(end).unwrap_or(i64::MAX));
     Ok(if list_result { Typval::list(vec![start, end]) } else { end })

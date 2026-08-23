@@ -1359,3 +1359,30 @@ fn position_builtins_round_trip_and_expand_tabs() {
     assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"column", 0), Ok(&Typval::Number(8)));
     assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"span", 0), Ok(&Typval::list(vec![Typval::Number(4), Typval::Number(8)])));
 }
+
+#[test]
+fn virtcol_counts_showbreak_on_wrapped_continuation_rows() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    let tab = editor.create_tabpage(buffer, Geometry::new(0, 0, 10, 6).unwrap()).unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.options_mut().set_window(window, "showbreak", OptionValue::String("!!".to_owned())).unwrap();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &mut editor,
+        "virtcol_showbreak.vim",
+        &format!(
+            "call setline(1, 'aaaaaaaaaaaa')\nlet g:first = virtcol([1, 10], v:true, {})\nlet g:wrapped = virtcol([1, 11], v:true, {})",
+            i64::from(window),
+            i64::from(window),
+        ),
+    ).unwrap();
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"first", 0),
+        Ok(&Typval::list(vec![Typval::Number(10), Typval::Number(10)]))
+    );
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"wrapped", 0),
+        Ok(&Typval::list(vec![Typval::Number(13), Typval::Number(13)]))
+    );
+}
