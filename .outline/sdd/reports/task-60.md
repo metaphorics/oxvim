@@ -93,11 +93,24 @@ the throwpoint line numbers are wrong: the abort is reported at `function RunThe
   and no output: total silent loss of the record, replacing a pass 1 panic with something less visible.
   The missing subsystem is the exit sequence in `getout()`
   (`.references/neovim/src/nvim/main.c`).
-- D4. `test_alot.vim` (after 16.8 s of work) and `test_expand.vim` abort in `FinishTesting()` with
-  `E212: Can't open file for writing: No such file or directory`, writing the relative path `test.log`.
-  `ENOENT` on a relative path means the process cwd no longer exists, so `RunTheTest`'s
-  `exe 'cd ' . save_cwd` did not restore it. Both were pass 1 timeouts, so this is newly visible rather
-  than newly broken.
+- D4, and the one that matters most. `test_alot.vim` (after 16.8 s of work) and `test_expand.vim` abort
+  in `FinishTesting()` with `E212: Can't open file for writing: No such file or directory` while
+  writing `test.log`, because by then the process working directory has been recursively deleted.
+  `setup.vim:115` sandboxes the home directory with `let $HOME = expand(getcwd() . '/XfakeHOME')`, but
+  oxvim does not export a vim-level `let $VAR` into child environments: `$HOME` reads back as
+  `<cwd>/XfakeHOME` inside oxvim while `system('printf %s "$HOME"')` returns the inherited value, where
+  upstream's env branch in `.references/neovim/src/nvim/eval/vars.c` calls `vim_setenv`/`os_setenv`.
+  `test_expand.vim:37` then creates a directory named literally `Xdir ~ dir`, and
+  `Delete_Xtest_Files()` cleans up with `call system('rm -rf  ' .. file)`
+  (`.references/neovim/test/old/testdir/runtest.vim:472`); the shell word-splits the name and expands
+  `~` against the child's `HOME`, which the defect left as the real inherited one. The suite therefore
+  `rm -rf`s the inherited home directory. Only `test_expand.vim:37` creates such a name and only
+  `test_alot.vim:10` sources that file, which is exactly the two files showing `E212`. A second defect
+  from the same probe: `expand('~')` returns the literal `~` where upstream resolves it through
+  `expand_env_esc`/`home_replace` in `.references/neovim/src/nvim/os/env.c`. This is a hazard rather
+  than a statistic, and it is the mechanism behind the deletion that cost this session its checkout.
+  An earlier draft of this entry blamed a `:cd` restore failure; Task 61's non-reproduction disproved
+  that, and the corrected chain is measured end to end in `oldtest-blockers-2.md` D4.
 
 ## Blocker movement
 
@@ -134,6 +147,13 @@ comparable; a stricter `E<nnn>:` extraction gives lower absolute counts on both.
 
 ## Harness caveats
 
+- No oldtest run of any kind is permitted until the `let $VAR` export defect (D4) is fixed and its
+  regression test is green; that covers `runtest.vim` invocations, single-file measurements and quick
+  checks, and it suspends any brief's acceptance criterion that asks for a census file to be re-run.
+  When the ban lifts, two parts are mandatory together, not either: `HOME` set to a fresh throwaway
+  directory created per run, and the testdir copied to a scratch location so nothing runs inside
+  `.references`. `.references/neovim/test/old/testdir` currently holds a stale `test.log` recording
+  in-repo paths, so the suite has already been run in place at least once.
 - The timeout budget was 150 s here against pass 1's 120 s, so the timeout delta slightly favours
   pass 2 and should not be read as a pure speed win.
 - stdin must be `/dev/null`, as pass 1 established: with an inherited open stdin the headless process

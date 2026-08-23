@@ -322,17 +322,57 @@ never dispatches either: a repo-wide search finds no producer for those variants
 is upstream's exit sequence, `getout()` in `.references/neovim/src/nvim/main.c`, which fires
 `VimLeavePre` and then `VimLeave` before `os_exit()`.
 
-### D4. `:write` of a relative path aborts the harness at exit (2 files, fatal)
+### D4. `let $VAR` never reaches child processes, so the suite `rm -rf`s its own HOME (2 files, fatal)
 
 `test_alot.vim` (after 16.8 s of work) and `test_expand.vim` both abort in `FinishTesting()` with
 `E212: Can't open file for writing: No such file or directory (os error 2)` while writing `test.log`,
 so both files report 0 executed. In pass 1 both were timeouts, so this is newly visible rather than
-newly broken. The path is relative and the OS error is `ENOENT`, which means the process cwd no longer
-exists at exit: `RunTheTest`'s `exe 'cd ' . save_cwd` did not restore it. Upstream's
-`ex_cd`/`ex_write` pair is `.references/neovim/src/nvim/ex_docmd.c` `ex_cd` and
-`.references/neovim/src/nvim/ex_cmds.c` `ex_write`; the oxvim side to audit is whichever `:cd`
-implementation silently no-ops when the saved directory is gone. Left unfixed here: this leaf is
-measurement only.
+newly broken.
+
+The first write-up of this entry blamed a `:cd` restore failure. That was wrong, and Task 61's
+non-reproduction is what exposed it. The real chain has four steps, every one measured against the
+pinned binary:
+
+1. `setup.vim:115` sandboxes the home directory with `let $HOME = expand(getcwd() . '/XfakeHOME')`.
+2. oxvim does not export a vim-level `let $VAR` into the environment of child processes. Measured in
+   one script: `$HOME` reads back as `<cwd>/XfakeHOME` inside oxvim, while
+   `system('printf %s "$HOME"')` returns the inherited process value. Upstream's assignment path
+   (`.references/neovim/src/nvim/eval/vars.c`, the env branch of `set_var_lval`) calls
+   `vim_setenv`/`os_setenv`, so children inherit it.
+3. `test_expand.vim:37` creates a directory named literally `Xdir ~ dir`.
+4. `Delete_Xtest_Files()` (`.references/neovim/test/old/testdir/runtest.vim:461-475`) globs `X*` and,
+   for anything plain `delete()` could not remove, falls back to
+   `call system('rm -rf  ' .. file)` at line 472. The shell word-splits `rm -rf Xdir ~ dir` and
+   expands `~` against the *child's* `HOME`, which step 2 left as the inherited value rather than
+   `XfakeHOME`.
+
+The result is `rm -rf` of the whole inherited `HOME` tree. In this census `HOME` was the per-file run
+root, which contains `testdir`, so the process cwd vanished mid-run and every later write failed with
+`ENOENT`. Direct proof, no harness involved:
+
+```vim
+call mkdir('Xdir ~ dir')
+call writefile(['x'], 'Xdir ~ dir/inner.txt')
+call delete('Xdir ~ dir')
+call system('rm -rf  ' .. 'Xdir ~ dir')
+call writefile(['probe'], 'rmprobe.txt')
+" E482: Can't open file "rmprobe.txt" for writing: No such file or directory
+```
+
+`$HOME` and the cwd beneath it are both gone at that point. Only `test_expand.vim:37` creates a
+tilde-bearing `X*` name and only `test_alot.vim:10` sources that file, which is exactly the two files
+that show `E212`, so the chain is closed.
+
+This is a hazard, not just a census artifact: the same two files run with `HOME` pointing at a real
+home directory will delete it. `.references/neovim/test/old/testdir` currently holds a stale
+`test.log` whose recorded paths are the in-repo testdir, so the suite has been run in place at least
+once.
+
+A second defect fell out of the same probe: `expand('~')` returns the literal `~` instead of the home
+directory. Upstream expands it in `.references/neovim/src/nvim/os/env.c` (`expand_env_esc`, with
+`home_replace` for the reverse direction).
+
+Both are left unfixed here: this leaf is measurement only, and `crates/ox-editor` belongs to peers.
 
 ### Line attribution is off in tracebacks
 
@@ -356,6 +396,12 @@ comparison favours pass 2 slightly and the timeout delta should not be read as a
 
 ## Harness caveats
 
+- No oldtest run of any kind is permitted until the `let $VAR` export defect (D4) is fixed and its
+  regression test is green. That covers `runtest.vim` invocations, single-file measurements and
+  quick checks. When the ban lifts, two parts are mandatory together: `HOME` set to a fresh throwaway
+  directory created per run, and the testdir copied to scratch so nothing runs inside
+  `.references`. Two files (`test_expand.vim`, and `test_alot.vim` which sources it) recursively
+  delete whatever `HOME` names.
 - Relocating the binary breaks runtime discovery. `runtime_root()`
   (`crates/oxvim/src/runtime.rs:75-87`) resolves `$OXVIM_RUNTIME`, else `<exe dir>/../../runtime`, else
   `./runtime`. A copy under `/tmp` finds none of them, so every file dies at `setup.vim:121` with
