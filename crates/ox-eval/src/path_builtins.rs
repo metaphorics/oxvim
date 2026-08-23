@@ -397,7 +397,7 @@ fn string_arg(value: &Typval) -> Result<OxStr> {
         Typval::Number(value) => Ok(OxStr(value.to_string().into_bytes())),
         Typval::Bool(value) => Ok(OxStr::from(if *value { "v:true" } else { "v:false" })),
         Typval::Special(ox_types::Special::Null) => Ok(OxStr::from("")),
-        Typval::Float(_) => Err(EvalError::new("E806", 0, "Using a Float as a String")),
+        Typval::Float(number) => Ok(crate::builtins::float_as_string(*number)),
         Typval::List(_) => Err(EvalError::new("E730", 0, "Using a List as a String")),
         Typval::Dict(_) => Err(EvalError::new("E731", 0, "Using a Dictionary as a String")),
         _ => Err(EvalError::new("E729", 0, "Using invalid value as a String")),

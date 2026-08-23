@@ -1933,6 +1933,39 @@ fn string_renders_floats_the_way_upstream_encodes_them() {
     );
 }
 
+// `tv_get_string_buf_chk` (`typval.c:4684-4685`) renders `VAR_FLOAT` with
+// `%g` and never errors, so every builtin that wants a String takes a Float.
+// Each expectation below was measured on the oracle (v0.13.0-dev-1390).
+#[test]
+fn builtins_coerce_a_float_to_its_percent_g_rendering() {
+    assert_eq!(call("strlen", vec![Typval::Float(1.0)]).unwrap(), number(3));
+    assert_eq!(call("strlen", vec![Typval::Float(1.0e20)]).unwrap(), number(6));
+    assert_eq!(call("strchars", vec![Typval::Float(1.0)]).unwrap(), number(3));
+    assert_eq!(call("toupper", vec![Typval::Float(1.5)]).unwrap(), text("1.5"));
+    assert_eq!(call("str2nr", vec![Typval::Float(1.5)]).unwrap(), number(1));
+    assert_eq!(call("strlen", vec![Typval::Float(f64::INFINITY)]).unwrap(), number(3));
+    assert_eq!(call("strlen", vec![Typval::Float(f64::NAN)]).unwrap(), number(3));
+
+    // `f_len` (`funcs.c:3813-3816`) refuses a Float with E701, so the
+    // rendering must not leak into `len()` as the answer 3.
+    assert_eq!(call("len", vec![Typval::Float(1.0)]).unwrap_err().code, "E701");
+    // The other E701 arms, which `len` shared with `strlen` before the split.
+    assert_eq!(call("len", vec![Typval::Bool(true)]).unwrap_err().code, "E701");
+    assert_eq!(call("len", vec![Typval::Special(ox_types::Special::Null)]).unwrap_err().code, "E701");
+    assert_eq!(call("len", vec![funcref("abs")]).unwrap_err().code, "E701");
+    // `strlen` coerces where `len` refuses, and raises the String errors.
+    assert_eq!(call("strlen", vec![Typval::Bool(true)]).unwrap(), number(6));
+    assert_eq!(call("strlen", vec![Typval::Special(ox_types::Special::Null)]).unwrap(), number(6));
+    assert_eq!(call("strlen", vec![list(&[1, 2])]).unwrap_err().code, "E730");
+    assert_eq!(call("strlen", vec![Typval::Blob(vec![0x10, 0x20])]).unwrap_err().code, "E976");
+    assert_eq!(call("strlen", vec![funcref("abs")]).unwrap_err().code, "E729");
+    // Both still answer for the shapes they always agreed on.
+    assert_eq!(call("len", vec![Typval::Number(12)]).unwrap(), number(2));
+    assert_eq!(call("strlen", vec![Typval::Number(12)]).unwrap(), number(2));
+    assert_eq!(call("len", vec![Typval::Blob(vec![0x10, 0x20])]).unwrap(), number(2));
+    assert_eq!(call("len", vec![list(&[1, 2])]).unwrap(), number(2));
+}
+
 // Oracle: `test/old/testdir/test_expr.vim` `Test_printf_float`, which is the
 // spec for `vim_snprintf`'s float conversions (`strings.c:2075-2196`).
 #[test]

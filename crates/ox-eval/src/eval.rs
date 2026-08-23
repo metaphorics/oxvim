@@ -570,6 +570,9 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                 let index = usize::try_from(index).map_err(|_| EvalError::new("E111", offset, "invalid string index"))?;
                 Ok(Evaluated::plain(Typval::String(OxStr(vec![bytes.0[index]]))))
             }
+            // `check_can_index` (`eval.c:3225-3229`) is upstream's only E806:
+            // indexing is the one String context a Float is refused in.
+            Typval::Float(_) => Err(EvalError::new("E806", offset, "Using a Float as a String")),
             _ => Err(EvalError::new("E909", offset, "invalid value for subscript")),
         }
     }
@@ -591,6 +594,7 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                 Ok(Evaluated::plain(Typval::String(OxStr(value.0[start..end].to_vec()))))
             }
             Typval::Dict(_) => Err(EvalError::new("E719", offset, "Cannot slice a Dictionary")),
+            Typval::Float(_) => Err(EvalError::new("E806", offset, "Using a Float as a String")),
             _ => Err(EvalError::new("E709", offset, "invalid value for slice")),
         }
     }
@@ -826,7 +830,7 @@ fn to_string(value: &Typval, offset: usize) -> Result<OxStr> {
     match value {
         Typval::String(value) => Ok(value.clone()),
         Typval::Number(value) => Ok(OxStr(value.to_string().into_bytes())),
-        Typval::Float(_) => Err(EvalError::new("E806", offset, "Using a Float as a String")),
+        Typval::Float(number) => Ok(crate::builtins::float_as_string(*number)),
         Typval::Channel(value) | Typval::Job(value) => Ok(OxStr(value.to_string().into_bytes())),
         Typval::Bool(true) => Ok(OxStr::from("v:true")),
         Typval::Bool(false) => Ok(OxStr::from("v:false")),

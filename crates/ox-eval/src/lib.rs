@@ -12,8 +12,8 @@ mod path_builtins;
 pub mod scope;
 
 pub use builtins::{
-    builtin_spec, call_buffer_builtin, exists, is_buffer_builtin, is_builtin_implemented,
-    is_locked_value, lock_value, BuiltinSpec, Builtins, BUILTINS,
+    builtin_spec, call_buffer_builtin, exists, float_as_string, is_buffer_builtin,
+    is_builtin_implemented, is_locked_value, lock_value, BuiltinSpec, Builtins, BUILTINS,
 };
 pub use error::{EvalError, EvalErrorKind, Result};
 pub use eval::{BuiltinHost, BufferHost, Evaluator, NoBuiltins, NoRegex, RegexEngine, RegexMatch};

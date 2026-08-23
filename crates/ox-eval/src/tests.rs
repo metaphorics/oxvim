@@ -228,12 +228,40 @@ error_cases!(
     (error_duplicate_lambda_param_types, b"{list, list -> 1}([1], [2])", "E853", "userfunc.c:134"),
     (error_list_relational_compare, b"[1] > [2]", "E692", "eval.c:6789-6791"),
     (error_dict_relational_compare, b"{'a': 1} > {'a': 0}", "E736", "eval.c:6822-6828"),
-    (error_float_string_concat, b"1.5 .. 'x'", "E806", "vimeval.txt:1121-1131"),
     // Comparison is non-associative, so `< 3` is left unconsumed and reported
     // as trailing text: nvim v0.13.0-dev gives `E488: Trailing characters: < 3`.
     (error_chained_comparison, b"1 < 2 < 3", "E488", "errors.h:123 e_trailing_arg"),
     (error_dictionary_slice, b"{'a': 1}[0:0]", "E719", "eval.c:eval_index_inner E719")
 );
+
+// `error_float_string_concat` used to live in the table above, asserting that
+// `1.5 .. 'x'` is E806, on the strength of `vimeval.txt:1121-1131`. That doc
+// range says `1 . 90 * 90.0` "does NOT work, since this attempts to
+// concatenate a Float and a String" — and it is stale: the oracle
+// (v0.13.0-dev-1390) answers `'18100.0'` for exactly that expression.
+// `tv_check_str` (`typval.c:4245`) accepts `VAR_FLOAT` and
+// `tv_get_string_buf_chk` (`typval.c:4684-4685`) renders it with `%g`, so a
+// Float coerces to a String in every String context but one.
+//
+// The one exception is `check_can_index` (`eval.c:3225-3229`), which is where
+// upstream's only E806 lives. So the assertion is inverted rather than
+// dropped: concatenation now has to produce the rendering, and indexing and
+// slicing have to keep the error.
+#[test]
+fn float_concatenates_as_a_string_and_only_indexing_is_e806() {
+    assert_eq!(value(b"1.5 .. 'x'"), Typval::String(OxStr::from("1.5x")));
+    assert_eq!(value(b"1.0 . ''"), Typval::String(OxStr::from("1.0")));
+    assert_eq!(value(b"1 . 90 * 90.0"), Typval::String(OxStr::from("18100.0")));
+    assert_eq!(value(b"(1.0/0.0) . ''"), Typval::String(OxStr::from("inf")));
+    assert_eq!(value(b"(-1.0/0.0) . ''"), Typval::String(OxStr::from("-inf")));
+    assert_eq!(value(b"(0.0/0.0) . ''"), Typval::String(OxStr::from("nan")));
+    assert_eq!(value(b"1.0e20 . ''"), Typval::String(OxStr::from("1.0e20")));
+    assert_eq!(value(b"-0.0 . ''"), Typval::String(OxStr::from("-0.0")));
+
+    assert_eq!(error(b"1.0[0]").code, "E806");
+    assert_eq!(error(b"1.0[1:2]").code, "E806");
+    assert_eq!(error(b"1.0[:]").code, "E806");
+}
 
 #[test]
 fn newline_without_marker_ends_expression() {

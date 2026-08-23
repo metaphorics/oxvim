@@ -1241,9 +1241,11 @@ fn string_arg(value: &Typval) -> Result<OxStr> {
         Typval::Number(value) => Ok(OxStr(value.to_string().into_bytes())),
         Typval::Bool(value) => Ok(OxStr::from(if *value { "v:true" } else { "v:false" })),
         Typval::Special(Special::Null) => Ok(OxStr::from("v:null")),
-        Typval::Float(_) => Err(EvalError::new("E806", 0, "Using a Float as a String")),
+        Typval::Float(number) => Ok(float_as_string(*number)),
         Typval::List(_) => Err(EvalError::new("E730", 0, "Using a List as a String")),
         Typval::Dict(_) => Err(EvalError::new("E731", 0, "Using a Dictionary as a String")),
+        Typval::Blob(_) => Err(EvalError::new("E976", 0, "Using a Blob as a String")),
+        Typval::Funcref(_) | Typval::Partial(_) => Err(EvalError::new("E729", 0, "Using a Funcref as a String")),
         _ => Err(EvalError::new("E729", 0, "Using invalid value as a String")),
     }
 }
@@ -1354,13 +1356,28 @@ fn is_empty(value: &Typval) -> bool {
     }
 }
 
-fn length(value: &Typval, bytes_only: bool) -> Result<Typval> {
+/// `f_len` (`funcs.c:3793-3819`) and `f_strlen` (`funcs.c`) are two different
+/// questions and were one function here, which the Float-as-String fix made
+/// visible: with a Float now rendering, `len(1.0)` would have answered 3 where
+/// upstream answers E701.
+///
+/// `len()` counts a container's elements and the string length of a String or
+/// a Number, and refuses everything else with E701 — a Bool, a Special, a
+/// Float and a Funcref all reach that arm. `strlen()` is only
+/// `strlen(tv_get_string(...))`, so it coerces: `strlen(v:true)` is 6 and
+/// `strlen(1.0)` is 3, while a List, Dict, Blob or Funcref raises its own
+/// String error out of `string_arg`.
+fn length(value: &Typval, string_length: bool) -> Result<Typval> {
+    if string_length {
+        return Ok(Typval::Number(saturating_i64(string_arg(value)?.as_bytes().len())));
+    }
     let length = match value {
-        Typval::String(value) => if bytes_only { value.as_bytes().len() } else { value.as_bytes().len() },
+        Typval::String(value) => value.as_bytes().len(),
+        Typval::Number(value) => value.to_string().len(),
         Typval::Blob(value) => value.len(),
         Typval::List(value) => list_items(value)?.len(),
         Typval::Dict(value) => dict_entries(value)?.len(),
-        _ => string_arg(value)?.as_bytes().len(),
+        _ => return Err(EvalError::new("E701", 0, "Invalid type for len()")),
     };
     Ok(Typval::Number(saturating_i64(length)))
 }
@@ -1988,6 +2005,19 @@ fn strip_superfluous_zeroes(rendered: &str, exponential: bool, precision_specifi
         }
     }
     text.into_iter().collect()
+}
+
+/// `tv_get_string_buf_chk`'s `VAR_FLOAT` arm (`eval/typval.c:4684-4685`):
+/// `vim_snprintf(buf, NUMBUFLEN, "%g", …)`, which never fails. A Float
+/// coerces to a String wherever upstream wants a String — `1.0 . ''` is
+/// `'1.0'`, `strlen(1.0)` is 3 — and `tv_check_str` (`typval.c:4245`) accepts
+/// `VAR_FLOAT` for the same reason.
+///
+/// E806 is deliberately absent here. Upstream raises it in exactly one place,
+/// `check_can_index` (`eval.c:3225-3229`), so it is the answer for `1.0[0]`
+/// and `1.0[1:2]` and for nothing else.
+pub fn float_as_string(number: f64) -> OxStr {
+    OxStr(format_float('g', number, None, false, true).0.into_bytes())
 }
 
 /// `TYPVAL_ENCODE_CONV_FLOAT` (`eval/encode.c:351-372`): `%g` for a finite
