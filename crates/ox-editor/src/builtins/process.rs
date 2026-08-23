@@ -8,6 +8,7 @@ use std::rc::Rc;
 use ox_eval::EvalError;
 use ox_eval::Scope;
 use ox_types::{OxStr, Special, Typval};
+use crate::options::OptionValue;
 use crate::script::FileIO;
 use crate::{Editor, JobCallbacks, JobEvent, JobManager, JobStartOptions};
 
@@ -21,13 +22,48 @@ pub(crate) fn call<F: FileIO>(
     scope: &mut Scope,
 ) -> ox_eval::Result<Typval> {
     match name {
-        "chansend" | "jobpid" | "jobsend" | "jobstart" | "jobstop" | "jobwait" => {
+        "chansend" | "jobpid" | "jobsend" | "jobstop" | "jobwait" => {
             call_job_builtin(host.runtime, host.editor, scope, host.lua, name, args)
         }
-        "system" => call_system_builtin(args, scope),
-        "systemlist" => call_systemlist_builtin(host.runtime, args, scope),
+        "jobstart" | "system" | "systemlist" => {
+            let shell = shell_argv(host.editor);
+            match name {
+                "jobstart" => call_job_start(host.runtime, &shell, args),
+                "system" => call_system_builtin(host.runtime, &shell, args, scope),
+                _ => call_systemlist_builtin(host.runtime, &shell, args, scope),
+            }
+        }
         _ => unreachable!("process builtin route and dispatcher disagree"),
     }
+}
+
+/// The `'shell'` + `'shellcmdflag'` prefix a String command is executed
+/// through, upstream `shell_build_argv` (`os/shell.c` 60-97).
+///
+/// Both options may carry arguments of their own, and
+/// `set_init_default_shell` (`option.c` 182-199) double-quotes a `$SHELL`
+/// holding a space, so a quoted first word is one word.
+fn shell_argv(editor: &Editor) -> Vec<String> {
+    let read = |name: &str, fallback: &str| match editor.options().get_global(name) {
+        Ok(OptionValue::String(value)) if !value.is_empty() => value.clone(),
+        _ => fallback.to_owned(),
+    };
+    let shell = read("shell", if cfg!(windows) { "cmd.exe" } else { "sh" });
+    let mut argv = split_shell_words(&shell);
+    argv.extend(split_shell_words(&read("shellcmdflag", if cfg!(windows) { "/c" } else { "-c" })));
+    argv
+}
+
+fn split_shell_words(text: &str) -> Vec<String> {
+    let text = text.trim();
+    if let Some(rest) = text.strip_prefix('"') {
+        if let Some((quoted, tail)) = rest.split_once('"') {
+            let mut argv = vec![quoted.to_owned()];
+            argv.extend(tail.split_whitespace().map(str::to_owned));
+            return argv;
+        }
+    }
+    text.split_whitespace().map(str::to_owned).collect()
 }
 
 pub(crate) fn call_job_builtin<F: FileIO>(
@@ -39,20 +75,6 @@ pub(crate) fn call_job_builtin<F: FileIO>(
     args: Vec<Typval>,
 ) -> ox_eval::Result<Typval> {
     match name {
-        "jobstart" => {
-            let options = normalize_job_options(&args)?;
-            let id = runtime.channel_ids.allocate();
-            let mut manager = match runtime.jobs.take() {
-                Some(manager) => manager,
-                None => match JobManager::new() {
-                    Ok(manager) => manager,
-                    Err(_) => return Ok(Typval::Number(-1)),
-                },
-            };
-            let started = manager.start(id, options);
-            runtime.jobs = Some(manager);
-            Ok(Typval::Number(if started.is_ok() { id as i64 } else { -1 }))
-        }
         "jobstop" => {
             let id = job_id(args.first())?;
             let Some(manager) = runtime.jobs.as_mut() else { return Ok(Typval::Number(0)); };
@@ -91,32 +113,45 @@ pub(crate) fn call_job_builtin<F: FileIO>(
     }
 }
 
-fn call_system_builtin(args: Vec<Typval>, scope: &mut Scope) -> ox_eval::Result<Typval> {
-    let Some(command) = args.first().and_then(|value| match value {
-        Typval::String(value) => Some(value.to_string_lossy()),
-        _ => None,
-    }) else {
-        return Err(EvalError::new("E730", 0, "Using a List as a String"));
+fn call_job_start<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    shell: &[String],
+    args: Vec<Typval>,
+) -> ox_eval::Result<Typval> {
+    let options = normalize_job_options(shell, &args)?;
+    let id = runtime.channel_ids.allocate();
+    let mut manager = match runtime.jobs.take() {
+        Some(manager) => manager,
+        None => match JobManager::new() {
+            Ok(manager) => manager,
+            Err(_) => return Ok(Typval::Number(-1)),
+        },
     };
-    let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
-    let output = std::process::Command::new(shell)
-        .arg(flag)
-        .arg(command.as_ref())
-        .output()
-        .map_err(|error| EvalError::new("E677", 0, format!("Error writing temp file: {error}")))?;
-    let status = output.status.code().unwrap_or(-1);
-    replace_scope_pair(&mut scope.vim, "shell_error", Typval::Number(i64::from(status)));
-    Ok(Typval::String(OxStr(output.stdout)))
+    let started = manager.start(id, options);
+    runtime.jobs = Some(manager);
+    Ok(Typval::Number(if started.is_ok() { id as i64 } else { -1 }))
 }
 
-fn call_systemlist_builtin<F: FileIO>(
+/// `f_system`/`f_systemlist` (`eval/funcs.c`) through `os_system`.
+///
+/// The optional second argument is the child's standard input, and upstream
+/// closes that pipe once it has been written (`os/shell.c` `do_os_system`
+/// shuts the input stream down before waiting). Without the close a child that
+/// reads to EOF -- `system('cat', '123')` -- never finishes and the wait never
+/// returns; that was the one census-3 timeout.
+///
+/// A shell that cannot be spawned is not an error upstream: `os_system` reports
+/// it through `v:shell_error` and yields no output, which is what `nvim` does
+/// with an unreachable `'shell'`. The `E677` this used to raise has no upstream
+/// counterpart anywhere on this path, and being fatal it destroyed a whole test
+/// file's record when `test_cmdline.vim` left `$PATH` poisoned.
+fn run_shell_command<F: FileIO>(
     runtime: &mut ExRuntime<F>,
-    args: Vec<Typval>,
-    scope: &mut Scope,
-) -> ox_eval::Result<Typval> {
-    let (program, command_args) = job_command(args.first())?;
+    shell: &[String],
+    args: &[Typval],
+) -> ox_eval::Result<(i64, Vec<u8>)> {
+    let (program, command_args) = job_command(shell, args.first())?;
     let input = args.get(1).map(|value| channel_bytes(Some(value))).transpose()?.unwrap_or_default();
-    let keep_empty = args.get(2).is_some_and(value_bool);
     let Typval::Dict(options) = Typval::dict(Vec::new()) else { unreachable!() };
     let id = runtime.channel_ids.allocate();
     let start = JobStartOptions {
@@ -127,23 +162,55 @@ fn call_systemlist_builtin<F: FileIO>(
         detached: false,
         pty: false,
         rpc: false,
-        stdin_pipe: !input.is_empty(),
+        // Always a pipe, even for empty input: the child must see EOF on
+        // standard input rather than inherit the parent's.
+        stdin_pipe: true,
         stdout_buffered: true,
         stderr_buffered: true,
         callbacks: JobCallbacks { options, stdout: None, stderr: None, exit: None },
     };
-    let mut manager = runtime.jobs.take().unwrap_or(JobManager::new().map_err(|message| {
-        EvalError::new("E677", 0, format!("Error writing temp file: {message}"))
-    })?);
-    manager.start(id, start).map_err(|message| EvalError::new("E677", 0, message))?;
-    if !input.is_empty() {
-        manager.send(id, input).map_err(|message| EvalError::new("E677", 0, message))?;
-        manager.close_input(id);
+    let Some(mut manager) = runtime.jobs.take().or_else(|| JobManager::new().ok()) else {
+        return Ok((-1, Vec::new()));
+    };
+    if manager.start(id, start).is_err() {
+        runtime.jobs = Some(manager);
+        return Ok((-1, Vec::new()));
     }
-    let (statuses, _) = manager.wait(&[id], -1).map_err(|message| EvalError::new("E677", 0, message))?;
-    let (stdout, _) = manager.take_buffered_output(id).unwrap_or_default();
+    let sent = input.is_empty() || manager.send(id, input).is_ok();
+    manager.close_input(id);
+    let waited = manager.wait(&[id], -1);
+    // `os_system` collects the child's standard error into the same buffer as
+    // its standard output, which is why `system('nosuchcmd')` answers with the
+    // shell's diagnostic rather than an empty string.
+    let (mut stdout, stderr) = manager.take_buffered_output(id).unwrap_or_default();
+    stdout.extend_from_slice(&stderr);
     runtime.jobs = Some(manager);
-    let status = statuses.first().copied().unwrap_or(-1);
+    let status = match waited {
+        Ok((statuses, _)) if sent => statuses.first().copied().unwrap_or(-1),
+        _ => -1,
+    };
+    Ok((status, stdout))
+}
+
+fn call_system_builtin<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    shell: &[String],
+    args: Vec<Typval>,
+    scope: &mut Scope,
+) -> ox_eval::Result<Typval> {
+    let (status, stdout) = run_shell_command(runtime, shell, &args)?;
+    replace_scope_pair(&mut scope.vim, "shell_error", Typval::Number(status));
+    Ok(Typval::String(OxStr(stdout)))
+}
+
+fn call_systemlist_builtin<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    shell: &[String],
+    args: Vec<Typval>,
+    scope: &mut Scope,
+) -> ox_eval::Result<Typval> {
+    let keep_empty = args.get(2).is_some_and(value_bool);
+    let (status, stdout) = run_shell_command(runtime, shell, &args)?;
     replace_scope_pair(&mut scope.vim, "shell_error", Typval::Number(status));
 
     let mut lines = stdout
@@ -159,8 +226,8 @@ fn call_systemlist_builtin<F: FileIO>(
     Ok(Typval::list(lines))
 }
 
-fn normalize_job_options(args: &[Typval]) -> ox_eval::Result<JobStartOptions> {
-    let (program, command_args) = job_command(args.first())?;
+fn normalize_job_options(shell: &[String], args: &[Typval]) -> ox_eval::Result<JobStartOptions> {
+    let (program, command_args) = job_command(shell, args.first())?;
     let options = match args.get(1) {
         None => Typval::dict(Vec::new()),
         Some(Typval::Dict(options)) => Typval::Dict(options.clone()),
@@ -213,11 +280,19 @@ fn normalize_job_options(args: &[Typval]) -> ox_eval::Result<JobStartOptions> {
     })
 }
 
-fn job_command(value: Option<&Typval>) -> ox_eval::Result<(PathBuf, Vec<OsString>)> {
+/// `shell_build_argv` (`os/shell.c` 60-97): a String command runs through
+/// `'shell'` + `'shellcmdflag'`, a List command is the argv itself.
+///
+/// `$SHELL` was read directly here before, which is not what upstream reads and
+/// left `system()` (hardcoded `sh`) and `systemlist()` disagreeing about the
+/// shell of the same editor.
+fn job_command(shell: &[String], value: Option<&Typval>) -> ox_eval::Result<(PathBuf, Vec<OsString>)> {
     match value {
         Some(Typval::String(command)) if !command.as_bytes().is_empty() => {
-            let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("sh"));
-            Ok((PathBuf::from(shell), vec![OsString::from("-c"), OsString::from(command.to_string_lossy().into_owned())]))
+            let (program, flags) = shell.split_first().ok_or_else(|| EvalError::new("E474", 0, "Invalid argument"))?;
+            let mut args: Vec<OsString> = flags.iter().map(OsString::from).collect();
+            args.push(OsString::from(command.to_string_lossy().into_owned()));
+            Ok((PathBuf::from(program), args))
         }
         Some(Typval::List(items)) => {
             let items = items.borrow();

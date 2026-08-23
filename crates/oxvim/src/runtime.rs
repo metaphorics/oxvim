@@ -153,6 +153,16 @@ pub fn export_vim_environment() -> Result<(), AppError> {
 /// buffer that exists at this point (upstream's `curbuf`).
 pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppError> {
     let editor_error = |error: OptionError| AppError::Editor(error.to_string());
+    // option.c set_init_default_shell (182-199): the static 'shell' default is
+    // the bare name "sh", and startup replaces it with $SHELL when that is set
+    // and non-empty, quoting it if it holds a space. The absolute path is the
+    // point: a script that poisons $PATH -- `let $PATH = 'Xpathdir'`, which
+    // test_cmdline.vim does -- must still be able to run a shell afterwards.
+    if let Some(shell) = std::env::var_os("SHELL").filter(|shell| !shell.is_empty()) {
+        let shell = shell.to_string_lossy();
+        let value = if shell.contains(' ') { format!("\"{shell}\"") } else { shell.into_owned() };
+        editor.options_mut().set_global("shell", OptionValue::String(value)).map_err(editor_error)?;
+    }
     // message.c msg_use_printf/msg_puts_printf read these process modes for
     // every message; main.c sets them while scanning the command line.
     editor.message_routing = MessageRouting {

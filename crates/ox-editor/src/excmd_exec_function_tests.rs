@@ -1837,3 +1837,56 @@ fn writefile_defer_flag_deletes_per_frame_on_return_and_on_abort() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// eval/funcs.c f_system through os_system, os/shell.c shell_build_argv 60-97 —
+// a String command runs through 'shell' + 'shellcmdflag', the second argument
+// is the child's standard input and its pipe is closed, and a shell that
+// cannot be spawned is reported through v:shell_error rather than raised.
+//
+// The E677 this replaces was fatal: `test_cmdline.vim` poisons $PATH and never
+// restores it, so `system()` in runtest.vim's cleanup aborted FinishTesting()
+// before it wrote `messages`, losing a 45-test record.
+//
+// One case per part: the input argument (a `cat` that echoes it back proves
+// both that the input arrives and that its pipe is closed, since `cat` would
+// otherwise never exit), 'shellcmdflag' (a flag the option names and nothing
+// else supplies), and an unreachable 'shell' (which must not raise and must
+// report -1).
+#[test]
+fn system_uses_the_shell_options_feeds_input_and_never_raises_on_a_bad_shell() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &mut editor,
+        "system.vim",
+        "set shell=/bin/sh shellcmdflag=-c\n\
+         let g:echoed = system('echo ok')\n\
+         let g:fed = system('cat', '123')\n\
+         let g:listed = systemlist('cat', '123')\n\
+         set shellcmdflag=-cx\n\
+         let g:traced = system('true')\n\
+         let g:traced_error = v:shell_error\n\
+         set shellcmdflag=-c\n\
+         set shell=/nonexistent/ox-no-shell\n\
+         let g:missing = system('echo unreachable')\n\
+         let g:missing_error = v:shell_error",
+    )
+    .unwrap();
+
+    let global = |name: &[u8]| exec.scope().get_scoped(ScopeKind::Global, name, 0).cloned();
+    assert_eq!(global(b"echoed"), Ok(Typval::String(OxStr::from("ok\n"))));
+    // The input argument reaches the child and its pipe is closed afterwards.
+    assert_eq!(global(b"fed"), Ok(Typval::String(OxStr::from("123"))));
+    assert_eq!(global(b"listed"), Ok(Typval::list(vec![Typval::String(OxStr::from("123"))])));
+    // `-cx` traces to standard error, which `os_system` merges into the output,
+    // so only a 'shellcmdflag' that is actually read produces this.
+    assert!(
+        matches!(&global(b"traced"), Ok(Typval::String(text)) if text.to_string_lossy().contains("true")),
+        "shellcmdflag was not used: {:?}",
+        global(b"traced")
+    );
+    assert_eq!(global(b"traced_error"), Ok(Typval::Number(0)));
+    // An unreachable 'shell' is `v:shell_error` == -1 and no exception.
+    assert_eq!(global(b"missing"), Ok(Typval::String(OxStr::from(""))));
+    assert_eq!(global(b"missing_error"), Ok(Typval::Number(-1)));
+}
