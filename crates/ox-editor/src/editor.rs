@@ -1194,6 +1194,39 @@ impl Editor {
         Ok(Some(replayed.seq))
     }
 
+    /// Navigates a buffer's undo tree to sequence `seq`, replaying every step
+    /// through the position-bearing subsystems.
+    ///
+    /// The target may be behind or ahead of the current state, and on another
+    /// branch, which is what `:undo {N}` needs (`undo_time`, `undo.c:1975`).
+    /// An unknown sequence is reported, not silently clamped.
+    pub fn buffer_undo_to_seq(
+        &mut self,
+        buffer: BufHandle,
+        seq: u64,
+    ) -> Result<usize, EditorError> {
+        let state = self
+            .buffers
+            .get_mut(&buffer)
+            .ok_or(EditorError::UnknownBuffer(buffer))?;
+        let replayed = state.undo_to_seq(seq)?;
+        let count = replayed.len();
+        for edit in replayed {
+            self.finish_replay(buffer, edit);
+        }
+        Ok(count)
+    }
+
+    /// Returns a buffer's current undo sequence, upstream's `b_u_seq_cur`.
+    pub fn buffer_undo_seq(&self, buffer: BufHandle) -> Result<u64, EditorError> {
+        Ok(self
+            .buffers
+            .get(&buffer)
+            .ok_or(EditorError::UnknownBuffer(buffer))?
+            .undo
+            .current_seq())
+    }
+
     /// Opens one containing fold, corresponding to `zo`.
     pub fn fold_open(
         &mut self,

@@ -1536,3 +1536,92 @@ fn vnew_splits_onto_a_new_empty_buffer() {
     executor.execute_line(&mut editor, "vsplit").unwrap();
     assert_eq!(editor.current_buffer(), Some(created));
 }
+
+// ---------------------------------------------------------------------------
+// :undo / :redo
+// Citations: ex_docmd.c ex_undo:6729, ex_redo:6783, undo.c undo_time:1975,
+// u_doit:1899 (the "Already at ..." messages), set_cmd_count:1372.
+// ---------------------------------------------------------------------------
+
+/// `:undo` steps back one change and `:redo` forward again; `:u` is the
+/// shortest abbreviation of `:undo`.
+///
+/// Oracle, on a buffer built with one edit: `undo` empties it, `redo`
+/// restores it, `u` empties it again.
+#[test]
+fn undo_and_redo_step_one_change() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "call setline(1, 'x')").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["x"]);
+    executor.execute_line(&mut editor, "undo").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a"]);
+    executor.execute_line(&mut editor, "redo").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["x"]);
+    executor.execute_line(&mut editor, "u").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a"]);
+}
+
+/// An address on `:undo` is a *sequence number*, not a step count, and the
+/// `COUNT` and `RANGE` spellings mean the same thing because `set_cmd_count`
+/// folds both into `line2`. Seeking can therefore move forward.
+///
+/// Oracle: after one edit, `undo 0` returns to the original state and
+/// `undo 1` / `1undo` both return to the edited one.
+#[test]
+fn undo_with_an_address_seeks_a_sequence() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "call setline(1, 'x')").unwrap();
+    executor.execute_line(&mut editor, "undo 0").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a"]);
+    // Forward, from sequence 0 back up to 1: not something a run of undos
+    // could do.
+    executor.execute_line(&mut editor, "undo 1").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["x"]);
+    executor.execute_line(&mut editor, "undo 0").unwrap();
+    executor.execute_line(&mut editor, "1undo").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["x"]);
+}
+
+/// A sequence that does not exist is E830 and changes nothing.
+///
+/// Oracle: `undo 99` → `Vim(undo):E830: Undo number 99 not found`.
+#[test]
+fn undo_with_an_unknown_sequence_raises_e830() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "call setline(1, 'x')").unwrap();
+    assert_vim_error(executor.execute_line(&mut editor, "undo 99"), "E830");
+    assert_eq!(buffer_text(&editor), vec!["x"]);
+}
+
+/// Running out of history is a message, not an error (`undo.c:1935,1948`).
+#[test]
+fn undo_and_redo_report_the_ends_of_the_history() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "undo").unwrap();
+    assert_eq!(
+        echo_messages(&editor).last().map(String::as_str),
+        Some("Already at oldest change")
+    );
+    executor.execute_line(&mut editor, "redo").unwrap();
+    assert_eq!(
+        echo_messages(&editor).last().map(String::as_str),
+        Some("Already at newest change")
+    );
+}
+
+/// `:redo` takes no count of any kind: its table entry carries neither RANGE
+/// nor COUNT, so an address is E481 rather than three redos. `:red` is its
+/// abbreviation.
+///
+/// Oracle: `3redo` → `Vim(redo):E481: No range allowed`.
+#[test]
+fn redo_rejects_a_count_with_e481() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "call setline(1, 'x')").unwrap();
+    executor.execute_line(&mut editor, "undo").unwrap();
+    assert_vim_error(executor.execute_line(&mut editor, "3redo"), "E481");
+    // Still undone: the rejected command did nothing.
+    assert_eq!(buffer_text(&editor), vec!["a"]);
+    executor.execute_line(&mut editor, "red").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["x"]);
+}

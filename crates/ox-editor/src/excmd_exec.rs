@@ -939,6 +939,8 @@ fn dispatch<F: FileIO>(
         "vsplit" | "vnew" => command_split(runtime, editor, command, true),
         "tabnew" | "tabedit" => command_tabnew(runtime, editor, command),
         "tabonly" => command_tabonly(runtime, editor, command),
+        "undo" => command_undo(runtime, editor, command),
+        "redo" => command_redo(runtime, editor),
         "resize" => command_resize(runtime, editor, command),
         "wincmd" => command_wincmd(runtime, editor, command),
         "echohl" => command_echohl(runtime, editor, command),
@@ -3099,6 +3101,72 @@ fn command_close<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, com
     match editor.close_window(tab, window, true) {
         Ok(_) => Flow::Normal,
         Err(error) => error_flow(runtime, "E444", error.to_string()),
+    }
+}
+
+/// `:undo` (`ex_docmd.c` `ex_undo`:6729).
+///
+/// Without an address this is one step back. *With* one it is a sequence
+/// number, not a step count, and it may move forward: `set_cmd_count`
+/// (`ex_docmd.c:1372-1393`) folds the `COUNT` form into the same `line2` the
+/// `RANGE` form uses, so `:undo 2` and `:2undo` both mean "go to state 2"
+/// through `undo_time(step, absolute)`. `:undo 0` returns to the original
+/// state. A sequence that does not exist is `E830`.
+///
+/// Reaching the oldest change is a message, not an error
+/// (`undo.c:1935`).
+///
+/// Named gap: `:undo!` is upstream's `u_undo_and_forget`, which discards the
+/// redo branch it moves off. This port's `UndoTree` has no forget operation,
+/// so the bang is rejected rather than silently treated as a plain `:undo` —
+/// that would leave a redo branch upstream would have destroyed.
+fn command_undo<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    let Some(buffer) = editor.current_buffer() else {
+        return error_flow(runtime, "E749", "Empty buffer");
+    };
+    if command.bang {
+        return Flow::NotImplemented("undo!".to_owned());
+    }
+    let target = match (&command.range, command.count) {
+        (None, None) => {
+            return match editor.buffer_undo(buffer) {
+                Ok(Some(_)) => Flow::Normal,
+                Ok(None) => {
+                    push_text_message(editor, "Already at oldest change".to_owned(), false, false);
+                    Flow::Normal
+                }
+                Err(error) => error_flow(runtime, "E749", error.to_string()),
+            };
+        }
+        (_, Some(count)) => count,
+        (Some(_), None) => match resolve_range_raw(editor, command) {
+            Ok((_, end)) => end as u64,
+            Err(message) => return error_flow(runtime, "E16", message),
+        },
+    };
+    match editor.buffer_undo_to_seq(buffer, target) {
+        Ok(_) => Flow::Normal,
+        Err(_) => error_flow(runtime, "E830", format!("Undo number {target} not found")),
+    }
+}
+
+/// `:redo` (`ex_docmd.c` `ex_redo`:6783): always exactly one step forward.
+///
+/// Upstream is `u_redo(1)` with no count of any kind, and `redo`'s table entry
+/// carries neither `RANGE` nor `COUNT`, so `:3redo` is rejected by the parser
+/// rather than redoing three times. Reaching the newest change is a message
+/// (`undo.c:1948`), not an error.
+fn command_redo<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> Flow {
+    let Some(buffer) = editor.current_buffer() else {
+        return error_flow(runtime, "E749", "Empty buffer");
+    };
+    match editor.buffer_redo(buffer) {
+        Ok(Some(_)) => Flow::Normal,
+        Ok(None) => {
+            push_text_message(editor, "Already at newest change".to_owned(), false, false);
+            Flow::Normal
+        }
+        Err(error) => error_flow(runtime, "E749", error.to_string()),
     }
 }
 

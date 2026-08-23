@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use ox_text::{Buffer, BufferError, Cursor, LineEdit, Position, UndoStep, UndoTree};
+use ox_text::{Buffer, BufferError, Cursor, LineEdit, Position, UndoError, UndoStep, UndoTree};
 use ox_types::{Dict, Object, OxStr};
 use thiserror::Error;
 
@@ -50,6 +50,9 @@ pub enum BufferStateError {
     /// A manual fold could not be normalized after the text mutation.
     #[error(transparent)]
     Fold(#[from] FoldError),
+    /// An undo-tree navigation failed.
+    #[error(transparent)]
+    Undo(#[from] UndoError),
 }
 
 /// Text and buffer-local state owned by [`crate::Editor`].
@@ -373,66 +376,91 @@ impl BufferState {
     /// text and mark pipeline with the changedtick advanced. Returns the
     /// undone header's sequence, or `None` when already at the oldest change.
     pub fn undo(&mut self) -> Result<Option<ReplayedEdit>, BufferStateError> {
-        let Ok(UndoStep::Undo(entry)) = self.undo.undo() else {
+        let Ok(step) = self.undo.undo() else {
             return Ok(None);
         };
-        let edit = &entry.edit;
-        self.replay_text(edit.start, &edit.after, &edit.before)?;
-        self.marks
-            .splice(edit.start, edit.after.len(), edit.before.len());
-        self.splice_folds(edit.start, edit.after.len(), edit.before.len())?;
-        if let Some(extmark_undo) = self.extmark_undo.get(&entry.seq) {
-            self.extmarks.undo_splice(
-                extmark_undo,
-                ExtmarkPosition::new(edit.start.saturating_sub(1), 0),
-                TextExtent::new(edit.before.len(), 0),
-                TextExtent::new(edit.after.len(), 0),
-            )?;
-        } else {
-            self.extmarks.splice(
-                ExtmarkPosition::new(edit.start.saturating_sub(1), 0),
-                TextExtent::new(edit.after.len(), 0),
-                TextExtent::new(edit.before.len(), 0),
-            )?;
-        }
-        self.refresh_modified();
-        self.bump_derived_ticks();
-        Ok(Some(ReplayedEdit {
-            seq: entry.seq,
-            start: edit.start,
-            old_count: edit.after.len(),
-            new_count: edit.before.len(),
-            cursor: Position {
-                lnum: edit.cursor_before.lnum,
-                col: edit.cursor_before.col,
-            },
-        }))
+        self.apply_undo_step(&step).map(Some)
     }
 
     /// Redoes the next change, replaying its stored edit through the text and
     /// mark pipeline with the changedtick advanced. Returns the redone
     /// header's sequence, or `None` when already at the newest change.
     pub fn redo(&mut self) -> Result<Option<ReplayedEdit>, BufferStateError> {
-        let Ok(UndoStep::Redo(entry)) = self.undo.redo() else {
+        let Ok(step) = self.undo.redo() else {
             return Ok(None);
         };
+        self.apply_undo_step(&step).map(Some)
+    }
+
+    /// Navigates the undo tree to sequence `seq`, replaying every step the
+    /// route needs, and returns them in application order.
+    ///
+    /// This is what `:undo {N}` needs (`undo_time` with `absolute`,
+    /// `undo.c:1975`): the target may be behind *or* ahead of the current
+    /// state, and may be on another branch, so it is not a run of one-step
+    /// undos. `UndoTree::undo_to_seq` picks the route; this applies it.
+    pub fn undo_to_seq(
+        &mut self,
+        seq: u64,
+    ) -> Result<Vec<ReplayedEdit>, BufferStateError> {
+        let steps = self.undo.undo_to_seq(seq)?;
+        let mut replayed = Vec::with_capacity(steps.len());
+        for step in steps {
+            replayed.push(self.apply_undo_step(&step)?);
+        }
+        Ok(replayed)
+    }
+
+    /// Replays one undo-tree step through text, marks, folds and extmarks.
+    ///
+    /// One owner for the direction-dependent parts so `undo`, `redo` and
+    /// `undo_to_seq` cannot drift: an undo swaps `after` for `before` and
+    /// lands on the edit's *pre* cursor, a redo does the reverse.
+    fn apply_undo_step(
+        &mut self,
+        step: &UndoStep,
+    ) -> Result<ReplayedEdit, BufferStateError> {
+        let (entry, undoing) = match step {
+            UndoStep::Undo(entry) => (entry, true),
+            UndoStep::Redo(entry) => (entry, false),
+        };
         let edit = &entry.edit;
-        self.replay_text(edit.start, &edit.before, &edit.after)?;
-        self.marks
-            .splice(edit.start, edit.before.len(), edit.after.len());
-        let _ = self.splice_derived_state(edit.start, edit.before.len(), edit.after.len())?;
+        let (remove, apply) = if undoing {
+            (&edit.after, &edit.before)
+        } else {
+            (&edit.before, &edit.after)
+        };
+        self.replay_text(edit.start, remove, apply)?;
+        self.marks.splice(edit.start, remove.len(), apply.len());
+        if undoing {
+            self.splice_folds(edit.start, remove.len(), apply.len())?;
+            if let Some(extmark_undo) = self.extmark_undo.get(&entry.seq) {
+                self.extmarks.undo_splice(
+                    extmark_undo,
+                    ExtmarkPosition::new(edit.start.saturating_sub(1), 0),
+                    TextExtent::new(apply.len(), 0),
+                    TextExtent::new(remove.len(), 0),
+                )?;
+            } else {
+                self.extmarks.splice(
+                    ExtmarkPosition::new(edit.start.saturating_sub(1), 0),
+                    TextExtent::new(remove.len(), 0),
+                    TextExtent::new(apply.len(), 0),
+                )?;
+            }
+        } else {
+            let _ = self.splice_derived_state(edit.start, remove.len(), apply.len())?;
+        }
         self.refresh_modified();
         self.bump_derived_ticks();
-        Ok(Some(ReplayedEdit {
+        let cursor = if undoing { edit.cursor_before } else { edit.cursor_after };
+        Ok(ReplayedEdit {
             seq: entry.seq,
             start: edit.start,
-            old_count: edit.before.len(),
-            new_count: edit.after.len(),
-            cursor: Position {
-                lnum: edit.cursor_after.lnum,
-                col: edit.cursor_after.col,
-            },
-        }))
+            old_count: remove.len(),
+            new_count: apply.len(),
+            cursor: Position { lnum: cursor.lnum, col: cursor.col },
+        })
     }
 
     /// Applies `apply` in place of the `remove` lines currently at `start`,
