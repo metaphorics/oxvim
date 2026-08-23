@@ -132,9 +132,9 @@ fn call_luaeval_builtin<F: FileIO>(
         Typval::Number(value) => value.to_string(),
         Typval::Bool(value) => OxStr::from(if *value { "v:true" } else { "v:false" }).to_string_lossy().into_owned(),
         Typval::Special(Special::Null) => "v:null".to_owned(),
-        Typval::Float(_) => {
-            return Err(EvalError::new("E806", 0, "Using a Float as a String"));
-        }
+        // `tv_get_string_buf_chk` (`typval.c:4684-4685`) renders a Float with
+        // `%g`; E806 belongs only to `check_can_index` (`eval.c:3225-3229`).
+        Typval::Float(number) => ox_eval::float_as_string(*number).to_string_lossy().into_owned(),
         Typval::List(_) => {
             return Err(EvalError::new("E730", 0, "Using a List as a String"));
         }

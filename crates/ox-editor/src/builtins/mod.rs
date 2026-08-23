@@ -125,7 +125,9 @@ pub(crate) fn input_string_arg(value: &Typval) -> ox_eval::Result<OxStr> {
         Typval::Special(Special::Null) => Ok(OxStr::from("")),
         Typval::List(_) => Err(EvalError::new("E730", 0, "Using a List as a String")),
         Typval::Dict(_) => Err(EvalError::new("E731", 0, "Using a Dictionary as a String")),
-        Typval::Float(_) => Err(EvalError::new("E806", 0, "Using a Float as a String")),
+        // `tv_get_string_buf_chk` (`typval.c:4684-4685`) renders a Float with
+        // `%g`; E806 belongs only to `check_can_index` (`eval.c:3225-3229`).
+        Typval::Float(number) => Ok(ox_eval::float_as_string(*number)),
         _ => Err(EvalError::new("E729", 0, "Using invalid value as a String")),
     }
 }
