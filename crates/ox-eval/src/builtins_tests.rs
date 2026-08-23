@@ -379,13 +379,16 @@ case!(str2nr_binary_explicit, "str2nr", [text("0b101"), number(2)], number(5));
 case!(str2nr_octal_explicit, "str2nr", [text("0o17"), number(8)], number(15));
 case!(str2nr_default_is_decimal, "str2nr", [text("0xff")], number(0));
 case!(str2float_basic, "str2float", [text("1.25")], Typval::Float(1.25));
-case!(type_number, "type", [number(1)], number(1));
-case!(type_string, "type", [text("x")], number(2));
-case!(type_list, "type", [list(&[])], number(4));
-case!(type_dict, "type", [Typval::dict(vec![])], number(5));
-case!(type_float, "type", [Typval::Float(1.0)], number(6));
-case!(type_bool, "type", [Typval::Bool(true)], number(7));
-case!(type_null, "type", [Typval::Special(Special::Null)], number(8));
+// `eval/typval_defs.h:123-133`, each measured on the oracle.
+case!(type_number, "type", [number(1)], number(0));
+case!(type_string, "type", [text("x")], number(1));
+case!(type_func, "type", [funcref("tr")], number(2));
+case!(type_list, "type", [list(&[])], number(3));
+case!(type_dict, "type", [Typval::dict(vec![])], number(4));
+case!(type_float, "type", [Typval::Float(1.0)], number(5));
+case!(type_bool, "type", [Typval::Bool(true)], number(6));
+case!(type_null, "type", [Typval::Special(Special::Null)], number(7));
+case!(type_blob, "type", [Typval::Blob(vec![0])], number(10));
 case!(string_number, "string", [number(12)], text("12"));
 case!(string_text_quotes, "string", [text("a")], text("'a'"));
 case!(string_bool, "string", [Typval::Bool(true)], text("v:true"));
@@ -747,6 +750,57 @@ fn eval_builtin(source: &[u8], mut scope: Scope) -> (Typval, Scope) {
     let mut builtins = Builtins::without_regex();
     let result = Evaluator::new(&mut builtins, &regex).eval(&expression, &mut scope).unwrap();
     (result, scope)
+}
+
+/// `type(x) == v:t_<name>` is how plugin code actually spells a type check, so
+/// the builtin and the variables have to agree value for value. Both sides are
+/// pinned to the oracle: each expected number was measured by running
+/// `type()` and `v:t_*` through `.references/neovim/build/bin/nvim`.
+#[test]
+fn type_matches_its_vim_type_variable_for_every_supported_type() {
+    // `function()` is a host-layer builtin, so the Funcref case arrives as a
+    // seeded variable rather than a literal call.
+    let seeded = || {
+        let mut scope = Scope::new();
+        scope.set(b"Ref", funcref("tr")).unwrap();
+        scope
+    };
+    let cases: [(&[u8], &[u8], i64); 9] = [
+        (b"0", b"v:t_number", 0),
+        (b"''", b"v:t_string", 1),
+        (b"Ref", b"v:t_func", 2),
+        (b"{x -> x}", b"v:t_func", 2),
+        (b"[]", b"v:t_list", 3),
+        (b"{}", b"v:t_dict", 4),
+        (b"0.0", b"v:t_float", 5),
+        (b"v:true", b"v:t_bool", 6),
+        (b"0z00", b"v:t_blob", 10),
+    ];
+    for (value, variable, expected) in cases {
+        let mut source = Vec::from(b"type(".as_slice());
+        source.extend_from_slice(value);
+        source.extend_from_slice(b") == ");
+        source.extend_from_slice(variable);
+        let name = String::from_utf8_lossy(variable).into_owned();
+        assert_eq!(
+            eval_builtin(&source, seeded()).0,
+            number(1),
+            "type({}) must equal {name}",
+            String::from_utf8_lossy(value),
+        );
+
+        let mut probe = Vec::from(b"type(".as_slice());
+        probe.extend_from_slice(value);
+        probe.push(b')');
+        assert_eq!(eval_builtin(&probe, seeded()).0, number(expected), "type({name}'s value)");
+        assert_eq!(eval_builtin(variable, seeded()).0, number(expected), "{name}");
+        assert_eq!(call("exists", vec![text(&name)]).unwrap(), number(1), "exists('{name}')");
+    }
+
+    // `v:null` is `VAR_TYPE_SPECIAL`, which upstream gives no `v:t_` name:
+    // `exists('v:t_special')` is 0 on the oracle.
+    assert_eq!(eval_builtin(b"type(v:null)", Scope::new()).0, number(7));
+    assert_eq!(call("exists", vec![text("v:t_special")]).unwrap(), number(0));
 }
 
 #[test]

@@ -419,7 +419,14 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
             b"v:true" => return Ok(Evaluated::plain(Typval::Bool(true))),
             b"v:false" => return Ok(Evaluated::plain(Typval::Bool(false))),
             b"v:null" | b"v:none" => return Ok(Evaluated::plain(Typval::Special(Special::Null))),
-            _ => {}
+            // `v:t_*` are set once at startup and never assignable
+            // (`eval/vars.c:324-331`), so they resolve here rather than from the
+            // `v:` table, which hosts rebuild from their own editor state.
+            other => {
+                if let Some(value) = crate::builtins::vim_type_var(other) {
+                    return Ok(Evaluated::plain(Typval::Number(value)));
+                }
+            }
         }
         let bytes = name.as_bytes();
         if bytes.len() == 2 && bytes[1] == b':' {

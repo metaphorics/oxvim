@@ -17,6 +17,61 @@ use crate::scope::Scope;
 
 const MAX_CONTAINER_DEPTH: usize = 100;
 
+/// Upstream's `VAR_TYPE_*` values (`eval/typval_defs.h:123-133`): the numbers
+/// `type()` returns and the `v:t_*` variables hold. These are a *public*
+/// numbering, deliberately distinct from the internal `VAR_*` discriminants in
+/// `ox_types` — `f_type` (`eval/funcs.c:7570-7597`) translates one to the
+/// other, and the two disagree for every type but Blob.
+const VAR_TYPE_NUMBER: i64 = 0;
+const VAR_TYPE_STRING: i64 = 1;
+const VAR_TYPE_FUNC: i64 = 2;
+const VAR_TYPE_LIST: i64 = 3;
+const VAR_TYPE_DICT: i64 = 4;
+const VAR_TYPE_FLOAT: i64 = 5;
+const VAR_TYPE_BOOL: i64 = 6;
+const VAR_TYPE_SPECIAL: i64 = 7;
+const VAR_TYPE_BLOB: i64 = 10;
+
+/// The read-only `v:t_*` type constants, in the order `set_vim_var_nr` defines
+/// them (`eval/vars.c:324-331`). `VAR_TYPE_SPECIAL` has no `v:t_` name
+/// upstream — `exists('v:t_special')` is 0 on the oracle — so it has none here.
+pub const VIM_TYPE_VARS: [(&[u8], i64); 8] = [
+    (b"v:t_number", VAR_TYPE_NUMBER),
+    (b"v:t_string", VAR_TYPE_STRING),
+    (b"v:t_func", VAR_TYPE_FUNC),
+    (b"v:t_list", VAR_TYPE_LIST),
+    (b"v:t_dict", VAR_TYPE_DICT),
+    (b"v:t_float", VAR_TYPE_FLOAT),
+    (b"v:t_bool", VAR_TYPE_BOOL),
+    (b"v:t_blob", VAR_TYPE_BLOB),
+];
+
+/// `f_type` (`eval/funcs.c:7570-7597`): the public type number of a value.
+///
+/// A Partial answers `VAR_TYPE_FUNC` alongside a Funcref, as upstream's
+/// `case VAR_PARTIAL:` falls through to `case VAR_FUNC:`. Channel and Job are
+/// Numbers upstream and answer `VAR_TYPE_NUMBER`.
+#[must_use]
+pub const fn type_constant(value: &Typval) -> i64 {
+    match value {
+        Typval::Number(_) | Typval::Channel(_) | Typval::Job(_) => VAR_TYPE_NUMBER,
+        Typval::String(_) => VAR_TYPE_STRING,
+        Typval::Funcref(_) | Typval::Partial(_) => VAR_TYPE_FUNC,
+        Typval::List(_) => VAR_TYPE_LIST,
+        Typval::Dict(_) => VAR_TYPE_DICT,
+        Typval::Float(_) => VAR_TYPE_FLOAT,
+        Typval::Bool(_) => VAR_TYPE_BOOL,
+        Typval::Special(_) => VAR_TYPE_SPECIAL,
+        Typval::Blob(_) => VAR_TYPE_BLOB,
+    }
+}
+
+/// The value of a `v:t_*` constant, by fully qualified name.
+#[must_use]
+pub fn vim_type_var(name: &[u8]) -> Option<i64> {
+    VIM_TYPE_VARS.iter().find_map(|(key, value)| (*key == name).then_some(*value))
+}
+
 /// Declarative metadata recovered from Neovim's `eval.lua`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuiltinSpec {
@@ -175,7 +230,7 @@ impl<'a> Builtins<'a> {
             "tr" => translate(&args),
             "utf16idx" => utf16idx(&args),
             "charidx" => charidx(&args),
-            "type" => Ok(Typval::Number(i64::from(args[0].vartype()))),
+            "type" => Ok(Typval::Number(type_constant(&args[0]))),
             "uniq" => uniq(args),
             "values" => dict_projection(&args[0], Projection::Values),
             "xor" => binary_number(&args, |left, right| left ^ right),
@@ -970,6 +1025,7 @@ pub fn exists(value: &Typval, scope: &Scope) -> Result<Typval> {
             .is_some_and(|name| builtin_spec(name).is_some()),
         Some(b':' | b'#') | None => false,
         _ => matches!(bytes, b"v:true" | b"v:false" | b"v:null" | b"v:none")
+            || vim_type_var(bytes).is_some()
             || scope.contains_variable(bytes),
     };
     Ok(Typval::Number(i64::from(found)))
