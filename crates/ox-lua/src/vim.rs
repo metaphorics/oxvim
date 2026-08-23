@@ -378,6 +378,23 @@ pub fn bind_api(
             })?,
         )?;
     }
+
+    // api/vim.c `nvim__get_runtime` is an internal, so it is absent from the
+    // canonical API metadata the registry is built from, but the package loader
+    // in runtime/lua/vim/_init_packages.lua reaches 'runtimepath' through it.
+    // Bind it here, where the editor whose 'runtimepath' it must walk is in
+    // scope. Upstream `runtime_get_named` defaults a missing `is_lua` to false.
+    api.set(
+        "nvim__get_runtime",
+        lua.create_function(move |_, (patterns, all, opts): (Vec<String>, bool, Table)| {
+            let is_lua = opts.get::<Option<bool>>("is_lua")?.unwrap_or(false);
+            let editor = context.editor.borrow();
+            Ok(ox_api::runtime_get_named(&editor, &patterns, all, is_lua)
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<String>>())
+        })?,
+    )?;
     Ok(())
 }
 

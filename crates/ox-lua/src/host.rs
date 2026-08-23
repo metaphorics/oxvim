@@ -109,7 +109,7 @@ impl LuaHost {
         configure_package_path(&lua, &runtime_root)?;
         let fast_callbacks = install_vim_core(&lua, builtins.clone(), scheduler.clone())?;
         stdlib::install(&lua)?;
-        embedded::install(&lua, runtime_root.clone())?;
+        embedded::install(&lua)?;
         treesitter::install(&lua, scheduler.clone())?;
         uv_core::install(
             &lua,

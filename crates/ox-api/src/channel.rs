@@ -1,7 +1,5 @@
 //! RPC channel metadata, subscriptions, and runtime-file lookup.
 
-use std::collections::BTreeSet;
-
 use ox_editor::Editor;
 
 use crate::runtime::{ChannelInfo, with_state, with_state_mut};
@@ -91,24 +89,21 @@ pub fn nvim_set_client_info(editor: &mut Editor, name: OxStr, version: Dict, cli
 
 #[api(since = 1)]
 pub fn nvim_list_runtime_paths(editor: &mut Editor) -> Result<Vec<OxStr>, ApiError> {
-    Ok(with_state(editor, |state| state.runtime_paths.iter().map(|path| OxStr::from(path.to_string_lossy().as_bytes())).collect()))
+    // api/vim.c: nvim_list_runtime_paths() is nvim_get_runtime_file("", true).
+    Ok(runtime_file_strings(editor, "", true))
 }
 
 #[api(since = 7)]
 pub fn nvim_get_runtime_file(editor: &mut Editor, name: OxStr, all: bool) -> Result<Vec<OxStr>, ApiError> {
     let pattern = utf8(&name, "name")?;
-    with_state(editor, |state| {
-        let mut found = Vec::new();
-        let mut seen = BTreeSet::new();
-        for root in &state.runtime_paths {
-            for path in state.file_io.glob(root, &pattern).map_err(ApiError::exception)? {
-                let string = OxStr::from(path.to_string_lossy().as_bytes());
-                if seen.insert(string.clone()) { found.push(string); }
-                if !all && !found.is_empty() { return Ok(found); }
-            }
-        }
-        Ok(found)
-    })
+    Ok(runtime_file_strings(editor, &pattern, all))
+}
+
+fn runtime_file_strings(editor: &Editor, name: &str, all: bool) -> Vec<OxStr> {
+    crate::runtime::find_runtime_files(editor, name, all)
+        .iter()
+        .map(|path| OxStr::from(path.to_string_lossy().as_bytes()))
+        .collect()
 }
 
 pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {

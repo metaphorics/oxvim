@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mlua::{Function, Lua, Table, Value};
-pub use ox_lua::RuntimeRoot;
 
 #[path = "../src/embedded.rs"]
 mod embedded;
@@ -81,9 +80,8 @@ fn bare_lua() -> mlua::Result<Lua> {
 
 #[test]
 fn preloads_exact_upstream_builtin_set() -> Result<(), Box<dyn Error>> {
-    let runtime = TemporaryRuntime::empty()?;
     let lua = bare_lua()?;
-    embedded::install(&lua, RuntimeRoot::new(runtime.path()))?;
+    embedded::install(&lua)?;
 
     let embedded_names = embedded::EMBEDDED_MODULES
         .iter()
@@ -102,37 +100,10 @@ fn preloads_exact_upstream_builtin_set() -> Result<(), Box<dyn Error>> {
 fn requires_shared_core_from_bytes_with_empty_runtime_root() -> Result<(), Box<dyn Error>> {
     let runtime = TemporaryRuntime::empty()?;
     let lua = bare_lua()?;
-    embedded::install(&lua, RuntimeRoot::new(runtime.path()))?;
+    embedded::install(&lua)?;
 
     let shared: Table = lua.load("return require('vim._core.shared')").eval()?;
     let _: Function = shared.get("deepcopy")?;
     assert!(runtime.path().read_dir()?.next().is_none());
-    Ok(())
-}
-
-#[test]
-fn runtime_listing_uses_the_supplied_root_and_all_flag() -> Result<(), Box<dyn Error>> {
-    let runtime = TemporaryRuntime::empty()?;
-    fs::create_dir(runtime.path().join("lua"))?;
-    fs::write(runtime.path().join("lua/first.lua"), b"return true\n")?;
-    fs::write(runtime.path().join("lua/second.lua"), b"return true\n")?;
-
-    let lua = bare_lua()?;
-    embedded::install(&lua, RuntimeRoot::new(runtime.path()))?;
-    let found: Vec<String> = lua
-        .load(
-            "return vim.api.nvim__get_runtime(\
-             {'lua/first.lua', 'lua/second.lua'}, false, {is_lua = true})",
-        )
-        .eval()?;
-
-    assert_eq!(
-        found,
-        vec![runtime
-            .path()
-            .join("lua/first.lua")
-            .to_string_lossy()
-            .into_owned()]
-    );
     Ok(())
 }

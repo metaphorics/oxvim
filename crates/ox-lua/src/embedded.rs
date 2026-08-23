@@ -2,13 +2,12 @@
 
 use mlua::{Lua, MultiValue, Table, Value};
 
-use crate::RuntimeRoot;
-
 include!(concat!(env!("OUT_DIR"), "/ox_lua_embedded.rs"));
 
-/// Install Neovim's built-in Lua preloaders and the single-runtime-root
-/// implementation of `nvim__get_runtime` used by Lua package discovery.
-pub(crate) fn install(lua: &Lua, runtime_root: RuntimeRoot) -> mlua::Result<()> {
+/// Install Neovim's built-in Lua preloaders. Runtime-file discovery itself
+/// lives on the editor's 'runtimepath', so `vim.api.nvim__get_runtime` is bound
+/// by [`crate::bind_api`] rather than against this single root.
+pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     let package: Table = lua.globals().get("package")?;
     let preload: Table = package.get("preload")?;
 
@@ -25,28 +24,6 @@ pub(crate) fn install(lua: &Lua, runtime_root: RuntimeRoot) -> mlua::Result<()> 
             })?,
         )?;
     }
-
-    let vim: Table = lua.globals().get("vim")?;
-    let api: Table = vim.get("api")?;
-    api.set(
-        "nvim__get_runtime",
-        lua.create_function(move |_, (patterns, all, opts): (Vec<String>, bool, Table)| {
-            // executor.c:nlua_thr_api_nvim__get_runtime requires this boolean.
-            // RuntimeRoot already represents the single Lua-aware runtime root,
-            // so the value validates the API contract without changing the root.
-            let _: bool = opts.get("is_lua")?;
-            let mut matches = Vec::new();
-            for pattern in patterns {
-                for entry in runtime_root.runtime_entries(pattern) {
-                    matches.push(entry.to_string_lossy().into_owned());
-                    if !all {
-                        return Ok(matches);
-                    }
-                }
-            }
-            Ok(matches)
-        })?,
-    )?;
 
     Ok(())
 }

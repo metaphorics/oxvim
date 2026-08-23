@@ -1262,3 +1262,240 @@ fn option_setter_error_shapes_match_upstream() {
         ))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Runtime-file search over 'runtimepath'
+// ---------------------------------------------------------------------------
+
+/// An in-memory directory tree, so the ordering rules can be exercised without
+/// a real filesystem. Every entry is an absolute path; a trailing `/` marks a
+/// directory, and every parent directory of a listed path exists.
+struct MemoryFileIO {
+    dirs: std::collections::BTreeSet<String>,
+    files: std::collections::BTreeSet<String>,
+}
+
+impl MemoryFileIO {
+    fn new(entries: &[&str]) -> Self {
+        let mut io = Self { dirs: std::collections::BTreeSet::new(), files: std::collections::BTreeSet::new() };
+        for entry in entries {
+            let path = entry.trim_end_matches('/');
+            if entry.ends_with('/') {
+                io.dirs.insert(path.to_owned());
+            } else {
+                io.files.insert(path.to_owned());
+            }
+            let mut parent = std::path::Path::new(path).parent();
+            while let Some(directory) = parent.filter(|directory| directory.as_os_str().len() > 1) {
+                io.dirs.insert(directory.to_string_lossy().into_owned());
+                parent = directory.parent();
+            }
+        }
+        io
+    }
+
+    /// Component-wise wildcard match, the way a shell glob and upstream's
+    /// `gen_expand_wildcards()` both treat `*`: it never spans a separator.
+    fn matches(pattern: &str, path: &str) -> bool {
+        let (pattern, path): (Vec<&str>, Vec<&str>) = (pattern.split('/').collect(), path.split('/').collect());
+        pattern.len() == path.len()
+            && pattern.iter().zip(&path).all(|(part, name)| crate::runtime::wildcard(part.as_bytes(), name.as_bytes()))
+    }
+}
+
+impl crate::FileIO for MemoryFileIO {
+    fn expand(&self, pattern: &str, kind: crate::MatchKind) -> Vec<std::path::PathBuf> {
+        let candidates: Box<dyn Iterator<Item = &String>> = match kind {
+            crate::MatchKind::Dirs => Box::new(self.dirs.iter()),
+            crate::MatchKind::Files => Box::new(self.files.iter()),
+            crate::MatchKind::DirsAndFiles => Box::new(self.dirs.iter().chain(self.files.iter())),
+        };
+        let mut found: Vec<String> =
+            candidates.filter(|path| Self::matches(pattern, path)).cloned().collect();
+        found.sort();
+        found.into_iter().map(std::path::PathBuf::from).collect()
+    }
+
+    fn is_dir(&self, path: &std::path::Path) -> bool {
+        self.dirs.contains(path.to_string_lossy().as_ref())
+    }
+
+    fn is_readable(&self, path: &std::path::Path) -> bool {
+        self.files.contains(path.to_string_lossy().as_ref())
+    }
+}
+
+/// Builds an editor whose 'runtimepath'/'packpath' and filesystem are the
+/// supplied ones, with nothing inherited from the host.
+fn runtime_editor(runtimepath: &str, packpath: &str, entries: &[&str]) -> Editor {
+    let mut editor = Editor::new();
+    for (name, value) in [("runtimepath", runtimepath), ("packpath", packpath)] {
+        editor
+            .options_mut()
+            .set_global(name, ox_editor::OptionValue::String(value.to_owned()))
+            .expect("option is settable");
+    }
+    crate::set_file_io(&editor, Box::new(MemoryFileIO::new(entries)));
+    editor
+}
+
+fn list_paths(editor: &mut Editor) -> Vec<String> {
+    crate::channel::nvim_list_runtime_paths(editor)
+        .expect("listing succeeds")
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn runtime_file(editor: &mut Editor, name: &str, all: bool) -> Vec<String> {
+    crate::channel::nvim_get_runtime_file(editor, OxStr::from(name), all)
+        .expect("lookup succeeds")
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn get_named(editor: &Editor, patterns: &[&str], all: bool, is_lua: bool) -> Vec<String> {
+    let patterns: Vec<String> = patterns.iter().map(|pattern| (*pattern).to_owned()).collect();
+    crate::runtime_get_named(editor, &patterns, all, is_lua)
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+const TREE: &[&str] = &[
+    "/a/lua/shared.lua",
+    "/a/lua/onlya.lua",
+    "/a/plugin/x.vim",
+    "/b/after/lua/shared.lua",
+    "/b/after/plugin/x.vim",
+    "/c/lua/shared.lua",
+    "/c/plugin/x.vim",
+    "/nolua/plugin/shared.lua",
+    "/w/p1/lua/shared.lua",
+    "/w/p2/lua/shared.lua",
+    "/pk/pack/vendor/start/bundle/lua/shared.lua",
+    "/pk/pack/vendor/start/bundle/after/lua/shared.lua",
+];
+
+// runtime.c do_in_cached_path — `all` decides whether the walk collects every
+// match or stops at the first. Three entries all hold the file, so a search
+// that ignored `all` would answer with three paths either way, and one that
+// ignored 'runtimepath' order would not stop on /a.
+#[test]
+fn runtime_file_lookup_honors_the_all_flag() {
+    let mut editor = runtime_editor("/a,/b/after,/c", "", TREE);
+    assert_eq!(
+        runtime_file(&mut editor, "lua/shared.lua", true),
+        ["/a/lua/shared.lua", "/b/after/lua/shared.lua", "/c/lua/shared.lua"]
+    );
+    assert_eq!(runtime_file(&mut editor, "lua/shared.lua", false), ["/a/lua/shared.lua"]);
+    assert_eq!(get_named(&editor, &["lua/shared.lua"], false, true), ["/a/lua/shared.lua"]);
+}
+
+// runtime.c do_in_cached_path — the walk follows 'runtimepath' left to right,
+// so reordering the same three entries reorders every answer. A search that
+// sorted its results, or read the option once and cached it, would return the
+// first block's answer here too.
+#[test]
+fn runtime_file_lookup_follows_runtimepath_order() {
+    let mut editor = runtime_editor("/c,/a", "", TREE);
+    assert_eq!(runtime_file(&mut editor, "lua/shared.lua", true), ["/c/lua/shared.lua", "/a/lua/shared.lua"]);
+    assert_eq!(runtime_file(&mut editor, "lua/shared.lua", false), ["/c/lua/shared.lua"]);
+
+    editor
+        .options_mut()
+        .set_global("runtimepath", ox_editor::OptionValue::String("/a,/c".to_owned()))
+        .expect("option is settable");
+    assert_eq!(runtime_file(&mut editor, "lua/shared.lua", true), ["/a/lua/shared.lua", "/c/lua/shared.lua"]);
+    assert_eq!(runtime_file(&mut editor, "lua/shared.lua", false), ["/a/lua/shared.lua"]);
+}
+
+// runtime.c runtime_search_path_build — the first pass stops at the first
+// `after` entry and the rest of 'runtimepath' is appended from there, so an
+// `after` entry in the middle keeps its place. Partitioning the entries into
+// non-after then after would move /b/after behind /c and answer with the same
+// list as the tail-after case below, which is what makes the pair a test.
+#[test]
+fn after_entries_keep_their_runtimepath_position() {
+    let mut middle = runtime_editor("/a,/b/after,/c", "", TREE);
+    assert_eq!(list_paths(&mut middle), ["/a", "/b/after", "/c"]);
+
+    let mut tail = runtime_editor("/a,/c,/b/after", "", TREE);
+    assert_eq!(list_paths(&mut tail), ["/a", "/c", "/b/after"]);
+
+    assert_ne!(list_paths(&mut middle), list_paths(&mut tail));
+}
+
+// runtime.c runtime_search_path_build — an entry that is also a 'packpath'
+// entry splices its start bundles in directly behind itself, while the
+// bundles' `after` directories wait for the pass that runs once every
+// non-after entry is placed. Appending the after dir next to its bundle, or
+// putting the bundles at the end, both reorder this list.
+#[test]
+fn package_bundles_follow_their_packpath_entry_and_after_dirs_come_last() {
+    let mut editor = runtime_editor("/a,/pk,/c", "/pk", TREE);
+    assert_eq!(
+        list_paths(&mut editor),
+        ["/a", "/pk", "/pk/pack/vendor/start/bundle", "/c", "/pk/pack/vendor/start/bundle/after"]
+    );
+}
+
+// runtime.c expand_rtp_entry — a wildcard entry expands to the directories it
+// matches, in sorted order, and a directory already on the path is not placed
+// again when a later entry names it. Without the dedup /w/p1 would appear
+// twice; without the expansion /w/* would contribute nothing.
+#[test]
+fn wildcard_entries_expand_and_repeats_collapse() {
+    let mut editor = runtime_editor("/w/*,/c,/w/p1", "", TREE);
+    assert_eq!(list_paths(&mut editor), ["/w/p1", "/w/p2", "/c"]);
+    assert_eq!(
+        runtime_file(&mut editor, "lua/shared.lua", true),
+        ["/w/p1/lua/shared.lua", "/w/p2/lua/shared.lua", "/c/lua/shared.lua"]
+    );
+}
+
+// runtime.c runtime_get_named — with `is_lua` an entry that has no `lua/`
+// subdirectory is skipped entirely, which is how `require` avoids probing
+// every runtime directory. nvim_get_runtime_file has no such filter, so the
+// same tree answers differently through the two entry points.
+#[test]
+fn lua_lookup_skips_entries_without_a_lua_directory() {
+    let mut editor = runtime_editor("/nolua,/a", "", TREE);
+    assert_eq!(list_paths(&mut editor), ["/nolua", "/a"]);
+    assert_eq!(get_named(&editor, &["plugin/shared.lua"], true, true), Vec::<String>::new());
+    assert_eq!(get_named(&editor, &["plugin/shared.lua"], true, false), ["/nolua/plugin/shared.lua"]);
+    assert_eq!(runtime_file(&mut editor, "plugin/shared.lua", true), ["/nolua/plugin/shared.lua"]);
+}
+
+// api/vim.c nvim_get_runtime_file — the name may hold several whitespace
+// separated patterns and may glob, and DIP_DIRFILE lets it match directories
+// as well as files. All three are tried under one entry before moving on.
+#[test]
+fn runtime_file_lookup_expands_multiple_patterns_and_directories() {
+    let mut editor = runtime_editor("/a,/c", "", TREE);
+    assert_eq!(
+        runtime_file(&mut editor, "lua/onlya.lua plugin/x.vim", true),
+        ["/a/lua/onlya.lua", "/a/plugin/x.vim", "/c/plugin/x.vim"]
+    );
+    assert_eq!(
+        runtime_file(&mut editor, "lua/*.lua", true),
+        ["/a/lua/onlya.lua", "/a/lua/shared.lua", "/c/lua/shared.lua"]
+    );
+    assert_eq!(runtime_file(&mut editor, "lua", true), ["/a/lua", "/c/lua"]);
+}
+
+// runtime.c runtime_get_named — patterns are literal readable-file probes, so
+// an entry contributes at most one path per pattern and a directory never
+// answers. `all` stops the walk on the first hit, as it does for the search.
+#[test]
+fn lua_lookup_probes_literal_paths_in_order() {
+    let editor = runtime_editor("/a,/c", "", TREE);
+    assert_eq!(
+        get_named(&editor, &["lua/onlya.lua", "lua/shared.lua"], true, true),
+        ["/a/lua/onlya.lua", "/a/lua/shared.lua", "/c/lua/shared.lua"]
+    );
+    assert_eq!(get_named(&editor, &["lua/onlya.lua", "lua/shared.lua"], false, true), ["/a/lua/onlya.lua"]);
+    assert_eq!(get_named(&editor, &["lua/*.lua"], true, true), Vec::<String>::new());
+    assert_eq!(get_named(&editor, &["lua"], true, true), Vec::<String>::new());
+}
