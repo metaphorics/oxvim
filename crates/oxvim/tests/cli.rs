@@ -370,6 +370,22 @@ fn post_commands_keep_argv_order_after_every_pre_command() {
     assert_eq!(String::from_utf8_lossy(&output.stderr), "first+second\n");
 }
 
+/// `-R` is upstream's `readonlymode` (`main.c` line 1286), and `open_buffer`
+/// (`buffer.c` line 258) applies it to every buffer it loads for a named
+/// file, not just the startup buffer. Windows padded with fresh empty
+/// buffers stay writable, because upstream requires a file name.
+#[test]
+fn readonly_mode_reaches_every_loaded_startup_buffer() {
+    let one = TempFile::new(".txt", "aaa\n");
+    let two = TempFile::new(".txt", "bbb\n");
+    let output = batch_verbose(
+        &["-R", "-o5", one.text(), two.text()],
+        "echo \"W1=\" . &readonly\n2wincmd w\necho \"W2=\" . &readonly\n4wincmd w\necho \"W4=\" . &readonly\n",
+    );
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "W1=1\nW2=1\nW4=0\n");
+}
+
 /// Every usage failure is observable: `mainerr` prints `{prog}: {msg}` with a
 /// `-h` pointer and exits 1, and a repeated script file exits 2.
 #[test]

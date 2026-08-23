@@ -226,7 +226,7 @@ pub fn open_startup_buffers(editor: &mut Editor, cli: &Cli) -> Result<(), AppErr
     if cli.stdin_file {
         open_stdin_buffer(editor)?;
     }
-    let buffers = open_startup_files(editor, &cli.files)?;
+    let buffers = open_startup_files(editor, &cli.files, cli.readonly)?;
     if cli.window_layout != WindowLayout::Single {
         create_startup_windows(editor, cli, &buffers)?;
     }
@@ -239,9 +239,15 @@ pub fn open_startup_buffers(editor: &mut Editor, cli: &Cli) -> Result<(), AppErr
 /// each remaining file becomes a loaded buffer without stealing the current
 /// window.  When a startup script has already replaced or modified the
 /// startup buffer, every file, the first included, gets its own buffer.
+/// `-R` is `readonlymode`, not a one-off write to the startup buffer:
+/// `open_buffer` (`buffer.c` line 258) sets `'readonly'` on every buffer it
+/// loads for a named file while that mode is on, so the second and later
+/// files of `-R -o a b` are read-only too. Windows padded with fresh empty
+/// buffers stay writable, because upstream requires `b_ffname != NULL`.
 fn open_startup_files(
     editor: &mut Editor,
     files: &[String],
+    readonly: bool,
 ) -> Result<Vec<BufHandle>, AppError> {
     let first_into_current = editor.current_buffer().is_some_and(|current| {
         editor
@@ -268,6 +274,12 @@ fn open_startup_files(
         if let Ok(state) = editor.buffer_mut(handle) {
             state.set_name(OxStr::from(file.as_str()));
             state.mark_saved();
+        }
+        if readonly {
+            editor
+                .options_mut()
+                .set_buffer(handle, "readonly", OptionValue::Boolean(true))
+                .map_err(|error| AppError::Editor(error.to_string()))?;
         }
         handles.push(handle);
     }
