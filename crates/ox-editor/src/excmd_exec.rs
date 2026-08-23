@@ -1030,7 +1030,10 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
             return call_execute_builtin(self.runtime, self.editor, scope, self.lua, args);
         }
         if name_text == "feedkeys" {
-            return call_feedkeys_builtin(self.editor, args);
+            return call_feedkeys_builtin(self.runtime, self.editor, scope, self.lua, args);
+        }
+        if matches!(&*name_text, "input" | "inputdialog" | "inputlist") {
+            return call_input_builtin(self.editor, &name_text, args);
         }
         if name_text == "chdir" {
             return call_chdir_builtin(self.runtime, self.editor, args);
@@ -5764,21 +5767,56 @@ fn call_virtcol_builtin(editor: &Editor, args: Vec<Typval>) -> ox_eval::Result<T
     Ok(if list_result { Typval::list(vec![start, end]) } else { end })
 }
 
-fn call_feedkeys_builtin(editor: &mut Editor, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+fn call_feedkeys_builtin<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    args: Vec<Typval>,
+) -> ox_eval::Result<Typval> {
     if args.is_empty() || args.len() > 2 {
         return Err(EvalError::new(if args.is_empty() { "E119" } else { "E118" }, 0, "Invalid arguments for feedkeys"));
     }
     let keys = input_string_arg(&args[0])?;
-    let mode = args.get(1).map(input_string_arg).transpose()?.unwrap_or_else(|| OxStr::from(""));
-    let keys = Keys::from_encoded(keys.as_bytes().to_vec()).map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
-    let execute = editor.typeahead_mut().feedkeys(&keys, &mode.to_string_lossy()).map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
+    let mode = args.get(1).map(input_string_arg).transpose()?.unwrap_or_else(|| OxStr::from("m"));
+    let execute = editor.typeahead_mut().feedkeys(&Keys::from_encoded(keys.as_bytes().to_vec()).map_err(|error| EvalError::new("E475", 0, error.to_string()))?, &mode.to_string_lossy()).map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
     if execute {
         let mut machine = ModeMachine::default();
         while !editor.typeahead().is_empty() {
             if !machine.run_once(editor).map_err(|error| EvalError::new("E523", 0, error.to_string()))? { break; }
+            if let Some(command) = machine.take_ex_command() {
+                let logical = vec![LogicalLine { text: command, first_line: runtime.scripts.current_line().max(1) }];
+                let program = parse_program(&runtime.user_commands, &logical)
+                    .map_err(|error| EvalError::new("E488", 0, error.to_string()))?;
+                if let Flow::Exception(exception) = run_program(runtime, editor, scope, lua, &program, 0, program.len()) {
+                    return Err(EvalError::new("E605", 0, exception.message()));
+                }
+            }
         }
     }
     Ok(Typval::Number(0))
+}
+
+fn call_input_builtin(editor: &mut Editor, name: &str, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    let default = args.get(1).map(input_string_arg).transpose()?.unwrap_or_else(|| OxStr::from(""));
+    let cancel = args.get(2).map(input_string_arg).transpose()?.unwrap_or_else(|| OxStr::from(""));
+    let mut bytes = Vec::new();
+    let mut cancelled = false;
+    while let Some(key) = editor.typeahead_mut().pop().map_err(|error| EvalError::new("E475", 0, error.to_string()))? {
+        match key {
+            Key::Byte(b'\r' | b'\n') => break,
+            Key::Byte(0x1b) => { cancelled = true; break; }
+            Key::Byte(0x08 | 0x7f) => { bytes.pop(); }
+            Key::Byte(byte) => bytes.push(byte),
+            Key::Special(_, _) => {}
+        }
+    }
+    if name == "inputlist" {
+        if cancelled || bytes == b"q" { return Ok(Typval::Number(0)); }
+        return Ok(Typval::Number(String::from_utf8_lossy(&bytes).parse().unwrap_or(0)));
+    }
+    if cancelled { return Ok(Typval::String(cancel)); }
+    Ok(Typval::String(if bytes.is_empty() { default } else { OxStr(bytes) }))
 }
 
 fn call_getchar_builtin(editor: &mut Editor, name: &str, args: Vec<Typval>) -> ox_eval::Result<Typval> {

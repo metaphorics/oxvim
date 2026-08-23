@@ -10,7 +10,7 @@ use crate::ops::{self, EditRange, Operator};
 use crate::search::{SearchDirection, SearchState};
 use crate::textobject;
 use crate::{BufferStateError, Editor, EditorError, Key, KeyDecodeError, MarkLocation, MotionKind, OptionValue, SearchError, VisualKind, VisualState};
-use crate::{Lookup, MapMode, MappingAction, Remap, TypeaheadError, TypeaheadFlags};
+use crate::{Lookup, MapMode, MappingAction, Remap, TypeaheadError, TypeaheadFlags, KS_EXTRA};
 
 /// Kind of command line currently being edited.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,7 +165,14 @@ impl ModeMachine {
                 }
             }
             let Some(key) = editor.typeahead_mut().pop()? else { return Ok(Step::Idle); };
-            return match key { Key::Byte(byte) => Ok(Step::Key(char::from(byte))), Key::Special(_, _) => Ok(Step::ProcessEvents) };
+            return match key {
+                Key::Byte(byte) => Ok(Step::Key(char::from(byte))),
+                Key::Special(KS_EXTRA, b'R' | b'N') => Ok(Step::Key('\r')),
+                Key::Special(KS_EXTRA, b'T') => Ok(Step::Key('\t')),
+                Key::Special(KS_EXTRA, b'E') => Ok(Step::Key('\u{1b}')),
+                Key::Special(KS_EXTRA, b'B') => Ok(Step::Key('\u{8}')),
+                Key::Special(_, _) => Ok(Step::ProcessEvents),
+            };
         }
     }
 

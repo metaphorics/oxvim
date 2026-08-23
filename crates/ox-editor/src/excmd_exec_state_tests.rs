@@ -1341,6 +1341,22 @@ fn feedkeys_x_executes_through_mode_machine() {
 }
 
 #[test]
+fn feedkeys_execute_runs_command_line_input_without_e121() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &mut editor,
+        "feedkeys_input.vim",
+        r#"call feedkeys(":let c = input('Q:')\<CR>B\<CR>", 'xt')
+let g:captured = c"#,
+    ).unwrap();
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"captured", 0),
+        Ok(&Typval::String(OxStr::from("B")))
+    );
+}
+
+#[test]
 fn highlight_exists_reads_editor_highlight_table() {
     let mut editor = Editor::new();
     let mut exec = ExExecutor::new();
