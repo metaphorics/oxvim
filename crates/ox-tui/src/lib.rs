@@ -1413,6 +1413,8 @@ fn resolve_client_pair(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
     use super::*;
     use crate::theme::ThemeTokens;
 
