@@ -1748,6 +1748,233 @@ fn redo_rejects_a_count_with_e481() {
 }
 
 // ---------------------------------------------------------------------------
+// Undo-block grouping.
+// Citations: undo.c u_savecommon:388-500,616 (new header only when synced),
+// u_sync:2704-2717, ex_undojoin:2800-2816, u_undoredo:1665,
+// input.c may_sync_undo:1300-1306; eval/funcs.c f_changenr:604-607;
+// undo.c f_undotree:3243-3263, u_eval_tree:3193-3221.
+// ---------------------------------------------------------------------------
+
+/// Everything a single command does is one undo block, so one `:undo` puts
+/// every line back.
+///
+/// Oracle (`nvim -u NONE --headless`, three-line file):
+/// `setline(1,['A','B','C'])` → `changenr()` 1, `seq_last` 1, one
+/// `undotree().entries`; after `undo` the buffer is `a b c` again.
+#[test]
+fn one_command_is_one_undo_block() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&mut editor, "call setline(1, ['A','B','C'])").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["A", "B", "C"]);
+    executor.execute_line(&mut editor, "let g:seq = changenr()").unwrap();
+    assert_eq!(global_value(&executor, "seq"), Some(ox_types::Typval::Number(1)));
+    executor.execute_line(&mut editor, "let g:last = undotree().seq_last").unwrap();
+    assert_eq!(global_value(&executor, "last"), Some(ox_types::Typval::Number(1)));
+    executor.execute_line(&mut editor, "undo").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "b", "c"]);
+    executor.execute_line(&mut editor, "let g:after = changenr()").unwrap();
+    assert_eq!(global_value(&executor, "after"), Some(ox_types::Typval::Number(0)));
+}
+
+/// Two Ex command lines run from a script join the same block, because
+/// nothing between them returns to the main loop to read a typed key. The
+/// second `:undo` therefore has nothing left to undo.
+///
+/// Oracle: two separate `call setline()` lines both report `changenr()` 1 and
+/// `seq_last` 1, and the second `undo` leaves the original text.
+#[test]
+fn two_scripted_commands_join_one_undo_block() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&mut editor, "call setline(1, 'A')").unwrap();
+    executor.execute_line(&mut editor, "let g:first = changenr()").unwrap();
+    executor.execute_line(&mut editor, "call setline(2, 'B')").unwrap();
+    executor.execute_line(&mut editor, "let g:second = changenr()").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["A", "B", "c"]);
+    assert_eq!(global_value(&executor, "first"), Some(ox_types::Typval::Number(1)));
+    assert_eq!(
+        global_value(&executor, "second"),
+        Some(ox_types::Typval::Number(1)),
+        "the second command joined the open block"
+    );
+    executor.execute_line(&mut editor, "undo").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "b", "c"]);
+    executor.execute_line(&mut editor, "undo").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "b", "c"]);
+    assert_eq!(
+        echo_messages(&editor).last().map(String::as_str),
+        Some("Already at oldest change")
+    );
+}
+
+/// A typed key closes the open block first, so two commands typed at the
+/// prompt are two undo steps. `feedkeys()` queues *typed* input, which is
+/// what upstream reports through `gotchars` (`input.c:2495-2497`).
+///
+/// Oracle: `feedkeys('x','xt')` then `feedkeys('dd','xt')` report
+/// `changenr()` 1 then 2, and two undos walk back through both.
+#[test]
+fn a_typed_key_closes_the_block_so_two_commands_are_two_steps() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"aa".to_vec(), b"bb".to_vec(), b"cc".to_vec()]);
+    executor.execute_line(&mut editor, "call feedkeys('x', 'xt')").unwrap();
+    executor.execute_line(&mut editor, "let g:first = changenr()").unwrap();
+    executor.execute_line(&mut editor, "call feedkeys('dd', 'xt')").unwrap();
+    executor.execute_line(&mut editor, "let g:second = changenr()").unwrap();
+    assert_eq!(global_value(&executor, "first"), Some(ox_types::Typval::Number(1)));
+    assert_eq!(global_value(&executor, "second"), Some(ox_types::Typval::Number(2)));
+    assert_eq!(buffer_text(&editor), vec!["bb", "cc"]);
+    executor.execute_line(&mut editor, "undo").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "bb", "cc"]);
+    executor.execute_line(&mut editor, "undo").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["aa", "bb", "cc"]);
+}
+
+/// Keys a mapping produced are not typed keys, so two changes made by one
+/// mapping stay in one block.
+///
+/// Oracle: `nnoremap q ddx` then `feedkeys('q','xt')` reports `changenr()` 1,
+/// and one `undo` restores all three original lines.
+#[test]
+fn a_mapping_making_two_changes_is_one_undo_block() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"aa".to_vec(), b"bb".to_vec(), b"cc".to_vec()]);
+    executor.execute_line(&mut editor, "nnoremap q ddx").unwrap();
+    executor.execute_line(&mut editor, "call feedkeys('q', 'xt')").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["b", "cc"]);
+    executor.execute_line(&mut editor, "let g:seq = changenr()").unwrap();
+    assert_eq!(global_value(&executor, "seq"), Some(ox_types::Typval::Number(1)));
+    executor.execute_line(&mut editor, "undo").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["aa", "bb", "cc"]);
+}
+
+/// `:g/pattern/d` deletes each matching line separately and they group.
+///
+/// Oracle: `g/x/d` over `x1 y x2 y x3` reports `changenr()` 1 and one `undo`
+/// restores all five lines.
+#[test]
+fn a_global_delete_is_one_undo_block() {
+    let (mut editor, mut executor) = setup_with_content(&[
+        b"x1".to_vec(),
+        b"y".to_vec(),
+        b"x2".to_vec(),
+        b"y".to_vec(),
+        b"x3".to_vec(),
+    ]);
+    executor.execute_line(&mut editor, "g/x/d").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["y", "y"]);
+    executor.execute_line(&mut editor, "let g:seq = changenr()").unwrap();
+    assert_eq!(global_value(&executor, "seq"), Some(ox_types::Typval::Number(1)));
+    executor.execute_line(&mut editor, "undo").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["x1", "y", "x2", "y", "x3"]);
+}
+
+/// `:undojoin` reopens the closed block so the next change joins it, and one
+/// `undo` then takes both back together.
+///
+/// Oracle: after two typed changes (`changenr()` 2),
+/// `undojoin | call setline(1,'J')` still reports 2, and `undo` returns to
+/// state 1.
+#[test]
+fn undojoin_puts_the_next_change_in_the_previous_block() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"aa".to_vec(), b"bb".to_vec(), b"cc".to_vec()]);
+    executor.execute_line(&mut editor, "call feedkeys('x', 'xt')").unwrap();
+    executor.execute_line(&mut editor, "call feedkeys('dd', 'xt')").unwrap();
+    executor.execute_line(&mut editor, "undojoin | call setline(1, 'J')").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["J", "cc"]);
+    executor.execute_line(&mut editor, "let g:seq = changenr()").unwrap();
+    assert_eq!(global_value(&executor, "seq"), Some(ox_types::Typval::Number(2)));
+    executor.execute_line(&mut editor, "undo").unwrap();
+    assert_eq!(
+        buffer_text(&editor),
+        vec!["a", "bb", "cc"],
+        "the joined change went back with the block it joined"
+    );
+}
+
+/// `:undojoin` after an undo is E790, because the header it would reopen is
+/// the one the undo moved off.
+///
+/// Both of upstream's rejecting shapes are covered: an undo that landed back
+/// at the original state (`b_u_newhead` set, `b_u_curhead` set) and an undo
+/// that stopped on an earlier header.
+#[test]
+fn undojoin_after_an_undo_raises_e790() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "call setline(1, 'A')").unwrap();
+    executor.execute_line(&mut editor, "undo").unwrap();
+    assert_vim_error(executor.execute_line(&mut editor, "undojoin"), "E790");
+
+    // Two blocks, undone by one step: the current state carries a header and
+    // there is a newer one ahead of it.
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"aa".to_vec(), b"bb".to_vec(), b"cc".to_vec()]);
+    executor.execute_line(&mut editor, "call feedkeys('x', 'xt')").unwrap();
+    executor.execute_line(&mut editor, "call feedkeys('dd', 'xt')").unwrap();
+    executor.execute_line(&mut editor, "undo").unwrap();
+    executor.execute_line(&mut editor, "let g:seq = changenr()").unwrap();
+    assert_eq!(global_value(&executor, "seq"), Some(ox_types::Typval::Number(1)));
+    assert_vim_error(executor.execute_line(&mut editor, "undojoin"), "E790");
+}
+
+/// `undotree()` reports the active branch oldest-first with the abandoned
+/// branch under `alt`, and `synced` tracks whether a block is still open.
+///
+/// Oracle: two typed changes, an undo, then a third change gives
+/// `seq_last` 3, `entries` seqs `[1, 3]` and `alt` `[2]`.
+#[test]
+fn undotree_reports_the_branch_shape_and_the_sync_flag() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"aa".to_vec(), b"bb".to_vec(), b"cc".to_vec()]);
+    executor.execute_line(&mut editor, "call feedkeys('x', 'xt')").unwrap();
+    executor.execute_line(&mut editor, "let g:open = undotree().synced").unwrap();
+    assert_eq!(global_value(&executor, "open"), Some(ox_types::Typval::Number(0)));
+    executor.execute_line(&mut editor, "call feedkeys('dd', 'xt')").unwrap();
+    executor.execute_line(&mut editor, "undo").unwrap();
+    executor.execute_line(&mut editor, "let g:closed = undotree().synced").unwrap();
+    assert_eq!(global_value(&executor, "closed"), Some(ox_types::Typval::Number(1)));
+    executor.execute_line(&mut editor, "call feedkeys('x', 'xt')").unwrap();
+    executor
+        .execute_line(&mut editor, "let g:seqs = map(copy(undotree().entries), 'v:val.seq')")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "seqs"),
+        Some(ox_types::Typval::list(vec![
+            ox_types::Typval::Number(1),
+            ox_types::Typval::Number(3),
+        ]))
+    );
+    executor
+        .execute_line(&mut editor, "let g:alt = map(copy(undotree().entries[-1].alt), 'v:val.seq')")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "alt"),
+        Some(ox_types::Typval::list(vec![ox_types::Typval::Number(2)]))
+    );
+    executor.execute_line(&mut editor, "let g:last = undotree().seq_last").unwrap();
+    assert_eq!(global_value(&executor, "last"), Some(ox_types::Typval::Number(3)));
+}
+
+/// Saving mid-block and then adding a change to the same block still sets
+/// `'modified'`: the block's sequence has not moved, so the saved state has
+/// to be identified by how many edits that block held.
+#[test]
+fn a_change_joining_a_saved_block_still_sets_modified() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec(), b"b".to_vec()]);
+    executor.execute_line(&mut editor, "call setline(1, 'A')").unwrap();
+    let buffer = editor.current_buffer().expect("current buffer");
+    editor.buffer_mut(buffer).expect("buffer").mark_saved();
+    assert!(!editor.buffer(buffer).expect("buffer").modified);
+    executor.execute_line(&mut editor, "call setline(2, 'B')").unwrap();
+    assert!(
+        editor.buffer(buffer).expect("buffer").modified,
+        "a change that joined the saved block must still mark the buffer modified"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // winnr() counts within one tabpage.
 // Citation: eval/window.c get_winnr:278-292 (tp_lastwin for "$").
 // ---------------------------------------------------------------------------

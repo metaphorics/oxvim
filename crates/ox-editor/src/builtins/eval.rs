@@ -15,9 +15,10 @@ use ox_types::{Funcref, Object, OxStr, Special, Typval};
 use crate::script::{FileIO, LogicalLine};
 use crate::autocmd::Event;
 use crate::typeahead::Keys;
+use crate::mapping::MappingAction;
 use crate::{Editor, ModeMachine};
 
-use crate::excmd_exec::{EvalHost, ExRuntime, Flow, LuaExec, LuaExecError, VimRegex, exec_error_flow, expand_env_esc, flow_to_eval_error, parse_program, run_program, sync_editor_into_scope, sync_scope_into_editor, typval_number, typval_to_text};
+use crate::excmd_exec::{EvalHost, program_from_commands, ExRuntime, Flow, LuaExec, LuaExecError, VimRegex, exec_error_flow, expand_env_esc, flow_to_eval_error, parse_program, run_program, sync_editor_into_scope, sync_scope_into_editor, typval_number, typval_to_text};
 use super::{input_string_arg};
 
 /// Routes one expression- or script-evaluating builtin.
@@ -276,6 +277,20 @@ fn call_feedkeys_builtin<F: FileIO>(
                 let program = parse_program(&runtime.user_commands, &logical)
                     .map_err(|error| EvalError::new("E488", 0, error.to_string()))?;
                 if let Flow::Exception(exception) = run_program(runtime, editor, scope, lua, &program, 0, program.len()) {
+                    return Err(EvalError::new("E605", 0, exception.message()));
+                }
+            }
+            // A mapping whose right-hand side is an Ex command reaches the
+            // host as a pending action rather than as keys, so it has to be
+            // run here too; without this the mapping is silently dropped and
+            // `feedkeys()` cannot observe a mapped `:call`. `oxvim`'s server
+            // loop does the same at `server.rs:612-627`.
+            if let Some(MappingAction::ExCommands(commands)) = machine.take_mapping_action() {
+                let program =
+                    program_from_commands(&commands, runtime.scripts.current_line().max(1));
+                if let Flow::Exception(exception) =
+                    run_program(runtime, editor, scope, lua, &program, 0, program.len())
+                {
                     return Err(EvalError::new("E605", 0, exception.message()));
                 }
             }
