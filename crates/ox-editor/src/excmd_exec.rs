@@ -495,9 +495,14 @@ pub(crate) fn drain_typeahead<F: FileIO>(
                 Ok(false) => break,
                 Err(error) => return error_flow(runtime, "E523", error.to_string()),
             },
-            // `emsg(e_recursive_mapping)` (`vgetorpeek`, `getchar.c`).
+            // `emsg(e_recursive_mapping)` then `flush_buffers(FLUSH_MINIMAL)`
+            // and `return map_result_fail` (`vgetorpeek`, `input.c:2513-2518`):
+            // a message and a discarded queue, not a thrown exception. The
+            // oracle confirms it — `:try`/`:catch` around `:normal ,x` with
+            // `nmap ,x ,x` catches nothing and the script continues.
             Err(crate::ModeError::RecursiveMapping) => {
-                return error_flow(runtime, "E223", "recursive mapping")
+                push_text_message(editor, "E223: recursive mapping".to_owned(), true, true);
+                editor.typeahead_mut().flush();
             }
             Err(error) => return error_flow(runtime, "E523", error.to_string()),
         }

@@ -411,6 +411,23 @@ impl Typeahead {
         self.flags.clear();
     }
 
+    /// `flush_buffers(FLUSH_MINIMAL)` (`input.c:473-499`): discards the
+    /// *mapped* run at the front of the queue and leaves typed input alone.
+    ///
+    /// This is how an error in Normal mode abandons the rest of what produced
+    /// it. `:normal` stuffs its argument with `ins_typebuf(..., nottyped =
+    /// true)`, which counts the whole argument into `tb_maplen`
+    /// (`input.c:964-966`), so the remainder of a `:normal` goes here too.
+    pub fn flush_mapped(&mut self) {
+        let mapped = self
+            .flags
+            .iter()
+            .take_while(|flags| flags.mapped)
+            .count();
+        self.bytes.drain(..mapped);
+        self.flags.drain(..mapped);
+    }
+
     /// Number of encoded bytes, matching upstream `tb_len` semantics.
     #[must_use]
     pub fn len(&self) -> usize {

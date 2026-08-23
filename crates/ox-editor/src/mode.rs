@@ -310,7 +310,11 @@ impl ModeMachine {
         if state.prefix == "register" { state.register = Some(key); state.prefix.clear(); return Ok(Mode::Normal(state)); }
         if matches!(state.prefix.as_str(), "f" | "F" | "t" | "T") {
             let find = FindMotion { direction: if matches!(state.prefix.as_str(), "f" | "t") { FindDirection::Forward } else { FindDirection::Backward }, till: matches!(state.prefix.as_str(), "t" | "T"), target: key as u8 };
-            self.move_find(editor, find, state.count.max(1), false)?; self.last_find = Some(find); return Ok(Mode::default());
+            // `nv_csearch`: `if (searchc(cap, t_cmd) == false) clearopbeep()`.
+            // `searchc` records the target before searching, so a failed
+            // `fz` is still what `;` repeats.
+            if !self.move_find(editor, find, state.count.max(1), false)? { beep_flush(editor); }
+            self.last_find = Some(find); return Ok(Mode::default());
         }
         if state.prefix == "g" {
             state.prefix.clear();
@@ -328,7 +332,21 @@ impl ModeMachine {
             'd' | 'c' | 'y' | '>' | '<' | '=' => Ok(Mode::OperatorPending(OperatorPendingState { operator: operator_for(key), count, count_was_set: state.count != 0, motion_count: 0, register: state.register, prefix: String::new() })),
             'g' => { state.prefix = "g".into(); Ok(Mode::Normal(state)) }
             'f' | 'F' | 't' | 'T' => { state.prefix = key.to_string(); Ok(Mode::Normal(state)) }
-            ';' | ',' => { if let Some(mut find) = self.last_find { if key == ',' { find.direction = reverse_find(find.direction); } self.move_find(editor, find, count, false)?; } Ok(Mode::default()) }
+            // `searchc` returns false when there is no previous `f`/`t` to
+            // repeat (`*lastc == NUL`), and `nv_csearch` turns that into
+            // `clearopbeep` — which flushes the rest of the mapped typeahead,
+            // so the remainder of a `:normal` argument never runs.
+            ';' | ',' => {
+                let moved = match self.last_find {
+                    Some(mut find) => {
+                        if key == ',' { find.direction = reverse_find(find.direction); }
+                        self.move_find(editor, find, count, false)?
+                    }
+                    None => false,
+                };
+                if !moved { beep_flush(editor); }
+                Ok(Mode::default())
+            }
             'h' | 'j' | 'k' | 'l' | 'w' | 'W' | 'e' | 'E' | 'b' | 'B' | '0' | '^' | '$' | '%' | '{' | '}' | '(' | ')' | 'G' | 'H' | 'M' | 'L' => { let command = if key == 'G' && state.count != 0 { "G_count".to_owned() } else { key.to_string() }; self.move_command(editor, &command, count, false)?; Ok(Mode::default()) }
             'i' => Ok(Mode::Insert(InsertState)),
             'a' => { self.advance_insert_cursor(editor, false)?; Ok(Mode::Insert(InsertState)) }
@@ -449,10 +467,20 @@ impl ModeMachine {
     }
 
     fn move_command(&mut self, editor: &mut Editor, command: &str, count: usize, visual: bool) -> Result<(), ModeError> { let ctx = context(editor)?; if let Some(motion) = resolve(&ctx.lines, ctx.cursor, command, count, option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { if motion.is_jump && !visual { push_jump(editor, ctx.buffer, ctx.cursor); } editor.set_window_cursor(ctx.window, motion.target)?; } Ok(()) }
-    fn move_find(&mut self, editor: &mut Editor, find: FindMotion, count: usize, _visual: bool) -> Result<(), ModeError> { let ctx = context(editor)?; if let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, count) { editor.set_window_cursor(ctx.window, motion.target)?; } Ok(()) }
+    /// `searchc` (`search.c`): reports whether the target was found, so the
+    /// caller can `clearopbeep` when it was not.
+    fn move_find(&mut self, editor: &mut Editor, find: FindMotion, count: usize, _visual: bool) -> Result<bool, ModeError> { let ctx = context(editor)?; let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, count) else { return Ok(false) }; editor.set_window_cursor(ctx.window, motion.target)?; Ok(true) }
     fn repeat_search(&mut self, editor: &mut Editor, opposite: bool, count: usize) -> Result<(), ModeError> { let ctx = context(editor)?; let result = self.search.repeat(&ctx.lines, ctx.cursor, opposite, count, option_bool(editor, "wrapscan", true))?; push_jump(editor, ctx.buffer, ctx.cursor); editor.set_window_cursor(ctx.window, result.target)?; Ok(()) }
     fn advance_insert_cursor(&self, editor: &mut Editor, line_end: bool) -> Result<(), ModeError> { let ctx = context(editor)?; let line = &ctx.lines[ctx.cursor.lnum - 1]; let col = if line_end { line.len() } else { next_boundary(line, ctx.cursor.col) }; editor.set_window_cursor(ctx.window, Position { lnum: ctx.cursor.lnum, col })?; Ok(()) }
     fn open_line(&self, editor: &mut Editor, below: bool) -> Result<(), ModeError> { let ctx = context(editor)?; let after_line = if below { ctx.cursor.lnum } else { ctx.cursor.lnum.saturating_sub(1) }; let pos = Position { lnum: after_line + 1, col: 0 }; editor.append_buffer_lines(ctx.buffer, after_line, &[Vec::new()], ctx.cursor, self.timestamp)?; editor.set_window_cursor(ctx.window, pos)?; Ok(()) }
+}
+
+/// `beep_flush` (`input.c:523-529`): an error in Normal mode discards the
+/// mapped run at the front of the typeahead, which is how the rest of a
+/// `:normal` argument — or of a mapping's right-hand side — is abandoned.
+/// The beep itself is a UI effect this port has no channel for.
+fn beep_flush(editor: &mut Editor) {
+    editor.typeahead_mut().flush_mapped();
 }
 
 fn map_mode(mode: &Mode) -> MapMode {

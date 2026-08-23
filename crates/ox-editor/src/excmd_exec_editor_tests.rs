@@ -2963,19 +2963,21 @@ fn a_mapping_run_by_normal_stays_one_undo_block() {
     );
 }
 
-/// `if (++mapdepth >= p_mmd) { emsg(e_recursive_mapping) }`
-/// (`vgetorpeek`, `getchar.c`): a mapping whose right-hand side re-triggers it
-/// must stop, not expand forever. This only became reachable once `:normal`
-/// started applying mappings at all, and it hung the process.
+/// `if (++mapdepth >= p_mmd) { emsg(e_recursive_mapping) }` followed by
+/// `flush_buffers(FLUSH_MINIMAL)` and `return map_result_fail`
+/// (`vgetorpeek`, `input.c:2513-2518`): a mapping whose right-hand side
+/// re-triggers it must stop, not expand forever, and it stops with a *message*
+/// and a discarded queue rather than a thrown exception.
 ///
-/// Named divergence: upstream reports E223 as a message and lets the rest of
-/// the script run; this raises it, which a `:catch` sees.
+/// Oracle, v0.13.0-dev-1390: `:try | normal ,x | catch | ... | endtry` around
+/// `nmap ,x ,x` catches nothing and the following line still runs.
 #[test]
 fn a_self_recursive_mapping_stops_at_maxmapdepth() {
     let (mut editor, mut executor) = setup();
     executor.execute_line(&mut editor, "nmap ,x ,x").unwrap();
 
-    assert_vim_error(executor.execute_line(&mut editor, "normal ,x"), "E223");
+    executor.execute_line(&mut editor, "normal ,x").unwrap();
+    assert_eq!(last_error_message(&editor).as_deref(), Some("E223: recursive mapping"));
 
     // The depth counter is per key consumed, not cumulative: a mapping that
     // does terminate still works afterwards.
@@ -2997,10 +2999,52 @@ fn maxmapdepth_bounds_how_far_a_mapping_chain_expands() {
     executor.execute_line(&mut editor, "nmap ,b ,c").unwrap();
     executor.execute_line(&mut editor, "nmap ,a ,b").unwrap();
 
-    assert_vim_error(executor.execute_line(&mut editor, "normal ,a"), "E223");
+    executor.execute_line(&mut editor, "normal ,a").unwrap();
+    assert_eq!(last_error_message(&editor).as_deref(), Some("E223: recursive mapping"));
+    assert_eq!(global_text(&executor, "hit"), None, "the chain never reached ,c");
 
     executor.execute_line(&mut editor, "normal ,c").unwrap();
     assert_eq!(global_text(&executor, "hit").as_deref(), Some("yes"));
+}
+
+/// The most recent error message, as text.
+fn last_error_message(editor: &Editor) -> Option<String> {
+    editor
+        .messages()
+        .iter()
+        .rev()
+        .find(|message| message.kind == crate::MessageKind::Error)
+        .and_then(|message| match &message.content {
+            ox_types::Object::String(text) => Some(text.to_string_lossy().into_owned()),
+            _ => None,
+        })
+}
+
+/// `nv_csearch`: `;` and `,` with no previous `f`/`t` fail in `searchc`, and
+/// the `clearopbeep` that follows runs `flush_buffers(FLUSH_MINIMAL)` — which
+/// discards the rest of the `:normal` argument, because `ex_normal` stuffs it
+/// with `nottyped = true` and that counts into `tb_maplen`.
+///
+/// Oracle, v0.13.0-dev-1390: with `['aaa','bbb','ccc']` and the cursor at 1,1,
+/// `:normal! ,x` leaves `aaa` and `:normal! x,x` leaves `aa`.
+#[test]
+fn an_error_in_normal_discards_the_rest_of_its_argument() {
+    let (mut editor, mut executor) = setup_with_content(&[b"aaa".to_vec(), b"bbb".to_vec()]);
+    executor.execute_line(&mut editor, "normal! ,x").unwrap();
+    assert_eq!(buffer_text(&editor)[0], "aaa", "',' failed, so 'x' never ran");
+
+    executor.execute_line(&mut editor, "normal! x,x").unwrap();
+    assert_eq!(buffer_text(&editor)[0], "aa", "the first 'x' ran, the second did not");
+
+    // A find that succeeds still repeats, and the keys after it still run.
+    let (mut editor, mut executor) = setup_with_content(&[b"abcabc".to_vec()]);
+    executor.execute_line(&mut editor, "normal! fbx;x").unwrap();
+    assert_eq!(buffer_text(&editor)[0], "acac");
+
+    // A find whose target is absent fails the same way.
+    let (mut editor, mut executor) = setup_with_content(&[b"abc".to_vec()]);
+    executor.execute_line(&mut editor, "normal! fzx").unwrap();
+    assert_eq!(buffer_text(&editor)[0], "abc", "'fz' found nothing, so 'x' never ran");
 }
 
 /// Nothing in `do_one_cmd` strips a trailing CR from an Ex argument, and
