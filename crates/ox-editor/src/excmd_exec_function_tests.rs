@@ -1214,6 +1214,23 @@ fn system_builtin_captures_stdout_and_exit_status() {
 }
 
 #[test]
+fn systemlist_uses_job_channels_for_shell_and_argv_forms() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&mut editor, "let g:shell = systemlist('printf \"hello\\n\\n\"')").unwrap();
+    exec.execute_line(&mut editor, "let g:argv = systemlist(['printf', 'one\\ntwo\\n'])").unwrap();
+    exec.execute_line(&mut editor, "let g:kept = systemlist('printf \"x\\n\"', '', 1)").unwrap();
+    exec.execute_line(&mut editor, "let g:failed = systemlist('printf bad; exit 7')").unwrap();
+
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"shell", 0).unwrap(), &Typval::list(vec![Typval::String(OxStr::from("hello")), Typval::String(OxStr::from(""))]));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"argv", 0).unwrap(), &Typval::list(vec![Typval::String(OxStr::from("one")), Typval::String(OxStr::from("two"))]));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"kept", 0).unwrap(), &Typval::list(vec![Typval::String(OxStr::from("x")), Typval::String(OxStr::from(""))]));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"failed", 0).unwrap(), &Typval::list(vec![Typval::String(OxStr::from("bad"))]));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Vim, b"shell_error", 0).unwrap(), &Typval::Number(7));
+}
+
+#[test]
 fn expand_builtin_reads_current_buffer_and_preserves_paths() {
     let mut editor = Editor::new();
     let buffer = editor.create_buffer(true).unwrap();

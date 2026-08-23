@@ -1087,6 +1087,9 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         if name_text == "system" {
             return call_system_builtin(args, scope);
         }
+        if name_text == "systemlist" {
+            return call_systemlist_builtin(self.runtime, args, scope);
+        }
         if name_text == "luaeval" {
             return call_luaeval_builtin(self.runtime, self.editor, scope, self.lua, args);
         }
@@ -1335,6 +1338,56 @@ fn call_system_builtin(args: Vec<Typval>, scope: &mut Scope) -> ox_eval::Result<
     let status = output.status.code().unwrap_or(-1);
     replace_scope_pair(&mut scope.vim, "shell_error", Typval::Number(i64::from(status)));
     Ok(Typval::String(OxStr(output.stdout)))
+}
+
+fn call_systemlist_builtin<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    args: Vec<Typval>,
+    scope: &mut Scope,
+) -> ox_eval::Result<Typval> {
+    let (program, command_args) = job_command(args.first())?;
+    let input = args.get(1).map(|value| channel_bytes(Some(value))).transpose()?.unwrap_or_default();
+    let keep_empty = args.get(2).is_some_and(value_bool);
+    let Typval::Dict(options) = Typval::dict(Vec::new()) else { unreachable!() };
+    let id = runtime.channel_ids.allocate();
+    let start = JobStartOptions {
+        program,
+        args: command_args,
+        environment: None,
+        cwd: None,
+        detached: false,
+        pty: false,
+        rpc: false,
+        stdin_pipe: !input.is_empty(),
+        stdout_buffered: true,
+        stderr_buffered: true,
+        callbacks: JobCallbacks { options, stdout: None, stderr: None, exit: None },
+    };
+    let mut manager = runtime.jobs.take().unwrap_or(JobManager::new().map_err(|message| {
+        EvalError::new("E677", 0, format!("Error writing temp file: {message}"))
+    })?);
+    manager.start(id, start).map_err(|message| EvalError::new("E677", 0, message))?;
+    if !input.is_empty() {
+        manager.send(id, input).map_err(|message| EvalError::new("E677", 0, message))?;
+        manager.close_input(id);
+    }
+    let (statuses, _) = manager.wait(&[id], -1).map_err(|message| EvalError::new("E677", 0, message))?;
+    let (stdout, _) = manager.take_buffered_output(id).unwrap_or_default();
+    runtime.jobs = Some(manager);
+    let status = statuses.first().copied().unwrap_or(-1);
+    replace_scope_pair(&mut scope.vim, "shell_error", Typval::Number(status));
+
+    let mut lines = stdout
+        .split(|byte| *byte == b'\n')
+        .map(|line| Typval::String(OxStr(line.strip_suffix(b"\r").unwrap_or(line).to_vec())))
+        .collect::<Vec<_>>();
+    if !keep_empty && stdout.ends_with(b"\n") {
+        lines.pop();
+    }
+    if stdout.is_empty() {
+        lines.clear();
+    }
+    Ok(Typval::list(lines))
 }
 
 /// `luaeval({expr}[, {arg}])`: eval/funcs.c `f_luaeval` → lua/executor.c

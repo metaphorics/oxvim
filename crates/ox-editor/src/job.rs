@@ -245,6 +245,17 @@ impl JobManager {
         Ok(true)
     }
 
+    /// Close a job's writable input endpoint so readers observe EOF.
+    pub fn close_input(&mut self, id: u64) -> bool {
+        self.jobs.get_mut(&id).is_some_and(|job| job.input.take().is_some())
+    }
+
+    /// Take output accumulated by buffered streams after the job completes.
+    pub fn take_buffered_output(&mut self, id: u64) -> Option<(Vec<u8>, Vec<u8>)> {
+        let job = self.jobs.get_mut(&id)?;
+        Some((std::mem::take(&mut job.stdout.bytes), std::mem::take(&mut job.stderr.bytes)))
+    }
+
     /// Send SIGTERM to a live job. An already-reaped job is a successful no-op.
     pub fn stop(&mut self, id: u64) -> Result<bool, String> {
         let Some(job) = self.jobs.get(&id) else { return Ok(false); };
