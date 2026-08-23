@@ -34,7 +34,7 @@ use crate::mapping::{MapMode, MapModes, MapScope, MappingAction, MappingOptions}
 use crate::options::{find_unescaped, CommaItems, OptionListKind, OptionScope, OptionType, OptionValue, OPTION_METADATA};
 use crate::register::RegisterContent;
 use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid};
-use crate::typeahead::Keys;
+use crate::typeahead::{Key, Keys, KS_EXTRA, K_SPECIAL};
 use crate::userfunc::{UserFuncError, UserFunctions};
 use crate::{
     BufferRelease, ChannelIds, Editor, Geometry, JobCallbacks, JobEvent, JobManager, JobStartOptions, Message,
@@ -1018,6 +1018,12 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         }
         if name_text == "execute" {
             return call_execute_builtin(self.runtime, self.editor, scope, self.lua, args);
+        }
+        if name_text == "feedkeys" {
+            return call_feedkeys_builtin(self.editor, args);
+        }
+        if matches!(&*name_text, "getchar" | "getcharstr") {
+            return call_getchar_builtin(self.editor, &name_text, args);
         }
         if name_text == "submatch" {
             let index = args.first().and_then(typval_number).unwrap_or(0).max(0) as usize;
@@ -5224,4 +5230,66 @@ fn call_strftime_builtin(args: Vec<Typval>) -> ox_eval::Result<Typval> {
     let minutes = seconds % 3_600 / 60;
     let seconds = seconds % 60;
     Ok(Typval::String(OxStr::from(format!("{hours:02}:{minutes:02}:{seconds:02}").as_str())))
+}
+
+fn input_string_arg(value: &Typval) -> ox_eval::Result<OxStr> {
+    match value {
+        Typval::String(value) => Ok(value.clone()),
+        Typval::Number(value) => Ok(OxStr::from(value.to_string().as_str())),
+        Typval::Bool(value) => Ok(OxStr::from(if *value { "v:true" } else { "v:false" })),
+        Typval::Special(Special::Null) => Ok(OxStr::from("")),
+        Typval::List(_) => Err(EvalError::new("E730", 0, "Using a List as a String")),
+        Typval::Dict(_) => Err(EvalError::new("E731", 0, "Using a Dictionary as a String")),
+        Typval::Float(_) => Err(EvalError::new("E806", 0, "Using a Float as a String")),
+        _ => Err(EvalError::new("E729", 0, "Using invalid value as a String")),
+    }
+}
+
+fn call_feedkeys_builtin(editor: &mut Editor, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(EvalError::new(if args.is_empty() { "E119" } else { "E118" }, 0, "Invalid arguments for feedkeys"));
+    }
+    let keys = input_string_arg(&args[0])?;
+    let mode = args.get(1).map(input_string_arg).transpose()?.unwrap_or_else(|| OxStr::from(""));
+    let keys = Keys::from_encoded(keys.as_bytes().to_vec()).map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
+    let execute = editor.typeahead_mut().feedkeys(&keys, &mode.to_string_lossy()).map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
+    if execute {
+        let mut machine = ModeMachine::default();
+        while !editor.typeahead().is_empty() {
+            if !machine.run_once(editor).map_err(|error| EvalError::new("E523", 0, error.to_string()))? { break; }
+        }
+    }
+    Ok(Typval::Number(0))
+}
+
+fn call_getchar_builtin(editor: &mut Editor, name: &str, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    if args.len() > 2 {
+        return Err(EvalError::new("E118", 0, format!("Too many arguments for function: {name}")));
+    }
+    let Some(key) = editor.typeahead_mut().pop().map_err(|error| EvalError::new("E475", 0, error.to_string()))? else {
+        return Ok(if name == "getcharstr" { Typval::String(OxStr::from("")) } else { Typval::Number(0) });
+    };
+    let simplified = match key {
+        Key::Special(KS_EXTRA, b'T') => Some(b'\t'),
+        Key::Special(KS_EXTRA, b'N') => Some(b'\n'),
+        Key::Special(KS_EXTRA, b'R') => Some(b'\r'),
+        Key::Special(KS_EXTRA, b'E') => Some(0x1b),
+        Key::Special(KS_EXTRA, b'S') => Some(b' '),
+        Key::Special(KS_EXTRA, b'L') => Some(b'<'),
+        Key::Special(KS_EXTRA, b'D') => Some(0x7f),
+        Key::Byte(byte) => Some(byte),
+        Key::Special(_, _) => None,
+    };
+    if name == "getcharstr" {
+        return Ok(Typval::String(match (key, simplified) {
+            (_, Some(byte)) => OxStr(vec![byte]),
+            (Key::Special(second, third), None) => OxStr(vec![K_SPECIAL, second, third]),
+            (Key::Byte(byte), None) => OxStr(vec![byte]),
+        }));
+    }
+    Ok(match (key, simplified) {
+        (_, Some(byte)) => Typval::Number(i64::from(byte)),
+        (Key::Special(second, third), None) => Typval::String(OxStr(vec![K_SPECIAL, second, third])),
+        (Key::Byte(byte), None) => Typval::Number(i64::from(byte)),
+    })
 }

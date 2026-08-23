@@ -1223,3 +1223,25 @@ fn assert_fails_executes_commands_and_consumes_expected_errors() {
     let Some(Object::Array(errors)) = editor.vvars().get(&OxStr::from("errors")) else { panic!("v:errors must remain an Array") };
     assert!(matches!(&errors[0], Object::String(text) if text.to_string_lossy().contains("must fail")));
 }
+
+#[test]
+fn feedkeys_builtin_queues_input_consumed_by_getchar() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&mut editor, "call feedkeys('a', 'n')").unwrap();
+    assert_eq!(editor.typeahead().as_bytes(), b"a");
+    assert_eq!(editor.typeahead().front_flags().unwrap().remap, crate::Remap::No);
+    exec.execute_line(&mut editor, "let g:fed = getchar()").unwrap();
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"fed", 0), Ok(&Typval::Number(97)));
+    assert!(editor.typeahead().is_empty());
+}
+
+#[test]
+fn feedkeys_x_executes_through_mode_machine() {
+    let (mut editor, _buffer, window) = editor_with_window();
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&mut editor, "call setline(1, 'abc')").unwrap();
+    exec.execute_line(&mut editor, "call feedkeys('l', 'x')").unwrap();
+    assert_eq!(editor.window(window).unwrap().cursor, Position { lnum: 1, col: 1 });
+    assert!(editor.typeahead().is_empty());
+}

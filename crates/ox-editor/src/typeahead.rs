@@ -16,6 +16,8 @@ pub const KS_ZERO: u8 = 0xff;
 pub const KS_SPECIAL: u8 = 0xfe;
 /// Second byte used by named special keys without termcap names.
 pub const KS_EXTRA: u8 = 0xfd;
+/// Third byte identifying the event-loop wakeup key used by low-level input.
+pub const KE_EVENT: u8 = 102;
 /// Third-byte filler used with quoted literal bytes.
 pub const KE_FILLER: u8 = b'X';
 
@@ -224,6 +226,29 @@ impl Typeahead {
         self.bytes.extend_from_slice(keys.as_bytes());
         self.flags
             .extend(std::iter::repeat_n(flags, keys.len()));
+    }
+
+    /// Queues input with `feedkeys()` mode semantics and reports whether the
+    /// caller must execute the queue immediately (`x`). All input remains in
+    /// this one buffer; `L` precedes raw input with `K_EVENT` so the normal
+    /// state loop takes its event-processing path before consuming it.
+    pub fn feedkeys(&mut self, keys: &Keys, mode: &str) -> Result<bool, TypeaheadError> {
+        let flags = TypeaheadFlags {
+            remap: if mode.contains('n') { Remap::No } else { Remap::Yes },
+            ..TypeaheadFlags::default()
+        };
+        if mode.contains('L') {
+            let event = Keys::special(KS_EXTRA, KE_EVENT)?;
+            let mut low_level = event.as_bytes().to_vec();
+            low_level.extend_from_slice(keys.as_bytes());
+            let low_level = Keys::from_encoded(low_level)?;
+            if mode.contains('i') { self.push(&low_level, 0, flags)?; } else { self.append(&low_level, flags); }
+        } else if mode.contains('i') {
+            self.push(keys, 0, flags)?;
+        } else {
+            self.append(keys, flags);
+        }
+        Ok(mode.contains('x'))
     }
 
     /// Encoded bytes used for prefix mapping lookup.

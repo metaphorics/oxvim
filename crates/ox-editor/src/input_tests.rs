@@ -765,6 +765,44 @@ fn typeahead_flush_clears_bytes_and_metadata() {
 }
 
 #[test]
+fn feedkeys_i_inserts_before_pending_input() {
+    let mut input = Typeahead::new();
+    input.append(&keys("tail"), TypeaheadFlags::default());
+    assert!(!input.feedkeys(&keys("head"), "i").unwrap());
+    assert_eq!(input.as_bytes(), b"headtail");
+}
+
+#[test]
+fn feedkeys_n_marks_injected_input_not_remappable() {
+    let mut input = Typeahead::new();
+    input.feedkeys(&keys("x"), "n").unwrap();
+    assert_eq!(input.front_flags().unwrap().remap, Remap::No);
+}
+
+#[test]
+fn feedkeys_x_requests_immediate_execution() {
+    let mut input = Typeahead::new();
+    assert!(input.feedkeys(&keys("x"), "x").unwrap());
+    assert_eq!(input.as_bytes(), b"x");
+}
+
+#[test]
+fn feedkeys_bang_appends_after_pending_input() {
+    let mut input = Typeahead::new();
+    input.append(&keys("pending"), TypeaheadFlags::default());
+    input.feedkeys(&keys("later"), "!").unwrap();
+    assert_eq!(input.as_bytes(), b"pendinglater");
+}
+
+#[test]
+fn feedkeys_low_level_uses_event_key_path() {
+    let mut input = Typeahead::new();
+    input.feedkeys(&keys("x"), "L").unwrap();
+    assert_eq!(input.pop().unwrap(), Some(Key::Special(KS_EXTRA, crate::KE_EVENT)));
+    assert_eq!(input.pop().unwrap(), Some(Key::Byte(b'x')));
+}
+
+#[test]
 fn empty_typeahead_peek_and_pop_return_none() {
     let mut input = Typeahead::new();
     assert_eq!(input.peek().unwrap(), None);

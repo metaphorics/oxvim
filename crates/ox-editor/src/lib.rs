@@ -82,7 +82,7 @@ pub use register::{
     RegisterKind, Registers, Selection,
 };
 pub use typeahead::{
-    Key, KeyDecodeError, Keys, Remap, Typeahead, TypeaheadError, TypeaheadFlags, KE_FILLER,
+    Key, KeyDecodeError, Keys, Remap, Typeahead, TypeaheadError, TypeaheadFlags, KE_EVENT, KE_FILLER,
     KS_EXTRA, KS_SPECIAL, KS_ZERO, K_SPECIAL,
 };
 
