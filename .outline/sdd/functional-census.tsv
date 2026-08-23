@@ -1,0 +1,485 @@
+spec	outcome	pass	fail	error	pending	executed	ctl_pass	ctl_fail	blocker_class	first_blocker	hang_at	oxvimhost_pass	oxvimhost_fail
+api/autocmd_spec.lua	partial	23	65	0	1	88	88	0	editor	assert eq: values differ		2	86
+api/buffer_spec.lua	partial	52	135	0	0	187	187	0	protocol	API not implemented via curbuf_depr		4	183
+api/buffer_updates_spec.lua	zero-pass	0	28	0	0	28	28	0	editor	E121: Undefined variable: b:changedtick (byte <n>)		0	28
+api/command_spec.lua	zero-pass	0	17	0	0	17	17	0	protocol	API not implemented via nvim_get_commands		0	17
+api/deprecated_spec.lua	zero-pass	0	0	1	0	1	15	0	protocol	screen: nvim_get_color_map not implemented		0	1
+api/extmark_spec.lua	partial	10	109	0	0	119	119	0	editor	assert eq: values differ		0	119
+api/fast_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	assert eq: values differ		0	2
+api/highlight_spec.lua	partial	4	35	0	0	39	39	0	editor	assert eq: values differ		0	39
+api/keymap_spec.lua	partial	1	325	0	0	326	326	0	protocol	API not implemented via nvim_get_keymap		0	268
+api/menu_spec.lua	zero-pass	0	3	0	0	3	3	0	protocol	screen: nvim_get_color_map not implemented		0	3
+api/proc_spec.lua	zero-pass	0	4	0	0	4	4	0	protocol	API not implemented via request		0	4
+api/server_notifications_spec.lua	zero-pass	0	4	0	0	4	4	0	editor	attempt to concatenate upvalue 'channel' (a nil value)		0	4
+api/server_requests_spec.lua	zero-pass	0	15	0	4	15	18	0	protocol	API not implemented via nvim_exec2		0	19
+api/tabpage_spec.lua	partial	2	19	0	0	21	21	0	editor	assert eq: values differ		0	21
+api/ui_spec.lua	zero-pass	0	8	0	0	8	8	0	protocol	screen: nvim_get_color_map not implemented		0	8
+api/version_spec.lua	partial	7	5	0	0	12	12	0	protocol	Not implemented: api_info		0	6
+api/vim_spec.lua	partial	21	381	0	1	402	402	0	editor	assert matches: pattern mismatch		0	1
+api/window_spec.lua	partial	18	126	0	0	144	144	0	editor	assert eq: values differ		0	144
+autocmd/autocmd_oldtest_spec.lua	zero-pass	0	2	0	0	2	2	0	protocol	API not implemented via nvim_exec2		0	2
+autocmd/autocmd_spec.lua	zero-pass	0	31	0	0	31	31	0	editor	E121: Undefined variable: g:evs (byte <n>)		0	31
+autocmd/bufenter_spec.lua	zero-pass	0	3	0	0	3	2	1	editor	E484: Can't open file .: Is a directory (os error <n>)		0	3
+autocmd/cmdline_spec.lua	zero-pass	0	6	0	0	6	6	0	protocol	API not implemented via nvim_set_var		0	6
+autocmd/completedone_spec.lua	zero-pass	0	6	0	0	6	6	0	editor	Not implemented: col		0	6
+autocmd/cursorhold_spec.lua	zero-pass	0	4	0	0	4	4	0	protocol	API not implemented via nvim_exec2		0	4
+autocmd/cursormoved_spec.lua	zero-pass	0	5	0	0	5	5	0	protocol	API not implemented via nvim_exec2		0	5
+autocmd/dirchanged_spec.lua	zero-pass	0	11	0	0	11	11	0	editor	E121: Undefined variable: g:evpre (byte <n>)		0	11
+autocmd/filetype_spec.lua	zero-pass	0	1	0	0	1	0	1	editor	not implemented: help		0	1
+autocmd/focus_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+autocmd/markset_spec.lua	zero-pass	0	6	0	0	6	6	0	editor	E15: Invalid expression		0	6
+autocmd/modechanged_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	not implemented: terminal		0	2
+autocmd/optionset_spec.lua	zero-pass	0	3	0	0	3	3	0	protocol	API not implemented via nvim_exec2		0	3
+autocmd/recording_spec.lua	zero-pass	0	6	0	0	6	6	0	protocol	API not implemented via nvim_exec2		0	6
+autocmd/safestate_spec.lua	zero-pass	0	5	0	0	5	5	0	protocol	API not implemented via nvim_exec2		0	5
+autocmd/searchwrapped_spec.lua	zero-pass	0	3	0	0	3	3	0	editor	E121: Undefined variable: g:test (byte <n>)		0	3
+autocmd/show_spec.lua	partial	1	5	0	0	6	6	0	editor	Not implemented: execute		0	6
+autocmd/signal_spec.lua	partial	7	5	0	0	12	6	0	editor	retry() attempts: <n>		0	13
+autocmd/tabclose_spec.lua	zero-pass	0	6	0	0	6	6	0	editor	Not implemented: tabpagenr		0	6
+autocmd/tabmove_spec.lua	zero-pass	0	4	0	0	4	4	0	editor	not implemented: tabmove		0	4
+autocmd/tabnew_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	E121: Undefined variable: g:test (byte <n>)		0	2
+autocmd/tabnewentered_spec.lua	zero-pass	0	61	0	0	61	61	0	editor	Not implemented: nvim_command executor		0	61
+autocmd/termxx_spec.lua	zero-pass	0	17	0	0	17	17	0	editor	E216: No such group or event: nvim.terminal		0	17
+autocmd/textchanged_spec.lua	zero-pass	0	4	0	0	4	4	0	protocol	API not implemented via nvim_exec2		0	4
+autocmd/textyankpost_spec.lua	zero-pass	0	8	0	0	8	8	0	editor	E121: Undefined variable: g:event (byte <n>)		0	8
+autocmd/win_scrolled_resized_spec.lua	zero-pass	0	13	0	0	13	13	0	protocol	API not implemented via nvim_exec2		0	13
+core/channels_spec.lua	zero-pass	0	18	0	0	18	18	0	protocol	API not implemented via nvim_exec2		0	18
+core/env_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	E5108: runtime error: Error(CallbackError { traceback: "s		0	1
+core/exit_spec.lua	hang	0	4	0	0	4	15	0	editor	E121: Undefined variable: v:exiting (byte <n>)	T5 :cquit exits with non-zero after :cquit	0	4
+core/fileio_spec.lua	partial	1	11	0	0	12	7	5	editor	Invalid method: nvim__stats		0	12
+core/job_spec.lua	zero-pass	0	66	0	1	66	66	0	protocol	API not implemented via nvim_set_var		0	66
+core/keycode_spec.lua	partial	4	8	0	0	12	12	0	protocol	Lua: runtime error: Error(CallbackError { traceback: "stack traceback:\n\t[C]: in ?\n\t[C]		0	12
+core/log_spec.lua	zero-pass	0	4	0	0	4	4	0	editor	Invalid method: nvim__stats		0	4
+core/main_spec.lua	hang	0	2	0	0	2	9	0	editor	Not implemented: system	T3 command-line option -s does not crash when running completion in Ex mode	0	2
+core/path_spec.lua	zero-pass	0	15	0	1	15	14	0	editor	Not implemented: expand		0	14
+core/remote_spec.lua	zero-pass	0	10	0	0	10	12	0	protocol	Not implemented: serverlist		0	12
+core/server_spec.lua	partial	1	13	0	1	14	14	0	editor	Not implemented: stdpath		1	13
+core/spellfile_spec.lua	partial	3	8	0	0	11	11	0	editor	expected failure, but got success		0	11
+core/startup_spec.lua	hang	0	3	0	0	3	82	0	editor	Not implemented: stdpath	T4 startup --startuptime does not crash on error #31125	0	3
+editor/K_spec.lua	zero-pass	0	4	0	0	4	4	0	protocol	API not implemented via nvim_exec2		0	4
+editor/cmdatom_spec.lua	zero-pass	0	24	0	0	24	24	0	editor	Not implemented: setline		0	24
+editor/cmdwin_spec.lua	partial	1	15	0	0	16	16	0	editor	Not implemented: getcmdwintype		0	16
+editor/completion_spec.lua	zero-pass	0	56	0	0	56	55	0	protocol	API not implemented via nvim_exec2		0	56
+editor/count_spec.lua	zero-pass	0	4	0	0	4	4	0	editor	E474: E<n>: Trailing characters: C-u>let g:count = at by		0	4
+editor/ctrl_c_spec.lua	zero-pass	0	3	0	0	3	3	0	protocol	screen: nvim_get_color_map not implemented		0	3
+editor/defaults_spec.lua	zero-pass	0	13	0	0	13	14	0	protocol	API not implemented via exec_lua		0	13
+editor/fold_spec.lua	zero-pass	0	19	0	0	19	19	0	editor	not implemented: !		0	19
+editor/ftplugin_spec.lua	zero-pass	0	0	2	0	2	5	0	protocol	API not implemented via nvim_set_current_dir		0	2
+editor/jump_spec.lua	zero-pass	0	18	0	0	18	18	0	editor	Not implemented: execute		0	18
+editor/lang_spec.lua	zero-pass	0	1	0	1	1	1	0	editor	assert eq: values differ		0	1
+editor/langmap_spec.lua	partial	5	18	0	3	23	23	0	editor	assert eq: values differ		0	23
+editor/macro_spec.lua	zero-pass	0	15	0	0	15	15	0	editor	assert eq: values differ		0	15
+editor/mark_spec.lua	zero-pass	0	32	0	0	32	32	0	protocol	API not implemented via nvim_buf_get_mark		0	32
+editor/meta_key_spec.lua	zero-pass	0	7	0	0	7	7	0	editor	assert eq: values differ		0	7
+editor/mode_cmdline_spec.lua	zero-pass	0	8	0	0	8	8	0	editor	Not implemented: getcmdline		0	8
+editor/mode_insert_spec.lua	partial	1	29	0	0	30	30	0	editor	assert eq: values differ		0	30
+editor/mode_normal_spec.lua	partial	1	3	0	0	4	4	0	editor	Not implemented: setline		0	4
+editor/put_spec.lua	zero-pass	0	0	1	0	1	225	0	editor	E54: regular-expression engine is not installed (byte <		0	1
+editor/runtime_spec.lua	zero-pass	0	0	1	0	1	19	0	protocol	API not implemented via nvim_exec2		0	1
+editor/search_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+editor/tabpage_spec.lua	partial	1	10	0	0	11	11	0	editor	Not implemented: tabpagenr		0	11
+editor/textobject_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	Not implemented: getreg		0	2
+editor/undo_spec.lua	partial	1	13	0	0	14	14	0	editor	assert eq: values differ		0	14
+editor/xxd_spec.lua	zero-pass	0	2	0	0	2	0	2	editor	Not implemented: system		0	2
+ex_cmds/append_spec.lua	zero-pass	0	8	0	0	8	8	0	editor	assert eq: values differ		0	8
+ex_cmds/arg_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	not implemented: terminal		0	1
+ex_cmds/cd_spec.lua	zero-pass	0	36	0	0	36	36	0	editor	Not implemented: winnr		0	36
+ex_cmds/cmd_map_spec.lua	zero-pass	0	15	0	0	15	15	0	protocol	screen: nvim_get_color_map not implemented		0	15
+ex_cmds/debug_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+ex_cmds/dict_notifications_spec.lua	partial	3	67	0	0	70	70	0	protocol	API not implemented via nvim_set_var		0	70
+ex_cmds/digraphs_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+ex_cmds/drop_spec.lua	zero-pass	0	5	0	0	5	5	0	protocol	screen: nvim_get_color_map not implemented		0	5
+ex_cmds/echo_spec.lua	zero-pass	0	0	1	0	1	41	0	protocol	API not implemented via nvim_exec2		0	1
+ex_cmds/edit_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	expected failure, but got success		0	2
+ex_cmds/encoding_spec.lua	zero-pass	0	3	0	0	3	3	0	editor	assert eq: values differ		0	3
+ex_cmds/excmd_spec.lua	partial	1	4	0	0	5	5	0	editor	assert eq: values differ		0	5
+ex_cmds/file_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	not implemented: file		0	1
+ex_cmds/grep_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	not implemented: grep		0	1
+ex_cmds/help_spec.lua	zero-pass	0	4	0	0	4	4	0	editor	not implemented: helptags		0	4
+ex_cmds/highlight_spec.lua	zero-pass	0	6	0	0	6	6	0	protocol	screen: nvim_get_color_map not implemented		0	6
+ex_cmds/log_spec.lua	zero-pass	0	5	0	0	5	5	0	protocol	API not implemented via exec_lua		0	5
+ex_cmds/ls_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	not implemented: terminal		0	2
+ex_cmds/lsp_spec.lua	zero-pass	0	13	0	0	13	13	0	editor	E117: Function is not implemented: stdpath (byte <n>)\ns		0	13
+ex_cmds/make_spec.lua	no-tests	0	0	0	1	0	0	0				0	1
+ex_cmds/map_spec.lua	partial	1	13	0	0	14	14	0	protocol	API not implemented via nvim_set_var		0	14
+ex_cmds/marks_spec.lua	zero-pass	0	3	0	0	3	3	0	editor	Not implemented: setline		0	3
+ex_cmds/menu_spec.lua	zero-pass	0	13	0	0	13	13	0	editor	not implemented: nnoremenu		0	13
+ex_cmds/mksession_spec.lua	zero-pass	0	18	0	0	18	18	0	editor	not implemented: terminal		0	18
+ex_cmds/mkview_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	not implemented: mkview		0	1
+ex_cmds/normal_spec.lua	partial	1	3	0	0	4	4	0	editor	assert eq: values differ		0	4
+ex_cmds/oldfiles_spec.lua	zero-pass	0	5	0	0	5	5	0	protocol	screen: nvim_get_color_map not implemented		0	5
+ex_cmds/pack_spec.lua	zero-pass	0	15	0	0	15	15	0	protocol	API not implemented via exec_lua		0	15
+ex_cmds/print_commands_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	Not implemented: line		0	2
+ex_cmds/profile_spec.lua	zero-pass	0	4	0	0	4	4	0	editor	E121: Undefined variable: v:profiling (byte <n>)		0	4
+ex_cmds/quickfix_commands_spec.lua	zero-pass	0	6	0	0	6	6	0	editor	not implemented: lfile		0	6
+ex_cmds/quit_spec.lua	clean	1	0	0	0	1	1	0				1	0
+ex_cmds/script_spec.lua	zero-pass	0	0	1	0	1	16	0	editor	E117: Function is not implemented: expand (byte <n>)") }		0	1
+ex_cmds/sign_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	not implemented: sign		0	2
+ex_cmds/source_spec.lua	partial	1	13	0	1	14	14	0	editor	E484: : No such file or directory (os error <n>)		0	14
+ex_cmds/swapfile_preserve_recover_spec.lua	zero-pass	0	16	0	1	16	16	0	editor	assert eq: values differ		0	16
+ex_cmds/syntax_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+ex_cmds/trust_spec.lua	zero-pass	0	5	0	0	5	5	0	protocol	API not implemented via nvim_exec2		0	5
+ex_cmds/undojoin_spec.lua	zero-pass	0	3	0	0	3	3	0	editor	not implemented: goto		0	3
+ex_cmds/uptime_spec.lua	zero-pass	0	2	0	0	2	2	0	protocol	API not implemented via nvim_exec2		0	2
+ex_cmds/verbose_spec.lua	zero-pass	0	5	5	0	10	80	0	protocol	API not implemented via nvim_exec2		0	10
+ex_cmds/wincmd_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	Not implemented: winnr		0	1
+ex_cmds/write_spec.lua	hang	0	2	0	0	2	21	2	editor	not implemented: !	T3 :write appends FIFO file	0	23
+ex_cmds/wundo_spec.lua	partial	1	1	0	0	2	2	0	editor	not implemented: wundo		0	2
+ex_cmds/wviminfo_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	not implemented: wshada		0	2
+example_spec.lua	zero-pass	0	2	0	0	2	2	0	protocol	screen: nvim_get_color_map not implemented		0	2
+harness/assert_spec.lua	clean	3	0	0	0	3	3	0				3	0
+harness/harness_spec.lua	clean	48	0	0	0	48	48	0				0	48
+legacy/002_filename_recognition_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E474: invalid value for option `isfname`: duplicate comm		0	1
+legacy/004_bufenter_with_modelines_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E16: Search addresses are not implemented in ranges: .,		0	1
+legacy/005_bufleave_delete_buffer_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E488: unterminated search pattern: /start of		0	1
+legacy/007_ball_buffer_list_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E16: Search addresses are not implemented in ranges: .,		0	1
+legacy/008_autocommands_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	Not implemented: bufname		0	1
+legacy/011_autocommands_spec.lua	zero-pass	0	5	0	0	5	5	0	editor	assert eq: values differ		0	1
+legacy/012_directory_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	Not implemented: buffer_name		0	2
+legacy/015_alignment_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E16: Search addresses are not implemented in ranges: /^		0	1
+legacy/018_unset_smart_indenting_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+legacy/019_smarttab_expandtab_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E518: Unknown option: t_kD		0	1
+legacy/020_blockwise_visual_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+legacy/021_control_wi_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+legacy/023_edit_arguments_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E492: Not an editor command: s/|/PIPE/		0	1
+legacy/025_jump_tag_hidden_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	not implemented: !		0	1
+legacy/026_execute_while_if_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/028_source_ctrl_v_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	E16: Search addresses are not implemented in ranges: /f		0	2
+legacy/029_fuzzy_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E93: More than one match for buf_a		0	1
+legacy/030_fileformats_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+legacy/031_close_commands_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E37: No write since last change (add ! to override)		0	1
+legacy/033_lisp_indent_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E488: unterminated search pattern: /^(defun		0	1
+legacy/034_user_function_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/035_increment_and_decrement_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E492: Not an editor command: <n>		0	1
+legacy/036_regexp_character_classes_spec.lua	zero-pass	0	17	0	1	17	17	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/038_virtual_replace_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E518: Unknown option: t_kD		0	1
+legacy/039_visual_block_mode_commands_spec.lua	zero-pass	0	8	0	0	8	8	0	editor	E518: Unknown option: ts&vi		0	8
+legacy/043_magic_settings_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E523: E<n>: Pattern not found: g\*h\{<n>}i\+		0	1
+legacy/044_099_regexp_multibyte_magic_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	E523: E<n>: Pattern not found: g\*h\{<n>}i\+		0	2
+legacy/046_multi_line_regexps_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E16: Search addresses are not implemented in ranges: /^		0	1
+legacy/054_buffer_local_autocommands_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+legacy/055_list_and_dict_types_spec.lua	zero-pass	0	25	0	0	25	25	0	protocol	API not implemented via nvim_exec2		0	25
+legacy/056_script_local_function_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	not implemented: =		0	1
+legacy/057_sort_spec.lua	zero-pass	0	30	0	0	30	30	0	editor	not implemented: sort		0	30
+legacy/060_exists_and_has_functions_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/061_undo_tree_spec.lua	zero-pass	0	6	0	0	6	6	0	editor	retry() attempts: <n>		0	6
+legacy/063_match_and_matchadd_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+legacy/065_float_and_logic_operators_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/066_visual_block_tab_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+legacy/067_augroup_exists_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	not implemented: bfirst		0	1
+legacy/068_text_formatting_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E523: E<n>: Pattern not found: mno pqr/		0	1
+legacy/069_multibyte_formatting_spec.lua	zero-pass	0	12	0	0	12	12	0	editor	assert eq: values differ		0	12
+legacy/072_undo_file_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E37: No write since last change (add ! to override)		0	1
+legacy/074_global_var_in_viminfo_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E121: Undefined variable: MY_GLOBAL_DICT (byte <n>)		0	2
+legacy/081_coptions_movement_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+legacy/082_string_comparison_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/083_tag_search_with_file_encoding_spec.lua	no-tests	0	0	0	1	0	1	0				0	1
+legacy/090_sha256_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/091_context_variables_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/092_mksession_cursor_cols_utf8_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E36: <n> cells cannot be divided among <n> frame childr		0	1
+legacy/093_mksession_cursor_cols_latin1_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E36: <n> cells cannot be divided among <n> frame childr		0	1
+legacy/094_visual_mode_operators_spec.lua	zero-pass	0	23	0	0	23	23	0	protocol	API not implemented via nvim_exec2		0	23
+legacy/095_regexp_multibyte_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/096_location_list_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/097_glob_path_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+legacy/101_hlsearch_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E121: Undefined variable: v:hlsearch		0	1
+legacy/102_fnameescape_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E488: Trailing characters: =<x>: try | exe <x> . fnamees		0	1
+legacy/103_visual_mode_reset_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/106_errorformat_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	not implemented: cgetexpr		0	1
+legacy/107_adjust_window_and_contents_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+legacy/108_backtrace_debug_commands_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E126: Missing :endfunction		0	1
+legacy/arglist_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	expected failure, but got success		0	2
+legacy/assert_spec.lua	partial	1	16	0	0	17	17	0	protocol	API not implemented via nvim_exec2		0	17
+legacy/autochdir_spec.lua	zero-pass	0	5	0	0	5	5	0	editor	Not implemented: expand		0	5
+legacy/autocmd_option_spec.lua	zero-pass	0	37	0	0	37	37	0	protocol	API not implemented via nvim_exec2		0	37
+legacy/autocmd_spec.lua	zero-pass	0	4	0	0	4	4	0	protocol	API not implemented via nvim_exec2		0	4
+legacy/autoformat_join_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E715: Dictionary required		0	1
+legacy/breakindent_spec.lua	zero-pass	0	2	0	0	2	2	0	protocol	screen: nvim_get_color_map not implemented		0	2
+legacy/changelist_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E600: Missing :endtry		0	1
+legacy/charsearch_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	not implemented: getcharsearch		0	1
+legacy/close_count_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E170: Missing :endfor		0	1
+legacy/cmdline_spec.lua	zero-pass	0	15	0	0	15	15	0	protocol	screen: nvim_get_color_map not implemented		0	15
+legacy/command_count_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/comparators_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E488: Trailing characters: is#<n> (byte <n>)		0	1
+legacy/conceal_spec.lua	zero-pass	0	14	0	0	14	14	0	protocol	screen: nvim_get_color_map not implemented		0	14
+legacy/cpoptions_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+legacy/crash_spec.lua	partial	4	3	0	0	7	7	0	editor	E474: Invalid argument: p		0	7
+legacy/debugger_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+legacy/delete_spec.lua	zero-pass	0	5	0	0	5	5	0	editor	Not implemented: readfile		0	5
+legacy/digraph_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+legacy/display_spec.lua	zero-pass	0	9	0	0	9	9	0	protocol	screen: nvim_get_color_map not implemented		0	9
+legacy/edit_spec.lua	zero-pass	0	4	0	0	4	4	0	editor	assert eq: values differ		0	4
+legacy/erasebackword_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+legacy/eval_spec.lua	zero-pass	0	22	0	0	22	22	0	editor	E121: Undefined variable: @<x>abc'		0	1
+legacy/ex_mode_spec.lua	zero-pass	0	6	0	0	6	6	0	protocol	screen: nvim_get_color_map not implemented		0	6
+legacy/excmd_spec.lua	zero-pass	0	5	0	0	5	5	0	protocol	screen: nvim_get_color_map not implemented		0	5
+legacy/fixeol_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+legacy/fnamemodify_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/fold_spec.lua	zero-pass	0	9	0	0	9	9	0	protocol	screen: nvim_get_color_map not implemented		0	9
+legacy/function_sort_spec.lua	partial	5	1	0	0	6	6	0	protocol	API not implemented via nvim_exec2		0	6
+legacy/getcwd_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/gf_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+legacy/glob2regpat_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	Not implemented: glob<n>regpat		0	2
+legacy/global_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+legacy/highlight_spec.lua	zero-pass	0	2	0	0	2	2	0	protocol	screen: nvim_get_color_map not implemented		0	2
+legacy/insertcount_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+legacy/join_spec.lua	zero-pass	0	5	0	0	5	5	0	editor	Not implemented: getline		0	5
+legacy/lispwords_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/listchars_spec.lua	zero-pass	0	3	0	0	3	3	0	protocol	API not implemented via nvim_exec2		0	3
+legacy/listlbr_spec.lua	zero-pass	0	5	0	0	5	5	0	editor	E521: Number required after =: ^E		0	5
+legacy/listlbr_utf8_spec.lua	zero-pass	0	3	0	0	3	3	0	protocol	API not implemented via nvim_exec2		0	3
+legacy/mapping_spec.lua	partial	1	9	0	0	10	10	0	editor	not implemented: inoreabbrev		0	10
+legacy/marks_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	E492: Not an editor command: :/^\t/+<n>		0	2
+legacy/match_spec.lua	zero-pass	0	4	0	0	4	4	0	protocol	screen: nvim_get_color_map not implemented		0	4
+legacy/matchparen_spec.lua	zero-pass	0	7	0	0	7	7	0	protocol	screen: nvim_get_color_map not implemented		0	7
+legacy/memory_usage_spec.lua	partial	2	1	0	0	3	3	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/messages_spec.lua	zero-pass	0	17	0	0	17	17	0	protocol	screen: nvim_get_color_map not implemented		0	17
+legacy/mksession_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	not implemented: mksession		0	1
+legacy/move_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+legacy/nested_function_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/normal_spec.lua	zero-pass	0	4	0	0	4	3	0	protocol	screen: nvim_get_color_map not implemented		0	4
+legacy/number_spec.lua	zero-pass	0	4	0	0	4	4	0	protocol	screen: nvim_get_color_map not implemented		0	4
+legacy/prompt_buffer_spec.lua	zero-pass	0	20	0	0	20	20	0	protocol	screen: nvim_get_color_map not implemented		0	20
+legacy/put_spec.lua	zero-pass	0	2	0	0	2	2	0	protocol	screen: nvim_get_color_map not implemented		0	2
+legacy/qf_title_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/registers_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/scroll_opt_spec.lua	zero-pass	0	31	0	0	31	31	0	protocol	screen: nvim_get_color_map not implemented		0	31
+legacy/search_mbyte_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E492: Not an editor command: /^Test bce:/+<n>		0	1
+legacy/search_spec.lua	zero-pass	0	19	0	0	19	19	0	protocol	screen: nvim_get_color_map not implemented		0	19
+legacy/search_stat_spec.lua	zero-pass	0	6	0	0	6	6	0	protocol	screen: nvim_get_color_map not implemented		0	6
+legacy/signs_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	not implemented: sign		0	2
+legacy/source_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+legacy/statusline_spec.lua	zero-pass	0	4	0	0	4	4	0	protocol	screen: nvim_get_color_map not implemented		0	4
+legacy/substitute_spec.lua	zero-pass	0	10	0	0	10	10	0	editor	E54: regular-expression engine is not installed (byte <		0	10
+legacy/syn_attr_spec.lua	zero-pass	0	54	0	0	54	54	0	editor	Not implemented: hlID		0	24
+legacy/tabline_spec.lua	zero-pass	0	2	0	0	2	2	0	protocol	screen: nvim_get_color_map not implemented		0	2
+legacy/tagcase_spec.lua	zero-pass	0	3	0	0	3	3	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/utf8_spec.lua	zero-pass	0	3	0	0	3	3	0	editor	E354: line range <n>..=<n> is outside <n>..=<n>		0	3
+legacy/vimscript_spec.lua	zero-pass	0	2	0	0	2	2	0	protocol	screen: nvim_get_color_map not implemented		0	2
+legacy/visual_spec.lua	zero-pass	0	2	0	0	2	2	0	protocol	screen: nvim_get_color_map not implemented		0	2
+legacy/window_cmd_spec.lua	zero-pass	0	9	0	0	9	9	0	protocol	screen: nvim_get_color_map not implemented		0	9
+legacy/wordcount_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_exec2		0	1
+legacy/writefile_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+lua/api_spec.lua	partial	1	15	0	0	16	16	0	editor	Not implemented: setline		0	16
+lua/base64_spec.lua	partial	1	1	0	0	2	2	0	editor	assert eq: values differ		0	2
+lua/buffer_updates_spec.lua	zero-pass	0	113	0	0	113	113	0	editor	unexpected line updates received.		0	113
+lua/command_line_completion_spec.lua	partial	12	17	0	0	29	29	0	editor	E117: Function is not implemented: stdpath (byte <n>)") 		0	29
+lua/commands_spec.lua	partial	1	19	0	0	20	20	0	protocol	API not implemented via nvim_exec2		0	20
+lua/comment_spec.lua	partial	1	28	0	0	29	29	0	protocol	Lua: runtime error: Error(CallbackError { traceback: "stack traceback:\n\t[C]: in ?\n\t[C]		0	29
+lua/deprecated_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E117: Function is not implemented: api_info (byte <n>)\n		0	1
+lua/diagnostic_spec.lua	zero-pass	0	141	0	0	141	141	0	protocol	Lua: runtime error: Error(CallbackError { traceback: "stack traceback:\n\t[C]: in ?\n\t[C]		0	141
+lua/ffi_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via exec_lua		0	1
+lua/filetype_spec.lua	partial	1	18	0	0	19	19	0	editor	E117: Function is not implemented: getenv (byte <n>)\nst		0	19
+lua/fs_spec.lua	partial	40	16	0	0	56	51	5	editor	foo.lua: Expected values to be equal.		28	28
+lua/func_memoize_spec.lua	clean	6	0	0	0	6	6	0				0	6
+lua/glob_spec.lua	clean	10	0	0	0	10	10	0				0	10
+lua/hl_spec.lua	zero-pass	0	14	0	0	14	14	0	protocol	screen: nvim_get_color_map not implemented		0	14
+lua/inspector_spec.lua	zero-pass	0	2	0	0	2	2	0	protocol	Lua: runtime error: Error(CallbackError { traceback: "stack traceback:\n\t[C]: in ?\n\t[C]		0	2
+lua/iter_spec.lua	clean	38	0	0	0	38	38	0				38	0
+lua/json_spec.lua	partial	14	6	0	0	20	20	0	editor	assert eq: values differ		0	20
+lua/list_spec.lua	clean	3	0	0	0	3	3	0				3	0
+lua/loader_spec.lua	zero-pass	0	4	0	0	4	5	0	editor	E117: Function is not implemented: stdpath (byte <n>)\ns		0	4
+lua/log_spec.lua	zero-pass	0	6	0	0	6	6	0	editor	E117: Function is not implemented: stdpath (byte <n>)\ns		0	6
+lua/luaeval_spec.lua	zero-pass	0	38	0	0	38	38	0	editor	Not implemented: luaeval		0	38
+lua/mpack_spec.lua	partial	3	1	0	0	4	4	0	protocol	Lua: runtime error: Error(CallbackError { traceback: "stack traceback:\n\t[C]: in ?\n\t[C]		0	4
+lua/net_spec.lua	zero-pass	0	2	0	9	2	2	0	protocol	API not implemented via exec_lua		0	2
+lua/option_and_var_spec.lua	partial	30	52	0	1	82	82	0	protocol	API not implemented via exec_lua		1	81
+lua/overrides_spec.lua	partial	1	13	0	0	14	14	0	editor	Not implemented: luaeval		0	14
+lua/pos_spec.lua	partial	4	2	0	0	6	6	0	editor	E117: Function is not implemented: bufloaded (byte <n>)\		0	6
+lua/range_spec.lua	partial	9	3	0	0	12	12	0	editor	E117: Function is not implemented: bufloaded (byte <n>)\		0	12
+lua/secure_spec.lua	partial	1	12	0	0	13	13	0	protocol	screen: nvim_get_color_map not implemented		0	13
+lua/snippet_spec.lua	zero-pass	0	35	0	0	35	35	0	protocol	API not implemented via exec_lua		0	35
+lua/spell_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	assert eq: values differ		0	2
+lua/ssh_spec.lua	clean	3	0	0	0	3	3	0				3	0
+lua/system_spec.lua	zero-pass	0	17	0	0	17	16	0	editor	assert matches: pattern mismatch		0	17
+lua/text_spec.lua	clean	6	0	0	0	6	6	0				0	6
+lua/thread_spec.lua	zero-pass	0	17	0	0	17	17	0	protocol	screen: nvim_get_color_map not implemented		0	17
+lua/time_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	Lua: runtime error: Error(CallbackError { traceback: "stack traceback:\n\t[C]: in ?\n\t[C]		0	1
+lua/ui_event_spec.lua	zero-pass	0	14	0	0	14	14	0	protocol	screen: nvim_get_color_map not implemented		0	14
+lua/ui_select_spec.lua	partial	1	10	0	0	11	11	0	protocol	API not implemented via exec_lua		0	11
+lua/ui_spec.lua	partial	4	9	0	0	13	12	1	editor	E121: Undefined variable: v:errmsg (byte <n>)		0	13
+lua/uri_spec.lua	partial	23	2	0	1	25	25	0	editor	E117: Function is not implemented: bufadd (byte <n>)") }		0	25
+lua/uv_spec.lua	zero-pass	0	7	0	0	7	7	0	editor	Not implemented: luaeval		0	7
+lua/version_spec.lua	partial	222	1	0	0	223	223	0	protocol	Not implemented: api_info		221	2
+lua/vim_spec.lua	hang	23	23	0	0	46	128	0	editor	Not implemented: luaeval	T47 lua stdlib vim.rpcrequest and vim.rpcnotify	3	43
+lua/watch_spec.lua	zero-pass	0	4	0	2	4	4	0	protocol	Lua: runtime error: Error(CallbackError { traceback: "stack traceback:\n\t[C]: in ?\n\t[C]		0	6
+lua/with_spec.lua	partial	2	68	0	12	70	70	0	protocol	Lua: runtime error: Error(CallbackError { traceback: "stack traceback:\n\t[C]: in ?\n\t[C]		0	70
+lua/xdiff_spec.lua	partial	4	3	0	0	7	7	0	editor	assert matches: pattern mismatch		0	7
+options/autochdir_spec.lua	zero-pass	0	3	0	0	3	3	0	editor	assert eq: values differ		0	3
+options/autoread_spec.lua	zero-pass	0	9	0	0	9	9	0	editor	assert eq: values differ		0	9
+options/belloff_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+options/chars_spec.lua	zero-pass	0	13	0	0	13	13	0	protocol	screen: nvim_get_color_map not implemented		0	13
+options/cursorbind_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+options/defaults_spec.lua	partial	6	45	0	1	51	59	0	protocol	screen: nvim_get_color_map not implemented		0	51
+options/keymap_spec.lua	partial	3	14	0	1	17	17	0	protocol	API not implemented via nvim_exec2		0	17
+options/modified_spec.lua	clean	1	0	0	0	1	1	0				0	1
+options/mousescroll_spec.lua	partial	1	9	0	0	10	10	0	editor	expected failure, but got success		0	10
+options/num_options_spec.lua	zero-pass	0	4	0	0	4	4	0	editor	option `iminsert` cannot be used at Global scope		0	4
+options/options_spec.lua	partial	1	18	0	0	19	19	0	editor	not implemented: options		0	19
+options/shell_spec.lua	zero-pass	0	5	0	2	5	5	0	protocol	API not implemented via nvim_get_option_info2		0	5
+options/shortmess_spec.lua	zero-pass	0	2	0	0	2	2	0	protocol	screen: nvim_get_color_map not implemented		0	2
+options/tabstop_spec.lua	clean	1	0	0	0	1	1	0				0	1
+options/winfixbuf_spec.lua	partial	2	2	0	0	4	4	0	editor	expected failure, but got success		0	4
+plugin/cfilter_spec.lua	zero-pass	0	18	0	0	18	18	0	editor	not implemented: packadd		0	18
+plugin/difftool_spec.lua	zero-pass	0	7	0	0	7	7	0	editor	not implemented: packadd		0	1
+plugin/dir_spec.lua	zero-pass	0	33	0	0	33	37	0	editor	E484: Can't open file /tmp/lua_sNMKli space%#: Is a dire		0	33
+plugin/editorconfig_spec.lua	zero-pass	0	11	0	0	11	11	0	protocol	API not implemented via nvim_get_option_info2		0	1
+plugin/health_spec.lua	zero-pass	0	42	0	0	42	42	0	editor	assert eq: values differ		0	42
+plugin/lsp/buf_spec.lua	zero-pass	0	39	0	0	39	39	0	editor	E117: Function is not implemented: stdpath (byte <n>)\ns		0	39
+plugin/lsp/codelens_spec.lua	zero-pass	0	7	0	0	7	7	0	editor	E117: Function is not implemented: stdpath (byte <n>)\ns		0	1
+plugin/lsp/completion_spec.lua	zero-pass	0	51	0	0	51	48	3	editor	E54: regular-expression engine is not installed (byte <		0	51
+plugin/lsp/diagnostic_spec.lua	zero-pass	0	19	0	0	19	19	0	editor	E117: Function is not implemented: stdpath (byte <n>)\ns		0	19
+plugin/lsp/document_color_spec.lua	zero-pass	0	8	0	0	8	8	0	protocol	screen: nvim_get_color_map not implemented		0	1
+plugin/lsp/folding_range_spec.lua	zero-pass	0	12	0	0	12	12	0	editor	E117: Function is not implemented: stdpath (byte <n>)\ns		0	12
+plugin/lsp/incremental_sync_spec.lua	zero-pass	0	22	0	0	22	22	0	editor	assert eq: values differ		0	22
+plugin/lsp/inlay_hint_spec.lua	zero-pass	0	9	0	0	9	9	0	protocol	screen: nvim_get_color_map not implemented		0	1
+plugin/lsp/inline_completion_spec.lua	zero-pass	0	6	0	0	6	6	0	protocol	screen: nvim_get_color_map not implemented		0	1
+plugin/lsp/linked_editing_range_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	E117: Function is not implemented: stdpath (byte <n>)\ns		0	1
+plugin/lsp/on_type_formatting_spec.lua	zero-pass	0	4	0	0	4	4	0	editor	E117: Function is not implemented: stdpath (byte <n>)\ns		0	1
+plugin/lsp/selection_range_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+plugin/lsp/semantic_tokens_spec.lua	zero-pass	0	25	0	0	25	25	0	editor	E117: Function is not implemented: stdpath (byte <n>)\ns		0	1
+plugin/lsp/snippet_spec.lua	zero-pass	0	8	0	0	8	8	0	protocol	Lua: runtime error: Error(CallbackError { traceback: "stack traceback:\n\t[C]: in ?\n\t[C]		0	1
+plugin/lsp/util_spec.lua	zero-pass	0	65	0	0	65	65	0	editor	E117: Function is not implemented: bufadd (byte <n>)\nst		0	65
+plugin/lsp_spec.lua	hang	0	122	1	1	123	138	1	editor	E117: Function is not implemented: stdpath (byte <n>)\ns	T246 LSP vim.lsp.config() and vim.lsp.enable() in first FileType event (on startup): oxvim: Ex command failed: Vim(lua):	0	134
+plugin/man_spec.lua	zero-pass	0	14	0	0	14	14	0	protocol	screen: nvim_get_color_map not implemented		0	1
+plugin/matchparen_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+plugin/msgpack_spec.lua	zero-pass	0	41	0	0	41	41	0	editor	Not implemented: msgpack#equal		0	41
+plugin/optwin_spec.lua	zero-pass	0	2	0	0	2	1	1	editor	not implemented: options		0	2
+plugin/pack_spec.lua	zero-pass	0	0	1	0	1	64	1	editor	Not implemented: mkdir		0	1
+plugin/shada_spec.lua	zero-pass	0	10	1	0	11	41	0	editor	E126: Missing :endfunction		0	11
+plugin/spellfile_spec.lua	zero-pass	0	4	0	0	4	4	0	protocol	API not implemented via nvim_exec2		0	4
+plugin/tohtml_spec.lua	zero-pass	0	18	0	0	18	18	0	editor	not implemented: packadd		0	18
+plugin/tutor_spec.lua	zero-pass	0	4	0	0	4	4	0	editor	E492: Not an editor command: Tutor		0	4
+plugin/undotree_spec.lua	zero-pass	0	4	0	0	4	4	0	protocol	API not implemented via nvim_exec2		0	4
+plugin/vim_syntax_spec.lua	zero-pass	0	1	0	0	1	0	1	protocol	API not implemented via nvim_exec2		0	1
+plugin/zip_spec.lua	partial	2	25	0	0	27	28	0	editor	assert eq: values differ		0	27
+provider/clipboard_spec.lua	zero-pass	0	46	0	0	46	46	0	protocol	screen: nvim_get_color_map not implemented		0	46
+provider/define_spec.lua	zero-pass	0	60	0	0	60	60	0	editor	attempt to concatenate a nil value		0	60
+provider/nodejs_spec.lua	zero-pass	0	0	1	0	1	0	0	editor	Not implemented: provider#node#Detect		0	1
+provider/perl_spec.lua	zero-pass	0	0	1	0	1	0	0	protocol	Lua: runtime error: Error(CallbackError { traceback: "stack traceback:\n\t[C]: in ?\n\t[C]		0	1
+provider/provider_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	expected failure, but got success		0	2
+provider/python3_spec.lua	zero-pass	0	0	1	0	1	2	0	editor	E117: Function is not implemented: expand (byte <n>)") }		0	1
+provider/ruby_spec.lua	zero-pass	0	1	0	1	1	1	0	editor	assert matches: pattern mismatch		0	1
+script/clint_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	assert eq: values differ		0	1
+script/luacats_grammar_spec.lua	clean	92	0	0	0	92	92	0				0	1
+script/luacats_parser_spec.lua	clean	9	0	0	0	9	9	0				0	1
+script/text_utils_spec.lua	zero-pass	0	3	0	0	3	3	0	protocol	Lua: runtime error: Error(CallbackError { traceback: "stack traceback:\n\t[C]: in ?\n\t[C]		0	3
+shada/buffers_spec.lua	zero-pass	0	10	0	0	10	10	0	protocol	API not implemented via nvim_set_var		0	10
+shada/compatibility_spec.lua	zero-pass	0	16	0	0	16	16	0	protocol	API not implemented via nvim_set_var		0	16
+shada/errors_spec.lua	zero-pass	0	97	0	0	97	97	0	protocol	API not implemented via nvim_set_var		0	97
+shada/history_spec.lua	zero-pass	0	23	0	0	23	23	0	protocol	API not implemented via nvim_set_var		0	23
+shada/marks_spec.lua	zero-pass	0	20	0	0	20	20	0	protocol	API not implemented via nvim_set_var		0	20
+shada/merging_spec.lua	zero-pass	0	67	0	0	67	67	0	protocol	API not implemented via nvim_set_var		0	67
+shada/registers_spec.lua	zero-pass	0	14	0	0	14	14	0	protocol	API not implemented via nvim_set_var		0	14
+shada/shada_spec.lua	partial	1	20	0	0	21	21	0	protocol	API not implemented via nvim_set_var		1	20
+shada/variables_spec.lua	zero-pass	0	21	0	0	21	21	0	protocol	API not implemented via nvim_set_var		0	21
+terminal/altscreen_spec.lua	zero-pass	0	7	0	0	7	7	0	protocol	screen: nvim_get_color_map not implemented		0	7
+terminal/api_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+terminal/buffer_spec.lua	partial	2	88	0	0	90	90	0	protocol	screen: nvim_get_color_map not implemented		0	90
+terminal/channel_spec.lua	zero-pass	0	22	0	0	22	22	0	protocol	screen: nvim_get_color_map not implemented		0	22
+terminal/clipboard_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	E121: Undefined variable: g:clipboard (byte <n>)		0	2
+terminal/cursor_spec.lua	zero-pass	0	39	0	0	39	39	0	protocol	screen: nvim_get_color_map not implemented		0	39
+terminal/edit_spec.lua	zero-pass	0	2	0	0	2	2	0	protocol	API not implemented via nvim_set_var		0	2
+terminal/ex_terminal_spec.lua	zero-pass	0	30	0	0	30	30	0	protocol	screen: nvim_get_color_map not implemented		0	30
+terminal/highlight_spec.lua	zero-pass	0	21	0	0	21	21	0	protocol	screen: nvim_get_color_map not implemented		0	21
+terminal/mouse_spec.lua	zero-pass	0	17	0	0	17	17	0	protocol	screen: nvim_get_color_map not implemented		0	17
+terminal/parser_spec.lua	partial	3	3	0	0	6	6	0	editor	Key not found: term_title		0	6
+terminal/scrollback_spec.lua	partial	2	91	0	0	93	93	0	protocol	screen: nvim_get_color_map not implemented		0	93
+terminal/synchronized_output_spec.lua	zero-pass	0	7	0	0	7	7	0	protocol	screen: nvim_get_color_map not implemented		0	7
+terminal/tui_spec.lua	hang	0	48	0	1	48	163	0	protocol	screen: nvim_get_color_map not implemented		0	153
+terminal/window_spec.lua	zero-pass	0	16	0	0	16	16	0	editor	E474: option `wrap` cannot be used at Global scope		0	16
+terminal/window_split_tab_spec.lua	zero-pass	0	6	0	0	6	5	1	protocol	screen: nvim_get_color_map not implemented		0	6
+treesitter/fold_spec.lua	zero-pass	0	16	0	0	16	16	0	protocol	Lua: runtime error: Error(CallbackError { traceback: "stack traceback:\n\t[C]: in ?\n\t[C]		0	16
+treesitter/highlight_spec.lua	zero-pass	0	31	0	0	31	32	0	protocol	screen: nvim_get_color_map not implemented		0	32
+treesitter/inspect_tree_spec.lua	zero-pass	0	8	0	0	8	8	0	editor	<f> Parser could not be created for buffer <n> and language "lua": ...ns/B<n>/root/runtime		0	8
+treesitter/language_spec.lua	partial	1	7	0	0	8	8	0	editor	assert matches: pattern mismatch		0	8
+treesitter/node_spec.lua	zero-pass	0	14	0	0	14	14	0	editor	<f> Parser could not be created for buffer <n> and language "lua": ...ns/B<n>/root/runtime		0	14
+treesitter/parser_spec.lua	zero-pass	0	53	0	0	53	53	0	editor	<f> attempt to index field 'parser' (a nil value)		0	53
+treesitter/query_spec.lua	zero-pass	0	23	0	0	23	23	0	editor	<f> attempt to index a nil value		0	23
+treesitter/select_spec.lua	zero-pass	0	13	0	0	13	13	0	editor	E117: Function is not implemented: getpos (byte <n>)\nst		0	13
+treesitter/util_spec.lua	partial	1	1	0	0	2	2	0	editor	<f> attempt to index local 'parser' (a nil value)		0	2
+treesitter/wasm_spec.lua	no-tests	0	0	0	1	0	0	0				0	1
+ui/bufhl_spec.lua	zero-pass	0	22	0	1	22	22	0	protocol	screen: nvim_get_color_map not implemented		0	22
+ui/cmdline2_spec.lua	zero-pass	0	14	0	0	14	15	0	protocol	screen: nvim_get_color_map not implemented		0	14
+ui/cmdline_highlight_spec.lua	zero-pass	0	28	0	0	28	28	0	protocol	screen: nvim_get_color_map not implemented		0	28
+ui/cmdline_spec.lua	zero-pass	0	72	0	0	72	72	0	protocol	screen: nvim_get_color_map not implemented		0	72
+ui/cursor_spec.lua	zero-pass	0	5	0	0	5	5	0	protocol	screen: nvim_get_color_map not implemented		0	5
+ui/decorations_spec.lua	zero-pass	0	192	0	1	192	192	0	protocol	screen: nvim_get_color_map not implemented		0	192
+ui/diff_spec.lua	zero-pass	0	38	4	0	42	49	0	editor	not implemented: diffthis		0	40
+ui/embed_spec.lua	zero-pass	0	9	0	0	9	12	0	protocol	screen: nvim_get_color_map not implemented		0	10
+ui/float_spec.lua	partial	9	371	0	2	380	377	3	editor	Not implemented: win_getid		0	267
+ui/fold_spec.lua	zero-pass	0	50	0	0	50	50	0	protocol	screen: nvim_get_color_map not implemented		0	50
+ui/highlight_spec.lua	zero-pass	0	84	0	0	84	84	0	editor	assert eq: values differ		0	84
+ui/hlstate_spec.lua	zero-pass	0	8	0	0	8	8	0	protocol	screen: nvim_get_color_map not implemented		0	8
+ui/img_spec.lua	partial	3	2	0	0	5	5	0	protocol	Lua: runtime error: Error(CallbackError { traceback: "stack traceback:\n\t[C]: in ?\n\t[C]		0	5
+ui/inccommand_spec.lua	partial	4	104	0	0	108	108	0	editor	retry() attempts: <n>		0	108
+ui/inccommand_user_spec.lua	zero-pass	0	18	0	0	18	18	0	protocol	screen: nvim_get_color_map not implemented		0	18
+ui/input_spec.lua	partial	4	22	0	0	26	26	0	editor	not implemented: rpcnotify		0	26
+ui/linematch_spec.lua	zero-pass	0	35	0	0	35	35	0	editor	not implemented: windo		0	35
+ui/messages2_spec.lua	zero-pass	0	31	0	0	31	30	1	protocol	screen: nvim_get_color_map not implemented		0	31
+ui/messages_spec.lua	zero-pass	0	86	0	1	86	85	1	protocol	screen: nvim_get_color_map not implemented		0	86
+ui/mode_spec.lua	zero-pass	0	8	0	0	8	8	0	protocol	screen: nvim_get_color_map not implemented		0	8
+ui/mouse_spec.lua	zero-pass	0	198	0	0	198	198	0	protocol	screen: nvim_get_color_map not implemented		0	198
+ui/multibyte_spec.lua	zero-pass	0	21	0	0	21	21	0	protocol	screen: nvim_get_color_map not implemented		0	21
+ui/multigrid_spec.lua	zero-pass	0	39	0	0	39	39	0	protocol	screen: nvim_get_color_map not implemented		0	39
+ui/options_spec.lua	zero-pass	0	9	0	0	9	9	0	protocol	screen: nvim_get_color_map not implemented		0	9
+ui/output_spec.lua	zero-pass	0	8	0	0	8	8	0	protocol	screen: nvim_get_color_map not implemented		0	1
+ui/popupmenu_spec.lua	zero-pass	0	201	0	0	201	201	0	protocol	screen: nvim_get_color_map not implemented		0	201
+ui/preview_spec.lua	zero-pass	0	12	0	0	12	12	0	protocol	screen: nvim_get_color_map not implemented		0	12
+ui/quickfix_spec.lua	zero-pass	0	5	0	0	5	5	0	protocol	screen: nvim_get_color_map not implemented		0	5
+ui/screen_basic_spec.lua	zero-pass	0	60	0	0	60	60	0	protocol	screen: nvim_get_color_map not implemented		0	60
+ui/scrollbind_spec.lua	zero-pass	0	4	0	0	4	4	0	protocol	screen: nvim_get_color_map not implemented		0	4
+ui/searchhl_spec.lua	zero-pass	0	17	0	0	17	17	0	protocol	screen: nvim_get_color_map not implemented		0	17
+ui/sign_spec.lua	zero-pass	0	22	0	0	22	22	0	protocol	screen: nvim_get_color_map not implemented		0	22
+ui/spell_spec.lua	zero-pass	0	10	0	0	10	10	0	protocol	screen: nvim_get_color_map not implemented		0	10
+ui/statuscolumn_spec.lua	zero-pass	0	34	0	0	34	34	0	protocol	screen: nvim_get_color_map not implemented		0	34
+ui/statusline_spec.lua	zero-pass	0	74	0	0	74	74	0	protocol	screen: nvim_get_color_map not implemented		0	74
+ui/syntax_conceal_spec.lua	zero-pass	0	31	0	0	31	31	0	protocol	screen: nvim_get_color_map not implemented		0	31
+ui/tabline_spec.lua	zero-pass	0	8	0	0	8	8	0	protocol	screen: nvim_get_color_map not implemented		0	8
+ui/title_spec.lua	zero-pass	0	15	0	0	15	15	0	protocol	screen: nvim_get_color_map not implemented		0	15
+ui/wildmode_spec.lua	zero-pass	0	23	0	0	23	23	0	protocol	screen: nvim_get_color_map not implemented		0	23
+ui/winbar_spec.lua	zero-pass	0	23	0	0	23	24	0	protocol	screen: nvim_get_color_map not implemented		0	23
+vimscript/api_functions_spec.lua	zero-pass	0	10	0	0	10	9	1	editor	E117: Unknown function: nvim_command		0	10
+vimscript/buf_functions_spec.lua	zero-pass	0	31	0	0	31	31	0	editor	expected failure, but got success		0	31
+vimscript/changedtick_spec.lua	zero-pass	0	10	0	0	10	10	0	editor	Key not found: changedtick		0	10
+vimscript/container_functions_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	API not implemented via nvim_set_var		0	1
+vimscript/environ_spec.lua	partial	2	5	0	0	7	7	0	editor	Not implemented: environ		1	6
+vimscript/errorlist_spec.lua	zero-pass	0	9	0	0	9	9	0	editor	assert eq: values differ		0	9
+vimscript/eval_spec.lua	partial	1	8	0	1	9	9	0	editor	assert eq: values differ		0	8
+vimscript/executable_spec.lua	partial	4	1	1	3	6	8	0	editor	expected failure, but got success		0	6
+vimscript/execute_spec.lua	zero-pass	0	17	0	0	17	17	0	editor	E121: Undefined variable: g:__redir_output (byte <n>)		0	17
+vimscript/exepath_spec.lua	partial	2	1	0	1	3	3	0	editor	expected failure, but got success		0	3
+vimscript/fnamemodify_spec.lua	partial	9	4	0	0	13	13	0	editor	assert eq: values differ		0	1
+vimscript/functions_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	Not implemented: windowsversion		0	1
+vimscript/getchar_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	screen: nvim_get_color_map not implemented		0	1
+vimscript/getline_spec.lua	zero-pass	0	4	0	0	4	4	0	editor	Not implemented: setline		0	4
+vimscript/glob_spec.lua	zero-pass	0	5	0	0	5	5	0	editor	Not implemented: glob		0	5
+vimscript/has_spec.lua	partial	2	6	0	0	8	8	0	editor	assert eq: values differ		0	8
+vimscript/hostname_spec.lua	zero-pass	0	1	0	0	1	1	0	editor	Not implemented: system		0	1
+vimscript/input_spec.lua	zero-pass	0	26	0	0	26	26	0	protocol	screen: nvim_get_color_map not implemented		0	26
+vimscript/json_functions_spec.lua	partial	4	38	1	0	43	77	0	protocol	API not implemented via nvim_exec2		0	2
+vimscript/lang_spec.lua	no-tests	0	0	0	2	0	0	0				0	0
+vimscript/let_spec.lua	partial	1	10	0	0	11	11	0	protocol	API not implemented via nvim_set_var		0	11
+vimscript/map_functions_spec.lua	zero-pass	0	16	0	0	16	16	0	editor	Not implemented: maparg		0	16
+vimscript/match_functions_spec.lua	zero-pass	0	7	0	0	7	7	0	editor	Not implemented: setmatches		0	7
+vimscript/minmax_functions_spec.lua	partial	6	4	0	0	10	10	0	editor	assert eq: values differ		0	10
+vimscript/modeline_spec.lua	clean	1	0	0	0	1	1	0				0	1
+vimscript/msgpack_functions_spec.lua	zero-pass	0	71	0	0	71	71	0	protocol	API not implemented via nvim_set_var		0	71
+vimscript/null_spec.lua	partial	4	86	0	0	90	90	0	protocol	API not implemented via nvim_set_var		0	90
+vimscript/operators_spec.lua	clean	3	0	0	0	3	3	0				0	3
+vimscript/printf_spec.lua	partial	9	5	0	0	14	14	0	editor	assert eq: values differ		0	14
+vimscript/reltime_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	Not implemented: reltime		0	2
+vimscript/screenchar_spec.lua	zero-pass	0	2	2	0	4	10	0	protocol	screen: nvim_get_color_map not implemented		0	4
+vimscript/screenpos_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	Invalid 'config.focusable': expected Boolean		0	2
+vimscript/screenrowcol_spec.lua	no-tests	0	0	0	6	0	0	0				0	0
+vimscript/setpos_spec.lua	zero-pass	0	5	0	0	5	5	0	editor	Not implemented: setpos		0	5
+vimscript/sort_spec.lua	zero-pass	0	4	0	0	4	4	0	editor	expected failure, but got success		0	4
+vimscript/special_vars_spec.lua	partial	7	9	0	0	16	16	0	editor	E126: Missing :endfunction		0	16
+vimscript/state_spec.lua	zero-pass	0	1	0	0	1	1	0	protocol	nvim_ui_attach expects (Integer, Integer, Dict)		0	1
+vimscript/string_spec.lua	partial	20	5	1	0	26	35	0	protocol	API not implemented via nvim_exec2		0	26
+vimscript/system_spec.lua	partial	1	41	0	2	42	41	0	editor	assert eq: values differ		0	44
+vimscript/timer_spec.lua	zero-pass	0	18	0	0	18	18	0	protocol	API not implemented via nvim_exec2		0	18
+vimscript/uniq_spec.lua	zero-pass	0	2	0	0	2	2	0	editor	expected failure, but got success		0	2
+vimscript/vvars_spec.lua	partial	2	1	0	0	3	5	0	editor	E121: Undefined variable: v:event (byte <n>)		2	1
+vimscript/wait_spec.lua	zero-pass	0	7	0	0	7	7	0	protocol	API not implemented via nvim_set_var		0	7
+vimscript/writefile_spec.lua	partial	2	12	0	0	14	14	0	editor	Not implemented: writefile		0	14

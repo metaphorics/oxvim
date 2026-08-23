@@ -43,6 +43,8 @@ target/
 !.outline/sdd/oldtest-census-3.tsv
 !.outline/sdd/oldtest-blockers-3.md
 !.outline/sdd/plugin-probe.md
+!.outline/sdd/functional-census.tsv
+!.outline/sdd/functional-blockers.md
 .plan/
 PLAN.md
 TASKS.md
