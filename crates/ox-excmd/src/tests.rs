@@ -738,6 +738,18 @@ error_case!(error_trailing_characters, "undo extra", ErrorCode::E488);
 error_case!(error_argument_required, "badd", ErrorCode::E471);
 error_case!(error_unterminated_search, "/open print", ErrorCode::E488);
 
+/// The E481 message text matches upstream's `e_norange` byte for byte.
+///
+/// Error text is plugin-observable, so the capital "No" is load-bearing:
+/// `errors.h:74` is `N_("E481: No range allowed")`. Oracle: `:3redo` reports
+/// `Vim(redo):E481: No range allowed`.
+#[test]
+fn range_not_allowed_message_matches_upstream() {
+    let error = Parser::new().parse("3redo").expect_err("input must fail");
+    assert_eq!(error.code, ErrorCode::E481);
+    assert_eq!(error.message, "No range allowed");
+}
+
 #[test]
 fn unknown_command_error_offset_is_byte_accurate() {
     let error = Parser::new().parse(":  Bogus").expect_err("input must fail");

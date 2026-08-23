@@ -274,7 +274,7 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
         })?;
         let flags = effective_flags(&command);
         if range.is_some() && !flags.contains(CommandFlags::RANGE) {
-            return Err(error(ErrorCode::E481, range_offset, "no range allowed"));
+            return Err(error(ErrorCode::E481, range_offset, "No range allowed"));
         }
 
         cursor = after_name;
