@@ -20,6 +20,11 @@ pub(crate) fn getcwd(args: &[Typval]) -> Result<Typval> {
     Ok(text(directory.to_string_lossy()))
 }
 
+pub(crate) fn is_absolute_path(value: &Typval) -> Result<Typval> {
+    let value = string_arg(value)?;
+    Ok(boolean(Path::new(&value.to_string_lossy().as_ref()).is_absolute()))
+}
+
 pub(crate) fn executable(value: &Typval) -> Result<Typval> {
     let program = string_arg(value)?.to_string_lossy().into_owned();
     if program.is_empty() {

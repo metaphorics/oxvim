@@ -1200,3 +1200,27 @@ fn matchstrpos_and_matchlist_shape_results() {
     assert_eq!(builtins.call(&OxStr::from("matchstrpos"), vec![Typval::list(vec![text("vim"), text("testing")]), text("ing")], &mut Scope::new()).unwrap(), Typval::list(vec![text("ing"), number(1), number(4), number(7)]));
     assert_eq!(builtins.call(&OxStr::from("matchlist"), vec![text("acd"), text("acd")], &mut Scope::new()).unwrap(), Typval::list(vec![text("acd"), text(""), text(""), text(""), text(""), text(""), text(""), text(""), text(""), text("")]));
 }
+
+#[test]
+fn small_process_and_path_builtins_match_vim_contracts() {
+    assert_eq!(call("getpid", vec![]).unwrap(), number(i64::from(std::process::id())));
+    let Typval::String(hostname) = call("hostname", vec![]).unwrap() else { panic!("hostname must return a String") };
+    assert!(!hostname.as_bytes().is_empty());
+    assert_eq!(call("gettext", vec![text("message")]).unwrap(), text("message"));
+    assert_eq!(call("gettext", vec![number(1)]).unwrap_err().code, "E1174");
+    assert_eq!(call("isabsolutepath", vec![text("/tmp")]).unwrap(), number(1));
+    assert_eq!(call("isabsolutepath", vec![text("../tmp")]).unwrap(), number(0));
+}
+
+#[test]
+fn slice_uses_exclusive_bounds_and_clamps_negative_indices() {
+    assert_eq!(call("slice", vec![Typval::list((0..6).map(number).collect()), number(2), number(4)]).unwrap(), Typval::list(vec![number(2), number(3)]));
+    assert_eq!(call("slice", vec![text("012345"), number(1), number(-1)]).unwrap(), text("1234"));
+    assert_eq!(call("slice", vec![Typval::Blob(vec![0, 1, 2, 3]), number(-3)]).unwrap(), Typval::Blob(vec![1, 2, 3]));
+}
+
+#[test]
+fn insert_rejects_negative_list_indices() {
+    let values = Typval::list(vec![number(1)]);
+    assert_eq!(call("insert", vec![values, number(2), number(-1)]).unwrap_err().code, "E686");
+}

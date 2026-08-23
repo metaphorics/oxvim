@@ -107,12 +107,16 @@ impl<'a> Builtins<'a> {
             "floor" => float_unary(&args[0], f64::floor),
             "fnamemodify" => path_builtins::fnamemodify(self.regex, &args[0], &args[1]),
             "get" => get(&args),
+            "gettext" => gettext(&args[0]),
             "getcwd" => path_builtins::getcwd(&args),
+            "getpid" => Ok(Typval::Number(i64::from(std::process::id()))),
             "has" => has_feature(&args),
             "has_key" => has_key(&args),
+            "hostname" => hostname(),
             "index" => index(&args),
             "indexof" => self.indexof(&args, scope),
             "insert" => insert(args),
+            "isabsolutepath" => path_builtins::is_absolute_path(&args[0]),
             "islocked" => is_locked_value(&args[0]),
             "items" => dict_projection(&args[0], Projection::Items),
             "join" => join(&args),
@@ -143,6 +147,7 @@ impl<'a> Builtins<'a> {
             "reverse" => reverse(args),
             "setenv" => setenv(&args),
             "simplify" => path_builtins::simplify(&args[0]),
+            "slice" => slice(&args),
             "sort" => self.sort(args, scope),
             "split" => self.regex_split(&args),
             "sqrt" => float_unary(&args[0], f64::sqrt),
@@ -695,10 +700,10 @@ fn is_implemented(name: &str) -> bool {
     matches!(name,
         "abs" | "add" | "and" | "blob2list" | "ceil" | "char2nr" | "copy" | "count" |
         "deepcopy" | "empty" | "escape" | "executable" | "exepath" | "exists" | "extend" | "extendnew" | "filter" | "flatten" |
-        "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "get" | "getcwd" | "has" | "has_key" | "index" | "insert" | "items" |
-        "indexof" | "islocked" | "join" | "json_decode" | "json_encode" | "keytrans" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
+        "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "get" | "gettext" | "getcwd" | "getpid" | "has" | "has_key" | "hostname" | "index" | "insert" | "items" |
+        "indexof" | "isabsolutepath" | "islocked" | "join" | "json_decode" | "json_encode" | "keytrans" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
         "match" | "matchend" | "matchstr" | "matchlist" | "matchstrpos" | "max" | "min" | "nr2char" | "or" | "pathshorten" | "pow" | "printf" | "range" | "reduce" | "resolve" |
-        "remove" | "repeat" | "reverse" | "setenv" | "simplify" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
+        "remove" | "repeat" | "reverse" | "setenv" | "simplify" | "slice" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
         "str2nr" | "strcharlen" | "strchars" | "stridx" | "string" | "strpart" | "strridx" | "strtrans" | "strutf16len" | "strwidth" |
         "substitute" | "tolower" | "toupper" | "tr" | "trim" | "trunc" | "type" | "uniq" | "utf16idx" | "charidx" | "values" | "xor"
     )
@@ -1579,6 +1584,59 @@ fn has_key(args: &[Typval]) -> Result<Typval> {
     Ok(Typval::Number(i64::from(dict_entries(values)?.iter().any(|(candidate, _)| candidate == &key))))
 }
 
+fn gettext(value: &Typval) -> Result<Typval> {
+    let Typval::String(text) = value else {
+        return Err(EvalError::new("E1174", 0, "String required for argument 1"));
+    };
+    if text.as_bytes().is_empty() {
+        return Err(EvalError::new("E1175", 0, "Non-empty string required for argument 1"));
+    }
+    Ok(Typval::String(text.clone()))
+}
+
+fn hostname() -> Result<Typval> {
+    let name = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|value| value.trim_end_matches(['\r', '\n']).to_owned())
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .map_err(|error| EvalError::new("E500", 0, format!("Cannot determine hostname: {error}")))?;
+    Ok(Typval::String(OxStr::from(name.as_str())))
+}
+
+fn slice(args: &[Typval]) -> Result<Typval> {
+    let start = number_arg(&args[1])?;
+    let end = args.get(2).map(number_arg).transpose()?;
+    match &args[0] {
+        Typval::List(reference) => {
+            let items = list_items(reference)?;
+            let (start, end) = slice_bounds(items.len(), start, end);
+            Ok(Typval::list(items[start..end].to_vec()))
+        }
+        Typval::Blob(value) => {
+            let (start, end) = slice_bounds(value.len(), start, end);
+            Ok(Typval::Blob(value[start..end].to_vec()))
+        }
+        Typval::String(value) => {
+            let characters = String::from_utf8_lossy(value.as_bytes()).chars().collect::<Vec<_>>();
+            let (start, end) = slice_bounds(characters.len(), start, end);
+            Ok(Typval::String(OxStr(characters[start..end].iter().collect::<String>().into_bytes())))
+        }
+        _ => Err(EvalError::new("E1170", 0, "Cannot use slice() with this type")),
+    }
+}
+
+fn slice_bounds(length: usize, start: i64, end: Option<i64>) -> (usize, usize) {
+    fn bound(length: usize, index: i64) -> usize {
+        if index < 0 {
+            length.saturating_sub(index.unsigned_abs() as usize)
+        } else {
+            usize::try_from(index).unwrap_or(usize::MAX).min(length)
+        }
+    }
+    let start = bound(length, start);
+    let end = end.map_or(length, |index| bound(length, index));
+    (start.min(end), end)
+}
+
 fn index(args: &[Typval]) -> Result<Typval> {
     let Typval::List(values) = &args[0] else { return Err(EvalError::new("E714", 0, "List required")); };
     let values = list_items(values)?;
@@ -1598,8 +1656,12 @@ fn insert(mut args: Vec<Typval>) -> Result<Typval> {
         Some(Typval::List(reference)) => {
             let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
             ensure_unlocked(data.lock)?;
-            let index = if index < 0 { data.items.len().saturating_sub(index.unsigned_abs() as usize).saturating_add(1) } else { usize::try_from(index).unwrap_or(usize::MAX) };
-            if index > data.items.len() { return Err(EvalError::new("E684", 0, "List index out of range")); }
+            let index = if index < 0 {
+                return Err(EvalError::new("E686", 0, "Argument of insert() must be non-negative"));
+            } else {
+                usize::try_from(index).unwrap_or(usize::MAX)
+            };
+            if index > data.items.len() { return Err(EvalError::new("E686", 0, "List index out of range")); }
             data.items.insert(index, value);
             drop(data);
             Ok(args.remove(0))
