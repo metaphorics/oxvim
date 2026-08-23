@@ -4927,6 +4927,7 @@ fn command_invoke_user<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Edito
     if command.register.is_some() && !definition.accepts_register { return error_flow(runtime, "E488", "Trailing characters") }
     let (line1, line2) = resolve_range(editor, command).unwrap_or_else(|_| current_line_pair(editor));
     let expanded = definition.body
+        .replace("<f-args>", &split_command_arguments(args))
         .replace("<args>", args)
         .replace("<q-args>", &format!("'{}'", args.replace('\'', "''")))
         .replace("<bang>", if command.bang { "!" } else { "" })
@@ -4937,6 +4938,57 @@ fn command_invoke_user<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Edito
     let logical = vec![LogicalLine { text: expanded, first_line: runtime.scripts.current_line() }];
     let program = match parse_program(&runtime.user_commands, &logical) { Ok(program) => program, Err(error) => return exec_error_flow(runtime, error) };
     run_program(runtime, editor, scope, lua, &program, 0, program.len())
+}
+
+/// Expand `<f-args>`: split the argument text on unescaped whitespace and emit
+/// each piece as a double-quoted string, the way `uc_split_args()` does in
+/// `usercmd.c`. An empty argument list expands to nothing, not to `""`.
+pub(crate) fn split_command_arguments(args: &str) -> String {
+    if args.is_empty() {
+        return String::new();
+    }
+    let bytes = args.as_bytes();
+    let mut expanded = String::with_capacity(args.len() + 2);
+    expanded.push('"');
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match (byte, bytes.get(index + 1).copied()) {
+            (b'\\', Some(b'\\')) => {
+                expanded.push_str("\\\\");
+                index += 2;
+            }
+            // A backslash-escaped space or tab joins two words into one argument.
+            (b'\\', Some(white @ (b' ' | b'\t'))) => {
+                expanded.push(char::from(white));
+                index += 2;
+            }
+            (b'\\' | b'"', _) => {
+                expanded.push('\\');
+                expanded.push(char::from(byte));
+                index += 1;
+            }
+            (b' ' | b'\t', _) => {
+                while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+                    index += 1;
+                }
+                if index == bytes.len() {
+                    break;
+                }
+                expanded.push_str("\", \"");
+            }
+            _ => {
+                let start = index;
+                index += 1;
+                while index < bytes.len() && bytes[index] & 0xc0 == 0x80 {
+                    index += 1;
+                }
+                expanded.push_str(&args[start..index]);
+            }
+        }
+    }
+    expanded.push('"');
+    expanded
 }
 
 fn count_ex_arguments(args: &str) -> usize {

@@ -2289,3 +2289,96 @@ fn foldopen_bang_opens_nested_folds() {
 fn fold_lines() -> Vec<Vec<u8>> {
     (1..=6).map(|index| format!("a{index}").into_bytes()).collect()
 }
+
+// ---------------------------------------------------------------------------
+// <f-args> expansion in user command bodies
+// Citations: usercmd.c `uc_split_args` (1189-1302) and the `ct_ARGS`/`quote==2`
+// case (1501-1559); test/old/testdir/check.vim defines every `Check*` command
+// as `command -nargs=1 CheckX call CheckX(<f-args>)`.
+// ---------------------------------------------------------------------------
+
+/// Echoes `string([<f-args>])` from a `-nargs=*` user command so the expansion
+/// is observable as the argument list the body actually received.
+fn invoke_with_f_args(arguments: &str) -> String {
+    let (mut editor, mut executor) = setup();
+    executor
+        .execute_line(&mut editor, "command -nargs=* FArgs echo string([<f-args>])")
+        .unwrap();
+    executor
+        .execute_line(&mut editor, &format!("FArgs {arguments}"))
+        .unwrap();
+    match &editor.messages().last().unwrap().content {
+        ox_types::Object::String(text) => text.to_string_lossy().into_owned(),
+        other => panic!("expected a string message, got {other:?}"),
+    }
+}
+
+/// The normal case: `<f-args>` splits on whitespace into one quoted argument
+/// each, and runs of whitespace collapse.
+/// Upstream: `usercmd.c:1262-1270` emits `", "` for each whitespace run.
+#[test]
+fn f_args_splits_arguments_on_whitespace() {
+    assert_eq!(invoke_with_f_args("one"), "['one']");
+    assert_eq!(invoke_with_f_args("one two"), "['one', 'two']");
+    assert_eq!(invoke_with_f_args("one   two  three"), "['one', 'two', 'three']");
+}
+
+/// Boundary: an empty argument list expands to *nothing*, so the body sees zero
+/// arguments rather than one empty string.
+/// Upstream: `usercmd.c:1503-1512` returns length 0 for `quote == 2`.
+#[test]
+fn f_args_with_no_arguments_expands_to_nothing() {
+    assert_eq!(invoke_with_f_args(""), "[]");
+}
+
+/// A backslash-escaped space joins two words into one argument and `\\`
+/// collapses to a single backslash.
+/// Upstream: `usercmd.c:1252-1261`.
+#[test]
+fn f_args_honours_backslash_escapes() {
+    assert_eq!(invoke_with_f_args(r"a\ b c"), "['a b', 'c']");
+    assert_eq!(invoke_with_f_args(r"a\\b"), r"['a\b']");
+}
+
+/// A double quote inside an argument is escaped, not left to terminate the
+/// generated string. Checked against the splitter directly because the Ex
+/// argument parser truncates the command line at `"` before the expansion
+/// runs, which is a separate defect in command parsing.
+/// Upstream: `usercmd.c:1259-1261`.
+#[test]
+fn f_args_escapes_embedded_double_quote() {
+    assert_eq!(crate::excmd_exec::split_command_arguments(r#"he"llo"#), r#""he\"llo""#);
+    assert_eq!(crate::excmd_exec::split_command_arguments("a b"), r#""a", "b""#);
+    assert_eq!(crate::excmd_exec::split_command_arguments(""), "");
+}
+
+/// `<f-args>` is the construct that `check.vim` relies on: the whole oldtest
+/// suite routes `CheckFeature x` through `call CheckFeature(<f-args>)`. Before
+/// the expansion existed the literal `<f-args>` reached the expression parser
+/// and raised `E15`, aborting the file before any test ran.
+#[test]
+fn f_args_carries_check_vim_style_dispatch() {
+    let (mut editor, mut executor) = setup();
+    // check.vim defines the command in its own script; the test file that calls
+    // it is parsed afterwards, which is what makes the invocation resolvable.
+    executor
+        .execute_script(
+            &mut editor,
+            "check.vim",
+            "function Feature(name)\nlet g:seen = a:name\nendfunction\ncommand -nargs=1 CheckFeature call Feature(<f-args>)",
+        )
+        .unwrap();
+
+    executor.execute_line(&mut editor, "CheckFeature arabic").unwrap();
+
+    let seen = executor
+        .scope()
+        .global
+        .iter()
+        .find(|(name, _)| name.as_bytes() == b"seen")
+        .and_then(|(_, value)| match value {
+            ox_types::Typval::String(text) => Some(text.to_string_lossy().into_owned()),
+            _ => None,
+        });
+    assert_eq!(seen.as_deref(), Some("arabic"));
+}
