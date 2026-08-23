@@ -5,6 +5,7 @@ mod api_info;
 mod cli;
 mod runtime;
 mod server;
+mod usage;
 
 use std::fmt;
 use std::io::{self, Write};
@@ -83,6 +84,17 @@ fn process_code(code: i64) -> ExitCode {
 
 fn run() -> Result<ExitCode, AppError> {
     let cli = Cli::parse(std::env::args().skip(1)).map_err(AppError::Usage)?;
+    // main.c prints help and version from inside the argument scan and exits
+    // successfully, before any startup work happens.
+    if cli.help {
+        io::stdout().lock().write_all(usage::HELP.as_bytes()).map_err(AppError::Io)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if cli.version {
+        let text = usage::version()?;
+        io::stdout().lock().write_all(text.as_bytes()).map_err(AppError::Io)?;
+        return Ok(ExitCode::SUCCESS);
+    }
     // env.c vim_getenv: derive and export $VIM/$VIMRUNTIME before any
     // startup command or executor snapshots the environment.
     runtime::export_vim_environment()?;

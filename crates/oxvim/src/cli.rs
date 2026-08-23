@@ -89,6 +89,10 @@ pub struct Cli {
     pub verbose: Option<VerboseConfig>,
     /// Print API metadata and exit.
     pub api_info: bool,
+    /// Print the help message and exit successfully (`-h`, `-?`, `--help`).
+    pub help: bool,
+    /// Print version information and exit successfully (`-v`, `--version`).
+    pub version: bool,
     /// Whether plugin scripts should be loaded on startup.
     ///
     /// `--noplugin` resets this to `false`; `-u NONE` also resets it unless
@@ -114,6 +118,8 @@ impl Default for Cli {
             commands: Vec::new(),
             verbose: None,
             api_info: false,
+            help: false,
+            version: false,
             loadplugins: true,
             files: Vec::new(),
         }
@@ -228,6 +234,11 @@ impl Cli {
                     &mut cursor,
                     &mut had_minmin,
                 )?;
+                // main.c prints and exits inside the scan, so a later
+                // unknown option is never reached.
+                if cli.help || cli.version || cli.api_info {
+                    return Ok(cli);
+                }
                 match want {
                     Want::Done if cursor < argument.len() => continue,
                     Want::Done | Want::Argument => break,
@@ -304,6 +315,10 @@ impl Cli {
                 self.batch.get_or_insert_with(BatchMode::default);
                 Ok(Want::Done)
             }
+            'h' | '?' => {
+                self.help = true;
+                Ok(Want::Done)
+            }
             'H' => Err(unsupported(argument, "keymap file loading")),
             'q' => Err(unsupported(argument, "the quickfix list and 'errorformat'")),
             'r' | 'L' => Err(unsupported(argument, "swap-file recovery")),
@@ -316,6 +331,10 @@ impl Cli {
                 Ok(Want::Next('s'))
             }
             't' => Err(unsupported(argument, "the tags subsystem")),
+            'v' => {
+                self.version = true;
+                Ok(Want::Done)
+            }
             'V' => {
                 let level = number_argument(argument, cursor, 10);
                 let file = &argument[*cursor..];
@@ -341,8 +360,9 @@ impl Cli {
 
     /// Handle the long option in `argument`, whose name starts at `cursor`.
     ///
-    /// Upstream compares case-insensitively, and every name except
-    /// `api-info` matches by prefix, so `--noplugins` is accepted.
+    /// Upstream compares case-insensitively, and every name except `help`,
+    /// `version` and `api-info` matches by prefix, so `--noplugins` is
+    /// accepted.
     fn scan_long_option(
         &mut self,
         argument: &str,
@@ -354,7 +374,11 @@ impl Cli {
         let prefix = |expected: &str| {
             name.len() >= expected.len() && name[..expected.len()].eq_ignore_ascii_case(expected)
         };
-        if exact("api-info") {
+        if exact("help") {
+            self.help = true;
+        } else if exact("version") {
+            self.version = true;
+        } else if exact("api-info") {
             self.api_info = true;
         } else if exact("headless") {
             self.headless = true;
@@ -547,6 +571,11 @@ mod tests {
             Case { args: &["-Vlog.txt"], check: |c| c.verbose == Some(VerboseConfig { level: 10, file: Some("log.txt".into()) }) },
             Case { args: &["-V3log.txt"], check: |c| c.verbose == Some(VerboseConfig { level: 3, file: Some("log.txt".into()) }) },
             Case { args: &["--api-info"], check: |c| c.api_info },
+            Case { args: &["--help"], check: |c| c.help },
+            Case { args: &["-h"], check: |c| c.help },
+            Case { args: &["-?"], check: |c| c.help },
+            Case { args: &["--version"], check: |c| c.version },
+            Case { args: &["-v"], check: |c| c.version },
             Case { args: &["one", "two"], check: |c| c.files == ["one", "two"] },
             Case { args: &["--", "-mystery"], check: |c| c.files == ["-mystery"] },
             Case { args: &["--", "+cmd"], check: |c| c.files == ["+cmd"] && c.commands.is_empty() },

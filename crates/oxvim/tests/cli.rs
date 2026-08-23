@@ -223,6 +223,32 @@ fn session_flag_sources_file_after_startup() {
 }
 
 
+/// `-h`/`-?`/`--help` and `-v`/`--version` print and exit 0, upstream's
+/// `usage()`/`version()` followed by `os_exit(0)`.  The version text must
+/// carry the version and the API level; a script reads the level to decide
+/// which RPC surface exists.
+#[test]
+fn help_and_version_print_and_exit_zero() {
+    for flag in ["-h", "-?", "--help", "--HELP"] {
+        let output = oxvim().arg(flag).output().expect("spawn oxvim");
+        assert_eq!(output.status.code(), Some(0), "{flag}");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.starts_with("Usage:\n"), "{flag}: {text}");
+        assert!(text.contains("--cmd <cmd>"), "{flag}: {text}");
+        assert!(output.stderr.is_empty(), "{flag}");
+    }
+    for flag in ["-v", "--version"] {
+        let output = oxvim().arg(flag).output().expect("spawn oxvim");
+        assert_eq!(output.status.code(), Some(0), "{flag}");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.starts_with("OXVIM v"), "{flag}: {text}");
+        assert!(text.contains("API level 15"), "{flag}: {text}");
+    }
+    // main.c prints from inside the scan, so a later bad option never runs.
+    let output = oxvim().args(["--version", "--bogus"]).output().expect("spawn oxvim");
+    assert_eq!(output.status.code(), Some(0));
+}
+
 /// Upstream keeps `+cmd` and `-c` in one array and runs `--cmd` first, so the
 /// post-startup commands stay in argv order regardless of how they spell.
 #[test]
