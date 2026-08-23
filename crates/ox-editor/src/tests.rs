@@ -144,6 +144,23 @@ fn frame_tree_matches_naive_equal_partition_geometry() {
 }
 
 #[test]
+fn closing_split_preserves_root_geometry_across_repeated_cycles() {
+    let w1 = window_handle(1);
+    let buffer = buffer_handle(1);
+    let geometry = Geometry::new(0, 0, 80, 24).unwrap();
+    let mut layout = Layout::new(w1, WindowState::new(buffer, position(1, 0)), geometry).unwrap();
+
+    for id in 2..=8 {
+        let split = window_handle(id);
+        layout
+            .split_horizontal(w1, split, WindowState::new(buffer, position(1, 0)))
+            .unwrap();
+        layout.close(split).unwrap();
+        assert_eq!(layout.window_geometry(w1).unwrap(), geometry);
+    }
+}
+
+#[test]
 fn three_same_axis_splits_equalize_into_equal_thirds() {
     let w1 = window_handle(1);
     let w2 = window_handle(2);
@@ -540,3 +557,4 @@ fn runtime_roots_follow_runtimepath_entries() {
     let roots: Vec<&std::path::Path> = context.runtime_roots().iter().map(|root| root.path()).collect();
     assert_eq!(roots, vec![std::path::Path::new("/first"), std::path::Path::new("/second")]);
 }
+

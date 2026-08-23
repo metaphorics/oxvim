@@ -382,10 +382,10 @@ impl Layout {
             .copied()
             .ok_or(LayoutError::LastWindow)?;
 
+        let geometry = self.root.geometry();
         let removed = remove_leaf(&mut self.root, resolved)
             .ok_or(LayoutError::UnknownWindow(resolved))?;
         collapse_containers(&mut self.root);
-        let geometry = self.root.geometry();
         equalize_frame(&mut self.root, geometry)?;
 
         if self.current == resolved {
