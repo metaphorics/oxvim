@@ -413,7 +413,10 @@ impl<'a> Parser<'a> {
                 Ok(Expr::new(ExprKind::Interpolated(parts), token.span))
             }
             TokenKind::Blob(value) => Ok(Expr::new(ExprKind::Literal(Typval::Blob(value)), token.span)),
-            TokenKind::Identifier(value) => self.parse_variable(value, token.span),
+            TokenKind::Identifier(value) => {
+                let variable = self.parse_variable(value, token.span)?;
+                self.parse_detached_call(variable)
+            }
             TokenKind::Environment(value) => Ok(Expr::new(ExprKind::Environment(OxStr(value)), token.span)),
             TokenKind::Option { scope, name } => {
                 let scope = match scope {
@@ -467,6 +470,23 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(Expr::new(ExprKind::Variable(OxStr(name)), span))
+    }
+
+    /// A bare name may be separated from its argument list by white space, so
+    /// `substitute ( 'a', 'b', 'c', 'g' )` is a legal legacy call. Only a name
+    /// at the head of an expression gets this; in the subscript chain
+    /// `d.Fn ()`, `l[0] ()` and `Fn() ()` all stay errors.
+    /// Upstream: `eval.c:2783-2786` skips white space before testing for `(`,
+    /// while `handle_subscript` (`eval.c:6022-6026`) requires the `(` to be
+    /// adjacent.
+    fn parse_detached_call(&mut self, callee: Expr) -> Result<Expr, EvalError> {
+        if !matches!(self.current().kind, TokenKind::LParen) {
+            return Ok(callee);
+        }
+        self.advance();
+        let (args, end) = self.parse_arguments()?;
+        let span = Span::new(callee.span.start, end);
+        Ok(Expr::new(ExprKind::Call { callee: Box::new(callee), args }, span))
     }
 
     fn parse_list(&mut self, start: usize) -> Result<Expr, EvalError> {

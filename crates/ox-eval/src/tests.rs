@@ -591,3 +591,38 @@ fn trailing_input_boundary_is_one_byte() {
     assert_eq!(error(b"5)").message, "Trailing characters: )");
 }
 
+// ---------------------------------------------------------------------------
+// White space between a bare name and its argument list
+// Upstream: `eval.c:2783-2786` (name at the head of an expression: white space
+// skipped before the `(` test) versus `eval.c:6022-6026` (`handle_subscript`
+// requires an adjacent `(`).
+// Exercised by `test_expr.vim` `Test_white_in_function_call` and
+// `test_cursor_func.vim` `Test_screenpos_number` (`call setline (1, ...)`).
+// ---------------------------------------------------------------------------
+
+/// Normal case: a name at the head of an expression may be separated from its
+/// argument list by spaces or tabs, and the call still resolves.
+#[test]
+fn white_space_before_call_parenthesis_is_allowed_on_a_bare_name() {
+    assert_eq!(value(b"len ([1, 2, 3])"), Typval::Number(3));
+    assert_eq!(value(b"len\t([1, 2, 3])"), Typval::Number(3));
+    assert_eq!(value(b"sum  (  1, 2, 3  )"), Typval::Number(6));
+}
+
+/// Boundary: the white space is skipped, not swallowed as an argument, so an
+/// empty argument list stays empty and a nested detached call still parses.
+#[test]
+fn white_space_before_call_parenthesis_keeps_the_argument_list_intact() {
+    assert_eq!(value(b"len ([])"), Typval::Number(0));
+    assert_eq!(value(b"sum (len ([1]), 2)"), Typval::Number(3));
+}
+
+/// The relaxation is confined to the head of the expression: in the subscript
+/// chain a detached `(` is still trailing text, exactly as `handle_subscript`
+/// leaves it. `eval.c:6025` requires `!ascii_iswhite(*(*arg - 1))`.
+#[test]
+fn white_space_before_call_parenthesis_stays_an_error_in_the_subscript_chain() {
+    assert_eq!(error(b"{'f': 1}.f (1)").code, "E488");
+    assert_eq!(error(b"[1, 2][0] (1)").code, "E488");
+    assert_eq!(error(b"len([1]) (1)").code, "E488");
+}
