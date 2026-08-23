@@ -1904,3 +1904,173 @@ fn every_builtin_claimed_implemented_reaches_a_dispatch_arm() {
         }
     }
 }
+
+// `TYPVAL_ENCODE_CONV_FLOAT` (`eval/encode.c:351`): `%g` through
+// `vim_snprintf`, which keeps the zero after the dot, and a re-readable
+// `str2float()` call for the two values `%g` cannot round-trip.
+#[test]
+fn string_renders_floats_the_way_upstream_encodes_them() {
+    for (value, expected) in [
+        (1.0, "1.0"),
+        (0.0, "0.0"),
+        (-0.0, "-0.0"),
+        (1.23, "1.23"),
+        (-1.23, "-1.23"),
+        (9_999_999.9, "9999999.9"),
+        (1.0e20, "1.0e20"),
+        (1.0e-5, "1.0e-5"),
+        (0.001, "0.001"),
+        (f64::INFINITY, "str2float('inf')"),
+        (f64::NEG_INFINITY, "-str2float('inf')"),
+        (f64::NAN, "str2float('nan')"),
+    ] {
+        assert_eq!(call("string", vec![Typval::Float(value)]).unwrap(), text(expected), "string({value})");
+    }
+    // A Float inside a container uses the same rendering.
+    assert_eq!(
+        call("string", vec![Typval::list(vec![Typval::Float(1.0), Typval::Float(f64::INFINITY)])]).unwrap(),
+        text("[1.0, str2float('inf')]"),
+    );
+}
+
+// Oracle: `test/old/testdir/test_expr.vim` `Test_printf_float`, which is the
+// spec for `vim_snprintf`'s float conversions (`strings.c:2075-2196`).
+#[test]
+fn printf_float_conversions_match_vim_snprintf() {
+    let inf = Typval::Float(f64::INFINITY);
+    let neg_inf = Typval::Float(f64::NEG_INFINITY);
+    let nan = Typval::Float(f64::NAN);
+    let third = Typval::Float(1.0 / 3.0);
+    let neg_third = Typval::Float(-1.0 / 3.0);
+    for (format, value, expected) in [
+        ("%f", Typval::Number(1), "1.000000"),
+        ("%f", Typval::Float(1.23), "1.230000"),
+        ("%F", Typval::Float(1.23), "1.230000"),
+        ("%g", Typval::Float(9_999_999.9), "9999999.9"),
+        ("%G", Typval::Float(9_999_999.9), "9999999.9"),
+        ("%.8g", Typval::Float(10_000_000.1), "1.00000001e7"),
+        ("%.8G", Typval::Float(10_000_000.1), "1.00000001E7"),
+        ("%e", Typval::Float(1.23), "1.230000e+00"),
+        ("%E", Typval::Float(1.23), "1.230000E+00"),
+        ("%e", Typval::Float(0.012), "1.200000e-02"),
+        ("%e", Typval::Float(-0.012), "-1.200000e-02"),
+        ("%.2f", third.clone(), "0.33"),
+        ("%6.2f", third.clone(), "  0.33"),
+        ("%6.2f", neg_third.clone(), " -0.33"),
+        ("%06.2f", third.clone(), "000.33"),
+        ("%06.2f", neg_third.clone(), "-00.33"),
+        ("%+06.2f", neg_third.clone(), "-00.33"),
+        ("%+06.2f", third.clone(), "+00.33"),
+        ("% 06.2f", third.clone(), " 00.33"),
+        ("%06.2g", third.clone(), "000.33"),
+        ("%06.2g", neg_third.clone(), "-00.33"),
+        ("%3.2f", third.clone(), "0.33"),
+        ("%010.2e", third.clone(), "003.33e-01"),
+        ("% 010.2e", third.clone(), " 03.33e-01"),
+        ("%+010.2e", third.clone(), "+03.33e-01"),
+        ("%010.2e", neg_third, "-03.33e-01"),
+        // Precision 0 drops the dot.
+        ("%3.f", Typval::Float(7.0 / 3.0), "  2"),
+        ("%3.g", Typval::Float(7.0 / 3.0), "  2"),
+        ("%7.e", Typval::Float(7.0 / 3.0), "  2e+00"),
+        // Zero can be signed; infinity can be signed; NaN never is.
+        ("%+f", Typval::Float(0.0), "+0.000000"),
+        ("%f", Typval::Float(0.0), "0.000000"),
+        ("%f", Typval::Float(-0.0), "-0.000000"),
+        ("%s", Typval::Float(0.0), "0.0"),
+        ("%s", Typval::Float(-0.0), "-0.0"),
+        ("%f", inf.clone(), "inf"),
+        ("%f", neg_inf.clone(), "-inf"),
+        ("%g", inf.clone(), "inf"),
+        ("%e", neg_inf.clone(), "-inf"),
+        ("%F", inf.clone(), "INF"),
+        ("%E", neg_inf.clone(), "-INF"),
+        ("%G", neg_inf.clone(), "-INF"),
+        ("%+f", inf.clone(), "+inf"),
+        ("% f", inf.clone(), " inf"),
+        ("%6f", inf.clone(), "   inf"),
+        ("%6f", neg_inf.clone(), "  -inf"),
+        ("%+06f", inf.clone(), "  +inf"),
+        ("%-6f", inf.clone(), "inf   "),
+        ("%-+6f", inf.clone(), "+inf  "),
+        ("%- 6f", inf.clone(), " inf  "),
+        ("%-6G", neg_inf.clone(), "-INF  "),
+        ("%s", inf.clone(), "str2float('inf')"),
+        ("%s", neg_inf, "-str2float('inf')"),
+        ("%f", nan.clone(), "nan"),
+        ("%g", nan.clone(), "nan"),
+        ("%F", nan.clone(), "NAN"),
+        ("%E", nan.clone(), "NAN"),
+        ("%6f", nan.clone(), "   nan"),
+        ("%06f", nan.clone(), "   nan"),
+        ("%-6f", nan.clone(), "nan   "),
+        ("%s", nan, "str2float('nan')"),
+    ] {
+        assert_eq!(
+            call("printf", vec![text(format), value]).unwrap(),
+            text(expected),
+            "printf('{format}', …)",
+        );
+    }
+
+    // `%.330f` prints 330 decimals; the precision is capped at `TMP_LEN - 10`
+    // (`strings.c:2123`), so `%.340f` and `%.350f` both print 340.
+    for (precision, decimals) in [(330usize, 330usize), (340, 340), (350, 340)] {
+        let rendered = call("printf", vec![text(&format!("%.{precision}f")), Typval::Float(1.0)]).unwrap();
+        assert_eq!(rendered, text(&format!("1.{}", "0".repeat(decimals))), "%.{precision}f");
+    }
+
+    // `tv_float` (`strings.c:716`) has its own error for a non-numeric value.
+    assert_eq!(call("printf", vec![text("%f"), text("a")]).unwrap_err().code, "E807");
+}
+
+// One case per builtin added here, from the `eval.lua` doc examples and
+// `test/old/testdir/test_float_func.vim`.
+#[test]
+fn float_builtins_answer_like_libm() {
+    let one = |name: &str, argument: f64| match call(name, vec![Typval::Float(argument)]).unwrap() {
+        Typval::Float(value) => value,
+        other => panic!("{name} returned {other:?}"),
+    };
+    let close = |value: f64, expected: f64| assert!((value - expected).abs() < 1.0e-12, "{value} != {expected}");
+
+    close(one("acos", 0.0), std::f64::consts::FRAC_PI_2);
+    close(one("asin", 1.0), std::f64::consts::FRAC_PI_2);
+    close(one("atan", 1.0), std::f64::consts::FRAC_PI_4);
+    close(one("cos", 0.0), 1.0);
+    close(one("cosh", 0.0), 1.0);
+    close(one("exp", 1.0), std::f64::consts::E);
+    close(one("log", std::f64::consts::E), 1.0);
+    close(one("log10", 1000.0), 3.0);
+    close(one("sin", 0.0), 0.0);
+    close(one("sinh", 0.0), 0.0);
+    close(one("tan", 0.0), 0.0);
+    close(one("tanh", 0.0), 0.0);
+    // `round()` is half-away-from-zero, unlike `floor(x + 0.5)`.
+    assert_eq!(call("round", vec![Typval::Float(0.456)]).unwrap(), Typval::Float(0.0));
+    assert_eq!(call("round", vec![Typval::Float(4.5)]).unwrap(), Typval::Float(5.0));
+    assert_eq!(call("round", vec![Typval::Float(-4.5)]).unwrap(), Typval::Float(-5.0));
+    close(
+        match call("atan2", vec![Typval::Float(-1.0), Typval::Float(1.0)]).unwrap() {
+            Typval::Float(value) => value,
+            other => panic!("atan2 returned {other:?}"),
+        },
+        -std::f64::consts::FRAC_PI_4,
+    );
+    assert_eq!(call("fmod", vec![Typval::Float(12.33), Typval::Float(1.22)]).unwrap(), Typval::Float(12.33_f64 % 1.22));
+
+    // `f_isinf`/`f_isnan` (`funcs.c:3141-3154`) answer only for a Float: a
+    // Number never carries an infinity, so it is 0 rather than an error.
+    assert_eq!(call("isinf", vec![Typval::Float(f64::INFINITY)]).unwrap(), number(1));
+    assert_eq!(call("isinf", vec![Typval::Float(f64::NEG_INFINITY)]).unwrap(), number(-1));
+    assert_eq!(call("isinf", vec![Typval::Float(1.0)]).unwrap(), number(0));
+    assert_eq!(call("isinf", vec![number(1)]).unwrap(), number(0));
+    assert_eq!(call("isinf", vec![text("inf")]).unwrap(), number(0));
+    assert_eq!(call("isnan", vec![Typval::Float(f64::NAN)]).unwrap(), number(1));
+    assert_eq!(call("isnan", vec![Typval::Float(0.0)]).unwrap(), number(0));
+    assert_eq!(call("isnan", vec![number(0)]).unwrap(), number(0));
+
+    // The unary family shares `float_op_wrapper`'s conversion, so a String
+    // argument is E808 the way `sqrt("a")` already is.
+    assert_eq!(call("cos", vec![text("a")]).unwrap_err().code, "E808");
+}

@@ -143,6 +143,27 @@ impl<'a> Builtins<'a> {
             "abs" => absolute(&args[0]),
             "add" => add(args),
             "and" => binary_number(&args, |left, right| left & right),
+            // `float_op_wrapper` (`funcs.c:344`) hands the value to the
+            // same-named libm function; `func_float` in `eval.lua` names it.
+            "acos" => float_unary(&args[0], f64::acos),
+            "asin" => float_unary(&args[0], f64::asin),
+            "atan" => float_unary(&args[0], f64::atan),
+            "atan2" => float_binary(&args, f64::atan2),
+            "cos" => float_unary(&args[0], f64::cos),
+            "cosh" => float_unary(&args[0], f64::cosh),
+            "exp" => float_unary(&args[0], f64::exp),
+            "fmod" => float_binary(&args, |left, right| left % right),
+            "isinf" => Ok(Typval::Number(float_infinity_sign(&args[0]))),
+            "isnan" => Ok(Typval::Number(i64::from(
+                matches!(&args[0], Typval::Float(number) if number.is_nan()),
+            ))),
+            "log" => float_unary(&args[0], f64::ln),
+            "log10" => float_unary(&args[0], f64::log10),
+            "round" => float_unary(&args[0], f64::round),
+            "sin" => float_unary(&args[0], f64::sin),
+            "sinh" => float_unary(&args[0], f64::sinh),
+            "tan" => float_unary(&args[0], f64::tan),
+            "tanh" => float_unary(&args[0], f64::tanh),
             "blob2list" => blob2list(&args[0]),
             "ceil" => float_unary(&args[0], f64::ceil),
             "char2nr" => char2nr(&args),
@@ -1006,7 +1027,9 @@ fn check_arity(spec: &BuiltinSpec, count: usize) -> Result<()> {
 #[must_use]
 pub fn is_builtin_implemented(name: &str) -> bool {
     matches!(name,
-        "abs" | "add" | "and" | "blob2list" | "ceil" | "char2nr" | "copy" | "count" |
+        "abs" | "acos" | "add" | "and" | "asin" | "atan" | "atan2" | "blob2list" | "ceil" |
+        "char2nr" | "copy" | "cos" | "cosh" | "count" | "exp" | "fmod" | "isinf" | "isnan" |
+        "log" | "log10" | "round" | "sin" | "sinh" | "tan" | "tanh" |
         "deepcopy" | "empty" | "escape" | "executable" | "exepath" | "exists" | "extend" | "extendnew" | "filter" | "flatten" |
         "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "finddir" | "findfile" | "get" | "gettext" | "getcwd" | "getpid" | "has" | "has_key" | "hostname" | "index" | "insert" | "items" |
         "indexof" | "isabsolutepath" | "islocked" | "join" | "json_decode" | "json_encode" | "keytrans" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
@@ -1277,6 +1300,17 @@ fn float_unary(value: &Typval, operation: impl FnOnce(f64) -> f64) -> Result<Typ
 
 fn float_binary(args: &[Typval], operation: impl FnOnce(f64, f64) -> f64) -> Result<Typval> {
     Ok(Typval::Float(operation(float_arg(&args[0])?, float_arg(&args[1])?)))
+}
+
+/// `f_isinf` (`funcs.c:3141`): the sign of an infinite Float, and 0 for
+/// everything else — including a Number, which never carries an infinity.
+fn float_infinity_sign(value: &Typval) -> i64 {
+    match value {
+        Typval::Float(number) if number.is_infinite() => {
+            if *number > 0.0 { 1 } else { -1 }
+        }
+        _ => 0,
+    }
 }
 
 fn float_to_number(value: &Typval) -> Result<Typval> {
@@ -1719,7 +1753,11 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
             ));
         };
         let left = flags.contains('-');
-        let zero = flags.contains('0') && !left;
+        let mut zero = flags.contains('0') && !left;
+        // `strings.c:1516,1585`: `space_for_positive` starts set and only `+`
+        // clears it, so `+` wins over ` ` whichever order they appear in.
+        let force_sign = flags.contains('+') || flags.contains(' ');
+        let space_for_positive = !flags.contains('+');
         let width: usize = width.parse().unwrap_or(0);
         let rendered = match conversion {
             'd' | 'i' | 'u' => {
@@ -1772,14 +1810,20 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
                 other => char::from_u32(number_arg(other)? as u32).unwrap_or('\0').to_string(),
             },
             'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
-                let number = float_arg(value)?;
-                let digits = precision.unwrap_or(6);
-                match conversion {
-                    'f' | 'F' | 'g' => format!("{number:.digits$}"),
-                    'e' => format!("{number:.digits$e}"),
-                    'E' => format!("{number:.digits$e}").to_uppercase(),
-                    _ => format!("{number:.digits$}").to_uppercase(),
-                }
+                // `tv_float` (`strings.c:716`) has its own error, distinct from
+                // the E808 `tv_get_float` raises for `sqrt("a")`.
+                let number = match value {
+                    Typval::Float(number) => *number,
+                    Typval::Number(number) => *number as f64,
+                    _ => return Err(EvalError::new("E807", 0, "Expected Float argument for printf()")),
+                };
+                let (rendered, numeric) =
+                    format_float(conversion, number, precision, force_sign, space_for_positive);
+                // `infinity_str` and `nan` both clear `zero_padding`
+                // (`strings.c:2109`, `2114`), so `%06f` of infinity pads with
+                // blanks.
+                zero &= numeric;
+                rendered
             }
             's' => {
                 let mut text = match value {
@@ -1803,8 +1847,15 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
         if left {
             pieces.push_str(&rendered);
             pieces.push_str(&" ".repeat(padding));
-        } else if zero && matches!(conversion, 'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'b' | 'B' | 'c') {
-            let (sign, digits) = match rendered.strip_prefix(['-', '+']) {
+        } else if zero
+            && matches!(
+                conversion,
+                'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'b' | 'B' | 'c' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G'
+            )
+        {
+            // `strings.c:2188-2192`: padding zeroes go after the sign, and
+            // `space_for_positive` puts a blank there instead of a `+`.
+            let (sign, digits) = match rendered.strip_prefix(['-', '+', ' ']) {
                 Some(digits) => (rendered[..1].to_owned(), digits),
                 None => (String::new(), rendered.as_str()),
             };
@@ -1820,6 +1871,137 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
         return Err(EvalError::new("E767", 0, "Too many arguments to printf()"));
     }
     Ok(Typval::String(OxStr(pieces.into_bytes())))
+}
+
+/// `vim_snprintf`'s float conversions (`strings.c:2075-2196`), returning the
+/// rendering and whether zero padding still applies to it.
+///
+/// C's `%g` prints `1.0` as `1`, which upstream refuses ("can't use %g
+/// directly"): it rewrites `%g` to `%f` or `%e` by magnitude and then strips
+/// the superfluous zeroes itself, keeping the one just after the dot. That one
+/// kept zero is why `string(1.0)` is `'1.0'` and not `'1'`, and scripts compare
+/// against it.
+fn format_float(
+    conversion: char,
+    number: f64,
+    precision: Option<usize>,
+    force_sign: bool,
+    space_for_positive: bool,
+) -> (String, bool) {
+    let magnitude = number.abs();
+    let mut spec = conversion;
+    let mut remove_trailing_zeroes = false;
+    if matches!(spec, 'g' | 'G') {
+        let upper = spec == 'G';
+        spec = if (0.001..1.0e7).contains(&magnitude) || magnitude == 0.0 {
+            if upper { 'F' } else { 'f' }
+        } else if upper {
+            'E'
+        } else {
+            'e'
+        };
+        remove_trailing_zeroes = true;
+    }
+    let upper = spec.is_ascii_uppercase();
+
+    // `infinity_str` (`strings.c:800`) ignores the sign flags for a negative
+    // value, and `%f` gives up on anything past 1e307 rather than print 300
+    // digits.
+    if number.is_infinite() || (matches!(spec, 'f' | 'F') && magnitude > 1.0e307) {
+        let sign = if number < 0.0 {
+            "-"
+        } else if !force_sign {
+            ""
+        } else if space_for_positive {
+            " "
+        } else {
+            "+"
+        };
+        return (format!("{sign}{}", if upper { "INF" } else { "inf" }), false);
+    }
+    if number.is_nan() {
+        // Not a number has no sign, not even a forced one.
+        return ((if upper { "NAN" } else { "nan" }).to_owned(), false);
+    }
+
+    // `TMP_LEN - 10`, less the integer digits when `%f` has any to print.
+    let mut digits = precision.unwrap_or(6);
+    if precision.is_some() {
+        let mut limit = 340usize;
+        if matches!(spec, 'f' | 'F') && magnitude > 1.0 {
+            limit -= magnitude.log10() as usize;
+        }
+        digits = digits.min(limit);
+    }
+    let mut rendered = if matches!(spec, 'e' | 'E') {
+        // Rust writes `1.23e2`; C writes `1.230000e+02`.
+        let plain = format!("{number:.digits$e}");
+        let (mantissa, exponent) = plain.split_once('e').expect("LowerExp emits an exponent");
+        let exponent: i32 = exponent.parse().expect("LowerExp emits a decimal exponent");
+        let marker = if spec == 'E' { 'E' } else { 'e' };
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{mantissa}{marker}{sign}{:02}", exponent.abs())
+    } else {
+        format!("{number:.digits$}")
+    };
+    if force_sign && !rendered.starts_with('-') {
+        rendered.insert(0, if space_for_positive { ' ' } else { '+' });
+    }
+    if remove_trailing_zeroes {
+        rendered = strip_superfluous_zeroes(&rendered, matches!(spec, 'e' | 'E'), precision.is_some());
+    }
+    (rendered, true)
+}
+
+/// The `remove_trailing_zeroes` half of the float conversion
+/// (`strings.c:2144-2176`), which only `%g`/`%G` ask for.
+///
+/// An exponent loses its `+` and its leading zeroes unconditionally; the
+/// mantissa loses its trailing zeroes only when no precision was given, and
+/// never the one directly after the dot.
+fn strip_superfluous_zeroes(rendered: &str, exponential: bool, precision_specified: bool) -> String {
+    let mut text: Vec<char> = rendered.chars().collect();
+    let mut mantissa_end = text.len();
+    if exponential {
+        let Some(marker) = text.iter().position(|character| matches!(character, 'e' | 'E')) else {
+            return rendered.to_owned();
+        };
+        let mut cursor = marker + 1;
+        if text.get(cursor) == Some(&'+') {
+            text.remove(cursor);
+        } else if text.get(cursor) == Some(&'-') {
+            cursor += 1;
+        }
+        while text.get(cursor) == Some(&'0') && cursor + 1 < text.len() {
+            text.remove(cursor);
+        }
+        mantissa_end = marker;
+    }
+    if !precision_specified {
+        // The kept zero is the one directly after the dot. Upstream also
+        // bounds the loop at `tp > tmp + 2`, which never fires: `%f` and
+        // `%e` always emit that dot ahead of the zeroes, so the dot is what
+        // stops the loop, and `> 2` here is only index safety.
+        while mantissa_end > 2 && text[mantissa_end - 1] == '0' && text[mantissa_end - 2] != '.' {
+            text.remove(mantissa_end - 1);
+            mantissa_end -= 1;
+        }
+    }
+    text.into_iter().collect()
+}
+
+/// `TYPVAL_ENCODE_CONV_FLOAT` (`eval/encode.c:351-372`): `%g` for a finite
+/// value, and a re-readable `str2float()` call for the two that `%g` cannot
+/// round-trip.
+fn vim_float_string(number: f64) -> String {
+    if number.is_nan() {
+        return "str2float('nan')".to_owned();
+    }
+    if number.is_infinite() {
+        let sign = if number < 0.0 { "-" } else { "" };
+        return format!("{sign}str2float('inf')");
+    }
+    format_float('g', number, None, false, true).0
 }
 
 /// Digits of `value` in `radix`, lowercase, without prefix.
@@ -2488,7 +2670,7 @@ fn vim_string(value: &Typval, _depth: usize) -> Result<OxStr> {
         match value {
             Typval::String(value) => { output.push(b'\''); for byte in value.as_bytes() { output.push(*byte); if *byte == b'\'' { output.push(b'\''); } } output.push(b'\''); }
             Typval::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
-            Typval::Float(value) => output.extend_from_slice(value.to_string().as_bytes()),
+            Typval::Float(value) => output.extend_from_slice(vim_float_string(*value).as_bytes()),
             Typval::Bool(value) => output.extend_from_slice(if *value { b"v:true" } else { b"v:false" }),
             Typval::Special(Special::Null) => output.extend_from_slice(b"v:null"),
             Typval::Blob(value) => { output.extend_from_slice(b"0z"); for byte in value { let _ = write!(StringWriter(output), "{byte:02X}"); } }
