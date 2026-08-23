@@ -350,6 +350,7 @@ pub fn bind_api(
         let name = metadata.name;
         let fast = metadata.fast;
         let textlock = metadata.textlock;
+        let params = metadata.params;
         let state = fast_state.clone();
         let context = context.clone();
         api.set(
@@ -367,9 +368,14 @@ pub fn bind_api(
                     .iter()
                     .map(|value| lua_to_object(lua, value).map_err(mlua::Error::external))
                     .collect::<Result<Vec<_>, _>>()?;
-                if (name == "nvim_get_option_value" && args.len() == 1)
-                    || (name == "nvim_set_option_value" && args.len() == 2)
-                {
+                // executor.c nlua_api_call: a trailing optional Dict the
+                // caller left off arrives as an empty one, which is what lets
+                // `vim.cmd(...)` reach `nvim_exec2(src)` with no opts.
+                while args.len() < params.len() {
+                    let (_, kind, optional) = params[args.len()];
+                    if !optional || kind != ox_api::TypeRef::Dict {
+                        break;
+                    }
                     args.push(Object::Dict(ox_types::Dict(Vec::new())));
                 }
                 let result = dispatch(&mut context.editor.borrow_mut(), &args)
