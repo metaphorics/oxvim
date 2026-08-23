@@ -1439,18 +1439,31 @@ fn package_bundles_follow_their_packpath_entry_and_after_dirs_come_last() {
     );
 }
 
-// runtime.c expand_rtp_entry — a wildcard entry expands to the directories it
-// matches, in sorted order, and a directory already on the path is not placed
-// again when a later entry names it. Without the dedup /w/p1 would appear
-// twice; without the expansion /w/* would contribute nothing.
+// runtime.c expand_rtp_entry/push_path — a wildcard entry expands to the
+// directories it matches, in sorted order, and a directory already on the path
+// is never placed twice. Upstream drops a repeat at two points, and each needs
+// its own case: naming an entry that is already on the path skips the whole
+// entry, while a *different* pattern that expands onto a directory already
+// there is caught only when the expansion is pushed. Without the expansion
+// /w/* would contribute nothing at all.
 #[test]
 fn wildcard_entries_expand_and_repeats_collapse() {
-    let mut editor = runtime_editor("/w/*,/c,/w/p1", "", TREE);
-    assert_eq!(list_paths(&mut editor), ["/w/p1", "/w/p2", "/c"]);
+    let mut named = runtime_editor("/w/*,/c,/w/p1", "", TREE);
+    assert_eq!(list_paths(&mut named), ["/w/p1", "/w/p2", "/c"]);
     assert_eq!(
-        runtime_file(&mut editor, "lua/shared.lua", true),
+        runtime_file(&mut named, "lua/shared.lua", true),
         ["/w/p1/lua/shared.lua", "/w/p2/lua/shared.lua", "/c/lua/shared.lua"]
     );
+
+    // `/w/p1*` is not the text of any placed entry, so only the per-expansion
+    // check can tell that it produces a directory already on the path.
+    let mut overlapping = runtime_editor("/w/*,/c,/w/p1*", "", TREE);
+    assert_eq!(list_paths(&mut overlapping), ["/w/p1", "/w/p2", "/c"]);
+
+    // The same holds the other way round: the narrower pattern comes first and
+    // the wider one may add only what it did not already place.
+    let mut widening = runtime_editor("/w/p1*,/w/*", "", TREE);
+    assert_eq!(list_paths(&mut widening), ["/w/p1", "/w/p2"]);
 }
 
 // runtime.c runtime_get_named — with `is_lua` an entry that has no `lua/`
