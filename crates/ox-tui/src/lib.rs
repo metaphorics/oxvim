@@ -30,8 +30,8 @@ use ox_types::{Dict, Object, OxStr};
 use screen::{ApplyOutcome, ComposedGrid, Screen, ScreenError};
 use terminal::{
     Cell as TerminalCell, CellAttributes, ColorSupport, DamageWriter, Frame, FrameError,
-    ProcessFailure, ProcessFailureKind, ProbePolicy, TerminalCapabilities, TerminalColor,
-    TerminalEnvironment, TerminalError, TerminalSession, UnderlineStyle,
+    ProcessFailure, ProcessFailureKind, ProbePolicy, ShutdownSignals, TerminalCapabilities,
+    TerminalColor, TerminalEnvironment, TerminalError, TerminalSession, UnderlineStyle,
 };
 use theme::{HighlightGroup, HighlightStyle, Rgb, Theme};
 use thiserror::Error;
@@ -373,6 +373,10 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
     let mut shared = SharedWriter::stdout();
     let mut session = TerminalSession::start(shared.clone(), capabilities)?;
     let mut damage = DamageWriter::new(shared.clone(), capabilities.undercurl);
+    // Registered before the palette is programmed: a terminating signal that
+    // arrives between programming and the first loop turn must still reach the
+    // restore path instead of killing the process with OSC 4 still in effect.
+    let signals = ShutdownSignals::install()?;
     let mut state = TuiState::new(env::var("COLORFGBG").ok().as_deref(), MotionPolicy::from_environment());
     let tokens = state.theme.tokens();
     session.program_palette(&[
@@ -388,6 +392,14 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
     let mut mouse_capture_emitted = false;
 
     loop {
+        if let Some(signal) = signals.pending() {
+            if mouse_capture_emitted {
+                let _ = apply_mouse_capture(&mut shared, false);
+            }
+            let restored = session.restore();
+            ShutdownSignals::resume_default(signal)?;
+            return restored.map_err(TuiError::Terminal);
+        }
         match client.recv_redraw_timeout(LOOP_SLICE) {
             Ok(Some(events)) => {
                 let now = TimeMs(duration_millis(started.elapsed()));

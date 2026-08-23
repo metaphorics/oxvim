@@ -11,6 +11,7 @@ ox-types = { path = "../ox-types" }
 crossterm.workspace = true
 thiserror.workspace = true
 mio.workspace = true
+signal-hook.workspace = true
 
 [lints]
 workspace = true

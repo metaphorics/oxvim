@@ -1,8 +1,11 @@
 //! Terminal capability negotiation, lifecycle restoration, and retained output.
 #![allow(missing_docs)]
 
+use std::ffi::c_int;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::MoveTo;
@@ -371,6 +374,64 @@ pub enum TerminalError {
 impl TerminalError {
     fn io(operation: &'static str, source: io::Error) -> Self {
         Self::Io { operation, source }
+    }
+}
+
+/// Signals whose default action terminates the process, and which therefore
+/// bypass [`TerminalSession`]'s `Drop`.
+///
+/// Without an explicit handler the programmed OSC 4 palette, the hidden cursor
+/// and raw mode all outlive the client. Each of these is registered as a flag
+/// rather than as an action that writes from the handler, so restoration runs
+/// on the main thread with the ordering [`TerminalSession::restore`] guarantees
+/// and nothing async-signal-unsafe executes inside a handler.
+pub const RESTORE_SIGNALS: [c_int; 4] = [
+    signal_hook::consts::SIGHUP,
+    signal_hook::consts::SIGINT,
+    signal_hook::consts::SIGQUIT,
+    signal_hook::consts::SIGTERM,
+];
+
+/// Flags for the terminating signals that must restore the terminal first.
+pub struct ShutdownSignals {
+    flags: Vec<(c_int, Arc<AtomicBool>)>,
+}
+
+impl ShutdownSignals {
+    /// Register a flag for every signal in [`RESTORE_SIGNALS`].
+    pub fn install() -> Result<Self, TerminalError> {
+        Self::install_for(&RESTORE_SIGNALS)
+    }
+
+    /// Register a flag for each of `signals`.
+    pub fn install_for(signals: &[c_int]) -> Result<Self, TerminalError> {
+        let mut flags = Vec::with_capacity(signals.len());
+        for signal in signals {
+            let flag = Arc::new(AtomicBool::new(false));
+            signal_hook::flag::register(*signal, Arc::clone(&flag))
+                .map_err(|error| TerminalError::io("shutdown signal registration", error))?;
+            flags.push((*signal, flag));
+        }
+        Ok(Self { flags })
+    }
+
+    /// The first delivered signal, in [`RESTORE_SIGNALS`] order, or `None`.
+    ///
+    /// The flag is consumed, so a signal is reported exactly once.
+    pub fn pending(&self) -> Option<c_int> {
+        self.flags
+            .iter()
+            .find(|(_, flag)| flag.swap(false, Ordering::SeqCst))
+            .map(|(signal, _)| *signal)
+    }
+
+    /// Raise `signal`'s default action after the terminal has been restored.
+    ///
+    /// Returns only if the platform refuses the signal; the caller then exits
+    /// through its ordinary path rather than leaving the process alive.
+    pub fn resume_default(signal: c_int) -> Result<(), TerminalError> {
+        signal_hook::low_level::emulate_default_handler(signal)
+            .map_err(|error| TerminalError::io("shutdown signal default action", error))
     }
 }
 
@@ -1202,5 +1263,52 @@ mod tests {
         assert!(session.writer.starts_with(CURSOR_RESTORE));
         assert!(diagnostics.windows(13).any(|window| window == b"server detail"));
         assert!(diagnostics.ends_with(b"Embed exited with code 7.\n"));
+    }
+
+    #[test]
+    fn restore_signal_set_is_exactly_the_terminating_signals() {
+        assert_eq!(
+            RESTORE_SIGNALS,
+            [
+                signal_hook::consts::SIGHUP,
+                signal_hook::consts::SIGINT,
+                signal_hook::consts::SIGQUIT,
+                signal_hook::consts::SIGTERM,
+            ]
+        );
+    }
+
+    // `pending` carries four separate promises: it reports a signal that was
+    // delivered, it never reports one that was not, it consumes the report so a
+    // signal fires once, and it resolves several pending signals in
+    // registration order. Each case below is arranged so the other three
+    // promises would produce the wrong answer on their own.
+    //
+    // SIGUSR1/SIGUSR2 stand in for the real set: registration is
+    // process-global and permanent, so raising SIGTERM here would change the
+    // disposition every later test in this binary runs under.
+    #[test]
+    fn pending_reports_a_delivered_signal_and_ignores_an_undelivered_one() {
+        let signals = ShutdownSignals::install_for(&[
+            signal_hook::consts::SIGUSR1,
+            signal_hook::consts::SIGUSR2,
+        ])
+        .expect("register test signals");
+        assert_eq!(signals.pending(), None, "nothing delivered yet");
+
+        signal_hook::low_level::raise(signal_hook::consts::SIGUSR2).expect("raise SIGUSR2");
+        // Only the second registration was delivered: a `pending` that returned
+        // the first entry regardless of its flag would answer SIGUSR1 here.
+        assert_eq!(signals.pending(), Some(signal_hook::consts::SIGUSR2));
+        // The report is consumed: a load instead of a swap would repeat it.
+        assert_eq!(signals.pending(), None);
+
+        signal_hook::low_level::raise(signal_hook::consts::SIGUSR1).expect("raise SIGUSR1");
+        signal_hook::low_level::raise(signal_hook::consts::SIGUSR2).expect("raise SIGUSR2");
+        // Registration order decides, so scanning from the end would answer
+        // SIGUSR2 first.
+        assert_eq!(signals.pending(), Some(signal_hook::consts::SIGUSR1));
+        assert_eq!(signals.pending(), Some(signal_hook::consts::SIGUSR2));
+        assert_eq!(signals.pending(), None);
     }
 }

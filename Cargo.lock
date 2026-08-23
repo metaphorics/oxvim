@@ -541,6 +541,7 @@ dependencies = [
  "mio",
  "ox-rpc",
  "ox-types",
+ "signal-hook 0.4.4",
  "thiserror 2.0.20",
 ]
 
