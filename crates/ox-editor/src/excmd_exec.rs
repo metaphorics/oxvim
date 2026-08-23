@@ -337,6 +337,23 @@ impl Default for ExExecutor<RealFileIO> {
     }
 }
 
+/// Wraps already-parsed commands as an executable program.
+///
+/// One owner, because both `:map` right-hand sides and `feedkeys()`'s
+/// pending-mapping path have to build this the same way.
+pub(crate) fn program_from_commands(commands: &[ExCommand], line: usize) -> Vec<Instruction> {
+    commands
+        .iter()
+        .cloned()
+        .map(|command| Instruction {
+            source: render_command(&command),
+            command: Some(command),
+            parse_error: None,
+            line,
+        })
+        .collect()
+}
+
 impl<F: FileIO> ExExecutor<F> {
     /// Creates an executor using an injected IO seam.
     #[must_use]
@@ -426,17 +443,7 @@ impl<F: FileIO> ExExecutor<F> {
         editor: &mut Editor,
         commands: &[ExCommand],
     ) -> Result<ExecOutcome, ExecError> {
-        let line = self.runtime.scripts.current_line().max(1);
-        let program = commands
-            .iter()
-            .cloned()
-            .map(|command| Instruction {
-                source: render_command(&command),
-                command: Some(command),
-                parse_error: None,
-                line,
-            })
-            .collect::<Vec<_>>();
+        let program = program_from_commands(commands, self.runtime.scripts.current_line().max(1));
         sync_editor_into_scope(editor, &mut self.scope)?;
         let flow = run_program(
             &mut self.runtime,
@@ -972,6 +979,7 @@ fn dispatch<F: FileIO>(
         "tabonly" => command_tabonly(runtime, editor, command),
         "undo" => command_undo(runtime, editor, command),
         "redo" => command_redo(runtime, editor),
+        "undojoin" => command_undojoin(runtime, editor),
         "retab" => command_retab(runtime, editor, scope, command),
         "hide" => command_hide(runtime, editor, command),
         "sleep" => command_sleep(runtime, editor, command),
@@ -3248,6 +3256,28 @@ fn command_redo<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> F
         Ok(None) => {
             push_text_message(editor, "Already at newest change".to_owned(), false, false);
             Flow::Normal
+        }
+        Err(error) => error_flow(runtime, "E749", error.to_string()),
+    }
+}
+
+/// `:undojoin` (`ex_undojoin`, `undo.c:2800-2816`): reopen the newest undo
+/// block so the next change joins it instead of starting its own.
+///
+/// Three of upstream's four early returns are silent: nothing recorded yet,
+/// an already-open block, and `'undolevels'` below zero all just do nothing.
+/// Only a `:undojoin` that follows an undo is an error, `E790`, because the
+/// header it would reopen is the one the undo moved off.
+fn command_undojoin<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> Flow {
+    let Some(buffer) = editor.current_buffer() else {
+        return error_flow(runtime, "E749", "Empty buffer");
+    };
+    match editor.buffer_undojoin(buffer) {
+        Ok(()) => Flow::Normal,
+        Err(crate::EditorError::Buffer(crate::BufferStateError::Undo(
+            ox_text::UndoError::JoinAfterUndo,
+        ))) => {
+            error_flow(runtime, "E790", "undojoin is not allowed after undo")
         }
         Err(error) => error_flow(runtime, "E749", error.to_string()),
     }
@@ -5751,7 +5781,7 @@ fn regex_matches_catch_pattern(pattern: &str, text: &str) -> Result<bool, String
     Ok(ox_regex::exec(&program, &RegexText::new(text.to_owned())).is_some())
 }
 
-fn render_command(command: &ExCommand) -> String {
+pub(crate) fn render_command(command: &ExCommand) -> String {
     let mut text = String::new();
     if let Some(range) = &command.range { text.push_str(&render_range(range)); }
     text.push_str(command.command.name());

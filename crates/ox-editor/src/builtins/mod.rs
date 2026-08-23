@@ -57,8 +57,8 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         "assert_equal" | "assert_equalfile" | "assert_exception" | "assert_fails"
         | "assert_false" | "assert_inrange" | "assert_match" | "assert_notequal"
         | "assert_notmatch" | "assert_report" | "assert_true" => Family::Assert,
-        "append" | "bufexists" | "bufname" | "bufnr" | "getbufvar" | "last_buffer_nr"
-        | "setbufvar" => Family::Buffer,
+        "append" | "bufexists" | "bufname" | "bufnr" | "changenr" | "getbufvar"
+        | "last_buffer_nr" | "setbufvar" | "undotree" => Family::Buffer,
         "chdir" | "eventhandler" | "highlight_exists" | "hlexists" | "strftime" => {
             Family::Environment
         }

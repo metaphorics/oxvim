@@ -31,6 +31,8 @@ pub(crate) fn call<F: FileIO>(
             call_buffer_builtin(&mut seam, name, args)
         }
         "append" => call_append_builtin(host.editor, args),
+        "changenr" => call_changenr_builtin(host.editor, &args),
+        "undotree" => call_undotree_builtin(host.editor, &args),
         "bufexists" => call_bufexists_builtin(host.editor, &args),
         "bufname" | "bufnr" => call_buffer_identity_builtin(host.editor, name, &args),
         "getbufvar" => call_getbufvar_builtin(host.editor, scope, args),
@@ -205,6 +207,86 @@ fn call_append_builtin(editor: &mut Editor, args: Vec<Typval>) -> ox_eval::Resul
         .append_buffer_lines(buffer, after, &lines, cursor, 0)
         .map_err(|error| EvalError::new("E16", 0, error.to_string()))?;
     Ok(Typval::Number(0))
+}
+
+/// `changenr()`: the sequence number of the buffer's current undo state
+/// (`f_changenr`, `eval/funcs.c:604-607`, reading `b_u_seq_cur`).
+///
+/// Because a header keeps collecting edits until the block closes, every
+/// change that joins an open block answers the same number — which is the
+/// whole point of the grouping this reads.
+fn call_changenr_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    if !args.is_empty() {
+        return Err(EvalError::new("E118", 0, "Too many arguments for function: changenr"));
+    }
+    let seq = editor
+        .current_buffer()
+        .and_then(|buffer| editor.buffer_undo_tree(buffer).ok())
+        .map_or(0, ox_text::UndoTree::current_seq);
+    Ok(Typval::Number(i64::try_from(seq).unwrap_or(i64::MAX)))
+}
+
+/// `undotree([{buf}])`: the buffer's undo state and header list
+/// (`f_undotree`, `undo.c:3243-3263`).
+///
+/// `save_last` and `save_cur` are always zero: they count `:write`s recorded
+/// into headers through `u_unchanged`/`uh_save_nr`, which this port's undo
+/// tree does not carry. Every other field is real, including `synced`, which
+/// reports whether a block is still open.
+fn call_undotree_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    if args.len() > 1 {
+        return Err(EvalError::new("E118", 0, "Too many arguments for function: undotree"));
+    }
+    let buffer = match args.first() {
+        // `get_buf_arg` returning NULL leaves the empty dict upstream builds.
+        Some(argument) => match resolve_buffer_argument(editor, Some(argument)) {
+            Some(buffer) => buffer,
+            None => return Ok(Typval::dict(Vec::new())),
+        },
+        None => editor
+            .current_buffer()
+            .ok_or_else(|| EvalError::new("E749", 0, "Empty buffer"))?,
+    };
+    let tree = editor
+        .buffer_undo_tree(buffer)
+        .map_err(|error| EvalError::new("E749", 0, error.to_string()))?;
+    let summary = tree.summary();
+    let entry = |name: &str, value: i64| (OxStr::from(name), Typval::Number(value));
+    let fields = vec![
+        entry("synced", i64::from(tree.is_synced())),
+        entry("seq_last", i64::try_from(summary.seq_last).unwrap_or(i64::MAX)),
+        entry("save_last", 0),
+        entry("seq_cur", i64::try_from(summary.seq_cur).unwrap_or(i64::MAX)),
+        entry("time_cur", summary.time_cur),
+        entry("save_cur", 0),
+        (OxStr::from("entries"), undotree_entries(&tree.entries())),
+    ];
+    Ok(Typval::dict(fields))
+}
+
+/// One `undotree()` header list, with `newhead`, `curhead` and `alt` present
+/// only when they apply, exactly as `u_eval_tree` adds them.
+fn undotree_entries(nodes: &[ox_text::UndoTreeNode]) -> Typval {
+    let items = nodes
+        .iter()
+        .map(|node| {
+            let mut fields = vec![
+                (OxStr::from("seq"), Typval::Number(i64::try_from(node.seq).unwrap_or(i64::MAX))),
+                (OxStr::from("time"), Typval::Number(node.timestamp)),
+            ];
+            if node.newhead {
+                fields.push((OxStr::from("newhead"), Typval::Number(1)));
+            }
+            if node.curhead {
+                fields.push((OxStr::from("curhead"), Typval::Number(1)));
+            }
+            if !node.alt.is_empty() {
+                fields.push((OxStr::from("alt"), undotree_entries(&node.alt)));
+            }
+            Typval::dict(fields)
+        })
+        .collect();
+    Typval::list(items)
 }
 
 fn current_line_address(editor: &mut Editor, value: &Typval) -> ox_eval::Result<usize> {
