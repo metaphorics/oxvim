@@ -16,8 +16,8 @@ use ox_eval::{
     RegexEngine, Scope, ScopeKind,
 };
 use ox_excmd::{
-    Address, AddressBase, CommandFlags, ExCommand, ModifierKind, ParseError, Parser as ExParser, Range, RangeKind,
-    effective_flags,
+    AddrType, Address, AddressBase, CommandFlags, ExCommand, ModifierKind, ParseError, Parser as ExParser, Range, RangeKind,
+    effective_addr_type, effective_flags,
     ResolvedCommand, UserCommandMatch, UserCommandProvider,
 };
 use ox_regex::{
@@ -855,6 +855,12 @@ fn dispatch<F: FileIO>(
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
 ) -> Flow {
+    // invalid_range runs in do_one_cmd before the command function, so every
+    // EX_RANGE command is bounded whether or not it goes on to resolve its
+    // addresses (ex_docmd.c:2209).
+    if let Err(message) = check_address_domain(editor, command) {
+        return error_flow(runtime, "E16", message);
+    }
     let name = command.command.name();
     match name {
         "lua" => command_lua(runtime, editor, scope, lua, command),
@@ -4247,6 +4253,58 @@ fn resolve_range_raw(editor: &Editor, command: &ExCommand) -> Result<(usize, usi
     let end = range.end.as_ref().map_or(Ok(start), |address| resolve_address(editor, address, current, last))?;
     if start > end { return Err("Invalid range".to_owned()); }
     Ok((start, end))
+}
+
+/// Bounds a resolved range against its address domain, upstream's
+/// `invalid_range` (`ex_docmd.c:3735-3820`).
+///
+/// Upstream rejects an out-of-domain address instead of clamping it, and does
+/// so before a post-command count is folded in — `set_cmd_count`
+/// (`ex_docmd.c:1372-1393`) clamps a count silently, "be vi compatible: no
+/// error message for out of range". So `:99read f` in a three-line buffer is
+/// `E16` while `:1print 99` still prints to the end.
+///
+/// `Other`, `TabsRelative` and `Unsigned` accept any range upstream.
+/// `LoadedBuffers`, `QuickFix` and `QuickFixValid` are unchecked here: this
+/// port has neither a buffer load state ordered by number nor a quickfix
+/// list, so there is no limit to compare against.
+fn check_address_domain(editor: &Editor, command: &ExCommand) -> Result<(), String> {
+    if !effective_flags(&command.command).contains(CommandFlags::RANGE) {
+        return Ok(());
+    }
+    // Only an explicit address can leave a domain; the defaults never do.
+    if command.range.is_none() {
+        return Ok(());
+    }
+    let (start, end) = resolve_range_raw(editor, command)?;
+    let limit = match effective_addr_type(&command.command) {
+        AddrType::Lines => buffer_last_line(editor),
+        // "add 1 if ARGCOUNT is 0", so ":0argdelete" on an empty list is not
+        // an error (ex_docmd.c:3751-3756).
+        AddrType::Arguments => {
+            let count = editor.arglist().len();
+            if count == 0 { 1 } else { count }
+        }
+        AddrType::Windows => editor.windows().len(),
+        AddrType::Tabs => editor.tabpages().len(),
+        AddrType::Buffers => {
+            if start < 1 {
+                return Err("Invalid range".to_owned());
+            }
+            editor.buffers().into_iter().map(i64::from).max().unwrap_or(0).try_into().unwrap_or(usize::MAX)
+        }
+        AddrType::None
+        | AddrType::Other
+        | AddrType::TabsRelative
+        | AddrType::Unsigned
+        | AddrType::LoadedBuffers
+        | AddrType::QuickFix
+        | AddrType::QuickFixValid => return Ok(()),
+    };
+    if end > limit {
+        return Err("Invalid range".to_owned());
+    }
+    Ok(())
 }
 
 fn buffer_last_line(editor: &Editor) -> usize {

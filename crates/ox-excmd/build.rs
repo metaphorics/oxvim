@@ -10,6 +10,7 @@ use std::path::PathBuf;
 struct LuaCommand {
     name: String,
     flags: u32,
+    addr_type: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -43,8 +44,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let abbr = &command.name[..min_prefix_len];
         writeln!(
             generated,
-            "    CommandSpec {{ name: {:?}, abbr: {:?}, min_prefix_len: {}, flags: CommandFlags(0x{:x}) }},",
-            command.name, abbr, min_prefix_len, command.flags
+            "    CommandSpec {{ name: {:?}, abbr: {:?}, min_prefix_len: {}, flags: CommandFlags(0x{:x}), addr_type: AddrType::{} }},",
+            command.name,
+            abbr,
+            min_prefix_len,
+            command.flags,
+            addr_type_variant(&command.addr_type)?
         )?;
     }
     generated.push_str("];\n");
@@ -57,55 +62,88 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Collects one `LuaCommand` per `ex_cmds.lua` table entry.
+///
+/// Fields are accumulated until the entry's closing `},` because `addr_type`
+/// follows `flags` in every upstream entry, so an entry cannot be emitted at
+/// the moment its flags complete.
 fn parse_commands(lua: &str) -> Result<Vec<LuaCommand>, io::Error> {
     let mut commands = Vec::new();
     let mut pending_name: Option<String> = None;
-    let mut pending_flags: Option<String> = None;
+    let mut pending_flags: Option<u32> = None;
+    let mut pending_addr: Option<String> = None;
+    let mut continued_flags: Option<String> = None;
 
     for raw_line in lua.lines() {
         let line = raw_line.split("--").next().unwrap_or("").trim();
-        if let Some(expression) = pending_flags.as_mut() {
+        if let Some(expression) = continued_flags.as_mut() {
             expression.push_str(line);
             if line.ends_with("),") || line == ")" {
-                let name = pending_name
-                    .take()
-                    .ok_or_else(|| invalid("flags entry is missing command"))?;
-                let complete = pending_flags
+                let complete = continued_flags
                     .take()
                     .ok_or_else(|| invalid("multiline flags disappeared"))?;
-                commands.push(LuaCommand {
-                    name,
-                    flags: parse_flags(complete.trim_end_matches(',').trim_end())?,
-                });
+                pending_flags = Some(parse_flags(complete.trim_end_matches(',').trim_end())?);
             }
+            continue;
+        }
+        if line == "}," && pending_name.is_some() {
+            let name = pending_name.take().unwrap_or_default();
+            let flags = pending_flags
+                .take()
+                .ok_or_else(|| invalid(&format!("command {name} is missing flags")))?;
+            let addr_type = pending_addr
+                .take()
+                .ok_or_else(|| invalid(&format!("command {name} is missing addr_type")))?;
+            commands.push(LuaCommand { name, flags, addr_type });
             continue;
         }
         if let Some(value) = field_value(line, "command") {
             if pending_name.is_some() {
-                return Err(invalid("command entry is missing flags"));
+                return Err(invalid("command entry is missing its closing brace"));
             }
             pending_name = Some(parse_quoted(value, "command")?.to_owned());
             continue;
         }
+        if pending_name.is_none() {
+            continue;
+        }
         if let Some(value) = field_value(line, "flags") {
             if value.starts_with("bit.bor(") && !value.ends_with(')') {
-                pending_flags = Some(value.to_owned());
-                continue;
+                continued_flags = Some(value.to_owned());
+            } else {
+                pending_flags = Some(parse_flags(value)?);
             }
-            let Some(name) = pending_name.take() else {
-                continue;
-            };
-            commands.push(LuaCommand {
-                name,
-                flags: parse_flags(value)?,
-            });
+            continue;
+        }
+        if let Some(value) = field_value(line, "addr_type") {
+            pending_addr = Some(parse_quoted(value, "addr_type")?.to_owned());
         }
     }
 
-    if pending_name.is_some() || pending_flags.is_some() {
-        return Err(invalid("last command entry is missing flags"));
+    if pending_name.is_some() || continued_flags.is_some() {
+        return Err(invalid("last command entry is incomplete"));
     }
     Ok(commands)
+}
+
+/// Maps an upstream `ADDR_*` name onto the `AddrType` variant it generates.
+fn addr_type_variant(name: &str) -> Result<&'static str, io::Error> {
+    let variant = match name {
+        "ADDR_LINES" => "Lines",
+        "ADDR_WINDOWS" => "Windows",
+        "ADDR_ARGUMENTS" => "Arguments",
+        "ADDR_BUFFERS" => "Buffers",
+        "ADDR_LOADED_BUFFERS" => "LoadedBuffers",
+        "ADDR_TABS" => "Tabs",
+        "ADDR_TABS_RELATIVE" => "TabsRelative",
+        "ADDR_QUICKFIX" => "QuickFix",
+        "ADDR_QUICKFIX_VALID" => "QuickFixValid",
+        "ADDR_UNSIGNED" => "Unsigned",
+        "ADDR_OTHER" => "Other",
+        "ADDR_NONE" => "None",
+        unknown => return Err(invalid(&format!("unknown Ex command addr_type {unknown}"))),
+    };
+    Ok(variant)
 }
 
 fn field_value<'a>(line: &'a str, field: &str) -> Option<&'a str> {

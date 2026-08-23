@@ -37,6 +37,40 @@ impl CommandFlags {
     }
 }
 
+/// The domain an Ex command's addresses count in.
+///
+/// Copied from `addr_type` in Neovim's `ex_cmds.lua`. Address validation
+/// depends on it: `invalid_range` (`ex_docmd.c:3735-3820`) bounds each domain
+/// against a different limit, and [`AddrType::Other`] accepts any range.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum AddrType {
+    /// Buffer line numbers, bounded by the line count.
+    Lines,
+    /// Window numbers in the current tabpage.
+    Windows,
+    /// Argument-list indices.
+    Arguments,
+    /// Buffer numbers.
+    Buffers,
+    /// Loaded buffer numbers.
+    LoadedBuffers,
+    /// Tabpage numbers.
+    Tabs,
+    /// Tabpage numbers relative to the current one.
+    TabsRelative,
+    /// Quickfix list indices.
+    QuickFix,
+    /// Quickfix list indices restricted to valid entries.
+    QuickFixValid,
+    /// A non-negative count with no domain limit.
+    Unsigned,
+    /// A domain-free number; any range is accepted.
+    Other,
+    /// The command takes no address at all.
+    #[default]
+    None,
+}
+
 /// Static metadata for one built-in Ex command.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CommandSpec {
@@ -48,6 +82,8 @@ pub struct CommandSpec {
     pub min_prefix_len: usize,
     /// Upstream argument flags.
     pub flags: CommandFlags,
+    /// Domain the command's addresses are counted in.
+    pub addr_type: AddrType,
 }
 
 include!(concat!(env!("OUT_DIR"), "/command_specs.rs"));

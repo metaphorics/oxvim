@@ -1227,3 +1227,67 @@ fn write_filter_pipes_lines_into_the_command() {
     let buffer = editor.current_buffer().unwrap();
     assert_eq!(editor.buffer(buffer).unwrap().name().to_string_lossy(), "");
 }
+
+// ---------------------------------------------------------------------------
+// Address-domain validation: invalid_range, ex_docmd.c:3735-3820.
+// ---------------------------------------------------------------------------
+
+/// An ADDR_LINES address past the last line is rejected, not clamped onto the
+/// last line, so the buffer is left untouched.
+///
+/// Oracle: `['a','b','c']` + `99read in.txt` →
+/// `Vim(read):E16: Invalid range: 99read in.txt`, buffer still `a b c`.
+#[test]
+fn out_of_range_address_raises_e16_without_mutating_the_buffer() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.scripts().io().insert("in.txt", "x\ny\n");
+    assert_vim_error(executor.execute_line(&mut editor, "99read in.txt"), "E16");
+    assert_eq!(buffer_text(&editor), vec!["a", "b", "c"]);
+}
+
+/// The rule lives at the dispatch entry, so every ADDR_LINES command gets it,
+/// not just `:read`.
+///
+/// Oracle: `99print` → `Vim(print):E16: Invalid range: 99print`;
+/// `5,6delete` → `Vim(delete):E16: Invalid range: 5,6delete`.
+#[test]
+fn out_of_range_address_raises_e16_for_every_line_addressed_command() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    assert_vim_error(executor.execute_line(&mut editor, "99print"), "E16");
+    assert_vim_error(executor.execute_line(&mut editor, "5,6delete"), "E16");
+    assert_vim_error(executor.execute_line(&mut editor, "2,9yank"), "E16");
+    assert_eq!(buffer_text(&editor), vec!["a", "b", "c"]);
+}
+
+/// The last line itself is in range, and `:0read`'s ZEROR line 0 still
+/// resolves: the check bounds the upper end only.
+#[test]
+fn in_range_addresses_survive_the_domain_check() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.scripts().io().insert("in.txt", "x\n");
+    executor.execute_line(&mut editor, "3read in.txt").unwrap();
+    executor.execute_line(&mut editor, "0read in.txt").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["x", "a", "b", "c", "x"]);
+}
+
+/// Each address domain gets its own limit, exactly as `invalid_range` bounds
+/// them, and `ADDR_OTHER` stays unbounded.
+///
+/// Oracle, on a three-line buffer with one window and one buffer:
+/// `99resize` → no error (ADDR_OTHER, so the address is never checked);
+/// `99close` → `Vim(close):E16: Invalid range: 99close` (ADDR_WINDOWS);
+/// `99buffer` → `Vim(buffer):E16: Invalid range: 99buffer` (ADDR_BUFFERS).
+#[test]
+fn each_address_domain_gets_its_own_limit() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    // ADDR_OTHER: unbounded, so the address never reaches the domain check.
+    // `:resize` still fails on its own screen-extent limit, which is E36, not
+    // the E16 this test is about.
+    executor.execute_line(&mut editor, "99bnext").unwrap();
+    assert_vim_error(executor.execute_line(&mut editor, "99close"), "E16");
+    assert_vim_error(executor.execute_line(&mut editor, "99buffer"), "E16");
+}

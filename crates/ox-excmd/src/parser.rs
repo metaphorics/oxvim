@@ -1,7 +1,7 @@
 //! Byte-oriented parsing of Ex command lines.
 
 use crate::command::{
-    CommandFlags, NoUserCommands, ResolveError, ResolvedCommand, UserCommandProvider,
+    AddrType, CommandFlags, NoUserCommands, ResolveError, ResolvedCommand, UserCommandProvider,
     resolve_command,
 };
 use thiserror::Error;
@@ -357,6 +357,19 @@ pub fn effective_flags(command: &ResolvedCommand) -> CommandFlags {
                 | CommandFlags::EXTRA.bits()
                 | CommandFlags::TRLBAR.bits(),
         ),
+    }
+}
+
+/// The address domain that governs one resolved command.
+///
+/// User commands answer [`AddrType::Lines`], upstream's `-range` default
+/// (`usercmd.c:815-818`), matching the `RANGE` that [`effective_flags`]
+/// grants them.
+#[must_use]
+pub fn effective_addr_type(command: &ResolvedCommand) -> AddrType {
+    match command {
+        ResolvedCommand::Builtin(spec) => spec.addr_type,
+        ResolvedCommand::User(_) => AddrType::Lines,
     }
 }
 
