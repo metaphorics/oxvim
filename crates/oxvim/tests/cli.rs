@@ -33,6 +33,30 @@ fn batch(arguments: &[&str], input: &str) -> std::process::Output {
     child.wait_with_output().expect("wait for oxvim")
 }
 
+/// A scratch file holding `contents`, removed when the guard drops.
+struct TempFile(std::path::PathBuf);
+
+impl TempFile {
+    fn new(suffix: &str, contents: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!("oxvim-t57-{}-{unique}{suffix}", std::process::id()));
+        std::fs::write(&path, contents).expect("write scratch file");
+        Self(path)
+    }
+
+    fn text(&self) -> &str {
+        self.0.to_str().expect("UTF-8 temp path")
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _removed = std::fs::remove_file(&self.0);
+    }
+}
+
 fn map_field<'a>(value: &'a Value, name: &str) -> &'a Value {
     value
         .as_map()
@@ -281,6 +305,7 @@ fn usage_failures_match_upstream_text_and_status() {
         (vec!["--cmdfoo", "x"], "Garbage after option argument: \"--cmdfoo\""),
         (vec!["-u"], "Argument missing after: \"-u\""),
         (vec!["-c"], "Argument missing after: \"-c\""),
+        (vec!["--startuptime"], "Argument missing after: \"--startuptime\""),
     ] {
         let output = oxvim().args(&arguments).output().expect("spawn oxvim");
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -294,6 +319,181 @@ fn usage_failures_match_upstream_text_and_status() {
     assert_eq!(output.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("Attempt to open script file again: \"-s b\""), "{stderr}");
     assert!(!stderr.contains("More info"), "{stderr}");
+}
+
+/// `-R`, `-m`, `-M`, `-n` and `-b` reach the options they name before the
+/// first startup command runs, and a cluster applies every letter in it.
+#[test]
+fn startup_option_flags_reach_their_options() {
+    for (flags, query, expected) in [
+        (vec!["-R"], "set readonly?", "readonly"),
+        (vec!["-m"], "set write?", "nowrite"),
+        (vec!["-M"], "set modifiable?", "nomodifiable"),
+        (vec!["-n"], "set updatecount?", "updatecount=0"),
+        (vec!["-b"], "set binary?", "binary"),
+        // "-R" alone slows the swap file instead of disabling it.
+        (vec!["-R"], "set updatecount?", "updatecount=10000"),
+    ] {
+        let output = batch(&flags, &format!("{query}\n"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{flags:?}: {}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(stdout.trim(), expected, "{flags:?}");
+    }
+    // A cluster is the same as the separate letters (main.c argv_idx).
+    let output = batch(&["-Rnb"], "set readonly?\nset updatecount?\nset binary?\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "readonly\nupdatecount=0\nbinary\n"
+    );
+    // A startup command already observes them, because main.c sets them
+    // during the scan.
+    let output = batch(&["-R", "--cmd", "set readonly?"], "");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "readonly");
+}
+
+/// `-o`, `-O` and `-p` build the layout before the files load: an explicit
+/// count wins, otherwise one window or tab page per file, never fewer than
+/// the startup window, and the first window stays current.
+#[test]
+fn window_and_tab_openers_build_the_startup_layout() {
+    let one = TempFile::new(".txt", "aaa\n");
+    let two = TempFile::new(".txt", "bbb\n");
+    let three = TempFile::new(".txt", "ccc\n");
+    let files = [one.text(), two.text(), three.text()];
+    for (flag, windows, tabs) in [
+        ("-o", 3, 1),
+        ("-o2", 2, 1),
+        ("-o5", 5, 1),
+        ("-O", 3, 1),
+        ("-p", 1, 3),
+        ("-p3", 1, 3),
+        ("-p1", 1, 1),
+    ] {
+        let mut arguments = vec![flag];
+        arguments.extend(files);
+        let output = batch(&arguments, "echo winnr(\"$\") tabpagenr(\"$\") winnr()\n");
+        assert!(output.status.success(), "{flag}: {}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            format!("{windows} {tabs} 1"),
+            "{flag}"
+        );
+    }
+    // Every window shows the next file, in argv order (edit_buffers).
+    let mut arguments = vec!["-o"];
+    arguments.extend(files);
+    let output = batch(&arguments, "echo bufname(\"%\")\n2wincmd w\necho bufname(\"%\")\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{}\n{}\n", one.text(), two.text())
+    );
+    // Without a layout flag there is still exactly one window.
+    let mut arguments = vec!["--literal"];
+    arguments.extend(files);
+    let output = batch(&arguments, "echo winnr(\"$\") tabpagenr(\"$\")\n");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1 1");
+}
+
+/// `-E`/`-Es` set upstream's `input_istext`: standard input becomes buffer
+/// text during startup, and the `+cmd` arguments then run over it.
+#[test]
+fn improved_ex_mode_reads_stdin_as_buffer_text() {
+    let mut child = oxvim()
+        .args(["-Es", "-u", "NONE", "-i", "NONE", "+%print"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxvim");
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(b"hello\nworld\n")
+        .expect("write text input");
+    let output = child.wait_with_output().expect("wait for oxvim");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, b"hello\nworld\n");
+}
+
+/// A bare `-` edits standard input (upstream `EDIT_STDIN`), while `-` after
+/// `-e` is the silent-mode modifier instead and leaves stdin as Ex input.
+#[test]
+fn bare_dash_edits_standard_input() {
+    let written = TempFile::new(".txt", "");
+    let mut child = oxvim()
+        .args([
+            "--headless",
+            "-u",
+            "NONE",
+            "-i",
+            "NONE",
+            "-",
+            "-c",
+            &format!("w! {}", written.text()),
+            "-c",
+            "qa!",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxvim");
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(b"from stdin\n")
+        .expect("write stdin text");
+    let output = child.wait_with_output().expect("wait for oxvim");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(std::fs::read_to_string(written.text()).expect("read written file"), "from stdin\n");
+
+    // "-e -" is silent mode, so stdin stays Ex commands.
+    let output = batch(&["-"], "call setline(1, \"ex input\")\n%print\n");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ex input\n");
+}
+
+/// `--startuptime <file>` writes a timing log with one line per milestone.
+#[test]
+fn startuptime_writes_a_timing_log() {
+    let log = TempFile::new(".log", "");
+    let output = batch(&["--startuptime", log.text()], "");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let text = std::fs::read_to_string(log.text()).expect("read startuptime log");
+    assert!(text.starts_with("--- Startup times for process:"), "{text}");
+    for label in ["OXVIM STARTING", "parsing arguments", "opening buffers", "OXVIM STARTED"] {
+        assert!(text.contains(label), "{label} missing from {text}");
+    }
+    // Without the flag nothing is written anywhere.
+    let quiet = TempFile::new(".log", "");
+    let output = batch(&[], "");
+    assert!(output.status.success());
+    assert_eq!(std::fs::read_to_string(quiet.text()).expect("read scratch"), "");
+}
+
+/// `-w{number}` sets `'window'`; the option is the whole observable effect
+/// upstream produces at scan time.
+#[test]
+fn window_height_flag_sets_the_window_option() {
+    let output = batch(&["-w42"], "set window?\n");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "window=42");
+}
+
+/// Upstream accepts these and does nothing with them, so accepting them is
+/// parity rather than a silent no-op: `--literal` because file names are
+/// always literal, `-N`/`-X`/`-f` because they are compatibility stubs, and
+/// `-U {gvimrc}` because there is no GUI config to source.
+#[test]
+fn upstream_no_op_flags_are_accepted() {
+    let gvimrc = TempFile::new(".vim", "throw 'never sourced'\n");
+    let output = batch(
+        &["--literal", "-N", "-X", "-f", "-U", gvimrc.text()],
+        "call setline(1, \"ran\")\n%print\n",
+    );
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ran\n");
 }
 
 /// A flag whose honest behavior needs a subsystem oxvim does not have is
@@ -310,6 +510,7 @@ fn flags_without_their_subsystem_are_rejected_by_name() {
         (vec!["-t", "sometag"], "the tags subsystem"),
         (vec!["-r"], "swap-file recovery"),
         (vec!["-L"], "swap-file recovery"),
+        (vec!["-w", "keys.log"], "script recording of typed keys"),
         (vec!["-W", "keys.log"], "script recording of typed keys"),
         (vec!["--remote", "file"], "RPC client channels and vim._cs_remote"),
         (vec!["--remote-send", "iabc"], "RPC client channels and vim._cs_remote"),

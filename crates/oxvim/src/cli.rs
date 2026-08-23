@@ -40,6 +40,23 @@ pub struct BatchMode {
     /// Suppress the interactive Ex prompt and message stream (`-es`, `-Es`,
     /// `-e -`); upstream `silent_mode`.
     pub silent: bool,
+    /// Read standard input as buffer text rather than as Ex commands
+    /// (`-E`, `-Es`); upstream `input_istext`.
+    pub input_is_text: bool,
+}
+
+/// How the startup files are distributed over windows and tab pages.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WindowLayout {
+    /// One window showing the first file (`main.c` `WIN_NONE`).
+    #[default]
+    Single,
+    /// Horizontal splits (`-o`, `WIN_HOR`).
+    Horizontal,
+    /// Vertical splits (`-O`, `WIN_VER`).
+    Vertical,
+    /// Tab pages (`-p`, `WIN_TABS`).
+    Tabs,
 }
 
 /// A Lua script and the arguments following it.
@@ -93,6 +110,26 @@ pub struct Cli {
     pub help: bool,
     /// Print version information and exit successfully (`-v`, `--version`).
     pub version: bool,
+    /// Open the first buffer read-only (`-R`).
+    pub readonly: bool,
+    /// Forbid writing files (`-m`, `-M`).
+    pub no_write: bool,
+    /// Reset `'modifiable'` (`-M`).
+    pub no_modifiable: bool,
+    /// Use memory only, without a swap file (`-n`, `-l`, `-e -`).
+    pub no_swap_file: bool,
+    /// Edit in binary mode (`-b`).
+    pub binary: bool,
+    /// Edit standard input as the sole file (`nvim -`).
+    pub stdin_file: bool,
+    /// Explicit `-o{N}`/`-O{N}`/`-p{N}` count; zero means "one per file".
+    pub window_count: usize,
+    /// Distribution of startup files over windows and tab pages.
+    pub window_layout: WindowLayout,
+    /// `'window'` value requested with `-w{number}`.
+    pub window_height: Option<i64>,
+    /// Write startup timing messages to this file (`--startuptime`).
+    pub startuptime: Option<String>,
     /// Whether plugin scripts should be loaded on startup.
     ///
     /// `--noplugin` resets this to `false`; `-u NONE` also resets it unless
@@ -120,6 +157,16 @@ impl Default for Cli {
             api_info: false,
             help: false,
             version: false,
+            readonly: false,
+            no_write: false,
+            no_modifiable: false,
+            no_swap_file: false,
+            binary: false,
+            stdin_file: false,
+            window_count: 0,
+            window_layout: WindowLayout::Single,
+            window_height: None,
+            startuptime: None,
             loadplugins: true,
             files: Vec::new(),
         }
@@ -296,31 +343,66 @@ impl Cli {
         had_minmin: &mut bool,
     ) -> Result<Want, UsageError> {
         let Some(letter) = letter else {
-            // "nvim -e -": the silent batch modifier.
+            // "nvim -": silent mode inside Ex mode, otherwise edit stdin.
             if let Some(batch) = self.batch.as_mut() {
                 batch.silent = true;
-                return Ok(Want::Argument);
+                self.no_swap_file = true;
+            } else {
+                self.stdin_file = true;
             }
-            // A bare "-" edits standard input; that buffer path does not
-            // exist yet, so the argument stays a file name.
-            self.files.push("-".to_owned());
             return Ok(Want::Argument);
         };
         match letter {
             '-' => self.scan_long_option(argument, cursor, had_minmin),
             'A' => Err(unsupported(argument, "the 'arabic' option side effects and keymap files")),
+            'b' => {
+                self.binary = true;
+                Ok(Want::Done)
+            }
             'D' => Err(unsupported(argument, "the Ex debugger")),
             'd' => Err(unsupported(argument, "a diff engine")),
             'e' => {
                 self.batch.get_or_insert_with(BatchMode::default);
                 Ok(Want::Done)
             }
+            'E' => {
+                let batch = self.batch.get_or_insert_with(BatchMode::default);
+                batch.input_is_text = true;
+                Ok(Want::Done)
+            }
+            'f' | 'N' | 'X' => Ok(Want::Done),
             'h' | '?' => {
                 self.help = true;
                 Ok(Want::Done)
             }
             'H' => Err(unsupported(argument, "keymap file loading")),
+            'M' => {
+                self.no_modifiable = true;
+                self.no_write = true;
+                Ok(Want::Done)
+            }
+            'm' => {
+                self.no_write = true;
+                Ok(Want::Done)
+            }
+            'n' => {
+                self.no_swap_file = true;
+                Ok(Want::Done)
+            }
+            'p' | 'o' | 'O' => {
+                self.window_count = number_argument(argument, cursor, 0);
+                self.window_layout = match letter {
+                    'p' => WindowLayout::Tabs,
+                    'o' => WindowLayout::Horizontal,
+                    _ => WindowLayout::Vertical,
+                };
+                Ok(Want::Done)
+            }
             'q' => Err(unsupported(argument, "the quickfix list and 'errorformat'")),
+            'R' => {
+                self.readonly = true;
+                Ok(Want::Done)
+            }
             'r' | 'L' => Err(unsupported(argument, "swap-file recovery")),
             's' => {
                 if let Some(batch) = self.batch.as_mut() {
@@ -345,6 +427,15 @@ impl Cli {
                 });
                 Ok(Want::Done)
             }
+            'w' => {
+                // "-w{number}" sets 'window'; "-w {scriptout}" records keys.
+                if argument[*cursor..].starts_with(|c: char| c.is_ascii_digit()) {
+                    let number = number_argument(argument, cursor, 10);
+                    self.window_height = Some(i64::try_from(number).unwrap_or(i64::MAX));
+                    return Ok(Want::Done);
+                }
+                Ok(Want::Next('w'))
+            }
             'c' => {
                 // "-c{command}" runs inline; "-c {command}" takes the next word.
                 if *cursor < argument.len() {
@@ -361,8 +452,8 @@ impl Cli {
     /// Handle the long option in `argument`, whose name starts at `cursor`.
     ///
     /// Upstream compares case-insensitively, and every name except `help`,
-    /// `version` and `api-info` matches by prefix, so `--noplugins` is
-    /// accepted.
+    /// `version` and `api-info` matches by prefix, so `--noplugins` and
+    /// `--literalxyz` are both accepted.
     fn scan_long_option(
         &mut self,
         argument: &str,
@@ -387,6 +478,8 @@ impl Cli {
         } else if prefix("listen") {
             *cursor += "listen".len();
             return Ok(Want::Next('-'));
+        } else if prefix("literal") {
+            // Upstream no-op: file arguments are always literal (#7679).
         } else if prefix("remote") {
             return Err(unsupported(argument, "RPC client channels and vim._cs_remote"));
         } else if prefix("server") {
@@ -395,6 +488,9 @@ impl Cli {
             self.loadplugins = false;
         } else if prefix("cmd") {
             *cursor += "cmd".len();
+            return Ok(Want::Next('-'));
+        } else if prefix("startuptime") {
+            *cursor += "startuptime".len();
             return Ok(Want::Next('-'));
         } else if prefix("clean") {
             self.clean = true;
@@ -449,6 +545,7 @@ impl Cli {
                 // main.c: "-l" implies headless, silent, no swap file, and
                 // skips user config unless one was already requested.
                 self.headless = true;
+                self.no_swap_file = true;
                 if self.user_config == UserConfig::Default {
                     self.user_config = UserConfig::None;
                 }
@@ -477,7 +574,7 @@ impl Cli {
             }
             // "-U {gvimrc}" is accepted and ignored, like upstream.
             'U' => {}
-            'W' => {
+            'w' | 'W' => {
                 return Err(unsupported(option, "script recording of typed keys"));
             }
             '-' => {
@@ -487,9 +584,10 @@ impl Cli {
                         return Err(too_many_commands());
                     }
                     self.pre_commands.push(value.clone());
-                } else {
-                    debug_assert!(option.eq_ignore_ascii_case("--listen"));
+                } else if option.eq_ignore_ascii_case("--listen") {
                     self.listen = Some(value.clone());
+                } else {
+                    self.startuptime = Some(value.clone());
                 }
             }
             other => unreachable!("option -{other} does not take an argument"),
@@ -506,6 +604,17 @@ impl Cli {
         Ok(())
     }
 
+    /// The number of windows or tab pages to create for `files`.
+    ///
+    /// `main.c` `create_windows`: an explicit count wins, otherwise one per
+    /// file, and never fewer than the single startup window.
+    #[must_use]
+    pub fn startup_window_count(&self) -> usize {
+        if self.window_count > 0 {
+            return self.window_count;
+        }
+        self.files.len().max(1)
+    }
 }
 
 /// A recognized upstream option whose behavior needs a subsystem oxvim does
@@ -556,9 +665,13 @@ mod tests {
             Case { args: &["--headless"], check: |c| c.headless },
             Case { args: &["--HEADLESS"], check: |c| c.headless },
             Case { args: &["--listen", "127.0.0.1:7777"], check: |c| c.listen.as_deref() == Some("127.0.0.1:7777") },
-            Case { args: &["-e"], check: |c| c.batch == Some(BatchMode { silent: false }) },
-            Case { args: &["-es"], check: |c| c.batch == Some(BatchMode { silent: true }) },
-            Case { args: &["-e", "-"], check: |c| c.batch == Some(BatchMode { silent: true }) && c.files.is_empty() },
+            Case { args: &["--literal", "file"], check: |c| c.files == ["file"] },
+            Case { args: &["-e"], check: |c| c.batch == Some(BatchMode { silent: false, input_is_text: false }) },
+            Case { args: &["-es"], check: |c| c.batch == Some(BatchMode { silent: true, input_is_text: false }) },
+            Case { args: &["-E"], check: |c| c.batch == Some(BatchMode { silent: false, input_is_text: true }) },
+            Case { args: &["-Es"], check: |c| c.batch == Some(BatchMode { silent: true, input_is_text: true }) },
+            Case { args: &["-e", "-"], check: |c| c.batch == Some(BatchMode { silent: true, input_is_text: false }) && c.no_swap_file && !c.stdin_file },
+            Case { args: &["-"], check: |c| c.stdin_file && c.files.is_empty() },
             Case { args: &["-s", "script"], check: |c| c.scriptin.as_deref() == Some("script") },
             Case { args: &["-s", "-"], check: |c| c.scriptin.as_deref() == Some("-") },
             Case { args: &["+set number"], check: |c| c.commands == ["set number"] },
@@ -576,6 +689,17 @@ mod tests {
             Case { args: &["-?"], check: |c| c.help },
             Case { args: &["--version"], check: |c| c.version },
             Case { args: &["-v"], check: |c| c.version },
+            Case { args: &["-R"], check: |c| c.readonly },
+            Case { args: &["-m"], check: |c| c.no_write && !c.no_modifiable },
+            Case { args: &["-M"], check: |c| c.no_write && c.no_modifiable },
+            Case { args: &["-n"], check: |c| c.no_swap_file },
+            Case { args: &["-b"], check: |c| c.binary },
+            Case { args: &["-N", "-X", "-f", "-U", "gvimrc"], check: |c| c.files.is_empty() },
+            Case { args: &["-o"], check: |c| c.window_layout == WindowLayout::Horizontal && c.window_count == 0 },
+            Case { args: &["-O2"], check: |c| c.window_layout == WindowLayout::Vertical && c.window_count == 2 },
+            Case { args: &["-p3"], check: |c| c.window_layout == WindowLayout::Tabs && c.window_count == 3 },
+            Case { args: &["-w80"], check: |c| c.window_height == Some(80) },
+            Case { args: &["--startuptime", "log"], check: |c| c.startuptime.as_deref() == Some("log") },
             Case { args: &["one", "two"], check: |c| c.files == ["one", "two"] },
             Case { args: &["--", "-mystery"], check: |c| c.files == ["-mystery"] },
             Case { args: &["--", "+cmd"], check: |c| c.files == ["+cmd"] && c.commands.is_empty() },
@@ -587,14 +711,21 @@ mod tests {
     }
 
     #[test]
-    fn clustered_short_options_end_in_an_option_that_takes_a_value() {
+    fn clustered_short_options_apply_in_order() {
+        let parsed = Cli::parse(["-Rnb"]).unwrap();
+        assert!(parsed.readonly && parsed.no_swap_file && parsed.binary);
+
+        let parsed = Cli::parse(["-Mn"]).unwrap();
+        assert!(parsed.no_write && parsed.no_modifiable && parsed.no_swap_file);
+
         // A cluster may end in an option that takes the next argument.
-        let parsed = Cli::parse(["-ec", "echo 1"]).unwrap();
-        assert_eq!(parsed.batch, Some(BatchMode { silent: false }));
+        let parsed = Cli::parse(["-nc", "echo 1"]).unwrap();
+        assert!(parsed.no_swap_file);
         assert_eq!(parsed.commands, ["echo 1"]);
 
-        // Or in an option with an inline value.
-        let parsed = Cli::parse(["-eV3"]).unwrap();
+        // A cluster may end in an option with an inline value.
+        let parsed = Cli::parse(["-nV3"]).unwrap();
+        assert!(parsed.no_swap_file);
         assert_eq!(parsed.verbose, Some(VerboseConfig { level: 3, file: None }));
     }
 
@@ -638,12 +769,12 @@ mod tests {
         assert_eq!(parsed.commands, ["echo 1", "so session.vim", "echo 2"]);
 
         let parsed = Cli::parse(["-e", "-s", "-u", "NONE"]).unwrap();
-        assert_eq!(parsed.batch, Some(BatchMode { silent: true }));
+        assert_eq!(parsed.batch, Some(BatchMode { silent: true, input_is_text: false }));
         assert_eq!(parsed.user_config, UserConfig::None);
         assert!(parsed.scriptin.is_none());
 
         let parsed = Cli::parse(["-e", "-s", "file"]).unwrap();
-        assert_eq!(parsed.batch, Some(BatchMode { silent: true }));
+        assert_eq!(parsed.batch, Some(BatchMode { silent: true, input_is_text: false }));
         assert_eq!(parsed.files, ["file"]);
         assert!(parsed.scriptin.is_none());
     }
@@ -653,9 +784,18 @@ mod tests {
         let parsed = Cli::parse(["-l", "script.lua", "--clean", "file"]).unwrap();
         assert_eq!(parsed.lua_script, Some(LuaScript { path: "script.lua".into(), args: vec!["--clean".into(), "file".into()] }));
         assert!(!parsed.clean);
-        // main.c: "-l" implies headless and no user config.
-        assert!(parsed.headless);
+        // main.c: "-l" implies headless, no swap file and no user config.
+        assert!(parsed.headless && parsed.no_swap_file);
         assert_eq!(parsed.user_config, UserConfig::None);
+    }
+
+    #[test]
+    fn startup_window_count_follows_files_or_explicit_count() {
+        assert_eq!(Cli::parse(["-o", "a", "b", "c"]).unwrap().startup_window_count(), 3);
+        assert_eq!(Cli::parse(["-o2", "a", "b", "c"]).unwrap().startup_window_count(), 2);
+        assert_eq!(Cli::parse(["-o5", "a", "b", "c"]).unwrap().startup_window_count(), 5);
+        assert_eq!(Cli::parse(["-o"]).unwrap().startup_window_count(), 1);
+        assert_eq!(Cli::parse(["-p3"]).unwrap().startup_window_count(), 3);
     }
 
     #[test]
@@ -673,6 +813,7 @@ mod tests {
             Case { args: &["-i"], message: "Argument missing after: \"-i\"", code: 1 },
             Case { args: &["--listen"], message: "Argument missing after: \"--listen\"", code: 1 },
             Case { args: &["--cmd"], message: "Argument missing after: \"--cmd\"", code: 1 },
+            Case { args: &["--startuptime"], message: "Argument missing after: \"--startuptime\"", code: 1 },
             Case { args: &["-l"], message: "Argument missing after: \"-l\"", code: 1 },
             Case { args: &["-uxx", "NONE"], message: "Garbage after option argument: \"-uxx\"", code: 1 },
             Case { args: &["--cmdfoo", "x"], message: "Garbage after option argument: \"--cmdfoo\"", code: 1 },
@@ -720,6 +861,7 @@ mod tests {
             (vec!["-t", "tag"], "the tags subsystem"),
             (vec!["-r"], "swap-file recovery"),
             (vec!["-L"], "swap-file recovery"),
+            (vec!["-w", "keys.log"], "script recording of typed keys"),
             (vec!["-W", "keys.log"], "script recording of typed keys"),
             (vec!["--remote", "file"], "RPC client channels and vim._cs_remote"),
             (vec!["--remote-expr", "1"], "RPC client channels and vim._cs_remote"),

@@ -25,7 +25,6 @@ use ox_lua::{
     typval_to_lua,
 };
 use ox_rpc::{CHAN_STDIO, ChannelId, IncrementalDecoder, Message};
-use ox_text::Buffer;
 use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, Typval, WinHandle};
 use ox_ui::{
     ChromeState, CmdlineState as UiCmdlineState, Compositor, ContentChunk, Emitter, HlState,
@@ -39,7 +38,8 @@ use ox_uv::net::Pipe;
 
 use crate::AppError;
 use crate::cli::{Cli, UserConfig};
-use crate::runtime::runtime_root;
+use crate::runtime::{apply_startup_options, open_startup_buffers, runtime_root};
+use crate::startuptime::StartupTimer;
 
 #[derive(Default)]
 struct TerminalChannelSink {
@@ -73,7 +73,7 @@ pub struct AppState {
 
 impl AppState {
     /// Build one editor/Lua/API instance and execute process startup.
-    pub fn new(cli: &Cli) -> Result<Self, AppError> {
+    pub fn new(cli: &Cli, timer: &mut StartupTimer) -> Result<Self, AppError> {
         let mut editor = Editor::new();
         let buffer = editor
             .create_buffer(true)
@@ -89,6 +89,7 @@ impl AppState {
             OxStr::from("servername"),
             Object::String(OxStr::from("")),
         );
+        apply_startup_options(&mut editor, cli)?;
         // option.c set_init_default for 'runtimepath'/'packpath': the
         // runtimepath_default layout over the resolved runtime tree,
         // before any user startup command runs.
@@ -163,11 +164,11 @@ impl AppState {
             highlights: HlState::new(),
             chrome: ChromeState::new(),
         };
-        state.run_startup(cli)?;
+        state.run_startup(cli, timer)?;
         Ok(state)
     }
 
-    fn run_startup(&mut self, cli: &Cli) -> Result<(), AppError> {
+    fn run_startup(&mut self, cli: &Cli, timer: &mut StartupTimer) -> Result<(), AppError> {
 
         // main.c fills the global argument list from the command line
         // before any startup command runs, so argc()/argv() observe the
@@ -202,18 +203,17 @@ impl AppState {
                     .map_err(|error| AppError::Ex(error.to_string()))?;
             }
         }
+        timer.mark("sourcing vimrc file(s)");
 
-        // main.c create_windows()/edit_buffers(), single-window form:
-        // every positional file becomes a named buffer loaded from disk
-        // (upstream also names a buffer when the file does not exist
-        // yet), and the first file is displayed in the startup window.
+        // main.c create_windows()/edit_buffers(): the requested window or
+        // tab-page layout is built first, then every positional file becomes
+        // a named buffer loaded from disk (upstream also names a buffer when
+        // the file does not exist yet) and fills one window in argv order.
         if self.exiting {
             return Ok(());
         }
-        if !cli.files.is_empty() {
-            self.open_startup_files(&cli.files)?;
-        }
- 
+        open_startup_buffers(&mut self.editor.borrow_mut(), cli)?;
+        timer.mark("opening buffers");
         for command in &cli.commands {
             self.execute_ex(command)?;
             if self.exiting {
@@ -232,52 +232,6 @@ impl AppState {
         if let ExecOutcome::Quit(code) = outcome {
             self.exiting = true;
             self.exit_code = code;
-        }
-        Ok(())
-    }
-
-    /// Opens every positional file argument as a named buffer, mirroring
-    /// `main.c` `create_windows()`/`edit_buffers()` for the single-window
-    /// case: `open_buffer(false, ...)` reads the first file into the
-    /// startup buffer itself, so buffer numbers match `nvim a b c`, and
-    /// each remaining file becomes a loaded hidden buffer without
-    /// stealing the current window.  When a startup script has already
-    /// replaced or modified the startup buffer, every file, the first
-    /// included, is opened as a background buffer instead.
-    fn open_startup_files(&mut self, files: &[String]) -> Result<(), AppError> {
-        let first_into_current = self
-            .editor
-            .borrow()
-            .current_buffer()
-            .is_some_and(|current| {
-                self.editor
-                    .borrow()
-                    .buffer(current)
-                    .is_ok_and(|state| state.name().as_bytes().is_empty() && !state.modified)
-            });
-        for (index, file) in files.iter().enumerate() {
-            let text = read_startup_file(file)?;
-            if index == 0 && first_into_current {
-                let current = self
-                    .editor
-                    .borrow()
-                    .current_buffer()
-                    .ok_or_else(|| AppError::Editor("no current buffer at startup".into()))?;
-                if let Ok(state) = self.editor.borrow_mut().buffer_mut(current) {
-                    state.load(text);
-                    state.set_name(OxStr::from(file.as_str()));
-                }
-                continue;
-            }
-            let handle = self
-                .editor
-                .borrow_mut()
-                .create_buffer_with(text, true)
-                .map_err(|error| AppError::Editor(error.to_string()))?;
-            if let Ok(state) = self.editor.borrow_mut().buffer_mut(handle) {
-                state.set_name(OxStr::from(file.as_str()));
-                state.mark_saved();
-            }
         }
         Ok(())
     }
@@ -741,20 +695,6 @@ impl AppState {
     /// Process exit code requested so far (`:cquit`, else 0).
     fn exit_code(&self) -> i64 { self.exit_code }
 }
-
-/// Reads one startup file argument into buffer text.  A file that does
-/// not exist yet still opens as a named empty buffer, like upstream's
-/// buffer creation during argument-list setup; other read failures are
-/// `E484`, matching `:edit`'s error for unreadable files.
-fn read_startup_file(file: &str) -> Result<Buffer, AppError> {
-    let text = match fs::read_to_string(file) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(AppError::Ex(format!("E484: Can't open file {file}: {error}"))),
-    };
-    Buffer::from_bytes(text.as_bytes()).map_err(|error| AppError::Ex(format!("E474: {error}")))
-}
-
  fn positive_dimension(value: i64, name: &str) -> Result<usize, ApiError> {
     usize::try_from(value)
         .ok()
@@ -829,8 +769,8 @@ fn method_is_mutating(method: &str) -> bool {
 
 /// Serve channel 1 over stdin/stdout until the peer closes its write side.
 /// Returns the process exit code requested by `:cquit` (0 otherwise).
-pub fn run_stdio(cli: &Cli) -> Result<i64, AppError> {
-    let mut state = AppState::new(cli)?;
+pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
+    let mut state = AppState::new(cli, timer)?;
     let mut decoder = IncrementalDecoder::new();
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
@@ -857,8 +797,8 @@ pub fn run_stdio(cli: &Cli) -> Result<i64, AppError> {
 
 /// Serve RPC peers accepted from a TCP address or Unix-domain pipe.
 /// Returns the process exit code requested by `:cquit` (0 otherwise).
-pub fn run_listener(cli: &Cli, address: &str) -> Result<i64, AppError> {
-    let state = Rc::new(RefCell::new(AppState::new(cli)?));
+pub fn run_listener(cli: &Cli, address: &str, timer: &mut StartupTimer) -> Result<i64, AppError> {
+    let state = Rc::new(RefCell::new(AppState::new(cli, timer)?));
     let runtime = Rc::new(RefCell::new(NetworkRuntime::new(state)));
     let mut uv_loop = UvLoop::new().map_err(|error| AppError::Server(error.to_string()))?;
     let callback_runtime = runtime.clone();

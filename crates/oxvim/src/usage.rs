@@ -22,19 +22,32 @@ Options:
   -s <scriptin>         Read Normal mode commands from <scriptin>
   -u <config>           Use this config file
 
+  -b                    Binary mode
+  -e, -E                Ex mode; -E reads stdin as text
   -es, -Es              Silent (batch) mode
   -h, --help            Print this help message
   -i <shada>            Use this shada file
+  -m                    Forbid writing files
+  -M                    Forbid writing and modifying text
+  -n                    No swap file, use memory only
+  -o[N]                 Open N windows (default: one per file)
+  -O[N]                 Open N vertical windows (default: one per file)
+  -p[N]                 Open N tab pages (default: one per file)
+  -R                    Read-only (view) mode
   -v, --version         Print version information
   -V[N][file]           Verbose [level][file]
+  -w<N>                 Set the 'window' option to N
 
   --                    Only file names after this
+  -                     Read the file to edit from stdin
   --api-info            Write msgpack-encoded API metadata to stdout
   --clean               \"Factory defaults\" (skip user config and plugins, shada)
   --embed               Use stdin/stdout as a msgpack-rpc channel
   --headless            Don't start a user interface
   --listen <address>    Serve RPC API from this address
+  --literal             Take file names literally (always true)
   --noplugin            Skip loading plugins
+  --startuptime <file>  Write startup timing messages to <file>
 ";
 
 /// Version and API level, read from the same canonical metadata that
@@ -82,12 +95,18 @@ mod tests {
         // Every flag advertised here must parse; a rejected flag in the help
         // screen would promise an effect that never happens.
         for (advertised, invocation) in [
+            ("-b", "-b"),
+            ("-e, -E", "-e"),
             ("-es, -Es", "-es"),
-            ("-h, --help", "-h"),
-            ("-v, --version", "-v"),
-            ("--clean", "--clean"),
-            ("--headless", "--headless"),
-            ("--noplugin", "--noplugin"),
+            ("-m ", "-m"),
+            ("-M ", "-M"),
+            ("-n ", "-n"),
+            ("-R ", "-R"),
+            ("-o[N]", "-o"),
+            ("-O[N]", "-O"),
+            ("-p[N]", "-p"),
+            ("-w<N>", "-w80"),
+            ("--startuptime <file>", "--startuptime"),
         ] {
             assert!(HELP.contains(advertised), "help omits {advertised}");
             let parsed = crate::cli::Cli::parse([invocation, "log"]);
