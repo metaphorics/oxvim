@@ -940,7 +940,7 @@ fn sort_integer(value: &Typval) -> i64 {
     match value {
         Typval::Number(number) => *number,
         Typval::Bool(boolean) => i64::from(*boolean),
-        Typval::String(text) => parse_integer_prefix(text.as_bytes(), 10).unwrap_or(0),
+        Typval::String(text) => crate::eval::string_to_number(text.as_bytes()),
         Typval::Special(Special::Null) => 0,
         _ => 0,
     }
@@ -1214,15 +1214,23 @@ fn set_buffer_line(buffer: &mut dyn BufferHost, lnum: i64, text: &OxStr) -> Resu
     }
 }
 
+/// `tv_get_number_chk` (`typval.c:4292-4325`). The String arm is
+/// `vim_str2nr(…, STR2NR_ALL, …)`, shared with the evaluator's own coercion
+/// rather than restated: this used to be a decimal-only prefix scan, so
+/// `abs('-12')` was 0 and `abs('0x10')` was 0 against the oracle's 12 and 16.
+/// The error codes are `num_errors` (`typval.c:4171-4181`), which gives a
+/// Funcref E703 and a Blob E974.
 fn number_arg(value: &Typval) -> Result<i64> {
     match value {
         Typval::Number(number) => Ok(*number),
         Typval::Bool(value) => Ok(i64::from(*value)),
         Typval::Special(Special::Null) => Ok(0),
-        Typval::String(value) => Ok(parse_integer_prefix(value.as_bytes(), 10).unwrap_or(0)),
+        Typval::String(value) => Ok(crate::eval::string_to_number(value.as_bytes())),
         Typval::Float(_) => Err(EvalError::new("E805", 0, "Using a Float as a Number")),
+        Typval::Funcref(_) | Typval::Partial(_) => Err(EvalError::new("E703", 0, "Using a Funcref as a Number")),
         Typval::List(_) => Err(EvalError::new("E745", 0, "Using a List as a Number")),
         Typval::Dict(_) => Err(EvalError::new("E728", 0, "Using a Dictionary as a Number")),
+        Typval::Blob(_) => Err(EvalError::new("E974", 0, "Using a Blob as a Number")),
         _ => Err(EvalError::new("E745", 0, "Using invalid value as a Number")),
     }
 }

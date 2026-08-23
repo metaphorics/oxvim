@@ -409,22 +409,12 @@ fn number_arg(value: &Typval) -> Result<i64> {
         Typval::Number(value) => Ok(*value),
         Typval::Bool(value) => Ok(i64::from(*value)),
         Typval::Special(ox_types::Special::Null) => Ok(0),
-        Typval::String(value) => Ok(parse_integer_prefix(value.as_bytes()).unwrap_or(0)),
+        Typval::String(value) => Ok(crate::eval::string_to_number(value.as_bytes())),
         Typval::Float(_) => Err(EvalError::new("E805", 0, "Using a Float as a Number")),
         Typval::List(_) => Err(EvalError::new("E745", 0, "Using a List as a Number")),
         Typval::Dict(_) => Err(EvalError::new("E728", 0, "Using a Dictionary as a Number")),
         _ => Err(EvalError::new("E745", 0, "Using invalid value as a Number")),
     }
-}
-
-fn parse_integer_prefix(bytes: &[u8]) -> Option<i64> {
-    let text = std::str::from_utf8(bytes).ok()?.trim_start();
-    let end = text
-        .char_indices()
-        .take_while(|(index, character)| character.is_ascii_digit() || (*index == 0 && matches!(character, '+' | '-')))
-        .map(|(index, character)| index + character.len_utf8())
-        .last()?;
-    text[..end].parse().ok()
 }
 
 fn absolute_name(name: &str) -> String {

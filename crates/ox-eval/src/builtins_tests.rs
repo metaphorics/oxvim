@@ -2043,6 +2043,68 @@ fn str2float_parses_what_string2float_parses() {
     assert_eq!(call("str2float", vec![funcref("string")]).unwrap_err().code, "E729");
 }
 
+// `abs()` is the visible symptom and the wrong diagnosis: `f_abs`
+// (`funcs.c:424-441`) only takes the Float path for a Float, and hands
+// everything else to `tv_get_number_chk`. There is no String-to-Float
+// coercion anywhere in upstream — `tv_get_float` (`typval.c:4413-4415`)
+// answers E892 for a String and `tv_get_float_chk` (`typval.h:404`) answers
+// E808 — so `abs('-12')` is the Number 12 and `sqrt('12')` is an error.
+//
+// Oracle: `test/old/testdir/test_float_func.vim` `Test_abs`, plus the
+// base-detection and sign cases measured on v0.13.0-dev-1390.
+#[test]
+fn a_string_reaches_a_number_context_through_vim_str2nr() {
+    // `Test_abs`: the answer is a Number, not a Float, and keeps the prefix.
+    assert_eq!(call("abs", vec![text("-12")]).unwrap(), number(12));
+    assert_eq!(call("abs", vec![text("12abc")]).unwrap(), number(12));
+    assert_eq!(call("abs", vec![text("-12abc")]).unwrap(), number(12));
+    assert_eq!(call("abs", vec![text("abc")]).unwrap(), number(0));
+    assert_eq!(call("abs", vec![text("")]).unwrap(), number(0));
+    assert_eq!(call("abs", vec![list(&[])]).unwrap_err().code, "E745");
+    assert_eq!(call("abs", vec![Typval::dict(vec![])]).unwrap_err().code, "E728");
+    assert_eq!(call("abs", vec![funcref("string")]).unwrap_err().code, "E703");
+    assert_eq!(call("abs", vec![Typval::Blob(vec![0x10])]).unwrap_err().code, "E974");
+    // The Float path is untouched and still answers with a Float.
+    assert_eq!(call("abs", vec![Typval::Float(-1.23)]).unwrap(), Typval::Float(1.23));
+
+    // No String-to-Float coercion: a float context refuses a String outright.
+    assert_eq!(call("sqrt", vec![text("12")]).unwrap_err().code, "E808");
+    assert_eq!(call("cos", vec![text("a")]).unwrap_err().code, "E808");
+    assert_eq!(call("float2nr", vec![text("12")]).unwrap_err().code, "E808");
+
+    // `vim_str2nr(…, STR2NR_ALL, …)`: base detection, and the three rules a
+    // decimal-only prefix scan gets wrong.
+    for (input, expected) in [
+        ("0x10", 16),
+        ("0X1f", 31),
+        ("0b11", 3),
+        ("0o17", 15),
+        // A leading zero is octal only while every digit stays octal.
+        ("010", 8),
+        ("08", 8),
+        ("019", 19),
+        ("0", 0),
+        // No white space is skipped, and a `+` is not a sign.
+        (" 12", 0),
+        (" -12 ", 0),
+        ("+12", 0),
+        ("-12", -12),
+        ("12 ", 12),
+        ("-", 0),
+        // The accumulator is unsigned and saturates at both ends: `2^63`
+        // fits in it and only clamps on the way to a signed Number, while
+        // 23 nines overflow `UVARNUMBER_MAX` inside the digit loop.
+        ("-9223372036854775808", i64::MIN),
+        ("9223372036854775808", i64::MAX),
+        ("18446744073709551616", i64::MAX),
+        ("99999999999999999999999", i64::MAX),
+        ("-99999999999999999999999", i64::MIN),
+        ("0xffffffffffffffffff", i64::MAX),
+    ] {
+        assert_eq!(call("and", vec![text(input), number(-1)]).unwrap(), number(expected), "str2nr-all({input:?})");
+    }
+}
+
 // Oracle: `test/old/testdir/test_expr.vim` `Test_printf_float`, which is the
 // spec for `vim_snprintf`'s float conversions (`strings.c:2075-2196`).
 #[test]
