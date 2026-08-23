@@ -229,7 +229,9 @@ error_cases!(
     (error_list_relational_compare, b"[1] > [2]", "E692", "eval.c:6789-6791"),
     (error_dict_relational_compare, b"{'a': 1} > {'a': 0}", "E736", "eval.c:6822-6828"),
     (error_float_string_concat, b"1.5 .. 'x'", "E806", "vimeval.txt:1121-1131"),
-    (error_chained_comparison, b"1 < 2 < 3", "E15", "vimeval.txt:824-896"),
+    // Comparison is non-associative, so `< 3` is left unconsumed and reported
+    // as trailing text: nvim v0.13.0-dev gives `E488: Trailing characters: < 3`.
+    (error_chained_comparison, b"1 < 2 < 3", "E488", "errors.h:123 e_trailing_arg"),
     (error_dictionary_slice, b"{'a': 1}[0:0]", "E719", "eval.c:eval_index_inner E719")
 );
 
@@ -560,3 +562,32 @@ fn malformed_interpolated_strings_report_typed_errors() {
     assert_eq!(error(br#"$"{}""#).code, "E15");
     assert_eq!(error(br#"$"{1 + 2""#).code, "E1279");
 }
+
+// ---------------------------------------------------------------------------
+// Unconsumed input after a complete expression
+// Upstream: `errors.h:123` `e_trailing_arg` = "E488: Trailing characters: %s",
+// raised from `eval.c:1251` when `eval0` stops before the end of the string.
+// Exercised by `test_functions.vim` `Test_eval`.
+// ---------------------------------------------------------------------------
+
+/// Normal case and documented error: text left over after a complete
+/// expression is E488, and the message quotes the remainder verbatim from the
+/// first unconsumed token, white space excluded.
+#[test]
+fn trailing_input_reports_e488_with_the_remainder() {
+    let trailing = error(b"5 a");
+    assert_eq!(trailing.code, "E488");
+    assert_eq!(trailing.message, "Trailing characters: a");
+
+    // Comparison does not chain, so the second operator is trailing text.
+    assert_eq!(error(b"1 < 2 < 3").message, "Trailing characters: < 3");
+}
+
+/// Boundary: an expression that consumes the whole input raises nothing, and a
+/// single trailing byte is still reported rather than silently dropped.
+#[test]
+fn trailing_input_boundary_is_one_byte() {
+    assert_eq!(value(b"5"), Typval::Number(5));
+    assert_eq!(error(b"5)").message, "Trailing characters: )");
+}
+

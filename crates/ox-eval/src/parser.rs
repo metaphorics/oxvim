@@ -185,7 +185,12 @@ impl<'a> Parser<'a> {
         self.tokens = Lexer::new(self.source).tokenize()?;
         let expression = self.parse_expr1()?;
         if !matches!(self.current().kind, TokenKind::Eof) {
-            return Err(EvalError::new("E15", self.current().span.start, "trailing characters after expression"));
+            // Upstream reports the unconsumed remainder verbatim:
+            // `e_trailing_arg` is "E488: Trailing characters: %s" (errors.h:123),
+            // raised from `eval.c:1251` once `eval0` stops short of the end.
+            let start = self.current().span.start;
+            let rest = String::from_utf8_lossy(&self.source[start..]);
+            return Err(EvalError::new("E488", start, format!("Trailing characters: {rest}")));
         }
         Ok(expression)
     }
