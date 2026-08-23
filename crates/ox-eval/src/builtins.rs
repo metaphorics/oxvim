@@ -149,7 +149,8 @@ impl<'a> Builtins<'a> {
             "str2float" => str2float(&args[0]),
             "str2list" => str2list(&args),
             "str2nr" => str2nr(&args),
-            "strcharlen" | "strchars" => strcharlen(&args[0]),
+            "strcharlen" => strcharlen(&args[0]),
+            "strchars" => strchars(&args),
             "strtrans" => strtrans(&args[0]),
             "strutf16len" => strutf16len(&args),
             "strwidth" => strwidth(&args[0], self.ambiguous_wide),
@@ -1005,7 +1006,15 @@ fn length(value: &Typval, bytes_only: bool) -> Result<Typval> {
 
 fn strcharlen(value: &Typval) -> Result<Typval> {
     let value = string_arg(value)?;
-    Ok(Typval::Number(saturating_i64(String::from_utf8_lossy(value.as_bytes()).chars().count())))
+    let count = String::from_utf8_lossy(value.as_bytes()).chars().filter(|character| UnicodeWidthChar::width(*character).unwrap_or(0) != 0).count();
+    Ok(Typval::Number(saturating_i64(count)))
+}
+
+fn strchars(args: &[Typval]) -> Result<Typval> {
+    let value = string_arg(&args[0])?;
+    let skip_composing = args.get(1).is_some_and(Typval::is_truthy);
+    let count = String::from_utf8_lossy(value.as_bytes()).chars().filter(|character| !skip_composing || UnicodeWidthChar::width(*character).unwrap_or(0) != 0).count();
+    Ok(Typval::Number(saturating_i64(count)))
 }
 
 fn string_elements(mut bytes: &[u8]) -> Vec<OxStr> {

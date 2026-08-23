@@ -845,6 +845,7 @@ fn dispatch<F: FileIO>(
         "echo" | "echomsg" | "echon" | "echoerr" => {
             command_echo(runtime, editor, scope, lua, name, &command.args)
         }
+        "eval" => match eval_text(runtime, editor, scope, lua, command.args.trim()) { Ok(_) => Flow::Normal, Err(flow) => flow },
         "redir" => command_redir(runtime, editor, scope, command),
         "break" => Flow::Break,
         "continue" => Flow::Continue,
