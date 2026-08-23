@@ -5,9 +5,20 @@ use std::collections::BTreeMap;
 
 use thiserror::Error;
 
-/// The design-documented contrast of ordinary foreground on the accent surface.
-/// This pairing is intentionally forbidden; selected controls use `bg` text instead.
-pub const FORBIDDEN_FG_ON_ACCENT_CONTRAST: f64 = 1.91;
+/// The contrast every client-owned text pair must clear.
+pub const TEXT_CONTRAST_FLOOR: f64 = 4.5;
+
+/// Measured contrast of ordinary foreground on the accent surface, per variant.
+///
+/// The design brief quotes a single 1.91:1 for this pair, which reproduces for
+/// neither variant: the dark tokens give 1.78:1 and the light tokens 2.05:1.
+/// The prohibition stands either way — both are far below
+/// [`TEXT_CONTRAST_FLOOR`] — so the numbers here are the measured ones and the
+/// quoted aggregate is not used. Selected controls carry `bg`-colored text on
+/// accent instead.
+pub const FORBIDDEN_FG_ON_ACCENT_DARK: f64 = 1.78;
+/// See [`FORBIDDEN_FG_ON_ACCENT_DARK`].
+pub const FORBIDDEN_FG_ON_ACCENT_LIGHT: f64 = 2.05;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Rgb {
@@ -117,67 +128,12 @@ impl ThemeTokens {
             ThemeVariant::Light => Self::LIGHT,
         }
     }
-
-    /// Quantizes surfaces first, then selects the nearest foreground cube
-    /// entries that preserve every contrast contract for that role.
-    pub fn quantized(self) -> QuantizedThemeTokens {
-        let bg = self.bg.quantize_xterm();
-        let float_bg = self.float_bg.quantize_xterm();
-        let visual = self.visual.quantize_xterm();
-        let all_surfaces = [bg.rgb, float_bg.rgb, visual.rgb];
-        let ordinary_surfaces = [bg.rgb, float_bg.rgb];
-        let fg = quantize_text(self.fg, &all_surfaces, 4.5);
-        let fg_muted = quantize_text(self.fg_muted, &ordinary_surfaces, 4.5);
-        let accent = quantize_text(self.accent, &all_surfaces, 4.5);
-        let error = quantize_text(self.error, &all_surfaces, 4.5);
-        let warn = quantize_text(self.warn, &all_surfaces, 4.5);
-        let hint = quantize_text(self.hint, &all_surfaces, 4.5);
-
-        QuantizedThemeTokens {
-            bg,
-            float_bg,
-            visual,
-            fg,
-            fg_muted,
-            accent,
-            error,
-            warn,
-            hint,
-        }
-    }
-
-    pub fn ansi16(self) -> Ansi16ThemeTokens {
-        Ansi16ThemeTokens {
-            bg: nearest_ansi16(self.bg),
-            float_bg: nearest_ansi16(self.float_bg),
-            visual: nearest_ansi16(self.visual),
-            fg: nearest_ansi16(self.fg),
-            fg_muted: nearest_ansi16(self.fg_muted),
-            accent: nearest_ansi16(self.accent),
-            error: nearest_ansi16(self.error),
-            warn: nearest_ansi16(self.warn),
-            hint: nearest_ansi16(self.hint),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QuantizedColor {
     pub index: u8,
     pub rgb: Rgb,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct QuantizedThemeTokens {
-    pub bg: QuantizedColor,
-    pub float_bg: QuantizedColor,
-    pub visual: QuantizedColor,
-    pub fg: QuantizedColor,
-    pub fg_muted: QuantizedColor,
-    pub accent: QuantizedColor,
-    pub error: QuantizedColor,
-    pub warn: QuantizedColor,
-    pub hint: QuantizedColor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,19 +155,6 @@ pub enum Ansi16Color {
     BrightMagenta = 13,
     BrightCyan = 14,
     BrightWhite = 15,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Ansi16ThemeTokens {
-    pub bg: Ansi16Color,
-    pub float_bg: Ansi16Color,
-    pub visual: Ansi16Color,
-    pub fg: Ansi16Color,
-    pub fg_muted: Ansi16Color,
-    pub accent: Ansi16Color,
-    pub error: Ansi16Color,
-    pub warn: Ansi16Color,
-    pub hint: Ansi16Color,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -301,24 +244,53 @@ pub enum HighlightGroup {
 }
 
 impl HighlightGroup {
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "Normal" => Some(Self::Normal),
-            "NormalFloat" => Some(Self::NormalFloat),
-            "FloatBorder" => Some(Self::FloatBorder),
-            "Pmenu" => Some(Self::Pmenu),
-            "PmenuSel" => Some(Self::PmenuSel),
-            "PmenuKind" => Some(Self::PmenuKind),
-            "PmenuExtra" => Some(Self::PmenuExtra),
-            "PmenuSbar" => Some(Self::PmenuSbar),
-            "PmenuThumb" => Some(Self::PmenuThumb),
-            "MsgArea" => Some(Self::MsgArea),
-            "MsgSeparator" => Some(Self::MsgSeparator),
-            "WildMenu" => Some(Self::WildMenu),
-            "ErrorMsg" => Some(Self::ErrorMsg),
-            "WarningMsg" => Some(Self::WarningMsg),
-            _ => None,
+    /// Every group this client maps and can paint.
+    ///
+    /// [`Self::from_name`] is derived from this list, so a variant left out of
+    /// it is unreachable from the server's `hl_attr_define` metadata; the
+    /// contrast audit iterates it, so a variant left out is also unaudited.
+    /// `pinned_group_count` fails when the list and the enum drift.
+    pub const ALL: [Self; 14] = [
+        Self::Normal,
+        Self::NormalFloat,
+        Self::FloatBorder,
+        Self::Pmenu,
+        Self::PmenuSel,
+        Self::PmenuKind,
+        Self::PmenuExtra,
+        Self::PmenuSbar,
+        Self::PmenuThumb,
+        Self::MsgArea,
+        Self::MsgSeparator,
+        Self::WildMenu,
+        Self::ErrorMsg,
+        Self::WarningMsg,
+    ];
+
+    /// The Vim highlight-group name, as it arrives in `ui_name`/`hi_name`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::NormalFloat => "NormalFloat",
+            Self::FloatBorder => "FloatBorder",
+            Self::Pmenu => "Pmenu",
+            Self::PmenuSel => "PmenuSel",
+            Self::PmenuKind => "PmenuKind",
+            Self::PmenuExtra => "PmenuExtra",
+            Self::PmenuSbar => "PmenuSbar",
+            Self::PmenuThumb => "PmenuThumb",
+            Self::MsgArea => "MsgArea",
+            Self::MsgSeparator => "MsgSeparator",
+            Self::WildMenu => "WildMenu",
+            Self::ErrorMsg => "ErrorMsg",
+            Self::WarningMsg => "WarningMsg",
         }
+    }
+
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|group| group.name() == name)
     }
 }
 
@@ -428,10 +400,33 @@ fn fallback_style(tokens: ThemeTokens, group: HighlightGroup) -> HighlightStyle 
     }
 }
 
-fn quantize_text(source: Rgb, backgrounds: &[Rgb], floor: f64) -> QuantizedColor {
+/// The nearest xterm-256 entry to `source` that still clears `floor` against
+/// every background in `backgrounds`.
+///
+/// Quantizing a foreground and its background independently can drop a pair
+/// below the design system's floor, so client-owned chrome resolves its text
+/// color through here rather than by nearest-color alone.
+#[must_use]
+pub fn quantize_text(source: Rgb, backgrounds: &[Rgb], floor: f64) -> QuantizedColor {
     closest_xterm(source, |candidate| {
         backgrounds.iter().all(|background| candidate.contrast(*background) >= floor)
     })
+}
+
+/// The nearest of the sixteen ANSI colors to `source`.
+#[must_use]
+pub fn nearest_ansi16(source: Rgb) -> Ansi16Color {
+    ansi16_from_index(nearest_ansi16_index(source, &|_| true))
+}
+
+/// The nearest ANSI color to `source` that clears `floor` against
+/// `background`, or the nearest one outright when the sixteen colors offer
+/// nothing that does.
+#[must_use]
+pub fn quantize_ansi16_text(source: Rgb, background: Ansi16Color, floor: f64) -> Ansi16Color {
+    let surface = xterm_rgb(background as u8);
+    let index = nearest_ansi16_index(source, &|candidate| candidate.contrast(surface) >= floor);
+    ansi16_from_index(index)
 }
 
 fn closest_xterm(mut source: Rgb, predicate: impl Fn(Rgb) -> bool) -> QuantizedColor {
@@ -492,86 +487,180 @@ pub fn xterm_rgb(index: u8) -> Rgb {
     }
 }
 
-fn nearest_ansi16(source: Rgb) -> Ansi16Color {
-    let mut best = Ansi16Color::Black;
+/// The index of the ANSI color nearest `source` among those satisfying
+/// `predicate`, falling back to the nearest of all sixteen when none do.
+fn nearest_ansi16_index(source: Rgb, predicate: &dyn Fn(Rgb) -> bool) -> u8 {
+    let mut best = None;
     let mut best_distance = u32::MAX;
-    for index in 0..=15 {
+    for index in 0..=15u8 {
         let candidate = xterm_rgb(index);
+        if !predicate(candidate) {
+            continue;
+        }
         let red = i32::from(source.r) - i32::from(candidate.r);
         let green = i32::from(source.g) - i32::from(candidate.g);
         let blue = i32::from(source.b) - i32::from(candidate.b);
         let distance = (red * red + green * green + blue * blue) as u32;
         if distance < best_distance {
-            best = match index {
-                0 => Ansi16Color::Black,
-                1 => Ansi16Color::Red,
-                2 => Ansi16Color::Green,
-                3 => Ansi16Color::Yellow,
-                4 => Ansi16Color::Blue,
-                5 => Ansi16Color::Magenta,
-                6 => Ansi16Color::Cyan,
-                7 => Ansi16Color::White,
-                8 => Ansi16Color::BrightBlack,
-                9 => Ansi16Color::BrightRed,
-                10 => Ansi16Color::BrightGreen,
-                11 => Ansi16Color::BrightYellow,
-                12 => Ansi16Color::BrightBlue,
-                13 => Ansi16Color::BrightMagenta,
-                14 => Ansi16Color::BrightCyan,
-                _ => Ansi16Color::BrightWhite,
-            };
+            best = Some(index);
             best_distance = distance;
         }
     }
-    best
+    match best {
+        Some(index) => index,
+        None => nearest_ansi16_index(source, &|_| true),
+    }
+}
+
+const fn ansi16_from_index(index: u8) -> Ansi16Color {
+    match index {
+        0 => Ansi16Color::Black,
+        1 => Ansi16Color::Red,
+        2 => Ansi16Color::Green,
+        3 => Ansi16Color::Yellow,
+        4 => Ansi16Color::Blue,
+        5 => Ansi16Color::Magenta,
+        6 => Ansi16Color::Cyan,
+        7 => Ansi16Color::White,
+        8 => Ansi16Color::BrightBlack,
+        9 => Ansi16Color::BrightRed,
+        10 => Ansi16Color::BrightGreen,
+        11 => Ansi16Color::BrightYellow,
+        12 => Ansi16Color::BrightBlue,
+        13 => Ansi16Color::BrightMagenta,
+        14 => Ansi16Color::BrightCyan,
+        _ => Ansi16Color::BrightWhite,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn assert_text_gate(tokens: ThemeTokens) {
-        for foreground in [tokens.fg, tokens.accent, tokens.error, tokens.warn, tokens.hint] {
-            for background in [tokens.bg, tokens.float_bg, tokens.visual] {
-                assert!(foreground.contrast(background) >= 4.5);
-            }
-        }
-        for background in [tokens.bg, tokens.float_bg] {
-            assert!(tokens.fg_muted.contrast(background) >= 4.5);
-        }
-        assert!(tokens.bg.contrast(tokens.accent) >= 4.5);
-        assert!(tokens.accent.contrast(tokens.bg) >= 3.0);
-        assert!(tokens.accent.contrast(tokens.float_bg) >= 3.0);
-    }
+    /// The groups whose fallback pair the renderer paints as text. Every one
+    /// of these must clear [`TEXT_CONTRAST_FLOOR`] at every color depth.
+    const TEXT_GROUPS: [HighlightGroup; 12] = [
+        HighlightGroup::Normal,
+        HighlightGroup::NormalFloat,
+        HighlightGroup::FloatBorder,
+        HighlightGroup::Pmenu,
+        HighlightGroup::PmenuSel,
+        HighlightGroup::PmenuKind,
+        HighlightGroup::PmenuExtra,
+        HighlightGroup::MsgArea,
+        HighlightGroup::MsgSeparator,
+        HighlightGroup::WildMenu,
+        HighlightGroup::ErrorMsg,
+        HighlightGroup::WarningMsg,
+    ];
 
-    fn assert_quantized_gate(tokens: QuantizedThemeTokens) {
-        for foreground in [tokens.fg, tokens.accent, tokens.error, tokens.warn, tokens.hint] {
-            for background in [tokens.bg, tokens.float_bg, tokens.visual] {
-                assert!(foreground.rgb.contrast(background.rgb) >= 4.5);
-            }
+    /// `PmenuSbar` and `PmenuThumb` describe a completion scrollbar this
+    /// client does not draw. They exist only so a colorscheme's definitions
+    /// for them are retained rather than discarded, so they ship no text pair
+    /// and are audited at no threshold. Their fallbacks would not clear one:
+    /// `visual` on `float_bg` is 1.26:1 dark and 1.28:1 light.
+    const SURFACE_ONLY_GROUPS: [HighlightGroup; 2] =
+        [HighlightGroup::PmenuSbar, HighlightGroup::PmenuThumb];
+
+    /// The audit is only as complete as its partition, so the partition is
+    /// checked against the enum rather than trusted.
+    #[test]
+    fn every_group_is_classified_as_text_or_surface_exactly_once() {
+        assert_eq!(
+            TEXT_GROUPS.len() + SURFACE_ONLY_GROUPS.len(),
+            HighlightGroup::ALL.len(),
+            "a new highlight group must join TEXT_GROUPS or SURFACE_ONLY_GROUPS"
+        );
+        for group in HighlightGroup::ALL {
+            let text = TEXT_GROUPS.contains(&group);
+            let surface = SURFACE_ONLY_GROUPS.contains(&group);
+            assert!(text != surface, "{} is classified {text}/{surface}", group.name());
         }
-        for background in [tokens.bg, tokens.float_bg] {
-            assert!(tokens.fg_muted.rgb.contrast(background.rgb) >= 4.5);
-        }
-        assert!(tokens.bg.rgb.contrast(tokens.accent.rgb) >= 4.5);
-        assert!(tokens.accent.rgb.contrast(tokens.bg.rgb) >= 3.0);
-        assert!(tokens.accent.rgb.contrast(tokens.float_bg.rgb) >= 3.0);
     }
 
     #[test]
-    fn exact_design_tokens_and_wcag_gates_hold() {
+    fn pinned_group_count_matches_the_all_list() {
+        // Bump deliberately: a group added to the enum without joining ALL is
+        // unreachable from hl_attr_define and unaudited.
+        assert_eq!(HighlightGroup::ALL.len(), 14);
+        for group in HighlightGroup::ALL {
+            assert_eq!(HighlightGroup::from_name(group.name()), Some(group));
+        }
+    }
+
+    #[test]
+    fn exact_design_tokens_hold() {
         assert_eq!(ThemeTokens::DARK.bg, Rgb::new(0x16, 0x18, 0x1d));
+        assert_eq!(ThemeTokens::DARK.float_bg, Rgb::new(0x1d, 0x20, 0x26));
+        assert_eq!(ThemeTokens::DARK.visual, Rgb::new(0x2b, 0x31, 0x40));
+        assert_eq!(ThemeTokens::DARK.fg_muted, Rgb::new(0x87, 0x8c, 0x99));
         assert_eq!(ThemeTokens::DARK.accent, Rgb::new(0xda, 0x83, 0x4f));
+        assert_eq!(ThemeTokens::DARK.error, Rgb::new(0xf2, 0x6f, 0x74));
         assert_eq!(ThemeTokens::LIGHT.bg, Rgb::new(0xf3, 0xf5, 0xfb));
+        assert_eq!(ThemeTokens::LIGHT.float_bg, Rgb::new(0xe6, 0xe9, 0xf1));
+        assert_eq!(ThemeTokens::LIGHT.visual, Rgb::new(0xc7, 0xcf, 0xe4));
+        assert_eq!(ThemeTokens::LIGHT.fg_muted, Rgb::new(0x59, 0x5d, 0x69));
         assert_eq!(ThemeTokens::LIGHT.accent, Rgb::new(0x8d, 0x45, 0x12));
-        assert_text_gate(ThemeTokens::DARK);
-        assert_text_gate(ThemeTokens::LIGHT);
     }
 
+    /// Every text pair the client paints, in both variants, measured rather
+    /// than trusted. The truecolor pair is the design token pair; the
+    /// xterm-256 and sixteen-color pairs are what the renderer's quantizers
+    /// actually emit, so a quantizer that drops a pair below the floor fails
+    /// here instead of shipping.
     #[test]
-    fn quantized_design_tokens_keep_wcag_gates() {
-        assert_quantized_gate(ThemeTokens::DARK.quantized());
-        assert_quantized_gate(ThemeTokens::LIGHT.quantized());
+    fn every_painted_text_pair_clears_the_contrast_floor() {
+        for variant in [ThemeVariant::Dark, ThemeVariant::Light] {
+            let theme = ThemeTokens::for_variant(variant);
+            for group in TEXT_GROUPS {
+                let style = fallback_style(theme, group);
+                let (Some(foreground), Some(background)) = (style.foreground, style.background)
+                else {
+                    panic!("{} has no fallback pair", group.name());
+                };
+                let direct = foreground.contrast(background);
+                assert!(
+                    direct >= TEXT_CONTRAST_FLOOR,
+                    "{variant:?} {} truecolor {direct:.2}",
+                    group.name()
+                );
+
+                let surface = background.quantize_xterm();
+                let text = quantize_text(foreground, &[surface.rgb], TEXT_CONTRAST_FLOOR);
+                let quantized = text.rgb.contrast(surface.rgb);
+                assert!(
+                    quantized >= TEXT_CONTRAST_FLOOR,
+                    "{variant:?} {} xterm256 {quantized:.2}",
+                    group.name()
+                );
+
+                let surface = nearest_ansi16(background);
+                let text = quantize_ansi16_text(foreground, surface, TEXT_CONTRAST_FLOOR);
+                let ansi = xterm_rgb(text as u8).contrast(xterm_rgb(surface as u8));
+                assert!(
+                    ansi >= TEXT_CONTRAST_FLOOR,
+                    "{variant:?} {} ansi16 {ansi:.2}",
+                    group.name()
+                );
+            }
+        }
+    }
+
+    /// The floor is only worth having if nearest-color selection would in fact
+    /// break a pair the client ships. It does, on a sixteen-color terminal:
+    /// FloatBorder's accent lands on yellow beside bright white. If this ever
+    /// stops failing, the guard above has become vacuous.
+    #[test]
+    fn nearest_color_selection_would_break_a_pair_the_floor_saves() {
+        let light = ThemeTokens::LIGHT;
+        let surface = nearest_ansi16(light.float_bg);
+        let nearest = xterm_rgb(nearest_ansi16(light.accent) as u8)
+            .contrast(xterm_rgb(surface as u8));
+        assert!(nearest < TEXT_CONTRAST_FLOOR, "nearest-color accent-on-float is {nearest:.2}");
+
+        let floored = xterm_rgb(quantize_ansi16_text(light.accent, surface, TEXT_CONTRAST_FLOOR) as u8)
+            .contrast(xterm_rgb(surface as u8));
+        assert!(floored >= TEXT_CONTRAST_FLOOR, "floored accent-on-float is {floored:.2}");
     }
 
     #[test]
@@ -606,24 +695,33 @@ mod tests {
     #[test]
     fn every_client_group_has_a_fallback() {
         let theme = Theme::new(None);
-        for name in [
-            "Normal", "NormalFloat", "FloatBorder", "Pmenu", "PmenuSel", "PmenuKind",
-            "PmenuExtra", "PmenuSbar", "PmenuThumb", "MsgArea", "MsgSeparator",
-            "WildMenu", "ErrorMsg", "WarningMsg",
-        ] {
-            let group = HighlightGroup::from_name(name).expect("known group");
+        for group in HighlightGroup::ALL {
             let style = theme.style(group);
-            assert!(style.foreground.is_some());
-            assert!(style.background.is_some());
+            assert!(style.foreground.is_some(), "{} foreground", group.name());
+            assert!(style.background.is_some(), "{} background", group.name());
         }
     }
 
     #[test]
-    fn foreground_on_accent_is_the_documented_forbidden_pair() {
-        assert_eq!(FORBIDDEN_FG_ON_ACCENT_CONTRAST, 1.91);
-        for tokens in [ThemeTokens::DARK, ThemeTokens::LIGHT] {
-            assert!(tokens.fg.contrast(tokens.accent) < 4.5);
+    fn foreground_on_accent_is_forbidden_at_the_measured_ratio() {
+        // The brief quotes one aggregate, 1.91:1, which reproduces for neither
+        // variant. Each variant is asserted at its own measured value, so a
+        // palette change that moved either one fails here.
+        for (tokens, documented) in [
+            (ThemeTokens::DARK, FORBIDDEN_FG_ON_ACCENT_DARK),
+            (ThemeTokens::LIGHT, FORBIDDEN_FG_ON_ACCENT_LIGHT),
+        ] {
+            let measured = tokens.fg.contrast(tokens.accent);
+            assert!(
+                (measured - documented).abs() < 0.005,
+                "measured {measured:.4}, documented {documented}"
+            );
+            assert!(measured < TEXT_CONTRAST_FLOOR);
         }
+        // The replacement pairing, with the ratios the brief names.
+        assert!((ThemeTokens::DARK.bg.contrast(ThemeTokens::DARK.accent) - 6.21).abs() < 0.005);
+        assert!((ThemeTokens::LIGHT.bg.contrast(ThemeTokens::LIGHT.accent) - 6.44).abs() < 0.005);
+
         let dark = Theme::new(None);
         assert!(dark
             .validate_client_style(HighlightStyle::colors(ThemeTokens::DARK.fg, ThemeTokens::DARK.accent))
