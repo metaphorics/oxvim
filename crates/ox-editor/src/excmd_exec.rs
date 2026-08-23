@@ -846,6 +846,7 @@ fn dispatch<F: FileIO>(
         "setlocal" => command_set(runtime, editor, scope, &command.args, SetLayer::Local),
         "setglobal" => command_set(runtime, editor, scope, &command.args, SetLayer::Global),
         "syntax" if matches!(command.args.trim(), "on" | "off") => Flow::Normal,
+        "insert" => Flow::Normal,
         "aunmenu" | "tlunmenu" if command.args.trim() == "*" => Flow::Normal,
         "echo" | "echomsg" | "echon" | "echoerr" => {
             command_echo(runtime, editor, scope, lua, name, &command.args)
