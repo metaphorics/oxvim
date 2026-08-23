@@ -470,6 +470,48 @@ pub enum MessageClass {
     Ephemeral,
 }
 
+/// Diagnostic weight of a message.
+///
+/// The design system forbids color as the sole channel, so a diagnostic also
+/// carries a letter. The letter is client-owned chrome painted beside the
+/// message, never a rewrite of the server's bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageSeverity {
+    /// An error message kind (`emsg`, `echoerr`, `lua_error`, `rpc_error`,
+    /// `shell_err`).
+    Error,
+    /// A warning message kind (`wmsg`).
+    Warning,
+    /// Every other kind, including kinds this client does not recognize.
+    Plain,
+}
+
+impl MessageSeverity {
+    /// Classify a `msg_show` kind.
+    ///
+    /// Unknown kinds are [`Self::Plain`]: upstream requires clients to treat a
+    /// kind they do not know as the empty kind
+    /// (`runtime/doc/api-ui-events.txt`, `msg_show`).
+    #[must_use]
+    pub fn from_kind(kind: &OxStr) -> Self {
+        match kind.as_bytes() {
+            b"emsg" | b"echoerr" | b"lua_error" | b"rpc_error" | b"shell_err" => Self::Error,
+            b"wmsg" => Self::Warning,
+            _ => Self::Plain,
+        }
+    }
+
+    /// The non-color letter for a diagnostic, or `None` for plain output.
+    #[must_use]
+    pub const fn letter(self) -> Option<u8> {
+        match self {
+            Self::Error => Some(b'E'),
+            Self::Warning => Some(b'W'),
+            Self::Plain => None,
+        }
+    }
+}
+
 /// Current lifetime state of a visible message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MessageLifetime {
@@ -487,6 +529,14 @@ pub struct MessageEntry {
     pub history: bool,
     pub lifetime: MessageLifetime,
     pub sequence: u64,
+}
+
+impl MessageEntry {
+    /// The diagnostic weight this entry's kind carries.
+    #[must_use]
+    pub fn severity(&self) -> MessageSeverity {
+        MessageSeverity::from_kind(&self.key.kind)
+    }
 }
 
 /// Input for `msg_show` after RPC decoding.
