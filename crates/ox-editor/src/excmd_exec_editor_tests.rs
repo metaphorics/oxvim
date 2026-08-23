@@ -1625,3 +1625,41 @@ fn redo_rejects_a_count_with_e481() {
     executor.execute_line(&mut editor, "red").unwrap();
     assert_eq!(buffer_text(&editor), vec!["x"]);
 }
+
+// ---------------------------------------------------------------------------
+// winnr() counts within one tabpage.
+// Citation: eval/window.c get_winnr:278-292 (tp_lastwin for "$").
+// ---------------------------------------------------------------------------
+
+/// `winnr('$')` is the current tabpage's window count, not the editor's.
+///
+/// Only reachable once more than one tabpage can exist, which is why this was
+/// latent: with three single-window tabpages upstream answers 1, and 2 after a
+/// `:vnew` in the current one.
+///
+/// Oracle: `:vnew` with eight tabpages open reports `wins=1->2`.
+#[test]
+fn winnr_counts_windows_in_the_current_tabpage_only() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    // Three tabpages, one window each: the editor holds three windows.
+    assert_eq!(editor.windows().len(), 3);
+    executor.execute_line(&mut editor, "let g:count = winnr('$')").unwrap();
+    assert_eq!(global_value(&executor, "count"), Some(ox_types::Typval::Number(1)));
+    executor.execute_line(&mut editor, "vnew").unwrap();
+    executor.execute_line(&mut editor, "let g:after = winnr('$')").unwrap();
+    assert_eq!(global_value(&executor, "after"), Some(ox_types::Typval::Number(2)));
+    assert_eq!(editor.windows().len(), 4);
+}
+
+/// `winnr()` numbers the current window within its own tabpage, so the first
+/// window of a later tabpage is 1 and not its editor-wide index.
+#[test]
+fn winnr_numbers_the_current_window_within_its_tabpage() {
+    let (mut editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    executor.execute_line(&mut editor, "tabnew").unwrap();
+    executor.execute_line(&mut editor, "let g:nr = winnr()").unwrap();
+    assert_eq!(global_value(&executor, "nr"), Some(ox_types::Typval::Number(1)));
+}

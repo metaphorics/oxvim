@@ -27,6 +27,11 @@ pub(crate) fn call<F: FileIO>(
 
 /// `winnr()`: the current window's position in the tabpage, or the window
 /// count for `$` (`f_winnr` → `get_winnr`).
+///
+/// Upstream counts within one tabpage: `get_winnr`
+/// (`eval/window.c:278-292`) walks `tp`'s windows and uses `tp_lastwin` for
+/// `$`. Counting every window in the editor only agreed with that while a
+/// single tabpage was the only reachable state.
 fn call_winnr_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
     if args.len() > 1 {
         return Err(EvalError::new(
@@ -35,7 +40,10 @@ fn call_winnr_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typva
             "Too many arguments for function: winnr",
         ));
     }
-    let windows = editor.windows();
+    let windows = editor
+        .current_tabpage()
+        .and_then(|tab| editor.tabpage_windows(tab).ok())
+        .unwrap_or_default();
     let number = if args.first().is_some_and(|value| typval_to_text(value) == "$") {
         windows.len()
     } else {
@@ -116,10 +124,19 @@ fn call_screen_builtin(editor: &Editor, name: &str, args: Vec<Typval>) -> ox_eva
     })
 }
 
+/// Resolves one screen cell to the character the covering window shows.
+///
+/// Only the current tabpage is on screen, so only its windows can own a cell.
+/// Windows in other tabpages have overlapping geometries and would otherwise
+/// win this search and return a character from something invisible.
 fn screen_cell(editor: &Editor, row: i64, column: i64) -> Option<String> {
     let row = usize::try_from(row.checked_sub(1)?).ok()?;
     let column = usize::try_from(column.checked_sub(1)?).ok()?;
-    for window in editor.windows() {
+    let windows = editor
+        .current_tabpage()
+        .and_then(|tab| editor.tabpage_windows(tab).ok())
+        .unwrap_or_default();
+    for window in windows {
         let geometry = editor.window_geometry(window).ok()?;
         if row < geometry.row || row >= geometry.row + geometry.height || column < geometry.col || column >= geometry.col + geometry.width {
             continue;
