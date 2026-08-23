@@ -35,6 +35,18 @@ pub enum AppError {
     Tui(String),
 }
 
+impl AppError {
+    /// The process status this failure exits with.  Only usage errors vary:
+    /// `main.c` exits 2 for a duplicated script file and 1 for everything
+    /// else, and both statuses are observable by a calling script.
+    fn exit_code(&self) -> u8 {
+        match self {
+            Self::Usage(error) => error.exit_code(),
+            _ => 1,
+        }
+    }
+}
+
 impl fmt::Display for AppError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -58,7 +70,7 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(error) => {
             let _ignored = writeln!(io::stderr().lock(), "{error}");
-            ExitCode::from(1)
+            ExitCode::from(error.exit_code())
         }
     }
 }

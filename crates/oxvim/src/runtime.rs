@@ -106,7 +106,7 @@ pub fn export_vim_environment() -> Result<(), AppError> {
     }
     Ok(())
 }
-/// Execute Ex source read from stdin, with `--cmd` before and `+cmd` after.
+/// Execute Ex source read from stdin, with `--cmd` and `+cmd` before it.
 pub fn run_batch(cli: &Cli) -> Result<(), AppError> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).map_err(AppError::Io)?;
@@ -137,9 +137,11 @@ pub fn run_batch(cli: &Cli) -> Result<(), AppError> {
         .set_runtime_roots_from_rtp(&default_rtp);
     executor.set_channel_ids(editor.channel_ids());
 
+    // main.c finishes startup, `-c`/`+cmd` included, before the Ex command
+    // loop reads its first line of standard input.
     execute_lines(&mut executor, &mut editor, &cli.pre_commands)?;
-    execute_lines(&mut executor, &mut editor, input.lines().collect::<Vec<_>>().as_slice())?;
     execute_lines(&mut executor, &mut editor, &cli.commands)?;
+    execute_lines(&mut executor, &mut editor, input.lines().collect::<Vec<_>>().as_slice())?;
 
     let stdout = io::stdout();
     let stderr = io::stderr();

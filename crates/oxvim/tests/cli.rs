@@ -10,6 +10,29 @@ fn oxvim() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oxvim"))
 }
 
+
+/// Runs a silent Ex batch session and returns its captured output.
+///
+/// `-es` is the only startup mode whose message stream reaches stdout today,
+/// so it is the channel every observable-effect assertion below reads.
+fn batch(arguments: &[&str], input: &str) -> std::process::Output {
+    let mut child = oxvim()
+        .args(["-es", "-u", "NONE", "-i", "NONE"])
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oxvim");
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(input.as_bytes())
+        .expect("write Ex input");
+    child.wait_with_output().expect("wait for oxvim")
+}
+
 fn map_field<'a>(value: &'a Value, name: &str) -> &'a Value {
     value
         .as_map()
@@ -98,13 +121,18 @@ fn lua_failure_and_unknown_option_exit_one() {
 
     let usage = oxvim().arg("--unknown").output().expect("spawn oxvim");
     assert_eq!(usage.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&usage.stderr).contains("Unknown option: --unknown"));
+    assert!(
+        String::from_utf8_lossy(&usage.stderr)
+            .contains("Unknown option argument: \"--unknown\"")
+    );
 }
 
+/// `main.c` finishes startup, `-c`/`+cmd` included, before the Ex command
+/// loop reads its first line of standard input.
 #[test]
-fn batch_executes_pre_commands_before_stdin_and_post_commands_after() {
+fn batch_runs_pre_and_post_commands_before_reading_stdin() {
     let mut child = oxvim()
-        .args(["-es", "--cmd", "let g:pre=1", "+echo g:pre"])
+        .args(["-es", "-u", "NONE", "--cmd", "call setline(1, \"PRE\")", "+call setline(2, \"PLUS\")"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -114,11 +142,11 @@ fn batch_executes_pre_commands_before_stdin_and_post_commands_after() {
         .stdin
         .take()
         .expect("child stdin")
-        .write_all(b"call setline(1, \"x\") | %print\n")
+        .write_all(b"%print\n")
         .expect("write Ex input");
     let output = child.wait_with_output().expect("wait for oxvim");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(output.stdout, b"x\n1\n");
+    assert_eq!(output.stdout, b"PRE\nPLUS\n");
 }
 
 #[test]
@@ -126,7 +154,7 @@ fn bare_script_option_exits_with_usage_error() {
     let output = oxvim().arg("-s").output().expect("spawn oxvim");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Argument missing after: -s"));
+    assert!(stderr.contains("Argument missing after: \"-s\""), "{stderr}");
 }
 
 #[test]
@@ -192,4 +220,80 @@ fn session_flag_sources_file_after_startup() {
     let _removed = std::fs::remove_file(&path);
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("sourced"));
+}
+
+
+/// Upstream keeps `+cmd` and `-c` in one array and runs `--cmd` first, so the
+/// post-startup commands stay in argv order regardless of how they spell.
+#[test]
+fn post_commands_keep_argv_order_after_every_pre_command() {
+    let output = batch(
+        &[
+            "-c",
+            "call setline(1, \"one\")",
+            "--cmd",
+            "let g:pre = \"first\"",
+            "+call setline(2, \"two\")",
+            "-ccall setline(3, \"three\")",
+            "--cmd",
+            "let g:pre = g:pre . \"+second\"",
+        ],
+        "%print\necho g:pre\n",
+    );
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "one\ntwo\nthree\nfirst+second\n");
+}
+
+/// Every usage failure is observable: `mainerr` prints `{prog}: {msg}` with a
+/// `-h` pointer and exits 1, and a repeated script file exits 2.
+#[test]
+fn usage_failures_match_upstream_text_and_status() {
+    for (arguments, message) in [
+        (vec!["--bogus"], "Unknown option argument: \"--bogus\""),
+        (vec!["-Q"], "Unknown option argument: \"-Q\""),
+        (vec!["-uxx", "NONE"], "Garbage after option argument: \"-uxx\""),
+        (vec!["--cmdfoo", "x"], "Garbage after option argument: \"--cmdfoo\""),
+        (vec!["-u"], "Argument missing after: \"-u\""),
+        (vec!["-c"], "Argument missing after: \"-c\""),
+    ] {
+        let output = oxvim().args(&arguments).output().expect("spawn oxvim");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}: {stderr}");
+        assert!(stderr.contains(message), "{arguments:?}: {stderr}");
+        assert!(stderr.contains("More info with \"oxvim -h\""), "{arguments:?}: {stderr}");
+    }
+    // scripterror: a bare line and status 2, with no "-h" pointer.
+    let output = oxvim().args(["-s", "a", "-s", "b"]).output().expect("spawn oxvim");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("Attempt to open script file again: \"-s b\""), "{stderr}");
+    assert!(!stderr.contains("More info"), "{stderr}");
+}
+
+/// A flag whose honest behavior needs a subsystem oxvim does not have is
+/// rejected, not accepted and ignored: a caller can detect the status and the
+/// named requirement, but could never detect a silent no-op.
+#[test]
+fn flags_without_their_subsystem_are_rejected_by_name() {
+    for (arguments, requirement) in [
+        (vec!["-d"], "a diff engine"),
+        (vec!["-A"], "the 'arabic' option side effects and keymap files"),
+        (vec!["-H"], "keymap file loading"),
+        (vec!["-D"], "the Ex debugger"),
+        (vec!["-q", "errors.err"], "the quickfix list and 'errorformat'"),
+        (vec!["-t", "sometag"], "the tags subsystem"),
+        (vec!["-r"], "swap-file recovery"),
+        (vec!["-L"], "swap-file recovery"),
+        (vec!["-W", "keys.log"], "script recording of typed keys"),
+        (vec!["--remote", "file"], "RPC client channels and vim._cs_remote"),
+        (vec!["--remote-send", "iabc"], "RPC client channels and vim._cs_remote"),
+        (vec!["--server", "127.0.0.1:1"], "RPC client channels and vim._cs_remote"),
+        (vec!["--luamod-dev"], "the Lua module preload table"),
+    ] {
+        let output = oxvim().args(&arguments).output().expect("spawn oxvim");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}: {stderr}");
+        assert!(stderr.contains("Option not supported"), "{arguments:?}: {stderr}");
+        assert!(stderr.contains(requirement), "{arguments:?}: {stderr}");
+    }
 }
