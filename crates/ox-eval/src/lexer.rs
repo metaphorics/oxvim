@@ -752,6 +752,12 @@ fn decode_special_key(name: &[u8], offset: usize) -> Result<Vec<u8>, EvalError> 
         name = &name[2..];
     }
     let lower: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
+    let mut output = Vec::new();
+    if modifiers != 0 { output.extend_from_slice(&[SPECIAL, MODIFIER, modifiers]); }
+    if let [b'f', digit @ b'1'..=b'9'] = lower.as_slice() {
+        output.extend_from_slice(&[SPECIAL, b'k', *digit]);
+        return Ok(output);
+    }
     let named = match lower.as_slice() {
         b"bs" => Some((b'B', 0x08)),
         b"tab" => Some((b'T', b'\t')),
@@ -766,8 +772,6 @@ fn decode_special_key(name: &[u8], offset: usize) -> Result<Vec<u8>, EvalError> 
         b"home" => Some((b'H', 0)),
         _ => None,
     };
-    let mut output = Vec::new();
-    if modifiers != 0 { output.extend_from_slice(&[SPECIAL, MODIFIER, modifiers]); }
     if let Some((code, literal)) = named {
         if modifiers == 0 || code == b'H' { output.extend_from_slice(&[SPECIAL, EXTRA, code]); } else { output.push(literal); }
         return Ok(output);

@@ -5764,33 +5764,62 @@ fn call_feedkeys_builtin(editor: &mut Editor, args: Vec<Typval>) -> ox_eval::Res
 }
 
 fn call_getchar_builtin(editor: &mut Editor, name: &str, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    const KS_MODIFIER: u8 = 0xfc;
     if args.len() > 2 {
         return Err(EvalError::new("E118", 0, format!("Too many arguments for function: {name}")));
     }
-    let Some(key) = editor.typeahead_mut().pop().map_err(|error| EvalError::new("E475", 0, error.to_string()))? else {
-        return Ok(if name == "getcharstr" { Typval::String(OxStr::from("")) } else { Typval::Number(0) });
-    };
-    let simplified = match key {
-        Key::Special(KS_EXTRA, b'T') => Some(b'\t'),
-        Key::Special(KS_EXTRA, b'N') => Some(b'\n'),
-        Key::Special(KS_EXTRA, b'R') => Some(b'\r'),
-        Key::Special(KS_EXTRA, b'E') => Some(0x1b),
-        Key::Special(KS_EXTRA, b'S') => Some(b' '),
-        Key::Special(KS_EXTRA, b'L') => Some(b'<'),
-        Key::Special(KS_EXTRA, b'D') => Some(0x7f),
-        Key::Byte(byte) => Some(byte),
-        Key::Special(_, _) => None,
-    };
-    if name == "getcharstr" {
-        return Ok(Typval::String(match (key, simplified) {
-            (_, Some(byte)) => OxStr(vec![byte]),
-            (Key::Special(second, third), None) => OxStr(vec![K_SPECIAL, second, third]),
-            (Key::Byte(byte), None) => OxStr(vec![byte]),
-        }));
+    let mut number = name == "getchar";
+    let mut simplify = true;
+    if let Some(options) = args.get(1) {
+        let Typval::Dict(options) = options else {
+            return Err(EvalError::new("E1206", 0, "Dictionary required for argument 2"));
+        };
+        let options = options.try_borrow().map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?;
+        for (key, value) in &options.entries {
+            match key.as_bytes() {
+                b"number" if name == "getcharstr" => {
+                    return Err(EvalError::new("E475", 0, "Invalid value for argument number"));
+                }
+                b"number" => number = value.is_truthy(),
+                b"simplify" => simplify = value.is_truthy(),
+                _ => {}
+            }
+        }
     }
-    Ok(match (key, simplified) {
-        (_, Some(byte)) => Typval::Number(i64::from(byte)),
-        (Key::Special(second, third), None) => Typval::String(OxStr(vec![K_SPECIAL, second, third])),
-        (Key::Byte(byte), None) => Typval::Number(i64::from(byte)),
-    })
+    let Some(first) = editor.typeahead_mut().pop().map_err(|error| EvalError::new("E475", 0, error.to_string()))? else {
+        return Ok(if number { Typval::Number(0) } else { Typval::String(OxStr::from("")) });
+    };
+    let mut keys = vec![first];
+    if matches!(first, Key::Special(KS_MODIFIER, _)) {
+        if let Some(key) = editor.typeahead_mut().pop().map_err(|error| EvalError::new("E475", 0, error.to_string()))? {
+            keys.push(key);
+        }
+    }
+    let raw = keys.iter().flat_map(|key| match key {
+        Key::Byte(byte) => vec![*byte],
+        Key::Special(second, third) => vec![K_SPECIAL, *second, *third],
+    }).collect::<Vec<_>>();
+    let simplified = if simplify {
+        match keys.as_slice() {
+            [Key::Special(KS_EXTRA, b'T')] => Some(b'\t'),
+            [Key::Special(KS_EXTRA, b'N')] => Some(b'\n'),
+            [Key::Special(KS_EXTRA, b'R')] => Some(b'\r'),
+            [Key::Special(KS_EXTRA, b'E')] => Some(0x1b),
+            [Key::Special(KS_EXTRA, b'S')] => Some(b' '),
+            [Key::Special(KS_EXTRA, b'L')] => Some(b'<'),
+            [Key::Special(KS_EXTRA, b'D')] => Some(0x7f),
+            [Key::Special(KS_MODIFIER, modifiers), Key::Byte(byte)] if modifiers & 2 != 0 => Some(byte & 0x1f),
+            [Key::Byte(byte)] => Some(*byte),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if number {
+        return Ok(simplified.map_or_else(
+            || Typval::String(OxStr(raw)),
+            |byte| Typval::Number(i64::from(byte)),
+        ));
+    }
+    Ok(Typval::String(OxStr(simplified.map_or(raw, |byte| vec![byte]))))
 }

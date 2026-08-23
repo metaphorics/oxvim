@@ -1258,6 +1258,37 @@ fn feedkeys_builtin_queues_input_consumed_by_getchar() {
 }
 
 #[test]
+fn getchar_special_keys_preserve_or_simplify_as_requested() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &mut editor,
+        "getchar.vim",
+        r#"call feedkeys("\<M-F2>", '')
+let g:function_key = getchar(0)
+call feedkeys("\<*C-I>", '')
+let g:control_i = getchar(-1)
+call feedkeys("\<*C-I>", '')
+let g:raw_control_i = getchar(-1, #{simplify: v:false})
+call feedkeys("\<Tab>", '')
+let g:string_tab = getchar(-1, #{number: v:false})"#,
+    ).unwrap();
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"function_key", 0),
+        Ok(&Typval::String(OxStr(vec![0x80, 0xfc, 4, 0x80, b'k', b'2'])))
+    );
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"control_i", 0), Ok(&Typval::Number(9)));
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"raw_control_i", 0),
+        Ok(&Typval::String(OxStr(vec![0x80, 0xfc, 2, b'I'])))
+    );
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"string_tab", 0),
+        Ok(&Typval::String(OxStr(vec![b'\t'])))
+    );
+}
+
+#[test]
 fn progpath_is_seeded_from_the_running_executable() {
     let mut editor = Editor::new();
     let mut exec = ExExecutor::new();
