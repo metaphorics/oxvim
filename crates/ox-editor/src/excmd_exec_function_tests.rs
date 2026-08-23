@@ -601,7 +601,7 @@ fn closure_captures_defining_local_scope() {
     scope.set(b"captured", Typval::Number(123)).unwrap();
     let sig = UserFunctions::parse_signature("Clo() closure").unwrap();
     funcs
-        .define(sig, vec!["return l:captured".to_owned()], 0, false, &scope)
+        .define(sig, vec!["return l:captured".to_owned()], 0, 0, false, &scope)
         .unwrap();
     let func = funcs.get("Clo", 0).unwrap();
     assert!(func.flags.closure);
@@ -646,7 +646,7 @@ fn recursion_exceeds_maxfuncdepth_e132() {
     let mut funcs = UserFunctions::new();
     let sig = UserFunctions::parse_signature("Recurse()").unwrap();
     funcs
-        .define(sig, vec![], 0, false, &Scope::new())
+        .define(sig, vec![], 0, 0, false, &Scope::new())
         .unwrap();
     let mut scope = Scope::new();
     for _ in 0..MAX_FUNC_DEPTH {
@@ -873,6 +873,125 @@ fn nested_source_restores_caller_sid_and_script_scope() {
     // SID registry reflects both scripts
     let names = exec.scripts().script_names();
     assert_eq!(names, vec![(1, "/outer.vim"), (2, "/inner.vim")]);
+}
+
+// ---------------------------------------------------------------------------
+// Family: command resolution happens when a line runs, and re-sourcing a
+// script reuses its SID (ex_docmd.c find_ex_command / do_one_cmd;
+// runtime.c:2226,2333 find_script_by_name + sc_seq)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_user_command_is_resolved_when_its_line_runs_not_when_it_is_parsed() {
+    // find_ex_command consults the live command table inside do_one_cmd, so a
+    // :command created earlier in the same script — or in a script sourced by
+    // it — is visible on a later line even though the whole body was read
+    // first. check.vim's CheckFunction reaches test bodies exactly this way.
+    let io = MemoryFileIO::new();
+    io.insert("/guard.vim", "command! -nargs=1 T69Guard let g:guarded = <q-args>");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.execute_script(
+        &mut editor,
+        "/main.vim",
+        "command! -nargs=1 T69Same let g:same = <q-args>\n\
+         T69Same here\n\
+         source /guard.vim\n\
+         function! T69Body()\n\
+         T69Guard inside\n\
+         endfunction\n\
+         call T69Body()",
+    )
+    .unwrap();
+    assert_eq!(global_string(exec.scope(), "same").as_deref(), Some("here"));
+    assert_eq!(global_string(exec.scope(), "guarded").as_deref(), Some("inside"));
+}
+
+#[test]
+fn an_unresolvable_command_still_reports_e492_after_the_retry() {
+    // The retry is a re-resolution, not a rescue: a name no :command ever
+    // created reports E492 exactly as before.
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    let err = exec
+        .execute_script(&mut editor, "/main.vim", "T69NeverDefined arg")
+        .unwrap_err();
+    assert_eq!(error_code(&err), "E492");
+}
+
+#[test]
+fn re_sourcing_a_script_keeps_its_script_local_variables() {
+    // do_source looks the file up with find_script_by_name and reuses its SID
+    // (runtime.c:2226,2335), so `if exists('s:did_load') | finish | endif`
+    // — setup.vim:50-53, which guards the `comclear` that wipes every user
+    // command — short-circuits on the second sourcing.
+    let io = MemoryFileIO::new();
+    io.insert(
+        "/guarded.vim",
+        "let g:runs = get(g:, 'runs', 0) + 1\n\
+         if exists('s:did_load')\n\
+         finish\n\
+         endif\n\
+         let s:did_load = 1\n\
+         let g:bodies = get(g:, 'bodies', 0) + 1",
+    );
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.execute_script(
+        &mut editor,
+        "/main.vim",
+        "source /guarded.vim\nsource /guarded.vim\nsource /guarded.vim",
+    )
+    .unwrap();
+    assert_eq!(global_number(exec.scope(), "runs"), Some(3));
+    assert_eq!(global_number(exec.scope(), "bodies"), Some(1));
+    // One registry entry for the file, not one per sourcing event.
+    assert_eq!(
+        exec.scripts().script_names(),
+        vec![(1, "/main.vim"), (2, "/guarded.vim")]
+    );
+}
+
+#[test]
+fn a_reloaded_script_redefines_its_own_command_and_function_but_a_stranger_cannot() {
+    // "can be replaced with ! and when sourcing the same script again, but
+    // only once": usercmd.c:940-948 and eval/userfunc.c:2856-2863 both key on
+    // (sc_sid, sc_seq). Same SID, new sequence — silent replace. Different
+    // SID — E174/E122.
+    let io = MemoryFileIO::new();
+    io.insert(
+        "/defs.vim",
+        "command -nargs=1 T69Dup let g:dup = <q-args>\nfunc T69Fn()\nendfunc",
+    );
+    io.insert("/other.vim", "command -nargs=1 T69Dup let g:dup = 'other'");
+    io.insert("/otherfn.vim", "func T69Fn()\nendfunc");
+    // Two definitions inside *one* sourcing share a sequence number, so the
+    // reload exemption must not cover them.
+    io.insert(
+        "/twice.vim",
+        "command -nargs=1 T69Once echo 1\ncommand -nargs=1 T69Once echo 2",
+    );
+    io.insert("/twicefn.vim", "func T69Twice()\nendfunc\nfunc T69Twice()\nendfunc");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.execute_script(&mut editor, "/main.vim", "source /defs.vim\nsource /defs.vim")
+        .unwrap();
+    let command_err = exec
+        .execute_script(&mut editor, "/caller.vim", "source /other.vim")
+        .unwrap_err();
+    assert_eq!(error_code(&command_err), "E174");
+    let function_err = exec
+        .execute_script(&mut editor, "/caller2.vim", "source /otherfn.vim")
+        .unwrap_err();
+    assert_eq!(error_code(&function_err), "E122");
+    let same_seq_command = exec
+        .execute_script(&mut editor, "/caller3.vim", "source /twice.vim")
+        .unwrap_err();
+    assert_eq!(error_code(&same_seq_command), "E174");
+    let same_seq_function = exec
+        .execute_script(&mut editor, "/caller4.vim", "source /twicefn.vim")
+        .unwrap_err();
+    assert_eq!(error_code(&same_seq_function), "E122");
 }
 
 // ---------------------------------------------------------------------------

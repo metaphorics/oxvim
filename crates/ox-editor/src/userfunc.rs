@@ -47,6 +47,10 @@ pub struct UserFunc {
     pub body: Vec<String>,
     /// SID of the defining script, or zero for command-line definitions.
     pub sid: Sid,
+    /// Sourcing sequence in force when the function was defined, upstream's
+    /// `uf_script_ctx.sc_seq`. Only a *different* sequence under the same
+    /// SID is a reload the definition may replace without `!`.
+    pub seq: u64,
     /// Optional defining local-scope snapshot for `closure` functions.
     pub captured: ScopeMap,
 }
@@ -259,6 +263,7 @@ impl UserFunctions {
         signature: FunctionSignature,
         body: Vec<String>,
         sid: Sid,
+        seq: u64,
         replace: bool,
         scope: &Scope,
     ) -> Result<String, UserFuncError> {
@@ -284,6 +289,7 @@ impl UserFunctions {
                 flags: signature.flags,
                 body,
                 sid,
+                seq,
                 captured,
             },
         );

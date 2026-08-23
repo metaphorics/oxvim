@@ -216,8 +216,9 @@ pub struct UserCommand {
     pub accepts_range: bool,
     /// Whether invocation accepts a register.
     pub accepts_register: bool,
-    /// Canonical source script and sourcing SID that defined this command.
-    source: Option<(String, Sid)>,
+    /// SID and sourcing sequence of the `:command` that created this entry,
+    /// upstream's `uc_script_ctx`. `(0, 0)` outside any script.
+    script: (Sid, u64),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -950,7 +951,34 @@ fn run_instructions<F: FileIO>(
         };
         let command = match instruction.command() {
             Ok(command) => command,
-            Err(error) => return exec_error_flow(runtime, ExecError::Parse(error.clone())),
+            Err(_) => {
+                // `find_ex_command` runs when the line is *executed*, not when
+                // the enclosing script or function body was read
+                // (`ex_docmd.c` `do_one_cmd`), so a `:command` created after
+                // this line was parsed is visible here. Nothing else in a
+                // parse depends on state that can change, so the retry is on
+                // the error path only.
+                let error = instruction
+                    .parse_error
+                    .clone()
+                    .expect("deferred instruction has a parse error");
+                let logical = [LogicalLine {
+                    text: instruction.source.clone(),
+                    first_line: instruction.line,
+                }];
+                let retry = parse_program(&runtime.user_commands, &logical)
+                    .ok()
+                    .filter(|retry| !retry.is_empty() && retry.iter().all(|item| item.command.is_some()));
+                let Some(retry) = retry else {
+                    return exec_error_flow(runtime, ExecError::Parse(error));
+                };
+                let flow = run_program(runtime, editor, scope, lua, &retry, 0, retry.len());
+                if !matches!(flow, Flow::Normal) {
+                    return flow;
+                }
+                pc += 1;
+                continue;
+            }
         };
         let name = command.command.name();
         match name {
@@ -1104,15 +1132,19 @@ fn run_instructions<F: FileIO>(
                     .map(|item| item.source.clone())
                     .collect::<Vec<_>>();
                 let sid = runtime.scripts.current_sid().unwrap_or(0);
-                let same_script_reload = runtime.functions.get(&signature.name, sid).is_some_and(|existing| {
-                    existing.sid != sid
-                        && runtime.scripts.current_name().is_some_and(|name| !name.starts_with('<'))
-                        && runtime.scripts.script_name(existing.sid) == runtime.scripts.current_name()
-                });
+                let seq = runtime.scripts.current_seq();
+                // "Function can be replaced with function! and when sourcing
+                // the same script again, but only once"
+                // (`eval/userfunc.c:2856-2863`).
+                let same_script_reload = runtime
+                    .functions
+                    .get(&signature.name, sid)
+                    .is_some_and(|existing| existing.sid == sid && existing.seq != seq);
                 let canonical = match runtime.functions.define(
                     signature,
                     body,
                     sid,
+                    seq,
                     command.bang || same_script_reload,
                     scope,
                 ) {
@@ -5445,24 +5477,19 @@ fn command_user_command<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Edit
     }
     let Some(name) = words.next() else { return error_flow(runtime, "E183", "User defined commands must be capitalized") };
     if !valid_user_command_name(name) { return error_flow(runtime, "E183", "User defined commands must be capitalized") }
-    let source = runtime
-        .scripts
-        .current_name()
-        .zip(runtime.scripts.current_sid())
-        .map(|(name, sid)| (name.to_owned(), sid));
+    let script = (runtime.scripts.current_sid().unwrap_or(0), runtime.scripts.current_seq());
     if let Some(existing) = runtime.user_commands.commands.get(name) {
-        let same_script_new_source = match (&existing.source, &source) {
-            (Some((existing_name, existing_sid)), Some((current_name, current_sid))) => {
-                existing_name == current_name && existing_sid != current_sid
-            }
-            _ => false,
-        };
-        if !command.bang && !same_script_new_source {
+        // "Command can be replaced with command! and when sourcing the same
+        // script again, but only once" (`usercmd.c:940-948`): the same SID
+        // with a *different* sequence number is a reload and replaces
+        // silently; anything else is E174.
+        let same_script_reload = existing.script.0 == script.0 && existing.script.1 != script.1;
+        if !command.bang && !same_script_reload {
             return error_flow(runtime, "E174", "Command already exists: add ! to replace it");
         }
     }
     let body = words.collect::<Vec<_>>().join(" ");
-    runtime.user_commands.commands.insert(name.to_owned(), UserCommand { name: name.to_owned(), body, nargs, accepts_bang, accepts_range, accepts_register, source });
+    runtime.user_commands.commands.insert(name.to_owned(), UserCommand { name: name.to_owned(), body, nargs, accepts_bang, accepts_range, accepts_register, script });
     Flow::Normal
 }
 

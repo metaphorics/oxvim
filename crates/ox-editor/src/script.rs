@@ -318,8 +318,15 @@ impl std::error::Error for ScriptError {}
 /// One active `:source` frame: the script currently being executed.
 #[derive(Clone, Debug)]
 pub struct SourceFrame {
-    /// SID allocated for this sourcing event.
+    /// SID of the script being sourced. Re-sourcing the same file reuses
+    /// its SID (`runtime.c` `find_script_by_name`), so `s:` variables and
+    /// `<SNR>` names survive.
     pub sid: Sid,
+    /// Sequence number of *this* sourcing event, fresh every time
+    /// (`current_sctx.sc_seq = ++last_current_SID_seq`, `runtime.c:2333`).
+    /// Together with `sid` it is what lets a script redefine its own
+    /// functions and commands on a reload without `!`.
+    pub seq: u64,
     /// Display name used in throwpoints (`/abs/path.vim` or `<cmdline>`).
     pub name: String,
     /// One-based physical line currently executing.
@@ -474,6 +481,7 @@ fn expand_home(path: &str) -> String {
 pub struct ScriptCtx<F: FileIO = RealFileIO> {
     io: F,
     next_sid: Sid,
+    next_seq: u64,
     scripts: BTreeMap<Sid, ScriptInfo>,
     source_stack: Vec<SourceFrame>,
     sourced_once: BTreeSet<PathBuf>,
@@ -487,6 +495,7 @@ impl<F: FileIO> ScriptCtx<F> {
         Self {
             io,
             next_sid: 1,
+            next_seq: 0,
             scripts: BTreeMap::new(),
             source_stack: Vec::new(),
             sourced_once: BTreeSet::new(),
@@ -521,8 +530,7 @@ impl<F: FileIO> ScriptCtx<F> {
             .collect();
     }
 
-    /// Allocates a fresh SID for one sourcing event. SIDs are monotone and
-    /// never reused, so `<SNR>` references remain stable for the session.
+    /// Allocates a fresh SID for one sourcing event.
     pub fn allocate_sid(&mut self, name: &str) -> Sid {
         let sid = self.next_sid;
         self.next_sid = self.next_sid.saturating_add(1);
@@ -536,15 +544,42 @@ impl<F: FileIO> ScriptCtx<F> {
         sid
     }
 
-    /// Pushes a source frame, returning the allocated SID.
+    /// Pushes a source frame, returning the SID whose `s:` scope the frame
+    /// runs in.
+    ///
+    /// `do_source` looks the file up with `find_script_by_name` and reuses
+    /// the SID it already has (`runtime.c:2226,2335`), so a script sourced
+    /// twice keeps its `s:` variables and its `<SNR>` number; only the
+    /// sequence number is new. That is what makes a guard like setup.vim's
+    /// `if exists('s:did_load') | finish | endif` work on the second
+    /// sourcing. Named contexts that are not files — `<command line>` and
+    /// friends — are not looked up, matching `do_source_str`, which never
+    /// consults the registry.
     pub fn push_source(&mut self, name: String) -> Sid {
-        let sid = self.allocate_sid(&name);
+        let sid = self
+            .reusable_sid(&name)
+            .unwrap_or_else(|| self.allocate_sid(&name));
+        self.next_seq = self.next_seq.saturating_add(1);
         self.source_stack.push(SourceFrame {
             sid,
+            seq: self.next_seq,
             name,
             current_line: 0,
         });
         sid
+    }
+
+    /// The SID a previous sourcing of `name` already owns, when `name` is a
+    /// file rather than an anonymous context.
+    fn reusable_sid(&self, name: &str) -> Option<Sid> {
+        if name.starts_with('<') {
+            return None;
+        }
+        self.scripts
+            .iter()
+            .rev()
+            .find(|(_, info)| info.name == name)
+            .map(|(sid, _)| *sid)
     }
 
     /// Pops the current source frame, returning the SID of the caller when
@@ -558,6 +593,14 @@ impl<F: FileIO> ScriptCtx<F> {
     #[must_use]
     pub fn current_sid(&self) -> Option<Sid> {
         self.source_stack.last().map(|frame| frame.sid)
+    }
+
+    /// The sequence number of the sourcing event currently running, or `0`
+    /// outside any script (upstream's `current_sctx.sc_seq`, which starts at
+    /// zero and is only ever bumped by `do_source`).
+    #[must_use]
+    pub fn current_seq(&self) -> u64 {
+        self.source_stack.last().map_or(0, |frame| frame.seq)
     }
 
     /// The display name of the current script or line context.

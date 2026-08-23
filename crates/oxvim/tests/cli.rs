@@ -570,10 +570,11 @@ fn startuptime_writes_a_timing_log() {
 /// `crates/ox-eval/src/builtins_tests.rs`; these are the ones that need a real
 /// editor, so they are exercised here through the process the tests run.
 ///
-/// `user_commands` is checked inside a function because a user command in a
-/// script body is resolved when the line is parsed, which is the separate
-/// defect recorded in `.outline/sdd/reports/task-62.md`; `check.vim` reaches
-/// `CheckFeature` through a function call, so this is the path that matters.
+/// `user_commands` is checked inside a function because that is the path
+/// `check.vim` reaches `CheckFeature` through, and it is the path that used to
+/// fail: a user command was resolved when the enclosing body was parsed rather
+/// than when the line ran (`.outline/sdd/reports/task-62.md`, fixed in task
+/// 69).
 #[test]
 fn features_reported_present_have_their_capability() {
     let cases: &[(&str, &str, &str)] = &[
