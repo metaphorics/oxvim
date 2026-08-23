@@ -31,6 +31,8 @@ target/
 !.outline/sdd/progress.md
 !.outline/sdd/oldtest-census.tsv
 !.outline/sdd/oldtest-blockers.md
+!.outline/sdd/oldtest-census-2.tsv
+!.outline/sdd/oldtest-blockers-2.md
 .plan/
 PLAN.md
 TASKS.md
