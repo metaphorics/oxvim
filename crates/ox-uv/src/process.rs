@@ -427,6 +427,16 @@ impl ProcessPipe {
         Ok(id)
     }
 
+    /// Whether a queued write is still waiting for writable readiness.
+    ///
+    /// A caller that has to close this endpoint — child standard input, whose
+    /// close is the child's EOF — needs to know when the queue has drained, so
+    /// it can pump the loop rather than truncate the data.
+    #[must_use]
+    pub fn has_pending_writes(&self) -> bool {
+        !self.state.borrow().writes.pending.is_empty()
+    }
+
     /// Finishes pending writes and closes the child-stdin stream.
     pub fn shutdown(&mut self, uv_loop: &mut UvLoop) -> NetResult<()> {
         let result = {
