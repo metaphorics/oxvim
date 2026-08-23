@@ -33,6 +33,8 @@ target/
 !.outline/sdd/oldtest-blockers.md
 !.outline/sdd/oldtest-census-2.tsv
 !.outline/sdd/oldtest-blockers-2.md
+!.outline/sdd/oldtest-census-3.tsv
+!.outline/sdd/oldtest-blockers-3.md
 .plan/
 PLAN.md
 TASKS.md
