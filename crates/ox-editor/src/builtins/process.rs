@@ -15,65 +15,23 @@ use crate::{Editor, JobCallbacks, JobEvent, JobManager, JobStartOptions};
 use crate::excmd_exec::{EvalHost, ExRuntime, LuaExec, call_user_function_with_self, flow_to_eval_error, replace_scope_pair, typval_to_object};
 
 /// Routes one process builtin.
+///
+/// Every name [`super::route`] sends to [`super::Family::Process`] is served
+/// here. There used to be a second dispatcher below this one -- serving five
+/// of these eight names and ending in a bare `unreachable!()` -- which the
+/// public `ExExecutor::call_builtin` entry point called directly, so
+/// `jobstart`, `system` and `systemlist` (and every other builtin name a
+/// caller passed it) panicked instead of running. One match over one name set
+/// cannot drift that way.
 pub(crate) fn call<F: FileIO>(
     host: &mut EvalHost<'_, F>,
     name: &str,
     args: Vec<Typval>,
     scope: &mut Scope,
 ) -> ox_eval::Result<Typval> {
-    match name {
-        "chansend" | "jobpid" | "jobsend" | "jobstop" | "jobwait" => {
-            call_job_builtin(host.runtime, host.editor, scope, host.lua, name, args)
-        }
-        "jobstart" | "system" | "systemlist" => {
-            let shell = shell_argv(host.editor);
-            match name {
-                "jobstart" => call_job_start(host.runtime, &shell, args),
-                "system" => call_system_builtin(host.runtime, &shell, args, scope),
-                _ => call_systemlist_builtin(host.runtime, &shell, args, scope),
-            }
-        }
-        _ => unreachable!("process builtin route and dispatcher disagree"),
-    }
-}
-
-/// The `'shell'` + `'shellcmdflag'` prefix a String command is executed
-/// through, upstream `shell_build_argv` (`os/shell.c` 60-97).
-///
-/// Both options may carry arguments of their own, and
-/// `set_init_default_shell` (`option.c` 182-199) double-quotes a `$SHELL`
-/// holding a space, so a quoted first word is one word.
-fn shell_argv(editor: &Editor) -> Vec<String> {
-    let read = |name: &str, fallback: &str| match editor.options().get_global(name) {
-        Ok(OptionValue::String(value)) if !value.is_empty() => value.clone(),
-        _ => fallback.to_owned(),
-    };
-    let shell = read("shell", if cfg!(windows) { "cmd.exe" } else { "sh" });
-    let mut argv = split_shell_words(&shell);
-    argv.extend(split_shell_words(&read("shellcmdflag", if cfg!(windows) { "/c" } else { "-c" })));
-    argv
-}
-
-fn split_shell_words(text: &str) -> Vec<String> {
-    let text = text.trim();
-    if let Some(rest) = text.strip_prefix('"') {
-        if let Some((quoted, tail)) = rest.split_once('"') {
-            let mut argv = vec![quoted.to_owned()];
-            argv.extend(tail.split_whitespace().map(str::to_owned));
-            return argv;
-        }
-    }
-    text.split_whitespace().map(str::to_owned).collect()
-}
-
-pub(crate) fn call_job_builtin<F: FileIO>(
-    runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
-    scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
-    name: &str,
-    args: Vec<Typval>,
-) -> ox_eval::Result<Typval> {
+    let runtime = &mut *host.runtime;
+    let editor = &mut *host.editor;
+    let lua = host.lua;
     match name {
         "jobstop" => {
             let id = job_id(args.first())?;
@@ -109,8 +67,45 @@ pub(crate) fn call_job_builtin<F: FileIO>(
             invoke_job_events(runtime, editor, scope, lua, events)?;
             Ok(Typval::list(statuses.into_iter().map(Typval::Number).collect()))
         }
-        _ => unreachable!(),
+        "jobstart" | "system" | "systemlist" => {
+            let shell = shell_argv(editor);
+            match name {
+                "jobstart" => call_job_start(runtime, &shell, args),
+                "system" => call_system_builtin(runtime, &shell, args, scope),
+                _ => call_systemlist_builtin(runtime, &shell, args, scope),
+            }
+        }
+        _ => unreachable!("process builtin route and dispatcher disagree"),
     }
+}
+
+/// The `'shell'` + `'shellcmdflag'` prefix a String command is executed
+/// through, upstream `shell_build_argv` (`os/shell.c` 60-97).
+///
+/// Both options may carry arguments of their own, and
+/// `set_init_default_shell` (`option.c` 182-199) double-quotes a `$SHELL`
+/// holding a space, so a quoted first word is one word.
+fn shell_argv(editor: &Editor) -> Vec<String> {
+    let read = |name: &str, fallback: &str| match editor.options().get_global(name) {
+        Ok(OptionValue::String(value)) if !value.is_empty() => value.clone(),
+        _ => fallback.to_owned(),
+    };
+    let shell = read("shell", if cfg!(windows) { "cmd.exe" } else { "sh" });
+    let mut argv = split_shell_words(&shell);
+    argv.extend(split_shell_words(&read("shellcmdflag", if cfg!(windows) { "/c" } else { "-c" })));
+    argv
+}
+
+fn split_shell_words(text: &str) -> Vec<String> {
+    let text = text.trim();
+    if let Some(rest) = text.strip_prefix('"') {
+        if let Some((quoted, tail)) = rest.split_once('"') {
+            let mut argv = vec![quoted.to_owned()];
+            argv.extend(tail.split_whitespace().map(str::to_owned));
+            return argv;
+        }
+    }
+    text.split_whitespace().map(str::to_owned).collect()
 }
 
 fn call_job_start<F: FileIO>(

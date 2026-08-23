@@ -37,7 +37,6 @@ use crate::register::RegisterContent;
 use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid, SourceContext};
 use crate::typeahead::{special_notation, Keys, Remap, TypeaheadFlags};
 use crate::userfunc::{UserFuncError, UserFunctions};
-use crate::builtins::process::call_job_builtin;
 use crate::{
     BufferRelease, ChannelIds, Editor, Geometry, JobManager, Message, MessageKind, Mode, ModeMachine,
 };
@@ -651,19 +650,32 @@ impl<F: FileIO> ExExecutor<F> {
         &self.scope
     }
 
-    /// Call a stateful builtin through this executor's persistent runtime.
+    /// Call any builtin through this executor's persistent runtime, using the
+    /// same dispatch a Vimscript expression gets.
+    ///
+    /// This is the entry point the Lua `vim.fn`/`vim.call` bridge comes in
+    /// through, so it has to answer exactly what Vimscript answers: the
+    /// editor-stateful families, user functions, and the regex-backed
+    /// typval-only builtins. It used to forward straight into the job-builtin
+    /// dispatcher, which served five names and panicked on everything else.
     pub fn call_builtin(
         &mut self,
         editor: &mut Editor,
         name: &OxStr,
         args: Vec<Typval>,
     ) -> Result<Typval, ExecError> {
+        sync_editor_into_scope(editor, &mut self.scope)?;
         let lua = self.lua.clone();
-        call_job_builtin(
-            &mut self.runtime, editor, &mut self.scope, lua.as_ref(),
-            &name.to_string_lossy(), args,
-        )
-        .map_err(ExecError::Eval)
+        let result = call_builtin_dispatch(
+            &mut self.runtime,
+            editor,
+            &mut self.scope,
+            lua.as_ref(),
+            name,
+            args,
+        );
+        sync_scope_into_editor(editor, &self.scope)?;
+        result.map_err(ExecError::Eval)
     }
 
     /// Executes one command line, including bar-separated commands.
@@ -1415,6 +1427,28 @@ fn eval_text<F: FileIO>(
     Evaluator::new(&mut host, &regex)
         .eval(&expression, scope)
         .map_err(|error| eval_error_flow(host.runtime, error))
+}
+
+/// Serve one builtin call through the same [`EvalHost`] a Vimscript
+/// expression is evaluated against.
+fn call_builtin_dispatch<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    name: &OxStr,
+    args: Vec<Typval>,
+) -> ox_eval::Result<Typval> {
+    let regex = VimRegex;
+    let ambiguous_wide = matches!(editor.options().get_global("ambiwidth"), Ok(OptionValue::String(value)) if value == "double");
+    let mut host = EvalHost {
+        runtime,
+        editor,
+        lua,
+        builtins: Builtins::new(&regex).with_ambiguous_width(ambiguous_wide),
+        submatches: None,
+    };
+    BuiltinHost::call(&mut host, name, args, scope)
 }
 
 fn eval_condition<F: FileIO>(

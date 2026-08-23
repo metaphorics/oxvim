@@ -1304,6 +1304,82 @@ fn job_callbacks_bind_the_options_dictionary_as_self() {
     assert!(global_number(exec.scope(), "event_count").is_some_and(|count| count >= 2));
 }
 
+/// `ExExecutor::call_builtin` is the entry point the Lua `vim.fn` bridge comes
+/// in through. It used to forward straight into a job-only dispatcher that
+/// served five names -- `jobstop`, `jobpid`, `chansend`/`jobsend`, `jobwait` --
+/// and ended in a bare `unreachable!()`, so every other name reached that
+/// panic. The rows below are one per class of name the audit found behind it,
+/// each arranged to answer differently if only its own route were wrong:
+/// a name the old dispatcher did serve, the two Process-family names it did
+/// not, an editor-stateful name from another family, a typval-only name, a
+/// regex-backed typval-only name (which also proves the host carries a regex
+/// engine rather than `Builtins::without_regex`), and an unknown name, which
+/// must raise `E117` instead of aborting the process.
+#[test]
+fn call_builtin_serves_every_family_instead_of_panicking_outside_the_job_arms() {
+    let mut editor = editor_with_lines(&["alpha"]);
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    let call = |exec: &mut ExExecutor<MemoryFileIO>, editor: &mut Editor, name: &str, args: Vec<Typval>| {
+        exec.call_builtin(editor, &OxStr::from(name), args)
+    };
+
+    // Served before and after: an unknown job id waits to -3.
+    assert_eq!(
+        call(&mut exec, &mut editor, "jobwait", vec![Typval::list(vec![Typval::Number(9_999)])]).unwrap(),
+        Typval::list(vec![Typval::Number(-3)]),
+    );
+
+    // Process family, no arm before: jobstart returns a live channel id, and
+    // the job it started reaches exit status 0.
+    let job = call(
+        &mut exec,
+        &mut editor,
+        "jobstart",
+        vec![Typval::list(vec![Typval::String(OxStr::from("true"))])],
+    )
+    .unwrap();
+    let Typval::Number(id) = job else { panic!("jobstart did not answer a channel id: {job:?}") };
+    assert!(id > 0, "jobstart answered {id}");
+    assert_eq!(
+        call(&mut exec, &mut editor, "jobwait", vec![Typval::list(vec![Typval::Number(id)]), Typval::Number(5_000)]).unwrap(),
+        Typval::list(vec![Typval::Number(0)]),
+    );
+
+    // Process family, no arm before: system() runs through 'shell'.
+    assert_eq!(
+        call(&mut exec, &mut editor, "system", vec![Typval::String(OxStr::from("printf ok"))]).unwrap(),
+        Typval::String(OxStr::from("ok")),
+    );
+
+    // Another editor-stateful family entirely.
+    assert_eq!(
+        call(&mut exec, &mut editor, "bufnr", vec![Typval::String(OxStr::from("%"))]).unwrap(),
+        Typval::Number(1),
+    );
+
+    // Typval-only, no editor state.
+    assert_eq!(
+        call(&mut exec, &mut editor, "printf", vec![Typval::String(OxStr::from("%d-%s")), Typval::Number(7), Typval::String(OxStr::from("x"))]).unwrap(),
+        Typval::String(OxStr::from("7-x")),
+    );
+
+    // Regex-backed typval-only: `Builtins::without_regex()` answers E54 here.
+    assert_eq!(
+        call(&mut exec, &mut editor, "substitute", vec![
+            Typval::String(OxStr::from("aXbXc")),
+            Typval::String(OxStr::from("X")),
+            Typval::String(OxStr::from("-")),
+            Typval::String(OxStr::from("g")),
+        ])
+        .unwrap(),
+        Typval::String(OxStr::from("a-b-c")),
+    );
+
+    // An unknown name is an error, not a panic and not an abort.
+    let error = call(&mut exec, &mut editor, "nosuchbuiltin", Vec::new()).unwrap_err();
+    assert!(error.to_string().contains("nosuchbuiltin"), "{error}");
+}
+
 
 #[test]
 fn script_local_calls_inside_persisted_functions_use_defining_sid() {
