@@ -845,6 +845,7 @@ fn dispatch<F: FileIO>(
         "set" => command_set(runtime, editor, scope, &command.args, SetLayer::Effective),
         "setlocal" => command_set(runtime, editor, scope, &command.args, SetLayer::Local),
         "setglobal" => command_set(runtime, editor, scope, &command.args, SetLayer::Global),
+        "syntax" if matches!(command.args.trim(), "on" | "off") => Flow::Normal,
         "aunmenu" | "tlunmenu" if command.args.trim() == "*" => Flow::Normal,
         "echo" | "echomsg" | "echon" | "echoerr" => {
             command_echo(runtime, editor, scope, lua, name, &command.args)
@@ -1032,6 +1033,18 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         }
         if matches!(&*name_text, "function" | "funcref") {
             return call_function_builtin(self.runtime, &name_text, args);
+        }
+        if matches!(&*name_text, "hlexists" | "highlight_exists") {
+            return call_hlexists_builtin(self.editor, args);
+        }
+        if name_text == "getcurpos" {
+            return call_getcurpos_builtin(self.editor, args);
+        }
+        if name_text == "setpos" {
+            return call_setpos_builtin(self.editor, args);
+        }
+        if name_text == "virtcol" {
+            return call_virtcol_builtin(self.editor, args);
         }
         if matches!(&*name_text, "getchar" | "getcharstr") {
             return call_getchar_builtin(self.editor, &name_text, args);
@@ -5355,6 +5368,78 @@ fn call_function_builtin<F: FileIO>(runtime: &ExRuntime<F>, kind: &str, mut args
     if dictionary.is_some() { function.dict = dictionary; }
     let partial = kind == "funcref" || !function.args.is_empty() || function.dict.is_some();
     Ok(if partial { Typval::Partial(function) } else { Typval::Funcref(function) })
+}
+
+fn call_hlexists_builtin(editor: &Editor, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    if args.len() != 1 { return Err(EvalError::new(if args.is_empty() { "E119" } else { "E118" }, 0, "hlexists() requires one argument")); }
+    let name = input_string_arg(&args[0])?;
+    let name = name.to_string_lossy();
+    Ok(Typval::Number(i64::from(editor.highlights().keys().any(|candidate| candidate.eq_ignore_ascii_case(&name)))))
+}
+
+fn resolve_position_window(editor: &Editor, value: Option<&Typval>) -> Option<WinHandle> {
+    match value.and_then(typval_number) {
+        None | Some(0) => editor.current_window(),
+        Some(number) => WinHandle::try_from(number).ok().filter(|window| editor.window(*window).is_ok()),
+    }
+}
+
+fn call_getcurpos_builtin(editor: &Editor, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    if args.len() > 1 { return Err(EvalError::new("E118", 0, "Too many arguments for function: getcurpos")); }
+    let Some(window) = resolve_position_window(editor, args.first()) else {
+        return Ok(Typval::list(vec![Typval::Number(0); 5]));
+    };
+    let position = editor.window(window).map_err(|error| EvalError::new("E957", 0, error.to_string()))?.cursor;
+    let column = i64::try_from(position.col.saturating_add(1)).unwrap_or(i64::MAX);
+    Ok(Typval::list(vec![Typval::Number(0), Typval::Number(i64::try_from(position.lnum).unwrap_or(i64::MAX)), Typval::Number(column), Typval::Number(0), Typval::Number(column)]))
+}
+
+fn call_setpos_builtin(editor: &mut Editor, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    if args.len() != 2 { return Err(EvalError::new(if args.len() < 2 { "E119" } else { "E118" }, 0, "setpos() requires two arguments")); }
+    if input_string_arg(&args[0])?.as_bytes() != b"." { return Ok(Typval::Number(-1)); }
+    let Typval::List(reference) = &args[1] else { return Ok(Typval::Number(-1)); };
+    let values = reference.try_borrow().map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?;
+    if values.items.len() < 4 { return Ok(Typval::Number(-1)); }
+    let lnum = values.items.get(1).and_then(typval_number).unwrap_or(0);
+    let col = values.items.get(2).and_then(typval_number).unwrap_or(0);
+    let Some(window) = editor.current_window() else { return Ok(Typval::Number(-1)); };
+    if lnum <= 0 || col <= 0 { return Ok(Typval::Number(-1)); }
+    editor.set_window_cursor(window, Position { lnum: usize::try_from(lnum).unwrap_or(usize::MAX), col: usize::try_from(col - 1).unwrap_or(usize::MAX) }).map_err(|error| EvalError::new("E474", 0, error.to_string()))?;
+    Ok(Typval::Number(0))
+}
+
+fn call_virtcol_builtin(editor: &Editor, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    if args.is_empty() || args.len() > 3 { return Err(EvalError::new(if args.is_empty() { "E119" } else { "E118" }, 0, "Invalid arguments for virtcol")); }
+    let list_result = args.get(1).is_some_and(Typval::is_truthy);
+    let window = resolve_position_window(editor, args.get(2));
+    let zero = || if list_result { Typval::list(vec![Typval::Number(0), Typval::Number(0)]) } else { Typval::Number(0) };
+    let Some(window) = window else { return Ok(zero()); };
+    let state = editor.window(window).map_err(|error| EvalError::new("E957", 0, error.to_string()))?;
+    let position = match &args[0] {
+        Typval::String(value) if value.as_bytes() == b"." => state.cursor,
+        Typval::List(reference) => {
+            let values = reference.try_borrow().map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?;
+            let lnum = values.items.first().and_then(typval_number).unwrap_or(0);
+            let col = values.items.get(1).and_then(typval_number).unwrap_or(0);
+            if lnum <= 0 || col <= 0 { return Ok(zero()); }
+            Position { lnum: lnum as usize, col: col.saturating_sub(1) as usize }
+        }
+        Typval::String(value) if value.as_bytes().is_empty() => return Ok(zero()),
+        _ => return Ok(zero()),
+    };
+    let lines = buffer_lines(editor, state.buffer).map_err(|error| EvalError::new("E16", 0, error))?;
+    let Some(line) = lines.get(position.lnum.saturating_sub(1)) else { return Ok(zero()); };
+    let tabstop = match editor.options().get_global("tabstop") { Ok(OptionValue::Number(value)) => (*value).max(1) as usize, _ => 8 };
+    let mut start = 0usize;
+    let mut end = 0usize;
+    for (index, byte) in line.iter().copied().enumerate() {
+        start = end.saturating_add(1);
+        end = if byte == b'\t' { ((end / tabstop) + 1) * tabstop } else { end.saturating_add(1) };
+        if index >= position.col { break; }
+    }
+    let start = Typval::Number(i64::try_from(start).unwrap_or(i64::MAX));
+    let end = Typval::Number(i64::try_from(end).unwrap_or(i64::MAX));
+    Ok(if list_result { Typval::list(vec![start, end]) } else { end })
 }
 
 fn call_feedkeys_builtin(editor: &mut Editor, args: Vec<Typval>) -> ox_eval::Result<Typval> {

@@ -1266,3 +1266,23 @@ fn feedkeys_x_executes_through_mode_machine() {
     assert_eq!(editor.window(window).unwrap().cursor, Position { lnum: 1, col: 1 });
     assert!(editor.typeahead().is_empty());
 }
+
+#[test]
+fn highlight_exists_reads_editor_highlight_table() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(&mut editor, "highlight.vim", "highlight Number guifg=#ffffff\nlet g:yes = hlexists('number')\nlet g:no = highlight_exists('missing')").unwrap();
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"yes", 0), Ok(&Typval::Number(1)));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"no", 0), Ok(&Typval::Number(0)));
+}
+
+#[test]
+fn position_builtins_round_trip_and_expand_tabs() {
+    let (mut editor, _buffer, window) = editor_with_window();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(&mut editor, "position.vim", "call setline(1, \"the\tquick\")\ncall setpos('.', [0, 1, 4, 0])\nlet g:position = getcurpos()\nlet g:column = virtcol('.')\nlet g:span = virtcol('.', v:true)").unwrap();
+    assert_eq!(editor.window(window).unwrap().cursor, Position { lnum: 1, col: 3 });
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"position", 0), Ok(&Typval::list(vec![Typval::Number(0), Typval::Number(1), Typval::Number(4), Typval::Number(0), Typval::Number(4)])));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"column", 0), Ok(&Typval::Number(8)));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"span", 0), Ok(&Typval::list(vec![Typval::Number(4), Typval::Number(8)])));
+}

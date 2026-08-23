@@ -510,7 +510,7 @@ fn evaluator_error_inside_user_function_enters_caller_catch_frame() {
         &mut editor,
         concat!(
             "function! BrokenBuiltin()\n",
-            "return virtcol('.')\n",
+            "return screenattr(1, 1)\n",
             "endfunction\n",
             "let g:caught = 0\n",
             "let g:finalized = 0\n",
@@ -527,7 +527,7 @@ fn evaluator_error_inside_user_function_enters_caller_catch_frame() {
     );
     assert_eq!(global_number(exec.scope(), "caught"), Some(1));
     assert_eq!(global_number(exec.scope(), "finalized"), Some(1));
-    assert_eq!(global_string(exec.scope(), "exception").as_deref(), Some("E117: not implemented: virtcol"));
+    assert_eq!(global_string(exec.scope(), "exception").as_deref(), Some("E117: not implemented: screenattr"));
     assert_eq!(global_string(exec.scope(), "throwpoint").as_deref(), Some("function BrokenBuiltin[1]..script <test>[1]"));
 }
 
