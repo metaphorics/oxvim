@@ -491,6 +491,102 @@ fn expand_home(path: &str) -> String {
     )
 }
 
+/// One `stdpath()` selector, `f_stdpath`'s `what` argument
+/// (`eval/funcs.c:7021-7039`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StdPath {
+    /// `$XDG_CACHE_HOME/nvim`.
+    Cache,
+    /// `$XDG_CONFIG_HOME/nvim`.
+    Config,
+    /// Each `$XDG_CONFIG_DIRS` entry with `/nvim` appended.
+    ConfigDirs,
+    /// `$XDG_DATA_HOME/nvim`.
+    Data,
+    /// Each `$XDG_DATA_DIRS` entry with `/nvim` appended.
+    DataDirs,
+    /// `$XDG_STATE_HOME/nvim/logs`.
+    Log,
+    /// `$XDG_RUNTIME_DIR`, with no application component.
+    Run,
+    /// `$XDG_STATE_HOME/nvim`.
+    State,
+}
+
+impl StdPath {
+    /// Parses the `what` argument, or `None` for a name upstream rejects with
+    /// `E6100` (`eval/funcs.c:7038`).
+    #[must_use]
+    pub fn parse(what: &str) -> Option<Self> {
+        Some(match what {
+            "cache" => Self::Cache,
+            "config" => Self::Config,
+            "config_dirs" => Self::ConfigDirs,
+            "data" => Self::Data,
+            "data_dirs" => Self::DataDirs,
+            "log" => Self::Log,
+            "run" => Self::Run,
+            "state" => Self::State,
+            _ => return None,
+        })
+    }
+
+    /// Whether this selector answers a list rather than a single directory.
+    #[must_use]
+    pub const fn is_list(self) -> bool {
+        matches!(self, Self::ConfigDirs | Self::DataDirs)
+    }
+}
+
+/// Resolves one `stdpath()` selector, `f_stdpath` (`eval/funcs.c:7011-7040`)
+/// through `get_xdg_home` and `stdpaths_get_xdg_var` (`os/stdpaths.c:151-225`).
+///
+/// `get_xdg_home` appends `$NVIM_APPNAME`, defaulting to `nvim`
+/// (`os/stdpaths.c:70-87,222`), to every selector but `run`, which is the raw
+/// `$XDG_RUNTIME_DIR`, and `log`, which is the state home plus `logs`
+/// (`eval/funcs.c:7030-7032`). A list selector answers one entry per
+/// directory. This is the same resolver `'runtimepath'` is built from, so a
+/// plugin's `stdpath('config')` and the rtp entry it expects to find itself on
+/// cannot disagree.
+#[must_use]
+pub fn stdpath(what: StdPath) -> Vec<String> {
+    const APPNAME: &str = "nvim";
+    fn under(base: Option<String>, suffix: &str) -> Vec<String> {
+        base.into_iter()
+            .map(|dir| format!("{}/{suffix}", dir.trim_end_matches('/')))
+            .collect()
+    }
+    match what {
+        StdPath::Cache => under(xdg_home_dir("XDG_CACHE_HOME", "~/.cache"), APPNAME),
+        StdPath::Config => under(xdg_home_dir("XDG_CONFIG_HOME", "~/.config"), APPNAME),
+        StdPath::Data => under(xdg_home_dir("XDG_DATA_HOME", "~/.local/share"), APPNAME),
+        StdPath::State => under(xdg_home_dir("XDG_STATE_HOME", "~/.local/state"), APPNAME),
+        StdPath::Log => under(
+            xdg_home_dir("XDG_STATE_HOME", "~/.local/state"),
+            &format!("{APPNAME}/logs"),
+        ),
+        // `stdpaths_get_xdg_var` has no fallback for the runtime dir and no
+        // `get_xdg_home` wrapper, so this is the variable verbatim
+        // (`os/stdpaths.c:59,182-190`; `eval/funcs.c:7032`). Unset falls back
+        // to the temporary directory upstream decides at startup.
+        StdPath::Run => vec![
+            xdg_home_dir("XDG_RUNTIME_DIR", "")
+                .filter(|dir| !dir.is_empty())
+                .unwrap_or_else(|| {
+                    std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_owned()
+                }),
+        ],
+        StdPath::ConfigDirs => xdg_dir_list("XDG_CONFIG_DIRS", "/etc/xdg")
+            .into_iter()
+            .map(|dir| format!("{}/{APPNAME}", dir.trim_end_matches('/')))
+            .collect(),
+        StdPath::DataDirs => xdg_dir_list("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
+            .into_iter()
+            .map(|dir| format!("{}/{APPNAME}", dir.trim_end_matches('/')))
+            .collect(),
+    }
+}
+
 /// Sourcing state owned by the Ex executor.
 #[derive(Debug)]
 pub struct ScriptCtx<F: FileIO = RealFileIO> {

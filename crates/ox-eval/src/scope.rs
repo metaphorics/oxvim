@@ -425,6 +425,12 @@ impl Scope {
         }
     }
 
+    /// Every environment variable this scope carries, for `environ()`.
+    #[must_use]
+    pub fn env_entries(&self) -> &[(OxStr, Typval)] {
+        &self.env
+    }
+
     /// Read a register (`@r`).
     ///
     /// Missing registers return an empty string.

@@ -2299,3 +2299,111 @@ fn float_builtins_answer_like_libm() {
     // argument is E808 the way `sqrt("a")` already is.
     assert_eq!(call("cos", vec![text("a")]).unwrap_err().code, "E808");
 }
+
+/// `f_getenv` (`eval/funcs.c:1104-1115`) and `environ()`
+/// (`runtime/lua/vim/_core/vimfn.lua:16-26`).
+///
+/// Oracle, `nvim --headless -u <lua>` in a sandbox with `HOME` set:
+/// `vim.fn.getenv('HOME')` is the path, `vim.fn.getenv('T78_NOPE')` is
+/// `vim.NIL`, `type(vim.fn.environ())` is `table` and
+/// `vim.fn.environ()['HOME']` is the same path. The `v:null` answer, not an
+/// empty string, is the whole point: it is how a caller tells unset from set
+/// to empty, and `plenary/log.lua:12` is where telescope.nvim needs it.
+#[test]
+fn getenv_and_environ_answer_the_process_environment() {
+    const NAME: &str = "OXVIM_TEST_EVAL_GETENV";
+    const MISSING: &str = "OXVIM_TEST_EVAL_GETENV_UNSET";
+    let mut builtins = Builtins::without_regex();
+    let mut scope = Scope::new();
+    let call = |builtins: &mut Builtins<'_>, scope: &mut Scope, name: &str, args: Vec<Typval>| {
+        builtins.call(&OxStr::from(name), args, scope)
+    };
+
+    ox_sys::unset_env(MISSING);
+    assert_eq!(
+        call(&mut builtins, &mut scope, "getenv", vec![text(MISSING)]).unwrap(),
+        Typval::Special(Special::Null),
+    );
+
+    // Through `setenv`, so the process environment and the scope snapshot
+    // agree, which is the pair `getenv` has to read in the right order.
+    call(&mut builtins, &mut scope, "setenv", vec![text(NAME), text("value")]).unwrap();
+    assert_eq!(call(&mut builtins, &mut scope, "getenv", vec![text(NAME)]).unwrap(), text("value"));
+
+    let environment = call(&mut builtins, &mut scope, "environ", Vec::new()).unwrap();
+    let Typval::Dict(entries) = &environment else { panic!("environ() must answer a Dict: {environment:?}") };
+    let entries = entries.borrow().entries.clone();
+    assert_eq!(
+        entries.iter().find(|(key, _)| key == &OxStr::from(NAME)).map(|(_, value)| value.clone()),
+        Some(text("value")),
+    );
+    assert!(!entries.iter().any(|(key, _)| key == &OxStr::from(MISSING)));
+
+    call(&mut builtins, &mut scope, "setenv", vec![text(NAME), Typval::Special(Special::Null)]).unwrap();
+    assert_eq!(
+        call(&mut builtins, &mut scope, "getenv", vec![text(NAME)]).unwrap(),
+        Typval::Special(Special::Null),
+    );
+}
+
+/// `f_fnameescape` (`eval/funcs.c:1517-1521`) through
+/// `vim_strsave_fnameescape(fname, VSE_NONE)`, whose escape set is
+/// `PATH_ESC_CHARS` at `ex_getln.c:4103` and whose leading-character special
+/// case is at `ex_getln.c:4118-4122`.
+///
+/// Oracle: `vim.fn.fnameescape('a b|c%d#e*f[g')` is `a\ b\|c\%d\#e\*f\[g`,
+/// `fnameescape('>x')` is `\>x`, `fnameescape('-')` is `\-`.
+#[test]
+fn fnameescape_escapes_the_path_character_set() {
+    assert_eq!(
+        call("fnameescape", vec![text("a b|c%d#e*f[g")]).unwrap(),
+        text("a\\ b\\|c\\%d\\#e\\*f\\[g"),
+    );
+    // `>` and `+` lead some Ex commands and `cd -` has its own meaning.
+    assert_eq!(call("fnameescape", vec![text(">x")]).unwrap(), text("\\>x"));
+    assert_eq!(call("fnameescape", vec![text("+x")]).unwrap(), text("\\+x"));
+    assert_eq!(call("fnameescape", vec![text("-")]).unwrap(), text("\\-"));
+    // Only a lone `-`: upstream tests `p[1] == NUL`.
+    assert_eq!(call("fnameescape", vec![text("-x")]).unwrap(), text("-x"));
+    // `]`, `}` and `&` are not in PATH_ESC_CHARS, unlike SHELL_ESC_CHARS.
+    assert_eq!(call("fnameescape", vec![text("a]b}c&d")]).unwrap(), text("a]b}c&d"));
+}
+
+/// `f_localtime` (`eval/funcs.c:3924-3927`), `f_reltime`
+/// (`eval/funcs.c:5096-5134`), `f_reltimefloat` (`eval/funcs.c:6774-6784`)
+/// and `f_reltimestr` (`eval/funcs.c:5138-5148`) through `profile_msg`
+/// (`profile.c:72-78`).
+///
+/// A reltime value is one 64-bit nanosecond count split across two 32-bit
+/// list items, high half first (`list2proftime`, `eval/funcs.c:5065-5085`), so
+/// the arithmetic is pinned with literal values the oracle agrees on rather
+/// than with a clock reading:
+/// `reltimefloat(reltime([0,0],[2,500000000]))` is `9.089934592` on the oracle
+/// -- `(2 << 32) + 500000000` nanoseconds -- and `reltimestr` of the same
+/// value is `"  9.089935"`, right-aligned in ten columns by `"%10.6lf"`.
+#[test]
+fn localtime_and_the_reltime_family_match_the_upstream_encoding() {
+    let Typval::Number(seconds) = call("localtime", Vec::new()).unwrap() else {
+        panic!("localtime() must answer a Number")
+    };
+    assert!(seconds > 1_700_000_000, "localtime() answered {seconds}");
+
+    let elapsed = call("reltime", vec![list(&[0, 0]), list(&[2, 500_000_000])]).unwrap();
+    assert_eq!(elapsed, list(&[2, 500_000_000]));
+    assert_eq!(call("reltimefloat", vec![elapsed.clone()]).unwrap(), Typval::Float(9.089_934_592));
+    assert_eq!(call("reltimestr", vec![elapsed]).unwrap(), text("  9.089935"));
+
+    // A difference small enough to stay inside the low half stays there.
+    assert_eq!(call("reltime", vec![list(&[0, 0]), list(&[0, 1000])]).unwrap(), list(&[0, 1000]));
+
+    // No argument reads the clock, and one argument is the time since it, so
+    // the elapsed value is non-negative and the list shape is always two.
+    let start = call("reltime", Vec::new()).unwrap();
+    let Typval::List(items) = &start else { panic!("reltime() must answer a List") };
+    assert_eq!(items.borrow().items.len(), 2);
+    let Typval::Float(since) = call("reltimefloat", vec![call("reltime", vec![start]).unwrap()]).unwrap()
+    else {
+        panic!("reltimefloat() must answer a Float")
+    };
+    assert!(since >= 0.0, "elapsed time went backwards: {since}");
+}

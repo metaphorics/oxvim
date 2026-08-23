@@ -184,10 +184,13 @@ impl<'a> Builtins<'a> {
             "float2nr" => float_to_number(&args[0]),
             "floor" => float_unary(&args[0], f64::floor),
             "fnamemodify" => path_builtins::fnamemodify(self.regex, &args[0], &args[1]),
+            "environ" => environ(scope),
+            "fnameescape" => fnameescape(&args),
             "get" => get(&args),
             "gettext" => gettext(&args[0]),
             "getcwd" => path_builtins::getcwd(&args),
             "getpid" => Ok(Typval::Number(i64::from(std::process::id()))),
+            "getenv" => getenv(&args, scope),
             "has" => has_feature(&args),
             "has_key" => has_key(&args),
             "hostname" => hostname(),
@@ -199,6 +202,7 @@ impl<'a> Builtins<'a> {
             "items" => dict_projection(&args[0], Projection::Items),
             "join" => join(&args),
             "keytrans" => keytrans(&args[0]),
+            "localtime" => localtime(),
             "json_decode" => json_decode(&args[0]),
             "json_encode" => json_encode(&args[0]),
             "keys" => dict_projection(&args[0], Projection::Keys),
@@ -225,6 +229,9 @@ impl<'a> Builtins<'a> {
             "resolve" => path_builtins::resolve(&args[0]),
             "pathshorten" => pathshorten(&args),
             "reverse" => reverse(args),
+            "reltime" => reltime(&args),
+            "reltimefloat" => reltimefloat(&args),
+            "reltimestr" => reltimestr(&args),
             "setenv" => setenv(&args, scope),
             "simplify" => path_builtins::simplify(&args[0]),
             "slice" => slice(&args),
@@ -1035,10 +1042,11 @@ pub fn is_builtin_implemented(name: &str) -> bool {
         "char2nr" | "copy" | "cos" | "cosh" | "count" | "exp" | "fmod" | "isinf" | "isnan" |
         "log" | "log10" | "round" | "sin" | "sinh" | "tan" | "tanh" |
         "deepcopy" | "empty" | "escape" | "executable" | "exepath" | "exists" | "extend" | "extendnew" | "filter" | "flatten" |
-        "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "finddir" | "findfile" | "get" | "gettext" | "getcwd" | "getpid" | "has" | "has_key" | "hostname" | "index" | "insert" | "items" |
+        "flattennew" | "foreach" | "float2nr" | "floor" | "fnameescape" | "fnamemodify" | "finddir" | "findfile" | "environ" | "get" | "getenv" | "gettext" | "getcwd" | "getpid" | "has" | "has_key" | "hostname" | "index" | "insert" | "items" |
         "indexof" | "isabsolutepath" | "islocked" | "join" | "json_decode" | "json_encode" | "keytrans" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
         "match" | "matchend" | "matchstr" | "matchlist" | "matchstrpos" | "matchstrlist" | "matchfuzzy" | "matchfuzzypos" |
         "max" | "min" | "nr2char" | "or" | "pathshorten" | "pow" | "printf" | "range" | "reduce" | "resolve" |
+        "localtime" | "reltime" | "reltimefloat" | "reltimestr" |
         "remove" | "repeat" | "reverse" | "setenv" | "simplify" | "slice" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
         "str2nr" | "strcharlen" | "strchars" | "stridx" | "string" | "strpart" | "strridx" | "strtrans" | "strutf16len" | "strwidth" |
         "substitute" | "tempname" | "tolower" | "toupper" | "tr" | "trim" | "trunc" | "type" | "uniq" | "utf16idx" | "charidx" | "values" | "xor"
@@ -1280,6 +1288,155 @@ fn setenv(args: &[Typval], scope: &mut Scope) -> Result<Typval> {
         scope.set_env(name.as_bytes(), Typval::String(OxStr::from(value.as_str())));
     }
     Ok(Typval::Number(0))
+}
+
+/// `f_getenv` (`eval/funcs.c:1104-1115`): `vim_getenv`, answering `v:null`
+/// rather than an empty string when the variable is not set -- which is how
+/// callers tell "unset" from "set to empty". `plenary/log.lua:12` is the
+/// first thing telescope.nvim reaches this through.
+///
+/// The `Scope::env` snapshot is consulted first for the same reason
+/// [`setenv`] writes to it: `$VAR` reads come from the snapshot, so a value
+/// assigned this session lives there and not yet in the process environment.
+fn getenv(args: &[Typval], scope: &Scope) -> Result<Typval> {
+    let name = string_arg(&args[0])?;
+    if scope.contains_env(name.as_bytes()) {
+        return Ok(scope.get_env(name.as_bytes()));
+    }
+    Ok(std::env::var_os(name.to_string_lossy().as_ref()).map_or(
+        Typval::Special(Special::Null),
+        |value| Typval::String(OxStr::from(value.to_string_lossy().as_ref())),
+    ))
+}
+
+/// `environ()`, whose implementation upstream is Lua rather than C:
+/// `runtime/lua/vim/_core/vimfn.lua:16-26` returns `vim.uv.os_environ()`
+/// unchanged off Windows. The `Scope::env` snapshot overlays the process
+/// environment for the same reason [`getenv`] consults it.
+fn environ(scope: &Scope) -> Result<Typval> {
+    let mut entries: Vec<(OxStr, Typval)> = std::env::vars_os()
+        .filter(|(name, _)| !name.is_empty())
+        .map(|(name, value)| {
+            (
+                OxStr::from(name.to_string_lossy().as_ref()),
+                Typval::String(OxStr::from(value.to_string_lossy().as_ref())),
+            )
+        })
+        .collect();
+    for (name, value) in scope.env_entries() {
+        match entries.iter_mut().find(|(key, _)| key == name) {
+            Some(entry) => entry.1 = value.clone(),
+            None => entries.push((name.clone(), value.clone())),
+        }
+    }
+    Ok(Typval::dict(entries))
+}
+
+/// The characters `fnameescape()` puts a backslash before: `PATH_ESC_CHARS`
+/// in `ex_getln.c:4103`, reached through `vim_strsave_fnameescape(fname,
+/// VSE_NONE)` (`eval/funcs.c:1519`). The Windows `BACKSLASH_IN_FILENAME`
+/// variant at `ex_getln.c:4084` is a different set and is not this platform.
+const PATH_ESC_CHARS: &[u8] = b" \t\n*?[{`$\\%#'\"|!<";
+
+/// `f_fnameescape` (`eval/funcs.c:1517-1521`).
+///
+/// The trailing special case is `vim_strsave_fnameescape`'s own
+/// (`ex_getln.c:4118-4122`): `>` and `+` lead some Ex commands and `cd -` has
+/// its own meaning, so a result starting with one of those, or consisting of
+/// exactly `-`, gains a leading backslash.
+fn fnameescape(args: &[Typval]) -> Result<Typval> {
+    let name = string_arg(&args[0])?;
+    let mut escaped = Vec::with_capacity(name.as_bytes().len());
+    for byte in name.as_bytes() {
+        if PATH_ESC_CHARS.contains(byte) {
+            escaped.push(b'\\');
+        }
+        escaped.push(*byte);
+    }
+    if matches!(escaped.first(), Some(b'>' | b'+')) || escaped == b"-" {
+        escaped.insert(0, b'\\');
+    }
+    Ok(Typval::String(OxStr(escaped)))
+}
+
+/// `f_localtime` (`eval/funcs.c:3924-3927`): `time(NULL)`, seconds since the
+/// Unix epoch.
+fn localtime() -> Result<Typval> {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX));
+    Ok(Typval::Number(seconds))
+}
+
+/// Monotonic nanoseconds from a process-local origin, which is what
+/// `os_hrtime`/`uv_hrtime` gives `profile_start` (`profile.c`) and what
+/// `ox_uv::misc::hrtime` already uses. Upstream documents the value as
+/// relative to an arbitrary past instant, so only differences are meaningful.
+fn hrtime_nanos() -> i64 {
+    static ORIGIN: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    i64::try_from(ORIGIN.elapsed().as_nanos()).unwrap_or(i64::MAX)
+}
+
+/// `list2proftime` (`eval/funcs.c:5059-5085`): a reltime value is one 64-bit
+/// count split across two 32-bit list items, high half first.
+fn proftime_from_list(value: &Typval) -> Option<i64> {
+    let Typval::List(reference) = value else { return None };
+    let items = list_items(reference).ok()?;
+    let [high, low] = items.as_slice() else { return None };
+    let number = |value: &Typval| match value {
+        Typval::Number(number) => Some(*number),
+        _ => None,
+    };
+    let high = i64::from(i32::try_from(number(high)?).ok()?);
+    let low = i64::from(number(low)? as u32);
+    Some((high << 32) | low)
+}
+
+fn proftime_to_list(nanos: i64) -> Typval {
+    Typval::list(vec![
+        Typval::Number(nanos >> 32),
+        Typval::Number(i64::from((nanos & 0xFFFF_FFFF) as u32 as i32)),
+    ])
+}
+
+/// `f_reltime` (`eval/funcs.c:5096-5134`): no argument is "now", one argument
+/// is the time elapsed since it, two arguments are their difference.
+fn reltime(args: &[Typval]) -> Result<Typval> {
+    let nanos = match args {
+        [] => hrtime_nanos(),
+        [start] => {
+            let Some(start) = proftime_from_list(start) else { return Ok(Typval::list(Vec::new())) };
+            hrtime_nanos() - start
+        }
+        [start, end] => {
+            let (Some(start), Some(end)) = (proftime_from_list(start), proftime_from_list(end)) else {
+                return Ok(Typval::list(Vec::new()));
+            };
+            end - start
+        }
+        _ => return Ok(Typval::list(Vec::new())),
+    };
+    Ok(proftime_to_list(nanos))
+}
+
+/// `f_reltimefloat` (`eval/funcs.c:6774-6784`): `profile_signed(tm) / 1e9`.
+fn reltimefloat(args: &[Typval]) -> Result<Typval> {
+    let nanos = proftime_from_list(&args[0]).unwrap_or(0);
+    #[expect(clippy::cast_precision_loss, reason = "upstream casts the same nanosecond count to a C double")]
+    Ok(Typval::Float(nanos as f64 / 1_000_000_000.0))
+}
+
+/// `f_reltimestr` (`eval/funcs.c:5138-5148`) through `profile_msg`
+/// (`profile.c:72-78`), whose format is `"%10.6lf"` -- so a short elapsed
+/// time is right-aligned in ten columns and a long one simply overflows it.
+fn reltimestr(args: &[Typval]) -> Result<Typval> {
+    let Some(nanos) = proftime_from_list(&args[0]) else {
+        return Ok(Typval::String(OxStr(Vec::new())));
+    };
+    #[expect(clippy::cast_precision_loss, reason = "upstream casts the same nanosecond count to a C double")]
+    let seconds = nanos as f64 / 1_000_000_000.0;
+    Ok(Typval::String(OxStr::from(format!("{seconds:10.6}").as_str())))
 }
 
 fn borrow_error() -> EvalError { EvalError::new("E742", 0, "Cannot change value during recursive container access") }

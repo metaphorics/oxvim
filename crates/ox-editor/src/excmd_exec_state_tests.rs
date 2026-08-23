@@ -1554,3 +1554,118 @@ fn virtcol_counts_showbreak_on_wrapped_continuation_rows() {
         Ok(&Typval::list(vec![Typval::Number(13), Typval::Number(13)]))
     );
 }
+
+/// `f_stdpath` (`eval/funcs.c:7011-7040`) through `get_xdg_home` and
+/// `stdpaths_get_xdg_var` (`os/stdpaths.c:151-225`).
+///
+/// Oracle, `nvim --headless -u <lua>` with every `XDG_*` pointed at a scratch
+/// directory: `cache`/`config`/`data`/`state` are that directory plus
+/// `/nvim`, `log` is the state directory plus `/nvim/logs`, `run` is
+/// `$XDG_RUNTIME_DIR` with *no* `nvim` component, and `config_dirs` is a List.
+/// An unknown selector is `E6100` and no argument is `E119`.
+///
+/// `$XDG_*` is read from the process environment, so this test sets it for the
+/// duration and puts it back; `--test-threads=1` is how the suite runs.
+#[test]
+fn stdpath_resolves_every_selector_from_the_xdg_environment() {
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, previous) in &self.0 {
+                let _restored = match previous {
+                    Some(value) => ox_sys::set_env(name, value),
+                    None => ox_sys::unset_env(name),
+                };
+            }
+        }
+    }
+    let root = std::env::temp_dir().join(format!("oxvim-t78-stdpath-{}", std::process::id()));
+    let names = ["XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_DIRS"];
+    let _guard = EnvGuard(names.iter().map(|name| (*name, std::env::var_os(name))).collect());
+    for name in names {
+        let suffix = name.strip_prefix("XDG_").unwrap_or(name).to_ascii_lowercase();
+        let _set = ox_sys::set_env(name, root.join(suffix).as_os_str());
+    }
+
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &mut editor,
+        "stdpath.vim",
+        "let g:cache = stdpath('cache')\nlet g:config = stdpath('config')\nlet g:data = stdpath('data')\nlet g:state = stdpath('state')\nlet g:log = stdpath('log')\nlet g:run = stdpath('run')\nlet g:dirs = stdpath('config_dirs')",
+    )
+    .unwrap();
+    let expect = |name: &str, tail: &str| {
+        Typval::String(OxStr::from(
+            root.join(name).join(tail).to_string_lossy().as_ref(),
+        ))
+    };
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"cache", 0), Ok(&expect("cache_home", "nvim")));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"config", 0), Ok(&expect("config_home", "nvim")));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"data", 0), Ok(&expect("data_home", "nvim")));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"state", 0), Ok(&expect("state_home", "nvim")));
+    assert_eq!(exec.scope().get_scoped(ScopeKind::Global, b"log", 0), Ok(&expect("state_home", "nvim/logs")));
+    // `run` is the raw variable: `f_stdpath` calls `stdpaths_get_xdg_var`
+    // rather than `get_xdg_home` for it (`eval/funcs.c:7032`).
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"run", 0),
+        Ok(&Typval::String(OxStr::from(root.join("runtime_dir").to_string_lossy().as_ref()))),
+    );
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"dirs", 0),
+        Ok(&Typval::list(vec![expect("config_dirs", "nvim")])),
+    );
+
+    let mut exec = ExExecutor::new();
+    let bogus = exec.execute_line(&mut editor, "let g:x = stdpath('nope')").unwrap_err();
+    assert!(bogus.to_string().contains("E6100"), "{bogus}");
+    let missing = exec.execute_line(&mut editor, "let g:x = stdpath()").unwrap_err();
+    assert!(missing.to_string().contains("E119"), "{missing}");
+}
+
+/// `f_shellescape` (`eval/funcs.c:6660-6667`) through
+/// `vim_strsave_shellescape` (`strings.c:186-290`), and `f_strdisplaywidth`
+/// (`strings.c:2775-2785`).
+///
+/// Oracle: `shellescape("a b'c!d%e#f")` is `'a b'\''c!d%e#f'`,
+/// `shellescape('a!b', 1)` is `'a\!b'`, `shellescape('x%y#z', 1)` is
+/// `'x\%y\#z'`, `shellescape('a<cword>b', 1)` is `'a\<cword>b'`;
+/// `strdisplaywidth("a\tb")` is 9 and `strdisplaywidth("a\tb", 3)` is 6.
+/// The two `strdisplaywidth` rows differ only in the starting column, which is
+/// the whole reason it is not `strwidth`: the tab is measured to the next
+/// `'tabstop'`, so the answer moves with the column.
+#[test]
+fn shellescape_and_strdisplaywidth_follow_the_shell_and_the_tabstop() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &mut editor,
+        "escape.vim",
+        "let g:plain = shellescape(\"a b'c!d%e#f\")\nlet g:special = shellescape('a!b', 1)\nlet g:vars = shellescape('x%y#z', 1)\nlet g:cword = shellescape('a<cword>b', 1)\nlet g:width = strdisplaywidth(\"a\\tb\")\nlet g:width_at_3 = strdisplaywidth(\"a\\tb\", 3)",
+    )
+    .unwrap();
+    let global = |name: &[u8]| exec.scope().get_scoped(ScopeKind::Global, name, 0).cloned();
+    assert_eq!(global(b"plain"), Ok(Typval::String(OxStr::from("'a b'\\''c!d%e#f'"))));
+    assert_eq!(global(b"special"), Ok(Typval::String(OxStr::from("'a\\!b'"))));
+    // `%`, `#` and `<cword>` are `find_cmdline_var` names
+    // (`ex_docmd.c:7491-7508`), escaped only when the caller asked.
+    assert_eq!(global(b"vars"), Ok(Typval::String(OxStr::from("'x\\%y\\#z'"))));
+    assert_eq!(global(b"cword"), Ok(Typval::String(OxStr::from("'a\\<cword>b'"))));
+    assert_eq!(global(b"width"), Ok(Typval::Number(9)));
+    assert_eq!(global(b"width_at_3"), Ok(Typval::Number(6)));
+
+    // A csh-like 'shell' escapes `!` with no second argument at all, which is
+    // why this reads the option rather than $SHELL (`option.c:7095-7098`).
+    editor.options_mut().set_global("shell", OptionValue::String("/bin/tcsh".to_owned())).unwrap();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(&mut editor, "csh.vim", "let g:csh = shellescape('a!b')\nlet g:both = shellescape('a!b', 1)").unwrap();
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"csh", 0),
+        Ok(&Typval::String(OxStr::from("'a\\!b'"))),
+    );
+    // csh plus do_special is two backslashes: one for Vim, one for the shell.
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"both", 0),
+        Ok(&Typval::String(OxStr::from("'a\\\\!b'"))),
+    );
+}
