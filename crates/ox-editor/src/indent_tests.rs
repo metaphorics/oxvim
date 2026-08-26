@@ -333,6 +333,67 @@ fn open_forward_indents_brace_member_by_block_indent() {
 }
 
 #[test]
+fn existing_line_after_opening_brace_uses_block_indent() {
+    // Existing-line amount (T64/`<C-F>`): the line after `{` is a block member,
+    // not a leftover-line ramp and not a continuation of the brace line itself.
+    let source = lines("int {\n1M1");
+    let opts = IndentOptions {
+        shiftwidth: 2,
+        tabstop: 8,
+        expandtab: true,
+        cindent: true,
+        autoindent: true,
+        cinoptions: Cino::parse("", 2),
+        ..IndentOptions::default()
+    };
+    assert_eq!(cols(cindent(&source, 2, &opts)), 2);
+}
+
+#[test]
+fn existing_line_continuation_inside_brace_adds_one_shiftwidth() {
+    // Existing-line amount (T66/`=`): an unterminated prior member is a
+    // continuation of the first statement in the block, not of the `{` line.
+    // Blank lines between members are skipped; a `}` outdents to the opener.
+    let source = lines("int {\n1M1\n\n2M2\n}");
+    let opts = IndentOptions {
+        shiftwidth: 2,
+        tabstop: 8,
+        expandtab: true,
+        cindent: true,
+        autoindent: true,
+        cinoptions: Cino::parse("", 2),
+        ..IndentOptions::default()
+    };
+    assert_eq!(cols(cindent(&source, 2, &opts)), 2);
+    assert_eq!(cols(cindent(&source, 4, &opts)), 4);
+    assert_eq!(cols(cindent(&source, 5, &opts)), 0);
+    let staged = lines("int {\n  1M1\n\n2M2\n}");
+    assert_eq!(cols(cindent(&staged, 4, &opts)), 4);
+}
+
+#[test]
+fn existing_line_reindent_matches_open_forward_after_brace() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    let mut eval = NullExprEval;
+    let opts = cino_opts();
+    let existing = lines("{\nstmt;");
+    let context = IndentEvalContext::new(&editor, buffer, &existing);
+    let reindent = indent::amount_for(&context, 2, Method::Cindent, &opts, &mut eval).unwrap();
+    let open_forward = indent::fix_line_indent(
+        &context,
+        2,
+        CinTrigger::OpenForward,
+        &opts,
+        &mut eval,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(reindent, IndentAmount::Columns(4));
+    assert_eq!(open_forward, b"    ");
+}
+
+#[test]
 fn amount_for_expr_reads_context_view() {
     let mut editor = Editor::new();
     let buffer = editor

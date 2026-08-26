@@ -2330,4 +2330,107 @@ fn insert_ctrl_f_reindents_current_line() {
             .position(),
         ExtmarkPosition::new(1, 3)
     );
+    assert!(editor.buffer_undo(buffer).unwrap().is_some());
+    assert_eq!(
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .extmarks
+            .get(ns, id)
+            .unwrap()
+            .unwrap()
+            .position(),
+        ExtmarkPosition::new(1, 1)
+    );
+    assert!(editor.buffer_redo(buffer).unwrap().is_some());
+    assert_eq!(
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .extmarks
+            .get(ns, id)
+            .unwrap()
+            .unwrap()
+            .position(),
+        ExtmarkPosition::new(1, 3)
+    );
+}
+
+#[test]
+fn reindent_moves_extmarks_on_existing_lines_after_opening_brace() {
+    // Functional T66: `=gg` over `int {` / `1M1` / `2M2` with sw=2.
+    // Line 2 is a block member (indent 2 → mark (1,1)→(1,3)); line 3 is a
+    // continuation of that unterminated statement (indent 4 → (2,1)→(2,5)).
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"int {\n1M1\n2M2").unwrap(), true)
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "cindent", OptionValue::Boolean(true))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "autoindent", OptionValue::Boolean(true))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "expandtab", OptionValue::Boolean(true))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "shiftwidth", OptionValue::Number(2))
+        .unwrap();
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.set_window_cursor(window, position(3, 0)).unwrap();
+    let ns = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .create_namespace("reindent-t66")
+        .unwrap();
+    let m1 = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(1, 1)))
+        .unwrap();
+    let m2 = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(2, 1)))
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "=gg", &mut eval).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"int {\n  1M1\n    2M2"
+    );
+    assert_eq!(
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .extmarks
+            .get(ns, m1)
+            .unwrap()
+            .unwrap()
+            .position(),
+        ExtmarkPosition::new(1, 3)
+    );
+    assert_eq!(
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .extmarks
+            .get(ns, m2)
+            .unwrap()
+            .unwrap()
+            .position(),
+        ExtmarkPosition::new(2, 5)
+    );
 }

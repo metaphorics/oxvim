@@ -623,6 +623,16 @@ fn statement_start(scan: &CScan, line: usize, scope: Option<Pos>) -> usize {
         if previous >= cursor {
             break;
         }
+        // The statement that `cursor` continues can begin no earlier than
+        // `cursor` when the line above terminates a statement (`cin_isterminated`
+        // nonzero), or when the line above is the scope's own opening brace —
+        // the first statement of the block starts at `cursor`.
+        let previous_code = &scan.lines[previous].code;
+        if line_terminator(previous_code, false, true).is_some()
+            || scope.is_some_and(|scope| previous <= scope.line)
+        {
+            break;
+        }
         cursor = previous;
     }
     cursor
