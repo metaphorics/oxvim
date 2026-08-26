@@ -18,6 +18,7 @@ pub use builtins::{
 pub use error::{EvalError, EvalErrorKind, Result};
 pub use eval::{BuiltinHost, BufferHost, Evaluator, NoBuiltins, NoRegex, RegexEngine, RegexMatch};
 pub use parser::{Expr, Parser};
+pub use path_builtins::apply_filename_modifiers;
 pub use scope::{Scope, ScopeKind};
 
 #[cfg(test)]

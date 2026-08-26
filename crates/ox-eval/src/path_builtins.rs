@@ -95,9 +95,28 @@ pub(crate) fn fnamemodify(
     filename: &Typval,
     modifiers: &Typval,
 ) -> Result<Typval> {
-    let mut name = string_arg(filename)?.to_string_lossy().into_owned();
+    let name = string_arg(filename)?.to_string_lossy().into_owned();
     let modifiers = string_arg(modifiers)?;
-    let bytes = modifiers.as_bytes();
+    Ok(text(apply_filename_modifiers(regex, &name, modifiers.as_bytes())?))
+}
+
+/// `modify_fname` (`eval/fs.c:69`): apply a chain of filename modifiers
+/// (`:p`, `:~`, `:.`, `:h`, `:t`, `:r`, `:e`, `:s`, `:gs`, `:S`, `:8`) to
+/// `name`, in order. Unknown or truncated modifiers stop the chain and
+/// keep the name as modified so far — the same tolerance `fnamemodify`
+/// already has. Errors only when a `:s`/`:gs` modifier needs a regex
+/// engine that is `None` (E54 `regular-expression engine is not installed`)
+/// or when the substitution itself fails; the error is the caller's
+/// builtin error as it is for `fnamemodify` today. Modifiers are raw
+/// bytes — `fnamemodify` forwards its argument without a lossy string
+/// conversion, exactly as before this parser was shared.
+pub fn apply_filename_modifiers(
+    regex: Option<&dyn RegexEngine>,
+    name: &str,
+    modifiers: &[u8],
+) -> Result<String> {
+    let mut name = name.to_owned();
+    let bytes = modifiers;
     let mut cursor = 0;
 
     while bytes.get(cursor) == Some(&b':') {
@@ -161,7 +180,7 @@ pub(crate) fn fnamemodify(
         }
     }
 
-    Ok(text(name))
+    Ok(name)
 }
 
 /// `tempname()` — `f_tempname` (`eval/fs.c:1701-1705`) calling

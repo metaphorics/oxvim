@@ -181,28 +181,19 @@ fn call_luaeval_builtin<F: FileIO>(
     }
 }
 
-/// `expand()` (`f_expand`).
-///
-/// `%`, `#` and a `<...>` keyword go to `eval_vars`; anything else is a file
-/// pattern handed to `ExpandOne`, which resolves `~` and `$NAME` through
-/// `expand_env_esc` before matching. Returning such a pattern verbatim leaves
-/// `expand('~')` as the literal `~`, and callers that hand the result to a
-/// shell -- `runtest.vim`'s `system('rm -rf  ' .. file)` -- then let the
-/// *shell* expand it against its own environment.
-///
-/// Named gap: the wildcard half of `ExpandOne` is not here, so a pattern with
-/// `*` or `?` still comes back as itself; `glob()` is where this port matches
-/// files.
-fn call_expand_builtin<F: FileIO>(
+/// Leading cmdline sp_token table for `expand()` (`find_cmdline_var`,
+/// ex_docmd.c:7488), limited to the tokens this port resolves. Ordered
+/// longest-first so a later `<argname>`-style addition cannot be shadowed.
+const EXPAND_SPECIAL_TOKENS: &[&str] = &["<amatch>", "<afile>", "<abuf>", "<SID>", "%"];
+
+/// The `eval_vars` (ex_docmd.c:7551) bases behind `expand()`'s special
+/// tokens. A token this port does not know yields an empty base.
+fn expand_special_base<F: FileIO>(
     runtime: &ExRuntime<F>,
     editor: &Editor,
-    args: Vec<Typval>,
-) -> ox_eval::Result<Typval> {
-    let [Typval::String(value), ..] = args.as_slice() else {
-        return Err(EvalError::new("E730", 0, "Using a List as a String"));
-    };
-    let text = value.to_string_lossy();
-    let expanded = match text.as_ref() {
+    token: &str,
+) -> String {
+    match token {
         "%" => editor
             .current_buffer()
             .and_then(|buffer| editor.buffer(buffer).ok())
@@ -212,7 +203,61 @@ fn call_expand_builtin<F: FileIO>(
             .active_sid()
             .or_else(|| runtime.scripts.current_sid())
             .map_or_else(String::new, |sid| format!("<SNR>{sid}_")),
-        pattern => expand_env_esc(pattern),
+        "<amatch>" => runtime.active_autocmd.matched.clone(),
+        "<afile>" => runtime.active_autocmd.file.clone(),
+        "<abuf>" => runtime
+            .active_autocmd
+            .buffer
+            .map_or_else(String::new, |buffer| i64::from(buffer).to_string()),
+        _ => String::new(),
+    }
+}
+
+/// `expand()` (`f_expand`).
+///
+/// `%`, `#` and a `<...>` keyword go to `eval_vars`; this port resolves
+/// `%`, `<SID>`, `<amatch>`, `<afile>` and `<abuf>` as leading tokens with
+/// an optional trailing `:`-modifier chain applied through
+/// `ox_eval::apply_filename_modifiers` (`modify_fname` parity), so
+/// `expand('%:p')` is the absolute current-buffer name. Anything else is a
+/// file pattern handed to `ExpandOne`, which resolves `~` and `$NAME`
+/// through `expand_env_esc` before matching. Returning such a pattern
+/// verbatim leaves `expand('~')` as the literal `~`, and callers that hand
+/// the result to a shell -- `runtest.vim`'s `system('rm -rf  ' .. file)` --
+/// then let the *shell* expand it against its own environment.
+///
+/// Named gap: the wildcard half of `ExpandOne` is not here, so a pattern
+/// with `*` or `?` still comes back as itself; `glob()` is where this port
+/// matches files. `#` and `<cword>`/`<sfile>`-style tokens are likewise
+/// not recognized and pass through verbatim, and the `%<` extension-strip
+/// form is not implemented.
+fn call_expand_builtin<F: FileIO>(
+    runtime: &ExRuntime<F>,
+    editor: &Editor,
+    args: Vec<Typval>,
+) -> ox_eval::Result<Typval> {
+    let [Typval::String(value), ..] = args.as_slice() else {
+        return Err(EvalError::new("E730", 0, "Using a List as a String"));
+    };
+    let text = value.to_string_lossy();
+    let text: &str = text.as_ref();
+    let special = EXPAND_SPECIAL_TOKENS
+        .iter()
+        .find_map(|token| text.strip_prefix(token).map(|rest| (*token, rest)));
+    let expanded = match special {
+        // Exact token or token-plus-`:`-modifier chain (`eval_vars` +
+        // `modify_fname`).
+        Some((token, rest)) if rest.is_empty() || rest.starts_with(':') => {
+            let base = expand_special_base(runtime, editor, token);
+            // `expand()` on an unnamed source yields "" (upstream f_expand:
+            // eval_vars marks the result invalid and f_expand returns "").
+            if rest.is_empty() || base.is_empty() {
+                base
+            } else {
+                ox_eval::apply_filename_modifiers(Some(&VimRegex), &base, rest.as_bytes())?
+            }
+        }
+        _ => expand_env_esc(text),
     };
     Ok(Typval::String(OxStr(expanded.into_bytes())))
 }

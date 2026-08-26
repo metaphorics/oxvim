@@ -300,6 +300,15 @@ const fn reports_command_line(code: &str) -> bool {
     matches!(code.as_bytes(), b"E16" | b"E493")
 }
 
+/// Values bound to `<amatch>`, `<afile>`, and `<abuf>` while one autocmd action
+/// runs. Empty/`None` outside an active event.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ActiveAutocmdContext {
+    pub(crate) matched: String,
+    pub(crate) file: String,
+    pub(crate) buffer: Option<BufHandle>,
+}
+
 pub(crate) struct ExRuntime<F: FileIO> {
     pub(crate) scripts: ScriptCtx<F>,
     pub(crate) functions: UserFunctions,
@@ -328,6 +337,8 @@ pub(crate) struct ExRuntime<F: FileIO> {
     /// Threading it instead would mean touching several hundred `error_flow`
     /// call sites and would still miss the next one.
     pub(crate) executing: ExecutingCommand,
+    /// Active `<amatch>`/`<afile>`/`<abuf>` binding for the current autocmd action.
+    pub(crate) active_autocmd: ActiveAutocmdContext,
     /// One entry per active user-function frame, holding the paths that frame's
     /// `writefile(..., 'D')` calls asked to have deleted when it returns.
     ///
@@ -354,6 +365,7 @@ impl<F: FileIO> ExRuntime<F> {
             filetype: FiletypeState::default(),
             exiting: false,
             executing: ExecutingCommand::default(),
+            active_autocmd: ActiveAutocmdContext::default(),
             deferred_deletes: Vec::new(),
         }
     }
@@ -695,6 +707,28 @@ impl<F: FileIO> ExExecutor<F> {
         sync_scope_into_editor(editor, &self.scope)?;
         flow_to_result(flow)
     }
+
+    /// Executes one API-planned Ex autocmd with `<amatch>`, `<afile>`, and
+    /// `<abuf>` bound for the duration of the command.
+    pub fn execute_autocmd_command(
+        &mut self,
+        editor: &mut Editor,
+        action: &crate::AutocmdAction,
+        source: &str,
+    ) -> Result<ExecOutcome, ExecError> {
+        let previous_context = std::mem::replace(
+            &mut self.runtime.active_autocmd,
+            ActiveAutocmdContext {
+                matched: action.match_name.clone(),
+                file: action.file_name.clone(),
+                buffer: action.buffer,
+            },
+        );
+        let result = self.execute_line(editor, source);
+        self.runtime.active_autocmd = previous_context;
+        result
+    }
+
     /// Executes an already parsed command stream against `editor`.
     pub fn execute_commands(
         &mut self,
@@ -3303,7 +3337,9 @@ fn fire_read_autocmd<F: FileIO>(
     matched: Option<&str>,
 ) -> Flow {
     let (buffer, name) = match matched {
-        Some(name) => (None, name.to_owned()),
+        // FileRead* events still bind `<abuf>` to the current buffer, matching
+        // upstream `readfile` which passes `curbuf` alongside `sfname`.
+        Some(name) => (editor.current_buffer(), name.to_owned()),
         None => (editor.current_buffer(), current_buffer_name(editor)),
     };
     let plan = editor.autocmds_mut().plan(
@@ -5290,6 +5326,14 @@ fn run_autocmd_plan<F: FileIO>(
         if action.once {
             editor.autocmds_mut().consume_once(action.id);
         }
+        let previous_context = std::mem::replace(
+            &mut runtime.active_autocmd,
+            ActiveAutocmdContext {
+                matched: action.match_name.clone(),
+                file: action.file_name.clone(),
+                buffer: action.buffer,
+            },
+        );
         let action_flow = match action.kind {
             AutocmdKind::ExString(source) => {
                 let logical = vec![LogicalLine {
@@ -5301,25 +5345,28 @@ fn run_autocmd_plan<F: FileIO>(
                     Err(error) => exec_error_flow(runtime, error),
                 }
             }
-            AutocmdKind::LuaCallback(reference) => {
-                let Some(lua) = lua else {
-                    return error_flow(runtime, "E5108", "Lua callbacks are not installed");
-                };
-                if let Err(error) = sync_scope_into_editor(editor, scope) {
-                    return exec_error_flow(runtime, error);
+            AutocmdKind::LuaCallback(reference) => match lua {
+                None => error_flow(runtime, "E5108", "Lua callbacks are not installed"),
+                Some(lua) => {
+                    if let Err(error) = sync_scope_into_editor(editor, scope) {
+                        exec_error_flow(runtime, error)
+                    } else {
+                        match usize::try_from(reference) {
+                            Ok(reference) => match lua.borrow_mut().invoke_callback(editor, reference, Vec::new()) {
+                                Ok(()) => match sync_editor_into_scope(editor, scope) {
+                                    Ok(()) => Flow::Normal,
+                                    Err(error) => exec_error_flow(runtime, error),
+                                },
+                                Err(error) => lua_error_flow(runtime, error, "E5107", "E5108"),
+                            },
+                            Err(_) => error_flow(runtime, "E5108", "Lua callback reference is out of range"),
+                        }
+                    }
                 }
-                match usize::try_from(reference) {
-                    Ok(reference) => match lua.borrow_mut().invoke_callback(editor, reference, Vec::new()) {
-                        Ok(()) => match sync_editor_into_scope(editor, scope) {
-                            Ok(()) => Flow::Normal,
-                            Err(error) => exec_error_flow(runtime, error),
-                        },
-                        Err(error) => lua_error_flow(runtime, error, "E5107", "E5108"),
-                    },
-                    Err(_) => error_flow(runtime, "E5108", "Lua callback reference is out of range"),
-                }
-            }
+            },
         };
+        // One restore path for both normal and early-return action outcomes.
+        runtime.active_autocmd = previous_context;
         if !matches!(action_flow, Flow::Normal) {
             return action_flow;
         }

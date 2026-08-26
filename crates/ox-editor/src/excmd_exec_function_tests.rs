@@ -1559,6 +1559,134 @@ fn expand_builtin_reads_current_buffer_and_preserves_paths() {
     ));
 }
 
+/// `expand()` applies a `:`-modifier chain after a special token the way
+/// upstream `f_expand` does: `eval_vars` resolves the token base
+/// (ex_docmd.c:7551), then `modify_fname` (eval/fs.c:69) — here
+/// `ox_eval::apply_filename_modifiers` — eats the rest. This is the
+/// termdebug shape: `expand('%:p')` inside the `-break-insert` command
+/// (test_plugin_termdebug.vim Test_termdebug_break_command_builder).
+///
+/// The buffer name is absolute and non-existent so `:p` is deterministic:
+/// `absolute_name` only consults the filesystem (`fs::canonicalize`) for
+/// paths that exist. An empty base short-circuits to "" — upstream's
+/// `eval_vars` marks the result invalid and `f_expand` returns "".
+#[test]
+fn expand_builtin_applies_filename_modifiers_to_special_tokens() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    let directory = std::env::temp_dir().join(format!("ox-expand-mod-{}", std::process::id()));
+    let stored = directory.join("XTD_break_cmd.c");
+    let stored = stored.to_string_lossy().into_owned();
+    editor.buffer_mut(buffer).unwrap().set_name(OxStr::from(stored.as_str()));
+    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&mut editor, "let g:exact = expand('%')").unwrap();
+    exec.execute_line(&mut editor, "let g:absolute = expand('%:p')").unwrap();
+    exec.execute_line(&mut editor, "let g:head = expand('%:p:h')").unwrap();
+    exec.execute_line(&mut editor, "let g:tail = expand('%:t')").unwrap();
+
+    assert_eq!(global_string(exec.scope(), "exact").as_deref(), Some(stored.as_str()));
+    assert_eq!(global_string(exec.scope(), "absolute").as_deref(), Some(stored.as_str()));
+    let parent = directory.to_string_lossy().into_owned();
+    assert_eq!(global_string(exec.scope(), "head").as_deref(), Some(parent.as_str()));
+    assert_eq!(global_string(exec.scope(), "tail").as_deref(), Some("XTD_break_cmd.c"));
+
+    // An unnamed buffer has an empty base: both the exact token and the
+    // modifier chain yield "". `<afile>` outside an autocommand is the
+    // non-path token with the same empty-base rule.
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&mut editor, "let g:blank = expand('%')").unwrap();
+    exec.execute_line(&mut editor, "let g:blank_p = expand('%:p')").unwrap();
+    exec.execute_line(&mut editor, "let g:afile = expand('<afile>')").unwrap();
+    exec.execute_line(&mut editor, "let g:afile_h = expand('<afile>:h')").unwrap();
+
+    assert_eq!(global_string(exec.scope(), "blank").as_deref(), Some(""));
+    assert_eq!(global_string(exec.scope(), "blank_p").as_deref(), Some(""));
+    assert_eq!(global_string(exec.scope(), "afile").as_deref(), Some(""));
+    assert_eq!(global_string(exec.scope(), "afile_h").as_deref(), Some(""));
+}
+
+/// While a FileReadPre action runs, `<amatch>`, `<afile>`, `<afile>:h`, and
+/// `<abuf>` resolve from the active autocmd context installed for that action.
+#[test]
+fn expand_builtin_resolves_autocmd_special_tokens_during_event() {
+    let mut editor = editor_with_lines(&["initial"]);
+    let buffer = editor.current_buffer().unwrap();
+    let io = MemoryFileIO::new();
+    io.insert("dir/target.txt", "content\n");
+    let mut exec = ExExecutor::with_io(io);
+
+    for (pattern, body) in [
+        ("*.txt", "let g:m = expand('<amatch>')"),
+        ("*.txt", "let g:f = expand('<afile>')"),
+        ("*.txt", "let g:fh = expand('<afile>:h')"),
+        ("*.txt", "let g:b = expand('<abuf>')"),
+    ] {
+        editor
+            .autocmds_mut()
+            .register(
+                Event::FileReadPre,
+                pattern,
+                AutocmdKind::ExString(body.to_owned()),
+                AutocmdOptions::default(),
+            )
+            .unwrap();
+    }
+    exec.execute_line(&mut editor, "1read dir/target.txt").unwrap();
+
+    let expected_match = std::env::current_dir()
+        .unwrap()
+        .join("dir/target.txt")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(global_string(exec.scope(), "m").as_deref(), Some(expected_match.as_str()));
+    assert_eq!(global_string(exec.scope(), "f").as_deref(), Some("dir/target.txt"));
+    assert_eq!(global_string(exec.scope(), "fh").as_deref(), Some("dir"));
+    let expected_buf = i64::from(buffer).to_string();
+    assert_eq!(global_string(exec.scope(), "b").as_deref(), Some(expected_buf.as_str()));
+}
+
+/// Nested FileReadPre actions replace then restore the outer active context,
+/// and outside any event the autocmd tokens stay empty.
+#[test]
+fn expand_builtin_restores_autocmd_context_after_nested_event() {
+    let mut editor = editor_with_lines(&["initial"]);
+    let io = MemoryFileIO::new();
+    io.insert("outer.txt", "outer\n");
+    io.insert("nested.txt", "nested\n");
+    let mut exec = ExExecutor::with_io(io);
+
+    for (pattern, body) in [
+        ("nested.txt", "let g:inner_file = expand('<afile>')"),
+        ("outer.txt", "let g:outer_pre = expand('<afile>')"),
+        ("outer.txt", "1read nested.txt"),
+        ("outer.txt", "let g:outer_post = expand('<afile>')"),
+    ] {
+        editor
+            .autocmds_mut()
+            .register(
+                Event::FileReadPre,
+                pattern,
+                AutocmdKind::ExString(body.to_owned()),
+                AutocmdOptions::default(),
+            )
+            .unwrap();
+    }
+    exec.execute_line(&mut editor, "1read outer.txt").unwrap();
+
+    assert_eq!(global_string(exec.scope(), "outer_pre").as_deref(), Some("outer.txt"));
+    assert_eq!(global_string(exec.scope(), "inner_file").as_deref(), Some("nested.txt"));
+    assert_eq!(global_string(exec.scope(), "outer_post").as_deref(), Some("outer.txt"));
+
+    exec.execute_line(&mut editor, "let g:outside = expand('<afile>')").unwrap();
+    assert_eq!(global_string(exec.scope(), "outside").as_deref(), Some(""));
+}
+
 /// `expand()` resolves `~` and `$NAME` the way `ExpandOne` does, through
 /// `expand_env_esc` (`os/env.c`).
 ///
