@@ -83,12 +83,23 @@ fn apply_delete(
     range: EditRange,
     register: Option<char>,
 ) {
+    apply_op(editor, buffer, window, Operator::Delete, range, register);
+}
+
+fn apply_op(
+    editor: &mut Editor,
+    buffer: ox_types::BufHandle,
+    window: ox_types::WinHandle,
+    operator: Operator,
+    range: EditRange,
+    register: Option<char>,
+) {
     let mut eval = NullExprEval;
     ops::apply(
         editor,
         buffer,
         window,
-        Operator::Delete,
+        operator,
         range,
         register,
         10,
@@ -347,33 +358,6 @@ fn characterwise_exclusive_endpoint_and_whitespace_promotion() {
     );
     assert_eq!(editor.buffer_undo(buffer).unwrap(), Some(1));
     editor.sync_buffer_undo(buffer);
-
-    // Delete-only whitespace promotion becomes linewise.
-    let (mut editor, buffer, window) = setup(&[b"  ab", b"cd  ", b"keep"]);
-    editor.set_window_cursor(window, position(1, 0)).unwrap();
-    let (namespace, after) = mark_at(&mut editor, buffer, 2, 0);
-    apply_delete(
-        &mut editor,
-        buffer,
-        window,
-        EditRange {
-            start: position(1, 0),
-            end: position(2, 3),
-            kind: MotionKind::CharacterWise,
-            inclusive: true,
-        },
-        None,
-    );
-    assert_eq!(text_bytes(&editor, buffer), b"keep");
-    assert_eq!(
-        ext_pos(&editor, buffer, namespace, after),
-        ExtmarkPosition::new(0, 0)
-    );
-    assert_eq!(
-        editor.registers().get('"').unwrap().unwrap().kind(),
-        RegisterKind::LineWise
-    );
-    assert_eq!(editor.changelists().len(buffer), 1);
 }
 
 #[test]
@@ -722,4 +706,481 @@ fn blockwise_delete_batch_one_tick() {
     assert_eq!(editor.buffer(buffer).unwrap().undo.current_seq(), seq + 1);
     assert_eq!(editor.buffer_undo(buffer).unwrap(), Some(1));
     assert_eq!(text_bytes(&editor, buffer), b"12345\nabc\nVWXYZ");
+}
+
+#[test]
+fn inclusive_charwise_search_offset_is_not_promoted_linewise() {
+    // `d/pat/e` from column 0 on "one\ntwo abc\nthree" is inclusive charwise.
+    let (mut editor, buffer, window) = setup(&[b"one", b"two abc", b"three"]);
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let state = editor.buffer_mut(buffer).unwrap();
+    let namespace = state.extmarks.create_namespace("search-offset").unwrap();
+    let before = place(
+        &mut editor,
+        buffer,
+        namespace,
+        ExtmarkPlacement::new(ExtmarkPosition::new(0, 0)),
+    );
+    let inside = place(
+        &mut editor,
+        buffer,
+        namespace,
+        ExtmarkPlacement::new(ExtmarkPosition::new(1, 1)),
+    );
+    let after = place(
+        &mut editor,
+        buffer,
+        namespace,
+        ExtmarkPlacement::new(ExtmarkPosition::new(2, 1)),
+    );
+    apply_delete(
+        &mut editor,
+        buffer,
+        window,
+        EditRange {
+            start: position(1, 0),
+            end: position(2, 6),
+            kind: MotionKind::CharacterWise,
+            inclusive: true,
+        },
+        None,
+    );
+    assert_eq!(text_bytes(&editor, buffer), b"\nthree");
+    assert_eq!(
+        editor.registers().get('"').unwrap().unwrap().kind(),
+        RegisterKind::CharacterWise
+    );
+    assert_eq!(
+        ext_pos(&editor, buffer, namespace, before),
+        ExtmarkPosition::new(0, 0)
+    );
+    assert_eq!(
+        ext_pos(&editor, buffer, namespace, inside),
+        ExtmarkPosition::new(0, 0)
+    );
+    assert_eq!(
+        ext_pos(&editor, buffer, namespace, after),
+        ExtmarkPosition::new(1, 1)
+    );
+}
+
+#[test]
+fn around_paren_text_object_stays_charwise_full_span() {
+    let (mut editor, buffer, window) = setup(&[b"(", b"foo", b")", b"keep"]);
+    editor.set_window_cursor(window, position(2, 0)).unwrap();
+    let text = editor.buffer(buffer).unwrap().text().unwrap();
+    let lines = (1..=text.line_count())
+        .map(|lnum| text.line(lnum).unwrap())
+        .collect::<Vec<_>>();
+    let range = crate::textobject::resolve(&lines, position(2, 0), false, '(', 1).unwrap();
+    assert_eq!(range.kind, MotionKind::CharacterWise);
+    assert!(range.inclusive);
+    apply_delete(&mut editor, buffer, window, range, None);
+    assert_eq!(text_bytes(&editor, buffer), b"\nkeep");
+    assert_eq!(
+        editor.registers().get('"').unwrap().unwrap().kind(),
+        RegisterKind::CharacterWise
+    );
+}
+
+fn geometry_range(kind: MotionKind) -> EditRange {
+    match kind {
+        MotionKind::CharacterWise => EditRange {
+            start: position(1, 1),
+            end: position(2, 1),
+            kind,
+            inclusive: true,
+        },
+        MotionKind::LineWise => EditRange {
+            start: position(1, 0),
+            end: position(2, 0),
+            kind,
+            inclusive: true,
+        },
+        MotionKind::BlockWise => EditRange {
+            start: position(1, 1),
+            end: position(2, 2),
+            kind,
+            inclusive: true,
+        },
+    }
+}
+
+fn assert_exact_geometry(
+    operator: Operator,
+    kind: MotionKind,
+    expected: &[u8],
+    before: ExtmarkPosition,
+    inside: ExtmarkPosition,
+    after: ExtmarkPosition,
+    block_len: usize,
+) {
+    let (mut editor, buffer, window) = setup(&[b"abcde", b"fghij", b"klmno"]);
+    editor
+        .options_mut()
+        .set_buffer(buffer, "shiftwidth", crate::OptionValue::Number(2))
+        .unwrap();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let state = editor.buffer_mut(buffer).unwrap();
+    let namespace = state.extmarks.create_namespace("op-geometry").unwrap();
+    let before_id = place(
+        &mut editor,
+        buffer,
+        namespace,
+        ExtmarkPlacement::new(ExtmarkPosition::new(0, 0)),
+    );
+    let inside_id = place(
+        &mut editor,
+        buffer,
+        namespace,
+        ExtmarkPlacement::new(ExtmarkPosition::new(0, 2)),
+    );
+    let after_id = place(
+        &mut editor,
+        buffer,
+        namespace,
+        ExtmarkPlacement::new(ExtmarkPosition::new(2, 3)),
+    );
+    let tick = editor.buffer(buffer).unwrap().changedtick();
+    let changelist = editor.changelists().len(buffer);
+    let seq = editor.buffer(buffer).unwrap().undo.current_seq();
+    apply_op(
+        &mut editor,
+        buffer,
+        window,
+        operator,
+        geometry_range(kind),
+        Some('a'),
+    );
+    assert_eq!(text_bytes(&editor, buffer), expected);
+    assert_eq!(ext_pos(&editor, buffer, namespace, before_id), before);
+    assert_eq!(ext_pos(&editor, buffer, namespace, inside_id), inside);
+    assert_eq!(ext_pos(&editor, buffer, namespace, after_id), after);
+    assert_eq!(editor.changelists().len(buffer), changelist + 1);
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick + 1);
+    assert_eq!(editor.buffer(buffer).unwrap().undo.current_seq(), seq + 1);
+    assert_eq!(
+        editor.buffer(buffer).unwrap().undo.current_block_len(),
+        block_len
+    );
+    assert_eq!(editor.buffer_undo(buffer).unwrap(), Some(1));
+    assert_eq!(text_bytes(&editor, buffer), b"abcde\nfghij\nklmno");
+    assert_eq!(
+        ext_pos(&editor, buffer, namespace, after_id),
+        ExtmarkPosition::new(2, 3)
+    );
+    assert_eq!(editor.buffer_redo(buffer).unwrap(), Some(1));
+    assert_eq!(text_bytes(&editor, buffer), expected);
+    assert_eq!(ext_pos(&editor, buffer, namespace, after_id), after);
+}
+
+#[test]
+fn change_characterwise_uses_exact_splice_geometry() {
+    assert_exact_geometry(
+        Operator::Change,
+        MotionKind::CharacterWise,
+        b"ahij\nklmno",
+        ExtmarkPosition::new(0, 0),
+        ExtmarkPosition::new(0, 1),
+        ExtmarkPosition::new(1, 3),
+        1,
+    );
+}
+
+#[test]
+fn change_linewise_uses_exact_splice_geometry() {
+    assert_exact_geometry(
+        Operator::Change,
+        MotionKind::LineWise,
+        b"\nklmno",
+        ExtmarkPosition::new(0, 0),
+        ExtmarkPosition::new(0, 0),
+        ExtmarkPosition::new(1, 3),
+        1,
+    );
+}
+
+#[test]
+fn change_blockwise_uses_exact_splice_geometry() {
+    assert_exact_geometry(
+        Operator::Change,
+        MotionKind::BlockWise,
+        b"ade\nfij\nklmno",
+        ExtmarkPosition::new(0, 0),
+        ExtmarkPosition::new(0, 1),
+        ExtmarkPosition::new(2, 3),
+        2,
+    );
+}
+
+#[test]
+fn indent_linewise_uses_exact_splice_geometry() {
+    assert_exact_geometry(
+        Operator::Indent,
+        MotionKind::LineWise,
+        b"  abcde\n  fghij\nklmno",
+        ExtmarkPosition::new(0, 2),
+        ExtmarkPosition::new(0, 4),
+        ExtmarkPosition::new(2, 3),
+        2,
+    );
+}
+
+#[test]
+fn indent_characterwise_uses_exact_splice_geometry() {
+    assert_exact_geometry(
+        Operator::Indent,
+        MotionKind::CharacterWise,
+        b"  abcde\n  fghij\nklmno",
+        ExtmarkPosition::new(0, 2),
+        ExtmarkPosition::new(0, 4),
+        ExtmarkPosition::new(2, 3),
+        2,
+    );
+}
+
+#[test]
+fn indent_blockwise_uses_exact_splice_geometry() {
+    assert_exact_geometry(
+        Operator::Indent,
+        MotionKind::BlockWise,
+        b"a  bcde\nf  ghij\nklmno",
+        ExtmarkPosition::new(0, 0),
+        ExtmarkPosition::new(0, 4),
+        ExtmarkPosition::new(2, 3),
+        2,
+    );
+}
+
+#[test]
+fn unindent_linewise_uses_exact_splice_geometry() {
+    let (mut editor, buffer, window) = setup(&[b"  abcde", b"  fghij", b"klmno"]);
+    editor
+        .options_mut()
+        .set_buffer(buffer, "shiftwidth", crate::OptionValue::Number(2))
+        .unwrap();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let state = editor.buffer_mut(buffer).unwrap();
+    let namespace = state.extmarks.create_namespace("unindent").unwrap();
+    let before = place(
+        &mut editor,
+        buffer,
+        namespace,
+        ExtmarkPlacement::new(ExtmarkPosition::new(0, 0)),
+    );
+    let inside = place(
+        &mut editor,
+        buffer,
+        namespace,
+        ExtmarkPlacement::new(ExtmarkPosition::new(0, 4)),
+    );
+    let after = place(
+        &mut editor,
+        buffer,
+        namespace,
+        ExtmarkPlacement::new(ExtmarkPosition::new(2, 3)),
+    );
+    let tick = editor.buffer(buffer).unwrap().changedtick();
+    apply_op(
+        &mut editor,
+        buffer,
+        window,
+        Operator::Unindent,
+        EditRange {
+            start: position(1, 0),
+            end: position(2, 0),
+            kind: MotionKind::LineWise,
+            inclusive: true,
+        },
+        None,
+    );
+    assert_eq!(text_bytes(&editor, buffer), b"abcde\nfghij\nklmno");
+    assert_eq!(
+        ext_pos(&editor, buffer, namespace, before),
+        ExtmarkPosition::new(0, 0)
+    );
+    assert_eq!(
+        ext_pos(&editor, buffer, namespace, inside),
+        ExtmarkPosition::new(0, 2)
+    );
+    assert_eq!(
+        ext_pos(&editor, buffer, namespace, after),
+        ExtmarkPosition::new(2, 3)
+    );
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick + 1);
+    assert_eq!(editor.changelists().len(buffer), 1);
+    assert_eq!(editor.buffer(buffer).unwrap().undo.current_block_len(), 2);
+    assert_eq!(editor.buffer_undo(buffer).unwrap(), Some(1));
+    assert_eq!(text_bytes(&editor, buffer), b"  abcde\n  fghij\nklmno");
+}
+
+#[test]
+fn unindent_characterwise_uses_exact_splice_geometry() {
+    let (mut editor, buffer, window) = setup(&[b"  abcde", b"  fghij", b"klmno"]);
+    editor
+        .options_mut()
+        .set_buffer(buffer, "shiftwidth", crate::OptionValue::Number(2))
+        .unwrap();
+    let state = editor.buffer_mut(buffer).unwrap();
+    let namespace = state.extmarks.create_namespace("unindent-char").unwrap();
+    let after = place(
+        &mut editor,
+        buffer,
+        namespace,
+        ExtmarkPlacement::new(ExtmarkPosition::new(2, 3)),
+    );
+    apply_op(
+        &mut editor,
+        buffer,
+        window,
+        Operator::Unindent,
+        EditRange {
+            start: position(1, 0),
+            end: position(2, 2),
+            kind: MotionKind::CharacterWise,
+            inclusive: true,
+        },
+        None,
+    );
+    assert_eq!(text_bytes(&editor, buffer), b"abcde\nfghij\nklmno");
+    assert_eq!(
+        ext_pos(&editor, buffer, namespace, after),
+        ExtmarkPosition::new(2, 3)
+    );
+}
+
+#[test]
+fn unindent_blockwise_uses_exact_splice_geometry() {
+    let (mut editor, buffer, window) = setup(&[b"ab  cde", b"fg  hij", b"klmno"]);
+    let state = editor.buffer_mut(buffer).unwrap();
+    let namespace = state.extmarks.create_namespace("unindent-block").unwrap();
+    let after = place(
+        &mut editor,
+        buffer,
+        namespace,
+        ExtmarkPlacement::new(ExtmarkPosition::new(2, 3)),
+    );
+    apply_op(
+        &mut editor,
+        buffer,
+        window,
+        Operator::Unindent,
+        EditRange {
+            start: position(1, 2),
+            end: position(2, 3),
+            kind: MotionKind::BlockWise,
+            inclusive: true,
+        },
+        None,
+    );
+    assert_eq!(text_bytes(&editor, buffer), b"abcde\nfghij\nklmno");
+    assert_eq!(
+        ext_pos(&editor, buffer, namespace, after),
+        ExtmarkPosition::new(2, 3)
+    );
+}
+
+#[test]
+fn uppercase_characterwise_uses_exact_splice_geometry() {
+    assert_exact_geometry(
+        Operator::Uppercase,
+        MotionKind::CharacterWise,
+        b"aBCDE\nFGhij\nklmno",
+        ExtmarkPosition::new(0, 0),
+        ExtmarkPosition::new(0, 5),
+        ExtmarkPosition::new(2, 3),
+        2,
+    );
+}
+
+#[test]
+fn uppercase_linewise_uses_exact_splice_geometry() {
+    assert_exact_geometry(
+        Operator::Uppercase,
+        MotionKind::LineWise,
+        b"ABCDE\nFGHIJ\nklmno",
+        ExtmarkPosition::new(0, 5),
+        ExtmarkPosition::new(0, 5),
+        ExtmarkPosition::new(2, 3),
+        2,
+    );
+}
+
+#[test]
+fn uppercase_blockwise_uses_exact_splice_geometry() {
+    assert_exact_geometry(
+        Operator::Uppercase,
+        MotionKind::BlockWise,
+        b"aBCde\nfGHij\nklmno",
+        ExtmarkPosition::new(0, 0),
+        ExtmarkPosition::new(0, 3),
+        ExtmarkPosition::new(2, 3),
+        2,
+    );
+}
+
+#[test]
+fn lowercase_characterwise_uses_exact_splice_geometry() {
+    let (mut editor, buffer, window) = setup(&[b"ABCDE", b"FGHIJ", b"KLMNO"]);
+    let state = editor.buffer_mut(buffer).unwrap();
+    let namespace = state.extmarks.create_namespace("lower").unwrap();
+    let after = place(
+        &mut editor,
+        buffer,
+        namespace,
+        ExtmarkPlacement::new(ExtmarkPosition::new(2, 3)),
+    );
+    apply_op(
+        &mut editor,
+        buffer,
+        window,
+        Operator::Lowercase,
+        EditRange {
+            start: position(1, 1),
+            end: position(2, 1),
+            kind: MotionKind::CharacterWise,
+            inclusive: true,
+        },
+        None,
+    );
+    assert_eq!(text_bytes(&editor, buffer), b"Abcde\nfgHIJ\nKLMNO");
+    assert_eq!(
+        ext_pos(&editor, buffer, namespace, after),
+        ExtmarkPosition::new(2, 3)
+    );
+    assert_eq!(editor.buffer(buffer).unwrap().undo.current_block_len(), 2);
+}
+
+#[test]
+fn toggle_case_blockwise_uses_exact_splice_geometry() {
+    let (mut editor, buffer, window) = setup(&[b"aBcDe", b"FgHiJ", b"klmno"]);
+    let state = editor.buffer_mut(buffer).unwrap();
+    let namespace = state.extmarks.create_namespace("toggle").unwrap();
+    let after = place(
+        &mut editor,
+        buffer,
+        namespace,
+        ExtmarkPlacement::new(ExtmarkPosition::new(2, 3)),
+    );
+    apply_op(
+        &mut editor,
+        buffer,
+        window,
+        Operator::ToggleCase,
+        EditRange {
+            start: position(1, 1),
+            end: position(2, 2),
+            kind: MotionKind::BlockWise,
+            inclusive: true,
+        },
+        None,
+    );
+    assert_eq!(text_bytes(&editor, buffer), b"abCDe\nFGhiJ\nklmno");
+    assert_eq!(
+        ext_pos(&editor, buffer, namespace, after),
+        ExtmarkPosition::new(2, 3)
+    );
+    assert_eq!(editor.changelists().len(buffer), 1);
+    assert_eq!(editor.buffer_undo(buffer).unwrap(), Some(1));
+    assert_eq!(text_bytes(&editor, buffer), b"aBcDe\nFgHiJ\nklmno");
 }
