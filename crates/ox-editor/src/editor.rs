@@ -13,7 +13,7 @@ use crate::arglist::ArgList;
 use crate::autocmd::Autocmds;
 use crate::buffer::{BufferState, BufferStateError, BufferTextEditRequest};
 use crate::decoration::Decorations;
-use crate::extmark::{ExtmarkPosition, TextSplice};
+use crate::extmark::{NamespaceId, SignGroup, TextSplice};
 use crate::fold::{FoldError, Position as FoldPosition};
 use crate::layout::{Geometry, Layout, LayoutError, TabpageState, WinConfig, WindowState};
 use crate::mapping::Mappings;
@@ -94,6 +94,15 @@ pub struct MessageRouting {
 /// Values remain source spellings (`guifg=#rrggbb`, `bold`, `NONE`) so the
 /// UI layer can apply terminal- or GUI-specific interpretation later.
 pub type HighlightDefinition = BTreeMap<String, String>;
+/// Attributes registered by the legacy `:sign define` command.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SignDefinition {
+    pub(crate) text: Option<String>,
+    pub(crate) text_highlight: Option<String>,
+    pub(crate) number_highlight: Option<String>,
+    pub(crate) line_highlight: Option<String>,
+    pub(crate) cursorline_highlight: Option<String>,
+}
 
 /// A message retained until a UI or server consumes it.
 #[derive(Clone, Debug, PartialEq)]
@@ -224,6 +233,11 @@ pub struct Editor {
     vvars: Dict,
     /// Named highlight groups defined by `:highlight`.
     highlights: BTreeMap<String, HighlightDefinition>,
+    /// Named definitions registered by the legacy `:sign define` command.
+    sign_definitions: BTreeMap<String, SignDefinition>,
+    /// Namespace per named legacy sign group, editor-wide so one group name
+    /// resolves to the same namespace in every buffer.
+    sign_groups: BTreeMap<String, crate::extmark::SignGroup>,
     /// Messages waiting for a UI or server consumer.
     ///
     /// `message.c` `msg_puts_len` (line 2406) writes to the capture and
@@ -293,6 +307,8 @@ impl Editor {
                 ("_null_dict".into(), Object::Dict(Dict(Vec::new()))),
             ]),
             highlights: BTreeMap::new(),
+            sign_definitions: BTreeMap::new(),
+            sign_groups: BTreeMap::new(),
             messages: Vec::new(),
             message_destinations: Vec::new(),
             message_routing: MessageRouting::default(),
@@ -796,6 +812,37 @@ impl Editor {
     /// Returns mutable named highlight definitions.
     pub const fn highlights_mut(&mut self) -> &mut BTreeMap<String, HighlightDefinition> {
         &mut self.highlights
+    }
+
+    pub(crate) fn sign_definitions(&self) -> &BTreeMap<String, SignDefinition> {
+        &self.sign_definitions
+    }
+
+    pub(crate) fn sign_definitions_mut(&mut self) -> &mut BTreeMap<String, SignDefinition> {
+        &mut self.sign_definitions
+    }
+
+    /// Resolves the sign group for `name`, allocating its namespace on first
+    /// use the way upstream's `buf_set_sign` creates one per group.
+    pub(crate) fn sign_group(&mut self, name: &str) -> SignGroup {
+        if let Some(group) = self.sign_groups.get(name) {
+            return *group;
+        }
+        let offset = u32::try_from(self.sign_groups.len()).unwrap_or(u32::MAX);
+        let raw = SignGroup::NAMED_BASE.saturating_add(offset);
+        let group = SignGroup::from_namespace(NamespaceId::new(raw).expect("named sign namespaces stay positive"));
+        self.sign_groups.insert(name.to_owned(), group);
+        group
+    }
+
+    /// Returns the sign group for `name` when `:sign place` already created it.
+    pub(crate) fn sign_group_if_placed(&self, name: &str) -> Option<SignGroup> {
+        self.sign_groups.get(name).copied()
+    }
+
+    /// Every named sign group allocated so far, in name order.
+    pub(crate) fn sign_groups(&self) -> impl Iterator<Item = SignGroup> + '_ {
+        self.sign_groups.values().copied()
     }
 
     /// Returns buffer-separated change history.

@@ -391,6 +391,98 @@ fn extmark_details_order_limit_delete_and_clear() {
 }
 
 #[test]
+fn extmark_sign_details_match_neovim() {
+    let (mut editor, buffer, _, _) = editor_with_lines(&["one"]);
+    let namespace = crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("signs")).unwrap();
+    let id = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        0,
+        0,
+        dict(&[
+            ("sign_text", Object::String(OxStr::from(">>"))),
+            ("sign_hl_group", Object::String(OxStr::from("Statement"))),
+            ("number_hl_group", Object::String(OxStr::from("Statement"))),
+            ("line_hl_group", Object::String(OxStr::from("Statement"))),
+            ("cursorline_hl_group", Object::String(OxStr::from("Statement"))),
+            ("priority", Object::Integer(0)),
+        ]),
+    )
+    .unwrap();
+    let result = crate::extmark::nvim_buf_get_extmark_by_id(
+        &mut editor,
+        buffer,
+        namespace,
+        id,
+        dict(&[("details", Object::Boolean(true))]),
+    )
+    .unwrap();
+    let Object::Dict(details) = &result[2] else { panic!("missing details") };
+    assert_eq!(details.get(&OxStr::from("sign_text")), Some(&Object::String(OxStr::from(">>"))));
+    assert_eq!(details.get(&OxStr::from("sign_hl_group")), Some(&Object::String(OxStr::from("Statement"))));
+    assert_eq!(details.get(&OxStr::from("number_hl_group")), Some(&Object::String(OxStr::from("Statement"))));
+    assert_eq!(details.get(&OxStr::from("line_hl_group")), Some(&Object::String(OxStr::from("Statement"))));
+    assert_eq!(details.get(&OxStr::from("cursorline_hl_group")), Some(&Object::String(OxStr::from("Statement"))));
+    assert_eq!(details.get(&OxStr::from("priority")), Some(&Object::Integer(0)));
+    assert!(details.get(&OxStr::from("sign_name")).is_none());
+    assert!(details.get(&OxStr::from("invalidate")).is_none());
+    assert!(details.get(&OxStr::from("undo_restore")).is_none());
+
+    let default_id = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        0,
+        0,
+        dict(&[("cursorline_hl_group", Object::String(OxStr::from("Statement")))]),
+    )
+    .unwrap();
+    let result = crate::extmark::nvim_buf_get_extmark_by_id(
+        &mut editor,
+        buffer,
+        namespace,
+        default_id,
+        dict(&[("details", Object::Boolean(true))]),
+    )
+    .unwrap();
+    let Object::Dict(details) = &result[2] else { panic!("missing details") };
+    assert_eq!(details.get(&OxStr::from("cursorline_hl_group")), Some(&Object::String(OxStr::from("Statement"))));
+    assert_eq!(details.get(&OxStr::from("priority")), Some(&Object::Integer(0x1000)));
+
+    let ns = ox_editor::NamespaceId::new(u32::try_from(namespace).unwrap()).unwrap();
+    let eid = ox_editor::ExtmarkId::new(u32::try_from(id).unwrap()).unwrap();
+    let mut placement = editor.buffer(buffer).unwrap().extmarks.get(ns, eid).unwrap().unwrap().placement.clone();
+    placement.attributes.sign_name = Some("sign1".into());
+    placement.attributes.invalidate = true;
+    placement.attributes.undo_restore = false;
+    editor.buffer_mut(buffer).unwrap().extmarks.set(ns, Some(eid), placement).unwrap();
+    let result = crate::extmark::nvim_buf_get_extmark_by_id(
+        &mut editor,
+        buffer,
+        namespace,
+        id,
+        dict(&[("details", Object::Boolean(true))]),
+    )
+    .unwrap();
+    let Object::Dict(details) = &result[2] else { panic!("missing details") };
+    assert_eq!(details.get(&OxStr::from("sign_name")), Some(&Object::String(OxStr::from("sign1"))));
+    assert_eq!(details.get(&OxStr::from("invalidate")), Some(&Object::Boolean(true)));
+    assert_eq!(details.get(&OxStr::from("undo_restore")), Some(&Object::Boolean(false)));
+
+    let typed = crate::extmark::nvim_buf_get_extmarks(
+        &mut editor,
+        buffer,
+        namespace,
+        Object::Integer(0),
+        Object::Integer(-1),
+        dict(&[("type", Object::String(OxStr::from("sign")))]),
+    )
+    .unwrap();
+    assert!(!typed.is_empty());
+}
+
+#[test]
 fn extmark_argument_bound_namespace_and_filter_diagnostics_match_api_contract() {
     let (mut editor, buffer, _, _) = editor_with_lines(&["12345"]);
     let namespace = crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("validation")).unwrap();

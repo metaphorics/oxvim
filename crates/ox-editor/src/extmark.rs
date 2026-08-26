@@ -129,6 +129,9 @@ pub enum ExtmarkGravity {
 pub struct NamespaceId(u32);
 
 impl NamespaceId {
+    /// Internal namespace used by legacy `:sign` placements.
+    pub(crate) const fn legacy_sign() -> Self { Self(0) }
+
     /// Creates a positive namespace identifier.
     pub const fn new(value: u32) -> Result<Self, ExtmarkError> {
         if value == 0 {
@@ -143,6 +146,26 @@ impl NamespaceId {
     pub const fn get(self) -> u32 {
         self.0
     }
+}
+
+/// Identity of a legacy `:sign` group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SignGroup(NamespaceId);
+
+impl SignGroup {
+    /// First namespace handed to a named sign group. The API-layer registry
+    /// (`nvim_create_namespace`) counts up from one, so named groups start
+    /// far above it and the two allocators never meet in a buffer.
+    pub(crate) const NAMED_BASE: u32 = 1 << 30;
+
+    /// The default unnamed sign group.
+    pub(crate) const fn default_group() -> Self { Self(NamespaceId::legacy_sign()) }
+
+    /// Wraps an editor-allocated namespace as a named group.
+    pub(crate) const fn from_namespace(namespace: NamespaceId) -> Self { Self(namespace) }
+
+    /// The namespace this group's signs are stored in.
+    pub(crate) const fn namespace(self) -> NamespaceId { self.0 }
 }
 
 /// A stable identifier unique within one namespace.
@@ -193,7 +216,7 @@ pub type VirtualLine = Vec<VirtualTextChunk>;
 ///
 /// The shapes mirror the virtual-text, virtual-line, highlight, sign, and
 /// priority data in `src/nvim/decoration_defs.h:11-16,29-45,67-80,102-120`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtmarkAttributes {
     /// Virtual text rendered at the mark.
     pub virtual_text: Vec<VirtualTextChunk>,
@@ -203,10 +226,57 @@ pub struct ExtmarkAttributes {
     pub highlight_group: Option<String>,
     /// Text rendered in the sign column.
     pub sign_text: Option<String>,
+    /// Sign text highlight group.
+    pub sign_highlight_group: Option<String>,
+    /// Number-column highlight group.
+    pub number_highlight_group: Option<String>,
+    /// Whole-line highlight group.
+    pub line_highlight_group: Option<String>,
+    /// Sign-column highlight used on the cursor line.
+    pub cursorline_highlight_group: Option<String>,
+    /// Legacy sign name, when the mark came from `:sign`.
+    pub sign_name: Option<String>,
     /// Rendering priority; larger values render later.
     pub priority: u32,
+    /// Whether `priority` was explicitly supplied.
+    pub priority_set: bool,
     /// Hide the mark after deletion consumes its complete configured range.
     pub invalidate: bool,
+    /// Restore the exact position of the mark if surrounding text is undone.
+    pub undo_restore: bool,
+}
+
+impl Default for ExtmarkAttributes {
+    fn default() -> Self {
+        Self {
+            virtual_text: Vec::new(),
+            virtual_lines: Vec::new(),
+            highlight_group: None,
+            sign_text: None,
+            sign_highlight_group: None,
+            number_highlight_group: None,
+            line_highlight_group: None,
+            cursorline_highlight_group: None,
+            sign_name: None,
+            priority: 0,
+            priority_set: false,
+            invalidate: false,
+            undo_restore: true,
+        }
+    }
+}
+
+impl ExtmarkAttributes {
+    /// Whether this mark contributes sign-column data.
+    #[must_use]
+    pub fn has_sign(&self) -> bool {
+        self.sign_text.is_some()
+            || self.sign_highlight_group.is_some()
+            || self.number_highlight_group.is_some()
+            || self.line_highlight_group.is_some()
+            || self.cursorline_highlight_group.is_some()
+            || self.sign_name.is_some()
+    }
 }
 
 /// The optional end of an extmark range.

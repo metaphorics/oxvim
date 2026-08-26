@@ -28,7 +28,7 @@ use ox_text::{Buffer, Position};
 use ox_types::{BufHandle, Dict, DictRef, Funcref, Object, OxStr, Special, TabHandle, Typval, WinHandle};
 
 use crate::autocmd::{AutocmdContext, AutocmdKind, AutocmdOptions, AugroupId, DeleteAutocmds, Event, FiringPlan};
-use crate::extmark::{ExtmarkAttributes, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, NamespaceId};
+use crate::extmark::{ExtmarkAttributes, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, NamespaceId, SignGroup};
 use crate::mapping::{MapMode, MapModes, MapScope, Mapping, MappingAction, MappingOptions};
 use crate::options::{find_unescaped, CommaItems, OptionListKind, OptionScope, OptionType, OptionValue, OPTION_METADATA};
 use crate::builtins::position::cell_width;
@@ -1422,6 +1422,7 @@ fn dispatch<F: FileIO>(
         "colorscheme" => command_colorscheme(runtime, editor, scope, lua, command),
         "language" => command_language(runtime, editor, scope, command),
         "highlight" => command_highlight(runtime, editor, command),
+        "sign" => command_sign(runtime, editor, command),
         "augroup" => command_augroup(runtime, editor, command),
         "autocmd" => command_autocmd(runtime, editor, command),
         "command" => command_user_command(runtime, editor, command),
@@ -5584,6 +5585,189 @@ fn command_highlight<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor,
     }
     editor.highlights_mut().insert(group.to_owned(), attributes);
     Flow::Normal
+}
+
+
+fn canonical_sign_highlight(name: &str) -> String {
+    const NAMES: &[&str] = &["Title", "LineNr", "Normal", "CursorLine", "Statement", "Search", "Visual", "Macro", "Type", "String"];
+    NAMES.iter().copied().find(|known| known.eq_ignore_ascii_case(name)).unwrap_or(name).to_owned()
+}
+
+fn command_sign<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {
+    let mut words = command.args.split_whitespace();
+    let Some(action) = words.next() else {
+        return error_flow(runtime, "E471", "Argument required");
+    };
+
+    match action {
+        "define" => {
+            let Some(name) = words.next() else {
+                return error_flow(runtime, "E471", "Argument required");
+            };
+            let mut definition = crate::editor::SignDefinition::default();
+            for word in words {
+                let Some((key, value)) = word.split_once('=') else {
+                    return error_flow(runtime, "E475", format!("Invalid argument: {word}"));
+                };
+                let value = if key == "text" { value.to_owned() } else { canonical_sign_highlight(value) };
+                let slot = match key {
+                    "text" => &mut definition.text,
+                    "texthl" => &mut definition.text_highlight,
+                    "numhl" => &mut definition.number_highlight,
+                    "linehl" => &mut definition.line_highlight,
+                    "culhl" => &mut definition.cursorline_highlight,
+                    _ => return error_flow(runtime, "E475", format!("Invalid argument: {word}")),
+                };
+                *slot = Some(value);
+            }
+            editor.sign_definitions_mut().insert(name.to_owned(), definition);
+            Flow::Normal
+        }
+        "list" => {
+            let requested = words.next();
+            if words.next().is_some() {
+                return error_flow(runtime, "E488", "Trailing characters");
+            }
+            let definitions: Vec<_> = editor
+                .sign_definitions()
+                .iter()
+                .filter(|(name, _)| requested.is_none_or(|requested| requested == name.as_str()))
+                .map(|(name, definition)| {
+                    let mut line = format!("sign {name}");
+                    for (key, value) in [
+                        ("text", definition.text.as_ref()),
+                        ("texthl", definition.text_highlight.as_ref()),
+                        ("linehl", definition.line_highlight.as_ref()),
+                        ("numhl", definition.number_highlight.as_ref()),
+                        ("culhl", definition.cursorline_highlight.as_ref()),
+                    ] {
+                        if let Some(value) = value { line.push_str(&format!(" {key}={value}")); }
+                    }
+                    line
+                })
+                .collect();
+            if requested.is_some() && definitions.is_empty() {
+                return error_flow(runtime, "E155", "Unknown sign");
+            }
+            for message in definitions { push_text_message(editor, message, false, false); }
+            Flow::Normal
+        }
+        "place" => {
+            let Some(raw_id) = words.next() else {
+                return error_flow(runtime, "E471", "Argument required");
+            };
+            let Ok(raw_id) = raw_id.parse::<u32>() else {
+                return error_flow(runtime, "E474", "Invalid argument");
+            };
+            let Ok(id) = ExtmarkId::new(raw_id) else {
+                return error_flow(runtime, "E474", "Invalid argument");
+            };
+            let mut buffer = editor.current_buffer();
+            let mut line = None;
+            let mut name = None;
+            let mut priority = 10_u32;
+            let mut group = None;
+            for word in words {
+                let Some((key, value)) = word.split_once('=') else {
+                    return error_flow(runtime, "E474", "Invalid argument");
+                };
+                match key {
+                    "buffer" => buffer = value.parse::<i64>().ok().and_then(|value| BufHandle::try_from(value).ok()),
+                    "line" => line = value.parse::<usize>().ok(),
+                    "name" => name = Some(value),
+                    "priority" => match value.parse::<u32>() { Ok(value) => priority = value, Err(_) => return error_flow(runtime, "E474", "Invalid argument") },
+                    "group" => group = Some(value),
+                    _ => return error_flow(runtime, "E474", "Invalid argument"),
+                }
+            }
+            let (Some(buffer), Some(line), Some(name)) = (buffer, line, name) else {
+                return error_flow(runtime, "E474", "Invalid argument");
+            };
+            if line == 0 { return error_flow(runtime, "E474", "Invalid argument"); }
+            let Some(definition) = editor.sign_definitions().get(name).cloned() else {
+                return error_flow(runtime, "E155", format!("Unknown sign: {name}"));
+            };
+            let group = match group {
+                None => SignGroup::default_group(),
+                Some(name) if name.is_empty() || name.starts_with('*') => {
+                    return error_flow(runtime, "E474", "Invalid argument");
+                }
+                Some(name) => editor.sign_group(name),
+            };
+            let namespace = group.namespace();
+            let mut placement = ExtmarkPlacement::new(ExtmarkPosition::new(line - 1, 0));
+            placement.attributes = ExtmarkAttributes {
+                sign_text: definition.text,
+                sign_highlight_group: definition.text_highlight,
+                number_highlight_group: definition.number_highlight,
+                line_highlight_group: definition.line_highlight,
+                cursorline_highlight_group: definition.cursorline_highlight,
+                sign_name: Some(name.to_owned()),
+                priority,
+                priority_set: true,
+                invalidate: true,
+                undo_restore: false,
+                ..ExtmarkAttributes::default()
+            };
+            let result = editor.buffer_mut(buffer).and_then(|state| {
+                state.extmarks.ensure_namespace(namespace).map_err(crate::BufferStateError::from)?;
+                Ok(state.extmarks.set(namespace, Some(id), placement).map_err(crate::BufferStateError::from)?)
+            });
+            match result {
+                Ok(_) => Flow::Normal,
+                Err(error) => error_flow(runtime, "E474", error.to_string()),
+            }
+        }
+        "unplace" => {
+            let Some(raw_id) = words.next() else {
+                return error_flow(runtime, "E471", "Argument required");
+            };
+            let Ok(raw_id) = raw_id.parse::<u32>() else {
+                return error_flow(runtime, "E474", "Invalid argument");
+            };
+            let Ok(id) = ExtmarkId::new(raw_id) else {
+                return error_flow(runtime, "E474", "Invalid argument");
+            };
+            let mut buffer = editor.current_buffer();
+            let mut group = None;
+            for word in words {
+                let Some((key, value)) = word.split_once('=') else {
+                    return error_flow(runtime, "E474", "Invalid argument");
+                };
+                match key {
+                    "buffer" => buffer = value.parse::<i64>().ok().and_then(|value| BufHandle::try_from(value).ok()),
+                    "group" => group = Some(value),
+                    _ => return error_flow(runtime, "E474", "Invalid argument"),
+                }
+            }
+            let Some(buffer) = buffer else { return error_flow(runtime, "E474", "Invalid argument"); };
+            let namespaces = match group {
+                Some("") => return error_flow(runtime, "E474", "Invalid argument"),
+                Some(name) if name.starts_with('*') => {
+                    let mut sweep = vec![SignGroup::default_group().namespace()];
+                    sweep.extend(editor.sign_groups().map(SignGroup::namespace));
+                    sweep
+                }
+                Some(name) => editor.sign_group_if_placed(name).map(|group| vec![group.namespace()]).unwrap_or_default(),
+                None => vec![SignGroup::default_group().namespace()],
+            };
+            let named = group.is_some();
+            let result = editor.buffer_mut(buffer).and_then(|state| {
+                for namespace in namespaces {
+                    if named {
+                        state.extmarks.ensure_namespace(namespace).map_err(crate::BufferStateError::from)?;
+                    }
+                    state.extmarks.delete(namespace, id).map_err(crate::BufferStateError::from)?;
+                }
+                Ok(())
+            });
+            match result {
+                Ok(()) => Flow::Normal,
+                Err(error) => error_flow(runtime, "E474", error.to_string()),
+            }
+        }
+        _ => error_flow(runtime, "E160", format!("Unknown sign command: {action}")),
+    }
 }
 
 fn command_augroup<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, command: &ExCommand) -> Flow {

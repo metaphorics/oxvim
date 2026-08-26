@@ -173,9 +173,18 @@ fn placement(text: &Buffer, row: i64, col: i64, strict: bool, opts: &Dict) -> Re
     let mut attributes = ExtmarkAttributes::default();
     attributes.highlight_group = parse_highlight_groups(opts)?;
     attributes.sign_text = string(opts, "sign_text")?;
-    attributes.priority = integer(opts, "priority")?.map_or(Ok(0), |value| {
-        if (0..=i64::from(u16::MAX)).contains(&value) { Ok(value as u32) } else { Err(ApiError::validation("Invalid 'priority': out of range")) }
-    })?;
+    attributes.sign_highlight_group = string(opts, "sign_hl_group")?;
+    attributes.number_highlight_group = string(opts, "number_hl_group")?;
+    attributes.line_highlight_group = string(opts, "line_hl_group")?;
+    attributes.cursorline_highlight_group = string(opts, "cursorline_hl_group")?;
+    attributes.priority = match integer(opts, "priority")? {
+        Some(value) => {
+            attributes.priority_set = true;
+            if (0..=i64::from(u16::MAX)).contains(&value) { value as u32 } else { return Err(ApiError::validation("Invalid 'priority': out of range")); }
+        }
+        None if attributes.has_sign() => 0x1000,
+        None => 0,
+    };
     attributes.invalidate = boolean(opts, "invalidate", false)?;
     let _ = boolean(opts, "hl_eol", false)?;
     let _ = boolean(opts, "virt_text_hide", false)?;
@@ -184,7 +193,7 @@ fn placement(text: &Buffer, row: i64, col: i64, strict: bool, opts: &Dict) -> Re
     let _ = boolean(opts, "virt_lines_leftcol", false)?;
     let _ = boolean(opts, "ephemeral", false)?;
     let _ = boolean(opts, "ui_watched", false)?;
-    let _ = boolean(opts, "undo_restore", true)?;
+    attributes.undo_restore = boolean(opts, "undo_restore", true)?;
     if let Some(value) = opts.get(&OxStr::from("virt_text")) { attributes.virtual_text = chunks(value)?; }
     if let Some(value) = opts.get(&OxStr::from("virt_lines")) {
         let Object::Array(lines) = value else {
@@ -211,22 +220,31 @@ fn chunk_object(chunk: &VirtualTextChunk) -> Object {
 
 fn details(mark: &Extmark) -> Dict {
     let placement = &mark.placement;
+    let attributes = &placement.attributes;
     let mut values = vec![
         (OxStr::from("ns_id"), Object::Integer(i64::from(mark.namespace.get()))),
         (OxStr::from("right_gravity"), Object::Boolean(placement.gravity == ExtmarkGravity::Right)),
-        (OxStr::from("invalidate"), Object::Boolean(placement.attributes.invalidate)),
-        (OxStr::from("invalid"), Object::Boolean(mark.invalid)),
-        (OxStr::from("priority"), Object::Integer(i64::from(placement.attributes.priority))),
     ];
     if let Some(end) = placement.end {
         values.push((OxStr::from("end_row"), Object::Integer(i64::try_from(end.position.row).unwrap_or(i64::MAX))));
         values.push((OxStr::from("end_col"), Object::Integer(i64::try_from(end.position.column).unwrap_or(i64::MAX))));
         values.push((OxStr::from("end_right_gravity"), Object::Boolean(end.gravity == ExtmarkGravity::Right)));
     }
-    if let Some(group) = &placement.attributes.highlight_group { values.push((OxStr::from("hl_group"), Object::String(OxStr::from(group.as_str())))); }
-    if let Some(text) = &placement.attributes.sign_text { values.push((OxStr::from("sign_text"), Object::String(OxStr::from(text.as_str())))); }
-    if !placement.attributes.virtual_text.is_empty() { values.push((OxStr::from("virt_text"), Object::Array(placement.attributes.virtual_text.iter().map(chunk_object).collect()))); }
-    if !placement.attributes.virtual_lines.is_empty() { values.push((OxStr::from("virt_lines"), Object::Array(placement.attributes.virtual_lines.iter().map(|line| Object::Array(line.iter().map(chunk_object).collect())).collect()))); }
+    if !attributes.undo_restore { values.push((OxStr::from("undo_restore"), Object::Boolean(false))); }
+    if attributes.invalidate { values.push((OxStr::from("invalidate"), Object::Boolean(true))); }
+    if mark.invalid { values.push((OxStr::from("invalid"), Object::Boolean(true))); }
+    if let Some(group) = &attributes.highlight_group { values.push((OxStr::from("hl_group"), Object::String(OxStr::from(group.as_str())))); }
+    if let Some(text) = &attributes.sign_text { values.push((OxStr::from("sign_text"), Object::String(OxStr::from(text.as_str())))); }
+    if let Some(name) = &attributes.sign_name { values.push((OxStr::from("sign_name"), Object::String(OxStr::from(name.as_str())))); }
+    if let Some(group) = &attributes.sign_highlight_group { values.push((OxStr::from("sign_hl_group"), Object::String(OxStr::from(group.as_str())))); }
+    if let Some(group) = &attributes.number_highlight_group { values.push((OxStr::from("number_hl_group"), Object::String(OxStr::from(group.as_str())))); }
+    if let Some(group) = &attributes.line_highlight_group { values.push((OxStr::from("line_hl_group"), Object::String(OxStr::from(group.as_str())))); }
+    if let Some(group) = &attributes.cursorline_highlight_group { values.push((OxStr::from("cursorline_hl_group"), Object::String(OxStr::from(group.as_str())))); }
+    if !attributes.virtual_text.is_empty() { values.push((OxStr::from("virt_text"), Object::Array(attributes.virtual_text.iter().map(chunk_object).collect()))); }
+    if !attributes.virtual_lines.is_empty() { values.push((OxStr::from("virt_lines"), Object::Array(attributes.virtual_lines.iter().map(|line| Object::Array(line.iter().map(chunk_object).collect())).collect()))); }
+    if attributes.highlight_group.is_some() || attributes.has_sign() || !attributes.virtual_text.is_empty() || !attributes.virtual_lines.is_empty() {
+        values.push((OxStr::from("priority"), Object::Integer(i64::from(attributes.priority))));
+    }
     Dict(values)
 }
 
@@ -328,7 +346,7 @@ fn bound(extmarks: &Extmarks, namespace: Option<NamespaceId>, value: Object) -> 
 fn mark_has_type(mark: &Extmark, kind: &str) -> bool {
     let attributes = &mark.placement.attributes;
     match kind {
-        "sign" => attributes.sign_text.is_some(),
+        "sign" => attributes.has_sign(),
         "virt_text" => !attributes.virtual_text.is_empty(),
         "virt_lines" => !attributes.virtual_lines.is_empty(),
         "highlight" => attributes.highlight_group.is_some(),
