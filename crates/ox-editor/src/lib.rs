@@ -111,6 +111,8 @@ mod indent_tests;
 #[cfg(test)]
 mod mode_tests;
 #[cfg(test)]
+mod ops_tests;
+#[cfg(test)]
 mod position_tests;
 #[cfg(test)]
 mod task09d_tests;

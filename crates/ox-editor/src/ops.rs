@@ -96,6 +96,72 @@ pub fn apply(editor: &mut Editor, buffer: BufHandle, window: WinHandle, operator
         if starts_in_indent && suffix.iter().all(u8::is_ascii_whitespace) { normalized.kind = MotionKind::LineWise; normalized.start.col = 0; normalized.end.col = lines[normalized.end.lnum - 1].len().saturating_sub(1); normalized.inclusive = true; }
     }
     let shiftwidth = match editor.options().get_buffer(buffer, "shiftwidth") { Ok(OptionValue::Number(width)) if *width > 0 => *width as usize, _ => 2 };
+    enum DeleteEditPlan {
+        LineWise,
+        BlockWise(Vec<BufferTextEditRequest>),
+        CharacterWise(BufferTextEditRequest),
+    }
+    let delete_plan = (operator == Operator::Delete).then(|| match normalized.kind {
+        MotionKind::LineWise if normalized.start.lnum == 1 && normalized.end.lnum == old_count => {
+            DeleteEditPlan::CharacterWise(BufferTextEditRequest {
+                start: ExtmarkPosition::new(0, 0),
+                end: ExtmarkPosition::new(old_count - 1, lines[old_count - 1].len()),
+                replacement: Vec::new(),
+            })
+        }
+        MotionKind::LineWise => DeleteEditPlan::LineWise,
+        MotionKind::BlockWise => {
+            let width = normalized
+                .end
+                .col
+                .saturating_sub(normalized.start.col)
+                .saturating_add(usize::from(normalized.inclusive));
+            let requests = lines[normalized.start.lnum - 1..normalized.end.lnum]
+                .iter()
+                .enumerate()
+                .map(|(row_offset, line)| {
+                    let start_col = normalized.start.col.min(line.len());
+                    BufferTextEditRequest {
+                        start: ExtmarkPosition::new(
+                            normalized.start.lnum - 1 + row_offset,
+                            start_col,
+                        ),
+                        end: ExtmarkPosition::new(
+                            normalized.start.lnum - 1 + row_offset,
+                            start_col.saturating_add(width).min(line.len()),
+                        ),
+                        replacement: Vec::new(),
+                    }
+                })
+                .collect();
+            DeleteEditPlan::BlockWise(requests)
+        }
+        MotionKind::CharacterWise => DeleteEditPlan::CharacterWise(BufferTextEditRequest {
+            start: ExtmarkPosition::new(normalized.start.lnum - 1, normalized.start.col),
+            end: ExtmarkPosition::new(
+                normalized.end.lnum - 1,
+                normalized
+                    .end
+                    .col
+                    .saturating_add(usize::from(normalized.inclusive))
+                    .min(lines[normalized.end.lnum - 1].len()),
+            ),
+            replacement: Vec::new(),
+        }),
+    });
+    if let Some(plan) = &delete_plan {
+        match plan {
+            DeleteEditPlan::LineWise => {}
+            DeleteEditPlan::BlockWise(requests) => {
+                for request in requests {
+                    editor.buffer(buffer)?.prepare_buffer_text_edit(request)?;
+                }
+            }
+            DeleteEditPlan::CharacterWise(request) => {
+                editor.buffer(buffer)?.prepare_buffer_text_edit(request)?;
+            }
+        }
+    }
     let content = capture(&lines, normalized)?;
     match operator {
         Operator::Yank => store_yank(editor, register, content)?,
@@ -123,7 +189,40 @@ pub fn apply(editor: &mut Editor, buffer: BufHandle, window: WinHandle, operator
         MotionKind::LineWise => Position { lnum: normalized.start.lnum.min(lines.len().max(1)), col: first_nonblank(lines.get(normalized.start.lnum.saturating_sub(1)).map_or(&[], Vec::as_slice)) },
         _ => Position { lnum: normalized.start.lnum.min(lines.len().max(1)), col: normalized.start.col.min(lines.get(normalized.start.lnum.saturating_sub(1)).map_or(0, Vec::len).saturating_sub(1)) },
     };
-    if operator != Operator::Yank {
+    if let Some(plan) = delete_plan {
+        match plan {
+            DeleteEditPlan::LineWise => {
+                editor.replace_buffer_lines(
+                    buffer,
+                    normalized.start.lnum,
+                    normalized.end.lnum,
+                    &[],
+                    cursor_before,
+                    cursor,
+                    timestamp,
+                )?;
+            }
+            DeleteEditPlan::BlockWise(requests) => {
+                editor.replace_buffer_texts(
+                    buffer,
+                    window,
+                    &requests,
+                    cursor_before,
+                    cursor,
+                    timestamp,
+                )?;
+            }
+            DeleteEditPlan::CharacterWise(request) => {
+                editor.replace_buffer_text(
+                    buffer,
+                    &request,
+                    cursor_before,
+                    cursor,
+                    timestamp,
+                )?;
+            }
+        }
+    } else if operator != Operator::Yank {
         editor.replace_buffer_lines(buffer, 1, old_count, &lines, cursor_before, cursor, timestamp)?;
     }
     editor.set_window_cursor(window, cursor)?;
