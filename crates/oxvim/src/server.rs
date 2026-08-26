@@ -198,7 +198,7 @@ impl AppState {
             lua_work,
             ui_channels: UiChannels::new(),
             emitter: Emitter::new(),
-            highlights: HlState::new(),
+            highlights: HlState::with_default_syntax_groups(),
             chrome: ChromeState::new(),
         };
         state.run_startup(cli, timer)?;
@@ -670,7 +670,7 @@ impl AppState {
             .fold((1, 1), |(max_width, max_height), (width, height)| {
                 (max_width.max(width), max_height.max(height))
             });
-        let compositor = Compositor::from_editor(&self.editor.borrow(), width, height)
+        let compositor = Compositor::from_editor(&self.editor.borrow(), width, height, &mut self.highlights)
             .map_err(|error| ApiError::exception(error.to_string()))?;
         self.emitter
             .redraw(

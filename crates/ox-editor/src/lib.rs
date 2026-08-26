@@ -51,8 +51,8 @@ pub use excmd_exec::{
     VimException, VimExceptionKind,
 };
 pub use extmark::{
-    Extmark, ExtmarkAttributes, ExtmarkEnd, ExtmarkGravity, ExtmarkId, ExtmarkPlacement,
-    ExtmarkPosition, Extmarks, NamespaceId, VirtualLine, VirtualTextChunk,
+    Extmark, ExtmarkAttributes, ExtmarkEnd, ExtmarkGravity, ExtmarkHighlightMode, ExtmarkId,
+    ExtmarkPlacement, ExtmarkPosition, Extmarks, NamespaceId, VirtualLine, VirtualTextChunk,
 };
 pub use fold::Folds;
 pub use indent::{ExprEval, IndentEvalContext, IndentExprError, NullExprEval};

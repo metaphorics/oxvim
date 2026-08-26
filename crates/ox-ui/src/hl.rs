@@ -118,6 +118,8 @@ pub struct Highlight {
     pub rgb: HlAttrs,
     /// Cterm fallback attributes.
     pub cterm: HlAttrs,
+    /// Whether `default=true` was set (don't override existing definition).
+    pub default_flag: bool,
     /// Source metadata entries.
     pub info: Vec<HlInfo>,
 }
@@ -162,6 +164,24 @@ impl HlState {
         let mut ids = BTreeMap::new();
         ids.insert(default.clone(), 0);
         Self { definitions: vec![default], ids, groups: BTreeMap::new() }
+    }
+
+    /// Creates the render table with the standard syntax groups the editor
+    /// establishes while initializing highlighting (`Comment`, `String`).
+    #[must_use]
+    pub fn with_default_syntax_groups() -> Self {
+        let mut state = Self::new();
+        let comment = Highlight {
+            rgb: HlAttrs { foreground: Some(0x0000ff), ..HlAttrs::default() },
+            ..Highlight::default()
+        };
+        let string = Highlight {
+            rgb: HlAttrs { foreground: Some(0x0000ff), bold: true, ..HlAttrs::default() },
+            ..Highlight::default()
+        };
+        let _ = state.define_group("Comment", comment);
+        let _ = state.define_group("String", string);
+        state
     }
 
     /// Interns an attribute set, returning its stable id and an event only once.
@@ -232,6 +252,72 @@ impl HlState {
             .collect()
     }
 
+    /// Defines a named group, interning the highlight and binding the name.
+    pub fn define_group(&mut self, name: impl Into<OxStr>, highlight: Highlight) -> Result<u64, HlError> {
+        let (id, _) = self.intern(highlight)?;
+        self.set_group(name, id)?;
+        Ok(id)
+    }
+
+    /// Looks up a group id by name.
+    #[must_use]
+    pub fn group_id(&self, name: &OxStr) -> Option<u64> {
+        self.groups.get(name).copied()
+    }
+
+    /// Interns the result of stacking the overlay over the base highlight.
+    ///
+    /// Colors explicitly supplied by the later layer replace earlier colors;
+    /// style flags accumulate, matching Neovim's range-highlight composition.
+    pub fn combine(
+        &mut self,
+        base_id: u64,
+        overlay_id: u64,
+    ) -> Result<(u64, Option<HlEvent>), HlError> {
+        let base = self.get(base_id).ok_or(HlError::UnknownId(base_id))?.clone();
+        let overlay = self.get(overlay_id).ok_or(HlError::UnknownId(overlay_id))?.clone();
+        let mut combined = base;
+        combine_attrs(&mut combined.rgb, &overlay.rgb);
+        combine_attrs(&mut combined.cterm, &overlay.cterm);
+        combined.default_flag |= overlay.default_flag;
+        if !overlay.info.is_empty() {
+            combined.info = overlay.info;
+        }
+        self.intern(combined)
+    }
+
+    /// Interns the blend-mode composite of `overlay_id` layered over `base_id`.
+    pub fn blend(
+        &mut self,
+        base_id: u64,
+        overlay_id: u64,
+    ) -> Result<(u64, Option<HlEvent>), HlError> {
+        let base = self.get(base_id).ok_or(HlError::UnknownId(base_id))?.clone();
+        let overlay = self.get(overlay_id).ok_or(HlError::UnknownId(overlay_id))?.clone();
+        let amount = overlay.rgb.blend.unwrap_or(0).min(100);
+        let (overlay_fg, base_fg) = (overlay.rgb.foreground, base.rgb.foreground);
+        let (overlay_bg, base_bg) = (overlay.rgb.background, base.rgb.background);
+        let (overlay_sp, base_sp) = (overlay.rgb.special, base.rgb.special);
+        let mut mixed = base;
+        combine_attrs(&mut mixed.rgb, &overlay.rgb);
+        combine_attrs(&mut mixed.cterm, &overlay.cterm);
+        if let (Some(over), Some(under)) = (overlay_fg, base_fg) {
+            mixed.rgb.foreground = Some(premix_color(over, under, amount));
+        }
+        if let (Some(over), Some(under)) = (overlay_bg, base_bg) {
+            mixed.rgb.background = Some(premix_color(over, under, amount));
+        }
+        if let (Some(over), Some(under)) = (overlay_sp, base_sp) {
+            mixed.rgb.special = Some(premix_color(over, under, amount));
+        }
+        mixed.rgb.blend = None;
+        mixed.default_flag |= overlay.default_flag;
+        if !overlay.info.is_empty() {
+            mixed.info = overlay.info;
+        }
+        self.intern(mixed)
+    }
+
     /// Interns a winblend-premixed variant of `foreground_id` over `background_id`.
     pub fn premix(
         &mut self,
@@ -249,6 +335,28 @@ impl HlState {
         mixed.rgb.blend = None;
         self.intern(mixed)
     }
+}
+
+fn combine_attrs(base: &mut HlAttrs, overlay: &HlAttrs) {
+    if overlay.foreground.is_some() { base.foreground = overlay.foreground; }
+    if overlay.background.is_some() { base.background = overlay.background; }
+    if overlay.special.is_some() { base.special = overlay.special; }
+    base.bold |= overlay.bold;
+    base.italic |= overlay.italic;
+    base.underline |= overlay.underline;
+    base.undercurl |= overlay.undercurl;
+    base.underdouble |= overlay.underdouble;
+    base.underdotted |= overlay.underdotted;
+    base.underdashed |= overlay.underdashed;
+    base.strikethrough |= overlay.strikethrough;
+    base.reverse |= overlay.reverse;
+    base.altfont |= overlay.altfont;
+    base.dim |= overlay.dim;
+    base.blink |= overlay.blink;
+    base.conceal |= overlay.conceal;
+    base.overline |= overlay.overline;
+    if overlay.blend.is_some() { base.blend = overlay.blend; }
+    if overlay.url.is_some() { base.url.clone_from(&overlay.url); }
 }
 
 /// Premixes a foreground RGB color over a background with Neovim-style percentage rounding.

@@ -138,7 +138,7 @@ fn activate_hl(state: &mut RuntimeState, ns_id: i64) {
 pub fn nvim_set_hl(editor: &mut Editor, ns_id: i64, name: OxStr, val: Dict) -> Result<(), ApiError> {
     if ns_id < 0 { return Err(ApiError::validation("namespace must be non-negative")); }
     with_state_mut(editor, |state| {
-        let highlight = Highlight { rgb: attrs(&val)?, cterm: match val.get(&OxStr::from("cterm")) { Some(Object::Dict(dict)) => attrs(dict)?, _ => HlAttrs::default() }, info: Vec::new() };
+        let highlight = Highlight { rgb: attrs(&val)?, cterm: match val.get(&OxStr::from("cterm")) { Some(Object::Dict(dict)) => attrs(dict)?, _ => HlAttrs::default() }, info: Vec::new(), ..Highlight::default() };
         let ns = state.hl_namespaces.entry(ns_id).or_default();
         let (id, _) = ns.intern(highlight).map_err(|error| ApiError::exception(error.to_string()))?;
         ns.set_group(name, id).map_err(|error| ApiError::exception(error.to_string()))?;

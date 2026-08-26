@@ -212,6 +212,18 @@ impl VirtualTextChunk {
 /// A virtual line represented as independently highlighted chunks.
 pub type VirtualLine = Vec<VirtualTextChunk>;
 
+/// Highlight composition for range decorations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ExtmarkHighlightMode {
+    /// Replace the underlying cell highlight.
+    #[default]
+    Replace,
+    /// Combine with the underlying highlight.
+    Combine,
+    /// Blend with the underlying highlight.
+    Blend,
+}
+
 /// Rendering and lifetime attributes attached to an extmark.
 ///
 /// The shapes mirror the virtual-text, virtual-line, highlight, sign, and
@@ -224,6 +236,8 @@ pub struct ExtmarkAttributes {
     pub virtual_lines: Vec<VirtualLine>,
     /// Highlight group applied to the marked span.
     pub highlight_group: Option<String>,
+    /// Range-highlight composition, when explicitly supplied.
+    pub highlight_mode: Option<ExtmarkHighlightMode>,
     /// Text rendered in the sign column.
     pub sign_text: Option<String>,
     /// Sign text highlight group.
@@ -252,6 +266,7 @@ impl Default for ExtmarkAttributes {
             virtual_text: Vec::new(),
             virtual_lines: Vec::new(),
             highlight_group: None,
+            highlight_mode: None,
             sign_text: None,
             sign_highlight_group: None,
             number_highlight_group: None,
@@ -343,6 +358,8 @@ pub struct Extmark {
     pub placement: ExtmarkPlacement,
     /// Whether complete-range deletion has hidden the mark.
     pub invalid: bool,
+    /// Stable insertion order used to break equal rendering priorities.
+    render_order: u64,
 }
 
 impl Extmark {
@@ -496,6 +513,7 @@ pub struct Extmarks {
     highest_namespace: u32,
     named_namespaces: BTreeMap<String, NamespaceId>,
     namespaces: BTreeMap<NamespaceId, NamespaceState>,
+    next_render_order: u64,
 }
 
 impl Extmarks {
@@ -506,6 +524,7 @@ impl Extmarks {
             highest_namespace: 0,
             named_namespaces: BTreeMap::new(),
             namespaces: BTreeMap::new(),
+            next_render_order: 0,
         }
     }
 
@@ -567,6 +586,20 @@ impl Extmarks {
         placement: ExtmarkPlacement,
     ) -> Result<ExtmarkId, ExtmarkError> {
         validate_placement(&placement)?;
+        self.namespace_state(namespace)?;
+        let existing_order = requested_id.and_then(|id| {
+            self.namespace_state(namespace)
+                .ok()
+                .and_then(|state| state.by_id.get(&id))
+                .map(|mark| mark.render_order)
+        });
+        let render_order = existing_order.unwrap_or(self.next_render_order);
+        if existing_order.is_none() {
+            self.next_render_order = self
+                .next_render_order
+                .checked_add(1)
+                .ok_or(ExtmarkError::ExtmarkIdExhausted(namespace.get()))?;
+        }
         let state = self.namespace_mut(namespace)?;
         let id = match requested_id {
             Some(id) => {
@@ -594,6 +627,7 @@ impl Extmarks {
                 id,
                 placement,
                 invalid: false,
+                render_order,
             },
         );
         state.insert_index(position, id);
@@ -736,6 +770,20 @@ impl Extmarks {
             marks.reverse();
         }
         marks.truncate(capacity);
+        marks
+    }
+
+    /// Returns extmarks in decoration compositing order: low priority first,
+    /// then stable insertion order for deterministic equal-priority overlap.
+    #[must_use]
+    pub fn render_ordered(&self) -> Vec<&Extmark> {
+        let mut marks: Vec<_> = self
+            .namespaces
+            .values()
+            .flat_map(|state| state.by_id.values())
+            .filter(|mark| !mark.invalid && mark.placement.attributes.highlight_group.is_some())
+            .collect();
+        marks.sort_by_key(|mark| (mark.placement.attributes.priority, mark.render_order));
         marks
     }
 

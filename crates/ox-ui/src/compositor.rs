@@ -1,9 +1,12 @@
 //! Server-side grid layering modeled after Neovim's UI compositor.
 
-use ox_editor::{BufferStateError, Editor, EditorError, LayoutError};
+use ox_editor::{
+    extmark::ExtmarkHighlightMode, BufferStateError, Editor, EditorError, Extmark, LayoutError,
+};
 use ox_text::BufferError;
-use ox_types::WinHandle;
+use ox_types::{OxStr, WinHandle};
 use thiserror::Error;
+use unicode_width::UnicodeWidthStr;
 
 use crate::grid::{Cell, Grid, GridError};
 use crate::hl::{HlError, HlEvent, HlState};
@@ -133,7 +136,12 @@ impl Compositor {
     pub fn layers(&self) -> &[Layer] { &self.layers }
 
     /// Builds renderable window layers from the active editor tabpage.
-    pub fn from_editor(editor: &Editor, width: usize, height: usize) -> Result<Self, CompositorError> {
+    pub fn from_editor(
+        editor: &Editor,
+        width: usize,
+        height: usize,
+        highlights: &mut HlState,
+    ) -> Result<Self, CompositorError> {
         let tab_handle = editor.current_tabpage().ok_or(CompositorError::NoActiveTabpage)?;
         let tab = editor.tabpage(tab_handle)?;
         let current_window = editor.current_window();
@@ -144,13 +152,25 @@ impl Compositor {
             let config = tab.window_config(window)?;
             let grid_id = i64::try_from(ordinal + 2).unwrap_or(i64::MAX);
             let mut grid = Grid::new(grid_id, geometry.width, geometry.height)?;
-            let buffer = editor.buffer(state.buffer)?.text()?;
+            let buffer_state = editor.buffer(state.buffer)?;
+            let buffer = buffer_state.text()?;
+            let marks = buffer_state.extmarks.render_ordered();
             for screen_row in 0..geometry.height {
                 let line_number = state.topline.saturating_add(screen_row);
                 if line_number > buffer.line_count() { break; }
                 let bytes = buffer.line(line_number)?;
                 let line = String::from_utf8_lossy(&bytes);
                 grid.write_text(screen_row, 0, &line, 0)?;
+                apply_extmark_highlights(
+                    &mut grid,
+                    screen_row,
+                    line_number.saturating_sub(1),
+                    0,
+                    0,
+                    &line,
+                    &marks,
+                    highlights,
+                )?;
             }
             let kind = if config.is_some() { LayerKind::Float } else { LayerKind::Window };
             let zindex = config.map_or(0, |config| config.zindex);
@@ -240,4 +260,55 @@ impl Compositor {
             .position(|candidate| *candidate == window)
             .and_then(|index| i64::try_from(index + 2).ok())
     }
+}
+
+fn apply_extmark_highlights(
+    grid: &mut Grid,
+    screen_row: usize,
+    buffer_row: usize,
+    text_offset: usize,
+    segment_cell_start: usize,
+    line: &str,
+    marks: &[&Extmark],
+    highlights: &mut HlState,
+) -> Result<(), CompositorError> {
+    let segment_width = grid.width().saturating_sub(text_offset);
+    for mark in marks {
+        let start = mark.position();
+        let Some(end) = mark.placement.end.map(|end| end.position) else { continue };
+        if buffer_row < start.row || buffer_row > end.row { continue; }
+
+        let start_byte = if buffer_row == start.row { start.column } else { 0 };
+        let end_byte = if buffer_row == end.row { end.column } else { line.len() };
+        let absolute_start = display_column(line, start_byte);
+        let absolute_end = display_column(line, end_byte);
+        if absolute_start >= segment_cell_start.saturating_add(segment_width)
+            || absolute_end <= segment_cell_start
+        {
+            continue;
+        }
+        let start_col = text_offset.saturating_add(absolute_start.saturating_sub(segment_cell_start));
+        let end_col = text_offset.saturating_add(absolute_end.saturating_sub(segment_cell_start));
+
+        let Some(name) = mark.placement.attributes.highlight_group.as_deref() else { continue };
+        let Some(group_id) = highlights.group_id(&OxStr::from(name)) else { continue };
+        for col in start_col.min(grid.width())..end_col.min(grid.width()) {
+            let mut cell = grid.cell(screen_row, col)?.clone();
+            cell.hl_id = match mark.placement.attributes.highlight_mode {
+                Some(ExtmarkHighlightMode::Combine) => highlights.combine(cell.hl_id, group_id)?.0,
+                Some(ExtmarkHighlightMode::Blend) => highlights.blend(cell.hl_id, group_id)?.0,
+                None | Some(ExtmarkHighlightMode::Replace) => group_id,
+            };
+            grid.set_cell(screen_row, col, cell)?;
+        }
+    }
+    Ok(())
+}
+
+fn display_column(line: &str, byte: usize) -> usize {
+    let mut boundary = byte.min(line.len());
+    while !line.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    UnicodeWidthStr::width(&line[..boundary])
 }

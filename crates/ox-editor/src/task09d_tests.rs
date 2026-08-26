@@ -421,6 +421,24 @@ fn highlight_sign_and_priority_round_trip() {
     assert_eq!(attributes.priority, 200);
 }
 
+#[test]
+fn render_ordered_sorts_low_priority_first_then_insertion() {
+    let mut marks = Extmarks::new();
+    let namespace = marks.create_namespace("order").unwrap();
+    let mut late_high = ExtmarkPlacement::new(ExtmarkPosition::new(0, 0))
+        .with_end(ExtmarkPosition::new(0, 2));
+    late_high.attributes.highlight_group = Some("Comment".into());
+    late_high.attributes.priority = 20;
+    let mut early_low = ExtmarkPlacement::new(ExtmarkPosition::new(0, 0))
+        .with_end(ExtmarkPosition::new(0, 2));
+    early_low.attributes.highlight_group = Some("String".into());
+    early_low.attributes.priority = 10;
+    let high_id = marks.set(namespace, None, late_high).unwrap();
+    let low_id = marks.set(namespace, None, early_low).unwrap();
+    let ordered: Vec<_> = marks.render_ordered().into_iter().map(|mark| mark.id).collect();
+    assert_eq!(ordered, vec![low_id, high_id]);
+}
+
 // Fold methods, nesting, lazy invalidation and z-state operations:
 // src/nvim/fold.c:321-361,432-478,535-655,763-829,1122-1275,2841-2862.
 #[test]
