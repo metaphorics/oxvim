@@ -1893,3 +1893,678 @@ fn exec_lua_runs_through_the_installed_lua_host() {
         Some(Object::String(OxStr::from("return ...")))
     );
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplaceBufferTextSnapshot {
+    text: Vec<u8>,
+    changedtick: u64,
+    changedtick_diag: u64,
+    changedtick_fold: u64,
+    modified: bool,
+    undo_seq: u64,
+    undo_block_len: usize,
+    local_mark: Option<ox_text::Position>,
+    global_mark: Option<ox_text::Position>,
+    jumplist: Option<ox_text::Position>,
+    changelist: Option<ox_text::Position>,
+    extmark_col: i64,
+    window_col: usize,
+}
+
+fn snapshot_replace_buffer_text_state(
+    editor: &mut Editor,
+    buffer: crate::BufHandle,
+    namespace: i64,
+    extmark: i64,
+    window: crate::WinHandle,
+) -> ReplaceBufferTextSnapshot {
+    let state = editor.buffer(buffer).unwrap();
+    ReplaceBufferTextSnapshot {
+        text: state.text().unwrap().to_bytes(),
+        changedtick: state.changedtick(),
+        changedtick_diag: state.changedtick_diag,
+        changedtick_fold: state.changedtick_fold,
+        modified: state.modified,
+        undo_seq: state.undo.current_seq(),
+        undo_block_len: state.undo.current_block_len(),
+        local_mark: editor.local_mark(buffer, 'a').unwrap(),
+        global_mark: editor
+            .global_marks()
+            .get('A')
+            .unwrap()
+            .map(|mark| mark.position),
+        jumplist: editor.jumplist().entries().first().map(|entry| entry.position),
+        changelist: editor
+            .changelists()
+            .entries(buffer)
+            .unwrap()
+            .first()
+            .copied(),
+        extmark_col: {
+            let details = crate::extmark::nvim_buf_get_extmark_by_id(
+                editor,
+                buffer,
+                namespace,
+                extmark,
+                dict(&[]),
+            )
+            .unwrap();
+            match details[1].clone() {
+                Object::Integer(value) => value,
+                other => panic!("expected integer extmark column, got {other:?}"),
+            }
+        },
+        window_col: editor.window(window).unwrap().cursor.col,
+    }
+}
+
+fn seeded_replace_buffer_text_editor(
+    lines: &[&str],
+) -> (
+    Editor,
+    crate::BufHandle,
+    crate::TabHandle,
+    crate::WinHandle,
+    i64,
+    i64,
+) {
+    let (mut editor, buffer, tab, window) = editor_with_lines(lines);
+    let classic = ox_text::Position {
+        lnum: 1,
+        col: lines[0].len().min(3).max(1),
+    };
+    editor
+        .replace_buffer_lines(buffer, 1, 1, &[lines[0].as_bytes().to_vec()], classic, classic, 0)
+        .unwrap();
+    editor.sync_buffer_undo(buffer);
+    editor.set_local_mark(buffer, 'a', classic).unwrap();
+    editor
+        .global_marks_mut()
+        .set('A', ox_editor::MarkLocation::in_buffer(buffer, classic))
+        .unwrap();
+    editor
+        .jumplist_mut()
+        .push(ox_editor::MarkLocation::in_buffer(buffer, classic));
+    let namespace =
+        crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("replace-buffer-text")).unwrap();
+    let extmark = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        0,
+        i64::try_from(classic.col).unwrap(),
+        dict(&[]),
+    )
+    .unwrap();
+    let second = editor.split_vertical(tab, window, buffer).unwrap();
+    editor.set_window_cursor(second, classic).unwrap();
+    (editor, buffer, tab, second, namespace, extmark)
+}
+
+fn extmark_pos(
+    editor: &mut Editor,
+    buffer: crate::BufHandle,
+    namespace: i64,
+    extmark: i64,
+) -> (i64, i64) {
+    let details = crate::extmark::nvim_buf_get_extmark_by_id(
+        editor,
+        buffer,
+        namespace,
+        extmark,
+        dict(&[]),
+    )
+    .unwrap();
+    match (details[0].clone(), details[1].clone()) {
+        (Object::Integer(row), Object::Integer(col)) => (row, col),
+        other => panic!("expected integer row/col, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_text_keeps_classic_columns_while_byte_geometry_tracks_the_splice() {
+    let (mut editor, buffer, tab, window) = editor_with_lines(&["0123456789"]);
+    let classic = ox_text::Position { lnum: 1, col: 6 };
+
+    editor
+        .replace_buffer_lines(
+            buffer,
+            1,
+            1,
+            &[b"0123456789".to_vec()],
+            classic,
+            classic,
+            0,
+        )
+        .unwrap();
+    editor.sync_buffer_undo(buffer);
+    editor.set_local_mark(buffer, 'a', classic).unwrap();
+    editor
+        .global_marks_mut()
+        .set('A', ox_editor::MarkLocation::in_buffer(buffer, classic))
+        .unwrap();
+    editor
+        .jumplist_mut()
+        .push(ox_editor::MarkLocation::in_buffer(buffer, classic));
+
+    let namespace =
+        crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("classic-byte-columns"))
+            .unwrap();
+    let extmark = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        0,
+        6,
+        dict(&[]),
+    )
+    .unwrap();
+    let second = editor.split_vertical(tab, window, buffer).unwrap();
+    editor.set_window_cursor(second, classic).unwrap();
+
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 1),
+                end: ox_editor::ExtmarkPosition::new(0, 3),
+                replacement: vec![b"WXYZ".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 1 },
+            ox_text::Position { lnum: 1, col: 1 },
+            0,
+        )
+        .unwrap();
+    editor.sync_buffer_undo(buffer);
+
+    assert_eq!(editor.local_mark(buffer, 'a').unwrap(), Some(classic));
+    assert_eq!(editor.global_marks().get('A').unwrap().unwrap().position, classic);
+    assert_eq!(editor.jumplist().entries()[0].position, classic);
+    assert_eq!(editor.changelists().entries(buffer).unwrap()[0], classic);
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmark_by_id(
+            &mut editor,
+            buffer,
+            namespace,
+            extmark,
+            dict(&[]),
+        )
+        .unwrap(),
+        vec![Object::Integer(0), Object::Integer(8)]
+    );
+    assert_eq!(editor.window(second).unwrap().cursor.col, 8);
+
+    editor.buffer_undo(buffer).unwrap();
+    assert_eq!(editor.local_mark(buffer, 'a').unwrap(), Some(classic));
+    assert_eq!(editor.global_marks().get('A').unwrap().unwrap().position, classic);
+    assert_eq!(editor.jumplist().entries()[0].position, classic);
+    assert_eq!(editor.changelists().entries(buffer).unwrap()[0], classic);
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmark_by_id(
+            &mut editor,
+            buffer,
+            namespace,
+            extmark,
+            dict(&[]),
+        )
+        .unwrap(),
+        vec![Object::Integer(0), Object::Integer(6)]
+    );
+    assert_eq!(editor.window(second).unwrap().cursor.col, 8);
+
+    editor.buffer_redo(buffer).unwrap();
+    assert_eq!(editor.local_mark(buffer, 'a').unwrap(), Some(classic));
+    assert_eq!(editor.global_marks().get('A').unwrap().unwrap().position, classic);
+    assert_eq!(editor.jumplist().entries()[0].position, classic);
+    assert_eq!(editor.changelists().entries(buffer).unwrap()[0], classic);
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmark_by_id(
+            &mut editor,
+            buffer,
+            namespace,
+            extmark,
+            dict(&[]),
+        )
+        .unwrap(),
+        vec![Object::Integer(0), Object::Integer(8)]
+    );
+    assert_eq!(editor.window(second).unwrap().cursor.col, 8);
+}
+
+#[test]
+fn replace_buffer_text_out_of_range_leaves_state_unchanged() {
+    let (mut editor, buffer, _tab, window, namespace, extmark) =
+        seeded_replace_buffer_text_editor(&["abc"]);
+    let before = snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window);
+    for (start, end) in [
+        (
+            ox_editor::ExtmarkPosition::new(0, usize::MAX),
+            ox_editor::ExtmarkPosition::new(0, usize::MAX),
+        ),
+        (
+            ox_editor::ExtmarkPosition::new(9, 0),
+            ox_editor::ExtmarkPosition::new(9, 0),
+        ),
+    ] {
+        let err = editor
+            .replace_buffer_text(
+                buffer,
+                &ox_editor::BufferTextEditRequest {
+                    start,
+                    end,
+                    replacement: vec![b"X".to_vec()],
+                },
+                ox_text::Position { lnum: 1, col: 0 },
+                ox_text::Position { lnum: 1, col: 0 },
+                0,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ox_editor::EditorError::Buffer(ox_editor::BufferStateError::TextEdit(
+                ox_editor::BufferTextEditError::OutOfRange
+            ))
+        ));
+        assert_eq!(
+            snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window),
+            before
+        );
+    }
+}
+
+#[test]
+fn replace_buffer_text_reversed_same_row_leaves_state_unchanged() {
+    let (mut editor, buffer, _tab, window, namespace, extmark) =
+        seeded_replace_buffer_text_editor(&["abc"]);
+    let before = snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window);
+    let err = editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 2),
+                end: ox_editor::ExtmarkPosition::new(0, 1),
+                replacement: vec![b"abc".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 1 },
+            ox_text::Position { lnum: 1, col: 1 },
+            0,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ox_editor::EditorError::Buffer(ox_editor::BufferStateError::TextEdit(
+            ox_editor::BufferTextEditError::ReversedRange
+        ))
+    ));
+    assert_eq!(
+        snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window),
+        before
+    );
+}
+
+#[test]
+fn replace_buffer_text_reversed_cross_row_leaves_state_unchanged() {
+    let (mut editor, buffer, _tab, window, namespace, extmark) =
+        seeded_replace_buffer_text_editor(&["alpha", "bravo", "charlie"]);
+    let before = snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window);
+    let err = editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(2, 0),
+                end: ox_editor::ExtmarkPosition::new(0, 1),
+                replacement: vec![b"x".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 0 },
+            ox_text::Position { lnum: 1, col: 0 },
+            0,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ox_editor::EditorError::Buffer(ox_editor::BufferStateError::TextEdit(
+            ox_editor::BufferTextEditError::ReversedRange
+        ))
+    ));
+    assert_eq!(
+        snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window),
+        before
+    );
+}
+
+#[test]
+fn replace_buffer_text_non_char_boundary_leaves_state_unchanged() {
+    let (mut editor, buffer, _tab, window, namespace, extmark) =
+        seeded_replace_buffer_text_editor(&["한글"]);
+    let before = snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window);
+    let err = editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 1),
+                end: ox_editor::ExtmarkPosition::new(0, 3),
+                replacement: vec![b"X".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 0 },
+            ox_text::Position { lnum: 1, col: 0 },
+            0,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ox_editor::EditorError::Buffer(ox_editor::BufferStateError::TextEdit(
+            ox_editor::BufferTextEditError::NotCharBoundary(1)
+        ))
+    ));
+    assert_eq!(
+        snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window),
+        before
+    );
+}
+
+#[test]
+fn replace_buffer_text_more_rows_than_removed_preserves_prefix_suffix() {
+    let (mut editor, buffer, _tab, _window, namespace, extmark) =
+        seeded_replace_buffer_text_editor(&["alpha", "omega"]);
+    let before_col = extmark_pos(&mut editor, buffer, namespace, extmark).1;
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 1),
+                end: ox_editor::ExtmarkPosition::new(0, 2),
+                replacement: vec![b"L".to_vec(), b"M".to_vec(), b"N".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 1 },
+            ox_text::Position { lnum: 1, col: 1 },
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"aL\nM\nNpha\nomega"
+    );
+    let after_edit = extmark_pos(&mut editor, buffer, namespace, extmark);
+    editor.buffer_undo(buffer).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"alpha\nomega"
+    );
+    assert_eq!(
+        extmark_pos(&mut editor, buffer, namespace, extmark),
+        (0, before_col)
+    );
+    editor.buffer_redo(buffer).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"aL\nM\nNpha\nomega"
+    );
+    assert_eq!(extmark_pos(&mut editor, buffer, namespace, extmark), after_edit);
+}
+
+#[test]
+fn replace_buffer_text_fewer_rows_than_removed_preserves_prefix_suffix() {
+    let (mut editor, buffer, _tab, _window) = editor_with_lines(&["alpha", "omega"]);
+    let namespace =
+        crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("shrink")).unwrap();
+    let first = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        0,
+        4,
+        dict(&[]),
+    )
+    .unwrap();
+    let second = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        1,
+        3,
+        dict(&[]),
+    )
+    .unwrap();
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 1),
+                end: ox_editor::ExtmarkPosition::new(1, 2),
+                replacement: vec![b"x".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 1 },
+            ox_text::Position { lnum: 1, col: 1 },
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"axega"
+    );
+    editor.buffer_undo(buffer).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"alpha\nomega"
+    );
+    assert_eq!(extmark_pos(&mut editor, buffer, namespace, first), (0, 4));
+    assert_eq!(extmark_pos(&mut editor, buffer, namespace, second), (1, 3));
+    editor.buffer_redo(buffer).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"axega"
+    );
+}
+
+#[test]
+fn replace_buffer_text_multiline_request_updates_byte_geometry() {
+    let (mut editor, buffer, _tab, window, namespace, extmark) =
+        seeded_replace_buffer_text_editor(&["ab", "cd", "ef"]);
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 1),
+                end: ox_editor::ExtmarkPosition::new(1, 2),
+                replacement: vec![b"X".to_vec(), b"Yc".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 1 },
+            ox_text::Position { lnum: 2, col: 1 },
+            0,
+        )
+        .unwrap();
+    let state = editor.buffer(buffer).unwrap();
+    assert_eq!(state.text().unwrap().to_bytes(), b"aX\nYc\nef");
+    assert_eq!(
+        extmark_pos(&mut editor, buffer, namespace, extmark).0,
+        1
+    );
+    assert!(editor.window(window).unwrap().cursor.lnum >= 1);
+}
+
+#[test]
+fn replace_buffer_text_grouped_undo_replays_members_in_reverse_byte_exact() {
+    let (mut editor, buffer, tab, window) = editor_with_lines(&["alpha", "bravo", "charlie"]);
+    let namespace =
+        crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("grouped")).unwrap();
+    let marks = [
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, namespace, 0, 1, dict(&[])).unwrap(),
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, namespace, 1, 2, dict(&[])).unwrap(),
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, namespace, 2, 1, dict(&[])).unwrap(),
+    ];
+    let _second = editor.split_vertical(tab, window, buffer).unwrap();
+
+    let pre_text = editor.buffer(buffer).unwrap().text().unwrap().to_bytes();
+    let pre_marks: Vec<_> = marks
+        .iter()
+        .map(|id| extmark_pos(&mut editor, buffer, namespace, *id))
+        .collect();
+
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 1),
+                end: ox_editor::ExtmarkPosition::new(0, 3),
+                replacement: vec![b"LP".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 1 },
+            ox_text::Position { lnum: 1, col: 1 },
+            0,
+        )
+        .unwrap();
+    editor.buffer_undojoin(buffer).unwrap();
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(1, 2),
+                end: ox_editor::ExtmarkPosition::new(2, 1),
+                replacement: vec![b"Q".to_vec()],
+            },
+            ox_text::Position { lnum: 2, col: 2 },
+            ox_text::Position { lnum: 2, col: 2 },
+            0,
+        )
+        .unwrap();
+    editor.buffer_undojoin(buffer).unwrap();
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 4),
+                end: ox_editor::ExtmarkPosition::new(0, 4),
+                replacement: vec![b"xx".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 4 },
+            ox_text::Position { lnum: 1, col: 4 },
+            0,
+        )
+        .unwrap();
+
+    let final_text = editor.buffer(buffer).unwrap().text().unwrap().to_bytes();
+    let final_marks: Vec<_> = marks
+        .iter()
+        .map(|id| extmark_pos(&mut editor, buffer, namespace, *id))
+        .collect();
+
+    editor.buffer_undo(buffer).unwrap();
+    assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), pre_text);
+    let undone_marks: Vec<_> = marks
+        .iter()
+        .map(|id| extmark_pos(&mut editor, buffer, namespace, *id))
+        .collect();
+    assert_eq!(undone_marks, pre_marks);
+
+    editor.buffer_redo(buffer).unwrap();
+    assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), final_text);
+    let redone_marks: Vec<_> = marks
+        .iter()
+        .map(|id| extmark_pos(&mut editor, buffer, namespace, *id))
+        .collect();
+    assert_eq!(redone_marks, final_marks);
+}
+
+#[test]
+fn replace_buffer_text_undo_to_seq_walks_headers_byte_exact() {
+    let (mut editor, buffer, _tab, _window) = editor_with_lines(&["one", "two", "three", "four"]);
+    let namespace =
+        crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("undo-to-seq")).unwrap();
+    let mark = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        0,
+        1,
+        dict(&[]),
+    )
+    .unwrap();
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Snap {
+        text: Vec<u8>,
+        mark: (i64, i64),
+        seq: u64,
+    }
+
+    let capture = |editor: &mut Editor| Snap {
+        text: editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        mark: extmark_pos(editor, buffer, namespace, mark),
+        seq: editor.buffer(buffer).unwrap().undo.current_seq(),
+    };
+
+    let mut snaps = vec![capture(&mut editor)];
+
+    editor
+        .replace_buffer_lines(
+            buffer,
+            2,
+            2,
+            &[b"TWO".to_vec()],
+            ox_text::Position { lnum: 2, col: 0 },
+            ox_text::Position { lnum: 2, col: 0 },
+            0,
+        )
+        .unwrap();
+    editor.sync_buffer_undo(buffer);
+    snaps.push(capture(&mut editor));
+
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 1),
+                end: ox_editor::ExtmarkPosition::new(0, 2),
+                replacement: vec![b"XY".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 1 },
+            ox_text::Position { lnum: 1, col: 1 },
+            0,
+        )
+        .unwrap();
+    editor.sync_buffer_undo(buffer);
+    snaps.push(capture(&mut editor));
+
+    editor
+        .replace_buffer_lines(
+            buffer,
+            4,
+            4,
+            &[b"FOUR".to_vec()],
+            ox_text::Position { lnum: 4, col: 0 },
+            ox_text::Position { lnum: 4, col: 0 },
+            0,
+        )
+        .unwrap();
+    editor.sync_buffer_undo(buffer);
+    snaps.push(capture(&mut editor));
+
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(2, 0),
+                end: ox_editor::ExtmarkPosition::new(2, 1),
+                replacement: vec![b"Z".to_vec(), b"W".to_vec()],
+            },
+            ox_text::Position { lnum: 3, col: 0 },
+            ox_text::Position { lnum: 3, col: 0 },
+            0,
+        )
+        .unwrap();
+    editor.sync_buffer_undo(buffer);
+    snaps.push(capture(&mut editor));
+
+    let middle = snaps[2].seq;
+    let newest = snaps[4].seq;
+    let oldest = snaps[0].seq;
+
+    editor.buffer_undo_to_seq(buffer, middle).unwrap();
+    assert_eq!(capture(&mut editor), snaps[2]);
+
+    editor.buffer_undo_to_seq(buffer, newest).unwrap();
+    assert_eq!(capture(&mut editor), snaps[4]);
+
+    editor.buffer_undo_to_seq(buffer, oldest).unwrap();
+    assert_eq!(capture(&mut editor), snaps[0]);
+}

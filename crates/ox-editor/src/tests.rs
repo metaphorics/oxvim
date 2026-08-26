@@ -607,3 +607,63 @@ fn runtime_roots_follow_runtimepath_entries() {
     assert_eq!(roots, vec![std::path::Path::new("/first"), std::path::Path::new("/second")]);
 }
 
+
+#[test]
+fn replace_buffer_text_out_of_range_leaves_state_unchanged() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_lines(&[b"abc".to_vec()], false).unwrap(), true)
+        .unwrap();
+    let before = editor.buffer(buffer).unwrap().text().unwrap().to_bytes();
+    let err = editor
+        .replace_buffer_text(
+            buffer,
+            &crate::buffer::BufferTextEditRequest {
+                start: crate::extmark::ExtmarkPosition::new(0, usize::MAX),
+                end: crate::extmark::ExtmarkPosition::new(0, usize::MAX),
+                replacement: vec![b"X".to_vec()],
+            },
+            position(1, 0),
+            position(1, 0),
+            0,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::editor::EditorError::Buffer(crate::buffer::BufferStateError::TextEdit(
+            crate::buffer::BufferTextEditError::OutOfRange
+        ))
+    ));
+    assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), before);
+}
+
+#[test]
+fn extmark_splice_is_total_for_unbounded_positions() {
+    let mut marks = crate::Extmarks::new();
+    let namespace = marks.create_namespace("total").unwrap();
+    let id = marks
+        .set(
+            namespace,
+            None,
+            crate::extmark::ExtmarkPlacement::new(crate::extmark::ExtmarkPosition::new(
+                usize::MAX / 2,
+                usize::MAX / 2,
+            )),
+        )
+        .unwrap();
+    marks.splice(crate::extmark::TextSplice {
+        start: crate::extmark::ExtmarkPosition::new(0, 0),
+        old_extent: crate::extmark::TextExtent::EMPTY,
+        new_extent: crate::extmark::TextExtent::new(3, 2),
+    });
+    let (_, undo) = marks.splice_recording(crate::extmark::TextSplice {
+        start: crate::extmark::ExtmarkPosition::new(usize::MAX / 4, usize::MAX / 4),
+        old_extent: crate::extmark::TextExtent::EMPTY,
+        new_extent: crate::extmark::TextExtent::new(0, usize::MAX / 8),
+    });
+    marks.undo_splice(&undo);
+    marks.redo_splice(&undo);
+    let position = marks.get(namespace, id).unwrap().unwrap().position();
+    assert!(position.row >= usize::MAX / 2);
+    assert!(position.column >= usize::MAX / 2 || position.row > usize::MAX / 2);
+}

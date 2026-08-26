@@ -434,9 +434,9 @@ impl Folds {
         start: usize,
         old_rows: usize,
         new_rows: usize,
-    ) -> Result<(), FoldError> {
+    ) {
         if self.method != FoldMethod::Manual {
-            return Ok(());
+            return;
         }
         for fold in &mut self.manual {
             fold.range.start.row = splice_row(
@@ -456,6 +456,7 @@ impl Folds {
         }
         self.manual.retain(|fold| fold.range.start < fold.range.end);
         normalize_folds(&mut self.manual)
+            .expect("splice_row is a non-decreasing map; manual folds cannot cross");
     }
 
     /// Returns whether active fold data needs refreshing.

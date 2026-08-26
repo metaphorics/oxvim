@@ -61,6 +61,59 @@ impl TextExtent {
     pub const EMPTY: Self = Self::new(0, 0);
 }
 
+/// The single geometry representation shared by live edits and undo replay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TextSplice {
+    pub(crate) start: ExtmarkPosition,
+    pub(crate) old_extent: TextExtent,
+    pub(crate) new_extent: TextExtent,
+}
+
+impl TextSplice {
+    pub(crate) fn from_byte_edit(
+        start: ExtmarkPosition,
+        end: ExtmarkPosition,
+        replacement: &[Vec<u8>],
+    ) -> Self {
+        debug_assert!(!replacement.is_empty());
+        debug_assert!(start <= end);
+        let old_extent = if start.row == end.row {
+            TextExtent::new(0, end.column - start.column)
+        } else {
+            TextExtent::new(end.row - start.row, end.column)
+        };
+        let new_extent = if replacement.len() == 1 {
+            TextExtent::new(0, replacement[0].len())
+        } else {
+            TextExtent::new(
+                replacement.len() - 1,
+                replacement.last().expect("replacement is nonempty").len(),
+            )
+        };
+        Self { start, old_extent, new_extent }
+    }
+
+    pub(crate) const fn line_anchored(
+        start_row: usize,
+        old_rows: usize,
+        new_rows: usize,
+    ) -> Self {
+        Self {
+            start: ExtmarkPosition::new(start_row, 0),
+            old_extent: TextExtent::new(old_rows, 0),
+            new_extent: TextExtent::new(new_rows, 0),
+        }
+    }
+
+    pub(crate) fn old_end(self) -> ExtmarkPosition {
+        extent_end(self.start, self.old_extent)
+    }
+
+    pub(crate) fn new_end(self) -> ExtmarkPosition {
+        extent_end(self.start, self.new_extent)
+    }
+}
+
 /// Which side of text inserted at an endpoint owns that endpoint.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ExtmarkGravity {
@@ -249,11 +302,13 @@ struct SpliceUndoEntry {
     after_position: ExtmarkPosition,
     after_end: Option<ExtmarkPosition>,
     after_invalid: bool,
+    restore_before: bool,
 }
 
 /// Compact position and invalidation delta retained with one undo header.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExtmarkSpliceUndo {
+    splice: TextSplice,
     entries: Vec<SpliceUndoEntry>,
 }
 
@@ -283,9 +338,6 @@ pub enum ExtmarkError {
     /// A configured range ended before it started.
     #[error("extmark range end precedes its start")]
     EndBeforeStart,
-    /// Position arithmetic exceeded the platform's addressable range.
-    #[error("extmark splice position overflow")]
-    PositionOverflow,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -588,50 +640,20 @@ impl Extmarks {
     /// translated by the replacement delta (`src/nvim/marktree.c:2049-2073`).
     /// If independently transformed range endpoints cross, their positions are
     /// ordered again while retaining the gravity configured for each endpoint.
-    pub fn splice(
-        &mut self,
-        start: ExtmarkPosition,
-        old_extent: TextExtent,
-        new_extent: TextExtent,
-    ) -> Result<SpliceResult, ExtmarkError> {
-        self.splice_recording(start, old_extent, new_extent)
-            .map(|(result, _)| result)
+    pub(crate) fn splice(&mut self, splice: TextSplice) -> SpliceResult {
+        self.splice_recording(splice).0
     }
 
     pub(crate) fn splice_recording(
         &mut self,
-        start: ExtmarkPosition,
-        old_extent: TextExtent,
-        new_extent: TextExtent,
-    ) -> Result<(SpliceResult, ExtmarkSpliceUndo), ExtmarkError> {
-        let old_end = extent_end(start, old_extent)?;
-        let new_end = extent_end(start, new_extent)?;
-
-        for state in self.namespaces.values() {
-            for mark in state.by_id.values() {
-                transform_position(
-                    mark.position(),
-                    mark.placement.gravity,
-                    start,
-                    old_end,
-                    new_end,
-                    old_extent == TextExtent::EMPTY,
-                )?;
-                if let Some(end) = mark.placement.end {
-                    transform_position(
-                        end.position,
-                        end.gravity,
-                        start,
-                        old_end,
-                        new_end,
-                        old_extent == TextExtent::EMPTY,
-                    )?;
-                }
-            }
-        }
-
+        splice: TextSplice,
+    ) -> (SpliceResult, ExtmarkSpliceUndo) {
+        let start = splice.start;
+        let old_extent = splice.old_extent;
+        let old_end = splice.old_end();
+        let new_end = splice.new_end();
         let mut result = SpliceResult::default();
-        let mut undo = ExtmarkSpliceUndo::default();
+        let mut undo = ExtmarkSpliceUndo { splice, entries: Vec::new() };
         for state in self.namespaces.values_mut() {
             for mark in state.by_id.values_mut() {
                 let old_start = mark.position();
@@ -658,7 +680,7 @@ impl Extmarks {
                     old_end,
                     new_end,
                     old_extent == TextExtent::EMPTY,
-                )?;
+                );
                 if let Some(end) = &mut mark.placement.end {
                     end.position = transform_position(
                         end.position,
@@ -667,7 +689,7 @@ impl Extmarks {
                         old_end,
                         new_end,
                         old_extent == TextExtent::EMPTY,
-                    )?;
+                    );
                     if end.position < mark.placement.position {
                         std::mem::swap(&mut mark.placement.position, &mut end.position);
                     }
@@ -678,10 +700,13 @@ impl Extmarks {
                 {
                     result.moved += 1;
                 }
-                if mark.position() != old_start
+                let changed = mark.position() != old_start
                     || mark.placement.end.map(|end| end.position) != old_range_end
-                    || mark.invalid != old_invalid
-                {
+                    || mark.invalid != old_invalid;
+                let deletion_touched_endpoint = old_extent != TextExtent::EMPTY
+                    && ((start <= old_start && old_start < old_end)
+                        || old_range_end.is_some_and(|end| start <= end && end < old_end));
+                if changed || deletion_touched_endpoint {
                     undo.entries.push(SpliceUndoEntry {
                         namespace: mark.namespace,
                         id: mark.id,
@@ -691,21 +716,16 @@ impl Extmarks {
                         after_position: mark.position(),
                         after_end: mark.placement.end.map(|end| end.position),
                         after_invalid: mark.invalid,
+                        restore_before: true,
                     });
                 }
             }
             state.rebuild_index();
         }
-        Ok((result, undo))
+        (result, undo)
     }
 
-    pub(crate) fn undo_splice(
-        &mut self,
-        undo: &ExtmarkSpliceUndo,
-        start: ExtmarkPosition,
-        old_extent: TextExtent,
-        new_extent: TextExtent,
-    ) -> Result<(), ExtmarkError> {
+    pub(crate) fn undo_splice(&mut self, undo: &ExtmarkSpliceUndo) {
         let restorable: BTreeSet<_> = undo
             .entries
             .iter()
@@ -721,9 +741,13 @@ impl Extmarks {
                     .then_some((entry.namespace, entry.id))
             })
             .collect();
-        self.splice(start, new_extent, old_extent)?;
+        self.splice(TextSplice {
+            start: undo.splice.start,
+            old_extent: undo.splice.new_extent,
+            new_extent: undo.splice.old_extent,
+        });
         for entry in &undo.entries {
-            if !restorable.contains(&(entry.namespace, entry.id)) {
+            if !entry.restore_before || !restorable.contains(&(entry.namespace, entry.id)) {
                 continue;
             }
             if let Some(state) = self.namespaces.get_mut(&entry.namespace) {
@@ -739,7 +763,43 @@ impl Extmarks {
         for state in self.namespaces.values_mut() {
             state.rebuild_index();
         }
-        Ok(())
+    }
+
+    pub(crate) fn redo_splice(&mut self, undo: &ExtmarkSpliceUndo) {
+        let restorable: BTreeSet<_> = undo
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let mark = self
+                    .namespaces
+                    .get(&entry.namespace)?
+                    .by_id
+                    .get(&entry.id)?;
+                (!entry.restore_before
+                    || (mark.position() == entry.position
+                        && mark.placement.end.map(|end| end.position) == entry.end
+                        && mark.invalid == entry.invalid))
+                    .then_some((entry.namespace, entry.id))
+            })
+            .collect();
+        self.splice(undo.splice);
+        for entry in &undo.entries {
+            if !restorable.contains(&(entry.namespace, entry.id)) {
+                continue;
+            }
+            if let Some(state) = self.namespaces.get_mut(&entry.namespace) {
+                if let Some(mark) = state.by_id.get_mut(&entry.id) {
+                    mark.placement.position = entry.after_position;
+                    if let (Some(end), Some(position)) = (&mut mark.placement.end, entry.after_end) {
+                        end.position = position;
+                    }
+                    mark.invalid = entry.after_invalid;
+                }
+            }
+        }
+        for state in self.namespaces.values_mut() {
+            state.rebuild_index();
+        }
     }
 
     fn namespace_state(&self, namespace: NamespaceId) -> Result<&NamespaceState, ExtmarkError> {
@@ -780,22 +840,11 @@ fn ordered_bounds(
     }
 }
 
-fn extent_end(
-    start: ExtmarkPosition,
-    extent: TextExtent,
-) -> Result<ExtmarkPosition, ExtmarkError> {
+fn extent_end(start: ExtmarkPosition, extent: TextExtent) -> ExtmarkPosition {
     if extent.rows == 0 {
-        let column = start
-            .column
-            .checked_add(extent.columns)
-            .ok_or(ExtmarkError::PositionOverflow)?;
-        Ok(ExtmarkPosition::new(start.row, column))
+        ExtmarkPosition::new(start.row, start.column.saturating_add(extent.columns))
     } else {
-        let row = start
-            .row
-            .checked_add(extent.rows)
-            .ok_or(ExtmarkError::PositionOverflow)?;
-        Ok(ExtmarkPosition::new(row, extent.columns))
+        ExtmarkPosition::new(start.row.saturating_add(extent.rows), extent.columns)
     }
 }
 
@@ -806,44 +855,30 @@ fn transform_position(
     old_end: ExtmarkPosition,
     new_end: ExtmarkPosition,
     insertion: bool,
-) -> Result<ExtmarkPosition, ExtmarkError> {
+) -> ExtmarkPosition {
     if position < start {
-        return Ok(position);
+        return position;
     }
 
     if insertion && position == start {
-        return Ok(match gravity {
+        return match gravity {
             ExtmarkGravity::Left => start,
             ExtmarkGravity::Right => new_end,
-        });
+        };
     }
 
     if !insertion && position <= old_end {
-        return Ok(match gravity {
+        return match gravity {
             ExtmarkGravity::Left => start,
             ExtmarkGravity::Right => new_end,
-        });
+        };
     }
 
     if position.row == old_end.row {
-        let suffix = position
-            .column
-            .checked_sub(old_end.column)
-            .ok_or(ExtmarkError::PositionOverflow)?;
-        let column = new_end
-            .column
-            .checked_add(suffix)
-            .ok_or(ExtmarkError::PositionOverflow)?;
-        Ok(ExtmarkPosition::new(new_end.row, column))
+        let suffix = position.column.saturating_sub(old_end.column);
+        ExtmarkPosition::new(new_end.row, new_end.column.saturating_add(suffix))
     } else {
-        let suffix_rows = position
-            .row
-            .checked_sub(old_end.row)
-            .ok_or(ExtmarkError::PositionOverflow)?;
-        let row = new_end
-            .row
-            .checked_add(suffix_rows)
-            .ok_or(ExtmarkError::PositionOverflow)?;
-        Ok(ExtmarkPosition::new(row, position.column))
+        let suffix_rows = position.row.saturating_sub(old_end.row);
+        ExtmarkPosition::new(new_end.row.saturating_add(suffix_rows), position.column)
     }
 }

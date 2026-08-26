@@ -36,12 +36,13 @@ pub use autocmd::{
     AutocmdSink, Autocmds, AugroupId, DeleteAutocmds, Event, FiringPlan, PatternKind, EVENT_COUNT,
 };
 pub use buffer::{
-    BufferAttachSubscription, BufferState, BufferStateError, UserCommandDefinition,
+    BufferAttachSubscription, BufferState, BufferStateError, BufferTextEditError,
+    BufferTextEditRequest, UserCommandDefinition,
 };
 pub use decoration::Decorations;
 pub use editor::{
-    BufferRelease, ChannelIds, Editor, EditorError, HighlightDefinition, Message, MessageDestination,
-    MessageKind, MessageRouting,
+    BufferEditMode, BufferRelease, ChannelIds, Editor, EditorError, HighlightDefinition, Message,
+    MessageDestination, MessageKind, MessageRouting,
 };
 pub use excmd_exec::{
     vim_variable_is_writable, ExExecutor, ExecError, ExecOutcome, LuaExec, LuaExecError, UserCommand,

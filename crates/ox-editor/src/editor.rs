@@ -11,8 +11,9 @@ use thiserror::Error;
 
 use crate::arglist::ArgList;
 use crate::autocmd::Autocmds;
-use crate::buffer::{BufferState, BufferStateError};
+use crate::buffer::{BufferState, BufferStateError, BufferTextEditRequest};
 use crate::decoration::Decorations;
+use crate::extmark::{ExtmarkPosition, TextSplice};
 use crate::fold::{FoldError, Position as FoldPosition};
 use crate::layout::{Geometry, Layout, LayoutError, TabpageState, WinConfig, WindowState};
 use crate::mapping::Mappings;
@@ -159,6 +160,22 @@ pub enum BufferRelease {
     Unload,
 }
 
+/// Editor input mode visible to the buffer API for cursor-adjustment policy.
+///
+/// The buffer API needs to know whether the current window is in INSERT mode
+/// to decide whether `nvim_buf_set_text` moves the current window's cursor
+/// when text is added at the cursor position (`mark_col_adjust` in
+/// `mark.c` skips the current cursor when `restart_edit` is set). The host
+/// sets this before dispatching API calls that mutate buffer text.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BufferEditMode {
+    /// Normal command mode (the default).
+    #[default]
+    Normal,
+    /// Insert or replace mode.
+    Insert,
+}
+
 /// All mutable editor state under a single `&mut self` discipline.
 ///
 /// No state is process-global. Event-loop and RPC layers can serialize their
@@ -225,6 +242,10 @@ pub struct Editor {
     next_buffer: i64,
     next_window: i64,
     next_tabpage: i64,
+    /// Current edit mode for API-level cursor adjustment policy.
+    edit_mode: BufferEditMode,
+    /// Buffer whose current insert/replace session has recorded text.
+    active_text_edit: Option<BufHandle>,
     channel_ids: ChannelIds,
 }
 
@@ -278,6 +299,8 @@ impl Editor {
             next_buffer: 1,
             next_window: 1,
             next_tabpage: 1,
+            edit_mode: BufferEditMode::Normal,
+            active_text_edit: None,
             channel_ids: ChannelIds::new(),
         }
     }
@@ -458,6 +481,58 @@ impl Editor {
         let window = self.current_window().ok_or(EditorError::NoCurrentTabpage)?;
         self.set_window_buffer(window, buffer, release)
     }
+
+    /// Returns the current edit mode for API cursor-adjustment policy.
+    #[must_use]
+    pub const fn edit_mode(&self) -> BufferEditMode {
+        self.edit_mode
+    }
+
+    /// Sets the edit mode the host reports before dispatching buffer-text
+    /// mutations. The host sets [`BufferEditMode::Insert`] when the current
+    /// window is in insert/replace mode so `nvim_buf_set_text` preserves the
+    /// current cursor when text is added at the cursor position.
+    pub fn set_edit_mode(&mut self, mode: BufferEditMode) {
+        if self.edit_mode != mode {
+            self.active_text_edit = None;
+        }
+        self.edit_mode = mode;
+    }
+
+    /// Whether this buffer has recorded text in the current insert/replace session.
+    #[must_use]
+    pub fn has_active_text_edit(&self, buffer: BufHandle) -> bool {
+        self.edit_mode == BufferEditMode::Insert
+            && self.current_buffer() == Some(buffer)
+            && self.active_text_edit == Some(buffer)
+    }
+
+    /// Replaces one validated byte range and adjusts every position-bearing
+    /// subsystem with column-aware cursor adjustment, matching
+    /// `mark_col_adjust` (`mark.c`).
+    pub fn replace_buffer_text(
+        &mut self,
+        buffer: BufHandle,
+        request: &BufferTextEditRequest,
+        cursor_before: Position,
+        cursor_after: Position,
+        timestamp: i64,
+    ) -> Result<u64, EditorError> {
+        let opens_active_edit = self.edit_mode == BufferEditMode::Insert
+            && self.current_buffer() == Some(buffer);
+        let prepared = self.buffer(buffer)?.prepare_buffer_text_edit(request)?;
+        let splice = prepared.splice;
+        let seq = self
+            .buffer_mut(buffer)?
+            .commit_buffer_text_edit(prepared, cursor_before, cursor_after, timestamp);
+        self.splice_text_positions(buffer, splice);
+        self.changelists.push(buffer, cursor_after);
+        if opens_active_edit {
+            self.active_text_edit = Some(buffer);
+        }
+        Ok(seq)
+    }
+
 
     /// Changes a live window's cursor position.
     pub fn set_window_cursor(
@@ -1465,6 +1540,20 @@ impl Editor {
         content: &crate::register::RegisterContent,
         timestamp: i64,
     ) -> Result<(), EditorError> {
+        if matches!(content.kind(), crate::register::RegisterKind::LineWise) {
+            let cursor = Position {
+                lnum: position.lnum.max(1),
+                col: position.col,
+            };
+            self.append_buffer_lines(
+                buffer,
+                position.lnum,
+                content.lines(),
+                cursor,
+                timestamp,
+            )?;
+            return Ok(());
+        }
         let original = self.buffer(buffer)?.text()?.clone();
         let before = buffer_lines(&original)?;
         let mut resulting = original;
@@ -1474,6 +1563,15 @@ impl Editor {
             return Ok(());
         }
 
+        if matches!(content.kind(), crate::register::RegisterKind::CharacterWise) {
+            let request = BufferTextEditRequest {
+                start: ExtmarkPosition::new(position.lnum - 1, position.col),
+                end: ExtmarkPosition::new(position.lnum - 1, position.col),
+                replacement: content.lines().to_vec(),
+            };
+            self.replace_buffer_text(buffer, &request, position, position, timestamp)?;
+            return Ok(());
+        }
         let prefix = before
             .iter()
             .zip(&after)
@@ -1576,6 +1674,66 @@ impl Editor {
         }
     }
 
+    /// Column-aware position splice for byte-level text edits.
+    ///
+    /// Like [`Self::splice_positions`] for marks, jumplist, changelists, and
+    /// toplines, but also adjusts cursor columns for windows showing the
+    /// edited buffer, matching `mark_col_adjust` (`mark.c`).
+    fn splice_text_positions(&mut self, buffer: BufHandle, splice: TextSplice) {
+        let start = splice.start.row + 1;
+        let old_count = splice.old_extent.rows + 1;
+        let new_count = splice.new_extent.rows + 1;
+        self.global_marks
+            .splice_buffer(buffer, start, old_count, new_count);
+        self.jumplist
+            .splice_buffer(buffer, start, old_count, new_count);
+        self.changelists
+            .splice_buffer(buffer, start, old_count, new_count);
+
+        let old_end = splice.old_end();
+        let anchor = splice.new_end();
+        let current_window = self.current_window();
+        let insert_current = self.edit_mode == BufferEditMode::Insert
+            && self.current_buffer() == Some(buffer);
+
+        let windows = &self.windows;
+        let tabpages = &mut self.tabpages;
+        for (&window, &tab) in windows {
+            let Some(tabpage) = tabpages.get_mut(&tab) else {
+                continue;
+            };
+            let Ok(state) = tabpage.window_mut(window) else {
+                continue;
+            };
+            if state.buffer != buffer {
+                continue;
+            }
+
+            let is_current = current_window == Some(window);
+            let (new_row, new_col) = adjust_text_cursor(
+                state.cursor.lnum.saturating_sub(1),
+                state.cursor.col,
+                splice.start.row,
+                splice.start.column,
+                old_end.row,
+                old_end.column,
+                anchor.row,
+                anchor.column,
+                new_count,
+                insert_current && is_current,
+            );
+            state.cursor.lnum = new_row + 1;
+            state.cursor.col = new_col;
+
+            let mut top = Position {
+                lnum: state.topline,
+                col: 0,
+            };
+            splice_position(&mut top, start, old_count, new_count);
+            state.topline = top.lnum;
+        }
+    }
+
     fn require_buffer(&self, buffer: BufHandle) -> Result<(), EditorError> {
         if self.buffers.contains_key(&buffer) {
             Ok(())
@@ -1637,6 +1795,72 @@ fn splice_position(position: &mut Position, start: usize, old_count: usize, new_
         position.lnum = start.max(1);
         position.col = 0;
     }
+}
+
+/// Adjusts a 0-based `(row, col)` cursor for a byte-level text replacement
+/// from `(start_row, start_col)` to `(end_row, end_col)`, producing
+/// `new_count` lines whose last line has the byte length encoded in
+/// `anchor_col` for multi-line replacements.
+///
+/// `anchor_row`/`anchor_col` is where old `(end_row, end_col)` maps to in
+/// the new text. When `insert_current` is true (INSERT mode in the current
+/// window), a cursor at the start of an insertion stays put, matching
+/// `mark_col_adjust` skipping `restart_edit` cursors.
+fn adjust_text_cursor(
+    crow: usize,
+    ccol: usize,
+    start_row: usize,
+    start_col: usize,
+    end_row: usize,
+    end_col: usize,
+    anchor_row: usize,
+    anchor_col: usize,
+    new_count: usize,
+    insert_current: bool,
+) -> (usize, usize) {
+    // Before the edit: no change.
+    if crow < start_row {
+        return (crow, ccol);
+    }
+    if crow == start_row && ccol < start_col {
+        return (crow, ccol);
+    }
+
+    // At the exact start position.
+    if crow == start_row && ccol == start_col {
+        let range_empty = start_row == end_row && start_col == end_col;
+        let has_replacement = new_count > 1 || anchor_col > start_col;
+        if !has_replacement {
+            // Pure deletion at cursor: stays at start (anchor == start).
+            return (crow, ccol);
+        }
+        if range_empty || (new_count == 1 && anchor_col > start_col) {
+            // Insertion or single-line replacement at cursor.
+            if insert_current {
+                return (crow, ccol);
+            }
+        }
+        return (anchor_row, anchor_col);
+    }
+
+    // Within the replaced range (strictly inside).
+    if crow < end_row || (crow == end_row && ccol < end_col) {
+        return (anchor_row, anchor_col);
+    }
+
+    // At or after the end position on the end row.
+    if crow == end_row && ccol >= end_col {
+        return (anchor_row, anchor_col + (ccol - end_col));
+    }
+
+    // Beyond the replaced range: shift row by delta, keep column.
+    let delta = new_count as i64 - 1 - (end_row - start_row) as i64;
+    let new_row = if delta >= 0 {
+        crow.saturating_add(delta as usize)
+    } else {
+        (crow as i64 + delta).max(0) as usize
+    };
+    (new_row, ccol)
 }
 
 fn buffer_lines(buffer: &Buffer) -> Result<Vec<Vec<u8>>, BufferStateError> {

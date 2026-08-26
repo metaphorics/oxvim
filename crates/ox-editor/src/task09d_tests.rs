@@ -52,13 +52,11 @@ macro_rules! insertion_gravity_test {
         fn $name() {
             let mut marks = Extmarks::new();
             let (namespace, id) = one_mark(&mut marks, $row, $column, $gravity);
-            marks
-                .splice(
-                    ExtmarkPosition::new($start_row, $start_column),
-                    TextExtent::EMPTY,
-                    $extent,
-                )
-                .unwrap();
+            marks.splice(crate::extmark::TextSplice {
+                start: ExtmarkPosition::new($start_row, $start_column),
+                old_extent: TextExtent::EMPTY,
+                new_extent: $extent,
+            });
             assert_eq!(
                 mark_position(&marks, namespace, id),
                 ExtmarkPosition::new($expected_row, $expected_column)
@@ -82,13 +80,15 @@ macro_rules! replacement_gravity_test {
         fn $name() {
             let mut marks = Extmarks::new();
             let (namespace, id) = one_mark(&mut marks, 1, $column, $gravity);
-            marks
-                .splice(
-                    ExtmarkPosition::new(1, 2),
-                    TextExtent::new(0, 4),
-                    TextExtent::new(0, 2),
-                )
-                .unwrap();
+            marks.splice(crate::extmark::TextSplice {
+
+                start: ExtmarkPosition::new(1, 2),
+
+                old_extent: TextExtent::new(0, 4),
+
+                new_extent: TextExtent::new(0, 2),
+
+            });
             assert_eq!(mark_position(&marks, namespace, id), ExtmarkPosition::new(1, $expected));
         }
     };
@@ -111,13 +111,15 @@ fn range_start_and_end_use_independent_gravity() {
         gravity: ExtmarkGravity::Right,
     });
     let id = marks.set(namespace, None, mark).unwrap();
-    marks
-        .splice(
-            ExtmarkPosition::new(1, 2),
-            TextExtent::EMPTY,
-            TextExtent::new(0, 2),
-        )
-        .unwrap();
+    marks.splice(crate::extmark::TextSplice {
+
+        start: ExtmarkPosition::new(1, 2),
+
+        old_extent: TextExtent::EMPTY,
+
+        new_extent: TextExtent::new(0, 2),
+
+    });
     let mark = marks.get(namespace, id).unwrap().unwrap();
     assert_eq!(mark.position(), ExtmarkPosition::new(1, 2));
     assert_eq!(mark.placement.end.unwrap().position, ExtmarkPosition::new(1, 7));
@@ -148,13 +150,11 @@ fn complete_range_deletion_invalidates_when_requested() {
         .with_end(ExtmarkPosition::new(1, 5));
     mark.attributes.invalidate = true;
     let id = marks.set(namespace, None, mark).unwrap();
-    let result = marks
-        .splice(
-            ExtmarkPosition::new(1, 1),
-            TextExtent::new(0, 6),
-            TextExtent::EMPTY,
-        )
-        .unwrap();
+    let result = marks.splice(crate::extmark::TextSplice {
+     start: ExtmarkPosition::new(1, 1),
+     old_extent: TextExtent::new(0, 6),
+     new_extent: TextExtent::EMPTY,
+ });
     assert_eq!(result.invalidated, 1);
     assert!(marks.get(namespace, id).unwrap().unwrap().invalid);
 }
@@ -171,13 +171,15 @@ fn complete_range_deletion_without_invalidate_keeps_visible() {
                 .with_end(ExtmarkPosition::new(1, 5)),
         )
         .unwrap();
-    marks
-        .splice(
-            ExtmarkPosition::new(1, 1),
-            TextExtent::new(0, 6),
-            TextExtent::EMPTY,
-        )
-        .unwrap();
+    marks.splice(crate::extmark::TextSplice {
+
+        start: ExtmarkPosition::new(1, 1),
+
+        old_extent: TextExtent::new(0, 6),
+
+        new_extent: TextExtent::EMPTY,
+
+    });
     assert!(!marks.get(namespace, id).unwrap().unwrap().invalid);
 }
 
@@ -189,13 +191,15 @@ fn partial_range_deletion_does_not_invalidate() {
         .with_end(ExtmarkPosition::new(1, 8));
     mark.attributes.invalidate = true;
     let id = marks.set(namespace, None, mark).unwrap();
-    marks
-        .splice(
-            ExtmarkPosition::new(1, 3),
-            TextExtent::new(0, 2),
-            TextExtent::EMPTY,
-        )
-        .unwrap();
+    marks.splice(crate::extmark::TextSplice {
+
+        start: ExtmarkPosition::new(1, 3),
+
+        old_extent: TextExtent::new(0, 2),
+
+        new_extent: TextExtent::EMPTY,
+
+    });
     assert!(!marks.get(namespace, id).unwrap().unwrap().invalid);
 }
 
@@ -1098,13 +1102,15 @@ fn whole_line_deletion_invalidates_point_mark() {
     let mut point = ExtmarkPlacement::new(ExtmarkPosition::new(2, 3));
     point.attributes.invalidate = true;
     let id = marks.set(namespace, None, point).unwrap();
-    marks
-        .splice(
-            ExtmarkPosition::new(2, 0),
-            TextExtent::new(1, 0),
-            TextExtent::EMPTY,
-        )
-        .unwrap();
+    marks.splice(crate::extmark::TextSplice {
+
+        start: ExtmarkPosition::new(2, 0),
+
+        old_extent: TextExtent::new(1, 0),
+
+        new_extent: TextExtent::EMPTY,
+
+    });
     assert!(marks.get(namespace, id).unwrap().unwrap().invalid);
 }
 

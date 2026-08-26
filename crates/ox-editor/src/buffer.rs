@@ -8,8 +8,7 @@ use thiserror::Error;
 
 use crate::marks::LocalMarks;
 use crate::{Extmarks, Folds};
-use crate::extmark::{ExtmarkError, ExtmarkPosition, TextExtent};
-use crate::extmark::ExtmarkSpliceUndo;
+use crate::extmark::{ExtmarkError, ExtmarkPosition, ExtmarkSpliceUndo, TextSplice};
 use crate::fold::FoldError;
 
 /// A buffer-local user command retained for later command execution.
@@ -53,6 +52,45 @@ pub enum BufferStateError {
     /// An undo-tree navigation failed.
     #[error(transparent)]
     Undo(#[from] UndoError),
+    /// A byte-precise text edit request was invalid.
+    #[error(transparent)]
+    TextEdit(#[from] BufferTextEditError),
+}
+
+/// Failures while validating a byte-precise buffer text edit.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum BufferTextEditError {
+    /// The requested byte range was reversed.
+    #[error("text edit range is reversed")]
+    ReversedRange,
+    /// A row or column was outside the resident buffer.
+    #[error("text edit position is out of range")]
+    OutOfRange,
+    /// A byte column split a UTF-8 code point.
+    #[error("byte column {0} is not a UTF-8 boundary")]
+    NotCharBoundary(usize),
+}
+
+/// One validated byte-precise text replacement against a pre-edit snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BufferTextEditRequest {
+    /// Zero-based inclusive start of the spliced byte range.
+    pub start: ExtmarkPosition,
+    /// Zero-based exclusive end of the spliced byte range.
+    pub end: ExtmarkPosition,
+    /// Raw replacement lines under nvim_buf_set_text semantics.
+    ///
+    /// Row count is arbitrary. The kernel composes the start-line prefix and
+    /// end-line suffix around these lines. An empty vector means deletion and
+    /// is normalized to one empty line.
+    pub replacement: Vec<Vec<u8>>,
+}
+
+pub(crate) struct PreparedBufferTextEdit {
+    start_line: usize,
+    before: Vec<Vec<u8>>,
+    after: Vec<Vec<u8>>,
+    pub(crate) splice: TextSplice,
 }
 
 /// Text and buffer-local state owned by [`crate::Editor`].
@@ -307,29 +345,17 @@ impl BufferState {
         let before = (start..=end)
             .map(|line| self.text.line(line))
             .collect::<Result<Vec<_>, _>>()?;
-        self.text.replace_lines(start, end, lines)?;
-        self.marks.splice(start, before.len(), lines.len());
-        let extmark_undo = self.splice_derived_state(start, before.len(), lines.len())?;
-        let seq = self.undo.record(
-            LineEdit {
-                start,
-                before,
-                after: lines.to_vec(),
-                cursor_before: Cursor {
-                    lnum: cursor_before.lnum,
-                    col: cursor_before.col,
-                },
-                cursor_after: Cursor {
-                    lnum: cursor_after.lnum,
-                    col: cursor_after.col,
-                },
-            },
+        let after = lines.to_vec();
+        let splice = TextSplice::line_anchored(start.saturating_sub(1), before.len(), after.len());
+        Ok(self.commit_recorded_splice(
+            start,
+            before,
+            after,
+            splice,
+            cursor_before,
+            cursor_after,
             timestamp,
-        );
-        self.extmark_undo.entry(seq).or_default().push(extmark_undo);
-        self.refresh_modified();
-        self.bump_derived_ticks();
-        Ok(seq)
+        ))
     }
 
     /// Inserts logical lines after `lnum`, joining the open undo block or
@@ -342,30 +368,21 @@ impl BufferState {
         timestamp: i64,
     ) -> Result<u64, BufferStateError> {
         self.require_loaded()?;
-        self.text.append_lines(lnum, lines)?;
-        self.marks.splice(lnum.saturating_add(1), 0, lines.len());
-        let extmark_undo =
-            self.splice_derived_state(lnum.saturating_add(1), 0, lines.len())?;
-        let seq = self.undo.record(
-            LineEdit {
-                start: lnum.saturating_add(1),
-                before: Vec::new(),
-                after: lines.to_vec(),
-                cursor_before: Cursor {
-                    lnum: cursor.lnum,
-                    col: cursor.col,
-                },
-                cursor_after: Cursor {
-                    lnum: cursor.lnum.saturating_add(lines.len()),
-                    col: cursor.col,
-                },
+        let start = lnum.saturating_add(1);
+        let after = lines.to_vec();
+        let splice = TextSplice::line_anchored(lnum, 0, after.len());
+        Ok(self.commit_recorded_splice(
+            start,
+            Vec::new(),
+            after,
+            splice,
+            cursor,
+            Position {
+                lnum: cursor.lnum.saturating_add(lines.len()),
+                col: cursor.col,
             },
             timestamp,
-        );
-        self.extmark_undo.entry(seq).or_default().push(extmark_undo);
-        self.refresh_modified();
-        self.bump_derived_ticks();
-        Ok(seq)
+        ))
     }
 
     /// Deletes an inclusive logical-line range, joining the open undo block
@@ -378,6 +395,91 @@ impl BufferState {
         timestamp: i64,
     ) -> Result<u64, BufferStateError> {
         self.replace_lines(start, end, &[], cursor, cursor, timestamp)
+    }
+
+    /// Replaces one validated byte range using nvim_buf_set_text semantics.
+    pub fn replace_buffer_text(
+        &mut self,
+        request: &BufferTextEditRequest,
+        cursor_before: Position,
+        cursor_after: Position,
+        timestamp: i64,
+    ) -> Result<u64, BufferStateError> {
+        let prepared = self.prepare_buffer_text_edit(request)?;
+        Ok(self.commit_buffer_text_edit(prepared, cursor_before, cursor_after, timestamp))
+    }
+
+    pub(crate) fn prepare_buffer_text_edit(
+        &self,
+        request: &BufferTextEditRequest,
+    ) -> Result<PreparedBufferTextEdit, BufferStateError> {
+        self.require_loaded()?;
+        let start = request.start;
+        let end = request.end;
+        let mut replacement = request.replacement.clone();
+        if replacement.is_empty() {
+            replacement.push(Vec::new());
+        }
+
+        if start.row > end.row {
+            return Err(BufferTextEditError::ReversedRange.into());
+        }
+
+        let line_count = self.text.line_count();
+        if start.row >= line_count || end.row >= line_count {
+            return Err(BufferTextEditError::OutOfRange.into());
+        }
+
+        let start_line_bytes = self.text.line(start.row + 1)?;
+        let end_line_bytes = if end.row == start.row {
+            start_line_bytes.clone()
+        } else {
+            self.text.line(end.row + 1)?
+        };
+        if start.column > start_line_bytes.len() || end.column > end_line_bytes.len() {
+            return Err(BufferTextEditError::OutOfRange.into());
+        }
+
+        if start.row == end.row && start.column > end.column {
+            return Err(BufferTextEditError::ReversedRange.into());
+        }
+
+        if !is_utf8_boundary(&start_line_bytes, start.column) {
+            return Err(BufferTextEditError::NotCharBoundary(start.column).into());
+        }
+        if !is_utf8_boundary(&end_line_bytes, end.column) {
+            return Err(BufferTextEditError::NotCharBoundary(end.column).into());
+        }
+
+        let before = (start.row + 1..=end.row + 1)
+            .map(|line| self.text.line(line))
+            .collect::<Result<Vec<_>, _>>()?;
+        let after = compose_replacement_lines(&before, start.column, end.column, &replacement);
+        let splice = TextSplice::from_byte_edit(start, end, &replacement);
+        Ok(PreparedBufferTextEdit {
+            start_line: start.row + 1,
+            before,
+            after,
+            splice,
+        })
+    }
+
+    pub(crate) fn commit_buffer_text_edit(
+        &mut self,
+        prepared: PreparedBufferTextEdit,
+        cursor_before: Position,
+        cursor_after: Position,
+        timestamp: i64,
+    ) -> u64 {
+        self.commit_recorded_splice(
+            prepared.start_line,
+            prepared.before,
+            prepared.after,
+            prepared.splice,
+            cursor_before,
+            cursor_after,
+            timestamp,
+        )
     }
 
     /// Undoes the most recent undo block, replaying the inverse of every edit
@@ -467,32 +569,28 @@ impl BufferState {
             } else {
                 (&edit.before, &edit.after)
             };
-            self.replay_text(edit.start, remove, apply)?;
+            self.replay_text(edit.start, remove, apply)
+                .expect("recorded undo ranges are valid by construction");
             self.marks.splice(edit.start, remove.len(), apply.len());
-            if undoing {
-                self.splice_folds(edit.start, remove.len(), apply.len())?;
-                let recorded = self
-                    .extmark_undo
-                    .get(&entry.seq)
-                    .and_then(|undos| undos.get(index))
-                    .cloned();
-                if let Some(extmark_undo) = recorded {
-                    self.extmarks.undo_splice(
-                        &extmark_undo,
-                        ExtmarkPosition::new(edit.start.saturating_sub(1), 0),
-                        TextExtent::new(apply.len(), 0),
-                        TextExtent::new(remove.len(), 0),
-                    )?;
+            let recorded = self
+                .extmark_undo
+                .get(&entry.seq)
+                .and_then(|undos| undos.get(index));
+            if let Some(extmark_undo) = recorded {
+                if undoing {
+                    self.extmarks.undo_splice(extmark_undo);
                 } else {
-                    self.extmarks.splice(
-                        ExtmarkPosition::new(edit.start.saturating_sub(1), 0),
-                        TextExtent::new(remove.len(), 0),
-                        TextExtent::new(apply.len(), 0),
-                    )?;
+                    self.extmarks.redo_splice(extmark_undo);
                 }
             } else {
-                let _ = self.splice_derived_state(edit.start, remove.len(), apply.len())?;
+                debug_assert!(
+                    false,
+                    "missing extmark undo record for seq {} member {}",
+                    entry.seq,
+                    index
+                );
             }
+            self.splice_folds(edit.start, remove.len(), apply.len());
             let cursor = if undoing { edit.cursor_before } else { edit.cursor_after };
             replayed.push(ReplayedEdit {
                 seq: entry.seq,
@@ -568,31 +666,58 @@ impl BufferState {
         self.subscriptions.clear();
     }
 
-    fn splice_derived_state(
+    fn commit_recorded_splice(
         &mut self,
-        start: usize,
-        old_rows: usize,
-        new_rows: usize,
-    ) -> Result<ExtmarkSpliceUndo, BufferStateError> {
-        let (_, undo) = self.extmarks.splice_recording(
-            ExtmarkPosition::new(start.saturating_sub(1), 0),
-            TextExtent::new(old_rows, 0),
-            TextExtent::new(new_rows, 0),
-        )?;
-        self.splice_folds(start, old_rows, new_rows)?;
-        Ok(undo)
+        start_line: usize,
+        before: Vec<Vec<u8>>,
+        after: Vec<Vec<u8>>,
+        splice: TextSplice,
+        cursor_before: Position,
+        cursor_after: Position,
+        timestamp: i64,
+    ) -> u64 {
+        if before.is_empty() {
+            self.text
+                .append_lines(start_line.saturating_sub(1), &after)
+                .expect("prepared append range is valid by construction");
+        } else {
+            let end = start_line
+                .checked_add(before.len())
+                .and_then(|line| line.checked_sub(1))
+                .expect("prepared line range is valid by construction");
+            self.text
+                .replace_lines(start_line, end, &after)
+                .expect("prepared line range is valid by construction");
+        }
+        self.marks.splice(start_line, before.len(), after.len());
+        let (_, extmark_undo) = self.extmarks.splice_recording(splice);
+        self.splice_folds(start_line, before.len(), after.len());
+        let seq = self.undo.record(
+            LineEdit {
+                start: start_line,
+                before,
+                after,
+                cursor_before: Cursor {
+                    lnum: cursor_before.lnum,
+                    col: cursor_before.col,
+                },
+                cursor_after: Cursor {
+                    lnum: cursor_after.lnum,
+                    col: cursor_after.col,
+                },
+            },
+            timestamp,
+        );
+        self.extmark_undo.entry(seq).or_default().push(extmark_undo);
+        self.refresh_modified();
+        self.bump_derived_ticks();
+        seq
     }
 
-    fn splice_folds(
-        &mut self,
-        start: usize,
-        old_rows: usize,
-        new_rows: usize,
-    ) -> Result<(), FoldError> {
+    fn splice_folds(&mut self, start: usize, old_rows: usize, new_rows: usize) {
         self.folds
-            .splice_rows(start.saturating_sub(1), old_rows, new_rows)?;
+            .splice_rows(start.saturating_sub(1), old_rows, new_rows);
         self.folds.invalidate(self.changedtick());
-        Ok(())
     }
 
     fn refresh_modified(&mut self) {
@@ -604,4 +729,34 @@ impl BufferState {
         self.changedtick_diag = self.changedtick_diag.wrapping_add(1);
         self.changedtick_fold = self.changedtick_fold.wrapping_add(1);
     }
+}
+
+fn is_utf8_boundary(line: &[u8], col: usize) -> bool {
+    col >= line.len() || line[col] & 0xC0 != 0x80
+}
+
+fn compose_replacement_lines(
+    before: &[Vec<u8>],
+    start_column: usize,
+    end_column: usize,
+    replacement: &[Vec<u8>],
+) -> Vec<Vec<u8>> {
+    debug_assert!(!before.is_empty());
+    debug_assert!(!replacement.is_empty());
+    if replacement.len() == 1 {
+        let mut line = before[0][..start_column].to_vec();
+        line.extend_from_slice(&replacement[0]);
+        line.extend_from_slice(&before[before.len() - 1][end_column..]);
+        return vec![line];
+    }
+
+    let mut after = Vec::with_capacity(replacement.len());
+    let mut first = before[0][..start_column].to_vec();
+    first.extend_from_slice(&replacement[0]);
+    after.push(first);
+    after.extend(replacement[1..replacement.len() - 1].iter().cloned());
+    let mut last = replacement[replacement.len() - 1].clone();
+    last.extend_from_slice(&before[before.len() - 1][end_column..]);
+    after.push(last);
+    after
 }
