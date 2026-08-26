@@ -52,8 +52,44 @@ fn line_len(lines: &[Vec<u8>], lnum: usize) -> usize {
 
 fn clamp(lines: &[Vec<u8>], mut pos: Position) -> Position {
     pos.lnum = pos.lnum.clamp(1, lines.len().max(1));
-    pos.col = pos.col.min(line_len(lines, pos.lnum).saturating_sub(1));
+    pos.col = lines.get(pos.lnum.saturating_sub(1)).map_or(0, |line| {
+        let col = pos.col.min(prev_char_boundary(line, line.len()));
+        prev_char_boundary(line, col.saturating_add(1))
+    });
     pos
+}
+/// Returns the first UTF-8 scalar boundary strictly after `col`.
+///
+/// Invalid UTF-8 falls back to one-byte movement, matching the editor's
+/// existing treatment of undecodable buffer contents.
+#[must_use]
+pub fn next_char_boundary(line: &[u8], col: usize) -> usize {
+    let col = col.min(line.len());
+    let Some(text) = std::str::from_utf8(line).ok() else {
+        return col.saturating_add(1).min(line.len());
+    };
+    let mut next = col.saturating_add(1).min(line.len());
+    while next < line.len() && !text.is_char_boundary(next) {
+        next += 1;
+    }
+    next
+}
+
+/// Returns the last UTF-8 scalar boundary strictly before `col`.
+///
+/// Invalid UTF-8 falls back to one-byte movement, matching the editor's
+/// existing treatment of undecodable buffer contents.
+#[must_use]
+pub fn prev_char_boundary(line: &[u8], col: usize) -> usize {
+    let col = col.min(line.len());
+    let Some(text) = std::str::from_utf8(line).ok() else {
+        return col.saturating_sub(1);
+    };
+    let mut previous = col.saturating_sub(1);
+    while previous > 0 && !text.is_char_boundary(previous) {
+        previous -= 1;
+    }
+    previous
 }
 
 fn classify(byte: u8, big: bool) -> u8 {
@@ -128,8 +164,16 @@ pub fn resolve(lines: &[Vec<u8>], start: Position, command: &str, count: usize, 
     let mut inclusive = false;
     let mut is_jump = false;
     match command {
-        "h" => target.col = target.col.saturating_sub(count),
-        "l" => target.col = target.col.saturating_add(count),
+        "h" => {
+            for _ in 0..count {
+                target.col = prev_char_boundary(lines.get(target.lnum - 1)?, target.col);
+            }
+        }
+        "l" => {
+            for _ in 0..count {
+                target.col = next_char_boundary(lines.get(target.lnum - 1)?, target.col);
+            }
+        }
         "j" => { target.lnum = target.lnum.saturating_add(count); kind = MotionKind::LineWise; },
         "k" => { target.lnum = target.lnum.saturating_sub(count); kind = MotionKind::LineWise; },
         "0" => target.col = 0,

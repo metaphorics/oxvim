@@ -54,6 +54,9 @@ behavior!(append_line, "one", position(1,0), "AX\u{1b}", "oneX", position(1,3), 
 behavior!(insert_newline, "one", position(1,1), "i\nt\u{1b}", "o\ntne", position(2,0), "normal");
 behavior!(insert_backspace, "one", position(1,1), "i\u{8}\u{1b}", "ne", position(1,0), "normal");
 behavior!(insert_backspace_join, "one\ntwo", position(2,0), "i\u{8}\u{1b}", "onetwo", position(1,2), "normal");
+behavior!(move_left_by_unicode_scalars, "A한글あ漢Z", position(1,13), "3h", "A한글あ漢Z", position(1,4), "normal");
+behavior!(move_right_by_unicode_scalars, "A한글あ漢Z", position(1,1), "3l", "A한글あ漢Z", position(1,10), "normal");
+behavior!(combining_mark_motion_is_codepoint_based, "가\u{327}A", position(1,5), "h", "가\u{327}A", position(1,3), "normal");
 behavior!(open_below, "one", position(1,0), "oX\u{1b}", "one\nX", position(2,0), "normal");
 behavior!(open_above, "one", position(1,0), "OX\u{1b}", "X\none", position(1,0), "normal");
 behavior!(search_forward, "one two one", position(1,0), "/two\n", "one two one", position(1,4), "normal");
