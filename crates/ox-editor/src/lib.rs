@@ -27,6 +27,7 @@ pub mod indent;
 pub mod job;
 pub mod marks;
 pub mod options;
+mod put;
 pub mod register;
 pub mod userfunc;
 pub mod typeahead;
@@ -86,8 +87,7 @@ pub use options::{
     OptionScope, OptionStore, OptionType, OptionValue, OPTION_COUNT, OPTION_METADATA,
 };
 pub use register::{
-    put_content, ClipboardProvider, ExpressionEvaluator, RegisterContent, RegisterError,
-    RegisterKind, Registers, Selection,
+    ClipboardProvider, RegisterContent, RegisterError, RegisterKind, Registers, Selection,
 };
 pub use typeahead::{
     Key, KeyDecodeError, Keys, Remap, Typeahead, TypeaheadError, TypeaheadFlags, KE_EVENT, KE_FILLER,

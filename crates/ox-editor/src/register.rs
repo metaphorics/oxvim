@@ -1,6 +1,5 @@
-//! Vim-compatible register storage and put operations.
+//! Vim-compatible register storage.
 
-use ox_text::{Buffer, BufferError, Position};
 use thiserror::Error;
 
 /// The shape of text stored in a register.
@@ -155,23 +154,7 @@ pub trait ClipboardProvider {
     }
 }
 
-/// Host integration for evaluating the expression register (`=`).
-pub trait ExpressionEvaluator {
-    /// Evaluates expression source, or returns `None` when evaluation is absent.
-    fn evaluate(&mut self, _source: &[u8]) -> Result<Option<RegisterContent>, RegisterError> {
-        Ok(None)
-    }
-}
 
-#[derive(Default)]
-struct NoClipboard;
-
-impl ClipboardProvider for NoClipboard {}
-
-#[derive(Default)]
-struct NoExpressionEvaluator;
-
-impl ExpressionEvaluator for NoExpressionEvaluator {}
 
 /// Failures from register parsing, integration, or buffer insertion.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -215,9 +198,6 @@ pub enum RegisterError {
     /// A read-only or externally-owned register was written without its host seam.
     #[error("register {0:?} requires a host provider")]
     ProviderRequired(char),
-    /// A buffer operation failed.
-    #[error(transparent)]
-    Buffer(#[from] BufferError),
     /// The clipboard provider rejected an operation.
     #[error("clipboard provider failed: {0}")]
     Clipboard(String),
@@ -306,25 +286,6 @@ impl Registers {
             RegisterName::BlackHole
             | RegisterName::Expression
             | RegisterName::Selection(_) => Ok(None),
-        }
-    }
-
-    /// Resolves stored, clipboard, and expression registers into owned content.
-    pub fn resolve(
-        &self,
-        name: char,
-        clipboard: &mut dyn ClipboardProvider,
-        evaluator: &mut dyn ExpressionEvaluator,
-    ) -> Result<Option<RegisterContent>, RegisterError> {
-        match RegisterName::try_from(name)? {
-            RegisterName::Selection(selection) => clipboard.get(selection),
-            RegisterName::Expression => {
-                let Some(source) = self.expression_source.as_deref() else {
-                    return Ok(None);
-                };
-                evaluator.evaluate(source)
-            }
-            _ => self.get(name).map(|content| content.cloned()),
         }
     }
 
@@ -450,186 +411,6 @@ impl Registers {
     ) -> Result<(), RegisterError> {
         self.yank_to(name, content)
     }
-
-    /// Puts a stored register into a real [`Buffer`].
-    ///
-    /// Characterwise and blockwise values begin at `position.col`. Linewise
-    /// values are inserted after `position.lnum`, matching Vim's `p` command.
-    /// Clipboard and expression registers behave as empty without host seams.
-    pub fn put(
-        &self,
-        buffer: &mut Buffer,
-        position: Position,
-        name: char,
-    ) -> Result<bool, RegisterError> {
-        let mut clipboard = NoClipboard;
-        let mut evaluator = NoExpressionEvaluator;
-        self.put_with(
-            buffer,
-            position,
-            name,
-            &mut clipboard,
-            &mut evaluator,
-        )
-    }
-
-    /// Resolves a register through host seams and puts it into `buffer`.
-    ///
-    /// Returns `false` when the selected register has no content.
-    pub fn put_with(
-        &self,
-        buffer: &mut Buffer,
-        position: Position,
-        name: char,
-        clipboard: &mut dyn ClipboardProvider,
-        evaluator: &mut dyn ExpressionEvaluator,
-    ) -> Result<bool, RegisterError> {
-        let Some(content) = self.resolve(name, clipboard, evaluator)? else {
-            return Ok(false);
-        };
-        put_content(buffer, position, &content)?;
-        Ok(true)
-    }
-}
-
-/// Inserts validated content into a buffer without involving register lookup.
-pub fn put_content(
-    buffer: &mut Buffer,
-    position: Position,
-    content: &RegisterContent,
-) -> Result<(), RegisterError> {
-    let mut lines = read_buffer_lines(buffer)?;
-    let line_index = position
-        .lnum
-        .checked_sub(1)
-        .ok_or_else(|| invalid_line_error(buffer, position.lnum))?;
-    if line_index >= lines.len() {
-        return Err(invalid_line_error(buffer, position.lnum));
-    }
-
-    match content.kind {
-        RegisterKind::CharacterWise => {
-            put_characterwise(&mut lines, line_index, position, content)?;
-        }
-        RegisterKind::LineWise => {
-            let insertion = line_index.saturating_add(1);
-            lines.splice(insertion..insertion, content.lines.iter().cloned());
-        }
-        RegisterKind::BlockWise { width } => {
-            put_blockwise(&mut lines, line_index, position, content, width)?;
-        }
-    }
-
-    let end = buffer.line_count();
-    buffer.replace_lines(1, end, &lines)?;
-    Ok(())
-}
-
-fn put_characterwise(
-    lines: &mut Vec<Vec<u8>>,
-    line_index: usize,
-    position: Position,
-    content: &RegisterContent,
-) -> Result<(), RegisterError> {
-    let Some(target) = lines.get(line_index) else {
-        return Err(RegisterError::ColumnOutOfBounds {
-            lnum: position.lnum,
-            col: position.col,
-            line_len: 0,
-        });
-    };
-    validate_column(target, position)?;
-    let prefix = target.get(..position.col).ok_or(RegisterError::NotCharBoundary {
-        lnum: position.lnum,
-        col: position.col,
-    })?;
-    let suffix = target.get(position.col..).ok_or(RegisterError::NotCharBoundary {
-        lnum: position.lnum,
-        col: position.col,
-    })?;
-
-    let Some(first) = content.lines.first() else {
-        return Ok(());
-    };
-    let mut replacement = Vec::with_capacity(content.lines.len());
-    if content.lines.len() == 1 {
-        let mut line = Vec::with_capacity(prefix.len() + first.len() + suffix.len());
-        line.extend_from_slice(prefix);
-        line.extend_from_slice(first);
-        line.extend_from_slice(suffix);
-        replacement.push(line);
-    } else {
-        let mut first_line = Vec::with_capacity(prefix.len() + first.len());
-        first_line.extend_from_slice(prefix);
-        first_line.extend_from_slice(first);
-        replacement.push(first_line);
-        replacement.extend(
-            content
-                .lines
-                .iter()
-                .skip(1)
-                .take(content.lines.len().saturating_sub(2))
-                .cloned(),
-        );
-        let Some(last) = content.lines.last() else {
-            return Ok(());
-        };
-        let mut last_line = Vec::with_capacity(last.len() + suffix.len());
-        last_line.extend_from_slice(last);
-        last_line.extend_from_slice(suffix);
-        replacement.push(last_line);
-    }
-    lines.splice(line_index..=line_index, replacement);
-    Ok(())
-}
-
-fn put_blockwise(
-    lines: &mut Vec<Vec<u8>>,
-    line_index: usize,
-    position: Position,
-    content: &RegisterContent,
-    width: usize,
-) -> Result<(), RegisterError> {
-    for (row_index, row) in content.lines.iter().enumerate() {
-        let target_index = line_index
-            .checked_add(row_index)
-            .ok_or(RegisterError::PositionOverflow)?;
-        while lines.len() <= target_index {
-            lines.push(Vec::new());
-        }
-        let target_lnum = position
-            .lnum
-            .checked_add(row_index)
-            .ok_or(RegisterError::PositionOverflow)?;
-        let Some(target) = lines.get_mut(target_index) else {
-            return Err(RegisterError::PositionOverflow);
-        };
-        if position.col <= target.len() {
-            validate_column(
-                target,
-                Position {
-                    lnum: target_lnum,
-                    col: position.col,
-                },
-            )?;
-        } else {
-            target.resize(position.col, b' ');
-        }
-        let padding = width
-            .checked_sub(row.len())
-            .ok_or(RegisterError::InvalidBlockWidth { width })?;
-        let mut rectangle = Vec::with_capacity(width);
-        rectangle.extend_from_slice(row);
-        rectangle.resize(row.len().saturating_add(padding), b' ');
-        target.splice(position.col..position.col, rectangle);
-    }
-    Ok(())
-}
-
-fn read_buffer_lines(buffer: &Buffer) -> Result<Vec<Vec<u8>>, BufferError> {
-    (1..=buffer.line_count())
-        .map(|lnum| buffer.line(lnum))
-        .collect()
 }
 
 fn validate_register_line(line: &[u8]) -> Result<(), RegisterError> {
@@ -639,33 +420,6 @@ fn validate_register_line(line: &[u8]) -> Result<(), RegisterError> {
     std::str::from_utf8(line)
         .map(|_| ())
         .map_err(|_| RegisterError::InvalidUtf8)
-}
-
-fn validate_column(line: &[u8], position: Position) -> Result<(), RegisterError> {
-    if position.col > line.len() {
-        return Err(RegisterError::ColumnOutOfBounds {
-            lnum: position.lnum,
-            col: position.col,
-            line_len: line.len(),
-        });
-    }
-    let text = std::str::from_utf8(line).map_err(|_| RegisterError::InvalidUtf8)?;
-    if !text.is_char_boundary(position.col) {
-        return Err(RegisterError::NotCharBoundary {
-            lnum: position.lnum,
-            col: position.col,
-        });
-    }
-    Ok(())
-}
-
-fn invalid_line_error(buffer: &Buffer, lnum: usize) -> RegisterError {
-    BufferError::LineRange {
-        start: lnum,
-        end: lnum,
-        line_count: buffer.line_count(),
-    }
-    .into()
 }
 
 fn write_slot(

@@ -395,7 +395,8 @@ fn editor_register_put_updates_text_undo_ticks_marks_and_changes() {
         .set('a', RegisterContent::linewise(vec![b"inserted".to_vec()]).unwrap())
         .unwrap();
 
-    assert!(editor.put_register(buffer, position(1, 0), 'a', 10).unwrap());
+    let content = editor.registers().get('a').unwrap().cloned().unwrap();
+    editor.put_content(buffer, position(1, 0), &content, 10).unwrap();
     let state = editor.buffer(buffer).unwrap();
     assert_eq!(state.text().unwrap().line(2).unwrap(), b"inserted");
     assert_eq!(state.text().unwrap().line(3).unwrap(), b"two");
@@ -497,7 +498,7 @@ fn undo_redo_replay_through_ticks_marks_and_winpos() {
 }
 
 #[test]
-fn registers_rotate_append_and_put_rectangles() {
+fn registers_rotate_append_and_concatenate() {
     let mut registers = Registers::new();
     let first = RegisterContent::linewise(vec![b"first".to_vec()]).unwrap();
     let second = RegisterContent::linewise(vec![b"second".to_vec()]).unwrap();
@@ -518,13 +519,6 @@ fn registers_rotate_append_and_put_rectangles() {
         .set('A', RegisterContent::characterwise(b"right").unwrap())
         .unwrap();
     assert_eq!(registers.get('a').unwrap().unwrap().to_bytes(), b"leftright");
-
-    let block = RegisterContent::blockwise(vec![b"Q".to_vec(), b"YZ".to_vec()], 2).unwrap();
-    registers.set('b', block).unwrap();
-    let mut buffer = Buffer::from_lines(&[b"abc".to_vec(), b"x".to_vec()], false).unwrap();
-    assert!(registers.put(&mut buffer, position(1, 1), 'b').unwrap());
-    assert_eq!(buffer.line(1).unwrap(), b"aQ bc");
-    assert_eq!(buffer.line(2).unwrap(), b"xYZ");
 }
 
 #[test]

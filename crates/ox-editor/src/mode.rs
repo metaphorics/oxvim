@@ -8,6 +8,7 @@ use crate::indent::{self, CinTrigger, ExprEval, IndentExprError};
 use crate::insert;
 use crate::motion::{resolve, resolve_find, FindDirection, FindMotion};
 use crate::ops::{self, EditRange, Operator};
+use crate::put::PutDirection;
 use crate::search::{SearchDirection, SearchState};
 use crate::textobject;
 use crate::{BufferStateError, Editor, EditorError, Key, KeyDecodeError, MarkLocation, MotionKind, OptionValue, SearchError, VisualKind, VisualState};
@@ -374,6 +375,13 @@ impl ModeMachine {
             '/' | '?' => Ok(Some(Mode::Cmdline(CmdlineState { kind: CmdlineKind::Search(if key == '/' { SearchDirection::Forward } else { SearchDirection::Backward }), text: String::new(), count }))),
             ':' => Ok(Some(Mode::Cmdline(CmdlineState { kind: CmdlineKind::Ex, text: String::new(), count }))),
             'n' | 'N' => { self.repeat_search(editor, key == 'N', count)?; Ok(Some(Mode::default())) }
+            'p' | 'P' => {
+                let ctx = context(editor)?;
+                let name = state.register.unwrap_or('"');
+                let direction = if key == 'p' { PutDirection::After } else { PutDirection::Before };
+                let _ = editor.put_register(ctx.window, name, direction, count, self.timestamp)?;
+                Ok(Some(Mode::default()))
+            }
             'x' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::Delete, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, state.register, self.timestamp, eval)?; Ok(Some(Mode::default())) }
             '~' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::ToggleCase, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, None, self.timestamp, eval)?; self.move_command(editor, "l", count, false)?; Ok(Some(Mode::default())) }
             'u' => { let ctx = context(editor)?; editor.buffer_undo(ctx.buffer)?; Ok(Some(Mode::default())) }

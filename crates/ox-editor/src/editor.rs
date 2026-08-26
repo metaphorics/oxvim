@@ -19,7 +19,8 @@ use crate::layout::{Geometry, Layout, LayoutError, TabpageState, WinConfig, Wind
 use crate::mapping::Mappings;
 use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError};
 use crate::options::{OptionStore, OptionValue};
-use crate::register::{put_content, RegisterError, Registers};
+use crate::put::{plan_put, put_origin, PutDirection, PutEdit, PutPlan};
+use crate::register::{RegisterError, Registers};
 use crate::typeahead::Typeahead;
 
 static NEXT_API_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -1591,15 +1592,24 @@ impl Editor {
     /// Returns false when the selected register has no retained content.
     pub fn put_register(
         &mut self,
-        buffer: BufHandle,
-        position: Position,
+        window: WinHandle,
         name: char,
+        direction: PutDirection,
+        count: usize,
         timestamp: i64,
     ) -> Result<bool, EditorError> {
+        let window = self.resolve_window_handle(window)?;
+        let state = self.window(window)?;
+        let buffer = state.buffer;
+        let mut cursor = state.cursor;
         let Some(content) = self.registers.get(name)?.cloned() else {
             return Ok(false);
         };
-        self.put_content(buffer, position, &content, timestamp)?;
+        let lines = buffer_lines(self.buffer(buffer)?.text()?)?;
+        cursor.lnum = cursor.lnum.clamp(1, lines.len().max(1));
+        let origin = put_origin(&lines, cursor, content.kind(), direction);
+        let plan = plan_put(&lines, origin, &content, count.max(1), cursor)?;
+        self.commit_put_plan(buffer, Some(window), plan, timestamp)?;
         Ok(true)
     }
 
@@ -1611,67 +1621,106 @@ impl Editor {
         content: &crate::register::RegisterContent,
         timestamp: i64,
     ) -> Result<(), EditorError> {
-        if matches!(content.kind(), crate::register::RegisterKind::LineWise) {
-            let cursor = Position {
-                lnum: position.lnum.max(1),
-                col: position.col,
-            };
-            self.append_buffer_lines(
-                buffer,
-                position.lnum,
-                content.lines(),
-                cursor,
-                timestamp,
-            )?;
-            return Ok(());
-        }
-        let original = self.buffer(buffer)?.text()?.clone();
-        let before = buffer_lines(&original)?;
-        let mut resulting = original;
-        put_content(&mut resulting, position, content)?;
-        let after = buffer_lines(&resulting)?;
-        if before == after {
-            return Ok(());
-        }
-
-        if matches!(content.kind(), crate::register::RegisterKind::CharacterWise) {
-            let request = BufferTextEditRequest {
-                start: ExtmarkPosition::new(position.lnum - 1, position.col),
-                end: ExtmarkPosition::new(position.lnum - 1, position.col),
-                replacement: content.lines().to_vec(),
-            };
-            self.replace_buffer_text(buffer, &request, position, position, timestamp)?;
-            return Ok(());
-        }
-        let prefix = before
-            .iter()
-            .zip(&after)
-            .take_while(|(left, right)| left == right)
-            .count();
-        let suffix = before[prefix..]
-            .iter()
-            .rev()
-            .zip(after[prefix..].iter().rev())
-            .take_while(|(left, right)| left == right)
-            .count();
-        let old_count = before.len().saturating_sub(prefix + suffix);
-        let new_end = after.len().saturating_sub(suffix);
-        let replacement = &after[prefix..new_end];
-        if old_count == 0 {
-            self.append_buffer_lines(buffer, prefix, replacement, position, timestamp)?;
-        } else {
-            self.replace_buffer_lines(
-                buffer,
-                prefix + 1,
-                prefix + old_count,
-                replacement,
-                position,
-                position,
-                timestamp,
-            )?;
-        }
+        let lines = buffer_lines(self.buffer(buffer)?.text()?)?;
+        let plan = plan_put(&lines, position, content, 1, position)?;
+        self.commit_put_plan(buffer, None, plan, timestamp)?;
         Ok(())
     }
+
+    fn commit_put_plan(
+        &mut self,
+        buffer: BufHandle,
+        window: Option<WinHandle>,
+        plan: PutPlan,
+        timestamp: i64,
+    ) -> Result<bool, EditorError> {
+        let PutPlan { edits, cursor_before, cursor_after } = plan;
+        if edits.is_empty() {
+            return Ok(false);
+        }
+
+        let buffer = self.resolve_buffer_handle(buffer)?;
+        let opens_active_edit = self.edit_mode == BufferEditMode::Insert
+            && self.current_buffer() == Some(buffer);
+        self.buffer(buffer)?.text()?;
+        let window = if let Some(window) = window {
+            let window = self.resolve_window_handle(window)?;
+            self.window(window)?;
+            Some(window)
+        } else {
+            None
+        };
+        let mut prepared = Vec::with_capacity(edits.len());
+        let mut trailing_insert = None;
+        for edit in edits {
+            match edit {
+                PutEdit::Splice(request) => {
+                    prepared.push(self.buffer(buffer)?.prepare_buffer_text_edit(&request)?);
+                }
+                PutEdit::InsertLines { after_lnum, lines } => {
+                    debug_assert!(trailing_insert.is_none());
+                    trailing_insert = Some((after_lnum, lines));
+                }
+            }
+        }
+
+        let mut splices = Vec::with_capacity(prepared.len());
+        let inserted_lines = trailing_insert
+            .as_ref()
+            .map(|(after_lnum, lines)| (*after_lnum, lines.len()));
+        {
+            let state = self
+                .buffers
+                .get_mut(&buffer)
+                .expect("buffer resolved during validation");
+            for edit in prepared {
+                splices.push(edit.splice);
+                state.commit_buffer_text_edit(
+                    edit,
+                    cursor_before,
+                    cursor_after,
+                    timestamp,
+                );
+            }
+            if let Some((after_lnum, lines)) = trailing_insert {
+                state.insert_lines(
+                    after_lnum,
+                    &lines,
+                    cursor_before,
+                    cursor_after,
+                    timestamp,
+                );
+            }
+        }
+
+        for splice in splices {
+            self.splice_text_positions(buffer, splice);
+        }
+        if let Some((after_lnum, line_count)) = inserted_lines {
+            self.splice_positions(buffer, after_lnum + 1, 0, line_count);
+        }
+        self.changelists.push(buffer, cursor_after);
+        if opens_active_edit {
+            self.active_text_edit = Some(buffer);
+        }
+        if let Some(window) = window {
+            let tab = self
+                .windows
+                .get(&window)
+                .copied()
+                .expect("window resolved during validation");
+            let tabpage = self
+                .tabpages
+                .get_mut(&tab)
+                .expect("tabpage resolved during validation");
+            tabpage
+                .window_mut(window)
+                .expect("window state resolved during validation")
+                .cursor = cursor_after;
+        }
+        Ok(true)
+    }
+
 
     fn split_window(
         &mut self,

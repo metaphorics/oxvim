@@ -4972,9 +4972,13 @@ fn command_put<F: FileIO>(
             Err(error) => error_flow(runtime, "E354", error.to_string()),
         };
     }
-    match editor.put_register(buffer, position, register, 0) {
-        Ok(true) => Flow::Normal,
-        Ok(false) => error_flow(runtime, "E353", format!("Nothing in register {register}")),
+    let content = match editor.registers().get(register) {
+        Ok(Some(content)) => content.clone(),
+        Ok(None) => return error_flow(runtime, "E353", format!("Nothing in register {register}")),
+        Err(error) => return error_flow(runtime, "E353", error.to_string()),
+    };
+    match editor.put_content(buffer, position, &content, 0) {
+        Ok(()) => Flow::Normal,
         Err(error) => error_flow(runtime, "E353", error.to_string()),
     }
 }

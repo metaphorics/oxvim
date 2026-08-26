@@ -358,6 +358,29 @@ impl BufferState {
         ))
     }
 
+    /// Inserts logical lines after `after_lnum` with explicit undo cursors.
+    pub(crate) fn insert_lines(
+        &mut self,
+        after_lnum: usize,
+        lines: &[Vec<u8>],
+        cursor_before: Position,
+        cursor_after: Position,
+        timestamp: i64,
+    ) -> u64 {
+        let start = after_lnum.saturating_add(1);
+        let after = lines.to_vec();
+        let splice = TextSplice::line_anchored(after_lnum, 0, after.len());
+        self.commit_recorded_splice(
+            start,
+            Vec::new(),
+            after,
+            splice,
+            cursor_before,
+            cursor_after,
+            timestamp,
+        )
+    }
+
     /// Inserts logical lines after `lnum`, joining the open undo block or
     /// starting a new one.
     pub fn append_lines(
@@ -368,14 +391,9 @@ impl BufferState {
         timestamp: i64,
     ) -> Result<u64, BufferStateError> {
         self.require_loaded()?;
-        let start = lnum.saturating_add(1);
-        let after = lines.to_vec();
-        let splice = TextSplice::line_anchored(lnum, 0, after.len());
-        Ok(self.commit_recorded_splice(
-            start,
-            Vec::new(),
-            after,
-            splice,
+        Ok(self.insert_lines(
+            lnum,
+            lines,
             cursor,
             Position {
                 lnum: cursor.lnum.saturating_add(lines.len()),
