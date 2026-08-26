@@ -54,6 +54,8 @@ behavior!(delete_around_parens, "a (two) b", position(1,4), "da(", "a  b", posit
 behavior!(delete_inner_word, "one two", position(1,5), "diw", "one ", position(1,3), "normal");
 behavior!(delete_around_word, "one two three", position(1,5), "daw", "one three", position(1,4), "normal");
 behavior!(visual_delete, "one", position(1,0), "vld", "e", position(1,0), "normal");
+behavior!(visual_char_delete_with_x, "one", position(1,0), "vlx", "e", position(1,0), "normal");
+behavior!(visual_char_delete_with_capital_x, "one", position(1,0), "vlX", "e", position(1,0), "normal");
 behavior!(visual_line_delete, "one\ntwo\nthree", position(2,0), "Vd", "one\nthree", position(2,0), "normal");
 behavior!(visual_swap_anchor, "one", position(1,0), "vlo", "one", position(1,0), "visual");
 behavior!(insert_plain, "one", position(1,0), "iX\u{1b}", "Xone", position(1,0), "normal");
@@ -900,6 +902,7 @@ behavior!(find_reverse_repeat, "a-b-c-d", position(1,6), "F-,", "a-b-c-d", posit
 behavior!(search_backward, "one two one", position(1,10), "?two\n", "one two one", position(1,4), "normal");
 behavior!(search_line_offset, "a\nb\nc", position(1,0), "/b/+1\n", "a\nb\nc", position(3,0), "normal");
 behavior!(visual_block_delete, "abcd\nefgh", position(1,0), "\u{16}ljd", "cd\ngh", position(1,0), "normal");
+behavior!(visual_block_delete_with_x, "abcd\nefgh", position(1,0), "\u{16}ljx", "cd\ngh", position(1,0), "normal");
 behavior!(visual_uppercase, "one", position(1,0), "vllU", "ONE", position(1,0), "normal");
 behavior!(visual_reselect, "one", position(1,0), "vldgv", "e", position(1,1), "visual");
 
