@@ -742,7 +742,7 @@ impl BufferState {
     fn release_resident_state(&mut self) {
         self.text = Buffer::new();
         self.undo = UndoTree::new();
-        self.extmarks = Extmarks::new();
+        self.extmarks.invalidate_for_unload();
         self.extmark_undo.clear();
         self.folds = Folds::new();
         self.modified = false;

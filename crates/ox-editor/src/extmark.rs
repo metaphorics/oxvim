@@ -802,6 +802,30 @@ impl Extmarks {
         self.splice_recording(splice).0
     }
 
+    /// Hide `invalidate` marks and drop the rest when a nofile buffer unloads.
+    ///
+    /// Neovim splices the whole buffer away (`src/nvim/buffer.c:928-932`).
+    /// Marks with `invalidate` and `undo_restore` remain at the origin as
+    /// invalid so `nvim_buf_get_extmark_by_id` still finds them. Marks without
+    /// `invalidate`, or with `undo_restore = false`, are deleted.
+    pub fn invalidate_for_unload(&mut self) {
+        for state in self.namespaces.values_mut() {
+            let mut kept = BTreeMap::new();
+            for (id, mut mark) in std::mem::take(&mut state.by_id) {
+                if mark.placement.attributes.invalidate && mark.placement.attributes.undo_restore {
+                    mark.placement.position = ExtmarkPosition::new(0, 0);
+                    if let Some(end) = &mut mark.placement.end {
+                        end.position = ExtmarkPosition::new(0, 0);
+                    }
+                    mark.invalid = true;
+                    kept.insert(id, mark);
+                }
+            }
+            state.by_id = kept;
+            state.rebuild_index();
+        }
+    }
+
     pub(crate) fn splice_recording(
         &mut self,
         splice: TextSplice,
@@ -813,6 +837,7 @@ impl Extmarks {
         let mut result = SpliceResult::default();
         let mut undo = ExtmarkSpliceUndo { splice, entries: Vec::new() };
         for state in self.namespaces.values_mut() {
+            let mut removed = Vec::new();
             for mark in state.by_id.values_mut() {
                 let old_start = mark.position();
                 let old_range_end = mark.placement.end.map(|end| end.position);
@@ -827,8 +852,14 @@ impl Extmarks {
                         && start <= old_start
                         && old_start.row < old_end.row))
                 {
-                    mark.invalid = true;
                     result.invalidated += 1;
+                    if !mark.placement.attributes.undo_restore {
+                        // `undo_restore = false`: delete instead of hiding
+                        // (`src/nvim/extmark.c:451-453`).
+                        removed.push(mark.id);
+                        continue;
+                    }
+                    mark.invalid = true;
                 }
 
                 mark.placement.position = transform_position(
@@ -876,6 +907,11 @@ impl Extmarks {
                         after_invalid: mark.invalid,
                         restore_before: true,
                     });
+                }
+            }
+            for id in removed {
+                if let Some(mark) = state.by_id.remove(&id) {
+                    state.remove_index(mark.position(), id);
                 }
             }
             state.rebuild_index();
