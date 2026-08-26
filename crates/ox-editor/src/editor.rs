@@ -533,6 +533,77 @@ impl Editor {
         Ok(seq)
     }
 
+    /// Replaces several byte ranges as one planning-atomic batch
+    /// (`op_reindent`, indent.c:947): every request is prepared against the
+    /// pre-edit buffer and the cursor window is resolved before the first
+    /// commit, so a validation failure leaves text, cursor, undo, and ticks
+    /// untouched. Requests must be row-disjoint, line-count-preserving edits
+    /// in ascending row order; their commits join the open undo block as one
+    /// transaction and the changelist gains one entry.
+    pub(crate) fn replace_buffer_texts(
+        &mut self,
+        buffer: BufHandle,
+        window: WinHandle,
+        requests: &[BufferTextEditRequest],
+        cursor_before: Position,
+        cursor_after: Position,
+        timestamp: i64,
+    ) -> Result<u64, EditorError> {
+        debug_assert!(requests.iter().all(|r| r.start.row == r.end.row));
+        debug_assert!(requests.windows(2).all(|pair| pair[0].start.row < pair[1].start.row));
+        let opens_active_edit = self.edit_mode == BufferEditMode::Insert
+            && self.current_buffer() == Some(buffer);
+        let any = !requests.is_empty();
+        // Validate: every fallible step runs before the first commit.
+        let buffer = self.resolve_buffer_handle(buffer)?;
+        let window = self.resolve_window_handle(window)?;
+        self.window(window)?;
+        let mut prepared = Vec::with_capacity(requests.len());
+        for request in requests {
+            prepared.push(self.buffer(buffer)?.prepare_buffer_text_edit(request)?);
+        }
+        // Commit: infallible by construction (buffer.rs prepare/commit split).
+        let mut splices = Vec::with_capacity(prepared.len());
+        let mut seq = 0;
+        {
+            let state = self
+                .buffers
+                .get_mut(&buffer)
+                .expect("buffer resolved during validation");
+            for edit in prepared {
+                splices.push(edit.splice);
+                seq = state.commit_buffer_text_edit(edit, cursor_before, cursor_after, timestamp);
+            }
+        }
+        // Row-disjoint, same-row, line-count-preserving splices commute, so
+        // deferred transforms equal the singular per-edit interleaving.
+        for splice in splices {
+            self.splice_text_positions(buffer, splice);
+        }
+        if any {
+            self.changelists.push(buffer, cursor_after);
+            if opens_active_edit {
+                self.active_text_edit = Some(buffer);
+            }
+        }
+        // Cursor last; the window was resolved above and evaluation is
+        // read-only, so nothing between validation and here can remove it.
+        let tab = self
+            .windows
+            .get(&window)
+            .copied()
+            .expect("window resolved during validation");
+        let tabpage = self
+            .tabpages
+            .get_mut(&tab)
+            .expect("tabpage resolved during validation");
+        tabpage
+            .window_mut(window)
+            .expect("window state resolved during validation")
+            .cursor = cursor_after;
+        Ok(seq)
+    }
+
 
     /// Changes a live window's cursor position.
     pub fn set_window_cursor(

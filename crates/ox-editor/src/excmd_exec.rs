@@ -532,7 +532,11 @@ pub(crate) fn drain_typeahead<F: FileIO>(
     machine: &mut ModeMachine,
 ) -> Flow {
     while !editor.typeahead().is_empty() {
-        match machine.run_once(editor) {
+        let result = {
+            let mut eval = crate::indent::NullExprEval;
+            machine.run_once(editor, &mut eval)
+        };
+        match result {
             Ok(true) => {}
             // Nothing is ready but input is still queued: the front of the
             // queue is the prefix of a longer mapping, and `check` is waiting

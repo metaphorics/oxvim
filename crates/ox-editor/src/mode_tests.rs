@@ -5,7 +5,14 @@
 
 use ox_text::{Buffer, Position};
 
-use crate::{BufferRelease, Editor, Geometry, Keys, MapMode, MappingAction, MappingOptions, Mode, ModeMachine, TypeaheadFlags};
+use crate::extmark::{ExtmarkPlacement, ExtmarkPosition};
+use crate::indent::{ExprEval, IndentEvalContext, IndentExprError};
+use crate::insert::InsertError;
+use crate::ops::OperatorError;
+use crate::{
+    BufferRelease, Editor, Geometry, InsertState, Keys, MapMode, MappingAction, MappingOptions,
+    Mode, ModeError, ModeMachine, NullExprEval, OptionValue, TypeaheadFlags,
+};
 
 fn position(lnum: usize, col: usize) -> Position { Position { lnum, col } }
 
@@ -16,7 +23,8 @@ fn run(text: &str, cursor: Position, keys: &str) -> (String, Position, &'static 
     let window = editor.tabpage(tab).unwrap().current_window();
     editor.set_window_cursor(window, cursor).unwrap();
     let mut machine = ModeMachine::default();
-    machine.feed_keys(&mut editor, keys).unwrap();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, keys, &mut eval).unwrap();
     let output = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     let cursor = editor.window(window).unwrap().cursor;
     let mode = match machine.mode() { Mode::Normal(_) => "normal", Mode::Insert(_) => "insert", Mode::Visual(_) => "visual", Mode::Cmdline(_) => "cmdline", Mode::OperatorPending(_) => "operator" };
@@ -109,15 +117,48 @@ behavior!(visual_counted_motion, "abcde", position(1,0), "v2ld", "de", position(
 behavior!(visual_g_operator, "one two", position(1,0), "vegU", "ONE two", position(1,0), "normal");
 behavior!(visual_text_object, "one two", position(1,5), "viwd", "one ", position(1,3), "normal");
 
+// `test/old/testdir/test_cindent.vim` Test_cindent_01: sibling statements inside a
+// brace share the block indent; `=` must not apply a per-line offset ramp.
 #[test]
-fn unavailable_reindent_is_typed() {
+fn reindent_applies_cindent_not_line_offset_ramp() {
+    let text = "{\nif (test)\ncmd1;\ncmd2;\n}";
+    let expected = "{\n    if (test)\n        cmd1;\n    cmd2;\n}";
     let mut editor = Editor::new();
-    let buffer = editor.create_buffer_with(Buffer::from_bytes(b"one").unwrap(), true).unwrap();
-    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(text.as_bytes()).unwrap(), true)
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "cindent", crate::OptionValue::Boolean(true))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "expandtab", crate::OptionValue::Boolean(true))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "shiftwidth", crate::OptionValue::Number(4))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "tabstop", crate::OptionValue::Number(4))
+        .unwrap();
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.set_window_cursor(window, position(5, 0)).unwrap();
     let mut machine = ModeMachine::default();
-    let error = machine.feed_keys(&mut editor, "==").unwrap_err();
-    assert!(matches!(error, crate::ModeError::Operator(crate::OperatorError::NotImplemented(_))));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "=gg", &mut eval).unwrap();
+    let output =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
+    assert_eq!(output, expected);
+    assert_eq!(editor.window(window).unwrap().cursor, position(1, 0));
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
 }
+
+
 
 #[test]
 fn failed_search_reports_e486() {
@@ -125,7 +166,8 @@ fn failed_search_reports_e486() {
     let buffer = editor.create_buffer_with(Buffer::from_bytes(b"one").unwrap(), true).unwrap();
     editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
     let mut machine = ModeMachine::default();
-    let error = machine.feed_keys(&mut editor, "/missing\n").unwrap_err();
+    let mut eval = NullExprEval;
+    let error = machine.feed_keys(&mut editor, "/missing\n", &mut eval).unwrap_err();
     assert!(matches!(error, crate::ModeError::Search(crate::SearchError::PatternNotFound(pattern)) if pattern == "missing"));
 }
 
@@ -137,9 +179,10 @@ fn state_loop_checks_then_executes_typeahead() {
     let window = editor.tabpage(tab).unwrap().current_window();
     editor.typeahead_mut().append(&crate::Keys::from("l"), crate::TypeaheadFlags::default());
     let mut machine = ModeMachine::default();
-    assert!(machine.run_once(&mut editor).unwrap());
+    let mut eval = NullExprEval;
+    assert!(machine.run_once(&mut editor, &mut eval).unwrap());
     assert_eq!(editor.window(window).unwrap().cursor, position(1,1));
-    assert!(!machine.run_once(&mut editor).unwrap());
+    assert!(!machine.run_once(&mut editor, &mut eval).unwrap());
 }
 
 #[test]
@@ -214,9 +257,10 @@ fn nowrap_search_reports_pattern_not_found_at_end() {
     let window = editor.tabpage(editor.current_tabpage().unwrap()).unwrap().current_window();
     editor.set_window_cursor(window, position(1,4)).unwrap();
     let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
     // 'wrapscan' off stops the search at the buffer end instead of wrapping
     // (`search.c:933-944`).
-    let error = machine.feed_keys(&mut editor, "/two\n").unwrap_err();
+    let error = machine.feed_keys(&mut editor, "/two\n", &mut eval).unwrap_err();
     assert!(matches!(error, crate::ModeError::Search(crate::SearchError::PatternNotFound(pattern)) if pattern == "two"));
 }
 
@@ -234,12 +278,13 @@ fn ex_cmdline_completes_and_aborts_without_executing_in_the_machine() {
     let buffer = editor.create_buffer(true).unwrap();
     editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
     let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
 
-    machine.feed_keys(&mut editor, ":echo 1+1\r").unwrap();
+    machine.feed_keys(&mut editor, ":echo 1+1\r", &mut eval).unwrap();
     assert_eq!(machine.take_ex_command().as_deref(), Some("echo 1+1"));
     assert!(matches!(machine.mode(), Mode::Normal(_)));
 
-    machine.feed_keys(&mut editor, ":quit\u{1b}").unwrap();
+    machine.feed_keys(&mut editor, ":quit\u{1b}", &mut eval).unwrap();
     assert_eq!(machine.take_ex_command(), None);
     assert!(matches!(machine.mode(), Mode::Normal(_)));
 }
@@ -256,8 +301,9 @@ fn run_once_expands_mapped_keys_before_mode_execution() {
     ).unwrap();
     editor.typeahead_mut().append(&Keys::from("Q"), TypeaheadFlags::default());
     let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
 
-    while machine.run_once(&mut editor).unwrap() {}
+    while machine.run_once(&mut editor, &mut eval).unwrap() {}
 
     assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), b"X");
     assert!(matches!(machine.mode(), Mode::Normal(_)));
@@ -280,8 +326,289 @@ fn append_runs_after_the_window_buffer_shrank_under_the_cursor() {
     editor.set_window_buffer(window, short, BufferRelease::KeepLoaded).unwrap();
 
     let mut machine = ModeMachine::default();
-    machine.feed_keys(&mut editor, "aY\u{1b}").unwrap();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "aY\u{1b}", &mut eval).unwrap();
 
     assert_eq!(editor.buffer(short).unwrap().text().unwrap().to_bytes(), b"xY");
     assert_eq!(editor.window(window).unwrap().cursor, position(1, 1));
+}
+
+
+struct FailingIndentEval;
+impl ExprEval for FailingIndentEval {
+    fn eval_indentexpr(
+        &mut self,
+        _context: &IndentEvalContext<'_>,
+        _lnum: usize,
+        _expression: &str,
+    ) -> Result<i64, IndentExprError> {
+        Err(IndentExprError::Failed("fail".into()))
+    }
+}
+
+struct FixedIndentEval(i64);
+impl ExprEval for FixedIndentEval {
+    fn eval_indentexpr(
+        &mut self,
+        _context: &IndentEvalContext<'_>,
+        _lnum: usize,
+        _expression: &str,
+    ) -> Result<i64, IndentExprError> {
+        Ok(self.0)
+    }
+}
+
+struct ScriptIndentEval {
+    results: Vec<Result<i64, IndentExprError>>,
+    calls: Vec<usize>,
+}
+impl ExprEval for ScriptIndentEval {
+    fn eval_indentexpr(
+        &mut self,
+        _context: &IndentEvalContext<'_>,
+        lnum: usize,
+        _expression: &str,
+    ) -> Result<i64, IndentExprError> {
+        self.calls.push(lnum);
+        let idx = self.calls.len() - 1;
+        self.results.get(idx).cloned().unwrap_or(Ok(0))
+    }
+}
+
+struct StagedObservingEval {
+    staged_leads: Vec<usize>,
+    live_leads: Vec<usize>,
+}
+impl ExprEval for StagedObservingEval {
+    fn eval_indentexpr(
+        &mut self,
+        context: &IndentEvalContext<'_>,
+        lnum: usize,
+        _expression: &str,
+    ) -> Result<i64, IndentExprError> {
+        if lnum >= 2 {
+            let staged = context.lines()[lnum - 2]
+                .iter()
+                .take_while(|b| b.is_ascii_whitespace())
+                .count();
+            let live = context
+                .editor()
+                .buffer(context.buffer())
+                .map_err(|err| IndentExprError::Failed(err.to_string()))?
+                .text()
+                .map_err(|err| IndentExprError::Failed(err.to_string()))?
+                .line(lnum - 1)
+                .map_err(|err| IndentExprError::Failed(err.to_string()))?;
+            let live_lead = live.iter().take_while(|b| b.is_ascii_whitespace()).count();
+            self.staged_leads.push(staged);
+            self.live_leads.push(live_lead);
+        }
+        Ok(4)
+    }
+}
+
+fn set_indentexpr(editor: &mut Editor, buffer: ox_types::BufHandle) {
+    editor
+        .options_mut()
+        .set_buffer(buffer, "indentexpr", OptionValue::String("Fail()".into()))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "expandtab", OptionValue::Boolean(true))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "shiftwidth", OptionValue::Number(4))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "tabstop", OptionValue::Number(4))
+        .unwrap();
+}
+
+#[test]
+fn insert_newline_eval_failure_keeps_insert_mode_and_text() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"if (x) {").unwrap(), true)
+        .unwrap();
+    set_indentexpr(&mut editor, buffer);
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.set_window_cursor(window, position(1, 8)).unwrap();
+    let mut machine = ModeMachine::default();
+    let mut ok_eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut ok_eval).unwrap();
+    let before = editor.buffer(buffer).unwrap().text().unwrap().to_bytes();
+    let cursor_before = editor.window(window).unwrap().cursor;
+    let mut fail = FailingIndentEval;
+    let err = machine.feed_keys(&mut editor, "\r", &mut fail).unwrap_err();
+    assert!(matches!(
+        err,
+        ModeError::Insert(InsertError::Indent(_))
+    ));
+    assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), before);
+    assert_eq!(editor.window(window).unwrap().cursor, cursor_before);
+    assert_eq!(machine.mode(), &Mode::Insert(InsertState));
+    let mut ok_eval = NullExprEval;
+    machine.feed_keys(&mut editor, "x", &mut ok_eval).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"if (x) {x"
+    );
+}
+
+#[test]
+fn operator_eval_failure_restores_pending_state_and_text() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"aaaa\nbbbb\ncccc").unwrap(), true)
+        .unwrap();
+    set_indentexpr(&mut editor, buffer);
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let mut machine = ModeMachine::default();
+    let mut ok_eval = NullExprEval;
+    machine.feed_keys(&mut editor, "=", &mut ok_eval).unwrap();
+    let pending = machine.mode().clone();
+    assert!(matches!(pending, Mode::OperatorPending(_)));
+    let bytes_before = editor.buffer(buffer).unwrap().text().unwrap().to_bytes();
+    let cursor_before = editor.window(window).unwrap().cursor;
+    let tick_before = editor.buffer(buffer).unwrap().changedtick();
+    let seq_before = editor.buffer(buffer).unwrap().undo.current_seq();
+    let modified_before = editor.buffer(buffer).unwrap().modified;
+    let mut fail = FailingIndentEval;
+    let err = machine.feed_keys(&mut editor, "G", &mut fail).unwrap_err();
+    assert!(matches!(
+        err,
+        ModeError::Operator(OperatorError::Indent(_))
+    ));
+    assert_eq!(machine.mode(), &pending);
+    assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), bytes_before);
+    assert_eq!(editor.window(window).unwrap().cursor, cursor_before);
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick_before);
+    assert_eq!(editor.buffer(buffer).unwrap().undo.current_seq(), seq_before);
+    assert_eq!(editor.buffer(buffer).unwrap().modified, modified_before);
+    let mut fixed = FixedIndentEval(4);
+    machine.feed_keys(&mut editor, "G", &mut fixed).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"    aaaa\n    bbbb\n    cccc"
+    );
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+}
+
+#[test]
+fn reindent_failure_leaves_no_partial_edits() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"aaaa\nbbbb\ncccc").unwrap(), true)
+        .unwrap();
+    set_indentexpr(&mut editor, buffer);
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let ns = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .create_namespace("reindent-fail")
+        .unwrap();
+    editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .set(
+            ns,
+            None,
+            ExtmarkPlacement::new(ExtmarkPosition::new(1, 0)),
+        )
+        .unwrap();
+    let bytes_before = editor.buffer(buffer).unwrap().text().unwrap().to_bytes();
+    let cursor_before = editor.window(window).unwrap().cursor;
+    let tick_before = editor.buffer(buffer).unwrap().changedtick();
+    let seq_before = editor.buffer(buffer).unwrap().undo.current_seq();
+    let modified_before = editor.buffer(buffer).unwrap().modified;
+    let changelist_before = editor.changelists().len(buffer);
+    let extmarks_before = editor.buffer(buffer).unwrap().extmarks.clone();
+    let mut eval = ScriptIndentEval {
+        results: vec![Ok(4), Err(IndentExprError::Failed("line2".into())), Ok(4)],
+        calls: Vec::new(),
+    };
+    let mut machine = ModeMachine::default();
+    let err = machine.feed_keys(&mut editor, "=G", &mut eval).unwrap_err();
+    assert!(matches!(
+        err,
+        ModeError::Operator(OperatorError::Indent(_))
+    ));
+    assert_eq!(eval.calls, vec![1, 2]);
+    assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), bytes_before);
+    assert_eq!(editor.window(window).unwrap().cursor, cursor_before);
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick_before);
+    assert_eq!(editor.buffer(buffer).unwrap().undo.current_seq(), seq_before);
+    assert_eq!(editor.buffer(buffer).unwrap().modified, modified_before);
+    assert_eq!(editor.changelists().len(buffer), changelist_before);
+    assert_eq!(editor.buffer(buffer).unwrap().extmarks, extmarks_before);
+}
+
+#[test]
+fn reindent_success_is_one_undo_block() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"aaaa\nbbbb\ncccc").unwrap(), true)
+        .unwrap();
+    set_indentexpr(&mut editor, buffer);
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = FixedIndentEval(4);
+    machine.feed_keys(&mut editor, "=G", &mut eval).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"    aaaa\n    bbbb\n    cccc"
+    );
+    assert_eq!(editor.window(window).unwrap().cursor, position(1, 4));
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+    assert!(editor.buffer_undo(buffer).unwrap().is_some());
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"aaaa\nbbbb\ncccc"
+    );
+    assert!(editor.buffer_undo(buffer).unwrap().is_none());
+}
+
+#[test]
+fn reindent_evaluator_observes_staged_prior_lines() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"aaaa\nbbbb\ncccc").unwrap(), true)
+        .unwrap();
+    set_indentexpr(&mut editor, buffer);
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = StagedObservingEval {
+        staged_leads: Vec::new(),
+        live_leads: Vec::new(),
+    };
+    machine.feed_keys(&mut editor, "=G", &mut eval).unwrap();
+    assert_eq!(eval.staged_leads, vec![4, 4]);
+    assert_eq!(eval.live_leads, vec![0, 0]);
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"    aaaa\n    bbbb\n    cccc"
+    );
 }

@@ -23,6 +23,7 @@ pub mod textobject;
 pub mod script;
 pub mod visual;
 pub mod insert;
+pub mod indent;
 pub mod job;
 pub mod marks;
 pub mod options;
@@ -53,6 +54,7 @@ pub use extmark::{
     ExtmarkPosition, Extmarks, NamespaceId, VirtualLine, VirtualTextChunk,
 };
 pub use fold::Folds;
+pub use indent::{ExprEval, IndentEvalContext, IndentExprError, NullExprEval};
 pub use layout::{
     Anchor, Border, BorderText, FloatingWindow, Frame, Geometry, Layout, LayoutError, LeafFrame,
     Margins, RelativeTo, TabpageState, TextAlignment, WinConfig, WindowApiState, WindowState,
@@ -104,6 +106,8 @@ mod excmd_exec_regex_tests;
 mod excmd_exec_state_tests;
 #[cfg(test)]
 mod input_tests;
+#[cfg(test)]
+mod indent_tests;
 #[cfg(test)]
 mod mode_tests;
 #[cfg(test)]

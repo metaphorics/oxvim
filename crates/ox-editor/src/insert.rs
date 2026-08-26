@@ -2,8 +2,25 @@
 
 use ox_text::Position;
 use ox_types::{BufHandle, WinHandle};
+use thiserror::Error;
 
+use crate::buffer::BufferTextEditRequest;
+use crate::extmark::ExtmarkPosition;
+use crate::indent::{self, CinTrigger, ExprEval, IndentExprError};
 use crate::{BufferStateError, Editor, EditorError};
+
+/// Insert-mode editing failures, combining core editor errors and inherited
+/// indent-expression evaluation failures so either can be threaded through
+/// [`crate::ModeError`] without being swallowed.
+#[derive(Debug, Error)]
+pub enum InsertError {
+    /// Core editor operation failed.
+    #[error(transparent)]
+    Editor(#[from] EditorError),
+    /// Indent expression evaluation failed.
+    #[error(transparent)]
+    Indent(#[from] IndentExprError),
+}
 
 fn line(editor: &Editor, buffer: BufHandle, lnum: usize) -> Result<Vec<u8>, EditorError> {
     editor.buffer(buffer)?.text()?.line(lnum).map_err(BufferStateError::from).map_err(EditorError::from)
@@ -21,12 +38,41 @@ pub fn insert_char(editor: &mut Editor, buffer: BufHandle, window: WinHandle, cu
     Ok(after)
 }
 
-/// Splits the current line at the insertion cursor.
-pub fn newline(editor: &mut Editor, buffer: BufHandle, window: WinHandle, cursor: Position, timestamp: i64) -> Result<Position, EditorError> {
-    let line = line(editor, buffer, cursor.lnum)?; let col = cursor.col.min(line.len());
-    let replacement = [line[..col].to_vec(), line[col..].to_vec()]; let after = Position { lnum: cursor.lnum + 1, col: 0 };
-    editor.replace_buffer_lines(buffer, cursor.lnum, cursor.lnum, &replacement, cursor, after, timestamp)?;
-    editor.set_window_cursor(window, after)?; Ok(after)
+/// Splits the current line at the insertion cursor, indenting the new line
+/// when an indent method is active (`edit.c` newline + `fix_indent`).
+pub fn newline(editor: &mut Editor, buffer: BufHandle, window: WinHandle, cursor: Position, timestamp: i64, eval: &mut dyn ExprEval) -> Result<Position, InsertError> {
+    let line = line(editor, buffer, cursor.lnum)?;
+    let col = cursor.col.min(line.len());
+    let opts = indent::IndentOptions::capture(editor, buffer);
+    let source_prefix = &line[..col];
+    let smart = indent::smart_source_trigger(source_prefix, false, &opts);
+    let mut indent = indent::smart_newline_indent(source_prefix, smart, &opts);
+    let text = editor.buffer(buffer)?.text().map_err(EditorError::from)?;
+    let mut lines = (1..=text.line_count())
+        .map(|lnum| text.line(lnum))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(BufferStateError::from)
+        .map_err(EditorError::from)?;
+    let suffix = line[col..].to_vec();
+    let mut second = indent.clone();
+    second.extend_from_slice(&suffix);
+    lines[cursor.lnum - 1] = line[..col].to_vec();
+    lines.insert(cursor.lnum, second);
+    {
+        let context = indent::IndentEvalContext::new(editor, buffer, &lines);
+        if let Some(whitespace) = indent::fix_line_indent(&context, cursor.lnum + 1, CinTrigger::OpenForward, &opts, eval)? {
+            indent = whitespace;
+        }
+    }
+    let request = BufferTextEditRequest {
+        start: ExtmarkPosition::new(cursor.lnum - 1, col),
+        end: ExtmarkPosition::new(cursor.lnum - 1, col),
+        replacement: vec![Vec::new(), indent.clone()],
+    };
+    let after = Position { lnum: cursor.lnum + 1, col: indent.len() };
+    editor.replace_buffer_text(buffer, &request, cursor, after, timestamp)?;
+    editor.set_window_cursor(window, after)?;
+    Ok(after)
 }
 
 /// Deletes the previous character or joins with the previous line when allowed.

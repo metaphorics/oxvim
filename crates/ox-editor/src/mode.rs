@@ -4,6 +4,7 @@ use ox_text::Position;
 use ox_types::{BufHandle, WinHandle};
 use thiserror::Error;
 
+use crate::indent::{self, CinTrigger, ExprEval, IndentExprError};
 use crate::insert;
 use crate::motion::{resolve, resolve_find, FindDirection, FindMotion};
 use crate::ops::{self, EditRange, Operator};
@@ -103,6 +104,10 @@ pub enum ModeError {
     #[error(transparent)] Operator(#[from] ops::OperatorError),
     /// Buffer text could not be read.
     #[error(transparent)] Buffer(#[from] BufferStateError),
+    /// Insert-mode operation failed.
+    #[error(transparent)] Insert(#[from] insert::InsertError),
+    /// Indent expression evaluation failed.
+    #[error(transparent)] Indent(#[from] IndentExprError),
     /// A named special key has no behavior in the current mode.
     #[error("non-character input is not supported in this modal state")]
     UnsupportedKey,
@@ -278,60 +283,72 @@ impl ModeMachine {
     }
 
     /// Executes the action classified by [`Self::check`].
-    pub fn execute(&mut self, editor: &mut Editor, step: Step) -> Result<(), ModeError> {
-        match step { Step::Idle | Step::ProcessEvents => Ok(()), Step::Key(key) => self.execute_key(editor, key) }
+    pub fn execute(&mut self, editor: &mut Editor, step: Step, eval: &mut dyn ExprEval) -> Result<(), ModeError> {
+        match step { Step::Idle | Step::ProcessEvents => Ok(()), Step::Key(key) => self.execute_key(editor, key, eval) }
     }
 
     /// Runs one check/execute iteration, returning whether work was ready.
-    pub fn run_once(&mut self, editor: &mut Editor) -> Result<bool, ModeError> {
-        let step = self.check(editor)?; let ready = step != Step::Idle; self.execute(editor, step)?; Ok(ready)
+    pub fn run_once(&mut self, editor: &mut Editor, eval: &mut dyn ExprEval) -> Result<bool, ModeError> {
+        let step = self.check(editor)?; let ready = step != Step::Idle; self.execute(editor, step, eval)?; Ok(ready)
     }
 
     /// Convenience entry point used by behavioral tests and embedding frontends.
-    pub fn feed_keys(&mut self, editor: &mut Editor, keys: &str) -> Result<(), ModeError> {
-        for key in keys.chars() { self.execute_key(editor, key)?; }
+    pub fn feed_keys(&mut self, editor: &mut Editor, keys: &str, eval: &mut dyn ExprEval) -> Result<(), ModeError> {
+        for key in keys.chars() { self.execute_key(editor, key, eval)?; }
         Ok(())
     }
 
-    fn execute_key(&mut self, editor: &mut Editor, key: char) -> Result<(), ModeError> {
+    fn execute_key(&mut self, editor: &mut Editor, key: char, eval: &mut dyn ExprEval) -> Result<(), ModeError> {
         self.timestamp = self.timestamp.saturating_add(1);
-        let mode = std::mem::take(&mut self.mode);
-        self.mode = match mode {
-            Mode::Normal(state) => self.normal(editor, state, key)?,
-            Mode::Insert(state) => self.insert(editor, state, key)?,
-            Mode::Visual(state) => self.visual(editor, state, key)?,
-            Mode::Cmdline(state) => self.cmdline(editor, state, key)?,
-            Mode::OperatorPending(state) => self.operator_pending(editor, state, key)?,
+        // Handlers borrow `self` next to their variant state, so the mode is
+        // taken into a local for the duration of dispatch; every exit path
+        // refills the slot, so a handler error restores the exact pre-key
+        // variant state instead of stranding the machine on a default Normal.
+        let mut mode = std::mem::take(&mut self.mode);
+        let transition = match &mut mode {
+            Mode::Normal(state) => self.normal(editor, state, key, eval),
+            Mode::Insert(state) => self.insert(editor, state, key, eval),
+            Mode::Visual(state) => self.visual(editor, state, key, eval),
+            Mode::Cmdline(state) => self.cmdline(editor, state, key),
+            Mode::OperatorPending(state) => self.operator_pending(editor, state, key, eval),
         };
+        match transition {
+            Ok(Some(next)) => self.mode = next,
+            Ok(None) => self.mode = mode,
+            Err(error) => {
+                self.mode = mode;
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
-    fn normal(&mut self, editor: &mut Editor, mut state: NormalState, key: char) -> Result<Mode, ModeError> {
-        if state.prefix == "register" { state.register = Some(key); state.prefix.clear(); return Ok(Mode::Normal(state)); }
+    fn normal(&mut self, editor: &mut Editor, state: &mut NormalState, key: char, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
+        if state.prefix == "register" { state.register = Some(key); state.prefix.clear(); return Ok(None); }
         if matches!(state.prefix.as_str(), "f" | "F" | "t" | "T") {
             let find = FindMotion { direction: if matches!(state.prefix.as_str(), "f" | "t") { FindDirection::Forward } else { FindDirection::Backward }, till: matches!(state.prefix.as_str(), "t" | "T"), target: key as u8 };
             // `nv_csearch`: `if (searchc(cap, t_cmd) == false) clearopbeep()`.
             // `searchc` records the target before searching, so a failed
             // `fz` is still what `;` repeats.
             if !self.move_find(editor, find, state.count.max(1), false)? { beep_flush(editor); }
-            self.last_find = Some(find); return Ok(Mode::default());
+            self.last_find = Some(find); return Ok(Some(Mode::default()));
         }
         if state.prefix == "g" {
             state.prefix.clear();
             if key == 'v' {
-                if let Some(visual) = self.last_visual.clone() { let window = context(editor)?.window; editor.set_window_cursor(window, visual.cursor)?; return Ok(Mode::Visual(visual)); }
-                return Ok(Mode::default());
+                if let Some(visual) = self.last_visual.clone() { let window = context(editor)?.window; editor.set_window_cursor(window, visual.cursor)?; return Ok(Some(Mode::Visual(visual))); }
+                return Ok(Some(Mode::default()));
             }
-            if key == 'u' || key == 'U' { return Ok(Mode::OperatorPending(OperatorPendingState { operator: if key == 'u' { Operator::Lowercase } else { Operator::Uppercase }, count: state.count.max(1), count_was_set: state.count != 0, motion_count: 0, register: state.register, prefix: String::new() })); }
-            let command = format!("g{key}"); self.move_command(editor, &command, state.count.max(1), false)?; return Ok(Mode::default());
+            if key == 'u' || key == 'U' { return Ok(Some(Mode::OperatorPending(OperatorPendingState { operator: if key == 'u' { Operator::Lowercase } else { Operator::Uppercase }, count: state.count.max(1), count_was_set: state.count != 0, motion_count: 0, register: state.register, prefix: String::new() }))); }
+            let command = format!("g{key}"); self.move_command(editor, &command, state.count.max(1), false)?; return Ok(Some(Mode::default()));
         }
-        if key.is_ascii_digit() && (key != '0' || state.count != 0) { state.count = append_digit(state.count, key); return Ok(Mode::Normal(state)); }
+        if key.is_ascii_digit() && (key != '0' || state.count != 0) { state.count = append_digit(state.count, key); return Ok(None); }
         let count = state.count.max(1);
         match key {
-            '"' => { state.prefix = "register".into(); Ok(Mode::Normal(state)) }
-            'd' | 'c' | 'y' | '>' | '<' | '=' => Ok(Mode::OperatorPending(OperatorPendingState { operator: operator_for(key), count, count_was_set: state.count != 0, motion_count: 0, register: state.register, prefix: String::new() })),
-            'g' => { state.prefix = "g".into(); Ok(Mode::Normal(state)) }
-            'f' | 'F' | 't' | 'T' => { state.prefix = key.to_string(); Ok(Mode::Normal(state)) }
+            '"' => { state.prefix = "register".into(); Ok(None) }
+            'd' | 'c' | 'y' | '>' | '<' | '=' => Ok(Some(Mode::OperatorPending(OperatorPendingState { operator: operator_for(key), count, count_was_set: state.count != 0, motion_count: 0, register: state.register, prefix: String::new() }))),
+            'g' => { state.prefix = "g".into(); Ok(None) }
+            'f' | 'F' | 't' | 'T' => { state.prefix = key.to_string(); Ok(None) }
             // `searchc` returns false when there is no previous `f`/`t` to
             // repeat (`*lastc == NUL`), and `nv_csearch` turns that into
             // `clearopbeep` — which flushes the rest of the mapped typeahead,
@@ -345,46 +362,46 @@ impl ModeMachine {
                     None => false,
                 };
                 if !moved { beep_flush(editor); }
-                Ok(Mode::default())
+                Ok(Some(Mode::default()))
             }
-            'h' | 'j' | 'k' | 'l' | 'w' | 'W' | 'e' | 'E' | 'b' | 'B' | '0' | '^' | '$' | '%' | '{' | '}' | '(' | ')' | 'G' | 'H' | 'M' | 'L' => { let command = if key == 'G' && state.count != 0 { "G_count".to_owned() } else { key.to_string() }; self.move_command(editor, &command, count, false)?; Ok(Mode::default()) }
-            'i' => Ok(Mode::Insert(InsertState)),
-            'a' => { self.advance_insert_cursor(editor, false)?; Ok(Mode::Insert(InsertState)) }
-            'A' => { self.advance_insert_cursor(editor, true)?; Ok(Mode::Insert(InsertState)) }
-            'I' => { self.move_command(editor, "^", 1, false)?; Ok(Mode::Insert(InsertState)) }
-            'o' | 'O' => { self.open_line(editor, key == 'o')?; Ok(Mode::Insert(InsertState)) }
-            'v' | 'V' | '\u{16}' => { let cursor = context(editor)?.cursor; Ok(Mode::Visual(VisualState::new(cursor, if key == 'v' { VisualKind::Character } else if key == 'V' { VisualKind::Line } else { VisualKind::Block }))) }
-            '/' | '?' => Ok(Mode::Cmdline(CmdlineState { kind: CmdlineKind::Search(if key == '/' { SearchDirection::Forward } else { SearchDirection::Backward }), text: String::new(), count })),
-            ':' => Ok(Mode::Cmdline(CmdlineState { kind: CmdlineKind::Ex, text: String::new(), count })),
-            'n' | 'N' => { self.repeat_search(editor, key == 'N', count)?; Ok(Mode::default()) }
-            'x' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::Delete, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, state.register, self.timestamp)?; Ok(Mode::default()) }
-            '~' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::ToggleCase, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, None, self.timestamp)?; self.move_command(editor, "l", count, false)?; Ok(Mode::default()) }
-            'u' => { let ctx = context(editor)?; editor.buffer_undo(ctx.buffer)?; Ok(Mode::default()) }
-            _ => Ok(Mode::default()),
+            'h' | 'j' | 'k' | 'l' | 'w' | 'W' | 'e' | 'E' | 'b' | 'B' | '0' | '^' | '$' | '%' | '{' | '}' | '(' | ')' | 'G' | 'H' | 'M' | 'L' => { let command = if key == 'G' && state.count != 0 { "G_count".to_owned() } else { key.to_string() }; self.move_command(editor, &command, count, false)?; Ok(Some(Mode::default())) }
+            'i' => Ok(Some(Mode::Insert(InsertState))),
+            'a' => { self.advance_insert_cursor(editor, false)?; Ok(Some(Mode::Insert(InsertState))) }
+            'A' => { self.advance_insert_cursor(editor, true)?; Ok(Some(Mode::Insert(InsertState))) }
+            'I' => { self.move_command(editor, "^", 1, false)?; Ok(Some(Mode::Insert(InsertState))) }
+            'o' | 'O' => { self.open_line(editor, key == 'o', eval)?; Ok(Some(Mode::Insert(InsertState))) }
+            'v' | 'V' | '\u{16}' => { let cursor = context(editor)?.cursor; Ok(Some(Mode::Visual(VisualState::new(cursor, if key == 'v' { VisualKind::Character } else if key == 'V' { VisualKind::Line } else { VisualKind::Block })))) }
+            '/' | '?' => Ok(Some(Mode::Cmdline(CmdlineState { kind: CmdlineKind::Search(if key == '/' { SearchDirection::Forward } else { SearchDirection::Backward }), text: String::new(), count }))),
+            ':' => Ok(Some(Mode::Cmdline(CmdlineState { kind: CmdlineKind::Ex, text: String::new(), count }))),
+            'n' | 'N' => { self.repeat_search(editor, key == 'N', count)?; Ok(Some(Mode::default())) }
+            'x' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::Delete, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, state.register, self.timestamp, eval)?; Ok(Some(Mode::default())) }
+            '~' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::ToggleCase, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, None, self.timestamp, eval)?; self.move_command(editor, "l", count, false)?; Ok(Some(Mode::default())) }
+            'u' => { let ctx = context(editor)?; editor.buffer_undo(ctx.buffer)?; Ok(Some(Mode::default())) }
+            _ => Ok(Some(Mode::default())),
         }
     }
 
-    fn operator_pending(&mut self, editor: &mut Editor, mut state: OperatorPendingState, key: char) -> Result<Mode, ModeError> {
+    fn operator_pending(&mut self, editor: &mut Editor, state: &mut OperatorPendingState, key: char, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
         if matches!(state.prefix.as_str(), "f" | "F" | "t" | "T") {
             let find = FindMotion { direction: if matches!(state.prefix.as_str(), "f" | "t") { FindDirection::Forward } else { FindDirection::Backward }, till: matches!(state.prefix.as_str(), "t" | "T"), target: key as u8 };
             let ctx = context(editor)?;
-            let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, state.count.saturating_mul(state.motion_count.max(1))) else { return Ok(Mode::default()); };
-            self.apply_operator(editor, &state, EditRange::from_motion(ctx.cursor, motion))?; self.last_find = Some(find); return Ok(if state.operator == Operator::Change { Mode::Insert(InsertState) } else { Mode::default() });
+            let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, state.count.saturating_mul(state.motion_count.max(1))) else { return Ok(Some(Mode::default())); };
+            self.apply_operator(editor, &state, EditRange::from_motion(ctx.cursor, motion), eval)?; self.last_find = Some(find); return Ok(Some(if state.operator == Operator::Change { Mode::Insert(InsertState) } else { Mode::default() }));
         }
-        if state.prefix == "g" { state.prefix.clear(); let command = format!("g{key}"); return self.finish_operator_motion(editor, state, &command); }
+        if state.prefix == "g" { state.prefix.clear(); let command = format!("g{key}"); return self.finish_operator_motion(editor, state, &command, eval); }
         if state.prefix == "i" || state.prefix == "a" {
             let inner = state.prefix == "i"; let ctx = context(editor)?;
-            if let Some(range) = textobject::resolve(&ctx.lines, ctx.cursor, inner, key, state.count.saturating_mul(state.motion_count.max(1))) { let change = state.operator == Operator::Change; self.apply_operator(editor, &state, range)?; return Ok(if change { Mode::Insert(InsertState) } else { Mode::default() }); }
-            return Ok(Mode::default());
+            if let Some(range) = textobject::resolve(&ctx.lines, ctx.cursor, inner, key, state.count.saturating_mul(state.motion_count.max(1))) { let change = state.operator == Operator::Change; self.apply_operator(editor, &state, range, eval)?; return Ok(Some(if change { Mode::Insert(InsertState) } else { Mode::default() })); }
+            return Ok(Some(Mode::default()));
         }
-        if key.is_ascii_digit() && (key != '0' || state.motion_count != 0) { state.motion_count = append_digit(state.motion_count, key); return Ok(Mode::OperatorPending(state)); }
-        if key == 'i' || key == 'a' || matches!(key, 'f' | 'F' | 't' | 'T') { state.prefix = key.to_string(); return Ok(Mode::OperatorPending(state)); }
-        if key == 'g' { state.prefix = "g".into(); return Ok(Mode::OperatorPending(state)); }
-        if key == operator_key(state.operator) { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum.saturating_add(state.count.saturating_mul(state.motion_count.max(1)) - 1).min(ctx.lines.len()), col: 0 }; let range = EditRange { start: ctx.cursor, end, kind: MotionKind::LineWise, inclusive: true }; let change = state.operator == Operator::Change; self.apply_operator(editor, &state, range)?; return Ok(if change { Mode::Insert(InsertState) } else { Mode::default() }); }
-        self.finish_operator_motion(editor, state, &key.to_string())
+        if key.is_ascii_digit() && (key != '0' || state.motion_count != 0) { state.motion_count = append_digit(state.motion_count, key); return Ok(None); }
+        if key == 'i' || key == 'a' || matches!(key, 'f' | 'F' | 't' | 'T') { state.prefix = key.to_string(); return Ok(None); }
+        if key == 'g' { state.prefix = "g".into(); return Ok(None); }
+        if key == operator_key(state.operator) { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum.saturating_add(state.count.saturating_mul(state.motion_count.max(1)) - 1).min(ctx.lines.len()), col: 0 }; let range = EditRange { start: ctx.cursor, end, kind: MotionKind::LineWise, inclusive: true }; let change = state.operator == Operator::Change; self.apply_operator(editor, &state, range, eval)?; return Ok(Some(if change { Mode::Insert(InsertState) } else { Mode::default() })); }
+        self.finish_operator_motion(editor, state, &key.to_string(), eval)
     }
 
-    fn finish_operator_motion(&mut self, editor: &mut Editor, state: OperatorPendingState, command: &str) -> Result<Mode, ModeError> {
+    fn finish_operator_motion(&mut self, editor: &mut Editor, state: &mut OperatorPendingState, command: &str, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
         let ctx = context(editor)?; let count = state.count.saturating_mul(state.motion_count.max(1));
         let current = ctx.lines.get(ctx.cursor.lnum.saturating_sub(1)).and_then(|line| line.get(ctx.cursor.col)).copied();
         let resolved_command = match (state.operator, command, current) {
@@ -393,62 +410,62 @@ impl ModeMachine {
             (_, "G", _) if state.count_was_set || state.motion_count != 0 => "G_count",
             _ => command,
         };
-        if let Some(motion) = resolve(&ctx.lines, ctx.cursor, resolved_command, count, option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { let change = state.operator == Operator::Change; if motion.is_jump { push_jump(editor, ctx.buffer, ctx.cursor); } self.apply_operator(editor, &state, EditRange::from_motion(ctx.cursor, motion))?; return Ok(if change { Mode::Insert(InsertState) } else { Mode::default() }); }
-        Ok(Mode::default())
+        if let Some(motion) = resolve(&ctx.lines, ctx.cursor, resolved_command, count, option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { let change = state.operator == Operator::Change; if motion.is_jump { push_jump(editor, ctx.buffer, ctx.cursor); } self.apply_operator(editor, &state, EditRange::from_motion(ctx.cursor, motion), eval)?; return Ok(Some(if change { Mode::Insert(InsertState) } else { Mode::default() })); }
+        Ok(Some(Mode::default()))
     }
 
-    fn apply_operator(&mut self, editor: &mut Editor, state: &OperatorPendingState, range: EditRange) -> Result<(), ModeError> { let ctx = context(editor)?; ops::apply(editor, ctx.buffer, ctx.window, state.operator, range, state.register, self.timestamp)?; Ok(()) }
+    fn apply_operator(&mut self, editor: &mut Editor, state: &OperatorPendingState, range: EditRange, eval: &mut dyn ExprEval) -> Result<(), ModeError> { let ctx = context(editor)?; ops::apply(editor, ctx.buffer, ctx.window, state.operator, range, state.register, self.timestamp, eval)?; Ok(()) }
 
-    fn visual(&mut self, editor: &mut Editor, mut state: VisualState, key: char) -> Result<Mode, ModeError> {
+    fn visual(&mut self, editor: &mut Editor, state: &mut VisualState, key: char, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
         if state.prefix == "g" {
             state.prefix.clear();
             if matches!(key, 'u' | 'U' | '~') {
                 let operator = match key { 'u' => Operator::Lowercase, 'U' => Operator::Uppercase, _ => Operator::ToggleCase };
-                return self.finish_visual_operator(editor, state, operator);
+                return self.finish_visual_operator(editor, state, operator, eval);
             }
             let ctx = context(editor)?; let command = format!("g{key}");
-            if let Some(motion) = resolve(&ctx.lines, ctx.cursor, &command, state.count.max(1), option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(&mut state, motion.target, ctx.cursor); }
-            state.count = 0; return Ok(Mode::Visual(state));
+            if let Some(motion) = resolve(&ctx.lines, ctx.cursor, &command, state.count.max(1), option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(state, motion.target, ctx.cursor); }
+            state.count = 0; return Ok(None);
         }
         if matches!(state.prefix.as_str(), "f" | "F" | "t" | "T") {
-            if key.len_utf8() != 1 { state.prefix.clear(); return Ok(Mode::Visual(state)); }
+            if key.len_utf8() != 1 { state.prefix.clear(); return Ok(None); }
             let find = FindMotion { direction: if matches!(state.prefix.as_str(), "f" | "t") { FindDirection::Forward } else { FindDirection::Backward }, till: matches!(state.prefix.as_str(), "t" | "T"), target: key as u8 };
-            let ctx = context(editor)?; if let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, state.count.max(1)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(&mut state, motion.target, ctx.cursor); self.last_find = Some(find); }
-            state.prefix.clear(); state.count = 0; return Ok(Mode::Visual(state));
+            let ctx = context(editor)?; if let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, state.count.max(1)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(state, motion.target, ctx.cursor); self.last_find = Some(find); }
+            state.prefix.clear(); state.count = 0; return Ok(None);
         }
         if state.prefix == "i" || state.prefix == "a" {
             let inner = state.prefix == "i"; let ctx = context(editor)?;
             if let Some(range) = textobject::resolve(&ctx.lines, ctx.cursor, inner, key, state.count.max(1)) { state.anchor = range.start; state.cursor = range.end; state.kind = match range.kind { MotionKind::LineWise => VisualKind::Line, MotionKind::BlockWise => VisualKind::Block, MotionKind::CharacterWise => VisualKind::Character }; editor.set_window_cursor(ctx.window, state.cursor)?; }
-            state.prefix.clear(); state.count = 0; return Ok(Mode::Visual(state));
+            state.prefix.clear(); state.count = 0; return Ok(None);
         }
-        if key.is_ascii_digit() && (key != '0' || state.count != 0) { state.count = append_digit(state.count, key); return Ok(Mode::Visual(state)); }
+        if key.is_ascii_digit() && (key != '0' || state.count != 0) { state.count = append_digit(state.count, key); return Ok(None); }
         match key {
-            '\u{1b}' => { self.last_visual = Some(state); Ok(Mode::default()) }
-            'o' | 'O' => { if key == 'O' && state.kind == VisualKind::Block { state.swap_columns(); } else { state.swap_ends(); } let window = context(editor)?.window; editor.set_window_cursor(window, state.cursor)?; Ok(Mode::Visual(state)) }
-            'g' | 'f' | 'F' | 't' | 'T' | 'i' | 'a' => { state.prefix = key.to_string(); Ok(Mode::Visual(state)) }
-            'd' | 'c' | 'y' | '>' | '<' | '=' | 'u' | 'U' | '~' => self.finish_visual_operator(editor, state, match key { 'u' => Operator::Lowercase, 'U' => Operator::Uppercase, '~' => Operator::ToggleCase, _ => operator_for(key) }),
-            _ => { let ctx = context(editor)?; if let Some(motion) = resolve(&ctx.lines, ctx.cursor, &key.to_string(), state.count.max(1), option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(&mut state, motion.target, ctx.cursor); } state.count = 0; Ok(Mode::Visual(state)) }
+            '\u{1b}' => { self.last_visual = Some(state.clone()); Ok(Some(Mode::default())) }
+            'o' | 'O' => { if key == 'O' && state.kind == VisualKind::Block { state.swap_columns(); } else { state.swap_ends(); } let window = context(editor)?.window; editor.set_window_cursor(window, state.cursor)?; Ok(None) }
+            'g' | 'f' | 'F' | 't' | 'T' | 'i' | 'a' => { state.prefix = key.to_string(); Ok(None) }
+            'd' | 'c' | 'y' | '>' | '<' | '=' | 'u' | 'U' | '~' => self.finish_visual_operator(editor, state, match key { 'u' => Operator::Lowercase, 'U' => Operator::Uppercase, '~' => Operator::ToggleCase, _ => operator_for(key) }, eval),
+            _ => { let ctx = context(editor)?; if let Some(motion) = resolve(&ctx.lines, ctx.cursor, &key.to_string(), state.count.max(1), option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(state, motion.target, ctx.cursor); } state.count = 0; Ok(None) }
         }
     }
-    fn finish_visual_operator(&mut self, editor: &mut Editor, state: VisualState, operator: Operator) -> Result<Mode, ModeError> {
-        let ctx = context(editor)?; self.last_visual = Some(state.clone()); let result = ops::apply(editor, ctx.buffer, ctx.window, operator, state.range(), None, self.timestamp)?; Ok(if result.enter_insert { Mode::Insert(InsertState) } else { Mode::default() })
+    fn finish_visual_operator(&mut self, editor: &mut Editor, state: &VisualState, operator: Operator, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
+        let ctx = context(editor)?; self.last_visual = Some(state.clone()); let result = ops::apply(editor, ctx.buffer, ctx.window, operator, state.range(), None, self.timestamp, eval)?; Ok(Some(if result.enter_insert { Mode::Insert(InsertState) } else { Mode::default() }))
     }
 
-    fn insert(&mut self, editor: &mut Editor, _state: InsertState, key: char) -> Result<Mode, ModeError> {
+    fn insert(&mut self, editor: &mut Editor, _state: &mut InsertState, key: char, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
         let ctx = context(editor)?;
         match key {
-            '\u{1b}' => { insert::normal_cursor(editor, ctx.window, ctx.cursor)?; Ok(Mode::default()) }
-            '\n' | '\r' => { insert::newline(editor, ctx.buffer, ctx.window, ctx.cursor, self.timestamp)?; Ok(Mode::Insert(InsertState)) }
-            '\u{8}' | '\u{7f}' => { insert::backspace(editor, ctx.buffer, ctx.window, ctx.cursor, option_contains(editor, "backspace", "eol", true), self.timestamp)?; Ok(Mode::Insert(InsertState)) }
-            ch if !ch.is_control() => { insert::insert_char(editor, ctx.buffer, ctx.window, ctx.cursor, ch, self.timestamp)?; Ok(Mode::Insert(InsertState)) }
-            _ => Ok(Mode::Insert(InsertState)),
+            '\u{1b}' => { insert::normal_cursor(editor, ctx.window, ctx.cursor)?; Ok(Some(Mode::default())) }
+            '\n' | '\r' => { insert::newline(editor, ctx.buffer, ctx.window, ctx.cursor, self.timestamp, eval)?; Ok(None) }
+            '\u{8}' | '\u{7f}' => { insert::backspace(editor, ctx.buffer, ctx.window, ctx.cursor, option_contains(editor, "backspace", "eol", true), self.timestamp)?; Ok(None) }
+            ch if !ch.is_control() => { insert::insert_char(editor, ctx.buffer, ctx.window, ctx.cursor, ch, self.timestamp)?; Ok(None) }
+            _ => Ok(None),
         }
     }
 
-    fn cmdline(&mut self, editor: &mut Editor, mut state: CmdlineState, key: char) -> Result<Mode, ModeError> {
+    fn cmdline(&mut self, editor: &mut Editor, state: &mut CmdlineState, key: char) -> Result<Option<Mode>, ModeError> {
         match key {
-            '\u{1b}' => Ok(Mode::default()),
-            '\u{8}' | '\u{7f}' => { state.text.pop(); Ok(Mode::Cmdline(state)) }
+            '\u{1b}' => Ok(Some(Mode::default())),
+            '\u{8}' | '\u{7f}' => { state.text.pop(); Ok(None) }
             '\n' | '\r' => {
                 match state.kind {
                     CmdlineKind::Search(direction) => {
@@ -457,12 +474,12 @@ impl ModeMachine {
                         push_jump(editor, ctx.buffer, ctx.cursor);
                         editor.set_window_cursor(ctx.window, result.target)?;
                     }
-                    CmdlineKind::Ex => self.completed_ex_command = Some(state.text),
+                    CmdlineKind::Ex => self.completed_ex_command = Some(std::mem::take(&mut state.text)),
                 }
-                Ok(Mode::default())
+                Ok(Some(Mode::default()))
             }
-            ch if !ch.is_control() => { state.text.push(ch); Ok(Mode::Cmdline(state)) }
-            _ => Ok(Mode::Cmdline(state)),
+            ch if !ch.is_control() => { state.text.push(ch); Ok(None) }
+            _ => Ok(None),
         }
     }
 
@@ -472,7 +489,28 @@ impl ModeMachine {
     fn move_find(&mut self, editor: &mut Editor, find: FindMotion, count: usize, _visual: bool) -> Result<bool, ModeError> { let ctx = context(editor)?; let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, count) else { return Ok(false) }; editor.set_window_cursor(ctx.window, motion.target)?; Ok(true) }
     fn repeat_search(&mut self, editor: &mut Editor, opposite: bool, count: usize) -> Result<(), ModeError> { let ctx = context(editor)?; let result = self.search.repeat(&ctx.lines, ctx.cursor, opposite, count, option_bool(editor, "wrapscan", true))?; push_jump(editor, ctx.buffer, ctx.cursor); editor.set_window_cursor(ctx.window, result.target)?; Ok(()) }
     fn advance_insert_cursor(&self, editor: &mut Editor, line_end: bool) -> Result<(), ModeError> { let ctx = context(editor)?; let line = &ctx.lines[ctx.cursor.lnum - 1]; let col = if line_end { line.len() } else { next_boundary(line, ctx.cursor.col) }; editor.set_window_cursor(ctx.window, Position { lnum: ctx.cursor.lnum, col })?; Ok(()) }
-    fn open_line(&self, editor: &mut Editor, below: bool) -> Result<(), ModeError> { let ctx = context(editor)?; let after_line = if below { ctx.cursor.lnum } else { ctx.cursor.lnum.saturating_sub(1) }; let pos = Position { lnum: after_line + 1, col: 0 }; editor.append_buffer_lines(ctx.buffer, after_line, &[Vec::new()], ctx.cursor, self.timestamp)?; editor.set_window_cursor(ctx.window, pos)?; Ok(()) }
+    fn open_line(&self, editor: &mut Editor, below: bool, eval: &mut dyn ExprEval) -> Result<(), ModeError> {
+        let ctx = context(editor)?;
+        let opts = indent::IndentOptions::capture(editor, ctx.buffer);
+        let source = &ctx.lines[ctx.cursor.lnum - 1];
+        let smart = indent::smart_source_trigger(source, !below, &opts);
+        let mut indent_bytes = indent::smart_newline_indent(source, smart, &opts);
+        let after_line = if below { ctx.cursor.lnum } else { ctx.cursor.lnum.saturating_sub(1) };
+        let new_lnum = after_line + 1;
+        let mut lines = ctx.lines.clone();
+        lines.insert(new_lnum - 1, indent_bytes.clone());
+        let trigger = if below { CinTrigger::OpenForward } else { CinTrigger::OpenBackward };
+        {
+            let context = indent::IndentEvalContext::new(editor, ctx.buffer, &lines);
+            if let Some(whitespace) = indent::fix_line_indent(&context, new_lnum, trigger, &opts, eval)? {
+                indent_bytes = whitespace;
+            }
+        }
+        let pos = Position { lnum: new_lnum, col: indent_bytes.len() };
+        editor.append_buffer_lines(ctx.buffer, after_line, &[indent_bytes], ctx.cursor, self.timestamp)?;
+        editor.set_window_cursor(ctx.window, pos)?;
+        Ok(())
+    }
 }
 
 /// `beep_flush` (`input.c:523-529`): an error in Normal mode discards the
