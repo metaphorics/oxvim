@@ -11,7 +11,7 @@ use crate::ops::{self, EditRange, Operator};
 use crate::put::PutDirection;
 use crate::search::{SearchDirection, SearchState};
 use crate::textobject;
-use crate::{BufferStateError, Editor, EditorError, Key, KeyDecodeError, MarkLocation, MotionKind, OptionValue, SearchError, VisualKind, VisualState};
+use crate::{BufferStateError, BufferTextEditRequest, Editor, EditorError, ExtmarkPosition, Key, KeyDecodeError, MarkLocation, MotionKind, OptionValue, SearchError, VisualKind, VisualState};
 use crate::{Lookup, MapMode, MappingAction, MappingOptions, Remap, TypeaheadError, TypeaheadFlags, KS_EXTRA};
 
 /// Kind of command line currently being edited.
@@ -382,6 +382,16 @@ impl ModeMachine {
                 let _ = editor.put_register(ctx.window, name, direction, count, self.timestamp)?;
                 Ok(Some(Mode::default()))
             }
+            'J' => {
+                let ctx = context(editor)?;
+                let end_lnum = ctx
+                    .cursor
+                    .lnum
+                    .saturating_add(count.max(2) - 1)
+                    .min(ctx.lines.len());
+                self.join_lines(editor, ctx.cursor.lnum, end_lnum)?;
+                Ok(Some(Mode::default()))
+            }
             'x' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::Delete, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, state.register, self.timestamp, eval)?; Ok(Some(Mode::default())) }
             '~' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::ToggleCase, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, None, self.timestamp, eval)?; self.move_command(editor, "l", count, false)?; Ok(Some(Mode::default())) }
             'u' => { let ctx = context(editor)?; editor.buffer_undo(ctx.buffer)?; Ok(Some(Mode::default())) }
@@ -451,10 +461,113 @@ impl ModeMachine {
             '\u{1b}' => { self.last_visual = Some(state.clone()); Ok(Some(Mode::default())) }
             'o' | 'O' => { if key == 'O' && state.kind == VisualKind::Block { state.swap_columns(); } else { state.swap_ends(); } let window = context(editor)?.window; editor.set_window_cursor(window, state.cursor)?; Ok(None) }
             'g' | 'f' | 'F' | 't' | 'T' | 'i' | 'a' => { state.prefix = key.to_string(); Ok(None) }
+            'J' => {
+                let range = state.range();
+                let start_lnum = range.start.lnum.min(range.end.lnum);
+                let end_lnum = range.start.lnum.max(range.end.lnum);
+                self.join_lines(editor, start_lnum, end_lnum)?;
+                Ok(Some(Mode::default()))
+            }
             'd' | 'c' | 'y' | '>' | '<' | '=' | 'u' | 'U' | '~' => self.finish_visual_operator(editor, state, match key { 'u' => Operator::Lowercase, 'U' => Operator::Uppercase, '~' => Operator::ToggleCase, _ => operator_for(key) }, eval),
             _ => { let ctx = context(editor)?; if let Some(motion) = resolve(&ctx.lines, ctx.cursor, &key.to_string(), state.count.max(1), option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(state, motion.target, ctx.cursor); } state.count = 0; Ok(None) }
         }
     }
+    fn join_lines(
+        &mut self,
+        editor: &mut Editor,
+        start_lnum: usize,
+        end_lnum: usize,
+    ) -> Result<(), ModeError> {
+        if end_lnum <= start_lnum {
+            return Ok(());
+        }
+
+        let ctx = context(editor)?;
+        let joinspaces = matches!(
+            editor.options().get_global("joinspaces"),
+            Ok(OptionValue::Boolean(true))
+        );
+        let keep_first_join_col = matches!(
+            editor.options().get_global("cpoptions"),
+            Ok(OptionValue::String(value)) if value.contains('q')
+        );
+        let formatoptions = match editor.options().get_buffer(ctx.buffer, "formatoptions") {
+            Ok(OptionValue::String(value)) => value.clone(),
+            _ => "tcqj".to_owned(),
+        };
+        let comments = match editor.options().get_buffer(ctx.buffer, "comments") {
+            Ok(OptionValue::String(value)) => value.clone(),
+            _ => "s1:/*,mb:*,ex:*/,://,b:#,:%,:XCOMM,n:>,fb:-,fb:•".to_owned(),
+        };
+        let policy = JoinPolicy {
+            joinspaces,
+            multibyte: formatoptions.contains('M'),
+            multibyte_pairs: formatoptions.contains('B'),
+        };
+        let remove_comments = formatoptions.contains('j');
+
+        let first = &ctx.lines[start_lnum - 1];
+        let mut joined = first.clone();
+        let mut previous_was_comment = remove_comments
+            && scan_comment_line(first, &comments).ends_open;
+        let mut last_join_col = first.len();
+        let mut last_leading = 0;
+        let mut last_suffix_len = 0;
+        for lnum in start_lnum + 1..=end_lnum {
+            let line = &ctx.lines[lnum - 1];
+            let comment = if remove_comments {
+                scan_comment_line(line, &comments)
+            } else {
+                CommentScan::default()
+            };
+            let comment_leading = if previous_was_comment {
+                comment.leading_removal
+            } else {
+                0
+            };
+            previous_was_comment = remove_comments && comment.ends_open;
+            let leading = comment_leading
+                + line[comment_leading..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_whitespace())
+                    .count();
+            let segment = &line[leading..];
+            last_join_col = joined.len();
+            let separator_len = join_separator_len(&joined, segment, policy);
+            for _ in 0..separator_len {
+                joined.push(b' ');
+            }
+            joined.extend_from_slice(segment);
+            if lnum == end_lnum {
+                last_leading = leading;
+                last_suffix_len = segment.len();
+            }
+        }
+
+        let cursor_after = Position {
+            lnum: start_lnum,
+            col: if keep_first_join_col {
+                first.len()
+            } else {
+                last_join_col
+            },
+        };
+        let replacement_end = joined.len() - last_suffix_len;
+        editor.replace_buffer_text(
+            ctx.buffer,
+            &BufferTextEditRequest {
+                start: ExtmarkPosition::new(start_lnum - 1, first.len()),
+                end: ExtmarkPosition::new(end_lnum - 1, last_leading),
+                replacement: vec![joined[first.len()..replacement_end].to_vec()],
+            },
+            ctx.cursor,
+            cursor_after,
+            self.timestamp,
+        )?;
+        editor.set_window_cursor(ctx.window, cursor_after)?;
+        Ok(())
+    }
+
     fn finish_visual_operator(&mut self, editor: &mut Editor, state: &VisualState, operator: Operator, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
         let ctx = context(editor)?; self.last_visual = Some(state.clone()); let result = ops::apply(editor, ctx.buffer, ctx.window, operator, state.range(), None, self.timestamp, eval)?; Ok(Some(if result.enter_insert { Mode::Insert(InsertState) } else { Mode::default() }))
     }
@@ -519,6 +632,180 @@ impl ModeMachine {
         editor.set_window_cursor(ctx.window, pos)?;
         Ok(())
     }
+}
+
+
+#[derive(Clone, Copy)]
+struct JoinPolicy {
+    joinspaces: bool,
+    multibyte: bool,
+    multibyte_pairs: bool,
+}
+
+fn join_separator_len(left: &[u8], right: &[u8], policy: JoinPolicy) -> usize {
+    let (Some(&last), Some(&first)) = (left.last(), right.first()) else {
+        return 0;
+    };
+    if first == b')' || last == b'\t' {
+        return 0;
+    }
+
+    let left_char = last_codepoint(left);
+    let right_char = first_codepoint(right);
+    if policy.multibyte && (left_char >= 0x100 || right_char >= 0x100) {
+        return 0;
+    }
+    if policy.multibyte_pairs
+        && !((right_char < 0x100 && !unicode_eats_join_space(left_char))
+            || (left_char < 0x100 && !unicode_eats_join_space(right_char)))
+    {
+        return 0;
+    }
+
+    if last.is_ascii_whitespace() {
+        return usize::from(
+            policy.joinspaces
+                && last == b' '
+                && left
+                    .get(left.len().saturating_sub(2))
+                    .is_some_and(|byte| matches!(byte, b'.' | b'?' | b'!')),
+        );
+    }
+    1 + usize::from(policy.joinspaces && matches!(last, b'.' | b'?' | b'!'))
+}
+
+fn first_codepoint(bytes: &[u8]) -> u32 {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.chars().next())
+        .map_or_else(|| u32::from(bytes[0]), u32::from)
+}
+
+fn last_codepoint(bytes: &[u8]) -> u32 {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.chars().next_back())
+        .map_or_else(|| u32::from(bytes[bytes.len() - 1]), u32::from)
+}
+
+fn unicode_eats_join_space(codepoint: u32) -> bool {
+    matches!(
+        codepoint,
+        0x2000..=0x206f
+            | 0x2e00..=0x2e7f
+            | 0x3000..=0x303f
+            | 0xff01..=0xff0f
+            | 0xff1a..=0xff20
+            | 0xff3b..=0xff40
+            | 0xff5b..=0xff65
+    )
+}
+
+#[derive(Clone, Copy)]
+struct CommentPart<'a> {
+    flags: &'a str,
+    leader: &'a [u8],
+}
+
+fn comment_parts(value: &str) -> impl Iterator<Item = CommentPart<'_>> {
+    value.split(',').filter_map(|part| {
+        let (flags, leader) = part.split_once(':')?;
+        Some(CommentPart {
+            flags,
+            leader: leader.as_bytes(),
+        })
+    })
+}
+
+fn leader_match_len(line: &[u8], offset: usize, part: CommentPart<'_>) -> Option<usize> {
+    if part.leader.is_empty() {
+        return None;
+    }
+    let mut leader = part.leader;
+    if leader[0].is_ascii_whitespace() {
+        if offset == 0 || !line[offset - 1].is_ascii_whitespace() {
+            return None;
+        }
+        leader = &leader[leader
+            .iter()
+            .take_while(|byte| byte.is_ascii_whitespace())
+            .count()..];
+    }
+    if !line.get(offset..)?.starts_with(leader) {
+        return None;
+    }
+    let end = offset + leader.len();
+    if part.flags.contains('b')
+        && line
+            .get(end)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    if part.flags.contains('m')
+        && line[..offset]
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(leader.len())
+}
+
+fn leading_comment_part<'a>(
+    line: &[u8],
+    offset: usize,
+    comments: &'a str,
+) -> Option<(CommentPart<'a>, usize)> {
+    let mut middle = None;
+    for part in comment_parts(comments) {
+        let Some(len) = leader_match_len(line, offset, part) else {
+            continue;
+        };
+        if part.flags.contains('m') {
+            middle.get_or_insert((part, len));
+            continue;
+        }
+        if let Some((_, middle_len)) = middle {
+            if part.flags.contains('e') && len > middle_len {
+                return Some((part, len));
+            }
+            return middle;
+        }
+        return Some((part, len));
+    }
+    middle
+}
+
+#[derive(Clone, Copy, Default)]
+struct CommentScan {
+    leading_removal: usize,
+    ends_open: bool,
+}
+
+fn scan_comment_line(line: &[u8], comments: &str) -> CommentScan {
+    let leading = line
+        .iter()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count();
+    let mut scan = CommentScan::default();
+    for offset in 0..line.len() {
+        let Some((part, len)) = leading_comment_part(line, offset, comments) else {
+            continue;
+        };
+        if offset == leading && !part.flags.contains('e') {
+            let mut end = offset + len;
+            while line
+                .get(end)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                end += 1;
+            }
+            scan.leading_removal = end;
+        }
+        scan.ends_open = !part.flags.contains('e');
+    }
+    scan
 }
 
 /// `beep_flush` (`input.c:523-529`): an error in Normal mode discards the

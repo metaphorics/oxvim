@@ -622,6 +622,252 @@ fn normal_blockwise_put_shifts_extmark_columns() {
         .unwrap();
     assert_eq!(mark.position(), ExtmarkPosition::new(0, 3));
 }
+
+#[test]
+fn normal_join_moves_extmark_with_splice_geometry() {
+    for (text, keys, expected, cursor_col, mark_col) in [
+        ("12345\n222", "J", "12345 222", 5, 6),
+        ("left\n)", "J", "left)", 4, 4),
+        ("Done.\nNext", "J", "Done.  Next", 5, 7),
+    ] {
+        let mut editor = Editor::new();
+        let buffer = editor
+            .create_buffer_with(Buffer::from_bytes(text.as_bytes()).unwrap(), true)
+            .unwrap();
+        editor
+            .options_mut()
+            .set_global("joinspaces", OptionValue::Boolean(true))
+            .unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let window = editor
+            .tabpage(editor.current_tabpage().unwrap())
+            .unwrap()
+            .current_window();
+        editor.set_window_cursor(window, position(1, 0)).unwrap();
+        let ns = editor
+            .buffer_mut(buffer)
+            .unwrap()
+            .extmarks
+            .create_namespace("join-geometry")
+            .unwrap();
+        let id = editor
+            .buffer_mut(buffer)
+            .unwrap()
+            .extmarks
+            .set(
+                ns,
+                None,
+                ExtmarkPlacement::new(ExtmarkPosition::new(1, 0)),
+            )
+            .unwrap();
+        let mut machine = ModeMachine::default();
+        let mut eval = NullExprEval;
+        machine.feed_keys(&mut editor, keys, &mut eval).unwrap();
+        assert_eq!(
+            String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(),
+            expected
+        );
+        assert_eq!(editor.window(window).unwrap().cursor, position(1, cursor_col));
+        let mark = editor
+            .buffer(buffer)
+            .unwrap()
+            .extmarks
+            .get(ns, id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mark.position(), ExtmarkPosition::new(0, mark_col));
+        assert!(editor.buffer_undo(buffer).unwrap().is_some());
+        let mark = editor
+            .buffer(buffer)
+            .unwrap()
+            .extmarks
+            .get(ns, id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mark.position(), ExtmarkPosition::new(1, 0));
+    }
+}
+
+behavior!(join_two_lines_inserts_space_and_cursor, "12345\n1", position(1,0), "J", "12345 1", position(1,5), "normal");
+behavior!(join_on_last_line_is_noop, "12345", position(1,0), "J", "12345", position(1,0), "normal");
+behavior!(join_strips_leading_whitespace, "abc\n  def", position(1,0), "J", "abc def", position(1,3), "normal");
+behavior!(visual_multiline_join, "12345\n222\n333\n444", position(2,0), "VGJ", "12345\n222 333 444", position(2,7), "normal");
+behavior!(join_preserves_one_trailing_space, "left \n  right", position(1,0), "J", "left right", position(1,5), "normal");
+behavior!(join_preserves_two_trailing_spaces, "left  \nright", position(1,0), "J", "left  right", position(1,6), "normal");
+behavior!(join_before_closing_paren_inserts_no_space, "left\n  )", position(1,0), "J", "left)", position(1,4), "normal");
+behavior!(join_trailing_tab_inserts_no_space, "left\t\nright", position(1,0), "J", "left\tright", position(1,5), "normal");
+behavior!(join_empty_right_inserts_no_space, "left\n   ", position(1,0), "J", "left", position(1,4), "normal");
+behavior!(visual_join_before_paren_inserts_no_space, "left\n  )\nkeep", position(1,0), "VjJ", "left)\nkeep", position(1,4), "normal");
+
+fn run_join_with_options(
+    text: &str,
+    keys: &str,
+    joinspaces: bool,
+    formatoptions: &str,
+    comments: &str,
+) -> (String, Position) {
+    run_join_with_options_and_cpoptions(text, keys, joinspaces, formatoptions, comments, None)
+}
+
+fn run_join_with_options_and_cpoptions(
+    text: &str,
+    keys: &str,
+    joinspaces: bool,
+    formatoptions: &str,
+    comments: &str,
+    cpoptions: Option<&str>,
+) -> (String, Position) {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(text.as_bytes()).unwrap(), true)
+        .unwrap();
+    editor
+        .options_mut()
+        .set_global("joinspaces", OptionValue::Boolean(joinspaces))
+        .unwrap();
+    if let Some(cpoptions) = cpoptions {
+        editor
+            .options_mut()
+            .set_global("cpoptions", OptionValue::String(cpoptions.to_owned()))
+            .unwrap();
+    }
+    editor
+        .options_mut()
+        .set_buffer(buffer, "formatoptions", OptionValue::String(formatoptions.to_owned()))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "comments", OptionValue::String(comments.to_owned()))
+        .unwrap();
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, keys, &mut eval).unwrap();
+    let output = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
+    let cursor = editor.window(window).unwrap().cursor;
+    (output, cursor)
+}
+
+#[test]
+fn joinspaces_punctuation_and_existing_spaces() {
+    let cases = [
+        (false, "Done.\nNext", "Done. Next"),
+        (true, "Done.\nNext", "Done.  Next"),
+        (true, "Done?\nNext", "Done?  Next"),
+        (true, "Done!\nNext", "Done!  Next"),
+        (true, "Done. \nNext", "Done.  Next"),
+        (true, "Done.  \nNext", "Done.  Next"),
+        (false, "Done. \nNext", "Done. Next"),
+        (true, "plain\nNext", "plain Next"),
+    ];
+    for (joinspaces, text, expected) in cases {
+        let (output, cursor) = run_join_with_options(text, "J", joinspaces, "tcq", "://");
+        assert_eq!(output, expected, "joinspaces={joinspaces} text={text:?}");
+        assert_eq!(cursor.lnum, 1);
+        assert_eq!(cursor.col, text.lines().next().unwrap().len());
+    }
+}
+
+#[test]
+fn formatoptions_multibyte_join_spacing() {
+    let cases = [
+        ("M", "한\nx", "한x"),
+        ("M", "x\n한", "x한"),
+        ("B", "한\n글", "한글"),
+        ("B", "한\nx", "한 x"),
+        ("B", "x\n한", "x 한"),
+        ("", "한\n글", "한 글"),
+    ];
+    for (formatoptions, text, expected) in cases {
+        let (output, _) = run_join_with_options(text, "J", false, formatoptions, "://");
+        assert_eq!(output, expected, "fo={formatoptions:?} text={text:?}");
+    }
+}
+
+#[test]
+fn formatoptions_j_comment_leader_rules() {
+    let comments = "s1:/*,mb:*,ex:*/,://";
+    let cases = [
+        ("tcqj", "// comment1\n// comment2", "// comment1 comment2"),
+        ("tcq", "// comment1\n// comment2", "// comment1 // comment2"),
+        ("tcqj", "code\n// comment", "code // comment"),
+        ("tcqj", "i++; // comment1\n           // comment2", "i++; // comment1 comment2"),
+        ("tcqj", "/* start\n */", "/* start */"),
+        ("tcqj", "/* keep */\n// next", "/* keep */ // next"),
+    ];
+    for (formatoptions, text, expected) in cases {
+        let (output, _) = run_join_with_options(text, "3J", false, formatoptions, comments);
+        assert_eq!(output, expected, "fo={formatoptions:?} text={text:?}");
+    }
+}
+
+#[test]
+fn join_comment_block_close_and_trailing_reopen() {
+    let comments = "s1:/*,mb:*,ex:*/,://";
+    let (output, _) = run_join_with_options(
+        "/* head\n */\n// next();",
+        "3J",
+        false,
+        "tcqj",
+        comments,
+    );
+    assert_eq!(output, "/* head */ // next();");
+
+    let (output, _) = run_join_with_options(
+        "/* head\n */ // continuation\n// tail",
+        "3J",
+        false,
+        "tcqj",
+        comments,
+    );
+    assert_eq!(output, "/* head */ // continuation tail");
+}
+
+#[test]
+fn visual_join_comment_and_joinspaces_geometry() {
+    let (output, cursor) = run_join_with_options(
+        "// one\n// two\n// three",
+        "VGJ",
+        false,
+        "tcqj",
+        "://",
+    );
+    assert_eq!(output, "// one two three");
+    assert_eq!(cursor, position(1, 10));
+
+    let (output, cursor) = run_join_with_options("Done.\nNext\nTail", "VjJ", true, "tcq", "://");
+    assert_eq!(output, "Done.  Next\nTail");
+    assert_eq!(cursor, position(1, 5));
+}
+
+#[test]
+fn join_multiline_cursor_follows_final_boundary_unless_cpo_q() {
+    let (output, cursor) = run_join_with_options("aa\nbbb\ncccc", "3J", false, "tcq", "://");
+    assert_eq!(output, "aa bbb cccc");
+    assert_eq!(cursor, position(1, 6));
+
+    let (output, cursor) = run_join_with_options("222\n333\n444", "VGJ", false, "tcq", "://");
+    assert_eq!(output, "222 333 444");
+    assert_eq!(cursor, position(1, 7));
+
+    let (output, cursor) = run_join_with_options_and_cpoptions(
+        "aa\nbbb\ncccc",
+        "3J",
+        false,
+        "tcq",
+        "://",
+        Some("aABceFs_q"),
+    );
+    assert_eq!(output, "aa bbb cccc");
+    assert_eq!(cursor, position(1, 2));
+}
+
 behavior!(open_below, "one", position(1,0), "oX\u{1b}", "one\nX", position(2,0), "normal");
 behavior!(open_above, "one", position(1,0), "OX\u{1b}", "X\none", position(1,0), "normal");
 behavior!(search_forward, "one two one", position(1,0), "/two\n", "one two one", position(1,4), "normal");
