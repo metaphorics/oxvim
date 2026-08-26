@@ -411,6 +411,8 @@ impl ModeMachine {
             }
             'x' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::Delete, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, state.register, self.timestamp, eval)?; Ok(Some(Mode::default())) }
             '~' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::ToggleCase, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, None, self.timestamp, eval)?; self.move_command(editor, "l", count, false)?; Ok(Some(Mode::default())) }
+            '\u{1}' => { self.adjust_number(editor, count.min(999_999_999) as i64)?; Ok(Some(Mode::default())) }
+            '\u{18}' => { self.adjust_number(editor, -(count.min(999_999_999) as i64))?; Ok(Some(Mode::default())) }
             'u' => { let ctx = context(editor)?; editor.buffer_undo(ctx.buffer)?; Ok(Some(Mode::default())) }
             _ => Ok(Some(Mode::default())),
         }
@@ -766,6 +768,29 @@ impl ModeMachine {
         Ok(())
     }
 
+    fn adjust_number(&mut self, editor: &mut Editor, delta: i64) -> Result<(), ModeError> {
+        let ctx = context(editor)?;
+        let line = ctx.lines[ctx.cursor.lnum - 1].clone();
+        let Some((start, end, rendered)) = adjust_number_span(&line, ctx.cursor.col, delta) else {
+            return Ok(());
+        };
+        if rendered.as_slice() == &line[start..end] {
+            return Ok(());
+        }
+        let cursor = Position {
+            lnum: ctx.cursor.lnum,
+            col: start.saturating_add(rendered.len().saturating_sub(1)),
+        };
+        let request = BufferTextEditRequest {
+            start: ExtmarkPosition::new(ctx.cursor.lnum - 1, start),
+            end: ExtmarkPosition::new(ctx.cursor.lnum - 1, end),
+            replacement: vec![rendered],
+        };
+        editor.replace_buffer_text(ctx.buffer, &request, ctx.cursor, cursor, self.timestamp)?;
+        editor.set_window_cursor(ctx.window, cursor)?;
+        Ok(())
+    }
+
     fn open_line(&self, editor: &mut Editor, below: bool, eval: &mut dyn ExprEval) -> Result<(), ModeError> {
         let ctx = context(editor)?;
         let opts = indent::IndentOptions::capture(editor, ctx.buffer);
@@ -1084,6 +1109,244 @@ fn scalar_count_in_range(line: &[u8], start: usize, end: usize) -> usize {
         col = next;
     }
     count
+}
+fn adjust_number_span(line: &[u8], col: usize, delta: i64) -> Option<(usize, usize, Vec<u8>)> {
+    let (start, end, token) = find_number_token(line, col)?;
+    let rendered = render_adjusted_number(token, &line[start..end], delta);
+    Some((start, end, rendered))
+}
+
+#[derive(Clone, Copy)]
+enum NumberToken {
+    Decimal { magnitude: u64, negative: bool, overflow: bool },
+    Hex { value: u64, prefix: u8, upper: bool, overflow: bool },
+    Bin { value: u64, prefix: u8, overflow: bool },
+}
+
+fn find_number_token(line: &[u8], col: usize) -> Option<(usize, usize, NumberToken)> {
+    // Mirror `do_addsub` (`ops.c`) normal-mode scanning under default
+    // 'nrformats' (hex + bin, no octal/alpha): the nearest number at or after
+    // the cursor wins. A `0x`/`0b` prefix is honored only when the cursor sits
+    // inside that run, or the forward-found digit run begins at the prefix's
+    // `0`; otherwise the token is decimal, including a leading `-`.
+    if line.is_empty() {
+        return None;
+    }
+    let col = col.min(line.len().saturating_sub(1));
+
+    // Cursor-context prefix walk: step left over hex digits (a superset of the
+    // binary digits). On a hex/bin overlap, rescan over decimal digits so a
+    // `0b…` run is not mistaken for the tail of a hex number.
+    let hex_prefix_at = |p: usize| {
+        p >= 1
+            && matches!(line[p], b'x' | b'X')
+            && line[p - 1] == b'0'
+            && p + 1 < line.len()
+            && line[p + 1].is_ascii_hexdigit()
+    };
+    let mut pos = col;
+    while pos > 0 && line[pos].is_ascii_hexdigit() {
+        pos -= 1;
+    }
+    if !hex_prefix_at(pos) {
+        pos = col;
+        while pos > 0 && line[pos].is_ascii_digit() {
+            pos -= 1;
+        }
+    }
+    if hex_prefix_at(pos) {
+        let mut end = pos + 1;
+        while end < line.len() && line[end].is_ascii_hexdigit() {
+            end += 1;
+        }
+        return parse_prefixed(line, pos - 1, end);
+    }
+    if pos >= 1
+        && matches!(line[pos], b'b' | b'B')
+        && line[pos - 1] == b'0'
+        && pos + 1 < line.len()
+        && matches!(line[pos + 1], b'0' | b'1')
+    {
+        let mut end = pos + 1;
+        while end < line.len() && matches!(line[end], b'0' | b'1') {
+            end += 1;
+        }
+        return parse_prefixed(line, pos - 1, end);
+    }
+
+    // Forward scan from the cursor to the first decimal digit, then walk back to
+    // the run start.
+    let mut idx = col;
+    while idx < line.len() && !line[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx >= line.len() {
+        return None;
+    }
+    let mut start = idx;
+    while start > 0 && line[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+
+    // A forward-found run that begins at a prefix's `0` is that prefixed number.
+    if line[start] == b'0' && start + 2 < line.len() {
+        if matches!(line[start + 1], b'x' | b'X') && line[start + 2].is_ascii_hexdigit() {
+            let mut end = start + 2;
+            while end < line.len() && line[end].is_ascii_hexdigit() {
+                end += 1;
+            }
+            return parse_prefixed(line, start, end);
+        }
+        if matches!(line[start + 1], b'b' | b'B') && matches!(line[start + 2], b'0' | b'1') {
+            let mut end = start + 2;
+            while end < line.len() && matches!(line[end], b'0' | b'1') {
+                end += 1;
+            }
+            return parse_prefixed(line, start, end);
+        }
+    }
+
+    // Otherwise decimal, absorbing an immediately preceding minus sign.
+    let digit_start = start;
+    let mut negative = false;
+    if start > 0 && line[start - 1] == b'-' {
+        start -= 1;
+        negative = true;
+    }
+    let mut end = digit_start;
+    while end < line.len() && line[end].is_ascii_digit() {
+        end += 1;
+    }
+    let (magnitude, overflow) = parse_u64_digits(&line[digit_start..end], 10)?;
+    Some((start, end, NumberToken::Decimal { magnitude, negative, overflow }))
+}
+fn parse_prefixed(line: &[u8], start: usize, end: usize) -> Option<(usize, usize, NumberToken)> {
+    let marker = line[start + 1];
+    let digits = &line[start + 2..end];
+    if marker.eq_ignore_ascii_case(&b'x') {
+        let (value, overflow) = parse_u64_digits(digits, 16)?;
+        let upper = hex_case_upper(line, start, end);
+        Some((start, end, NumberToken::Hex { value, prefix: marker, upper, overflow }))
+    } else {
+        let (value, overflow) = parse_u64_digits(digits, 2)?;
+        Some((start, end, NumberToken::Bin { value, prefix: marker, overflow }))
+    }
+}
+
+fn parse_u64_digits(digits: &[u8], base: u32) -> Option<(u64, bool)> {
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value = 0u64;
+    let mut overflow = false;
+    let radix = u64::from(base);
+    for &b in digits {
+        let digit = match b {
+            b'0'..=b'9' => u64::from(b - b'0'),
+            b'a'..=b'f' if base == 16 => u64::from(b - b'a') + 10,
+            b'A'..=b'F' if base == 16 => u64::from(b - b'A') + 10,
+            _ => return None,
+        };
+        if digit >= radix {
+            return None;
+        }
+        if overflow {
+            continue;
+        }
+        match value.checked_mul(radix).and_then(|next| next.checked_add(digit)) {
+            Some(next) => value = next,
+            None => {
+                value = u64::MAX;
+                overflow = true;
+            }
+        }
+    }
+    Some((value, overflow))
+}
+
+fn hex_case_upper(line: &[u8], start: usize, end: usize) -> bool {
+    // Upstream `hexupper` is last ASCII-alphabetic byte in the old token,
+    // including the `x`/`X` marker (`ops.c` `do_addsub`).
+    line[start..end]
+        .iter()
+        .rev()
+        .find(|b| b.is_ascii_alphabetic())
+        .map(|b| b.is_ascii_uppercase())
+        .unwrap_or(false)
+}
+
+fn render_adjusted_number(token: NumberToken, old: &[u8], delta: i64) -> Vec<u8> {
+    match token {
+        NumberToken::Decimal { magnitude, negative, overflow } => {
+            let (next, next_negative) = if overflow {
+                (magnitude, negative && magnitude != 0)
+            } else {
+                add_signed_u64(magnitude, negative, delta)
+            };
+            pad_number(old, None, next_negative, next.to_string().as_bytes())
+        }
+        NumberToken::Hex { value, prefix, upper, overflow } => {
+            let next = if overflow { value } else { add_u64(value, delta) };
+            let digits = if upper { format!("{next:X}") } else { format!("{next:x}") };
+            pad_number(old, Some(prefix), false, digits.as_bytes())
+        }
+        NumberToken::Bin { value, prefix, overflow } => {
+            let next = if overflow { value } else { add_u64(value, delta) };
+            let digits = if next == 0 { "0".to_string() } else { format!("{next:b}") };
+            pad_number(old, Some(prefix), false, digits.as_bytes())
+        }
+    }
+}
+
+fn pad_number(old: &[u8], prefix: Option<u8>, negative: bool, digits: &[u8]) -> Vec<u8> {
+    let firstdigit = if old.first() == Some(&b'-') { old.get(1).copied() } else { old.first().copied() };
+    let pad_width = if firstdigit == Some(b'0') {
+        old.len().saturating_sub(usize::from(old.first() == Some(&b'-')))
+    } else {
+        0
+    };
+    let mut out = Vec::new();
+    if negative {
+        out.push(b'-');
+    }
+    let mut body_len = digits.len();
+    if let Some(marker) = prefix {
+        out.push(b'0');
+        out.push(marker);
+        body_len += 2;
+    }
+    if pad_width > body_len {
+        out.extend(std::iter::repeat(b'0').take(pad_width - body_len));
+    }
+    out.extend_from_slice(digits);
+    out
+}
+
+fn add_signed_u64(magnitude: u64, negative: bool, delta: i64) -> (u64, bool) {
+    let subtract = (delta < 0) ^ negative;
+    let amount = delta.unsigned_abs();
+    let old = magnitude;
+    let next = if subtract { old.wrapping_sub(amount) } else { old.wrapping_add(amount) };
+    let mut next_negative = negative;
+    if subtract {
+        if next > old {
+            return (1u64.wrapping_add(!next), !negative);
+        }
+    } else if next < old {
+        return (!next, !negative);
+    }
+    if next == 0 {
+        next_negative = false;
+    }
+    (next, next_negative)
+}
+
+fn add_u64(value: u64, delta: i64) -> u64 {
+    if delta >= 0 {
+        value.wrapping_add(delta as u64)
+    } else {
+        value.wrapping_sub(delta.unsigned_abs())
+    }
 }
 /// `'maxmapdepth'` (`p_mmd`), upstream's default 1000.
 fn max_map_depth(editor: &Editor) -> u64 {

@@ -625,6 +625,243 @@ fn normal_blockwise_put_shifts_extmark_columns() {
     assert_eq!(mark.position(), ExtmarkPosition::new(0, 3));
 }
 
+behavior!(adjust_number_preserves_embedded_token_neighbors, "abc 12 def", position(1,0), "\u{1}", "abc 13 def", position(1,5), "normal");
+behavior!(adjust_number_applies_count, "10", position(1,0), "5\u{1}", "15", position(1,1), "normal");
+behavior!(adjust_number_ctrl_x_decrements, "13", position(1,0), "\u{18}", "12", position(1,1), "normal");
+behavior!(adjust_number_includes_sign_after_letters, "abc-9xxx", position(1,3), "\u{1}", "abc-8xxx", position(1,4), "normal");
+behavior!(adjust_number_grows_when_order_of_magnitude_increases, "abc999xxx", position(1,2), "\u{1}", "abc1000xxx", position(1,6), "normal");
+behavior!(adjust_number_hex_prefix, "0xff", position(1,0), "\u{1}", "0x100", position(1,4), "normal");
+behavior!(adjust_number_bin_prefix, "0b11", position(1,0), "\u{1}", "0b100", position(1,4), "normal");
+behavior!(adjust_number_prefers_nearest_decimal_over_later_hex, "9 0x10", position(1,0), "\u{1}", "10 0x10", position(1,1), "normal");
+behavior!(adjust_number_ctrl_x_prefers_nearest_decimal_over_later_hex, "9 0x10", position(1,0), "\u{18}", "8 0x10", position(1,0), "normal");
+behavior!(adjust_number_later_hex_wins_when_cursor_is_on_it, "9 0x10", position(1,2), "\u{1}", "9 0x11", position(1,5), "normal");
+behavior!(adjust_number_hex_digit_run_is_hex_not_decimal, "9 0x19", position(1,4), "\u{1}", "9 0x1a", position(1,5), "normal");
+behavior!(adjust_number_prefers_nearest_decimal_over_later_bin, "1 0b01", position(1,0), "\u{1}", "2 0b01", position(1,0), "normal");
+behavior!(adjust_number_clamps_typed_count_to_upstream_max, "0", position(1,0), "9999999999\u{1}", "999999999", position(1,8), "normal");
+behavior!(adjust_number_clamps_typed_count_ctrl_x, "0", position(1,0), "9999999999\u{18}", "-999999999", position(1,9), "normal");
+behavior!(adjust_number_pads_leading_zeros_000, "000", position(1,0), "\u{1}", "001", position(1,2), "normal");
+behavior!(adjust_number_pads_leading_zeros_007, "007", position(1,0), "\u{1}", "008", position(1,2), "normal");
+behavior!(adjust_number_pads_leading_zeros_ctrl_x, "001", position(1,0), "\u{18}", "000", position(1,2), "normal");
+behavior!(adjust_number_hex_prefixed_decrement_keeps_padding, "0x0ff", position(1,0), "\u{18}", "0x0fe", position(1,4), "normal");
+behavior!(adjust_number_bin_prefixed_decrement_keeps_padding, "0b010", position(1,0), "\u{18}", "0b001", position(1,4), "normal");
+behavior!(adjust_number_hex_case_follows_last_alpha_digit, "0xABc", position(1,0), "\u{1}", "0xabd", position(1,4), "normal");
+behavior!(adjust_number_hex_case_follows_uppercase_marker, "0X10", position(1,0), "\u{1}", "0X11", position(1,3), "normal");
+behavior!(adjust_number_hex_mixed_pair_last_lower, "0xAb", position(1,0), "\u{1}", "0xac", position(1,3), "normal");
+behavior!(adjust_number_hex_mixed_pair_last_upper, "0xaB", position(1,0), "\u{1}", "0xAC", position(1,3), "normal");
+behavior!(adjust_number_minus_excluded_from_pad_width, "-007", position(1,0), "\u{1}", "-006", position(1,3), "normal");
+behavior!(adjust_number_i64_max_plus_one, "9223372036854775807", position(1,0), "\u{1}", "9223372036854775808", position(1,18), "normal");
+behavior!(adjust_number_i64_min_minus_one, "-9223372036854775808", position(1,0), "\u{18}", "-9223372036854775809", position(1,19), "normal");
+behavior!(adjust_number_u64_max_plus_one_wraps_negative, "18446744073709551615", position(1,0), "\u{1}", "-18446744073709551615", position(1,20), "normal");
+behavior!(adjust_number_u64_overflow_parse_saturates_to_max, "18446744073709551616", position(1,0), "\u{18}", "18446744073709551615", position(1,19), "normal");
+behavior!(adjust_number_u64_max_minus_one, "18446744073709551615", position(1,0), "\u{18}", "18446744073709551614", position(1,19), "normal");
+behavior!(adjust_number_zero_from_negative, "-1", position(1,0), "\u{1}", "0", position(1,0), "normal");
+behavior!(adjust_number_zero_minus_one_is_negative_one, "0", position(1,0), "\u{18}", "-1", position(1,1), "normal");
+behavior!(adjust_number_i64_min_plus_one, "-9223372036854775808", position(1,0), "\u{1}", "-9223372036854775807", position(1,19), "normal");
+#[test]
+fn adjust_number_splices_exact_token_span_for_extmarks_undo_and_ticks() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"abc999xxx").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor
+        .tabpage(editor.current_tabpage().unwrap())
+        .unwrap()
+        .current_window();
+    editor.set_window_cursor(window, position(1, 2)).unwrap();
+    let ns = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .create_namespace("number-geometry")
+        .unwrap();
+    let mark_at = |editor: &mut Editor, col: usize| {
+        editor
+            .buffer_mut(buffer)
+            .unwrap()
+            .extmarks
+            .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(0, col)))
+            .unwrap()
+    };
+    let before = mark_at(&mut editor, 2);
+    let start = mark_at(&mut editor, 3);
+    let inside = mark_at(&mut editor, 5);
+    let old_end = mark_at(&mut editor, 6);
+    let after = mark_at(&mut editor, 7);
+    let tick = editor.buffer(buffer).unwrap().changedtick();
+    let changelist = editor.changelists().len(buffer);
+
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "\u{1}", &mut eval).unwrap();
+
+    assert_eq!(
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(),
+        "abc1000xxx"
+    );
+    assert_eq!(editor.window(window).unwrap().cursor, position(1, 6));
+    let pos = |editor: &Editor, id| {
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .extmarks
+            .get(ns, id)
+            .unwrap()
+            .unwrap()
+            .position()
+    };
+    assert_eq!(pos(&editor, before), ExtmarkPosition::new(0, 2));
+    assert_eq!(pos(&editor, start), ExtmarkPosition::new(0, 7));
+    assert_eq!(pos(&editor, inside), ExtmarkPosition::new(0, 7));
+    assert_eq!(pos(&editor, old_end), ExtmarkPosition::new(0, 7));
+    assert_eq!(pos(&editor, after), ExtmarkPosition::new(0, 8));
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick + 1);
+    assert_eq!(editor.changelists().len(buffer), changelist + 1);
+
+    machine.feed_keys(&mut editor, "u", &mut eval).unwrap();
+    assert_eq!(
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(),
+        "abc999xxx"
+    );
+    assert_eq!(pos(&editor, before), ExtmarkPosition::new(0, 2));
+    assert_eq!(pos(&editor, start), ExtmarkPosition::new(0, 3));
+    assert_eq!(pos(&editor, inside), ExtmarkPosition::new(0, 5));
+    assert_eq!(pos(&editor, old_end), ExtmarkPosition::new(0, 6));
+    assert_eq!(pos(&editor, after), ExtmarkPosition::new(0, 7));
+}
+#[test]
+fn adjust_number_padded_hex_preserves_extmarks_undo_and_ticks() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"zz0x0ffyy").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor
+        .tabpage(editor.current_tabpage().unwrap())
+        .unwrap()
+        .current_window();
+    editor.set_window_cursor(window, position(1, 2)).unwrap();
+    let ns = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .create_namespace("number-geometry-pad")
+        .unwrap();
+    let mark_at = |editor: &mut Editor, col: usize| {
+        editor
+            .buffer_mut(buffer)
+            .unwrap()
+            .extmarks
+            .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(0, col)))
+            .unwrap()
+    };
+    let before = mark_at(&mut editor, 1);
+    let start = mark_at(&mut editor, 2);
+    let inside = mark_at(&mut editor, 4);
+    let old_end = mark_at(&mut editor, 7);
+    let after = mark_at(&mut editor, 8);
+    let tick = editor.buffer(buffer).unwrap().changedtick();
+    let seq = editor.buffer(buffer).unwrap().undo.current_seq();
+
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "\u{18}", &mut eval).unwrap();
+
+    assert_eq!(
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(),
+        "zz0x0feyy"
+    );
+    assert_eq!(editor.window(window).unwrap().cursor, position(1, 6));
+    let pos = |editor: &Editor, id| {
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .extmarks
+            .get(ns, id)
+            .unwrap()
+            .unwrap()
+            .position()
+    };
+    assert_eq!(pos(&editor, before), ExtmarkPosition::new(0, 1));
+    assert_eq!(pos(&editor, start), ExtmarkPosition::new(0, 7));
+    assert_eq!(pos(&editor, inside), ExtmarkPosition::new(0, 7));
+    assert_eq!(pos(&editor, old_end), ExtmarkPosition::new(0, 7));
+    assert_eq!(pos(&editor, after), ExtmarkPosition::new(0, 8));
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick + 1);
+    assert_eq!(editor.buffer(buffer).unwrap().undo.current_seq(), seq + 1);
+
+    machine.feed_keys(&mut editor, "u", &mut eval).unwrap();
+    assert_eq!(
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(),
+        "zz0x0ffyy"
+    );
+    assert_eq!(pos(&editor, before), ExtmarkPosition::new(0, 1));
+    assert_eq!(pos(&editor, start), ExtmarkPosition::new(0, 2));
+    assert_eq!(pos(&editor, inside), ExtmarkPosition::new(0, 4));
+    assert_eq!(pos(&editor, old_end), ExtmarkPosition::new(0, 7));
+    assert_eq!(pos(&editor, after), ExtmarkPosition::new(0, 8));
+}
+
+#[test]
+fn adjust_number_overflow_parse_splices_max_and_undo() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"18446744073709551616").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor
+        .tabpage(editor.current_tabpage().unwrap())
+        .unwrap()
+        .current_window();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let ns = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .create_namespace("number-geometry-overflow")
+        .unwrap();
+    let mark = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(0, 5)))
+        .unwrap();
+    let tick = editor.buffer(buffer).unwrap().changedtick();
+    let seq = editor.buffer(buffer).unwrap().undo.current_seq();
+
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "\u{18}", &mut eval).unwrap();
+
+    assert_eq!(
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(),
+        "18446744073709551615"
+    );
+    assert_eq!(editor.window(window).unwrap().cursor, position(1, 19));
+    assert_eq!(
+        editor.buffer(buffer).unwrap().extmarks.get(ns, mark).unwrap().unwrap().position(),
+        ExtmarkPosition::new(0, 20)
+    );
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick + 1);
+    assert_eq!(editor.buffer(buffer).unwrap().undo.current_seq(), seq + 1);
+
+    machine.feed_keys(&mut editor, "u", &mut eval).unwrap();
+    assert_eq!(
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(),
+        "18446744073709551616"
+    );
+    assert_eq!(
+        editor.buffer(buffer).unwrap().extmarks.get(ns, mark).unwrap().unwrap().position(),
+        ExtmarkPosition::new(0, 5)
+    );
+}
+
 behavior!(replace_count_beyond_remaining_characters_is_noop, "ab", position(1,1), "3rX", "ab", position(1,1), "normal");
 behavior!(normal_replace_preserves_cursor_and_repeats_scalars, "abcd", position(1,1), "2rX", "aXXd", position(1,1), "normal");
 behavior!(normal_replace_counts_cjk_scalars_not_bytes, "한글a", position(1,0), "2rX", "XXa", position(1,0), "normal");
