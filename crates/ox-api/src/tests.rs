@@ -391,6 +391,355 @@ fn extmark_details_order_limit_delete_and_clear() {
 }
 
 #[test]
+fn extmark_argument_bound_namespace_and_filter_diagnostics_match_api_contract() {
+    let (mut editor, buffer, _, _) = editor_with_lines(&["12345"]);
+    let namespace = crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("validation")).unwrap();
+    let invalid_ns = namespace + 1;
+
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, invalid_ns, 0, 0, dict(&[])).unwrap_err().message(),
+        format!("Invalid 'ns_id': {invalid_ns}")
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_del_extmark(&mut editor, buffer, invalid_ns, 1).unwrap_err().message(),
+        format!("Invalid 'ns_id': {invalid_ns}")
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmarks(
+            &mut editor,
+            buffer,
+            invalid_ns,
+            Object::Integer(0),
+            Object::Integer(-1),
+            dict(&[]),
+        )
+        .unwrap_err()
+        .message(),
+        format!("Invalid 'ns_id': {invalid_ns}")
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmark_by_id(&mut editor, buffer, invalid_ns, 1, dict(&[])).unwrap_err().message(),
+        format!("Invalid 'ns_id': {invalid_ns}")
+    );
+
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("id", Object::Array(Vec::new())), ("end_col", Object::Integer(1)), ("end_row", Object::Integer(1))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'id': expected Integer, got Array"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("id", Object::Integer(0))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'id': expected positive Integer"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("end_col", Object::Array(Vec::new())), ("end_row", Object::Integer(1))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'end_col': expected Integer, got Array"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("end_col", Object::Integer(1)), ("end_row", Object::Array(Vec::new()))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'end_row': expected Integer, got Array"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("virt_text_pos", Object::Integer(0))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'virt_text_pos': expected String, got Integer"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("virt_text_pos", Object::String(OxStr::from("foo")))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'virt_text_pos': 'foo'"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[
+                ("virt_text_pos", Object::String(OxStr::from("foo"))),
+                ("virt_text_win_col", Object::Integer(5)),
+            ]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'virt_text_pos': 'foo'"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("hl_mode", Object::Integer(0))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'hl_mode': expected String, got Integer"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("hl_mode", Object::String(OxStr::from("foo")))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'hl_mode': 'foo'"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("virt_lines_overflow", Object::String(OxStr::from("foo")))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'virt_lines_overflow': 'foo'"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("end_row", Object::Integer(0)), ("end_line", Object::Integer(0))]),
+        )
+        .unwrap_err()
+        .message(),
+        "cannot use both 'end_row' and 'end_line'"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("end_right_gravity", Object::Boolean(true))]),
+        )
+        .unwrap_err()
+        .message(),
+        "cannot set end_right_gravity without end_row or end_col"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("priority", Object::Integer(-1))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'priority': out of range"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, namespace, 0, 6, dict(&[])).unwrap_err().message(),
+        "Invalid 'col': out of range"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, namespace, 3, 6, dict(&[])).unwrap_err().message(),
+        "Invalid 'line': out of range"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("end_col", Object::Integer(1)), ("end_row", Object::Integer(1))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'end_col': out of range"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("end_col", Object::Integer(-1)), ("end_row", Object::Integer(0))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'end_col': out of range"
+    );
+
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmarks(
+            &mut editor,
+            buffer,
+            namespace,
+            Object::Array(Vec::new()),
+            Object::Array(vec![Object::Integer(-1), Object::Integer(-1)]),
+            dict(&[]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid mark position: expected 2 Integer items"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmarks(
+            &mut editor,
+            buffer,
+            namespace,
+            Object::Boolean(true),
+            Object::Array(vec![Object::Integer(-1), Object::Integer(-1)]),
+            dict(&[]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid mark position: expected mark id Integer or 2-item Array"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmarks(
+            &mut editor,
+            buffer,
+            namespace,
+            Object::Integer(-2),
+            Object::Integer(-1),
+            dict(&[]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid mark id: -2"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmarks(
+            &mut editor,
+            buffer,
+            namespace,
+            Object::Integer(99),
+            Object::Integer(-1),
+            dict(&[]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid mark id (not found): 99"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmarks(
+            &mut editor,
+            buffer,
+            namespace,
+            Object::Integer(0),
+            Object::Integer(-1),
+            dict(&[("type", Object::String(OxStr::from("bogus")))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'type': expected sign, virt_text, virt_lines or highlight, got bogus"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmarks(
+            &mut editor,
+            buffer,
+            namespace,
+            Object::Integer(0),
+            Object::Integer(-1),
+            dict(&[("limit", Object::Boolean(true))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'limit': expected Integer, got Boolean"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("virt_lines", Object::Integer(1))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'virt_lines': expected Array, got Integer"
+    );
+}
+
+#[test]
+fn extmark_boolean_option_diagnostic_matches_api_contract() {
+    let (mut editor, buffer, _, _) = editor_with_lines(&["one"]);
+    let namespace = crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("tests")).unwrap();
+    let error = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        0,
+        0,
+        dict(&[("right_gravity", Object::String(OxStr::from("invalid")))]),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.message(), "Invalid 'right_gravity': expected boolean");
+}
+
+#[test]
 fn context_channel_and_ui_round_trip() {
     let (mut editor, _, _, _) = editor_with_lines(&["one"]);
     editor.vvars_mut().0.push((OxStr::from("answer"), Object::Integer(42)));
@@ -897,13 +1246,23 @@ fn set_extmark_strict_rejects_out_of_buffer_and_line() {
     // placed if the line is past end-of-buffer or the column past end-of-line.
     let (mut editor, buffer, _, _) = editor_with_lines(&["one", "two"]);
     let ns = crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("s")).unwrap();
-    assert!(crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, ns, 5, 0, dict(&[])).is_err());
-    assert!(crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, ns, 0, 50, dict(&[])).is_err());
-    assert!(crate::extmark::nvim_buf_set_extmark(
-        &mut editor, buffer, ns, 0, 0,
-        dict(&[("end_row", Object::Integer(9)), ("end_col", Object::Integer(0))]),
-    )
-    .is_err());
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, ns, 5, 0, dict(&[])).unwrap_err().message(),
+        "Invalid 'line': out of range"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, ns, 0, 50, dict(&[])).unwrap_err().message(),
+        "Invalid 'col': out of range"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor, buffer, ns, 0, 0,
+            dict(&[("end_row", Object::Integer(9)), ("end_col", Object::Integer(0))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'end_row': out of range"
+    );
     // strict=false allows out-of-range placement.
     let id = crate::extmark::nvim_buf_set_extmark(
         &mut editor, buffer, ns, 5, 50,
