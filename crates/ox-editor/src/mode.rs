@@ -770,6 +770,10 @@ impl ModeMachine {
             '\u{1b}' => { insert::normal_cursor(editor, ctx.window, ctx.cursor)?; Ok(Some(Mode::default())) }
             '\n' | '\r' => { insert::newline(editor, ctx.buffer, ctx.window, ctx.cursor, self.timestamp, eval)?; Ok(None) }
             '\u{8}' | '\u{7f}' => { insert::backspace(editor, ctx.buffer, ctx.window, ctx.cursor, option_contains(editor, "backspace", "eol", true), self.timestamp)?; Ok(None) }
+            '\u{9}' => { insert::insert_tab(editor, ctx.buffer, ctx.window, ctx.cursor, self.timestamp)?; Ok(None) }
+            '\u{4}' => { insert::adjust_indent(editor, ctx.buffer, ctx.window, ctx.cursor, false, self.timestamp)?; Ok(None) }
+            '\u{14}' => { insert::adjust_indent(editor, ctx.buffer, ctx.window, ctx.cursor, true, self.timestamp)?; Ok(None) }
+            '\u{6}' => { insert::force_reindent(editor, ctx.buffer, ctx.window, ctx.cursor, self.timestamp, eval)?; Ok(None) }
             ch if !ch.is_control() => { insert::insert_char(editor, ctx.buffer, ctx.window, ctx.cursor, ch, self.timestamp)?; Ok(None) }
             _ => Ok(None),
         }

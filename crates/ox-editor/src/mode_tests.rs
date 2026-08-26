@@ -2126,3 +2126,208 @@ fn operator_search_missing_match_does_not_mutate() {
     assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick);
     assert!(matches!(machine.mode(), Mode::Normal(_)));
 }
+
+
+fn insert_control_editor(text: &[u8]) -> (Editor, ox_types::BufHandle, ox_types::WinHandle) {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(text).unwrap(), true)
+        .unwrap();
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    (editor, buffer, window)
+}
+
+fn place_mark(
+    editor: &mut Editor,
+    buffer: ox_types::BufHandle,
+    column: usize,
+) -> (crate::NamespaceId, crate::ExtmarkId) {
+    let ns = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .create_namespace("insert-control")
+        .unwrap();
+    let id = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(0, column)))
+        .unwrap();
+    (ns, id)
+}
+
+fn mark_col(editor: &Editor, buffer: ox_types::BufHandle, ns: crate::NamespaceId, id: crate::ExtmarkId) -> usize {
+    editor
+        .buffer(buffer)
+        .unwrap()
+        .extmarks
+        .get(ns, id)
+        .unwrap()
+        .unwrap()
+        .position()
+        .column
+}
+
+/// T53: expandtab + shiftwidth=2, two tabs move a mark at col 2 to col 6.
+#[test]
+fn insert_tab_expandtab_shifts_extmark() {
+    let (mut editor, buffer, window) = insert_control_editor(b"12345");
+    editor
+        .options_mut()
+        .set_buffer(buffer, "expandtab", OptionValue::Boolean(true))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "shiftwidth", OptionValue::Number(2))
+        .unwrap();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let (ns, id) = place_mark(&mut editor, buffer, 2);
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i\t\t\u{1b}", &mut eval).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"    12345"
+    );
+    assert_eq!(mark_col(&editor, buffer, ns, id), 6);
+}
+
+/// T54: noexpandtab + softtabstop=2 inserts two spaces and moves a mark 2→4.
+#[test]
+fn insert_tab_softtabstop_shifts_extmark() {
+    let (mut editor, buffer, window) = insert_control_editor(b"12345");
+    editor
+        .options_mut()
+        .set_buffer(buffer, "expandtab", OptionValue::Boolean(false))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "shiftwidth", OptionValue::Number(2))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "softtabstop", OptionValue::Number(2))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "tabstop", OptionValue::Number(8))
+        .unwrap();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let (ns, id) = place_mark(&mut editor, buffer, 2);
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i\t\u{1b}", &mut eval).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"  12345"
+    );
+    assert_eq!(mark_col(&editor, buffer, ns, id), 4);
+}
+
+/// T65: <C-D> removes a shiftwidth of leading indent and moves a mark 3→1.
+#[test]
+fn insert_ctrl_d_removes_auto_indent_extmark() {
+    let (mut editor, buffer, window) = insert_control_editor(b"12345");
+    editor
+        .options_mut()
+        .set_buffer(buffer, "cindent", OptionValue::Boolean(true))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "autoindent", OptionValue::Boolean(true))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "shiftwidth", OptionValue::Number(2))
+        .unwrap();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i\t\u{1b}", &mut eval).unwrap();
+    let (ns, id) = place_mark(&mut editor, buffer, 3);
+    machine.feed_keys(&mut editor, "0i\u{4}\u{1b}", &mut eval).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"12345"
+    );
+    assert_eq!(mark_col(&editor, buffer, ns, id), 1);
+}
+
+#[test]
+fn insert_ctrl_t_adds_shiftwidth_extmark() {
+    let (mut editor, buffer, window) = insert_control_editor(b"12345");
+    editor
+        .options_mut()
+        .set_buffer(buffer, "expandtab", OptionValue::Boolean(true))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "shiftwidth", OptionValue::Number(2))
+        .unwrap();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let (ns, id) = place_mark(&mut editor, buffer, 2);
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i\u{14}\u{1b}", &mut eval).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"  12345"
+    );
+    assert_eq!(mark_col(&editor, buffer, ns, id), 4);
+}
+
+#[test]
+fn insert_ctrl_f_reindents_current_line() {
+    let (mut editor, buffer, window) = insert_control_editor(b"int {\n1M1");
+    editor
+        .options_mut()
+        .set_buffer(buffer, "cindent", OptionValue::Boolean(true))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "autoindent", OptionValue::Boolean(true))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "expandtab", OptionValue::Boolean(true))
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "shiftwidth", OptionValue::Number(2))
+        .unwrap();
+    editor.set_window_cursor(window, position(2, 0)).unwrap();
+    let ns = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .create_namespace("insert-control-cf")
+        .unwrap();
+    let id = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(1, 1)))
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i\u{6}\u{1b}", &mut eval).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"int {\n  1M1"
+    );
+    assert_eq!(
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .extmarks
+            .get(ns, id)
+            .unwrap()
+            .unwrap()
+            .position(),
+        ExtmarkPosition::new(1, 3)
+    );
+}
