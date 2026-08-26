@@ -61,6 +61,10 @@ pub struct OperatorPendingState {
     pub register: Option<char>,
     /// Incomplete motion or text-object prefix.
     pub prefix: String,
+    /// Forced range shape selected with operator-pending `v` or `V`.
+    pub force_motion: Option<MotionKind>,
+    /// Search direction and expression retained while entering `/` or `?`.
+    pub search: Option<(SearchDirection, String)>,
 }
 
 /// Active editor input mode.
@@ -356,14 +360,14 @@ impl ModeMachine {
                 if let Some(visual) = self.last_visual.clone() { let window = context(editor)?.window; editor.set_window_cursor(window, visual.cursor)?; return Ok(Some(Mode::Visual(visual))); }
                 return Ok(Some(Mode::default()));
             }
-            if key == 'u' || key == 'U' { return Ok(Some(Mode::OperatorPending(OperatorPendingState { operator: if key == 'u' { Operator::Lowercase } else { Operator::Uppercase }, count: state.count.max(1), count_was_set: state.count != 0, motion_count: 0, register: state.register, prefix: String::new() }))); }
+            if key == 'u' || key == 'U' { return Ok(Some(Mode::OperatorPending(OperatorPendingState { operator: if key == 'u' { Operator::Lowercase } else { Operator::Uppercase }, count: state.count.max(1), count_was_set: state.count != 0, motion_count: 0, register: state.register, prefix: String::new(), force_motion: None, search: None }))); }
             let command = format!("g{key}"); self.move_command(editor, &command, state.count.max(1), false)?; return Ok(Some(Mode::default()));
         }
         if key.is_ascii_digit() && (key != '0' || state.count != 0) { state.count = append_digit(state.count, key); return Ok(None); }
         let count = state.count.max(1);
         match key {
             '"' => { state.prefix = "register".into(); Ok(None) }
-            'd' | 'c' | 'y' | '>' | '<' | '=' => Ok(Some(Mode::OperatorPending(OperatorPendingState { operator: operator_for(key), count, count_was_set: state.count != 0, motion_count: 0, register: state.register, prefix: String::new() }))),
+            'd' | 'c' | 'y' | '>' | '<' | '=' => Ok(Some(Mode::OperatorPending(OperatorPendingState { operator: operator_for(key), count, count_was_set: state.count != 0, motion_count: 0, register: state.register, prefix: String::new(), force_motion: None, search: None }))),
             'g' => { state.prefix = "g".into(); Ok(None) }
             'f' | 'F' | 't' | 'T' => { state.prefix = key.to_string(); Ok(None) }
             'r' => { state.prefix = "r".into(); Ok(None) }
@@ -419,6 +423,57 @@ impl ModeMachine {
     }
 
     fn operator_pending(&mut self, editor: &mut Editor, state: &mut OperatorPendingState, key: char, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
+        if let Some((direction, expression)) = state.search.as_mut() {
+            match key {
+                '\u{1b}' => return Ok(Some(Mode::default())),
+                '\u{8}' | '\u{7f}' => {
+                    expression.pop();
+                    return Ok(None);
+                }
+                '\n' | '\r' => {
+                    let direction = *direction;
+                    let mut expression = expression.clone();
+                    let delimiter = match direction { SearchDirection::Forward => '/', SearchDirection::Backward => '?' };
+                    if expression.ends_with(delimiter) {
+                        expression.pop();
+                    }
+                    let ctx = context(editor)?;
+                    let count = state.count.saturating_mul(state.motion_count.max(1));
+                    let result = match self.search.search(
+                        &ctx.lines,
+                        ctx.cursor,
+                        &expression,
+                        direction,
+                        count,
+                        option_bool(editor, "wrapscan", true),
+                    ) {
+                        Ok(result) => result,
+                        Err(_) => {
+                            beep_flush(editor);
+                            return Ok(Some(Mode::default()));
+                        }
+                    };
+                    push_jump(editor, ctx.buffer, ctx.cursor);
+                    let range = EditRange::from_motion(
+                        ctx.cursor,
+                        crate::motion::Motion {
+                            target: result.target,
+                            kind: if result.has_line_offset { MotionKind::LineWise } else { MotionKind::CharacterWise },
+                            inclusive: result.use_end,
+                            is_jump: true,
+                        },
+                    );
+                    let change = state.operator == Operator::Change;
+                    self.apply_operator(editor, state, range, eval)?;
+                    return Ok(Some(if change { Mode::Insert(InsertState) } else { Mode::default() }));
+                }
+                ch if !ch.is_control() => {
+                    expression.push(ch);
+                    return Ok(None);
+                }
+                _ => return Ok(None),
+            }
+        }
         if matches!(state.prefix.as_str(), "f" | "F" | "t" | "T") {
             let find = FindMotion { direction: if matches!(state.prefix.as_str(), "f" | "t") { FindDirection::Forward } else { FindDirection::Backward }, till: matches!(state.prefix.as_str(), "t" | "T"), target: key as u8 };
             let ctx = context(editor)?;
@@ -430,6 +485,17 @@ impl ModeMachine {
             let inner = state.prefix == "i"; let ctx = context(editor)?;
             if let Some(range) = textobject::resolve(&ctx.lines, ctx.cursor, inner, key, state.count.saturating_mul(state.motion_count.max(1))) { let change = state.operator == Operator::Change; self.apply_operator(editor, &state, range, eval)?; return Ok(Some(if change { Mode::Insert(InsertState) } else { Mode::default() })); }
             return Ok(Some(Mode::default()));
+        }
+        if key == '\u{1b}' {
+            return Ok(Some(Mode::default()));
+        }
+        if key == 'v' || key == 'V' {
+            state.force_motion = Some(if key == 'v' { MotionKind::CharacterWise } else { MotionKind::LineWise });
+            return Ok(None);
+        }
+        if key == '/' || key == '?' {
+            state.search = Some((if key == '/' { SearchDirection::Forward } else { SearchDirection::Backward }, String::new()));
+            return Ok(None);
         }
         if key.is_ascii_digit() && (key != '0' || state.motion_count != 0) { state.motion_count = append_digit(state.motion_count, key); return Ok(None); }
         if key == 'i' || key == 'a' || matches!(key, 'f' | 'F' | 't' | 'T') { state.prefix = key.to_string(); return Ok(None); }
@@ -451,7 +517,17 @@ impl ModeMachine {
         Ok(Some(Mode::default()))
     }
 
-    fn apply_operator(&mut self, editor: &mut Editor, state: &OperatorPendingState, range: EditRange, eval: &mut dyn ExprEval) -> Result<(), ModeError> { let ctx = context(editor)?; ops::apply(editor, ctx.buffer, ctx.window, state.operator, range, state.register, self.timestamp, eval)?; Ok(()) }
+    fn apply_operator(&mut self, editor: &mut Editor, state: &OperatorPendingState, mut range: EditRange, eval: &mut dyn ExprEval) -> Result<(), ModeError> {
+        if let Some(force) = state.force_motion {
+            if force == MotionKind::CharacterWise {
+                range.inclusive = if range.kind == MotionKind::CharacterWise { !range.inclusive } else { false };
+            }
+            range.kind = force;
+        }
+        let ctx = context(editor)?;
+        ops::apply(editor, ctx.buffer, ctx.window, state.operator, range, state.register, self.timestamp, eval)?;
+        Ok(())
+    }
 
     fn visual(&mut self, editor: &mut Editor, state: &mut VisualState, key: char, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
         if state.prefix == "r" {

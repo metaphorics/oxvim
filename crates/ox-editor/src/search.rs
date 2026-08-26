@@ -22,6 +22,8 @@ pub struct SearchOffset {
     pub character_delta: isize,
     /// Move this many logical lines after choosing the match.
     pub line_delta: isize,
+    /// Whether a line offset form was parsed (`search.c` `off.line`), including `+0`/`-0`.
+    pub has_line_offset: bool,
 }
 
 /// A resolved search match and count metadata.
@@ -29,6 +31,12 @@ pub struct SearchOffset {
 pub struct SearchResult {
     /// Cursor destination after offsets.
     pub target: Position,
+    /// Whether the parsed offset anchors at the end of the match.
+    pub use_end: bool,
+    /// Parsed logical-line delta applied to the match position.
+    pub line_delta: isize,
+    /// Whether a line offset form was parsed (`search.c` `off.line`), including `+0`/`-0`.
+    pub has_line_offset: bool,
     /// One-based match index in buffer order.
     pub ordinal: usize,
     /// Total match count.
@@ -89,7 +97,11 @@ fn parse_expression(expression: &str, direction: SearchDirection) -> (&str, Sear
     let (use_end, number) = if let Some(rest) = suffix.strip_prefix('e') { (true, rest) } else { (false, suffix) };
     if !number.is_empty() && number.parse::<isize>().is_err() { return (expression, SearchOffset::default()); }
     let delta = if number.is_empty() { 0 } else { number.parse().map_or(0, |value| value) };
-    let offset = if use_end { SearchOffset { use_end: true, character_delta: delta, line_delta: 0 } } else { SearchOffset { use_end: false, character_delta: 0, line_delta: delta } };
+    let offset = if use_end {
+        SearchOffset { use_end: true, character_delta: delta, line_delta: 0, has_line_offset: false }
+    } else {
+        SearchOffset { use_end: false, character_delta: 0, line_delta: delta, has_line_offset: true }
+    };
     (expression.get(..slash).map_or(expression, |pattern| pattern), offset)
 }
 
@@ -134,7 +146,7 @@ fn run(lines: &[Vec<u8>], cursor: Position, pattern: &str, direction: SearchDire
     let base = text.position(base_byte).map_or(selected.start, |position| position);
     let target_line = base.lnum.saturating_add_signed(offset.line_delta).clamp(1, lines.len().max(1));
     let target = Position { lnum: target_line, col: if offset.line_delta == 0 { base.col.min(lines[target_line - 1].len().saturating_sub(1)) } else { 0 } };
-    Ok(SearchResult { target, ordinal: index + 1, total: matches.len(), wrapped })
+    Ok(SearchResult { target, use_end: offset.use_end, line_delta: offset.line_delta, has_line_offset: offset.has_line_offset, ordinal: index + 1, total: matches.len(), wrapped })
 }
 
 fn byte_of(lines: &[Vec<u8>], pos: Position) -> usize { lines.iter().take(pos.lnum.saturating_sub(1)).map(|line| line.len().saturating_add(1)).sum::<usize>().saturating_add(pos.col) }

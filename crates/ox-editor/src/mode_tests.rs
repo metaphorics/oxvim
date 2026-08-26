@@ -2094,3 +2094,35 @@ fn reindent_evaluator_observes_staged_prior_lines() {
         b"    aaaa\n    bbbb\n    cccc"
     );
 }
+
+// Operator-pending `v`/`V` forcing and `/`/`?` search motions.
+behavior!(operator_charwise_force_backward_search, "\n12345\ntest-me", position(1,0), "dv?-m?\n", "me", position(1,0), "normal");
+behavior!(operator_forward_search_delete, "one two three", position(1,0), "d/two\n", "two three", position(1,0), "normal");
+behavior!(operator_charwise_force_vertical_is_not_linewise, "abc\ndef\nghi", position(1,1), "dvj", "aef\nghi", position(1,1), "normal");
+behavior!(operator_linewise_force_search, "one two\nthree", position(1,0), "dV/two\n", "three", position(1,0), "normal");
+behavior!(operator_pending_escape_aborts, "one two", position(1,0), "d\u{1b}l", "one two", position(1,1), "normal");
+behavior!(operator_search_escape_aborts, "one two", position(1,0), "d/two\u{1b}l", "one two", position(1,1), "normal");
+behavior!(operator_search_end_offset_is_inclusive, "one two three", position(1,0), "d/two/e\n", " three", position(1,0), "normal");
+behavior!(operator_search_end_character_offset_is_inclusive, "one two three", position(1,0), "d/two/e+1\n", "three", position(1,0), "normal");
+behavior!(operator_charwise_force_toggles_search_end_inclusive, "one two three", position(1,0), "dv/two/e\n", "o three", position(1,0), "normal");
+behavior!(operator_search_line_offset_is_linewise, "one two\nthree four\nfive", position(1,0), "d/two/+1\n", "five", position(1,0), "normal");
+behavior!(operator_search_zero_line_offset_is_linewise, "one two\nthree four\nfive", position(1,0), "d/two/+0\n", "three four\nfive", position(1,0), "normal");
+behavior!(operator_search_invalid_regex_returns_to_normal, "one two", position(1,0), "d/[\nx", "ne two", position(1,0), "normal");
+
+#[test]
+fn operator_search_missing_match_does_not_mutate() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer_with(Buffer::from_bytes(b"one two").unwrap(), true).unwrap();
+    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    editor.options_mut().set_global("wrapscan", crate::OptionValue::Boolean(false)).unwrap();
+    let window = editor.tabpage(editor.current_tabpage().unwrap()).unwrap().current_window();
+    editor.set_window_cursor(window, position(1, 4)).unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    let tick = editor.buffer(buffer).unwrap().changedtick();
+    machine.feed_keys(&mut editor, "d/missing\n", &mut eval).unwrap();
+    assert_eq!(String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(), "one two");
+    assert_eq!(editor.window(window).unwrap().cursor, position(1, 4));
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick);
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+}
