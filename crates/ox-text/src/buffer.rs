@@ -37,6 +37,9 @@ pub enum BufferError {
     /// A byte offset split a UTF-8 code point.
     #[error("byte offset {0} is not a UTF-8 boundary")]
     NotCharBoundary(usize),
+    /// A batch of splices was not strictly ascending and row-disjoint.
+    #[error("batch splices must be ascending and row-disjoint")]
+    OverlappingSplices,
 }
 
 /// A rope-backed Vim buffer.
@@ -45,6 +48,16 @@ pub struct Buffer {
     rope: Rope,
     has_eol: bool,
     changedtick: u64,
+}
+
+/// One inclusive row replacement in a disjoint batch.
+pub struct LineSplice<'a> {
+    /// First one-based line.
+    pub start: usize,
+    /// Last one-based line.
+    pub end: usize,
+    /// Replacement logical lines, borrowed for the duration of the batch.
+    pub lines: &'a [Vec<u8>],
 }
 
 impl Default for Buffer {
@@ -191,6 +204,42 @@ impl Buffer {
     ) -> Result<(), BufferError> {
         self.check_range(start, end)?;
         validate_lines(lines)?;
+        self.splice_span(start, end, lines)?;
+        self.changedtick = self.changedtick.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Applies every splice against the pre-edit line map, then mutates
+    /// bottom-up so earlier row numbers stay stable. A non-empty batch bumps
+    /// [`changedtick`](Self::changedtick) once; an empty slice is a no-op.
+    pub fn replace_lines_disjoint(
+        &mut self,
+        splices: &[LineSplice<'_>],
+    ) -> Result<(), BufferError> {
+        let mut prev_end = None;
+        for splice in splices {
+            self.check_range(splice.start, splice.end)?;
+            validate_lines(splice.lines)?;
+            if prev_end.is_some_and(|prev| splice.start <= prev) {
+                return Err(BufferError::OverlappingSplices);
+            }
+            prev_end = Some(splice.end);
+        }
+        for splice in splices.iter().rev() {
+            self.splice_span(splice.start, splice.end, splice.lines)?;
+        }
+        if !splices.is_empty() {
+            self.changedtick = self.changedtick.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    fn splice_span(
+        &mut self,
+        start: usize,
+        end: usize,
+        lines: &[Vec<u8>],
+    ) -> Result<(), BufferError> {
         let line_count = self.line_count();
         let mut text = join_lines(lines)?;
         if !lines.is_empty() && (end < line_count || self.has_eol) {
@@ -213,7 +262,6 @@ impl Buffer {
         if !text.is_empty() {
             self.rope.insert(from, &text);
         }
-        self.changedtick = self.changedtick.wrapping_add(1);
         Ok(())
     }
 

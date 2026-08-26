@@ -625,6 +625,445 @@ fn normal_blockwise_put_shifts_extmark_columns() {
     assert_eq!(mark.position(), ExtmarkPosition::new(0, 3));
 }
 
+behavior!(replace_count_beyond_remaining_characters_is_noop, "ab", position(1,1), "3rX", "ab", position(1,1), "normal");
+behavior!(normal_replace_preserves_cursor_and_repeats_scalars, "abcd", position(1,1), "2rX", "aXXd", position(1,1), "normal");
+behavior!(normal_replace_counts_cjk_scalars_not_bytes, "한글a", position(1,0), "2rX", "XXa", position(1,0), "normal");
+behavior!(visual_charwise_replace_repeats_per_scalar, "abcd", position(1,1), "vlrX", "aXXd", position(1,1), "normal");
+behavior!(visual_charwise_replace_counts_cjk_scalars, "한글a", position(1,0), "vlrX", "XXa", position(1,0), "normal");
+behavior!(visual_blockwise_replace_per_line_scalars, "abcd\nefgh", position(1,0), "\u{16}ljrX", "XXcd\nXXgh", position(1,0), "normal");
+#[test]
+fn visual_blockwise_replace_moves_interior_extmark_with_right_gravity() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"12345\n12345").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor
+        .tabpage(editor.current_tabpage().unwrap())
+        .unwrap()
+        .current_window();
+    editor.set_window_cursor(window, position(2, 0)).unwrap();
+    let ns = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .create_namespace("replace-geometry")
+        .unwrap();
+    let id = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .set(
+            ns,
+            None,
+            ExtmarkPlacement::new(ExtmarkPosition::new(0, 2)),
+        )
+        .unwrap();
+
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine
+        .feed_keys(&mut editor, "0\u{16}llkr1", &mut eval)
+        .unwrap();
+
+    assert_eq!(
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(),
+        "11145\n11145"
+    );
+    let mark = editor
+        .buffer(buffer)
+        .unwrap()
+        .extmarks
+        .get(ns, id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(mark.position(), ExtmarkPosition::new(0, 3));
+}
+#[test]
+fn normal_replace_preserves_exterior_extmark_columns() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"12345").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor
+        .tabpage(editor.current_tabpage().unwrap())
+        .unwrap()
+        .current_window();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let ns = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .create_namespace("replace-geometry")
+        .unwrap();
+    let id = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .set(
+            ns,
+            None,
+            ExtmarkPlacement::new(ExtmarkPosition::new(0, 2)),
+        )
+        .unwrap();
+
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "0r2", &mut eval).unwrap();
+
+    assert_eq!(
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(),
+        "22345"
+    );
+    let mark = editor
+        .buffer(buffer)
+        .unwrap()
+        .extmarks
+        .get(ns, id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(mark.position(), ExtmarkPosition::new(0, 2));
+}
+
+behavior!(normal_replace_typed_cr_inserts_one_line_break, "abcdef", position(1,1), "3r\r", "a\nef", position(2,0), "normal");
+behavior!(normal_replace_typed_nl_inserts_one_line_break, "abcdef", position(1,1), "3r\n", "a\nef", position(2,0), "normal");
+behavior!(normal_replace_typed_cr_multibyte_span, "a한글d", position(1,1), "2r\r", "a\nd", position(2,0), "normal");
+behavior!(normal_replace_quoted_cr_embeds_literal_cr, "abcd", position(1,1), "r\u{16}\r", "a\rcd", position(1,1), "normal");
+behavior!(normal_replace_quoted_nl_embeds_nul, "abcd", position(1,1), "r\u{16}\n", "a\x00cd", position(1,1), "normal");
+behavior!(normal_replace_quoted_cr_via_ctrl_q, "abcd", position(1,1), "r\u{11}\r", "a\rcd", position(1,1), "normal");
+behavior!(normal_replace_quote_pending_escape_aborts, "abcd", position(1,1), "r\u{16}\u{1b}", "abcd", position(1,1), "normal");
+behavior!(normal_replace_quoted_ctrl_v_embeds_literal, "abcd", position(1,1), "r\u{16}\u{16}", "a\u{16}cd", position(1,1), "normal");
+behavior!(normal_replace_typed_cr_beyond_remaining_is_noop, "ab", position(1,1), "3r\r", "ab", position(1,1), "normal");
+behavior!(visual_charwise_typed_cr_stays_literal, "abcd", position(1,1), "vlr\r", "a\r\rd", position(1,1), "normal");
+behavior!(visual_charwise_typed_nl_stays_nul, "abcd", position(1,1), "vlr\n", "a\x00\x00d", position(1,1), "normal");
+behavior!(visual_linewise_typed_cr_stays_literal, "abcd", position(1,1), "Vr\r", "\r\r\r\r", position(1,0), "normal");
+behavior!(visual_blockwise_quoted_cr_keeps_literal_cr, "98765\n98765\n98765", position(1,0), "02l\u{16}2jr\u{16}\r", "98\r65\n98\r65\n98\r65", position(1,2), "normal");
+behavior!(visual_blockwise_quoted_nl_keeps_nul, "98765\n98765\n98765", position(1,0), "02l\u{16}2jr\u{16}\n", "98\x0065\n98\x0065\n98\x0065", position(1,2), "normal");
+
+#[test]
+fn normal_replace_typed_cr_full_invariants() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"abcdef").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor
+        .tabpage(editor.current_tabpage().unwrap())
+        .unwrap()
+        .current_window();
+    editor.set_window_cursor(window, position(1, 1)).unwrap();
+    let ns = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .create_namespace("replace-break")
+        .unwrap();
+    let mut mark = ExtmarkPlacement::new(ExtmarkPosition::new(0, 2));
+    mark.gravity = ExtmarkGravity::Right;
+    let id = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .set(ns, None, mark)
+        .unwrap();
+    let tick = editor.buffer(buffer).unwrap().changedtick();
+    let seq = editor.buffer(buffer).unwrap().undo.current_seq();
+    let changelist = editor.changelists().len(buffer);
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "3r\r", &mut eval).unwrap();
+    let text = editor.buffer(buffer).unwrap().text().unwrap();
+    assert_eq!(text.to_bytes(), b"a\nef");
+    assert_eq!(text.line_count(), 2);
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick + 1);
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick_diag, 1);
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick_fold, 1);
+    assert_eq!(editor.buffer(buffer).unwrap().undo.current_seq(), seq + 1);
+    assert_eq!(editor.changelists().len(buffer), changelist + 1);
+    assert_eq!(
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .extmarks
+            .get(ns, id)
+            .unwrap()
+            .unwrap()
+            .position(),
+        ExtmarkPosition::new(1, 0)
+    );
+    assert_eq!(editor.buffer_undo(buffer).unwrap(), Some(1));
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"abcdef"
+    );
+    assert_eq!(editor.buffer_undo(buffer).unwrap(), None);
+    assert_eq!(editor.buffer_redo(buffer).unwrap(), Some(1));
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"a\nef"
+    );
+}
+
+#[test]
+fn normal_replace_typed_cr_autoindents() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"    abcdef").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor
+        .tabpage(editor.current_tabpage().unwrap())
+        .unwrap()
+        .current_window();
+    editor.set_window_cursor(window, position(1, 4)).unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "autoindent", OptionValue::Boolean(true))
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "3r\r", &mut eval).unwrap();
+    assert_eq!(
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(),
+        "    \n    def"
+    );
+    assert_eq!(editor.window(window).unwrap().cursor, position(2, 3));
+
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"    abcdef").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor
+        .tabpage(editor.current_tabpage().unwrap())
+        .unwrap()
+        .current_window();
+    editor.set_window_cursor(window, position(1, 4)).unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "autoindent", OptionValue::Boolean(false))
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "3r\r", &mut eval).unwrap();
+    assert_eq!(
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(),
+        "    \ndef"
+    );
+    assert_eq!(editor.window(window).unwrap().cursor, position(2, 0));
+}
+
+#[test]
+fn visual_blockwise_typed_cr_splits_every_row() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"123456789\n123456789\n123456789").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor
+        .tabpage(editor.current_tabpage().unwrap())
+        .unwrap()
+        .current_window();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let ns = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .create_namespace("block-break")
+        .unwrap();
+    let mut mark = ExtmarkPlacement::new(ExtmarkPosition::new(1, 6));
+    mark.gravity = ExtmarkGravity::Right;
+    let id = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .set(ns, None, mark)
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine
+        .feed_keys(&mut editor, "05l\u{16}2jr\r", &mut eval)
+        .unwrap();
+    let text = editor.buffer(buffer).unwrap().text().unwrap();
+    assert_eq!(text.to_bytes(), b"12345\n789\n12345\n789\n12345\n789");
+    assert_eq!(text.line_count(), 6);
+    assert_eq!(editor.window(window).unwrap().cursor, position(1, 5));
+    assert_eq!(
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .extmarks
+            .get(ns, id)
+            .unwrap()
+            .unwrap()
+            .position(),
+        ExtmarkPosition::new(3, 0)
+    );
+    assert_eq!(editor.buffer_undo(buffer).unwrap(), Some(1));
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"123456789\n123456789\n123456789"
+    );
+    assert_eq!(editor.buffer_redo(buffer).unwrap(), Some(1));
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"12345\n789\n12345\n789\n12345\n789"
+    );
+}
+
+#[test]
+fn visual_blockwise_replace_batch_one_tick() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"12345\n12345\n12345").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor
+        .tabpage(editor.current_tabpage().unwrap())
+        .unwrap()
+        .current_window();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let ns = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .create_namespace("block-tick")
+        .unwrap();
+    let mut mark = ExtmarkPlacement::new(ExtmarkPosition::new(1, 2));
+    mark.gravity = ExtmarkGravity::Right;
+    let id = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .set(ns, None, mark)
+        .unwrap();
+    let tick = editor.buffer(buffer).unwrap().changedtick();
+    let diag = editor.buffer(buffer).unwrap().changedtick_diag;
+    let fold = editor.buffer(buffer).unwrap().changedtick_fold;
+    let seq = editor.buffer(buffer).unwrap().undo.current_seq();
+    let changelist = editor.changelists().len(buffer);
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine
+        .feed_keys(&mut editor, "0\u{16}2jrX", &mut eval)
+        .unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"X2345\nX2345\nX2345"
+    );
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick + 1);
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick_diag, diag + 1);
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick_fold, fold + 1);
+    assert_eq!(editor.buffer(buffer).unwrap().undo.current_seq(), seq + 1);
+    assert_eq!(editor.changelists().len(buffer), changelist + 1);
+    assert_eq!(
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .extmarks
+            .get(ns, id)
+            .unwrap()
+            .unwrap()
+            .position(),
+        ExtmarkPosition::new(1, 2)
+    );
+    assert_eq!(editor.buffer_undo(buffer).unwrap(), Some(1));
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"12345\n12345\n12345"
+    );
+}
+
+#[test]
+fn visual_charwise_multirow_replace_one_tick() {
+    let (text, _, _, editor, buffer) = run("ab\nxy\npq", position(1, 0), "vjjrZ");
+    assert_eq!(text, "ZZ\nZZ\nZq");
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick(), 1);
+
+    let (text, _, _, editor, buffer) = run("abcd", position(1, 1), "vlrX");
+    assert_eq!(text, "aXXd");
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick(), 1);
+}
+
+#[test]
+fn visual_replace_empty_selection_zero_tick() {
+    let (text, _, _, editor, buffer) = run("\n\n", position(1, 0), "\u{16}2jrX");
+    assert_eq!(text, "\n\n");
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick(), 0);
+    assert_eq!(editor.changelists().len(buffer), 0);
+}
+
+#[test]
+fn blockwise_put_batch_one_tick() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"abc\ndef").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor
+        .tabpage(editor.current_tabpage().unwrap())
+        .unwrap()
+        .current_window();
+    editor.set_window_cursor(window, position(1, 1)).unwrap();
+    let ns = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .create_namespace("put-tick")
+        .unwrap();
+    let id = editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .extmarks
+        .set(
+            ns,
+            None,
+            ExtmarkPlacement::new(ExtmarkPosition::new(0, 2)),
+        )
+        .unwrap();
+    editor
+        .registers_mut()
+        .set(
+            'a',
+            crate::RegisterContent::blockwise(vec![b"Q".to_vec(), b"R".to_vec()], 1).unwrap(),
+        )
+        .unwrap();
+    let tick = editor.buffer(buffer).unwrap().changedtick();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "\"aP", &mut eval).unwrap();
+    assert_eq!(
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(),
+        "aQbc\ndRef"
+    );
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick + 1);
+    let mark = editor
+        .buffer(buffer)
+        .unwrap()
+        .extmarks
+        .get(ns, id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(mark.position(), ExtmarkPosition::new(0, 3));
+}
+
 #[test]
 fn normal_join_moves_extmark_with_splice_geometry() {
     for (text, keys, expected, cursor_col, mark_col) in [
@@ -935,11 +1374,11 @@ fn reindent_applies_cindent_not_line_offset_ramp() {
         .unwrap();
     editor
         .options_mut()
-        .set_buffer(buffer, "cindent", crate::OptionValue::Boolean(true))
+        .set_buffer(buffer, "cindent", OptionValue::Boolean(true))
         .unwrap();
     editor
         .options_mut()
-        .set_buffer(buffer, "expandtab", crate::OptionValue::Boolean(true))
+        .set_buffer(buffer, "expandtab", OptionValue::Boolean(true))
         .unwrap();
     editor
         .options_mut()

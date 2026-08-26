@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use ox_text::buffer::LineSplice;
 use ox_text::{Buffer, BufferError, Cursor, LineEdit, Position, UndoError, UndoStep, UndoTree};
 use ox_types::{Dict, Object, OxStr};
 use thiserror::Error;
@@ -69,6 +70,12 @@ pub enum BufferTextEditError {
     /// A byte column split a UTF-8 code point.
     #[error("byte column {0} is not a UTF-8 boundary")]
     NotCharBoundary(usize),
+    /// A logical replacement line contained a newline byte.
+    #[error("text edit replacement element contains a newline")]
+    EmbeddedNewline,
+    /// A logical replacement line was not valid UTF-8.
+    #[error("text edit replacement element is not valid UTF-8")]
+    InvalidUtf8,
 }
 
 /// One validated byte-precise text replacement against a pre-edit snapshot.
@@ -91,6 +98,12 @@ pub(crate) struct PreparedBufferTextEdit {
     before: Vec<Vec<u8>>,
     after: Vec<Vec<u8>>,
     pub(crate) splice: TextSplice,
+}
+
+impl PreparedBufferTextEdit {
+    pub(crate) const fn preserves_line_count(&self) -> bool {
+        self.before.len() == self.after.len()
+    }
 }
 
 /// Text and buffer-local state owned by [`crate::Editor`].
@@ -439,6 +452,13 @@ impl BufferState {
             replacement.push(Vec::new());
         }
 
+        if replacement.iter().any(|line| line.contains(&b'\n')) {
+            return Err(BufferTextEditError::EmbeddedNewline.into());
+        }
+        if replacement.iter().any(|line| std::str::from_utf8(line).is_err()) {
+            return Err(BufferTextEditError::InvalidUtf8.into());
+        }
+
         if start.row > end.row {
             return Err(BufferTextEditError::ReversedRange.into());
         }
@@ -707,6 +727,30 @@ impl BufferState {
                 .replace_lines(start_line, end, &after)
                 .expect("prepared line range is valid by construction");
         }
+        let seq = self.record_committed_splice(
+            start_line,
+            before,
+            after,
+            splice,
+            cursor_before,
+            cursor_after,
+            timestamp,
+        );
+        self.refresh_modified();
+        self.bump_derived_ticks();
+        seq
+    }
+
+    fn record_committed_splice(
+        &mut self,
+        start_line: usize,
+        before: Vec<Vec<u8>>,
+        after: Vec<Vec<u8>>,
+        splice: TextSplice,
+        cursor_before: Position,
+        cursor_after: Position,
+        timestamp: i64,
+    ) -> u64 {
         self.marks.splice(start_line, before.len(), after.len());
         let (_, extmark_undo) = self.extmarks.splice_recording(splice);
         self.splice_folds(start_line, before.len(), after.len());
@@ -727,6 +771,50 @@ impl BufferState {
             timestamp,
         );
         self.extmark_undo.entry(seq).or_default().push(extmark_undo);
+        seq
+    }
+
+    pub(crate) fn commit_prepared_line_preserving_batch(
+        &mut self,
+        prepared: Vec<PreparedBufferTextEdit>,
+        cursor_before: Position,
+        cursor_after: Position,
+        timestamp: i64,
+    ) -> u64 {
+        if prepared.is_empty() {
+            return 0;
+        }
+        let splices: Vec<LineSplice<'_>> = prepared
+            .iter()
+            .map(|edit| {
+                let end = edit
+                    .start_line
+                    .checked_add(edit.before.len())
+                    .and_then(|line| line.checked_sub(1))
+                    .expect("prepared line range is valid by construction");
+                LineSplice {
+                    start: edit.start_line,
+                    end,
+                    lines: &edit.after,
+                }
+            })
+            .collect();
+        self.text
+            .replace_lines_disjoint(&splices)
+            .expect("prepared line range is valid by construction");
+        let mut seq = 0;
+        for edit in prepared {
+            debug_assert!(edit.preserves_line_count());
+            seq = self.record_committed_splice(
+                edit.start_line,
+                edit.before,
+                edit.after,
+                edit.splice,
+                cursor_before,
+                cursor_after,
+                timestamp,
+            );
+        }
         self.refresh_modified();
         self.bump_derived_ticks();
         seq
@@ -777,4 +865,145 @@ fn compose_replacement_lines(
     last.extend_from_slice(&before[before.len() - 1][end_column..]);
     after.push(last);
     after
+}
+
+#[cfg(test)]
+mod tests {
+    use ox_text::Buffer;
+
+    use super::*;
+    use crate::{Editor, EditorError, ExtmarkPosition, Geometry};
+
+    fn position(lnum: usize, col: usize) -> Position {
+        Position { lnum, col }
+    }
+
+    fn editor_with(text: &[u8]) -> (Editor, ox_types::BufHandle, ox_types::WinHandle) {
+        let mut editor = Editor::new();
+        let buffer = editor
+            .create_buffer_with(Buffer::from_bytes(text).unwrap(), true)
+            .unwrap();
+        let tab = editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let window = editor.tabpage(tab).unwrap().current_window();
+        (editor, buffer, window)
+    }
+
+    fn snapshot(editor: &Editor, buffer: ox_types::BufHandle) -> (Vec<u8>, u64, u64, bool, usize) {
+        let state = editor.buffer(buffer).unwrap();
+        (
+            state.text().unwrap().to_bytes(),
+            state.changedtick(),
+            state.undo.current_seq(),
+            state.modified,
+            editor.changelists().len(buffer),
+        )
+    }
+
+    #[test]
+    fn prepare_rejects_lf_in_replacement_element() {
+        let (mut editor, buffer, _) = editor_with(b"abc");
+        let before = snapshot(&editor, buffer);
+        let error = editor
+            .replace_buffer_text(
+                buffer,
+                &BufferTextEditRequest {
+                    start: ExtmarkPosition::new(0, 0),
+                    end: ExtmarkPosition::new(0, 1),
+                    replacement: vec![b"a\nb".to_vec()],
+                },
+                position(1, 0),
+                position(1, 0),
+                1,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EditorError::Buffer(BufferStateError::TextEdit(
+                BufferTextEditError::EmbeddedNewline
+            ))
+        ));
+        assert_eq!(snapshot(&editor, buffer), before);
+    }
+
+    #[test]
+    fn prepare_rejects_invalid_utf8_replacement() {
+        let (mut editor, buffer, _) = editor_with(b"abc");
+        let before = snapshot(&editor, buffer);
+        let error = editor
+            .replace_buffer_text(
+                buffer,
+                &BufferTextEditRequest {
+                    start: ExtmarkPosition::new(0, 0),
+                    end: ExtmarkPosition::new(0, 1),
+                    replacement: vec![vec![0xff, 0xfe]],
+                },
+                position(1, 0),
+                position(1, 0),
+                1,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EditorError::Buffer(BufferStateError::TextEdit(BufferTextEditError::InvalidUtf8))
+        ));
+        assert_eq!(snapshot(&editor, buffer), before);
+    }
+
+    #[test]
+    fn prepare_accepts_embedded_cr() {
+        let (mut editor, buffer, _) = editor_with(b"abc");
+        editor
+            .replace_buffer_text(
+                buffer,
+                &BufferTextEditRequest {
+                    start: ExtmarkPosition::new(0, 1),
+                    end: ExtmarkPosition::new(0, 2),
+                    replacement: vec![vec![b'\r']],
+                },
+                position(1, 0),
+                position(1, 0),
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+            b"a\rc"
+        );
+    }
+
+    #[test]
+    fn batch_prepare_failure_is_atomic() {
+        let (mut editor, buffer, window) = editor_with(b"abc\ndef");
+        let before = snapshot(&editor, buffer);
+        let error = editor
+            .replace_buffer_texts(
+                buffer,
+                window,
+                &[
+                    BufferTextEditRequest {
+                        start: ExtmarkPosition::new(0, 0),
+                        end: ExtmarkPosition::new(0, 1),
+                        replacement: vec![b"X".to_vec()],
+                    },
+                    BufferTextEditRequest {
+                        start: ExtmarkPosition::new(1, 0),
+                        end: ExtmarkPosition::new(1, 1),
+                        replacement: vec![b"Y\nZ".to_vec()],
+                    },
+                ],
+                position(1, 0),
+                position(1, 0),
+                1,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EditorError::Buffer(BufferStateError::TextEdit(
+                BufferTextEditError::EmbeddedNewline
+            ))
+        ));
+        assert_eq!(snapshot(&editor, buffer), before);
+    }
 }

@@ -538,9 +538,11 @@ impl Editor {
     /// (`op_reindent`, indent.c:947): every request is prepared against the
     /// pre-edit buffer and the cursor window is resolved before the first
     /// commit, so a validation failure leaves text, cursor, undo, and ticks
-    /// untouched. Requests must be row-disjoint, line-count-preserving edits
-    /// in ascending row order; their commits join the open undo block as one
-    /// transaction and the changelist gains one entry.
+    /// untouched. Requests must be row-disjoint, same-row, and strictly
+    /// ascending. Line-count-preserving batches commit as one text/derived
+    /// tick; structural batches commit bottom-up with per-splice ticks.
+    /// Commits join the open undo block as one transaction and the changelist
+    /// gains one entry.
     pub(crate) fn replace_buffer_texts(
         &mut self,
         buffer: BufHandle,
@@ -564,20 +566,40 @@ impl Editor {
             prepared.push(self.buffer(buffer)?.prepare_buffer_text_edit(request)?);
         }
         // Commit: infallible by construction (buffer.rs prepare/commit split).
-        let mut splices = Vec::with_capacity(prepared.len());
+        let line_preserving = prepared.iter().all(|edit| edit.preserves_line_count());
+        let splices: Vec<TextSplice> = if line_preserving {
+            prepared.iter().map(|edit| edit.splice).collect()
+        } else {
+            prepared.iter().rev().map(|edit| edit.splice).collect()
+        };
         let mut seq = 0;
         {
             let state = self
                 .buffers
                 .get_mut(&buffer)
                 .expect("buffer resolved during validation");
-            for edit in prepared {
-                splices.push(edit.splice);
-                seq = state.commit_buffer_text_edit(edit, cursor_before, cursor_after, timestamp);
+            if line_preserving {
+                seq = state.commit_prepared_line_preserving_batch(
+                    prepared,
+                    cursor_before,
+                    cursor_after,
+                    timestamp,
+                );
+            } else {
+                for edit in prepared.into_iter().rev() {
+                    seq = state.commit_buffer_text_edit(
+                        edit,
+                        cursor_before,
+                        cursor_after,
+                        timestamp,
+                    );
+                }
             }
         }
-        // Row-disjoint, same-row, line-count-preserving splices commute, so
-        // deferred transforms equal the singular per-edit interleaving.
+        // Splices are applied in commit order. Line-preserving disjoint
+        // splices commute; row-count-changing ones must be applied bottom-up
+        // so each pre-edit-coordinate transform only row-shifts positions
+        // below its already-processed span.
         for splice in splices {
             self.splice_text_positions(buffer, splice);
         }
@@ -1664,7 +1686,8 @@ impl Editor {
             }
         }
 
-        let mut splices = Vec::with_capacity(prepared.len());
+        let line_preserving = prepared.iter().all(|edit| edit.preserves_line_count());
+        let splices: Vec<TextSplice> = prepared.iter().map(|edit| edit.splice).collect();
         let inserted_lines = trailing_insert
             .as_ref()
             .map(|(after_lnum, lines)| (*after_lnum, lines.len()));
@@ -1673,14 +1696,24 @@ impl Editor {
                 .buffers
                 .get_mut(&buffer)
                 .expect("buffer resolved during validation");
-            for edit in prepared {
-                splices.push(edit.splice);
-                state.commit_buffer_text_edit(
-                    edit,
-                    cursor_before,
-                    cursor_after,
-                    timestamp,
-                );
+            if line_preserving {
+                if !prepared.is_empty() {
+                    state.commit_prepared_line_preserving_batch(
+                        prepared,
+                        cursor_before,
+                        cursor_after,
+                        timestamp,
+                    );
+                }
+            } else {
+                for edit in prepared {
+                    state.commit_buffer_text_edit(
+                        edit,
+                        cursor_before,
+                        cursor_after,
+                        timestamp,
+                    );
+                }
             }
             if let Some((after_lnum, lines)) = trailing_insert {
                 state.insert_lines(

@@ -698,3 +698,28 @@ fn left_gravity_mark_collapses_to_delete_start() {
         ExtmarkPosition::new(0, 2)
     );
 }
+
+#[test]
+fn blockwise_delete_batch_one_tick() {
+    let (mut editor, buffer, window) = setup(&[b"12345", b"abc", b"VWXYZ"]);
+    editor.set_window_cursor(window, position(1, 1)).unwrap();
+    let tick = editor.buffer(buffer).unwrap().changedtick();
+    let seq = editor.buffer(buffer).unwrap().undo.current_seq();
+    apply_delete(
+        &mut editor,
+        buffer,
+        window,
+        EditRange {
+            start: position(1, 1),
+            end: position(3, 3),
+            kind: MotionKind::BlockWise,
+            inclusive: true,
+        },
+        Some('b'),
+    );
+    assert_eq!(text_bytes(&editor, buffer), b"15\na\nVZ");
+    assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick + 1);
+    assert_eq!(editor.buffer(buffer).unwrap().undo.current_seq(), seq + 1);
+    assert_eq!(editor.buffer_undo(buffer).unwrap(), Some(1));
+    assert_eq!(text_bytes(&editor, buffer), b"12345\nabc\nVWXYZ");
+}

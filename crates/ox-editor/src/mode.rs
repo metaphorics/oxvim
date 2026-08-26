@@ -326,6 +326,22 @@ impl ModeMachine {
 
     fn normal(&mut self, editor: &mut Editor, state: &mut NormalState, key: char, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
         if state.prefix == "register" { state.register = Some(key); state.prefix.clear(); return Ok(None); }
+        if state.prefix == "r" {
+            if key == '\u{16}' || key == '\u{11}' {
+                state.prefix = "r\u{16}".into();
+                return Ok(None);
+            }
+            state.prefix.clear();
+            if key == '\u{1b}' { return Ok(Some(Mode::default())); }
+            self.replace_chars(editor, state.count.max(1), classify_replace_key(key, false))?;
+            return Ok(Some(Mode::default()));
+        }
+        if state.prefix == "r\u{16}" {
+            state.prefix.clear();
+            if key == '\u{1b}' { return Ok(Some(Mode::default())); }
+            self.replace_chars(editor, state.count.max(1), classify_replace_key(key, true))?;
+            return Ok(Some(Mode::default()));
+        }
         if matches!(state.prefix.as_str(), "f" | "F" | "t" | "T") {
             let find = FindMotion { direction: if matches!(state.prefix.as_str(), "f" | "t") { FindDirection::Forward } else { FindDirection::Backward }, till: matches!(state.prefix.as_str(), "t" | "T"), target: key as u8 };
             // `nv_csearch`: `if (searchc(cap, t_cmd) == false) clearopbeep()`.
@@ -350,6 +366,7 @@ impl ModeMachine {
             'd' | 'c' | 'y' | '>' | '<' | '=' => Ok(Some(Mode::OperatorPending(OperatorPendingState { operator: operator_for(key), count, count_was_set: state.count != 0, motion_count: 0, register: state.register, prefix: String::new() }))),
             'g' => { state.prefix = "g".into(); Ok(None) }
             'f' | 'F' | 't' | 'T' => { state.prefix = key.to_string(); Ok(None) }
+            'r' => { state.prefix = "r".into(); Ok(None) }
             // `searchc` returns false when there is no previous `f`/`t` to
             // repeat (`*lastc == NUL`), and `nv_csearch` turns that into
             // `clearopbeep` — which flushes the rest of the mapped typeahead,
@@ -435,6 +452,26 @@ impl ModeMachine {
     fn apply_operator(&mut self, editor: &mut Editor, state: &OperatorPendingState, range: EditRange, eval: &mut dyn ExprEval) -> Result<(), ModeError> { let ctx = context(editor)?; ops::apply(editor, ctx.buffer, ctx.window, state.operator, range, state.register, self.timestamp, eval)?; Ok(()) }
 
     fn visual(&mut self, editor: &mut Editor, state: &mut VisualState, key: char, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
+        if state.prefix == "r" {
+            if key == '\u{16}' || key == '\u{11}' {
+                state.prefix = "r\u{16}".into();
+                return Ok(None);
+            }
+            state.prefix.clear();
+            if key == '\u{1b}' {
+                return Ok(Some(Mode::default()));
+            }
+            self.visual_replace(editor, state, classify_replace_key(key, false))?;
+            return Ok(Some(Mode::default()));
+        }
+        if state.prefix == "r\u{16}" {
+            state.prefix.clear();
+            if key == '\u{1b}' {
+                return Ok(Some(Mode::default()));
+            }
+            self.visual_replace(editor, state, classify_replace_key(key, true))?;
+            return Ok(Some(Mode::default()));
+        }
         if state.prefix == "g" {
             state.prefix.clear();
             if matches!(key, 'u' | 'U' | '~') {
@@ -461,6 +498,7 @@ impl ModeMachine {
             '\u{1b}' => { self.last_visual = Some(state.clone()); Ok(Some(Mode::default())) }
             'o' | 'O' => { if key == 'O' && state.kind == VisualKind::Block { state.swap_columns(); } else { state.swap_ends(); } let window = context(editor)?.window; editor.set_window_cursor(window, state.cursor)?; Ok(None) }
             'g' | 'f' | 'F' | 't' | 'T' | 'i' | 'a' => { state.prefix = key.to_string(); Ok(None) }
+            'r' => { state.prefix = "r".into(); Ok(None) }
             'J' => {
                 let range = state.range();
                 let start_lnum = range.start.lnum.min(range.end.lnum);
@@ -472,6 +510,82 @@ impl ModeMachine {
             _ => { let ctx = context(editor)?; if let Some(motion) = resolve(&ctx.lines, ctx.cursor, &key.to_string(), state.count.max(1), option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(state, motion.target, ctx.cursor); } state.count = 0; Ok(None) }
         }
     }
+    fn visual_replace(
+        &mut self,
+        editor: &mut Editor,
+        state: &VisualState,
+        input: ReplaceInput,
+    ) -> Result<(), ModeError> {
+        let ctx = context(editor)?;
+        let range = state.range();
+        let start_lnum = range.start.lnum.min(range.end.lnum);
+        let end_lnum = range.start.lnum.max(range.end.lnum);
+        let cursor_after = range.start;
+        let structural_block = range.kind == MotionKind::BlockWise
+            && matches!(input, ReplaceInput::TypedCr | ReplaceInput::TypedNl);
+        let input = if structural_block {
+            input
+        } else {
+            literal_for_nonblock(input)
+        };
+        let replacement_scalar = scalar_bytes(input);
+        let mut requests = Vec::with_capacity(end_lnum - start_lnum + 1);
+
+        for lnum in start_lnum..=end_lnum {
+            let line = &ctx.lines[lnum - 1];
+            let (start_col, end_col) = match range.kind {
+                MotionKind::BlockWise => (
+                    range.start.col.min(line.len()),
+                    crate::motion::next_char_boundary(line, range.end.col).min(line.len()),
+                ),
+                MotionKind::CharacterWise => (
+                    if lnum == start_lnum { range.start.col } else { 0 },
+                    if lnum == end_lnum {
+                        crate::motion::next_char_boundary(line, range.end.col)
+                    } else {
+                        line.len()
+                    },
+                ),
+                MotionKind::LineWise => (0, line.len()),
+            };
+            if start_col >= end_col {
+                continue;
+            }
+
+            if structural_block {
+                requests.push(BufferTextEditRequest {
+                    start: ExtmarkPosition::new(lnum - 1, start_col),
+                    end: ExtmarkPosition::new(lnum - 1, end_col),
+                    replacement: vec![Vec::new(), Vec::new()],
+                });
+                continue;
+            }
+
+            let scalar_count = scalar_count_in_range(line, start_col, end_col);
+            let mut replacement =
+                Vec::with_capacity(replacement_scalar.len().saturating_mul(scalar_count));
+            for _ in 0..scalar_count {
+                replacement.extend_from_slice(&replacement_scalar);
+            }
+            requests.push(BufferTextEditRequest {
+                start: ExtmarkPosition::new(lnum - 1, start_col),
+                end: ExtmarkPosition::new(lnum - 1, end_col),
+                replacement: vec![replacement],
+            });
+        }
+
+        editor.replace_buffer_texts(
+            ctx.buffer,
+            ctx.window,
+            &requests,
+            ctx.cursor,
+            cursor_after,
+            self.timestamp,
+        )?;
+        editor.set_window_cursor(ctx.window, cursor_after)?;
+        Ok(())
+    }
+
     fn join_lines(
         &mut self,
         editor: &mut Editor,
@@ -610,6 +724,48 @@ impl ModeMachine {
     fn move_find(&mut self, editor: &mut Editor, find: FindMotion, count: usize, _visual: bool) -> Result<bool, ModeError> { let ctx = context(editor)?; let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, count) else { return Ok(false) }; editor.set_window_cursor(ctx.window, motion.target)?; Ok(true) }
     fn repeat_search(&mut self, editor: &mut Editor, opposite: bool, count: usize) -> Result<(), ModeError> { let ctx = context(editor)?; let result = self.search.repeat(&ctx.lines, ctx.cursor, opposite, count, option_bool(editor, "wrapscan", true))?; push_jump(editor, ctx.buffer, ctx.cursor); editor.set_window_cursor(ctx.window, result.target)?; Ok(()) }
     fn advance_insert_cursor(&self, editor: &mut Editor, line_end: bool) -> Result<(), ModeError> { let ctx = context(editor)?; let line = &ctx.lines[ctx.cursor.lnum - 1]; let col = if line_end { line.len() } else { next_boundary(line, ctx.cursor.col) }; editor.set_window_cursor(ctx.window, Position { lnum: ctx.cursor.lnum, col })?; Ok(()) }
+    fn replace_chars(&mut self, editor: &mut Editor, count: usize, input: ReplaceInput) -> Result<(), ModeError> {
+        let ctx = context(editor)?;
+        let line = &ctx.lines[ctx.cursor.lnum - 1];
+        let Some(end_col) = inclusive_scalar_end(line, ctx.cursor.col, count) else {
+            return Ok(());
+        };
+        let (replacement, after) = match input {
+            ReplaceInput::TypedCr | ReplaceInput::TypedNl => {
+                let prefix = line[..ctx.cursor.col.min(line.len())].to_vec();
+                let opts = indent::IndentOptions::capture(editor, ctx.buffer);
+                let indent_bytes = indent::smart_newline_indent(&prefix, false, &opts);
+                let after = Position {
+                    lnum: ctx.cursor.lnum + 1,
+                    col: indent_bytes.len().saturating_sub(1),
+                };
+                (vec![Vec::new(), indent_bytes], after)
+            }
+            _ => {
+                let bytes = scalar_bytes(input);
+                let mut replacement = Vec::with_capacity(bytes.len().saturating_mul(count));
+                for _ in 0..count {
+                    replacement.extend_from_slice(&bytes);
+                }
+                (vec![replacement], ctx.cursor)
+            }
+        };
+        let request = BufferTextEditRequest {
+            start: ExtmarkPosition::new(ctx.cursor.lnum - 1, ctx.cursor.col),
+            end: ExtmarkPosition::new(ctx.cursor.lnum - 1, end_col + 1),
+            replacement,
+        };
+        editor.replace_buffer_text(
+            ctx.buffer,
+            &request,
+            ctx.cursor,
+            after,
+            self.timestamp,
+        )?;
+        editor.set_window_cursor(ctx.window, after)?;
+        Ok(())
+    }
+
     fn open_line(&self, editor: &mut Editor, below: bool, eval: &mut dyn ExprEval) -> Result<(), ModeError> {
         let ctx = context(editor)?;
         let opts = indent::IndentOptions::capture(editor, ctx.buffer);
@@ -857,6 +1013,77 @@ fn next_boundary(line: &[u8], col: usize) -> usize {
     let mut next = col.saturating_add(1).min(line.len());
     while next < line.len() && std::str::from_utf8(line).map_or(false, |text| !text.is_char_boundary(next)) { next += 1; }
     next
+}
+
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplaceInput {
+    Scalar(char),
+    TypedCr,
+    TypedNl,
+    QuotedCr,
+    QuotedNl,
+}
+
+fn classify_replace_key(key: char, quoted: bool) -> ReplaceInput {
+    match (key, quoted) {
+        ('\r', false) => ReplaceInput::TypedCr,
+        ('\n', false) => ReplaceInput::TypedNl,
+        ('\r', true) => ReplaceInput::QuotedCr,
+        ('\n', true) => ReplaceInput::QuotedNl,
+        _ => ReplaceInput::Scalar(key),
+    }
+}
+
+fn scalar_bytes(input: ReplaceInput) -> Vec<u8> {
+    match input {
+        ReplaceInput::Scalar(ch) => {
+            let mut encoded = [0u8; 4];
+            ch.encode_utf8(&mut encoded).as_bytes().to_vec()
+        }
+        ReplaceInput::QuotedCr | ReplaceInput::TypedCr => vec![b'\r'],
+        ReplaceInput::QuotedNl | ReplaceInput::TypedNl => vec![0x00],
+    }
+}
+
+fn literal_for_nonblock(input: ReplaceInput) -> ReplaceInput {
+    match input {
+        ReplaceInput::TypedCr => ReplaceInput::QuotedCr,
+        ReplaceInput::TypedNl => ReplaceInput::QuotedNl,
+        other => other,
+    }
+}
+
+fn inclusive_scalar_end(line: &[u8], start: usize, count: usize) -> Option<usize> {
+    let mut col = start.min(line.len());
+    let mut last = None;
+    for _ in 0..count {
+        if col >= line.len() {
+            return None;
+        }
+        let next = crate::motion::next_char_boundary(line, col);
+        if next <= col {
+            return None;
+        }
+        last = Some(next - 1);
+        col = next;
+    }
+    last
+}
+
+fn scalar_count_in_range(line: &[u8], start: usize, end: usize) -> usize {
+    let mut col = start.min(line.len());
+    let end = end.min(line.len());
+    let mut count = 0;
+    while col < end {
+        let next = crate::motion::next_char_boundary(line, col);
+        if next <= col {
+            break;
+        }
+        count += 1;
+        col = next;
+    }
+    count
 }
 /// `'maxmapdepth'` (`p_mmd`), upstream's default 1000.
 fn max_map_depth(editor: &Editor) -> u64 {

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rmpv::Value;
 
 use super::*;
+use crate::buffer::LineSplice;
 
 fn bytes(lines: &[&str]) -> Vec<Vec<u8>> {
     lines.iter().map(|line| line.as_bytes().to_vec()).collect()
@@ -826,4 +827,87 @@ fn undo_file_entry_fields_reject_negative() {
             "negative {name} was accepted"
         );
     }
+}
+
+#[test]
+fn replace_lines_disjoint_single_tick_and_geometry() {
+    let mut buffer = Buffer::from_bytes(b"a\nb\nc\nd\n").unwrap();
+    let tick = buffer.changedtick();
+    let first = bytes(&["A", "AA"]);
+    let third = bytes(&["C"]);
+    buffer
+        .replace_lines_disjoint(&[
+            LineSplice {
+                start: 1,
+                end: 1,
+                lines: &first,
+            },
+            LineSplice {
+                start: 3,
+                end: 3,
+                lines: &third,
+            },
+        ])
+        .unwrap();
+    assert_eq!(buffer.changedtick(), tick + 1);
+    assert_eq!(buffer.to_bytes(), b"A\nAA\nb\nC\nd\n");
+}
+
+#[test]
+fn replace_lines_disjoint_validates_before_mutating() {
+    let mut buffer = Buffer::from_bytes(b"a\nb\nc\n").unwrap();
+    let tick = buffer.changedtick();
+    let original = buffer.to_bytes();
+    let bad = vec![b"x\ny".to_vec()];
+    assert_eq!(
+        buffer.replace_lines_disjoint(&[LineSplice {
+            start: 1,
+            end: 1,
+            lines: &bad,
+        }]),
+        Err(BufferError::NewlineInLine)
+    );
+    assert_eq!(buffer.to_bytes(), original);
+    assert_eq!(buffer.changedtick(), tick);
+
+    assert!(matches!(
+        buffer.replace_lines_disjoint(&[LineSplice {
+            start: 8,
+            end: 8,
+            lines: &bytes(&["z"]),
+        }]),
+        Err(BufferError::LineRange { .. })
+    ));
+    assert_eq!(buffer.to_bytes(), original);
+    assert_eq!(buffer.changedtick(), tick);
+
+    let one = bytes(&["A"]);
+    let two = bytes(&["B"]);
+    assert_eq!(
+        buffer.replace_lines_disjoint(&[
+            LineSplice {
+                start: 1,
+                end: 2,
+                lines: &one,
+            },
+            LineSplice {
+                start: 2,
+                end: 3,
+                lines: &two,
+            },
+        ]),
+        Err(BufferError::OverlappingSplices)
+    );
+    assert_eq!(buffer.to_bytes(), original);
+    assert_eq!(buffer.changedtick(), tick);
+}
+
+#[test]
+fn replace_lines_disjoint_empty_is_noop() {
+    let mut buffer = Buffer::from_bytes(b"a\nb\n").unwrap();
+    let tick = buffer.changedtick();
+    let original = buffer.to_bytes();
+    buffer.replace_lines_disjoint(&[]).unwrap();
+    assert_eq!(buffer.changedtick(), tick);
+    assert_eq!(buffer.to_bytes(), original);
 }
