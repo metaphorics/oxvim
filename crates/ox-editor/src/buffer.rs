@@ -9,7 +9,10 @@ use thiserror::Error;
 
 use crate::marks::LocalMarks;
 use crate::{Extmarks, Folds};
-use crate::extmark::{ExtmarkError, ExtmarkPosition, ExtmarkSpliceUndo, TextSplice};
+use crate::extmark::{
+    ExtmarkError, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, ExtmarkSpliceUndo, TextSplice,
+};
+use crate::NamespaceId;
 use crate::fold::FoldError;
 
 /// A buffer-local user command retained for later command execution.
@@ -426,6 +429,51 @@ impl BufferState {
         timestamp: i64,
     ) -> Result<u64, BufferStateError> {
         self.replace_lines(start, end, &[], cursor, cursor, timestamp)
+    }
+
+    /// Creates or moves an extmark, binding complete point/range geometry to
+    /// the last recorded splice when `bind_to_open_edit` is set.
+    pub fn set_extmark_recorded(
+        &mut self,
+        namespace: NamespaceId,
+        requested: Option<ExtmarkId>,
+        placement: ExtmarkPlacement,
+        bind_to_open_edit: bool,
+    ) -> Result<ExtmarkId, ExtmarkError> {
+        let previous = requested.and_then(|id| {
+            self.extmarks.get(namespace, id).ok().flatten().map(|mark| {
+                (
+                    mark.position(),
+                    mark.placement.end.map(|end| end.position),
+                    mark.invalid,
+                )
+            })
+        });
+        let after_position = placement.position;
+        let after_end = placement.end.map(|end| end.position);
+        let id = self.extmarks.set(namespace, requested, placement)?;
+        if bind_to_open_edit {
+            self.retarget_recorded_set(namespace, id, after_position, after_end, previous);
+        }
+        Ok(id)
+    }
+
+    fn retarget_recorded_set(
+        &mut self,
+        namespace: NamespaceId,
+        id: ExtmarkId,
+        after_position: ExtmarkPosition,
+        after_end: Option<ExtmarkPosition>,
+        previous: Option<(ExtmarkPosition, Option<ExtmarkPosition>, bool)>,
+    ) {
+        let seq = self.undo.current_seq();
+        let Some(undos) = self.extmark_undo.get_mut(&seq) else {
+            return;
+        };
+        let Some(last) = undos.last_mut() else {
+            return;
+        };
+        last.retarget_set(namespace, id, after_position, after_end, false, previous);
     }
 
     /// Replaces one validated byte range using nvim_buf_set_text semantics.
@@ -1005,5 +1053,113 @@ mod tests {
             ))
         ));
         assert_eq!(snapshot(&editor, buffer), before);
+    }
+
+    fn cursor(lnum: usize, col: usize) -> Position {
+        Position { lnum, col }
+    }
+
+    fn range_tuple(
+        state: &BufferState,
+        namespace: crate::NamespaceId,
+        id: crate::ExtmarkId,
+    ) -> (usize, usize, Option<(usize, usize)>, bool) {
+        let mark = state.extmarks.get(namespace, id).unwrap().unwrap();
+        (
+            mark.position().row,
+            mark.position().column,
+            mark.placement.end.map(|end| (end.position.row, end.position.column)),
+            mark.invalid,
+        )
+    }
+
+    #[test]
+    fn undo_redo_extmark_created_during_edit_restores_range() {
+        let mut state = BufferState::new(Buffer::from_bytes(b"").unwrap(), true);
+        state
+            .replace_buffer_text(
+                &BufferTextEditRequest {
+                    start: ExtmarkPosition::new(0, 0),
+                    end: ExtmarkPosition::new(0, 0),
+                    replacement: vec![b"foobar".to_vec()],
+                },
+                cursor(1, 0),
+                cursor(1, 6),
+                1,
+            )
+            .unwrap();
+        let namespace = state.extmarks.create_namespace("during-edit").unwrap();
+        let id = crate::ExtmarkId::new(1).unwrap();
+        let mut invalidate = crate::ExtmarkPlacement::new(ExtmarkPosition::new(0, 3))
+            .with_end(ExtmarkPosition::new(0, 6));
+        invalidate.attributes.invalidate = true;
+        state
+            .set_extmark_recorded(
+                namespace,
+                Some(id),
+                crate::ExtmarkPlacement::new(ExtmarkPosition::new(0, 3))
+                    .with_end(ExtmarkPosition::new(0, 6)),
+                true,
+            )
+            .unwrap();
+        let invalidated = crate::ExtmarkId::new(2).unwrap();
+        state
+            .set_extmark_recorded(namespace, Some(invalidated), invalidate, true)
+            .unwrap();
+        state.sync_undo();
+        assert_eq!(range_tuple(&state, namespace, id), (0, 3, Some((0, 6)), false));
+        state.undo().unwrap();
+        assert_eq!(range_tuple(&state, namespace, id), (0, 0, Some((0, 0)), false));
+        assert_eq!(
+            range_tuple(&state, namespace, invalidated),
+            (0, 0, Some((0, 0)), true)
+        );
+        state.redo().unwrap();
+        assert_eq!(range_tuple(&state, namespace, id), (0, 3, Some((0, 6)), false));
+        assert_eq!(
+            range_tuple(&state, namespace, invalidated),
+            (0, 3, Some((0, 6)), false)
+        );
+    }
+
+    #[test]
+    fn undo_redo_extmark_moved_during_edit_restores_explicit_point() {
+        let mut state = BufferState::new(Buffer::from_bytes(b"abcdef").unwrap(), true);
+        let namespace = state.extmarks.create_namespace("during-edit-move").unwrap();
+        let id = crate::ExtmarkId::new(1).unwrap();
+        state
+            .set_extmark_recorded(
+                namespace,
+                Some(id),
+                crate::ExtmarkPlacement::new(ExtmarkPosition::new(0, 4)),
+                false,
+            )
+            .unwrap();
+        state
+            .replace_buffer_text(
+                &BufferTextEditRequest {
+                    start: ExtmarkPosition::new(0, 0),
+                    end: ExtmarkPosition::new(0, 0),
+                    replacement: vec![b"!!".to_vec()],
+                },
+                cursor(1, 0),
+                cursor(1, 2),
+                1,
+            )
+            .unwrap();
+        state
+            .set_extmark_recorded(
+                namespace,
+                Some(id),
+                crate::ExtmarkPlacement::new(ExtmarkPosition::new(0, 1)),
+                true,
+            )
+            .unwrap();
+        state.sync_undo();
+        assert_eq!(range_tuple(&state, namespace, id), (0, 1, None, false));
+        state.undo().unwrap();
+        assert_eq!(range_tuple(&state, namespace, id), (0, 4, None, false));
+        state.redo().unwrap();
+        assert_eq!(range_tuple(&state, namespace, id), (0, 1, None, false));
     }
 }

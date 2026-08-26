@@ -312,6 +312,46 @@ pub(crate) struct ExtmarkSpliceUndo {
     entries: Vec<SpliceUndoEntry>,
 }
 
+impl ExtmarkSpliceUndo {
+    /// Binds an explicit create/move to this recorded splice so redo restores
+    /// the set-time point or range instead of the splice-adjusted result.
+    pub(crate) fn retarget_set(
+        &mut self,
+        namespace: NamespaceId,
+        id: ExtmarkId,
+        after_position: ExtmarkPosition,
+        after_end: Option<ExtmarkPosition>,
+        after_invalid: bool,
+        previous: Option<(ExtmarkPosition, Option<ExtmarkPosition>, bool)>,
+    ) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.namespace == namespace && entry.id == id)
+        {
+            entry.after_position = after_position;
+            entry.after_end = after_end;
+            entry.after_invalid = after_invalid;
+            return;
+        }
+        let (position, end, invalid, restore_before) = match previous {
+            Some((position, end, invalid)) => (position, end, invalid, true),
+            None => (after_position, after_end, after_invalid, false),
+        };
+        self.entries.push(SpliceUndoEntry {
+            namespace,
+            id,
+            position,
+            end,
+            invalid,
+            after_position,
+            after_end,
+            after_invalid,
+            restore_before,
+        });
+    }
+}
+
 /// An invalid namespace, id, range, or splice operation.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum ExtmarkError {
@@ -752,11 +792,7 @@ impl Extmarks {
             }
             if let Some(state) = self.namespaces.get_mut(&entry.namespace) {
                 if let Some(mark) = state.by_id.get_mut(&entry.id) {
-                    mark.placement.position = entry.position;
-                    if let (Some(end), Some(position)) = (&mut mark.placement.end, entry.end) {
-                        end.position = position;
-                    }
-                    mark.invalid = entry.invalid;
+                    apply_recorded_geometry(mark, entry.position, entry.end, entry.invalid);
                 }
             }
         }
@@ -789,11 +825,12 @@ impl Extmarks {
             }
             if let Some(state) = self.namespaces.get_mut(&entry.namespace) {
                 if let Some(mark) = state.by_id.get_mut(&entry.id) {
-                    mark.placement.position = entry.after_position;
-                    if let (Some(end), Some(position)) = (&mut mark.placement.end, entry.after_end) {
-                        end.position = position;
-                    }
-                    mark.invalid = entry.after_invalid;
+                    apply_recorded_geometry(
+                        mark,
+                        entry.after_position,
+                        entry.after_end,
+                        entry.after_invalid,
+                    );
                 }
             }
         }
@@ -816,6 +853,22 @@ impl Extmarks {
             .get_mut(&namespace)
             .ok_or(ExtmarkError::UnknownNamespace(namespace.get()))
     }
+}
+
+fn apply_recorded_geometry(
+    mark: &mut Extmark,
+    position: ExtmarkPosition,
+    end: Option<ExtmarkPosition>,
+    invalid: bool,
+) {
+    mark.placement.position = position;
+    match (mark.placement.end.as_mut(), end) {
+        (Some(existing), Some(position)) => existing.position = position,
+        (None, Some(position)) => mark.placement.end = Some(ExtmarkEnd::new(position)),
+        (Some(_), None) => mark.placement.end = None,
+        (None, None) => {}
+    }
+    mark.invalid = invalid;
 }
 
 fn validate_placement(placement: &ExtmarkPlacement) -> Result<(), ExtmarkError> {
