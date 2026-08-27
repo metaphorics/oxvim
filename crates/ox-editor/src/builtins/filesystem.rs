@@ -40,7 +40,24 @@ pub(crate) fn call<F: FileIO>(
             &mut deferred,
         );
         if let Some(path) = deferred {
-            host.runtime.push_deferred_delete(path);
+            host.runtime.push_deferred_delete(path, crate::fs_builtins::DeleteMode::File);
+        }
+        return result;
+    }
+    if name == "mkdir" {
+        // The `D`/`R` flags are `add_defer("delete", dir, 'd'/'rf')` against
+        // the enclosing function frame, so `mkdir` needs the runtime like
+        // `writefile` does.
+        crate::fs_builtins::check_arity("mkdir", args.len())?;
+        let mut deferred = None;
+        let result = crate::fs_builtins::mkdir(
+            host.runtime.scripts.io(),
+            &args,
+            host.runtime.can_add_defer(),
+            &mut deferred,
+        );
+        if let Some((path, mode)) = deferred {
+            host.runtime.push_deferred_delete(path, mode);
         }
         return result;
     }

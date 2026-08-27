@@ -351,7 +351,7 @@ pub(crate) struct ExRuntime<F: FileIO> {
     /// narrowed to the only deferred call this port can produce. An empty stack
     /// is `get_current_funccal() == NULL`, which is what `can_add_defer`
     /// (3457-3464) reports as `E193`.
-    pub(crate) deferred_deletes: Vec<Vec<PathBuf>>,
+    pub(crate) deferred_deletes: Vec<Vec<(PathBuf, crate::fs_builtins::DeleteMode)>>,
 }
 
 impl<F: FileIO> ExRuntime<F> {
@@ -382,9 +382,10 @@ impl<F: FileIO> ExRuntime<F> {
     }
 
     /// `add_defer` for the `delete` this port can produce.
-    pub(crate) fn push_deferred_delete(&mut self, path: PathBuf) {
+    /// `add_defer("delete", ...)` for the deletes this port can register.
+    pub(crate) fn push_deferred_delete(&mut self, path: PathBuf, mode: crate::fs_builtins::DeleteMode) {
         if let Some(frame) = self.deferred_deletes.last_mut() {
-            frame.push(path);
+            frame.push((path, mode));
         }
     }
 
@@ -395,10 +396,10 @@ impl<F: FileIO> ExRuntime<F> {
     /// around it, so an aborted function still gets its files removed.
     pub(crate) fn run_deferred_deletes(&mut self) {
         let Some(frame) = self.deferred_deletes.pop() else { return };
-        for path in frame.into_iter().rev() {
-            // `delete(name)` reports failure through its return value, which
-            // `add_defer`'s deferred call discards.
-            let _ignored = self.scripts.io().remove_file(&path);
+        for (path, mode) in frame.into_iter().rev() {
+            // `delete(name, flags)` reports failure through its return value,
+            // which `add_defer`'s deferred call discards.
+            let _ignored = mode.remove(self.scripts.io(), &path);
         }
     }
 
@@ -1340,6 +1341,7 @@ fn dispatch<F: FileIO>(
             Err(flow) => flow,
         },
         "call" => command_call(runtime, editor, scope, lua, command),
+        "defer" => command_defer(runtime, editor, scope, lua, command),
         "return" => {
             if skipwhite_trim(&command.args).is_empty() {
                 Flow::Return(Typval::Number(0))
@@ -2501,6 +2503,50 @@ fn capture_command_messages<F: FileIO>(
     Ok(())
 }
 
+fn command_defer<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    _editor: &mut Editor,
+    scope: &mut Scope,
+    _lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    command: &ExCommand,
+) -> Flow {
+    if !runtime.can_add_defer() {
+        return error_flow(runtime, "E193", "defer not inside a function");
+    }
+    let text = command.args.trim();
+    let Some(arguments) = text
+        .strip_prefix("delete(")
+        .and_then(|arguments| arguments.strip_suffix(')'))
+    else {
+        return Flow::NotImplemented(format!("defer {text}"));
+    };
+    let parts = split_comma_args(arguments);
+    if let Err(error) = crate::fs_builtins::check_arity("delete", parts.len()) {
+        return error_flow(runtime, error.code, error.message);
+    }
+    let mut parts = parts.into_iter();
+    let path = match eval_text(runtime, _editor, scope, _lua, parts.next().unwrap_or("")) {
+        Ok(value) => PathBuf::from(typval_to_text(&value)),
+        Err(flow) => return flow,
+    };
+    let flags = match parts.next() {
+        Some(expression) => match eval_text(runtime, _editor, scope, _lua, expression) {
+            Ok(value) => typval_to_text(&value),
+            Err(flow) => return flow,
+        },
+        None => String::new(),
+    };
+    // Upstream `add_defer` stores the raw call and evaluates it (including
+    // flag validation) at deferred execution time.  This port validates the
+    // `delete()` flags here at registration, which changes the abort
+    // semantics for invalid flags; the `E193` message has no leading colon.
+    let mode = match crate::fs_builtins::DeleteMode::parse(&flags) {
+        Ok(mode) => mode,
+        Err(error) => return error_flow(runtime, error.code, error.message),
+    };
+    runtime.push_deferred_delete(path, mode);
+    Flow::Normal
+}
 fn command_call<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,

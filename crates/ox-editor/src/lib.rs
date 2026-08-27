@@ -95,6 +95,9 @@ pub use typeahead::{
 };
 
 #[cfg(test)]
+pub(crate) static PROCESS_STATE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod excmd_exec_control_tests;
 #[cfg(test)]
 mod excmd_exec_editor_tests;

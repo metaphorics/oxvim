@@ -83,6 +83,17 @@ impl FileIO for MemoryFileIO {
     fn canonicalize(&self, path: &Path) -> PathBuf {
         path.to_path_buf()
     }
+
+    fn copy_file(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let content = self
+            .files
+            .borrow()
+            .get(from)
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("not found: {}", from.display())))?;
+        self.files.borrow_mut().insert(to.to_path_buf(), content);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

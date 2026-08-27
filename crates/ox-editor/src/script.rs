@@ -86,6 +86,27 @@ pub trait FileIO {
     fn read_bytes(&self, path: &Path) -> io::Result<Vec<u8>> {
         self.read_to_string(path).map(String::into_bytes)
     }
+    /// Reads a range of bytes from a file.  A negative `offset` counts from
+    /// the end, `size == -1` reads through end of file, and any other
+    /// non-positive `size` yields an empty buffer.
+    fn read_bytes_range(&self, path: &Path, offset: i64, size: i64) -> io::Result<Vec<u8>> {
+        let bytes = self.read_bytes(path)?;
+        let len = bytes.len() as i64;
+        let start = if offset >= 0 {
+            (offset as usize).min(bytes.len())
+        } else {
+            ((len + offset).max(0)) as usize
+        };
+        if size <= 0 && size != -1 {
+            return Ok(Vec::new());
+        }
+        let end = if size == -1 {
+            bytes.len()
+        } else {
+            (start + size as usize).min(bytes.len())
+        };
+        Ok(bytes[start..end].to_vec())
+    }
     /// Writes a complete file.
     fn write_string(&self, path: &Path, contents: &str) -> io::Result<()>;
     /// Writes bytes, optionally appending to an existing file.
@@ -127,6 +148,12 @@ pub trait FileIO {
     fn rename(&self, _from: &Path, _to: &Path) -> io::Result<()> {
         Err(unsupported("rename is not supported by this FileIO"))
     }
+    /// Copies one regular file or symbolic link without following the link.
+    /// The destination is created with the source's permission bits.  A
+    /// symlink is recreated at the destination rather than copied through.
+    fn copy_file(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+        Err(unsupported("file copy is not supported by this FileIO"))
+    }
     /// Canonical form used for the source-once registry. Implementations may
     /// fall back to the input path when canonicalization fails.
     fn canonicalize(&self, path: &Path) -> PathBuf;
@@ -148,6 +175,62 @@ impl FileIO for RealFileIO {
 
     fn read_bytes(&self, path: &Path) -> io::Result<Vec<u8>> {
         fs::read(path)
+    }
+    fn read_bytes_range(&self, path: &Path, offset: i64, size: i64) -> io::Result<Vec<u8>> {
+        use std::io::{Read, Seek};
+        #[cfg(unix)]
+        use std::os::unix::fs::FileTypeExt as _;
+        let mut file = fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        let len = metadata.len() as i64;
+
+        #[cfg(unix)]
+        let is_special = metadata.file_type().is_char_device() || metadata.file_type().is_block_device();
+        #[cfg(not(unix))]
+        let is_special = false;
+
+        // Negative offsets count from the end; for regular files clamp to the start.
+        let offset = if offset < 0 && !is_special {
+            offset.max(-len)
+        } else {
+            offset
+        };
+
+        let pos = if offset != 0 {
+            let whence = if offset >= 0 {
+                std::io::SeekFrom::Start(offset as u64)
+            } else {
+                std::io::SeekFrom::End(offset)
+            };
+            match file.seek(whence) {
+                Ok(p) => p as i64,
+                Err(_) => return Ok(Vec::new()),
+            }
+        } else {
+            0
+        };
+
+        let remaining = if is_special {
+            if size == -1 { 0 } else { size }
+        } else {
+            let remaining = (len - pos).max(0);
+            if size == -1 { remaining } else { size.min(remaining) }
+        };
+
+        if remaining <= 0 {
+            return Ok(Vec::new());
+        }
+
+        let count = remaining as usize;
+        if is_special {
+            let mut buf = vec![0; count];
+            file.read_exact(&mut buf)?;
+            Ok(buf)
+        } else {
+            let mut buf = Vec::with_capacity(count);
+            file.take(count as u64).read_to_end(&mut buf)?;
+            Ok(buf)
+        }
     }
 
     fn write_string(&self, path: &Path, contents: &str) -> io::Result<()> {
@@ -210,6 +293,34 @@ impl FileIO for RealFileIO {
     fn remove_dir(&self, path: &Path) -> io::Result<()> { fs::remove_dir(path) }
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> { fs::remove_dir_all(path) }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> { fs::rename(from, to) }
+    fn copy_file(&self, from: &Path, to: &Path) -> io::Result<()> {
+        // Recreate symbolic links rather than copying their target, matching
+        // `vim_copyfile`'s `readlink` + `symlink` path (fileio.c:2774-2788).
+        if let Ok(target) = fs::read_link(from) {
+            #[cfg(unix)]
+            { return std::os::unix::fs::symlink(&target, to); }
+            #[cfg(not(unix))]
+            { let _ = target; }
+        }
+        let mut source = fs::File::open(from)?;
+        let metadata = source.metadata()?;
+        let mut dest = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(to)?;
+        std::io::copy(&mut source, &mut dest)?;
+        drop(dest);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(to, fs::Permissions::from_mode(metadata.permissions().mode()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &metadata;
+        }
+        Ok(())
+    }
 
     fn canonicalize(&self, path: &Path) -> PathBuf {
         fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
