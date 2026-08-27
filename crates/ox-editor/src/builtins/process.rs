@@ -47,10 +47,19 @@ pub(crate) fn call<F: FileIO>(
         "chansend" | "jobsend" => {
             let id = job_id(args.first())?;
             let data = channel_bytes(args.get(1))?;
-            let Some(manager) = runtime.jobs.as_mut() else { return Ok(Typval::Number(0)); };
-            manager.send(id, data)
-                .map(|sent| Typval::Number(i64::from(sent)))
-                .map_err(|message| EvalError::new("E900", 0, message))
+            let Some(mut manager) = runtime.jobs.take() else { return Ok(Typval::Number(0)); };
+            let sent = manager.send(id, data).map_err(|message| EvalError::new("E900", 0, message))?;
+            if editor.terminal_channel(id).is_some() {
+                let events = manager.poll().map_err(|message| EvalError::new("E900", 0, message))?;
+                runtime.jobs = Some(manager);
+                invoke_job_events(runtime, editor, scope, lua, events)?;
+                if let Some(bytes) = runtime.jobs.as_mut().unwrap().take_pty_output(id) {
+                    editor.append_terminal_buffer(id, &bytes).ok();
+                }
+            } else {
+                runtime.jobs = Some(manager);
+            }
+            Ok(Typval::Number(i64::from(sent)))
         }
         "jobwait" => {
             let ids = job_ids(args.first())?;
@@ -62,6 +71,13 @@ pub(crate) fn call<F: FileIO>(
                 return Ok(Typval::list(ids.iter().map(|_| Typval::Number(-3)).collect()));
             };
             let waited = manager.wait(&ids, timeout);
+            for &id in &ids {
+                if editor.terminal_channel(id).is_some() {
+                    if let Some(bytes) = manager.take_pty_output(id) {
+                        editor.append_terminal_buffer(id, &bytes).ok();
+                    }
+                }
+            }
             runtime.jobs = Some(manager);
             let (statuses, events) = waited.map_err(|message| EvalError::new("E900", 0, message))?;
             invoke_job_events(runtime, editor, scope, lua, events)?;
@@ -70,7 +86,7 @@ pub(crate) fn call<F: FileIO>(
         "jobstart" | "system" | "systemlist" => {
             let shell = shell_argv(editor);
             match name {
-                "jobstart" => call_job_start(runtime, &shell, args),
+                "jobstart" => call_job_start(runtime, editor, &shell, args),
                 "system" => call_system_builtin(runtime, &shell, args, scope),
                 _ => call_systemlist_builtin(runtime, &shell, args, scope),
             }
@@ -110,11 +126,13 @@ fn split_shell_words(text: &str) -> Vec<String> {
 
 fn call_job_start<F: FileIO>(
     runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
     shell: &[String],
     args: Vec<Typval>,
 ) -> ox_eval::Result<Typval> {
     let options = normalize_job_options(shell, &args)?;
     let id = runtime.channel_ids.allocate();
+    let wants_pty = options.pty;
     let mut manager = match runtime.jobs.take() {
         Some(manager) => manager,
         None => match JobManager::new() {
@@ -123,6 +141,16 @@ fn call_job_start<F: FileIO>(
         },
     };
     let started = manager.start(id, options);
+    if let Ok(_pid) = started {
+        if wants_pty {
+            if let Ok(buffer) = editor.allocate_terminal_buffer(id) {
+                if let Some(pty) = manager.pty_slave(id).map(str::to_owned) {
+                    editor.set_terminal_channel_pty(id, Some(pty));
+                }
+                manager.set_terminal_buffer(id, buffer);
+            }
+        }
+    }
     runtime.jobs = Some(manager);
     Ok(Typval::Number(if started.is_ok() { id as i64 } else { -1 }))
 }
@@ -162,6 +190,7 @@ fn run_shell_command<F: FileIO>(
         stdin_pipe: true,
         stdout_buffered: true,
         stderr_buffered: true,
+        terminal_buffer: None,
         callbacks: JobCallbacks { options, stdout: None, stderr: None, exit: None },
     };
     let Some(mut manager) = runtime.jobs.take().or_else(|| JobManager::new().ok()) else {
@@ -271,6 +300,7 @@ fn normalize_job_options(shell: &[String], args: &[Typval]) -> ox_eval::Result<J
         stdin_pipe,
         stdout_buffered: get("stdout_buffered").is_some_and(|value| value_bool(&value)),
         stderr_buffered: get("stderr_buffered").is_some_and(|value| value_bool(&value)),
+        terminal_buffer: None,
         callbacks,
     })
 }
@@ -391,4 +421,64 @@ fn value_number(value: &Typval) -> Option<i64> {
 
 fn value_bool(value: &Typval) -> bool {
     value_number(value).is_some_and(|value| value != 0)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::{Editor, ExExecutor};
+    use ox_eval::Scope;
+    use ox_types::{OxStr, Typval};
+
+    fn global(scope: &Scope, name: &str) -> Option<Typval> {
+        scope.global.iter().find(|(key, _)| key.to_string_lossy() == name).map(|(_, value)| value.clone())
+    }
+
+    fn global_number(scope: &Scope, name: &str) -> Option<i64> {
+        match global(scope, name)? {
+            Typval::Number(value) => Some(value),
+            Typval::Bool(value) => Some(i64::from(value)),
+            _ => None,
+        }
+    }
+
+    fn global_flag(scope: &Scope, name: &str) -> bool {
+        global_number(scope, name) == Some(1)
+    }
+
+    #[test]
+    fn chansend_to_pty_delivers_stdout_and_exit_events_without_dropping() {
+        let mut editor = Editor::new();
+        let mut exec = ExExecutor::new();
+        let source = r#"
+            let s:logger = {'events': []}
+            function! s:logger.on_stdout(id, data, event)
+                let g:stdout_seen = 1
+                call add(self.events, a:data)
+            endfunction
+            function! s:logger.on_exit(id, status, event)
+                let g:exit_seen = 1
+            endfunction
+            let g:job = jobstart(['sh', '-c', 'cat'], s:logger)
+            for i in range(30)
+                call chansend(g:job, "hello\n")
+                if exists('g:stdout_seen')
+                    break
+                endif
+                sleep 20m
+            endfor
+            call jobstop(g:job)
+            for i in range(30)
+                call chansend(g:job, "x")
+                if exists('g:exit_seen')
+                    break
+                endif
+                sleep 20m
+            endfor
+            call jobwait([g:job], 2000)
+        "#;
+        exec.execute_script(&mut editor, "<test>", source).unwrap();
+        assert!(global_flag(exec.scope(), "stdout_seen"), "chansend poll must deliver on_stdout event");
+        assert!(global_flag(exec.scope(), "exit_seen"), "chansend poll must deliver on_exit event");
+    }
 }

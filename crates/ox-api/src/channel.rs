@@ -22,11 +22,22 @@ fn channel_dict(info: &ChannelInfo) -> Dict {
 #[api(since = 4)]
 pub fn nvim_chan_send(editor: &mut Editor, chan: i64, data: OxStr) -> Result<(), ApiError> {
     let channel = u64::try_from(chan).map_err(|_| ApiError::validation("Invalid channel id"))?;
-    with_state_mut(editor, |state| {
-        if !state.channels.contains_key(&channel) { return Err(ApiError::validation(format!("Invalid channel: {chan}"))); }
-        state.channel_sink.as_mut().ok_or_else(|| ApiError::exception("channel has no writable sink"))?
-            .send(channel, data.as_bytes()).map_err(ApiError::exception)
-    })
+    let output = with_state_mut(editor, |state| {
+        if state.channels.contains_key(&channel) {
+            let sink = state.channel_sink.as_mut()
+                .ok_or_else(|| ApiError::exception("channel has no writable sink"))?;
+            sink.send(channel, data.as_bytes()).map_err(ApiError::exception)?;
+            return sink.take_pty_output(channel).map_err(ApiError::exception);
+        }
+        if editor.terminal_channel(channel).is_some() {
+            let sink = state.job_sink.as_mut()
+                .ok_or_else(|| ApiError::exception("channel has no writable sink"))?;
+            sink.send(channel, data.as_bytes()).map_err(ApiError::exception)?;
+            return sink.take_pty_output(channel).map_err(ApiError::exception);
+        }
+        Err(ApiError::validation(format!("Invalid channel: {chan}")))
+    })?;
+    editor.append_terminal_buffer(channel, &output).map_err(|error| ApiError::exception(error.to_string()))
 }
 
 #[api(since = 1, deprecated_since = 13)]
@@ -51,7 +62,22 @@ pub fn nvim_list_chans(editor: &mut Editor) -> Result<Vec<Dict>, ApiError> {
 #[api(since = 4)]
 pub fn nvim_get_chan_info(editor: &mut Editor, chan: i64) -> Result<Dict, ApiError> {
     let channel = u64::try_from(chan).map_err(|_| ApiError::validation("Invalid channel id"))?;
-    Ok(with_state(editor, |state| state.channels.get(&channel).map(channel_dict).unwrap_or_else(|| Dict(Vec::new()))))
+    Ok(with_state(editor, |state| {
+        if let Some(info) = state.channels.get(&channel) {
+            return channel_dict(info);
+        }
+        if let Some(term) = editor.terminal_channel(channel) {
+            let mut values = vec![
+                (OxStr::from("id"), Object::Integer(i64::try_from(channel).unwrap_or(i64::MAX))),
+                (OxStr::from("stream"), Object::String(OxStr::from("job"))),
+                (OxStr::from("mode"), Object::String(OxStr::from("terminal"))),
+            ];
+            if let Some(pty) = &term.pty { values.push((OxStr::from("pty"), Object::String(OxStr::from(pty.as_str())))); }
+            values.push((OxStr::from("buffer"), Object::Integer(i64::from(term.buffer))));
+            return Dict(values);
+        }
+        Dict(Vec::new())
+    }))
 }
 
 fn utf8(value: &OxStr, field: &str) -> Result<String, ApiError> {
@@ -116,4 +142,25 @@ pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(nvim_list_runtime_paths__API_META(), nvim_list_runtime_paths__API_DISPATCH)?;
     registry.register(nvim_get_runtime_file__API_META(), nvim_get_runtime_file__API_DISPATCH)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ox_editor::Editor;
+
+    #[test]
+    fn nvim_get_chan_info_reports_job_stream_for_terminal_channel() {
+        let mut editor = Editor::new();
+        editor.allocate_terminal_buffer(7).unwrap();
+        let info = nvim_get_chan_info(&mut editor, 7).unwrap();
+        let Object::String(stream) = info.0.iter().find(|(k, _)| k.to_string_lossy() == "stream").map(|(_, v)| v).unwrap() else {
+            panic!("stream must be a String");
+        };
+        assert_eq!(stream.to_string_lossy(), "job");
+        let Object::String(mode) = info.0.iter().find(|(k, _)| k.to_string_lossy() == "mode").map(|(_, v)| v).unwrap() else {
+            panic!("mode must be a String");
+        };
+        assert_eq!(mode.to_string_lossy(), "terminal");
+    }
 }

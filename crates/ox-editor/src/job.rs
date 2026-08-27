@@ -47,6 +47,8 @@ pub struct JobStartOptions {
     pub stdout_buffered: bool,
     /// Whether stderr is delivered once at EOF.
     pub stderr_buffered: bool,
+    /// Editor buffer that receives PTY output as live text, when allocated.
+    pub terminal_buffer: Option<ox_types::BufHandle>,
     /// Deferred callbacks and their receiver.
     pub callbacks: JobCallbacks,
 }
@@ -102,9 +104,31 @@ struct Job {
     stderr: StreamState,
     status: i64,
     rpc: bool,
+    /// PTY slave path the child is attached to, when spawned through a
+    /// pseudoterminal. Mirrors upstream's `channel.pty` string populated for
+    /// `jobstart(..., {'pty': v:true})` (`eval/funcs.c` `f_jobstart` →
+    /// `os/shell.c` `terminal_running`) so `nvim_get_chan_info` can answer the
+    /// `pty` field word-for-word.
+    pty_slave: Option<String>,
+    /// Buffer that receives PTY output, when one was allocated.
+    terminal_buffer: Option<ox_types::BufHandle>,
+    /// Raw PTY output accumulated for the terminal buffer.
+    pty_output: Vec<u8>,
     /// `jobstart({'detach': v:true})`: upstream leaves a detached child running
     /// past editor exit and terminates every other one (`channel_close_on_exit`).
     detached: bool,
+}
+/// Resolve the PTY slave path behind a child that was spawned through one.
+///
+/// `portable_pty` does not expose the slave path taken by the child, but on
+/// Linux the child ends up with the slave on one of standard input, output,
+/// or error; reading `/proc/<pid>/fd/0`'s link target is the cheapest stable
+/// lookup and mirrors what `ps`/`lsof` prints.
+#[cfg(unix)]
+fn pty_slave_path(pid: u32) -> Option<String> {
+    let link = std::fs::read_link(format!("/proc/{pid}/fd/0")).ok()?;
+    let text = link.to_string_lossy().into_owned();
+    if text.starts_with("/dev/pts/") { Some(text) } else { None }
 }
 
 /// Owns job channels and the `ox-uv` loop which drives their process handles.
@@ -112,13 +136,22 @@ pub struct JobManager {
     loop_: UvLoop,
     jobs: HashMap<u64, Job>,
     raw: Arc<Mutex<VecDeque<RawEvent>>>,
+    /// Events polled on a path with no callback host; the next poll re-enters
+    /// them (`channel.c` defers callbacks onto the main loop instead of
+    /// dropping them, which is what `let _ = poll()` did).
+    deferred: Vec<JobEvent>,
 }
 
 impl JobManager {
     /// Create an isolated reactor-backed job table.
     pub fn new() -> Result<Self, String> {
         let loop_ = UvLoop::new().map_err(|error| error.to_string())?;
-        Ok(Self { loop_, jobs: HashMap::new(), raw: Arc::new(Mutex::new(VecDeque::new())) })
+        Ok(Self {
+            loop_,
+            jobs: HashMap::new(),
+            raw: Arc::new(Mutex::new(VecDeque::new())),
+            deferred: Vec::new(),
+        })
     }
 
     /// Spawn a process and register it under the already-allocated channel id.
@@ -190,6 +223,10 @@ impl JobManager {
         };
 
         let pid = process.pid();
+        #[cfg(unix)]
+        let pty_slave = if options.pty { pty_slave_path(pid) } else { None };
+        #[cfg(not(unix))]
+        let pty_slave = None;
         self.jobs.insert(id, Job {
             process,
             input,
@@ -200,15 +237,27 @@ impl JobManager {
             stderr: StreamState { buffered: options.stderr_buffered, ..StreamState::default() },
             status: -1,
             rpc: options.rpc,
+            pty_slave,
+            terminal_buffer: options.terminal_buffer,
+            pty_output: Vec::new(),
             detached: options.detached,
         });
         Ok(pid)
     }
 
-    /// Run one non-blocking reactor turn and return callback work queued by it.
+    /// Run one non-blocking reactor turn and return callback work queued by
+    /// it, ahead of any events deferred by a poll that could not deliver them.
     pub fn poll(&mut self) -> Result<Vec<JobEvent>, String> {
         self.loop_.run_nowait().map_err(|error| error.to_string())?;
-        Ok(self.drain_raw())
+        let mut events = std::mem::take(&mut self.deferred);
+        events.extend(self.drain_raw());
+        Ok(events)
+    }
+
+    /// Stash events a caller polled but could not invoke; the next poll
+    /// surfaces them first so callbacks are never silently discarded.
+    pub fn defer_events(&mut self, events: Vec<JobEvent>) {
+        self.deferred.extend(events);
     }
 
     /// Wait for the selected jobs, sharing one deadline across the list.
@@ -310,6 +359,36 @@ impl JobManager {
     /// Report whether a registered job channel carries msgpack-rpc.
     pub fn is_rpc(&self, id: u64) -> bool { self.jobs.get(&id).is_some_and(|job| job.rpc) }
 
+    /// PTY slave path behind a job channel that was spawned through one.
+    #[must_use]
+    pub fn pty_slave(&self, id: u64) -> Option<&str> {
+        self.jobs.get(&id).and_then(|job| job.pty_slave.as_deref())
+    }
+
+    /// Bind the editor-owned terminal buffer to an already-started PTY job.
+    pub fn set_terminal_buffer(&mut self, id: u64, buffer: ox_types::BufHandle) {
+        if let Some(job) = self.jobs.get_mut(&id) {
+            job.terminal_buffer = Some(buffer);
+        }
+    }
+
+    /// Take accumulated PTY output for the terminal buffer.
+    pub fn take_pty_output(&mut self, id: u64) -> Option<Vec<u8>> {
+        let job = self.jobs.get_mut(&id)?;
+        if job.pty_output.is_empty() { return None; }
+        Some(std::mem::take(&mut job.pty_output))
+    }
+
+    /// Poll once and write any PTY output to the editor-owned terminal buffer.
+    pub fn flush_pty_to_editor(&mut self, id: u64, editor: &mut crate::Editor) -> Result<(), String> {
+        let events = self.poll()?;
+        self.defer_events(events);
+        if let Some(bytes) = self.take_pty_output(id) {
+            editor.append_terminal_buffer(id, &bytes).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     fn drain_raw(&mut self) -> Vec<JobEvent> {
         let raw = {
             let mut queue = lock_queue(&self.raw);
@@ -320,6 +399,10 @@ impl JobManager {
             match event {
                 RawEvent::Data(id, stream, bytes) => {
                     let Some(job) = self.jobs.get_mut(&id) else { continue; };
+                    // PTY output accumulates for the terminal buffer.
+                    if job.terminal_buffer.is_some() && matches!(stream, StreamKind::Stdout) {
+                        job.pty_output.extend_from_slice(&bytes);
+                    }
                     let (state, callback, name) = stream_parts(job, stream);
                     if state.buffered {
                         state.bytes.extend_from_slice(&bytes);
@@ -441,6 +524,7 @@ mod tests {
             stdin_pipe: true,
             stdout_buffered: buffered,
             stderr_buffered: buffered,
+            terminal_buffer: None,
             callbacks: JobCallbacks {
                 options: reference,
                 stdout: Some(callback.clone()),
@@ -590,5 +674,24 @@ mod tests {
         jobs.start(3, job_options).unwrap();
         let (status, _) = jobs.wait(&[3], 2_000).unwrap();
         assert_eq!(status, vec![0]);
+    }
+
+    // If a caller polls the reactor but has no callback host available, the
+    // manager must keep those events and return them on the next poll so
+    // `chansend`/`take_pty_output` paths never drop an `on_stdout`/`on_exit`.
+    #[test]
+    fn deferred_events_are_redelivered_by_the_next_poll() {
+        let mut jobs = JobManager::new().unwrap();
+        let options = Typval::dict(Vec::new());
+        let Typval::Dict(reference) = options else { unreachable!() };
+        let event = JobEvent {
+            callback: Typval::String(OxStr::from("Callback")),
+            receiver: reference,
+            args: vec![Typval::Number(1), Typval::list(vec![Typval::String(OxStr::from("data"))]), Typval::String(OxStr::from("stdout"))],
+        };
+        jobs.defer_events(vec![event.clone(), event.clone()]);
+        let first = jobs.poll().unwrap();
+        assert_eq!(first.len(), 2, "deferred events must be returned on the next poll");
+        assert!(jobs.poll().unwrap().is_empty(), "deferred events must be drained after one poll");
     }
 }

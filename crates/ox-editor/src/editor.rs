@@ -186,6 +186,20 @@ pub enum BufferEditMode {
     Insert,
 }
 
+/// Metadata for one editor-owned terminal channel.
+///
+/// A terminal channel is backed by a pseudoterminal and displayed through a
+/// buffer; the pty slave name is reported by `nvim_get_chan_info` and used by
+/// plugins such as termdebug to communicate with the child.
+#[derive(Clone, Debug)]
+pub struct TerminalChannelInfo {
+    pub pty: Option<String>,
+    pub buffer: BufHandle,
+    /// Bytes of the last line if it has not yet ended with a newline; this
+    /// mirrors the text visible in `buffer` so the next chunk can complete it.
+    pub pending: Option<Vec<u8>>,
+}
+
 /// All mutable editor state under a single `&mut self` discipline.
 ///
 /// No state is process-global. Event-loop and RPC layers can serialize their
@@ -262,8 +276,13 @@ pub struct Editor {
     /// Buffer whose current insert/replace session has recorded text.
     active_text_edit: Option<BufHandle>,
     channel_ids: ChannelIds,
+    /// Channel id → editor-owned buffer used as a terminal surface.
+    ///
+    /// `jobstart(..., {'pty': v:true})` and `:terminal` allocate a terminal
+    /// channel and bind it to a live buffer so `nvim_get_chan_info` can report
+    /// the `buffer` field and so UI can show the child.
+    terminal_buffers: BTreeMap<u64, TerminalChannelInfo>,
 }
-
 impl Default for Editor {
     fn default() -> Self {
         Self::new()
@@ -319,6 +338,7 @@ impl Editor {
             edit_mode: BufferEditMode::Normal,
             active_text_edit: None,
             channel_ids: ChannelIds::new(),
+            terminal_buffers: BTreeMap::new(),
         }
     }
 
@@ -329,6 +349,102 @@ impl Editor {
     /// Return the allocator shared by every dynamic channel owner.
     #[must_use]
     pub fn channel_ids(&self) -> ChannelIds { self.channel_ids.clone() }
+
+    /// Allocate a buffer and bind it to a terminal channel.
+    ///
+    /// The buffer is created unlisted and empty; the caller is responsible for
+    /// recording the pty slave name with `set_terminal_channel`.
+    pub fn allocate_terminal_buffer(&mut self, channel: u64) -> Result<BufHandle, EditorError> {
+        let buffer = self.create_buffer(false)?;
+        self.terminal_buffers.insert(channel, TerminalChannelInfo { pty: None, buffer, pending: Some(Vec::new()) });
+        Ok(buffer)
+    }
+
+    /// Record or update the pty slave path for an existing terminal channel.
+    pub fn set_terminal_channel_pty(&mut self, channel: u64, pty: Option<String>) {
+        if let Some(info) = self.terminal_buffers.get_mut(&channel) {
+            info.pty = pty;
+        }
+    }
+
+    /// Append raw PTY output to the terminal channel's buffer.
+    ///
+    /// Chunks ending mid-line extend the current last line; chunks ending
+    /// with a newline are split into complete lines and a trailing empty
+    /// segment is discarded so an isolated `\n` does not add a blank line.
+    pub fn append_terminal_buffer(&mut self, channel: u64, bytes: &[u8]) -> Result<(), EditorError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let (buffer, had_partial, data) = match self.terminal_buffers.get_mut(&channel) {
+            Some(info) => {
+                let buffer = info.buffer;
+                let had_partial = info.pending.is_some();
+                let mut data = info.pending.take().unwrap_or_default();
+                data.extend_from_slice(bytes);
+                (buffer, had_partial, data)
+            }
+            None => return Ok(()),
+        };
+
+        let mut segments: Vec<&[u8]> = data.split(|byte| *byte == b'\n').collect();
+        let ends_newline = data.last() == Some(&b'\n');
+        if ends_newline {
+            let _ = segments.pop();
+        }
+        let partial = if ends_newline { None } else { segments.pop().map(|s| s.to_vec()) };
+
+        let strip_cr = |line: &[u8]| line.strip_suffix(b"\r").unwrap_or(line).to_vec();
+        let state = self.buffer_mut(buffer)?;
+        let count = state.text()?.line_count();
+        let cursor = ox_text::Position { lnum: count, col: 0 };
+
+        let (result, new_pending) = if segments.is_empty() {
+            // No complete line yet: update the visible partial line.
+            let result = if had_partial {
+                state.replace_lines(count, count, &[data.clone()], cursor, cursor, 0)
+                    .map(|_| ()).map_err(EditorError::Buffer)
+            } else {
+                state.append_lines(count, &[data.clone()], cursor, 0)
+                    .map(|_| ()).map_err(EditorError::Buffer)
+            };
+            drop(segments);
+            (result, Some(data))
+        } else {
+            let first = segments.remove(0);
+            let first_line = strip_cr(first);
+
+            let mut lines: Vec<Vec<u8>> = segments.iter().map(|&line| strip_cr(line)).collect();
+            if let Some(tail) = partial.as_ref() {
+                lines.push(tail.clone());
+            }
+
+            let result = if had_partial {
+                state.replace_lines(count, count, &[first_line], cursor, cursor, 0)
+                    .map(|_| ()).map_err(EditorError::Buffer)?;
+                state.append_lines(count, &lines, cursor, 0)
+                    .map(|_| ()).map_err(EditorError::Buffer)
+            } else {
+                lines.insert(0, first_line);
+                state.append_lines(count, &lines, cursor, 0)
+                    .map(|_| ()).map_err(EditorError::Buffer)
+            };
+            (result, partial)
+        };
+
+        if result.is_ok() {
+            if let Some(info) = self.terminal_buffers.get_mut(&channel) {
+                info.pending = new_pending;
+            }
+        }
+        result
+    }
+
+    /// Look up the editor-owned terminal channel metadata.
+    #[must_use]
+    pub fn terminal_channel(&self, channel: u64) -> Option<&TerminalChannelInfo> {
+        self.terminal_buffers.get(&channel)
+    }
 
     /// Stable identity for state owned by API and UI host layers.
     #[must_use]
@@ -2128,4 +2244,67 @@ fn allocate_tab_handle(next: &mut i64) -> Result<TabHandle, EditorError> {
         .checked_add(1)
         .ok_or(EditorError::HandleExhausted("tabpage"))?;
     Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn terminal_lines(editor: &Editor, channel: u64) -> Vec<Vec<u8>> {
+        let info = editor.terminal_channel(channel).unwrap();
+        let state = editor.buffer(info.buffer).unwrap();
+        buffer_lines(&state.text().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn terminal_buffer_merges_partial_line_chunks() {
+        let mut editor = Editor::new();
+        let channel = editor.allocate_channel_id();
+        editor.allocate_terminal_buffer(channel).unwrap();
+
+        editor.append_terminal_buffer(channel, b"hel").unwrap();
+        editor.append_terminal_buffer(channel, b"lo\n").unwrap();
+        editor.append_terminal_buffer(channel, b"wor").unwrap();
+        editor.append_terminal_buffer(channel, b"ld\n").unwrap();
+
+        let lines = terminal_lines(&editor, channel);
+        assert_eq!(lines, vec![b"hello".to_vec(), b"world".to_vec()]);
+    }
+
+    #[test]
+    fn terminal_buffer_appends_trailing_newline_without_blank_line() {
+        let mut editor = Editor::new();
+        let channel = editor.allocate_channel_id();
+        editor.allocate_terminal_buffer(channel).unwrap();
+
+        editor.append_terminal_buffer(channel, b"first\n").unwrap();
+        editor.append_terminal_buffer(channel, b"second\n").unwrap();
+
+        let lines = terminal_lines(&editor, channel);
+        assert_eq!(lines, vec![b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    #[test]
+    fn terminal_buffer_strips_carriage_returns_from_complete_lines() {
+        let mut editor = Editor::new();
+        let channel = editor.allocate_channel_id();
+        editor.allocate_terminal_buffer(channel).unwrap();
+
+        editor.append_terminal_buffer(channel, b"one\r\ntwo\r\n").unwrap();
+
+        let lines = terminal_lines(&editor, channel);
+        assert_eq!(lines, vec![b"one".to_vec(), b"two".to_vec()]);
+    }
+
+    #[test]
+    fn terminal_buffer_keeps_partial_line_visible_without_newline() {
+        let mut editor = Editor::new();
+        let channel = editor.allocate_channel_id();
+        editor.allocate_terminal_buffer(channel).unwrap();
+
+        editor.append_terminal_buffer(channel, b"partial").unwrap();
+
+        let lines = terminal_lines(&editor, channel);
+        assert_eq!(lines, vec![b"partial".to_vec()]);
+    }
 }

@@ -1,6 +1,6 @@
 //! Embedded stdio and listening RPC servers.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -51,6 +51,58 @@ impl ox_api::ChannelSink for TerminalChannelSink {
     }
 }
 
+struct JobChannelSink {
+    ex: Rc<RefCell<ExExecutor>>,
+    queue: Rc<RefCell<VecDeque<Work>>>,
+    /// Number of deferred sends; when > 0 the borrow is held by an outer
+    /// RPC handler and new sends must be queued to preserve order.
+    deferred: Rc<Cell<usize>>,
+}
+
+impl JobChannelSink {
+    fn run_send(&self, channel: u64, bytes: Vec<u8>) {
+        if let Ok(mut ex) = self.ex.try_borrow_mut() {
+            let _ = ex.job_send(channel, &bytes);
+            return;
+        }
+        let ex = self.ex.clone();
+        let queue = self.queue.clone();
+        let deferred = self.deferred.clone();
+        deferred.set(deferred.get().saturating_add(1));
+        queue.borrow_mut().push_back(Box::new(move || {
+            let _ = ex.borrow_mut().job_send(channel, &bytes);
+            deferred.set(deferred.get().saturating_sub(1));
+            Ok(())
+        }));
+    }
+}
+
+impl ox_api::ChannelSink for JobChannelSink {
+    fn send(&mut self, channel: u64, bytes: &[u8]) -> Result<(), String> {
+        if self.deferred.get() > 0 {
+            let ex = self.ex.clone();
+            let queue = self.queue.clone();
+            let deferred = self.deferred.clone();
+            let bytes = bytes.to_vec();
+            deferred.set(deferred.get().saturating_add(1));
+            queue.borrow_mut().push_back(Box::new(move || {
+                let _ = ex.borrow_mut().job_send(channel, &bytes);
+                deferred.set(deferred.get().saturating_sub(1));
+                Ok(())
+            }));
+            return Ok(());
+        }
+        self.run_send(channel, bytes.to_vec());
+        Ok(())
+    }
+
+    fn take_pty_output(&mut self, channel: u64) -> Result<Vec<u8>, String> {
+        match self.ex.try_borrow_mut() {
+            Ok(mut ex) => ex.take_pty_output(channel).map_err(|error| error.to_string()),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+}
 /// Every `plugin/**/*.vim` then every `plugin/**/*.lua` under one
 /// `'runtimepath'` entry, in the order `load_plugins` sources them.
 ///
@@ -172,7 +224,11 @@ impl AppState {
         bind_variables(lua.lua(), Rc::new(EditorVariables { editor: editor.clone() }))
             .map_err(|error| AppError::Lua(error.to_string()))?;
         ox_api::set_channel_sink(&editor.borrow(), Box::new(TerminalChannelSink::default()));
-
+        ox_api::set_job_sink(&editor.borrow(), Box::new(JobChannelSink {
+            ex: ex.clone(),
+            queue: lua_work.clone(),
+            deferred: Rc::new(Cell::new(0)),
+        }));
         // Load the reachable embedded core prelude before user-controlled Ex startup commands.
         lua.exec("require('vim._core.shared')", Vec::new())
             .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -1728,5 +1784,33 @@ impl Scheduler for LuaScheduler {
     fn schedule_deferred(&self, work: Work) -> Result<(), String> {
         self.queue.borrow_mut().push_back(work);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_channel_sink_defers_send_on_reentrant_borrow() {
+        let ex = Rc::new(RefCell::new(ox_editor::ExExecutor::new()));
+        let queue = Rc::new(RefCell::new(VecDeque::new()));
+        let mut sink = JobChannelSink {
+            ex: ex.clone(),
+            queue: queue.clone(),
+            deferred: Rc::new(Cell::new(0)),
+        };
+
+        let _outer = ex.borrow_mut();
+        // A send while `ex` is already borrowed must not panic; it should
+        // queue the work for the scheduler instead.
+        ox_api::ChannelSink::send(&mut sink, 7, b"hello\n").unwrap();
+
+        assert_eq!(queue.borrow().len(), 1, "reentrant send must be queued");
+        assert_eq!(sink.deferred.get(), 1, "deferred counter must track queued send");
+
+        drop(_outer);
+        let work = queue.borrow_mut().pop_front().unwrap();
+        work().unwrap();
     }
 }

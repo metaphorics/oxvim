@@ -12,6 +12,9 @@ use ox_ui::{ChromeState, HlState, UiChannels};
 pub trait ChannelSink {
     /// Writes bytes to a channel.
     fn send(&mut self, channel: u64, bytes: &[u8]) -> Result<(), String>;
+
+    /// Drains any PTY output produced by a previous `send` on a terminal channel.
+    fn take_pty_output(&mut self, _channel: u64) -> Result<Vec<u8>, String> { Ok(Vec::new()) }
 }
 
 /// Host executor for actions produced by the editor's autocmd planner.
@@ -335,6 +338,7 @@ pub(crate) struct RuntimeState {
     pub channels: BTreeMap<u64, ChannelInfo>,
     pub subscriptions: BTreeMap<u64, BTreeSet<OxStr>>,
     pub channel_sink: Option<Box<dyn ChannelSink>>,
+    pub job_sink: Option<Box<dyn ChannelSink>>,
     pub autocmd_executor: Option<Box<dyn AutocmdExecutor>>,
     pub command_executor: Option<Box<dyn crate::CommandExecutor>>,
     pub lua_executor: Option<Box<dyn LuaExecutor>>,
@@ -370,6 +374,7 @@ impl Default for RuntimeState {
             channels,
             subscriptions: BTreeMap::new(),
             channel_sink: None,
+            job_sink: None,
             autocmd_executor: None,
             command_executor: None,
             lua_executor: None,
@@ -402,6 +407,14 @@ pub(crate) fn with_state_mut<R>(editor: &Editor, operation: impl FnOnce(&mut Run
 /// Installs the byte sink for one editor's RPC channels.
 pub fn set_channel_sink(editor: &Editor, sink: Box<dyn ChannelSink>) {
     with_state_mut(editor, |state| state.channel_sink = Some(sink));
+}
+
+/// Installs the byte sink for one editor's job/terminal channels.
+///
+/// `nvim_chan_send` uses this when the target channel is an editor-owned
+/// terminal channel, so `chansend()` from Vimscript reaches the child.
+pub fn set_job_sink(editor: &Editor, sink: Box<dyn ChannelSink>) {
+    with_state_mut(editor, |state| state.job_sink = Some(sink));
 }
 
 /// Installs the executor for actions produced by autocmd firing plans.

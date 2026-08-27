@@ -650,6 +650,29 @@ impl<F: FileIO> ExExecutor<F> {
         self.runtime.channel_ids = channel_ids;
     }
 
+    /// Write bytes to a job channel's standard input or PTY master.
+    ///
+    /// Used by the RPC host's job sink so `nvim_chan_send` can reach children
+    /// spawned by `jobstart`.
+    pub fn job_send(&mut self, channel: u64, data: &[u8]) -> Result<bool, String> {
+        if self.runtime.jobs.is_none() {
+            self.runtime.jobs = JobManager::new().ok();
+        }
+        let Some(manager) = self.runtime.jobs.as_mut() else { return Ok(false) };
+        manager.send(channel, data.to_vec())
+    }
+
+    /// Poll after a channel write and return any PTY output ready for the terminal buffer.
+    pub fn take_pty_output(&mut self, channel: u64) -> Result<Vec<u8>, String> {
+        if self.runtime.jobs.is_none() {
+            return Ok(Vec::new());
+        }
+        let Some(manager) = self.runtime.jobs.as_mut() else { return Ok(Vec::new()) };
+        let events = manager.poll()?;
+        manager.defer_events(events);
+        Ok(manager.take_pty_output(channel).unwrap_or_default())
+    }
+
     /// Script/SID/runtime-root state.
     #[must_use]
     pub fn scripts(&self) -> &ScriptCtx<F> {

@@ -1390,6 +1390,93 @@ fn call_builtin_serves_every_family_instead_of_panicking_outside_the_job_arms() 
     let error = call(&mut exec, &mut editor, "nosuchbuiltin", Vec::new()).unwrap_err();
     assert!(error.to_string().contains("nosuchbuiltin"), "{error}");
 }
+#[cfg(unix)]
+#[test]
+fn jobstart_pty_allocates_terminal_buffer_and_records_pty() {
+    let mut editor = editor_with_lines(&["alpha"]);
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    let call = |exec: &mut ExExecutor<MemoryFileIO>, editor: &mut Editor, name: &str, args: Vec<Typval>| {
+        exec.call_builtin(editor, &OxStr::from(name), args)
+    };
+
+    let options = Typval::dict(vec![(OxStr::from("pty"), Typval::Number(1))]);
+    let job = call(
+        &mut exec,
+        &mut editor,
+        "jobstart",
+        vec![
+            Typval::list(vec![Typval::String(OxStr::from("sh")), Typval::String(OxStr::from("-c")), Typval::String(OxStr::from("true"))]),
+            options,
+        ],
+    )
+    .unwrap();
+    let Typval::Number(id) = job else { panic!("jobstart did not answer a channel id: {job:?}") };
+    assert!(id > 0, "jobstart answered {id}");
+
+    let info = editor.terminal_channel(id as u64).expect("pty job must allocate a terminal channel");
+    let buffer = editor.buffer(info.buffer).expect("terminal buffer must exist");
+    assert_eq!(buffer.name().to_string_lossy(), "");
+    assert!(
+        info.pty.as_ref().is_some_and(|pty| pty.starts_with("/dev/pts/")),
+        "pty slave path must be real pts, got {:?}",
+        info.pty
+    );
+
+    call(&mut exec, &mut editor, "jobwait", vec![Typval::list(vec![Typval::Number(id)]), Typval::Number(5_000)]).unwrap();
+}
+#[cfg(unix)]
+#[test]
+fn pty_output_reaches_terminal_buffer_after_chansend() {
+    let mut editor = editor_with_lines(&["alpha"]);
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    let call = |exec: &mut ExExecutor<MemoryFileIO>, editor: &mut Editor, name: &str, args: Vec<Typval>| {
+        exec.call_builtin(editor, &OxStr::from(name), args)
+    };
+
+    let options = Typval::dict(vec![(OxStr::from("pty"), Typval::Number(1))]);
+    let job = call(
+        &mut exec,
+        &mut editor,
+        "jobstart",
+        vec![
+            Typval::list(vec![
+                Typval::String(OxStr::from("sh")),
+                Typval::String(OxStr::from("-c")),
+                Typval::String(OxStr::from("read x; echo $x")),
+            ]),
+            options,
+        ],
+    )
+    .unwrap();
+    let Typval::Number(id) = job else { panic!("jobstart did not answer a channel id: {job:?}") };
+
+    call(
+        &mut exec,
+        &mut editor,
+        "chansend",
+        vec![
+            Typval::Number(id),
+            Typval::String(OxStr::from("hello from pty\n")),
+        ],
+    )
+    .unwrap();
+
+    call(
+        &mut exec,
+        &mut editor,
+        "jobwait",
+        vec![Typval::list(vec![Typval::Number(id)]), Typval::Number(5_000)],
+    )
+    .unwrap();
+
+    let info = editor
+        .terminal_channel(id as u64)
+        .expect("pty job must keep its terminal channel");
+    let buffer = editor.buffer(info.buffer).expect("terminal buffer must exist");
+    let bytes = buffer.text().unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("hello from pty"), "terminal buffer should contain echoed PTY output, got {text:?}");
+}
 
 
 #[test]

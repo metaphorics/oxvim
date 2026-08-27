@@ -33,5 +33,6 @@ pub use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, WinHandl
 pub use registry::{core, DispatchFn, Registry, RegistryError};
 pub use runtime::{
     AutocmdExecutor, ChannelSink, FileIO, LuaExecutor, MatchKind, StdFileIO, runtime_get_named,
-    set_autocmd_executor, set_channel_sink, set_command_executor, set_file_io, set_lua_executor,
+    set_autocmd_executor, set_channel_sink, set_command_executor, set_file_io, set_job_sink,
+    set_lua_executor,
 };
