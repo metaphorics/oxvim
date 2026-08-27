@@ -47,19 +47,23 @@ pub fn newline(editor: &mut Editor, buffer: BufHandle, window: WinHandle, cursor
     let source_prefix = &line[..col];
     let smart = indent::smart_source_trigger(source_prefix, false, &opts);
     let mut indent = indent::smart_newline_indent(source_prefix, smart, &opts);
-    let text = editor.buffer(buffer)?.text().map_err(EditorError::from)?;
-    let mut lines = (1..=text.line_count())
-        .map(|lnum| text.line(lnum))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(BufferStateError::from)
-        .map_err(EditorError::from)?;
-    let suffix = line[col..].to_vec();
-    let mut second = indent.clone();
-    second.extend_from_slice(&suffix);
-    lines[cursor.lnum - 1] = line[..col].to_vec();
-    lines.insert(cursor.lnum, second);
-    {
-        let context = indent::IndentEvalContext::new(editor, buffer, &lines);
+    // The staged overlay only feeds indentexpr/lisp/cindent; with every
+    // method off, skip the whole-buffer materialization on each Enter.
+    if !(opts.indentexpr.is_empty() && !opts.lisp && !opts.cindent) {
+        let mut staged = {
+            let text = editor.buffer(buffer)?.text().map_err(EditorError::from)?;
+            (1..=text.line_count())
+                .map(|lnum| text.line(lnum))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(BufferStateError::from)
+                .map_err(EditorError::from)?
+        };
+        let suffix = line[col..].to_vec();
+        let mut second = indent.clone();
+        second.extend_from_slice(&suffix);
+        staged[cursor.lnum - 1] = line[..col].to_vec();
+        staged.insert(cursor.lnum, second);
+        let context = indent::IndentEvalContext::new(editor, buffer, &staged);
         if let Some(whitespace) = indent::fix_line_indent(&context, cursor.lnum + 1, CinTrigger::OpenForward, &opts, eval)? {
             indent = whitespace;
         }

@@ -1176,6 +1176,11 @@ pub(crate) fn cinkeys_trigger(opts: &IndentOptions, trigger: CinTrigger) -> bool
 pub enum IndentExprError {
     #[error("indent expression failed: {0}")]
     Failed(String),
+    /// No expression evaluator is wired (e.g. the typeahead drain is using
+    /// [`NullExprEval`]). Degrade to "expression ignored, indent unchanged"
+    /// instead of aborting the open/Enter/reindent operation.
+    #[error("indent expression evaluation is unavailable")]
+    Unavailable,
 }
 
 /// Read-only indent evaluation view over the live editor and a staged line overlay.
@@ -1239,6 +1244,35 @@ impl ExprEval for NullExprEval {
     }
 }
 
+/// Adapter that converts any indent-expression failure from the wrapped
+/// evaluator into [`IndentExprError::Unavailable`], so call sites degrade it
+/// to "expression ignored, indent unchanged" instead of aborting with E523.
+pub struct IgnoreExprEval<'a> {
+    inner: &'a mut dyn ExprEval,
+}
+
+impl<'a> IgnoreExprEval<'a> {
+    /// Wraps `inner` so its indent-expression errors are treated as ignored.
+    #[must_use]
+    pub fn new(inner: &'a mut dyn ExprEval) -> Self {
+        Self { inner }
+    }
+}
+
+impl<'a> ExprEval for IgnoreExprEval<'a> {
+    fn eval_indentexpr(
+        &mut self,
+        context: &IndentEvalContext<'_>,
+        lnum: usize,
+        expression: &str,
+    ) -> Result<i64, IndentExprError> {
+        self.inner
+            .eval_indentexpr(context, lnum, expression)
+            .map_err(|_| IndentExprError::Unavailable)
+    }
+}
+
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Method {
     Cindent,
@@ -1286,17 +1320,19 @@ pub(crate) fn amount_for(
     let amount = match method {
         Method::Cindent => cindent(context.lines(), lnum, opts),
         Method::Lisp => lisp_indent(context.lines(), lnum, opts),
-        Method::Expr => {
-            let value = eval.eval_indentexpr(context, lnum, &opts.indentexpr)?;
-            if value >= 0 {
+        Method::Expr => match eval.eval_indentexpr(context, lnum, &opts.indentexpr) {
+            Ok(value) if value >= 0 => {
                 IndentAmount::Columns(usize::try_from(value).unwrap_or(usize::MAX))
-            } else {
-                context.lines().get(lnum.saturating_sub(1)).map_or(
-                    IndentAmount::LeaveAlone,
-                    |line| IndentAmount::Columns(indent_columns(line, opts)),
-                )
             }
-        }
+            Ok(_) => context.lines().get(lnum.saturating_sub(1)).map_or(
+                IndentAmount::LeaveAlone,
+                |line| IndentAmount::Columns(indent_columns(line, opts)),
+            ),
+            // No real evaluator is wired; ignore the expression and keep the
+            // existing indent instead of aborting o/O/Enter/==.
+            Err(IndentExprError::Unavailable) => IndentAmount::LeaveAlone,
+            Err(error) => return Err(error),
+        },
     };
     Ok(amount)
 }

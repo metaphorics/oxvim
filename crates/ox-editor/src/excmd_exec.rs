@@ -539,7 +539,8 @@ pub(crate) fn drain_typeahead<F: FileIO>(
 ) -> Flow {
     while !editor.typeahead().is_empty() {
         let result = {
-            let mut eval = crate::indent::NullExprEval;
+            let mut null = crate::indent::NullExprEval;
+            let mut eval = crate::indent::IgnoreExprEval::new(&mut null);
             machine.run_once(editor, &mut eval)
         };
         match result {

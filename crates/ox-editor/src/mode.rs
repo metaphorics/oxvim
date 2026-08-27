@@ -872,25 +872,51 @@ impl ModeMachine {
     }
 
     fn open_line(&self, editor: &mut Editor, below: bool, eval: &mut dyn ExprEval) -> Result<(), ModeError> {
-        let ctx = context(editor)?;
-        let opts = indent::IndentOptions::capture(editor, ctx.buffer);
-        let source = &ctx.lines[ctx.cursor.lnum - 1];
-        let smart = indent::smart_source_trigger(source, !below, &opts);
-        let mut indent_bytes = indent::smart_newline_indent(source, smart, &opts);
-        let after_line = if below { ctx.cursor.lnum } else { ctx.cursor.lnum.saturating_sub(1) };
+        let (buffer, window, mut cursor) = {
+            let tab = editor.current_tabpage().ok_or(EditorError::UnknownTabpage(ox_types::TabHandle::CURRENT))?;
+            let tabpage = editor.tabpage(tab)?;
+            let window = tabpage.current_window();
+            let state = editor.window(window)?;
+            (state.buffer, window, state.cursor)
+        };
+        let count = {
+            let text = editor.buffer(buffer)?.text()?;
+            let count = text.line_count();
+            let valid = cursor.lnum.clamp(1, count.max(1));
+            if valid != cursor.lnum {
+                cursor.lnum = valid;
+                editor.set_window_cursor(window, cursor)?;
+            }
+            count
+        };
+        let source = {
+            let text = editor.buffer(buffer)?.text()?;
+            text.line(cursor.lnum).map_err(BufferStateError::from)?
+        };
+        let opts = indent::IndentOptions::capture(editor, buffer);
+        let smart = indent::smart_source_trigger(&source, !below, &opts);
+        let mut indent_bytes = indent::smart_newline_indent(&source, smart, &opts);
+        let after_line = if below { cursor.lnum } else { cursor.lnum.saturating_sub(1) };
         let new_lnum = after_line + 1;
-        let mut lines = ctx.lines.clone();
-        lines.insert(new_lnum - 1, indent_bytes.clone());
-        let trigger = if below { CinTrigger::OpenForward } else { CinTrigger::OpenBackward };
-        {
-            let context = indent::IndentEvalContext::new(editor, ctx.buffer, &lines);
+        // The staged overlay only feeds indentexpr/lisp/cindent; with every
+        // method off, skip the whole-buffer materialization and clone on each
+        // `o`/`O`.
+        if !(opts.indentexpr.is_empty() && !opts.lisp && !opts.cindent) {
+            let text = editor.buffer(buffer)?.text()?;
+            let mut lines = (1..=count)
+                .map(|lnum| text.line(lnum))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(BufferStateError::from)?;
+            lines.insert(new_lnum - 1, indent_bytes.clone());
+            let trigger = if below { CinTrigger::OpenForward } else { CinTrigger::OpenBackward };
+            let context = indent::IndentEvalContext::new(editor, buffer, &lines);
             if let Some(whitespace) = indent::fix_line_indent(&context, new_lnum, trigger, &opts, eval)? {
                 indent_bytes = whitespace;
             }
         }
         let pos = Position { lnum: new_lnum, col: indent_bytes.len() };
-        editor.append_buffer_lines(ctx.buffer, after_line, &[indent_bytes], ctx.cursor, self.timestamp)?;
-        editor.set_window_cursor(ctx.window, pos)?;
+        editor.append_buffer_lines(buffer, after_line, &[indent_bytes], cursor, self.timestamp)?;
+        editor.set_window_cursor(window, pos)?;
         Ok(())
     }
 }
