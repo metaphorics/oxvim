@@ -396,11 +396,19 @@ fn hide_is_a_modifier_when_a_command_follows() {
 // src/nvim/ex_docmd.c:4112-4165 (separate_nextcmd): EX_TRLBAR gates generic
 // bar splitting; commands such as :normal and :global own their remaining
 // argument text.
+//
+// The trailing space before the bar is part of the argument for every command
+// below, and that is upstream: `del_trailing_spaces` runs only from inside
+// `separate_nextcmd`, so it is reached only by an EX_TRLBAR command, and then
+// only when EX_NOTRLCOM is absent. `:substitute` and `:echo` have no
+// EX_TRLBAR at all (they find their own bar in `do_sub`/`ex_echo`) and the
+// vimgrep family has EX_NOTRLCOM, so none of them is ever trimmed.
+// `write_splits_at_bar` below is the other side of that rule.
 #[test]
 fn substitute_splits_at_trailing_bar() {
     let commands = Parser::new().parse("s/a/b/ | echo done").unwrap_or_default();
     assert_eq!(commands.len(), 2);
-    assert_eq!(commands[0].args, "/a/b/");
+    assert_eq!(commands[0].args, "/a/b/ ");
     assert_eq!(commands[1].command.name(), "echo");
 }
 
@@ -413,7 +421,7 @@ fn vimgrep_pattern_bar_is_not_a_separator() {
     let commands = Parser::new().parse("vimgrep /foo|bar/ f | copen").unwrap_or_default();
     assert_eq!(commands.len(), 2);
     assert_eq!(commands[0].command.name(), "vimgrep");
-    assert_eq!(commands[0].args, "/foo|bar/ f");
+    assert_eq!(commands[0].args, "/foo|bar/ f ");
     assert_eq!(commands[1].command.name(), "copen");
 }
 
@@ -422,7 +430,7 @@ fn vimgrepadd_pattern_bar_is_not_a_separator() {
     let commands = Parser::new().parse("vimgrepadd /a|b/ file | echo x").unwrap_or_default();
     assert_eq!(commands.len(), 2);
     assert_eq!(commands[0].command.name(), "vimgrepadd");
-    assert_eq!(commands[0].args, "/a|b/ file");
+    assert_eq!(commands[0].args, "/a|b/ file ");
     assert_eq!(commands[1].command.name(), "echo");
 }
 
@@ -431,14 +439,14 @@ fn lvimgrep_pattern_with_flags_splits_after_files() {
     let commands = Parser::new().parse("lvimgrep /a|b/g file | print").unwrap_or_default();
     assert_eq!(commands.len(), 2);
     assert_eq!(commands[0].command.name(), "lvimgrep");
-    assert_eq!(commands[0].args, "/a|b/g file");
+    assert_eq!(commands[0].args, "/a|b/g file ");
 }
 
 #[test]
 fn substitute_pattern_may_contain_bar() {
     let commands = Parser::new().parse(r"s/a\|b/c/ | print").unwrap_or_default();
     assert_eq!(commands.len(), 2);
-    assert_eq!(commands[0].args, r"/a\|b/c/");
+    assert_eq!(commands[0].args, "/a\\|b/c/ ");
 }
 
 #[test]
@@ -484,14 +492,60 @@ fn write_splits_at_bar() {
 fn echo_splits_at_top_level_bar() {
     let commands = Parser::new().parse("echo 'a|b' | print").unwrap_or_default();
     assert_eq!(commands.len(), 2);
-    assert_eq!(commands[0].args, "'a|b'");
+    assert_eq!(commands[0].args, "'a|b' ");
 }
 
 #[test]
 fn echo_boolean_or_is_not_a_separator() {
     let commands = Parser::new().parse("echo left || right | print").unwrap_or_default();
     assert_eq!(commands.len(), 2);
-    assert_eq!(commands[0].args, "left || right");
+    assert_eq!(commands[0].args, "left || right ");
+}
+
+/// A trailing CR belongs to the argument of *every* command. Nothing in
+/// `do_one_cmd` removes it: `ea.arg = skipwhite(p)` skips space and tab only
+/// (`ascii_iswhite`, `ascii_defs.h:84-87`), and the one trimmer,
+/// `del_trailing_spaces` (`strings.c:429-436`), also takes space and tab only
+/// — and is reached only from `separate_nextcmd`.
+///
+/// Oracle, v0.13.0-dev-1390: `execute("normal! :let g:a=1\r")` sets `g:a`;
+/// `execute("let g:c = 4\r")` is `E488: Trailing characters`;
+/// `execute("edit Xa\r")` gives a buffer literally named `Xa\r`.
+#[test]
+fn a_trailing_cr_is_part_of_every_command_argument() {
+    for line in [
+        "normal! :let g:a=1\r",
+        "let g:c = 4\r",
+        "echo 'z'\r",
+        "execute 'let g:d = 5'\r",
+        "nnoremap ,x :let g:b=3\r",
+        "command! -nargs=1 Foo let g:f = <q-args>\r",
+        "edit Xt69a\r",
+        "print\r",
+    ] {
+        let command = parse_one(line);
+        assert!(
+            command.args.ends_with('\r'),
+            "{line:?} lost its CR: args = {:?}",
+            command.args
+        );
+    }
+}
+
+/// The trailing space rule, both sides. `:edit` and `:print` are EX_TRLBAR
+/// without EX_NOTRLCOM, so `del_trailing_spaces` reaches them; `:map`,
+/// `:normal`, `:let` and `:execute` keep every trailing byte. An escaped
+/// space survives even where trimming applies, and the argument's first byte
+/// is never removed (`--q > ptr`).
+#[test]
+fn trailing_spaces_are_removed_only_where_del_trailing_spaces_runs() {
+    assert_eq!(parse_one("edit Xfile   ").args, "Xfile");
+    assert_eq!(parse_one(r"edit Xfile\ ").args, r"Xfile\ ");
+    assert_eq!(parse_one("edit \t").args, "");
+    assert_eq!(parse_one("nnoremap ,y :let g:e=6   ").args, ",y :let g:e=6   ");
+    assert_eq!(parse_one("normal! ix  ").args, "ix  ");
+    assert_eq!(parse_one("let g:x = 1  ").args, "g:x = 1  ");
+    assert_eq!(parse_one("execute 'echo 1'  ").args, "'echo 1'  ");
 }
 
 #[test]
@@ -509,14 +563,52 @@ fn insert_owns_argument_bar() {
     assert_eq!(parse_one("insert |text").args, "|text");
 }
 
+/// ":write !cmd" and ":read !cmd" spend the "!" on `usefilter` and keep the
+/// rest of the line as one shell command (ex_docmd.c:2256-2275, 2291-2313).
 #[test]
 fn write_filter_owns_shell_pipeline() {
-    assert_eq!(parse_one("write !cat | sed s/a/b/").args, "!cat | sed s/a/b/");
+    let command = parse_one("write !cat | sed s/a/b/");
+    assert!(command.usefilter);
+    assert!(!command.bang);
+    assert_eq!(command.args, "cat | sed s/a/b/");
 }
 
 #[test]
 fn read_filter_owns_shell_pipeline() {
-    assert_eq!(parse_one("read !printf a|b").args, "!printf a|b");
+    let command = parse_one("read !printf a|b");
+    assert!(command.usefilter);
+    assert_eq!(command.args, "printf a|b");
+}
+
+/// ":r!cmd" is the same filter form: the bang is consumed by `usefilter`
+/// rather than left as a force flag (ex_docmd.c:2269-2271).
+#[test]
+fn read_bang_selects_the_filter_and_clears_the_bang() {
+    let command = parse_one("read!printf a|b");
+    assert!(command.usefilter);
+    assert!(!command.bang);
+    assert_eq!(command.args, "printf a|b");
+}
+
+/// ":read file" is an ordinary TRLBAR command: no filter, and a bar still
+/// separates the next command.
+#[test]
+fn read_file_is_not_a_filter_and_splits_at_bar() {
+    let commands = Parser::new().parse("read one.txt | print").unwrap_or_default();
+    assert_eq!(commands.len(), 2);
+    assert!(!commands[0].usefilter);
+    assert_eq!(commands[0].args, "one.txt");
+    assert_eq!(commands[1].command.name(), "print");
+}
+
+/// ":w!" is still a forced write, not a filter (only ":r!" maps its bang
+/// onto `usefilter`).
+#[test]
+fn write_bang_stays_a_force_flag() {
+    let command = parse_one("write! out.txt");
+    assert!(!command.usefilter);
+    assert!(command.bang);
+    assert_eq!(command.args, "out.txt");
 }
 
 #[test]
@@ -695,10 +787,42 @@ error_case!(error_forced_ho_abbreviation, "ho", ErrorCode::E492);
 error_case!(error_forced_def_abbreviation, "def", ErrorCode::E492);
 error_case!(error_range_not_allowed, "2echo hi", ErrorCode::E481);
 error_case!(error_percent_not_allowed, "%echo hi", ErrorCode::E481);
-error_case!(error_bang_not_allowed, "print!", ErrorCode::E488);
+error_case!(error_bang_not_allowed, "print!", ErrorCode::E477);
 error_case!(error_trailing_characters, "undo extra", ErrorCode::E488);
 error_case!(error_argument_required, "badd", ErrorCode::E471);
 error_case!(error_unterminated_search, "/open print", ErrorCode::E488);
+
+/// Every parser error carries upstream's message text, capitals included.
+///
+/// These are plugin-observable through `v:exception`, and the codes are too:
+/// a disallowed bang is `e_nobang` (E477), not a trailing-characters error,
+/// and `e_trailing_arg` (errors.h:123) names the offending text.
+#[test]
+fn parser_error_texts_match_upstream() {
+    for (input, code, message) in [
+        ("print!", ErrorCode::E477, "No ! allowed"),
+        ("print zz", ErrorCode::E488, "Trailing characters: zz"),
+        ("badd", ErrorCode::E471, "Argument required"),
+        ("doesnotexist", ErrorCode::E492, "Not an editor command"),
+        ("sleep 0m", ErrorCode::E939, "Positive count required"),
+    ] {
+        let error = Parser::new().parse(input).expect_err("input must fail");
+        assert_eq!(error.code, code, "{input}");
+        assert_eq!(error.message, message, "{input}");
+    }
+}
+
+/// The E481 message text matches upstream's `e_norange` byte for byte.
+///
+/// Error text is plugin-observable, so the capital "No" is load-bearing:
+/// `errors.h:74` is `N_("E481: No range allowed")`. Oracle: `:3redo` reports
+/// `Vim(redo):E481: No range allowed`.
+#[test]
+fn range_not_allowed_message_matches_upstream() {
+    let error = Parser::new().parse("3redo").expect_err("input must fail");
+    assert_eq!(error.code, ErrorCode::E481);
+    assert_eq!(error.message, "No range allowed");
+}
 
 #[test]
 fn unknown_command_error_offset_is_byte_accurate() {

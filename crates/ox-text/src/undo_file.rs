@@ -412,15 +412,19 @@ fn put_global_header(
     bytes.push(0); // optional-field terminator
 }
 
-/// Writes one undo header and its entry lines.
+/// Writes one undo header and the entry lines of every edit it groups.
 fn put_header(bytes: &mut Vec<u8>, record: &crate::HeaderRecord) {
     put_u16(bytes, HEADER_MAGIC);
     for link in [record.next, record.prev, record.alt_next, record.alt_prev] {
         put_u32(bytes, u32::try_from(link).unwrap_or(u32::MAX));
     }
     put_u32(bytes, u32::try_from(record.seq).unwrap_or(u32::MAX));
-    // Saved cursor (before the edit: the state undoing restores), then vcol.
-    put_pos(bytes, record.edit.cursor_before.lnum, record.edit.cursor_before.col);
+    // Saved cursor (before the block: the state undoing restores), then vcol.
+    let cursor = record
+        .edits
+        .first()
+        .map_or(crate::Cursor::default(), |edit| edit.cursor_before);
+    put_pos(bytes, cursor.lnum, cursor.col);
     put_u32(bytes, 0); // cursor vcol
     put_u16(bytes, 0); // flags
     for _ in 0..NAMED_MARKS {
@@ -437,22 +441,29 @@ fn put_header(bytes: &mut Vec<u8>, record: &crate::HeaderRecord) {
     put_u32(bytes, 0); // save count
     bytes.push(0); // optional-field terminator
 
-    // One entry undoing the "after" range back to the "before" lines.
-    // `u_undoredo` deletes lines (top+1 .. bot-1) and inserts `ue_size`
-    // lines after `top`; anchoring at `start-1` with `bot = start+after.len`
-    // therefore deletes the `after` block and reinserts `before` at `start`.
-    put_u16(bytes, ENTRY_MAGIC);
-    let start = u32::try_from(record.edit.start).unwrap_or(u32::MAX);
-    let after = u32::try_from(record.edit.after.len()).unwrap_or(u32::MAX);
-    let before = u32::try_from(record.edit.before.len()).unwrap_or(u32::MAX);
-    put_u32(bytes, start.saturating_sub(1)); // ue_top
-    put_u32(bytes, start.saturating_add(after)); // ue_bot
-    put_u32(bytes, 0); // ue_lcount
-    put_u32(bytes, before); // ue_size
-    for line in &record.edit.before {
-        let len = u32::try_from(line.len()).unwrap_or(u32::MAX);
-        put_u32(bytes, len);
-        bytes.extend_from_slice(line);
+    // One entry per grouped edit, undoing the "after" range back to the
+    // "before" lines. `u_undoredo` deletes lines (top+1 .. bot-1) and inserts
+    // `ue_size` lines after `top`; anchoring at `start-1` with
+    // `bot = start+after.len` therefore deletes the `after` block and
+    // reinserts `before` at `start`.
+    //
+    // Upstream pushes each entry onto the front of `uh_entry`
+    // (`undo.c:610-611`), so the list a reader walks is newest-first, which is
+    // also the order the edits have to be undone in.
+    for edit in record.edits.iter().rev() {
+        put_u16(bytes, ENTRY_MAGIC);
+        let start = u32::try_from(edit.start).unwrap_or(u32::MAX);
+        let after = u32::try_from(edit.after.len()).unwrap_or(u32::MAX);
+        let before = u32::try_from(edit.before.len()).unwrap_or(u32::MAX);
+        put_u32(bytes, start.saturating_sub(1)); // ue_top
+        put_u32(bytes, start.saturating_add(after)); // ue_bot
+        put_u32(bytes, 0); // ue_lcount
+        put_u32(bytes, before); // ue_size
+        for line in &edit.before {
+            let len = u32::try_from(line.len()).unwrap_or(u32::MAX);
+            put_u32(bytes, len);
+            bytes.extend_from_slice(line);
+        }
     }
     put_u16(bytes, ENTRY_END_MAGIC);
     put_u16(bytes, ENTRY_END_MAGIC); // extmark section is empty

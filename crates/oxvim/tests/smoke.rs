@@ -372,12 +372,17 @@ vim.api.nvim_create_autocmd('VimEnter', { callback = function() suffix('-enter')
     );
     assert_eq!(lines, Value::Array(vec![Value::from("pre-init-post-enter")]));
 
+    // `--clean` *is* `-u NONE` (main.c:1193-1197), so a later `-u <file>` on
+    // the same command line overwrites it and is sourced. This row used to
+    // assert the opposite -- an empty buffer -- because config sourcing was
+    // gated on `!cli.clean`. Oracle, same build:
+    // `nvim --headless --clean -u <file.lua>` runs the file.
     let mut clean = Embedded::spawn_with(&["--clean", "-u", &path_string]);
     let clean_lines = clean.request(
         "nvim_buf_get_lines",
         vec![Value::from(0), Value::from(0), Value::from(-1), Value::Boolean(true)],
     );
-    assert_eq!(clean_lines, Value::Array(vec![Value::from("")]));
+    assert_eq!(clean_lines, Value::Array(vec![Value::from("-init-enter")]));
     fs::remove_file(path).unwrap();
 }
 

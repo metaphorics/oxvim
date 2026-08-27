@@ -419,7 +419,14 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
             b"v:true" => return Ok(Evaluated::plain(Typval::Bool(true))),
             b"v:false" => return Ok(Evaluated::plain(Typval::Bool(false))),
             b"v:null" | b"v:none" => return Ok(Evaluated::plain(Typval::Special(Special::Null))),
-            _ => {}
+            // `v:t_*` are set once at startup and never assignable
+            // (`eval/vars.c:324-331`), so they resolve here rather than from the
+            // `v:` table, which hosts rebuild from their own editor state.
+            other => {
+                if let Some(value) = crate::builtins::vim_type_var(other) {
+                    return Ok(Evaluated::plain(Typval::Number(value)));
+                }
+            }
         }
         let bytes = name.as_bytes();
         if bytes.len() == 2 && bytes[1] == b':' {
@@ -563,6 +570,9 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                 let index = usize::try_from(index).map_err(|_| EvalError::new("E111", offset, "invalid string index"))?;
                 Ok(Evaluated::plain(Typval::String(OxStr(vec![bytes.0[index]]))))
             }
+            // `check_can_index` (`eval.c:3225-3229`) is upstream's only E806:
+            // indexing is the one String context a Float is refused in.
+            Typval::Float(_) => Err(EvalError::new("E806", offset, "Using a Float as a String")),
             _ => Err(EvalError::new("E909", offset, "invalid value for subscript")),
         }
     }
@@ -584,6 +594,7 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                 Ok(Evaluated::plain(Typval::String(OxStr(value.0[start..end].to_vec()))))
             }
             Typval::Dict(_) => Err(EvalError::new("E719", offset, "Cannot slice a Dictionary")),
+            Typval::Float(_) => Err(EvalError::new("E806", offset, "Using a Float as a String")),
             _ => Err(EvalError::new("E709", offset, "invalid value for slice")),
         }
     }
@@ -771,7 +782,7 @@ fn to_number(value: &Typval, offset: usize) -> Result<i64> {
     match value {
         Typval::Number(value) => Ok(*value),
         Typval::Channel(value) | Typval::Job(value) => Ok(i64::try_from(*value).unwrap_or(i64::MAX)),
-        Typval::String(value) => Ok(parse_number_prefix(value.as_bytes())),
+        Typval::String(value) => Ok(string_to_number(value.as_bytes())),
         Typval::Bool(value) => Ok(i64::from(*value)),
         Typval::Special(Special::Null) => Ok(0),
         Typval::Funcref(_) | Typval::Partial(_) => Err(EvalError::new("E703", offset, "Using a Funcref as a Number")),
@@ -782,44 +793,66 @@ fn to_number(value: &Typval, offset: usize) -> Result<i64> {
     }
 }
 
-fn parse_number_prefix(bytes: &[u8]) -> i64 {
-    let mut index = 0;
-    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) { index += 1; }
-    let negative = bytes.get(index) == Some(&b'-');
-    if matches!(bytes.get(index), Some(b'-' | b'+')) { index += 1; }
-    let rest = &bytes[index..];
-    let (base, prefix, legacy_octal) = if rest.starts_with(b"0x") || rest.starts_with(b"0X") {
-        (16_u32, 2, false)
-    } else if rest.starts_with(b"0b") || rest.starts_with(b"0B") {
-        (2, 2, false)
-    } else if rest.starts_with(b"0o") || rest.starts_with(b"0O") {
-        (8, 2, false)
-    } else {
-        (10, 0, rest.len() > 1 && rest.first() == Some(&b'0'))
-    };
-    let base = if legacy_octal { 8 } else { base };
-    let mut value = 0_i64;
-    let mut any = false;
-    for &byte in &rest[prefix..] {
-        let digit = match byte {
-            b'0'..=b'9' => u32::from(byte - b'0'),
-            b'a'..=b'f' => u32::from(byte - b'a') + 10,
-            b'A'..=b'F' => u32::from(byte - b'A') + 10,
-            _ => break,
-        };
-        if digit >= base { break; }
-        any = true;
-        value = value.wrapping_mul(i64::from(base)).wrapping_add(i64::from(digit));
+/// `vim_str2nr(text, …, STR2NR_ALL, …)` (`charset.c:1219-1406`), which is how
+/// `tv_get_number_chk` (`typval.c:4306-4312`) reads a String.
+///
+/// Three rules here are easy to get wrong and each was measured on the
+/// oracle. No white space is skipped, so `' 12' + 0` is 0, not 12. Only `-`
+/// is a sign; a leading `+` is not consumed and stops the scan, so
+/// `'+12' + 0` is 0. And a leading zero selects octal only when *every*
+/// following digit is octal — `'010' + 0` is 8 while `'08' + 0` is 8 as
+/// decimal, because `ptr[1]` being `8` or `9` skips the base detection
+/// outright (`charset.c:1276-1277`).
+pub(crate) fn string_to_number(bytes: &[u8]) -> i64 {
+    let byte = |index: usize| bytes.get(index).copied().unwrap_or(0);
+    let negative = byte(0) == b'-';
+    let start = usize::from(negative);
+    let (base, digits_at) = detect_base(bytes, start);
+    // The accumulator is unsigned and saturates, exactly as upstream's does,
+    // so `'-9223372036854775808'` reaches `VARNUMBER_MIN` instead of wrapping.
+    let mut magnitude = 0_u64;
+    let mut index = digits_at;
+    while let Some(digit) = char::from(byte(index)).to_digit(base) {
+        magnitude = magnitude.saturating_mul(u64::from(base)).saturating_add(u64::from(digit));
+        index += 1;
     }
-    if !any { return 0; }
-    if negative { value.wrapping_neg() } else { value }
+    if negative {
+        if magnitude > i64::MAX as u64 { i64::MIN } else { -(magnitude as i64) }
+    } else {
+        i64::try_from(magnitude).unwrap_or(i64::MAX)
+    }
+}
+
+/// The base-detection half of `vim_str2nr` without `STR2NR_FORCE`
+/// (`charset.c:1275-1318`), returning the base and where its digits start.
+fn detect_base(bytes: &[u8], start: usize) -> (u32, usize) {
+    let byte = |index: usize| bytes.get(index).copied().unwrap_or(0);
+    if byte(start) != b'0' || matches!(byte(start + 1), b'8' | b'9') {
+        return (10, start);
+    }
+    match byte(start + 1) {
+        b'x' | b'X' if char::from(byte(start + 2)).is_ascii_hexdigit() => (16, start + 2),
+        b'b' | b'B' if matches!(byte(start + 2), b'0' | b'1') => (2, start + 2),
+        b'o' | b'O' if byte(start + 2).is_ascii_digit() && byte(start + 2) < b'8' => (8, start + 2),
+        // Old-style octal: `0` then octal digits, and only if the whole digit
+        // run stays octal. One `8` or `9` anywhere in it makes it decimal.
+        digit if digit.is_ascii_digit() && digit < b'8' => {
+            let mut index = start + 2;
+            while byte(index).is_ascii_digit() {
+                if byte(index) > b'7' { return (10, start); }
+                index += 1;
+            }
+            (8, start + 1)
+        }
+        _ => (10, start),
+    }
 }
 
 fn to_string(value: &Typval, offset: usize) -> Result<OxStr> {
     match value {
         Typval::String(value) => Ok(value.clone()),
         Typval::Number(value) => Ok(OxStr(value.to_string().into_bytes())),
-        Typval::Float(_) => Err(EvalError::new("E806", offset, "Using a Float as a String")),
+        Typval::Float(number) => Ok(crate::builtins::float_as_string(*number)),
         Typval::Channel(value) | Typval::Job(value) => Ok(OxStr(value.to_string().into_bytes())),
         Typval::Bool(true) => Ok(OxStr::from("v:true")),
         Typval::Bool(false) => Ok(OxStr::from("v:false")),

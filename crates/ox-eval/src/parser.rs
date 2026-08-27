@@ -160,6 +160,22 @@ pub struct Parser<'a> {
     nesting: usize,
 }
 
+/// Choose between a parse failure and the byte the lexer refused.
+///
+/// [`Lexer::tokenize_tolerant`] leaves a synthetic `Eof` at `stop`, the offset
+/// it refused to read past, so a parser that ran out of tokens fails *there*
+/// while really having needed the refused byte. Upstream lexes lazily and
+/// would have hit the byte itself, so its own error is the honest one. A parse
+/// failure before `stop` is unrelated and stands. The refusal's own offset is
+/// not the comparison point: it can sit inside the token that failed to lex,
+/// past the offset the parser reports.
+fn resolve_refusal(error: EvalError, refused: &Option<EvalError>, stop: usize) -> EvalError {
+    match refused {
+        Some(refusal) if error.offset >= stop => refusal.clone(),
+        _ => error,
+    }
+}
+
 impl<'a> Parser<'a> {
     /// Create a parser using [`DEFAULT_MAX_NESTING`].
     #[must_use]
@@ -182,17 +198,29 @@ impl<'a> Parser<'a> {
 
     /// Parse one complete expression and reject trailing tokens.
     pub fn parse(mut self) -> Result<Expr, EvalError> {
-        self.tokens = Lexer::new(self.source).tokenize()?;
-        let expression = self.parse_expr1()?;
-        if !matches!(self.current().kind, TokenKind::Eof) {
-            return Err(EvalError::new("E15", self.current().span.start, "trailing characters after expression"));
+        let (tokens, refused) = Lexer::new(self.source).tokenize_tolerant();
+        let stop = tokens.last().map_or(0, |token| token.span.start);
+        self.tokens = tokens;
+        let expression = self.parse_expr1().map_err(|error| resolve_refusal(error, &refused, stop))?;
+        if !matches!(self.current().kind, TokenKind::Eof) || refused.is_some() {
+            // Upstream reports the unconsumed remainder verbatim:
+            // `e_trailing_arg` is "E488: Trailing characters: %s" (errors.h:123),
+            // raised from `eval.c:1251` once `eval0` stops short of the end.
+            // A byte the lexer refused counts as remainder too, because
+            // `eval0` never looked at it: the expression in front of it was
+            // already complete.
+            let start = self.current().span.start;
+            let rest = String::from_utf8_lossy(&self.source[start..]);
+            return Err(EvalError::new("E488", start, format!("Trailing characters: {rest}")));
         }
         Ok(expression)
     }
 
     /// Parse whitespace-separated expressions, as consumed by `:execute`.
     pub fn parse_many(mut self) -> Result<Vec<Expr>, EvalError> {
-        self.tokens = Lexer::new(self.source).tokenize()?;
+        let (tokens, refused) = Lexer::new(self.source).tokenize_tolerant();
+        let stop = tokens.last().map_or(0, |token| token.span.start);
+        self.tokens = tokens;
         let mut expressions: Vec<Expr> = Vec::new();
         while !matches!(self.current().kind, TokenKind::Eof) {
             if let Some(previous) = expressions.last() {
@@ -205,9 +233,15 @@ impl<'a> Parser<'a> {
                     ));
                 }
             }
-            expressions.push(self.parse_expr1()?);
+            expressions.push(self.parse_expr1().map_err(|error| resolve_refusal(error, &refused, stop))?);
         }
-        Ok(expressions)
+        // `:echo`, `:echomsg` and `:execute` loop `eval1` until the line is
+        // spent (`eval.c:1846` and `ex_docmd`'s echo handlers), so they do
+        // reach a byte the lexer refused and answer E15, not E488.
+        match refused {
+            Some(error) => Err(error),
+            None => Ok(expressions),
+        }
     }
 
     fn parse_expr1(&mut self) -> Result<Expr, EvalError> {
@@ -408,7 +442,10 @@ impl<'a> Parser<'a> {
                 Ok(Expr::new(ExprKind::Interpolated(parts), token.span))
             }
             TokenKind::Blob(value) => Ok(Expr::new(ExprKind::Literal(Typval::Blob(value)), token.span)),
-            TokenKind::Identifier(value) => self.parse_variable(value, token.span),
+            TokenKind::Identifier(value) => {
+                let variable = self.parse_variable(value, token.span)?;
+                self.parse_detached_call(variable)
+            }
             TokenKind::Environment(value) => Ok(Expr::new(ExprKind::Environment(OxStr(value)), token.span)),
             TokenKind::Option { scope, name } => {
                 let scope = match scope {
@@ -428,9 +465,18 @@ impl<'a> Parser<'a> {
             TokenKind::HashLBrace => self.parse_literal_dict(token.span.start),
             TokenKind::LBrace if self.brace_is_lambda() => self.parse_lambda(token.span.start),
             TokenKind::LBrace => self.parse_dict(token.span.start),
-            TokenKind::Eof => Err(EvalError::new("E15", token.span.start, "expression expected")),
-            _ => Err(EvalError::new("E15", token.span.start, "expression expected")),
+            // Nothing here can begin an expression. Upstream does not describe
+            // the offending token; `e_invexpr2` (errors.h:38) quotes the whole
+            // expression back: `E15: Invalid expression: "%s"`.
+            _ => Err(self.invalid_expression()),
         }
+    }
+
+    /// `e_invexpr2` (errors.h:38): `E15: Invalid expression: "%s"`, quoting the
+    /// whole expression rather than the token that could not be parsed.
+    fn invalid_expression(&self) -> EvalError {
+        let source = String::from_utf8_lossy(self.source);
+        EvalError::new("E15", 0, format!("Invalid expression: \"{source}\""))
     }
 
     fn parse_variable(&mut self, mut name: Vec<u8>, mut span: Span) -> Result<Expr, EvalError> {
@@ -462,6 +508,23 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(Expr::new(ExprKind::Variable(OxStr(name)), span))
+    }
+
+    /// A bare name may be separated from its argument list by white space, so
+    /// `substitute ( 'a', 'b', 'c', 'g' )` is a legal legacy call. Only a name
+    /// at the head of an expression gets this; in the subscript chain
+    /// `d.Fn ()`, `l[0] ()` and `Fn() ()` all stay errors.
+    /// Upstream: `eval.c:2783-2786` skips white space before testing for `(`,
+    /// while `handle_subscript` (`eval.c:6022-6026`) requires the `(` to be
+    /// adjacent.
+    fn parse_detached_call(&mut self, callee: Expr) -> Result<Expr, EvalError> {
+        if !matches!(self.current().kind, TokenKind::LParen) {
+            return Ok(callee);
+        }
+        self.advance();
+        let (args, end) = self.parse_arguments()?;
+        let span = Span::new(callee.span.start, end);
+        Ok(Expr::new(ExprKind::Call { callee: Box::new(callee), args }, span))
     }
 
     fn parse_list(&mut self, start: usize) -> Result<Expr, EvalError> {
@@ -509,29 +572,40 @@ impl<'a> Parser<'a> {
             return Ok(Expr::new(ExprKind::Dict(entries), Span::new(start, close.span.end)));
         }
         loop {
+            // `get_literal_key` (eval.c:4458-4472) scans raw bytes, not tokens:
+            // the key is a run of ASCII alphanumerics, `_` and `-`, and white
+            // space may follow it before the colon.
             let key_start = self.current().span.start;
             let mut key_end = key_start;
-            while !matches!(self.current().kind, TokenKind::Colon | TokenKind::Eof | TokenKind::RBrace) {
-                if self.current().span.start != key_end && key_end != key_start {
-                    return Err(EvalError::new("E720", self.current().span.start, "white space in literal dictionary key"));
-                }
-                key_end = self.current().span.end;
-                self.advance();
+            while self
+                .source
+                .get(key_end)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                key_end += 1;
             }
             if key_end == key_start {
-                return Err(EvalError::new("E720", key_start, "literal dictionary key is missing"));
-            }
-            let key_bytes = &self.source[key_start..key_end];
-            if key_bytes
-                .iter()
-                .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
-            {
-                return Err(EvalError::new("E720", key_start, "invalid literal dictionary key"));
+                // The key is not a literal key at all, so upstream abandons the
+                // dictionary entirely and reports the whole expression as
+                // invalid (`eval_dict` FAIL -> `e_invexpr2`, eval.c:4512-4514).
+                let rest = String::from_utf8_lossy(&self.source[start..]);
+                return Err(EvalError::new("E15", start, format!("Invalid expression: \"{rest}\"")));
             }
             let key = Expr::new(
-                ExprKind::Literal(Typval::String(OxStr(key_bytes.to_vec()))),
+                ExprKind::Literal(Typval::String(OxStr(self.source[key_start..key_end].to_vec()))),
                 Span::new(key_start, key_end),
             );
+            let mut colon = key_end;
+            while matches!(self.source.get(colon), Some(b' ' | b'\t')) {
+                colon += 1;
+            }
+            if self.source.get(colon) != Some(&b':') {
+                let rest = String::from_utf8_lossy(&self.source[colon..]);
+                return Err(EvalError::new("E720", colon, format!("Missing colon in Dictionary: {rest}")));
+            }
+            while self.current().span.start < colon && !matches!(self.current().kind, TokenKind::Eof) {
+                self.advance();
+            }
             self.require(|kind| matches!(kind, TokenKind::Colon), "E720", "missing ':' in dictionary")?;
             let value = self.parse_expr1()?;
             entries.push((key, value));
@@ -626,25 +700,43 @@ impl<'a> Parser<'a> {
 
     fn parse_method_call(&mut self, receiver: Expr) -> Result<Expr, EvalError> {
         let arrow_end = self.previous_span().end;
-        let method = if matches!(self.current().kind, TokenKind::LBrace) {
+        // `eval_method` (eval.c:2996-3016) does not skip white space before the
+        // method name, so a gap after `->` leaves the rest of the expression
+        // unparsed and the caller reports the remainder as invalid rather than
+        // complaining about the arrow.
+        // Tested on the raw byte rather than the next token span, so a trailing
+        // `-> ` at the end of the source is caught too.
+        if matches!(self.source.get(arrow_end), Some(b' ' | b'\t')) {
+            let rest = String::from_utf8_lossy(&self.source[arrow_end..]);
+            return Err(EvalError::new("E15", arrow_end, format!("Invalid expression: \"{rest}\"")));
+        }
+        let is_lambda = matches!(self.current().kind, TokenKind::LBrace);
+        let method = if is_lambda {
             let open = self.advance().clone();
             if !self.brace_is_lambda() {
-                return Err(EvalError::new("E260", open.span.start, "lambda expected after '->'"));
+                return Err(EvalError::new("E260", open.span.start, "Missing name after ->"));
             }
             self.parse_lambda(open.span.start)?
         } else {
             let token = self.advance().clone();
             let TokenKind::Identifier(name) = token.kind else {
-                return Err(EvalError::new("E260", token.span.start, "method name expected"));
+                return Err(EvalError::new("E260", token.span.start, "Missing name after ->"));
             };
             Expr::new(ExprKind::Variable(OxStr(name)), token.span)
         };
-        if method.span.start != arrow_end {
-            return Err(EvalError::new("E274", method.span.start, "white space is not allowed after '->'"));
+        if !matches!(self.current().kind, TokenKind::LParen) {
+            // `e_missingparen` is "E107: Missing parentheses: %s" (errors.h:131);
+            // `eval_lambda` passes the literal "lambda" for the `{...}` form.
+            let name = if is_lambda {
+                "lambda".to_owned()
+            } else {
+                String::from_utf8_lossy(&self.source[method.span.start..method.span.end]).into_owned()
+            };
+            return Err(EvalError::new("E107", method.span.start, format!("Missing parentheses: {name}")));
         }
-        let open = self.require(|kind| matches!(kind, TokenKind::LParen), "E274", "method name must be followed by '('")?;
+        let open = self.advance().clone();
         if method.span.end != open.span.start {
-            return Err(EvalError::new("E274", open.span.start, "white space is not allowed before method arguments"));
+            return Err(EvalError::new("E274", open.span.start, "No white space allowed before parenthesis"));
         }
         let (args, end) = self.parse_arguments()?;
         let span = Span::new(receiver.span.start, end);

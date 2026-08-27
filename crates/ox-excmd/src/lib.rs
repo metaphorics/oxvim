@@ -9,13 +9,13 @@ pub mod expand;
 pub mod parser;
 
 pub use command::{
-    COMMANDS, CommandFlags, CommandSpec, NoUserCommands, ResolveError, ResolvedCommand,
+    COMMANDS, AddrType, CommandFlags, CommandSpec, NoUserCommands, ResolveError, ResolvedCommand,
     UserCommandMatch, UserCommandProvider, command_spec, resolve_command,
 };
 pub use expand::{CmdlineContext, CmdlineSpecial, ExpansionPart, expand_with, scan_expansions};
 pub use parser::{
     Address, AddressBase, CommandModifier, ErrorCode, ExCommand, ModifierKind, ParseError, Parser,
-    Range, RangeKind, RangeSeparator,
+    Range, RangeKind, RangeSeparator, effective_addr_type, effective_flags,
 };
 
 impl ExCommand {

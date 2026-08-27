@@ -130,6 +130,25 @@ pub struct Scope {
     pub options_local: ScopeMap,
     /// `@r` register contents.
     pub registers: ScopeMap,
+    /// Variables `:lockvar` marked, upstream's `DI_FLAGS_LOCK`.
+    pub locked: Vec<LockMark>,
+}
+
+/// A `:lockvar` mark on one variable.
+///
+/// `do_lock_var` (`eval/vars.c:1802`) sets two things: `DI_FLAGS_LOCK` on the
+/// dict item, and — only when `depth` is non-zero — `v_lock` on the
+/// variable's own value through `tv_item_lock`. A List or Dict carries
+/// `v_lock` in its own [`ox_types::LockState`]; a scalar has nowhere to put
+/// it, so the flag is recorded here beside the name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LockMark {
+    /// The scope map holding the marked variable.
+    pub scope: ScopeKind,
+    /// The variable name inside that scope, without its prefix.
+    pub name: OxStr,
+    /// Whether `tv_item_lock` also locked the variable's own value.
+    pub value: bool,
 }
 
 impl Scope {
@@ -192,16 +211,128 @@ impl Scope {
     ///
     /// If a `l:` entry with the same byte key exists, it is updated in place;
     /// otherwise a new entry is appended, preserving insertion order.
-    pub fn set(&mut self, name: &[u8], value: Typval) {
+    ///
+    /// # Errors
+    /// `E741` or `E1122` when `:lockvar` locked the variable being replaced.
+    pub fn set(&mut self, name: &[u8], value: Typval) -> Result<()> {
+        self.check_assignable(name, 0)?;
         assign(&mut self.local, name, value);
+        Ok(())
     }
 
-    /// Apply `:lockvar` to an unqualified container variable; `deep` models `!`.
-    pub fn lockvar(&self, name: &[u8], deep: bool, offset: usize) -> Result<()> {
-        crate::builtins::lock_value(self.get(name, offset)?, deep)
+    /// `set_var_const` (`eval/vars.c:2869-2877`): an existing variable refuses
+    /// a new value when its value is locked, and then when the variable
+    /// itself is locked, in upstream's order. A name that does not exist yet
+    /// has no dict item to carry either flag, so it always assigns.
+    ///
+    /// This is the check every assignment to `{name}` owes, including the
+    /// compound (`+=`), list-element, and `:for` target forms.
+    ///
+    /// # Errors
+    /// `E741` when the value is locked, `E1122` when the variable is, and
+    /// `E742` when the value is already borrowed.
+    pub fn check_assignable(&self, name: &[u8], offset: usize) -> Result<()> {
+        if self.resolve(name).is_none() {
+            return Ok(());
+        }
+        self.check_value_lock(name, offset)?;
+        self.check_variable_lock(name)
+    }
+
+    /// `:lockvar[!] [depth] {name}` — `ex_lockvar` (`eval/vars.c:1554`) with
+    /// `do_lock_var` (`eval/vars.c:1802`): mark the variable itself locked
+    /// (`DI_FLAGS_LOCK`), then, when `depth` is non-zero, lock its value
+    /// `depth` levels down. `depth` is 2 by default and -1 for `:lockvar!`.
+    ///
+    /// An unknown name is silently ignored, because `do_lock_var` fails
+    /// without a message when `find_var` finds nothing.
+    ///
+    /// # Errors
+    /// `E742` when a container in the traversal is already borrowed.
+    pub fn lockvar(&mut self, name: &[u8], depth: i32) -> Result<()> {
+        self.set_variable_lock(name, depth, true)
+    }
+
+    /// `:unlockvar[!] [depth] {name}`, the same path with `lock` false.
+    ///
+    /// # Errors
+    /// `E742` when a container in the traversal is already borrowed.
+    pub fn unlockvar(&mut self, name: &[u8], depth: i32) -> Result<()> {
+        self.set_variable_lock(name, depth, false)
+    }
+
+    fn set_variable_lock(&mut self, name: &[u8], depth: i32, lock: bool) -> Result<()> {
+        let Some((kind, bare)) = self.resolve(name) else { return Ok(()) };
+        let Some((_, value)) = find_pair(self.map(kind), bare) else { return Ok(()) };
+        let value = value.clone();
+        let position = self.locked.iter().position(|mark| mark.scope == kind && mark.name.as_bytes() == bare);
+        match (lock, position) {
+            (true, None) => self.locked.push(LockMark { scope: kind, name: OxStr::from(bare), value: depth != 0 }),
+            (true, Some(position)) => self.locked[position].value |= depth != 0,
+            (false, Some(position)) => {
+                self.locked.remove(position);
+            }
+            (false, None) => {}
+        }
+        crate::builtins::lock_value(&value, depth, lock)
+    }
+
+    /// `var_check_lock` (`eval/vars.c:2990`): reject an assignment to a
+    /// variable that `:lockvar` marked. An unknown name has no mark.
+    ///
+    /// # Errors
+    /// `E1122` when the variable itself is locked.
+    pub fn check_variable_lock(&self, name: &[u8]) -> Result<()> {
+        let Some((kind, bare)) = self.resolve(name) else { return Ok(()) };
+        if self.mark(kind, bare).is_some() {
+            return Err(EvalError::new("E1122", 0, format!("Variable is locked: {}", lossy(name))));
+        }
+        Ok(())
+    }
+
+    /// `value_check_lock` (`eval/typval.c:4000`): reject a change to a value
+    /// `:lockvar` locked. Names the variable, as `e_value_is_locked_str` does.
+    ///
+    /// A List or Dict carries that flag in its own `LockState`; a scalar has
+    /// nowhere to put it, so the [`LockMark`] carries it instead.
+    ///
+    /// # Errors
+    /// `E121` when the variable does not exist, `E741` when its value is
+    /// locked, and `E742` when the value is already borrowed.
+    pub fn check_value_lock(&self, name: &[u8], offset: usize) -> Result<()> {
+        let Some((kind, bare)) = self.resolve(name) else { return Err(undefined(name, offset)) };
+        let value = self.get_scoped(kind, bare, offset)?;
+        let locked = self.mark(kind, bare).is_some_and(|mark| mark.value)
+            || matches!(crate::builtins::is_locked_value(value)?, Typval::Number(state) if state != 0);
+        if locked {
+            return Err(EvalError::new("E741", 0, format!("Value is locked: {}", lossy(name))));
+        }
+        Ok(())
+    }
+
+    /// `find_var` (`eval/vars.c:2634`): the scope map that holds `name` —
+    /// the one its `x:` prefix names, or the first of `l:`, `a:`, `g:` that
+    /// has it — together with the name inside that map.
+    fn resolve<'a>(&self, name: &'a [u8]) -> Option<(ScopeKind, &'a [u8])> {
+        if name.len() >= 2 && name[1] == b':' {
+            let kind = ScopeKind::from_byte(name[0])?;
+            let bare = &name[2..];
+            return find_pair(self.map(kind), bare).map(|_| (kind, bare));
+        }
+        [ScopeKind::Local, ScopeKind::Argument, ScopeKind::Global]
+            .into_iter()
+            .find(|kind| find_pair(self.map(*kind), name).is_some())
+            .map(|kind| (kind, name))
+    }
+
+    fn mark(&self, kind: ScopeKind, name: &[u8]) -> Option<&LockMark> {
+        self.locked.iter().find(|mark| mark.scope == kind && mark.name.as_bytes() == name)
     }
 
     /// Return the lock state of an unqualified variable (0 through 3).
+    ///
+    /// # Errors
+    /// `E121` when the variable does not exist.
     pub fn islocked(&self, name: &[u8], offset: usize) -> Result<i64> {
         match crate::builtins::is_locked_value(self.get(name, offset)?)? {
             Typval::Number(status) => Ok(status),
@@ -240,7 +371,12 @@ impl Scope {
 
     /// Assign a value to a scoped name.
     ///
-    /// `v:` and `a:` are read-only for normal assignment and produce `E46`.
+    /// `v:` and `a:` are read-only for normal assignment and produce `E46`;
+    /// upstream checks that before either lock (`eval/vars.c:2869-2877`).
+    ///
+    /// # Errors
+    /// `E46` for a read-only namespace, `E741` or `E1122` when `:lockvar`
+    /// locked the variable being replaced.
     pub fn set_scoped(
         &mut self,
         kind: ScopeKind,
@@ -254,6 +390,14 @@ impl Scope {
                 offset,
                 format!("Cannot change read-only variable \"{}\"", lossy(name)),
             ));
+        }
+        if find_pair(self.map(kind), name).is_some() {
+            // The lock checks and their messages name the variable as it was
+            // written, which for a scoped target is `g:x`, not `x`.
+            let mut written = Vec::with_capacity(kind.as_str().len() + name.len());
+            written.extend_from_slice(kind.as_str().as_bytes());
+            written.extend_from_slice(name);
+            self.check_assignable(&written, offset)?;
         }
         assign(self.map_mut(kind), name, value);
         Ok(())
@@ -271,6 +415,20 @@ impl Scope {
     /// Set or create an environment variable (`$VAR = ...`).
     pub fn set_env(&mut self, name: &[u8], value: Typval) {
         assign(&mut self.env, name, value);
+    }
+
+    /// Remove an environment variable, so `$VAR` reads fall back to the empty
+    /// string the way `os_unsetenv` leaves them.
+    pub fn unset_env(&mut self, name: &[u8]) {
+        if let Some(index) = find_index(&self.env, name) {
+            self.env.remove(index);
+        }
+    }
+
+    /// Every environment variable this scope carries, for `environ()`.
+    #[must_use]
+    pub fn env_entries(&self) -> &[(OxStr, Typval)] {
+        &self.env
     }
 
     /// Read a register (`@r`).

@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrome::{
-    Chrome, ChromeError, ChunkLine, HistoryEntry, MessageUpdate, PopupItem, Rect, TextChunk, TimeMs,
+    Chrome, ChromeError, ChunkLine, HistoryEntry, MessageSeverity, MessageUpdate, PopupItem, Rect,
+    TextChunk, TimeMs,
 };
 use client::{Client, ClientError};
 use crossterm::Command as _;
@@ -30,10 +31,10 @@ use ox_types::{Dict, Object, OxStr};
 use screen::{ApplyOutcome, ComposedGrid, Screen, ScreenError};
 use terminal::{
     Cell as TerminalCell, CellAttributes, ColorSupport, DamageWriter, Frame, FrameError,
-    ProcessFailure, ProcessFailureKind, ProbePolicy, TerminalCapabilities, TerminalColor,
-    TerminalEnvironment, TerminalError, TerminalSession, UnderlineStyle,
+    ProcessFailure, ProcessFailureKind, ProbePolicy, ShutdownSignals, TerminalCapabilities,
+    TerminalColor, TerminalEnvironment, TerminalError, TerminalSession, UnderlineStyle,
 };
-use theme::{HighlightGroup, HighlightStyle, Rgb, Theme};
+use theme::{HighlightGroup, HighlightStyle, MonoTheme, Rgb, Theme};
 use thiserror::Error;
 
 const LOOP_SLICE: Duration = Duration::from_millis(16);
@@ -358,6 +359,8 @@ pub enum TuiError {
 
 /// Run an already-spawned client until its RPC stream closes.
 pub fn run(mut client: Client) -> Result<(), TuiError> {
+    // This full-screen client owns its palette; NO_COLOR must not strip its SGR output.
+    crossterm::style::force_color_output(true);
     let (width, height) = crossterm::terminal::size().map_err(TuiError::Input)?;
     client.attach(width, height)?;
 
@@ -373,6 +376,10 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
     let mut shared = SharedWriter::stdout();
     let mut session = TerminalSession::start(shared.clone(), capabilities)?;
     let mut damage = DamageWriter::new(shared.clone(), capabilities.undercurl);
+    // Registered before the palette is programmed: a terminating signal that
+    // arrives between programming and the first loop turn must still reach the
+    // restore path instead of killing the process with OSC 4 still in effect.
+    let signals = ShutdownSignals::install()?;
     let mut state = TuiState::new(env::var("COLORFGBG").ok().as_deref(), MotionPolicy::from_environment());
     let tokens = state.theme.tokens();
     session.program_palette(&[
@@ -388,6 +395,14 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
     let mut mouse_capture_emitted = false;
 
     loop {
+        if let Some(signal) = signals.pending() {
+            if mouse_capture_emitted {
+                let _ = apply_mouse_capture(&mut shared, false);
+            }
+            let restored = session.restore();
+            ShutdownSignals::resume_default(signal)?;
+            return restored.map_err(TuiError::Terminal);
+        }
         match client.recv_redraw_timeout(LOOP_SLICE) {
             Ok(Some(events)) => {
                 let now = TimeMs(duration_millis(started.elapsed()));
@@ -563,8 +578,16 @@ fn render_frame(
     let cursor_row = state.screen.cursor().map(|cursor| cursor.row);
     let layout = state.chrome.layout(grid.width(), grid.height(), cursor_row);
     if let (Some(rect), Some(popup)) = (layout.insert_popup, &state.chrome.insert_popup) {
-        let text = popup.items.iter().flat_map(|item| item.word.as_bytes().iter().copied().chain(std::iter::once(b'\n'))).collect::<Vec<_>>();
-        paint_surface(&mut cells, grid.width(), grid.height(), rect, &text, &state.theme, HighlightGroup::Pmenu, capabilities.colors, 1.0);
+        paint_completion_menu(
+            &mut cells,
+            grid.width(),
+            grid.height(),
+            rect,
+            &popup.items,
+            popup.selected,
+            &state.theme,
+            capabilities.colors,
+        );
     }
     if let (Some(rect), Some(popup)) = (layout.documentation, &state.chrome.insert_popup) {
         if let Some(info) = popup.documentation() {
@@ -587,22 +610,19 @@ fn render_frame(
         paint_surface(&mut cells, grid.width(), grid.height(), rect, &text, &state.theme, HighlightGroup::WildMenu, capabilities.colors, 1.0);
     }
     if let (Some(rect), Some(wildmenu)) = (layout.wildmenu, &state.chrome.wildmenu) {
-        let text = wildmenu.items.iter().flat_map(|item| item.word.as_bytes().iter().copied().chain(std::iter::once(b' '))).collect::<Vec<_>>();
-        paint_surface(&mut cells, grid.width(), grid.height(), rect, &text, &state.theme, HighlightGroup::WildMenu, capabilities.colors, 1.0);
+        paint_wildmenu_strip(
+            &mut cells,
+            grid.width(),
+            grid.height(),
+            rect,
+            &wildmenu.items,
+            wildmenu.selected,
+            &state.theme,
+            capabilities.colors,
+        );
     }
     if let Some(rect) = layout.messages {
-        let visible = state.chrome.visible_messages();
-        let mut text = Vec::new();
-        for entry in &visible.entries {
-            for chunk in &entry.content {
-                text.extend_from_slice(chunk.text.as_bytes());
-            }
-            text.push(b'\n');
-        }
-        if let Some(badge) = visible.overflow_badge {
-            text.extend_from_slice(badge.as_bytes());
-        }
-        paint_surface(&mut cells, grid.width(), grid.height(), rect, &text, &state.theme, HighlightGroup::MsgArea, capabilities.colors, state.notification_opacity());
+        paint_message_stack(&mut cells, grid.width(), grid.height(), rect, state, capabilities.colors);
     }
     if let (Some(rect), Some(search_count)) = (layout.search_count, &state.chrome.search_count) {
         let text = search_count.iter().flat_map(|chunk| chunk.text.as_bytes().iter().copied()).collect::<Vec<_>>();
@@ -621,36 +641,215 @@ fn render_frame(
     Ok(Frame::new(width, height, cells)?)
 }
 
-fn paint_surface(
-    cells: &mut [TerminalCell],
-    width: usize,
-    height: usize,
-    rect: Rect,
-    text: &[u8],
+/// The three resolved colors a client-owned float paints with.
+#[derive(Clone, Copy)]
+struct SurfaceStyle {
+    foreground: TerminalColor,
+    background: TerminalColor,
+    border: TerminalColor,
+}
+
+/// Resolve `group` against the theme, premixed towards the editor background
+/// by the notification fade.
+fn surface_style(
     theme: &Theme,
     group: HighlightGroup,
     color_support: ColorSupport,
     opacity: f64,
-) {
-    if rect.width == 0 || rect.height == 0 {
-        return;
-    }
+) -> SurfaceStyle {
     let tokens = theme.tokens();
     let surface = theme.style(group);
     let border_style = theme.style(HighlightGroup::FloatBorder);
     let fade = ((1.0 - opacity.clamp(0.0, 1.0)) * 100.0).round() as u8;
-    let foreground = fallback_color(
+    let background = premix(surface.background.unwrap_or(tokens.float_bg), tokens.bg, fade);
+    let (foreground, background_color) = resolve_client_pair(
         premix(surface.foreground.unwrap_or(tokens.fg), tokens.bg, fade),
+        background,
         color_support,
     );
-    let background = fallback_color(
-        premix(surface.background.unwrap_or(tokens.float_bg), tokens.bg, fade),
-        color_support,
-    );
-    let border = fallback_color(
+    let (border, _) = resolve_client_pair(
         premix(border_style.foreground.unwrap_or(tokens.accent), tokens.bg, fade),
+        background,
         color_support,
     );
+    SurfaceStyle { foreground, background: background_color, border }
+}
+
+/// Repaint `count` cells of one row in `style`, as a selection band.
+///
+/// A monochrome terminal has no color channel at all, so the band also carries
+/// the mono theme's reverse attribute: without it the selected row would be
+/// indistinguishable from the rest of the menu.
+fn fill_row(
+    cells: &mut [TerminalCell],
+    width: usize,
+    x: usize,
+    y: usize,
+    count: usize,
+    style: SurfaceStyle,
+    monochrome: bool,
+) {
+    let reverse = monochrome && MonoTheme::default().selected.reverse;
+    let bold = monochrome && MonoTheme::default().selected.bold;
+    for column in x..x.saturating_add(count).min(width) {
+        let Some(cell) = y
+            .checked_mul(width)
+            .and_then(|base| base.checked_add(column))
+            .and_then(|index| cells.get_mut(index))
+        else {
+            continue;
+        };
+        cell.text = " ".into();
+        cell.continuation = false;
+        cell.foreground = style.foreground;
+        cell.background = style.background;
+        cell.attributes.reverse = reverse;
+        cell.attributes.bold = bold;
+    }
+}
+
+/// Rendered cell width of one line of `text`.
+fn text_width(text: &[u8]) -> usize {
+    let mut offset = 0usize;
+    let mut column = 0usize;
+    while offset < text.len() {
+        let (consumed, advance) = chrome::decoded_cell_width(text, offset, column);
+        column = column.saturating_add(advance);
+        offset = offset.saturating_add(consumed);
+    }
+    column
+}
+
+/// Paint the insert-completion menu, one item per inner row.
+///
+/// The selected row is `PmenuSel`: background-colored text on accent, the only
+/// sanctioned way to put text on the accent surface (ordinary foreground on
+/// accent is 1.78:1 dark and 2.05:1 light, and is forbidden). An unselected
+/// row shows the item's kind and menu columns in `PmenuKind`/`PmenuExtra`.
+#[allow(clippy::too_many_arguments)]
+fn paint_completion_menu(
+    cells: &mut [TerminalCell],
+    width: usize,
+    height: usize,
+    rect: Rect,
+    items: &[PopupItem],
+    selected: Option<usize>,
+    theme: &Theme,
+    color_support: ColorSupport,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let monochrome = color_support == ColorSupport::Mono;
+    let base = surface_style(theme, HighlightGroup::Pmenu, color_support, 1.0);
+    let selection = surface_style(theme, HighlightGroup::PmenuSel, color_support, 1.0);
+    fill_surface(cells, width, height, rect, base);
+
+    let inner_x = rect.x.saturating_add(1);
+    let inner_y = rect.y.saturating_add(1);
+    let inner_width = rect.width.saturating_sub(2);
+    let inner_height = rect.height.saturating_sub(2);
+    for (index, item) in items.iter().take(inner_height).enumerate() {
+        let row = inner_y.saturating_add(index);
+        let chosen = selected == Some(index);
+        if chosen {
+            fill_row(cells, width, inner_x, row, inner_width, selection, monochrome);
+        }
+        let mut column = 0usize;
+        for (text, group) in [
+            (item.word.as_bytes(), HighlightGroup::Pmenu),
+            (item.kind.as_bytes(), HighlightGroup::PmenuKind),
+            (item.menu.as_bytes(), HighlightGroup::PmenuExtra),
+        ] {
+            if text.is_empty() || column >= inner_width {
+                continue;
+            }
+            let style = if chosen {
+                selection
+            } else {
+                surface_style(theme, group, color_support, 1.0)
+            };
+            flow_text(
+                cells,
+                width,
+                inner_x.saturating_add(column),
+                row,
+                inner_width.saturating_sub(column),
+                1,
+                text,
+                style.foreground,
+                style.background,
+            );
+            column = column.saturating_add(text_width(text)).saturating_add(1);
+        }
+    }
+}
+
+/// Paint the horizontal command-line completion strip.
+///
+/// Items sit on one row separated by a space, and the selected item alone
+/// carries the `WildMenu` selection colors, so the strip shows *which* item is
+/// current rather than only that a strip exists.
+#[allow(clippy::too_many_arguments)]
+fn paint_wildmenu_strip(
+    cells: &mut [TerminalCell],
+    width: usize,
+    height: usize,
+    rect: Rect,
+    items: &[PopupItem],
+    selected: Option<usize>,
+    theme: &Theme,
+    color_support: ColorSupport,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let monochrome = color_support == ColorSupport::Mono;
+    let base = surface_style(theme, HighlightGroup::Pmenu, color_support, 1.0);
+    let selection = surface_style(theme, HighlightGroup::WildMenu, color_support, 1.0);
+    fill_surface(cells, width, height, rect, base);
+
+    let inner_x = rect.x.saturating_add(1);
+    let inner_y = rect.y.saturating_add(1);
+    let inner_width = rect.width.saturating_sub(2);
+    if rect.height < 3 {
+        return;
+    }
+    let mut column = 0usize;
+    for (index, item) in items.iter().enumerate() {
+        let word = item.word.as_bytes();
+        let span = text_width(word);
+        if column.saturating_add(span) > inner_width {
+            break;
+        }
+        let chosen = selected == Some(index);
+        let style = if chosen { selection } else { base };
+        if chosen {
+            fill_row(cells, width, inner_x.saturating_add(column), inner_y, span, selection, monochrome);
+        }
+        flow_text(
+            cells,
+            width,
+            inner_x.saturating_add(column),
+            inner_y,
+            inner_width.saturating_sub(column),
+            1,
+            word,
+            style.foreground,
+            style.background,
+        );
+        column = column.saturating_add(span).saturating_add(1);
+    }
+}
+
+/// Clear `rect` to the surface background and recolor its one-cell frame.
+fn fill_surface(
+    cells: &mut [TerminalCell],
+    width: usize,
+    height: usize,
+    rect: Rect,
+    style: SurfaceStyle,
+) {
     for y in rect.y..rect.y.saturating_add(rect.height).min(height) {
         for x in rect.x..rect.x.saturating_add(rect.width).min(width) {
             let Some(index) = y.checked_mul(width).and_then(|row| row.checked_add(x)) else {
@@ -661,20 +860,36 @@ fn paint_surface(
             };
             cell.text = " ".into();
             cell.continuation = false;
-            cell.foreground = foreground;
-            cell.background = background;
+            cell.foreground = style.foreground;
+            cell.background = style.background;
             if y == rect.y || y + 1 == rect.y.saturating_add(rect.height) || x == rect.x || x + 1 == rect.x.saturating_add(rect.width) {
-                cell.foreground = border;
+                cell.foreground = style.border;
             }
         }
     }
-    let inner_x = rect.x.saturating_add(1);
-    let inner_y = rect.y.saturating_add(1);
-    let inner_width = rect.width.saturating_sub(2);
-    let inner_height = rect.height.saturating_sub(2);
+}
+
+/// Flow `text` into an already-filled area and return the number of rows it
+/// occupied, so a caller stacking several runs knows where the next one starts.
+#[allow(clippy::too_many_arguments)]
+fn flow_text(
+    cells: &mut [TerminalCell],
+    width: usize,
+    origin_x: usize,
+    origin_y: usize,
+    wrap_width: usize,
+    max_rows: usize,
+    text: &[u8],
+    foreground: TerminalColor,
+    background: TerminalColor,
+) -> usize {
+    if max_rows == 0 {
+        return 0;
+    }
     let mut x = 0usize;
     let mut y = 0usize;
     let mut offset = 0usize;
+    let mut rows = 0usize;
     let mut last_glyph_x: Option<usize> = None;
     while offset < text.len() {
         if text[offset] == b'\n' {
@@ -685,17 +900,18 @@ fn paint_surface(
             continue;
         }
         let (consumed, mut advance) = chrome::decoded_cell_width(text, offset, x);
-        if advance > 0 && x.saturating_add(advance) > inner_width {
+        if advance > 0 && x.saturating_add(advance) > wrap_width {
             x = 0;
             y = y.saturating_add(1);
             last_glyph_x = None;
-            advance = chrome::decoded_cell_width(text, offset, 0).1.min(inner_width);
+            advance = chrome::decoded_cell_width(text, offset, 0).1.min(wrap_width);
         }
-        if y >= inner_height {
+        if y >= max_rows {
             break;
         }
-        let column = inner_x.saturating_add(x);
-        let row = inner_y.saturating_add(y);
+        let column = origin_x.saturating_add(x);
+        let row = origin_y.saturating_add(y);
+        rows = y.saturating_add(1);
         if let Some(cell) = row.checked_mul(width).and_then(|base| base.checked_add(column)).and_then(|index| cells.get_mut(index)) {
             if advance > 0 {
                 cell.text = text[offset..offset.saturating_add(consumed)].to_vec();
@@ -722,7 +938,7 @@ fn paint_surface(
             } else if let Some(base_x) = last_glyph_x {
                 // Zero-width combining/decorative marks overlay the preceding
                 // glyph, preserving the original byte sequence.
-                let base_column = inner_x.saturating_add(base_x);
+                let base_column = origin_x.saturating_add(base_x);
                 if let Some(base_cell) = row.checked_mul(width).and_then(|base| base.checked_add(base_column)).and_then(|index| cells.get_mut(index)) {
                     base_cell.text.extend_from_slice(&text[offset..offset.saturating_add(consumed)]);
                     base_cell.continuation = false;
@@ -731,6 +947,143 @@ fn paint_surface(
         }
         x = x.saturating_add(advance);
         offset = offset.saturating_add(consumed);
+    }
+    rows
+}
+
+fn paint_surface(
+    cells: &mut [TerminalCell],
+    width: usize,
+    height: usize,
+    rect: Rect,
+    text: &[u8],
+    theme: &Theme,
+    group: HighlightGroup,
+    color_support: ColorSupport,
+    opacity: f64,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let style = surface_style(theme, group, color_support, opacity);
+    fill_surface(cells, width, height, rect, style);
+    flow_text(
+        cells,
+        width,
+        rect.x.saturating_add(1),
+        rect.y.saturating_add(1),
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(2),
+        text,
+        style.foreground,
+        style.background,
+    );
+}
+
+/// The theme group a diagnostic weight paints its letter with.
+const fn severity_group(severity: MessageSeverity) -> HighlightGroup {
+    match severity {
+        MessageSeverity::Error => HighlightGroup::ErrorMsg,
+        MessageSeverity::Warning => HighlightGroup::WarningMsg,
+        MessageSeverity::Plain => HighlightGroup::MsgArea,
+    }
+}
+
+/// Paint the message stack, one entry per row band.
+///
+/// A diagnostic gets a letter in the first inner column and that letter is
+/// colored by severity, so the same fact reaches a reader through two
+/// independent channels: a monochrome terminal still shows `E`/`W`, and the
+/// color is never the only cue. Server bytes start after the badge column and
+/// are copied verbatim.
+fn paint_message_stack(
+    cells: &mut [TerminalCell],
+    width: usize,
+    height: usize,
+    rect: Rect,
+    state: &TuiState,
+    color_support: ColorSupport,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let opacity = state.notification_opacity();
+    let base = surface_style(&state.theme, HighlightGroup::MsgArea, color_support, opacity);
+    fill_surface(cells, width, height, rect, base);
+
+    let inner_x = rect.x.saturating_add(1);
+    let inner_y = rect.y.saturating_add(1);
+    let inner_width = rect.width.saturating_sub(2);
+    let inner_height = rect.height.saturating_sub(2);
+    // A one-column letter plus one column of separation. Narrow terminals keep
+    // the badge and give up message columns instead: the diagnostic weight is
+    // the part a clipped message must not lose.
+    const BADGE_WIDTH: usize = 2;
+
+    let visible = state.chrome.visible_messages();
+    let mut row = 0usize;
+    for entry in &visible.entries {
+        if row >= inner_height {
+            break;
+        }
+        let severity = entry.severity();
+        let (text_x, text_width) = match severity.letter() {
+            Some(letter) if inner_width > BADGE_WIDTH => {
+                let badge = surface_style(
+                    &state.theme,
+                    severity_group(severity),
+                    color_support,
+                    opacity,
+                );
+                flow_text(
+                    cells,
+                    width,
+                    inner_x,
+                    inner_y.saturating_add(row),
+                    1,
+                    1,
+                    &[letter],
+                    badge.foreground,
+                    badge.background,
+                );
+                (
+                    inner_x.saturating_add(BADGE_WIDTH),
+                    inner_width.saturating_sub(BADGE_WIDTH),
+                )
+            }
+            _ => (inner_x, inner_width),
+        };
+        let mut text = Vec::new();
+        for chunk in &entry.content {
+            text.extend_from_slice(chunk.text.as_bytes());
+        }
+        let used = flow_text(
+            cells,
+            width,
+            text_x,
+            inner_y.saturating_add(row),
+            text_width,
+            inner_height.saturating_sub(row),
+            &text,
+            base.foreground,
+            base.background,
+        );
+        row = row.saturating_add(used.max(1));
+    }
+    if let Some(badge) = visible.overflow_badge
+        && row < inner_height
+    {
+        flow_text(
+            cells,
+            width,
+            inner_x,
+            inner_y.saturating_add(row),
+            inner_width,
+            inner_height.saturating_sub(row),
+            badge.as_bytes(),
+            base.foreground,
+            base.background,
+        );
     }
 }
 
@@ -995,10 +1348,15 @@ fn premix(top: Rgb, bottom: Rgb, blend_percentage: u8) -> Rgb {
     )
 }
 
+/// Quantize one server-originated color for the terminal's depth.
+///
+/// No contrast floor: these are the colorscheme's own colors and the client
+/// does not second-guess them. Client-owned chrome goes through
+/// [`resolve_client_pair`] instead.
 fn fallback_color(rgb: Rgb, support: ColorSupport) -> TerminalColor {
     match support {
         ColorSupport::TrueColor => TerminalColor::Rgb(rgb),
-        ColorSupport::Xterm256 | ColorSupport::Ansi16 => {
+        ColorSupport::Xterm256 => {
             let cube_component = |component: u8| -> u8 {
                 if component < 48 { 0 } else if component < 115 { 1 } else { ((component - 35) / 40).min(5) }
             };
@@ -1018,13 +1376,49 @@ fn fallback_color(rgb: Rgb, support: ColorSupport) -> TerminalColor {
             let index = if distance(theme::xterm_rgb(gray_index)) < distance(theme::xterm_rgb(cube_index)) { gray_index } else { cube_index };
             TerminalColor::Xterm256(theme::QuantizedColor { index, rgb: theme::xterm_rgb(index) })
         }
+        // A sixteen-color terminal must be sent one of its sixteen colors:
+        // an xterm-256 index there is either out of range or wrong.
+        ColorSupport::Ansi16 => TerminalColor::Ansi16(theme::nearest_ansi16(rgb)),
         ColorSupport::Mono => TerminalColor::Default,
+    }
+}
+
+/// Resolve a client-owned text/surface pair for the terminal's color depth.
+///
+/// Quantizing the two colors independently is what drops a pair below the
+/// design system's floor: on a 256-color terminal `fg_muted` on `float_bg`
+/// lands at 4.38:1 that way. Here the surface is quantized first and the text
+/// color is the nearest palette entry that still clears
+/// [`theme::TEXT_CONTRAST_FLOOR`] against it, so no color depth can silently
+/// break the contract.
+fn resolve_client_pair(
+    foreground: Rgb,
+    background: Rgb,
+    support: ColorSupport,
+) -> (TerminalColor, TerminalColor) {
+    match support {
+        ColorSupport::TrueColor => (TerminalColor::Rgb(foreground), TerminalColor::Rgb(background)),
+        ColorSupport::Xterm256 => {
+            let surface = background.quantize_xterm();
+            let text = theme::quantize_text(foreground, &[surface.rgb], theme::TEXT_CONTRAST_FLOOR);
+            (TerminalColor::Xterm256(text), TerminalColor::Xterm256(surface))
+        }
+        ColorSupport::Ansi16 => {
+            let surface = theme::nearest_ansi16(background);
+            let text =
+                theme::quantize_ansi16_text(foreground, surface, theme::TEXT_CONTRAST_FLOOR);
+            (TerminalColor::Ansi16(text), TerminalColor::Ansi16(surface))
+        }
+        ColorSupport::Mono => (TerminalColor::Default, TerminalColor::Default),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
     use super::*;
+    use crate::theme::ThemeTokens;
 
     #[test]
     fn reduced_motion_is_instant_and_full_is_bounded() {
@@ -1278,5 +1672,190 @@ mod tests {
         assert!(state.mouse_capture);
         state.apply_redraw(&[event("mouse_off")], TimeMs(0)).unwrap();
         assert!(!state.mouse_capture);
+    }
+
+    fn truecolor_capabilities() -> TerminalCapabilities {
+        TerminalCapabilities {
+            colors: ColorSupport::TrueColor,
+            kitty_keyboard: false,
+            synchronized_output: false,
+            undercurl: false,
+            colored_underline: false,
+            osc52_clipboard: false,
+            palette: terminal::PaletteDecision::Direct,
+        }
+    }
+
+    /// A blank `columns` x `rows` server grid, so a rendered frame contains
+    /// nothing but client chrome.
+    fn blank_grid(state: &mut TuiState, columns: i64, rows: i64) {
+        state
+            .apply_redraw(
+                &[RedrawEvent {
+                    name: OxStr::from("grid_resize"),
+                    argsets: vec![vec![
+                        Object::Integer(1),
+                        Object::Integer(columns),
+                        Object::Integer(rows),
+                    ]],
+                }],
+                TimeMs(0),
+            )
+            .unwrap();
+    }
+
+    fn message(state: &mut TuiState, kind: &str, text: &str) {
+        state
+            .chrome
+            .message_show(MessageUpdate {
+                kind: OxStr::from(kind),
+                content: vec![TextChunk::new(0, text, -1)],
+                replace_last: false,
+                history: false,
+                append: false,
+                id: Object::Nil,
+                prompt: false,
+            })
+            .unwrap();
+    }
+
+    /// Read a frame row as `(glyphs, foregrounds)`.
+    fn row_of(frame: &Frame, row: usize) -> (String, Vec<TerminalColor>) {
+        let width = usize::from(frame.width());
+        let cells = &frame.cells()[row * width..(row + 1) * width];
+        let text = cells
+            .iter()
+            .map(|cell| String::from_utf8_lossy(&cell.text).into_owned())
+            .collect::<String>();
+        (text, cells.iter().map(|cell| cell.foreground).collect())
+    }
+
+    // `from_kind` names five error kinds and exactly one warning kind, and
+    // treats every other kind — including one it has never heard of — as
+    // plain. One case per part: each error kind is asserted on its own, so
+    // dropping any single kind from the match fails here, and the plain cases
+    // fail if the match were widened.
+    #[test]
+    fn message_severity_covers_each_error_kind_the_warning_kind_and_no_others() {
+        for kind in ["emsg", "echoerr", "lua_error", "rpc_error", "shell_err"] {
+            assert_eq!(
+                MessageSeverity::from_kind(&OxStr::from(kind)),
+                MessageSeverity::Error,
+                "{kind} is an error kind"
+            );
+        }
+        assert_eq!(
+            MessageSeverity::from_kind(&OxStr::from("wmsg")),
+            MessageSeverity::Warning
+        );
+        for kind in ["echo", "echomsg", "shell_out", "confirm", "", "kind_from_the_future"] {
+            assert_eq!(
+                MessageSeverity::from_kind(&OxStr::from(kind)),
+                MessageSeverity::Plain,
+                "{kind} carries no diagnostic weight"
+            );
+        }
+        assert_eq!(MessageSeverity::Error.letter(), Some(b'E'));
+        assert_eq!(MessageSeverity::Warning.letter(), Some(b'W'));
+        assert_eq!(MessageSeverity::Plain.letter(), None);
+    }
+
+    // The design system forbids color as the sole channel. A diagnostic must
+    // therefore satisfy two independent promises, and each assertion below is
+    // arranged so the other promise cannot cover for it. The bodies
+    // deliberately do not begin with their own severity letter, so a client
+    // that dropped the badge and started the server text one column earlier
+    // fails the glyph assertion; and the letter's color is compared against
+    // the ordinary message color, so a client that painted the letter in the
+    // message color fails the color assertion.
+    #[test]
+    fn a_rendered_diagnostic_carries_both_a_letter_and_its_own_color() {
+        let mut state = TuiState::default();
+        blank_grid(&mut state, 40, 10);
+        message(&mut state, "emsg", "Pattern not found");
+        message(&mut state, "wmsg", "search hit BOTTOM");
+        message(&mut state, "echomsg", "written");
+
+        let grid = state.screen.composed_grid().unwrap();
+        let frame = render_frame(&grid, &state, truecolor_capabilities()).unwrap();
+        let rect = state.chrome.layout(40, 10, None).messages.expect("message stack");
+        let plain = surface_style(&state.theme, HighlightGroup::MsgArea, ColorSupport::TrueColor, 1.0);
+        let error = surface_style(&state.theme, HighlightGroup::ErrorMsg, ColorSupport::TrueColor, 1.0);
+        let warning = surface_style(&state.theme, HighlightGroup::WarningMsg, ColorSupport::TrueColor, 1.0);
+
+        let badge_column = rect.x + 1;
+        let text_column = badge_column + 2;
+        for (offset, letter, expected, body) in [
+            (0usize, 'E', error.foreground, "Pattern not found"),
+            (1, 'W', warning.foreground, "search hit BOTTOM"),
+        ] {
+            let (glyphs, colors) = row_of(&frame, rect.y + 1 + offset);
+            assert_eq!(
+                glyphs.chars().nth(badge_column),
+                Some(letter),
+                "row {offset} must carry its severity letter as a glyph"
+            );
+            assert_eq!(colors[badge_column], expected, "row {offset} letter color");
+            assert_ne!(
+                colors[badge_column], plain.foreground,
+                "row {offset} letter must not reuse the ordinary message color"
+            );
+            assert!(
+                glyphs[text_column..].starts_with(body),
+                "row {offset} keeps the server bytes verbatim after the badge, got {glyphs:?}"
+            );
+        }
+
+        // A message with no diagnostic weight spends no columns on a badge.
+        let (glyphs, colors) = row_of(&frame, rect.y + 3);
+        assert!(glyphs[badge_column..].starts_with("written"), "got {glyphs:?}");
+        assert_eq!(colors[badge_column], plain.foreground);
+    }
+
+    /// The 256-color defect the client shipped before `resolve_client_pair`
+    /// existed: quantizing a client pair with the server-color quantizer sends
+    /// muted text on a float at 4.38:1. Both halves are asserted, so this
+    /// fails whether the floor stops being applied or the defect it guards
+    /// against disappears (making the guard vacuous).
+    #[test]
+    fn client_chrome_quantization_keeps_a_pair_the_server_quantizer_breaks() {
+        let tokens = ThemeTokens::DARK;
+        let independent = |color: Rgb| match fallback_color(color, ColorSupport::Xterm256) {
+            TerminalColor::Xterm256(quantized) => quantized.rgb,
+            other => panic!("expected an xterm-256 color, got {other:?}"),
+        };
+        let unguarded =
+            independent(tokens.fg_muted).contrast(independent(tokens.float_bg));
+        assert!(
+            unguarded < theme::TEXT_CONTRAST_FLOOR,
+            "independent quantization is {unguarded:.2}, so the floor guards nothing"
+        );
+
+        let (foreground, background) =
+            resolve_client_pair(tokens.fg_muted, tokens.float_bg, ColorSupport::Xterm256);
+        let (TerminalColor::Xterm256(text), TerminalColor::Xterm256(surface)) =
+            (foreground, background)
+        else {
+            panic!("client chrome must resolve to xterm-256 colors");
+        };
+        let guarded = text.rgb.contrast(surface.rgb);
+        assert!(guarded >= theme::TEXT_CONTRAST_FLOOR, "floored pair is {guarded:.2}");
+    }
+
+    /// A sixteen-color terminal must receive one of its sixteen colors: an
+    /// xterm-256 index is out of range there.
+    #[test]
+    fn a_sixteen_color_terminal_receives_ansi_colors() {
+        assert!(matches!(
+            fallback_color(ThemeTokens::DARK.fg, ColorSupport::Ansi16),
+            TerminalColor::Ansi16(_)
+        ));
+        let (foreground, background) = resolve_client_pair(
+            ThemeTokens::LIGHT.accent,
+            ThemeTokens::LIGHT.float_bg,
+            ColorSupport::Ansi16,
+        );
+        assert!(matches!(foreground, TerminalColor::Ansi16(_)));
+        assert!(matches!(background, TerminalColor::Ansi16(_)));
     }
 }

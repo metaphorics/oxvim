@@ -4,13 +4,15 @@ use ox_text::Position;
 use ox_types::{BufHandle, WinHandle};
 use thiserror::Error;
 
+use crate::indent::{self, CinTrigger, ExprEval, IndentExprError};
 use crate::insert;
 use crate::motion::{resolve, resolve_find, FindDirection, FindMotion};
 use crate::ops::{self, EditRange, Operator};
+use crate::put::PutDirection;
 use crate::search::{SearchDirection, SearchState};
 use crate::textobject;
-use crate::{BufferStateError, Editor, EditorError, Key, KeyDecodeError, MarkLocation, MotionKind, OptionValue, SearchError, VisualKind, VisualState};
-use crate::{Lookup, MapMode, MappingAction, Remap, TypeaheadError, TypeaheadFlags, KS_EXTRA};
+use crate::{BufferStateError, BufferTextEditRequest, Editor, EditorError, ExtmarkPosition, Key, KeyDecodeError, MarkLocation, MotionKind, OptionValue, SearchError, VisualKind, VisualState};
+use crate::{Lookup, MapMode, MappingAction, MappingOptions, Remap, TypeaheadError, TypeaheadFlags, KS_EXTRA};
 
 /// Kind of command line currently being edited.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +61,10 @@ pub struct OperatorPendingState {
     pub register: Option<char>,
     /// Incomplete motion or text-object prefix.
     pub prefix: String,
+    /// Forced range shape selected with operator-pending `v` or `V`.
+    pub force_motion: Option<MotionKind>,
+    /// Search direction and expression retained while entering `/` or `?`.
+    pub search: Option<(SearchDirection, String)>,
 }
 
 /// Active editor input mode.
@@ -103,9 +109,16 @@ pub enum ModeError {
     #[error(transparent)] Operator(#[from] ops::OperatorError),
     /// Buffer text could not be read.
     #[error(transparent)] Buffer(#[from] BufferStateError),
+    /// Insert-mode operation failed.
+    #[error(transparent)] Insert(#[from] insert::InsertError),
+    /// Indent expression evaluation failed.
+    #[error(transparent)] Indent(#[from] IndentExprError),
     /// A named special key has no behavior in the current mode.
     #[error("non-character input is not supported in this modal state")]
     UnsupportedKey,
+    /// `'maxmapdepth'` mapping expansions happened without consuming a key.
+    #[error("recursive mapping")]
+    RecursiveMapping,
 }
 
 /// Stateful modal command processor.
@@ -117,7 +130,10 @@ pub struct ModeMachine {
     last_find: Option<FindMotion>,
     last_visual: Option<VisualState>,
     completed_ex_command: Option<String>,
-    pending_mapping_action: Option<MappingAction>,
+    pending_mapping_action: Option<(MappingAction, MappingOptions)>,
+    /// `mapdepth` (`getchar.c`): mapping expansions since the last key was
+    /// consumed. `nmap ,x ,x` re-expands forever without it.
+    map_depth: u32,
     timestamp: i64,
 }
 
@@ -130,8 +146,9 @@ impl ModeMachine {
     #[must_use] pub const fn search_state(&self) -> &SearchState { &self.search }
     /// Takes an Ex command completed with Enter.
     pub fn take_ex_command(&mut self) -> Option<String> { self.completed_ex_command.take() }
-    /// Takes a non-key mapping action for execution by the embedding host.
-    pub fn take_mapping_action(&mut self) -> Option<MappingAction> { self.pending_mapping_action.take() }
+    /// Takes a non-key mapping action, with the flags it was registered with,
+    /// for execution by the embedding host.
+    pub fn take_mapping_action(&mut self) -> Option<(MappingAction, MappingOptions)> { self.pending_mapping_action.take() }
 
     /// `state.c:34-106`: checking consumes mappings and input but performs no buffer mutation.
     pub fn check(&mut self, editor: &mut Editor) -> Result<Step, ModeError> {
@@ -147,23 +164,17 @@ impl ModeMachine {
                     Lookup::None => None,
                 };
                 if let Some((action, options, width)) = resolved {
-                    editor.typeahead_mut().consume(width);
-                    match action {
-                        MappingAction::Keys(keys) => {
-                            editor.typeahead_mut().push(&keys, 0, TypeaheadFlags {
-                                remap: if options.remap { Remap::Yes } else { Remap::No },
-                                modes: options.modes,
-                                buffer,
-                                mapped: true,
-                                silent: options.silent,
-                            })?;
-                            continue;
-                        }
-                        MappingAction::Nop => continue,
-                        action => { self.pending_mapping_action = Some(action); return Ok(Step::ProcessEvents); }
+                    if self.apply_mapping(editor, action, options, width)? {
+                        return Ok(Step::ProcessEvents);
                     }
+                    continue;
                 }
             }
+            self.may_sync_undo(editor, flags);
+            // `mapdepth = 0` once a character is actually returned
+            // (`vgetorpeek`, `getchar.c`): the limit counts expansions that
+            // produced no input, not expansions overall.
+            self.map_depth = 0;
             let Some(key) = editor.typeahead_mut().pop()? else { return Ok(Step::Idle); };
             return match key {
                 Key::Byte(byte) => Ok(Step::Key(char::from(byte))),
@@ -176,96 +187,324 @@ impl ModeMachine {
         }
     }
 
+    /// `vgetorpeek`'s mapping timeout (`getchar.c`), for the case where the
+    /// wait is already over: inside `:normal`, or under `feedkeys()`'s `x`
+    /// flag, no further key can arrive, so an incomplete mapping "behaves like
+    /// it timed out". The longest *complete* match already queued wins; with
+    /// no complete match the queued keys are used literally, which upstream
+    /// arranges by clearing one byte of `typebuf.tb_noremap` and returning it.
+    ///
+    /// [`Self::check`] deliberately keeps waiting instead, because the
+    /// interactive path really can receive another key. Returns whether the
+    /// queue changed, so a caller draining it knows to keep going.
+    pub fn timeout_pending_mapping(&mut self, editor: &mut Editor) -> Result<bool, ModeError> {
+        let Some(flags) = editor.typeahead().front_flags() else { return Ok(false) };
+        if flags.remap != Remap::Yes {
+            return Ok(false);
+        }
+        let mode = map_mode(&self.mode);
+        let buffer = editor.current_buffer();
+        let resolved = match editor.mappings().lookup_typeahead(editor.typeahead(), mode, buffer) {
+            Lookup::Prefix(Some(mapping)) => {
+                Some((mapping.action.clone(), mapping.options.clone(), mapping.lhs.len()))
+            }
+            Lookup::Prefix(None) => None,
+            Lookup::Exact(_, _) | Lookup::None => return Ok(false),
+        };
+        match resolved {
+            Some((action, options, width)) => {
+                self.apply_mapping(editor, action, options, width)?;
+                Ok(true)
+            }
+            None => {
+                editor.typeahead_mut().deny_front_remap();
+                Ok(true)
+            }
+        }
+    }
+
+    /// Consumes a matched mapping's left-hand side and installs its
+    /// right-hand side: replacement keys go back onto the typeahead as
+    /// not-typed input (`ins_typebuf`), and anything only a host can run is
+    /// parked for [`Self::take_mapping_action`].
+    ///
+    /// Reports whether an action was parked, which is the caller's cue to
+    /// leave the input loop so the host can run it.
+    fn apply_mapping(
+        &mut self,
+        editor: &mut Editor,
+        action: MappingAction,
+        options: MappingOptions,
+        width: usize,
+    ) -> Result<bool, ModeError> {
+        // `if (++mapdepth >= p_mmd) { emsg(e_recursive_mapping) }`
+        // (`vgetorpeek`, `getchar.c`): without this `nmap ,x ,x` re-expands
+        // its own right-hand side forever and never returns a key.
+        self.map_depth = self.map_depth.saturating_add(1);
+        if u64::from(self.map_depth) >= max_map_depth(editor) {
+            editor.typeahead_mut().flush();
+            return Err(ModeError::RecursiveMapping);
+        }
+        editor.typeahead_mut().consume(width);
+        match action {
+            MappingAction::Keys(keys) => {
+                let buffer = editor.current_buffer();
+                editor.typeahead_mut().push(&keys, 0, TypeaheadFlags {
+                    remap: if options.remap { Remap::Yes } else { Remap::No },
+                    modes: options.modes,
+                    buffer,
+                    mapped: true,
+                    silent: options.silent,
+                })?;
+                Ok(false)
+            }
+            MappingAction::Nop => Ok(false),
+            action => {
+                self.pending_mapping_action = Some((action, options));
+                Ok(true)
+            }
+        }
+    }
+
+    /// `may_sync_undo` (`input.c:1294-1306`): consuming a *typed* key closes
+    /// the open undo block, so everything one command does lands in one block
+    /// and the next thing the user types starts another.
+    ///
+    /// Keys a mapping produced are exempt because upstream only reports the
+    /// bytes past `typebuf.tb_maplen` through `gotchars`
+    /// (`input.c:2495-2497`), which is what calls this. Insert and command-line
+    /// mode are exempt so one insert session, and one typed Ex command line,
+    /// stay single blocks.
+    ///
+    /// Named gap: upstream also syncs inside Insert mode once a cursor key has
+    /// moved the caret (`Ins.moved != kInsNone`). This port's insert mode has
+    /// no cursor-key handling to set that state, so there is nothing here to
+    /// read; when it gains one, this is the predicate to extend.
+    fn may_sync_undo(&mut self, editor: &mut Editor, flags: TypeaheadFlags) {
+        if flags.mapped || matches!(self.mode, Mode::Insert(_) | Mode::Cmdline(_)) {
+            return;
+        }
+        editor.sync_current_undo();
+    }
+
     /// Executes the action classified by [`Self::check`].
-    pub fn execute(&mut self, editor: &mut Editor, step: Step) -> Result<(), ModeError> {
-        match step { Step::Idle | Step::ProcessEvents => Ok(()), Step::Key(key) => self.execute_key(editor, key) }
+    pub fn execute(&mut self, editor: &mut Editor, step: Step, eval: &mut dyn ExprEval) -> Result<(), ModeError> {
+        match step { Step::Idle | Step::ProcessEvents => Ok(()), Step::Key(key) => self.execute_key(editor, key, eval) }
     }
 
     /// Runs one check/execute iteration, returning whether work was ready.
-    pub fn run_once(&mut self, editor: &mut Editor) -> Result<bool, ModeError> {
-        let step = self.check(editor)?; let ready = step != Step::Idle; self.execute(editor, step)?; Ok(ready)
+    pub fn run_once(&mut self, editor: &mut Editor, eval: &mut dyn ExprEval) -> Result<bool, ModeError> {
+        let step = self.check(editor)?; let ready = step != Step::Idle; self.execute(editor, step, eval)?; Ok(ready)
     }
 
     /// Convenience entry point used by behavioral tests and embedding frontends.
-    pub fn feed_keys(&mut self, editor: &mut Editor, keys: &str) -> Result<(), ModeError> {
-        for key in keys.chars() { self.execute_key(editor, key)?; }
+    pub fn feed_keys(&mut self, editor: &mut Editor, keys: &str, eval: &mut dyn ExprEval) -> Result<(), ModeError> {
+        for key in keys.chars() { self.execute_key(editor, key, eval)?; }
         Ok(())
     }
 
-    fn execute_key(&mut self, editor: &mut Editor, key: char) -> Result<(), ModeError> {
+    fn execute_key(&mut self, editor: &mut Editor, key: char, eval: &mut dyn ExprEval) -> Result<(), ModeError> {
         self.timestamp = self.timestamp.saturating_add(1);
-        let mode = std::mem::take(&mut self.mode);
-        self.mode = match mode {
-            Mode::Normal(state) => self.normal(editor, state, key)?,
-            Mode::Insert(state) => self.insert(editor, state, key)?,
-            Mode::Visual(state) => self.visual(editor, state, key)?,
-            Mode::Cmdline(state) => self.cmdline(editor, state, key)?,
-            Mode::OperatorPending(state) => self.operator_pending(editor, state, key)?,
+        // Handlers borrow `self` next to their variant state, so the mode is
+        // taken into a local for the duration of dispatch; every exit path
+        // refills the slot, so a handler error restores the exact pre-key
+        // variant state instead of stranding the machine on a default Normal.
+        let mut mode = std::mem::take(&mut self.mode);
+        let transition = match &mut mode {
+            Mode::Normal(state) => self.normal(editor, state, key, eval),
+            Mode::Insert(state) => self.insert(editor, state, key, eval),
+            Mode::Visual(state) => self.visual(editor, state, key, eval),
+            Mode::Cmdline(state) => self.cmdline(editor, state, key),
+            Mode::OperatorPending(state) => self.operator_pending(editor, state, key, eval),
         };
+        match transition {
+            Ok(Some(next)) => self.mode = next,
+            Ok(None) => self.mode = mode,
+            Err(error) => {
+                self.mode = mode;
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
-    fn normal(&mut self, editor: &mut Editor, mut state: NormalState, key: char) -> Result<Mode, ModeError> {
-        if state.prefix == "register" { state.register = Some(key); state.prefix.clear(); return Ok(Mode::Normal(state)); }
+    fn normal(&mut self, editor: &mut Editor, state: &mut NormalState, key: char, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
+        if state.prefix == "register" { state.register = Some(key); state.prefix.clear(); return Ok(None); }
+        if state.prefix == "r" {
+            if key == '\u{16}' || key == '\u{11}' {
+                state.prefix = "r\u{16}".into();
+                return Ok(None);
+            }
+            state.prefix.clear();
+            if key == '\u{1b}' { return Ok(Some(Mode::default())); }
+            self.replace_chars(editor, state.count.max(1), classify_replace_key(key, false))?;
+            return Ok(Some(Mode::default()));
+        }
+        if state.prefix == "r\u{16}" {
+            state.prefix.clear();
+            if key == '\u{1b}' { return Ok(Some(Mode::default())); }
+            self.replace_chars(editor, state.count.max(1), classify_replace_key(key, true))?;
+            return Ok(Some(Mode::default()));
+        }
         if matches!(state.prefix.as_str(), "f" | "F" | "t" | "T") {
             let find = FindMotion { direction: if matches!(state.prefix.as_str(), "f" | "t") { FindDirection::Forward } else { FindDirection::Backward }, till: matches!(state.prefix.as_str(), "t" | "T"), target: key as u8 };
-            self.move_find(editor, find, state.count.max(1), false)?; self.last_find = Some(find); return Ok(Mode::default());
+            // `nv_csearch`: `if (searchc(cap, t_cmd) == false) clearopbeep()`.
+            // `searchc` records the target before searching, so a failed
+            // `fz` is still what `;` repeats.
+            if !self.move_find(editor, find, state.count.max(1), false)? { beep_flush(editor); }
+            self.last_find = Some(find); return Ok(Some(Mode::default()));
         }
         if state.prefix == "g" {
             state.prefix.clear();
             if key == 'v' {
-                if let Some(visual) = self.last_visual.clone() { editor.set_window_cursor(context(editor)?.window, visual.cursor)?; return Ok(Mode::Visual(visual)); }
-                return Ok(Mode::default());
+                if let Some(visual) = self.last_visual.clone() { let window = context(editor)?.window; editor.set_window_cursor(window, visual.cursor)?; return Ok(Some(Mode::Visual(visual))); }
+                return Ok(Some(Mode::default()));
             }
-            if key == 'u' || key == 'U' { return Ok(Mode::OperatorPending(OperatorPendingState { operator: if key == 'u' { Operator::Lowercase } else { Operator::Uppercase }, count: state.count.max(1), count_was_set: state.count != 0, motion_count: 0, register: state.register, prefix: String::new() })); }
-            let command = format!("g{key}"); self.move_command(editor, &command, state.count.max(1), false)?; return Ok(Mode::default());
+            if key == 'u' || key == 'U' { return Ok(Some(Mode::OperatorPending(OperatorPendingState { operator: if key == 'u' { Operator::Lowercase } else { Operator::Uppercase }, count: state.count.max(1), count_was_set: state.count != 0, motion_count: 0, register: state.register, prefix: String::new(), force_motion: None, search: None }))); }
+            let command = format!("g{key}"); self.move_command(editor, &command, state.count.max(1), false)?; return Ok(Some(Mode::default()));
         }
-        if key.is_ascii_digit() && (key != '0' || state.count != 0) { state.count = append_digit(state.count, key); return Ok(Mode::Normal(state)); }
+        if key.is_ascii_digit() && (key != '0' || state.count != 0) { state.count = append_digit(state.count, key); return Ok(None); }
         let count = state.count.max(1);
         match key {
-            '"' => { state.prefix = "register".into(); Ok(Mode::Normal(state)) }
-            'd' | 'c' | 'y' | '>' | '<' | '=' => Ok(Mode::OperatorPending(OperatorPendingState { operator: operator_for(key), count, count_was_set: state.count != 0, motion_count: 0, register: state.register, prefix: String::new() })),
-            'g' => { state.prefix = "g".into(); Ok(Mode::Normal(state)) }
-            'f' | 'F' | 't' | 'T' => { state.prefix = key.to_string(); Ok(Mode::Normal(state)) }
-            ';' | ',' => { if let Some(mut find) = self.last_find { if key == ',' { find.direction = reverse_find(find.direction); } self.move_find(editor, find, count, false)?; } Ok(Mode::default()) }
-            'h' | 'j' | 'k' | 'l' | 'w' | 'W' | 'e' | 'E' | 'b' | 'B' | '0' | '^' | '$' | '%' | '{' | '}' | '(' | ')' | 'G' | 'H' | 'M' | 'L' => { let command = if key == 'G' && state.count != 0 { "G_count".to_owned() } else { key.to_string() }; self.move_command(editor, &command, count, false)?; Ok(Mode::default()) }
-            'i' => Ok(Mode::Insert(InsertState)),
-            'a' => { self.advance_insert_cursor(editor, false)?; Ok(Mode::Insert(InsertState)) }
-            'A' => { self.advance_insert_cursor(editor, true)?; Ok(Mode::Insert(InsertState)) }
-            'I' => { self.move_command(editor, "^", 1, false)?; Ok(Mode::Insert(InsertState)) }
-            'o' | 'O' => { self.open_line(editor, key == 'o')?; Ok(Mode::Insert(InsertState)) }
-            'v' | 'V' | '\u{16}' => { let cursor = context(editor)?.cursor; Ok(Mode::Visual(VisualState::new(cursor, if key == 'v' { VisualKind::Character } else if key == 'V' { VisualKind::Line } else { VisualKind::Block }))) }
-            '/' | '?' => Ok(Mode::Cmdline(CmdlineState { kind: CmdlineKind::Search(if key == '/' { SearchDirection::Forward } else { SearchDirection::Backward }), text: String::new(), count })),
-            ':' => Ok(Mode::Cmdline(CmdlineState { kind: CmdlineKind::Ex, text: String::new(), count })),
-            'n' | 'N' => { self.repeat_search(editor, key == 'N', count)?; Ok(Mode::default()) }
-            'x' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::Delete, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, state.register, self.timestamp)?; Ok(Mode::default()) }
-            '~' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::ToggleCase, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, None, self.timestamp)?; self.move_command(editor, "l", count, false)?; Ok(Mode::default()) }
-            'u' => { let ctx = context(editor)?; editor.buffer_undo(ctx.buffer)?; Ok(Mode::default()) }
-            _ => Ok(Mode::default()),
+            '"' => { state.prefix = "register".into(); Ok(None) }
+            'd' | 'c' | 'y' | '>' | '<' | '=' => Ok(Some(Mode::OperatorPending(OperatorPendingState { operator: operator_for(key), count, count_was_set: state.count != 0, motion_count: 0, register: state.register, prefix: String::new(), force_motion: None, search: None }))),
+            'g' => { state.prefix = "g".into(); Ok(None) }
+            'f' | 'F' | 't' | 'T' => { state.prefix = key.to_string(); Ok(None) }
+            'r' => { state.prefix = "r".into(); Ok(None) }
+            // `searchc` returns false when there is no previous `f`/`t` to
+            // repeat (`*lastc == NUL`), and `nv_csearch` turns that into
+            // `clearopbeep` — which flushes the rest of the mapped typeahead,
+            // so the remainder of a `:normal` argument never runs.
+            ';' | ',' => {
+                let moved = match self.last_find {
+                    Some(mut find) => {
+                        if key == ',' { find.direction = reverse_find(find.direction); }
+                        self.move_find(editor, find, count, false)?
+                    }
+                    None => false,
+                };
+                if !moved { beep_flush(editor); }
+                Ok(Some(Mode::default()))
+            }
+            'h' | 'j' | 'k' | 'l' | 'w' | 'W' | 'e' | 'E' | 'b' | 'B' | '0' | '^' | '$' | '%' | '{' | '}' | '(' | ')' | 'G' | 'H' | 'M' | 'L' => { let command = if key == 'G' && state.count != 0 { "G_count".to_owned() } else { key.to_string() }; self.move_command(editor, &command, count, false)?; Ok(Some(Mode::default())) }
+            'i' => Ok(Some(Mode::Insert(InsertState))),
+            'a' => { self.advance_insert_cursor(editor, false)?; Ok(Some(Mode::Insert(InsertState))) }
+            'A' => { self.advance_insert_cursor(editor, true)?; Ok(Some(Mode::Insert(InsertState))) }
+            'I' => { self.move_command(editor, "^", 1, false)?; Ok(Some(Mode::Insert(InsertState))) }
+            'o' | 'O' => { self.open_line(editor, key == 'o', eval)?; Ok(Some(Mode::Insert(InsertState))) }
+            'v' | 'V' | '\u{16}' => { let cursor = context(editor)?.cursor; Ok(Some(Mode::Visual(VisualState::new(cursor, if key == 'v' { VisualKind::Character } else if key == 'V' { VisualKind::Line } else { VisualKind::Block })))) }
+            '/' | '?' => Ok(Some(Mode::Cmdline(CmdlineState { kind: CmdlineKind::Search(if key == '/' { SearchDirection::Forward } else { SearchDirection::Backward }), text: String::new(), count }))),
+            ':' => Ok(Some(Mode::Cmdline(CmdlineState { kind: CmdlineKind::Ex, text: String::new(), count }))),
+            'n' | 'N' => { self.repeat_search(editor, key == 'N', count)?; Ok(Some(Mode::default())) }
+            'p' | 'P' => {
+                let ctx = context(editor)?;
+                let name = state.register.unwrap_or('"');
+                let direction = if key == 'p' { PutDirection::After } else { PutDirection::Before };
+                let _ = editor.put_register(ctx.window, name, direction, count, self.timestamp)?;
+                Ok(Some(Mode::default()))
+            }
+            'J' => {
+                let ctx = context(editor)?;
+                let end_lnum = ctx
+                    .cursor
+                    .lnum
+                    .saturating_add(count.max(2) - 1)
+                    .min(ctx.lines.len());
+                self.join_lines(editor, ctx.cursor.lnum, end_lnum)?;
+                Ok(Some(Mode::default()))
+            }
+            'x' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::Delete, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, state.register, self.timestamp, eval)?; Ok(Some(Mode::default())) }
+            '~' => { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum, col: ctx.cursor.col.saturating_add(count - 1) }; ops::apply(editor, ctx.buffer, ctx.window, Operator::ToggleCase, EditRange { start: ctx.cursor, end, kind: MotionKind::CharacterWise, inclusive: true }, None, self.timestamp, eval)?; self.move_command(editor, "l", count, false)?; Ok(Some(Mode::default())) }
+            '\u{1}' => { self.adjust_number(editor, count.min(999_999_999) as i64)?; Ok(Some(Mode::default())) }
+            '\u{18}' => { self.adjust_number(editor, -(count.min(999_999_999) as i64))?; Ok(Some(Mode::default())) }
+            'u' => { let ctx = context(editor)?; editor.buffer_undo(ctx.buffer)?; Ok(Some(Mode::default())) }
+            _ => Ok(Some(Mode::default())),
         }
     }
 
-    fn operator_pending(&mut self, editor: &mut Editor, mut state: OperatorPendingState, key: char) -> Result<Mode, ModeError> {
+    fn operator_pending(&mut self, editor: &mut Editor, state: &mut OperatorPendingState, key: char, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
+        if let Some((direction, expression)) = state.search.as_mut() {
+            match key {
+                '\u{1b}' => return Ok(Some(Mode::default())),
+                '\u{8}' | '\u{7f}' => {
+                    expression.pop();
+                    return Ok(None);
+                }
+                '\n' | '\r' => {
+                    let direction = *direction;
+                    let mut expression = expression.clone();
+                    let delimiter = match direction { SearchDirection::Forward => '/', SearchDirection::Backward => '?' };
+                    if expression.ends_with(delimiter) {
+                        expression.pop();
+                    }
+                    let ctx = context(editor)?;
+                    let count = state.count.saturating_mul(state.motion_count.max(1));
+                    let result = match self.search.search(
+                        &ctx.lines,
+                        ctx.cursor,
+                        &expression,
+                        direction,
+                        count,
+                        option_bool(editor, "wrapscan", true),
+                    ) {
+                        Ok(result) => result,
+                        Err(_) => {
+                            beep_flush(editor);
+                            return Ok(Some(Mode::default()));
+                        }
+                    };
+                    push_jump(editor, ctx.buffer, ctx.cursor);
+                    let range = EditRange::from_motion(
+                        ctx.cursor,
+                        crate::motion::Motion {
+                            target: result.target,
+                            kind: if result.has_line_offset { MotionKind::LineWise } else { MotionKind::CharacterWise },
+                            inclusive: result.use_end,
+                            is_jump: true,
+                        },
+                    );
+                    let change = state.operator == Operator::Change;
+                    self.apply_operator(editor, state, range, eval)?;
+                    return Ok(Some(if change { Mode::Insert(InsertState) } else { Mode::default() }));
+                }
+                ch if !ch.is_control() => {
+                    expression.push(ch);
+                    return Ok(None);
+                }
+                _ => return Ok(None),
+            }
+        }
         if matches!(state.prefix.as_str(), "f" | "F" | "t" | "T") {
             let find = FindMotion { direction: if matches!(state.prefix.as_str(), "f" | "t") { FindDirection::Forward } else { FindDirection::Backward }, till: matches!(state.prefix.as_str(), "t" | "T"), target: key as u8 };
             let ctx = context(editor)?;
-            let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, state.count.saturating_mul(state.motion_count.max(1))) else { return Ok(Mode::default()); };
-            self.apply_operator(editor, &state, EditRange::from_motion(ctx.cursor, motion))?; self.last_find = Some(find); return Ok(if state.operator == Operator::Change { Mode::Insert(InsertState) } else { Mode::default() });
+            let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, state.count.saturating_mul(state.motion_count.max(1))) else { return Ok(Some(Mode::default())); };
+            self.apply_operator(editor, &state, EditRange::from_motion(ctx.cursor, motion), eval)?; self.last_find = Some(find); return Ok(Some(if state.operator == Operator::Change { Mode::Insert(InsertState) } else { Mode::default() }));
         }
-        if state.prefix == "g" { state.prefix.clear(); let command = format!("g{key}"); return self.finish_operator_motion(editor, state, &command); }
+        if state.prefix == "g" { state.prefix.clear(); let command = format!("g{key}"); return self.finish_operator_motion(editor, state, &command, eval); }
         if state.prefix == "i" || state.prefix == "a" {
             let inner = state.prefix == "i"; let ctx = context(editor)?;
-            if let Some(range) = textobject::resolve(&ctx.lines, ctx.cursor, inner, key, state.count.saturating_mul(state.motion_count.max(1))) { let change = state.operator == Operator::Change; self.apply_operator(editor, &state, range)?; return Ok(if change { Mode::Insert(InsertState) } else { Mode::default() }); }
-            return Ok(Mode::default());
+            if let Some(range) = textobject::resolve(&ctx.lines, ctx.cursor, inner, key, state.count.saturating_mul(state.motion_count.max(1))) { let change = state.operator == Operator::Change; self.apply_operator(editor, &state, range, eval)?; return Ok(Some(if change { Mode::Insert(InsertState) } else { Mode::default() })); }
+            return Ok(Some(Mode::default()));
         }
-        if key.is_ascii_digit() && (key != '0' || state.motion_count != 0) { state.motion_count = append_digit(state.motion_count, key); return Ok(Mode::OperatorPending(state)); }
-        if key == 'i' || key == 'a' || matches!(key, 'f' | 'F' | 't' | 'T') { state.prefix = key.to_string(); return Ok(Mode::OperatorPending(state)); }
-        if key == 'g' { state.prefix = "g".into(); return Ok(Mode::OperatorPending(state)); }
-        if key == operator_key(state.operator) { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum.saturating_add(state.count.saturating_mul(state.motion_count.max(1)) - 1).min(ctx.lines.len()), col: 0 }; let range = EditRange { start: ctx.cursor, end, kind: MotionKind::LineWise, inclusive: true }; let change = state.operator == Operator::Change; self.apply_operator(editor, &state, range)?; return Ok(if change { Mode::Insert(InsertState) } else { Mode::default() }); }
-        self.finish_operator_motion(editor, state, &key.to_string())
+        if key == '\u{1b}' {
+            return Ok(Some(Mode::default()));
+        }
+        if key == 'v' || key == 'V' {
+            state.force_motion = Some(if key == 'v' { MotionKind::CharacterWise } else { MotionKind::LineWise });
+            return Ok(None);
+        }
+        if key == '/' || key == '?' {
+            state.search = Some((if key == '/' { SearchDirection::Forward } else { SearchDirection::Backward }, String::new()));
+            return Ok(None);
+        }
+        if key.is_ascii_digit() && (key != '0' || state.motion_count != 0) { state.motion_count = append_digit(state.motion_count, key); return Ok(None); }
+        if key == 'i' || key == 'a' || matches!(key, 'f' | 'F' | 't' | 'T') { state.prefix = key.to_string(); return Ok(None); }
+        if key == 'g' { state.prefix = "g".into(); return Ok(None); }
+        if key == operator_key(state.operator) { let ctx = context(editor)?; let end = Position { lnum: ctx.cursor.lnum.saturating_add(state.count.saturating_mul(state.motion_count.max(1)) - 1).min(ctx.lines.len()), col: 0 }; let range = EditRange { start: ctx.cursor, end, kind: MotionKind::LineWise, inclusive: true }; let change = state.operator == Operator::Change; self.apply_operator(editor, &state, range, eval)?; return Ok(Some(if change { Mode::Insert(InsertState) } else { Mode::default() })); }
+        self.finish_operator_motion(editor, state, &key.to_string(), eval)
     }
 
-    fn finish_operator_motion(&mut self, editor: &mut Editor, state: OperatorPendingState, command: &str) -> Result<Mode, ModeError> {
+    fn finish_operator_motion(&mut self, editor: &mut Editor, state: &mut OperatorPendingState, command: &str, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
         let ctx = context(editor)?; let count = state.count.saturating_mul(state.motion_count.max(1));
         let current = ctx.lines.get(ctx.cursor.lnum.saturating_sub(1)).and_then(|line| line.get(ctx.cursor.col)).copied();
         let resolved_command = match (state.operator, command, current) {
@@ -274,62 +513,276 @@ impl ModeMachine {
             (_, "G", _) if state.count_was_set || state.motion_count != 0 => "G_count",
             _ => command,
         };
-        if let Some(motion) = resolve(&ctx.lines, ctx.cursor, resolved_command, count, option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { let change = state.operator == Operator::Change; if motion.is_jump { push_jump(editor, ctx.buffer, ctx.cursor); } self.apply_operator(editor, &state, EditRange::from_motion(ctx.cursor, motion))?; return Ok(if change { Mode::Insert(InsertState) } else { Mode::default() }); }
-        Ok(Mode::default())
+        if let Some(motion) = resolve(&ctx.lines, ctx.cursor, resolved_command, count, option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { let change = state.operator == Operator::Change; if motion.is_jump { push_jump(editor, ctx.buffer, ctx.cursor); } self.apply_operator(editor, &state, EditRange::from_motion(ctx.cursor, motion), eval)?; return Ok(Some(if change { Mode::Insert(InsertState) } else { Mode::default() })); }
+        Ok(Some(Mode::default()))
     }
 
-    fn apply_operator(&mut self, editor: &mut Editor, state: &OperatorPendingState, range: EditRange) -> Result<(), ModeError> { let ctx = context(editor)?; ops::apply(editor, ctx.buffer, ctx.window, state.operator, range, state.register, self.timestamp)?; Ok(()) }
+    fn apply_operator(&mut self, editor: &mut Editor, state: &OperatorPendingState, mut range: EditRange, eval: &mut dyn ExprEval) -> Result<(), ModeError> {
+        if let Some(force) = state.force_motion {
+            if force == MotionKind::CharacterWise {
+                range.inclusive = if range.kind == MotionKind::CharacterWise { !range.inclusive } else { false };
+            }
+            range.kind = force;
+        }
+        let ctx = context(editor)?;
+        ops::apply(editor, ctx.buffer, ctx.window, state.operator, range, state.register, self.timestamp, eval)?;
+        Ok(())
+    }
 
-    fn visual(&mut self, editor: &mut Editor, mut state: VisualState, key: char) -> Result<Mode, ModeError> {
+    fn visual(&mut self, editor: &mut Editor, state: &mut VisualState, key: char, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
+        if state.prefix == "r" {
+            if key == '\u{16}' || key == '\u{11}' {
+                state.prefix = "r\u{16}".into();
+                return Ok(None);
+            }
+            state.prefix.clear();
+            if key == '\u{1b}' {
+                return Ok(Some(Mode::default()));
+            }
+            self.visual_replace(editor, state, classify_replace_key(key, false))?;
+            return Ok(Some(Mode::default()));
+        }
+        if state.prefix == "r\u{16}" {
+            state.prefix.clear();
+            if key == '\u{1b}' {
+                return Ok(Some(Mode::default()));
+            }
+            self.visual_replace(editor, state, classify_replace_key(key, true))?;
+            return Ok(Some(Mode::default()));
+        }
         if state.prefix == "g" {
             state.prefix.clear();
             if matches!(key, 'u' | 'U' | '~') {
                 let operator = match key { 'u' => Operator::Lowercase, 'U' => Operator::Uppercase, _ => Operator::ToggleCase };
-                return self.finish_visual_operator(editor, state, operator);
+                return self.finish_visual_operator(editor, state, operator, eval);
             }
             let ctx = context(editor)?; let command = format!("g{key}");
-            if let Some(motion) = resolve(&ctx.lines, ctx.cursor, &command, state.count.max(1), option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(&mut state, motion.target, ctx.cursor); }
-            state.count = 0; return Ok(Mode::Visual(state));
+            if let Some(motion) = resolve(&ctx.lines, ctx.cursor, &command, state.count.max(1), option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(state, motion.target, ctx.cursor); }
+            state.count = 0; return Ok(None);
         }
         if matches!(state.prefix.as_str(), "f" | "F" | "t" | "T") {
-            if key.len_utf8() != 1 { state.prefix.clear(); return Ok(Mode::Visual(state)); }
+            if key.len_utf8() != 1 { state.prefix.clear(); return Ok(None); }
             let find = FindMotion { direction: if matches!(state.prefix.as_str(), "f" | "t") { FindDirection::Forward } else { FindDirection::Backward }, till: matches!(state.prefix.as_str(), "t" | "T"), target: key as u8 };
-            let ctx = context(editor)?; if let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, state.count.max(1)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(&mut state, motion.target, ctx.cursor); self.last_find = Some(find); }
-            state.prefix.clear(); state.count = 0; return Ok(Mode::Visual(state));
+            let ctx = context(editor)?; if let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, state.count.max(1)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(state, motion.target, ctx.cursor); self.last_find = Some(find); }
+            state.prefix.clear(); state.count = 0; return Ok(None);
         }
         if state.prefix == "i" || state.prefix == "a" {
             let inner = state.prefix == "i"; let ctx = context(editor)?;
             if let Some(range) = textobject::resolve(&ctx.lines, ctx.cursor, inner, key, state.count.max(1)) { state.anchor = range.start; state.cursor = range.end; state.kind = match range.kind { MotionKind::LineWise => VisualKind::Line, MotionKind::BlockWise => VisualKind::Block, MotionKind::CharacterWise => VisualKind::Character }; editor.set_window_cursor(ctx.window, state.cursor)?; }
-            state.prefix.clear(); state.count = 0; return Ok(Mode::Visual(state));
+            state.prefix.clear(); state.count = 0; return Ok(None);
         }
-        if key.is_ascii_digit() && (key != '0' || state.count != 0) { state.count = append_digit(state.count, key); return Ok(Mode::Visual(state)); }
+        if key.is_ascii_digit() && (key != '0' || state.count != 0) { state.count = append_digit(state.count, key); return Ok(None); }
         match key {
-            '\u{1b}' => { self.last_visual = Some(state); Ok(Mode::default()) }
-            'o' | 'O' => { if key == 'O' && state.kind == VisualKind::Block { state.swap_columns(); } else { state.swap_ends(); } let window = context(editor)?.window; editor.set_window_cursor(window, state.cursor)?; Ok(Mode::Visual(state)) }
-            'g' | 'f' | 'F' | 't' | 'T' | 'i' | 'a' => { state.prefix = key.to_string(); Ok(Mode::Visual(state)) }
-            'd' | 'c' | 'y' | '>' | '<' | '=' | 'u' | 'U' | '~' => self.finish_visual_operator(editor, state, match key { 'u' => Operator::Lowercase, 'U' => Operator::Uppercase, '~' => Operator::ToggleCase, _ => operator_for(key) }),
-            _ => { let ctx = context(editor)?; if let Some(motion) = resolve(&ctx.lines, ctx.cursor, &key.to_string(), state.count.max(1), option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(&mut state, motion.target, ctx.cursor); } state.count = 0; Ok(Mode::Visual(state)) }
+            '\u{1b}' => { self.last_visual = Some(state.clone()); Ok(Some(Mode::default())) }
+            'o' | 'O' => { if key == 'O' && state.kind == VisualKind::Block { state.swap_columns(); } else { state.swap_ends(); } let window = context(editor)?.window; editor.set_window_cursor(window, state.cursor)?; Ok(None) }
+            'g' | 'f' | 'F' | 't' | 'T' | 'i' | 'a' => { state.prefix = key.to_string(); Ok(None) }
+            'r' => { state.prefix = "r".into(); Ok(None) }
+            'J' => {
+                let range = state.range();
+                let start_lnum = range.start.lnum.min(range.end.lnum);
+                let end_lnum = range.start.lnum.max(range.end.lnum);
+                self.join_lines(editor, start_lnum, end_lnum)?;
+                Ok(Some(Mode::default()))
+            }
+            'd' | 'x' | 'X' | 'c' | 'y' | '>' | '<' | '=' | 'u' | 'U' | '~' => self.finish_visual_operator(editor, state, match key { 'x' | 'X' => Operator::Delete, 'u' => Operator::Lowercase, 'U' => Operator::Uppercase, '~' => Operator::ToggleCase, _ => operator_for(key) }, eval),
+            _ => { let ctx = context(editor)?; if let Some(motion) = resolve(&ctx.lines, ctx.cursor, &key.to_string(), state.count.max(1), option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { editor.set_window_cursor(ctx.window, motion.target)?; extend_visual(state, motion.target, ctx.cursor); } state.count = 0; Ok(None) }
         }
     }
-    fn finish_visual_operator(&mut self, editor: &mut Editor, state: VisualState, operator: Operator) -> Result<Mode, ModeError> {
-        let ctx = context(editor)?; self.last_visual = Some(state.clone()); let result = ops::apply(editor, ctx.buffer, ctx.window, operator, state.range(), None, self.timestamp)?; Ok(if result.enter_insert { Mode::Insert(InsertState) } else { Mode::default() })
+    fn visual_replace(
+        &mut self,
+        editor: &mut Editor,
+        state: &VisualState,
+        input: ReplaceInput,
+    ) -> Result<(), ModeError> {
+        let ctx = context(editor)?;
+        let range = state.range();
+        let start_lnum = range.start.lnum.min(range.end.lnum);
+        let end_lnum = range.start.lnum.max(range.end.lnum);
+        let cursor_after = range.start;
+        let structural_block = range.kind == MotionKind::BlockWise
+            && matches!(input, ReplaceInput::TypedCr | ReplaceInput::TypedNl);
+        let input = if structural_block {
+            input
+        } else {
+            literal_for_nonblock(input)
+        };
+        let replacement_scalar = scalar_bytes(input);
+        let mut requests = Vec::with_capacity(end_lnum - start_lnum + 1);
+
+        for lnum in start_lnum..=end_lnum {
+            let line = &ctx.lines[lnum - 1];
+            let (start_col, end_col) = match range.kind {
+                MotionKind::BlockWise => (
+                    range.start.col.min(line.len()),
+                    crate::motion::next_char_boundary(line, range.end.col).min(line.len()),
+                ),
+                MotionKind::CharacterWise => (
+                    if lnum == start_lnum { range.start.col } else { 0 },
+                    if lnum == end_lnum {
+                        crate::motion::next_char_boundary(line, range.end.col)
+                    } else {
+                        line.len()
+                    },
+                ),
+                MotionKind::LineWise => (0, line.len()),
+            };
+            if start_col >= end_col {
+                continue;
+            }
+
+            if structural_block {
+                requests.push(BufferTextEditRequest {
+                    start: ExtmarkPosition::new(lnum - 1, start_col),
+                    end: ExtmarkPosition::new(lnum - 1, end_col),
+                    replacement: vec![Vec::new(), Vec::new()],
+                });
+                continue;
+            }
+
+            let scalar_count = scalar_count_in_range(line, start_col, end_col);
+            let mut replacement =
+                Vec::with_capacity(replacement_scalar.len().saturating_mul(scalar_count));
+            for _ in 0..scalar_count {
+                replacement.extend_from_slice(&replacement_scalar);
+            }
+            requests.push(BufferTextEditRequest {
+                start: ExtmarkPosition::new(lnum - 1, start_col),
+                end: ExtmarkPosition::new(lnum - 1, end_col),
+                replacement: vec![replacement],
+            });
+        }
+
+        editor.replace_buffer_texts(
+            ctx.buffer,
+            ctx.window,
+            &requests,
+            ctx.cursor,
+            cursor_after,
+            self.timestamp,
+        )?;
+        editor.set_window_cursor(ctx.window, cursor_after)?;
+        Ok(())
     }
 
-    fn insert(&mut self, editor: &mut Editor, _state: InsertState, key: char) -> Result<Mode, ModeError> {
+    fn join_lines(
+        &mut self,
+        editor: &mut Editor,
+        start_lnum: usize,
+        end_lnum: usize,
+    ) -> Result<(), ModeError> {
+        if end_lnum <= start_lnum {
+            return Ok(());
+        }
+
+        let ctx = context(editor)?;
+        let joinspaces = matches!(
+            editor.options().get_global("joinspaces"),
+            Ok(OptionValue::Boolean(true))
+        );
+        let keep_first_join_col = matches!(
+            editor.options().get_global("cpoptions"),
+            Ok(OptionValue::String(value)) if value.contains('q')
+        );
+        let formatoptions = match editor.options().get_buffer(ctx.buffer, "formatoptions") {
+            Ok(OptionValue::String(value)) => value.clone(),
+            _ => "tcqj".to_owned(),
+        };
+        let comments = match editor.options().get_buffer(ctx.buffer, "comments") {
+            Ok(OptionValue::String(value)) => value.clone(),
+            _ => "s1:/*,mb:*,ex:*/,://,b:#,:%,:XCOMM,n:>,fb:-,fb:•".to_owned(),
+        };
+        let policy = JoinPolicy {
+            joinspaces,
+            multibyte: formatoptions.contains('M'),
+            multibyte_pairs: formatoptions.contains('B'),
+        };
+        let remove_comments = formatoptions.contains('j');
+
+        let first = &ctx.lines[start_lnum - 1];
+        let mut joined = first.clone();
+        let mut previous_was_comment = remove_comments
+            && scan_comment_line(first, &comments).ends_open;
+        let mut last_join_col = first.len();
+        let mut last_leading = 0;
+        let mut last_suffix_len = 0;
+        for lnum in start_lnum + 1..=end_lnum {
+            let line = &ctx.lines[lnum - 1];
+            let comment = if remove_comments {
+                scan_comment_line(line, &comments)
+            } else {
+                CommentScan::default()
+            };
+            let comment_leading = if previous_was_comment {
+                comment.leading_removal
+            } else {
+                0
+            };
+            previous_was_comment = remove_comments && comment.ends_open;
+            let leading = comment_leading
+                + line[comment_leading..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_whitespace())
+                    .count();
+            let segment = &line[leading..];
+            last_join_col = joined.len();
+            let separator_len = join_separator_len(&joined, segment, policy);
+            for _ in 0..separator_len {
+                joined.push(b' ');
+            }
+            joined.extend_from_slice(segment);
+            if lnum == end_lnum {
+                last_leading = leading;
+                last_suffix_len = segment.len();
+            }
+        }
+
+        let cursor_after = Position {
+            lnum: start_lnum,
+            col: if keep_first_join_col {
+                first.len()
+            } else {
+                last_join_col
+            },
+        };
+        let replacement_end = joined.len() - last_suffix_len;
+        editor.replace_buffer_text(
+            ctx.buffer,
+            &BufferTextEditRequest {
+                start: ExtmarkPosition::new(start_lnum - 1, first.len()),
+                end: ExtmarkPosition::new(end_lnum - 1, last_leading),
+                replacement: vec![joined[first.len()..replacement_end].to_vec()],
+            },
+            ctx.cursor,
+            cursor_after,
+            self.timestamp,
+        )?;
+        editor.set_window_cursor(ctx.window, cursor_after)?;
+        Ok(())
+    }
+
+    fn finish_visual_operator(&mut self, editor: &mut Editor, state: &VisualState, operator: Operator, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
+        let ctx = context(editor)?; self.last_visual = Some(state.clone()); let result = ops::apply(editor, ctx.buffer, ctx.window, operator, state.range(), None, self.timestamp, eval)?; Ok(Some(if result.enter_insert { Mode::Insert(InsertState) } else { Mode::default() }))
+    }
+
+    fn insert(&mut self, editor: &mut Editor, _state: &mut InsertState, key: char, eval: &mut dyn ExprEval) -> Result<Option<Mode>, ModeError> {
         let ctx = context(editor)?;
         match key {
-            '\u{1b}' => { insert::normal_cursor(editor, ctx.window, ctx.cursor)?; Ok(Mode::default()) }
-            '\n' | '\r' => { insert::newline(editor, ctx.buffer, ctx.window, ctx.cursor, self.timestamp)?; Ok(Mode::Insert(InsertState)) }
-            '\u{8}' | '\u{7f}' => { insert::backspace(editor, ctx.buffer, ctx.window, ctx.cursor, option_contains(editor, "backspace", "eol", true), self.timestamp)?; Ok(Mode::Insert(InsertState)) }
-            ch if !ch.is_control() => { insert::insert_char(editor, ctx.buffer, ctx.window, ctx.cursor, ch, self.timestamp)?; Ok(Mode::Insert(InsertState)) }
-            _ => Ok(Mode::Insert(InsertState)),
+            '\u{1b}' => { insert::normal_cursor(editor, ctx.window, ctx.cursor)?; Ok(Some(Mode::default())) }
+            '\n' | '\r' => { insert::newline(editor, ctx.buffer, ctx.window, ctx.cursor, self.timestamp, eval)?; Ok(None) }
+            '\u{8}' | '\u{7f}' => { insert::backspace(editor, ctx.buffer, ctx.window, ctx.cursor, option_contains(editor, "backspace", "eol", true), self.timestamp)?; Ok(None) }
+            '\u{9}' => { insert::insert_tab(editor, ctx.buffer, ctx.window, ctx.cursor, self.timestamp)?; Ok(None) }
+            '\u{4}' => { insert::adjust_indent(editor, ctx.buffer, ctx.window, ctx.cursor, false, self.timestamp)?; Ok(None) }
+            '\u{14}' => { insert::adjust_indent(editor, ctx.buffer, ctx.window, ctx.cursor, true, self.timestamp)?; Ok(None) }
+            '\u{6}' => { insert::force_reindent(editor, ctx.buffer, ctx.window, ctx.cursor, self.timestamp, eval)?; Ok(None) }
+            ch if !ch.is_control() => { insert::insert_char(editor, ctx.buffer, ctx.window, ctx.cursor, ch, self.timestamp)?; Ok(None) }
+            _ => Ok(None),
         }
     }
 
-    fn cmdline(&mut self, editor: &mut Editor, mut state: CmdlineState, key: char) -> Result<Mode, ModeError> {
+    fn cmdline(&mut self, editor: &mut Editor, state: &mut CmdlineState, key: char) -> Result<Option<Mode>, ModeError> {
         match key {
-            '\u{1b}' => Ok(Mode::default()),
-            '\u{8}' | '\u{7f}' => { state.text.pop(); Ok(Mode::Cmdline(state)) }
+            '\u{1b}' => Ok(Some(Mode::default())),
+            '\u{8}' | '\u{7f}' => { state.text.pop(); Ok(None) }
             '\n' | '\r' => {
                 match state.kind {
                     CmdlineKind::Search(direction) => {
@@ -338,20 +791,316 @@ impl ModeMachine {
                         push_jump(editor, ctx.buffer, ctx.cursor);
                         editor.set_window_cursor(ctx.window, result.target)?;
                     }
-                    CmdlineKind::Ex => self.completed_ex_command = Some(state.text),
+                    CmdlineKind::Ex => self.completed_ex_command = Some(std::mem::take(&mut state.text)),
                 }
-                Ok(Mode::default())
+                Ok(Some(Mode::default()))
             }
-            ch if !ch.is_control() => { state.text.push(ch); Ok(Mode::Cmdline(state)) }
-            _ => Ok(Mode::Cmdline(state)),
+            ch if !ch.is_control() => { state.text.push(ch); Ok(None) }
+            _ => Ok(None),
         }
     }
 
     fn move_command(&mut self, editor: &mut Editor, command: &str, count: usize, visual: bool) -> Result<(), ModeError> { let ctx = context(editor)?; if let Some(motion) = resolve(&ctx.lines, ctx.cursor, command, count, option_bool(editor, "startofline", true), (ctx.topline, ctx.bottomline)) { if motion.is_jump && !visual { push_jump(editor, ctx.buffer, ctx.cursor); } editor.set_window_cursor(ctx.window, motion.target)?; } Ok(()) }
-    fn move_find(&mut self, editor: &mut Editor, find: FindMotion, count: usize, _visual: bool) -> Result<(), ModeError> { let ctx = context(editor)?; if let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, count) { editor.set_window_cursor(ctx.window, motion.target)?; } Ok(()) }
+    /// `searchc` (`search.c`): reports whether the target was found, so the
+    /// caller can `clearopbeep` when it was not.
+    fn move_find(&mut self, editor: &mut Editor, find: FindMotion, count: usize, _visual: bool) -> Result<bool, ModeError> { let ctx = context(editor)?; let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, count) else { return Ok(false) }; editor.set_window_cursor(ctx.window, motion.target)?; Ok(true) }
     fn repeat_search(&mut self, editor: &mut Editor, opposite: bool, count: usize) -> Result<(), ModeError> { let ctx = context(editor)?; let result = self.search.repeat(&ctx.lines, ctx.cursor, opposite, count, option_bool(editor, "wrapscan", true))?; push_jump(editor, ctx.buffer, ctx.cursor); editor.set_window_cursor(ctx.window, result.target)?; Ok(()) }
     fn advance_insert_cursor(&self, editor: &mut Editor, line_end: bool) -> Result<(), ModeError> { let ctx = context(editor)?; let line = &ctx.lines[ctx.cursor.lnum - 1]; let col = if line_end { line.len() } else { next_boundary(line, ctx.cursor.col) }; editor.set_window_cursor(ctx.window, Position { lnum: ctx.cursor.lnum, col })?; Ok(()) }
-    fn open_line(&self, editor: &mut Editor, below: bool) -> Result<(), ModeError> { let ctx = context(editor)?; let after_line = if below { ctx.cursor.lnum } else { ctx.cursor.lnum.saturating_sub(1) }; let pos = Position { lnum: after_line + 1, col: 0 }; editor.append_buffer_lines(ctx.buffer, after_line, &[Vec::new()], ctx.cursor, self.timestamp)?; editor.set_window_cursor(ctx.window, pos)?; Ok(()) }
+    fn replace_chars(&mut self, editor: &mut Editor, count: usize, input: ReplaceInput) -> Result<(), ModeError> {
+        let ctx = context(editor)?;
+        let line = &ctx.lines[ctx.cursor.lnum - 1];
+        let Some(end_col) = inclusive_scalar_end(line, ctx.cursor.col, count) else {
+            return Ok(());
+        };
+        let (replacement, after) = match input {
+            ReplaceInput::TypedCr | ReplaceInput::TypedNl => {
+                let prefix = line[..ctx.cursor.col.min(line.len())].to_vec();
+                let opts = indent::IndentOptions::capture(editor, ctx.buffer);
+                let indent_bytes = indent::smart_newline_indent(&prefix, false, &opts);
+                let after = Position {
+                    lnum: ctx.cursor.lnum + 1,
+                    col: indent_bytes.len().saturating_sub(1),
+                };
+                (vec![Vec::new(), indent_bytes], after)
+            }
+            _ => {
+                let bytes = scalar_bytes(input);
+                let mut replacement = Vec::with_capacity(bytes.len().saturating_mul(count));
+                for _ in 0..count {
+                    replacement.extend_from_slice(&bytes);
+                }
+                (vec![replacement], ctx.cursor)
+            }
+        };
+        let request = BufferTextEditRequest {
+            start: ExtmarkPosition::new(ctx.cursor.lnum - 1, ctx.cursor.col),
+            end: ExtmarkPosition::new(ctx.cursor.lnum - 1, end_col + 1),
+            replacement,
+        };
+        editor.replace_buffer_text(
+            ctx.buffer,
+            &request,
+            ctx.cursor,
+            after,
+            self.timestamp,
+        )?;
+        editor.set_window_cursor(ctx.window, after)?;
+        Ok(())
+    }
+
+    fn adjust_number(&mut self, editor: &mut Editor, delta: i64) -> Result<(), ModeError> {
+        let ctx = context(editor)?;
+        let line = ctx.lines[ctx.cursor.lnum - 1].clone();
+        let Some((start, end, rendered)) = adjust_number_span(&line, ctx.cursor.col, delta) else {
+            return Ok(());
+        };
+        if rendered.as_slice() == &line[start..end] {
+            return Ok(());
+        }
+        let cursor = Position {
+            lnum: ctx.cursor.lnum,
+            col: start.saturating_add(rendered.len().saturating_sub(1)),
+        };
+        let request = BufferTextEditRequest {
+            start: ExtmarkPosition::new(ctx.cursor.lnum - 1, start),
+            end: ExtmarkPosition::new(ctx.cursor.lnum - 1, end),
+            replacement: vec![rendered],
+        };
+        editor.replace_buffer_text(ctx.buffer, &request, ctx.cursor, cursor, self.timestamp)?;
+        editor.set_window_cursor(ctx.window, cursor)?;
+        Ok(())
+    }
+
+    fn open_line(&self, editor: &mut Editor, below: bool, eval: &mut dyn ExprEval) -> Result<(), ModeError> {
+        let (buffer, window, mut cursor) = {
+            let tab = editor.current_tabpage().ok_or(EditorError::UnknownTabpage(ox_types::TabHandle::CURRENT))?;
+            let tabpage = editor.tabpage(tab)?;
+            let window = tabpage.current_window();
+            let state = editor.window(window)?;
+            (state.buffer, window, state.cursor)
+        };
+        let count = {
+            let text = editor.buffer(buffer)?.text()?;
+            let count = text.line_count();
+            let valid = cursor.lnum.clamp(1, count.max(1));
+            if valid != cursor.lnum {
+                cursor.lnum = valid;
+                editor.set_window_cursor(window, cursor)?;
+            }
+            count
+        };
+        let source = {
+            let text = editor.buffer(buffer)?.text()?;
+            text.line(cursor.lnum).map_err(BufferStateError::from)?
+        };
+        let opts = indent::IndentOptions::capture(editor, buffer);
+        let smart = indent::smart_source_trigger(&source, !below, &opts);
+        let mut indent_bytes = indent::smart_newline_indent(&source, smart, &opts);
+        let after_line = if below { cursor.lnum } else { cursor.lnum.saturating_sub(1) };
+        let new_lnum = after_line + 1;
+        // The staged overlay only feeds indentexpr/lisp/cindent; with every
+        // method off, skip the whole-buffer materialization and clone on each
+        // `o`/`O`.
+        if !(opts.indentexpr.is_empty() && !opts.lisp && !opts.cindent) {
+            let text = editor.buffer(buffer)?.text()?;
+            let mut lines = (1..=count)
+                .map(|lnum| text.line(lnum))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(BufferStateError::from)?;
+            lines.insert(new_lnum - 1, indent_bytes.clone());
+            let trigger = if below { CinTrigger::OpenForward } else { CinTrigger::OpenBackward };
+            let context = indent::IndentEvalContext::new(editor, buffer, &lines);
+            if let Some(whitespace) = indent::fix_line_indent(&context, new_lnum, trigger, &opts, eval)? {
+                indent_bytes = whitespace;
+            }
+        }
+        let pos = Position { lnum: new_lnum, col: indent_bytes.len() };
+        editor.append_buffer_lines(buffer, after_line, &[indent_bytes], cursor, self.timestamp)?;
+        editor.set_window_cursor(window, pos)?;
+        Ok(())
+    }
+}
+
+
+#[derive(Clone, Copy)]
+struct JoinPolicy {
+    joinspaces: bool,
+    multibyte: bool,
+    multibyte_pairs: bool,
+}
+
+fn join_separator_len(left: &[u8], right: &[u8], policy: JoinPolicy) -> usize {
+    let (Some(&last), Some(&first)) = (left.last(), right.first()) else {
+        return 0;
+    };
+    if first == b')' || last == b'\t' {
+        return 0;
+    }
+
+    let left_char = last_codepoint(left);
+    let right_char = first_codepoint(right);
+    if policy.multibyte && (left_char >= 0x100 || right_char >= 0x100) {
+        return 0;
+    }
+    if policy.multibyte_pairs
+        && !((right_char < 0x100 && !unicode_eats_join_space(left_char))
+            || (left_char < 0x100 && !unicode_eats_join_space(right_char)))
+    {
+        return 0;
+    }
+
+    if last.is_ascii_whitespace() {
+        return usize::from(
+            policy.joinspaces
+                && last == b' '
+                && left
+                    .get(left.len().saturating_sub(2))
+                    .is_some_and(|byte| matches!(byte, b'.' | b'?' | b'!')),
+        );
+    }
+    1 + usize::from(policy.joinspaces && matches!(last, b'.' | b'?' | b'!'))
+}
+
+fn first_codepoint(bytes: &[u8]) -> u32 {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.chars().next())
+        .map_or_else(|| u32::from(bytes[0]), u32::from)
+}
+
+fn last_codepoint(bytes: &[u8]) -> u32 {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.chars().next_back())
+        .map_or_else(|| u32::from(bytes[bytes.len() - 1]), u32::from)
+}
+
+fn unicode_eats_join_space(codepoint: u32) -> bool {
+    matches!(
+        codepoint,
+        0x2000..=0x206f
+            | 0x2e00..=0x2e7f
+            | 0x3000..=0x303f
+            | 0xff01..=0xff0f
+            | 0xff1a..=0xff20
+            | 0xff3b..=0xff40
+            | 0xff5b..=0xff65
+    )
+}
+
+#[derive(Clone, Copy)]
+struct CommentPart<'a> {
+    flags: &'a str,
+    leader: &'a [u8],
+}
+
+fn comment_parts(value: &str) -> impl Iterator<Item = CommentPart<'_>> {
+    value.split(',').filter_map(|part| {
+        let (flags, leader) = part.split_once(':')?;
+        Some(CommentPart {
+            flags,
+            leader: leader.as_bytes(),
+        })
+    })
+}
+
+fn leader_match_len(line: &[u8], offset: usize, part: CommentPart<'_>) -> Option<usize> {
+    if part.leader.is_empty() {
+        return None;
+    }
+    let mut leader = part.leader;
+    if leader[0].is_ascii_whitespace() {
+        if offset == 0 || !line[offset - 1].is_ascii_whitespace() {
+            return None;
+        }
+        leader = &leader[leader
+            .iter()
+            .take_while(|byte| byte.is_ascii_whitespace())
+            .count()..];
+    }
+    if !line.get(offset..)?.starts_with(leader) {
+        return None;
+    }
+    let end = offset + leader.len();
+    if part.flags.contains('b')
+        && line
+            .get(end)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    if part.flags.contains('m')
+        && line[..offset]
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(leader.len())
+}
+
+fn leading_comment_part<'a>(
+    line: &[u8],
+    offset: usize,
+    comments: &'a str,
+) -> Option<(CommentPart<'a>, usize)> {
+    let mut middle = None;
+    for part in comment_parts(comments) {
+        let Some(len) = leader_match_len(line, offset, part) else {
+            continue;
+        };
+        if part.flags.contains('m') {
+            middle.get_or_insert((part, len));
+            continue;
+        }
+        if let Some((_, middle_len)) = middle {
+            if part.flags.contains('e') && len > middle_len {
+                return Some((part, len));
+            }
+            return middle;
+        }
+        return Some((part, len));
+    }
+    middle
+}
+
+#[derive(Clone, Copy, Default)]
+struct CommentScan {
+    leading_removal: usize,
+    ends_open: bool,
+}
+
+fn scan_comment_line(line: &[u8], comments: &str) -> CommentScan {
+    let leading = line
+        .iter()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count();
+    let mut scan = CommentScan::default();
+    for offset in 0..line.len() {
+        let Some((part, len)) = leading_comment_part(line, offset, comments) else {
+            continue;
+        };
+        if offset == leading && !part.flags.contains('e') {
+            let mut end = offset + len;
+            while line
+                .get(end)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                end += 1;
+            }
+            scan.leading_removal = end;
+        }
+        scan.ends_open = !part.flags.contains('e');
+    }
+    scan
+}
+
+/// `beep_flush` (`input.c:523-529`): an error in Normal mode discards the
+/// mapped run at the front of the typeahead, which is how the rest of a
+/// `:normal` argument — or of a mapping's right-hand side — is abandoned.
+/// The beep itself is a UI effect this port has no channel for.
+fn beep_flush(editor: &mut Editor) {
+    editor.typeahead_mut().flush_mapped();
 }
 
 fn map_mode(mode: &Mode) -> MapMode {
@@ -370,11 +1119,20 @@ fn extend_visual(state: &mut VisualState, target: Position, from: Position) {
     if state.kind == VisualKind::Block { state.extend_block(target, from); } else { state.extend(target); }
 }
 
-fn context(editor: &Editor) -> Result<Context, ModeError> {
+/// Snapshots the editor state one mode operation reads.
+///
+/// The window cursor is validated first, the way `check_cursor_lnum`
+/// (`cursor.c`) validates it before upstream runs a normal-mode command: a
+/// window keeps its cursor when its buffer is replaced or shortened, so
+/// `w_cursor.lnum` can point past the last line, and every caller below
+/// indexes `lines` with it.
+fn context(editor: &mut Editor) -> Result<Context, ModeError> {
     let tab = editor.current_tabpage().ok_or(EditorError::UnknownTabpage(ox_types::TabHandle::CURRENT))?;
     let tabpage = editor.tabpage(tab)?; let window = tabpage.current_window(); let height = tabpage.layout().window_geometry(window).map_err(EditorError::from)?.height;
-    let state = editor.window(window)?; let buffer = state.buffer; let cursor = state.cursor; let topline = state.topline; let text = editor.buffer(buffer)?.text()?;
+    let state = editor.window(window)?; let buffer = state.buffer; let mut cursor = state.cursor; let topline = state.topline; let text = editor.buffer(buffer)?.text()?;
     let lines = (1..=text.line_count()).map(|lnum| text.line(lnum)).collect::<Result<Vec<_>, _>>().map_err(BufferStateError::from)?;
+    let valid = cursor.lnum.clamp(1, lines.len().max(1));
+    if valid != cursor.lnum { cursor.lnum = valid; editor.set_window_cursor(window, cursor)?; }
     let bottomline = topline.saturating_add(height.saturating_sub(1)).min(lines.len().max(1));
     Ok(Context { buffer, window, cursor, lines, topline, bottomline })
 }
@@ -386,6 +1144,322 @@ fn next_boundary(line: &[u8], col: usize) -> usize {
     let mut next = col.saturating_add(1).min(line.len());
     while next < line.len() && std::str::from_utf8(line).map_or(false, |text| !text.is_char_boundary(next)) { next += 1; }
     next
+}
+
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplaceInput {
+    Scalar(char),
+    TypedCr,
+    TypedNl,
+    QuotedCr,
+    QuotedNl,
+}
+
+fn classify_replace_key(key: char, quoted: bool) -> ReplaceInput {
+    match (key, quoted) {
+        ('\r', false) => ReplaceInput::TypedCr,
+        ('\n', false) => ReplaceInput::TypedNl,
+        ('\r', true) => ReplaceInput::QuotedCr,
+        ('\n', true) => ReplaceInput::QuotedNl,
+        _ => ReplaceInput::Scalar(key),
+    }
+}
+
+fn scalar_bytes(input: ReplaceInput) -> Vec<u8> {
+    match input {
+        ReplaceInput::Scalar(ch) => {
+            let mut encoded = [0u8; 4];
+            ch.encode_utf8(&mut encoded).as_bytes().to_vec()
+        }
+        ReplaceInput::QuotedCr | ReplaceInput::TypedCr => vec![b'\r'],
+        ReplaceInput::QuotedNl | ReplaceInput::TypedNl => vec![0x00],
+    }
+}
+
+fn literal_for_nonblock(input: ReplaceInput) -> ReplaceInput {
+    match input {
+        ReplaceInput::TypedCr => ReplaceInput::QuotedCr,
+        ReplaceInput::TypedNl => ReplaceInput::QuotedNl,
+        other => other,
+    }
+}
+
+fn inclusive_scalar_end(line: &[u8], start: usize, count: usize) -> Option<usize> {
+    let mut col = start.min(line.len());
+    let mut last = None;
+    for _ in 0..count {
+        if col >= line.len() {
+            return None;
+        }
+        let next = crate::motion::next_char_boundary(line, col);
+        if next <= col {
+            return None;
+        }
+        last = Some(next - 1);
+        col = next;
+    }
+    last
+}
+
+fn scalar_count_in_range(line: &[u8], start: usize, end: usize) -> usize {
+    let mut col = start.min(line.len());
+    let end = end.min(line.len());
+    let mut count = 0;
+    while col < end {
+        let next = crate::motion::next_char_boundary(line, col);
+        if next <= col {
+            break;
+        }
+        count += 1;
+        col = next;
+    }
+    count
+}
+fn adjust_number_span(line: &[u8], col: usize, delta: i64) -> Option<(usize, usize, Vec<u8>)> {
+    let (start, end, token) = find_number_token(line, col)?;
+    let rendered = render_adjusted_number(token, &line[start..end], delta);
+    Some((start, end, rendered))
+}
+
+#[derive(Clone, Copy)]
+enum NumberToken {
+    Decimal { magnitude: u64, negative: bool, overflow: bool },
+    Hex { value: u64, prefix: u8, upper: bool, overflow: bool },
+    Bin { value: u64, prefix: u8, overflow: bool },
+}
+
+fn find_number_token(line: &[u8], col: usize) -> Option<(usize, usize, NumberToken)> {
+    // Mirror `do_addsub` (`ops.c`) normal-mode scanning under default
+    // 'nrformats' (hex + bin, no octal/alpha): the nearest number at or after
+    // the cursor wins. A `0x`/`0b` prefix is honored only when the cursor sits
+    // inside that run, or the forward-found digit run begins at the prefix's
+    // `0`; otherwise the token is decimal, including a leading `-`.
+    if line.is_empty() {
+        return None;
+    }
+    let col = col.min(line.len().saturating_sub(1));
+
+    // Cursor-context prefix walk: step left over hex digits (a superset of the
+    // binary digits). On a hex/bin overlap, rescan over decimal digits so a
+    // `0b…` run is not mistaken for the tail of a hex number.
+    let hex_prefix_at = |p: usize| {
+        p >= 1
+            && matches!(line[p], b'x' | b'X')
+            && line[p - 1] == b'0'
+            && p + 1 < line.len()
+            && line[p + 1].is_ascii_hexdigit()
+    };
+    let mut pos = col;
+    while pos > 0 && line[pos].is_ascii_hexdigit() {
+        pos -= 1;
+    }
+    if !hex_prefix_at(pos) {
+        pos = col;
+        while pos > 0 && line[pos].is_ascii_digit() {
+            pos -= 1;
+        }
+    }
+    if hex_prefix_at(pos) {
+        let mut end = pos + 1;
+        while end < line.len() && line[end].is_ascii_hexdigit() {
+            end += 1;
+        }
+        return parse_prefixed(line, pos - 1, end);
+    }
+    if pos >= 1
+        && matches!(line[pos], b'b' | b'B')
+        && line[pos - 1] == b'0'
+        && pos + 1 < line.len()
+        && matches!(line[pos + 1], b'0' | b'1')
+    {
+        let mut end = pos + 1;
+        while end < line.len() && matches!(line[end], b'0' | b'1') {
+            end += 1;
+        }
+        return parse_prefixed(line, pos - 1, end);
+    }
+
+    // Forward scan from the cursor to the first decimal digit, then walk back to
+    // the run start.
+    let mut idx = col;
+    while idx < line.len() && !line[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx >= line.len() {
+        return None;
+    }
+    let mut start = idx;
+    while start > 0 && line[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+
+    // A forward-found run that begins at a prefix's `0` is that prefixed number.
+    if line[start] == b'0' && start + 2 < line.len() {
+        if matches!(line[start + 1], b'x' | b'X') && line[start + 2].is_ascii_hexdigit() {
+            let mut end = start + 2;
+            while end < line.len() && line[end].is_ascii_hexdigit() {
+                end += 1;
+            }
+            return parse_prefixed(line, start, end);
+        }
+        if matches!(line[start + 1], b'b' | b'B') && matches!(line[start + 2], b'0' | b'1') {
+            let mut end = start + 2;
+            while end < line.len() && matches!(line[end], b'0' | b'1') {
+                end += 1;
+            }
+            return parse_prefixed(line, start, end);
+        }
+    }
+
+    // Otherwise decimal, absorbing an immediately preceding minus sign.
+    let digit_start = start;
+    let mut negative = false;
+    if start > 0 && line[start - 1] == b'-' {
+        start -= 1;
+        negative = true;
+    }
+    let mut end = digit_start;
+    while end < line.len() && line[end].is_ascii_digit() {
+        end += 1;
+    }
+    let (magnitude, overflow) = parse_u64_digits(&line[digit_start..end], 10)?;
+    Some((start, end, NumberToken::Decimal { magnitude, negative, overflow }))
+}
+fn parse_prefixed(line: &[u8], start: usize, end: usize) -> Option<(usize, usize, NumberToken)> {
+    let marker = line[start + 1];
+    let digits = &line[start + 2..end];
+    if marker.eq_ignore_ascii_case(&b'x') {
+        let (value, overflow) = parse_u64_digits(digits, 16)?;
+        let upper = hex_case_upper(line, start, end);
+        Some((start, end, NumberToken::Hex { value, prefix: marker, upper, overflow }))
+    } else {
+        let (value, overflow) = parse_u64_digits(digits, 2)?;
+        Some((start, end, NumberToken::Bin { value, prefix: marker, overflow }))
+    }
+}
+
+fn parse_u64_digits(digits: &[u8], base: u32) -> Option<(u64, bool)> {
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value = 0u64;
+    let mut overflow = false;
+    let radix = u64::from(base);
+    for &b in digits {
+        let digit = match b {
+            b'0'..=b'9' => u64::from(b - b'0'),
+            b'a'..=b'f' if base == 16 => u64::from(b - b'a') + 10,
+            b'A'..=b'F' if base == 16 => u64::from(b - b'A') + 10,
+            _ => return None,
+        };
+        if digit >= radix {
+            return None;
+        }
+        if overflow {
+            continue;
+        }
+        match value.checked_mul(radix).and_then(|next| next.checked_add(digit)) {
+            Some(next) => value = next,
+            None => {
+                value = u64::MAX;
+                overflow = true;
+            }
+        }
+    }
+    Some((value, overflow))
+}
+
+fn hex_case_upper(line: &[u8], start: usize, end: usize) -> bool {
+    // Upstream `hexupper` is last ASCII-alphabetic byte in the old token,
+    // including the `x`/`X` marker (`ops.c` `do_addsub`).
+    line[start..end]
+        .iter()
+        .rev()
+        .find(|b| b.is_ascii_alphabetic())
+        .map(|b| b.is_ascii_uppercase())
+        .unwrap_or(false)
+}
+
+fn render_adjusted_number(token: NumberToken, old: &[u8], delta: i64) -> Vec<u8> {
+    match token {
+        NumberToken::Decimal { magnitude, negative, overflow } => {
+            let (next, next_negative) = if overflow {
+                (magnitude, negative && magnitude != 0)
+            } else {
+                add_signed_u64(magnitude, negative, delta)
+            };
+            pad_number(old, None, next_negative, next.to_string().as_bytes())
+        }
+        NumberToken::Hex { value, prefix, upper, overflow } => {
+            let next = if overflow { value } else { add_u64(value, delta) };
+            let digits = if upper { format!("{next:X}") } else { format!("{next:x}") };
+            pad_number(old, Some(prefix), false, digits.as_bytes())
+        }
+        NumberToken::Bin { value, prefix, overflow } => {
+            let next = if overflow { value } else { add_u64(value, delta) };
+            let digits = if next == 0 { "0".to_string() } else { format!("{next:b}") };
+            pad_number(old, Some(prefix), false, digits.as_bytes())
+        }
+    }
+}
+
+fn pad_number(old: &[u8], prefix: Option<u8>, negative: bool, digits: &[u8]) -> Vec<u8> {
+    let firstdigit = if old.first() == Some(&b'-') { old.get(1).copied() } else { old.first().copied() };
+    let pad_width = if firstdigit == Some(b'0') {
+        old.len().saturating_sub(usize::from(old.first() == Some(&b'-')))
+    } else {
+        0
+    };
+    let mut out = Vec::new();
+    if negative {
+        out.push(b'-');
+    }
+    let mut body_len = digits.len();
+    if let Some(marker) = prefix {
+        out.push(b'0');
+        out.push(marker);
+        body_len += 2;
+    }
+    if pad_width > body_len {
+        out.extend(std::iter::repeat(b'0').take(pad_width - body_len));
+    }
+    out.extend_from_slice(digits);
+    out
+}
+
+fn add_signed_u64(magnitude: u64, negative: bool, delta: i64) -> (u64, bool) {
+    let subtract = (delta < 0) ^ negative;
+    let amount = delta.unsigned_abs();
+    let old = magnitude;
+    let next = if subtract { old.wrapping_sub(amount) } else { old.wrapping_add(amount) };
+    let mut next_negative = negative;
+    if subtract {
+        if next > old {
+            return (1u64.wrapping_add(!next), !negative);
+        }
+    } else if next < old {
+        return (!next, !negative);
+    }
+    if next == 0 {
+        next_negative = false;
+    }
+    (next, next_negative)
+}
+
+fn add_u64(value: u64, delta: i64) -> u64 {
+    if delta >= 0 {
+        value.wrapping_add(delta as u64)
+    } else {
+        value.wrapping_sub(delta.unsigned_abs())
+    }
+}
+/// `'maxmapdepth'` (`p_mmd`), upstream's default 1000.
+fn max_map_depth(editor: &Editor) -> u64 {
+    match editor.options().get_global("maxmapdepth") {
+        Ok(OptionValue::Number(value)) if *value > 0 => u64::try_from(*value).unwrap_or(1000),
+        _ => 1000,
+    }
 }
 fn option_bool(editor: &Editor, name: &str, fallback: bool) -> bool { match editor.options().get_global(name) { Ok(OptionValue::Boolean(value)) => *value, _ => fallback } }
 fn option_contains(editor: &Editor, name: &str, item: &str, fallback: bool) -> bool { match editor.options().get_global(name) { Ok(OptionValue::String(value)) => value.split(',').any(|candidate| candidate == item), _ => fallback } }

@@ -391,6 +391,447 @@ fn extmark_details_order_limit_delete_and_clear() {
 }
 
 #[test]
+fn extmark_sign_details_match_neovim() {
+    let (mut editor, buffer, _, _) = editor_with_lines(&["one"]);
+    let namespace = crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("signs")).unwrap();
+    let id = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        0,
+        0,
+        dict(&[
+            ("sign_text", Object::String(OxStr::from(">>"))),
+            ("sign_hl_group", Object::String(OxStr::from("Statement"))),
+            ("number_hl_group", Object::String(OxStr::from("Statement"))),
+            ("line_hl_group", Object::String(OxStr::from("Statement"))),
+            ("cursorline_hl_group", Object::String(OxStr::from("Statement"))),
+            ("priority", Object::Integer(0)),
+        ]),
+    )
+    .unwrap();
+    let result = crate::extmark::nvim_buf_get_extmark_by_id(
+        &mut editor,
+        buffer,
+        namespace,
+        id,
+        dict(&[("details", Object::Boolean(true))]),
+    )
+    .unwrap();
+    let Object::Dict(details) = &result[2] else { panic!("missing details") };
+    assert_eq!(details.get(&OxStr::from("sign_text")), Some(&Object::String(OxStr::from(">>"))));
+    assert_eq!(details.get(&OxStr::from("sign_hl_group")), Some(&Object::String(OxStr::from("Statement"))));
+    assert_eq!(details.get(&OxStr::from("number_hl_group")), Some(&Object::String(OxStr::from("Statement"))));
+    assert_eq!(details.get(&OxStr::from("line_hl_group")), Some(&Object::String(OxStr::from("Statement"))));
+    assert_eq!(details.get(&OxStr::from("cursorline_hl_group")), Some(&Object::String(OxStr::from("Statement"))));
+    assert_eq!(details.get(&OxStr::from("priority")), Some(&Object::Integer(0)));
+    assert!(details.get(&OxStr::from("sign_name")).is_none());
+    assert!(details.get(&OxStr::from("invalidate")).is_none());
+    assert!(details.get(&OxStr::from("undo_restore")).is_none());
+
+    let default_id = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        0,
+        0,
+        dict(&[("cursorline_hl_group", Object::String(OxStr::from("Statement")))]),
+    )
+    .unwrap();
+    let result = crate::extmark::nvim_buf_get_extmark_by_id(
+        &mut editor,
+        buffer,
+        namespace,
+        default_id,
+        dict(&[("details", Object::Boolean(true))]),
+    )
+    .unwrap();
+    let Object::Dict(details) = &result[2] else { panic!("missing details") };
+    assert_eq!(details.get(&OxStr::from("cursorline_hl_group")), Some(&Object::String(OxStr::from("Statement"))));
+    assert_eq!(details.get(&OxStr::from("priority")), Some(&Object::Integer(0x1000)));
+
+    let ns = ox_editor::NamespaceId::new(u32::try_from(namespace).unwrap()).unwrap();
+    let eid = ox_editor::ExtmarkId::new(u32::try_from(id).unwrap()).unwrap();
+    let mut placement = editor.buffer(buffer).unwrap().extmarks.get(ns, eid).unwrap().unwrap().placement.clone();
+    placement.attributes.sign_name = Some("sign1".into());
+    placement.attributes.invalidate = true;
+    placement.attributes.undo_restore = false;
+    editor.buffer_mut(buffer).unwrap().extmarks.set(ns, Some(eid), placement).unwrap();
+    let result = crate::extmark::nvim_buf_get_extmark_by_id(
+        &mut editor,
+        buffer,
+        namespace,
+        id,
+        dict(&[("details", Object::Boolean(true))]),
+    )
+    .unwrap();
+    let Object::Dict(details) = &result[2] else { panic!("missing details") };
+    assert_eq!(details.get(&OxStr::from("sign_name")), Some(&Object::String(OxStr::from("sign1"))));
+    assert_eq!(details.get(&OxStr::from("invalidate")), Some(&Object::Boolean(true)));
+    assert_eq!(details.get(&OxStr::from("undo_restore")), Some(&Object::Boolean(false)));
+
+    let typed = crate::extmark::nvim_buf_get_extmarks(
+        &mut editor,
+        buffer,
+        namespace,
+        Object::Integer(0),
+        Object::Integer(-1),
+        dict(&[("type", Object::String(OxStr::from("sign")))]),
+    )
+    .unwrap();
+    assert!(!typed.is_empty());
+}
+
+#[test]
+fn extmark_argument_bound_namespace_and_filter_diagnostics_match_api_contract() {
+    let (mut editor, buffer, _, _) = editor_with_lines(&["12345"]);
+    let namespace = crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("validation")).unwrap();
+    let invalid_ns = namespace + 1;
+
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, invalid_ns, 0, 0, dict(&[])).unwrap_err().message(),
+        format!("Invalid 'ns_id': {invalid_ns}")
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_del_extmark(&mut editor, buffer, invalid_ns, 1).unwrap_err().message(),
+        format!("Invalid 'ns_id': {invalid_ns}")
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmarks(
+            &mut editor,
+            buffer,
+            invalid_ns,
+            Object::Integer(0),
+            Object::Integer(-1),
+            dict(&[]),
+        )
+        .unwrap_err()
+        .message(),
+        format!("Invalid 'ns_id': {invalid_ns}")
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmark_by_id(&mut editor, buffer, invalid_ns, 1, dict(&[])).unwrap_err().message(),
+        format!("Invalid 'ns_id': {invalid_ns}")
+    );
+
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("id", Object::Array(Vec::new())), ("end_col", Object::Integer(1)), ("end_row", Object::Integer(1))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'id': expected Integer, got Array"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("id", Object::Integer(0))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'id': expected positive Integer"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("end_col", Object::Array(Vec::new())), ("end_row", Object::Integer(1))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'end_col': expected Integer, got Array"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("end_col", Object::Integer(1)), ("end_row", Object::Array(Vec::new()))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'end_row': expected Integer, got Array"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("virt_text_pos", Object::Integer(0))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'virt_text_pos': expected String, got Integer"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("virt_text_pos", Object::String(OxStr::from("foo")))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'virt_text_pos': 'foo'"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[
+                ("virt_text_pos", Object::String(OxStr::from("foo"))),
+                ("virt_text_win_col", Object::Integer(5)),
+            ]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'virt_text_pos': 'foo'"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("hl_mode", Object::Integer(0))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'hl_mode': expected String, got Integer"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("hl_mode", Object::String(OxStr::from("foo")))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'hl_mode': 'foo'"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("virt_lines_overflow", Object::String(OxStr::from("foo")))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'virt_lines_overflow': 'foo'"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("end_row", Object::Integer(0)), ("end_line", Object::Integer(0))]),
+        )
+        .unwrap_err()
+        .message(),
+        "cannot use both 'end_row' and 'end_line'"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("end_right_gravity", Object::Boolean(true))]),
+        )
+        .unwrap_err()
+        .message(),
+        "cannot set end_right_gravity without end_row or end_col"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("priority", Object::Integer(-1))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'priority': out of range"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, namespace, 0, 6, dict(&[])).unwrap_err().message(),
+        "Invalid 'col': out of range"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, namespace, 3, 6, dict(&[])).unwrap_err().message(),
+        "Invalid 'line': out of range"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("end_col", Object::Integer(1)), ("end_row", Object::Integer(1))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'end_col': out of range"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("end_col", Object::Integer(-1)), ("end_row", Object::Integer(0))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'end_col': out of range"
+    );
+
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmarks(
+            &mut editor,
+            buffer,
+            namespace,
+            Object::Array(Vec::new()),
+            Object::Array(vec![Object::Integer(-1), Object::Integer(-1)]),
+            dict(&[]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid mark position: expected 2 Integer items"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmarks(
+            &mut editor,
+            buffer,
+            namespace,
+            Object::Boolean(true),
+            Object::Array(vec![Object::Integer(-1), Object::Integer(-1)]),
+            dict(&[]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid mark position: expected mark id Integer or 2-item Array"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmarks(
+            &mut editor,
+            buffer,
+            namespace,
+            Object::Integer(-2),
+            Object::Integer(-1),
+            dict(&[]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid mark id: -2"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmarks(
+            &mut editor,
+            buffer,
+            namespace,
+            Object::Integer(99),
+            Object::Integer(-1),
+            dict(&[]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid mark id (not found): 99"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmarks(
+            &mut editor,
+            buffer,
+            namespace,
+            Object::Integer(0),
+            Object::Integer(-1),
+            dict(&[("type", Object::String(OxStr::from("bogus")))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'type': expected sign, virt_text, virt_lines or highlight, got bogus"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmarks(
+            &mut editor,
+            buffer,
+            namespace,
+            Object::Integer(0),
+            Object::Integer(-1),
+            dict(&[("limit", Object::Boolean(true))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'limit': expected Integer, got Boolean"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor,
+            buffer,
+            namespace,
+            0,
+            0,
+            dict(&[("virt_lines", Object::Integer(1))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'virt_lines': expected Array, got Integer"
+    );
+}
+
+#[test]
+fn extmark_boolean_option_diagnostic_matches_api_contract() {
+    let (mut editor, buffer, _, _) = editor_with_lines(&["one"]);
+    let namespace = crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("tests")).unwrap();
+    let error = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        0,
+        0,
+        dict(&[("right_gravity", Object::String(OxStr::from("invalid")))]),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.message(), "Invalid 'right_gravity': expected boolean");
+}
+
+#[test]
 fn context_channel_and_ui_round_trip() {
     let (mut editor, _, _, _) = editor_with_lines(&["one"]);
     editor.vvars_mut().0.push((OxStr::from("answer"), Object::Integer(42)));
@@ -897,13 +1338,23 @@ fn set_extmark_strict_rejects_out_of_buffer_and_line() {
     // placed if the line is past end-of-buffer or the column past end-of-line.
     let (mut editor, buffer, _, _) = editor_with_lines(&["one", "two"]);
     let ns = crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("s")).unwrap();
-    assert!(crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, ns, 5, 0, dict(&[])).is_err());
-    assert!(crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, ns, 0, 50, dict(&[])).is_err());
-    assert!(crate::extmark::nvim_buf_set_extmark(
-        &mut editor, buffer, ns, 0, 0,
-        dict(&[("end_row", Object::Integer(9)), ("end_col", Object::Integer(0))]),
-    )
-    .is_err());
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, ns, 5, 0, dict(&[])).unwrap_err().message(),
+        "Invalid 'line': out of range"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, ns, 0, 50, dict(&[])).unwrap_err().message(),
+        "Invalid 'col': out of range"
+    );
+    assert_eq!(
+        crate::extmark::nvim_buf_set_extmark(
+            &mut editor, buffer, ns, 0, 0,
+            dict(&[("end_row", Object::Integer(9)), ("end_col", Object::Integer(0))]),
+        )
+        .unwrap_err()
+        .message(),
+        "Invalid 'end_row': out of range"
+    );
     // strict=false allows out-of-range placement.
     let id = crate::extmark::nvim_buf_set_extmark(
         &mut editor, buffer, ns, 5, 50,
@@ -1237,8 +1688,8 @@ fn option_setter_error_shapes_match_upstream() {
             "Invalid value for option 'expandtab': expected boolean, got string \"x\""
         ))
     );
-    // Unknown operations use upstream's message; unimplemented merge
-    // operations keep an explicit unsupported error.
+    // api/options.c validate_option_value_args rejects an unknown operation by
+    // name and a merge into a boolean option as a conflict.
     assert_eq!(
         set_option_value(
             &mut editor,
@@ -1253,12 +1704,1318 @@ fn option_setter_error_shapes_match_upstream() {
     assert_eq!(
         set_option_value(
             &mut editor,
-            "wildignore",
-            Object::String(OxStr::from("*.x")),
+            "ignorecase",
+            Object::Boolean(true),
             &[("operation", Object::String(OxStr::from("append")))]
         ),
-        Err(ApiError::validation(
-            "Unsupported nvim_set_option_value operation: append"
-        ))
+        Err(ApiError::validation("Conflict: 'append' not allowed with boolean options"))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Runtime-file search over 'runtimepath'
+// ---------------------------------------------------------------------------
+
+/// An in-memory directory tree, so the ordering rules can be exercised without
+/// a real filesystem. Every entry is an absolute path; a trailing `/` marks a
+/// directory, and every parent directory of a listed path exists.
+struct MemoryFileIO {
+    dirs: std::collections::BTreeSet<String>,
+    files: std::collections::BTreeSet<String>,
+}
+
+impl MemoryFileIO {
+    fn new(entries: &[&str]) -> Self {
+        let mut io = Self { dirs: std::collections::BTreeSet::new(), files: std::collections::BTreeSet::new() };
+        for entry in entries {
+            let path = entry.trim_end_matches('/');
+            if entry.ends_with('/') {
+                io.dirs.insert(path.to_owned());
+            } else {
+                io.files.insert(path.to_owned());
+            }
+            let mut parent = std::path::Path::new(path).parent();
+            while let Some(directory) = parent.filter(|directory| directory.as_os_str().len() > 1) {
+                io.dirs.insert(directory.to_string_lossy().into_owned());
+                parent = directory.parent();
+            }
+        }
+        io
+    }
+
+    /// Component-wise wildcard match, the way a shell glob and upstream's
+    /// `gen_expand_wildcards()` both treat `*`: it never spans a separator.
+    fn matches(pattern: &str, path: &str) -> bool {
+        let (pattern, path): (Vec<&str>, Vec<&str>) = (pattern.split('/').collect(), path.split('/').collect());
+        pattern.len() == path.len()
+            && pattern.iter().zip(&path).all(|(part, name)| crate::runtime::wildcard(part.as_bytes(), name.as_bytes()))
+    }
+}
+
+impl crate::FileIO for MemoryFileIO {
+    fn expand(&self, pattern: &str, kind: crate::MatchKind) -> Vec<std::path::PathBuf> {
+        let candidates: Box<dyn Iterator<Item = &String>> = match kind {
+            crate::MatchKind::Dirs => Box::new(self.dirs.iter()),
+            crate::MatchKind::Files => Box::new(self.files.iter()),
+            crate::MatchKind::DirsAndFiles => Box::new(self.dirs.iter().chain(self.files.iter())),
+        };
+        let mut found: Vec<String> =
+            candidates.filter(|path| Self::matches(pattern, path)).cloned().collect();
+        found.sort();
+        found.into_iter().map(std::path::PathBuf::from).collect()
+    }
+
+    fn is_dir(&self, path: &std::path::Path) -> bool {
+        self.dirs.contains(path.to_string_lossy().as_ref())
+    }
+
+    fn is_readable(&self, path: &std::path::Path) -> bool {
+        self.files.contains(path.to_string_lossy().as_ref())
+    }
+}
+
+/// Builds an editor whose 'runtimepath'/'packpath' and filesystem are the
+/// supplied ones, with nothing inherited from the host.
+fn runtime_editor(runtimepath: &str, packpath: &str, entries: &[&str]) -> Editor {
+    let mut editor = Editor::new();
+    for (name, value) in [("runtimepath", runtimepath), ("packpath", packpath)] {
+        editor
+            .options_mut()
+            .set_global(name, ox_editor::OptionValue::String(value.to_owned()))
+            .expect("option is settable");
+    }
+    crate::set_file_io(&editor, Box::new(MemoryFileIO::new(entries)));
+    editor
+}
+
+fn list_paths(editor: &mut Editor) -> Vec<String> {
+    crate::channel::nvim_list_runtime_paths(editor)
+        .expect("listing succeeds")
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn runtime_file(editor: &mut Editor, name: &str, all: bool) -> Vec<String> {
+    crate::channel::nvim_get_runtime_file(editor, OxStr::from(name), all)
+        .expect("lookup succeeds")
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn get_named(editor: &Editor, patterns: &[&str], all: bool, is_lua: bool) -> Vec<String> {
+    let patterns: Vec<String> = patterns.iter().map(|pattern| (*pattern).to_owned()).collect();
+    crate::runtime_get_named(editor, &patterns, all, is_lua)
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+const TREE: &[&str] = &[
+    "/a/lua/shared.lua",
+    "/a/lua/onlya.lua",
+    "/a/plugin/x.vim",
+    "/b/after/lua/shared.lua",
+    "/b/after/plugin/x.vim",
+    "/c/lua/shared.lua",
+    "/c/plugin/x.vim",
+    "/nolua/plugin/shared.lua",
+    "/w/p1/lua/shared.lua",
+    "/w/p2/lua/shared.lua",
+    "/pk/pack/vendor/start/bundle/lua/shared.lua",
+    "/pk/pack/vendor/start/bundle/after/lua/shared.lua",
+];
+
+// runtime.c do_in_cached_path — `all` decides whether the walk collects every
+// match or stops at the first. Three entries all hold the file, so a search
+// that ignored `all` would answer with three paths either way, and one that
+// ignored 'runtimepath' order would not stop on /a.
+#[test]
+fn runtime_file_lookup_honors_the_all_flag() {
+    let mut editor = runtime_editor("/a,/b/after,/c", "", TREE);
+    assert_eq!(
+        runtime_file(&mut editor, "lua/shared.lua", true),
+        ["/a/lua/shared.lua", "/b/after/lua/shared.lua", "/c/lua/shared.lua"]
+    );
+    assert_eq!(runtime_file(&mut editor, "lua/shared.lua", false), ["/a/lua/shared.lua"]);
+    assert_eq!(get_named(&editor, &["lua/shared.lua"], false, true), ["/a/lua/shared.lua"]);
+}
+
+// runtime.c do_in_cached_path — the walk follows 'runtimepath' left to right,
+// so reordering the same three entries reorders every answer. A search that
+// sorted its results, or read the option once and cached it, would return the
+// first block's answer here too.
+#[test]
+fn runtime_file_lookup_follows_runtimepath_order() {
+    let mut editor = runtime_editor("/c,/a", "", TREE);
+    assert_eq!(runtime_file(&mut editor, "lua/shared.lua", true), ["/c/lua/shared.lua", "/a/lua/shared.lua"]);
+    assert_eq!(runtime_file(&mut editor, "lua/shared.lua", false), ["/c/lua/shared.lua"]);
+
+    editor
+        .options_mut()
+        .set_global("runtimepath", ox_editor::OptionValue::String("/a,/c".to_owned()))
+        .expect("option is settable");
+    assert_eq!(runtime_file(&mut editor, "lua/shared.lua", true), ["/a/lua/shared.lua", "/c/lua/shared.lua"]);
+    assert_eq!(runtime_file(&mut editor, "lua/shared.lua", false), ["/a/lua/shared.lua"]);
+}
+
+// runtime.c runtime_search_path_build — the first pass stops at the first
+// `after` entry and the rest of 'runtimepath' is appended from there, so an
+// `after` entry in the middle keeps its place. Partitioning the entries into
+// non-after then after would move /b/after behind /c and answer with the same
+// list as the tail-after case below, which is what makes the pair a test.
+#[test]
+fn after_entries_keep_their_runtimepath_position() {
+    let mut middle = runtime_editor("/a,/b/after,/c", "", TREE);
+    assert_eq!(list_paths(&mut middle), ["/a", "/b/after", "/c"]);
+
+    let mut tail = runtime_editor("/a,/c,/b/after", "", TREE);
+    assert_eq!(list_paths(&mut tail), ["/a", "/c", "/b/after"]);
+
+    assert_ne!(list_paths(&mut middle), list_paths(&mut tail));
+}
+
+// runtime.c runtime_search_path_build — an entry that is also a 'packpath'
+// entry splices its start bundles in directly behind itself, while the
+// bundles' `after` directories wait for the pass that runs once every
+// non-after entry is placed. Appending the after dir next to its bundle, or
+// putting the bundles at the end, both reorder this list.
+#[test]
+fn package_bundles_follow_their_packpath_entry_and_after_dirs_come_last() {
+    let mut editor = runtime_editor("/a,/pk,/c", "/pk", TREE);
+    assert_eq!(
+        list_paths(&mut editor),
+        ["/a", "/pk", "/pk/pack/vendor/start/bundle", "/c", "/pk/pack/vendor/start/bundle/after"]
+    );
+}
+
+// runtime.c expand_rtp_entry/push_path — a wildcard entry expands to the
+// directories it matches, in sorted order, and a directory already on the path
+// is never placed twice. Upstream drops a repeat at two points, and each needs
+// its own case: naming an entry that is already on the path skips the whole
+// entry, while a *different* pattern that expands onto a directory already
+// there is caught only when the expansion is pushed. Without the expansion
+// /w/* would contribute nothing at all.
+#[test]
+fn wildcard_entries_expand_and_repeats_collapse() {
+    let mut named = runtime_editor("/w/*,/c,/w/p1", "", TREE);
+    assert_eq!(list_paths(&mut named), ["/w/p1", "/w/p2", "/c"]);
+    assert_eq!(
+        runtime_file(&mut named, "lua/shared.lua", true),
+        ["/w/p1/lua/shared.lua", "/w/p2/lua/shared.lua", "/c/lua/shared.lua"]
+    );
+
+    // `/w/p1*` is not the text of any placed entry, so only the per-expansion
+    // check can tell that it produces a directory already on the path.
+    let mut overlapping = runtime_editor("/w/*,/c,/w/p1*", "", TREE);
+    assert_eq!(list_paths(&mut overlapping), ["/w/p1", "/w/p2", "/c"]);
+
+    // The same holds the other way round: the narrower pattern comes first and
+    // the wider one may add only what it did not already place.
+    let mut widening = runtime_editor("/w/p1*,/w/*", "", TREE);
+    assert_eq!(list_paths(&mut widening), ["/w/p1", "/w/p2"]);
+}
+
+// runtime.c runtime_get_named — with `is_lua` an entry that has no `lua/`
+// subdirectory is skipped entirely, which is how `require` avoids probing
+// every runtime directory. nvim_get_runtime_file has no such filter, so the
+// same tree answers differently through the two entry points.
+#[test]
+fn lua_lookup_skips_entries_without_a_lua_directory() {
+    let mut editor = runtime_editor("/nolua,/a", "", TREE);
+    assert_eq!(list_paths(&mut editor), ["/nolua", "/a"]);
+    assert_eq!(get_named(&editor, &["plugin/shared.lua"], true, true), Vec::<String>::new());
+    assert_eq!(get_named(&editor, &["plugin/shared.lua"], true, false), ["/nolua/plugin/shared.lua"]);
+    assert_eq!(runtime_file(&mut editor, "plugin/shared.lua", true), ["/nolua/plugin/shared.lua"]);
+}
+
+// api/vim.c nvim_get_runtime_file — the name may hold several whitespace
+// separated patterns and may glob, and DIP_DIRFILE lets it match directories
+// as well as files. All three are tried under one entry before moving on.
+#[test]
+fn runtime_file_lookup_expands_multiple_patterns_and_directories() {
+    let mut editor = runtime_editor("/a,/c", "", TREE);
+    assert_eq!(
+        runtime_file(&mut editor, "lua/onlya.lua plugin/x.vim", true),
+        ["/a/lua/onlya.lua", "/a/plugin/x.vim", "/c/plugin/x.vim"]
+    );
+    assert_eq!(
+        runtime_file(&mut editor, "lua/*.lua", true),
+        ["/a/lua/onlya.lua", "/a/lua/shared.lua", "/c/lua/shared.lua"]
+    );
+    assert_eq!(runtime_file(&mut editor, "lua", true), ["/a/lua", "/c/lua"]);
+}
+
+// runtime.c runtime_get_named — patterns are literal readable-file probes, so
+// an entry contributes at most one path per pattern and a directory never
+// answers. `all` stops the walk on the first hit, as it does for the search.
+#[test]
+fn lua_lookup_probes_literal_paths_in_order() {
+    let editor = runtime_editor("/a,/c", "", TREE);
+    assert_eq!(
+        get_named(&editor, &["lua/onlya.lua", "lua/shared.lua"], true, true),
+        ["/a/lua/onlya.lua", "/a/lua/shared.lua", "/c/lua/shared.lua"]
+    );
+    assert_eq!(get_named(&editor, &["lua/onlya.lua", "lua/shared.lua"], false, true), ["/a/lua/onlya.lua"]);
+    assert_eq!(get_named(&editor, &["lua/*.lua"], true, true), Vec::<String>::new());
+    assert_eq!(get_named(&editor, &["lua"], true, true), Vec::<String>::new());
+}
+
+// ---------------------------------------------------------------------------
+// vim.opt append / prepend / remove
+// ---------------------------------------------------------------------------
+
+fn merge_option(editor: &mut Editor, name: &str, value: &str, operation: &str) -> Result<Object, ApiError> {
+    set_option_value(
+        editor,
+        name,
+        Object::String(OxStr::from(value)),
+        &[("operation", Object::String(OxStr::from(operation)))],
+    )
+}
+
+fn option_text(editor: &mut Editor, name: &str) -> String {
+    match get_option_value(editor, name) {
+        Ok(Object::String(value)) => value.to_string_lossy().into_owned(),
+        other => panic!("expected a string option, got {other:?}"),
+    }
+}
+
+// option.c get_option_newval — the comma-list merges `vim.opt.rtp:append()`,
+// `:prepend()` and `:remove()` compile to, checked against the reference
+// binary: appending an entry already present is a no-op, and removing one that
+// is absent leaves the value alone.
+#[test]
+fn comma_list_options_append_prepend_and_remove() {
+    let mut editor = runtime_editor("/a,/b", "", &[]);
+    assert_eq!(
+        merge_option(&mut editor, "runtimepath", "/c", "append"),
+        Ok(Object::Array(vec![
+            Object::String(OxStr::from("/a")),
+            Object::String(OxStr::from("/b")),
+            Object::String(OxStr::from("/c")),
+        ]))
+    );
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/a,/b,/c");
+    merge_option(&mut editor, "runtimepath", "/z", "prepend").expect("prepend succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/z,/a,/b,/c");
+    merge_option(&mut editor, "runtimepath", "/b", "remove").expect("remove succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/z,/a,/c");
+    merge_option(&mut editor, "runtimepath", "/a", "append").expect("duplicate append succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/z,/a,/c");
+    merge_option(&mut editor, "runtimepath", "/nope", "remove").expect("absent remove succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/z,/a,/c");
+    // Removing the first and the last item each take exactly one comma with them.
+    merge_option(&mut editor, "runtimepath", "/z", "remove").expect("remove succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/a,/c");
+    merge_option(&mut editor, "runtimepath", "/c", "remove").expect("remove succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/a");
+}
+
+// option.c stropt_concat_with_comma — an empty original value takes no
+// separator, and a flag-list option is not comma separated at all.
+#[test]
+fn merge_adds_a_separator_only_where_the_option_has_one() {
+    let mut editor = runtime_editor("", "", &[]);
+    merge_option(&mut editor, "runtimepath", "/only", "append").expect("append succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/only");
+
+    editor
+        .options_mut()
+        .set_global("shortmess", ox_editor::OptionValue::String("filnx".to_owned()))
+        .expect("option is settable");
+    merge_option(&mut editor, "shortmess", "tI", "append").expect("append succeeds");
+    assert_eq!(option_text(&mut editor, "shortmess"), "filnxtI");
+    merge_option(&mut editor, "shortmess", "l", "remove").expect("remove succeeds");
+    assert_eq!(option_text(&mut editor, "shortmess"), "finxtI");
+}
+
+// option.c get_option_newval — a number option adds, multiplies and subtracts
+// rather than concatenating, so `prepend` on 'scrolloff' is a product.
+#[test]
+fn number_options_merge_arithmetically() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    let mut apply = |operation: &str, start: i64, value: i64| {
+        // 'scrolloff' is global-local, so reset it through the same target the
+        // merge reads its old value from.
+        set_option_value(&mut editor, "scrolloff", Object::Integer(start), &[]).expect("reset succeeds");
+        set_option_value(
+            &mut editor,
+            "scrolloff",
+            Object::Integer(value),
+            &[("operation", Object::String(OxStr::from(operation)))],
+        )
+    };
+    assert_eq!(apply("append", 5, 3), Ok(Object::Integer(8)));
+    assert_eq!(apply("prepend", 5, 3), Ok(Object::Integer(15)));
+    assert_eq!(apply("remove", 5, 3), Ok(Object::Integer(2)));
+}
+
+// option.c stropt_handle_keymatch — for a `key:value` comma list, an appended
+// item replaces the entry with the same key instead of adding a second one,
+// and a removal matches on the key. A plain comma-list merge would leave
+// `fold:-` in place beside `fold:.`.
+#[test]
+fn key_value_options_merge_on_the_key() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    editor
+        .options_mut()
+        .set_global("fillchars", ox_editor::OptionValue::String("vert:|,fold:-".to_owned()))
+        .expect("option is settable");
+    merge_option(&mut editor, "fillchars", "fold:.", "append").expect("append succeeds");
+    assert_eq!(option_text(&mut editor, "fillchars"), "vert:|,fold:.");
+    merge_option(&mut editor, "fillchars", "vert:|", "remove").expect("remove succeeds");
+    assert_eq!(option_text(&mut editor, "fillchars"), "fold:.");
+}
+
+// option.c option_expand — an option flagged `expand` substitutes `$VAR` and a
+// leading `~` before the merge, so `vim.opt.rtp:prepend('~/x')` stores an
+// absolute path. An unset variable is left standing.
+#[test]
+fn expand_flagged_options_substitute_home_and_environment() {
+    // Read from the ambient environment rather than mutating it: `set_var` is
+    // unsafe, and this crate forbids unsafe code.
+    let home = std::env::var("HOME").expect("HOME is set for the test process");
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
+    let mut editor = runtime_editor("/a", "", &[]);
+
+    merge_option(&mut editor, "runtimepath", "~/tp", "prepend").expect("prepend succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), format!("{home}/tp,/a"));
+    merge_option(&mut editor, "runtimepath", "$CARGO_MANIFEST_DIR/x", "append").expect("append succeeds");
+    assert_eq!(option_text(&mut editor, "runtimepath"), format!("{home}/tp,/a,{manifest}/x"));
+    merge_option(&mut editor, "runtimepath", "${CARGO_MANIFEST_DIR}/y", "append").expect("append succeeds");
+    assert_eq!(
+        option_text(&mut editor, "runtimepath"),
+        format!("{home}/tp,/a,{manifest}/x,{manifest}/y")
+    );
+    // An unset variable and a `~` that does not open a path component both
+    // stay literal, and an option without the expand flag is never touched.
+    merge_option(&mut editor, "runtimepath", "$OXVIM_TEST_RTP_UNSET/z", "append").expect("append succeeds");
+    assert!(option_text(&mut editor, "runtimepath").ends_with(",$OXVIM_TEST_RTP_UNSET/z"));
+    merge_option(&mut editor, "runtimepath", "~tilde", "append").expect("append succeeds");
+    assert!(option_text(&mut editor, "runtimepath").ends_with(",~tilde"));
+    merge_option(&mut editor, "wildignore", "~/w", "append").expect("append succeeds");
+    assert_eq!(option_text(&mut editor, "wildignore"), "~/w");
+}
+
+// api/options.c nvim_set_option_value — `dry_run` still merges and returns the
+// result, but leaves the option where it was.
+#[test]
+fn dry_run_merges_without_storing() {
+    let mut editor = runtime_editor("/a", "", &[]);
+    assert_eq!(
+        set_option_value(
+            &mut editor,
+            "runtimepath",
+            Object::String(OxStr::from("/b")),
+            &[
+                ("operation", Object::String(OxStr::from("append"))),
+                ("dry_run", Object::Boolean(true)),
+            ]
+        ),
+        Ok(Object::Array(vec![Object::String(OxStr::from("/a")), Object::String(OxStr::from("/b"))]))
+    );
+    assert_eq!(option_text(&mut editor, "runtimepath"), "/a");
+}
+
+// ---------------------------------------------------------------------------
+// Mappings and the Ex-command / Lua hosts
+// ---------------------------------------------------------------------------
+
+fn set_keymap(editor: &mut Editor, mode: &str, lhs: &str, rhs: &str, opts: &[(&str, Object)]) -> Result<(), ApiError> {
+    crate::keymap::nvim_set_keymap(editor, OxStr::from(mode), OxStr::from(lhs), OxStr::from(rhs), dict(opts))
+}
+
+fn keymaps(editor: &mut Editor, mode: &str) -> Vec<Dict> {
+    crate::keymap::nvim_get_keymap(editor, OxStr::from(mode))
+        .expect("listing succeeds")
+        .into_iter()
+        .map(|entry| match entry {
+            Object::Dict(entry) => entry,
+            other => panic!("expected a dictionary, got {other:?}"),
+        })
+        .collect()
+}
+
+fn field(entry: &Dict, key: &str) -> Option<Object> {
+    entry.get(&OxStr::from(key)).cloned()
+}
+
+// mapping.c mapblock_fill_dict — a mapping set through the API comes back with
+// upstream's key set and values, read off the reference binary. `noremap`
+// tracks the option rather than the default, `desc` appears only when given,
+// and `<Leader>` in the lhs is replaced by the default backslash.
+#[test]
+fn set_keymap_round_trips_through_get_keymap() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    set_keymap(&mut editor, "n", "<Leader>x", ":echo \"hi\"<CR>", &[
+        ("noremap", Object::Boolean(true)),
+        ("silent", Object::Boolean(true)),
+        ("desc", Object::String(OxStr::from("probe cmd"))),
+    ])
+    .expect("set succeeds");
+    set_keymap(&mut editor, "n", "gp", "gP", &[]).expect("set succeeds");
+
+    let maps = keymaps(&mut editor, "n");
+    assert_eq!(maps.len(), 2);
+    let leader = maps.iter().find(|entry| field(entry, "lhs") == Some(Object::String(OxStr::from("\\x")))).expect("leader mapping");
+    assert_eq!(field(leader, "rhs"), Some(Object::String(OxStr::from(":echo \"hi\"<CR>"))));
+    assert_eq!(field(leader, "noremap"), Some(Object::Integer(1)));
+    assert_eq!(field(leader, "silent"), Some(Object::Integer(1)));
+    assert_eq!(field(leader, "desc"), Some(Object::String(OxStr::from("probe cmd"))));
+    assert_eq!(field(leader, "mode"), Some(Object::String(OxStr::from("n"))));
+    assert_eq!(field(leader, "mode_bits"), Some(Object::Integer(1)));
+    assert_eq!(field(leader, "buffer"), Some(Object::Integer(0)));
+    assert_eq!(field(leader, "buf"), Some(Object::Integer(0)));
+    assert_eq!(field(leader, "abbr"), Some(Object::Integer(0)));
+    assert_eq!(field(leader, "scriptversion"), Some(Object::Integer(1)));
+
+    let plain = maps.iter().find(|entry| field(entry, "lhs") == Some(Object::String(OxStr::from("gp")))).expect("plain mapping");
+    assert_eq!(field(plain, "noremap"), Some(Object::Integer(0)));
+    assert_eq!(field(plain, "silent"), Some(Object::Integer(0)));
+    assert_eq!(field(plain, "desc"), None);
+
+    crate::keymap::nvim_del_keymap(&mut editor, OxStr::from("n"), OxStr::from("gp")).expect("del succeeds");
+    assert_eq!(keymaps(&mut editor, "n").len(), 1);
+}
+
+// mapping.c modify_keymap/keymap_array — the mode string selects the mode set,
+// so a mapping set in one mode is invisible in another and the `:map` modes
+// (the empty string) see it while a single unrelated mode does not.
+#[test]
+fn keymap_modes_select_which_mappings_are_visible() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    set_keymap(&mut editor, "n", "za", "zA", &[]).expect("set succeeds");
+    set_keymap(&mut editor, "i", "zb", "zB", &[]).expect("set succeeds");
+    set_keymap(&mut editor, "!", "zc", "zC", &[]).expect("set succeeds");
+
+    assert_eq!(keymaps(&mut editor, "n").len(), 1);
+    // 'i' sees its own mapping and the `:map!` one, which covers insert.
+    assert_eq!(keymaps(&mut editor, "i").len(), 2);
+    assert_eq!(keymaps(&mut editor, "c").len(), 1);
+    assert_eq!(keymaps(&mut editor, "o").len(), 0);
+    // The empty mode is `:map`: normal, visual, select and operator-pending.
+    assert_eq!(keymaps(&mut editor, "").len(), 1);
+    let bang = keymaps(&mut editor, "c").first().cloned().expect("cmdline mapping");
+    assert_eq!(field(&bang, "mode"), Some(Object::String(OxStr::from("!"))));
+    assert_eq!(field(&bang, "mode_bits"), Some(Object::Integer(24)));
+}
+
+// mapping.c modify_keymap — the rejections, each with upstream's own message.
+#[test]
+fn keymap_rejections_match_upstream() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    assert_eq!(
+        set_keymap(&mut editor, "zz", "a", "b", &[]),
+        Err(ApiError::validation("Invalid mode shortname: \"zz\""))
+    );
+    assert_eq!(
+        set_keymap(&mut editor, "nv", "a", "b", &[]),
+        Err(ApiError::validation("Invalid mode shortname: \"nv\""))
+    );
+    assert_eq!(set_keymap(&mut editor, "n", "", "b", &[]), Err(ApiError::validation("Invalid (empty) LHS")));
+    assert_eq!(
+        set_keymap(&mut editor, "n", "a", "b", &[("bogus", Object::Boolean(true))]),
+        Err(ApiError::validation("invalid key: bogus"))
+    );
+    assert_eq!(
+        set_keymap(&mut editor, "n", "a", "b", &[("replace_keycodes", Object::Boolean(true))]),
+        Err(ApiError::validation("\"replace_keycodes\" requires \"expr\""))
+    );
+    assert_eq!(
+        crate::keymap::nvim_del_keymap(&mut editor, OxStr::from("n"), OxStr::from("nosuch")),
+        Err(ApiError::exception("E31: No such mapping"))
+    );
+    set_keymap(&mut editor, "n", "zr", "zR", &[]).expect("set succeeds");
+    assert_eq!(
+        set_keymap(&mut editor, "n", "zr", "zR", &[("unique", Object::Boolean(true))]),
+        Err(ApiError::exception("E227: Mapping already exists for zr"))
+    );
+}
+
+// api/buffer.c nvim_buf_set_keymap/nvim_buf_get_keymap — a buffer-local
+// mapping is reported by the buffer listing with its handle, and never by the
+// global one, which is the distinction between the two scopes.
+#[test]
+fn buffer_keymaps_stay_out_of_the_global_listing() {
+    let (mut editor, buffer, _, _) = editor_with_lines(&["one"]);
+    set_keymap(&mut editor, "n", "gg", "gG", &[]).expect("global set succeeds");
+    crate::keymap::nvim_buf_set_keymap(
+        &mut editor,
+        buffer,
+        OxStr::from("n"),
+        OxStr::from("gb"),
+        OxStr::from("gB"),
+        dict(&[("desc", Object::String(OxStr::from("buffer local")))]),
+    )
+    .expect("buffer set succeeds");
+
+    let global = keymaps(&mut editor, "n");
+    assert_eq!(global.len(), 1);
+    assert_eq!(field(&global[0], "lhs"), Some(Object::String(OxStr::from("gg"))));
+
+    let local = crate::keymap::nvim_buf_get_keymap(&mut editor, buffer, OxStr::from("n"))
+        .expect("buffer listing succeeds");
+    assert_eq!(local.len(), 1);
+    let Object::Dict(entry) = &local[0] else { panic!("expected a dictionary") };
+    assert_eq!(field(entry, "lhs"), Some(Object::String(OxStr::from("gb"))));
+    assert_eq!(field(entry, "buffer"), Some(Object::Integer(1)));
+    assert_eq!(field(entry, "buf"), Some(Object::Integer(i64::from(buffer))));
+    assert_eq!(field(entry, "desc"), Some(Object::String(OxStr::from("buffer local"))));
+
+    crate::keymap::nvim_buf_del_keymap(&mut editor, buffer, OxStr::from("n"), OxStr::from("gb"))
+        .expect("buffer del succeeds");
+    assert!(crate::keymap::nvim_buf_get_keymap(&mut editor, buffer, OxStr::from("n")).expect("listing").is_empty());
+    assert_eq!(keymaps(&mut editor, "n").len(), 1);
+}
+
+// api/vim.c nvim_exec2 / nvim_cmd / nvim_command run through the installed
+// Ex-command host, and `output` decides whether the messages the script
+// produced come back. Without a host installed they say so rather than
+// claiming the function does not exist.
+#[test]
+fn exec_functions_run_through_the_installed_command_host() {
+    let mut editor = Editor::new();
+    assert_eq!(
+        crate::global::nvim_command(&mut editor, OxStr::from("write")),
+        Err(ApiError::exception("no Ex-command host is installed"))
+    );
+
+    crate::set_command_executor(
+        &editor,
+        Box::new(RecordingExecutor { commands: Vec::new(), message: Some("captured") }),
+    );
+    assert_eq!(crate::global::nvim_command(&mut editor, OxStr::from("write")), Ok(()));
+    assert_eq!(
+        crate::global::nvim_exec2(&mut editor, OxStr::from("echo 'x'"), Dict(Vec::new())),
+        Ok(Dict(Vec::new()))
+    );
+    assert_eq!(
+        crate::global::nvim_exec2(
+            &mut editor,
+            OxStr::from("echo 'x'"),
+            dict(&[("output", Object::Boolean(true))])
+        ),
+        Ok(dict(&[("output", Object::String(OxStr::from("captured")))]))
+    );
+    assert_eq!(
+        crate::global::nvim_cmd(
+            &mut editor,
+            dict(&[("cmd", Object::String(OxStr::from("write")))]),
+            dict(&[("output", Object::Boolean(true))])
+        ),
+        Ok(OxStr::from("captured"))
+    );
+    // The host is put back after every call, so a second one still finds it.
+    assert_eq!(crate::global::nvim_command(&mut editor, OxStr::from("write")), Ok(()));
+}
+
+struct EchoingLua;
+
+impl crate::LuaExecutor for EchoingLua {
+    fn exec(&mut self, editor: &mut Editor, code: &str, args: Vec<Object>) -> Result<Object, String> {
+        // Prove the host receives the editor as well as the chunk.
+        editor.push_message(ox_editor::Message {
+            kind: ox_editor::MessageKind::Echo,
+            content: Object::String(OxStr::from(code)),
+            history: false,
+        });
+        Ok(Object::Array(args))
+    }
+}
+
+// api/vim.c nvim_exec_lua hands the chunk and its arguments to the Lua host
+// and returns what the host produced.
+#[test]
+fn exec_lua_runs_through_the_installed_lua_host() {
+    let mut editor = Editor::new();
+    assert_eq!(
+        crate::global::nvim_exec_lua(&mut editor, OxStr::from("return 1"), Vec::new()),
+        Err(ApiError::exception("no Lua host is installed"))
+    );
+    crate::set_lua_executor(&editor, Box::new(EchoingLua));
+    assert_eq!(
+        crate::global::nvim_exec_lua(&mut editor, OxStr::from("return ..."), vec![Object::Integer(7)]),
+        Ok(Object::Array(vec![Object::Integer(7)]))
+    );
+    assert_eq!(
+        editor.messages().last().map(|message| message.content.clone()),
+        Some(Object::String(OxStr::from("return ...")))
+    );
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplaceBufferTextSnapshot {
+    text: Vec<u8>,
+    changedtick: u64,
+    changedtick_diag: u64,
+    changedtick_fold: u64,
+    modified: bool,
+    undo_seq: u64,
+    undo_block_len: usize,
+    local_mark: Option<ox_text::Position>,
+    global_mark: Option<ox_text::Position>,
+    jumplist: Option<ox_text::Position>,
+    changelist: Option<ox_text::Position>,
+    extmark_col: i64,
+    window_col: usize,
+}
+
+fn snapshot_replace_buffer_text_state(
+    editor: &mut Editor,
+    buffer: crate::BufHandle,
+    namespace: i64,
+    extmark: i64,
+    window: crate::WinHandle,
+) -> ReplaceBufferTextSnapshot {
+    let state = editor.buffer(buffer).unwrap();
+    ReplaceBufferTextSnapshot {
+        text: state.text().unwrap().to_bytes(),
+        changedtick: state.changedtick(),
+        changedtick_diag: state.changedtick_diag,
+        changedtick_fold: state.changedtick_fold,
+        modified: state.modified,
+        undo_seq: state.undo.current_seq(),
+        undo_block_len: state.undo.current_block_len(),
+        local_mark: editor.local_mark(buffer, 'a').unwrap(),
+        global_mark: editor
+            .global_marks()
+            .get('A')
+            .unwrap()
+            .map(|mark| mark.position),
+        jumplist: editor.jumplist().entries().first().map(|entry| entry.position),
+        changelist: editor
+            .changelists()
+            .entries(buffer)
+            .unwrap()
+            .first()
+            .copied(),
+        extmark_col: {
+            let details = crate::extmark::nvim_buf_get_extmark_by_id(
+                editor,
+                buffer,
+                namespace,
+                extmark,
+                dict(&[]),
+            )
+            .unwrap();
+            match details[1].clone() {
+                Object::Integer(value) => value,
+                other => panic!("expected integer extmark column, got {other:?}"),
+            }
+        },
+        window_col: editor.window(window).unwrap().cursor.col,
+    }
+}
+
+fn seeded_replace_buffer_text_editor(
+    lines: &[&str],
+) -> (
+    Editor,
+    crate::BufHandle,
+    crate::TabHandle,
+    crate::WinHandle,
+    i64,
+    i64,
+) {
+    let (mut editor, buffer, tab, window) = editor_with_lines(lines);
+    let classic = ox_text::Position {
+        lnum: 1,
+        col: lines[0].len().min(3).max(1),
+    };
+    editor
+        .replace_buffer_lines(buffer, 1, 1, &[lines[0].as_bytes().to_vec()], classic, classic, 0)
+        .unwrap();
+    editor.sync_buffer_undo(buffer);
+    editor.set_local_mark(buffer, 'a', classic).unwrap();
+    editor
+        .global_marks_mut()
+        .set('A', ox_editor::MarkLocation::in_buffer(buffer, classic))
+        .unwrap();
+    editor
+        .jumplist_mut()
+        .push(ox_editor::MarkLocation::in_buffer(buffer, classic));
+    let namespace =
+        crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("replace-buffer-text")).unwrap();
+    let extmark = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        0,
+        i64::try_from(classic.col).unwrap(),
+        dict(&[]),
+    )
+    .unwrap();
+    let second = editor.split_vertical(tab, window, buffer).unwrap();
+    editor.set_window_cursor(second, classic).unwrap();
+    (editor, buffer, tab, second, namespace, extmark)
+}
+
+fn extmark_pos(
+    editor: &mut Editor,
+    buffer: crate::BufHandle,
+    namespace: i64,
+    extmark: i64,
+) -> (i64, i64) {
+    let details = crate::extmark::nvim_buf_get_extmark_by_id(
+        editor,
+        buffer,
+        namespace,
+        extmark,
+        dict(&[]),
+    )
+    .unwrap();
+    match (details[0].clone(), details[1].clone()) {
+        (Object::Integer(row), Object::Integer(col)) => (row, col),
+        other => panic!("expected integer row/col, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_text_keeps_classic_columns_while_byte_geometry_tracks_the_splice() {
+    let (mut editor, buffer, tab, window) = editor_with_lines(&["0123456789"]);
+    let classic = ox_text::Position { lnum: 1, col: 6 };
+
+    editor
+        .replace_buffer_lines(
+            buffer,
+            1,
+            1,
+            &[b"0123456789".to_vec()],
+            classic,
+            classic,
+            0,
+        )
+        .unwrap();
+    editor.sync_buffer_undo(buffer);
+    editor.set_local_mark(buffer, 'a', classic).unwrap();
+    editor
+        .global_marks_mut()
+        .set('A', ox_editor::MarkLocation::in_buffer(buffer, classic))
+        .unwrap();
+    editor
+        .jumplist_mut()
+        .push(ox_editor::MarkLocation::in_buffer(buffer, classic));
+
+    let namespace =
+        crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("classic-byte-columns"))
+            .unwrap();
+    let extmark = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        0,
+        6,
+        dict(&[]),
+    )
+    .unwrap();
+    let second = editor.split_vertical(tab, window, buffer).unwrap();
+    editor.set_window_cursor(second, classic).unwrap();
+
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 1),
+                end: ox_editor::ExtmarkPosition::new(0, 3),
+                replacement: vec![b"WXYZ".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 1 },
+            ox_text::Position { lnum: 1, col: 1 },
+            0,
+        )
+        .unwrap();
+    editor.sync_buffer_undo(buffer);
+
+    assert_eq!(editor.local_mark(buffer, 'a').unwrap(), Some(classic));
+    assert_eq!(editor.global_marks().get('A').unwrap().unwrap().position, classic);
+    assert_eq!(editor.jumplist().entries()[0].position, classic);
+    assert_eq!(editor.changelists().entries(buffer).unwrap()[0], classic);
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmark_by_id(
+            &mut editor,
+            buffer,
+            namespace,
+            extmark,
+            dict(&[]),
+        )
+        .unwrap(),
+        vec![Object::Integer(0), Object::Integer(8)]
+    );
+    assert_eq!(editor.window(second).unwrap().cursor.col, 8);
+
+    editor.buffer_undo(buffer).unwrap();
+    assert_eq!(editor.local_mark(buffer, 'a').unwrap(), Some(classic));
+    assert_eq!(editor.global_marks().get('A').unwrap().unwrap().position, classic);
+    assert_eq!(editor.jumplist().entries()[0].position, classic);
+    assert_eq!(editor.changelists().entries(buffer).unwrap()[0], classic);
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmark_by_id(
+            &mut editor,
+            buffer,
+            namespace,
+            extmark,
+            dict(&[]),
+        )
+        .unwrap(),
+        vec![Object::Integer(0), Object::Integer(6)]
+    );
+    assert_eq!(editor.window(second).unwrap().cursor.col, 8);
+
+    editor.buffer_redo(buffer).unwrap();
+    assert_eq!(editor.local_mark(buffer, 'a').unwrap(), Some(classic));
+    assert_eq!(editor.global_marks().get('A').unwrap().unwrap().position, classic);
+    assert_eq!(editor.jumplist().entries()[0].position, classic);
+    assert_eq!(editor.changelists().entries(buffer).unwrap()[0], classic);
+    assert_eq!(
+        crate::extmark::nvim_buf_get_extmark_by_id(
+            &mut editor,
+            buffer,
+            namespace,
+            extmark,
+            dict(&[]),
+        )
+        .unwrap(),
+        vec![Object::Integer(0), Object::Integer(8)]
+    );
+    assert_eq!(editor.window(second).unwrap().cursor.col, 8);
+}
+
+#[test]
+fn replace_buffer_text_out_of_range_leaves_state_unchanged() {
+    let (mut editor, buffer, _tab, window, namespace, extmark) =
+        seeded_replace_buffer_text_editor(&["abc"]);
+    let before = snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window);
+    for (start, end) in [
+        (
+            ox_editor::ExtmarkPosition::new(0, usize::MAX),
+            ox_editor::ExtmarkPosition::new(0, usize::MAX),
+        ),
+        (
+            ox_editor::ExtmarkPosition::new(9, 0),
+            ox_editor::ExtmarkPosition::new(9, 0),
+        ),
+    ] {
+        let err = editor
+            .replace_buffer_text(
+                buffer,
+                &ox_editor::BufferTextEditRequest {
+                    start,
+                    end,
+                    replacement: vec![b"X".to_vec()],
+                },
+                ox_text::Position { lnum: 1, col: 0 },
+                ox_text::Position { lnum: 1, col: 0 },
+                0,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ox_editor::EditorError::Buffer(ox_editor::BufferStateError::TextEdit(
+                ox_editor::BufferTextEditError::OutOfRange
+            ))
+        ));
+        assert_eq!(
+            snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window),
+            before
+        );
+    }
+}
+
+#[test]
+fn replace_buffer_text_reversed_same_row_leaves_state_unchanged() {
+    let (mut editor, buffer, _tab, window, namespace, extmark) =
+        seeded_replace_buffer_text_editor(&["abc"]);
+    let before = snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window);
+    let err = editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 2),
+                end: ox_editor::ExtmarkPosition::new(0, 1),
+                replacement: vec![b"abc".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 1 },
+            ox_text::Position { lnum: 1, col: 1 },
+            0,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ox_editor::EditorError::Buffer(ox_editor::BufferStateError::TextEdit(
+            ox_editor::BufferTextEditError::ReversedRange
+        ))
+    ));
+    assert_eq!(
+        snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window),
+        before
+    );
+}
+
+#[test]
+fn replace_buffer_text_reversed_cross_row_leaves_state_unchanged() {
+    let (mut editor, buffer, _tab, window, namespace, extmark) =
+        seeded_replace_buffer_text_editor(&["alpha", "bravo", "charlie"]);
+    let before = snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window);
+    let err = editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(2, 0),
+                end: ox_editor::ExtmarkPosition::new(0, 1),
+                replacement: vec![b"x".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 0 },
+            ox_text::Position { lnum: 1, col: 0 },
+            0,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ox_editor::EditorError::Buffer(ox_editor::BufferStateError::TextEdit(
+            ox_editor::BufferTextEditError::ReversedRange
+        ))
+    ));
+    assert_eq!(
+        snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window),
+        before
+    );
+}
+
+#[test]
+fn replace_buffer_text_non_char_boundary_leaves_state_unchanged() {
+    let (mut editor, buffer, _tab, window, namespace, extmark) =
+        seeded_replace_buffer_text_editor(&["한글"]);
+    let before = snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window);
+    let err = editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 1),
+                end: ox_editor::ExtmarkPosition::new(0, 3),
+                replacement: vec![b"X".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 0 },
+            ox_text::Position { lnum: 1, col: 0 },
+            0,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ox_editor::EditorError::Buffer(ox_editor::BufferStateError::TextEdit(
+            ox_editor::BufferTextEditError::NotCharBoundary(1)
+        ))
+    ));
+    assert_eq!(
+        snapshot_replace_buffer_text_state(&mut editor, buffer, namespace, extmark, window),
+        before
+    );
+}
+
+#[test]
+fn replace_buffer_text_more_rows_than_removed_preserves_prefix_suffix() {
+    let (mut editor, buffer, _tab, _window, namespace, extmark) =
+        seeded_replace_buffer_text_editor(&["alpha", "omega"]);
+    let before_col = extmark_pos(&mut editor, buffer, namespace, extmark).1;
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 1),
+                end: ox_editor::ExtmarkPosition::new(0, 2),
+                replacement: vec![b"L".to_vec(), b"M".to_vec(), b"N".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 1 },
+            ox_text::Position { lnum: 1, col: 1 },
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"aL\nM\nNpha\nomega"
+    );
+    let after_edit = extmark_pos(&mut editor, buffer, namespace, extmark);
+    editor.buffer_undo(buffer).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"alpha\nomega"
+    );
+    assert_eq!(
+        extmark_pos(&mut editor, buffer, namespace, extmark),
+        (0, before_col)
+    );
+    editor.buffer_redo(buffer).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"aL\nM\nNpha\nomega"
+    );
+    assert_eq!(extmark_pos(&mut editor, buffer, namespace, extmark), after_edit);
+}
+
+#[test]
+fn replace_buffer_text_fewer_rows_than_removed_preserves_prefix_suffix() {
+    let (mut editor, buffer, _tab, _window) = editor_with_lines(&["alpha", "omega"]);
+    let namespace =
+        crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("shrink")).unwrap();
+    let first = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        0,
+        4,
+        dict(&[]),
+    )
+    .unwrap();
+    let second = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        1,
+        3,
+        dict(&[]),
+    )
+    .unwrap();
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 1),
+                end: ox_editor::ExtmarkPosition::new(1, 2),
+                replacement: vec![b"x".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 1 },
+            ox_text::Position { lnum: 1, col: 1 },
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"axega"
+    );
+    editor.buffer_undo(buffer).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"alpha\nomega"
+    );
+    assert_eq!(extmark_pos(&mut editor, buffer, namespace, first), (0, 4));
+    assert_eq!(extmark_pos(&mut editor, buffer, namespace, second), (1, 3));
+    editor.buffer_redo(buffer).unwrap();
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"axega"
+    );
+}
+
+#[test]
+fn replace_buffer_text_multiline_request_updates_byte_geometry() {
+    let (mut editor, buffer, _tab, window, namespace, extmark) =
+        seeded_replace_buffer_text_editor(&["ab", "cd", "ef"]);
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 1),
+                end: ox_editor::ExtmarkPosition::new(1, 2),
+                replacement: vec![b"X".to_vec(), b"Yc".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 1 },
+            ox_text::Position { lnum: 2, col: 1 },
+            0,
+        )
+        .unwrap();
+    let state = editor.buffer(buffer).unwrap();
+    assert_eq!(state.text().unwrap().to_bytes(), b"aX\nYc\nef");
+    assert_eq!(
+        extmark_pos(&mut editor, buffer, namespace, extmark).0,
+        1
+    );
+    assert!(editor.window(window).unwrap().cursor.lnum >= 1);
+}
+
+#[test]
+fn replace_buffer_text_grouped_undo_replays_members_in_reverse_byte_exact() {
+    let (mut editor, buffer, tab, window) = editor_with_lines(&["alpha", "bravo", "charlie"]);
+    let namespace =
+        crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("grouped")).unwrap();
+    let marks = [
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, namespace, 0, 1, dict(&[])).unwrap(),
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, namespace, 1, 2, dict(&[])).unwrap(),
+        crate::extmark::nvim_buf_set_extmark(&mut editor, buffer, namespace, 2, 1, dict(&[])).unwrap(),
+    ];
+    let _second = editor.split_vertical(tab, window, buffer).unwrap();
+
+    let pre_text = editor.buffer(buffer).unwrap().text().unwrap().to_bytes();
+    let pre_marks: Vec<_> = marks
+        .iter()
+        .map(|id| extmark_pos(&mut editor, buffer, namespace, *id))
+        .collect();
+
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 1),
+                end: ox_editor::ExtmarkPosition::new(0, 3),
+                replacement: vec![b"LP".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 1 },
+            ox_text::Position { lnum: 1, col: 1 },
+            0,
+        )
+        .unwrap();
+    editor.buffer_undojoin(buffer).unwrap();
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(1, 2),
+                end: ox_editor::ExtmarkPosition::new(2, 1),
+                replacement: vec![b"Q".to_vec()],
+            },
+            ox_text::Position { lnum: 2, col: 2 },
+            ox_text::Position { lnum: 2, col: 2 },
+            0,
+        )
+        .unwrap();
+    editor.buffer_undojoin(buffer).unwrap();
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 4),
+                end: ox_editor::ExtmarkPosition::new(0, 4),
+                replacement: vec![b"xx".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 4 },
+            ox_text::Position { lnum: 1, col: 4 },
+            0,
+        )
+        .unwrap();
+
+    let final_text = editor.buffer(buffer).unwrap().text().unwrap().to_bytes();
+    let final_marks: Vec<_> = marks
+        .iter()
+        .map(|id| extmark_pos(&mut editor, buffer, namespace, *id))
+        .collect();
+
+    editor.buffer_undo(buffer).unwrap();
+    assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), pre_text);
+    let undone_marks: Vec<_> = marks
+        .iter()
+        .map(|id| extmark_pos(&mut editor, buffer, namespace, *id))
+        .collect();
+    assert_eq!(undone_marks, pre_marks);
+
+    editor.buffer_redo(buffer).unwrap();
+    assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), final_text);
+    let redone_marks: Vec<_> = marks
+        .iter()
+        .map(|id| extmark_pos(&mut editor, buffer, namespace, *id))
+        .collect();
+    assert_eq!(redone_marks, final_marks);
+}
+
+#[test]
+fn replace_buffer_text_undo_to_seq_walks_headers_byte_exact() {
+    let (mut editor, buffer, _tab, _window) = editor_with_lines(&["one", "two", "three", "four"]);
+    let namespace =
+        crate::extmark::nvim_create_namespace(&mut editor, OxStr::from("undo-to-seq")).unwrap();
+    let mark = crate::extmark::nvim_buf_set_extmark(
+        &mut editor,
+        buffer,
+        namespace,
+        0,
+        1,
+        dict(&[]),
+    )
+    .unwrap();
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Snap {
+        text: Vec<u8>,
+        mark: (i64, i64),
+        seq: u64,
+    }
+
+    let capture = |editor: &mut Editor| Snap {
+        text: editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        mark: extmark_pos(editor, buffer, namespace, mark),
+        seq: editor.buffer(buffer).unwrap().undo.current_seq(),
+    };
+
+    let mut snaps = vec![capture(&mut editor)];
+
+    editor
+        .replace_buffer_lines(
+            buffer,
+            2,
+            2,
+            &[b"TWO".to_vec()],
+            ox_text::Position { lnum: 2, col: 0 },
+            ox_text::Position { lnum: 2, col: 0 },
+            0,
+        )
+        .unwrap();
+    editor.sync_buffer_undo(buffer);
+    snaps.push(capture(&mut editor));
+
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(0, 1),
+                end: ox_editor::ExtmarkPosition::new(0, 2),
+                replacement: vec![b"XY".to_vec()],
+            },
+            ox_text::Position { lnum: 1, col: 1 },
+            ox_text::Position { lnum: 1, col: 1 },
+            0,
+        )
+        .unwrap();
+    editor.sync_buffer_undo(buffer);
+    snaps.push(capture(&mut editor));
+
+    editor
+        .replace_buffer_lines(
+            buffer,
+            4,
+            4,
+            &[b"FOUR".to_vec()],
+            ox_text::Position { lnum: 4, col: 0 },
+            ox_text::Position { lnum: 4, col: 0 },
+            0,
+        )
+        .unwrap();
+    editor.sync_buffer_undo(buffer);
+    snaps.push(capture(&mut editor));
+
+    editor
+        .replace_buffer_text(
+            buffer,
+            &ox_editor::BufferTextEditRequest {
+                start: ox_editor::ExtmarkPosition::new(2, 0),
+                end: ox_editor::ExtmarkPosition::new(2, 1),
+                replacement: vec![b"Z".to_vec(), b"W".to_vec()],
+            },
+            ox_text::Position { lnum: 3, col: 0 },
+            ox_text::Position { lnum: 3, col: 0 },
+            0,
+        )
+        .unwrap();
+    editor.sync_buffer_undo(buffer);
+    snaps.push(capture(&mut editor));
+
+    let middle = snaps[2].seq;
+    let newest = snaps[4].seq;
+    let oldest = snaps[0].seq;
+
+    editor.buffer_undo_to_seq(buffer, middle).unwrap();
+    assert_eq!(capture(&mut editor), snaps[2]);
+
+    editor.buffer_undo_to_seq(buffer, newest).unwrap();
+    assert_eq!(capture(&mut editor), snaps[4]);
+
+    editor.buffer_undo_to_seq(buffer, oldest).unwrap();
+    assert_eq!(capture(&mut editor), snaps[0]);
 }

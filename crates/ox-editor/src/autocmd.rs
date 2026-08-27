@@ -246,6 +246,10 @@ pub struct AutocmdAction {
     pub pattern: String,
     /// Selected buffer for a buffer-local pattern.
     pub buffer: Option<BufHandle>,
+    /// Match text supplied by this event occurrence.
+    pub match_name: String,
+    /// File text supplied by this event occurrence.
+    pub file_name: String,
     /// Optional user-facing description.
     pub description: Option<String>,
 }
@@ -588,14 +592,42 @@ impl Autocmds {
     /// acknowledges execution with `consume_once`, so abandoned plans leave
     /// `++once` definitions intact.
     pub fn plan(&mut self, event: Event, context: AutocmdContext<'_>) -> FiringPlan {
+        self.plan_filtered(event, None, context)
+    }
+
+    /// Builds the firing plan for one event occurrence restricted to one
+    /// augroup, the shape `:doautocmd {group} {event}` needs
+    /// (`autocmd.c` `do_doautocmd` → `apply_autocmds_group` with
+    /// `group != AUGROUP_ALL`). Definitions outside `group` never match;
+    /// matching order is unchanged.
+    pub fn plan_in_group(
+        &mut self,
+        event: Event,
+        group: AugroupId,
+        context: AutocmdContext<'_>,
+    ) -> FiringPlan {
+        self.plan_filtered(event, Some(group), context)
+    }
+
+    fn plan_filtered(
+        &mut self,
+        event: Event,
+        group: Option<AugroupId>,
+        context: AutocmdContext<'_>,
+    ) -> FiringPlan {
         if self.ignored.contains(&event) || !context.nested {
             return FiringPlan::default();
         }
         let mut matched: Vec<&Entry> = self.entries.iter().filter(|entry| {
-            entry.event == event && pattern_matches(&entry.pattern, context.buffer, context.file_name)
+            entry.event == event
+                && group.is_none_or(|group| entry.options.group == group)
+                && pattern_matches(&entry.pattern, context.buffer, context.file_name)
         }).collect();
         matched.sort_by_key(|entry| entry.sequence);
-        let ready: Vec<AutocmdAction> = matched.into_iter().map(|entry| self.action(entry)).collect();
+        let ready: Vec<AutocmdAction> = matched
+            .into_iter()
+            .map(|entry| self.action(entry, context))
+            .collect();
         FiringPlan { ready }
     }
 
@@ -607,7 +639,7 @@ impl Autocmds {
         self.entries.len() != before
     }
 
-    fn action(&self, entry: &Entry) -> AutocmdAction {
+    fn action(&self, entry: &Entry, context: AutocmdContext<'_>) -> AutocmdAction {
         AutocmdAction {
             id: entry.id,
             event: entry.event,
@@ -617,7 +649,27 @@ impl Autocmds {
             group: entry.options.group,
             group_name: self.groups.get(&entry.options.group).map(|(name, _)| name.clone()),
             pattern: entry.source_pattern.clone(),
-            buffer: match entry.pattern { StoredPattern::Buffer(buffer) => Some(buffer), StoredPattern::Glob(_) => None },
+            buffer: context.buffer.or_else(|| match entry.pattern {
+                StoredPattern::Buffer(buffer) => Some(buffer),
+                StoredPattern::Glob(_) => None,
+            }),
+            match_name: context.file_name.map_or_else(String::new, |name| {
+                if entry.event.pattern_kind() == PatternKind::None || name.is_empty() {
+                    name.to_owned()
+                } else {
+                    let path = std::path::Path::new(name);
+                    if path.is_absolute() {
+                        name.to_owned()
+                    } else {
+                        std::env::current_dir()
+                            .unwrap_or_default()
+                            .join(path)
+                            .to_string_lossy()
+                            .into_owned()
+                    }
+                }
+            }),
+            file_name: context.file_name.unwrap_or_default().to_owned(),
             description: entry.options.description.clone(),
         }
     }

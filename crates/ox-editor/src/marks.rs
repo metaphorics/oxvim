@@ -16,12 +16,12 @@ const FIRST_GLOBAL_MARK: char = 'A';
 const LAST_GLOBAL_MARK: char = 'Z';
 const FIRST_NUMBERED_MARK: char = '0';
 const LAST_NUMBERED_MARK: char = '9';
-const SPECIAL_LOCAL_MARKS: [char; 4] = ['\'', '`', '.', '^'];
+const SPECIAL_LOCAL_MARKS: [char; 5] = ['\'', '`', '.', '^', ':'];
 
 /// An invalid named-mark operation.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum MarkError {
-    /// The name is not one of `a-z`, `'`, `` ` ``, `.`, or `^`.
+    /// The name is not one of `a-z`, `'`, `` ` ``, `.`, `^`, or `:`.
     #[error("invalid local mark name '{0}'")]
     InvalidLocal(char),
     /// The name is not in `A-Z` or `0-9`.
@@ -87,7 +87,7 @@ impl MarkLocation {
 
 /// Buffer-local named marks.
 ///
-/// Lowercase marks and the four editor-maintained special marks use stable
+/// Lowercase marks and the editor-maintained special marks use stable
 /// identifiers in [`Marks`], so line splices inherit `ox-text`'s boundary and
 /// clamping semantics.
 #[derive(Clone, Debug, Default)]
@@ -126,7 +126,7 @@ impl LocalMarks {
         Ok(self.marks.remove(id))
     }
 
-    /// Iterates over set marks in `a-z`, `'`, `` ` ``, `.`, `^` order.
+    /// Iterates over set marks in `a-z`, `'`, `` ` ``, `.`, `^`, `:` order.
     pub fn iter(&self) -> impl Iterator<Item = (char, Position)> + '_ {
         self.marks
             .iter()

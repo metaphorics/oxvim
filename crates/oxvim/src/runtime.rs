@@ -1,23 +1,28 @@
 //! Non-interactive process entry points.
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::Command;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use ox_editor::{Editor, ExExecutor, ExecOutcome, Geometry, MessageKind, OptionValue};
+use ox_editor::{
+    Editor, EditorError, ExExecutor, ExecOutcome, Geometry, MessageRouting, OptionError, OptionValue,
+};
 use ox_eval::{Builtins, Scope};
 use ox_eval::BuiltinHost as EvalBuiltins;
 use ox_lua::{
     ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work, bind_api, bind_variables,
 };
-use ox_types::{Object, OxStr, Typval};
+use ox_text::Buffer;
+use ox_types::{BufHandle, Object, OxStr, Typval};
 
-use crate::cli::{Cli, LuaScript, ShadaConfig, UserConfig};
+use crate::cli::{Cli, LuaScript, ShadaConfig, UserConfig, WindowLayout};
 use crate::AppError;
+use crate::messages::PrintfSink;
 use crate::server::EditorVariables;
+use crate::startuptime::StartupTimer;
 
 /// Start the terminal client against a child copy of this executable in embed mode.
 pub fn run_interactive(cli: &Cli) -> Result<(), AppError> {
@@ -30,6 +35,12 @@ pub fn run_interactive(cli: &Cli) -> Result<(), AppError> {
     ox_tui::run_command(command).map_err(|error| AppError::Tui(error.to_string()))
 }
 
+/// Rebuilds the parsed command line for the embedded child process.
+///
+/// The child is the editor, so every option the scanner parsed has its
+/// effect there: a flag missing here is a flag with no effect at all in the
+/// default mode. `-` is deliberately absent, because the child's standard
+/// input is the RPC channel and has no buffer text to read.
 fn interactive_child_arguments(cli: &Cli) -> Vec<String> {
     let mut arguments = Vec::new();
     if cli.clean {
@@ -59,6 +70,33 @@ fn interactive_child_arguments(cli: &Cli) -> Vec<String> {
     }
     if !cli.loadplugins {
         arguments.push("--noplugin".into());
+    }
+    for (requested, flag) in [
+        (cli.readonly, "-R"),
+        (cli.no_modifiable, "-M"),
+        (cli.no_write && !cli.no_modifiable, "-m"),
+        (cli.no_swap_file, "-n"),
+        (cli.binary, "-b"),
+    ] {
+        if requested {
+            arguments.push(flag.into());
+        }
+    }
+    if let Some(height) = cli.window_height {
+        arguments.push(format!("-w{height}"));
+    }
+    if let Some(flag) = match cli.window_layout {
+        WindowLayout::Single => None,
+        WindowLayout::Horizontal => Some("-o"),
+        WindowLayout::Vertical => Some("-O"),
+        WindowLayout::Tabs => Some("-p"),
+    } {
+        // An explicit count belongs to the flag; zero means one per file.
+        if cli.window_count == 0 {
+            arguments.push(flag.into());
+        } else {
+            arguments.push(format!("{flag}{}", cli.window_count));
+        }
     }
     if !cli.files.is_empty() {
         arguments.push("--".into());
@@ -106,8 +144,229 @@ pub fn export_vim_environment() -> Result<(), AppError> {
     }
     Ok(())
 }
-/// Execute Ex source read from stdin, with `--cmd` before and `+cmd` after.
-pub fn run_batch(cli: &Cli) -> Result<(), AppError> {
+
+/// Applies the startup option flags to a freshly created editor.
+///
+/// `main.c` `command_line_scan` sets these through `set_option_value` while
+/// scanning, before any `--cmd` runs, so a startup command already observes
+/// them. Buffer-scoped options land on the startup buffer, which is the only
+/// buffer that exists at this point (upstream's `curbuf`).
+pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppError> {
+    let editor_error = |error: OptionError| AppError::Editor(error.to_string());
+    // option.c set_init_default_shell (182-199): the static 'shell' default is
+    // the bare name "sh", and startup replaces it with $SHELL when that is set
+    // and non-empty, quoting it if it holds a space. The absolute path is the
+    // point: a script that poisons $PATH -- `let $PATH = 'Xpathdir'`, which
+    // test_cmdline.vim does -- must still be able to run a shell afterwards.
+    if let Some(shell) = std::env::var_os("SHELL").filter(|shell| !shell.is_empty()) {
+        let shell = shell.to_string_lossy();
+        let value = if shell.contains(' ') { format!("\"{shell}\"") } else { shell.into_owned() };
+        editor.options_mut().set_global("shell", OptionValue::String(value)).map_err(editor_error)?;
+    }
+    // message.c msg_use_printf/msg_puts_printf read these process modes for
+    // every message; main.c sets them while scanning the command line.
+    editor.message_routing = MessageRouting {
+        embedded: cli.embed,
+        silent: cli.batch.is_some_and(|batch| batch.silent),
+        ui_attached: false,
+    };
+    // "-V{level}" is 'verbose' (option.lua varname p_verbose), and a nonzero
+    // 'verbose' is what keeps batch mode from dropping message output.
+    if let Some(verbose) = &cli.verbose {
+        editor
+            .options_mut()
+            .set_global("verbose", OptionValue::Number(i64::from(verbose.level)))
+            .map_err(editor_error)?;
+    }
+    editor
+        .options_mut()
+        .set_global("loadplugins", OptionValue::Boolean(cli.loadplugins))
+        .map_err(editor_error)?;
+    if cli.no_write {
+        editor.options_mut().set_global("write", OptionValue::Boolean(false)).map_err(editor_error)?;
+    }
+    // "-R" also slows the swap file down (`p_uc = 10000`); "-n" turns it off.
+    if cli.readonly {
+        editor
+            .options_mut()
+            .set_global("updatecount", OptionValue::Number(10_000))
+            .map_err(editor_error)?;
+    }
+    if cli.no_swap_file {
+        editor.options_mut().set_global("updatecount", OptionValue::Number(0)).map_err(editor_error)?;
+    }
+    if let Some(height) = cli.window_height {
+        editor.options_mut().set_global("window", OptionValue::Number(height)).map_err(editor_error)?;
+    }
+    let Some(buffer) = editor.current_buffer() else { return Ok(()) };
+    for (requested, name) in [
+        (cli.readonly, "readonly"),
+        (cli.no_modifiable, "modifiable"),
+        (cli.binary, "binary"),
+    ] {
+        if requested {
+            // 'modifiable' is the only one of the three that is reset.
+            let value = OptionValue::Boolean(name != "modifiable");
+            editor.options_mut().set_buffer(buffer, name, value).map_err(editor_error)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reads one startup file argument into buffer text.  A file that does not
+/// exist yet still opens as a named empty buffer, like upstream's buffer
+/// creation during argument-list setup; other read failures are `E484`,
+/// matching `:edit`'s error for an unreadable file.
+fn read_startup_file(file: &str) -> Result<Buffer, AppError> {
+    let text = match fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(AppError::Ex(format!("E484: Can't open file {file}: {error}"))),
+    };
+    Buffer::from_bytes(text.as_bytes()).map_err(|error| AppError::Ex(format!("E474: {error}")))
+}
+
+/// Turns the positional arguments into buffers and lays out the windows or
+/// tab pages that `-o`, `-O` and `-p` asked for.
+///
+/// This is `main.c` `create_windows()` followed by `edit_buffers()`, and it
+/// runs on both startup paths so a layout flag means the same thing in batch
+/// mode as it does under a UI.
+pub fn open_startup_buffers(editor: &mut Editor, cli: &Cli) -> Result<(), AppError> {
+    if cli.stdin_file {
+        open_stdin_buffer(editor)?;
+    }
+    let buffers = open_startup_files(editor, &cli.files, cli.readonly)?;
+    if cli.window_layout != WindowLayout::Single {
+        create_startup_windows(editor, cli, &buffers)?;
+    }
+    Ok(())
+}
+
+/// Opens every positional file argument as a named buffer, mirroring
+/// `main.c` `edit_buffers()`: `open_buffer(false, ...)` reads the first file
+/// into the startup buffer itself, so buffer numbers match `nvim a b c`, and
+/// each remaining file becomes a loaded buffer without stealing the current
+/// window.  When a startup script has already replaced or modified the
+/// startup buffer, every file, the first included, gets its own buffer.
+/// `-R` is `readonlymode`, not a one-off write to the startup buffer:
+/// `open_buffer` (`buffer.c` line 258) sets `'readonly'` on every buffer it
+/// loads for a named file while that mode is on, so the second and later
+/// files of `-R -o a b` are read-only too. Windows padded with fresh empty
+/// buffers stay writable, because upstream requires `b_ffname != NULL`.
+fn open_startup_files(
+    editor: &mut Editor,
+    files: &[String],
+    readonly: bool,
+) -> Result<Vec<BufHandle>, AppError> {
+    let first_into_current = editor.current_buffer().is_some_and(|current| {
+        editor
+            .buffer(current)
+            .is_ok_and(|state| state.name().as_bytes().is_empty() && !state.modified)
+    });
+    let mut handles = Vec::with_capacity(files.len());
+    for (index, file) in files.iter().enumerate() {
+        let text = read_startup_file(file)?;
+        if index == 0 && first_into_current {
+            let current = editor
+                .current_buffer()
+                .ok_or_else(|| AppError::Editor("no current buffer at startup".into()))?;
+            if let Ok(state) = editor.buffer_mut(current) {
+                state.load(text);
+                state.set_name(OxStr::from(file.as_str()));
+            }
+            handles.push(current);
+            continue;
+        }
+        let handle = editor
+            .create_buffer_with(text, true)
+            .map_err(|error| AppError::Editor(error.to_string()))?;
+        if let Ok(state) = editor.buffer_mut(handle) {
+            state.set_name(OxStr::from(file.as_str()));
+            state.mark_saved();
+        }
+        if readonly {
+            editor
+                .options_mut()
+                .set_buffer(handle, "readonly", OptionValue::Boolean(true))
+                .map_err(|error| AppError::Editor(error.to_string()))?;
+        }
+        handles.push(handle);
+    }
+    Ok(handles)
+}
+
+/// Reads standard input into the startup buffer, upstream's `EDIT_STDIN` for
+/// a bare `-` argument. The buffer stays nameless, like upstream's.
+fn open_stdin_buffer(editor: &mut Editor) -> Result<(), AppError> {
+    let mut input = Vec::new();
+    io::stdin().lock().read_to_end(&mut input).map_err(AppError::Io)?;
+    let text = Buffer::from_bytes(&input).map_err(|error| AppError::Ex(format!("E474: {error}")))?;
+    let current = editor
+        .current_buffer()
+        .ok_or_else(|| AppError::Editor("no current buffer at startup".into()))?;
+    if let Ok(state) = editor.buffer_mut(current) {
+        state.load(text);
+    }
+    Ok(())
+}
+
+/// Builds the `-o`/`-O`/`-p` layout, upstream `main.c` `create_windows()`.
+///
+/// The startup window or tab page already shows the first buffer, so this
+/// adds `count - 1` more. Each new one shows the next startup buffer;
+/// windows past the last file get a fresh empty buffer, matching upstream,
+/// where the extra split windows are never edited into. The first window of
+/// the first tab page stays current.
+fn create_startup_windows(
+    editor: &mut Editor,
+    cli: &Cli,
+    buffers: &[BufHandle],
+) -> Result<(), AppError> {
+    let editor_error = |error: EditorError| AppError::Editor(error.to_string());
+    let first_window = editor
+        .current_window()
+        .ok_or_else(|| AppError::Editor("no current window at startup".into()))?;
+    let first_tab = editor
+        .current_tabpage()
+        .ok_or_else(|| AppError::Editor("no current tabpage at startup".into()))?;
+    let mut previous = first_window;
+    for index in 1..cli.startup_window_count() {
+        let buffer = match buffers.get(index) {
+            Some(buffer) => *buffer,
+            None => editor.create_buffer(true).map_err(editor_error)?,
+        };
+        if cli.window_layout == WindowLayout::Tabs {
+            let geometry = Geometry::new(0, 0, 80, 24)
+                .map_err(|error| AppError::Editor(error.to_string()))?;
+            editor.create_tabpage(buffer, geometry).map_err(editor_error)?;
+            continue;
+        }
+        previous = if cli.window_layout == WindowLayout::Vertical {
+            editor.split_vertical(first_tab, previous, buffer).map_err(editor_error)?
+        } else {
+            editor.split_horizontal(first_tab, previous, buffer).map_err(editor_error)?
+        };
+    }
+    editor.set_current_tabpage(first_tab).map_err(editor_error)?;
+    editor.set_current_window(first_window).map_err(editor_error)
+}
+
+/// Execute Ex source read from stdin, with `--cmd` before startup and `+cmd`
+/// after it.
+///
+/// `main.c` finishes startup (`--cmd`, config, files, `-c`/`+cmd`,
+/// `VimEnter`) and only then enters the Ex command loop that reads standard
+/// input, so every startup command is already done by the first input line.
+/// `-E`/`-Es` set upstream's `input_istext`, which instead reads standard
+/// input as buffer text during startup, before the `-c`/`+cmd` arguments.
+///
+/// A startup command that quits ends the process there (`main.c` `getout`):
+/// the remaining startup work and the whole Ex input loop are skipped, and
+/// the requested status is the process status.
+///
+/// Returns the exit code the last executed command asked for.
+pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input).map_err(AppError::Io)?;
 
@@ -116,10 +375,7 @@ pub fn run_batch(cli: &Cli) -> Result<(), AppError> {
     editor
         .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).map_err(|error| AppError::Editor(error.to_string()))?)
         .map_err(|error| AppError::Editor(error.to_string()))?;
-    editor
-        .options_mut()
-        .set_global("loadplugins", OptionValue::Boolean(cli.loadplugins))
-        .map_err(|error| AppError::Editor(error.to_string()))?;
+    apply_startup_options(&mut editor, cli)?;
     // option.c set_init_default for 'runtimepath'/'packpath' before any
     // user command runs (option.c runtimepath_default layout).
     let default_rtp = ox_editor::default_runtimepath(cli.clean, &runtime_root()?);
@@ -137,41 +393,70 @@ pub fn run_batch(cli: &Cli) -> Result<(), AppError> {
         .set_runtime_roots_from_rtp(&default_rtp);
     executor.set_channel_ids(editor.channel_ids());
 
-    execute_lines(&mut executor, &mut editor, &cli.pre_commands)?;
-    execute_lines(&mut executor, &mut editor, input.lines().collect::<Vec<_>>().as_slice())?;
-    execute_lines(&mut executor, &mut editor, &cli.commands)?;
-
-    let stdout = io::stdout();
-    let stderr = io::stderr();
-    let mut out = stdout.lock();
-    let mut err = stderr.lock();
-    for message in editor.messages() {
-        let destination: &mut dyn Write = if message.kind == MessageKind::Error { &mut err } else { &mut out };
-        match &message.content {
-            Object::String(text) => destination.write_all(text.as_bytes()).map_err(AppError::Io)?,
-            value => write!(destination, "{value:?}").map_err(AppError::Io)?,
+    let mut exit_code = 0;
+    'startup: {
+        if let Some(code) = execute_lines(&mut executor, &mut editor, &cli.pre_commands)? {
+            exit_code = code;
+            break 'startup;
         }
-        destination.write_all(b"\n").map_err(AppError::Io)?;
+        timer.mark("sourcing vimrc file(s)");
+        let input_is_text = cli.batch.is_some_and(|batch| batch.input_is_text);
+        if input_is_text {
+            let text = Buffer::from_bytes(input.as_bytes())
+                .map_err(|error| AppError::Ex(format!("E474: {error}")))?;
+            editor
+                .buffer_mut(buffer)
+                .map_err(|error| AppError::Editor(error.to_string()))?
+                .load(text);
+        } else {
+            open_startup_buffers(&mut editor, cli)?;
+        }
+        timer.mark("opening buffers");
+        if let Some(code) = execute_lines(&mut executor, &mut editor, &cli.commands)? {
+            exit_code = code;
+            break 'startup;
+        }
+        if !input_is_text {
+            let lines = input.lines().collect::<Vec<_>>();
+            if let Some(code) = execute_lines(&mut executor, &mut editor, &lines)? {
+                exit_code = code;
+            }
+        }
     }
-    Ok(())
+
+    // `main.c` finishes every exit through `getout`, including the one where
+    // the Ex loop simply runs out of input, so the exit autocommands run here
+    // too. Before the flush, since what they emit is routed with the rest.
+    executor
+        .run_exit_sequence(&mut editor)
+        .map_err(|error| AppError::Ex(error.to_string()))?;
+
+    let mut sink = PrintfSink::default();
+    for (message, destination) in editor.messages().iter().zip(editor.message_destinations()) {
+        sink.write(*destination, message).map_err(AppError::Io)?;
+    }
+    sink.finish(editor.message_routing).map_err(AppError::Io)?;
+    Ok(exit_code)
 }
 
+/// Runs each line, stopping at the first command that quits and reporting the
+/// exit status it asked for.
 fn execute_lines<S: AsRef<str>>(
     executor: &mut ExExecutor,
     editor: &mut Editor,
     lines: &[S],
-) -> Result<(), AppError> {
+) -> Result<Option<i64>, AppError> {
     for line in lines {
         for command in split_commands(line.as_ref()) {
             let outcome = executor
                 .execute_line(editor, command)
                 .map_err(|error| AppError::Ex(error.to_string()))?;
-            if let ExecOutcome::Quit(_) = outcome {
-                return Ok(());
+            if let ExecOutcome::Quit(code) = outcome {
+                return Ok(Some(code));
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn split_commands(line: &str) -> Vec<&str> {

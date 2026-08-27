@@ -91,6 +91,28 @@ impl FoldRange {
             end: self.end.max(other.end),
         }
     }
+
+    /// Returns whether the fold occupies any part of a zero-based row.
+    ///
+    /// Neovim's folds are whole lines: `fold_T` stores `fd_top` and `fd_len`
+    /// as line counts (`src/nvim/fold_defs.h:31-45`). A whole-line range
+    /// therefore occupies rows `[start.row, end.row)`, while a range ending
+    /// inside a row still occupies that row.
+    #[must_use]
+    pub const fn covers_row(self, row: usize) -> bool {
+        self.start.row <= row
+            && (row < self.end.row || (row == self.end.row && self.end.column > 0))
+    }
+
+    /// Returns the last zero-based row the fold occupies.
+    #[must_use]
+    pub const fn last_row(self) -> usize {
+        if self.end.column > 0 {
+            self.end.row
+        } else {
+            self.end.row.saturating_sub(1)
+        }
+    }
 }
 
 /// The source used to derive folds.
@@ -124,6 +146,23 @@ impl FoldMethod {
             Self::Syntax => Some(HostFoldKind::Syntax),
             Self::Diff => Some(HostFoldKind::Diff),
             Self::Manual | Self::Indent | Self::Marker => None,
+        }
+    }
+
+    /// Returns the method `'foldmethod'` names, defaulting to manual.
+    ///
+    /// Neovim validates the string in `src/nvim/optionstr.c` and compares it
+    /// with the same six names through the `foldmethodIs*` macros in
+    /// `src/nvim/fold.h:15-21`.
+    #[must_use]
+    pub fn from_option_value(value: &str) -> Self {
+        match value {
+            "indent" => Self::Indent,
+            "expr" => Self::Expr,
+            "marker" => Self::Marker,
+            "syntax" => Self::Syntax,
+            "diff" => Self::Diff,
+            _ => Self::Manual,
         }
     }
 }
@@ -395,9 +434,9 @@ impl Folds {
         start: usize,
         old_rows: usize,
         new_rows: usize,
-    ) -> Result<(), FoldError> {
+    ) {
         if self.method != FoldMethod::Manual {
-            return Ok(());
+            return;
         }
         for fold in &mut self.manual {
             fold.range.start.row = splice_row(
@@ -417,6 +456,7 @@ impl Folds {
         }
         self.manual.retain(|fold| fold.range.start < fold.range.end);
         normalize_folds(&mut self.manual)
+            .expect("splice_row is a non-decreasing map; manual folds cannot cross");
     }
 
     /// Returns whether active fold data needs refreshing.
@@ -636,6 +676,34 @@ impl Folds {
         self.active()
             .iter()
             .filter(|fold| fold.range.contains(position))
+            .count()
+    }
+
+    /// Returns the first and last zero-based rows of the closed fold covering
+    /// `row`, or `None` when no fold covering it is closed.
+    ///
+    /// `hasFoldingWin` (`src/nvim/fold.c:173-263`) descends from the outermost
+    /// fold and stops at the first closed one, so a closed fold nested inside
+    /// an open one is reported while an open fold nested inside a closed one is
+    /// not: the answer is always the outermost closed fold covering `row`.
+    #[must_use]
+    pub fn closed_rows_at(&self, row: usize) -> Option<(usize, usize)> {
+        self.active()
+            .iter()
+            .find(|fold| fold.range.covers_row(row) && fold.state == FoldState::Closed)
+            .map(|fold| (fold.range.start.row, fold.range.last_row()))
+    }
+
+    /// Returns the nesting level at a zero-based row, zero when no fold covers
+    /// it.
+    ///
+    /// `foldLevelWin` (`src/nvim/fold.c:1088-1107`) counts the folds containing
+    /// the line whatever their open or closed state.
+    #[must_use]
+    pub fn level_at_row(&self, row: usize) -> usize {
+        self.active()
+            .iter()
+            .filter(|fold| fold.range.covers_row(row))
             .count()
     }
 

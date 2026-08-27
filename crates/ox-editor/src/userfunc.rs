@@ -11,7 +11,7 @@ use ox_eval::scope::ScopeMap;
 use ox_eval::Scope;
 use ox_types::{OxStr, Typval};
 
-use crate::script::Sid;
+use crate::script::{Sid, SourceContext};
 
 /// Upstream's default `'maxfuncdepth'`.
 pub const MAX_FUNC_DEPTH: usize = 100;
@@ -45,8 +45,11 @@ pub struct UserFunc {
     pub flags: UserFuncFlags,
     /// Logical source lines forming the body.
     pub body: Vec<String>,
-    /// SID of the defining script, or zero for command-line definitions.
-    pub sid: Sid,
+    /// Script context the `:function` was written in, upstream's
+    /// `uf_script_ctx`. `map_add` adds the body-relative line to its `lnum`
+    /// (`mapping.c:534-535`), which is what makes `maparg()`'s `lnum` point at
+    /// the `:map` inside a function body rather than at the body's own line 1.
+    pub context: SourceContext,
     /// Optional defining local-scope snapshot for `closure` functions.
     pub captured: ScopeMap,
 }
@@ -56,14 +59,16 @@ pub struct UserFunc {
 pub struct CallFrame {
     /// Canonical function name.
     pub name: String,
-    /// SID whose `s:` scope is visible in the function.
-    pub sid: Sid,
     /// Caller-local scope restored after the call.
     caller_local: ScopeMap,
     /// Caller argument scope restored after the call.
     caller_argument: ScopeMap,
     /// One-based function-body line currently executing.
     pub current_line: usize,
+    /// The defining function's [`UserFunc::context`], carried so the script
+    /// context of a command inside the body can be answered without a
+    /// registry lookup.
+    context: SourceContext,
 }
 
 /// User-function definition/call failure.
@@ -258,11 +263,11 @@ impl UserFunctions {
         &mut self,
         signature: FunctionSignature,
         body: Vec<String>,
-        sid: Sid,
+        context: SourceContext,
         replace: bool,
         scope: &Scope,
     ) -> Result<String, UserFuncError> {
-        let name = Self::canonical_name(&signature.name, sid);
+        let name = Self::canonical_name(&signature.name, context.sid);
         if self.functions.contains_key(&name) && !replace {
             return Err(UserFuncError::new(
                 "E122",
@@ -283,7 +288,7 @@ impl UserFunctions {
                 varargs: signature.varargs,
                 flags: signature.flags,
                 body,
-                sid,
+                context,
                 captured,
             },
         );
@@ -394,7 +399,7 @@ impl UserFunctions {
 
         self.call_stack.push(CallFrame {
             name: function.name.clone(),
-            sid: function.sid,
+            context: function.context,
             caller_local,
             caller_argument,
             current_line: 0,
@@ -423,11 +428,6 @@ impl UserFunctions {
         &self.call_stack
     }
 
-    /// SID visible to `s:` names in the active function body.
-    #[must_use]
-    pub fn active_sid(&self) -> Option<Sid> {
-        self.call_stack.last().map(|frame| frame.sid).filter(|sid| *sid != 0)
-    }
 
     /// Upstream-style call-stack throwpoint prefix.
     #[must_use]

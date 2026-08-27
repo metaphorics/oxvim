@@ -3,6 +3,8 @@
 
 pub mod arglist;
 
+mod builtins;
+
 pub mod autocmd;
 pub mod buffer;
 pub mod decoration;
@@ -21,9 +23,11 @@ pub mod textobject;
 pub mod script;
 pub mod visual;
 pub mod insert;
+pub mod indent;
 pub mod job;
 pub mod marks;
 pub mod options;
+mod put;
 pub mod register;
 pub mod userfunc;
 pub mod typeahead;
@@ -34,31 +38,36 @@ pub use autocmd::{
     AutocmdSink, Autocmds, AugroupId, DeleteAutocmds, Event, FiringPlan, PatternKind, EVENT_COUNT,
 };
 pub use buffer::{
-    BufferAttachSubscription, BufferState, BufferStateError, UserCommandDefinition,
+    BufferAttachSubscription, BufferState, BufferStateError, BufferTextEditError,
+    BufferTextEditRequest, UserCommandDefinition,
 };
 pub use decoration::Decorations;
-pub use editor::{BufferRelease, ChannelIds, Editor, EditorError, HighlightDefinition, Message, MessageKind};
+pub use editor::{
+    BufferEditMode, BufferRelease, ChannelIds, Editor, EditorError, HighlightDefinition, Message,
+    MessageDestination, MessageKind, MessageRouting,
+};
 pub use excmd_exec::{
     vim_variable_is_writable, ExExecutor, ExecError, ExecOutcome, LuaExec, LuaExecError, UserCommand,
     VimException, VimExceptionKind,
 };
 pub use extmark::{
-    Extmark, ExtmarkAttributes, ExtmarkEnd, ExtmarkGravity, ExtmarkId, ExtmarkPlacement,
-    ExtmarkPosition, Extmarks, NamespaceId, VirtualLine, VirtualTextChunk,
+    Extmark, ExtmarkAttributes, ExtmarkEnd, ExtmarkGravity, ExtmarkHighlightMode, ExtmarkId,
+    ExtmarkPlacement, ExtmarkPosition, Extmarks, NamespaceId, VirtualLine, VirtualTextChunk,
 };
 pub use fold::Folds;
+pub use indent::{ExprEval, IndentEvalContext, IndentExprError, NullExprEval};
 pub use layout::{
     Anchor, Border, BorderText, FloatingWindow, Frame, Geometry, Layout, LayoutError, LeafFrame,
     Margins, RelativeTo, TabpageState, TextAlignment, WinConfig, WindowApiState, WindowState,
 };
 pub use mapping::{
     Abbreviation, Lookup, MapMode, MapModes, MapScope, Mapping, MappingAction, MappingError,
-    MappingExprSink, MappingOptions, Mappings,
+    MappingOptions, Mappings,
 };
 pub use mode::{CmdlineKind, CmdlineState, InsertState, Mode, ModeError, ModeMachine, NormalState, OperatorPendingState, Step};
 pub use script::{
     FileEntry, FileIO, FileKind, FileMetadata, LogicalLine, RealFileIO, RuntimeRoot, ScriptCtx, ScriptError, ScriptInfo, Sid,
-    SourceFrame, default_runtimepath,
+    SourceFrame, StdPath, default_runtimepath, stdpath,
 };
 pub use userfunc::{
     CallFrame, FunctionSignature, UserFunc, UserFuncError, UserFuncFlags, UserFunctions,
@@ -78,13 +87,15 @@ pub use options::{
     OptionScope, OptionStore, OptionType, OptionValue, OPTION_COUNT, OPTION_METADATA,
 };
 pub use register::{
-    put_content, ClipboardProvider, ExpressionEvaluator, RegisterContent, RegisterError,
-    RegisterKind, Registers, Selection,
+    ClipboardProvider, RegisterContent, RegisterError, RegisterKind, Registers, Selection,
 };
 pub use typeahead::{
     Key, KeyDecodeError, Keys, Remap, Typeahead, TypeaheadError, TypeaheadFlags, KE_EVENT, KE_FILLER,
     KS_EXTRA, KS_SPECIAL, KS_ZERO, K_SPECIAL,
 };
+
+#[cfg(test)]
+pub(crate) static PROCESS_STATE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod excmd_exec_control_tests;
@@ -99,7 +110,13 @@ mod excmd_exec_state_tests;
 #[cfg(test)]
 mod input_tests;
 #[cfg(test)]
+mod indent_tests;
+#[cfg(test)]
 mod mode_tests;
+#[cfg(test)]
+mod ops_tests;
+#[cfg(test)]
+mod position_tests;
 #[cfg(test)]
 mod task09d_tests;
 #[cfg(test)]

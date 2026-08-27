@@ -47,6 +47,8 @@ pub struct JobStartOptions {
     pub stdout_buffered: bool,
     /// Whether stderr is delivered once at EOF.
     pub stderr_buffered: bool,
+    /// Editor buffer that receives PTY output as live text, when allocated.
+    pub terminal_buffer: Option<ox_types::BufHandle>,
     /// Deferred callbacks and their receiver.
     pub callbacks: JobCallbacks,
 }
@@ -102,6 +104,31 @@ struct Job {
     stderr: StreamState,
     status: i64,
     rpc: bool,
+    /// PTY slave path the child is attached to, when spawned through a
+    /// pseudoterminal. Mirrors upstream's `channel.pty` string populated for
+    /// `jobstart(..., {'pty': v:true})` (`eval/funcs.c` `f_jobstart` →
+    /// `os/shell.c` `terminal_running`) so `nvim_get_chan_info` can answer the
+    /// `pty` field word-for-word.
+    pty_slave: Option<String>,
+    /// Buffer that receives PTY output, when one was allocated.
+    terminal_buffer: Option<ox_types::BufHandle>,
+    /// Raw PTY output accumulated for the terminal buffer.
+    pty_output: Vec<u8>,
+    /// `jobstart({'detach': v:true})`: upstream leaves a detached child running
+    /// past editor exit and terminates every other one (`channel_close_on_exit`).
+    detached: bool,
+}
+/// Resolve the PTY slave path behind a child that was spawned through one.
+///
+/// `portable_pty` does not expose the slave path taken by the child, but on
+/// Linux the child ends up with the slave on one of standard input, output,
+/// or error; reading `/proc/<pid>/fd/0`'s link target is the cheapest stable
+/// lookup and mirrors what `ps`/`lsof` prints.
+#[cfg(unix)]
+fn pty_slave_path(pid: u32) -> Option<String> {
+    let link = std::fs::read_link(format!("/proc/{pid}/fd/0")).ok()?;
+    let text = link.to_string_lossy().into_owned();
+    if text.starts_with("/dev/pts/") { Some(text) } else { None }
 }
 
 /// Owns job channels and the `ox-uv` loop which drives their process handles.
@@ -109,13 +136,22 @@ pub struct JobManager {
     loop_: UvLoop,
     jobs: HashMap<u64, Job>,
     raw: Arc<Mutex<VecDeque<RawEvent>>>,
+    /// Events polled on a path with no callback host; the next poll re-enters
+    /// them (`channel.c` defers callbacks onto the main loop instead of
+    /// dropping them, which is what `let _ = poll()` did).
+    deferred: Vec<JobEvent>,
 }
 
 impl JobManager {
     /// Create an isolated reactor-backed job table.
     pub fn new() -> Result<Self, String> {
         let loop_ = UvLoop::new().map_err(|error| error.to_string())?;
-        Ok(Self { loop_, jobs: HashMap::new(), raw: Arc::new(Mutex::new(VecDeque::new())) })
+        Ok(Self {
+            loop_,
+            jobs: HashMap::new(),
+            raw: Arc::new(Mutex::new(VecDeque::new())),
+            deferred: Vec::new(),
+        })
     }
 
     /// Spawn a process and register it under the already-allocated channel id.
@@ -187,6 +223,10 @@ impl JobManager {
         };
 
         let pid = process.pid();
+        #[cfg(unix)]
+        let pty_slave = if options.pty { pty_slave_path(pid) } else { None };
+        #[cfg(not(unix))]
+        let pty_slave = None;
         self.jobs.insert(id, Job {
             process,
             input,
@@ -197,14 +237,27 @@ impl JobManager {
             stderr: StreamState { buffered: options.stderr_buffered, ..StreamState::default() },
             status: -1,
             rpc: options.rpc,
+            pty_slave,
+            terminal_buffer: options.terminal_buffer,
+            pty_output: Vec::new(),
+            detached: options.detached,
         });
         Ok(pid)
     }
 
-    /// Run one non-blocking reactor turn and return callback work queued by it.
+    /// Run one non-blocking reactor turn and return callback work queued by
+    /// it, ahead of any events deferred by a poll that could not deliver them.
     pub fn poll(&mut self) -> Result<Vec<JobEvent>, String> {
         self.loop_.run_nowait().map_err(|error| error.to_string())?;
-        Ok(self.drain_raw())
+        let mut events = std::mem::take(&mut self.deferred);
+        events.extend(self.drain_raw());
+        Ok(events)
+    }
+
+    /// Stash events a caller polled but could not invoke; the next poll
+    /// surfaces them first so callbacks are never silently discarded.
+    pub fn defer_events(&mut self, events: Vec<JobEvent>) {
+        self.deferred.extend(events);
     }
 
     /// Wait for the selected jobs, sharing one deadline across the list.
@@ -246,8 +299,41 @@ impl JobManager {
     }
 
     /// Close a job's writable input endpoint so readers observe EOF.
+    ///
+    /// Dropping the handle is not enough. A [`ProcessPipe`] shares its stream
+    /// state with the clone the loop's reactor holds, so letting the handle go
+    /// left the child's standard input open: `systemlist('cat', '123')` wrote
+    /// its input, dropped the handle, and then waited forever on a `cat` that
+    /// never saw EOF. That was the only timeout in oldtest census 3, and the
+    /// `/bin/sh -c cat` it left behind outlived the runner's deadline.
+    ///
+    /// `Handle::close` is what actually deregisters the descriptor and drops it.
+    /// A write the synchronous attempt could not finish is still queued, so the
+    /// loop is pumped until the queue drains first — the reactor clears it on
+    /// either a completed write or a closed peer, so the pump terminates.
     pub fn close_input(&mut self, id: u64) -> bool {
-        self.jobs.get_mut(&id).is_some_and(|job| job.input.take().is_some())
+        let Some(job) = self.jobs.get_mut(&id) else { return false };
+        let Some(input) = job.input.take() else { return false };
+        match input {
+            JobInput::Pipe(pipe) => {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while pipe.has_pending_writes() && Instant::now() < deadline {
+                    if self.loop_.run_nowait().is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // `shutdown` refuses while a write is queued, so it could leave
+                // the descriptor open on a stuck peer; the full handle close
+                // cannot, and a descriptor still open is the whole defect.
+                let _ignored = ox_uv::Handle::close(&pipe, &mut self.loop_);
+            }
+            // A PTY has no separate write side to shut: closing the master is
+            // the child's hangup, which `stop`/teardown already performs.
+            #[cfg(unix)]
+            JobInput::Pty(_) => {}
+        }
+        true
     }
 
     /// Take output accumulated by buffered streams after the job completes.
@@ -273,6 +359,36 @@ impl JobManager {
     /// Report whether a registered job channel carries msgpack-rpc.
     pub fn is_rpc(&self, id: u64) -> bool { self.jobs.get(&id).is_some_and(|job| job.rpc) }
 
+    /// PTY slave path behind a job channel that was spawned through one.
+    #[must_use]
+    pub fn pty_slave(&self, id: u64) -> Option<&str> {
+        self.jobs.get(&id).and_then(|job| job.pty_slave.as_deref())
+    }
+
+    /// Bind the editor-owned terminal buffer to an already-started PTY job.
+    pub fn set_terminal_buffer(&mut self, id: u64, buffer: ox_types::BufHandle) {
+        if let Some(job) = self.jobs.get_mut(&id) {
+            job.terminal_buffer = Some(buffer);
+        }
+    }
+
+    /// Take accumulated PTY output for the terminal buffer.
+    pub fn take_pty_output(&mut self, id: u64) -> Option<Vec<u8>> {
+        let job = self.jobs.get_mut(&id)?;
+        if job.pty_output.is_empty() { return None; }
+        Some(std::mem::take(&mut job.pty_output))
+    }
+
+    /// Poll once and write any PTY output to the editor-owned terminal buffer.
+    pub fn flush_pty_to_editor(&mut self, id: u64, editor: &mut crate::Editor) -> Result<(), String> {
+        let events = self.poll()?;
+        self.defer_events(events);
+        if let Some(bytes) = self.take_pty_output(id) {
+            editor.append_terminal_buffer(id, &bytes).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     fn drain_raw(&mut self) -> Vec<JobEvent> {
         let raw = {
             let mut queue = lock_queue(&self.raw);
@@ -283,6 +399,10 @@ impl JobManager {
             match event {
                 RawEvent::Data(id, stream, bytes) => {
                     let Some(job) = self.jobs.get_mut(&id) else { continue; };
+                    // PTY output accumulates for the terminal buffer.
+                    if job.terminal_buffer.is_some() && matches!(stream, StreamKind::Stdout) {
+                        job.pty_output.extend_from_slice(&bytes);
+                    }
                     let (state, callback, name) = stream_parts(job, stream);
                     if state.buffered {
                         state.bytes.extend_from_slice(&bytes);
@@ -323,6 +443,23 @@ impl JobManager {
             }
         }
         callbacks
+    }
+}
+
+/// No non-detached child outlives the manager that spawned it.
+///
+/// Upstream terminates every job channel on exit and leaves only `detach`ed
+/// ones running (`channel_close_on_exit`). Without this a child still blocked
+/// when the editor goes away becomes an orphan holding the inherited standard
+/// output, which is what made the census's `test_system.vim` timeout hang a
+/// runner reading that pipe rather than just failing.
+impl Drop for JobManager {
+    fn drop(&mut self) {
+        for job in self.jobs.values() {
+            if job.status < 0 && !job.detached {
+                let _ignored = ox_uv::Handle::close(&job.process, &mut self.loop_);
+            }
+        }
     }
 }
 
@@ -387,12 +524,25 @@ mod tests {
             stdin_pipe: true,
             stdout_buffered: buffered,
             stderr_buffered: buffered,
+            terminal_buffer: None,
             callbacks: JobCallbacks {
                 options: reference,
                 stdout: Some(callback.clone()),
                 stderr: Some(callback.clone()),
                 exit: Some(callback),
             },
+        }
+    }
+
+    /// Buffered with no callbacks, which is how `system()`/`systemlist()`
+    /// configure a job: `drain_raw` hands a buffered stream's bytes to the EOF
+    /// callback when there is one, so only this shape leaves them for
+    /// `take_buffered_output`.
+    fn collected(command: &str) -> JobStartOptions {
+        let Typval::Dict(reference) = Typval::dict(Vec::new()) else { unreachable!() };
+        JobStartOptions {
+            callbacks: JobCallbacks { options: reference, stdout: None, stderr: None, exit: None },
+            ..options(command, true)
         }
     }
 
@@ -417,6 +567,78 @@ mod tests {
         assert!(events.iter().any(|event| event_name(event) == "stdout"));
         assert!(events.iter().any(|event| event_name(event) == "stderr"));
         assert!(events.iter().any(|event| event_name(event) == "exit"));
+    }
+
+    // `close_input` must close the descriptor, not just drop the handle: the
+    // loop holds its own clone of the stream state, so dropping alone left the
+    // child's standard input open. `cat` is the exact shape that exposes it —
+    // it reads to EOF, so without the close it never exits and the bounded
+    // wait below reports the timeout sentinel instead of a status.
+    //
+    // Three parts, each isolating one: the child must exit (a leaked
+    // descriptor leaves it running), its status must be the real 0 (a killed
+    // child would not be), and the input must arrive intact (a close that
+    // truncated the queued write would lose it).
+    #[test]
+    fn close_input_gives_a_reading_child_eof_after_its_input() {
+        let mut jobs = JobManager::new().unwrap();
+        jobs.start(7, collected("cat")).unwrap();
+        assert!(jobs.send(7, b"123".to_vec()).unwrap());
+        assert!(jobs.close_input(7));
+        let (status, _) = jobs.wait(&[7], 5_000).unwrap();
+        assert_eq!(status, vec![0], "child did not exit: stdin was left open");
+        let (stdout, _) = jobs.take_buffered_output(7).unwrap();
+        assert_eq!(stdout, b"123", "queued input was truncated by the close");
+    }
+
+    // A large input cannot fit one pipe buffer, so the synchronous write leaves
+    // a remainder queued. The close has to pump the loop until it drains rather
+    // than discard it.
+    #[test]
+    fn close_input_flushes_a_write_larger_than_one_pipe_buffer() {
+        let payload = vec![b'x'; 512 * 1024];
+        let mut jobs = JobManager::new().unwrap();
+        jobs.start(8, collected("cat")).unwrap();
+        assert!(jobs.send(8, payload.clone()).unwrap());
+        assert!(jobs.close_input(8));
+        let (status, _) = jobs.wait(&[8], 20_000).unwrap();
+        assert_eq!(status, vec![0]);
+        let (stdout, _) = jobs.take_buffered_output(8).unwrap();
+        assert_eq!(stdout.len(), payload.len(), "the queued remainder was dropped");
+    }
+
+    // Dropping the manager terminates a child that is still running, so no
+    // child outlives the parent that was waiting on it. A detached child is the
+    // one exception upstream makes.
+    #[test]
+    fn dropping_the_manager_terminates_a_live_child_but_not_a_detached_one() {
+        let live_pid;
+        let detached_pid;
+        {
+            let mut jobs = JobManager::new().unwrap();
+            live_pid = jobs.start(9, options("sleep 60", true)).unwrap();
+            let mut detached = options("sleep 60", true);
+            detached.detached = true;
+            detached_pid = jobs.start(10, detached).unwrap();
+            // One turn so both children are really running before the drop.
+            jobs.wait(&[9, 10], 200).unwrap();
+        }
+        assert!(!process_is_alive(live_pid), "a live child outlived its manager");
+        assert!(process_is_alive(detached_pid), "a detached child was terminated");
+        let _ignored = ox_uv::process::kill(detached_pid, Some(9));
+    }
+
+    fn process_is_alive(pid: u32) -> bool {
+        // A terminated child is reaped by the manager's waiter, so the pid is
+        // gone rather than a zombie. Retry briefly: SIGTERM delivery and the
+        // reap are not instantaneous.
+        for _ in 0..50 {
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
     }
 
     #[test]
@@ -452,5 +674,24 @@ mod tests {
         jobs.start(3, job_options).unwrap();
         let (status, _) = jobs.wait(&[3], 2_000).unwrap();
         assert_eq!(status, vec![0]);
+    }
+
+    // If a caller polls the reactor but has no callback host available, the
+    // manager must keep those events and return them on the next poll so
+    // `chansend`/`take_pty_output` paths never drop an `on_stdout`/`on_exit`.
+    #[test]
+    fn deferred_events_are_redelivered_by_the_next_poll() {
+        let mut jobs = JobManager::new().unwrap();
+        let options = Typval::dict(Vec::new());
+        let Typval::Dict(reference) = options else { unreachable!() };
+        let event = JobEvent {
+            callback: Typval::String(OxStr::from("Callback")),
+            receiver: reference,
+            args: vec![Typval::Number(1), Typval::list(vec![Typval::String(OxStr::from("data"))]), Typval::String(OxStr::from("stdout"))],
+        };
+        jobs.defer_events(vec![event.clone(), event.clone()]);
+        let first = jobs.poll().unwrap();
+        assert_eq!(first.len(), 2, "deferred events must be returned on the next poll");
+        assert!(jobs.poll().unwrap().is_empty(), "deferred events must be drained after one poll");
     }
 }

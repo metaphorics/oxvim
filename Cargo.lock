@@ -443,12 +443,14 @@ dependencies = [
  "ox-types",
  "ox-uv",
  "thiserror 2.0.20",
+ "unicode-width",
 ]
 
 [[package]]
 name = "ox-eval"
 version = "0.1.0"
 dependencies = [
+ "ox-regex",
  "ox-sys",
  "ox-types",
  "serde_json",
@@ -539,6 +541,8 @@ dependencies = [
  "mio",
  "ox-rpc",
  "ox-types",
+ "portable-pty",
+ "signal-hook 0.4.4",
  "thiserror 2.0.20",
 ]
 

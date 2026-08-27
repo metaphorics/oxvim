@@ -17,6 +17,61 @@ use crate::scope::Scope;
 
 const MAX_CONTAINER_DEPTH: usize = 100;
 
+/// Upstream's `VAR_TYPE_*` values (`eval/typval_defs.h:123-133`): the numbers
+/// `type()` returns and the `v:t_*` variables hold. These are a *public*
+/// numbering, deliberately distinct from the internal `VAR_*` discriminants in
+/// `ox_types` — `f_type` (`eval/funcs.c:7570-7597`) translates one to the
+/// other, and the two disagree for every type but Blob.
+const VAR_TYPE_NUMBER: i64 = 0;
+const VAR_TYPE_STRING: i64 = 1;
+const VAR_TYPE_FUNC: i64 = 2;
+const VAR_TYPE_LIST: i64 = 3;
+const VAR_TYPE_DICT: i64 = 4;
+const VAR_TYPE_FLOAT: i64 = 5;
+const VAR_TYPE_BOOL: i64 = 6;
+const VAR_TYPE_SPECIAL: i64 = 7;
+const VAR_TYPE_BLOB: i64 = 10;
+
+/// The read-only `v:t_*` type constants, in the order `set_vim_var_nr` defines
+/// them (`eval/vars.c:324-331`). `VAR_TYPE_SPECIAL` has no `v:t_` name
+/// upstream — `exists('v:t_special')` is 0 on the oracle — so it has none here.
+pub const VIM_TYPE_VARS: [(&[u8], i64); 8] = [
+    (b"v:t_number", VAR_TYPE_NUMBER),
+    (b"v:t_string", VAR_TYPE_STRING),
+    (b"v:t_func", VAR_TYPE_FUNC),
+    (b"v:t_list", VAR_TYPE_LIST),
+    (b"v:t_dict", VAR_TYPE_DICT),
+    (b"v:t_float", VAR_TYPE_FLOAT),
+    (b"v:t_bool", VAR_TYPE_BOOL),
+    (b"v:t_blob", VAR_TYPE_BLOB),
+];
+
+/// `f_type` (`eval/funcs.c:7570-7597`): the public type number of a value.
+///
+/// A Partial answers `VAR_TYPE_FUNC` alongside a Funcref, as upstream's
+/// `case VAR_PARTIAL:` falls through to `case VAR_FUNC:`. Channel and Job are
+/// Numbers upstream and answer `VAR_TYPE_NUMBER`.
+#[must_use]
+pub const fn type_constant(value: &Typval) -> i64 {
+    match value {
+        Typval::Number(_) | Typval::Channel(_) | Typval::Job(_) => VAR_TYPE_NUMBER,
+        Typval::String(_) => VAR_TYPE_STRING,
+        Typval::Funcref(_) | Typval::Partial(_) => VAR_TYPE_FUNC,
+        Typval::List(_) => VAR_TYPE_LIST,
+        Typval::Dict(_) => VAR_TYPE_DICT,
+        Typval::Float(_) => VAR_TYPE_FLOAT,
+        Typval::Bool(_) => VAR_TYPE_BOOL,
+        Typval::Special(_) => VAR_TYPE_SPECIAL,
+        Typval::Blob(_) => VAR_TYPE_BLOB,
+    }
+}
+
+/// The value of a `v:t_*` constant, by fully qualified name.
+#[must_use]
+pub fn vim_type_var(name: &[u8]) -> Option<i64> {
+    VIM_TYPE_VARS.iter().find_map(|(key, value)| (*key == name).then_some(*value))
+}
+
 /// Declarative metadata recovered from Neovim's `eval.lua`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuiltinSpec {
@@ -80,7 +135,7 @@ impl<'a> Builtins<'a> {
 
     fn dispatch(&mut self, name: &str, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
         let spec = builtin_spec(name).ok_or_else(|| EvalError::not_implemented(OxStr::from(name)))?;
-        if !is_implemented(name) {
+        if !is_builtin_implemented(name) {
             return Err(EvalError::not_implemented(OxStr::from(name)));
         }
         check_arity(spec, args.len())?;
@@ -88,6 +143,27 @@ impl<'a> Builtins<'a> {
             "abs" => absolute(&args[0]),
             "add" => add(args),
             "and" => binary_number(&args, |left, right| left & right),
+            // `float_op_wrapper` (`funcs.c:344`) hands the value to the
+            // same-named libm function; `func_float` in `eval.lua` names it.
+            "acos" => float_unary(&args[0], f64::acos),
+            "asin" => float_unary(&args[0], f64::asin),
+            "atan" => float_unary(&args[0], f64::atan),
+            "atan2" => float_binary(&args, f64::atan2),
+            "cos" => float_unary(&args[0], f64::cos),
+            "cosh" => float_unary(&args[0], f64::cosh),
+            "exp" => float_unary(&args[0], f64::exp),
+            "fmod" => float_binary(&args, |left, right| left % right),
+            "isinf" => Ok(Typval::Number(float_infinity_sign(&args[0]))),
+            "isnan" => Ok(Typval::Number(i64::from(
+                matches!(&args[0], Typval::Float(number) if number.is_nan()),
+            ))),
+            "log" => float_unary(&args[0], f64::ln),
+            "log10" => float_unary(&args[0], f64::log10),
+            "round" => float_unary(&args[0], f64::round),
+            "sin" => float_unary(&args[0], f64::sin),
+            "sinh" => float_unary(&args[0], f64::sinh),
+            "tan" => float_unary(&args[0], f64::tan),
+            "tanh" => float_unary(&args[0], f64::tanh),
             "blob2list" => blob2list(&args[0]),
             "ceil" => float_unary(&args[0], f64::ceil),
             "char2nr" => char2nr(&args),
@@ -103,13 +179,18 @@ impl<'a> Builtins<'a> {
             "filter" => self.filter_or_map(args, scope, CollectionOp::Filter),
             "flatten" => flatten(&args, true),
             "flattennew" => flatten(&args, false),
-            "float2nr" | "trunc" => float_to_number(&args[0]),
+            "findfile" => path_builtins::findfilendir(self.regex, &args, scope, crate::find_file::FindWhat::File),
+            "finddir" => path_builtins::findfilendir(self.regex, &args, scope, crate::find_file::FindWhat::Dir),
+            "float2nr" => float_to_number(&args[0]),
             "floor" => float_unary(&args[0], f64::floor),
             "fnamemodify" => path_builtins::fnamemodify(self.regex, &args[0], &args[1]),
+            "environ" => environ(scope),
+            "fnameescape" => fnameescape(&args),
             "get" => get(&args),
             "gettext" => gettext(&args[0]),
             "getcwd" => path_builtins::getcwd(&args),
             "getpid" => Ok(Typval::Number(i64::from(std::process::id()))),
+            "getenv" => getenv(&args, scope),
             "has" => has_feature(&args),
             "has_key" => has_key(&args),
             "hostname" => hostname(),
@@ -121,6 +202,7 @@ impl<'a> Builtins<'a> {
             "items" => dict_projection(&args[0], Projection::Items),
             "join" => join(&args),
             "keytrans" => keytrans(&args[0]),
+            "localtime" => localtime(),
             "json_decode" => json_decode(&args[0]),
             "json_encode" => json_encode(&args[0]),
             "keys" => dict_projection(&args[0], Projection::Keys),
@@ -134,6 +216,7 @@ impl<'a> Builtins<'a> {
             "match" | "matchend" | "matchstr" => self.regex_match(name, &args),
             "matchlist" | "matchstrpos" => self.regex_result(name, &args),
             "matchstrlist" => self.matchstrlist(&args),
+            "matchfuzzy" | "matchfuzzypos" => self.matchfuzzy(name, &args, scope),
             "max" => extremum(&args[0], true),
             "min" => extremum(&args[0], false),
             "nr2char" => nr2char(&args),
@@ -146,7 +229,10 @@ impl<'a> Builtins<'a> {
             "resolve" => path_builtins::resolve(&args[0]),
             "pathshorten" => pathshorten(&args),
             "reverse" => reverse(args),
-            "setenv" => setenv(&args),
+            "reltime" => reltime(&args),
+            "reltimefloat" => reltimefloat(&args),
+            "reltimestr" => reltimestr(&args),
+            "setenv" => setenv(&args, scope),
             "simplify" => path_builtins::simplify(&args[0]),
             "slice" => slice(&args),
             "sort" => self.sort(args, scope),
@@ -168,10 +254,15 @@ impl<'a> Builtins<'a> {
             "tolower" => change_case(&args[0], false),
             "toupper" => change_case(&args[0], true),
             "trim" => trim(&args),
+            "tempname" => path_builtins::tempname(),
             "tr" => translate(&args),
+            // `trunc` is `float_op_wrapper` over libm's `trunc` (`eval.lua`),
+            // so it answers with a Float: `trunc(4.8)` is `4.0`, not `4`. It
+            // shared `float2nr`'s arm here and answered a Number.
+            "trunc" => float_unary(&args[0], f64::trunc),
             "utf16idx" => utf16idx(&args),
             "charidx" => charidx(&args),
-            "type" => Ok(Typval::Number(i64::from(args[0].vartype()))),
+            "type" => Ok(Typval::Number(type_constant(&args[0]))),
             "uniq" => uniq(args),
             "values" => dict_projection(&args[0], Projection::Values),
             "xor" => binary_number(&args, |left, right| left ^ right),
@@ -332,6 +423,117 @@ impl<'a> Builtins<'a> {
             matches.push(Typval::dict(entry));
         }
         Ok(Typval::list(matches))
+    }
+
+    /// `matchfuzzy()`/`matchfuzzypos()` — `do_fuzzymatch` (`fuzzy.c:349-417`)
+    /// driving `fuzzy_match_in_list` (`fuzzy.c:200-345`). Scoring lives in
+    /// [`crate::fuzzy`]; this method owns argument validation, the `key` /
+    /// `text_cb` / `limit` / `matchseq` options, the tie-break sort, and the
+    /// two return shapes.
+    fn matchfuzzy(&mut self, name: &str, args: &[Typval], scope: &mut Scope) -> Result<Typval> {
+        let retmatchpos = name == "matchfuzzypos";
+        let Typval::List(reference) = &args[0] else {
+            return Err(EvalError::new("E686", 0, format!("Argument of {name}() must be a List")));
+        };
+        let pattern = match &args[1] {
+            Typval::String(value) => value.clone(),
+            other => {
+                let rendered = string_arg(other)?;
+                return Err(EvalError::new("E475", 0, format!("Invalid argument: {}", rendered.to_string_lossy())));
+            }
+        };
+
+        let options = fuzzy_options(args.get(2))?;
+
+        let pattern_chars = crate::fuzzy::composed_chars(pattern.as_bytes());
+        let mut found: Vec<FuzzyItem> = Vec::new();
+        for (index, item) in list_items(reference)?.into_iter().enumerate() {
+            if options.limit > 0 && saturating_i64(found.len()) >= options.limit {
+                break;
+            }
+            let Some(text) = self.fuzzy_item_text(&item, options.key.as_ref(), options.text_cb.as_ref(), scope)? else {
+                continue;
+            };
+            let haystack = crate::fuzzy::composed_chars(text.as_bytes());
+            let Some(matched) = crate::fuzzy::fuzzy_match(&haystack, &pattern_chars, options.matchseq) else {
+                continue;
+            };
+            found.push(FuzzyItem { index, item, score: matched.score, positions: matched.positions, text });
+        }
+
+        // `fuzzy_match_item_compare` (`fuzzy.c:162-189`): score descending,
+        // then an exact prefix match at the first matched position wins, then
+        // the original order. Upstream indexes `itemstr` with the character
+        // position `matches[0]` as if it were a byte offset; that quirk is
+        // observable, so it is reproduced.
+        found.sort_by(|left, right| {
+            right.score.cmp(&left.score).then_with(|| {
+                let exact = |item: &FuzzyItem| {
+                    let offset = item.positions.first().copied().unwrap_or(0);
+                    item.text.as_bytes().get(offset..).is_some_and(|tail| tail.starts_with(pattern.as_bytes()))
+                };
+                exact(right).cmp(&exact(left)).then_with(|| left.index.cmp(&right.index))
+            })
+        });
+
+        let items = found.iter().map(|entry| entry.item.clone()).collect();
+        if !retmatchpos {
+            return Ok(Typval::list(items));
+        }
+        let positions = found
+            .iter()
+            .map(|entry| {
+                // `fuzzy.c:264-276`: one position per pattern character,
+                // skipping blanks unless "matchseq" was given.
+                let mut slot = 0usize;
+                let mut values = Vec::new();
+                for character in &pattern_chars {
+                    if slot >= crate::fuzzy::MATCH_MAX_LEN {
+                        break;
+                    }
+                    if options.matchseq || !matches!(character, ' ' | '\t') {
+                        values.push(Typval::Number(saturating_i64(entry.positions.get(slot).copied().unwrap_or(0))));
+                        slot += 1;
+                    }
+                }
+                Typval::list(values)
+            })
+            .collect();
+        let scores = found.iter().map(|entry| Typval::Number(i64::from(entry.score))).collect();
+        Ok(Typval::list(vec![Typval::list(items), Typval::list(positions), Typval::list(scores)]))
+    }
+
+    /// The string a `matchfuzzy()` list item contributes: the item itself for
+    /// a String, the `key` entry or the `text_cb` result for a Dict, and
+    /// nothing for anything else, so the item is skipped (`fuzzy.c:224-254`).
+    fn fuzzy_item_text(
+        &mut self,
+        item: &Typval,
+        key: Option<&OxStr>,
+        text_cb: Option<&Typval>,
+        scope: &Scope,
+    ) -> Result<Option<OxStr>> {
+        match item {
+            Typval::String(text) => Ok(Some(text.clone())),
+            Typval::Dict(entries) => {
+                if let Some(key) = key {
+                    return dict_entries(entries)?
+                        .iter()
+                        .find(|(candidate, _)| candidate == key)
+                        .map(|(_, value)| string_arg(value))
+                        .transpose();
+                }
+                let Some(callback) = text_cb else { return Ok(None) };
+                let regex = RegexRef(self.regex);
+                let result = Evaluator::new(self, &regex)
+                    .invoke(callback.clone(), vec![item.clone()], &mut scope.snapshot())?;
+                Ok(match result {
+                    Typval::String(text) => Some(text),
+                    _ => None,
+                })
+            }
+            _ => Ok(None),
+        }
     }
 
     fn regex_substitute(&self, args: &[Typval]) -> Result<Typval> {
@@ -630,6 +832,76 @@ impl<'a> Builtins<'a> {
 
 }
 
+/// `fuzzyItem_T` (`fuzzy.c:56-65`), reduced to the fields the two return
+/// shapes and the tie-break comparator need.
+struct FuzzyItem {
+    index: usize,
+    item: Typval,
+    score: i32,
+    positions: Vec<usize>,
+    text: OxStr,
+}
+
+/// The optional third argument of `matchfuzzy()`/`matchfuzzypos()`.
+#[derive(Default)]
+struct FuzzyOptions {
+    key: Option<OxStr>,
+    text_cb: Option<Typval>,
+    limit: i64,
+    matchseq: bool,
+}
+
+/// Parse the `{dict}` argument of `matchfuzzy()` (`fuzzy.c:363-399`).
+/// `text_cb` is consulted only when `key` is absent, and `matchseq` is keyed
+/// on presence rather than value.
+fn fuzzy_options(value: Option<&Typval>) -> Result<FuzzyOptions> {
+    let Some(value) = value else { return Ok(FuzzyOptions::default()) };
+    let Typval::Dict(value) = value else {
+        return Err(EvalError::new("E1206", 0, "Dictionary required for argument 3"));
+    };
+    let entries = dict_entries(value)?;
+    let entry = |wanted: &[u8]| {
+        entries.iter().find(|(candidate, _)| candidate.as_bytes() == wanted).map(|(_, value)| value)
+    };
+    let mut options = FuzzyOptions::default();
+    if let Some(value) = entry(b"key") {
+        match value {
+            Typval::String(text) if !text.as_bytes().is_empty() => options.key = Some(text.clone()),
+            _ => {
+                let rendered = string_arg(value)?;
+                return Err(EvalError::new("E475", 0, format!("Invalid value for argument key: {}", rendered.to_string_lossy())));
+            }
+        }
+    } else if let Some(value) = entry(b"text_cb") {
+        // `tv_dict_get_callback` (`typval.c:2506-2529`) rejects a
+        // non-function, non-String value with E6000; then
+        // `callback_from_typval` rejects a String starting with a digit with
+        // E921. An empty String leaves no callback at all.
+        options.text_cb = match value {
+            Typval::Funcref(_) | Typval::Partial(_) => Some(value.clone()),
+            Typval::String(function) => match function.as_bytes().first() {
+                None => None,
+                Some(b'0'..=b'9') => return Err(EvalError::new("E921", 0, "Invalid callback argument")),
+                Some(_) => Some(Typval::Funcref(Funcref {
+                    name: function.clone(),
+                    args: Vec::new(),
+                    dict: None,
+                    registry: None,
+                })),
+            },
+            _ => return Err(EvalError::new("E6000", 0, "Argument is not a function or function name")),
+        };
+    }
+    if let Some(value) = entry(b"limit") {
+        let Typval::Number(value) = value else {
+            return Err(EvalError::new("E475", 0, "Invalid value for argument limit"));
+        };
+        options.limit = *value;
+    }
+    options.matchseq = entry(b"matchseq").is_some();
+    Ok(options)
+}
+
 #[derive(Clone, Copy)]
 enum CollectionOp { Map, Filter, MapNew, ForEach }
 
@@ -679,7 +951,7 @@ fn sort_integer(value: &Typval) -> i64 {
     match value {
         Typval::Number(number) => *number,
         Typval::Bool(boolean) => i64::from(*boolean),
-        Typval::String(text) => parse_integer_prefix(text.as_bytes(), 10).unwrap_or(0),
+        Typval::String(text) => crate::eval::string_to_number(text.as_bytes()),
         Typval::Special(Special::Null) => 0,
         _ => 0,
     }
@@ -753,16 +1025,31 @@ fn check_arity(spec: &BuiltinSpec, count: usize) -> Result<()> {
     Ok(())
 }
 
-fn is_implemented(name: &str) -> bool {
+/// Whether this port implements `name`, as opposed to merely carrying its
+/// entry in the generated `eval.lua` metadata table.
+///
+/// [`builtin_spec`] answers the *inventory* question — arity, method
+/// eligibility, the name upstream declares — for every builtin Neovim has.
+/// [`Builtins::dispatch`] serves only the subset below and reports `E117` for
+/// the rest, so this predicate, not `builtin_spec`, is what `exists('*name')`
+/// has to key on. `check.vim`'s `CheckFunction` is `exists('*' .. name)`, so a
+/// name that answers 1 and then reports `not implemented` turns an honest skip
+/// into a wall of failures.
+#[must_use]
+pub fn is_builtin_implemented(name: &str) -> bool {
     matches!(name,
-        "abs" | "add" | "and" | "blob2list" | "ceil" | "char2nr" | "copy" | "count" |
+        "abs" | "acos" | "add" | "and" | "asin" | "atan" | "atan2" | "blob2list" | "ceil" |
+        "char2nr" | "copy" | "cos" | "cosh" | "count" | "exp" | "fmod" | "isinf" | "isnan" |
+        "log" | "log10" | "round" | "sin" | "sinh" | "tan" | "tanh" |
         "deepcopy" | "empty" | "escape" | "executable" | "exepath" | "exists" | "extend" | "extendnew" | "filter" | "flatten" |
-        "flattennew" | "foreach" | "float2nr" | "floor" | "fnamemodify" | "get" | "gettext" | "getcwd" | "getpid" | "has" | "has_key" | "hostname" | "index" | "insert" | "items" |
+        "flattennew" | "foreach" | "float2nr" | "floor" | "fnameescape" | "fnamemodify" | "finddir" | "findfile" | "environ" | "get" | "getenv" | "gettext" | "getcwd" | "getpid" | "has" | "has_key" | "hostname" | "index" | "insert" | "items" |
         "indexof" | "isabsolutepath" | "islocked" | "join" | "json_decode" | "json_encode" | "keytrans" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
-        "match" | "matchend" | "matchstr" | "matchlist" | "matchstrpos" | "matchstrlist" | "max" | "min" | "nr2char" | "or" | "pathshorten" | "pow" | "printf" | "range" | "reduce" | "resolve" |
+        "match" | "matchend" | "matchstr" | "matchlist" | "matchstrpos" | "matchstrlist" | "matchfuzzy" | "matchfuzzypos" |
+        "max" | "min" | "nr2char" | "or" | "pathshorten" | "pow" | "printf" | "range" | "reduce" | "resolve" |
+        "localtime" | "reltime" | "reltimefloat" | "reltimestr" |
         "remove" | "repeat" | "reverse" | "setenv" | "simplify" | "slice" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
         "str2nr" | "strcharlen" | "strchars" | "stridx" | "string" | "strpart" | "strridx" | "strtrans" | "strutf16len" | "strwidth" |
-        "substitute" | "tolower" | "toupper" | "tr" | "trim" | "trunc" | "type" | "uniq" | "utf16idx" | "charidx" | "values" | "xor"
+        "substitute" | "tempname" | "tolower" | "toupper" | "tr" | "trim" | "trunc" | "type" | "uniq" | "utf16idx" | "charidx" | "values" | "xor"
     )
 }
 
@@ -779,11 +1066,15 @@ pub fn exists(value: &Typval, scope: &Scope) -> Result<Typval> {
                 || std::env::var_os(String::from_utf8_lossy(name).as_ref()).is_some()
         }
         Some(b'&' | b'+') => option_exists(scope, &bytes[1..]),
+        // `f_exists` calls `function_exists`, which asks whether the function
+        // can be *called* — so the answer is the implemented subset, not the
+        // generated inventory (see [`is_builtin_implemented`]).
         Some(b'*') => std::str::from_utf8(&bytes[1..])
             .ok()
-            .is_some_and(|name| builtin_spec(name).is_some()),
+            .is_some_and(is_builtin_implemented),
         Some(b':' | b'#') | None => false,
         _ => matches!(bytes, b"v:true" | b"v:false" | b"v:null" | b"v:none")
+            || vim_type_var(bytes).is_some()
             || scope.contains_variable(bytes),
     };
     Ok(Typval::Number(i64::from(found)))
@@ -935,15 +1226,23 @@ fn set_buffer_line(buffer: &mut dyn BufferHost, lnum: i64, text: &OxStr) -> Resu
     }
 }
 
+/// `tv_get_number_chk` (`typval.c:4292-4325`). The String arm is
+/// `vim_str2nr(…, STR2NR_ALL, …)`, shared with the evaluator's own coercion
+/// rather than restated: this used to be a decimal-only prefix scan, so
+/// `abs('-12')` was 0 and `abs('0x10')` was 0 against the oracle's 12 and 16.
+/// The error codes are `num_errors` (`typval.c:4171-4181`), which gives a
+/// Funcref E703 and a Blob E974.
 fn number_arg(value: &Typval) -> Result<i64> {
     match value {
         Typval::Number(number) => Ok(*number),
         Typval::Bool(value) => Ok(i64::from(*value)),
         Typval::Special(Special::Null) => Ok(0),
-        Typval::String(value) => Ok(parse_integer_prefix(value.as_bytes(), 10).unwrap_or(0)),
+        Typval::String(value) => Ok(crate::eval::string_to_number(value.as_bytes())),
         Typval::Float(_) => Err(EvalError::new("E805", 0, "Using a Float as a Number")),
+        Typval::Funcref(_) | Typval::Partial(_) => Err(EvalError::new("E703", 0, "Using a Funcref as a Number")),
         Typval::List(_) => Err(EvalError::new("E745", 0, "Using a List as a Number")),
         Typval::Dict(_) => Err(EvalError::new("E728", 0, "Using a Dictionary as a Number")),
+        Typval::Blob(_) => Err(EvalError::new("E974", 0, "Using a Blob as a Number")),
         _ => Err(EvalError::new("E745", 0, "Using invalid value as a Number")),
     }
 }
@@ -962,22 +1261,182 @@ fn string_arg(value: &Typval) -> Result<OxStr> {
         Typval::Number(value) => Ok(OxStr(value.to_string().into_bytes())),
         Typval::Bool(value) => Ok(OxStr::from(if *value { "v:true" } else { "v:false" })),
         Typval::Special(Special::Null) => Ok(OxStr::from("v:null")),
-        Typval::Float(_) => Err(EvalError::new("E806", 0, "Using a Float as a String")),
+        Typval::Float(number) => Ok(float_as_string(*number)),
         Typval::List(_) => Err(EvalError::new("E730", 0, "Using a List as a String")),
         Typval::Dict(_) => Err(EvalError::new("E731", 0, "Using a Dictionary as a String")),
+        Typval::Blob(_) => Err(EvalError::new("E976", 0, "Using a Blob as a String")),
+        Typval::Funcref(_) | Typval::Partial(_) => Err(EvalError::new("E729", 0, "Using a Funcref as a String")),
         _ => Err(EvalError::new("E729", 0, "Using invalid value as a String")),
     }
 }
 
-fn setenv(args: &[Typval]) -> Result<Typval> {
+/// `f_setenv` (`eval/funcs.c`) is `os_setenv`/`os_unsetenv`, so the assignment
+/// changes the process environment. oxvim additionally keeps a snapshot of the
+/// environment in `Scope::env`, taken once at startup, and `$VAR` reads come
+/// from that snapshot; upstream has no snapshot and reads the live environment
+/// through `os_getenv` every time. Writing only the process environment
+/// therefore left `setenv('X', 'v')` invisible to `echo $X` in the same
+/// session, so both are updated here, exactly as `:let $VAR` does.
+fn setenv(args: &[Typval], scope: &mut Scope) -> Result<Typval> {
     let name = string_arg(&args[0])?.to_string_lossy().into_owned();
     if args[1] == Typval::Special(Special::Null) {
-        ox_sys::unset_env(name);
+        ox_sys::unset_env(&name);
+        scope.unset_env(name.as_bytes());
     } else {
         let value = string_arg(&args[1])?.to_string_lossy().into_owned();
-        ox_sys::set_env(name, value);
+        ox_sys::set_env(&name, &value);
+        scope.set_env(name.as_bytes(), Typval::String(OxStr::from(value.as_str())));
     }
     Ok(Typval::Number(0))
+}
+
+/// `f_getenv` (`eval/funcs.c:1104-1115`): `vim_getenv`, answering `v:null`
+/// rather than an empty string when the variable is not set -- which is how
+/// callers tell "unset" from "set to empty". `plenary/log.lua:12` is the
+/// first thing telescope.nvim reaches this through.
+///
+/// The `Scope::env` snapshot is consulted first for the same reason
+/// [`setenv`] writes to it: `$VAR` reads come from the snapshot, so a value
+/// assigned this session lives there and not yet in the process environment.
+fn getenv(args: &[Typval], scope: &Scope) -> Result<Typval> {
+    let name = string_arg(&args[0])?;
+    if scope.contains_env(name.as_bytes()) {
+        return Ok(scope.get_env(name.as_bytes()));
+    }
+    Ok(std::env::var_os(name.to_string_lossy().as_ref()).map_or(
+        Typval::Special(Special::Null),
+        |value| Typval::String(OxStr::from(value.to_string_lossy().as_ref())),
+    ))
+}
+
+/// `environ()`, whose implementation upstream is Lua rather than C:
+/// `runtime/lua/vim/_core/vimfn.lua:16-26` returns `vim.uv.os_environ()`
+/// unchanged off Windows. The `Scope::env` snapshot overlays the process
+/// environment for the same reason [`getenv`] consults it.
+fn environ(scope: &Scope) -> Result<Typval> {
+    let mut entries: Vec<(OxStr, Typval)> = std::env::vars_os()
+        .filter(|(name, _)| !name.is_empty())
+        .map(|(name, value)| {
+            (
+                OxStr::from(name.to_string_lossy().as_ref()),
+                Typval::String(OxStr::from(value.to_string_lossy().as_ref())),
+            )
+        })
+        .collect();
+    for (name, value) in scope.env_entries() {
+        match entries.iter_mut().find(|(key, _)| key == name) {
+            Some(entry) => entry.1 = value.clone(),
+            None => entries.push((name.clone(), value.clone())),
+        }
+    }
+    Ok(Typval::dict(entries))
+}
+
+/// The characters `fnameescape()` puts a backslash before: `PATH_ESC_CHARS`
+/// in `ex_getln.c:4103`, reached through `vim_strsave_fnameescape(fname,
+/// VSE_NONE)` (`eval/funcs.c:1519`). The Windows `BACKSLASH_IN_FILENAME`
+/// variant at `ex_getln.c:4084` is a different set and is not this platform.
+const PATH_ESC_CHARS: &[u8] = b" \t\n*?[{`$\\%#'\"|!<";
+
+/// `f_fnameescape` (`eval/funcs.c:1517-1521`).
+///
+/// The trailing special case is `vim_strsave_fnameescape`'s own
+/// (`ex_getln.c:4118-4122`): `>` and `+` lead some Ex commands and `cd -` has
+/// its own meaning, so a result starting with one of those, or consisting of
+/// exactly `-`, gains a leading backslash.
+fn fnameescape(args: &[Typval]) -> Result<Typval> {
+    let name = string_arg(&args[0])?;
+    let mut escaped = Vec::with_capacity(name.as_bytes().len());
+    for byte in name.as_bytes() {
+        if PATH_ESC_CHARS.contains(byte) {
+            escaped.push(b'\\');
+        }
+        escaped.push(*byte);
+    }
+    if matches!(escaped.first(), Some(b'>' | b'+')) || escaped == b"-" {
+        escaped.insert(0, b'\\');
+    }
+    Ok(Typval::String(OxStr(escaped)))
+}
+
+/// `f_localtime` (`eval/funcs.c:3924-3927`): `time(NULL)`, seconds since the
+/// Unix epoch.
+fn localtime() -> Result<Typval> {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX));
+    Ok(Typval::Number(seconds))
+}
+
+/// Monotonic nanoseconds from a process-local origin, which is what
+/// `os_hrtime`/`uv_hrtime` gives `profile_start` (`profile.c`) and what
+/// `ox_uv::misc::hrtime` already uses. Upstream documents the value as
+/// relative to an arbitrary past instant, so only differences are meaningful.
+fn hrtime_nanos() -> i64 {
+    static ORIGIN: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    i64::try_from(ORIGIN.elapsed().as_nanos()).unwrap_or(i64::MAX)
+}
+
+/// `list2proftime` (`eval/funcs.c:5059-5085`): a reltime value is one 64-bit
+/// count split across two 32-bit list items, high half first.
+fn proftime_from_list(value: &Typval) -> Option<i64> {
+    let Typval::List(reference) = value else { return None };
+    let items = list_items(reference).ok()?;
+    let [high, low] = items.as_slice() else { return None };
+    let number = |value: &Typval| match value {
+        Typval::Number(number) => Some(*number),
+        _ => None,
+    };
+    let high = i64::from(i32::try_from(number(high)?).ok()?);
+    let low = i64::from(number(low)? as u32);
+    Some((high << 32) | low)
+}
+
+fn proftime_to_list(nanos: i64) -> Typval {
+    Typval::list(vec![
+        Typval::Number(nanos >> 32),
+        Typval::Number(i64::from((nanos & 0xFFFF_FFFF) as u32 as i32)),
+    ])
+}
+
+/// `f_reltime` (`eval/funcs.c:5096-5134`): no argument is "now", one argument
+/// is the time elapsed since it, two arguments are their difference.
+fn reltime(args: &[Typval]) -> Result<Typval> {
+    let nanos = match args {
+        [] => hrtime_nanos(),
+        [start] => {
+            let Some(start) = proftime_from_list(start) else { return Ok(Typval::list(Vec::new())) };
+            hrtime_nanos() - start
+        }
+        [start, end] => {
+            let (Some(start), Some(end)) = (proftime_from_list(start), proftime_from_list(end)) else {
+                return Ok(Typval::list(Vec::new()));
+            };
+            end - start
+        }
+        _ => return Ok(Typval::list(Vec::new())),
+    };
+    Ok(proftime_to_list(nanos))
+}
+
+/// `f_reltimefloat` (`eval/funcs.c:6774-6784`): `profile_signed(tm) / 1e9`.
+fn reltimefloat(args: &[Typval]) -> Result<Typval> {
+    let nanos = proftime_from_list(&args[0]).unwrap_or(0);
+    #[expect(clippy::cast_precision_loss, reason = "upstream casts the same nanosecond count to a C double")]
+    Ok(Typval::Float(nanos as f64 / 1_000_000_000.0))
+}
+
+/// `f_reltimestr` (`eval/funcs.c:5138-5148`) through `profile_msg`
+/// (`profile.c:72-78`), whose format is `"%10.6lf"` -- so a short elapsed
+/// time is right-aligned in ten columns and a long one simply overflows it.
+fn reltimestr(args: &[Typval]) -> Result<Typval> {
+    let Some(nanos) = proftime_from_list(&args[0]) else {
+        return Ok(Typval::String(OxStr(Vec::new())));
+    };
+    #[expect(clippy::cast_precision_loss, reason = "upstream casts the same nanosecond count to a C double")]
+    let seconds = nanos as f64 / 1_000_000_000.0;
+    Ok(Typval::String(OxStr::from(format!("{seconds:10.6}").as_str())))
 }
 
 fn borrow_error() -> EvalError { EvalError::new("E742", 0, "Cannot change value during recursive container access") }
@@ -995,10 +1454,18 @@ fn ensure_unlocked(lock: ox_types::LockState) -> Result<()> {
     if lock.locked { Err(locked_error()) } else { Ok(()) }
 }
 
+/// `f_abs` (`funcs.c:424-441`): a Float goes to `fabs`, everything else to
+/// `tv_get_number_chk` and then `n > 0 ? n : -n`. That negation is plain,
+/// not saturating, so `VARNUMBER_MIN` negates back to itself and
+/// `abs('-9223372036854775808')` is -9223372036854775808 on the oracle. A
+/// saturating negation answered `VARNUMBER_MAX` here.
 fn absolute(value: &Typval) -> Result<Typval> {
     match value {
         Typval::Float(value) => Ok(Typval::Float(value.abs())),
-        _ => Ok(Typval::Number(number_arg(value)?.saturating_abs())),
+        _ => {
+            let number = number_arg(value)?;
+            Ok(Typval::Number(if number > 0 { number } else { number.wrapping_neg() }))
+        }
     }
 }
 
@@ -1014,9 +1481,45 @@ fn float_binary(args: &[Typval], operation: impl FnOnce(f64, f64) -> f64) -> Res
     Ok(Typval::Float(operation(float_arg(&args[0])?, float_arg(&args[1])?)))
 }
 
+/// `f_isinf` (`funcs.c:3141`): the sign of an infinite Float, and 0 for
+/// everything else — including a Number, which never carries an infinity.
+fn float_infinity_sign(value: &Typval) -> i64 {
+    match value {
+        Typval::Float(number) if number.is_infinite() => {
+            if *number > 0.0 { 1 } else { -1 }
+        }
+        _ => 0,
+    }
+}
+
+/// `f_float2nr` (`funcs.c:1484-1500`). The bounds are
+/// `f <= (float_T)(-VARNUMBER_MAX) + DBL_EPSILON` and
+/// `f >= (float_T)VARNUMBER_MAX - DBL_EPSILON`, and the two `DBL_EPSILON`
+/// terms do nothing: `(double)VARNUMBER_MAX` is exactly 2^63, whose
+/// neighbouring doubles are 1024 apart, so 2.2e-16 is absorbed and both
+/// comparisons are against ±2^63. Inside that range the C cast truncates
+/// toward zero.
+///
+/// The saturation value is `±VARNUMBER_MAX`, so the low end is
+/// -9223372036854775807 and not `VARNUMBER_MIN` — the off-by-one this fixes.
+/// NaN fails both comparisons, since every comparison with a NaN is false,
+/// and reaches the cast, which on x86-64 gives `INT64_MIN`. Measured on the
+/// oracle: `float2nr(-1.0/0.0)` is -9223372036854775807 and
+/// `float2nr(0.0/0.0)` is -9223372036854775808.
 fn float_to_number(value: &Typval) -> Result<Typval> {
     let value = float_arg(value)?;
-    let number = if value.is_nan() { 0 } else if value >= i64::MAX as f64 { i64::MAX } else if value <= i64::MIN as f64 { i64::MIN } else { value.trunc() as i64 };
+    // `i64::MAX as f64` rounds up to 2^63, which is the bound upstream
+    // compares against after its own `(float_T)` conversion does the same.
+    let limit = i64::MAX as f64;
+    let number = if value <= -limit {
+        -i64::MAX
+    } else if value >= limit {
+        i64::MAX
+    } else if value.is_nan() {
+        i64::MIN
+    } else {
+        value.trunc() as i64
+    };
     Ok(Typval::Number(number))
 }
 
@@ -1055,13 +1558,28 @@ fn is_empty(value: &Typval) -> bool {
     }
 }
 
-fn length(value: &Typval, bytes_only: bool) -> Result<Typval> {
+/// `f_len` (`funcs.c:3793-3819`) and `f_strlen` (`funcs.c`) are two different
+/// questions and were one function here, which the Float-as-String fix made
+/// visible: with a Float now rendering, `len(1.0)` would have answered 3 where
+/// upstream answers E701.
+///
+/// `len()` counts a container's elements and the string length of a String or
+/// a Number, and refuses everything else with E701 — a Bool, a Special, a
+/// Float and a Funcref all reach that arm. `strlen()` is only
+/// `strlen(tv_get_string(...))`, so it coerces: `strlen(v:true)` is 6 and
+/// `strlen(1.0)` is 3, while a List, Dict, Blob or Funcref raises its own
+/// String error out of `string_arg`.
+fn length(value: &Typval, string_length: bool) -> Result<Typval> {
+    if string_length {
+        return Ok(Typval::Number(saturating_i64(string_arg(value)?.as_bytes().len())));
+    }
     let length = match value {
-        Typval::String(value) => if bytes_only { value.as_bytes().len() } else { value.as_bytes().len() },
+        Typval::String(value) => value.as_bytes().len(),
+        Typval::Number(value) => value.to_string().len(),
         Typval::Blob(value) => value.len(),
         Typval::List(value) => list_items(value)?.len(),
         Typval::Dict(value) => dict_entries(value)?.len(),
-        _ => string_arg(value)?.as_bytes().len(),
+        _ => return Err(EvalError::new("E701", 0, "Invalid type for len()")),
     };
     Ok(Typval::Number(saturating_i64(length)))
 }
@@ -1454,7 +1972,11 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
             ));
         };
         let left = flags.contains('-');
-        let zero = flags.contains('0') && !left;
+        let mut zero = flags.contains('0') && !left;
+        // `strings.c:1516,1585`: `space_for_positive` starts set and only `+`
+        // clears it, so `+` wins over ` ` whichever order they appear in.
+        let force_sign = flags.contains('+') || flags.contains(' ');
+        let space_for_positive = !flags.contains('+');
         let width: usize = width.parse().unwrap_or(0);
         let rendered = match conversion {
             'd' | 'i' | 'u' => {
@@ -1507,14 +2029,20 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
                 other => char::from_u32(number_arg(other)? as u32).unwrap_or('\0').to_string(),
             },
             'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
-                let number = float_arg(value)?;
-                let digits = precision.unwrap_or(6);
-                match conversion {
-                    'f' | 'F' | 'g' => format!("{number:.digits$}"),
-                    'e' => format!("{number:.digits$e}"),
-                    'E' => format!("{number:.digits$e}").to_uppercase(),
-                    _ => format!("{number:.digits$}").to_uppercase(),
-                }
+                // `tv_float` (`strings.c:716`) has its own error, distinct from
+                // the E808 `tv_get_float` raises for `sqrt("a")`.
+                let number = match value {
+                    Typval::Float(number) => *number,
+                    Typval::Number(number) => *number as f64,
+                    _ => return Err(EvalError::new("E807", 0, "Expected Float argument for printf()")),
+                };
+                let (rendered, numeric) =
+                    format_float(conversion, number, precision, force_sign, space_for_positive);
+                // `infinity_str` and `nan` both clear `zero_padding`
+                // (`strings.c:2109`, `2114`), so `%06f` of infinity pads with
+                // blanks.
+                zero &= numeric;
+                rendered
             }
             's' => {
                 let mut text = match value {
@@ -1538,8 +2066,15 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
         if left {
             pieces.push_str(&rendered);
             pieces.push_str(&" ".repeat(padding));
-        } else if zero && matches!(conversion, 'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'b' | 'B' | 'c') {
-            let (sign, digits) = match rendered.strip_prefix(['-', '+']) {
+        } else if zero
+            && matches!(
+                conversion,
+                'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'b' | 'B' | 'c' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G'
+            )
+        {
+            // `strings.c:2188-2192`: padding zeroes go after the sign, and
+            // `space_for_positive` puts a blank there instead of a `+`.
+            let (sign, digits) = match rendered.strip_prefix(['-', '+', ' ']) {
                 Some(digits) => (rendered[..1].to_owned(), digits),
                 None => (String::new(), rendered.as_str()),
             };
@@ -1555,6 +2090,150 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
         return Err(EvalError::new("E767", 0, "Too many arguments to printf()"));
     }
     Ok(Typval::String(OxStr(pieces.into_bytes())))
+}
+
+/// `vim_snprintf`'s float conversions (`strings.c:2075-2196`), returning the
+/// rendering and whether zero padding still applies to it.
+///
+/// C's `%g` prints `1.0` as `1`, which upstream refuses ("can't use %g
+/// directly"): it rewrites `%g` to `%f` or `%e` by magnitude and then strips
+/// the superfluous zeroes itself, keeping the one just after the dot. That one
+/// kept zero is why `string(1.0)` is `'1.0'` and not `'1'`, and scripts compare
+/// against it.
+fn format_float(
+    conversion: char,
+    number: f64,
+    precision: Option<usize>,
+    force_sign: bool,
+    space_for_positive: bool,
+) -> (String, bool) {
+    let magnitude = number.abs();
+    let mut spec = conversion;
+    let mut remove_trailing_zeroes = false;
+    if matches!(spec, 'g' | 'G') {
+        let upper = spec == 'G';
+        spec = if (0.001..1.0e7).contains(&magnitude) || magnitude == 0.0 {
+            if upper { 'F' } else { 'f' }
+        } else if upper {
+            'E'
+        } else {
+            'e'
+        };
+        remove_trailing_zeroes = true;
+    }
+    let upper = spec.is_ascii_uppercase();
+
+    // `infinity_str` (`strings.c:800`) ignores the sign flags for a negative
+    // value, and `%f` gives up on anything past 1e307 rather than print 300
+    // digits.
+    if number.is_infinite() || (matches!(spec, 'f' | 'F') && magnitude > 1.0e307) {
+        let sign = if number < 0.0 {
+            "-"
+        } else if !force_sign {
+            ""
+        } else if space_for_positive {
+            " "
+        } else {
+            "+"
+        };
+        return (format!("{sign}{}", if upper { "INF" } else { "inf" }), false);
+    }
+    if number.is_nan() {
+        // Not a number has no sign, not even a forced one.
+        return ((if upper { "NAN" } else { "nan" }).to_owned(), false);
+    }
+
+    // `TMP_LEN - 10`, less the integer digits when `%f` has any to print.
+    let mut digits = precision.unwrap_or(6);
+    if precision.is_some() {
+        let mut limit = 340usize;
+        if matches!(spec, 'f' | 'F') && magnitude > 1.0 {
+            limit -= magnitude.log10() as usize;
+        }
+        digits = digits.min(limit);
+    }
+    let mut rendered = if matches!(spec, 'e' | 'E') {
+        // Rust writes `1.23e2`; C writes `1.230000e+02`.
+        let plain = format!("{number:.digits$e}");
+        let (mantissa, exponent) = plain.split_once('e').expect("LowerExp emits an exponent");
+        let exponent: i32 = exponent.parse().expect("LowerExp emits a decimal exponent");
+        let marker = if spec == 'E' { 'E' } else { 'e' };
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{mantissa}{marker}{sign}{:02}", exponent.abs())
+    } else {
+        format!("{number:.digits$}")
+    };
+    if force_sign && !rendered.starts_with('-') {
+        rendered.insert(0, if space_for_positive { ' ' } else { '+' });
+    }
+    if remove_trailing_zeroes {
+        rendered = strip_superfluous_zeroes(&rendered, matches!(spec, 'e' | 'E'), precision.is_some());
+    }
+    (rendered, true)
+}
+
+/// The `remove_trailing_zeroes` half of the float conversion
+/// (`strings.c:2144-2176`), which only `%g`/`%G` ask for.
+///
+/// An exponent loses its `+` and its leading zeroes unconditionally; the
+/// mantissa loses its trailing zeroes only when no precision was given, and
+/// never the one directly after the dot.
+fn strip_superfluous_zeroes(rendered: &str, exponential: bool, precision_specified: bool) -> String {
+    let mut text: Vec<char> = rendered.chars().collect();
+    let mut mantissa_end = text.len();
+    if exponential {
+        let Some(marker) = text.iter().position(|character| matches!(character, 'e' | 'E')) else {
+            return rendered.to_owned();
+        };
+        let mut cursor = marker + 1;
+        if text.get(cursor) == Some(&'+') {
+            text.remove(cursor);
+        } else if text.get(cursor) == Some(&'-') {
+            cursor += 1;
+        }
+        while text.get(cursor) == Some(&'0') && cursor + 1 < text.len() {
+            text.remove(cursor);
+        }
+        mantissa_end = marker;
+    }
+    if !precision_specified {
+        // The kept zero is the one directly after the dot. Upstream also
+        // bounds the loop at `tp > tmp + 2`, which never fires: `%f` and
+        // `%e` always emit that dot ahead of the zeroes, so the dot is what
+        // stops the loop, and `> 2` here is only index safety.
+        while mantissa_end > 2 && text[mantissa_end - 1] == '0' && text[mantissa_end - 2] != '.' {
+            text.remove(mantissa_end - 1);
+            mantissa_end -= 1;
+        }
+    }
+    text.into_iter().collect()
+}
+
+/// `tv_get_string_buf_chk`'s `VAR_FLOAT` arm (`eval/typval.c:4684-4685`):
+/// `vim_snprintf(buf, NUMBUFLEN, "%g", …)`, which never fails. A Float
+/// coerces to a String wherever upstream wants a String — `1.0 . ''` is
+/// `'1.0'`, `strlen(1.0)` is 3 — and `tv_check_str` (`typval.c:4245`) accepts
+/// `VAR_FLOAT` for the same reason.
+///
+/// E806 is deliberately absent here. Upstream raises it in exactly one place,
+/// `check_can_index` (`eval.c:3225-3229`), so it is the answer for `1.0[0]`
+/// and `1.0[1:2]` and for nothing else.
+pub fn float_as_string(number: f64) -> OxStr {
+    OxStr(format_float('g', number, None, false, true).0.into_bytes())
+}
+
+/// `TYPVAL_ENCODE_CONV_FLOAT` (`eval/encode.c:351-372`): `%g` for a finite
+/// value, and a re-readable `str2float()` call for the two that `%g` cannot
+/// round-trip.
+fn vim_float_string(number: f64) -> String {
+    if number.is_nan() {
+        return "str2float('nan')".to_owned();
+    }
+    if number.is_infinite() {
+        let sign = if number < 0.0 { "-" } else { "" };
+        return format!("{sign}str2float('inf')");
+    }
+    format_float('g', number, None, false, true).0
 }
 
 /// Digits of `value` in `radix`, lowercase, without prefix.
@@ -1646,13 +2325,51 @@ fn get(args: &[Typval]) -> Result<Typval> {
     }
 }
 
+/// Feature names this build genuinely provides, answered by `has()`.
+///
+/// Upstream's `has_list` (`eval/funcs.c:2532-2667`) is a compile-time list of
+/// everything *Neovim* provides, so copying it wholesale would make `has()`
+/// lie: a test that stops skipping runs code paths this rewrite does not have,
+/// which turns an honest skip into a wall of noise. Every entry below was
+/// admitted only after the capability it names was exercised against the
+/// oracle and matched; the subsystem that answers for it is cited. Names
+/// upstream lists but this build does not implement are deliberately absent,
+/// so they keep returning 0 — see `.outline/sdd/reports/task-63.md` for the
+/// per-name evidence and for what each omission is still missing.
+///
+/// Sorted for `binary_search`; `f_has` compares with `STRICMP`, so lookups
+/// lowercase the query first. The trailing comment on each line names the
+/// module that answers for the feature, or the probe that proved it.
+pub(crate) const FEATURES: &[&str] = &[
+    "eval",                // ox-eval/eval.rs: `eval("1+2")` == 3
+    "file_in_path",        // ox-eval/find_file.rs: `findfile()` honours 'path'
+    "float",               // ox-eval Typval::Float: arithmetic, str2float, float2nr, sqrt, floor
+    "fork",                // ox-uv/process.rs forks for `system()`
+    "lambda",              // ox-eval/parser.rs: `{a, b -> a * b}(6, 7)` == 42
+    "modify_fname",        // ox-eval/path_builtins.rs: `fnamemodify()` modifiers
+    "multi_byte",          // ox-eval: strchars/strlen agree on multi-byte input
+    "multi_byte_encoding", // ox-eval: char2nr/nr2char round-trip; upstream is unconditional
+    "num64",               // ox-eval Typval::Number is i64
+    "nvim",                // this build targets Neovim 0.13 (ox_rpc API_LEVEL 15)
+    "path_extra",          // ox-eval/find_file.rs: `**` downward and `dir;` upward search
+    "startuptime",         // oxvim/cli.rs implements `--startuptime`
+    "textobjects",         // ox-editor: `daw` deletes a word with its white space
+    "user-commands",       // the spelling upstream keeps for 5.4 compatibility
+    "user_commands",       // ox-editor/excmd_exec.rs: `:command! -nargs=1` plus `<f-args>`
+    "vertsplit",           // ox-editor/layout.rs: `:vsplit` yields two windows
+    "vimscript-1",         // legacy Vimscript is the dialect ox-eval implements
+    "visual",              // ox-editor: `v2ld` deletes the Visual selection
+    "windows",             // ox-editor/layout.rs: `:split` yields two windows
+];
+
 /// `"has"` — feature probe. Mirrors `f_has` in `eval/funcs.c`: the
 /// `"nvim-X.Y[.Z]"` form compares against the Neovim version this build
 /// targets (0.13.0, matching `ox_rpc`'s `API_LEVEL = 15`); everything else
-/// answers from a small compile-time-honest table and defaults to 0, which is
-/// what upstream returns for features the build does not provide.
+/// answers from [`FEATURES`], which lists only capabilities this build was
+/// observed to provide, and defaults to 0, which is what upstream returns for
+/// features the build does not provide.
 fn has_feature(args: &[Typval]) -> Result<Typval> {
-    let feature = string_arg(&args[0])?.to_string_lossy().into_owned();
+    let feature = string_arg(&args[0])?.to_string_lossy().to_ascii_lowercase();
     let supported = if let Some(version) = feature.strip_prefix("nvim-") {
         let mut parts = version.split('.').map(|part| part.parse::<u64>().unwrap_or(u64::MAX));
         let requested = (parts.next().unwrap_or(0), parts.next().unwrap_or(0), parts.next().unwrap_or(0));
@@ -1662,8 +2379,10 @@ fn has_feature(args: &[Typval]) -> Result<Typval> {
             "unix" => cfg!(unix),
             "win32" | "win64" => cfg!(windows),
             "macunix" => cfg!(target_os = "macos"),
-            "multi_byte" => true,
-            _ => false,
+            // `#ifndef CASE_INSENSITIVE_FILENAME` and `#ifdef __linux__`.
+            "fname_case" => cfg!(not(any(target_os = "macos", windows))),
+            "linux" => cfg!(target_os = "linux"),
+            name => FEATURES.binary_search(&name).is_ok(),
         }
     };
     Ok(Typval::Number(i64::from(supported)))
@@ -1932,35 +2651,51 @@ fn deep_copy(value: &Typval) -> Result<Typval> {
     copy(value, &mut HashMap::new(), &mut HashMap::new(), 0)
 }
 
-/// Lock a container shallowly or through every reachable container.
-pub fn lock_value(value: &Typval, deep: bool) -> Result<()> {
-    fn lock(value: &Typval, scope: ox_types::LockScope, seen: &mut HashSet<(usize, u8)>) -> Result<()> {
+/// `tv_item_lock` (`eval/typval.c`): lock or unlock a container `depth`
+/// levels down, where `depth` 0 changes nothing and a negative `depth`
+/// reaches every nested container. `:lockvar` uses 2, `:lockvar!` uses -1.
+///
+/// The recorded [`ox_types::LockScope`] is what `islocked()` reports:
+/// `Shallow` for a single level, `Deep` for anything that recurses.
+///
+/// # Errors
+/// `E742` when a container in the traversal is already borrowed.
+pub fn lock_value(value: &Typval, depth: i32, lock: bool) -> Result<()> {
+    fn apply(value: &Typval, depth: i32, lock: bool, seen: &mut HashSet<(usize, u8)>) -> Result<()> {
+        if depth == 0 {
+            return Ok(());
+        }
+        let recurse = depth < 0 || depth > 1;
+        let state = ox_types::LockState {
+            scope: if recurse { ox_types::LockScope::Deep } else { ox_types::LockScope::Shallow },
+            locked: lock,
+        };
         match value {
             Typval::List(reference) => {
                 let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_LIST);
                 if !seen.insert(key) { return Ok(()); }
                 let items = {
                     let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
-                    data.lock = ox_types::LockState { scope, locked: true };
+                    data.lock = state;
                     data.items.clone()
                 };
-                if scope == ox_types::LockScope::Deep { for item in &items { lock(item, scope, seen)?; } }
+                if recurse { for item in &items { apply(item, depth - 1, lock, seen)?; } }
             }
             Typval::Dict(reference) => {
                 let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_DICT);
                 if !seen.insert(key) { return Ok(()); }
                 let entries = {
                     let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
-                    data.lock = ox_types::LockState { scope, locked: true };
+                    data.lock = state;
                     data.entries.clone()
                 };
-                if scope == ox_types::LockScope::Deep { for (_, item) in &entries { lock(item, scope, seen)?; } }
+                if recurse { for (_, item) in &entries { apply(item, depth - 1, lock, seen)?; } }
             }
             _ => {}
         }
         Ok(())
     }
-    lock(value, if deep { ox_types::LockScope::Deep } else { ox_types::LockScope::Shallow }, &mut HashSet::new())
+    apply(value, depth, lock, &mut HashSet::new())
 }
 
 /// Return the encoded lock state: 0 unlocked, 1 direct, 2 shallow, 3 deep.
@@ -2044,11 +2779,126 @@ fn str2nr(args: &[Typval]) -> Result<Typval> {
     Ok(Typval::Number(number))
 }
 
+/// `f_str2float` (`funcs.c:7042-7056`): leading white space is skipped, then
+/// an optional sign — after which white space is skipped *again*, so
+/// `str2float('- 1.5')` is `-1.5` — and the rest goes to `string2float`. Only
+/// a leading `-` sets the sign; a `+` is consumed and ignored.
 fn str2float(value: &Typval) -> Result<Typval> {
-    let value = string_arg(value)?;
-    let text = String::from_utf8_lossy(value.as_bytes());
-    let prefix: String = text.trim_start().chars().take_while(|character| character.is_ascii_digit() || matches!(character, '+' | '-' | '.' | 'e' | 'E')).collect();
-    Ok(Typval::Float(prefix.parse().unwrap_or(0.0)))
+    let text = string_arg(value)?;
+    let mut bytes = skip_white(text.as_bytes());
+    let negative = bytes.first() == Some(&b'-');
+    if matches!(bytes.first(), Some(b'-' | b'+')) {
+        bytes = skip_white(&bytes[1..]);
+    }
+    let number = string2float(bytes);
+    // Upstream multiplies by -1, which flips the sign of a zero and leaves a
+    // NaN a NaN: `str2float('-')` is `-0.0` and `str2float('-nan')` is `nan`.
+    Ok(Typval::Float(if negative { number * -1.0 } else { number }))
+}
+
+/// `skipwhite` (`charset.c`), where `ascii_iswhite` is a space or a tab and
+/// nothing else — a newline or a form feed stops it.
+fn skip_white(bytes: &[u8]) -> &[u8] {
+    let end = bytes.iter().position(|byte| !matches!(byte, b' ' | b'\t')).unwrap_or(bytes.len());
+    &bytes[end..]
+}
+
+/// `string2float` (`eval.c:4611-4630`): the three spellings MS-Windows'
+/// `strtod` gets wrong are matched case-insensitively ahead of it, so
+/// `str2float('INF')` is infinity and `str2float('infinity')` is too — the
+/// check is a three-byte prefix, not a whole word. `-inf` is unreachable from
+/// `f_str2float`, which strips the sign first, but `string2float` is also the
+/// number literal scanner (`eval.c:3490`) and is kept whole.
+fn string2float(bytes: &[u8]) -> f64 {
+    if bytes.len() >= 3 && bytes[..3].eq_ignore_ascii_case(b"inf") {
+        return f64::INFINITY;
+    }
+    if bytes.len() >= 4 && bytes[..4].eq_ignore_ascii_case(b"-inf") {
+        return f64::NEG_INFINITY;
+    }
+    if bytes.len() >= 3 && bytes[..3].eq_ignore_ascii_case(b"nan") {
+        return f64::NAN;
+    }
+    strtod(bytes)
+}
+
+/// The `strtod` `string2float` falls back to, under the C locale upstream
+/// pins with `setlocale(LC_NUMERIC, "C")`. It takes the longest valid prefix
+/// and answers 0.0 when there is none, which is why `str2float('abc')` is
+/// 0.0 and `str2float('1.5abc')` is 1.5. A `0x` significand with a binary
+/// exponent is part of the grammar, so `str2float('0x10')` is 16.0.
+fn strtod(bytes: &[u8]) -> f64 {
+    let (negative, rest) = match bytes.first() {
+        Some(b'-') => (true, &bytes[1..]),
+        Some(b'+') => (false, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    let hexadecimal = rest.len() > 2 && rest[0] == b'0' && matches!(rest[1], b'x' | b'X');
+    let magnitude = if hexadecimal { hex_float_prefix(&rest[2..]) } else { None }
+        .or_else(|| decimal_float_prefix(rest))
+        .unwrap_or(0.0);
+    if negative { -magnitude } else { magnitude }
+}
+
+/// `[0-9]*(\.[0-9]*)?([eE][+-]?[0-9]+)?` with at least one significand digit,
+/// handed to Rust's parser, which accepts the same shapes (`1.`, `.5`, `1e3`)
+/// and saturates the exponent the way `strtod` does.
+fn decimal_float_prefix(bytes: &[u8]) -> Option<f64> {
+    let mut end = 0;
+    let mut digits = 0;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) { end += 1; digits += 1; }
+    if bytes.get(end) == Some(&b'.') {
+        end += 1;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) { end += 1; digits += 1; }
+    }
+    if digits == 0 { return None; }
+    if matches!(bytes.get(end), Some(b'e' | b'E')) {
+        let mut cursor = end + 1;
+        if matches!(bytes.get(cursor), Some(b'+' | b'-')) { cursor += 1; }
+        let exponent = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) { cursor += 1; }
+        // An `e` with no digits after it is not part of the number.
+        if cursor > exponent { end = cursor; }
+    }
+    std::str::from_utf8(&bytes[..end]).ok()?.parse().ok()
+}
+
+/// `0x` already consumed: `[0-9a-f]*(\.[0-9a-f]*)?([pP][+-]?[0-9]+)?` with at
+/// least one significand digit. The value is assembled by scaling rather than
+/// parsed, since Rust has no hexadecimal float literal.
+fn hex_float_prefix(bytes: &[u8]) -> Option<f64> {
+    let mut cursor = 0;
+    let mut value = 0.0_f64;
+    let mut digits = 0;
+    while let Some(digit) = bytes.get(cursor).and_then(|byte| (*byte as char).to_digit(16)) {
+        value = value * 16.0 + f64::from(digit);
+        cursor += 1;
+        digits += 1;
+    }
+    let mut exponent = 0i32;
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        while let Some(digit) = bytes.get(cursor).and_then(|byte| (*byte as char).to_digit(16)) {
+            value = value * 16.0 + f64::from(digit);
+            cursor += 1;
+            digits += 1;
+            exponent -= 4;
+        }
+    }
+    if digits == 0 { return None; }
+    if matches!(bytes.get(cursor), Some(b'p' | b'P')) {
+        let mut scan = cursor + 1;
+        let negative = bytes.get(scan) == Some(&b'-');
+        if matches!(bytes.get(scan), Some(b'+' | b'-')) { scan += 1; }
+        let start = scan;
+        let mut binary = 0i32;
+        while let Some(digit) = bytes.get(scan).and_then(|byte| (*byte as char).to_digit(10)) {
+            binary = binary.saturating_mul(10).saturating_add(digit as i32);
+            scan += 1;
+        }
+        if scan > start { exponent += if negative { -binary } else { binary }; }
+    }
+    Some(value * 2.0_f64.powi(exponent))
 }
 
 /// "str2nr()" digit conversion following upstream `vim_str2nr`
@@ -2167,7 +3017,7 @@ fn vim_string(value: &Typval, _depth: usize) -> Result<OxStr> {
         match value {
             Typval::String(value) => { output.push(b'\''); for byte in value.as_bytes() { output.push(*byte); if *byte == b'\'' { output.push(b'\''); } } output.push(b'\''); }
             Typval::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
-            Typval::Float(value) => output.extend_from_slice(value.to_string().as_bytes()),
+            Typval::Float(value) => output.extend_from_slice(vim_float_string(*value).as_bytes()),
             Typval::Bool(value) => output.extend_from_slice(if *value { b"v:true" } else { b"v:false" }),
             Typval::Special(Special::Null) => output.extend_from_slice(b"v:null"),
             Typval::Blob(value) => { output.extend_from_slice(b"0z"); for byte in value { let _ = write!(StringWriter(output), "{byte:02X}"); } }

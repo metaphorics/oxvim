@@ -27,7 +27,7 @@ use ox_eval::{Scope, ScopeKind};
 use ox_text::Buffer;
 use ox_types::{Object, OxStr, Typval};
 
-use crate::script::{FileIO, ScriptCtx};
+use crate::script::{FileIO, ScriptCtx, SourceContext};
 use crate::userfunc::{UserFunctions, MAX_FUNC_DEPTH};
 use crate::{
     AutocmdKind, AutocmdOptions, Editor, Event, ExecError, ExExecutor, Geometry, LuaExec,
@@ -82,6 +82,17 @@ impl FileIO for MemoryFileIO {
     }
     fn canonicalize(&self, path: &Path) -> PathBuf {
         path.to_path_buf()
+    }
+
+    fn copy_file(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let content = self
+            .files
+            .borrow()
+            .get(from)
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("not found: {}", from.display())))?;
+        self.files.borrow_mut().insert(to.to_path_buf(), content);
+        Ok(())
     }
 }
 
@@ -495,9 +506,11 @@ fn default_expression_evaluates_in_caller_scope_and_aborts_call() {
         ),
     );
     assert_eq!(global_number(exec.scope(), "caught"), Some(1));
+    // Oracle: an error raised while evaluating a default argument escapes
+    // through `:call`, so `v:exception` is `Vim(call):E121: ...`.
     assert!(global_string(exec.scope(), "msg")
         .unwrap()
-        .starts_with("E121: Undefined variable: s:undefined_variable"));
+        .starts_with("Vim(call):E121: Undefined variable: s:undefined_variable"));
     assert_eq!(global_number(exec.scope(), "entered"), Some(0));
 }
 
@@ -527,7 +540,7 @@ fn evaluator_error_inside_user_function_enters_caller_catch_frame() {
     );
     assert_eq!(global_number(exec.scope(), "caught"), Some(1));
     assert_eq!(global_number(exec.scope(), "finalized"), Some(1));
-    assert_eq!(global_string(exec.scope(), "exception").as_deref(), Some("E117: not implemented: screenrow"));
+    assert_eq!(global_string(exec.scope(), "exception").as_deref(), Some("Vim(call):E117: not implemented: screenrow"));
     assert_eq!(global_string(exec.scope(), "throwpoint").as_deref(), Some("function BrokenBuiltin[1]..script <test>[1]"));
 }
 
@@ -596,10 +609,10 @@ fn closure_captures_defining_local_scope() {
     // test_user_func.vim: closure captures.
     let mut funcs = UserFunctions::new();
     let mut scope = Scope::new();
-    scope.set(b"captured", Typval::Number(123));
+    scope.set(b"captured", Typval::Number(123)).unwrap();
     let sig = UserFunctions::parse_signature("Clo() closure").unwrap();
     funcs
-        .define(sig, vec!["return l:captured".to_owned()], 0, false, &scope)
+        .define(sig, vec!["return l:captured".to_owned()], SourceContext::default(), false, &scope)
         .unwrap();
     let func = funcs.get("Clo", 0).unwrap();
     assert!(func.flags.closure);
@@ -644,7 +657,7 @@ fn recursion_exceeds_maxfuncdepth_e132() {
     let mut funcs = UserFunctions::new();
     let sig = UserFunctions::parse_signature("Recurse()").unwrap();
     funcs
-        .define(sig, vec![], 0, false, &Scope::new())
+        .define(sig, vec![], SourceContext::default(), false, &Scope::new())
         .unwrap();
     let mut scope = Scope::new();
     for _ in 0..MAX_FUNC_DEPTH {
@@ -874,6 +887,125 @@ fn nested_source_restores_caller_sid_and_script_scope() {
 }
 
 // ---------------------------------------------------------------------------
+// Family: command resolution happens when a line runs, and re-sourcing a
+// script reuses its SID (ex_docmd.c find_ex_command / do_one_cmd;
+// runtime.c:2226,2333 find_script_by_name + sc_seq)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_user_command_is_resolved_when_its_line_runs_not_when_it_is_parsed() {
+    // find_ex_command consults the live command table inside do_one_cmd, so a
+    // :command created earlier in the same script — or in a script sourced by
+    // it — is visible on a later line even though the whole body was read
+    // first. check.vim's CheckFunction reaches test bodies exactly this way.
+    let io = MemoryFileIO::new();
+    io.insert("/guard.vim", "command! -nargs=1 T69Guard let g:guarded = <q-args>");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.execute_script(
+        &mut editor,
+        "/main.vim",
+        "command! -nargs=1 T69Same let g:same = <q-args>\n\
+         T69Same here\n\
+         source /guard.vim\n\
+         function! T69Body()\n\
+         T69Guard inside\n\
+         endfunction\n\
+         call T69Body()",
+    )
+    .unwrap();
+    assert_eq!(global_string(exec.scope(), "same").as_deref(), Some("here"));
+    assert_eq!(global_string(exec.scope(), "guarded").as_deref(), Some("inside"));
+}
+
+#[test]
+fn an_unresolvable_command_still_reports_e492_after_the_retry() {
+    // The retry is a re-resolution, not a rescue: a name no :command ever
+    // created reports E492 exactly as before.
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    let err = exec
+        .execute_script(&mut editor, "/main.vim", "T69NeverDefined arg")
+        .unwrap_err();
+    assert_eq!(error_code(&err), "E492");
+}
+
+#[test]
+fn re_sourcing_a_script_keeps_its_script_local_variables() {
+    // do_source looks the file up with find_script_by_name and reuses its SID
+    // (runtime.c:2226,2335), so `if exists('s:did_load') | finish | endif`
+    // — setup.vim:50-53, which guards the `comclear` that wipes every user
+    // command — short-circuits on the second sourcing.
+    let io = MemoryFileIO::new();
+    io.insert(
+        "/guarded.vim",
+        "let g:runs = get(g:, 'runs', 0) + 1\n\
+         if exists('s:did_load')\n\
+         finish\n\
+         endif\n\
+         let s:did_load = 1\n\
+         let g:bodies = get(g:, 'bodies', 0) + 1",
+    );
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.execute_script(
+        &mut editor,
+        "/main.vim",
+        "source /guarded.vim\nsource /guarded.vim\nsource /guarded.vim",
+    )
+    .unwrap();
+    assert_eq!(global_number(exec.scope(), "runs"), Some(3));
+    assert_eq!(global_number(exec.scope(), "bodies"), Some(1));
+    // One registry entry for the file, not one per sourcing event.
+    assert_eq!(
+        exec.scripts().script_names(),
+        vec![(1, "/main.vim"), (2, "/guarded.vim")]
+    );
+}
+
+#[test]
+fn a_reloaded_script_redefines_its_own_command_and_function_but_a_stranger_cannot() {
+    // "can be replaced with ! and when sourcing the same script again, but
+    // only once": usercmd.c:940-948 and eval/userfunc.c:2856-2863 both key on
+    // (sc_sid, sc_seq). Same SID, new sequence — silent replace. Different
+    // SID — E174/E122.
+    let io = MemoryFileIO::new();
+    io.insert(
+        "/defs.vim",
+        "command -nargs=1 T69Dup let g:dup = <q-args>\nfunc T69Fn()\nendfunc",
+    );
+    io.insert("/other.vim", "command -nargs=1 T69Dup let g:dup = 'other'");
+    io.insert("/otherfn.vim", "func T69Fn()\nendfunc");
+    // Two definitions inside *one* sourcing share a sequence number, so the
+    // reload exemption must not cover them.
+    io.insert(
+        "/twice.vim",
+        "command -nargs=1 T69Once echo 1\ncommand -nargs=1 T69Once echo 2",
+    );
+    io.insert("/twicefn.vim", "func T69Twice()\nendfunc\nfunc T69Twice()\nendfunc");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.execute_script(&mut editor, "/main.vim", "source /defs.vim\nsource /defs.vim")
+        .unwrap();
+    let command_err = exec
+        .execute_script(&mut editor, "/caller.vim", "source /other.vim")
+        .unwrap_err();
+    assert_eq!(error_code(&command_err), "E174");
+    let function_err = exec
+        .execute_script(&mut editor, "/caller2.vim", "source /otherfn.vim")
+        .unwrap_err();
+    assert_eq!(error_code(&function_err), "E122");
+    let same_seq_command = exec
+        .execute_script(&mut editor, "/caller3.vim", "source /twice.vim")
+        .unwrap_err();
+    assert_eq!(error_code(&same_seq_command), "E174");
+    let same_seq_function = exec
+        .execute_script(&mut editor, "/caller4.vim", "source /twicefn.vim")
+        .unwrap_err();
+    assert_eq!(error_code(&same_seq_function), "E122");
+}
+
+// ---------------------------------------------------------------------------
 // Family: autoload path resolution and load-once
 // (runtime.c: autoload name-to-path, load-once; test_autoload.vim)
 // ---------------------------------------------------------------------------
@@ -979,6 +1111,81 @@ fn set_write_is_scope_visible_and_expands_env_vars() {
         global_string(exec.scope(), "literal").as_deref(),
         Some("$OXVIM_TEST_UNSET_VAR/x")
     );
+}
+
+/// `let $VAR = value` changes the *process* environment, so a child process
+/// sees it.
+///
+/// `ex_let_env` (`eval/vars.c`:1349-1351) assigns through `vim_setenv_ext`,
+/// which is `os_setenv`. Recording the value only in the script scope is not a
+/// smaller version of that, it is a different behavior with teeth:
+/// `setup.vim:115` sandboxes the home directory with
+/// `let $HOME = expand(getcwd() . '/XfakeHOME')`, and `runtest.vim:472` cleans
+/// up with `call system('rm -rf  ' .. file)`. A file named `Xdir ~ dir`
+/// word-splits there, so the shell expands `~` against the child's HOME. With
+/// the assignment kept out of the environment the child inherits the real home
+/// directory and the cleanup deletes it.
+///
+/// The child here is the shell `system()` uses, and HOME is a throwaway path
+/// that is never written to.
+#[test]
+fn let_env_assignment_reaches_child_processes() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    let sandbox = std::env::temp_dir().join(format!("ox-editor-fakehome-{}", std::process::id()));
+    let sandbox = sandbox.to_string_lossy().into_owned();
+    let restore = std::env::var_os("HOME");
+
+    exec.execute_script(
+        &mut editor,
+        "<let-env>",
+        &format!(
+            "let $HOME = '{sandbox}'\n\
+             let g:vim_side = $HOME\n\
+             let g:child_side = substitute(system('printf %s \"$HOME\"'), '\\n', '', 'g')\n\
+             let g:child_tilde = substitute(system('printf %s ~'), '\\n', '', 'g')"
+        ),
+    )
+    .unwrap();
+
+    let vim_side = global_string(exec.scope(), "vim_side");
+    let child_side = global_string(exec.scope(), "child_side");
+    let child_tilde = global_string(exec.scope(), "child_tilde");
+    // Put the process back before asserting, whatever happened.
+    assert!(match restore {
+        Some(home) => ox_sys::set_env("HOME", home),
+        None => ox_sys::unset_env("HOME"),
+    });
+
+    assert_eq!(vim_side.as_deref(), Some(sandbox.as_str()));
+    assert_eq!(child_side.as_deref(), Some(sandbox.as_str()));
+    // The shell's own `~` is the sandbox too, which is the expansion that
+    // `rm -rf ~` in a suite cleanup lands on.
+    assert_eq!(child_tilde.as_deref(), Some(sandbox.as_str()));
+}
+
+/// `unlet $VAR` is the process-wide unset (`vim_unsetenv_ext`), so a child no
+/// longer sees it either.
+#[test]
+fn unlet_env_removes_the_variable_from_child_processes() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+
+    exec.execute_script(
+        &mut editor,
+        "<unlet-env>",
+        "let $OXVIM_TEST_UNLET = 'present'\n\
+         let g:before = substitute(system('printf %s \"$OXVIM_TEST_UNLET\"'), '\\n', '', 'g')\n\
+         unlet $OXVIM_TEST_UNLET\n\
+         let g:after = substitute(system('printf %s \"$OXVIM_TEST_UNLET\"'), '\\n', '', 'g')\n\
+         let g:read_back = $OXVIM_TEST_UNLET",
+    )
+    .unwrap();
+
+    assert_eq!(global_string(exec.scope(), "before").as_deref(), Some("present"));
+    assert_eq!(global_string(exec.scope(), "after").as_deref(), Some(""));
+    assert_eq!(global_string(exec.scope(), "read_back").as_deref(), Some(""));
+    assert!(std::env::var_os("OXVIM_TEST_UNLET").is_none());
 }
 #[test]
 fn colorscheme_sources_runtime_file_then_fires_matching_autocmd() {
@@ -1106,6 +1313,169 @@ fn job_callbacks_bind_the_options_dictionary_as_self() {
     assert_eq!(global_number(exec.scope(), "pid_ok"), Some(1));
     assert_eq!(global_number(exec.scope(), "exit_code"), Some(0));
     assert!(global_number(exec.scope(), "event_count").is_some_and(|count| count >= 2));
+}
+
+/// `ExExecutor::call_builtin` is the entry point the Lua `vim.fn` bridge comes
+/// in through. It used to forward straight into a job-only dispatcher that
+/// served five names -- `jobstop`, `jobpid`, `chansend`/`jobsend`, `jobwait` --
+/// and ended in a bare `unreachable!()`, so every other name reached that
+/// panic. The rows below are one per class of name the audit found behind it,
+/// each arranged to answer differently if only its own route were wrong:
+/// a name the old dispatcher did serve, the two Process-family names it did
+/// not, an editor-stateful name from another family, a typval-only name, a
+/// regex-backed typval-only name (which also proves the host carries a regex
+/// engine rather than `Builtins::without_regex`), and an unknown name, which
+/// must raise `E117` instead of aborting the process.
+#[test]
+fn call_builtin_serves_every_family_instead_of_panicking_outside_the_job_arms() {
+    let mut editor = editor_with_lines(&["alpha"]);
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    let call = |exec: &mut ExExecutor<MemoryFileIO>, editor: &mut Editor, name: &str, args: Vec<Typval>| {
+        exec.call_builtin(editor, &OxStr::from(name), args)
+    };
+
+    // Served before and after: an unknown job id waits to -3.
+    assert_eq!(
+        call(&mut exec, &mut editor, "jobwait", vec![Typval::list(vec![Typval::Number(9_999)])]).unwrap(),
+        Typval::list(vec![Typval::Number(-3)]),
+    );
+
+    // Process family, no arm before: jobstart returns a live channel id, and
+    // the job it started reaches exit status 0.
+    let job = call(
+        &mut exec,
+        &mut editor,
+        "jobstart",
+        vec![Typval::list(vec![Typval::String(OxStr::from("true"))])],
+    )
+    .unwrap();
+    let Typval::Number(id) = job else { panic!("jobstart did not answer a channel id: {job:?}") };
+    assert!(id > 0, "jobstart answered {id}");
+    assert_eq!(
+        call(&mut exec, &mut editor, "jobwait", vec![Typval::list(vec![Typval::Number(id)]), Typval::Number(5_000)]).unwrap(),
+        Typval::list(vec![Typval::Number(0)]),
+    );
+
+    // Process family, no arm before: system() runs through 'shell'.
+    assert_eq!(
+        call(&mut exec, &mut editor, "system", vec![Typval::String(OxStr::from("printf ok"))]).unwrap(),
+        Typval::String(OxStr::from("ok")),
+    );
+
+    // Another editor-stateful family entirely.
+    assert_eq!(
+        call(&mut exec, &mut editor, "bufnr", vec![Typval::String(OxStr::from("%"))]).unwrap(),
+        Typval::Number(1),
+    );
+
+    // Typval-only, no editor state.
+    assert_eq!(
+        call(&mut exec, &mut editor, "printf", vec![Typval::String(OxStr::from("%d-%s")), Typval::Number(7), Typval::String(OxStr::from("x"))]).unwrap(),
+        Typval::String(OxStr::from("7-x")),
+    );
+
+    // Regex-backed typval-only: `Builtins::without_regex()` answers E54 here.
+    assert_eq!(
+        call(&mut exec, &mut editor, "substitute", vec![
+            Typval::String(OxStr::from("aXbXc")),
+            Typval::String(OxStr::from("X")),
+            Typval::String(OxStr::from("-")),
+            Typval::String(OxStr::from("g")),
+        ])
+        .unwrap(),
+        Typval::String(OxStr::from("a-b-c")),
+    );
+
+    // An unknown name is an error, not a panic and not an abort.
+    let error = call(&mut exec, &mut editor, "nosuchbuiltin", Vec::new()).unwrap_err();
+    assert!(error.to_string().contains("nosuchbuiltin"), "{error}");
+}
+#[cfg(unix)]
+#[test]
+fn jobstart_pty_allocates_terminal_buffer_and_records_pty() {
+    let mut editor = editor_with_lines(&["alpha"]);
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    let call = |exec: &mut ExExecutor<MemoryFileIO>, editor: &mut Editor, name: &str, args: Vec<Typval>| {
+        exec.call_builtin(editor, &OxStr::from(name), args)
+    };
+
+    let options = Typval::dict(vec![(OxStr::from("pty"), Typval::Number(1))]);
+    let job = call(
+        &mut exec,
+        &mut editor,
+        "jobstart",
+        vec![
+            Typval::list(vec![Typval::String(OxStr::from("sh")), Typval::String(OxStr::from("-c")), Typval::String(OxStr::from("true"))]),
+            options,
+        ],
+    )
+    .unwrap();
+    let Typval::Number(id) = job else { panic!("jobstart did not answer a channel id: {job:?}") };
+    assert!(id > 0, "jobstart answered {id}");
+
+    let info = editor.terminal_channel(id as u64).expect("pty job must allocate a terminal channel");
+    let buffer = editor.buffer(info.buffer).expect("terminal buffer must exist");
+    assert_eq!(buffer.name().to_string_lossy(), "");
+    assert!(
+        info.pty.as_ref().is_some_and(|pty| pty.starts_with("/dev/pts/")),
+        "pty slave path must be real pts, got {:?}",
+        info.pty
+    );
+
+    call(&mut exec, &mut editor, "jobwait", vec![Typval::list(vec![Typval::Number(id)]), Typval::Number(5_000)]).unwrap();
+}
+#[cfg(unix)]
+#[test]
+fn pty_output_reaches_terminal_buffer_after_chansend() {
+    let mut editor = editor_with_lines(&["alpha"]);
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    let call = |exec: &mut ExExecutor<MemoryFileIO>, editor: &mut Editor, name: &str, args: Vec<Typval>| {
+        exec.call_builtin(editor, &OxStr::from(name), args)
+    };
+
+    let options = Typval::dict(vec![(OxStr::from("pty"), Typval::Number(1))]);
+    let job = call(
+        &mut exec,
+        &mut editor,
+        "jobstart",
+        vec![
+            Typval::list(vec![
+                Typval::String(OxStr::from("sh")),
+                Typval::String(OxStr::from("-c")),
+                Typval::String(OxStr::from("read x; echo $x")),
+            ]),
+            options,
+        ],
+    )
+    .unwrap();
+    let Typval::Number(id) = job else { panic!("jobstart did not answer a channel id: {job:?}") };
+
+    call(
+        &mut exec,
+        &mut editor,
+        "chansend",
+        vec![
+            Typval::Number(id),
+            Typval::String(OxStr::from("hello from pty\n")),
+        ],
+    )
+    .unwrap();
+
+    call(
+        &mut exec,
+        &mut editor,
+        "jobwait",
+        vec![Typval::list(vec![Typval::Number(id)]), Typval::Number(5_000)],
+    )
+    .unwrap();
+
+    let info = editor
+        .terminal_channel(id as u64)
+        .expect("pty job must keep its terminal channel");
+    let buffer = editor.buffer(info.buffer).expect("terminal buffer must exist");
+    let bytes = buffer.text().unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("hello from pty"), "terminal buffer should contain echoed PTY output, got {text:?}");
 }
 
 
@@ -1285,6 +1655,186 @@ fn expand_builtin_reads_current_buffer_and_preserves_paths() {
         exec.scope().global.iter().find(|(key, _)| key.as_bytes() == b"path"),
         Some((_, Typval::String(value))) if value.as_bytes() == b"/tmp/build"
     ));
+}
+
+/// `expand()` applies a `:`-modifier chain after a special token the way
+/// upstream `f_expand` does: `eval_vars` resolves the token base
+/// (ex_docmd.c:7551), then `modify_fname` (eval/fs.c:69) — here
+/// `ox_eval::apply_filename_modifiers` — eats the rest. This is the
+/// termdebug shape: `expand('%:p')` inside the `-break-insert` command
+/// (test_plugin_termdebug.vim Test_termdebug_break_command_builder).
+///
+/// The buffer name is absolute and non-existent so `:p` is deterministic:
+/// `absolute_name` only consults the filesystem (`fs::canonicalize`) for
+/// paths that exist. An empty base short-circuits to "" — upstream's
+/// `eval_vars` marks the result invalid and `f_expand` returns "".
+#[test]
+fn expand_builtin_applies_filename_modifiers_to_special_tokens() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    let directory = std::env::temp_dir().join(format!("ox-expand-mod-{}", std::process::id()));
+    let stored = directory.join("XTD_break_cmd.c");
+    let stored = stored.to_string_lossy().into_owned();
+    editor.buffer_mut(buffer).unwrap().set_name(OxStr::from(stored.as_str()));
+    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&mut editor, "let g:exact = expand('%')").unwrap();
+    exec.execute_line(&mut editor, "let g:absolute = expand('%:p')").unwrap();
+    exec.execute_line(&mut editor, "let g:head = expand('%:p:h')").unwrap();
+    exec.execute_line(&mut editor, "let g:tail = expand('%:t')").unwrap();
+
+    assert_eq!(global_string(exec.scope(), "exact").as_deref(), Some(stored.as_str()));
+    assert_eq!(global_string(exec.scope(), "absolute").as_deref(), Some(stored.as_str()));
+    let parent = directory.to_string_lossy().into_owned();
+    assert_eq!(global_string(exec.scope(), "head").as_deref(), Some(parent.as_str()));
+    assert_eq!(global_string(exec.scope(), "tail").as_deref(), Some("XTD_break_cmd.c"));
+
+    // An unnamed buffer has an empty base: both the exact token and the
+    // modifier chain yield "". `<afile>` outside an autocommand is the
+    // non-path token with the same empty-base rule.
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&mut editor, "let g:blank = expand('%')").unwrap();
+    exec.execute_line(&mut editor, "let g:blank_p = expand('%:p')").unwrap();
+    exec.execute_line(&mut editor, "let g:afile = expand('<afile>')").unwrap();
+    exec.execute_line(&mut editor, "let g:afile_h = expand('<afile>:h')").unwrap();
+
+    assert_eq!(global_string(exec.scope(), "blank").as_deref(), Some(""));
+    assert_eq!(global_string(exec.scope(), "blank_p").as_deref(), Some(""));
+    assert_eq!(global_string(exec.scope(), "afile").as_deref(), Some(""));
+    assert_eq!(global_string(exec.scope(), "afile_h").as_deref(), Some(""));
+}
+
+/// While a FileReadPre action runs, `<amatch>`, `<afile>`, `<afile>:h`, and
+/// `<abuf>` resolve from the active autocmd context installed for that action.
+#[test]
+fn expand_builtin_resolves_autocmd_special_tokens_during_event() {
+    let mut editor = editor_with_lines(&["initial"]);
+    let buffer = editor.current_buffer().unwrap();
+    let io = MemoryFileIO::new();
+    io.insert("dir/target.txt", "content\n");
+    let mut exec = ExExecutor::with_io(io);
+
+    for (pattern, body) in [
+        ("*.txt", "let g:m = expand('<amatch>')"),
+        ("*.txt", "let g:f = expand('<afile>')"),
+        ("*.txt", "let g:fh = expand('<afile>:h')"),
+        ("*.txt", "let g:b = expand('<abuf>')"),
+    ] {
+        editor
+            .autocmds_mut()
+            .register(
+                Event::FileReadPre,
+                pattern,
+                AutocmdKind::ExString(body.to_owned()),
+                AutocmdOptions::default(),
+            )
+            .unwrap();
+    }
+    exec.execute_line(&mut editor, "1read dir/target.txt").unwrap();
+
+    let expected_match = std::env::current_dir()
+        .unwrap()
+        .join("dir/target.txt")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(global_string(exec.scope(), "m").as_deref(), Some(expected_match.as_str()));
+    assert_eq!(global_string(exec.scope(), "f").as_deref(), Some("dir/target.txt"));
+    assert_eq!(global_string(exec.scope(), "fh").as_deref(), Some("dir"));
+    let expected_buf = i64::from(buffer).to_string();
+    assert_eq!(global_string(exec.scope(), "b").as_deref(), Some(expected_buf.as_str()));
+}
+
+/// Nested FileReadPre actions replace then restore the outer active context,
+/// and outside any event the autocmd tokens stay empty.
+#[test]
+fn expand_builtin_restores_autocmd_context_after_nested_event() {
+    let mut editor = editor_with_lines(&["initial"]);
+    let io = MemoryFileIO::new();
+    io.insert("outer.txt", "outer\n");
+    io.insert("nested.txt", "nested\n");
+    let mut exec = ExExecutor::with_io(io);
+
+    for (pattern, body) in [
+        ("nested.txt", "let g:inner_file = expand('<afile>')"),
+        ("outer.txt", "let g:outer_pre = expand('<afile>')"),
+        ("outer.txt", "1read nested.txt"),
+        ("outer.txt", "let g:outer_post = expand('<afile>')"),
+    ] {
+        editor
+            .autocmds_mut()
+            .register(
+                Event::FileReadPre,
+                pattern,
+                AutocmdKind::ExString(body.to_owned()),
+                AutocmdOptions::default(),
+            )
+            .unwrap();
+    }
+    exec.execute_line(&mut editor, "1read outer.txt").unwrap();
+
+    assert_eq!(global_string(exec.scope(), "outer_pre").as_deref(), Some("outer.txt"));
+    assert_eq!(global_string(exec.scope(), "inner_file").as_deref(), Some("nested.txt"));
+    assert_eq!(global_string(exec.scope(), "outer_post").as_deref(), Some("outer.txt"));
+
+    exec.execute_line(&mut editor, "let g:outside = expand('<afile>')").unwrap();
+    assert_eq!(global_string(exec.scope(), "outside").as_deref(), Some(""));
+}
+
+/// `expand()` resolves `~` and `$NAME` the way `ExpandOne` does, through
+/// `expand_env_esc` (`os/env.c`).
+///
+/// Returning the pattern verbatim is not a smaller answer: `setup.vim`:115
+/// builds its sandbox with `expand(getcwd() . '/XfakeHOME')`, and a caller that
+/// hands an unexpanded `~` to a shell lets the *shell* expand it against its
+/// own environment instead. HOME is a throwaway path here and nothing is
+/// written to it.
+#[test]
+fn expand_builtin_resolves_home_and_environment_variables() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    let mut exec = ExExecutor::new();
+    let sandbox = std::env::temp_dir().join(format!("ox-editor-expand-{}", std::process::id()));
+    let sandbox = sandbox.to_string_lossy().into_owned();
+    let restore = std::env::var_os("HOME");
+    ox_sys::set_env("HOME", &sandbox);
+    ox_sys::set_env("OXVIM_TEST_EXPAND_DIR", "/sentinel");
+
+    exec.execute_script(
+        &mut editor,
+        "<expand>",
+        "let g:tilde = expand('~')\n\
+         let g:tilde_path = expand('~/XfakeHOME')\n\
+         let g:dollar = expand('$OXVIM_TEST_EXPAND_DIR/x')\n\
+         let g:braced = expand('${OXVIM_TEST_EXPAND_DIR}/y')\n\
+         let g:unset = expand('$OXVIM_TEST_EXPAND_MISSING/z')\n\
+         let g:interior = expand('/keep/~/as-is')",
+    )
+    .unwrap();
+
+    let values: Vec<Option<String>> = ["tilde", "tilde_path", "dollar", "braced", "unset", "interior"]
+        .iter()
+        .map(|name| global_string(exec.scope(), name))
+        .collect();
+    assert!(match restore {
+        Some(home) => ox_sys::set_env("HOME", home),
+        None => ox_sys::unset_env("HOME"),
+    });
+    ox_sys::unset_env("OXVIM_TEST_EXPAND_DIR");
+
+    assert_eq!(values[0].as_deref(), Some(sandbox.as_str()));
+    assert_eq!(values[1].as_deref(), Some(format!("{sandbox}/XfakeHOME").as_str()));
+    assert_eq!(values[2].as_deref(), Some("/sentinel/x"));
+    assert_eq!(values[3].as_deref(), Some("/sentinel/y"));
+    // An unset variable stays literal, as `vim_getenv` returning NULL leaves it.
+    assert_eq!(values[4].as_deref(), Some("$OXVIM_TEST_EXPAND_MISSING/z"));
+    // Only a leading `~` is a home reference.
+    assert_eq!(values[5].as_deref(), Some("/keep/~/as-is"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1528,4 +2078,188 @@ fn function_builtin_reports_name_and_binding_errors() {
         let error = exec.execute_line(&mut editor, line).unwrap_err();
         assert_eq!(error_code(&error), code, "{line}");
     }
+}
+
+// eval/userfunc.c handle_defer_one 3487-3524, called from call_user_func's
+// cleanup (1272) — `writefile(..., 'D')` deletes its file when the enclosing
+// function returns, whatever the outcome was, and the nesting is per frame.
+//
+// Four cases, each isolating one part of the contract so no part can be
+// dropped: the file must exist *inside* the frame (so a defer that deletes
+// immediately fails), be gone *after* it (so a defer that never runs fails), an
+// inner frame's defer must not take the outer frame's file with it (so a single
+// shared list fails), and a frame that aborts must still delete (so running the
+// deletes only on the success path fails).
+#[test]
+fn writefile_defer_flag_deletes_per_frame_on_return_and_on_abort() {
+    let root = std::env::temp_dir().join(format!("ox-editor-defer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let base = root.display().to_string();
+
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &mut editor,
+        "defer.vim",
+        &format!(
+            "func Inner()\n\
+             call writefile(['i'], '{base}/inner', 'D')\n\
+             let g:inner_inside = filereadable('{base}/inner')\n\
+             endfunc\n\
+             func Outer()\n\
+             call writefile(['o'], '{base}/outer', 'D')\n\
+             call Inner()\n\
+             let g:inner_after = filereadable('{base}/inner')\n\
+             let g:outer_inside = filereadable('{base}/outer')\n\
+             endfunc\n\
+             call Outer()\n\
+             let g:outer_after = filereadable('{base}/outer')\n\
+             func Aborts()\n\
+             call writefile(['a'], '{base}/aborted', 'D')\n\
+             throw 'boom'\n\
+             endfunc\n\
+             try\n\
+             call Aborts()\n\
+             catch\n\
+             let g:caught = v:exception\n\
+             endtry\n\
+             let g:aborted_after = filereadable('{base}/aborted')"
+        ),
+    )
+    .unwrap();
+
+    let flag = |name: &[u8]| exec.scope().get_scoped(ScopeKind::Global, name, 0).cloned();
+    assert_eq!(flag(b"inner_inside"), Ok(Typval::Number(1)), "file missing inside its own frame");
+    assert_eq!(flag(b"inner_after"), Ok(Typval::Number(0)), "inner frame's defer did not run");
+    assert_eq!(flag(b"outer_inside"), Ok(Typval::Number(1)), "inner frame took the outer frame's file");
+    assert_eq!(flag(b"outer_after"), Ok(Typval::Number(0)), "outer frame's defer did not run");
+    assert!(matches!(&flag(b"caught"), Ok(Typval::String(text)) if text.to_string_lossy().contains("boom")));
+    assert_eq!(flag(b"aborted_after"), Ok(Typval::Number(0)), "an aborted frame's defer did not run");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// eval/funcs.c f_system through os_system, os/shell.c shell_build_argv 60-97 —
+// a String command runs through 'shell' + 'shellcmdflag', the second argument
+// is the child's standard input and its pipe is closed, and a shell that
+// cannot be spawned is reported through v:shell_error rather than raised.
+//
+// The E677 this replaces was fatal: `test_cmdline.vim` poisons $PATH and never
+// restores it, so `system()` in runtest.vim's cleanup aborted FinishTesting()
+// before it wrote `messages`, losing a 45-test record.
+//
+// One case per part: the input argument (a `cat` that echoes it back proves
+// both that the input arrives and that its pipe is closed, since `cat` would
+// otherwise never exit), 'shellcmdflag' (a flag the option names and nothing
+// else supplies), and an unreachable 'shell' (which must not raise and must
+// report -1).
+#[test]
+fn system_uses_the_shell_options_feeds_input_and_never_raises_on_a_bad_shell() {
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &mut editor,
+        "system.vim",
+        "set shell=/bin/sh shellcmdflag=-c\n\
+         let g:echoed = system('echo ok')\n\
+         let g:fed = system('cat', '123')\n\
+         let g:listed = systemlist('cat', '123')\n\
+         set shellcmdflag=-cx\n\
+         let g:traced = system('true')\n\
+         let g:traced_error = v:shell_error\n\
+         set shellcmdflag=-c\n\
+         set shell=/nonexistent/ox-no-shell\n\
+         let g:missing = system('echo unreachable')\n\
+         let g:missing_error = v:shell_error",
+    )
+    .unwrap();
+
+    let global = |name: &[u8]| exec.scope().get_scoped(ScopeKind::Global, name, 0).cloned();
+    assert_eq!(global(b"echoed"), Ok(Typval::String(OxStr::from("ok\n"))));
+    // The input argument reaches the child and its pipe is closed afterwards.
+    assert_eq!(global(b"fed"), Ok(Typval::String(OxStr::from("123"))));
+    assert_eq!(global(b"listed"), Ok(Typval::list(vec![Typval::String(OxStr::from("123"))])));
+    // `-cx` traces to standard error, which `os_system` merges into the output,
+    // so only a 'shellcmdflag' that is actually read produces this.
+    assert!(
+        matches!(&global(b"traced"), Ok(Typval::String(text)) if text.to_string_lossy().contains("true")),
+        "shellcmdflag was not used: {:?}",
+        global(b"traced")
+    );
+    assert_eq!(global(b"traced_error"), Ok(Typval::Number(0)));
+    // An unreachable 'shell' is `v:shell_error` == -1 and no exception.
+    assert_eq!(global(b"missing"), Ok(Typval::String(OxStr::from(""))));
+    assert_eq!(global(b"missing_error"), Ok(Typval::Number(-1)));
+}
+
+// ---------------------------------------------------------------------------
+// Family: dynamic script context (script.c current_sctx, usercmd.c do_ucmd,
+// eval/userfunc.c call_user_func) — Task 4B
+// ---------------------------------------------------------------------------
+
+#[test]
+fn user_command_uses_defining_script_context() {
+    let io = MemoryFileIO::new();
+    io.insert("/def.vim", "function! s:Hit()\n  let g:hit = 1\nendfunction\ncommand Hit call s:Hit()");
+    io.insert("/invoke.vim", "function! s:Hit()\n  let g:hit = 2\nendfunction\nHit");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.source_file(&mut editor, "/def.vim".as_ref()).unwrap();
+    exec.source_file(&mut editor, "/invoke.vim".as_ref()).unwrap();
+    assert_eq!(global_number(exec.scope(), "hit"), Some(1));
+}
+
+#[test]
+fn keepscript_retains_invocation_script_context() {
+    let io = MemoryFileIO::new();
+    io.insert("/def.vim", "function! s:Hit()\n  let g:hit = 1\nendfunction\ncommand -keepscript Hit call s:Hit()");
+    io.insert("/invoke.vim", "function! s:Hit()\n  let g:hit = 2\nendfunction\nHit");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.source_file(&mut editor, "/def.vim".as_ref()).unwrap();
+    exec.source_file(&mut editor, "/invoke.vim".as_ref()).unwrap();
+    assert_eq!(global_number(exec.scope(), "hit"), Some(2));
+}
+
+#[test]
+fn user_command_body_error_restores_caller_script_context() {
+    let io = MemoryFileIO::new();
+    io.insert("/def.vim", "function! s:Boom()\n  throw 'boom'\nendfunction\ncommand Boom call s:Boom()");
+    io.insert("/invoke.vim", "function! s:Mark()\n  let g:mark = 1\nendfunction\nBoom\nlet g:after = 1");
+    io.insert("/later.vim", "function! s:Later()\n  let g:later = 1\nendfunction\ncall s:Later()");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.source_file(&mut editor, "/def.vim".as_ref()).unwrap();
+    let err = exec.source_file(&mut editor, "/invoke.vim".as_ref()).unwrap_err();
+    assert_eq!(error_code(&err), "Throw");
+    assert_eq!(global_number(exec.scope(), "after"), None);
+    exec.source_file(&mut editor, "/later.vim".as_ref()).unwrap();
+    assert_eq!(global_number(exec.scope(), "later"), Some(1));
+}
+#[test]
+fn nested_user_command_invocation_restores_script_context() {
+    let io = MemoryFileIO::new();
+    io.insert("/a.vim", "function! s:A()\n  let g:a = 1\nendfunction\ncommand A call s:A()");
+    io.insert("/b.vim", "command B A");
+    io.insert("/c.vim", "function! s:After()\n  let g:after = 1\nendfunction\nB\ncall s:After()");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.source_file(&mut editor, "/a.vim".as_ref()).unwrap();
+    exec.source_file(&mut editor, "/b.vim".as_ref()).unwrap();
+    exec.source_file(&mut editor, "/c.vim".as_ref()).unwrap();
+    assert_eq!(global_number(exec.scope(), "a"), Some(1));
+    assert_eq!(global_number(exec.scope(), "after"), Some(1));
+}
+
+#[test]
+fn function_call_uses_defining_script_context() {
+    let io = MemoryFileIO::new();
+    io.insert("/def.vim", "function! s:Hit()\n  let g:hit = 1\nendfunction\nfunction! GlobalHit()\n  call s:Hit()\nendfunction");
+    io.insert("/invoke.vim", "function! s:Hit()\n  let g:hit = 2\nendfunction\ncall GlobalHit()");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.source_file(&mut editor, "/def.vim".as_ref()).unwrap();
+    exec.source_file(&mut editor, "/invoke.vim".as_ref()).unwrap();
+    assert_eq!(global_number(exec.scope(), "hit"), Some(1));
 }

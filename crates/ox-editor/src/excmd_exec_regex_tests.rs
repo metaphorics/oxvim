@@ -274,6 +274,58 @@ fn substitute_c_flag_errors_without_interactive_ui() {
     assert_eq!(text.to_bytes(), b"foo");
 }
 
+#[test]
+fn substitute_multiline_newline_pattern_adjusts_extmark_and_undo() {
+    // Functional counterpart: `extmark_spec.lua` "bug from check_col in extmark_set".
+    // `:1,5s:5\n:5 ` splices `5\n` to `5 `; the mark on the second `5` moves
+    // with the byte-precise endpoint, and undo restores it.
+    use crate::extmark::{ExtmarkPlacement, ExtmarkPosition};
+
+    let (mut editor, buffer, _window, mut executor) =
+        setup("12345\n67890\nxx\n12345\n67890\nxx");
+    let (namespace, id) = {
+        let state = editor.buffer_mut(buffer).unwrap();
+        let namespace = state.extmarks.create_namespace("check_col").unwrap();
+        let id = state
+            .extmarks
+            .set(
+                namespace,
+                None,
+                ExtmarkPlacement::new(ExtmarkPosition::new(3, 4)),
+            )
+            .unwrap();
+        (namespace, id)
+    };
+    executor.execute_line(&mut editor, "1,5s:5\\n:5 ").unwrap();
+    {
+        let state = editor.buffer(buffer).unwrap();
+        assert_eq!(
+            state.text().unwrap().to_bytes(),
+            b"12345 67890\nxx\n12345 67890\nxx"
+        );
+        assert_eq!(
+            state.extmarks.get(namespace, id).unwrap().unwrap().position(),
+            ExtmarkPosition::new(2, 6)
+        );
+    }
+    editor.buffer_mut(buffer).unwrap().undo().unwrap();
+    {
+        let restored = editor.buffer(buffer).unwrap();
+        assert_eq!(
+            restored.extmarks.get(namespace, id).unwrap().unwrap().position(),
+            ExtmarkPosition::new(3, 4)
+        );
+    }
+    editor.buffer_mut(buffer).unwrap().redo().unwrap();
+    {
+        let redone = editor.buffer(buffer).unwrap();
+        assert_eq!(
+            redone.extmarks.get(namespace, id).unwrap().unwrap().position(),
+            ExtmarkPosition::new(2, 6)
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // :delete, :yank and :put with registers
 // ---------------------------------------------------------------------------

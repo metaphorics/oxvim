@@ -4,18 +4,21 @@
 pub mod builtins;
 pub mod error;
 pub mod eval;
+mod find_file;
+mod fuzzy;
 pub mod lexer;
 pub mod parser;
 mod path_builtins;
 pub mod scope;
 
 pub use builtins::{
-    builtin_spec, call_buffer_builtin, exists, is_buffer_builtin, is_locked_value, lock_value, BuiltinSpec,
-    Builtins, BUILTINS,
+    builtin_spec, call_buffer_builtin, exists, float_as_string, is_buffer_builtin,
+    is_builtin_implemented, is_locked_value, lock_value, BuiltinSpec, Builtins, BUILTINS,
 };
 pub use error::{EvalError, EvalErrorKind, Result};
 pub use eval::{BuiltinHost, BufferHost, Evaluator, NoBuiltins, NoRegex, RegexEngine, RegexMatch};
 pub use parser::{Expr, Parser};
+pub use path_builtins::apply_filename_modifiers;
 pub use scope::{Scope, ScopeKind};
 
 #[cfg(test)]

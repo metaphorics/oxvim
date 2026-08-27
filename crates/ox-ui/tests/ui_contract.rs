@@ -3,7 +3,10 @@
 
 use std::collections::BTreeMap;
 
+use ox_editor::extmark::ExtmarkHighlightMode;
+use ox_editor::{Editor, ExtmarkPlacement, ExtmarkPosition, Geometry};
 use ox_rpc::decode;
+use ox_text::Buffer;
 use ox_types::{Dict, Object, OxStr};
 use ox_ui::{
     premix_color, Cell, ChromeState, Compositor, ContentChunk, Emitter, Grid, Highlight, HlAttrs,
@@ -146,6 +149,134 @@ fn winblend_premixes_rgb_with_integer_rounding() {
     let mixed = highlights.get(mixed_id).unwrap();
     assert_eq!(mixed.rgb.foreground, Some(0x800080));
     assert_eq!(mixed.rgb.background, Some(0x008000));
+}
+
+
+#[test]
+fn rendering_does_not_define_undefined_named_groups() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_lines(&[b"hello".to_vec()], true).unwrap(), true)
+        .unwrap();
+    editor.create_tabpage(buffer, Geometry::new(0, 0, 10, 4).unwrap()).unwrap();
+    let namespace = editor.buffer_mut(buffer).unwrap().extmarks.create_namespace("test").unwrap();
+    let mut placement = ExtmarkPlacement::new(ExtmarkPosition::new(0, 0))
+        .with_end(ExtmarkPosition::new(0, 5));
+    placement.attributes.highlight_group = Some("Comment".to_string());
+    placement.attributes.highlight_mode = Some(ExtmarkHighlightMode::Combine);
+    editor.buffer_mut(buffer).unwrap().extmarks.set(namespace, None, placement).unwrap();
+
+    let mut highlights = HlState::new();
+    let compositor = Compositor::from_editor(&editor, 10, 4, &mut highlights).unwrap();
+    let screen = compositor.compose(&mut highlights).unwrap();
+    assert!(highlights.group_id(&OxStr::from("Comment")).is_none());
+    assert_eq!(screen.grid.cell(0, 0).unwrap().hl_id, 0);
+}
+
+#[test]
+fn higher_priority_extmark_highlight_wins() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_lines(&[b"12345".to_vec()], true).unwrap(), true)
+        .unwrap();
+    editor.create_tabpage(buffer, Geometry::new(0, 0, 15, 10).unwrap()).unwrap();
+    let namespace = editor.buffer_mut(buffer).unwrap().extmarks.create_namespace("test").unwrap();
+    let mut first = ExtmarkPlacement::new(ExtmarkPosition::new(0, 0))
+        .with_end(ExtmarkPosition::new(0, 2));
+    first.attributes.highlight_group = Some("Comment".to_string());
+    first.attributes.priority = 20;
+    let mut second = ExtmarkPlacement::new(ExtmarkPosition::new(0, 0))
+        .with_end(ExtmarkPosition::new(0, 2));
+    second.attributes.highlight_group = Some("String".to_string());
+    second.attributes.priority = 10;
+    {
+        let extmarks = &mut editor.buffer_mut(buffer).unwrap().extmarks;
+        extmarks.set(namespace, None, first).unwrap();
+        extmarks.set(namespace, None, second).unwrap();
+    }
+    let mut highlights = HlState::with_default_syntax_groups();
+    let compositor = Compositor::from_editor(&editor, 15, 10, &mut highlights).unwrap();
+    let screen = compositor.compose(&mut highlights).unwrap();
+    let comment = highlights.group_id(&OxStr::from("Comment")).unwrap();
+    let string = highlights.group_id(&OxStr::from("String")).unwrap();
+    assert_eq!(screen.grid.cell(0, 0).unwrap().hl_id, comment);
+    assert_eq!(screen.grid.cell(0, 1).unwrap().hl_id, comment);
+    assert_ne!(screen.grid.cell(0, 0).unwrap().hl_id, string);
+}
+
+#[test]
+fn blend_mode_mixes_rgb_and_differs_from_combine() {
+    let base = Highlight {
+        rgb: HlAttrs {
+            foreground: Some(0x0000ff),
+            background: Some(0x000000),
+            ..HlAttrs::default()
+        },
+        ..Highlight::default()
+    };
+    let veil = Highlight {
+        rgb: HlAttrs {
+            foreground: Some(0xff0000),
+            background: Some(0x00ff00),
+            blend: Some(50),
+            ..HlAttrs::default()
+        },
+        ..Highlight::default()
+    };
+    for (expected_fg, expected_bg, expected_blend, mode) in [
+        (Some(0xff0000), Some(0x00ff00), Some(50), ExtmarkHighlightMode::Combine),
+        (Some(0x800080), Some(0x008000), None, ExtmarkHighlightMode::Blend),
+    ] {
+        let mut editor = Editor::new();
+        let buffer = editor
+            .create_buffer_with(Buffer::from_lines(&[b"hello".to_vec()], true).unwrap(), true)
+            .unwrap();
+        editor.create_tabpage(buffer, Geometry::new(0, 0, 10, 4).unwrap()).unwrap();
+        let namespace = editor.buffer_mut(buffer).unwrap().extmarks.create_namespace("test").unwrap();
+        let mut under = ExtmarkPlacement::new(ExtmarkPosition::new(0, 0))
+            .with_end(ExtmarkPosition::new(0, 5));
+        under.attributes.highlight_group = Some("Base".to_string());
+        let mut over = ExtmarkPlacement::new(ExtmarkPosition::new(0, 0))
+            .with_end(ExtmarkPosition::new(0, 5));
+        over.attributes.highlight_group = Some("Veil".to_string());
+        over.attributes.priority = 10;
+        over.attributes.highlight_mode = Some(mode);
+        {
+            let extmarks = &mut editor.buffer_mut(buffer).unwrap().extmarks;
+            extmarks.set(namespace, None, under).unwrap();
+            extmarks.set(namespace, None, over).unwrap();
+        }
+        let mut highlights = HlState::new();
+        highlights.define_group("Base", base.clone()).unwrap();
+        highlights.define_group("Veil", veil.clone()).unwrap();
+        let compositor = Compositor::from_editor(&editor, 10, 4, &mut highlights).unwrap();
+        let screen = compositor.compose(&mut highlights).unwrap();
+        let rendered = highlights.get(screen.grid.cell(0, 0).unwrap().hl_id).unwrap();
+        assert_eq!(rendered.rgb.foreground, expected_fg, "foreground for {mode:?}");
+        assert_eq!(rendered.rgb.background, expected_bg, "background for {mode:?}");
+        assert_eq!(rendered.rgb.blend, expected_blend, "blend for {mode:?}");
+    }
+}
+
+#[test]
+fn combine_preserves_base_default_flag() {
+    let mut highlights = HlState::new();
+    let base = Highlight {
+        rgb: HlAttrs { bold: true, ..HlAttrs::default() },
+        default_flag: true,
+        ..Highlight::default()
+    };
+    let overlay = Highlight {
+        rgb: HlAttrs { italic: true, ..HlAttrs::default() },
+        ..Highlight::default()
+    };
+    let (base_id, _) = highlights.intern(base).unwrap();
+    let (overlay_id, _) = highlights.intern(overlay).unwrap();
+    let (combined_id, _) = highlights.combine(base_id, overlay_id).unwrap();
+    let combined = highlights.get(combined_id).unwrap();
+    assert!(combined.default_flag, "base default flag was overwritten with false");
+    assert!(combined.rgb.bold);
+    assert!(combined.rgb.italic);
 }
 
 #[test]

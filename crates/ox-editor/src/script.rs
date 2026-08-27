@@ -20,6 +20,21 @@ use ox_excmd::Parser as ExParser;
 /// Stable identifier assigned to one sourcing event.
 pub type Sid = u64;
 
+/// Upstream's `sctx_T`: the script context in force when something was
+/// defined. A definition records it so later queries — `maparg()`'s `sid` and
+/// `lnum`, the `:function` reload rule — can report where it came from.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SourceContext {
+    /// Defining script id (`sc_sid`), zero at the command line.
+    pub sid: Sid,
+    /// Sourcing sequence in force (`sc_seq`). Only a *different* sequence
+    /// under the same `sid` is a reload.
+    pub seq: u64,
+    /// Physical line within the defining script (`sc_lnum`). Zero for a whole
+    /// script, whose executing line is tracked separately.
+    pub lnum: usize,
+}
+
 /// Maximum length of one logical line after continuation joining.
 const MAX_LOGICAL_LINE: usize = 1_048_576;
 
@@ -71,6 +86,27 @@ pub trait FileIO {
     fn read_bytes(&self, path: &Path) -> io::Result<Vec<u8>> {
         self.read_to_string(path).map(String::into_bytes)
     }
+    /// Reads a range of bytes from a file.  A negative `offset` counts from
+    /// the end, `size == -1` reads through end of file, and any other
+    /// non-positive `size` yields an empty buffer.
+    fn read_bytes_range(&self, path: &Path, offset: i64, size: i64) -> io::Result<Vec<u8>> {
+        let bytes = self.read_bytes(path)?;
+        let len = bytes.len() as i64;
+        let start = if offset >= 0 {
+            (offset as usize).min(bytes.len())
+        } else {
+            ((len + offset).max(0)) as usize
+        };
+        if size <= 0 && size != -1 {
+            return Ok(Vec::new());
+        }
+        let end = if size == -1 {
+            bytes.len()
+        } else {
+            (start + size as usize).min(bytes.len())
+        };
+        Ok(bytes[start..end].to_vec())
+    }
     /// Writes a complete file.
     fn write_string(&self, path: &Path, contents: &str) -> io::Result<()>;
     /// Writes bytes, optionally appending to an existing file.
@@ -112,6 +148,12 @@ pub trait FileIO {
     fn rename(&self, _from: &Path, _to: &Path) -> io::Result<()> {
         Err(unsupported("rename is not supported by this FileIO"))
     }
+    /// Copies one regular file or symbolic link without following the link.
+    /// The destination is created with the source's permission bits.  A
+    /// symlink is recreated at the destination rather than copied through.
+    fn copy_file(&self, _from: &Path, _to: &Path) -> io::Result<()> {
+        Err(unsupported("file copy is not supported by this FileIO"))
+    }
     /// Canonical form used for the source-once registry. Implementations may
     /// fall back to the input path when canonicalization fails.
     fn canonicalize(&self, path: &Path) -> PathBuf;
@@ -133,6 +175,62 @@ impl FileIO for RealFileIO {
 
     fn read_bytes(&self, path: &Path) -> io::Result<Vec<u8>> {
         fs::read(path)
+    }
+    fn read_bytes_range(&self, path: &Path, offset: i64, size: i64) -> io::Result<Vec<u8>> {
+        use std::io::{Read, Seek};
+        #[cfg(unix)]
+        use std::os::unix::fs::FileTypeExt as _;
+        let mut file = fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        let len = metadata.len() as i64;
+
+        #[cfg(unix)]
+        let is_special = metadata.file_type().is_char_device() || metadata.file_type().is_block_device();
+        #[cfg(not(unix))]
+        let is_special = false;
+
+        // Negative offsets count from the end; for regular files clamp to the start.
+        let offset = if offset < 0 && !is_special {
+            offset.max(-len)
+        } else {
+            offset
+        };
+
+        let pos = if offset != 0 {
+            let whence = if offset >= 0 {
+                std::io::SeekFrom::Start(offset as u64)
+            } else {
+                std::io::SeekFrom::End(offset)
+            };
+            match file.seek(whence) {
+                Ok(p) => p as i64,
+                Err(_) => return Ok(Vec::new()),
+            }
+        } else {
+            0
+        };
+
+        let remaining = if is_special {
+            if size == -1 { 0 } else { size }
+        } else {
+            let remaining = (len - pos).max(0);
+            if size == -1 { remaining } else { size.min(remaining) }
+        };
+
+        if remaining <= 0 {
+            return Ok(Vec::new());
+        }
+
+        let count = remaining as usize;
+        if is_special {
+            let mut buf = vec![0; count];
+            file.read_exact(&mut buf)?;
+            Ok(buf)
+        } else {
+            let mut buf = Vec::with_capacity(count);
+            file.take(count as u64).read_to_end(&mut buf)?;
+            Ok(buf)
+        }
     }
 
     fn write_string(&self, path: &Path, contents: &str) -> io::Result<()> {
@@ -195,6 +293,34 @@ impl FileIO for RealFileIO {
     fn remove_dir(&self, path: &Path) -> io::Result<()> { fs::remove_dir(path) }
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> { fs::remove_dir_all(path) }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> { fs::rename(from, to) }
+    fn copy_file(&self, from: &Path, to: &Path) -> io::Result<()> {
+        // Recreate symbolic links rather than copying their target, matching
+        // `vim_copyfile`'s `readlink` + `symlink` path (fileio.c:2774-2788).
+        if let Ok(target) = fs::read_link(from) {
+            #[cfg(unix)]
+            { return std::os::unix::fs::symlink(&target, to); }
+            #[cfg(not(unix))]
+            { let _ = target; }
+        }
+        let mut source = fs::File::open(from)?;
+        let metadata = source.metadata()?;
+        let mut dest = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(to)?;
+        std::io::copy(&mut source, &mut dest)?;
+        drop(dest);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(to, fs::Permissions::from_mode(metadata.permissions().mode()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &metadata;
+        }
+        Ok(())
+    }
 
     fn canonicalize(&self, path: &Path) -> PathBuf {
         fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
@@ -318,10 +444,23 @@ impl std::error::Error for ScriptError {}
 /// One active `:source` frame: the script currently being executed.
 #[derive(Clone, Debug)]
 pub struct SourceFrame {
-    /// SID allocated for this sourcing event.
+    /// SID of the script being sourced. Re-sourcing the same file reuses
+    /// its SID (`runtime.c` `find_script_by_name`), so `s:` variables and
+    /// `<SNR>` names survive.
     pub sid: Sid,
+    /// Sequence number of *this* sourcing event, fresh every time
+    /// (`current_sctx.sc_seq = ++last_current_SID_seq`, `runtime.c:2333`).
+    /// Together with `sid` it is what lets a script redefine its own
+    /// functions and commands on a reload without `!`.
+    pub seq: u64,
     /// Display name used in throwpoints (`/abs/path.vim` or `<cmdline>`).
     pub name: String,
+    /// Line number base (`sc_lnum`) for definitions that run inside this
+    /// frame. A sourced script or user-command alias uses `0`; a function
+    /// call's frame carries the `:function` line, so `maparg()` and reload
+    /// rules see the *defining* script's line (`mapping.c:530-537` adds
+    /// `SOURCING_LNUM` to `sc_lnum`).
+    pub definition_line: usize,
     /// One-based physical line currently executing.
     pub current_line: usize,
 }
@@ -469,11 +608,108 @@ fn expand_home(path: &str) -> String {
     )
 }
 
+/// One `stdpath()` selector, `f_stdpath`'s `what` argument
+/// (`eval/funcs.c:7021-7039`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StdPath {
+    /// `$XDG_CACHE_HOME/nvim`.
+    Cache,
+    /// `$XDG_CONFIG_HOME/nvim`.
+    Config,
+    /// Each `$XDG_CONFIG_DIRS` entry with `/nvim` appended.
+    ConfigDirs,
+    /// `$XDG_DATA_HOME/nvim`.
+    Data,
+    /// Each `$XDG_DATA_DIRS` entry with `/nvim` appended.
+    DataDirs,
+    /// `$XDG_STATE_HOME/nvim/logs`.
+    Log,
+    /// `$XDG_RUNTIME_DIR`, with no application component.
+    Run,
+    /// `$XDG_STATE_HOME/nvim`.
+    State,
+}
+
+impl StdPath {
+    /// Parses the `what` argument, or `None` for a name upstream rejects with
+    /// `E6100` (`eval/funcs.c:7038`).
+    #[must_use]
+    pub fn parse(what: &str) -> Option<Self> {
+        Some(match what {
+            "cache" => Self::Cache,
+            "config" => Self::Config,
+            "config_dirs" => Self::ConfigDirs,
+            "data" => Self::Data,
+            "data_dirs" => Self::DataDirs,
+            "log" => Self::Log,
+            "run" => Self::Run,
+            "state" => Self::State,
+            _ => return None,
+        })
+    }
+
+    /// Whether this selector answers a list rather than a single directory.
+    #[must_use]
+    pub const fn is_list(self) -> bool {
+        matches!(self, Self::ConfigDirs | Self::DataDirs)
+    }
+}
+
+/// Resolves one `stdpath()` selector, `f_stdpath` (`eval/funcs.c:7011-7040`)
+/// through `get_xdg_home` and `stdpaths_get_xdg_var` (`os/stdpaths.c:151-225`).
+///
+/// `get_xdg_home` appends `$NVIM_APPNAME`, defaulting to `nvim`
+/// (`os/stdpaths.c:70-87,222`), to every selector but `run`, which is the raw
+/// `$XDG_RUNTIME_DIR`, and `log`, which is the state home plus `logs`
+/// (`eval/funcs.c:7030-7032`). A list selector answers one entry per
+/// directory. This is the same resolver `'runtimepath'` is built from, so a
+/// plugin's `stdpath('config')` and the rtp entry it expects to find itself on
+/// cannot disagree.
+#[must_use]
+pub fn stdpath(what: StdPath) -> Vec<String> {
+    const APPNAME: &str = "nvim";
+    fn under(base: Option<String>, suffix: &str) -> Vec<String> {
+        base.into_iter()
+            .map(|dir| format!("{}/{suffix}", dir.trim_end_matches('/')))
+            .collect()
+    }
+    match what {
+        StdPath::Cache => under(xdg_home_dir("XDG_CACHE_HOME", "~/.cache"), APPNAME),
+        StdPath::Config => under(xdg_home_dir("XDG_CONFIG_HOME", "~/.config"), APPNAME),
+        StdPath::Data => under(xdg_home_dir("XDG_DATA_HOME", "~/.local/share"), APPNAME),
+        StdPath::State => under(xdg_home_dir("XDG_STATE_HOME", "~/.local/state"), APPNAME),
+        StdPath::Log => under(
+            xdg_home_dir("XDG_STATE_HOME", "~/.local/state"),
+            &format!("{APPNAME}/logs"),
+        ),
+        // `stdpaths_get_xdg_var` has no fallback for the runtime dir and no
+        // `get_xdg_home` wrapper, so this is the variable verbatim
+        // (`os/stdpaths.c:59,182-190`; `eval/funcs.c:7032`). Unset falls back
+        // to the temporary directory upstream decides at startup.
+        StdPath::Run => vec![
+            xdg_home_dir("XDG_RUNTIME_DIR", "")
+                .filter(|dir| !dir.is_empty())
+                .unwrap_or_else(|| {
+                    std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_owned()
+                }),
+        ],
+        StdPath::ConfigDirs => xdg_dir_list("XDG_CONFIG_DIRS", "/etc/xdg")
+            .into_iter()
+            .map(|dir| format!("{}/{APPNAME}", dir.trim_end_matches('/')))
+            .collect(),
+        StdPath::DataDirs => xdg_dir_list("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
+            .into_iter()
+            .map(|dir| format!("{}/{APPNAME}", dir.trim_end_matches('/')))
+            .collect(),
+    }
+}
+
 /// Sourcing state owned by the Ex executor.
 #[derive(Debug)]
 pub struct ScriptCtx<F: FileIO = RealFileIO> {
     io: F,
     next_sid: Sid,
+    next_seq: u64,
     scripts: BTreeMap<Sid, ScriptInfo>,
     source_stack: Vec<SourceFrame>,
     sourced_once: BTreeSet<PathBuf>,
@@ -487,6 +723,7 @@ impl<F: FileIO> ScriptCtx<F> {
         Self {
             io,
             next_sid: 1,
+            next_seq: 0,
             scripts: BTreeMap::new(),
             source_stack: Vec::new(),
             sourced_once: BTreeSet::new(),
@@ -521,8 +758,7 @@ impl<F: FileIO> ScriptCtx<F> {
             .collect();
     }
 
-    /// Allocates a fresh SID for one sourcing event. SIDs are monotone and
-    /// never reused, so `<SNR>` references remain stable for the session.
+    /// Allocates a fresh SID for one sourcing event.
     pub fn allocate_sid(&mut self, name: &str) -> Sid {
         let sid = self.next_sid;
         self.next_sid = self.next_sid.saturating_add(1);
@@ -536,15 +772,63 @@ impl<F: FileIO> ScriptCtx<F> {
         sid
     }
 
-    /// Pushes a source frame, returning the allocated SID.
+    /// Pushes a source frame, returning the SID whose `s:` scope the frame
+    /// runs in.
+    ///
+    /// `do_source` looks the file up with `find_script_by_name` and reuses
+    /// the SID it already has (`runtime.c:2226,2335`), so a script sourced
+    /// twice keeps its `s:` variables and its `<SNR>` number; only the
+    /// sequence number is new. That is what makes a guard like setup.vim's
+    /// `if exists('s:did_load') | finish | endif` work on the second
+    /// sourcing. Named contexts that are not files — `<command line>` and
+    /// friends — are not looked up, matching `do_source_str`, which never
+    /// consults the registry.
     pub fn push_source(&mut self, name: String) -> Sid {
-        let sid = self.allocate_sid(&name);
+        let sid = self
+            .reusable_sid(&name)
+            .unwrap_or_else(|| self.allocate_sid(&name));
+        self.next_seq = self.next_seq.saturating_add(1);
         self.source_stack.push(SourceFrame {
             sid,
+            seq: self.next_seq,
             name,
+            definition_line: 0,
             current_line: 0,
         });
         sid
+    }
+
+    /// Pushes a frame that reuses an existing SID without allocating a
+    /// new one and without bumping the sequence counter.
+    ///
+    /// This is the dynamic half of a user-command invocation
+    /// (`usercmd.c:1756-1769`) or a function call
+    /// (`eval/userfunc.c:1250-1251`): the body runs in its *defining*
+    /// script's context, so `current_sid()`, `<SNR>` canonicalization, and
+    /// `current_context()` all observe that script while it executes. A
+    /// user command passes the caller's `seq` to keep `sc_seq` unchanged,
+    /// while a function call passes the function's own `seq`.
+    pub fn push_alias_source(&mut self, sid: Sid, seq: u64, lnum: usize, name: String) {
+        self.source_stack.push(SourceFrame {
+            sid,
+            seq,
+            name,
+            definition_line: lnum,
+            current_line: 0,
+        });
+    }
+
+    /// The SID a previous sourcing of `name` already owns, when `name` is a
+    /// file rather than an anonymous context.
+    fn reusable_sid(&self, name: &str) -> Option<Sid> {
+        if name.starts_with('<') {
+            return None;
+        }
+        self.scripts
+            .iter()
+            .rev()
+            .find(|(_, info)| info.name == name)
+            .map(|(sid, _)| *sid)
     }
 
     /// Pops the current source frame, returning the SID of the caller when
@@ -558,6 +842,31 @@ impl<F: FileIO> ScriptCtx<F> {
     #[must_use]
     pub fn current_sid(&self) -> Option<Sid> {
         self.source_stack.last().map(|frame| frame.sid)
+    }
+
+    /// The sequence number of the sourcing event currently running, or `0`
+    /// outside any script (upstream's `current_sctx.sc_seq`, which starts at
+    /// zero and is only ever bumped by `do_source`).
+    #[must_use]
+    pub fn current_seq(&self) -> u64 {
+        self.source_stack.last().map_or(0, |frame| frame.seq)
+    }
+
+    /// The dynamic script context in force, upstream's `current_sctx`:
+    /// the innermost sourcing, function-call, or user-command frame, with
+    /// the executing line folded into `lnum` (`sc_lnum + SOURCING_LNUM`).
+    /// Definitions record this so `maparg()`'s `sid`/`lnum` and the reload
+    /// rules see the *defining* script even when it differs from the
+    /// script being sourced.
+    #[must_use]
+    pub fn current_context(&self) -> SourceContext {
+        self.source_stack.last().map_or_else(SourceContext::default, |frame| {
+            SourceContext {
+                sid: frame.sid,
+                seq: frame.seq,
+                lnum: frame.definition_line.saturating_add(frame.current_line),
+            }
+        })
     }
 
     /// The display name of the current script or line context.
@@ -691,6 +1000,11 @@ impl<F: FileIO> ScriptCtx<F> {
     /// * A `#!` interpreter line at the very start of a script is ignored.
     /// * A control character in the text terminates the script, mirroring
     ///   upstream treating NUL as end-of-file.
+    /// * A trailing CR stays in the line. `get_one_sourceline`
+    ///   (`runtime.c:2891-2905`) removes it only when the source file is
+    ///   `EOL_DOS`, and that whole branch sits under `#ifdef USE_CRNL`, which
+    ///   is a Windows-only define — so on this platform a sourced
+    ///   `let g:v = 4<CR>` keeps its CR and reaches `eval0` as E488.
     pub fn join_logical_lines(&self, text: &str) -> Result<Vec<LogicalLine>, ScriptError> {
         let physical = text.split('\n').collect::<Vec<_>>();
         let mut logical: Vec<LogicalLine> = Vec::new();
@@ -698,8 +1012,7 @@ impl<F: FileIO> ScriptCtx<F> {
         let mut index = 0;
         while index < physical.len() {
             let number = index.saturating_add(1);
-            let raw = physical[index];
-            let content = raw.strip_suffix('\r').unwrap_or(raw);
+            let content = physical[index];
             if first_line_of_script && content.starts_with("#!") {
                 first_line_of_script = false;
                 index += 1;
@@ -713,17 +1026,16 @@ impl<F: FileIO> ScriptCtx<F> {
                 line: Some(number),
             })?;
             if let Some(spec) = spec {
-                let mut joined = content.trim_end().to_owned();
+                let mut joined = content.trim_end_matches([' ', '\t']).to_owned();
                 joined.push('\n');
                 let mut text_indent: Option<&str> = None;
                 let mut found_marker = false;
                 index += 1;
                 while index < physical.len() {
-                    let body_raw = physical[index];
-                    if body_raw.is_empty() && index + 1 == physical.len() && text.ends_with('\n') {
+                    let body = physical[index];
+                    if body.is_empty() && index + 1 == physical.len() && text.ends_with('\n') {
                         break;
                     }
-                    let body = body_raw.strip_suffix('\r').unwrap_or(body_raw);
                     let marker_line = if spec.trim {
                         body.strip_prefix(spec.command_indent).unwrap_or(body)
                     } else {
@@ -801,7 +1113,7 @@ impl<F: FileIO> ScriptCtx<F> {
                 continue;
             }
             logical.push(LogicalLine {
-                text: content.trim_end().to_owned(),
+                text: content.trim_end_matches([' ', '\t']).to_owned(),
                 first_line: number,
             });
             index += 1;

@@ -88,6 +88,104 @@ impl Keys {
         }
         Ok(result)
     }
+
+    /// Decodes `<...>` key notation into key bytes (`replace_termcodes`,
+    /// `keycodes.c:830-1000`), the translation every `:map` left- and
+    /// right-hand side goes through before it is stored.
+    ///
+    /// Without it a mapping is only usable when both sides are literal text:
+    /// `nnoremap ,q ix<Esc>` inserted the seven characters `x<Esc>` instead of
+    /// leaving Insert mode, and `<Leader>` never resolved.
+    ///
+    /// Only notation that names a **byte** is decoded — the ASCII control and
+    /// named keys, `<C-x>`, and `<Leader>`/`<LocalLeader>`. Notation naming an
+    /// internal three-byte key (`<F2>`, `<Up>`, …) is left literal on purpose:
+    /// that encoding is also produced by `ox-eval`'s `\<Key>` string escape
+    /// and by the RPC input decoder, the three do not agree yet, and decoding
+    /// it here alone would make such a mapping match a sequence nothing
+    /// produces. Unrecognized notation is likewise left exactly as written,
+    /// which is what upstream does with an unknown `<...>` name.
+    #[must_use]
+    pub fn parse_notation(text: &str, leader: &str, local_leader: &str) -> Self {
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != b'<' {
+                out.push(bytes[index]);
+                index += 1;
+                continue;
+            }
+            let Some(close) = bytes[index + 1..].iter().position(|byte| *byte == b'>') else {
+                out.push(bytes[index]);
+                index += 1;
+                continue;
+            };
+            let name = &text[index + 1..index + 1 + close];
+            match named_key_bytes(name, leader, local_leader) {
+                Some(decoded) => out.extend_from_slice(&decoded),
+                None => {
+                    out.push(bytes[index]);
+                    index += 1;
+                    continue;
+                }
+            }
+            index += close + 2;
+        }
+        Self::encode(&out)
+    }
+}
+
+/// One `<...>` key name's byte expansion, or `None` when the name is not one
+/// this port can represent as bytes.
+///
+/// Names are matched case-insensitively, as `find_special_key` does.
+fn named_key_bytes(name: &str, leader: &str, local_leader: &str) -> Option<Vec<u8>> {
+    // `<Leader>`/`<LocalLeader>` expand to text, not to one byte
+    // (`replace_termcodes`'s `REPTERM_SPECIAL` pass over "mapleader").
+    if name.eq_ignore_ascii_case("leader") {
+        return Some(leader.as_bytes().to_vec());
+    }
+    if name.eq_ignore_ascii_case("localleader") {
+        return Some(local_leader.as_bytes().to_vec());
+    }
+    let single = match name.to_ascii_lowercase().as_str() {
+        "lt" => b'<',
+        "bslash" => b'\\',
+        "bar" => b'|',
+        "space" => b' ',
+        "tab" => 0x09,
+        "cr" | "return" | "enter" => 0x0d,
+        "nl" | "newline" | "linefeed" | "lf" => 0x0a,
+        "esc" | "escape" => 0x1b,
+        "bs" | "backspace" => 0x08,
+        "del" | "delete" => 0x7f,
+        "nul" => 0x00,
+        rest => return control_key_byte(rest),
+    };
+    Some(vec![single])
+}
+
+/// `<C-x>` and its `<Char->`-free aliases (`Ctrl_chr`, `keycodes.h`).
+///
+/// `<S-x>` and `<M-x>`/`<A-x>` are deliberately absent: a shifted letter is
+/// already writable literally, and this port has no meta-key input path to
+/// produce the byte `<M-x>` would name.
+fn control_key_byte(name: &str) -> Option<Vec<u8>> {
+    let rest = name.strip_prefix("c-").or_else(|| name.strip_prefix("ctrl-"))?;
+    let mut chars = rest.chars();
+    let key = chars.next()?;
+    if chars.next().is_some() || !key.is_ascii() {
+        return None;
+    }
+    let upper = key.to_ascii_uppercase() as u8;
+    // `Ctrl_chr` is defined over '@'..'_' plus '?'; anything else is not a
+    // control byte and stays literal.
+    match upper {
+        b'?' => Some(vec![0x7f]),
+        b'@'..=b'_' => Some(vec![upper & 0x1f]),
+        _ => None,
+    }
 }
 
 impl From<&str> for Keys {
@@ -100,6 +198,66 @@ impl From<Vec<u8>> for Keys {
     fn from(value: Vec<u8>) -> Self {
         Self::encode(&value)
     }
+}
+
+/// `str2specialbuf` (`message.c:2173-2187`), which drives `str2special`
+/// (`message.c:2084-2166`) over a whole encoded key string: control bytes and
+/// named special keys become `<>` notation and everything else passes through.
+///
+/// `replace_spaces` and `replace_lt` are upstream's two flags. `maparg()`'s
+/// `lhs` key uses `(true, false)` and its `rhs` key and string form use
+/// `(false, false)`; `:map`'s listing uses `(true, false)` for the lhs and
+/// `(false, false)` for the rhs (`mapping.c:2096,2116,2206`, `showmap`
+/// `mapping.c:236,262`).
+///
+/// Named gap: this port's [`Keys::parse_notation`] decodes `<BS>`, `<Del>`,
+/// `<NL>` and `<Nul>` to plain bytes where upstream builds the special keys
+/// `K_BS`, `K_DEL`, `K_NL` and `K_ZERO`, so those four render here as
+/// `<C-H>`, a raw `0x7f`, `<NL>` and `<Nul>`. `<CR>`, `<Tab>`, `<Esc>` and
+/// every `<C-x>` agree with upstream because they *are* plain bytes there too.
+#[must_use]
+pub fn special_notation(bytes: &[u8], replace_spaces: bool, replace_lt: bool) -> String {
+    // Bytes, not chars: a multi-byte character passes through one byte at a
+    // time, so pushing `char::from(byte)` would re-encode each of its bytes as
+    // a separate code point.
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut offset = 0;
+    while offset < bytes.len() {
+        // `mb_unescape` runs first in `str2special`, so a quoted literal byte
+        // is rendered as the byte it stands for, not as a special key.
+        let (byte, width) = match bytes[offset..] {
+            [K_SPECIAL, KS_ZERO, KE_FILLER, ..] => (0u8, 3),
+            [K_SPECIAL, KS_SPECIAL, KE_FILLER, ..] => (K_SPECIAL, 3),
+            [K_SPECIAL, second, third, ..] => {
+                // A named special key this port cannot name; upstream prints
+                // its termcap pair as `<t_xx>` (`keycodes.c:324-327`).
+                out.extend_from_slice(b"<t_");
+                out.extend_from_slice(&[second, third, b'>']);
+                offset += 3;
+                continue;
+            }
+            [byte, ..] => (byte, 1),
+            [] => break,
+        };
+        offset += width;
+        match byte {
+            b' ' if replace_spaces => out.extend_from_slice(b"<Space>"),
+            b'<' if replace_lt => out.extend_from_slice(b"<lt>"),
+            0x00 => out.extend_from_slice(b"<Nul>"),
+            0x09 => out.extend_from_slice(b"<Tab>"),
+            0x0a => out.extend_from_slice(b"<NL>"),
+            0x0d => out.extend_from_slice(b"<CR>"),
+            0x1b => out.extend_from_slice(b"<Esc>"),
+            // `get_special_key` (`keycodes.c:292-297`): a control byte with no
+            // table entry becomes `<C-` plus the byte offset by `@`.
+            0x01..=0x1f => {
+                out.extend_from_slice(b"<C-");
+                out.extend_from_slice(&[byte | 0x40, b'>']);
+            }
+            other => out.push(other),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// One decoded logical key.
@@ -269,6 +427,17 @@ impl Typeahead {
         self.flags.first().copied()
     }
 
+    /// Marks the front byte un-remappable, so mapping lookup skips it.
+    ///
+    /// `vgetorpeek` clears one byte of `typebuf.tb_noremap` when an
+    /// incomplete mapping times out with no complete match behind it, which is
+    /// what releases the queued keys literally.
+    pub fn deny_front_remap(&mut self) {
+        if let Some(flags) = self.flags.first_mut() {
+            flags.remap = Remap::No;
+        }
+    }
+
     /// Decodes the next logical key without consuming it.
     pub fn peek(&self) -> Result<Option<Key>, KeyDecodeError> {
         if self.bytes.is_empty() {
@@ -300,6 +469,23 @@ impl Typeahead {
     pub fn flush(&mut self) {
         self.bytes.clear();
         self.flags.clear();
+    }
+
+    /// `flush_buffers(FLUSH_MINIMAL)` (`input.c:473-499`): discards the
+    /// *mapped* run at the front of the queue and leaves typed input alone.
+    ///
+    /// This is how an error in Normal mode abandons the rest of what produced
+    /// it. `:normal` stuffs its argument with `ins_typebuf(..., nottyped =
+    /// true)`, which counts the whole argument into `tb_maplen`
+    /// (`input.c:964-966`), so the remainder of a `:normal` goes here too.
+    pub fn flush_mapped(&mut self) {
+        let mapped = self
+            .flags
+            .iter()
+            .take_while(|flags| flags.mapped)
+            .count();
+        self.bytes.drain(..mapped);
+        self.flags.drain(..mapped);
     }
 
     /// Number of encoded bytes, matching upstream `tb_len` semantics.

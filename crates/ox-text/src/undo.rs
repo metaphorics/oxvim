@@ -1,4 +1,17 @@
 //! Explicit sequence-numbered branching undo history.
+//!
+//! One node is one undo *header*, and a header carries the list of edits
+//! that belong to one undo block. Upstream groups every change made without
+//! returning to the main loop into a single header: `u_savecommon` only
+//! allocates a new header when `b_u_synced` is true and otherwise pushes
+//! another entry onto the open one (`undo.c:388-500`), clearing the flag on
+//! the way out (`undo.c:616`). `u_sync` closes the open header
+//! (`undo.c:2704-2717`), and `may_sync_undo` calls it when the editor
+//! consumes a typed key (`input.c:1255,1300-1306`).
+//!
+//! [`UndoTree`] owns that flag so no caller can forget it: [`UndoTree::record`]
+//! joins the open header, [`UndoTree::sync`] closes it, and every navigation
+//! entry point closes it the way `u_undoredo` does (`undo.c:1665`).
 
 use thiserror::Error;
 
@@ -27,14 +40,34 @@ pub struct LineEdit {
 }
 
 /// A recorded undo header.
+///
+/// `edits` are in the order they were applied, so undoing walks them in
+/// reverse and redoing walks them forwards. Upstream keeps the same list on
+/// `uh_entry` (`undo.c:610-611`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UndoEntry {
     /// Monotonically increasing sequence number.
     pub seq: u64,
     /// Unix timestamp in seconds.
     pub timestamp: i64,
-    /// Edit represented by this header.
-    pub edit: LineEdit,
+    /// Edits this header groups, in application order.
+    pub edits: Vec<LineEdit>,
+}
+
+impl UndoEntry {
+    /// Cursor to restore when this header is undone: the position before its
+    /// first edit, which is upstream's header-level `uh_cursor`.
+    #[must_use]
+    pub fn cursor_before(&self) -> Cursor {
+        self.edits.first().map_or(Cursor::default(), |edit| edit.cursor_before)
+    }
+
+    /// Cursor to restore when this header is redone: the position after its
+    /// last edit.
+    #[must_use]
+    pub fn cursor_after(&self) -> Cursor {
+        self.edits.last().map_or(Cursor::default(), |edit| edit.cursor_after)
+    }
 }
 
 /// Direction and entry returned to the buffer owner.
@@ -66,6 +99,11 @@ pub enum UndoError {
     /// The requested sequence does not exist.
     #[error("undo sequence {0} does not exist")]
     UnknownSequence(u64),
+    /// `:undojoin` was used after an undo, which upstream refuses because
+    /// the header it would join is the one an undo moved off
+    /// (`ex_undojoin`, `undo.c:2805-2807`).
+    #[error("undojoin is not allowed after undo")]
+    JoinAfterUndo,
 }
 
 #[derive(Clone, Debug)]
@@ -88,8 +126,8 @@ pub struct HeaderRecord {
     pub seq: u64,
     /// Unix timestamp in seconds.
     pub timestamp: i64,
-    /// The edit this header records.
-    pub edit: LineEdit,
+    /// The edits this header groups, in application order.
+    pub edits: Vec<LineEdit>,
     /// Link to the older header.
     pub next: u64,
     /// Link to the newer active header.
@@ -98,6 +136,22 @@ pub struct HeaderRecord {
     pub alt_next: u64,
     /// Link to the previous inactive sibling header.
     pub alt_prev: u64,
+}
+
+/// One header as `undotree()` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndoTreeNode {
+    /// Header sequence number.
+    pub seq: u64,
+    /// Unix timestamp in seconds.
+    pub timestamp: i64,
+    /// Whether this is the newest header on the active branch
+    /// (`b_u_newhead`).
+    pub newhead: bool,
+    /// Whether this is the header an undo moved off (`b_u_curhead`).
+    pub curhead: bool,
+    /// Inactive branches hanging off this header.
+    pub alt: Vec<UndoTreeNode>,
 }
 
 /// Tree-wide fields required by the persistent-undo top-level header.
@@ -123,6 +177,9 @@ pub struct UndoTree {
     nodes: Vec<Node>,
     current: usize,
     next_seq: u64,
+    /// Upstream's `b_u_synced`: true when the newest header is closed, so the
+    /// next recorded edit starts a new one (`buffer_defs.h:499`).
+    synced: bool,
 }
 
 impl Default for UndoTree {
@@ -144,7 +201,60 @@ impl UndoTree {
             }],
             current: 0,
             next_seq: 1,
+            synced: true,
         }
+    }
+
+    /// Whether the newest header is closed (upstream `b_u_synced`).
+    #[must_use]
+    pub const fn is_synced(&self) -> bool {
+        self.synced
+    }
+
+    /// Closes the open header so the next edit starts a new undo block.
+    ///
+    /// This is `u_sync` (`undo.c:2704-2717`). It is idempotent, which is why
+    /// upstream can call it from every boundary without counting.
+    pub const fn sync(&mut self) {
+        self.synced = true;
+    }
+
+    /// Number of edits grouped into the current header, zero at the root.
+    ///
+    /// Together with [`UndoTree::current_seq`] this identifies the buffer
+    /// state even while a header is still open and growing.
+    #[must_use]
+    pub fn current_block_len(&self) -> usize {
+        self.nodes[self.current]
+            .entry
+            .as_ref()
+            .map_or(0, |entry| entry.edits.len())
+    }
+
+    /// Reopens the newest header so the next edit joins it (`:undojoin`,
+    /// `ex_undojoin`, `undo.c:2800-2816`).
+    ///
+    /// Nothing recorded yet, or an already-open header, is a silent no-op
+    /// upstream; only a `:undojoin` that follows an undo is an error.
+    pub fn undojoin(&mut self) -> Result<(), UndoError> {
+        if !self.synced {
+            return Ok(());
+        }
+        if self.nodes[self.current].entry.is_none() {
+            // `b_u_newhead == NULL`: nothing changed before, or an undo walked
+            // all the way back to the original state.
+            return if self.next_seq > 1 {
+                Err(UndoError::JoinAfterUndo)
+            } else {
+                Ok(())
+            };
+        }
+        if self.active_child(self.current).is_some() {
+            // `b_u_curhead != NULL`: an undo left a header ahead of us.
+            return Err(UndoError::JoinAfterUndo);
+        }
+        self.synced = false;
+        Ok(())
     }
 
     /// Returns the current sequence, or zero at the root.
@@ -156,8 +266,17 @@ impl UndoTree {
             .map_or(0, |entry| entry.seq)
     }
 
-    /// Records an edit as a child of the current state.
+    /// Records an edit, starting a new header or joining the open one.
+    ///
+    /// Returns the sequence of the header the edit landed in, which is the
+    /// existing one whenever a block is still open.
     pub fn record(&mut self, edit: LineEdit, timestamp: i64) -> u64 {
+        if !self.synced {
+            if let Some(entry) = self.nodes[self.current].entry.as_mut() {
+                entry.edits.push(edit);
+                return entry.seq;
+            }
+        }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         let node_index = self.nodes.len();
@@ -166,7 +285,7 @@ impl UndoTree {
             entry: Some(UndoEntry {
                 seq,
                 timestamp,
-                edit,
+                edits: vec![edit],
             }),
             parent: Some(self.current),
             children: Vec::new(),
@@ -175,10 +294,15 @@ impl UndoTree {
         self.nodes[self.current].children.push(node_index);
         self.nodes[self.current].preferred_child = Some(child_index);
         self.current = node_index;
+        self.synced = false;
         seq
     }
 
-    /// Moves to the parent state.
+    /// Moves to the parent state, closing the open block first.
+    ///
+    /// `u_undo` syncs before undoing so an open block is undone whole
+    /// (`undo.c:1825-1828`), and `u_undoredo` leaves the tree synced
+    /// (`undo.c:1665`); both live here so the flag cannot be left stale.
     pub fn undo(&mut self) -> Result<UndoStep, UndoError> {
         let parent = self.nodes[self.current]
             .parent
@@ -195,6 +319,7 @@ impl UndoTree {
             self.nodes[parent].preferred_child = Some(index);
         }
         self.current = parent;
+        self.synced = true;
         Ok(UndoStep::Undo(entry))
     }
 
@@ -226,6 +351,7 @@ impl UndoTree {
             .entry
             .clone()
             .ok_or(UndoError::AtNewest)?;
+        self.synced = true;
         Ok(UndoStep::Redo(entry))
     }
 
@@ -308,17 +434,15 @@ impl UndoTree {
             .map_or(0, |entry| entry.seq)
     }
 
-    /// Computes upstream-compatible header records for every node with an
-    /// entry. Link semantics follow Neovim's `u_addbranch`:
-    /// `next` is the parent (older) header, `prev` is the active child
-    /// (newer) header, and non-active siblings chain through
-    /// `alt_next`/`alt_prev` from the active child.
-    #[must_use]
-    pub fn header_records(&self) -> Vec<HeaderRecord> {
-        let mut records = Vec::with_capacity(self.nodes.len().saturating_sub(1));
-        let mut alt_next_of = vec![0_u64; self.nodes.len()];
-        let mut alt_prev_of = vec![0_u64; self.nodes.len()];
-
+    /// The alternate-branch sibling links, by node index.
+    ///
+    /// `u_addbranch` hangs every inactive sibling off the active child:
+    /// `alt_next` of the active child is the newest inactive sibling, and each
+    /// inactive sibling's `alt_next` is the next older one. `alt_prev` walks
+    /// back the same chain.
+    fn alt_links(&self) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
+        let mut alt_next = vec![None; self.nodes.len()];
+        let mut alt_prev = vec![None; self.nodes.len()];
         for parent in 0..self.nodes.len() {
             let mut inactive: Vec<usize> = self.nodes[parent]
                 .children
@@ -333,19 +457,29 @@ impl UndoTree {
             inactive.sort_unstable();
             inactive.reverse();
             if let Some(active) = self.active_child(parent) {
-                alt_next_of[active] = self.seq_of(inactive[0]);
+                alt_next[active] = Some(inactive[0]);
             }
             for (slot, &sibling) in inactive.iter().enumerate() {
-                alt_next_of[sibling] = inactive
-                    .get(slot + 1)
-                    .map_or(0, |&next_sib| self.seq_of(next_sib));
-                alt_prev_of[sibling] = if slot == 0 {
-                    self.active_child(parent).map_or(0, |active| self.seq_of(active))
+                alt_next[sibling] = inactive.get(slot + 1).copied();
+                alt_prev[sibling] = if slot == 0 {
+                    self.active_child(parent)
                 } else {
-                    self.seq_of(inactive[slot - 1])
+                    Some(inactive[slot - 1])
                 };
             }
         }
+        (alt_next, alt_prev)
+    }
+
+    /// Computes upstream-compatible header records for every node with an
+    /// entry. Link semantics follow Neovim's `u_addbranch`:
+    /// `next` is the parent (older) header, `prev` is the active child
+    /// (newer) header, and non-active siblings chain through
+    /// `alt_next`/`alt_prev` from the active child.
+    #[must_use]
+    pub fn header_records(&self) -> Vec<HeaderRecord> {
+        let mut records = Vec::with_capacity(self.nodes.len().saturating_sub(1));
+        let (alt_next_of, alt_prev_of) = self.alt_links();
 
         for (index, node) in self.nodes.iter().enumerate() {
             let Some(entry) = node.entry.as_ref() else {
@@ -358,14 +492,59 @@ impl UndoTree {
             records.push(HeaderRecord {
                 seq: entry.seq,
                 timestamp: entry.timestamp,
-                edit: entry.edit.clone(),
+                edits: entry.edits.clone(),
                 next,
                 prev,
-                alt_next: alt_next_of[index],
-                alt_prev: alt_prev_of[index],
+                alt_next: alt_next_of[index].map_or(0, |node| self.seq_of(node)),
+                alt_prev: alt_prev_of[index].map_or(0, |node| self.seq_of(node)),
             });
         }
         records
+    }
+
+    /// The header list `undotree()` reports, oldest first along the active
+    /// branch with inactive branches nested under `alt`.
+    ///
+    /// This is `u_eval_tree` (`undo.c:3193-3221`): it starts at `b_u_oldhead`,
+    /// walks `uh_prev` (the newer header on the branch), and recurses into
+    /// `uh_alt_next` for the alternates.
+    #[must_use]
+    pub fn entries(&self) -> Vec<UndoTreeNode> {
+        let (alt_next_of, _) = self.alt_links();
+        let newhead = {
+            let mut node = self.current;
+            while let Some(child) = self.active_child(node) {
+                node = child;
+            }
+            node
+        };
+        let curhead = self.active_child(self.current);
+        self.eval_chain(self.active_child(0), &alt_next_of, newhead, curhead)
+    }
+
+    fn eval_chain(
+        &self,
+        start: Option<usize>,
+        alt_next_of: &[Option<usize>],
+        newhead: usize,
+        curhead: Option<usize>,
+    ) -> Vec<UndoTreeNode> {
+        let mut out = Vec::new();
+        let mut cursor = start;
+        while let Some(node) = cursor {
+            let Some(entry) = self.nodes[node].entry.as_ref() else {
+                break;
+            };
+            out.push(UndoTreeNode {
+                seq: entry.seq,
+                timestamp: entry.timestamp,
+                newhead: node == newhead,
+                curhead: curhead == Some(node),
+                alt: self.eval_chain(alt_next_of[node], alt_next_of, newhead, curhead),
+            });
+            cursor = self.active_child(node);
+        }
+        out
     }
 
     /// Computes the top-level header fields for serialization.

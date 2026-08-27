@@ -842,39 +842,86 @@ fn map_and_map_bang_mode_sets_match_command_families() {
 
 #[test]
 fn mapping_rhs_parses_nop_case_insensitively() {
-    assert_eq!(MappingAction::parse_rhs("<NoP>").unwrap(), MappingAction::Nop);
+    assert_eq!(MappingAction::parse_rhs("<NoP>", "\\", "\\").unwrap(), MappingAction::Nop);
 }
 
 #[test]
 fn mapping_rhs_encodes_plain_keys() {
     assert_eq!(
-        MappingAction::parse_rhs("abc").unwrap(),
+        MappingAction::parse_rhs("abc", "\\", "\\").unwrap(),
         MappingAction::Keys(keys("abc"))
     );
 }
 
+/// A command-shaped right-hand side keeps the text it was parsed from
+/// (upstream's `m_str`), because `maparg()`'s string form and `:map`'s listing
+/// render that text and a `Vec<ExCommand>` cannot be printed back to it.
 #[test]
 fn mapping_rhs_parses_cmd_form_with_ex_parser() {
-    let MappingAction::ExCommands(commands) = MappingAction::parse_rhs("<Cmd>echo hi<CR>").unwrap() else {
+    let MappingAction::ExCommands { keys: rhs, commands } = MappingAction::parse_rhs("<Cmd>echo hi<CR>", "\\", "\\").unwrap() else {
         panic!("expected parsed Ex commands");
     };
     assert_eq!(commands.len(), 1);
+    assert_eq!(rhs.as_bytes(), b"<Cmd>echo hi\r");
 }
 
 #[test]
 fn mapping_rhs_parses_colon_command_form() {
-    let MappingAction::ExCommands(commands) = MappingAction::parse_rhs(":echo hi<CR>").unwrap() else {
+    let MappingAction::ExCommands { keys: rhs, commands } = MappingAction::parse_rhs(":echo hi<CR>", "\\", "\\").unwrap() else {
         panic!("expected parsed Ex commands");
     };
     assert_eq!(commands.len(), 1);
+    assert_eq!(rhs.as_bytes(), b":echo hi\r");
 }
 
 #[test]
 fn mapping_rhs_rejects_unknown_ex_command() {
     assert!(matches!(
-        MappingAction::parse_rhs("<Cmd>definitelynotacommand<CR>"),
+        MappingAction::parse_rhs("<Cmd>definitelynotacommand<CR>", "\\", "\\"),
         Err(MappingError::ExCommand(_))
     ));
+}
+
+/// `replace_termcodes` (`keycodes.c`): a key right-hand side is notation, not
+/// literal text. `nnoremap ,q ix<Esc>` used to insert the six characters
+/// `<Esc>` writes instead of leaving Insert mode.
+#[test]
+fn mapping_rhs_decodes_key_notation_into_bytes() {
+    assert_eq!(
+        MappingAction::parse_rhs("ix<Esc>", "\\", "\\").unwrap(),
+        MappingAction::Keys(keys("ix\u{1b}"))
+    );
+    assert_eq!(
+        MappingAction::parse_rhs("o<Tab><CR><BS><Space><lt><Bar>", "\\", "\\").unwrap(),
+        MappingAction::Keys(keys("o\t\r\u{8} <|"))
+    );
+    assert_eq!(
+        MappingAction::parse_rhs("<C-u><C-A><C-?>", "\\", "\\").unwrap(),
+        MappingAction::Keys(keys("\u{15}\u{1}\u{7f}"))
+    );
+}
+
+/// `<Leader>`/`<LocalLeader>` expand to `mapleader`'s *text*, so they can be
+/// several bytes, and the two leaders are independent.
+#[test]
+fn mapping_notation_expands_both_leaders() {
+    assert_eq!(
+        Keys::parse_notation("<Leader>x<LocalLeader>y", ",,", "-"),
+        keys(",,x-y")
+    );
+}
+
+/// Notation this port cannot represent as bytes stays exactly as written,
+/// which is also what upstream does with an unknown `<...>` name. Decoding
+/// `<F2>` here alone would make the mapping match a sequence no input path
+/// produces.
+#[test]
+fn mapping_notation_leaves_unrepresentable_names_literal() {
+    assert_eq!(Keys::parse_notation("<F2>", "\\", "\\"), keys("<F2>"));
+    assert_eq!(Keys::parse_notation("<Up>", "\\", "\\"), keys("<Up>"));
+    assert_eq!(Keys::parse_notation("<M-x>", "\\", "\\"), keys("<M-x>"));
+    assert_eq!(Keys::parse_notation("<C-", "\\", "\\"), keys("<C-"));
+    assert_eq!(Keys::parse_notation("a<b", "\\", "\\"), keys("a<b"));
 }
 
 #[test]
@@ -1221,4 +1268,135 @@ fn editor_wipe_preserves_global_and_other_buffer_state() {
     assert_eq!(editor.mappings().mapping_len(), 2);
     assert!(matches!(editor.mappings().lookup(b"g", MapMode::Normal, None), Lookup::Exact(_, 1)));
     assert!(matches!(editor.mappings().lookup(b"k", MapMode::Normal, Some(kept)), Lookup::Exact(_, 1)));
+}
+
+/// `str2special` renders a C0 control byte through the special-key table when
+/// it has an entry and as `<C-x>` when it does not (`message.c:2141-2148`,
+/// `keycodes.c:292-297`). Each byte below picks a different arm, so a mutation
+/// to any one of them shows up here rather than only in whichever arm a
+/// single-case test happened to hit.
+///
+/// Oracle, v0.13.0-dev-1390: `keytrans(nr2char(n))` for n in 1..=32.
+#[test]
+fn special_notation_names_each_class_of_control_byte() {
+    use crate::typeahead::special_notation;
+
+    for (byte, expected) in [
+        (0x01, "<C-A>"),
+        (0x08, "<C-H>"),
+        (0x09, "<Tab>"),
+        (0x0a, "<NL>"),
+        (0x0d, "<CR>"),
+        (0x1a, "<C-Z>"),
+        (0x1b, "<Esc>"),
+        (0x1c, "<C-\\>"),
+        (0x1f, "<C-_>"),
+    ] {
+        assert_eq!(special_notation(&[byte], false, false), expected, "byte {byte:#04x}");
+    }
+
+    // A space and a `<` are conditional on the two flags, and each flag gates
+    // only its own byte.
+    assert_eq!(special_notation(b" <", false, false), " <");
+    assert_eq!(special_notation(b" <", true, false), "<Space><");
+    assert_eq!(special_notation(b" <", false, true), " <lt>");
+
+    // Printable text and multi-byte characters pass through byte for byte.
+    assert_eq!(special_notation("a\u{00e9}\u{4e2d}z".as_bytes(), true, true), "a\u{00e9}\u{4e2d}z");
+
+    // The two quoting pairs `Keys::encode` produces stand for the bytes they
+    // quote, as `mb_unescape` does before `str2special` looks at them.
+    assert_eq!(special_notation(&[K_SPECIAL, KS_ZERO, KE_FILLER], false, false), "<Nul>");
+    assert_eq!(
+        special_notation(&[K_SPECIAL, b'k', b'b'], false, false),
+        "<t_kb>",
+        "a named special key this port cannot name prints its termcap pair"
+    );
+}
+
+/// `map_mode_to_chars` (`mapping.c:170-208`) is a chain of alternatives whose
+/// order matters: insert-plus-cmdline wins over insert, and the four `:map`
+/// modes together collapse to a blank. One case per arm.
+#[test]
+fn mode_chars_and_bits_cover_every_map_mode_to_chars_arm() {
+    let of = |modes: MapModes| modes.to_chars();
+    assert_eq!(of(MapModes::MAP_BANG), "!");
+    assert_eq!(of(MapMode::Insert.into()), "i");
+    assert_eq!(of(MapMode::LangArg.into()), "l");
+    assert_eq!(of(MapMode::CommandLine.into()), "c");
+    assert_eq!(of(MapModes::MAP), " ");
+    assert_eq!(of(MapMode::Normal.into()), "n");
+    assert_eq!(of(MapMode::OperatorPending.into()), "o");
+    assert_eq!(of(MapMode::Terminal.into()), "t");
+    assert_eq!(of(MapMode::Visual | MapMode::Select), "v");
+    assert_eq!(of(MapMode::Visual.into()), "x");
+    assert_eq!(of(MapMode::Select.into()), "s");
+    assert_eq!(of(MapMode::Normal | MapMode::OperatorPending), "no");
+
+    // The discriminants are upstream's `MODE_*` values, which `maparg()`
+    // reports verbatim as `mode_bits` (`state_defs.h:21-28`).
+    assert_eq!(MapModes::one(MapMode::Normal).bits(), 0x01);
+    assert_eq!(MapModes::one(MapMode::Visual).bits(), 0x02);
+    assert_eq!(MapModes::one(MapMode::OperatorPending).bits(), 0x04);
+    assert_eq!(MapModes::one(MapMode::CommandLine).bits(), 0x08);
+    assert_eq!(MapModes::one(MapMode::Insert).bits(), 0x10);
+    assert_eq!(MapModes::one(MapMode::LangArg).bits(), 0x20);
+    assert_eq!(MapModes::one(MapMode::Select).bits(), 0x40);
+    assert_eq!(MapModes::one(MapMode::Terminal).bits(), 0x80);
+    assert_eq!(MapModes::MAP.bits(), 0x47);
+}
+
+/// `get_map_mode` (`mapping.c:988-1023`) over `maparg()`'s mode string: only
+/// the first character decides, an unknown or empty string means `:map`, and
+/// the `n`-not-followed-by-`o` guard keeps `noremap` out of Normal mode.
+#[test]
+fn mode_string_parsing_matches_get_map_mode() {
+    for (text, expected) in [
+        ("i", MapModes::one(MapMode::Insert)),
+        ("l", MapModes::one(MapMode::LangArg)),
+        ("c", MapModes::one(MapMode::CommandLine)),
+        ("n", MapModes::one(MapMode::Normal)),
+        ("nx", MapModes::one(MapMode::Normal)),
+        ("v", MapMode::Visual | MapMode::Select),
+        ("x", MapModes::one(MapMode::Visual)),
+        ("s", MapModes::one(MapMode::Select)),
+        ("o", MapModes::one(MapMode::OperatorPending)),
+        ("t", MapModes::one(MapMode::Terminal)),
+        ("", MapModes::MAP),
+        ("z", MapModes::MAP),
+        ("noremap", MapModes::MAP),
+    ] {
+        assert_eq!(MapModes::from_mode_string(text), expected, "mode string {text:?}");
+    }
+}
+
+/// `check_map` with `exact` set (`mapping.c:2036`) tests the mode overlap and
+/// the exact key length, and searches the buffer-local table before the global
+/// one. Each of the three is exercised where the other two cannot decide it.
+#[test]
+fn exact_mapping_lookup_tests_mode_length_and_locality_separately() {
+    let mut mappings = Mappings::new();
+    mappings.map(keys("xy"), MappingAction::Nop, map_options(MapMode::Normal)).unwrap();
+    mappings.map(keys("z"), MappingAction::Nop, map_options(MapMode::Insert)).unwrap();
+
+    // Length: a prefix of a registered lhs is not an exact match.
+    assert!(mappings.find_exact(b"xy", MapMode::Normal.into(), None).is_some());
+    assert!(mappings.find_exact(b"x", MapMode::Normal.into(), None).is_none());
+    assert!(mappings.find_exact(b"xyz", MapMode::Normal.into(), None).is_none());
+
+    // Mode: the same lhs in the wrong mode does not match.
+    assert!(mappings.find_exact(b"z", MapMode::Insert.into(), None).is_some());
+    assert!(mappings.find_exact(b"z", MapMode::Normal.into(), None).is_none());
+
+    // Locality: a buffer-local mapping shadows the global one with the same
+    // lhs, and is reported as local.
+    let mut local = map_options(MapMode::Normal);
+    local.scope = MapScope::Buffer(buffer(7));
+    mappings.map(keys("xy"), MappingAction::Keys(keys("local")), local).unwrap();
+    let (found, is_local) = mappings.find_exact(b"xy", MapMode::Normal.into(), Some(buffer(7))).unwrap();
+    assert!(is_local);
+    assert_eq!(found.action, MappingAction::Keys(keys("local")));
+    let (found, is_local) = mappings.find_exact(b"xy", MapMode::Normal.into(), Some(buffer(8))).unwrap();
+    assert!(!is_local, "another buffer sees the global mapping");
+    assert_eq!(found.action, MappingAction::Nop);
 }

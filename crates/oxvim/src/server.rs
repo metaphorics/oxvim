@@ -1,6 +1,6 @@
 //! Embedded stdio and listening RPC servers.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -12,12 +12,9 @@ use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
 use ox_api::{CommandExecutor, Registry};
 use ox_editor::{
     vim_variable_is_writable, AutocmdContext, AutocmdKind, CmdlineKind, Editor, Event, ExExecutor,
-    ExecOutcome, Geometry, LuaExec, LuaExecError, MappingAction, MessageKind, Mode, ModeMachine, Keys,
+    ExecError, ExecOutcome, Geometry, LuaExec, LuaExecError, MessageDestination, MessageKind,
+    Mode, ModeMachine, Keys,
     OptionValue, TypeaheadFlags,
-};
-use ox_eval::{
-    BufferHost, BuiltinHost as EvalBuiltinHost, Builtins, Scope, call_buffer_builtin,
-    is_buffer_builtin,
 };
 use ox_lua::{
     ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot as LuaRuntimeRoot, Scheduler, VariableHost, VariableScope, Work, bind_api,
@@ -25,7 +22,6 @@ use ox_lua::{
     typval_to_lua,
 };
 use ox_rpc::{CHAN_STDIO, ChannelId, IncrementalDecoder, Message};
-use ox_text::Buffer;
 use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, Typval, WinHandle};
 use ox_ui::{
     ChromeState, CmdlineState as UiCmdlineState, Compositor, ContentChunk, Emitter, HlState,
@@ -39,7 +35,9 @@ use ox_uv::net::Pipe;
 
 use crate::AppError;
 use crate::cli::{Cli, UserConfig};
-use crate::runtime::runtime_root;
+use crate::runtime::{apply_startup_options, open_startup_buffers, runtime_root};
+use crate::messages::PrintfSink;
+use crate::startuptime::StartupTimer;
 
 #[derive(Default)]
 struct TerminalChannelSink {
@@ -53,6 +51,89 @@ impl ox_api::ChannelSink for TerminalChannelSink {
     }
 }
 
+struct JobChannelSink {
+    ex: Rc<RefCell<ExExecutor>>,
+    queue: Rc<RefCell<VecDeque<Work>>>,
+    /// Number of deferred sends; when > 0 the borrow is held by an outer
+    /// RPC handler and new sends must be queued to preserve order.
+    deferred: Rc<Cell<usize>>,
+}
+
+impl JobChannelSink {
+    fn run_send(&self, channel: u64, bytes: Vec<u8>) {
+        if let Ok(mut ex) = self.ex.try_borrow_mut() {
+            let _ = ex.job_send(channel, &bytes);
+            return;
+        }
+        let ex = self.ex.clone();
+        let queue = self.queue.clone();
+        let deferred = self.deferred.clone();
+        deferred.set(deferred.get().saturating_add(1));
+        queue.borrow_mut().push_back(Box::new(move || {
+            let _ = ex.borrow_mut().job_send(channel, &bytes);
+            deferred.set(deferred.get().saturating_sub(1));
+            Ok(())
+        }));
+    }
+}
+
+impl ox_api::ChannelSink for JobChannelSink {
+    fn send(&mut self, channel: u64, bytes: &[u8]) -> Result<(), String> {
+        if self.deferred.get() > 0 {
+            let ex = self.ex.clone();
+            let queue = self.queue.clone();
+            let deferred = self.deferred.clone();
+            let bytes = bytes.to_vec();
+            deferred.set(deferred.get().saturating_add(1));
+            queue.borrow_mut().push_back(Box::new(move || {
+                let _ = ex.borrow_mut().job_send(channel, &bytes);
+                deferred.set(deferred.get().saturating_sub(1));
+                Ok(())
+            }));
+            return Ok(());
+        }
+        self.run_send(channel, bytes.to_vec());
+        Ok(())
+    }
+
+    fn take_pty_output(&mut self, channel: u64) -> Result<Vec<u8>, String> {
+        match self.ex.try_borrow_mut() {
+            Ok(mut ex) => ex.take_pty_output(channel).map_err(|error| error.to_string()),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+}
+/// Every `plugin/**/*.vim` then every `plugin/**/*.lua` under one
+/// `'runtimepath'` entry, in the order `load_plugins` sources them.
+///
+/// `gen_expand_wildcards` sorts each pattern's matches, and
+/// `source_callback_vim_lua` (runtime.c:371-396) then walks the whole match
+/// list twice -- `.vim` first, `.lua` second -- so a `plugin/a.lua` is sourced
+/// after a `plugin/z.vim`. Files with any other extension are not sourced by
+/// this path at all.
+fn plugin_scripts(root: &Path) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        let mut entries: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, found);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&root.join("plugin"), &mut found);
+    let extension = |path: &Path, wanted: &str| {
+        path.extension().is_some_and(|value| value == wanted)
+    };
+    let mut ordered: Vec<_> = found.iter().filter(|path| extension(path, "vim")).cloned().collect();
+    ordered.extend(found.iter().filter(|path| extension(path, "lua")).cloned());
+    ordered
+}
+
 /// All mutable state shared by every RPC transport.
 pub struct AppState {
     editor: Rc<RefCell<Editor>>,
@@ -64,6 +145,8 @@ pub struct AppState {
     /// Process exit code requested by `:cquit` (0 for plain quits).
     exit_code: i64,
     rendered_messages: usize,
+    /// Stdout/stderr message output for the modes with no attached UI.
+    printf: PrintfSink,
     lua_work: Rc<RefCell<VecDeque<Work>>>,
     ui_channels: UiChannels,
     emitter: Emitter,
@@ -73,7 +156,7 @@ pub struct AppState {
 
 impl AppState {
     /// Build one editor/Lua/API instance and execute process startup.
-    pub fn new(cli: &Cli) -> Result<Self, AppError> {
+    pub fn new(cli: &Cli, timer: &mut StartupTimer) -> Result<Self, AppError> {
         let mut editor = Editor::new();
         let buffer = editor
             .create_buffer(true)
@@ -89,6 +172,7 @@ impl AppState {
             OxStr::from("servername"),
             Object::String(OxStr::from("")),
         );
+        apply_startup_options(&mut editor, cli)?;
         // option.c set_init_default for 'runtimepath'/'packpath': the
         // runtimepath_default layout over the resolved runtime tree,
         // before any user startup command runs.
@@ -121,7 +205,12 @@ impl AppState {
         nested_ex.borrow_mut().set_channel_ids(channel_ids);
         let mut lua = LuaHost::new(
             LuaRuntimeRoot::new(runtime_path),
-            Rc::new(EditorBuiltins { editor: editor.clone(), ex: ex.clone(), nested_ex: nested_ex.clone() }),
+            Rc::new(EditorBuiltins {
+                editor: editor.clone(),
+                ex: ex.clone(),
+                nested_ex: nested_ex.clone(),
+                nested_editor: Rc::new(RefCell::new(Editor::new())),
+            }),
             Rc::new(LuaScheduler { queue: lua_work.clone() }),
         )
         .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -135,7 +224,11 @@ impl AppState {
         bind_variables(lua.lua(), Rc::new(EditorVariables { editor: editor.clone() }))
             .map_err(|error| AppError::Lua(error.to_string()))?;
         ox_api::set_channel_sink(&editor.borrow(), Box::new(TerminalChannelSink::default()));
-
+        ox_api::set_job_sink(&editor.borrow(), Box::new(JobChannelSink {
+            ex: ex.clone(),
+            queue: lua_work.clone(),
+            deferred: Rc::new(Cell::new(0)),
+        }));
         // Load the reachable embedded core prelude before user-controlled Ex startup commands.
         lua.exec("require('vim._core.shared')", Vec::new())
             .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -157,17 +250,21 @@ impl AppState {
             exiting: false,
             exit_code: 0,
             rendered_messages: 0,
+            printf: PrintfSink::default(),
             lua_work,
             ui_channels: UiChannels::new(),
             emitter: Emitter::new(),
-            highlights: HlState::new(),
+            highlights: HlState::with_default_syntax_groups(),
             chrome: ChromeState::new(),
         };
-        state.run_startup(cli)?;
+        state.run_startup(cli, timer)?;
+        // main.c writes startup message output before the process waits on
+        // its input, and --headless/-es exit without ever attaching a UI.
+        state.publish_messages()?;
         Ok(state)
     }
 
-    fn run_startup(&mut self, cli: &Cli) -> Result<(), AppError> {
+    fn run_startup(&mut self, cli: &Cli, timer: &mut StartupTimer) -> Result<(), AppError> {
 
         // main.c fills the global argument list from the command line
         // before any startup command runs, so argc()/argv() observe the
@@ -185,35 +282,46 @@ impl AppState {
             }
         }
 
-        // No user-config discovery contract is exported yet.  Explicit files
-        // are real and deterministic; NONE/NORC/--clean intentionally source
-        // nothing rather than guessing platform paths.
-        if !cli.clean && let UserConfig::File(path) = &cli.user_config {
-            if Path::new(path).extension().is_some_and(|extension| extension == "lua") {
-                self.lua
-                    .borrow_mut()
-                    .exec_file(Path::new(path))
-                    .map_err(|error| AppError::Lua(error.to_string()))?;
-            } else {
-                let source = fs::read_to_string(path).map_err(AppError::Io)?;
-                self.ex
-                    .borrow_mut()
-                    .execute_script(&mut self.editor.borrow_mut(), path, &source)
-                    .map_err(|error| AppError::Ex(error.to_string()))?;
+        // main.c `source_startup_scripts` (2229-2249): an explicit `-u` file
+        // replaces discovery entirely, `NONE` and `NORC` source nothing at
+        // all, and otherwise the user's config is discovered. `-es` skips the
+        // whole step upstream (`else if (!silent_mode)`).
+        //
+        // `--clean` is not a separate case: it *is* `-u NONE`
+        // (main.c:1193-1197), so a later `-u <file>` on the same command line
+        // overwrites it and is honoured. Gating this on `!cli.clean` made
+        // `--clean -u file` ignore the file, which the oracle sources.
+        match &cli.user_config {
+            UserConfig::File(path) => self.source_config_file(Path::new(path))?,
+            UserConfig::None | UserConfig::NoRc => {}
+            UserConfig::Default => {
+                if !cli.batch.is_some_and(|batch| batch.silent) {
+                    self.discover_user_config()?;
+                }
             }
         }
-
-        // main.c create_windows()/edit_buffers(), single-window form:
-        // every positional file becomes a named buffer loaded from disk
-        // (upstream also names a buffer when the file does not exist
-        // yet), and the first file is displayed in the startup window.
+        timer.mark("sourcing vimrc file(s)");
         if self.exiting {
             return Ok(());
         }
-        if !cli.files.is_empty() {
-            self.open_startup_files(&cli.files)?;
+
+        // main.c:489 `load_plugins`, after the user config and before the
+        // window layout. 'loadplugins' already carries the `--noplugin` and
+        // `-u NONE`-unless-`--clean` rules from cli.rs.
+        if cli.loadplugins {
+            self.load_plugins()?;
         }
- 
+        timer.mark("loading plugins");
+
+        // main.c create_windows()/edit_buffers(): the requested window or
+        // tab-page layout is built first, then every positional file becomes
+        // a named buffer loaded from disk (upstream also names a buffer when
+        // the file does not exist yet) and fills one window in argv order.
+        if self.exiting {
+            return Ok(());
+        }
+        open_startup_buffers(&mut self.editor.borrow_mut(), cli)?;
+        timer.mark("opening buffers");
         for command in &cli.commands {
             self.execute_ex(command)?;
             if self.exiting {
@@ -221,6 +329,128 @@ impl AppState {
             }
         }
         self.fire_vim_enter()
+    }
+
+    /// Sources one config file, choosing the host by extension the way
+    /// `do_source` picks between `nlua_exec_file` and the Ex parser.
+    fn source_config_file(&mut self, path: &Path) -> Result<(), AppError> {
+        if path.extension().is_some_and(|extension| extension == "lua") {
+            return self
+                .lua
+                .borrow_mut()
+                .exec_file(path)
+                .map_err(|error| AppError::Lua(error.to_string()));
+        }
+        let source = fs::read_to_string(path).map_err(AppError::Io)?;
+        let name = path.to_string_lossy().into_owned();
+        self.ex
+            .borrow_mut()
+            .execute_script(&mut self.editor.borrow_mut(), &name, &source)
+            .map_err(|error| AppError::Ex(error.to_string()))?;
+        Ok(())
+    }
+
+    /// `do_user_initialization` (main.c:2108-2210), in its order:
+    ///
+    /// 1. `$VIMINIT` as Ex commands, and nothing else if it ran.
+    /// 2. `stdpath('config')/init.lua`, then `init.vim`. Only one is sourced;
+    ///    when the Lua one wins and the Vim one also exists, upstream reports
+    ///    `E5422: Conflicting configs` (errors.h:233) and keeps going.
+    /// 3. The same pair under each `stdpath('config_dirs')` entry, in order.
+    /// 4. `$EXINIT` as Ex commands.
+    ///
+    /// This is the step whose absence meant nothing a user wrote ever ran:
+    /// before it, only an explicit `-u` was read.
+    fn discover_user_config(&mut self) -> Result<(), AppError> {
+        if self.execute_env("VIMINIT")? {
+            return Ok(());
+        }
+        let mut bases = ox_editor::stdpath(ox_editor::StdPath::Config);
+        bases.extend(ox_editor::stdpath(ox_editor::StdPath::ConfigDirs));
+        for base in bases {
+            let lua = Path::new(&base).join("init.lua");
+            let vim = Path::new(&base).join("init.vim");
+            if lua.is_file() {
+                self.source_config_file(&lua)?;
+                if vim.is_file() {
+                    self.editor.borrow_mut().push_message(ox_editor::Message {
+                        kind: MessageKind::Error,
+                        content: Object::String(OxStr::from(
+                            format!(
+                                "E5422: Conflicting configs: \"{}\" \"{}\"",
+                                lua.display(),
+                                vim.display()
+                            )
+                            .as_str(),
+                        )),
+                        history: true,
+                    });
+                }
+                return Ok(());
+            }
+            if vim.is_file() {
+                return self.source_config_file(&vim);
+            }
+        }
+        self.execute_env("EXINIT").map(|_| ())
+    }
+
+    /// `execute_env` (main.c:2257-...): a non-empty environment variable is run
+    /// as Ex command lines. Reports whether it ran.
+    fn execute_env(&mut self, name: &str) -> Result<bool, AppError> {
+        let Some(value) = std::env::var_os(name) else { return Ok(false) };
+        let value = value.to_string_lossy().into_owned();
+        if value.is_empty() {
+            return Ok(false);
+        }
+        self.execute_ex(&value)?;
+        Ok(true)
+    }
+
+    /// `load_plugins` (runtime.c:1397-1424): `plugin/**/*` under every
+    /// `'runtimepath'` entry, with the `after/` entries held back to the end
+    /// (`DIP_NOAFTER` then `DIP_AFTER`).
+    ///
+    /// Within one entry every `.vim` file is sourced before every `.lua` file,
+    /// which is `source_callback_vim_lua`'s two passes (runtime.c:371-396) and
+    /// not an accident of directory order.
+    ///
+    /// Packages (`pack/*/start/*`) are not sourced here: upstream's
+    /// `add_pack_start_dirs`/`load_start_packages` also rewrite
+    /// `'runtimepath'`, which is a separate mechanism from this one.
+    fn load_plugins(&mut self) -> Result<(), AppError> {
+        let rtp = match self.editor.borrow().options().get_global("runtimepath") {
+            Ok(OptionValue::String(value)) => value.clone(),
+            _ => return Ok(()),
+        };
+        let (after, plain): (Vec<&str>, Vec<&str>) = rtp
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .partition(|entry| Path::new(entry).file_name().is_some_and(|name| name == "after"));
+        for entry in plain.into_iter().chain(after) {
+            for script in plugin_scripts(Path::new(entry)) {
+                // `source_callback_vim_lua` (runtime.c:371-396) discards
+                // `do_source`'s result and sources the next file, so an error
+                // inside one plugin ends that plugin and nothing else. One
+                // broken plugin must not be able to stop startup -- with the
+                // error propagated instead, `runtime/plugin/gzip.vim` took the
+                // whole editor down on every plain startup.
+                if let Err(error) = self.source_config_file(&script) {
+                    self.editor.borrow_mut().push_message(ox_editor::Message {
+                        kind: MessageKind::Error,
+                        content: Object::String(OxStr::from(
+                            format!("{}: {error}", script.display()).as_str(),
+                        )),
+                        history: true,
+                    });
+                }
+                if self.exiting {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 
     fn execute_ex(&mut self, command: &str) -> Result<(), AppError> {
@@ -232,52 +462,6 @@ impl AppState {
         if let ExecOutcome::Quit(code) = outcome {
             self.exiting = true;
             self.exit_code = code;
-        }
-        Ok(())
-    }
-
-    /// Opens every positional file argument as a named buffer, mirroring
-    /// `main.c` `create_windows()`/`edit_buffers()` for the single-window
-    /// case: `open_buffer(false, ...)` reads the first file into the
-    /// startup buffer itself, so buffer numbers match `nvim a b c`, and
-    /// each remaining file becomes a loaded hidden buffer without
-    /// stealing the current window.  When a startup script has already
-    /// replaced or modified the startup buffer, every file, the first
-    /// included, is opened as a background buffer instead.
-    fn open_startup_files(&mut self, files: &[String]) -> Result<(), AppError> {
-        let first_into_current = self
-            .editor
-            .borrow()
-            .current_buffer()
-            .is_some_and(|current| {
-                self.editor
-                    .borrow()
-                    .buffer(current)
-                    .is_ok_and(|state| state.name().as_bytes().is_empty() && !state.modified)
-            });
-        for (index, file) in files.iter().enumerate() {
-            let text = read_startup_file(file)?;
-            if index == 0 && first_into_current {
-                let current = self
-                    .editor
-                    .borrow()
-                    .current_buffer()
-                    .ok_or_else(|| AppError::Editor("no current buffer at startup".into()))?;
-                if let Ok(state) = self.editor.borrow_mut().buffer_mut(current) {
-                    state.load(text);
-                    state.set_name(OxStr::from(file.as_str()));
-                }
-                continue;
-            }
-            let handle = self
-                .editor
-                .borrow_mut()
-                .create_buffer_with(text, true)
-                .map_err(|error| AppError::Editor(error.to_string()))?;
-            if let Ok(state) = self.editor.borrow_mut().buffer_mut(handle) {
-                state.set_name(OxStr::from(file.as_str()));
-                state.mark_saved();
-            }
         }
         Ok(())
     }
@@ -493,6 +677,7 @@ impl AppState {
         self.ui_channels
             .attach(channel.get(), width, height, UiOptions::from_dict(&options))
             .map_err(|error| ApiError::exception(error.to_string()))?;
+        self.sync_ui_active();
         Ok(Object::Nil)
     }
 
@@ -504,7 +689,16 @@ impl AppState {
             .detach(channel.get())
             .map_err(|error| ApiError::exception(error.to_string()))?;
         self.emitter.detach(channel.get());
+        self.sync_ui_active();
         Ok(Object::Nil)
+    }
+
+    /// Mirrors `ui_active()` into the message sink: `msg_use_printf`
+    /// (`message.c` line 3013) stops printing as soon as a UI can display the
+    /// text, and starts again when the last one detaches.
+    fn sync_ui_active(&mut self) {
+        let attached = self.ui_channels.iter().next().is_some();
+        self.editor.borrow_mut().message_routing.ui_attached = attached;
     }
 
     fn ui_resize(&mut self, channel: ChannelId, params: &[Object]) -> Result<Object, ApiError> {
@@ -523,6 +717,8 @@ impl AppState {
 
     fn redraw(&mut self) -> Result<BTreeMap<u64, Vec<u8>>, ApiError> {
         self.sync_chrome();
+        self.publish_messages()
+            .map_err(|error| ApiError::exception(error.to_string()))?;
         let (width, height) = self
             .ui_channels
             .iter()
@@ -530,7 +726,7 @@ impl AppState {
             .fold((1, 1), |(max_width, max_height), (width, height)| {
                 (max_width.max(width), max_height.max(height))
             });
-        let compositor = Compositor::from_editor(&self.editor.borrow(), width, height)
+        let compositor = Compositor::from_editor(&self.editor.borrow(), width, height, &mut self.highlights)
             .map_err(|error| ApiError::exception(error.to_string()))?;
         self.emitter
             .redraw(
@@ -562,59 +758,79 @@ impl AppState {
             }
             _ => self.chrome.hide_cmdline(1, false),
         }
-
-        let editor = self.editor.borrow();
-        for message in &editor.messages()[self.rendered_messages..] {
-            let text = match &message.content {
-                Object::String(text) => text.clone(),
-                value => OxStr::from(format!("{value:?}").as_bytes()),
-            };
-            self.chrome.show_message(MessageState {
-                kind: OxStr::from(if message.kind == MessageKind::Error { "emsg" } else { "echo" }),
-                content: vec![ContentChunk::new(0, text)],
-                replace_last: false,
-                history: message.history,
-                append: false,
-                id: Object::Nil,
-                trigger: OxStr::from(""),
-            });
-        }
-        self.rendered_messages = editor.messages().len();
     }
 
-    fn drive_input(&mut self) -> Result<(), ApiError> {
-        loop {
-            let ready = self.mode.run_once(&mut self.editor.borrow_mut())
-                .map_err(|error| ApiError::exception(error.to_string()))?;
-            if !ready { break; }
+    /// Sends every newly retained message where the editor sink decided it
+    /// goes: an attached UI, stdout, stderr, or nowhere.
+    fn publish_messages(&mut self) -> Result<(), AppError> {
+        let pending: Vec<(ox_editor::Message, MessageDestination)> = {
+            let editor = self.editor.borrow();
+            let from = self.rendered_messages;
+            editor.messages()[from..]
+                .iter()
+                .cloned()
+                .zip(editor.message_destinations()[from..].iter().copied())
+                .collect()
+        };
+        self.rendered_messages += pending.len();
+        for (message, destination) in &pending {
+            if *destination == MessageDestination::Ui {
+                self.show_in_chrome(message);
+            } else {
+                self.printf.write(*destination, message).map_err(AppError::Io)?;
+            }
+        }
+        Ok(())
+    }
 
-            if let Some(command) = self.mode.take_ex_command() {
-                let outcome = self.ex
-                    .borrow_mut()
-                    .execute_line(&mut self.editor.borrow_mut(), &command)
-                    .map_err(|error| ApiError::exception(error.to_string()))?;
-                if let ExecOutcome::Quit(code) = outcome {
-                    self.exiting = true;
-                    self.exit_code = code;
-                }
-            }
-            if let Some(action) = self.mode.take_mapping_action() {
-                let outcome = match action {
-                    MappingAction::ExCommands(commands) => self.ex
-                        .borrow_mut()
-                        .execute_commands(&mut self.editor.borrow_mut(), &commands)
-                        .map_err(|error| ApiError::exception(error.to_string()))?,
-                    MappingAction::Expr(id) | MappingAction::Callback(id) => {
-                        return Err(ApiError::exception(format!("mapping callback {id} has no registered host evaluator")));
-                    }
-                    MappingAction::Keys(_) | MappingAction::Nop => ExecOutcome::Completed,
-                };
-                if let ExecOutcome::Quit(code) = outcome {
-                    self.exiting = true;
-                    self.exit_code = code;
-                }
-            }
-            if self.exiting { break; }
+    /// `getout` (`main.c`:753) for an exit this host decided on rather than a
+    /// command: the peer closed its write side, or the loop was stopped. The
+    /// executor's own sequence is idempotent, so an exit a `:quit` already
+    /// carried through fires nothing a second time. Anything the handlers emit
+    /// is published, as upstream's exit messages are.
+    fn run_exit(&mut self) -> Result<(), AppError> {
+        {
+            let mut editor = self.editor.borrow_mut();
+            self.ex
+                .borrow_mut()
+                .run_exit_sequence(&mut editor)
+                .map_err(|error| AppError::Ex(error.to_string()))?;
+        }
+        self.publish_messages()
+    }
+
+    fn show_in_chrome(&mut self, message: &ox_editor::Message) {
+        let text = match &message.content {
+            Object::String(text) => text.clone(),
+            value => OxStr::from(format!("{value:?}").as_bytes()),
+        };
+        self.chrome.show_message(MessageState {
+            kind: OxStr::from(if message.kind == MessageKind::Error { "emsg" } else { "echo" }),
+            content: vec![ContentChunk::new(0, text)],
+            replace_last: false,
+            history: message.history,
+            append: false,
+            id: Object::Nil,
+            trigger: OxStr::from(""),
+        });
+    }
+
+    /// One turn of `state_enter`'s input handling (`state.c:34-106`).
+    ///
+    /// Everything a consumed key produces — a finished `:` command line, a
+    /// mapping's Ex-command or `<expr>` right-hand side — is run by
+    /// `ExExecutor::run_typeahead`, the same entry point `:normal` and
+    /// `feedkeys()` use, so a mapping cannot behave differently depending on
+    /// how its left-hand side arrived.
+    fn drive_input(&mut self) -> Result<(), ApiError> {
+        let outcome = self
+            .ex
+            .borrow_mut()
+            .run_typeahead(&mut self.editor.borrow_mut(), &mut self.mode)
+            .map_err(|error| ApiError::exception(error.to_string()))?;
+        if let ExecOutcome::Quit(code) = outcome {
+            self.exiting = true;
+            self.exit_code = code;
         }
         Ok(())
     }
@@ -741,20 +957,6 @@ impl AppState {
     /// Process exit code requested so far (`:cquit`, else 0).
     fn exit_code(&self) -> i64 { self.exit_code }
 }
-
-/// Reads one startup file argument into buffer text.  A file that does
-/// not exist yet still opens as a named empty buffer, like upstream's
-/// buffer creation during argument-list setup; other read failures are
-/// `E484`, matching `:edit`'s error for unreadable files.
-fn read_startup_file(file: &str) -> Result<Buffer, AppError> {
-    let text = match fs::read_to_string(file) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(AppError::Ex(format!("E484: Can't open file {file}: {error}"))),
-    };
-    Buffer::from_bytes(text.as_bytes()).map_err(|error| AppError::Ex(format!("E474: {error}")))
-}
-
  fn positive_dimension(value: i64, name: &str) -> Result<usize, ApiError> {
     usize::try_from(value)
         .ok()
@@ -829,12 +1031,20 @@ fn method_is_mutating(method: &str) -> bool {
 
 /// Serve channel 1 over stdin/stdout until the peer closes its write side.
 /// Returns the process exit code requested by `:cquit` (0 otherwise).
-pub fn run_stdio(cli: &Cli) -> Result<i64, AppError> {
-    let mut state = AppState::new(cli)?;
+pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
+    let mut state = AppState::new(cli, timer)?;
     let mut decoder = IncrementalDecoder::new();
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     let mut bytes = [0_u8; 8192];
+
+    // main.c getout(): a startup command that quits ends the process before
+    // the input loop starts, so `--headless -c 'echo x' -c 'qall!'` never
+    // waits for a peer to close stdin.
+    if state.should_exit() {
+        state.run_exit()?;
+        return Ok(state.exit_code());
+    }
 
     loop {
         let count = input.read(&mut bytes).map_err(AppError::Io)?;
@@ -852,13 +1062,14 @@ pub fn run_stdio(cli: &Cli) -> Result<i64, AppError> {
         output.flush().map_err(AppError::Io)?;
         if state.should_exit() { break; }
     }
+    state.run_exit()?;
     Ok(state.exit_code())
 }
 
 /// Serve RPC peers accepted from a TCP address or Unix-domain pipe.
 /// Returns the process exit code requested by `:cquit` (0 otherwise).
-pub fn run_listener(cli: &Cli, address: &str) -> Result<i64, AppError> {
-    let state = Rc::new(RefCell::new(AppState::new(cli)?));
+pub fn run_listener(cli: &Cli, address: &str, timer: &mut StartupTimer) -> Result<i64, AppError> {
+    let state = Rc::new(RefCell::new(AppState::new(cli, timer)?));
     let runtime = Rc::new(RefCell::new(NetworkRuntime::new(state)));
     let mut uv_loop = UvLoop::new().map_err(|error| AppError::Server(error.to_string()))?;
     let callback_runtime = runtime.clone();
@@ -906,6 +1117,7 @@ pub fn run_listener(cli: &Cli, address: &str) -> Result<i64, AppError> {
         return Err(AppError::Server(error));
     }
     close_result?;
+    state.borrow_mut().run_exit()?;
     Ok(state.borrow().exit_code())
 }
 
@@ -1170,31 +1382,47 @@ struct EditorBuiltins {
     editor: Rc<RefCell<Editor>>,
     ex: Rc<RefCell<ExExecutor>>,
     nested_ex: Rc<RefCell<ExExecutor>>,
+    nested_editor: Rc<RefCell<Editor>>,
+}
+
+impl EditorBuiltins {
+    /// Serve `name` through the outermost executor and editor that are free.
+    ///
+    /// The first tier is the real pair, and it is the tier `vim.fn` reaches
+    /// from a Lua config file, an RPC request, a scheduled callback or an
+    /// autocommand -- everywhere a plugin runs. The inner tiers exist because
+    /// Lua can also be reached from *inside* Ex execution (`:lua`, `lua <<EOF`
+    /// in an init.vim), which already holds both; a nested executor over a
+    /// scratch editor still answers every builtin that needs no editor state,
+    /// and the alternative here was a `RefCell already borrowed` panic.
+    fn dispatch(&self, name: &OxStr, args: Vec<Typval>) -> Result<Typval, ExecError> {
+        if let Ok(mut ex) = self.ex.try_borrow_mut() {
+            if let Ok(mut editor) = self.editor.try_borrow_mut() {
+                return ex.call_builtin(&mut editor, name, args);
+            }
+        }
+        if let Ok(mut ex) = self.nested_ex.try_borrow_mut() {
+            if let Ok(mut editor) = self.nested_editor.try_borrow_mut() {
+                return ex.call_builtin(&mut editor, name, args);
+            }
+        }
+        ExExecutor::new().call_builtin(&mut Editor::new(), name, args)
+    }
 }
 
 impl BuiltinHost for EditorBuiltins {
+    /// One route for every name, because `vim.fn.X()` and `:echo X()` have to
+    /// answer the same thing.
+    ///
+    /// This replaces a three-branch dispatch that sent six job names to the Ex
+    /// executor, `getline`/`setline` to a buffer seam, and *everything else* to
+    /// `Builtins::without_regex()` -- a stateless table with no editor, no file
+    /// IO and no regex engine. 24 builtins that work in Vimscript answered
+    /// `E117` from Lua and every regex builtin answered `E54: regular-
+    /// expression engine is not installed`, so the same function gave two
+    /// answers depending on which language called it.
     fn call(&self, name: &OxStr, args: Vec<Typval>) -> Result<Typval, String> {
-        let name_text = name.to_string_lossy();
-        if matches!(&*name_text, "jobstart" | "jobstop" | "jobwait" | "jobpid" | "chansend" | "jobsend") {
-            let mut fallback = Editor::new();
-            let result = match (self.editor.try_borrow_mut(), self.ex.try_borrow_mut()) {
-                (Ok(mut editor), Ok(mut ex)) => ex.call_builtin(&mut editor, name, args),
-                _ => self.nested_ex.borrow_mut().call_builtin(&mut fallback, name, args),
-            };
-            return result.map_err(|error| error.to_string());
-        }
-        if is_buffer_builtin(&name_text) {
-            return call_buffer_builtin(
-                &mut CurrentBuffer(&mut self.editor.borrow_mut()),
-                &name_text,
-                args,
-            )
-            .map_err(|error| error.to_string());
-        }
-        let mut builtins = Builtins::without_regex();
-        builtins
-            .call(name, args, &mut Scope::new())
-            .map_err(|error| error.to_string())
+        self.dispatch(name, args).map_err(|error| error.to_string())
     }
 }
 
@@ -1277,85 +1505,6 @@ fn variables_mut(
         VariableScope::Tabpage => editor
             .tabpage_variables_mut(TabHandle::try_from(handle).map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string()),
-    }
-}
-
-struct CurrentBuffer<'a>(&'a mut Editor);
-
-impl BufferHost for CurrentBuffer<'_> {
-    fn line_count(&self) -> ox_eval::Result<usize> {
-        let buffer = self
-            .0
-            .current_buffer()
-            .ok_or_else(|| ox_eval::EvalError::new("E86", 0, "Buffer not found"))?;
-        self.0
-            .buffer(buffer)
-            .and_then(|state| state.text().map_err(Into::into))
-            .map(|text| text.line_count())
-            .map_err(|error: ox_editor::EditorError| {
-                ox_eval::EvalError::new("E86", 0, error.to_string())
-            })
-    }
-
-    fn get_line(&self, lnum: usize) -> ox_eval::Result<Option<OxStr>> {
-        let buffer = self
-            .0
-            .current_buffer()
-            .ok_or_else(|| ox_eval::EvalError::new("E86", 0, "Buffer not found"))?;
-        let state = self
-            .0
-            .buffer(buffer)
-            .map_err(|error| ox_eval::EvalError::new("E86", 0, error.to_string()))?;
-        let text = state
-            .text()
-            .map_err(|error| ox_eval::EvalError::new("E86", 0, error.to_string()))?;
-        if lnum == 0 || lnum > text.line_count() { return Ok(None); }
-        text.line(lnum)
-            .map(|line| Some(OxStr(line)))
-            .map_err(|error| ox_eval::EvalError::new("E86", 0, error.to_string()))
-    }
-
-    fn replace_line(&mut self, lnum: usize, text: &OxStr) -> ox_eval::Result<()> {
-        let buffer = self
-            .0
-            .current_buffer()
-            .ok_or_else(|| ox_eval::EvalError::new("E86", 0, "Buffer not found"))?;
-        let state = self
-            .0
-            .buffer_mut(buffer)
-            .map_err(|error| ox_eval::EvalError::new("E86", 0, error.to_string()))?;
-        state
-            .replace_lines(
-                lnum,
-                lnum,
-                &[text.as_bytes().to_vec()],
-                ox_text::Position { lnum, col: 0 },
-                ox_text::Position { lnum, col: 0 },
-                0,
-            )
-            .map(|_| ())
-            .map_err(|error| ox_eval::EvalError::new("E86", 0, error.to_string()))
-    }
-
-    fn append_line(&mut self, text: &OxStr) -> ox_eval::Result<()> {
-        let count = self.line_count()?;
-        let buffer = self
-            .0
-            .current_buffer()
-            .ok_or_else(|| ox_eval::EvalError::new("E86", 0, "Buffer not found"))?;
-        let state = self
-            .0
-            .buffer_mut(buffer)
-            .map_err(|error| ox_eval::EvalError::new("E86", 0, error.to_string()))?;
-        state
-            .append_lines(
-                count,
-                &[text.as_bytes().to_vec()],
-                ox_text::Position { lnum: count, col: 0 },
-                0,
-            )
-            .map(|_| ())
-            .map_err(|error| ox_eval::EvalError::new("E86", 0, error.to_string()))
     }
 }
 
@@ -1635,5 +1784,33 @@ impl Scheduler for LuaScheduler {
     fn schedule_deferred(&self, work: Work) -> Result<(), String> {
         self.queue.borrow_mut().push_back(work);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_channel_sink_defers_send_on_reentrant_borrow() {
+        let ex = Rc::new(RefCell::new(ox_editor::ExExecutor::new()));
+        let queue = Rc::new(RefCell::new(VecDeque::new()));
+        let mut sink = JobChannelSink {
+            ex: ex.clone(),
+            queue: queue.clone(),
+            deferred: Rc::new(Cell::new(0)),
+        };
+
+        let _outer = ex.borrow_mut();
+        // A send while `ex` is already borrowed must not panic; it should
+        // queue the work for the scheduler instead.
+        ox_api::ChannelSink::send(&mut sink, 7, b"hello\n").unwrap();
+
+        assert_eq!(queue.borrow().len(), 1, "reentrant send must be queued");
+        assert_eq!(sink.deferred.get(), 1, "deferred counter must track queued send");
+
+        drop(_outer);
+        let work = queue.borrow_mut().pop_front().unwrap();
+        work().unwrap();
     }
 }

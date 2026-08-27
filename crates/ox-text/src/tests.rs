@@ -3,11 +3,12 @@ use std::io::Cursor as IoCursor;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmpv::Value;
 
 use super::*;
+use crate::buffer::LineSplice;
 
 fn bytes(lines: &[&str]) -> Vec<Vec<u8>> {
     lines.iter().map(|line| line.as_bytes().to_vec()).collect()
@@ -144,6 +145,106 @@ fn randomized_buffer_matches_vec_model() {
     }
 }
 
+/// Differential oracle for the in-place ranged mutators. Unlike
+/// [`randomized_buffer_matches_vec_model`] this also drives `append_lines`,
+/// `delete_lines`, and `set_eol`, so every branch of the rope splice (interior
+/// insert, append past a terminated and an unterminated final line, deletion
+/// through the final line, and total deletion) is compared against a `Vec`
+/// model that tracks end-of-line state alongside the lines.
+#[test]
+fn randomized_mixed_mutations_match_vec_model() {
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        usize::try_from(state >> 33).unwrap()
+    };
+    let mut buffer = Buffer::new();
+    let mut model = vec![Vec::new()];
+    let mut has_eol = false;
+    for expected_tick in 1..=1200_u64 {
+        let mut replacement = Vec::new();
+        for index in 0..next() % 3 {
+            replacement.push(format!("{}-{index}", next()).into_bytes());
+        }
+        match next() % 4 {
+            0 => {
+                let lnum = next() % (model.len() + 1);
+                buffer.append_lines(lnum, &replacement).unwrap();
+                model.splice(lnum..lnum, replacement);
+            }
+            1 => {
+                let start = next() % model.len();
+                let span = next() % (model.len() - start) + 1;
+                buffer.delete_lines(start + 1, start + span).unwrap();
+                model.drain(start..start + span);
+            }
+            2 => {
+                let start = next() % model.len();
+                let span = next() % (model.len() - start) + 1;
+                buffer
+                    .replace_lines(start + 1, start + span, &replacement)
+                    .unwrap();
+                model.splice(start..start + span, replacement);
+            }
+            _ => {
+                has_eol = next() % 2 == 1;
+                buffer.set_eol(has_eol);
+            }
+        }
+        if model.is_empty() {
+            // Deleting every line leaves the canonical empty Vim buffer.
+            model.push(Vec::new());
+            has_eol = false;
+        }
+        assert_eq!(buffer.changedtick(), expected_tick);
+        assert_eq!(buffer.has_eol(), has_eol, "eol at tick {expected_tick}");
+        assert_eq!(buffer.line_count(), model.len(), "count at tick {expected_tick}");
+        let mut serialized = model.join(&b'\n');
+        if has_eol {
+            serialized.push(b'\n');
+        }
+        assert_eq!(buffer.to_bytes(), serialized, "bytes at tick {expected_tick}");
+        let mut offset = 0;
+        for (index, expected) in model.iter().enumerate() {
+            assert_eq!(buffer.line(index + 1).unwrap(), *expected);
+            assert_eq!(buffer.byte_of_line(index + 1).unwrap(), offset);
+            offset += expected.len() + usize::from(index + 1 != model.len() || has_eol);
+        }
+        assert_eq!(buffer.byte_of_line(model.len() + 1).unwrap(), offset);
+    }
+}
+
+/// Appending one line at a time must cost the edit, not the buffer.
+///
+/// The superseded implementation materialized every logical line into a `Vec`
+/// and rebuilt the entire rope on each call, making an N-line insert O(N^2);
+/// this loop measured 497.3s against it (a debug build on this workstation)
+/// and pushed upstream's `test_window_cmd.vim` past a 120s timeout. The ranged
+/// rope splice runs the same loop in 84ms. The one-second bound leaves an
+/// order of magnitude of headroom over that, so a loaded machine cannot make
+/// it flaky, yet it still fails hard against any return of the quadratic shape.
+#[test]
+fn appending_ten_thousand_lines_costs_the_edit_not_the_buffer() {
+    let mut buffer = Buffer::new();
+    let started = Instant::now();
+    for index in 0..10_000_usize {
+        let last = buffer.line_count();
+        buffer
+            .append_lines(last, &[format!("line {index}").into_bytes()])
+            .unwrap();
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(buffer.line_count(), 10_001);
+    assert_eq!(buffer.line(1).unwrap(), b"");
+    assert_eq!(buffer.line(10_001).unwrap(), b"line 9999");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "10000 single-line appends took {elapsed:?}, expected well under 1s"
+    );
+}
+
 #[test]
 fn marks_follow_splice_boundaries() {
     let mut marks = Marks::new();
@@ -170,13 +271,24 @@ fn edit(label: &str) -> LineEdit {
     }
 }
 
+/// Records `edit` as its own undo block: the tree only starts a new header
+/// when the previous one is closed, so a test about *branches* has to close
+/// each one the way a typed key would.
+fn record_block(tree: &mut UndoTree, label: &str, timestamp: i64) -> u64 {
+    tree.sync();
+    tree.record(edit(label), timestamp)
+}
+
 #[test]
 fn undo_tree_preserves_and_navigates_branches() {
     let mut tree = UndoTree::new();
-    let first = tree.record(edit("one"), 10);
-    let second = tree.record(edit("two"), 20);
-    assert_eq!(tree.undo().unwrap(), UndoStep::Undo(UndoEntry { seq: second, timestamp: 20, edit: edit("two") }));
-    let third = tree.record(edit("branch"), 30);
+    let first = record_block(&mut tree, "one", 10);
+    let second = record_block(&mut tree, "two", 20);
+    assert_eq!(
+        tree.undo().unwrap(),
+        UndoStep::Undo(UndoEntry { seq: second, timestamp: 20, edits: vec![edit("two")] })
+    );
+    let third = record_block(&mut tree, "branch", 30);
     assert_eq!(tree.current_seq(), third);
     tree.undo().unwrap();
     assert_eq!(tree.branches(), vec![second, third]);
@@ -185,6 +297,105 @@ fn undo_tree_preserves_and_navigates_branches() {
     assert_eq!(steps.len(), 2);
     assert_eq!(tree.current_seq(), third);
     assert_eq!(tree.undo_to_seq(first).unwrap().len(), 1);
+}
+
+/// Edits recorded without a sync between them are one header, and one undo
+/// step takes the whole block back (`u_savecommon`, `undo.c:388-500`).
+#[test]
+fn unsynced_edits_join_one_undo_block() {
+    let mut tree = UndoTree::new();
+    let first = tree.record(edit("one"), 10);
+    let joined = tree.record(edit("two"), 20);
+    let also_joined = tree.record(edit("three"), 30);
+    assert_eq!(joined, first, "an open block must not allocate a sequence");
+    assert_eq!(also_joined, first);
+    assert_eq!(tree.current_seq(), first);
+    assert_eq!(tree.current_block_len(), 3);
+    assert!(!tree.is_synced());
+    assert_eq!(tree.summary().seq_last, first, "no extra header was created");
+
+    let UndoStep::Undo(entry) = tree.undo().unwrap() else {
+        panic!("expected an undo step");
+    };
+    assert_eq!(entry.edits, vec![edit("one"), edit("two"), edit("three")]);
+    assert!(tree.is_synced(), "undoing closes the block");
+    assert_eq!(tree.current_seq(), 0);
+    assert!(tree.undo().is_err(), "one block, one step");
+}
+
+/// A sync between two edits makes two headers, which is the boundary a typed
+/// key installs (`may_sync_undo`, `input.c:1300`).
+#[test]
+fn a_sync_between_edits_starts_a_new_undo_block() {
+    let mut tree = UndoTree::new();
+    let first = tree.record(edit("one"), 10);
+    tree.sync();
+    let second = tree.record(edit("two"), 20);
+    assert_ne!(second, first);
+    assert_eq!(tree.summary().seq_last, second);
+    assert_eq!(tree.current_block_len(), 1);
+    tree.undo().unwrap();
+    assert_eq!(tree.current_seq(), first);
+    tree.undo().unwrap();
+    assert_eq!(tree.current_seq(), 0);
+}
+
+/// `:undojoin` reopens the newest block, is a no-op when one is already open,
+/// and is `E790` after an undo (`ex_undojoin`, `undo.c:2800-2816`).
+#[test]
+fn undojoin_reopens_the_newest_block_but_never_after_an_undo() {
+    let mut tree = UndoTree::new();
+    // Nothing recorded yet: silent no-op, and the next edit still starts a
+    // block of its own.
+    tree.undojoin().unwrap();
+    let first = tree.record(edit("one"), 10);
+    // Already open: also a no-op, and the flag stays open.
+    tree.undojoin().unwrap();
+    assert!(!tree.is_synced());
+
+    tree.sync();
+    tree.undojoin().unwrap();
+    let joined = tree.record(edit("two"), 20);
+    assert_eq!(joined, first, "undojoin put the edit in the existing header");
+    assert_eq!(tree.current_block_len(), 2);
+
+    tree.undo().unwrap();
+    assert_eq!(tree.undojoin(), Err(UndoError::JoinAfterUndo));
+
+    // The other rejecting shape: an undo that stopped on an earlier header
+    // rather than at the original state.
+    let mut tree = UndoTree::new();
+    record_block(&mut tree, "one", 10);
+    record_block(&mut tree, "two", 20);
+    tree.undo().unwrap();
+    assert_ne!(tree.current_seq(), 0, "stopped on a header, not at the root");
+    assert_eq!(tree.undojoin(), Err(UndoError::JoinAfterUndo));
+}
+
+/// The header list `undotree()` reports: oldest first along the active
+/// branch, with the abandoned branch nested under `alt`
+/// (`u_eval_tree`, `undo.c:3193-3221`).
+#[test]
+fn undotree_entries_report_the_active_branch_and_its_alternates() {
+    let mut tree = UndoTree::new();
+    let first = record_block(&mut tree, "one", 10);
+    let second = record_block(&mut tree, "two", 20);
+    tree.undo().unwrap();
+    let branch = record_block(&mut tree, "branch", 30);
+
+    let entries = tree.entries();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].seq, first);
+    assert!(entries[0].alt.is_empty());
+    assert_eq!(entries[1].seq, branch);
+    assert!(entries[1].newhead, "the branch tip is b_u_newhead");
+    assert!(!entries[1].curhead);
+    assert_eq!(entries[1].alt.len(), 1);
+    assert_eq!(entries[1].alt[0].seq, second);
+
+    tree.undo().unwrap();
+    let entries = tree.entries();
+    assert!(entries[1].curhead, "the undone header is b_u_curhead");
 }
 
 #[test]
@@ -302,11 +513,15 @@ fn ox_text_writes_undo_history_real_nvim_undoes_forward() {
     let mut buffer = Buffer::from_bytes(b"a\nb\n").unwrap();
     let mut tree = UndoTree::new();
 
-    // Three sequential edits: line 2 b->c, c->d, then append "e".
+    // Three sequential edits, each its own undo block: line 2 b->c, c->d,
+    // then append "e". Without the syncs they would be one header, which is
+    // what a scripted run of three mutations actually produces.
     tree.record(edit_at(2, &bytes(&["b"]), &bytes(&["c"])), 1710000001);
     buffer.replace_lines(2, 2, &bytes(&["c"])).unwrap();
+    tree.sync();
     tree.record(edit_at(2, &bytes(&["c"]), &bytes(&["d"])), 1710000002);
     buffer.replace_lines(2, 2, &bytes(&["d"])).unwrap();
+    tree.sync();
     tree.record(edit_at(3, &[], &bytes(&["e"])), 1710000003);
     buffer.append_lines(2, &bytes(&["e"])).unwrap();
 
@@ -335,9 +550,11 @@ fn ox_text_writes_branching_history_real_nvim_follows_active_branch() {
     let mut buffer = Buffer::from_bytes(b"a\nb\n").unwrap();
     let mut tree = UndoTree::new();
 
-    // E1 b->c, E2 c->d, then abandon E2 (undo) and branch fresh edit E3.
+    // E1 b->c, E2 c->d, then abandon E2 (undo) and branch fresh edit E3, each
+    // in its own undo block.
     tree.record(edit_at(2, &bytes(&["b"]), &bytes(&["c"])), 1710000001);
     buffer.replace_lines(2, 2, &bytes(&["c"])).unwrap();
+    tree.sync();
     tree.record(edit_at(2, &bytes(&["c"]), &bytes(&["d"])), 1710000002);
     buffer.replace_lines(2, 2, &bytes(&["d"])).unwrap();
     buffer.replace_lines(2, 2, &bytes(&["c"])).unwrap(); // sync buffer to E1 state
@@ -359,6 +576,44 @@ fn ox_text_writes_branching_history_real_nvim_follows_active_branch() {
     assert_eq!(fs::read_to_string(&dumps[1]).unwrap(), "a\nb\n");
     assert_eq!(fs::read_to_string(&dumps[2]).unwrap(), "a\nb\n");
     assert_eq!(fs::read_to_string(&dumps[3]).unwrap(), "a\nb\n");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A header holding several edits must read back as one undoable unit in real
+/// Neovim: one `:undo` puts every line the block touched back at once.
+///
+/// This is the file-format half of the grouping change — a header carries an
+/// entry list upstream (`uh_entry`, `undo.c:610-611`), and this proves our
+/// writer emits that list in an order Neovim replays correctly.
+#[test]
+fn ox_text_writes_a_grouped_block_real_nvim_undoes_it_in_one_step() {
+    if !Path::new(nvim()).exists() {
+        return;
+    }
+    let dir = oracle_dir("fwd-grouped");
+    let mut buffer = Buffer::from_bytes(b"a\nb\nc\n").unwrap();
+    let mut tree = UndoTree::new();
+
+    // One block whose edits are order-sensitive: delete line 1 twice, as
+    // `:g/^[ab]$/d` does. Undoing has to reinsert "b" before "a", so a
+    // wrongly ordered entry list produces "b\na\nc\n" instead.
+    for gone in ["a", "b"] {
+        tree.record(edit_at(1, &bytes(&[gone]), &[]), 1710000001);
+        buffer.replace_lines(1, 1, &[]).unwrap();
+    }
+    assert_eq!(buffer.to_bytes(), b"c\n");
+
+    let undo = UndoFile::from_tree(&buffer, &tree);
+    undo.verify_buffer(&buffer).unwrap();
+    let mut undo_bytes = Vec::new();
+    undo.write(&mut undo_bytes).unwrap();
+    assert_eq!(written_header_count(&undo_bytes), 1, "two edits, one header");
+
+    let dumps = forward_undo_dumps(&dir, b"c\n", &undo_bytes);
+    // The first undo restores both lines in their original order, and there
+    // is nothing older.
+    assert_eq!(fs::read_to_string(&dumps[0]).unwrap(), "a\nb\nc\n");
+    assert_eq!(fs::read_to_string(&dumps[1]).unwrap(), "a\nb\nc\n");
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -497,6 +752,7 @@ fn undo_file_header_seq_validation() {
     let buffer = Buffer::from_bytes(b"a\nb\n").unwrap();
     let mut tree = UndoTree::new();
     tree.record(edit_at(2, &bytes(&["b"]), &bytes(&["c"])), 1710000001);
+    tree.sync();
     tree.record(edit_at(2, &bytes(&["c"]), &bytes(&["d"])), 1710000002);
     let undo = UndoFile::from_tree(&buffer, &tree);
     let mut valid = Vec::new();
@@ -571,4 +827,87 @@ fn undo_file_entry_fields_reject_negative() {
             "negative {name} was accepted"
         );
     }
+}
+
+#[test]
+fn replace_lines_disjoint_single_tick_and_geometry() {
+    let mut buffer = Buffer::from_bytes(b"a\nb\nc\nd\n").unwrap();
+    let tick = buffer.changedtick();
+    let first = bytes(&["A", "AA"]);
+    let third = bytes(&["C"]);
+    buffer
+        .replace_lines_disjoint(&[
+            LineSplice {
+                start: 1,
+                end: 1,
+                lines: &first,
+            },
+            LineSplice {
+                start: 3,
+                end: 3,
+                lines: &third,
+            },
+        ])
+        .unwrap();
+    assert_eq!(buffer.changedtick(), tick + 1);
+    assert_eq!(buffer.to_bytes(), b"A\nAA\nb\nC\nd\n");
+}
+
+#[test]
+fn replace_lines_disjoint_validates_before_mutating() {
+    let mut buffer = Buffer::from_bytes(b"a\nb\nc\n").unwrap();
+    let tick = buffer.changedtick();
+    let original = buffer.to_bytes();
+    let bad = vec![b"x\ny".to_vec()];
+    assert_eq!(
+        buffer.replace_lines_disjoint(&[LineSplice {
+            start: 1,
+            end: 1,
+            lines: &bad,
+        }]),
+        Err(BufferError::NewlineInLine)
+    );
+    assert_eq!(buffer.to_bytes(), original);
+    assert_eq!(buffer.changedtick(), tick);
+
+    assert!(matches!(
+        buffer.replace_lines_disjoint(&[LineSplice {
+            start: 8,
+            end: 8,
+            lines: &bytes(&["z"]),
+        }]),
+        Err(BufferError::LineRange { .. })
+    ));
+    assert_eq!(buffer.to_bytes(), original);
+    assert_eq!(buffer.changedtick(), tick);
+
+    let one = bytes(&["A"]);
+    let two = bytes(&["B"]);
+    assert_eq!(
+        buffer.replace_lines_disjoint(&[
+            LineSplice {
+                start: 1,
+                end: 2,
+                lines: &one,
+            },
+            LineSplice {
+                start: 2,
+                end: 3,
+                lines: &two,
+            },
+        ]),
+        Err(BufferError::OverlappingSplices)
+    );
+    assert_eq!(buffer.to_bytes(), original);
+    assert_eq!(buffer.changedtick(), tick);
+}
+
+#[test]
+fn replace_lines_disjoint_empty_is_noop() {
+    let mut buffer = Buffer::from_bytes(b"a\nb\n").unwrap();
+    let tick = buffer.changedtick();
+    let original = buffer.to_bytes();
+    buffer.replace_lines_disjoint(&[]).unwrap();
+    assert_eq!(buffer.changedtick(), tick);
+    assert_eq!(buffer.to_bytes(), original);
 }

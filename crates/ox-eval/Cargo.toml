@@ -14,3 +14,6 @@ ox-types = { path = "../ox-types" }
 serde_json.workspace = true
 thiserror.workspace = true
 unicode-width = "0.2.2"
+
+[dev-dependencies]
+ox-regex = { path = "../ox-regex" }

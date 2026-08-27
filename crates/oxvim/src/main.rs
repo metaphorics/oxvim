@@ -3,8 +3,11 @@
 
 mod api_info;
 mod cli;
+mod messages;
 mod runtime;
 mod server;
+mod startuptime;
+mod usage;
 
 use std::fmt;
 use std::io::{self, Write};
@@ -35,6 +38,18 @@ pub enum AppError {
     Tui(String),
 }
 
+impl AppError {
+    /// The process status this failure exits with.  Only usage errors vary:
+    /// `main.c` exits 2 for a duplicated script file and 1 for everything
+    /// else, and both statuses are observable by a calling script.
+    fn exit_code(&self) -> u8 {
+        match self {
+            Self::Usage(error) => error.exit_code(),
+            _ => 1,
+        }
+    }
+}
+
 impl fmt::Display for AppError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -54,11 +69,12 @@ impl fmt::Display for AppError {
 impl std::error::Error for AppError {}
 
 fn main() -> ExitCode {
-    match run() {
+    let timer = startuptime::StartupTimer::start();
+    match run(timer) {
         Ok(code) => code,
         Err(error) => {
             let _ignored = writeln!(io::stderr().lock(), "{error}");
-            ExitCode::from(1)
+            ExitCode::from(error.exit_code())
         }
     }
 }
@@ -69,8 +85,20 @@ fn process_code(code: i64) -> ExitCode {
     ExitCode::from(code.rem_euclid(256) as u8)
 }
 
-fn run() -> Result<ExitCode, AppError> {
+fn run(mut timer: startuptime::StartupTimer) -> Result<ExitCode, AppError> {
     let cli = Cli::parse(std::env::args().skip(1)).map_err(AppError::Usage)?;
+    // main.c prints help and version from inside the argument scan and exits
+    // successfully, before any startup work happens.
+    if cli.help {
+        io::stdout().lock().write_all(usage::HELP.as_bytes()).map_err(AppError::Io)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if cli.version {
+        let text = usage::version()?;
+        io::stdout().lock().write_all(text.as_bytes()).map_err(AppError::Io)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    timer.mark("parsing arguments");
     // env.c vim_getenv: derive and export $VIM/$VIMRUNTIME before any
     // startup command or executor snapshots the environment.
     runtime::export_vim_environment()?;
@@ -85,16 +113,27 @@ fn run() -> Result<ExitCode, AppError> {
     if cli.scriptin.is_some() {
         return Err(AppError::NotWired("normal-mode script"));
     }
+    let code = run_editor(&cli, &mut timer)?;
+    if let Some(path) = &cli.startuptime {
+        timer.finish(path).map_err(AppError::Io)?;
+    }
+    Ok(code)
+}
+
+fn run_editor(
+    cli: &Cli,
+    timer: &mut startuptime::StartupTimer,
+) -> Result<ExitCode, AppError> {
     if cli.batch.is_some() {
-        return runtime::run_batch(&cli).map(|()| ExitCode::SUCCESS);
+        return runtime::run_batch(cli, timer).map(process_code);
     }
     // A listening headless process must enter its network loop rather than the
     // stdio server; --listen is therefore selected before --headless/embed.
     if let Some(address) = &cli.listen {
-        return server::run_listener(&cli, address).map(process_code);
+        return server::run_listener(cli, address, timer).map(process_code);
     }
     if cli.embed || cli.headless {
-        return server::run_stdio(&cli).map(process_code);
+        return server::run_stdio(cli, timer).map(process_code);
     }
-    runtime::run_interactive(&cli).map(|()| ExitCode::SUCCESS)
+    runtime::run_interactive(cli).map(|()| ExitCode::SUCCESS)
 }

@@ -239,6 +239,55 @@ fn split_uses_immediate_parent_axis_not_deepest_matching_ancestor() {
 }
 
 #[test]
+fn same_axis_split_three_containers_deep_joins_its_immediate_parent() {
+    // The root-to-leaf child path used to be collected leaf-first, so from the
+    // third container down the descent followed the wrong branch and reached a
+    // leaf where a container was required. test_window_cmd.vim crashed the
+    // process there. Upstream `win_split_ins` inserts the new frame next to
+    // the target inside the target's own parent row.
+    let w1 = window_handle(1);
+    let w2 = window_handle(2);
+    let w3 = window_handle(3);
+    let w4 = window_handle(4);
+    let w5 = window_handle(5);
+    let buffer = buffer_handle(1);
+    let geometry = Geometry::new(0, 0, 9, 7).unwrap();
+    let mut layout = Layout::new(w1, WindowState::new(buffer, position(1, 0)), geometry).unwrap();
+
+    layout
+        .split_vertical(w1, w2, WindowState::new(buffer, position(1, 0)))
+        .unwrap();
+    layout
+        .split_horizontal(w2, w3, WindowState::new(buffer, position(1, 0)))
+        .unwrap();
+    layout
+        .split_vertical(w3, w4, WindowState::new(buffer, position(1, 0)))
+        .unwrap();
+    layout
+        .split_vertical(w3, w5, WindowState::new(buffer, position(1, 0)))
+        .unwrap();
+
+    match layout.root() {
+        Frame::Row { children, .. } => match &children[1] {
+            Frame::Column { children, .. } => match &children[1] {
+                Frame::Row { children, .. } => {
+                    assert_eq!(children.len(), 3);
+                    assert!(matches!(&children[0], Frame::Leaf(leaf) if leaf.window == w3));
+                    assert!(matches!(&children[1], Frame::Leaf(leaf) if leaf.window == w5));
+                    assert!(matches!(&children[2], Frame::Leaf(leaf) if leaf.window == w4));
+                }
+                _ => panic!("expected the Row holding w3 to absorb the same-axis split"),
+            },
+            _ => panic!("expected Column wrapping w2 and the nested Row"),
+        },
+        _ => panic!("expected root Row"),
+    }
+    assert_eq!(layout.winnr(w3).unwrap(), 3);
+    assert_eq!(layout.winnr(w5).unwrap(), 4);
+    assert_eq!(layout.winnr(w4).unwrap(), 5);
+}
+
+#[test]
 fn failed_window_creation_on_unloaded_buffer_is_atomic() {
     let mut editor = Editor::new();
     let loaded = editor.create_buffer(true).unwrap();
@@ -346,7 +395,8 @@ fn editor_register_put_updates_text_undo_ticks_marks_and_changes() {
         .set('a', RegisterContent::linewise(vec![b"inserted".to_vec()]).unwrap())
         .unwrap();
 
-    assert!(editor.put_register(buffer, position(1, 0), 'a', 10).unwrap());
+    let content = editor.registers().get('a').unwrap().cloned().unwrap();
+    editor.put_content(buffer, position(1, 0), &content, 10).unwrap();
     let state = editor.buffer(buffer).unwrap();
     assert_eq!(state.text().unwrap().line(2).unwrap(), b"inserted");
     assert_eq!(state.text().unwrap().line(3).unwrap(), b"two");
@@ -448,7 +498,7 @@ fn undo_redo_replay_through_ticks_marks_and_winpos() {
 }
 
 #[test]
-fn registers_rotate_append_and_put_rectangles() {
+fn registers_rotate_append_and_concatenate() {
     let mut registers = Registers::new();
     let first = RegisterContent::linewise(vec![b"first".to_vec()]).unwrap();
     let second = RegisterContent::linewise(vec![b"second".to_vec()]).unwrap();
@@ -469,13 +519,6 @@ fn registers_rotate_append_and_put_rectangles() {
         .set('A', RegisterContent::characterwise(b"right").unwrap())
         .unwrap();
     assert_eq!(registers.get('a').unwrap().unwrap().to_bytes(), b"leftright");
-
-    let block = RegisterContent::blockwise(vec![b"Q".to_vec(), b"YZ".to_vec()], 2).unwrap();
-    registers.set('b', block).unwrap();
-    let mut buffer = Buffer::from_lines(&[b"abc".to_vec(), b"x".to_vec()], false).unwrap();
-    assert!(registers.put(&mut buffer, position(1, 1), 'b').unwrap());
-    assert_eq!(buffer.line(1).unwrap(), b"aQ bc");
-    assert_eq!(buffer.line(2).unwrap(), b"xYZ");
 }
 
 #[test]
@@ -558,3 +601,63 @@ fn runtime_roots_follow_runtimepath_entries() {
     assert_eq!(roots, vec![std::path::Path::new("/first"), std::path::Path::new("/second")]);
 }
 
+
+#[test]
+fn replace_buffer_text_out_of_range_leaves_state_unchanged() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_lines(&[b"abc".to_vec()], false).unwrap(), true)
+        .unwrap();
+    let before = editor.buffer(buffer).unwrap().text().unwrap().to_bytes();
+    let err = editor
+        .replace_buffer_text(
+            buffer,
+            &crate::buffer::BufferTextEditRequest {
+                start: crate::extmark::ExtmarkPosition::new(0, usize::MAX),
+                end: crate::extmark::ExtmarkPosition::new(0, usize::MAX),
+                replacement: vec![b"X".to_vec()],
+            },
+            position(1, 0),
+            position(1, 0),
+            0,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::editor::EditorError::Buffer(crate::buffer::BufferStateError::TextEdit(
+            crate::buffer::BufferTextEditError::OutOfRange
+        ))
+    ));
+    assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), before);
+}
+
+#[test]
+fn extmark_splice_is_total_for_unbounded_positions() {
+    let mut marks = crate::Extmarks::new();
+    let namespace = marks.create_namespace("total").unwrap();
+    let id = marks
+        .set(
+            namespace,
+            None,
+            crate::extmark::ExtmarkPlacement::new(crate::extmark::ExtmarkPosition::new(
+                usize::MAX / 2,
+                usize::MAX / 2,
+            )),
+        )
+        .unwrap();
+    marks.splice(crate::extmark::TextSplice {
+        start: crate::extmark::ExtmarkPosition::new(0, 0),
+        old_extent: crate::extmark::TextExtent::EMPTY,
+        new_extent: crate::extmark::TextExtent::new(3, 2),
+    });
+    let (_, undo) = marks.splice_recording(crate::extmark::TextSplice {
+        start: crate::extmark::ExtmarkPosition::new(usize::MAX / 4, usize::MAX / 4),
+        old_extent: crate::extmark::TextExtent::EMPTY,
+        new_extent: crate::extmark::TextExtent::new(0, usize::MAX / 8),
+    });
+    marks.undo_splice(&undo);
+    marks.redo_splice(&undo);
+    let position = marks.get(namespace, id).unwrap().unwrap().position();
+    assert!(position.row >= usize::MAX / 2);
+    assert!(position.column >= usize::MAX / 2 || position.row > usize::MAX / 2);
+}

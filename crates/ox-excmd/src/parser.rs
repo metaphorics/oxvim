@@ -1,7 +1,7 @@
 //! Byte-oriented parsing of Ex command lines.
 
 use crate::command::{
-    CommandFlags, NoUserCommands, ResolveError, ResolvedCommand, UserCommandProvider,
+    AddrType, CommandFlags, NoUserCommands, ResolveError, ResolvedCommand, UserCommandProvider,
     resolve_command,
 };
 use thiserror::Error;
@@ -21,6 +21,10 @@ pub enum ErrorCode {
     E488,
     /// E471: Argument required.
     E471,
+    /// E477: No ! allowed.
+    E477,
+    /// E939: Positive count required.
+    E939,
 }
 
 impl ErrorCode {
@@ -32,6 +36,8 @@ impl ErrorCode {
             Self::E481 => "E481",
             Self::E488 => "E488",
             Self::E471 => "E471",
+            Self::E477 => "E477",
+            Self::E939 => "E939",
         }
     }
 }
@@ -44,8 +50,9 @@ pub struct ParseError {
     pub code: ErrorCode,
     /// Zero-based byte offset in the original command line.
     pub offset: usize,
-    /// Human-readable detail.
-    pub message: &'static str,
+    /// Human-readable detail, which may name the offending text the way
+    /// upstream's `%s` messages do.
+    pub message: String,
 }
 
 /// Base of one Ex address.
@@ -187,6 +194,11 @@ pub struct ExCommand {
     pub range: Option<Range>,
     /// Command bang.
     pub bang: bool,
+    /// `eap->usefilter` (`ex_docmd.c:2256-2275`): `:read !cmd`, `:read!cmd`,
+    /// and `:write !cmd` hand their whole tail to the shell. The `!` that
+    /// selected the filter is consumed, so `args` is the shell command and
+    /// is never split at `|`.
+    pub usefilter: bool,
     /// Post-command count.
     pub count: Option<u64>,
     /// Post-command register.
@@ -258,34 +270,62 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
         let command_offset = cursor;
         let (typed, after_name) = parse_command_name(input, cursor);
         if typed.is_empty() {
-            return Err(error(ErrorCode::E492, command_offset, "not an editor command"));
+            return Err(error(ErrorCode::E492, command_offset, "Not an editor command"));
         }
         let command = resolve_command(typed, self.users).map_err(|resolve_error| {
             let message = match resolve_error {
-                ResolveError::NotFound => "not an editor command",
+                ResolveError::NotFound => "Not an editor command",
                 ResolveError::AmbiguousUserCommand => "ambiguous user command",
             };
             error(ErrorCode::E492, command_offset, message)
         })?;
         let flags = effective_flags(&command);
         if range.is_some() && !flags.contains(CommandFlags::RANGE) {
-            return Err(error(ErrorCode::E481, range_offset, "no range allowed"));
+            return Err(error(ErrorCode::E481, range_offset, "No range allowed"));
         }
 
         cursor = after_name;
         let bang_offset = cursor;
-        let bang = input.as_bytes().get(cursor) == Some(&b'!');
+        let mut bang = input.as_bytes().get(cursor) == Some(&b'!');
         if bang {
             if !flags.contains(CommandFlags::BANG) {
-                return Err(error(ErrorCode::E488, bang_offset, "trailing characters"));
+                return Err(error(ErrorCode::E477, bang_offset, "No ! allowed"));
             }
             cursor += 1;
         }
         cursor = skip_ascii_space(input, cursor);
-        let end = command_end(input, cursor, &command, flags, bang);
-        let mut args_start = cursor;
-        let mut args_end = end;
-        trim_ascii_space(input, &mut args_start, &mut args_end);
+        // ":r!cmd" spends its bang on the filter, and a "!" standing where
+        // ":read"/":write" expect a file name selects the filter too
+        // (ex_docmd.c:2256-2275). Either way the "!" is consumed here so the
+        // remaining line is one shell command.
+        let mut usefilter = false;
+        if command.name() == "read" && bang {
+            usefilter = true;
+            bang = false;
+        } else if matches!(command.name(), "read" | "write")
+            && input.as_bytes().get(cursor) == Some(&b'!')
+        {
+            usefilter = true;
+            cursor += 1;
+        }
+        let end = command_end(input, cursor, flags, usefilter, command.name());
+        // `ea.arg = skipwhite(p)` (`ex_docmd.c`): space and tab only, so a CR
+        // or a newline that ends the argument stays in it.
+        let args_start = skip_ascii_space(input, cursor).min(end);
+        // Trailing whitespace is removed by `separate_nextcmd`, which runs
+        // only for an `EX_TRLBAR` command that is not a filter, and only calls
+        // `del_trailing_spaces` when `EX_NOTRLCOM` is absent
+        // (`ex_docmd.c:4162-4164`). So `:normal`, `:let`, `:execute` and
+        // `:map` keep every trailing byte, and `:edit` loses only unescaped
+        // spaces and tabs.
+        let args_end = if flags.contains(CommandFlags::TRLBAR)
+            && !flags.contains(CommandFlags::NOTRLCOM)
+            && !usefilter
+        {
+            del_trailing_spaces(input, args_start, end)
+        } else {
+            end
+        };
 
         let mut args = input[args_start..args_end].to_owned();
         let register = if flags.contains(CommandFlags::REGSTR) {
@@ -294,19 +334,31 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
             None
         };
         let count = if flags.contains(CommandFlags::COUNT) {
-            take_count(&mut args)
+            let count = take_count(&mut args, flags.contains(CommandFlags::BUFNAME));
+            // "n <= 0" is rejected unless the command accepts zero
+            // (ex_docmd.c:1420-1425), so `:sleep 0m` is E939 while `:0read`
+            // is fine.
+            if count == Some(0) && !flags.contains(CommandFlags::ZEROR) {
+                return Err(error(ErrorCode::E939, args_start, "Positive count required"));
+            }
+            count
         } else {
             None
         };
 
         if flags.contains(CommandFlags::NEEDARG) && args.trim().is_empty() {
-            return Err(error(ErrorCode::E471, args_start, "argument required"));
+            return Err(error(ErrorCode::E471, args_start, "Argument required"));
         }
         if !flags.contains(CommandFlags::EXTRA)
             && !matches!(command.name(), "append" | "change" | "insert")
             && !args.trim().is_empty()
         {
-            return Err(error(ErrorCode::E488, args_start, "trailing characters"));
+            // e_trailing_arg (errors.h:123) names the offending text.
+            return Err(error(
+                ErrorCode::E488,
+                args_start,
+                format!("Trailing characters: {}", args.trim()),
+            ));
         }
 
         Ok((
@@ -315,9 +367,10 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
                 modifiers,
                 range,
                 bang,
+                usefilter,
                 count,
                 register,
-                args: args.trim_end().to_owned(),
+                args,
                 span: start..end,
             },
             end,
@@ -325,7 +378,10 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
     }
 }
 
-fn effective_flags(command: &ResolvedCommand) -> CommandFlags {
+/// The argument flags that govern one resolved command: a built-in's table
+/// entry, or the fixed set upstream gives user commands.
+#[must_use]
+pub fn effective_flags(command: &ResolvedCommand) -> CommandFlags {
     match command {
         ResolvedCommand::Builtin(spec) => spec.flags,
         ResolvedCommand::User(_) => CommandFlags(
@@ -334,6 +390,19 @@ fn effective_flags(command: &ResolvedCommand) -> CommandFlags {
                 | CommandFlags::EXTRA.bits()
                 | CommandFlags::TRLBAR.bits(),
         ),
+    }
+}
+
+/// The address domain that governs one resolved command.
+///
+/// User commands answer [`AddrType::Lines`], upstream's `-range` default
+/// (`usercmd.c:815-818`), matching the `RANGE` that [`effective_flags`]
+/// grants them.
+#[must_use]
+pub fn effective_addr_type(command: &ResolvedCommand) -> AddrType {
+    match command {
+        ResolvedCommand::Builtin(spec) => spec.addr_type,
+        ResolvedCommand::User(_) => AddrType::Lines,
     }
 }
 
@@ -701,17 +770,17 @@ fn parse_pattern(input: &str, start: usize, delimiter: u8) -> Result<(String, us
 fn command_end(
     input: &str,
     args_start: usize,
-    command: &ResolvedCommand,
     flags: CommandFlags,
-    bang: bool,
+    usefilter: bool,
+    name: &str,
 ) -> usize {
-    let name = command.name();
     if matches!(name, "append" | "change" | "insert") {
         return input.len();
     }
-    if matches!(name, "read" | "write")
-        && (input[args_start..].starts_with('!') || (name == "read" && bang))
-    {
+    // ":read !cmd" and ":write !cmd" own the rest of the line: upstream skips
+    // separate_nextcmd for them (ex_docmd.c:2291-2313), so a "|" inside the
+    // shell command is not a command separator.
+    if usefilter {
         return input.len();
     }
     if matches!(name, "execute" | "echo" | "echon" | "echomsg" | "echoerr") {
@@ -850,11 +919,26 @@ fn is_register(character: char) -> bool {
     character.is_ascii_alphanumeric() || "\"-:.%#=*+_/@".contains(character)
 }
 
-fn take_count(args: &mut String) -> Option<u64> {
+/// `parse_count` (`ex_docmd.c:1395-1430`): a leading digit run on a `COUNT`
+/// command is the count.
+///
+/// The digits are taken greedily and whatever follows stays in the argument,
+/// which is what `:sleep 100m` needs. Only a `BUFNAME` command insists the
+/// digits end at whitespace or end-of-argument, so that `:buffer 123foo`
+/// stays a buffer name rather than becoming count 123 plus "foo".
+fn take_count(args: &mut String, buffer_name: bool) -> Option<u64> {
     let trimmed = args.trim_start();
     let skipped = args.len() - trimmed.len();
     let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
-    if digits == 0 || trimmed.as_bytes().get(digits).is_some_and(|byte| !byte.is_ascii_whitespace()) {
+    if digits == 0 {
+        return None;
+    }
+    if buffer_name
+        && trimmed
+            .as_bytes()
+            .get(digits)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
         return None;
     }
     let count = trimmed[..digits].parse::<u64>().ok()?;
@@ -874,20 +958,29 @@ fn skip_space_and_colons(input: &str, mut cursor: usize) -> usize {
     }
 }
 
+/// `skipwhite` (`charset.c`): `ascii_iswhite` is space and tab only
+/// (`ascii_defs.h:84-87`), so CR, NL and every other control byte stop it.
 fn skip_ascii_space(input: &str, mut cursor: usize) -> usize {
-    while input.as_bytes().get(cursor).is_some_and(u8::is_ascii_whitespace) {
+    while matches!(input.as_bytes().get(cursor), Some(b' ' | b'\t')) {
         cursor += 1;
     }
     cursor
 }
 
-fn trim_ascii_space(input: &str, start: &mut usize, end: &mut usize) {
-    *start = skip_ascii_space(input, *start);
-    while *end > *start && input.as_bytes()[*end - 1].is_ascii_whitespace() {
-        *end -= 1;
+/// `del_trailing_spaces` (`strings.c:429-436`): removes trailing spaces and
+/// tabs, stops at one escaped with `\` or CTRL-V, and never removes the
+/// first byte of the argument.
+fn del_trailing_spaces(input: &str, start: usize, mut end: usize) -> usize {
+    let bytes = input.as_bytes();
+    while end > start + 1
+        && matches!(bytes[end - 1], b' ' | b'\t')
+        && !matches!(bytes[end - 2], b'\\' | 0x16)
+    {
+        end -= 1;
     }
+    end
 }
 
-fn error(code: ErrorCode, offset: usize, message: &'static str) -> ParseError {
-    ParseError { code, offset, message }
+fn error(code: ErrorCode, offset: usize, message: impl Into<String>) -> ParseError {
+    ParseError { code, offset, message: message.into() }
 }

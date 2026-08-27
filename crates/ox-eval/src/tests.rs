@@ -228,10 +228,40 @@ error_cases!(
     (error_duplicate_lambda_param_types, b"{list, list -> 1}([1], [2])", "E853", "userfunc.c:134"),
     (error_list_relational_compare, b"[1] > [2]", "E692", "eval.c:6789-6791"),
     (error_dict_relational_compare, b"{'a': 1} > {'a': 0}", "E736", "eval.c:6822-6828"),
-    (error_float_string_concat, b"1.5 .. 'x'", "E806", "vimeval.txt:1121-1131"),
-    (error_chained_comparison, b"1 < 2 < 3", "E15", "vimeval.txt:824-896"),
+    // Comparison is non-associative, so `< 3` is left unconsumed and reported
+    // as trailing text: nvim v0.13.0-dev gives `E488: Trailing characters: < 3`.
+    (error_chained_comparison, b"1 < 2 < 3", "E488", "errors.h:123 e_trailing_arg"),
     (error_dictionary_slice, b"{'a': 1}[0:0]", "E719", "eval.c:eval_index_inner E719")
 );
+
+// `error_float_string_concat` used to live in the table above, asserting that
+// `1.5 .. 'x'` is E806, on the strength of `vimeval.txt:1121-1131`. That doc
+// range says `1 . 90 * 90.0` "does NOT work, since this attempts to
+// concatenate a Float and a String" — and it is stale: the oracle
+// (v0.13.0-dev-1390) answers `'18100.0'` for exactly that expression.
+// `tv_check_str` (`typval.c:4245`) accepts `VAR_FLOAT` and
+// `tv_get_string_buf_chk` (`typval.c:4684-4685`) renders it with `%g`, so a
+// Float coerces to a String in every String context but one.
+//
+// The one exception is `check_can_index` (`eval.c:3225-3229`), which is where
+// upstream's only E806 lives. So the assertion is inverted rather than
+// dropped: concatenation now has to produce the rendering, and indexing and
+// slicing have to keep the error.
+#[test]
+fn float_concatenates_as_a_string_and_only_indexing_is_e806() {
+    assert_eq!(value(b"1.5 .. 'x'"), Typval::String(OxStr::from("1.5x")));
+    assert_eq!(value(b"1.0 . ''"), Typval::String(OxStr::from("1.0")));
+    assert_eq!(value(b"1 . 90 * 90.0"), Typval::String(OxStr::from("18100.0")));
+    assert_eq!(value(b"(1.0/0.0) . ''"), Typval::String(OxStr::from("inf")));
+    assert_eq!(value(b"(-1.0/0.0) . ''"), Typval::String(OxStr::from("-inf")));
+    assert_eq!(value(b"(0.0/0.0) . ''"), Typval::String(OxStr::from("nan")));
+    assert_eq!(value(b"1.0e20 . ''"), Typval::String(OxStr::from("1.0e20")));
+    assert_eq!(value(b"-0.0 . ''"), Typval::String(OxStr::from("-0.0")));
+
+    assert_eq!(error(b"1.0[0]").code, "E806");
+    assert_eq!(error(b"1.0[1:2]").code, "E806");
+    assert_eq!(error(b"1.0[:]").code, "E806");
+}
 
 #[test]
 fn newline_without_marker_ends_expression() {
@@ -255,7 +285,7 @@ fn unary_not_float_nonzero() {
 fn same_variable_preserves_list_identity() {
     // runtime/doc/vimeval.txt:1049-1053.
     let mut scope = Scope::new();
-    scope.set(b"xs", Typval::list(vec![Typval::Number(1)]));
+    scope.set(b"xs", Typval::list(vec![Typval::Number(1)])).unwrap();
     assert_eq!(value_in(b"xs is xs", &mut scope), Typval::Number(1));
 }
 
@@ -263,7 +293,7 @@ fn same_variable_preserves_list_identity() {
 fn repeated_list_index_preserves_nested_identity() {
     // runtime/doc/vimeval.txt:1049-1053 and 1182-1211.
     let mut scope = Scope::new();
-    scope.set(b"xs", Typval::list(vec![Typval::list(vec![Typval::Number(1)])]));
+    scope.set(b"xs", Typval::list(vec![Typval::list(vec![Typval::Number(1)])])).unwrap();
     assert_eq!(value_in(b"xs[0] is xs[0]", &mut scope), Typval::Number(1));
 }
 
@@ -271,7 +301,7 @@ fn repeated_list_index_preserves_nested_identity() {
 fn repeated_dict_member_preserves_nested_identity() {
     // runtime/doc/vimeval.txt:1049-1053 and 1266-1280.
     let mut scope = Scope::new();
-    scope.set(b"d", Typval::dict(vec![(OxStr::from("x"), Typval::list(vec![]))]));
+    scope.set(b"d", Typval::dict(vec![(OxStr::from("x"), Typval::list(vec![]))])).unwrap();
     assert_eq!(value_in(b"d.x is d.x", &mut scope), Typval::Number(1));
 }
 
@@ -353,14 +383,14 @@ fn closure_captures_snapshot() {
     // runtime/doc/vimeval.txt:1627-1639.
     let expression = Parser::new(b"{x -> x + captured}").parse().unwrap();
     let mut scope = Scope::new();
-    scope.set(b"captured", Typval::Number(4));
+    scope.set(b"captured", Typval::Number(4)).unwrap();
     let mut host = Host;
     let regex = Regex;
     let mut evaluator = Evaluator::new(&mut host, &regex);
     let closure = evaluator.eval(&expression, &mut scope).unwrap();
-    scope.set(b"captured", Typval::Number(100));
+    scope.set(b"captured", Typval::Number(100)).unwrap();
     let mut call_scope = Scope::new();
-    call_scope.set(b"f", closure);
+    call_scope.set(b"f", closure).unwrap();
     let call = Parser::new(b"f(6)").parse().unwrap();
     assert_eq!(evaluator.eval(&call, &mut call_scope).unwrap(), Typval::Number(10));
 }
@@ -369,7 +399,7 @@ fn closure_captures_snapshot() {
 fn lambda_parameter_shadows_captured_local() {
     // runtime/doc/vimeval.txt:1611-1639.
     let mut scope = Scope::new();
-    scope.set(b"x", Typval::Number(99));
+    scope.set(b"x", Typval::Number(99)).unwrap();
     assert_eq!(value_in(b"{x -> x}(1)", &mut scope), Typval::Number(1));
 }
 
@@ -458,7 +488,7 @@ fn variadic_lambda_partial_binds_leading_args() {
         dict: None,
     });
     let mut scope = Scope::new();
-    scope.set(b"cb", bound);
+    scope.set(b"cb", bound).unwrap();
     let call = Parser::new(b"cb('three')").parse().unwrap();
     let mut call_host = Host;
     let registry = evaluator.closure_registry().clone();
@@ -511,10 +541,10 @@ fn closure_resolves_across_evaluator_sharing_registry() {
     // Define `{x -> x + base}` and keep the Partial in a scope.
     let define = Parser::new(b"{x -> x + base}").parse().unwrap();
     let mut scope = Scope::new();
-    scope.set(b"base", Typval::Number(40));
+    scope.set(b"base", Typval::Number(40)).unwrap();
     let closure = creator.eval(&define, &mut scope).unwrap();
     let mut store = Scope::new();
-    store.set(b"f", closure);
+    store.set(b"f", closure).unwrap();
     let call = Parser::new(b"f(2)").parse().unwrap();
 
     // A second evaluator that shares the registry resolves the stored Partial
@@ -539,7 +569,7 @@ fn closure_from_isolated_evaluator_is_not_callable() {
     // Ensure caller's registry also has a closure at index 0.
     let _closure_b = caller.eval(&define_b, &mut Scope::new()).unwrap();
     let mut store = Scope::new();
-    store.set(b"f", closure_a);
+    store.set(b"f", closure_a).unwrap();
     let call = Parser::new(b"f(5)").parse().unwrap();
     assert_eq!(caller.eval(&call, &mut store).unwrap_err().code, "E117");
 }
@@ -559,4 +589,266 @@ fn malformed_interpolated_strings_report_typed_errors() {
     assert_eq!(error(br#"$"moo}""#).code, "E1278");
     assert_eq!(error(br#"$"{}""#).code, "E15");
     assert_eq!(error(br#"$"{1 + 2""#).code, "E1279");
+}
+
+// ---------------------------------------------------------------------------
+// Unconsumed input after a complete expression
+// Upstream: `errors.h:123` `e_trailing_arg` = "E488: Trailing characters: %s",
+// raised from `eval.c:1251` when `eval0` stops before the end of the string.
+// Exercised by `test_functions.vim` `Test_eval`.
+// ---------------------------------------------------------------------------
+
+/// Normal case and documented error: text left over after a complete
+/// expression is E488, and the message quotes the remainder verbatim from the
+/// first unconsumed token, white space excluded.
+#[test]
+fn trailing_input_reports_e488_with_the_remainder() {
+    let trailing = error(b"5 a");
+    assert_eq!(trailing.code, "E488");
+    assert_eq!(trailing.message, "Trailing characters: a");
+
+    // Comparison does not chain, so the second operator is trailing text.
+    assert_eq!(error(b"1 < 2 < 3").message, "Trailing characters: < 3");
+}
+
+/// Boundary: an expression that consumes the whole input raises nothing, and a
+/// single trailing byte is still reported rather than silently dropped.
+#[test]
+fn trailing_input_boundary_is_one_byte() {
+    assert_eq!(value(b"5"), Typval::Number(5));
+    assert_eq!(error(b"5)").message, "Trailing characters: )");
+}
+
+/// A byte no token can start with, sitting *after* a complete expression, is
+/// trailing garbage — not a lexing failure. `eval0` (`eval.c:1234-1252`) parses
+/// `4`, stops, and reports the remainder; it never looks at the `\r`, so E15
+/// would be this port lexing further ahead than upstream ever does.
+///
+/// This is the half of the fix that lives in the lexer. Whitespace handling
+/// alone cannot produce it: hand `eval0` the same bytes with an eager
+/// tokenizer and the answer is E15 with no remainder.
+#[test]
+fn a_byte_the_lexer_refuses_after_a_complete_expression_is_e488() {
+    let carriage_return = error(b"4\r");
+    assert_eq!(carriage_return.code, "E488");
+    assert_eq!(carriage_return.message, "Trailing characters: \r");
+
+    // Vertical tab and form feed are not white space to `skipwhite` either.
+    assert_eq!(error(b"4\x0b").message, "Trailing characters: \x0b");
+    assert_eq!(error(b"4\x0c").message, "Trailing characters: \x0c");
+
+    // Tolerance is not special-cased to the unknown-byte arm: a token that
+    // starts legally and then fails to close is remainder just the same.
+    assert_eq!(error(b"4 'ab").message, "Trailing characters: 'ab");
+}
+
+/// The other side of the same rule: when the expression actually needed the
+/// refused byte, the lexer's own error is the answer, because upstream's lazy
+/// lexer would have reached it too. Reporting E488 here — the remainder rule
+/// applied unconditionally — would be wrong in both directions.
+#[test]
+fn a_refused_byte_the_expression_needed_keeps_the_lexer_error() {
+    // The `+` has no right operand, so `eval1` demands another token.
+    assert_eq!(error(b"1 + \r").code, "E15");
+    // The refusal is the whole expression.
+    assert_eq!(error(b"\r").code, "E15");
+    assert_eq!(error(b"'ab").code, "E115");
+}
+
+/// The comparison that decides between the two is the offset the lexer *stopped
+/// at*, not the offset inside the error it produced. `$"moo}"` refuses at byte
+/// 0 and reports E1278 against byte 5, so comparing against the error's own
+/// offset silently reinstates the parser's E15.
+#[test]
+fn refusal_is_resolved_against_the_stop_offset_not_the_error_offset() {
+    assert_eq!(error(br#"$"moo}""#).code, "E1278");
+    assert_eq!(error(br#"$"{1 + 2""#).code, "E1279");
+}
+
+/// `:execute`, `:echo` and `:echomsg` loop `eval1` until the text is spent
+/// (`eval.c:1846`), so they do reach the refused byte and answer E15 — the
+/// oracle agrees: `echo 'z'<CR>` is `E15`, not `E488`.
+#[test]
+fn parse_many_reaches_the_refused_byte_and_reports_e15() {
+    let refused = Parser::new(b"'z' \r").parse_many().unwrap_err();
+    assert_eq!(refused.code, "E15");
+
+    // The tolerant lexer must not have broken the ordinary multi-expression
+    // path: two clean expressions still parse, and neither is dropped.
+    assert_eq!(Parser::new(b"1 2").parse_many().unwrap().len(), 2);
+    assert_eq!(Parser::new(b"'a' 'b' 'c'").parse_many().unwrap().len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// White space between a bare name and its argument list
+// Upstream: `eval.c:2783-2786` (name at the head of an expression: white space
+// skipped before the `(` test) versus `eval.c:6022-6026` (`handle_subscript`
+// requires an adjacent `(`).
+// Exercised by `test_expr.vim` `Test_white_in_function_call` and
+// `test_cursor_func.vim` `Test_screenpos_number` (`call setline (1, ...)`).
+// ---------------------------------------------------------------------------
+
+/// Normal case: a name at the head of an expression may be separated from its
+/// argument list by spaces or tabs, and the call still resolves.
+#[test]
+fn white_space_before_call_parenthesis_is_allowed_on_a_bare_name() {
+    assert_eq!(value(b"len ([1, 2, 3])"), Typval::Number(3));
+    assert_eq!(value(b"len\t([1, 2, 3])"), Typval::Number(3));
+    assert_eq!(value(b"sum  (  1, 2, 3  )"), Typval::Number(6));
+}
+
+/// Boundary: the white space is skipped, not swallowed as an argument, so an
+/// empty argument list stays empty and a nested detached call still parses.
+#[test]
+fn white_space_before_call_parenthesis_keeps_the_argument_list_intact() {
+    assert_eq!(value(b"len ([])"), Typval::Number(0));
+    assert_eq!(value(b"sum (len ([1]), 2)"), Typval::Number(3));
+}
+
+/// The relaxation is confined to the head of the expression: in the subscript
+/// chain a detached `(` is still trailing text, exactly as `handle_subscript`
+/// leaves it. `eval.c:6025` requires `!ascii_iswhite(*(*arg - 1))`.
+#[test]
+fn white_space_before_call_parenthesis_stays_an_error_in_the_subscript_chain() {
+    assert_eq!(error(b"{'f': 1}.f (1)").code, "E488");
+    assert_eq!(error(b"[1, 2][0] (1)").code, "E488");
+    assert_eq!(error(b"len([1]) (1)").code, "E488");
+}
+
+// ---------------------------------------------------------------------------
+// Literal dictionary keys
+// Upstream: `get_literal_key` (eval.c:4458-4472) accepts a run of ASCII
+// alphanumerics, `_` and `-`, then skips white space; `eval_dict`
+// (eval.c:4512-4519) turns a failed key into E15 for the whole expression and
+// a missing colon into E720. Exercised by `test_listdict.vim` `Test_dict`.
+// ---------------------------------------------------------------------------
+
+/// Normal case: a bare key, a key holding `-` and digits, and white space
+/// between the key and its colon all parse.
+#[test]
+fn literal_dictionary_accepts_upstream_key_characters() {
+    assert_eq!(value(b"#{a: 1}"), value(b"{'a': 1}"));
+    assert_eq!(value(b"#{a-b_2: 1}"), value(b"{'a-b_2': 1}"));
+    assert_eq!(value(b"#{a : 1}"), value(b"{'a': 1}"));
+}
+
+/// Boundary: a digit-leading key is still a literal key, and `#{}` is the empty
+/// dictionary rather than a key error.
+#[test]
+fn literal_dictionary_key_boundary_cases() {
+    assert_eq!(value(b"#{1: 'x'}"), value(b"{'1': 'x'}"));
+    assert_eq!(value(b"#{-: 1}"), value(b"{'-': 1}"));
+    assert_eq!(value(b"#{}"), value(b"{}"));
+}
+
+/// Documented error: a first byte that cannot start a literal key makes
+/// upstream abandon the dictionary and report the *whole* expression as
+/// invalid, quoting it. A quoted key is the same failure — `#{'a': 1}` is not
+/// a literal dictionary, however reasonable it looks.
+#[test]
+fn literal_dictionary_rejects_a_non_literal_key_with_e15() {
+    for source in [&b"#{++ : 10}"[..], b"#{: 1}", b"#{'a': 1}"] {
+        let failure = error(source);
+        assert_eq!(failure.code, "E15", "{}", String::from_utf8_lossy(source));
+        assert_eq!(
+            failure.message,
+            format!("Invalid expression: \"{}\"", String::from_utf8_lossy(source))
+        );
+    }
+}
+
+/// A malformed variant that upstream rejects differently: the key is valid but
+/// no colon follows, which stays E720 and quotes the remainder from the first
+/// byte after the skipped white space.
+#[test]
+fn literal_dictionary_missing_colon_stays_e720() {
+    let failure = error(b"#{a 1}");
+    assert_eq!(failure.code, "E720");
+    assert_eq!(failure.message, "Missing colon in Dictionary: 1}");
+    assert_eq!(error(b"#{a.b: 1}").message, "Missing colon in Dictionary: .b: 1}");
+}
+
+// ---------------------------------------------------------------------------
+// White space around `->` method calls
+// Upstream: `eval_method` (eval.c:2990-3104). The method name is read straight
+// after the arrow with no skipwhite, `e_missingparen` is "E107: Missing
+// parentheses: %s" (errors.h:131) and `e_nowhitespace` is "E274: No white space
+// allowed before parenthesis" (eval.c:99-100).
+// Exercised by `test_method.vim` `Test_method_syntax`.
+// ---------------------------------------------------------------------------
+
+/// Normal case: white space before the arrow is fine and the chain still
+/// resolves, including inside the argument list.
+#[test]
+fn method_call_allows_white_space_before_the_arrow() {
+    assert_eq!(value(b"[1, 2, 3]->len()"), Typval::Number(3));
+    assert_eq!(value(b"[1, 2, 3]  ->len( )"), Typval::Number(3));
+    assert_eq!(value(b"[1]->len()->id()"), Typval::Number(1));
+}
+
+/// Documented error: a gap between `->` and the method name is not an arrow
+/// complaint. `eval_method` never skips white space, so the remainder is left
+/// unparsed and reported whole, quoted from the byte after the arrow.
+#[test]
+fn method_call_white_space_after_the_arrow_is_e15() {
+    let failure = error(b"[1, 2, 3]-> len()");
+    assert_eq!(failure.code, "E15");
+    assert_eq!(failure.message, "Invalid expression: \" len()\"");
+
+    // The quoted remainder runs to the end of the source, not to the call.
+    assert_eq!(error(b"[1, 2, 3]-> len() + 1").message, "Invalid expression: \" len() + 1\"");
+    // A bare trailing arrow with a gap behaves the same way.
+    assert_eq!(error(b"[1, 2, 3]-> ").message, "Invalid expression: \" \"");
+}
+
+/// Boundary: the gap moves the error, it does not merely rename it. White space
+/// on the *other* side of the name — between the name and its `(` — is E274,
+/// and that holds for the lambda form too.
+#[test]
+fn method_call_white_space_before_the_parenthesis_is_e274() {
+    let failure = error(b"[1, 2, 3]->len ()");
+    assert_eq!(failure.code, "E274");
+    assert_eq!(failure.message, "No white space allowed before parenthesis");
+    assert_eq!(error(b"'t'->{x -> x} ()").code, "E274");
+}
+
+/// A malformed variant upstream rejects differently again: a method name with
+/// no argument list at all is E107, naming the method, and the `{...}` form
+/// reports the literal "lambda".
+#[test]
+fn method_call_without_parentheses_is_e107() {
+    let failure = error(b"[1, 2, 3]->len");
+    assert_eq!(failure.code, "E107");
+    assert_eq!(failure.message, "Missing parentheses: len");
+    assert_eq!(error(b"'t'->{x -> x}").message, "Missing parentheses: lambda");
+    assert_eq!(error(b"[1, 2, 3]->").message, "Missing name after ->");
+}
+
+// ---------------------------------------------------------------------------
+// E15 message text
+// Upstream: `e_invexpr2` (errors.h:38) is `E15: Invalid expression: "%s"` and
+// is handed the whole expression, not the token that failed.
+// ---------------------------------------------------------------------------
+
+/// Documented error: an expression that cannot be parsed at all is quoted back
+/// whole, wherever inside it the parser gave up.
+#[test]
+fn unparsable_expressions_quote_the_whole_expression() {
+    for source in [&b"1 +"[..], b"(", b"!", b"*3"] {
+        let failure = error(source);
+        assert_eq!(failure.code, "E15", "{}", String::from_utf8_lossy(source));
+        assert_eq!(
+            failure.message,
+            format!("Invalid expression: \"{}\"", String::from_utf8_lossy(source))
+        );
+    }
+}
+
+/// Boundary: the empty expression is the same failure, and a construct that has
+/// its own diagnostic keeps it rather than being flattened into E15.
+#[test]
+fn unparsable_expression_boundaries_keep_specific_diagnostics() {
+    assert_eq!(error(b"").code, "E15");
+    assert_eq!(error(b"").message, "Invalid expression: \"\"");
+    assert_eq!(error(b"1 ? 2").code, "E109");
 }

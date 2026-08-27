@@ -13,6 +13,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     api, ApiError, BufHandle, Dict, Object, OxStr, Registry, RegistryError, TabHandle, WinHandle,
 };
+use crate::option_merge::SetOp;
 
 const MAX_CONVERSION_DEPTH: usize = 100;
 
@@ -345,9 +346,74 @@ pub fn nvim_get_api_info(_editor: &mut Editor) -> Result<Vec<Object>, ApiError> 
 }
 
 #[api(since = 1)]
-pub fn nvim_command(_editor: &mut Editor, command: OxStr) -> Result<(), ApiError> {
-    let _commands = parse_command(&command)?;
-    Err(ApiError::exception("Not implemented: nvim_command executor"))
+pub fn nvim_command(editor: &mut Editor, command: OxStr) -> Result<(), ApiError> {
+    crate::runtime::with_command_executor(editor, |editor, executor| {
+        execute_command(editor, &command, executor)
+    })
+}
+
+/// api/vim.c `nvim_exec2`: run Vimscript, returning `{ output = ... }` only
+/// when the caller asked for it.
+#[api(since = 11)]
+pub fn nvim_exec2(editor: &mut Editor, src: OxStr, opts: Dict) -> Result<Dict, ApiError> {
+    reject_keys(&opts, &["output"])?;
+    let output = optional_bool(&opts, "output")?.unwrap_or(false);
+    let captured = exec_capturing(editor, &src, output)?;
+    Ok(Dict(if output {
+        vec![(OxStr::from("output"), Object::String(captured))]
+    } else {
+        Vec::new()
+    }))
+}
+
+/// api/vim.c `nvim_cmd`: the structured command form, which decodes to a
+/// command line and runs through the same host.
+#[api(since = 10)]
+pub fn nvim_cmd(editor: &mut Editor, cmd: Dict, opts: Dict) -> Result<OxStr, ApiError> {
+    crate::runtime::with_command_executor(editor, |editor, executor| {
+        execute_nvim_cmd(editor, &cmd, &opts, executor)
+    })
+}
+
+/// api/vim.c `nvim_exec_lua`: `luaeval`-style execution of one chunk with
+/// `args` bound to `...`.
+#[api(since = 7)]
+pub fn nvim_exec_lua(editor: &mut Editor, code: OxStr, args: Vec<Object>) -> Result<Object, ApiError> {
+    let code = std::str::from_utf8(code.as_bytes())
+        .map_err(|_| ApiError::validation("Lua chunk must be valid UTF-8"))?
+        .to_owned();
+    crate::runtime::with_lua_executor(editor, |editor, executor| {
+        executor.exec(editor, &code, args).map_err(ApiError::exception)
+    })
+}
+
+/// Runs one script through the command host, collecting the `:echo` messages
+/// it produced when `capture` is set, the way `nvim_exec2`'s `output` option
+/// and `nvim_cmd`'s already do.
+fn exec_capturing(editor: &mut Editor, src: &OxStr, capture: bool) -> Result<OxStr, ApiError> {
+    crate::runtime::with_command_executor(editor, |editor, executor| {
+        let message_start = editor.messages().len();
+        let result = execute_command(editor, src, executor);
+        if !capture {
+            result?;
+            return Ok(OxStr::from(""));
+        }
+        if let Err(error) = result {
+            editor.truncate_messages(message_start);
+            return Err(error);
+        }
+        let captured = editor.messages()[message_start..]
+            .iter()
+            .filter(|message| message.kind == MessageKind::Echo)
+            .filter_map(|message| match &message.content {
+                Object::String(text) => Some(text.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.truncate_messages(message_start);
+        Ok(OxStr(captured.into_bytes()))
+    })
 }
 
 #[api(since = 1)]
@@ -451,10 +517,27 @@ pub fn nvim_set_option_value(
     opts: Dict,
 ) -> Result<Object, ApiError> {
     let name = option_name(&name)?;
-    validate_option_operation(&opts)?;
-    let target = option_target(editor, name, &opts)?;
     let metadata = ox_editor::OptionStore::metadata(name).map_err(exception)?;
+    let operation = match dict_string(&opts, "operation")? {
+        Some(text) => SetOp::parse(text.as_bytes())?,
+        None => SetOp::Set,
+    };
+    operation.check_supported(metadata)?;
+    let target = option_target(editor, name, &opts)?;
     let value = object_to_option_value(metadata, name, value)?;
+    let value = match value {
+        // option.c stropt_get_newval expands `$VAR` and `~` before merging.
+        OptionValue::String(text) => {
+            OptionValue::String(crate::option_merge::expand_value(metadata, operation, &text))
+        }
+        other => other,
+    };
+    let value = crate::option_merge::merge(
+        metadata,
+        &current_option_value(editor, name, target)?,
+        value,
+        operation,
+    )?;
     if dict_bool(&opts, "dry_run")? == Some(true) {
         validate_option_at(editor, name, &value, target)?;
         return Ok(structured_option_value(metadata, &value));
@@ -960,20 +1043,23 @@ fn comma_items(text: &str) -> impl Iterator<Item = &str> {
     text.split(',').filter(|item| !item.is_empty())
 }
 
-fn validate_option_operation(opts: &Dict) -> Result<(), ApiError> {
-    let Some(operation) = dict_string(opts, "operation")? else {
-        return Ok(());
+/// The option's value at `target`, which `nvim_set_option_value`'s merges fold
+/// the incoming value into (upstream reads it through `get_varp_from`).
+fn current_option_value(
+    editor: &Editor,
+    name: &str,
+    target: OptionTarget,
+) -> Result<OptionValue, ApiError> {
+    let value = match target {
+        OptionTarget::Global => editor.options().get_global(name),
+        OptionTarget::Buffer(buffer) | OptionTarget::GlobalAndBuffer(buffer) => {
+            editor.options().get_buffer(buffer, name)
+        }
+        OptionTarget::Window(window) | OptionTarget::GlobalAndWindow(window) => {
+            editor.options().get_window(window, name)
+        }
     };
-    match operation.as_bytes() {
-        b"set" => Ok(()),
-        b"append" | b"prepend" | b"remove" => Err(ApiError::validation(format!(
-            "Unsupported nvim_set_option_value operation: {}",
-            operation.to_string_lossy()
-        ))),
-        _ => Err(ApiError::validation(
-            "Invalid 'operation': expected 'set', 'append', 'prepend', or 'remove'",
-        )),
-    }
+    value.cloned().map_err(exception)
 }
 
 fn parse_command(command: &OxStr) -> Result<Vec<ExCommand>, ApiError> {
@@ -1351,6 +1437,9 @@ pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(nvim_list_tabpages__API_META(), nvim_list_tabpages__API_DISPATCH)?;
     registry.register(nvim_get_api_info__API_META(), nvim_get_api_info__API_DISPATCH)?;
     registry.register(nvim_command__API_META(), nvim_command__API_DISPATCH)?;
+    registry.register(nvim_exec2__API_META(), nvim_exec2__API_DISPATCH)?;
+    registry.register(nvim_cmd__API_META(), nvim_cmd__API_DISPATCH)?;
+    registry.register(nvim_exec_lua__API_META(), nvim_exec_lua__API_DISPATCH)?;
     registry.register(nvim_eval__API_META(), nvim_eval__API_DISPATCH)?;
     registry.register(nvim_call_function__API_META(), nvim_call_function__API_DISPATCH)?;
     registry.register(nvim_get_vvar__API_META(), nvim_get_vvar__API_DISPATCH)?;
