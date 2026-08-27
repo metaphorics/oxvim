@@ -212,6 +212,24 @@ impl VirtualTextChunk {
 /// A virtual line represented as independently highlighted chunks.
 pub type VirtualLine = Vec<VirtualTextChunk>;
 
+/// Virtual-text anchor relative to the buffer or window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ExtmarkVirtualTextPosition {
+    /// After the buffer line.
+    #[default]
+    EndOfLine,
+    /// Over the buffer text at the extmark column.
+    Overlay,
+    /// Right-aligned in the window.
+    RightAlign,
+    /// Right-aligned after the buffer line.
+    EndOfLineRightAlign,
+    /// Inline, shifting following buffer text to the right.
+    Inline,
+    /// A fixed zero-based window column.
+    WindowColumn(usize),
+}
+
 /// Highlight composition for range decorations.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ExtmarkHighlightMode {
@@ -232,10 +250,16 @@ pub enum ExtmarkHighlightMode {
 pub struct ExtmarkAttributes {
     /// Virtual text rendered at the mark.
     pub virtual_text: Vec<VirtualTextChunk>,
+    /// Virtual-text anchor.
+    pub virtual_text_position: ExtmarkVirtualTextPosition,
     /// Virtual lines associated with the mark.
     pub virtual_lines: Vec<VirtualLine>,
     /// Highlight group applied to the marked span.
     pub highlight_group: Option<String>,
+    /// Additional highlight groups stacked after the first.
+    pub additional_highlight_groups: Vec<String>,
+    /// Whether the range highlight extends through EOL.
+    pub highlight_eol: bool,
     /// Range-highlight composition, when explicitly supplied.
     pub highlight_mode: Option<ExtmarkHighlightMode>,
     /// Text rendered in the sign column.
@@ -258,14 +282,19 @@ pub struct ExtmarkAttributes {
     pub invalidate: bool,
     /// Restore the exact position of the mark if surrounding text is undone.
     pub undo_restore: bool,
+    /// Publish the rendered position to attached UIs.
+    pub ui_watched: bool,
 }
 
 impl Default for ExtmarkAttributes {
     fn default() -> Self {
         Self {
             virtual_text: Vec::new(),
+            virtual_text_position: ExtmarkVirtualTextPosition::EndOfLine,
             virtual_lines: Vec::new(),
             highlight_group: None,
+            additional_highlight_groups: Vec::new(),
+            highlight_eol: false,
             highlight_mode: None,
             sign_text: None,
             sign_highlight_group: None,
@@ -277,6 +306,7 @@ impl Default for ExtmarkAttributes {
             priority_set: false,
             invalidate: false,
             undo_restore: true,
+            ui_watched: false,
         }
     }
 }
@@ -781,7 +811,12 @@ impl Extmarks {
             .namespaces
             .values()
             .flat_map(|state| state.by_id.values())
-            .filter(|mark| !mark.invalid && mark.placement.attributes.highlight_group.is_some())
+            .filter(|mark| {
+                !mark.invalid
+                    && (mark.placement.attributes.highlight_group.is_some()
+                        || mark.placement.attributes.has_sign()
+                        || mark.placement.attributes.ui_watched)
+            })
             .collect();
         marks.sort_by_key(|mark| (mark.placement.attributes.priority, mark.render_order));
         marks

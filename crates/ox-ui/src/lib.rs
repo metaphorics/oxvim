@@ -13,7 +13,7 @@ pub use chrome::{
     ChromeState, CmdlineState, ContentChunk, MessageState, ModeInfo, PopupItem, PopupmenuState,
 };
 pub use compositor::{
-    ComposedScreen, Compositor, CompositorError, Layer, LayerKind, MESSAGE_ZINDEX,
+    ComposedScreen, Compositor, CompositorError, Layer, LayerKind, WatchedExtmark, MESSAGE_ZINDEX,
 };
 pub use emitter::{Emitter, EmitterError};
 pub use grid::{Cell, Grid, GridError, GridLine};

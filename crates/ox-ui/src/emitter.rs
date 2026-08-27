@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::channel::{UiChannelError, UiChannels, UiEvent, UiOptions};
 use crate::chrome::{ChromeState, ContentChunk};
-use crate::compositor::{Compositor, CompositorError, Layer, LayerKind};
+use crate::compositor::{Compositor, CompositorError, Layer, LayerKind, WatchedExtmark};
 use crate::grid::{Grid, GridError, GridLine};
 use crate::hl::{Highlight, HlEvent, HlState};
 
@@ -31,6 +31,7 @@ pub struct Emitter {
     previous: BTreeMap<(u64, i64), Grid>,
     sent_highlights: BTreeMap<(u64, u64), Highlight>,
     sent_groups: BTreeMap<(u64, OxStr), u64>,
+    watched_extmarks: BTreeMap<(u64, i64), Vec<WatchedExtmark>>,
     initialized: BTreeSet<u64>,
 }
 
@@ -42,6 +43,7 @@ impl Emitter {
             previous: BTreeMap::new(),
             sent_highlights: BTreeMap::new(),
             sent_groups: BTreeMap::new(),
+            watched_extmarks: BTreeMap::new(),
             initialized: BTreeSet::new(),
         }
     }
@@ -51,6 +53,7 @@ impl Emitter {
         self.previous.retain(|(id, _), _| *id != channel_id);
         self.sent_highlights.retain(|(id, _), _| *id != channel_id);
         self.sent_groups.retain(|(id, _), _| *id != channel_id);
+        self.watched_extmarks.retain(|(id, _), _| *id != channel_id);
         self.initialized.remove(&channel_id);
     }
 
@@ -78,6 +81,14 @@ impl Emitter {
                 self.emit_highlights(channel_id, channel, highlights, options)?;
                 let (width, height) = channel.size();
                 let mut default_grid = Grid::new(1, width, height)?;
+                for layer in compositor.layers() {
+                    if let Some((statusline, hl_id)) = &layer.statusline {
+                        let row = usize::try_from(layer.row).unwrap_or(0).saturating_add(layer.grid.height());
+                        if row < height {
+                            default_grid.write_text(row, usize::try_from(layer.col).unwrap_or(0), statusline, *hl_id)?;
+                        }
+                    }
+                }
                 if !options.ext_cmdline { apply_cmdline_fallback(&mut default_grid, chrome)?; }
                 self.emit_grid(channel_id, channel, &default_grid)?;
                 let float_compindex = float_compindexes(compositor);
@@ -111,6 +122,36 @@ impl Emitter {
                     ]))?;
                 }
             }
+            let current_grids = compositor.layers().iter().map(|layer| layer.grid.id()).collect::<BTreeSet<_>>();
+            let previous_grids = self
+                .watched_extmarks
+                .keys()
+                .filter_map(|(id, grid)| (*id == channel_id).then_some(*grid))
+                .collect::<BTreeSet<_>>();
+            let layout_changed = current_grids != previous_grids;
+            for layer in compositor.layers() {
+                let key = (channel_id, layer.grid.id());
+                let previous = self.watched_extmarks.get(&key).map(Vec::as_slice).unwrap_or_default();
+                let changed = layout_changed
+                    || (previous != layer.watched_extmarks.as_slice()
+                        && !watched_scroll_only(previous, &layer.watched_extmarks));
+                if changed {
+                    if let Some(window) = layer.window {
+                        for mark in &layer.watched_extmarks {
+                            channel.emit(UiEvent::new("win_extmark", vec![
+                                Object::Integer(layer.grid.id()),
+                                Object::Window(window),
+                                Object::Integer(i64::from(mark.namespace)),
+                                Object::Integer(i64::from(mark.mark)),
+                                integer(mark.row),
+                                integer(mark.col),
+                            ]))?;
+                        }
+                    }
+                }
+                self.watched_extmarks.insert(key, layer.watched_extmarks.clone());
+            }
+            self.watched_extmarks.retain(|(id, grid), _| *id != channel_id || current_grids.contains(grid));
             let routed_chrome = if first_redraw { &initial_chrome_events } else { &chrome_events };
             route_chrome(channel, options, routed_chrome)?;
             frames.insert(channel_id, channel.flush()?);
@@ -364,6 +405,30 @@ fn emit_highlight(
         args[3] = Object::Array(Vec::new());
     }
     channel.emit(UiEvent::new(event.name, args))
+}
+
+
+fn watched_scroll_only(previous: &[WatchedExtmark], current: &[WatchedExtmark]) -> bool {
+    if previous.is_empty() || previous.len() != current.len() {
+        return false;
+    }
+    let mut row_delta = None;
+    for (before, after) in previous.iter().zip(current) {
+        if before.namespace != after.namespace
+            || before.mark != after.mark
+            || before.col != after.col
+            || before.buffer_row != after.buffer_row
+        {
+            return false;
+        }
+        let delta = i128::try_from(after.row).unwrap_or(i128::MAX)
+            - i128::try_from(before.row).unwrap_or(i128::MAX);
+        if delta == 0 || row_delta.is_some_and(|expected| expected != delta) {
+            return false;
+        }
+        row_delta = Some(delta);
+    }
+    true
 }
 
 fn grid_line_event(grid: i64, line: GridLine) -> UiEvent {

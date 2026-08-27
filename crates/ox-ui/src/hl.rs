@@ -46,6 +46,8 @@ pub struct HlAttrs {
     pub blend: Option<u8>,
     /// Clickable hyperlink URL.
     pub url: Option<OxStr>,
+    /// Foreground is a terminal color index, not an RGB value.
+    pub fg_indexed: bool,
 }
 
 impl HlAttrs {
@@ -118,6 +120,8 @@ pub struct Highlight {
     pub rgb: HlAttrs,
     /// Cterm fallback attributes.
     pub cterm: HlAttrs,
+    /// Whether cterm attributes were explicitly supplied (vs inherited from gui).
+    pub cterm_explicit: bool,
     /// Whether `default=true` was set (don't override existing definition).
     pub default_flag: bool,
     /// Source metadata entries.
