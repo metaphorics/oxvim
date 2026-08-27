@@ -2094,3 +2094,74 @@ fn system_uses_the_shell_options_feeds_input_and_never_raises_on_a_bad_shell() {
     assert_eq!(global(b"missing"), Ok(Typval::String(OxStr::from(""))));
     assert_eq!(global(b"missing_error"), Ok(Typval::Number(-1)));
 }
+
+// ---------------------------------------------------------------------------
+// Family: dynamic script context (script.c current_sctx, usercmd.c do_ucmd,
+// eval/userfunc.c call_user_func) — Task 4B
+// ---------------------------------------------------------------------------
+
+#[test]
+fn user_command_uses_defining_script_context() {
+    let io = MemoryFileIO::new();
+    io.insert("/def.vim", "function! s:Hit()\n  let g:hit = 1\nendfunction\ncommand Hit call s:Hit()");
+    io.insert("/invoke.vim", "function! s:Hit()\n  let g:hit = 2\nendfunction\nHit");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.source_file(&mut editor, "/def.vim".as_ref()).unwrap();
+    exec.source_file(&mut editor, "/invoke.vim".as_ref()).unwrap();
+    assert_eq!(global_number(exec.scope(), "hit"), Some(1));
+}
+
+#[test]
+fn keepscript_retains_invocation_script_context() {
+    let io = MemoryFileIO::new();
+    io.insert("/def.vim", "function! s:Hit()\n  let g:hit = 1\nendfunction\ncommand -keepscript Hit call s:Hit()");
+    io.insert("/invoke.vim", "function! s:Hit()\n  let g:hit = 2\nendfunction\nHit");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.source_file(&mut editor, "/def.vim".as_ref()).unwrap();
+    exec.source_file(&mut editor, "/invoke.vim".as_ref()).unwrap();
+    assert_eq!(global_number(exec.scope(), "hit"), Some(2));
+}
+
+#[test]
+fn user_command_body_error_restores_caller_script_context() {
+    let io = MemoryFileIO::new();
+    io.insert("/def.vim", "function! s:Boom()\n  throw 'boom'\nendfunction\ncommand Boom call s:Boom()");
+    io.insert("/invoke.vim", "function! s:Mark()\n  let g:mark = 1\nendfunction\nBoom\nlet g:after = 1");
+    io.insert("/later.vim", "function! s:Later()\n  let g:later = 1\nendfunction\ncall s:Later()");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.source_file(&mut editor, "/def.vim".as_ref()).unwrap();
+    let err = exec.source_file(&mut editor, "/invoke.vim".as_ref()).unwrap_err();
+    assert_eq!(error_code(&err), "Throw");
+    assert_eq!(global_number(exec.scope(), "after"), None);
+    exec.source_file(&mut editor, "/later.vim".as_ref()).unwrap();
+    assert_eq!(global_number(exec.scope(), "later"), Some(1));
+}
+#[test]
+fn nested_user_command_invocation_restores_script_context() {
+    let io = MemoryFileIO::new();
+    io.insert("/a.vim", "function! s:A()\n  let g:a = 1\nendfunction\ncommand A call s:A()");
+    io.insert("/b.vim", "command B A");
+    io.insert("/c.vim", "function! s:After()\n  let g:after = 1\nendfunction\nB\ncall s:After()");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.source_file(&mut editor, "/a.vim".as_ref()).unwrap();
+    exec.source_file(&mut editor, "/b.vim".as_ref()).unwrap();
+    exec.source_file(&mut editor, "/c.vim".as_ref()).unwrap();
+    assert_eq!(global_number(exec.scope(), "a"), Some(1));
+    assert_eq!(global_number(exec.scope(), "after"), Some(1));
+}
+
+#[test]
+fn function_call_uses_defining_script_context() {
+    let io = MemoryFileIO::new();
+    io.insert("/def.vim", "function! s:Hit()\n  let g:hit = 1\nendfunction\nfunction! GlobalHit()\n  call s:Hit()\nendfunction");
+    io.insert("/invoke.vim", "function! s:Hit()\n  let g:hit = 2\nendfunction\ncall GlobalHit()");
+    let mut editor = Editor::new();
+    let mut exec = ExExecutor::with_io(io);
+    exec.source_file(&mut editor, "/def.vim".as_ref()).unwrap();
+    exec.source_file(&mut editor, "/invoke.vim".as_ref()).unwrap();
+    assert_eq!(global_number(exec.scope(), "hit"), Some(1));
+}

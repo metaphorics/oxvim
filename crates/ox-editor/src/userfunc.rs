@@ -428,26 +428,6 @@ impl UserFunctions {
         &self.call_stack
     }
 
-    /// SID visible to `s:` names in the active function body.
-    #[must_use]
-    pub fn active_sid(&self) -> Option<Sid> {
-        self.call_stack.last().map(|frame| frame.context.sid).filter(|sid| *sid != 0)
-    }
-
-    /// `current_sctx` while a function body runs (`call_user_func` sets it
-    /// from `uf_script_ctx`): the defining script and its `sc_lnum` plus the
-    /// body-relative line being executed, which is upstream's
-    /// `sc_lnum + SOURCING_LNUM` (`mapping.c:534-535`).
-    ///
-    /// `None` when no function body is running, in which case the caller's own
-    /// script stack is the context.
-    #[must_use]
-    pub fn script_context(&self) -> Option<SourceContext> {
-        self.call_stack.last().map(|frame| SourceContext {
-            lnum: frame.context.lnum.saturating_add(frame.current_line),
-            ..frame.context
-        })
-    }
 
     /// Upstream-style call-stack throwpoint prefix.
     #[must_use]

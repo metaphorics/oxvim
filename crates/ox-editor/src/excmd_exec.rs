@@ -216,9 +216,13 @@ pub struct UserCommand {
     pub accepts_range: bool,
     /// Whether invocation accepts a register.
     pub accepts_register: bool,
-    /// SID and sourcing sequence of the `:command` that created this entry,
-    /// upstream's `uc_script_ctx`. `(0, 0)` outside any script.
-    script: (Sid, u64),
+    /// SID, sequence, and source line of the `:command` that created this
+    /// entry, upstream's `uc_script_ctx`. `SourceContext::default()` outside
+    /// any script.
+    pub script_context: SourceContext,
+    /// Whether invocation keeps the caller's script context instead of
+    /// switching to `script_context` (`ex_docmd.c` `EX_KEEPSCRIPT`).
+    pub keepscript: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1528,12 +1532,7 @@ impl<F: FileIO> BuiltinHost for EvalHost<'_, F> {
         if let Some(family) = crate::builtins::route(&name_text) {
             return crate::builtins::call(self, family, &name_text, args, scope);
         }
-        let sid = self
-            .runtime
-            .functions
-            .active_sid()
-            .or_else(|| self.runtime.scripts.current_sid())
-            .unwrap_or(0);
+        let sid = self.runtime.scripts.current_sid().unwrap_or(0);
         if self.runtime.functions.contains(&name_text, sid) || name_text.contains('#') {
             let (first, last) = current_line_pair(self.editor);
             return call_user_function(
@@ -1912,11 +1911,7 @@ pub(crate) fn call_user_function_with_self<F: FileIO>(
     last_line: usize,
     receiver: Option<DictRef>,
 ) -> Result<Typval, Flow> {
-    let mut sid = runtime
-        .functions
-        .active_sid()
-        .or_else(|| runtime.scripts.current_sid())
-        .unwrap_or(0);
+    let mut sid = runtime.scripts.current_sid().unwrap_or(0);
     if !runtime.functions.contains(name, sid) && name.contains('#') {
         let path = runtime.scripts.resolve_autoload(name).ok_or_else(|| {
             error_flow(runtime, "E117", format!("Unknown function: {name}"))
@@ -1971,6 +1966,16 @@ pub(crate) fn call_user_function_with_self<F: FileIO>(
     let sid = function.context.sid;
     let switched_script = sid != 0 && runtime.scripts.current_sid() != Some(sid);
     let caller_script = scope.script.clone();
+    if sid != 0 {
+        let name = runtime
+            .scripts
+            .script_name(sid)
+            .map(|name| name.to_owned())
+            .unwrap_or_else(|| format!("<SNR>{sid}"));
+        runtime
+            .scripts
+            .push_alias_source(sid, function.context.seq, function.context.lnum, name);
+    }
     if switched_script {
         runtime.scripts.load_script_scope(sid, scope);
     }
@@ -1986,6 +1991,9 @@ pub(crate) fn call_user_function_with_self<F: FileIO>(
         }
         flow => flow,
     };
+    if sid != 0 {
+        runtime.scripts.pop_source();
+    }
     runtime.functions.end_call(scope);
     match flow {
         Flow::Normal => Ok(Typval::Number(0)),
@@ -2151,7 +2159,7 @@ fn command_delfunction<F: FileIO>(runtime: &mut ExRuntime<F>, command: &ExComman
     let name = command.args.trim();
     if name.is_empty() { return error_flow(runtime, "E471", "Argument required"); }
     if name.split_whitespace().count() != 1 { return error_flow(runtime, "E488", "Trailing characters"); }
-    let sid = runtime.functions.active_sid().or_else(|| runtime.scripts.current_sid()).unwrap_or(0);
+    let sid = runtime.scripts.current_sid().unwrap_or(0);
     if runtime.functions.is_active(name, sid) {
         return error_flow(runtime, "E131", format!("Cannot delete function {name}: It is in use"));
     }
@@ -5925,29 +5933,41 @@ fn command_user_command<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Edit
     let mut accepts_bang = false;
     let mut accepts_range = false;
     let mut accepts_register = false;
+    let mut keepscript = false;
     while words.peek().is_some_and(|word| word.starts_with('-')) {
         let flag = words.next().unwrap_or_default();
         if let Some(value) = flag.strip_prefix("-nargs=") { nargs = value.chars().next().unwrap_or('0'); }
         else if flag == "-bang" { accepts_bang = true; }
         else if flag == "-range" || flag.starts_with("-range=") { accepts_range = true; }
         else if flag == "-register" { accepts_register = true; }
+        else if flag == "-keepscript" { keepscript = true; }
         else if !matches!(flag, "-bar" | "-buffer" | "-complete" | "-count") && !flag.starts_with("-complete=") && !flag.starts_with("-count=") && !flag.starts_with("-addr=") { return error_flow(runtime, "E181", format!("Invalid attribute: {flag}")); }
     }
     let Some(name) = words.next() else { return error_flow(runtime, "E183", "User defined commands must be capitalized") };
     if !valid_user_command_name(name) { return error_flow(runtime, "E183", "User defined commands must be capitalized") }
-    let script = (runtime.scripts.current_sid().unwrap_or(0), runtime.scripts.current_seq());
+    let script_context = runtime.scripts.current_context();
     if let Some(existing) = runtime.user_commands.commands.get(name) {
         // "Command can be replaced with command! and when sourcing the same
         // script again, but only once" (`usercmd.c:940-948`): the same SID
         // with a *different* sequence number is a reload and replaces
         // silently; anything else is E174.
-        let same_script_reload = existing.script.0 == script.0 && existing.script.1 != script.1;
+        let same_script_reload = existing.script_context.sid == script_context.sid
+            && existing.script_context.seq != script_context.seq;
         if !command.bang && !same_script_reload {
             return error_flow(runtime, "E174", "Command already exists: add ! to replace it");
         }
     }
     let body = words.collect::<Vec<_>>().join(" ");
-    runtime.user_commands.commands.insert(name.to_owned(), UserCommand { name: name.to_owned(), body, nargs, accepts_bang, accepts_range, accepts_register, script });
+    runtime.user_commands.commands.insert(name.to_owned(), UserCommand {
+        name: name.to_owned(),
+        body,
+        nargs,
+        accepts_bang,
+        accepts_range,
+        accepts_register,
+        script_context,
+        keepscript,
+    });
     Flow::Normal
 }
 
@@ -5986,9 +6006,28 @@ fn command_invoke_user<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Edito
         .replace("<line2>", &line2.to_string())
         .replace("<count>", &command.count.unwrap_or(0).to_string())
         .replace("<reg>", &command.register.map_or(String::new(), |value| value.to_string()));
-    let logical = vec![LogicalLine { text: expanded, first_line: runtime.scripts.current_line() }];
+    let first_line = runtime.scripts.current_line();
+    let logical = vec![LogicalLine { text: expanded, first_line }];
     let program = match parse_program(&runtime.user_commands, &logical) { Ok(program) => program, Err(error) => return exec_error_flow(runtime, error) };
-    run_program(runtime, editor, scope, lua, &program, 0, program.len())
+    let sid = definition.script_context.sid;
+    let switched = !definition.keepscript && sid != 0 && runtime.scripts.current_sid() != Some(sid);
+    let caller_script = scope.script.clone();
+    if !definition.keepscript && sid != 0 {
+        let name = format!("command {name}");
+        runtime.scripts.push_alias_source(sid, runtime.scripts.current_seq(), 0, name);
+        if switched {
+            runtime.scripts.load_script_scope(sid, scope);
+        }
+    }
+    let flow = run_program(runtime, editor, scope, lua, &program, 0, program.len());
+    if !definition.keepscript && sid != 0 {
+        if switched {
+            runtime.scripts.store_script_scope(sid, scope);
+            scope.script = caller_script;
+        }
+        runtime.scripts.pop_source();
+    }
+    flow
 }
 
 /// Expand `<f-args>`: split the argument text on unescaped whitespace and emit
@@ -6217,11 +6256,7 @@ fn command_map<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor, scope
     // `SOURCING_LNUM` to its line (`mapping.c:501-505,530-537,890-894`).
     // Inside a function body that is the `:function`'s own line plus the body
     // line; at script level it is the physical line being executed.
-    let script_context = runtime.functions.script_context().unwrap_or(SourceContext {
-        sid: runtime.scripts.current_sid().unwrap_or(0),
-        seq: runtime.scripts.current_seq(),
-        lnum: runtime.scripts.current_line(),
-    });
+    let script_context = runtime.scripts.current_context();
     let options = MappingOptions { modes, scope: map_scope, remap, nowait: flags.nowait, silent: flags.silent, description: None, script: flags.script, orig_rhs: rhs.to_owned(), script_context };
     let result = if remap { editor.mappings_mut().map(lhs, action, options) } else { editor.mappings_mut().noremap(lhs, action, options) };
     match result { Ok(()) => Flow::Normal, Err(error) => error_flow(runtime, "E474", error.to_string()) }

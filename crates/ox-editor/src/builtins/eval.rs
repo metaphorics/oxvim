@@ -199,9 +199,8 @@ fn expand_special_base<F: FileIO>(
             .and_then(|buffer| editor.buffer(buffer).ok())
             .map_or_else(String::new, |buffer| buffer.name().to_string_lossy().into_owned()),
         "<SID>" => runtime
-            .functions
-            .active_sid()
-            .or_else(|| runtime.scripts.current_sid())
+            .scripts
+            .current_sid()
             .map_or_else(String::new, |sid| format!("<SNR>{sid}_")),
         "<amatch>" => runtime.active_autocmd.matched.clone(),
         "<afile>" => runtime.active_autocmd.file.clone(),
@@ -274,7 +273,7 @@ fn call_function_builtin<F: FileIO>(runtime: &mut ExRuntime<F>, kind: &str, mut 
             if text.is_empty() || text.as_bytes().first().is_some_and(u8::is_ascii_digit) {
                 return Err(EvalError::new("E475", 0, format!("Invalid argument: {text}")));
             }
-            let sid = runtime.functions.active_sid().or_else(|| runtime.scripts.current_sid()).unwrap_or(0);
+            let sid = runtime.scripts.current_sid().unwrap_or(0);
             if builtin_spec(&text).is_none() && !runtime.functions.contains(&text, sid) && !text.contains('#') {
                 return Err(EvalError::new("E700", 0, format!("Unknown function: {text}")));
             }
@@ -352,7 +351,7 @@ fn exists_with_editor<F: FileIO>(
         let option = option.strip_prefix("g:").or_else(|| option.strip_prefix("l:")).unwrap_or(option);
         i64::from(crate::options::OptionStore::metadata(option).is_ok())
     } else if let Some(name) = operand.strip_prefix('*') {
-        let sid = runtime.functions.active_sid().or_else(|| runtime.scripts.current_sid()).unwrap_or(0);
+        let sid = runtime.scripts.current_sid().unwrap_or(0);
         i64::from(is_callable_function(name) || runtime.functions.contains(name, sid))
     } else if let Some(name) = operand.strip_prefix(':') {
         match resolve_command(name, &runtime.user_commands) {

@@ -344,6 +344,12 @@ pub struct SourceFrame {
     pub seq: u64,
     /// Display name used in throwpoints (`/abs/path.vim` or `<cmdline>`).
     pub name: String,
+    /// Line number base (`sc_lnum`) for definitions that run inside this
+    /// frame. A sourced script or user-command alias uses `0`; a function
+    /// call's frame carries the `:function` line, so `maparg()` and reload
+    /// rules see the *defining* script's line (`mapping.c:530-537` adds
+    /// `SOURCING_LNUM` to `sc_lnum`).
+    pub definition_line: usize,
     /// One-based physical line currently executing.
     pub current_line: usize,
 }
@@ -675,9 +681,30 @@ impl<F: FileIO> ScriptCtx<F> {
             sid,
             seq: self.next_seq,
             name,
+            definition_line: 0,
             current_line: 0,
         });
         sid
+    }
+
+    /// Pushes a frame that reuses an existing SID without allocating a
+    /// new one and without bumping the sequence counter.
+    ///
+    /// This is the dynamic half of a user-command invocation
+    /// (`usercmd.c:1756-1769`) or a function call
+    /// (`eval/userfunc.c:1250-1251`): the body runs in its *defining*
+    /// script's context, so `current_sid()`, `<SNR>` canonicalization, and
+    /// `current_context()` all observe that script while it executes. A
+    /// user command passes the caller's `seq` to keep `sc_seq` unchanged,
+    /// while a function call passes the function's own `seq`.
+    pub fn push_alias_source(&mut self, sid: Sid, seq: u64, lnum: usize, name: String) {
+        self.source_stack.push(SourceFrame {
+            sid,
+            seq,
+            name,
+            definition_line: lnum,
+            current_line: 0,
+        });
     }
 
     /// The SID a previous sourcing of `name` already owns, when `name` is a
@@ -712,6 +739,23 @@ impl<F: FileIO> ScriptCtx<F> {
     #[must_use]
     pub fn current_seq(&self) -> u64 {
         self.source_stack.last().map_or(0, |frame| frame.seq)
+    }
+
+    /// The dynamic script context in force, upstream's `current_sctx`:
+    /// the innermost sourcing, function-call, or user-command frame, with
+    /// the executing line folded into `lnum` (`sc_lnum + SOURCING_LNUM`).
+    /// Definitions record this so `maparg()`'s `sid`/`lnum` and the reload
+    /// rules see the *defining* script even when it differs from the
+    /// script being sourced.
+    #[must_use]
+    pub fn current_context(&self) -> SourceContext {
+        self.source_stack.last().map_or_else(SourceContext::default, |frame| {
+            SourceContext {
+                sid: frame.sid,
+                seq: frame.seq,
+                lnum: frame.definition_line.saturating_add(frame.current_line),
+            }
+        })
     }
 
     /// The display name of the current script or line context.
