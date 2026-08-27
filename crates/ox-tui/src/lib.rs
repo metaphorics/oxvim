@@ -359,6 +359,8 @@ pub enum TuiError {
 
 /// Run an already-spawned client until its RPC stream closes.
 pub fn run(mut client: Client) -> Result<(), TuiError> {
+    // This full-screen client owns its palette; NO_COLOR must not strip its SGR output.
+    crossterm::style::force_color_output(true);
     let (width, height) = crossterm::terminal::size().map_err(TuiError::Input)?;
     client.attach(width, height)?;
 
