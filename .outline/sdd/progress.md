@@ -109,3 +109,17 @@ That is worth stating plainly because the metadata is generated from the same de
 The functional suite is the instrument that can: 930 passes against the oracle control's 9652 on the same 484 files, with 373 files executing and passing nothing. Unlike the oldtest corpus, which was gated by a handful of registry-level defects, this one is broadly short of behavior.
 
 Task 75 also refuted its own ranking by experiment, which is the part worth keeping: shimming the top blocker by file count (`nvim_get_color_map`, gating 171 files) produced 4 additional passes and lost 743 executions to 11 new hangs. File counts rank what is reached first, not what is worth fixing first.
+Task 3C9: complete (commit 1232822 fix(indent): compute existing-line indentation, review clean — 1013 lib tests, general brace engine fix).
+Task 3C10: complete (commit c2396e1 fix(extmark): restore marks created during edits, review clean — P2/P3 non-blocking findings deferred).
+Task 3A: complete (commit b1ca009 fix(api): validate extmark arguments and bounds, review clean after one fix pass — 77 ox-api tests).
+Task 3E: complete (commit 8ee9a2e fix(sign): implement legacy sign details and extmark integration, review clean — P2 non-blocking findings deferred).
+Task 3F: complete (commit 1072172 fix(highlight): composite extmark highlights by priority, review clean — P3 nit deferred).
+Task 3G: complete (commit f1ca1ea fix(extmark): complete invalidation lifecycle, review clean — 1019 lib tests).
+Task 3D1: complete (commit 770a429 fix(substitute): restore multiline substitute endpoint geometry, review clean — 1017 lib tests, mutation verified).
+Task 3D2: complete (commit b2c5746 fix(prompt): replace complete prompt prefix geometry, review clean — 1030 lib tests).
+Task 3D3: complete (commit 2803c08 fix(ui): allocate split grids with exact heights and watched mark updates, review clean after one fix pass — P3 notes deferred).
+Task 4B: complete (commit 98e9991 fix(eval): unify dynamic script context, review clean — P3 test gap deferred, 87 function tests pass).
+Task 1: complete (commit 52ac7dc fix(eval): match filesystem builtin semantics, review clean — 1044 lib tests, bounded readblob, filecopy E1174, E484 handling; P2 test-gap deferred).
+Grill P1: complete (commit 0b9961c fix(indent): avoid whole-buffer materialization and degrade NullExprEval, review clean — 1044 lib tests, 39 insert tests, manual indentexpr probe; landing gate workspace check 0 errors).
+Task 4: complete (commit 1a0320e fix(job): connect terminal buffers and channels, review clean after one fix pass — 4 P1/P2 findings closed, 1052 lib tests, job channel sink; oldtest termdebug still blocked by packadd).
+Gate 1a0320e: just build PASS (release 15.9 MB, 1m12s, 16 missing-docs warnings), just test 2295/2299 — same 4 ox-tui PTY pre-existing failures at ox-tui/tests/pty.rs:393,444,469,513 (Default vs Rgb, byte-identical to b52e406), cargo nextest 36 binaries, apidiff PASS (0 diff, schemas match), clippy FAIL (35-52 pedantic errors, style lints with -D warnings, not correctness).
