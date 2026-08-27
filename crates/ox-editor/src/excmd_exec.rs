@@ -28,6 +28,7 @@ use ox_text::{Buffer, Position};
 use ox_types::{BufHandle, Dict, DictRef, Funcref, Object, OxStr, Special, TabHandle, Typval, WinHandle};
 
 use crate::autocmd::{AutocmdContext, AutocmdKind, AutocmdOptions, AugroupId, DeleteAutocmds, Event, FiringPlan};
+use crate::buffer::BufferTextEditRequest;
 use crate::extmark::{ExtmarkAttributes, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, NamespaceId, SignGroup};
 use crate::mapping::{MapMode, MapModes, MapScope, Mapping, MappingAction, MappingOptions};
 use crate::options::{find_unescaped, CommaItems, OptionListKind, OptionScope, OptionType, OptionValue, OPTION_METADATA};
@@ -2899,9 +2900,11 @@ fn command_substitute<F: FileIO>(
         return error_flow(runtime, "E488", "Trailing characters");
     };
     let replacement_input = format!("{delimiter}{tail}");
-    let Some((replacement, flags)) = take_delimited(&replacement_input, delimiter) else {
-        return error_flow(runtime, "E488", "Trailing characters");
-    };
+    // A missing closing delimiter is valid: the replacement is the rest of
+    // the line (`ex_cmds.c` do_sub parsing). The check_col functional case
+    // is `:1,5s:5\n:5 ` with no third delimiter.
+    let (replacement, flags) = take_delimited(&replacement_input, delimiter)
+        .unwrap_or_else(|| (tail.to_owned(), ""));
     let flags = flags.trim();
     if flags.contains('c') {
         return error_flow(
@@ -2945,16 +2948,39 @@ fn command_substitute<F: FileIO>(
         Ok(program) => program,
         Err(error) => return error_flow(runtime, "E54", error.to_string()),
     };
-    let mut replacement_lines = Vec::new();
+    let mut substitutions = Vec::new();
     let mut changed = false;
-    for lnum in start..=end.min(original.len()) {
-        let source = String::from_utf8_lossy(&original[lnum - 1]).into_owned();
+    if pattern.contains("\\n") {
+        // `\n` in the pattern matches across line boundaries, so the range is
+        // joined into one source (`do_sub`, ex_cmds.c) and every match is
+        // translated back to byte-precise row/col coordinates.
+        let last = end.min(original.len());
+        let source = original[start - 1..last]
+            .iter()
+            .map(|line| String::from_utf8_lossy(line))
+            .collect::<Vec<_>>()
+            .join("\n");
         match substitute_line(runtime, editor, scope, &program_regex, &source, &replacement, expression, global) {
-            Ok((line, did_change)) => {
-                changed |= did_change;
-                replacement_lines.push(line.into_bytes());
+            Ok(edits) => {
+                changed |= !edits.is_empty();
+                for (from, to, rendered) in edits {
+                    let (start_offset, start_col) = byte_row_col(&source, from);
+                    let (end_offset, end_col) = byte_row_col(&source, to);
+                    substitutions.push((start - 1 + start_offset, start_col, start - 1 + end_offset, end_col, rendered));
+                }
             }
             Err(flow) => return flow,
+        }
+    } else {
+        for lnum in start..=end.min(original.len()) {
+            let source = String::from_utf8_lossy(&original[lnum - 1]).into_owned();
+            match substitute_line(runtime, editor, scope, &program_regex, &source, &replacement, expression, global) {
+                Ok(edits) => {
+                    changed |= !edits.is_empty();
+                    substitutions.extend(edits.into_iter().map(|(from, to, rendered)| (lnum - 1, from, lnum - 1, to, rendered)));
+                }
+                Err(flow) => return flow,
+            }
         }
     }
     if !changed && !suppress_nomatch {
@@ -2965,11 +2991,39 @@ fn command_substitute<F: FileIO>(
             Position { lnum: start, col: 0 },
             |window| window.cursor,
         );
-        if let Err(error) = editor.replace_buffer_lines(buffer, start, end, &replacement_lines, cursor, cursor, 0) {
-            return error_flow(runtime, "E16", error.to_string());
+        // Apply bottom-up so earlier (row, col) coordinates stay in pre-edit
+        // space; each splice records exact byte extents so extmark endpoints
+        // and undo replay the same geometry.
+        for (start_row, from, end_row, to, rendered) in substitutions.into_iter().rev() {
+            let parts = rendered
+                .as_bytes()
+                .split(|byte| matches!(*byte, b'\n' | b'\r'))
+                .map(|part| part.to_vec())
+                .collect::<Vec<_>>();
+            let request = BufferTextEditRequest {
+                start: ExtmarkPosition::new(start_row, from),
+                end: ExtmarkPosition::new(end_row, to),
+                replacement: parts,
+            };
+            if let Err(error) = editor.replace_buffer_text(buffer, &request, cursor, cursor, 0) {
+                return error_flow(runtime, "E16", error.to_string());
+            }
         }
     }
     Flow::Normal
+}
+
+
+/// Translates a byte offset in a `\n`-joined substitute source into a
+/// zero-based (row, column) pair.
+fn byte_row_col(source: &str, byte: usize) -> (usize, usize) {
+    let prefix = &source.as_bytes()[..byte.min(source.len())];
+    let row = prefix.iter().filter(|value| **value == b'\n').count();
+    let col = prefix
+        .iter()
+        .rposition(|value| *value == b'\n')
+        .map_or(prefix.len(), |newline| prefix.len() - newline - 1);
+    (row, col)
 }
 
 fn substitute_line<F: FileIO>(
@@ -2981,12 +3035,10 @@ fn substitute_line<F: FileIO>(
     replacement: &str,
     expression: Option<&str>,
     global: bool,
-) -> Result<(String, bool), Flow> {
+) -> Result<Vec<(usize, usize, String)>, Flow> {
     let text = RegexText::new(source.to_owned());
-    let mut output = String::new();
-    let mut previous = 0;
+    let mut edits = Vec::new();
     let mut cursor = 0;
-    let mut changed = false;
     while cursor <= source.len() {
         let Some(position) = text.position(cursor) else { break };
         let Some(matched) = regex_exec_at(
@@ -2996,7 +3048,6 @@ fn substitute_line<F: FileIO>(
         ) else {
             break;
         };
-        output.push_str(&source[previous..matched.start.byte]);
         let mut groups = vec![source[matched.start.byte..matched.end.byte].to_owned()];
         for capture in &matched.captures {
             groups.push(capture.as_ref().map_or_else(String::new, |capture| {
@@ -3008,13 +3059,15 @@ fn substitute_line<F: FileIO>(
         } else {
             expand_replacement(replacement, &groups)
         };
-        output.push_str(&rendered);
-        changed = true;
-        previous = matched.end.byte;
-        if !global {
-            break;
-        }
-        cursor = if matched.start.byte == matched.end.byte {
+        edits.push((matched.start.byte, matched.end.byte, rendered));
+        cursor = if !global {
+            // One substitution per line: skip to the line after the match.
+            source[matched.end.byte..]
+                .find('\n')
+                .map_or(source.len().saturating_add(1), |newline| {
+                    matched.end.byte.saturating_add(newline).saturating_add(1)
+                })
+        } else if matched.start.byte == matched.end.byte {
             next_boundary(source, matched.end.byte)
         } else {
             matched.end.byte
@@ -3023,11 +3076,7 @@ fn substitute_line<F: FileIO>(
             break;
         }
     }
-    if !changed {
-        return Ok((source.to_owned(), false));
-    }
-    output.push_str(&source[previous..]);
-    Ok((output, true))
+    Ok(edits)
 }
 
 fn eval_substitute_expression<F: FileIO>(
