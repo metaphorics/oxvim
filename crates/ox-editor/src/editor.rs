@@ -13,7 +13,7 @@ use crate::arglist::ArgList;
 use crate::autocmd::Autocmds;
 use crate::buffer::{BufferState, BufferStateError, BufferTextEditRequest};
 use crate::decoration::Decorations;
-use crate::extmark::{NamespaceId, SignGroup, TextSplice};
+use crate::extmark::{ExtmarkPosition, NamespaceId, SignGroup, TextExtent, TextSplice};
 use crate::fold::{FoldError, Position as FoldPosition};
 use crate::layout::{Geometry, Layout, LayoutError, TabpageState, WinConfig, WindowState};
 use crate::mapping::Mappings;
@@ -548,6 +548,31 @@ impl Editor {
             self.active_text_edit = Some(buffer);
         }
         Ok(seq)
+    }
+
+    /// Replaces the live prompt line without adding the replacement to normal
+    /// undo history, while preserving text-edit position geometry
+    /// (`f_prompt_setprompt`, `eval/buffer.c`).
+    pub fn replace_prompt_line(
+        &mut self,
+        buffer: BufHandle,
+        lnum: usize,
+        line: Vec<u8>,
+        old_len: usize,
+        new_len: usize,
+    ) -> Result<(), EditorError> {
+        let splice = TextSplice {
+            start: ExtmarkPosition::new(lnum.saturating_sub(1), 0),
+            old_extent: TextExtent::new(0, old_len),
+            new_extent: TextExtent::new(0, new_len),
+        };
+        let state = self
+            .buffers
+            .get_mut(&buffer)
+            .ok_or(EditorError::UnknownBuffer(buffer))?;
+        state.replace_prompt_line(lnum, line, splice)?;
+        self.splice_text_positions(buffer, splice);
+        Ok(())
     }
 
     /// Replaces several byte ranges as one planning-atomic batch

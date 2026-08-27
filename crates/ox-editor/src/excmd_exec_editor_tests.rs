@@ -3394,3 +3394,435 @@ fn map_lists_buffer_local_mappings_first_and_each_bucket_newest_first() {
     assert_eq!(rows[1][3..5], *"+z");
     assert_eq!(rows[2][3..5], *",z");
 }
+
+/// `prompt_setprompt()` on an ordinary buffer rewrites only the stored prompt
+/// text: visible lines move solely while 'buftype' is "prompt"
+/// (`f_prompt_setprompt`, `eval/buffer.c:963-1014`).
+#[test]
+fn prompt_setprompt_leaves_ordinary_buffer_first_line_unchanged() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"keep this line".to_vec(), b"second".to_vec()]);
+    let buffer = editor.current_buffer().unwrap();
+    let state = editor.buffer_mut(buffer).unwrap();
+    let namespace = state.extmarks.create_namespace("ordinary").unwrap();
+    let anchored = state
+        .set_extmark_recorded(
+            namespace,
+            None,
+            crate::ExtmarkPlacement::new(crate::ExtmarkPosition::new(0, 0)),
+            false,
+        )
+        .unwrap();
+
+    executor
+        .execute_line(&mut editor, "call prompt_setprompt(0, 'cmd: ')")
+        .unwrap();
+
+    let state = editor.buffer(buffer).unwrap();
+    assert_eq!(
+        state.text().unwrap().line(1).unwrap(),
+        b"keep this line".to_vec(),
+        "an ordinary buffer's first line is unchanged"
+    );
+    assert_eq!(state.text().unwrap().line(2).unwrap(), b"second".to_vec());
+    assert_eq!(state.prompt(), b"cmd: ", "the prompt is still stored");
+    assert_eq!(
+        state.extmarks.get(namespace, anchored).unwrap().unwrap().placement.position,
+        crate::ExtmarkPosition::new(0, 0),
+        "no splice reaches the extmark"
+    );
+}
+
+/// A prompt on a later line is replaced on its state-owned live row. Stale
+/// prompt-change marks and cursor placement cannot redirect the mutation into
+/// scrollback; the same row drives replacement and extmark splice geometry
+/// (f_prompt_setprompt, eval/buffer.c:974-1000).
+#[test]
+fn prompt_setprompt_replaces_live_prompt_line_with_exact_extmark_movement() {
+    let (mut editor, mut executor) = setup_with_content(&[
+        b"scrollback above".to_vec(),
+        b"cmd: input".to_vec(),
+        b"tail".to_vec(),
+    ]);
+    let buffer = editor.current_buffer().unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "buftype", crate::options::OptionValue::String("prompt".to_owned()))
+        .unwrap();
+    editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_prompt(b"cmd: ".to_vec(), 2);
+    editor
+        .set_local_mark(buffer, ':', ox_text::Position { lnum: 9, col: 999 })
+        .unwrap();
+    let state = editor.buffer_mut(buffer).unwrap();
+    let namespace = state.extmarks.create_namespace("live-prompt").unwrap();
+    let end_of_input = state
+        .set_extmark_recorded(
+            namespace,
+            None,
+            crate::ExtmarkPlacement::new(crate::ExtmarkPosition::new(1, 10)),
+            false,
+        )
+        .unwrap();
+    let spanning = state
+        .set_extmark_recorded(
+            namespace,
+            None,
+            crate::ExtmarkPlacement::new(crate::ExtmarkPosition::new(1, 5))
+                .with_end(crate::ExtmarkPosition::new(1, 10)),
+            false,
+        )
+        .unwrap();
+    let above = state
+        .set_extmark_recorded(
+            namespace,
+            None,
+            crate::ExtmarkPlacement::new(crate::ExtmarkPosition::new(0, 7)),
+            false,
+        )
+        .unwrap();
+    let below = state
+        .set_extmark_recorded(
+            namespace,
+            None,
+            crate::ExtmarkPlacement::new(crate::ExtmarkPosition::new(2, 0)),
+            false,
+        )
+        .unwrap();
+
+    executor
+        .execute_line(&mut editor, "call prompt_setprompt(0, 'floob: ')")
+        .unwrap();
+
+    let state = editor.buffer(buffer).unwrap();
+    assert_eq!(
+        state.text().unwrap().line(1).unwrap(),
+        b"scrollback above".to_vec(),
+        "the line above the prompt is untouched"
+    );
+    assert_eq!(
+        state.text().unwrap().line(2).unwrap(),
+        b"floob: input".to_vec(),
+        "only the prompt prefix on the live prompt/input line is replaced"
+    );
+    assert_eq!(
+        state.text().unwrap().line(3).unwrap(),
+        b"tail".to_vec(),
+        "the line below the prompt is untouched"
+    );
+    let marks = &state.extmarks;
+    assert_eq!(
+        marks.get(namespace, end_of_input).unwrap().unwrap().placement.position,
+        crate::ExtmarkPosition::new(1, 12),
+        "the end-of-input mark shifts by the prompt byte delta"
+    );
+    let spanned = marks.get(namespace, spanning).unwrap().unwrap();
+    assert_eq!(spanned.placement.position, crate::ExtmarkPosition::new(1, 7));
+    assert_eq!(
+        spanned.placement.end.map(|end| end.position),
+        Some(crate::ExtmarkPosition::new(1, 12))
+    );
+    assert_eq!(
+        marks.get(namespace, above).unwrap().unwrap().placement.position,
+        crate::ExtmarkPosition::new(0, 7),
+        "marks on other lines do not move"
+    );
+    assert_eq!(
+        marks.get(namespace, below).unwrap().unwrap().placement.position,
+        crate::ExtmarkPosition::new(2, 0),
+        "marks on other lines do not move"
+    );
+
+    // A stale prompt-change mark cannot redirect the next update into
+    // scrollback: the state-owned prompt row remains authoritative.
+    editor
+        .set_local_mark(buffer, ':', ox_text::Position { lnum: 1, col: 999 })
+        .unwrap();
+    executor
+        .execute_line(&mut editor, "call prompt_setprompt(0, 'next: ')")
+        .unwrap();
+    let state = editor.buffer(buffer).unwrap();
+    assert_eq!(
+        state.text().unwrap().line(1).unwrap(),
+        b"scrollback above".to_vec(),
+        "scrollback remains byte-identical despite the stale mark"
+    );
+    assert_eq!(state.text().unwrap().line(2).unwrap(), b"next: input".to_vec());
+    assert_eq!(state.text().unwrap().line(3).unwrap(), b"tail".to_vec());
+    assert_eq!(
+        state.marks.get(':').unwrap(),
+        Some(ox_text::Position { lnum: 2, col: 6 }),
+        "the prompt boundary returns to the authoritative live row"
+    );
+}
+
+#[test]
+fn prompt_setprompt_stores_unloaded_prompt_without_resident_text() {
+    let (mut editor, mut executor) = setup();
+    let buffer = editor
+        .create_buffer_with(
+            Buffer::from_lines(&[b"scrollback".to_vec(), b"old: input".to_vec()], true).unwrap(),
+            true,
+        )
+        .unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "buftype", crate::options::OptionValue::String("prompt".to_owned()))
+        .unwrap();
+    editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_prompt(b"old: ".to_vec(), 2);
+    editor.unload_buffer(buffer).unwrap();
+
+    executor
+        .execute_line(
+            &mut editor,
+            &format!("call prompt_setprompt({}, 'stored: ')", i64::from(buffer)),
+        )
+        .unwrap();
+
+    let state = editor.buffer(buffer).unwrap();
+    assert!(!state.loaded);
+    assert_eq!(state.prompt(), b"stored: ");
+    assert!(state.text().is_err(), "unloaded assignment does not synthesize resident text");
+}
+
+#[test]
+fn loading_shorter_prompt_buffer_clamps_authoritative_prompt_row() {
+    let mut state = crate::BufferState::new(
+        Buffer::from_lines(
+            &[b"one".to_vec(), b"two".to_vec(), b"old: input".to_vec()],
+            true,
+        )
+        .unwrap(),
+        true,
+    );
+    state.set_prompt(b"old: ".to_vec(), 3);
+    state.unload().unwrap();
+
+    state.load(Buffer::from_lines(&[b"replacement".to_vec()], true).unwrap());
+
+    assert_eq!(state.prompt_start(), 1);
+    assert_eq!(state.text().unwrap().line(1).unwrap(), b"replacement".to_vec());
+}
+
+#[test]
+fn prompt_replacement_stays_out_of_undo_without_clearing_earlier_change() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"before".to_vec(), b"old: input".to_vec()]);
+    let buffer = editor.current_buffer().unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "buftype", crate::options::OptionValue::String("prompt".to_owned()))
+        .unwrap();
+    editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_prompt(b"old: ".to_vec(), 2);
+    editor
+        .set_local_mark(buffer, ':', ox_text::Position { lnum: 2, col: 5 })
+        .unwrap();
+    executor
+        .execute_line(&mut editor, "call setline(1, 'edited')")
+        .unwrap();
+    editor.sync_buffer_undo(buffer);
+
+    executor
+        .execute_line(&mut editor, "call prompt_setprompt(0, 'new: ')")
+        .unwrap();
+    executor.execute_line(&mut editor, "undo").unwrap();
+
+    let state = editor.buffer(buffer).unwrap();
+    assert_eq!(state.text().unwrap().line(1).unwrap(), b"before".to_vec());
+    assert_eq!(
+        state.text().unwrap().line(2).unwrap(),
+        b"new: input".to_vec(),
+        "undoing the earlier edit cannot restore the old prompt"
+    );
+}
+
+#[test]
+fn prompt_setprompt_col999_discards_input_with_exact_extmark_geometry() {
+    let (mut editor, mut executor) = setup_with_content(&[b"input".to_vec()]);
+    let buffer = editor.current_buffer().unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "buftype", crate::options::OptionValue::String("prompt".to_owned()))
+        .unwrap();
+    let state = editor.buffer_mut(buffer).unwrap();
+    let namespace = state.extmarks.create_namespace("prompt-col999").unwrap();
+    let mark = state
+        .set_extmark_recorded(
+            namespace,
+            None,
+            crate::ExtmarkPlacement::new(crate::ExtmarkPosition::new(0, 5)),
+            false,
+        )
+        .unwrap();
+    let changedtick = state.changedtick();
+
+    executor
+        .execute_line(&mut editor, r#"call setpos("':", [0, 1, 999, 0])"#)
+        .unwrap();
+    executor
+        .execute_line(&mut editor, "call prompt_setprompt(0, 'discard > ')")
+        .unwrap();
+
+    let state = editor.buffer(buffer).unwrap();
+    assert_eq!(state.text().unwrap().line(1).unwrap(), b"discard > ".to_vec());
+    assert_eq!(
+        state.extmarks.get(namespace, mark).unwrap().unwrap().placement.position,
+        crate::ExtmarkPosition::new(0, 10)
+    );
+    assert_eq!(
+        state.marks.get(':').unwrap(),
+        Some(ox_text::Position { lnum: 1, col: 10 })
+    );
+    assert_eq!(state.changedtick(), changedtick + 1);
+}
+/// An empty stored prompt means the default `% `; setting a new prompt on
+/// a prompt buffer with plain input discards the input, while input that
+/// already carries the default prefix is preserved.
+#[test]
+fn prompt_setprompt_discards_plain_input_without_default_prefix() {
+    let (mut editor, mut executor) = setup_with_content(&[b"input".to_vec()]);
+    let buffer = editor.current_buffer().unwrap();
+    editor
+        .options_mut()
+        .set_buffer(
+            buffer,
+            "buftype",
+            crate::options::OptionValue::String("prompt".to_owned()),
+        )
+        .unwrap();
+
+    executor
+        .execute_line(&mut editor, "call prompt_setprompt(0, 'cmd: ')")
+        .unwrap();
+
+    let state = editor.buffer(buffer).unwrap();
+    assert_eq!(state.text().unwrap().line(1).unwrap(), b"cmd: ".to_vec());
+    assert_eq!(state.prompt(), b"cmd: ");
+}
+
+#[test]
+fn prompt_setprompt_replaces_default_prefix_and_preserves_input() {
+    let (mut editor, mut executor) = setup_with_content(&[b"% second".to_vec()]);
+    let buffer = editor.current_buffer().unwrap();
+    editor
+        .options_mut()
+        .set_buffer(
+            buffer,
+            "buftype",
+            crate::options::OptionValue::String("prompt".to_owned()),
+        )
+        .unwrap();
+
+    executor
+        .execute_line(&mut editor, "call prompt_setprompt(0, 'cmd: ')")
+        .unwrap();
+
+    let state = editor.buffer(buffer).unwrap();
+    assert_eq!(
+        state.text().unwrap().line(1).unwrap(),
+        b"cmd: second".to_vec()
+    );
+    assert_eq!(state.prompt(), b"cmd: ");
+}
+
+/// `prompt_getprompt()` returns the effective prompt text, reporting the
+/// default `% ` for an empty stored prefix on a prompt buffer.
+#[test]
+fn prompt_getprompt_reports_effective_default() {
+    let (mut editor, mut executor) = setup();
+    let buffer = editor.current_buffer().unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "buftype", crate::options::OptionValue::String("prompt".to_owned()))
+        .unwrap();
+
+    executor
+        .execute_line(&mut editor, "let g:p = prompt_getprompt(0)")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "p"),
+        Some(ox_types::Typval::String(ox_types::OxStr::from("% "))),
+        "empty stored prompt returns the default `% `"
+    );
+
+    executor
+        .execute_line(&mut editor, "call prompt_setprompt(0, 'cmd: ')")
+        .unwrap();
+    executor
+        .execute_line(&mut editor, "let g:p = prompt_getprompt(0)")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "p"),
+        Some(ox_types::Typval::String(ox_types::OxStr::from("cmd: ")))
+    );
+}
+
+/// When the special `':'` mark records a previous complete prompt/input
+/// prefix longer than the stored prompt text, replacement splices that
+/// entire prefix (`f_prompt_setprompt` happy path: `mark.col`).
+#[test]
+fn prompt_replace_geometry_uses_complete_mark_prefix() {
+    let (mut editor, mut executor) =
+        setup_with_content(&[b"xxxxcmd: leftover".to_vec()]);
+    let buffer = editor.current_buffer().unwrap();
+    editor
+        .options_mut()
+        .set_buffer(buffer, "buftype", crate::options::OptionValue::String("prompt".to_owned()))
+        .unwrap();
+    editor
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_prompt(b"cmd: ".to_vec(), 1);
+    editor
+        .set_local_mark(buffer, ':', ox_text::Position { lnum: 1, col: 9 })
+        .unwrap();
+    let state = editor.buffer_mut(buffer).unwrap();
+    let namespace = state.extmarks.create_namespace("complete-prefix").unwrap();
+    let leftover = state
+        .set_extmark_recorded(
+            namespace,
+            None,
+            crate::ExtmarkPlacement::new(crate::ExtmarkPosition::new(0, 9)),
+            false,
+        )
+        .unwrap();
+    let inside_owned = state
+        .set_extmark_recorded(
+            namespace,
+            None,
+            crate::ExtmarkPlacement::new(crate::ExtmarkPosition::new(0, 6)),
+            false,
+        )
+        .unwrap();
+
+    executor
+        .execute_line(&mut editor, "call prompt_setprompt(0, 'next: ')")
+        .unwrap();
+
+    let state = editor.buffer(buffer).unwrap();
+    assert_eq!(
+        state.text().unwrap().line(1).unwrap(),
+        b"next: leftover".to_vec(),
+        "the complete previous prompt/input prefix is replaced, not a suffix of the stored prompt"
+    );
+    assert_eq!(
+        state.extmarks.get(namespace, leftover).unwrap().unwrap().placement.position,
+        crate::ExtmarkPosition::new(0, 6)
+    );
+    assert_eq!(
+        state.extmarks.get(namespace, inside_owned).unwrap().unwrap().placement.position,
+        crate::ExtmarkPosition::new(0, 6)
+    );
+    assert_eq!(
+        state.marks.get(':').unwrap(),
+        Some(ox_text::Position { lnum: 1, col: 6 })
+    );
+}

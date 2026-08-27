@@ -11,7 +11,7 @@ use ox_types::{OxStr, Typval};
 use crate::script::FileIO;
 use ox_text::Position;
 
-use crate::options::OptionScope;
+use crate::options::{OptionScope, OptionValue};
 use crate::Editor;
 
 use crate::excmd_exec::{CurrentBuffer, EvalHost, object_to_typval, option_to_typval, replace_scope_pair, resolve_buffer_argument, typval_number, typval_to_object, typval_to_option, typval_to_text};
@@ -26,9 +26,27 @@ pub(crate) fn call<F: FileIO>(
     match name {
         // `getline`/`setline` reach the current buffer through
         // `ox_eval::BufferHost`; the typval-only dispatcher has no buffer.
-        "getline" | "setline" => {
+        "getline" => {
             let mut seam = CurrentBuffer(host.editor);
             call_buffer_builtin(&mut seam, name, args)
+        }
+        "setline" => {
+            let result = {
+                let mut seam = CurrentBuffer(host.editor);
+                call_buffer_builtin(&mut seam, name, args)?
+            };
+            let prompt = host.editor.current_buffer().and_then(|buffer| {
+                let state = host.editor.buffer(buffer).ok()?;
+                let line = state.text().ok()?.line(state.prompt_start()).ok()?;
+                (!state.prompt().is_empty() && line.is_empty()).then(|| state.prompt().to_vec())
+            });
+            if let Some(prompt) = prompt {
+                call_prompt_setprompt_builtin(
+                    host.editor,
+                    vec![Typval::Number(0), Typval::String(OxStr(prompt))],
+                )?;
+            }
+            Ok(result)
         }
         "append" => call_append_builtin(host.editor, args),
         "changenr" => call_changenr_builtin(host.editor, &args),
@@ -38,8 +56,103 @@ pub(crate) fn call<F: FileIO>(
         "getbufvar" => call_getbufvar_builtin(host.editor, scope, args),
         "last_buffer_nr" => call_last_buffer_nr_builtin(host.editor, &args),
         "setbufvar" => call_setbufvar_builtin(host.editor, scope, args),
+        "prompt_getprompt" => call_prompt_getprompt_builtin(host.editor, &args),
+        "prompt_setprompt" => call_prompt_setprompt_builtin(host.editor, args),
         _ => unreachable!("buffer builtin route and dispatcher disagree"),
     }
+}
+
+fn call_prompt_getprompt_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    if args.len() != 1 {
+        return Err(EvalError::new("E119", 0, "Not enough arguments for function: prompt_getprompt"));
+    }
+    let Some(buffer) = resolve_buffer_argument(editor, args.first()) else {
+        return Ok(Typval::String(OxStr::from("")));
+    };
+    let is_prompt = editor
+        .options()
+        .get_buffer(buffer, "buftype")
+        .ok()
+        .is_some_and(|value| matches!(value, OptionValue::String(value) if value == "prompt"));
+    if !is_prompt {
+        return Ok(Typval::String(OxStr::from("")));
+    }
+    match editor.buffer(buffer) {
+        Ok(state) => Ok(Typval::String(OxStr::from(state.effective_prompt()))),
+        Err(_) => Ok(Typval::String(OxStr::from(""))),
+    }
+}
+
+fn call_prompt_setprompt_builtin(editor: &mut Editor, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    if args.len() != 2 {
+        return Err(EvalError::new("E119", 0, "Not enough arguments for function: prompt_setprompt"));
+    }
+    let buffer = resolve_buffer_argument(editor, args.first())
+        .or_else(|| editor.current_buffer())
+        .ok_or_else(|| EvalError::new("E86", 0, "Buffer does not exist"))?;
+    let prompt = typval_to_text(&args[1]);
+    let stored = prompt.into_bytes();
+    let new_prompt: &[u8] = if stored.is_empty() { b"% " } else { &stored };
+    // `f_prompt_setprompt` (`eval/buffer.c:963-1014`) rewrites stored prompt
+    // for every valid buffer, but touches resident text only for a loaded
+    // prompt buffer. When the special `':'` mark or stored prompt state
+    // records a previous complete prefix, that entire prefix is replaced —
+    // not a suffix-matched slice of the current stored prompt.
+    let visible_prompt = matches!(
+        editor.options().get_buffer(buffer, "buftype"),
+        Ok(OptionValue::String(value)) if value == "prompt"
+    ) && editor
+        .buffer(buffer)
+        .map_err(|error| EvalError::new("E86", 0, error.to_string()))?
+        .loaded;
+    if visible_prompt {
+        let (lnum, line, old_len) = {
+            let state = editor
+                .buffer(buffer)
+                .map_err(|error| EvalError::new("E86", 0, error.to_string()))?;
+            let text = state
+                .text()
+                .map_err(|error| EvalError::new("E86", 0, error.to_string()))?;
+            let lnum = state.prompt_start();
+            let mut line = text
+                .line(lnum)
+                .map_err(|error| EvalError::new("E86", 0, error.to_string()))?;
+            let old_prompt = state.effective_prompt();
+            let prompt_mark = state
+                .marks
+                .get(':')
+                .map_err(|error| EvalError::new("E86", 0, error.to_string()))?
+                .filter(|mark| mark.lnum == lnum);
+            let old_len = match prompt_mark {
+                Some(mark)
+                    if mark.col >= old_prompt.len()
+                        && mark.col <= line.len()
+                        && line.get(mark.col - old_prompt.len()..mark.col) == Some(old_prompt) =>
+                {
+                    mark.col
+                }
+                Some(_) => line.len(),
+                None if line.starts_with(old_prompt) => old_prompt.len(),
+                None => line.len(),
+            };
+            line.splice(0..old_len, new_prompt.iter().copied());
+            (lnum, line, old_len)
+        };
+        editor
+            .replace_prompt_line(buffer, lnum, line, old_len, new_prompt.len())
+            .map_err(|error| EvalError::new("E86", 0, error.to_string()))?;
+        editor
+            .buffer_mut(buffer)
+            .map_err(|error| EvalError::new("E86", 0, error.to_string()))?
+            .marks
+            .set(':', Position { lnum, col: new_prompt.len() })
+            .map_err(|error| EvalError::new("E86", 0, error.to_string()))?;
+    }
+    editor
+        .buffer_mut(buffer)
+        .map_err(|error| EvalError::new("E86", 0, error.to_string()))?
+        .set_prompt_text(stored);
+    Ok(Typval::Number(0))
 }
 
 /// `bufexists()`: buffer number 0 never exists, every other resolvable

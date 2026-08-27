@@ -137,6 +137,10 @@ pub struct BufferState {
     pub modified: bool,
     /// Read-only policy data; command layers decide whether to raise E37/E89-class errors.
     pub readonly: bool,
+    /// Prefix currently owned by prompt-buffer input (`b_prompt_text`).
+    prompt: Vec<u8>,
+    /// One-based line containing the live prompt (`b_prompt_start.mark.lnum`).
+    prompt_start: usize,
     /// Text changedtick observed when the buffer was last marked saved.
     saved_changedtick: u64,
     /// Final-EOL state at the last save.
@@ -189,6 +193,7 @@ impl BufferState {
     pub fn new(text: Buffer, listed: bool) -> Self {
         let saved_changedtick = text.changedtick();
         let saved_has_eol = text.has_eol();
+        let prompt_start = text.line_count().max(1);
         Self {
             text,
             name: OxStr::from(""),
@@ -202,6 +207,8 @@ impl BufferState {
             folds: Folds::new(),
             modified: false,
             readonly: false,
+            prompt: Vec::new(),
+            prompt_start,
             saved_changedtick,
             saved_has_eol,
             saved_undo_state: (0, 0),
@@ -218,6 +225,39 @@ impl BufferState {
     #[must_use]
     pub const fn name(&self) -> &OxStr {
         &self.name
+    }
+
+    /// Returns the stored prompt prefix.
+    #[must_use]
+    pub fn prompt(&self) -> &[u8] {
+        &self.prompt
+    }
+
+    /// Returns the effective prompt prefix, defaulting to Neovim's `% `.
+    #[must_use]
+    pub fn effective_prompt(&self) -> &[u8] {
+        if self.prompt.is_empty() {
+            b"% "
+        } else {
+            &self.prompt
+        }
+    }
+
+    /// Returns the authoritative one-based live prompt row.
+    #[must_use]
+    pub const fn prompt_start(&self) -> usize {
+        self.prompt_start
+    }
+
+    /// Stores a prompt prefix and its authoritative live row.
+    pub fn set_prompt(&mut self, prompt: Vec<u8>, lnum: usize) {
+        self.prompt = prompt;
+        self.prompt_start = lnum.clamp(1, self.text.line_count());
+    }
+
+    /// Replaces the prompt prefix without changing its live row.
+    pub fn set_prompt_text(&mut self, prompt: Vec<u8>) {
+        self.prompt = prompt;
     }
 
     /// Replaces the API-visible buffer name.
@@ -298,6 +338,7 @@ impl BufferState {
     /// Replaces unloaded resident text before a window attaches.
     pub fn load(&mut self, text: Buffer) {
         self.text = text;
+        self.prompt_start = self.prompt_start.clamp(1, self.text.line_count().max(1));
         self.undo = UndoTree::new();
         self.extmarks = Extmarks::new();
         self.extmark_undo.clear();
@@ -343,6 +384,24 @@ impl BufferState {
         self.loaded = false;
         self.hidden = false;
         self.release_resident_state();
+        Ok(())
+    }
+
+    /// Replaces the live prompt line without recording undo, using exact
+    /// byte-splice geometry for extmarks (`f_prompt_setprompt`).
+    pub(crate) fn replace_prompt_line(
+        &mut self,
+        lnum: usize,
+        line: Vec<u8>,
+        splice: TextSplice,
+    ) -> Result<(), BufferStateError> {
+        self.require_loaded()?;
+        self.text.replace_lines(lnum, lnum, &[line])?;
+        self.marks.splice(lnum, 1, 1);
+        let _ = self.extmarks.splice_recording(splice);
+        self.splice_folds(lnum, 1, 1);
+        self.splice_prompt_start(lnum, 1, 1);
+        self.bump_derived_ticks();
         Ok(())
     }
 
@@ -802,6 +861,7 @@ impl BufferState {
         self.marks.splice(start_line, before.len(), after.len());
         let (_, extmark_undo) = self.extmarks.splice_recording(splice);
         self.splice_folds(start_line, before.len(), after.len());
+        self.splice_prompt_start(start_line, before.len(), after.len());
         let seq = self.undo.record(
             LineEdit {
                 start: start_line,
@@ -872,6 +932,25 @@ impl BufferState {
         self.folds
             .splice_rows(start.saturating_sub(1), old_rows, new_rows);
         self.folds.invalidate(self.changedtick());
+    }
+
+    /// Adjusts the prompt row through the same line splice that moves marks.
+    fn splice_prompt_start(&mut self, start: usize, old_count: usize, new_count: usize) {
+        let old_end = start.saturating_add(old_count);
+        self.prompt_start = if old_count == 0 && self.prompt_start >= start {
+            self.prompt_start.saturating_add(new_count)
+        } else if self.prompt_start >= old_end {
+            self.prompt_start.saturating_sub(old_count).saturating_add(new_count)
+        } else if self.prompt_start >= start {
+            start.saturating_add(
+                self.prompt_start
+                    .saturating_sub(start)
+                    .min(new_count.saturating_sub(1)),
+            )
+        } else {
+            self.prompt_start
+        };
+        self.prompt_start = self.prompt_start.clamp(1, self.text.line_count().max(1));
     }
 
     fn refresh_modified(&mut self) {
