@@ -539,13 +539,6 @@ fn list_as_number_has_error_code() {
 }
 
 #[test]
-fn sort_expression_comparator_receives_both_values() {
-    // `runtime/doc/builtin.txt` `sort()` comparator form.
-    let result = call("sort", vec![list(&[3, 1, 2]), text("v:key - v:val")]).unwrap();
-    assert_eq!(result, list(&[1, 2, 3]));
-}
-
-#[test]
 fn sort_default_comparator_uses_strings() {
     // `test/old/testdir/test_functions.vim` `Test_sort_numbers()` and
     // the default comparator in `item_compare` (typval.c:1192-1310): values
@@ -907,13 +900,6 @@ fn mapnew_and_flattennew_do_not_mutate_inputs() {
 }
 
 #[test]
-fn string_expression_and_funcref_callbacks_use_shared_dispatch() {
-    assert_eq!(call("map", vec![list(&[1, 2]), text("v:val * 3")]).unwrap(), list(&[3, 6]));
-    let and = Typval::Funcref(ox_types::Funcref { name: OxStr::from("and"), args: vec![], dict: None, registry: None });
-    assert_eq!(call("map", vec![list(&[3, 3]), and]).unwrap(), list(&[0, 1]));
-}
-
-#[test]
 fn callback_structural_mutation_is_rejected_and_lock_restored() {
     let mut scope = Scope::new();
     scope.set(b"xs", list(&[1, 2])).unwrap();
@@ -939,11 +925,27 @@ fn named_funcref_callbacks_cover_collection_builtins() {
 
 #[test]
 fn string_expression_callbacks_cover_collection_builtins() {
-    assert_eq!(call("map", vec![list(&[1, 2]), text("v:val * 3")]).unwrap(), list(&[3, 6]));
-    assert_eq!(call("filter", vec![list(&[1, 2, 3]), text("v:val % 2")]).unwrap(), list(&[1, 3]));
-    assert_eq!(call("foreach", vec![list(&[1, 2]), text("v:val * 9")]).unwrap(), list(&[1, 2]));
-    assert_eq!(call("reduce", vec![list(&[1, 2, 3]), text("v:key + v:val")]).unwrap(), number(6));
-    assert_eq!(call("sort", vec![list(&[3, 1, 2]), text("v:key - v:val")]).unwrap(), list(&[1, 2, 3]));
+    assert_eq!(
+        call("map", vec![list(&[1, 2]), text("v:val * 3")]).unwrap(),
+        list(&[3, 6])
+    );
+    assert_eq!(
+        call("filter", vec![list(&[1, 2, 3]), text("v:val % 2")]).unwrap(),
+        list(&[1, 3])
+    );
+    assert_eq!(
+        call("foreach", vec![list(&[1, 2]), text("v:val * 9")]).unwrap(),
+        list(&[1, 2])
+    );
+    assert_eq!(
+        call("reduce", vec![list(&[1, 2, 3]), text("v:key + v:val")]).unwrap(),
+        number(6)
+    );
+    // sort() comparator form: `runtime/doc/builtin.txt` sort().
+    assert_eq!(
+        call("sort", vec![list(&[3, 1, 2]), text("v:key - v:val")]).unwrap(),
+        list(&[1, 2, 3])
+    );
 }
 
 #[test]
