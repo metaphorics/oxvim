@@ -16309,6 +16309,8 @@ fn decode_funcref_dict(values: &Dict) -> Option<Typval> {
     })
 }
 
+/// Appends one text message to the message area, optionally flagged as an
+/// error and recorded in message history.
 pub fn push_text_message(editor: &mut Editor, text: String, error: bool, history: bool) {
     editor.push_message(Message {
         kind: if error {
