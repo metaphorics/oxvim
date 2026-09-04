@@ -1217,7 +1217,17 @@ impl AppState {
         loop {
             let work = self.lua_work.borrow_mut().pop_front();
             let Some(work) = work else { return Ok(()) };
-            work().map_err(|error| AppError::Lua(error.to_string()))?;
+            // A failing vim.schedule callback reports its error and the
+            // editor keeps running (upstream `nlua_error`,
+            // executor.c:526-544); propagating would disconnect the client
+            // that triggered the drain, or exit an embedded editor.
+            if let Err(error) = work() {
+                let message = error.to_string();
+                let session = self.session.clone();
+                session.with_editor_mut(|editor| {
+                    ox_editor::excmd_exec::push_text_message(editor, message, true, true);
+                });
+            }
         }
     }
 

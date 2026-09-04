@@ -16309,7 +16309,7 @@ fn decode_funcref_dict(values: &Dict) -> Option<Typval> {
     })
 }
 
-pub(crate) fn push_text_message(editor: &mut Editor, text: String, error: bool, history: bool) {
+pub fn push_text_message(editor: &mut Editor, text: String, error: bool, history: bool) {
     editor.push_message(Message {
         kind: if error {
             MessageKind::Error
