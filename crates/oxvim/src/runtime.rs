@@ -1,28 +1,30 @@
 //! Non-interactive process entry points.
 
+use std::cell::RefCell;
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::Command;
-use std::cell::RefCell;
 use std::rc::Rc;
 
-use ox_editor::{
-    Editor, EditorError, ExExecutor, ExecOutcome, Geometry, MessageRouting, OptionError, OptionValue,
-};
-use ox_eval::{Builtins, Scope};
-use ox_eval::BuiltinHost as EvalBuiltins;
-use ox_lua::{
-    ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work, bind_api, bind_variables,
-};
-use ox_text::Buffer;
-use ox_types::{BufHandle, Object, OxStr, Typval};
-
-use crate::cli::{Cli, LuaScript, ShadaConfig, UserConfig, WindowLayout};
 use crate::AppError;
+use crate::cli::{Cli, LuaScript, ShadaConfig, UserConfig, WindowLayout};
 use crate::messages::PrintfSink;
 use crate::server::EditorVariables;
 use crate::startuptime::StartupTimer;
+use ox_api::ApiSession;
+use ox_editor::{
+    Editor, EditorError, ExExecutor, ExecOutcome, Geometry, MessageRouting, OptionError,
+    OptionValue,
+};
+use ox_eval::BuiltinHost as EvalBuiltins;
+use ox_eval::{Builtins, Scope};
+use ox_lua::{
+    ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work, bind_api,
+    bind_variables,
+};
+use ox_text::Buffer;
+use ox_types::{BufHandle, Object, OxStr, Typval};
 
 /// Start the terminal client against a child copy of this executable in embed mode.
 pub fn run_interactive(cli: &Cli) -> Result<(), AppError> {
@@ -33,6 +35,16 @@ pub fn run_interactive(cli: &Cli) -> Result<(), AppError> {
         command.arg(argument);
     }
     ox_tui::run_command(command).map_err(|error| AppError::Tui(error.to_string()))
+}
+/// Seeds `v:argv` (main.c `build_argv_list`): the command line as the
+/// process saw it, `argv[0]` included.
+pub fn seed_argv(editor: &mut Editor) {
+    let argv = std::env::args_os()
+        .map(|argument| Object::String(OxStr::from(argument.to_string_lossy().as_bytes())))
+        .collect::<Vec<_>>();
+    editor
+        .vvars_mut()
+        .insert(OxStr::from("argv"), Object::Array(argv));
 }
 
 /// Rebuilds the parsed command line for the embedded child process.
@@ -117,7 +129,32 @@ pub fn runtime_root() -> Result<PathBuf, AppError> {
             return Ok(relative);
         }
     }
+    // Last resort for $VIMRUNTIME only: a CWD-relative tree is never a
+    // sourced runtime (see [`runtime_root_for_sourcing`]) — auto-sourcing
+    // plugin/ from the launch directory would execute planted files.
     Ok(PathBuf::from("./runtime"))
+}
+
+/// The runtime root that may reach 'runtimepath' and plugin auto-sourcing:
+/// `$OXVIM_RUNTIME` or the exe-relative tree, never the launch directory.
+/// Upstream resolves $VIMRUNTIME without consulting the CWD at all
+/// (os/env.c:884-936); a CWD fallback here would auto-source planted
+/// plugin files with full privileges whenever the binary has no sibling
+/// runtime tree.
+pub fn runtime_root_for_sourcing() -> Result<PathBuf, AppError> {
+    if let Some(path) = std::env::var_os("OXVIM_RUNTIME") {
+        return Ok(PathBuf::from(path));
+    }
+    let executable = std::env::current_exe().map_err(AppError::Io)?;
+    if let Some(directory) = executable.parent() {
+        let relative = directory.join("../../runtime");
+        if relative.is_dir() {
+            return Ok(relative);
+        }
+    }
+    Err(AppError::Server(
+        "no runtime tree found; set $OXVIM_RUNTIME or run beside the runtime/ tree".to_owned(),
+    ))
 }
 
 /// Seeds `$VIM` and `$VIMRUNTIME` from the resolved runtime tree (env.c
@@ -135,8 +172,7 @@ pub fn export_vim_environment() -> Result<(), AppError> {
         let vim = if runtime.file_name().is_some_and(|name| name == "runtime") {
             runtime
                 .parent()
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_else(|| runtime.clone())
+                .map_or_else(|| runtime.clone(), std::path::Path::to_path_buf)
         } else {
             runtime.clone()
         };
@@ -160,8 +196,15 @@ pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppEr
     // test_cmdline.vim does -- must still be able to run a shell afterwards.
     if let Some(shell) = std::env::var_os("SHELL").filter(|shell| !shell.is_empty()) {
         let shell = shell.to_string_lossy();
-        let value = if shell.contains(' ') { format!("\"{shell}\"") } else { shell.into_owned() };
-        editor.options_mut().set_global("shell", OptionValue::String(value)).map_err(editor_error)?;
+        let value = if shell.contains(' ') {
+            format!("\"{shell}\"")
+        } else {
+            shell.into_owned()
+        };
+        editor
+            .options_mut()
+            .set_global("shell", OptionValue::String(value))
+            .map_err(editor_error)?;
     }
     // message.c msg_use_printf/msg_puts_printf read these process modes for
     // every message; main.c sets them while scanning the command line.
@@ -183,7 +226,10 @@ pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppEr
         .set_global("loadplugins", OptionValue::Boolean(cli.loadplugins))
         .map_err(editor_error)?;
     if cli.no_write {
-        editor.options_mut().set_global("write", OptionValue::Boolean(false)).map_err(editor_error)?;
+        editor
+            .options_mut()
+            .set_global("write", OptionValue::Boolean(false))
+            .map_err(editor_error)?;
     }
     // "-R" also slows the swap file down (`p_uc = 10000`); "-n" turns it off.
     if cli.readonly {
@@ -193,12 +239,20 @@ pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppEr
             .map_err(editor_error)?;
     }
     if cli.no_swap_file {
-        editor.options_mut().set_global("updatecount", OptionValue::Number(0)).map_err(editor_error)?;
+        editor
+            .options_mut()
+            .set_global("updatecount", OptionValue::Number(0))
+            .map_err(editor_error)?;
     }
     if let Some(height) = cli.window_height {
-        editor.options_mut().set_global("window", OptionValue::Number(height)).map_err(editor_error)?;
+        editor
+            .options_mut()
+            .set_global("window", OptionValue::Number(height))
+            .map_err(editor_error)?;
     }
-    let Some(buffer) = editor.current_buffer() else { return Ok(()) };
+    let Some(buffer) = editor.current_buffer() else {
+        return Ok(());
+    };
     for (requested, name) in [
         (cli.readonly, "readonly"),
         (cli.no_modifiable, "modifiable"),
@@ -207,7 +261,10 @@ pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppEr
         if requested {
             // 'modifiable' is the only one of the three that is reset.
             let value = OptionValue::Boolean(name != "modifiable");
-            editor.options_mut().set_buffer(buffer, name, value).map_err(editor_error)?;
+            editor
+                .options_mut()
+                .set_buffer(buffer, name, value)
+                .map_err(editor_error)?;
         }
     }
     Ok(())
@@ -218,11 +275,19 @@ pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppEr
 /// creation during argument-list setup; other read failures are `E484`,
 /// matching `:edit`'s error for an unreadable file.
 fn read_startup_file(file: &str) -> Result<Buffer, AppError> {
-    let text = match fs::read_to_string(file) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(AppError::Ex(format!("E484: Can't open file {file}: {error}"))),
+    // `RealFileIO` decodes lossily, so a startup file with invalid UTF-8
+    // opens with replacement characters instead of failing like `:edit`
+    // on an unreadable file.
+    let bytes = match fs::read(file) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(AppError::Ex(format!(
+                "E484: Can't open file {file}: {error}"
+            )));
+        }
     };
+    let text = String::from_utf8_lossy(&bytes);
     Buffer::from_bytes(text.as_bytes()).map_err(|error| AppError::Ex(format!("E474: {error}")))
 }
 
@@ -260,9 +325,10 @@ fn open_startup_files(
     readonly: bool,
 ) -> Result<Vec<BufHandle>, AppError> {
     let first_into_current = editor.current_buffer().is_some_and(|current| {
-        editor
-            .buffer(current)
-            .is_ok_and(|state| state.name().as_bytes().is_empty() && !state.modified)
+        editor.buffer(current).is_ok_and(|state| {
+            state.name().as_bytes().is_empty()
+                && !state.flags.contains(ox_editor::BufferFlags::MODIFIED)
+        })
     });
     let mut handles = Vec::with_capacity(files.len());
     for (index, file) in files.iter().enumerate() {
@@ -300,8 +366,12 @@ fn open_startup_files(
 /// a bare `-` argument. The buffer stays nameless, like upstream's.
 fn open_stdin_buffer(editor: &mut Editor) -> Result<(), AppError> {
     let mut input = Vec::new();
-    io::stdin().lock().read_to_end(&mut input).map_err(AppError::Io)?;
-    let text = Buffer::from_bytes(&input).map_err(|error| AppError::Ex(format!("E474: {error}")))?;
+    io::stdin()
+        .lock()
+        .read_to_end(&mut input)
+        .map_err(AppError::Io)?;
+    let text =
+        Buffer::from_bytes(&input).map_err(|error| AppError::Ex(format!("E474: {error}")))?;
     let current = editor
         .current_buffer()
         .ok_or_else(|| AppError::Editor("no current buffer at startup".into()))?;
@@ -337,19 +407,29 @@ fn create_startup_windows(
             None => editor.create_buffer(true).map_err(editor_error)?,
         };
         if cli.window_layout == WindowLayout::Tabs {
-            let geometry = Geometry::new(0, 0, 80, 24)
-                .map_err(|error| AppError::Editor(error.to_string()))?;
-            editor.create_tabpage(buffer, geometry).map_err(editor_error)?;
+            let geometry =
+                Geometry::new(0, 0, 80, 24).map_err(|error| AppError::Editor(error.to_string()))?;
+            editor
+                .create_tabpage(buffer, geometry)
+                .map_err(editor_error)?;
             continue;
         }
         previous = if cli.window_layout == WindowLayout::Vertical {
-            editor.split_vertical(first_tab, previous, buffer).map_err(editor_error)?
+            editor
+                .split_vertical(first_tab, previous, buffer, true)
+                .map_err(editor_error)?
         } else {
-            editor.split_horizontal(first_tab, previous, buffer).map_err(editor_error)?
+            editor
+                .split_horizontal(first_tab, previous, buffer, true)
+                .map_err(editor_error)?
         };
     }
-    editor.set_current_tabpage(first_tab).map_err(editor_error)?;
-    editor.set_current_window(first_window).map_err(editor_error)
+    editor
+        .set_current_tabpage(first_tab)
+        .map_err(editor_error)?;
+    editor
+        .set_current_window(first_window)
+        .map_err(editor_error)
 }
 
 /// Execute Ex source read from stdin, with `--cmd` before startup and `+cmd`
@@ -368,17 +448,27 @@ fn create_startup_windows(
 /// Returns the exit code the last executed command asked for.
 pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
     let mut input = String::new();
-    io::stdin().read_to_string(&mut input).map_err(AppError::Io)?;
+    io::stdin()
+        .read_to_string(&mut input)
+        .map_err(AppError::Io)?;
 
     let mut editor = Editor::new();
-    let buffer = editor.create_buffer(true).map_err(|error| AppError::Editor(error.to_string()))?;
+    let buffer = editor
+        .create_buffer(true)
+        .map_err(|error| AppError::Editor(error.to_string()))?;
     editor
-        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).map_err(|error| AppError::Editor(error.to_string()))?)
+        .create_tabpage(
+            buffer,
+            Geometry::new(0, 0, 80, 24).map_err(|error| AppError::Editor(error.to_string()))?,
+        )
         .map_err(|error| AppError::Editor(error.to_string()))?;
     apply_startup_options(&mut editor, cli)?;
     // option.c set_init_default for 'runtimepath'/'packpath' before any
     // user command runs (option.c runtimepath_default layout).
-    let default_rtp = ox_editor::default_runtimepath(cli.clean, &runtime_root()?);
+    let default_rtp = ox_editor::default_runtimepath(
+        cli.clean,
+        &runtime_root_for_sourcing().unwrap_or_else(|_| PathBuf::new()),
+    );
     editor
         .options_mut()
         .set_global("runtimepath", OptionValue::String(default_rtp.clone()))
@@ -392,10 +482,13 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
         .scripts_mut()
         .set_runtime_roots_from_rtp(&default_rtp);
     executor.set_channel_ids(editor.channel_ids());
+    // The session is the sole editor carrier: everything below reaches the
+    // editor through `session.with_editor*`, matching the embed path.
+    let session = Rc::new(ApiSession::new(Rc::new(RefCell::new(editor))));
 
     let mut exit_code = 0;
     'startup: {
-        if let Some(code) = execute_lines(&mut executor, &mut editor, &cli.pre_commands)? {
+        if let Some(code) = execute_lines(&mut executor, &session, &cli.pre_commands)? {
             exit_code = code;
             break 'startup;
         }
@@ -404,21 +497,24 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
         if input_is_text {
             let text = Buffer::from_bytes(input.as_bytes())
                 .map_err(|error| AppError::Ex(format!("E474: {error}")))?;
-            editor
-                .buffer_mut(buffer)
-                .map_err(|error| AppError::Editor(error.to_string()))?
-                .load(text);
+            session.with_editor_mut(|editor| {
+                editor
+                    .buffer_mut(buffer)
+                    .map_err(|error| AppError::Editor(error.to_string()))?
+                    .load(text);
+                Ok::<(), AppError>(())
+            })?;
         } else {
-            open_startup_buffers(&mut editor, cli)?;
+            session.with_editor_mut(|editor| open_startup_buffers(editor, cli))?;
         }
         timer.mark("opening buffers");
-        if let Some(code) = execute_lines(&mut executor, &mut editor, &cli.commands)? {
+        if let Some(code) = execute_lines(&mut executor, &session, &cli.commands)? {
             exit_code = code;
             break 'startup;
         }
         if !input_is_text {
             let lines = input.lines().collect::<Vec<_>>();
-            if let Some(code) = execute_lines(&mut executor, &mut editor, &lines)? {
+            if let Some(code) = execute_lines(&mut executor, &session, &lines)? {
                 exit_code = code;
             }
         }
@@ -428,28 +524,37 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
     // the Ex loop simply runs out of input, so the exit autocommands run here
     // too. Before the flush, since what they emit is routed with the rest.
     executor
-        .run_exit_sequence(&mut editor)
+        .run_exit_sequence(&*session)
         .map_err(|error| AppError::Ex(error.to_string()))?;
 
     let mut sink = PrintfSink::default();
-    for (message, destination) in editor.messages().iter().zip(editor.message_destinations()) {
-        sink.write(*destination, message).map_err(AppError::Io)?;
+    session.with_editor(|editor| {
+        for (message, destination) in editor.messages().iter().zip(editor.message_destinations()) {
+            sink.write(*destination, message).map_err(AppError::Io)?;
+        }
+        sink.finish(editor.message_routing).map_err(AppError::Io)?;
+        Ok::<(), AppError>(())
+    })?;
+    // Upstream `getout` (main.c:762-764): under `exmode_active`, `exitval
+    // += ex_exitval`, where `emsg()` sets `ex_exitval` to 1 for each
+    // uncaught error. `-es` is ex mode, so an uncaught error adds 1 to
+    // whatever exit code the script requested.
+    if executor.did_emsg() {
+        exit_code += 1;
     }
-    sink.finish(editor.message_routing).map_err(AppError::Io)?;
     Ok(exit_code)
 }
 
 /// Runs each line, stopping at the first command that quits and reporting the
-/// exit status it asked for.
 fn execute_lines<S: AsRef<str>>(
     executor: &mut ExExecutor,
-    editor: &mut Editor,
+    session: &Rc<ApiSession>,
     lines: &[S],
 ) -> Result<Option<i64>, AppError> {
     for line in lines {
         for command in split_commands(line.as_ref()) {
             let outcome = executor
-                .execute_line(editor, command)
+                .execute_line_core(&**session, command)
                 .map_err(|error| AppError::Ex(error.to_string()))?;
             if let ExecOutcome::Quit(code) = outcome {
                 return Ok(Some(code));
@@ -497,7 +602,7 @@ fn split_commands(line: &str) -> Vec<&str> {
 }
 
 /// Run a Lua file with its trailing argv exposed in `_G.arg`.
-pub fn run_lua(script: &LuaScript) -> Result<(), AppError> {
+pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
     let source = if script.path == "-" {
         let mut source = Vec::new();
         io::stdin().read_to_end(&mut source).map_err(AppError::Io)?;
@@ -512,18 +617,30 @@ pub fn run_lua(script: &LuaScript) -> Result<(), AppError> {
     editor
         .create_tabpage(
             buffer,
-            Geometry::new(0, 0, 80, 24)
-                .map_err(|error| AppError::Editor(error.to_string()))?,
+            Geometry::new(0, 0, 80, 24).map_err(|error| AppError::Editor(error.to_string()))?,
         )
         .map_err(|error| AppError::Editor(error.to_string()))?;
-    editor.vvars_mut().insert(
-        OxStr::from("servername"),
-        Object::String(OxStr::from("")),
-    );
-    let editor = Rc::new(RefCell::new(editor));
+    editor
+        .vvars_mut()
+        .insert(OxStr::from("servername"), Object::String(OxStr::from("")));
+    seed_argv(&mut editor);
+    let session = Rc::new(ApiSession::new(Rc::new(RefCell::new(editor))));
+    let default_rtp =
+        ox_editor::default_runtimepath(clean, &runtime_root_for_sourcing().unwrap_or_default());
+    session.with_editor_mut(|editor| {
+        editor
+            .options_mut()
+            .set_global("runtimepath", OptionValue::String(default_rtp.clone()))
+            .map_err(|error| AppError::Editor(error.to_string()))?;
+        editor
+            .options_mut()
+            .set_global("packpath", OptionValue::String(default_rtp.clone()))
+            .map_err(|error| AppError::Editor(error.to_string()))?;
+        Ok::<(), AppError>(())
+    })?;
     let registry = ox_api::core().map_err(|error| AppError::Api(error.to_string()))?;
     let host = LuaHost::new(
-        RuntimeRoot::new(runtime_root()?),
+        RuntimeRoot::new(runtime_root_for_sourcing().unwrap_or_default()),
         Rc::new(ScriptBuiltins),
         Rc::new(ImmediateScheduler),
     )
@@ -531,23 +648,29 @@ pub fn run_lua(script: &LuaScript) -> Result<(), AppError> {
     bind_api(
         host.lua(),
         &registry,
-        ApiDispatchContext::new(editor.clone()),
+        ApiDispatchContext::new(session.clone()),
         host.fast_callbacks(),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
-    bind_variables(host.lua(), Rc::new(EditorVariables { editor }))
+    bind_variables(host.lua(), Rc::new(EditorVariables { session }))
         .map_err(|error| AppError::Lua(error.to_string()))?;
     let lua = host.lua();
-    let arguments = lua.create_table().map_err(|error| AppError::Lua(error.to_string()))?;
-    arguments.set(0, script.path.as_str()).map_err(|error| AppError::Lua(error.to_string()))?;
+    let arguments = lua
+        .create_table()
+        .map_err(|error| AppError::Lua(error.to_string()))?;
+    arguments
+        .set(0, script.path.as_str())
+        .map_err(|error| AppError::Lua(error.to_string()))?;
     for (index, argument) in script.args.iter().enumerate() {
         arguments
             .set(index + 1, argument.as_str())
             .map_err(|error| AppError::Lua(error.to_string()))?;
     }
-    lua.globals().set("arg", arguments).map_err(|error| AppError::Lua(error.to_string()))?;
+    lua.globals()
+        .set("arg", arguments)
+        .map_err(|error| AppError::Lua(error.to_string()))?;
     lua.load(&source)
-        .set_name(&format!("@{}", script.path))
+        .set_name(format!("@{}", script.path))
         .exec()
         .map_err(|error| AppError::Lua(error.to_string()))
 }
@@ -561,8 +684,7 @@ impl BuiltinHost for ScriptBuiltins {
         // stateless builtin.
         let mut builtins = Builtins::without_regex();
         let mut scope = Scope::new();
-        EvalBuiltins::call(&mut builtins, name, args, &mut scope)
-            .map_err(|error| error.to_string())
+        EvalBuiltins::call(&mut builtins, name, args, &mut scope).map_err(|error| error.to_string())
     }
 }
 
@@ -580,6 +702,9 @@ mod tests {
 
     #[test]
     fn splits_only_unquoted_unescaped_bars() {
-        assert_eq!(split_commands("echo 'a|b' | echo \"c|d\" | echo e\\|f"), ["echo 'a|b'", "echo \"c|d\"", "echo e\\|f"]);
+        assert_eq!(
+            split_commands("echo 'a|b' | echo \"c|d\" | echo e\\|f"),
+            ["echo 'a|b'", "echo \"c|d\"", "echo e\\|f"]
+        );
     }
 }
