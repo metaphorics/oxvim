@@ -1106,6 +1106,110 @@ mod tests {
     }
 
     #[test]
+    fn winfixbuf_jump_redirects_to_previous_window_then_splits() {
+        // qf_jump_edit_buffer (quickfix.c:2969-3006): a pinned window never
+        // switches buffers for an entry; it prefers the free previous
+        // window, else splits.
+        let (mut editor, _) = setup();
+        let target = editor.current_buffer().unwrap();
+        let pinned_buffer = editor
+            .create_buffer_with(Buffer::from_bytes(b"pinned").unwrap(), true)
+            .unwrap();
+        let tab = editor.current_tabpage().unwrap();
+        let window = editor.current_window().unwrap();
+        let previous_window = editor
+            .split_horizontal(tab, window, pinned_buffer, false)
+            .unwrap();
+        editor.set_current_window(previous_window).unwrap();
+        editor
+            .options_mut()
+            .set_window(previous_window, "winfixbuf", OptionValue::Boolean(true))
+            .unwrap();
+        call(
+            &mut editor,
+            "setqflist",
+            &[Typval::list(vec![item(target, 1, "entry")])],
+        )
+        .unwrap();
+        jump(&mut editor, QuickfixMove::Absolute(0), false).unwrap();
+        // The previous (free) window now shows the entry buffer and carries
+        // focus; the pinned window kept its buffer.
+        assert_eq!(editor.current_window(), Some(window));
+        assert_eq!(editor.window(window).unwrap().buffer, target);
+        assert_eq!(
+            editor.window(previous_window).unwrap().buffer,
+            pinned_buffer
+        );
+    }
+
+    #[test]
+    fn winfixbuf_jump_splits_when_previous_window_is_pinned() {
+        let (mut editor, _) = setup();
+        // The current (first) window is pinned and shows `target`; the
+        // second window is pinned too, so no previous window is free and
+        // the entry (aimed at a different buffer) must open a split.
+        let target = editor.current_buffer().unwrap();
+        let entry_buffer = editor
+            .create_buffer_with(Buffer::from_bytes(b"entry").unwrap(), true)
+            .unwrap();
+        let tab = editor.current_tabpage().unwrap();
+        let first = editor.current_window().unwrap();
+        let second = editor
+            .split_horizontal(tab, first, target, false)
+            .unwrap();
+        editor
+            .options_mut()
+            .set_window(first, "winfixbuf", OptionValue::Boolean(true))
+            .unwrap();
+        editor
+            .options_mut()
+            .set_window(second, "winfixbuf", OptionValue::Boolean(true))
+            .unwrap();
+        call(
+            &mut editor,
+            "setqflist",
+            &[Typval::list(vec![item(entry_buffer, 1, "entry")])],
+        )
+        .unwrap();
+        let before = editor.windows().len();
+        jump(&mut editor, QuickfixMove::Absolute(0), false).unwrap();
+        assert_eq!(editor.windows().len(), before + 1, "expected a split");
+        assert_eq!(
+            editor
+                .window(editor.current_window().unwrap())
+                .unwrap()
+                .buffer,
+            entry_buffer
+        );
+    }
+
+    #[test]
+    fn winfixbuf_jump_forceit_switches_in_place() {
+        let (mut editor, _) = setup();
+        let target = editor.current_buffer().unwrap();
+        let pinned_buffer = editor
+            .create_buffer_with(Buffer::from_bytes(b"pinned").unwrap(), true)
+            .unwrap();
+        let window = editor.current_window().unwrap();
+        editor
+            .set_current_buffer(pinned_buffer, BufferRelease::KeepLoaded)
+            .unwrap();
+        editor
+            .options_mut()
+            .set_window(window, "winfixbuf", OptionValue::Boolean(true))
+            .unwrap();
+        call(
+            &mut editor,
+            "setqflist",
+            &[Typval::list(vec![item(target, 1, "entry")])],
+        )
+        .unwrap();
+        jump(&mut editor, QuickfixMove::Absolute(0), true).unwrap();
+        assert_eq!(editor.current_window(), Some(window));
+        assert_eq!(editor.window(window).unwrap().buffer, target);
+    }
+
+    #[test]
     fn stack_replace_append_and_free_match_setqflist() {
         let (mut editor, _) = setup();
         let buffer = editor.current_buffer().unwrap();
