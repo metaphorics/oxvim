@@ -1410,6 +1410,39 @@ mod tests {
         }
     }
 
+    /// Selections past one full match cycle and backward wraps fall through
+    /// to the reference walk: the lazy drivers report `NeedFull` and the
+    /// collected list decides with cyclic wrap arithmetic.
+    #[test]
+    fn public_selection_falls_back_past_one_match_cycle() {
+        // Forward count past the only match: wraps to `matches[0]` twice.
+        let result = run(
+            &lines(&["foo"]),
+            Position { lnum: 1, col: 3 },
+            "foo",
+            SearchDirection::Forward,
+            SearchOffset::default(),
+            3,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.target, Position { lnum: 1, col: 0 });
+        assert!(result.wrapped);
+        // Backward wrap with nothing eligible: the last match overall.
+        let result = run(
+            &lines(&["foo"]),
+            Position { lnum: 1, col: 0 },
+            "foo",
+            SearchDirection::Backward,
+            SearchOffset::default(),
+            1,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.target, Position { lnum: 1, col: 0 });
+        assert!(result.wrapped);
+    }
+
     /// Backward public searches sweep the same non-overlapping list and pick
     /// the nearest earlier match, exactly like `N`.
     #[test]
