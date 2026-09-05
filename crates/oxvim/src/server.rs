@@ -40,7 +40,7 @@ use ox_uv::{Poll, PollEvents};
 use crate::AppError;
 use crate::cli::{Cli, UserConfig};
 use crate::messages::PrintfSink;
-use crate::runtime::{apply_startup_options, open_startup_buffers, runtime_root};
+use crate::runtime::{apply_startup_options, open_startup_buffers, runtime_root_for_sourcing};
 use crate::startuptime::StartupTimer;
 
 #[derive(Default)]
@@ -201,8 +201,11 @@ pub(crate) fn build_embedded_core(
     // option.c set_init_default for 'runtimepath'/'packpath': the
     // runtimepath_default layout over the resolved runtime tree,
     // before any user startup command runs.
-    let runtime_path = runtime_root()?;
-    let default_rtp = ox_editor::default_runtimepath(clean, &runtime_path);
+    // Sourcing-relevant roots never fall back to the launch directory
+    // (upstream os/env.c:884-936): an unresolved tree contributes no entry
+    // instead of auto-sourcing a planted `./runtime`.
+    let default_rtp =
+        ox_editor::default_runtimepath(clean, &runtime_root_for_sourcing().unwrap_or_default());
     editor
         .options_mut()
         .set_global("runtimepath", OptionValue::String(default_rtp.clone()))
@@ -239,7 +242,7 @@ pub(crate) fn build_embedded_core(
         .borrow_mut()
         .share_user_functions_from(&ex.borrow());
     let mut lua = LuaHost::new(
-        LuaRuntimeRoot::new(runtime_path),
+        LuaRuntimeRoot::new(runtime_root_for_sourcing().unwrap_or_default()),
         Rc::new(EditorBuiltins {
             session: session.clone(),
             ex: ex.clone(),
@@ -1703,11 +1706,11 @@ fn bind_stdio(
 /// socket that grants full editor control, so it must not be
 /// world-traversable. `DirBuilder::create` on an existing path leaves its
 /// permissions alone.
-/// Current effective uid without pulling a crate for one libc call.
+/// Current effective uid, through the audited `ox-sys` boundary: the old
+/// `/proc/self` read answered 0 (root) wherever `/proc` is absent.
 #[cfg(unix)]
 fn user_id() -> u32 {
-    use std::os::unix::fs::MetadataExt as _;
-    std::fs::metadata("/proc/self").map_or(0, |meta| meta.uid())
+    ox_sys::current_euid()
 }
 
 /// Creates (or accepts) `directory` as a uid-owned 0700 dir, mirroring
@@ -3772,5 +3775,17 @@ mod tests {
                 .unwrap();
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+    #[cfg(unix)]
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "temp-file fixture must succeed")]
+    fn user_id_matches_owner_of_new_files() {
+        // The old `/proc/self` read answered 0 (root) wherever `/proc` is
+        // absent; the euid must own files this process creates.
+        let path = std::env::temp_dir().join(format!("oxvim-uid-probe-{}.tmp", std::process::id()));
+        std::fs::write(&path, b"probe").unwrap();
+        let owned = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&path).unwrap());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(user_id(), owned);
     }
 }
