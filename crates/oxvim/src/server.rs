@@ -40,7 +40,7 @@ use ox_uv::{Poll, PollEvents};
 use crate::AppError;
 use crate::cli::{Cli, UserConfig};
 use crate::messages::PrintfSink;
-use crate::runtime::{apply_startup_options, open_startup_buffers, runtime_root_for_sourcing};
+use crate::runtime::{apply_startup_options, open_startup_buffers, runtime_root};
 use crate::startuptime::StartupTimer;
 
 #[derive(Default)]
@@ -59,28 +59,43 @@ impl ox_api::ChannelSink for TerminalChannelSink {
 }
 
 struct JobChannelSink {
+    session: Rc<ApiSession>,
     ex: Rc<RefCell<ExExecutor>>,
     queue: Rc<RefCell<VecDeque<Work>>>,
     /// Number of deferred sends; when > 0 the borrow is held by an outer
     /// RPC handler and new sends must be queued to preserve order.
     deferred: Rc<Cell<usize>>,
 }
-
 impl JobChannelSink {
     fn run_send(&self, channel: u64, bytes: Vec<u8>) {
         if let Ok(mut ex) = self.ex.try_borrow_mut() {
-            let _ = ex.job_send(channel, &bytes);
+            let sent = ex.job_send(channel, &bytes);
+            report_job_send(&self.session, sent, channel);
             return;
         }
         let ex = self.ex.clone();
+        let session = self.session.clone();
         let queue = self.queue.clone();
         let deferred = self.deferred.clone();
         deferred.set(deferred.get().saturating_add(1));
         queue.borrow_mut().push_back(Box::new(move || {
-            let _ = ex.borrow_mut().job_send(channel, &bytes);
+            let sent = ex.borrow_mut().job_send(channel, &bytes);
+            report_job_send(&session, sent, channel);
             deferred.set(deferred.get().saturating_sub(1));
             Ok(())
         }));
+    }
+}
+
+/// A failed job-channel write reports through the message system instead of
+/// vanishing: queued sends run after `send` returned, so there is no caller
+/// left to receive the error (upstream logs channel write failures).
+fn report_job_send(session: &Rc<ApiSession>, sent: Result<bool, String>, channel: u64) {
+    if let Err(error) = sent {
+        let message = format!("channel {channel} write failed: {error}");
+        session.with_editor_mut(|editor| {
+            ox_editor::excmd_exec::push_text_message(editor, message, true, true);
+        });
     }
 }
 
@@ -88,12 +103,14 @@ impl ox_api::ChannelSink for JobChannelSink {
     fn send(&mut self, channel: u64, bytes: &[u8]) -> Result<(), String> {
         if self.deferred.get() > 0 {
             let ex = self.ex.clone();
+            let session = self.session.clone();
             let queue = self.queue.clone();
             let deferred = self.deferred.clone();
             let bytes = bytes.to_vec();
             deferred.set(deferred.get().saturating_add(1));
             queue.borrow_mut().push_back(Box::new(move || {
-                let _ = ex.borrow_mut().job_send(channel, &bytes);
+                let sent = ex.borrow_mut().job_send(channel, &bytes);
+                report_job_send(&session, sent, channel);
                 deferred.set(deferred.get().saturating_sub(1));
                 Ok(())
             }));
@@ -204,8 +221,7 @@ pub(crate) fn build_embedded_core(
     // Sourcing-relevant roots never fall back to the launch directory
     // (upstream os/env.c:884-936): an unresolved tree contributes no entry
     // instead of auto-sourcing a planted `./runtime`.
-    let default_rtp =
-        ox_editor::default_runtimepath(clean, &runtime_root_for_sourcing().unwrap_or_default());
+    let default_rtp = ox_editor::default_runtimepath(clean, &runtime_root().unwrap_or_default());
     editor
         .options_mut()
         .set_global("runtimepath", OptionValue::String(default_rtp.clone()))
@@ -242,7 +258,7 @@ pub(crate) fn build_embedded_core(
         .borrow_mut()
         .share_user_functions_from(&ex.borrow());
     let mut lua = LuaHost::new(
-        LuaRuntimeRoot::new(runtime_root_for_sourcing().unwrap_or_default()),
+        LuaRuntimeRoot::new(runtime_root().unwrap_or_default()),
         Rc::new(EditorBuiltins {
             session: session.clone(),
             ex: ex.clone(),
@@ -270,6 +286,7 @@ pub(crate) fn build_embedded_core(
     ox_api::set_job_sink(
         &session,
         Box::new(JobChannelSink {
+            session: session.clone(),
             ex: ex.clone(),
             queue: lua_work.clone(),
             deferred: Rc::new(Cell::new(0)),
@@ -1701,11 +1718,6 @@ fn bind_stdio(
     Ok(poll)
 }
 
-/// Creates the run directory a generated listen name lands in (`os_mkdir_
-/// recurse` upstream). 0o700: the directory is the only gate on an RPC
-/// socket that grants full editor control, so it must not be
-/// world-traversable. `DirBuilder::create` on an existing path leaves its
-/// permissions alone.
 /// Current effective uid, through the audited `ox-sys` boundary: the old
 /// `/proc/self` read answered 0 (root) wherever `/proc` is absent.
 #[cfg(unix)]
@@ -1744,6 +1756,11 @@ fn make_private_listen_directory(directory: &std::path::Path) -> Result<(), AppE
     Ok(())
 }
 
+/// Creates the run directory a generated listen name lands in (`os_mkdir_
+/// recurse` upstream). 0o700: the directory is the only gate on an RPC
+/// socket that grants full editor control, so it must not be
+/// world-traversable. `DirBuilder::create` on an existing path leaves its
+/// permissions alone.
 fn make_listen_directory(directory: &std::path::Path) -> Result<(), AppError> {
     #[cfg(unix)]
     use std::os::unix::fs::DirBuilderExt as _;
@@ -3533,6 +3550,7 @@ mod tests {
         let ex = Rc::new(RefCell::new(ox_editor::ExExecutor::new()));
         let queue = Rc::new(RefCell::new(VecDeque::new()));
         let mut sink = JobChannelSink {
+            session: Rc::new(ApiSession::new(Rc::new(RefCell::new(Editor::new())))),
             ex: ex.clone(),
             queue: queue.clone(),
             deferred: Rc::new(Cell::new(0)),
@@ -3553,6 +3571,22 @@ mod tests {
         drop(outer);
         let work = queue.borrow_mut().pop_front().unwrap();
         work().unwrap();
+    }
+
+    #[test]
+    fn job_channel_sink_failure_reports_message() {
+        let session = Rc::new(ApiSession::new(Rc::new(RefCell::new(Editor::new()))));
+        // A write failure (EPIPE-class) routes into the message system;
+        // job_send reports Ok(false) for unknown channels, so drive the
+        // reporting helper with the failure shape directly.
+        report_job_send(&session, Err("broken pipe".to_owned()), 99);
+        let reported = session.with_editor(|editor| {
+            editor
+                .messages()
+                .iter()
+                .any(|m| format!("{:?}", m.content).contains("channel 99 write failed"))
+        });
+        assert!(reported, "failed job-channel write must report a message");
     }
 
     #[test]
