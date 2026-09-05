@@ -101,6 +101,23 @@ impl QuickfixList {
             .map_or(0, |index| index + 1);
         self.changedtick = self.changedtick.saturating_add(1);
     }
+    /// Replaces all entries, preserving the cursor position when the
+    /// entry at the previous index is still valid; otherwise clamps to
+    /// the first valid entry (upstream `setqflist` action 'u',
+    /// `qf_add_entries` quickfix.c:6804-6836).
+    pub fn set_items_update(&mut self, items: Vec<QuickfixItem>) {
+        let previous = self.idx;
+        self.items = items;
+        self.idx = if previous != 0 && self.items.get(previous - 1).is_some_and(|item| item.valid) {
+            previous
+        } else {
+            self.items
+                .iter()
+                .position(|item| item.valid)
+                .map_or(0, |index| index + 1)
+        };
+        self.changedtick = self.changedtick.saturating_add(1);
+    }
     /// Appends entries, selecting the first valid one if the list was empty.
     pub fn append_items(&mut self, items: Vec<QuickfixItem>) {
         let was_empty = self.items.is_empty();
@@ -136,14 +153,18 @@ impl QuickfixList {
     }
 }
 
-/// Global quickfix history (`qf_info_T`).
+/// Quickfix or location list history (`qf_info_T`).
+///
+/// Upstream stores only the list buffer number (`qf_bufnr`); the window is
+/// derived per command by scanning the current tabpage (`qf_find_win`,
+/// quickfix.c:4130-4140), so a window in another tabpage is never reused or
+/// closed by mistake.
 #[derive(Clone, Debug)]
 pub struct QuickfixStack {
     lists: Vec<QuickfixList>,
     current: usize,
     next_id: u64,
     buffer: Option<BufHandle>,
-    window: Option<WinHandle>,
 }
 
 impl Default for QuickfixStack {
@@ -161,7 +182,6 @@ impl QuickfixStack {
             current: 0,
             next_id: 1,
             buffer: None,
-            window: None,
         }
     }
     /// Returns the current (active) list, if any.
@@ -209,15 +229,10 @@ impl QuickfixStack {
             self.current + 1
         }
     }
-    /// Buffer backing the quickfix window, if one has been created.
+    /// Buffer backing the list window, if one has been created.
     #[must_use]
     pub const fn buffer(&self) -> Option<BufHandle> {
         self.buffer
-    }
-    /// Window displaying the quickfix list, if one is open.
-    #[must_use]
-    pub const fn window(&self) -> Option<WinHandle> {
-        self.window
     }
     /// Removes all lists and resets the cursor.
     pub fn clear(&mut self) {
@@ -303,46 +318,122 @@ impl QuickfixStack {
         // entry; `ex_cnext`/`ex_cprev` step at most `count` times, stopping at
         // the end entry, and fail E553 only when the first step cannot move.
         let last_index = quickfix_list.items.len() - 1;
-        let target = match movement {
+        let mut selected = match movement {
             QuickfixMove::Absolute(index) => index.min(last_index),
             QuickfixMove::First => 0,
             QuickfixMove::Last => last_index,
-            QuickfixMove::Next(count) => current.saturating_add(count).min(last_index),
-            QuickfixMove::Previous(count) => {
-                if current == 0 {
-                    return Err(QuickfixError::before_first());
-                }
-                current.saturating_sub(count)
-            }
+            QuickfixMove::Next(_) | QuickfixMove::Previous(_) => current,
         };
-        let mut selected = target;
-        // `:cfirst`/`:clast` select the first/last *valid* entry, like the
-        // stepped moves; only `:cc` addresses a literal index.
+        // `:cfirst`/`:clast` select the first/last *valid* entry; `:cnext`/`:cprevious`
+        // step at most `count` valid entries (upstream `get_nth_valid_entry`,
+        // quickfix.c:2600-2631). Only `:cc` addresses a literal index.
         if !matches!(movement, QuickfixMove::Absolute(_)) {
+            let items = &quickfix_list.items;
             let forward = !matches!(movement, QuickfixMove::Previous(_) | QuickfixMove::Last);
-            loop {
-                if quickfix_list
-                    .items
-                    .get(selected)
-                    .is_some_and(|item| item.valid)
-                {
-                    break;
-                }
-                if forward {
-                    if selected >= last_index {
-                        return Err(QuickfixError::beyond_last());
+            match movement {
+                QuickfixMove::Next(count) | QuickfixMove::Previous(count) => {
+                    let mut remaining = count.max(1);
+                    let mut first_step = true;
+                    while remaining > 0 {
+                        let found = if forward {
+                            (selected + 1..=last_index).find(|&index| items[index].valid)
+                        } else {
+                            (0..selected).rev().find(|&index| items[index].valid)
+                        };
+                        if let Some(index) = found {
+                            selected = index;
+                        } else if first_step {
+                            return if forward {
+                                Err(QuickfixError::beyond_last())
+                            } else {
+                                Err(QuickfixError::before_first())
+                            };
+                        } else {
+                            break;
+                        }
+                        remaining -= 1;
+                        first_step = false;
                     }
-                    selected += 1;
-                } else if selected == 0 {
-                    return Err(QuickfixError::before_first());
-                } else {
-                    selected -= 1;
                 }
+                _ => loop {
+                    if items.get(selected).is_some_and(|item| item.valid) {
+                        break;
+                    }
+                    if forward {
+                        if selected >= last_index {
+                            return Err(QuickfixError::beyond_last());
+                        }
+                        selected += 1;
+                    } else if selected == 0 {
+                        return Err(QuickfixError::before_first());
+                    } else {
+                        selected -= 1;
+                    }
+                },
             }
         }
         quickfix_list.idx = selected + 1;
         Ok(&quickfix_list.items[selected])
     }
+}
+
+/// Which stack a quickfix command or builtin operates on: the global
+/// quickfix stack, or one window's location list (`qf_info_T` selection in
+/// `qf_cmd_get_stack`/`set_errorlist`, quickfix.c:2151-2167, 7127-7134).
+#[derive(Clone, Copy, Debug)]
+pub enum QfScope {
+    /// The global quickfix stack (`ql_info`).
+    Quickfix,
+    /// The location list owned by `window` (`wp->w_llist`).
+    Loclist(WinHandle),
+}
+
+impl QfScope {
+    /// The stack for reads; `None` when a location list was never created
+    /// (`GET_LOC_LIST` returning NULL, quickfix.c:286).
+    pub(crate) fn stack(self, editor: &Editor) -> Option<&QuickfixStack> {
+        match self {
+            Self::Quickfix => Some(editor.quickfix()),
+            Self::Loclist(window) => editor.loclist(window),
+        }
+    }
+
+    /// The stack for writes, allocating a location list on first use
+    /// (`ll_get_or_alloc_list`, quickfix.c:2127-2145).
+    pub(crate) fn stack_mut(self, editor: &mut Editor) -> &mut QuickfixStack {
+        match self {
+            Self::Quickfix => editor.quickfix_mut(),
+            Self::Loclist(window) => editor.loclist_or_alloc_mut(window),
+        }
+    }
+}
+
+/// `qf_find_win` (quickfix.c:4130-4140): the window in the CURRENT tabpage
+/// displaying this stack's list buffer. Upstream stores no window handle —
+/// a list window is any current-tab window showing the stack's
+/// 'buftype=quickfix' buffer (`is_qf_win`, quickfix.c:4111-4126) — so a
+/// window in another tabpage is never found, reused, or closed by mistake.
+pub(crate) fn find_window(editor: &Editor, scope: QfScope) -> Option<WinHandle> {
+    let buffer = scope.stack(editor).and_then(|stack| stack.buffer)?;
+    let tab = editor.current_tabpage()?;
+    editor
+        .tabpage_windows(tab)
+        .ok()?
+        .into_iter()
+        .find(|window| {
+            editor
+                .window(*window)
+                .is_ok_and(|state| state.buffer == buffer)
+        })
+}
+
+/// Whether `buffer` is a quickfix/location list buffer
+/// (`bt_quickfix`, quickfix.c).
+fn is_list_buffer(editor: &Editor, buffer: BufHandle) -> bool {
+    editor
+        .options()
+        .get_buffer(buffer, "buftype")
+        .is_ok_and(|value| matches!(value, OptionValue::String(kind) if kind == "quickfix"))
 }
 
 /// Cursor movement for `:cnext`/`:cprev`/`:cc`/`:cfirst`/`:clast`.
@@ -408,6 +499,14 @@ impl QuickfixError {
             message: "Cannot switch buffer. 'winfixbuf' is enabled".to_owned(),
         }
     }
+    /// `E776` when a location-list command finds no stack on the window
+    /// (`qf_cmd_get_stack`, quickfix.c:2156-2163).
+    fn no_loclist() -> Self {
+        Self {
+            code: "E776",
+            message: "No location list".to_owned(),
+        }
+    }
 }
 
 /// Dispatches the editor-stateful quickfix builtins.
@@ -447,26 +546,79 @@ fn check_arity(name: &str, count: usize) -> Result<()> {
     Ok(())
 }
 
-/// `setloclist({nr}, {list}, ...)`: window-local lists share the quickfix
-/// stack until per-window loclists land; winid 0 is the current window.
-/// Validates the window number, then applies `setqflist` semantics.
+/// `setloclist({nr}, {list}, ...)` (`f_setloclist`, quickfix.c:7825-7833):
+/// the first argument resolves a window by number-or-id
+/// (`find_win_by_nr_or_id`, eval/window.c:202-211); an unresolvable window
+/// fails silently with -1.
 fn setloclist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
-    match &args[0] {
-        Typval::Number(_) | Typval::Bool(_) => {}
-        _ => return Err(EvalError::new("E745", 0, "Using a List as a Number")),
-    }
-    setqflist(editor, &args[1..])
+    let Some(window) = loclist_window(editor, &args[0])? else {
+        return Ok(Typval::Number(-1));
+    };
+    set_list(
+        editor,
+        QfScope::Loclist(window),
+        &args[1..],
+        ":setloclist()",
+    )
 }
 
+/// `getloclist({nr} [, {what}])` (`f_getloclist`, quickfix.c:7731-7735):
+/// an unresolvable window yields an empty list or dict
+/// (`get_qf_loc_list` skips the read when `wp` is NULL, quickfix.c:7707-7728).
 fn getloclist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
-    match &args[0] {
-        Typval::Number(_) | Typval::Bool(_) => {}
+    let Some(window) = loclist_window(editor, &args[0])? else {
+        return Ok(if args.len() > 1 {
+            Typval::dict(Vec::new())
+        } else {
+            Typval::list(Vec::new())
+        });
+    };
+    get_list(editor, QfScope::Loclist(window), &args[1..])
+}
+
+/// `find_win_by_nr_or_id` (eval/window.c:202-211): `0` is the current
+/// window, a value at or above the window-id floor is a window id in any
+/// tabpage, and anything else is a one-based window number in the current
+/// tabpage (`win_find_nr`, eval/window.c:51-63). `None` when not found.
+///
+/// # Errors
+///
+/// Returns E745 when the argument is not a number or boolean.
+fn loclist_window(editor: &Editor, value: &Typval) -> Result<Option<WinHandle>> {
+    let number = match value {
+        Typval::Number(number) => *number,
+        Typval::Bool(flag) => i64::from(*flag),
         _ => return Err(EvalError::new("E745", 0, "Using a List as a Number")),
+    };
+    if number < 0 {
+        return Ok(None);
     }
-    getqflist(editor, &args[1..])
+    if number == 0 {
+        return Ok(editor.current_window());
+    }
+    if number >= crate::editor::LOWEST_WINDOW_ID {
+        return Ok(WinHandle::try_from(number)
+            .ok()
+            .filter(|window| editor.window(*window).is_ok()));
+    }
+    let Some(tab) = editor.current_tabpage() else {
+        return Ok(None);
+    };
+    let windows = editor.tabpage_windows(tab).unwrap_or_default();
+    Ok(usize::try_from(number)
+        .ok()
+        .and_then(|index| index.checked_sub(1))
+        .and_then(|index| windows.get(index))
+        .copied())
 }
 
 /// Applies `setqflist` to the editor's quickfix stack.
+fn setqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
+    set_list(editor, QfScope::Quickfix, args, ":setqflist()")
+}
+
+/// Applies `setqflist`/`setloclist` semantics to `scope`'s stack
+/// (`set_errorlist`, quickfix.c:7127-7164).
 ///
 /// # Errors
 ///
@@ -474,7 +626,12 @@ fn getloclist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
 /// dictionary is locked, E927 for an invalid action, E1174 when the action
 /// is not a string, E475 for contradictory arguments, and E715 when the
 /// `what` argument is not a dictionary.
-fn setqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
+fn set_list(
+    editor: &mut Editor,
+    scope: QfScope,
+    args: &[Typval],
+    default_title: &str,
+) -> Result<Typval> {
     let Typval::List(items_ref) = &args[0] else {
         return Err(EvalError::new("E714", 0, "List required"));
     };
@@ -485,7 +642,7 @@ fn setqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
         .clone();
     let action = parse_action(args)?;
     if action == 'f' {
-        editor.quickfix_mut().clear();
+        scope.stack_mut(editor).clear();
         return Ok(Typval::Number(0));
     }
 
@@ -512,7 +669,7 @@ fn setqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
     };
     let title = legacy_title
         .or_else(|| dict_string(&what, "title"))
-        .unwrap_or_else(|| OxStr::from(":setqflist()"));
+        .unwrap_or_else(|| OxStr::from(default_title));
     // Invalid 'efm'/'lines' value types report -1 like upstream
     // `qf_setprop_items_from_lines` FAIL; a locked list raises E742
     // (quickfix.c:6952-6963).
@@ -522,20 +679,22 @@ fn setqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
 
     // `target_for_set` pushes a fresh list for ' ' (or an empty stack);
     // remember so a failed parse can drop it (quickfix.c:1218-1224).
-    let created = action == ' ' || editor.quickfix().lists.is_empty();
+    let created = action == ' '
+        || scope
+            .stack(editor)
+            .is_none_or(|stack| stack.lists.is_empty());
     // A continuation on the first line folds into the existing tail
     // (upstream seeds `old_last` from the list, quickfix.c:1131).
     let fold_tail = if matches!(action, 'a' | 'u') && !created {
-        editor
-            .quickfix()
-            .lists
-            .last()
+        scope
+            .stack(editor)
+            .and_then(|stack| stack.lists.last())
             .and_then(|list| list.items.last().map(|_| list.items.len() - 1))
     } else {
         None
     };
-    let target = editor
-        .quickfix_mut()
+    let target = scope
+        .stack_mut(editor)
         .target_for_set(action, &what, title)
         .ok_or_else(|| EvalError::new("E475", 0, "Invalid argument"))?;
 
@@ -567,7 +726,7 @@ fn setqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
         Ok(parsed_items) => parsed_items,
         Err(error) => {
             if created {
-                let stack = editor.quickfix_mut();
+                let stack = scope.stack_mut(editor);
                 stack.lists.remove(target);
                 if stack.current > 0 {
                     stack.current -= 1;
@@ -577,7 +736,7 @@ fn setqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
         }
     };
     apply_what_fields(
-        editor.quickfix_mut().list_mut(target),
+        scope.stack_mut(editor).list_mut(target),
         &what,
         action,
         !source_items.is_empty() || lines.is_some(),
@@ -586,7 +745,7 @@ fn setqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
     // Continuations that arrived before any entry of this call fold into the
     // pre-existing tail captured above; appending shifted nothing before it.
     if let Some(idx) = fold_tail
-        && let Some(item) = editor.quickfix_mut().list_mut(target).items.get_mut(idx)
+        && let Some(item) = scope.stack_mut(editor).list_mut(target).items.get_mut(idx)
     {
         for cont in &deferred {
             apply_continuation(item, cont);
@@ -624,6 +783,8 @@ fn apply_what_fields(
     if dict_value(what, "items").is_some() || has_source_items || what.is_empty() {
         if action == 'a' {
             list.append_items(parsed_items);
+        } else if action == 'u' {
+            list.set_items_update(parsed_items);
         } else {
             list.set_items(parsed_items);
         }
@@ -634,17 +795,28 @@ fn apply_what_fields(
 }
 
 /// Answers the editor-stateful `getqflist()` builtin.
+fn getqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
+    get_list(editor, QfScope::Quickfix, args)
+}
+
+/// Answers `getqflist()`/`getloclist()` against `scope`'s stack
+/// (`get_qf_loc_list`/`qf_get_properties`, quickfix.c:7707-7728, 6524-6602).
+/// An absent location list reads as an empty stack (`qf_stack_empty`,
+/// quickfix.c:922-926).
 ///
 /// # Errors
 ///
 /// Returns E742 when the argument dictionary is locked and E715 when the
 /// first argument is not a dictionary.
-fn getqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
+fn get_list(editor: &mut Editor, scope: QfScope, args: &[Typval]) -> Result<Typval> {
     if args.is_empty() {
         return Ok(Typval::list(
-            editor.quickfix().current().map_or_else(Vec::new, |list| {
-                list.items.iter().map(item_typval).collect()
-            }),
+            scope
+                .stack(editor)
+                .and_then(QuickfixStack::current)
+                .map_or_else(Vec::new, |list| {
+                    list.items.iter().map(item_typval).collect()
+                }),
         ));
     }
     let Typval::Dict(reference) = &args[0] else {
@@ -663,10 +835,9 @@ fn getqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
     }
     let all = dict_number(&what, "all").is_some_and(|value| value != 0);
 
-    let selected = editor
-        .quickfix()
-        .select(&what)
-        .and_then(|index| editor.quickfix().lists.get(index));
+    let selected = scope
+        .stack(editor)
+        .and_then(|stack| stack.select(&what).and_then(|index| stack.lists.get(index)));
     let wants = |key: &str| all || dict_value(&what, key).is_some();
     let mut answer = Vec::new();
     if wants("title") {
@@ -704,30 +875,34 @@ fn getqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
             ),
         ));
     }
-    push_list_numbers(editor, &what, all, &mut answer);
-    push_stack_handles(editor, &what, all, &mut answer);
-    if let (Some(list), true) = (selected, wants("id")) {
+    push_list_numbers(scope.stack(editor), &what, all, &mut answer);
+    push_stack_handles(editor, scope, &what, all, &mut answer);
+    if wants("id") {
         answer.push(pair(
             "id",
-            Typval::Number(i64::try_from(list.id).unwrap_or(i64::MAX)),
+            Typval::Number(selected.map_or(0, |list| i64::try_from(list.id).unwrap_or(i64::MAX))),
         ));
     }
-    if let (Some(list), true) = (selected, wants("idx")) {
+    if wants("idx") {
         answer.push(pair(
             "idx",
-            Typval::Number(i64::try_from(list.idx).unwrap_or(i64::MAX)),
+            Typval::Number(selected.map_or(0, |list| i64::try_from(list.idx).unwrap_or(i64::MAX))),
         ));
     }
-    if let (Some(list), true) = (selected, wants("size")) {
+    if wants("size") {
         answer.push(pair(
             "size",
-            Typval::Number(i64::try_from(list.items.len()).unwrap_or(i64::MAX)),
+            Typval::Number(selected.map_or(0, |list| {
+                i64::try_from(list.items.len()).unwrap_or(i64::MAX)
+            })),
         ));
     }
-    if let (Some(list), true) = (selected, wants("changedtick")) {
+    if wants("changedtick") {
         answer.push(pair(
             "changedtick",
-            Typval::Number(i64::try_from(list.changedtick).unwrap_or(i64::MAX)),
+            Typval::Number(selected.map_or(0, |list| {
+                i64::try_from(list.changedtick).unwrap_or(i64::MAX)
+            })),
         ));
     }
     Ok(Typval::dict(answer))
@@ -737,15 +912,14 @@ fn getqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
 /// `nr` reports the one-based position of the selected list, or 0 when no
 /// list matches the `what` selector.
 fn push_list_numbers(
-    editor: &Editor,
+    stack: Option<&QuickfixStack>,
     what: &[DictEntry],
     all: bool,
     answer: &mut Vec<(OxStr, Typval)>,
 ) {
     if all || dict_value(what, "nr").is_some() {
-        let number_usize = editor
-            .quickfix()
-            .select(what)
+        let number_usize = stack
+            .and_then(|stack| stack.select(what))
             .map_or(0_usize, |index| index + 1);
         let number = i64::try_from(number_usize).unwrap_or(i64::MAX);
         answer.push(pair("nr", Typval::Number(number)));
@@ -753,24 +927,24 @@ fn push_list_numbers(
 }
 
 /// Appends the stack-handle metadata keys (`winid`, `qfbufnr`) that report
-/// the quickfix window and buffer when they still exist.
+/// the list window and buffer when they still exist. `winid` is derived
+/// like upstream `qf_winid` → `qf_find_win` (quickfix.c:6258-6270): the
+/// current-tab window showing the stack's buffer, or 0.
 fn push_stack_handles(
     editor: &Editor,
+    scope: QfScope,
     what: &[DictEntry],
     all: bool,
     answer: &mut Vec<(OxStr, Typval)>,
 ) {
     if all || dict_value(what, "winid").is_some() {
-        let window = editor
-            .quickfix()
-            .window
-            .filter(|window| editor.window(*window).is_ok());
+        let window = find_window(editor, scope);
         answer.push(pair("winid", Typval::Number(window.map_or(0, i64::from))));
     }
     if all || dict_value(what, "qfbufnr").is_some() {
-        let buffer = editor
-            .quickfix()
-            .buffer
+        let buffer = scope
+            .stack(editor)
+            .and_then(|stack| stack.buffer)
             .filter(|buffer| editor.buffer(*buffer).is_ok());
         answer.push(pair("qfbufnr", Typval::Number(buffer.map_or(0, i64::from))));
     }
@@ -784,6 +958,7 @@ fn push_stack_handles(
 /// creation fails, and E86 when the new buffer cannot be renamed.
 pub(crate) fn parse_items(
     editor: &mut Editor,
+    scope: QfScope,
     values: &[Typval],
     fold_tail: Option<usize>,
 ) -> Result<Vec<QuickfixItem>> {
@@ -794,9 +969,10 @@ pub(crate) fn parse_items(
     let mut state = crate::efm::EfmState::default();
     let mut deferred: Vec<crate::efm::Continuation> = Vec::new();
     let result = parse_items_efm(editor, values, &mut state, None, &mut deferred);
-    if let Some(idx) = fold_tail
-        && let Some(item) = editor
-            .quickfix_mut()
+    if result.is_ok()
+        && let Some(idx) = fold_tail
+        && let Some(item) = scope
+            .stack_mut(editor)
             .current_mut()
             .and_then(|list| list.items.get_mut(idx))
     {
@@ -809,7 +985,9 @@ pub(crate) fn parse_items(
 
 /// `efm::EfmContext` over the editor buffer table: `%b` existence checks and
 /// filename→buffer find-or-create (upstream `buflist_findnr`/`buflist_new`,
-/// quickfix.c:1361, 2350).
+/// quickfix.c:1361, 2350). A freshly created buffer is left unloaded —
+/// upstream `buflist_new` allocates the buffer without reading the file;
+/// the read happens at jump time (`buflist_getfile`, buffer.c:2252-2325).
 struct EditorEfmContext<'a> {
     editor: &'a mut Editor,
 }
@@ -820,30 +998,30 @@ impl crate::efm::EfmContext for EditorEfmContext<'_> {
     }
 
     fn buffer_for_name(&mut self, name: &str) -> i64 {
-        let filename = OxStr::from(name);
-        let existing = self.editor.buffers().into_iter().find(|buffer| {
-            self.editor
-                .buffer(*buffer)
-                .is_ok_and(|state| state.name() == &filename)
-        });
-        let buffer = if let Some(buffer) = existing {
-            buffer
-        } else {
-            let Ok(buffer) = self.editor.create_buffer(true) else {
-                return 0;
-            };
-            if self
-                .editor
-                .buffer_mut(buffer)
-                .map(|state| state.set_name(filename))
-                .is_err()
-            {
-                return 0;
-            }
-            buffer
-        };
-        i64::from(buffer)
+        named_buffer(self.editor, OxStr::from(name)).map_or(0, i64::from)
     }
+}
+
+/// `buflist_findnr`/`buflist_new` (quickfix.c:1361, 2350): the buffer named
+/// `name`, creating it when absent. A created buffer is unloaded — the file
+/// is read when a jump lands in it, not at parse time.
+fn named_buffer(editor: &mut Editor, name: OxStr) -> Option<BufHandle> {
+    let existing = editor.buffers().into_iter().find(|buffer| {
+        editor
+            .buffer(*buffer)
+            .is_ok_and(|state| state.name() == &name)
+    });
+    if let Some(buffer) = existing {
+        return Some(buffer);
+    }
+    let buffer = editor.create_buffer(true).ok()?;
+    let state = editor.buffer_mut(buffer).ok()?;
+    state.set_name(name);
+    // A buffer created for a name has no text yet; mark it unloaded so the
+    // jump reads the file (upstream `buflist_new` leaves the buffer without
+    // lines until `readfile`).
+    let _ = state.unload();
+    Some(buffer)
 }
 
 /// The effective 'errorformat': the buffer-local value when set non-empty,
@@ -1020,23 +1198,8 @@ fn dict_entry_item(editor: &mut Editor, entries: &[DictEntry]) -> Result<Quickfi
         && let Some(filename) = dict_string(entries, "filename")
         && !filename.as_bytes().is_empty()
     {
-        let existing = editor.buffers().into_iter().find(|buffer| {
-            editor
-                .buffer(*buffer)
-                .is_ok_and(|state| state.name() == &filename)
-        });
-        let buffer = if let Some(buffer) = existing {
-            buffer
-        } else {
-            let buffer = editor
-                .create_buffer(true)
-                .map_err(|error| EvalError::new("E948", 0, error.to_string()))?;
-            editor
-                .buffer_mut(buffer)
-                .map_err(|error| EvalError::new("E86", 0, error.to_string()))?
-                .set_name(filename);
-            buffer
-        };
+        let buffer = named_buffer(editor, filename)
+            .ok_or_else(|| EvalError::new("E948", 0, "Cannot create buffer"))?;
         bufnr = i64::from(buffer);
     }
     if bufnr != 0
@@ -1115,26 +1278,36 @@ fn dict_string(entries: &[DictEntry], name: &str) -> Option<OxStr> {
     }
 }
 
-/// Opens or refreshes the global quickfix window.
+/// Opens or refreshes the window showing `scope`'s list (`ex_copen`,
+/// quickfix.c:3991-4037).
 ///
 /// # Errors
 ///
-/// Returns E925 when the backing buffer cannot be read or rewritten, a new
-/// buffer cannot be created or configured, or window layout operations fail.
-pub fn open(editor: &mut Editor) -> std::result::Result<WinHandle, QuickfixError> {
-    let lines = editor.quickfix().current().map_or_else(
-        || vec![Vec::new()],
-        |list| {
-            if list.items.is_empty() {
-                vec![Vec::new()]
-            } else {
-                list.items.iter().map(format_item).collect()
-            }
-        },
-    );
-    let existing_buffer = editor
-        .quickfix()
-        .buffer
+/// Returns E776 when `scope` is a location list that does not exist, and
+/// E925 when the backing buffer cannot be read or rewritten, a new buffer
+/// cannot be created or configured, or window layout operations fail.
+pub fn open(editor: &mut Editor, scope: QfScope) -> std::result::Result<WinHandle, QuickfixError> {
+    // `qf_cmd_get_stack` (quickfix.c:2151-2167): a location-list command on
+    // a window without a location list fails E776.
+    if scope.stack(editor).is_none() {
+        return Err(QuickfixError::no_loclist());
+    }
+    let lines = scope
+        .stack(editor)
+        .and_then(QuickfixStack::current)
+        .map_or_else(
+            || vec![Vec::new()],
+            |list| {
+                if list.items.is_empty() {
+                    vec![Vec::new()]
+                } else {
+                    list.items.iter().map(format_item).collect()
+                }
+            },
+        );
+    let existing_buffer = scope
+        .stack(editor)
+        .and_then(|stack| stack.buffer)
         .filter(|buffer| editor.buffer(*buffer).is_ok());
     let buffer = if let Some(buffer) = existing_buffer {
         let count = editor
@@ -1173,33 +1346,18 @@ pub fn open(editor: &mut Editor) -> std::result::Result<WinHandle, QuickfixError
                 OptionValue::String("quickfix".to_owned()),
             )
             .map_err(|error| QuickfixError::editor(&error))?;
-        editor.quickfix_mut().buffer = Some(buffer);
+        scope.stack_mut(editor).buffer = Some(buffer);
         buffer
     };
 
-    // Upstream `qf_find_win` (quickfix.c:4126-4136) only reuses a quickfix
-    // window inside the CURRENT tabpage (`FOR_ALL_WINDOWS_IN_TAB(win,
-    // curtab)`); a recording left pointing into a leftover tab must fall
-    // through to the split path, never move the user's tab.
-    let current_tab = editor.current_tabpage();
-    if let Some(window) = editor.quickfix().window.filter(|window| {
-        editor.window(*window).is_ok()
-            && editor
-                .window_tabpage(*window)
-                .is_ok_and(|tab| Some(tab) == current_tab)
-    }) {
+    // `qf_goto_cwindow` (quickfix.c:3869-3890) reuses the window only when
+    // `qf_find_win` derives one in the CURRENT tabpage; a window showing the
+    // list buffer in another tabpage is left alone and a fresh split opens
+    // here instead.
+    if let Some(window) = find_window(editor, scope) {
         editor
             .set_current_window(window)
             .map_err(|error| QuickfixError::editor(&error))?;
-        // The recorded window can outlive its buffer (a wiped buffer, a
-        // manual `:buffer` inside it): point it back at the quickfix buffer
-        // unless it is pinned to something else.
-        let shows = editor.window(window).map(|state| state.buffer);
-        if shows.is_ok_and(|shown| shown != buffer) && !window_fixed(editor, window) {
-            editor
-                .set_current_buffer(buffer, BufferRelease::KeepLoaded)
-                .map_err(|error| QuickfixError::editor(&error))?;
-        }
         return Ok(window);
     }
     let window =
@@ -1219,25 +1377,24 @@ pub fn open(editor: &mut Editor) -> std::result::Result<WinHandle, QuickfixError
                 .map_err(|error| QuickfixError::editor(&error))?
                 .current_window()
         };
-    editor.quickfix_mut().window = Some(window);
     editor
         .set_current_window(window)
         .map_err(|error| QuickfixError::editor(&error))?;
     Ok(window)
 }
 
-/// Closes the quickfix window if one is open.
+/// Closes the list window if one is open in the current tabpage.
+///
+/// `ex_cclose` (quickfix.c:3852-3865) derives the window with
+/// `qf_find_win`, which scans only the current tabpage — a list window in
+/// another tabpage is never closed.
 ///
 /// # Errors
 ///
 /// Returns E925 when locating the window's tabpage or closing the window
 /// fails.
-pub fn close(editor: &mut Editor) -> std::result::Result<(), QuickfixError> {
-    let Some(window) = editor
-        .quickfix()
-        .window
-        .filter(|window| editor.window(*window).is_ok())
-    else {
+pub fn close(editor: &mut Editor, scope: QfScope) -> std::result::Result<(), QuickfixError> {
+    let Some(window) = find_window(editor, scope) else {
         return Ok(());
     };
     let tab = editor
@@ -1246,61 +1403,93 @@ pub fn close(editor: &mut Editor) -> std::result::Result<(), QuickfixError> {
     editor
         .close_window(tab, window, true)
         .map_err(|error| QuickfixError::editor(&error))?;
-    editor.quickfix_mut().window = None;
     Ok(())
 }
 
-/// Locates a pattern-only entry in the target buffer: upstream `qf_jump`
-/// searches `pattern` when `lnum` is 0. Returns `None` when the buffer is
-/// unreadable, the pattern rejects, or nothing matches; the caller then
-/// jumps to the top like before.
+/// Locates a pattern-only entry in the target buffer: upstream `qf_jump_goto_line`
+/// (quickfix.c:3089-3095) searches from cursor lnum 0, before the first line,
+/// so a match at (1, 0) counts. Returns `None` when the buffer is unreadable,
+/// the pattern rejects, or nothing matches; the caller then jumps to the top.
 fn pattern_position(editor: &Editor, buffer: BufHandle, pattern: &OxStr) -> Option<Position> {
     let lines = buffer_lines(editor, buffer).ok()?;
-    let result = SearchState::default()
+    let expression = pattern.to_string_lossy();
+    // SearchState's forward scan treats the start position as exclusive,
+    // so probe line 1 from its end: every match in the line falls in the
+    // skip window and the wrap fallback returns the earliest, including (1, 0).
+    // If line 1 has no match, fall back to a whole-buffer search.
+    if let Some(first) = lines.first() {
+        let probe = lines[..1].to_vec();
+        let end = Position {
+            lnum: 1,
+            col: first.len(),
+        };
+        if let Ok(result) = SearchState::default().search(
+            &probe,
+            end,
+            &expression,
+            SearchDirection::Forward,
+            1,
+            true,
+        ) {
+            return Some(result.target);
+        }
+    }
+    SearchState::default()
         .search(
             &lines,
             Position { lnum: 1, col: 0 },
-            &pattern.to_string_lossy(),
+            &expression,
             SearchDirection::Forward,
             1,
             true,
         )
-        .ok()?;
-    Some(result.target)
+        .ok()
+        .map(|result| result.target)
 }
 
 /// Restores a pre-jump quickfix cursor after a failed target switch:
 /// upstream `qf_jump` puts the index back when the jump fails
 /// (quickfix.c:3320-3331), so a failed `:cnext` never consumes an entry.
-fn restore_idx(editor: &mut Editor, idx: Option<usize>) {
-    if let (Some(idx), Some(list)) = (idx, editor.quickfix_mut().current_mut()) {
+fn restore_idx(editor: &mut Editor, scope: QfScope, idx: Option<usize>) {
+    if let (Some(idx), Some(list)) = (idx, scope.stack_mut(editor).current_mut()) {
         list.idx = idx;
     }
 }
 
-/// Moves the quickfix cursor and switches to the target buffer/window.
+/// Moves the list cursor and switches to the target buffer/window.
 ///
 /// # Errors
 ///
-/// Returns E42 when there is no list or entry, E553 when the cursor cannot
-/// move, and E925 when buffer or window state changes fail.
+/// Returns E776 when `scope` is a location list that does not exist, E42
+/// when there is no list or entry, E553 when the cursor cannot move, and
+/// E925 when buffer or window state changes fail.
 #[expect(
     clippy::too_many_lines,
     reason = "jump mirrors qf_jump's sequential phases (guard, redirect, position) in one procedure"
 )]
 pub fn jump(
     editor: &mut Editor,
+    io: &dyn crate::script::FileIO,
+    scope: QfScope,
     movement: QuickfixMove,
     forceit: bool,
 ) -> std::result::Result<(), QuickfixError> {
-    let previous_idx = editor.quickfix().current().map(QuickfixList::idx);
-    let item = editor.quickfix_mut().move_entry(movement)?.clone();
+    // `qf_cmd_get_stack` (quickfix.c:2151-2167): a location-list command on
+    // a window without a location list fails E776.
+    if scope.stack(editor).is_none() {
+        return Err(QuickfixError::no_loclist());
+    }
+    let previous_idx = scope
+        .stack(editor)
+        .and_then(QuickfixStack::current)
+        .map(QuickfixList::idx);
+    let item = scope.stack_mut(editor).move_entry(movement)?.clone();
     let buffer = BufHandle::try_from(item.bufnr).map_err(|_| {
-        restore_idx(editor, previous_idx);
+        restore_idx(editor, scope, previous_idx);
         QuickfixError::no_errors()
     })?;
     if editor.buffer(buffer).is_err() {
-        restore_idx(editor, previous_idx);
+        restore_idx(editor, scope, previous_idx);
         return Err(QuickfixError::no_errors());
     }
     // `qf_jump_edit_buffer` (quickfix.c:2969-3006): a 'winfixbuf' window
@@ -1311,65 +1500,104 @@ pub fn jump(
         && editor.current_window_fixed_to_buffer()
         && editor.current_buffer() != Some(buffer)
     {
-        let quickfix_buffer = editor.quickfix().buffer;
+        let list_buffer = scope.stack(editor).and_then(|stack| stack.buffer);
         let previous = editor.previous_window().filter(|window| {
             !window_fixed(editor, *window)
                 && editor
                     .window(*window)
-                    .is_ok_and(|state| Some(state.buffer) != quickfix_buffer)
+                    .is_ok_and(|state| Some(state.buffer) != list_buffer)
         });
         if let Some(previous) = previous
             && editor.set_current_window(previous).is_err()
         {
-            restore_idx(editor, previous_idx);
+            restore_idx(editor, scope, previous_idx);
             return Err(QuickfixError::winfixbuf());
         }
         if editor.current_window_fixed_to_buffer() {
             let tab = editor.current_tabpage().ok_or_else(|| {
-                restore_idx(editor, previous_idx);
+                restore_idx(editor, scope, previous_idx);
                 QuickfixError::no_errors()
             })?;
             let current_window = editor.current_window().ok_or_else(|| {
-                restore_idx(editor, previous_idx);
+                restore_idx(editor, scope, previous_idx);
                 QuickfixError::no_errors()
             })?;
             let current_buffer = editor.current_buffer().ok_or_else(|| {
-                restore_idx(editor, previous_idx);
+                restore_idx(editor, scope, previous_idx);
                 QuickfixError::no_errors()
             })?;
-            editor
+            let new_window = editor
                 .split_horizontal(tab, current_window, current_buffer, true)
                 .map_err(|_| {
-                    restore_idx(editor, previous_idx);
+                    restore_idx(editor, scope, previous_idx);
                     QuickfixError::winfixbuf()
                 })?;
+            if let Err(error) = editor.set_current_window(new_window) {
+                restore_idx(editor, scope, previous_idx);
+                return Err(QuickfixError::editor(&error));
+            }
             if editor.current_window_fixed_to_buffer() {
-                restore_idx(editor, previous_idx);
+                restore_idx(editor, scope, previous_idx);
                 return Err(QuickfixError::winfixbuf());
             }
         }
     }
-    let qf_window = editor
-        .quickfix()
-        .window
-        .filter(|window| editor.current_window() == Some(*window));
-    if qf_window.is_some() {
-        // Upstream skips pinned windows when choosing a jump target
-        // (quickfix.c:2868-2885): a jump from the quickfix window must not
-        // route the entry into a 'winfixbuf' window.
-        let quickfix_buffer = editor.quickfix().buffer;
-        let target = editor.windows().into_iter().find(|window| {
-            Some(*window) != qf_window
+    // `qf_jump` (quickfix.c:3172): a jump from a window showing a
+    // 'buftype=quickfix' buffer must leave that window.
+    if editor
+        .current_buffer()
+        .is_some_and(|current| is_list_buffer(editor, current))
+    {
+        // Upstream `qf_jump_to_usable_window` (quickfix.c:2898-2945) and
+        // `qf_find_win_with_normal_buf` (quickfix.c:2759-2768): a jump from
+        // the list window must use a non-quickfix, non-pinned window in the
+        // current tabpage; when none exists the jump fails with E1513.
+        let current_tab = editor.current_tabpage().ok_or_else(|| {
+            restore_idx(editor, scope, previous_idx);
+            QuickfixError::no_errors()
+        })?;
+        let candidates = editor.tabpage_windows(current_tab).map_err(|error| {
+            restore_idx(editor, scope, previous_idx);
+            QuickfixError::editor(&error)
+        })?;
+        let target = candidates.into_iter().find(|window| {
+            Some(*window) != editor.current_window()
                 && !window_fixed(editor, *window)
                 && editor
                     .window(*window)
-                    .is_ok_and(|state| Some(state.buffer) != quickfix_buffer)
+                    .is_ok_and(|state| !is_list_buffer(editor, state.buffer))
         });
         if let Some(target) = target {
             editor.set_current_window(target).map_err(|error| {
-                restore_idx(editor, previous_idx);
+                restore_idx(editor, scope, previous_idx);
                 QuickfixError::editor(&error)
             })?;
+        } else {
+            restore_idx(editor, scope, previous_idx);
+            return Err(QuickfixError::winfixbuf());
+        }
+    }
+    // `buflist_getfile`→`getfile`→`do_ecmd` (buffer.c:2252-2325,
+    // ex_cmds.c:2239-2306): a named buffer that was never displayed reads
+    // its file now; a failed read still lands in the buffer, empty.
+    if editor
+        .buffer(buffer)
+        .is_ok_and(|state| !state.residency.is_loaded())
+    {
+        let name = editor
+            .buffer(buffer)
+            .map(|state| state.name().to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let text = if name.is_empty() {
+            Buffer::new()
+        } else {
+            io.read_to_string(std::path::Path::new(&name))
+                .ok()
+                .and_then(|text| Buffer::from_bytes(text.as_bytes()).ok())
+                .unwrap_or_default()
+        };
+        if let Ok(state) = editor.buffer_mut(buffer) {
+            state.load(text);
         }
     }
     editor
@@ -1381,7 +1609,7 @@ pub fn jump(
         .text()
         .map_err(|error| QuickfixError::editor(&error))?
         .line_count();
-    let patterned = (item.lnum == 0 && !item.pattern.as_bytes().is_empty())
+    let patterned = (!item.pattern.as_bytes().is_empty())
         .then(|| pattern_position(editor, buffer, &item.pattern))
         .flatten();
     let (lnum, col) = match patterned {
@@ -1509,7 +1737,6 @@ fn list_from_lines(editor: &mut Editor, what: &[DictEntry], lines: &Typval) -> R
     )]))
 }
 
-
 /// The validated 'efm'/'lines' pair consumed by setqflist.
 type EfmLines = (Option<String>, Option<Vec<Typval>>);
 
@@ -1517,9 +1744,7 @@ type EfmLines = (Option<String>, Option<Vec<Typval>>);
 /// invalid value type ('efm' must be a string and 'lines' a list when
 /// present; upstream `qf_setprop_items_from_lines` FAILs → -1
 /// (quickfix.c:6952-6963)). A locked `lines` list raises E742.
-fn efm_and_lines(
-    what: &[DictEntry],
-) -> std::result::Result<Option<EfmLines>, EvalError> {
+fn efm_and_lines(what: &[DictEntry]) -> std::result::Result<Option<EfmLines>, EvalError> {
     let efm_override = match dict_value(what, "efm") {
         None => None,
         Some(Typval::String(value)) => Some(value.to_string_lossy().into_owned()),
@@ -1545,7 +1770,6 @@ fn efm_and_lines(
 mod tests {
     use super::*;
     use crate::{ExExecutor, Geometry};
-
     fn setup() -> (Editor, ExExecutor) {
         let mut editor = Editor::new();
         let buffer = editor
@@ -1563,6 +1787,31 @@ mod tests {
             pair("lnum", Typval::Number(lnum)),
             pair("text", Typval::String(OxStr::from(text))),
         ])
+    }
+
+    /// Quickfix-scope `jump` against real filesystem IO.
+    fn jump(
+        editor: &mut Editor,
+        movement: QuickfixMove,
+        forceit: bool,
+    ) -> std::result::Result<(), QuickfixError> {
+        super::jump(
+            editor,
+            &crate::script::RealFileIO,
+            QfScope::Quickfix,
+            movement,
+            forceit,
+        )
+    }
+
+    /// Quickfix-scope `open`.
+    fn open(editor: &mut Editor) -> std::result::Result<WinHandle, QuickfixError> {
+        super::open(editor, QfScope::Quickfix)
+    }
+
+    /// Quickfix-scope `close`.
+    fn close(editor: &mut Editor) -> std::result::Result<(), QuickfixError> {
+        super::close(editor, QfScope::Quickfix)
     }
 
     #[test]
@@ -2101,10 +2350,11 @@ mod tests {
     }
 
     #[test]
-    fn open_restores_the_quickfix_buffer_in_its_window() {
-        // Review finding: a wiped buffer (or a manual `:buffer` inside the
-        // quickfix window) left `open` focusing a window showing other
-        // content instead of the quickfix buffer.
+    fn open_after_buffer_switch_opens_a_fresh_window() {
+        // Upstream `qf_find_win` (quickfix.c:4130-4140) derives the quickfix
+        // window from what it shows: a window switched to a normal buffer is
+        // no longer a quickfix window, so `:copen` splits a fresh one rather
+        // than stealing the repurposed window back.
         let (mut editor, _) = setup();
         let buffer = editor.current_buffer().unwrap();
         call(
@@ -2119,8 +2369,11 @@ mod tests {
             .set_current_buffer(buffer, BufferRelease::KeepLoaded)
             .unwrap();
         assert_eq!(editor.window(window).unwrap().buffer, buffer);
-        assert_eq!(open(&mut editor).unwrap(), window);
-        assert_eq!(editor.window(window).unwrap().buffer, qf_buffer);
+        let reopened = open(&mut editor).unwrap();
+        assert_ne!(reopened, window);
+        assert_eq!(editor.window(reopened).unwrap().buffer, qf_buffer);
+        // The repurposed window keeps its normal buffer.
+        assert_eq!(editor.window(window).unwrap().buffer, buffer);
     }
 
     #[test]
@@ -2261,5 +2514,406 @@ mod tests {
         let listed = editor.quickfix().current().unwrap();
         let expected: Vec<Vec<u8>> = listed.items().iter().map(format_item).collect();
         assert_eq!(shown, expected);
+    }
+    fn invalid_item(text: &str) -> Typval {
+        // A quickfix entry with no valid location (bufnr=0, lnum=0, no pattern).
+        Typval::dict(vec![pair("text", Typval::String(OxStr::from(text)))])
+    }
+
+    #[test]
+    fn cnext_count_steps_valid_entries() {
+        // Upstream `get_nth_valid_entry` (quickfix.c:2600-2631) counts valid
+        // entries, not raw positions: [V, I, V, V] from the first valid entry
+        // with `:cnext 2` lands on the third valid entry (list index 3).
+        let (mut editor, _) = setup();
+        let buffer = editor.current_buffer().unwrap();
+        call(
+            &mut editor,
+            "setqflist",
+            &[Typval::list(vec![
+                item(buffer, 1, "one"),
+                invalid_item("invalid"),
+                item(buffer, 2, "two"),
+                item(buffer, 3, "three"),
+            ])],
+        )
+        .unwrap();
+        jump(&mut editor, QuickfixMove::Next(2), false).unwrap();
+        assert_eq!(editor.quickfix().current().unwrap().idx(), 4);
+        // `:cprevious 2` from the last valid entry returns to the first.
+        jump(&mut editor, QuickfixMove::Previous(2), false).unwrap();
+        assert_eq!(editor.quickfix().current().unwrap().idx(), 1);
+    }
+
+    #[test]
+    fn setqflist_update_preserves_idx_when_still_valid() {
+        // Upstream setqflist action 'u' keeps the current entry when the
+        // replacement list still has a valid entry at the old index
+        // (qf_add_entries, quickfix.c:6804-6836).
+        let (mut editor, _) = setup();
+        let buffer = editor.current_buffer().unwrap();
+        call(
+            &mut editor,
+            "setqflist",
+            &[
+                Typval::list(vec![]),
+                Typval::String(OxStr::from(" ")),
+                Typval::dict(vec![
+                    pair(
+                        "items",
+                        Typval::list(vec![
+                            item(buffer, 1, "one"),
+                            item(buffer, 2, "two"),
+                            item(buffer, 3, "three"),
+                        ]),
+                    ),
+                    pair("idx", Typval::Number(3)),
+                ]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(editor.quickfix().current().unwrap().idx(), 3);
+        call(
+            &mut editor,
+            "setqflist",
+            &[
+                Typval::list(vec![
+                    item(buffer, 1, "new one"),
+                    item(buffer, 2, "new two"),
+                    item(buffer, 3, "new three"),
+                ]),
+                Typval::String(OxStr::from("u")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(editor.quickfix().current().unwrap().idx(), 3);
+    }
+
+    #[test]
+    fn getqflist_all_on_empty_stack_returns_zeroes() {
+        // Upstream `qf_getprop_default` (quickfix.c:6392-6428) returns 0 for
+        // numeric keys requested on an empty quickfix stack.
+        let (mut editor, _) = setup();
+        let answer = call(
+            &mut editor,
+            "getqflist",
+            &[Typval::dict(vec![pair("all", Typval::Number(1))])],
+        )
+        .unwrap();
+        let Typval::Dict(dict) = answer else {
+            panic!("dict expected")
+        };
+        let entries = &dict.borrow().entries;
+        assert_eq!(dict_value(entries, "id"), Some(&Typval::Number(0)));
+        assert_eq!(dict_value(entries, "idx"), Some(&Typval::Number(0)));
+        assert_eq!(dict_value(entries, "size"), Some(&Typval::Number(0)));
+        assert_eq!(dict_value(entries, "changedtick"), Some(&Typval::Number(0)));
+    }
+
+    #[test]
+    fn parse_items_error_leaves_tail_unmodified() {
+        // `parse_items` must apply any deferred continuations to `fold_tail`
+        // only when the parse succeeds; a locked dict triggers E742.
+        let (mut editor, _) = setup();
+        let buffer = editor.current_buffer().unwrap();
+        call(
+            &mut editor,
+            "setqflist",
+            &[Typval::list(vec![item(buffer, 1, "tail")])],
+        )
+        .unwrap();
+        let reference = {
+            let bad = Typval::dict(vec![]);
+            let Typval::Dict(reference) = &bad else {
+                panic!("dict expected")
+            };
+            reference.clone()
+        };
+        let _guard = reference.borrow_mut();
+        let values = vec![Typval::Dict(reference.clone())];
+        let result = parse_items(&mut editor, QfScope::Quickfix, &values, Some(0));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, "E742");
+        let list = editor.quickfix().current().unwrap();
+        assert_eq!(list.items()[0].text, OxStr::from("tail"));
+    }
+
+    #[test]
+    fn pattern_search_finds_match_at_start_of_first_line() {
+        // Upstream `qf_jump_goto_line` (quickfix.c:3089-3095) searches from
+        // before the first line, so a match at (1, 0) wins.
+        let (mut editor, _) = setup();
+        let buffer = editor
+            .create_buffer_with(Buffer::from_bytes(b"foo foo\nbar").unwrap(), true)
+            .unwrap();
+        call(
+            &mut editor,
+            "setqflist",
+            &[Typval::list(vec![Typval::dict(vec![
+                pair("bufnr", Typval::Number(i64::from(buffer))),
+                pair("pattern", Typval::String(OxStr::from("foo"))),
+                pair("text", Typval::String(OxStr::from("foo foo"))),
+            ])])],
+        )
+        .unwrap();
+        jump(&mut editor, QuickfixMove::Absolute(0), false).unwrap();
+        let cursor = editor
+            .window(editor.current_window().unwrap())
+            .unwrap()
+            .cursor;
+        assert_eq!(cursor, Position { lnum: 1, col: 0 });
+    }
+
+    #[test]
+    fn pattern_wins_over_lnum_when_both_present() {
+        // Upstream `qf_jump_goto_line` (quickfix.c:3068-3097) uses the pattern
+        // when it is present, ignoring lnum.
+        let (mut editor, _) = setup();
+        let buffer = editor
+            .create_buffer_with(Buffer::from_bytes(b"one\ntwo\nthree").unwrap(), true)
+            .unwrap();
+        call(
+            &mut editor,
+            "setqflist",
+            &[Typval::list(vec![Typval::dict(vec![
+                pair("bufnr", Typval::Number(i64::from(buffer))),
+                pair("lnum", Typval::Number(1)),
+                pair("pattern", Typval::String(OxStr::from("two"))),
+                pair("text", Typval::String(OxStr::from("two"))),
+            ])])],
+        )
+        .unwrap();
+        jump(&mut editor, QuickfixMove::Absolute(0), false).unwrap();
+        let cursor = editor
+            .window(editor.current_window().unwrap())
+            .unwrap()
+            .cursor;
+        assert_eq!(cursor, Position { lnum: 2, col: 0 });
+    }
+
+    #[test]
+    fn jump_from_qf_window_fails_without_usable_target() {
+        // Upstream `qf_jump_to_usable_window` (quickfix.c:2898-2945) only
+        // considers windows in the current tabpage; when none is usable the
+        // jump fails with E1513.
+        let (mut editor, _) = setup();
+        let target = editor.current_buffer().unwrap();
+        let pinned_buffer = editor
+            .create_buffer_with(Buffer::from_bytes(b"pinned").unwrap(), true)
+            .unwrap();
+        let other_tab = editor
+            .create_tabpage(target, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let other_window = editor.current_window().unwrap();
+        let _ = editor
+            .create_tabpage(target, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let tab = editor.current_tabpage().unwrap();
+        let original = editor.current_window().unwrap();
+        editor
+            .options_mut()
+            .set_window(original, "winfixbuf", OptionValue::Boolean(true))
+            .unwrap();
+        let qf_window = open(&mut editor).unwrap();
+        let pinned = editor
+            .split_horizontal(tab, qf_window, pinned_buffer, false)
+            .unwrap();
+        editor
+            .options_mut()
+            .set_window(pinned, "winfixbuf", OptionValue::Boolean(true))
+            .unwrap();
+        editor.set_current_window(qf_window).unwrap();
+        call(
+            &mut editor,
+            "setqflist",
+            &[Typval::list(vec![item(target, 1, "entry")])],
+        )
+        .unwrap();
+        let error = jump(&mut editor, QuickfixMove::Absolute(0), false).unwrap_err();
+        assert_eq!(error.code, "E1513");
+        assert_eq!(editor.current_window(), Some(qf_window));
+        assert_eq!(
+            editor.window(qf_window).unwrap().buffer,
+            editor.quickfix().buffer.unwrap()
+        );
+        // The window in the other tab was never chosen.
+        assert_eq!(editor.window_tabpage(other_window).unwrap(), other_tab);
+    }
+
+    #[test]
+    fn winfixbuf_split_targets_the_new_window() {
+        // Upstream `qf_jump_edit_buffer` (quickfix.c:2969-3006) splits a fresh
+        // window when neither current nor previous is free; the new window
+        // carries the jump target.
+        let (mut editor, _) = setup();
+        let target = editor.current_buffer().unwrap();
+        let pinned_buffer = editor
+            .create_buffer_with(Buffer::from_bytes(b"pinned").unwrap(), true)
+            .unwrap();
+        let tab = editor.current_tabpage().unwrap();
+        let first = editor.current_window().unwrap();
+        let second = editor.split_horizontal(tab, first, target, false).unwrap();
+        editor
+            .options_mut()
+            .set_window(first, "winfixbuf", OptionValue::Boolean(true))
+            .unwrap();
+        editor
+            .options_mut()
+            .set_window(second, "winfixbuf", OptionValue::Boolean(true))
+            .unwrap();
+        call(
+            &mut editor,
+            "setqflist",
+            &[Typval::list(vec![item(pinned_buffer, 1, "entry")])],
+        )
+        .unwrap();
+        jump(&mut editor, QuickfixMove::Absolute(0), false).unwrap();
+        assert_eq!(
+            editor
+                .window(editor.current_window().unwrap())
+                .unwrap()
+                .buffer,
+            pinned_buffer
+        );
+        // The previously pinned windows kept their buffer.
+        assert_eq!(editor.window(first).unwrap().buffer, target);
+        assert_eq!(editor.window(second).unwrap().buffer, target);
+    }
+
+    #[test]
+    fn copen_in_second_tab_leaves_first_tabs_window() {
+        // Upstream `qf_find_win` (quickfix.c:4130-4140) scans only the
+        // current tabpage: `:copen` in tab B must not reuse or clobber tab
+        // A's quickfix window, and `:cclose` in B closes only B's window.
+        let (mut editor, _) = setup();
+        let buffer = editor.current_buffer().unwrap();
+        call(
+            &mut editor,
+            "setqflist",
+            &[Typval::list(vec![item(buffer, 1, "one")])],
+        )
+        .unwrap();
+        let tab_a = editor.current_tabpage().unwrap();
+        let window_a = open(&mut editor).unwrap();
+        let qf_buffer = editor.window(window_a).unwrap().buffer;
+
+        // The new tabpage becomes current; its window shows a normal buffer.
+        let tab_b = editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        assert_eq!(editor.current_tabpage(), Some(tab_b));
+        let window_b = open(&mut editor).unwrap();
+        assert_ne!(window_b, window_a);
+        assert_eq!(editor.window(window_b).unwrap().buffer, qf_buffer);
+        // Tab A's quickfix window is untouched.
+        assert_eq!(editor.window_tabpage(window_a).unwrap(), tab_a);
+        assert_eq!(editor.window(window_a).unwrap().buffer, qf_buffer);
+
+        // `:cclose` in B closes only B's window.
+        close(&mut editor).unwrap();
+        assert!(editor.window(window_b).is_err());
+        assert_eq!(editor.window(window_a).unwrap().buffer, qf_buffer);
+    }
+
+    #[test]
+    fn filename_only_entry_loads_the_file_on_jump() {
+        // Upstream `buflist_new` (quickfix.c:2350) creates the entry's
+        // buffer without reading; `buflist_getfile` (buffer.c:2252-2325)
+        // reads the file when the jump lands in it.
+        let (mut editor, _) = setup();
+        let dir = std::env::temp_dir().join(format!("oxvim-qf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("entry.txt");
+        std::fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+        call(
+            &mut editor,
+            "setqflist",
+            &[Typval::list(vec![Typval::dict(vec![
+                pair(
+                    "filename",
+                    Typval::String(OxStr::from(file.to_string_lossy().as_ref())),
+                ),
+                pair("text", Typval::String(OxStr::from("entry"))),
+            ])])],
+        )
+        .unwrap();
+        jump(&mut editor, QuickfixMove::Absolute(0), false).unwrap();
+        let shown =
+            crate::excmd_exec::buffer_lines(&editor, editor.current_buffer().unwrap()).unwrap();
+        assert_eq!(
+            shown,
+            vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()]
+        );
+        let cursor = editor
+            .window(editor.current_window().unwrap())
+            .unwrap()
+            .cursor;
+        assert_eq!(cursor, Position { lnum: 1, col: 0 });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loclists_are_per_window_and_freed_on_close() {
+        // Upstream keeps each window's location list on `w_llist`
+        // (`ll_get_or_alloc_list`, quickfix.c:2127-2145);
+        // `setloclist`/`getloclist` never touch the global quickfix stack,
+        // and `win_free` frees the stack with its window (window.c:5667 →
+        // `qf_free_all`, quickfix.c:1848-1858).
+        let (mut editor, _) = setup();
+        let buffer = editor.current_buffer().unwrap();
+        let window_a = editor.current_window().unwrap();
+        let tab = editor.current_tabpage().unwrap();
+        let window_b = editor
+            .split_horizontal(tab, window_a, buffer, true)
+            .unwrap();
+
+        // Window A gets a location list; the quickfix stack stays empty.
+        editor.set_current_window(window_a).unwrap();
+        call(
+            &mut editor,
+            "setloclist",
+            &[
+                Typval::Number(0),
+                Typval::list(vec![item(buffer, 1, "loc-a")]),
+            ],
+        )
+        .unwrap();
+        let answer = call(&mut editor, "getqflist", &[]).unwrap();
+        let Typval::List(items) = answer else {
+            panic!("list expected")
+        };
+        assert!(items.borrow().items.is_empty());
+
+        // Window B's loclist is independent of A's, and A's is readable by
+        // window id from B.
+        editor.set_current_window(window_b).unwrap();
+        let answer = call(&mut editor, "getloclist", &[Typval::Number(0)]).unwrap();
+        let Typval::List(items) = answer else {
+            panic!("list expected")
+        };
+        assert!(items.borrow().items.is_empty());
+        let answer = call(
+            &mut editor,
+            "getloclist",
+            &[Typval::Number(i64::from(window_a))],
+        )
+        .unwrap();
+        let Typval::List(items) = answer else {
+            panic!("list expected")
+        };
+        assert_eq!(items.borrow().items.len(), 1);
+
+        // Closing A frees its stack; a later getloclist(A) reads as empty.
+        editor.close_window(tab, window_a, true).unwrap();
+        let answer = call(
+            &mut editor,
+            "getloclist",
+            &[Typval::Number(i64::from(window_a))],
+        )
+        .unwrap();
+        let Typval::List(items) = answer else {
+            panic!("list expected")
+        };
+        assert!(items.borrow().items.is_empty());
     }
 }

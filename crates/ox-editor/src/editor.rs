@@ -288,6 +288,9 @@ pub struct Editor {
     arglist: ArgList,
     /// Quickfix history and the current list (`quickfix.c` `ql_info`).
     quickfix: crate::quickfix::QuickfixStack,
+    /// Per-window location list stacks (`quickfix.c` `w_llist`), freed with
+    /// their window (`win_free` → `qf_free_all`, window.c:5667).
+    loclists: std::collections::BTreeMap<WinHandle, crate::quickfix::QuickfixStack>,
     /// Diff-mode state: saved window options and per-tabpage diff blocks
     /// (`diff.c` `w_p_diff_saved` and `tp_first_diff`).
     pub diff: crate::diffmode::DiffState,
@@ -406,6 +409,7 @@ impl Editor {
             global_marks: GlobalMarks::new(),
             jumplist: Jumplist::new(),
             quickfix: crate::quickfix::QuickfixStack::new(),
+            loclists: std::collections::BTreeMap::new(),
             diff: crate::diffmode::DiffState::default(),
             changelists: Changelists::new(),
             arglist: ArgList::new(),
@@ -1734,6 +1738,22 @@ impl Editor {
         &self.quickfix
     }
 
+    /// Returns the location list stack owned by `window`, if it has one
+    /// (`quickfix.c` `GET_LOC_LIST` reading `wp->w_llist`).
+    #[must_use]
+    pub fn loclist(&self, window: WinHandle) -> Option<&crate::quickfix::QuickfixStack> {
+        self.loclists.get(&window)
+    }
+
+    /// Returns the location list stack owned by `window`, allocating one
+    /// when absent (`ll_get_or_alloc_list`, quickfix.c:2127-2145).
+    pub fn loclist_or_alloc_mut(
+        &mut self,
+        window: WinHandle,
+    ) -> &mut crate::quickfix::QuickfixStack {
+        self.loclists.entry(window).or_default()
+    }
+
     /// Returns mutable global quickfix state.
     pub const fn quickfix_mut(&mut self) -> &mut crate::quickfix::QuickfixStack {
         &mut self.quickfix
@@ -2684,6 +2704,7 @@ impl Editor {
             .ok_or(EditorError::UnknownTabpage(tab))?;
         for window in removed.windows() {
             self.windows.remove(&window);
+            self.loclists.remove(&window);
             self.options.remove_window(window);
             if let Ok(state) = removed.window(window)
                 && let Some(buffer_state) = self.buffers.get_mut(&state.buffer)
@@ -2920,6 +2941,9 @@ impl Editor {
             tabpage.close_tiled(window)?
         };
         self.windows.remove(&window);
+        // `win_free` frees the window's location list stack with it
+        // (`qf_free_all`, quickfix.c:1848-1858, window.c:5667).
+        self.loclists.remove(&window);
         self.options.remove_window(window);
         if let Some(buffer_state) = self.buffers.get_mut(&canonical.buffer) {
             buffer_state.detach(keep_buffer_loaded);

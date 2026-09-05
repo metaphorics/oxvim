@@ -3069,7 +3069,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "jumps" => access.with_ex_editor(command_jumps),
         "delmarks" => access.with_ex_editor(|editor| command_delmarks(runtime, editor, command)),
         "cc" | "ll" => {
-            access.with_ex_editor(|editor| command_quickfix_jump(runtime, editor, command, false))
+            access.with_ex_editor(|editor| command_quickfix_jump(runtime, editor, command))
         }
         "cnext" | "lnext" | "cnfile" | "lnfile" | "cbelow" | "lbelow" | "cafter" | "lafter" => {
             access.with_ex_editor(|editor| command_quickfix_next(runtime, editor, command, 1))
@@ -3085,20 +3085,22 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
             access.with_ex_editor(|editor| command_quickfix_last(runtime, editor, command))
         }
         "colder" | "lolder" => {
-            access.with_ex_editor(|editor| command_quickfix_age(runtime, editor, -1))
+            access.with_ex_editor(|editor| command_quickfix_age(runtime, editor, command, -1))
         }
         "cnewer" | "lnewer" => {
-            access.with_ex_editor(|editor| command_quickfix_age(runtime, editor, 1))
+            access.with_ex_editor(|editor| command_quickfix_age(runtime, editor, command, 1))
         }
-        "clist" | "llist" => access.with_ex_editor(|editor| command_quickfix_list(runtime, editor)),
+        "clist" | "llist" => {
+            access.with_ex_editor(|editor| command_quickfix_list(runtime, editor, command))
+        }
         "copen" | "lopen" => {
             access.with_ex_editor(|editor| command_quickfix_open(runtime, editor, command))
         }
         "cclose" | "lclose" => {
-            access.with_ex_editor(|editor| command_quickfix_close(runtime, editor))
+            access.with_ex_editor(|editor| command_quickfix_close(runtime, editor, command))
         }
         "cwindow" | "lwindow" => {
-            access.with_ex_editor(|editor| command_quickfix_window(runtime, editor))
+            access.with_ex_editor(|editor| command_quickfix_window(runtime, editor, command))
         }
         "cexpr" | "cgetexpr" | "laddexpr" | "caddexpr" | "lexpr" | "lgetexpr" | "lcexpr" => {
             command_quickfix_expr(runtime, access, scope, lua, command)
@@ -6690,19 +6692,23 @@ fn jump_to_tag<F: FileIO, E: ExEditorAccess>(
         .and_then(|(_, value)| value.parse::<usize>().ok())
         .unwrap_or(0);
     let mut search_pattern = tag_search_pattern(&chosen.cmd);
-    let (target, guessed) = match crate::tags::cmd_target_from(&lines, &chosen.cmd, start_line) {
-        Some(found) => found,
-        None => match crate::tags::guess_target(&lines, &chosen.name) {
-            Some((position, pattern)) => {
-                search_pattern = Some(pattern);
-                (position, true)
-            }
-            None if chosen.cmd.contains('/') => {
-                return error_flow(runtime, "E434", "Can't find tag pattern");
-            }
-            None => (Position { lnum: 1, col: 0 }, false),
-        },
-    };
+    // `jumpto_tag` starts `do_search` before the `line:` field's line
+    // (tag.c:2812-2818), so that line is examined; `cmd_target_from`'s start
+    // is exclusive, hence the line before it.
+    let (target, guessed) =
+        match crate::tags::cmd_target_from(&lines, &chosen.cmd, start_line.saturating_sub(1)) {
+            Some(found) => found,
+            None => match crate::tags::guess_target(&lines, &chosen.name) {
+                Some((position, pattern)) => {
+                    search_pattern = Some(pattern);
+                    (position, true)
+                }
+                None if chosen.cmd.contains('/') => {
+                    return error_flow(runtime, "E434", "Can't find tag pattern");
+                }
+                None => (Position { lnum: 1, col: 0 }, false),
+            },
+        };
     if guessed {
         scope.replace_pair(
             ScopeKind::Vim,
@@ -16587,25 +16593,37 @@ fn lua_error_flow<F: FileIO>(
     }
 }
 
+/// `is_loclist_cmd` (quickfix.c): the `:l…` variants operate on the current
+/// window's location list stack, the `:c…` variants on the global quickfix
+/// stack. The current-window sentinel resolves to "no stack" (E776) on
+/// read paths when no window exists.
+fn quickfix_scope(editor: &Editor, command_name: &str) -> crate::quickfix::QfScope {
+    if command_name.starts_with('l') {
+        crate::quickfix::QfScope::Loclist(editor.current_window().unwrap_or(WinHandle::CURRENT))
+    } else {
+        crate::quickfix::QfScope::Quickfix
+    }
+}
+
 /// `:cc[!] [nr]` and `:ll[!] [nr]`: display quickfix entry `nr` (default:
 /// the current one) and jump to its file/line (`ex_cc`, quickfix.c).
 fn command_quickfix_jump<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     command: &ExCommand,
-    _location: bool,
 ) -> Flow {
+    let scope = quickfix_scope(editor, command.command.name());
     let number = command.args.trim().parse::<usize>().ok();
     let target = match number {
         Some(number) => QuickfixMove::Absolute(number.saturating_sub(1)),
         None => QuickfixMove::Absolute(
-            editor
-                .quickfix()
-                .current()
+            scope
+                .stack(editor)
+                .and_then(crate::quickfix::QuickfixStack::current)
                 .map_or(0, |list| list.idx().saturating_sub(1)),
         ),
     };
-    match crate::quickfix::jump(editor, target, command.bang) {
+    match crate::quickfix::jump(editor, runtime.scripts.io(), scope, target, command.bang) {
         Ok(()) => Flow::Normal,
         Err(error) => error_flow(runtime, error.code, error.message),
     }
@@ -16630,7 +16648,13 @@ fn command_quickfix_next<F: FileIO>(
         -1 => QuickfixMove::Previous(count),
         _ => QuickfixMove::First,
     };
-    match crate::quickfix::jump(editor, movement, command.bang) {
+    match crate::quickfix::jump(
+        editor,
+        runtime.scripts.io(),
+        quickfix_scope(editor, command.command.name()),
+        movement,
+        command.bang,
+    ) {
         Ok(()) => Flow::Normal,
         Err(error) => error_flow(runtime, error.code, error.message),
     }
@@ -16642,34 +16666,56 @@ fn command_quickfix_last<F: FileIO>(
     editor: &mut Editor,
     command: &ExCommand,
 ) -> Flow {
-    match crate::quickfix::jump(editor, QuickfixMove::Last, command.bang) {
+    match crate::quickfix::jump(
+        editor,
+        runtime.scripts.io(),
+        quickfix_scope(editor, command.command.name()),
+        QuickfixMove::Last,
+        command.bang,
+    ) {
         Ok(()) => Flow::Normal,
         Err(error) => error_flow(runtime, error.code, error.message),
     }
 }
 
-/// `:cope[n] [height]`: open the quickfix window.
+/// `:cope[n] [height]` / `:lope[n]`: open the list window (`ex_copen`).
 fn command_quickfix_open<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
-    _command: &ExCommand,
+    command: &ExCommand,
 ) -> Flow {
-    match crate::quickfix::open(editor) {
+    let scope = quickfix_scope(editor, command.command.name());
+    match crate::quickfix::open(editor, scope) {
         Ok(_) => Flow::Normal,
         Err(error) => error_flow(runtime, error.code, error.message),
     }
 }
 
-/// `:ccl[ose]`: close the quickfix window (`ex_cclose`, quickfix.c).
-fn command_quickfix_close<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> Flow {
-    match crate::quickfix::close(editor) {
+/// `:ccl[ose]` / `:lcl[ose]`: close the list window (`ex_cclose`,
+/// quickfix.c:3852-3865 — `qf_cmd_get_stack` with `print_emsg` false, so a
+/// missing location list is silent).
+fn command_quickfix_close<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    command: &ExCommand,
+) -> Flow {
+    let scope = quickfix_scope(editor, command.command.name());
+    match crate::quickfix::close(editor, scope) {
         Ok(()) => Flow::Normal,
         Err(error) => error_flow(runtime, error.code, error.message),
     }
 }
 
-fn command_quickfix_list<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> Flow {
-    let Some(list) = editor.quickfix().current() else {
+fn command_quickfix_list<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    command: &ExCommand,
+) -> Flow {
+    let scope = quickfix_scope(editor, command.command.name());
+    let Some(stack) = scope.stack(editor) else {
+        return error_flow(runtime, "E776", "No location list");
+    };
+    let Some(list) = stack.current() else {
         return error_flow(runtime, "E42", "No Errors");
     };
     let lines: Vec<String> = list
@@ -16694,24 +16740,38 @@ fn command_quickfix_list<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Edi
 fn command_quickfix_age<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
+    command: &ExCommand,
     delta: i32,
 ) -> Flow {
-    match editor.quickfix_mut().shift_history(delta) {
+    let scope = quickfix_scope(editor, command.command.name());
+    if scope.stack(editor).is_none() {
+        return error_flow(runtime, "E776", "No location list");
+    }
+    match scope.stack_mut(editor).shift_history(delta) {
         Ok(()) => Flow::Normal,
         Err(error) => error_flow(runtime, error.code, error.message),
     }
 }
 
-/// `:cwin[dow]`: open the quickfix window only when the list has entries.
-fn command_quickfix_window<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> Flow {
-    let empty = editor
-        .quickfix()
-        .current()
+/// `:cwin[dow]` / `:lwin[dow]`: open the list window only when the list has
+/// entries (`ex_cwindow`, quickfix.c:3823-3848).
+fn command_quickfix_window<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    command: &ExCommand,
+) -> Flow {
+    let scope = quickfix_scope(editor, command.command.name());
+    if scope.stack(editor).is_none() {
+        return error_flow(runtime, "E776", "No location list");
+    }
+    let empty = scope
+        .stack(editor)
+        .and_then(crate::quickfix::QuickfixStack::current)
         .is_none_or(|list| list.items().is_empty());
-    if empty && editor.quickfix().window().is_none() {
+    if empty && crate::quickfix::find_window(editor, scope).is_none() {
         return Flow::Normal;
     }
-    match crate::quickfix::open(editor) {
+    match crate::quickfix::open(editor, scope) {
         Ok(_) => Flow::Normal,
         Err(error) => error_flow(runtime, error.code, error.message),
     }
@@ -16792,34 +16852,37 @@ fn command_quickfix_file<F: FileIO>(
     command_quickfix_apply(runtime, editor, &items, command.command.name())
 }
 
-/// Applies parsed text or dict entries to the quickfix list: `:cexpr`-family
-/// replaces the list, `:caddexpr`/`:cgetexpr` keep the history slot.
+/// Applies parsed text or dict entries to the command's list: `:cexpr`-family
+/// replaces the list, `:caddexpr`/`:cgetexpr` keep the history slot. The
+/// `:l…` variants target the current window's location list, allocating it
+/// on first use (`qf_cmd_get_or_alloc_stack`, quickfix.c:2173-2184).
 fn command_quickfix_apply<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     items: &[Typval],
     command_name: &str,
 ) -> Flow {
+    let scope = quickfix_scope(editor, command_name);
     let add = command_name.contains("add");
     let action = if add { 'a' } else { ' ' };
     // A leading continuation folds into the current tail only for add
     // commands; replacing commands target a fresh list (upstream `old_last`
     // is NULL there, quickfix.c:1131).
     let fold_tail = if add {
-        editor
-            .quickfix()
-            .current()
+        scope
+            .stack(editor)
+            .and_then(crate::quickfix::QuickfixStack::current)
             .and_then(|list| list.items().last().map(|_| list.items().len() - 1))
     } else {
         None
     };
-    let parsed = match crate::quickfix::parse_items(editor, items, fold_tail) {
+    let parsed = match crate::quickfix::parse_items(editor, scope, items, fold_tail) {
         Ok(parsed) => parsed,
         Err(error) => return error_flow(runtime, error.code, error.message),
     };
-    let stack = editor.quickfix_mut();
+    let stack = scope.stack_mut(editor);
     if action == ' ' {
-        stack.push(OxStr::from(":cexpr"));
+        stack.push(OxStr::from(format!(":{command_name}").as_str()));
     }
     if let Some(list) = stack.current_mut() {
         if action == 'a' {

@@ -1152,8 +1152,7 @@ mod tests {
         // (:984). Line 2 therefore matches OPQ parts only — the `%f:%l:%m`
         // alternative is gated out and the line becomes an invalid entry —
         // while line 3 parses normally after the clear.
-        let (entries, _state, _ctx) =
-            parse_all("%O%rx,%f:%l:%m", &["ax", "f:1:msg", "g:2:ok2"]);
+        let (entries, _state, _ctx) = parse_all("%O%rx,%f:%l:%m", &["ax", "f:1:msg", "g:2:ok2"]);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].lnum, 0);
         assert!(!entries[0].valid);
@@ -1174,7 +1173,6 @@ mod tests {
         assert!(entries[0].valid);
         assert_eq!(ctx.names, ["Xfile1"]);
     }
-
 
     #[test]
     fn column_format() {
