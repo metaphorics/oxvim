@@ -308,6 +308,12 @@ impl TagNeedle {
             if pattern.ends_with('/') {
                 pattern.pop();
             }
+            // Upstream's tag pattern search honors 'ignorecase': the
+            // regmatch takes `rm_ic` from `p_ic` (tag.c:2248-2249) and the
+            // regexp match runs through that regmatch (tag.c:1755-1772).
+            // Inject the case modifier like the regular search path does;
+            // an explicit `\c`/`\C` in the pattern always wins.
+            let pattern = crate::search::pattern_with_case(&pattern, ignorecase);
             return compile_regex(&pattern, Magic::Magic)
                 .ok()
                 .map(Self::Pattern);
@@ -347,98 +353,198 @@ fn sorted_header(text: &str) -> Option<u8> {
     })
 }
 
-fn names_are_sorted(records: &[TagMatch]) -> bool {
-    records
-        .windows(2)
-        .all(|pair| pair[0].name.as_bytes() <= pair[1].name.as_bytes())
+/// Byte-wise sortedness of tag names (the text before the first TAB)
+/// without building records.
+fn names_sorted(text: &str) -> bool {
+    let mut previous: Option<&str> = None;
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with("!_") {
+            continue;
+        }
+        let name = match line.split_once('\t') {
+            Some((name, _)) => name,
+            None => line,
+        };
+        if let Some(previous) = previous
+            && previous.as_bytes() > name.as_bytes()
+        {
+            return false;
+        }
+        previous = Some(name);
+    }
+    true
 }
 
+/// E431 layout gate for the binary path: with empty commands accepted,
+/// `parse_record` rejects only lines with fewer than two TABs, so validate
+/// that without building records (upstream reports E431 from the read loop,
+/// tag.c:2008-2010).
+fn layout_ok(text: &str) -> bool {
+    text.lines()
+        .filter(|line| !line.is_empty() && !line.starts_with("!_"))
+        .all(|line| line.matches('\t').count() >= 2)
+}
+
+/// End offset of the line starting at `start`, excluding the newline.
+fn line_end(bytes: &[u8], start: usize) -> usize {
+    bytes[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(bytes.len(), |offset| start + offset)
+}
+
+/// Containing line of byte `midpoint`, skipping `!_` header lines forward
+/// like `findtags_get_next_line`; `None` past `high` or end of file.
+fn probe_line(bytes: &[u8], midpoint: usize, high: usize) -> Option<(usize, usize)> {
+    let mut start = bytes[..midpoint]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |offset| offset + 1);
+    let mut end = line_end(bytes, start);
+    while bytes[start..end].starts_with(b"!_") {
+        start = end.saturating_add(1);
+        if start >= high || start >= bytes.len() {
+            return None;
+        }
+        end = line_end(bytes, start);
+    }
+    if start >= high || start >= bytes.len() {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Line before byte offset `start` (a line start), or `None` at file start.
+fn preceding_line(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    if start == 0 {
+        return None;
+    }
+    let end = start - 1;
+    let line_start = bytes[..end]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |offset| offset + 1);
+    Some((line_start, end))
+}
+
+/// Line after line-end offset `end`, or `None` past end of file.
+fn following_line(bytes: &[u8], end: usize) -> Option<(usize, usize)> {
+    let start = end.checked_add(1)?;
+    (start < bytes.len()).then_some((start, line_end(bytes, start)))
+}
+
+/// Tag name of a record line: the text before the first TAB.
+fn record_name(line: &[u8]) -> &[u8] {
+    match line.iter().position(|byte| *byte == b'\t') {
+        Some(tab) => &line[..tab],
+        None => line,
+    }
+}
+
+/// Binary-searches a sorted tags file body over raw byte offsets, mirroring
+/// upstream's `TS_BINARY` → `TS_SKIP_BACK` → `TS_STEP_FORWARD` walk (tag.c
+/// 1641-1647, 1672-1688): compare only the probed line's name head
+/// (`strncmp` within `cmplen`, tag.c:1628; a shorter name searches forward,
+/// a longer one backward), then parse only the contiguous run of equal
+/// names, keeping the records the needle accepts.
 fn binary_matches(
     text: &str,
-    records: &[TagMatch],
     needle: &str,
     needle_matcher: &TagNeedle,
     taglength: usize,
     ignorecase: bool,
 ) -> Vec<TagMatch> {
     let bytes = text.as_bytes();
+    let equal = |line: &[u8]| {
+        tag_name_cmp(record_name(line), needle.as_bytes(), taglength, ignorecase)
+            == std::cmp::Ordering::Equal
+    };
     let mut low = 0;
     let mut high = bytes.len();
+    let mut hit = None;
     while low < high {
         let midpoint = low + (high - low) / 2;
-        let mut start = bytes[..midpoint]
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |offset| offset + 1);
-        let mut end = bytes[start..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(bytes.len(), |offset| start + offset);
-        while bytes[start..end].starts_with(b"!_") {
-            start = end.saturating_add(1);
-            if start >= high || start >= bytes.len() {
-                break;
-            }
-            end = bytes[start..]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(bytes.len(), |offset| start + offset);
-        }
-        if start >= high || start >= bytes.len() {
+        let Some((start, end)) = probe_line(bytes, midpoint, high) else {
             if midpoint == low {
                 break;
             }
             high = midpoint;
             continue;
-        }
-        let Ok(line) = str::from_utf8(&bytes[start..end]) else {
-            return Vec::new();
         };
-        let Ok(record) = parse_record(line) else {
-            return Vec::new();
-        };
-        match tag_name_cmp(&record.name, needle, taglength, ignorecase) {
+        let probe = tag_name_cmp(
+            record_name(&bytes[start..end]),
+            needle.as_bytes(),
+            taglength,
+            ignorecase,
+        );
+        match probe {
             std::cmp::Ordering::Less => low = end.saturating_add(1),
             std::cmp::Ordering::Greater => {
                 high = if start == low { midpoint } else { start };
             }
             std::cmp::Ordering::Equal => {
-                return records
-                    .iter()
-                    .filter(|record| needle_matcher.matches(&record.name, taglength, ignorecase))
-                    .cloned()
-                    .collect();
+                hit = Some(start);
+                break;
             }
         }
     }
-    Vec::new()
+    let Some(hit) = hit else {
+        return Vec::new();
+    };
+    // Skip back to the first line of the equal-name run.
+    let mut first = hit;
+    while let Some((start, end)) = preceding_line(bytes, first) {
+        if bytes[start..end].starts_with(b"!_") || !equal(&bytes[start..end]) {
+            break;
+        }
+        first = start;
+    }
+    // Parse only the run, keeping the records the needle accepts.
+    let mut matches = Vec::new();
+    let mut cursor = first;
+    loop {
+        let end = line_end(bytes, cursor);
+        let parsed = str::from_utf8(&bytes[cursor..end])
+            .ok()
+            .and_then(|line| parse_record(line.strip_suffix('\r').unwrap_or(line)).ok())
+            .filter(|record| needle_matcher.matches(&record.name, taglength, ignorecase));
+        if let Some(record) = parsed {
+            matches.push(record);
+        }
+        let Some((start, end)) = following_line(bytes, end) else {
+            break;
+        };
+        if bytes[start..end].starts_with(b"!_") || !equal(&bytes[start..end]) {
+            break;
+        }
+        cursor = start;
+    }
+    matches
 }
 
 fn tag_name_cmp(
-    name: &str,
-    needle: &str,
+    name: &[u8],
+    needle: &[u8],
     taglength: usize,
     ignorecase: bool,
 ) -> std::cmp::Ordering {
-    let left = name.as_bytes();
-    let right = needle.as_bytes();
     let compared = if taglength == 0 {
-        left.len().min(right.len())
+        name.len().min(needle.len())
     } else {
-        taglength.min(left.len()).min(right.len())
+        taglength.min(name.len()).min(needle.len())
     };
     for index in 0..compared {
-        let left_byte = if ignorecase {
-            left[index].to_ascii_lowercase()
+        let left = if ignorecase {
+            name[index].to_ascii_lowercase()
         } else {
-            left[index]
+            name[index]
         };
-        let right_byte = if ignorecase {
-            right[index].to_ascii_lowercase()
+        let right = if ignorecase {
+            needle[index].to_ascii_lowercase()
         } else {
-            right[index]
+            needle[index]
         };
-        match left_byte.cmp(&right_byte) {
+        match left.cmp(&right) {
             std::cmp::Ordering::Equal => {}
             ordering => return ordering,
         }
@@ -446,7 +552,7 @@ fn tag_name_cmp(
     if taglength > 0 {
         std::cmp::Ordering::Equal
     } else {
-        left.len().cmp(&right.len())
+        name.len().cmp(&needle.len())
     }
 }
 
@@ -541,14 +647,21 @@ pub fn lookup_search<F: FileIO>(
         };
         saw_file = true;
         let tag_needle = &needle_matcher;
-        let Ok(records) = parse_records(&text, needle.starts_with('/')) else {
-            return Err(("E431", format!("Format error in tags file \"{file}\"")));
-        };
         let header = sorted_header(&text);
         let use_binary =
             tagbsearch && !ignorecase && !needle.starts_with('/') && header != Some(b'0');
         if use_binary {
-            if header.is_none() && !names_are_sorted(&records) {
+            // Upstream reads and parses tag lines during the binary search
+            // and fully parses only the run of matching lines (tag.c
+            // 1672-1688), so validate the byte layout for E431 and let the
+            // binary walk below parse the matching range alone.
+            if !layout_ok(&text) {
+                return Err(("E431", format!("Format error in tags file \"{file}\"")));
+            }
+            if header.is_none() && !names_sorted(&text) {
+                let Ok(records) = parse_records(&text, false) else {
+                    return Err(("E431", format!("Format error in tags file \"{file}\"")));
+                };
                 let duplicate_matches: Vec<_> = records
                     .iter()
                     .filter(|record| tag_needle.matches(&record.name, taglength, ignorecase))
@@ -562,9 +675,12 @@ pub fn lookup_search<F: FileIO>(
                 continue;
             }
             matches.extend(binary_matches(
-                &text, &records, needle, tag_needle, taglength, ignorecase,
+                &text, needle, tag_needle, taglength, ignorecase,
             ));
         } else {
+            let Ok(records) = parse_records(&text, needle.starts_with('/')) else {
+                return Err(("E431", format!("Format error in tags file \"{file}\"")));
+            };
             matches.extend(
                 records
                     .into_iter()
@@ -618,7 +734,13 @@ pub fn cmd_target(lines: &[Vec<u8>], cmd: &str) -> Option<(Position, bool)> {
     cmd_target_from(lines, cmd, 0)
 }
 
-/// [`cmd_target`] starting at the tags `line:` field (1-based, exclusive start).
+/// [`cmd_target`] searching strictly after `start_line` (1-based, exclusive
+/// start): the hinted line itself is skipped, so a repeat on a later line
+/// wins.
+///
+/// Upstream `jumpto_tag` instead starts `do_search` before the `line:`
+/// field's line (tag.c:2812-2818), so that line is examined; callers
+/// mirroring that pass `start_line - 1`.
 #[must_use]
 pub fn cmd_target_from(
     lines: &[Vec<u8>],
@@ -648,7 +770,7 @@ pub fn cmd_target_from(
     let anchored_end = inner.ends_with('$');
     let needle = inner.strip_prefix('^').unwrap_or(inner);
     let needle = needle.strip_suffix('$').unwrap_or(needle);
-    let start = start_line.saturating_sub(1);
+    let start = start_line;
     if let Some(lnum) = find_line(
         &lines[start.min(lines.len())..],
         needle.as_bytes(),
@@ -739,4 +861,125 @@ fn find_line(
             }
         })
         .map(|index| index + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::fmt::Write as _;
+    use std::io;
+
+    use super::*;
+
+    struct FakeIo {
+        files: HashMap<String, String>,
+    }
+
+    impl FakeIo {
+        fn new(files: &[(&str, String)]) -> Self {
+            Self {
+                files: files
+                    .iter()
+                    .map(|(name, body)| ((*name).to_owned(), body.clone()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl FileIO for FakeIo {
+        fn read_to_string(&self, path: &Path) -> io::Result<String> {
+            self.files
+                .get(&path.to_string_lossy().into_owned())
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing"))
+        }
+
+        fn write_string(&self, _path: &Path, _contents: &str) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "read-only"))
+        }
+
+        fn exists(&self, path: &Path) -> bool {
+            self.files
+                .contains_key(&path.to_string_lossy().into_owned())
+        }
+
+        fn canonicalize(&self, path: &Path) -> PathBuf {
+            path.to_path_buf()
+        }
+    }
+
+    fn lines(text: &[&str]) -> Vec<Vec<u8>> {
+        text.iter().map(|line| line.as_bytes().to_vec()).collect()
+    }
+
+    /// `start_line` is an exclusive start: the hinted line is skipped and a
+    /// repeat on the next line is the hit.
+    #[test]
+    fn cmd_target_from_start_line_is_exclusive() {
+        let text = lines(&["alpha", "needle", "needle again"]);
+        let (position, guessed) = cmd_target_from(&text, "/needle/", 2).expect("hit");
+        assert!(!guessed);
+        assert_eq!(position.lnum, 3);
+        assert_eq!(position.col, 0);
+        // Zero still searches from the first line.
+        let (position, _) = cmd_target_from(&text, "/alpha/", 0).expect("hit");
+        assert_eq!(position.lnum, 1);
+    }
+
+    /// `/pat/` needles honor 'ignorecase' (tag.c:2248-2249) unless the
+    /// pattern carries an explicit `\c`/`\C`.
+    #[test]
+    fn pattern_needle_honors_ignorecase_and_explicit_case() {
+        let io = FakeIo::new(&[("tags", "Foo\tfile.rs\t1\nbar\tfile.rs\t2\n".to_owned())]);
+        let found = lookup_search(&io, "tags", "/foo/", 0, true, false).expect("found");
+        let names: Vec<_> = found.iter().map(|match_| match_.name.as_str()).collect();
+        assert_eq!(names, ["Foo"]);
+        // An explicit \C overrides the option; without it the search stays
+        // case-sensitive.
+        let strict = lookup_search(&io, "tags", "/\\Cfoo/", 0, true, false);
+        assert!(matches!(strict, Err(("E426", _))));
+        let sensitive = lookup_search(&io, "tags", "/foo/", 0, false, false);
+        assert!(matches!(sensitive, Err(("E426", _))));
+    }
+
+    /// The raw-byte binary search over a sorted file finds the same matches
+    /// as the linear path, including duplicate runs and `'taglength'` runs.
+    #[test]
+    fn binary_search_matches_linear_path_on_sorted_file() {
+        let mut body = String::from("!_TAG_FILE_SORTED\t1\t/sorted/\n");
+        for index in 0..2000 {
+            let _ = writeln!(body, "tag{index:04}\tfile_{index}.rs\t{index}");
+            if index == 500 {
+                body.push_str("tag0500\tdup.rs\t7\n");
+            }
+        }
+        let io = FakeIo::new(&[("tags", body)]);
+        let linear = lookup_search(&io, "tags", "tag0500", 0, false, false).expect("found");
+        let binary = lookup_search(&io, "tags", "tag0500", 0, false, true).expect("found");
+        assert_eq!(binary, linear);
+        assert_eq!(binary.len(), 2);
+        // A 'taglength' probe expands to the whole equal-prefix run.
+        let linear = lookup_search(&io, "tags", "tag0999", 4, false, false).expect("found");
+        let binary = lookup_search(&io, "tags", "tag0999", 4, false, true).expect("found");
+        assert_eq!(binary, linear);
+        assert_eq!(binary.len(), 1001);
+        let linear = lookup_search(&io, "tags", "tag1999", 0, false, false).expect("found");
+        let binary = lookup_search(&io, "tags", "tag1999", 0, false, true).expect("found");
+        assert_eq!(binary, linear);
+    }
+
+    /// A sorted file without the sorted header takes the same name-scan gate
+    /// and reaches the same matches through the binary walk.
+    #[test]
+    fn binary_search_without_sorted_header_matches_linear_path() {
+        let mut body = String::new();
+        for index in 0..500 {
+            let _ = writeln!(body, "name{index:03}\tsrc_{index}.rs\t{index}");
+        }
+        let io = FakeIo::new(&[("tags", body)]);
+        let linear = lookup_search(&io, "tags", "name250", 0, false, false).expect("found");
+        let binary = lookup_search(&io, "tags", "name250", 0, false, true).expect("found");
+        assert_eq!(binary, linear);
+        assert_eq!(binary.len(), 1);
+    }
 }
