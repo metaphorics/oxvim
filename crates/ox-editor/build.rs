@@ -1,7 +1,11 @@
 //! Generates option metadata from the authoritative Neovim options table.
+// Build script: panicking fails the build with the generation error, which
+// is the correct outcome; there is no caller to recover on cargo's behalf.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 
@@ -18,8 +22,10 @@ fn generate() -> Result<(), String> {
     let manifest_dir = required_path("CARGO_MANIFEST_DIR")?;
     let source_path = env::var_os("OXVIM_REF_ROOT")
         .map(PathBuf::from)
-        .map(|root| root.join("src/nvim/options.lua"))
-        .unwrap_or_else(|| manifest_dir.join("../../codegen/upstream/options.lua"));
+        .map_or_else(
+            || manifest_dir.join("../../codegen/upstream/options.lua"),
+            |root| root.join("src/nvim/options.lua"),
+        );
     println!("cargo:rerun-if-changed={}", source_path.display());
 
     if !source_path.is_file() {
@@ -33,7 +39,10 @@ fn generate() -> Result<(), String> {
         .map_err(|error| format!("cannot read {}: {error}", source_path.display()))?;
     let options = parse_options(&source)?;
     if options.is_empty() {
-        return Err(format!("no top-level option records found in {}", source_path.display()));
+        return Err(format!(
+            "no top-level option records found in {}",
+            source_path.display()
+        ));
     }
 
     let out_dir = required_path("OUT_DIR")?;
@@ -103,7 +112,7 @@ fn parse_options(source: &str) -> Result<Vec<ParsedOption>, String> {
         if bytes[cursor] == b'{' && has_exact_indent(source, cursor, 4) {
             let close = matching_delimiter(source, cursor, b'{', b'}')?;
             let fields = parse_fields(source, cursor + 1, close)?;
-            options.push(parse_option(fields, options.len() + 1)?);
+            options.push(parse_option(&fields, options.len() + 1)?);
             cursor = close + 1;
         } else {
             cursor = skip_value(source, cursor, table_close)?;
@@ -113,15 +122,18 @@ fn parse_options(source: &str) -> Result<Vec<ParsedOption>, String> {
     Ok(options)
 }
 
-fn parse_option(fields: BTreeMap<String, String>, ordinal: usize) -> Result<ParsedOption, String> {
-    let context = |field: &str| format!("option record {ordinal} is missing or has invalid `{field}`");
+fn parse_option(fields: &BTreeMap<String, String>, ordinal: usize) -> Result<ParsedOption, String> {
+    let context =
+        |field: &str| format!("option record {ordinal} is missing or has invalid `{field}`");
     let name = parse_string(
         fields
             .get("full_name")
             .ok_or_else(|| context("full_name"))?,
     )
     .ok_or_else(|| context("full_name"))?;
-    let short_name = fields.get("abbreviation").and_then(|value| parse_string(value));
+    let short_name = fields
+        .get("abbreviation")
+        .and_then(|value| parse_string(value));
     let aliases = fields
         .get("alias")
         .map(|value| parse_string_list(value))
@@ -138,19 +150,26 @@ fn parse_option(fields: BTreeMap<String, String>, ordinal: usize) -> Result<Pars
 
     let value_type = parse_string(fields.get("type").ok_or_else(|| context("type"))?)
         .ok_or_else(|| context("type"))?;
-    if !matches!(value_type.as_str(), "boolean" | "number" | "string" | "func" | "expr") {
-        return Err(format!("option `{name}` has unsupported type `{value_type}`"));
+    if !matches!(
+        value_type.as_str(),
+        "boolean" | "number" | "string" | "func" | "expr"
+    ) {
+        return Err(format!(
+            "option `{name}` has unsupported type `{value_type}`"
+        ));
     }
 
     let default = parse_default(fields.get("defaults"))?;
     let list = fields.get("list").and_then(|value| parse_string(value));
-    if let Some(kind) = &list {
-        if !matches!(
+    if let Some(kind) = &list
+        && !matches!(
             kind.as_str(),
             "comma" | "onecomma" | "commacolon" | "onecommacolon" | "flags" | "flagscomma"
-        ) {
-            return Err(format!("option `{name}` has unsupported list kind `{kind}`"));
-        }
+        )
+    {
+        return Err(format!(
+            "option `{name}` has unsupported list kind `{kind}`"
+        ));
     }
 
     Ok(ParsedOption {
@@ -161,8 +180,10 @@ fn parse_option(fields: BTreeMap<String, String>, ordinal: usize) -> Result<Pars
         value_type,
         default,
         list,
-        deny_duplicates: fields.get("deny_duplicates").is_some_and(|value| value.trim() == "true"),
-        expand: fields.get("expand").is_some(),
+        deny_duplicates: fields
+            .get("deny_duplicates")
+            .is_some_and(|value| value.trim() == "true"),
+        expand: fields.contains_key("expand"),
     })
 }
 
@@ -180,7 +201,10 @@ fn parse_default(value: Option<&String>) -> Result<ParsedDefault, String> {
     let selected = if conditional {
         let close = matching_delimiter(&raw, 0, b'{', b'}')?;
         let fields = parse_fields(&raw, 1, close)?;
-        let branch = match fields.get("condition").and_then(|value| parse_string(value)) {
+        let branch = match fields
+            .get("condition")
+            .and_then(|value| parse_string(value))
+        {
             Some(condition) if !condition_enabled(&condition)? => "if_false",
             _ => "if_true",
         };
@@ -202,9 +226,12 @@ fn condition_enabled(condition: &str) -> Result<bool, String> {
     let target_family = env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
     match condition {
         "UNIX" => Ok(target_family.split(',').any(|family| family == "unix")),
-        "MSWIN" | "USE_CRNL" | "CASE_INSENSITIVE_FILENAME"
-        | "BACKSLASH_IN_FILENAME" => Ok(target_os == "windows"),
-        other => Err(format!("unsupported options.lua default condition `{other}`")),
+        "MSWIN" | "USE_CRNL" | "CASE_INSENSITIVE_FILENAME" | "BACKSLASH_IN_FILENAME" => {
+            Ok(target_os == "windows")
+        }
+        other => Err(format!(
+            "unsupported options.lua default condition `{other}`"
+        )),
     }
 }
 
@@ -221,6 +248,41 @@ fn parse_literal(value: &str) -> Option<Literal> {
         "macros('DFLT_GREPFORMAT', 'string')" => {
             Some(Literal::String("%f:%l:%m,%f:%l%m,%f  %l%m".to_owned()))
         }
+        // option_vars.h CPO_VIM — gen_opt_test.vim `:set cpo&` needs a literal.
+        "macros('CPO_VIM', 'string')" => Some(Literal::String("aABceFs_".to_owned())),
+        "macros('CTRL_F_STR', 'string')" => Some(Literal::String("\u{6}".to_owned())),
+        "macros('ENC_DFLT', 'string')" => Some(Literal::String("utf-8".to_owned())),
+        "macros('DFLT_ERRORFILE', 'string')" => {
+            Some(Literal::String("errors.err".to_owned()))
+        }
+        "macros('DFLT_FO_VIM', 'string')" => Some(Literal::String("tcqj".to_owned())),
+        "macros('DFLT_GFN', 'string')" => Some(Literal::String(
+            // option_vars.h:43 __linux__ branch
+            "Source Code Pro,DejaVu Sans Mono,Courier New,monospace".to_owned(),
+        )),
+        "macros('DFLT_HELPFILE', 'string')" => {
+            Some(Literal::String("$VIMRUNTIME/doc/help.txt".to_owned()))
+        }
+        "macros('HIGHLIGHT_INIT', 'string')" => Some(Literal::String(
+            // option_vars.h:15-24, concatenated C parts verbatim
+            "8:SpecialKey,~:EndOfBuffer,z:TermCursor,@:NonText,d:Directory,e:ErrorMsg,i:IncSearch,l:Search,y:CurSearch,m:MoreMsg,M:ModeMsg,n:LineNr,a:LineNrAbove,b:LineNrBelow,N:CursorLineNr,G:CursorLineSign,O:CursorLineFold,r:Question,s:StatusLine,S:StatusLineNC,c:VertSplit,t:Title,v:Visual,V:VisualNOS,w:WarningMsg,W:WildMenu,f:Folded,F:FoldColumn,A:DiffAdd,C:DiffChange,D:DiffDelete,T:DiffText,E:DiffTextAdd,>:SignColumn,-:Conceal,B:SpellBad,P:SpellCap,R:SpellRare,L:SpellLocal,+:Pmenu,=:PmenuSel,k:PmenuMatch,<:PmenuMatchSel,[:PmenuKind,]:PmenuKindSel,{:PmenuExtra,}:PmenuExtraSel,x:PmenuSbar,X:PmenuThumb,*:TabLine,#:TabLineSel,_:TabLineFill,!:CursorColumn,.:CursorLine,o:ColorColumn,q:QuickFixLine,z:StatusLineTerm,Z:StatusLineTermNC,g:MsgArea,h:ComplMatchIns,0:Whitespace,I:PreInsert".to_owned(),
+        )),
+        "macros('LISPWORD_VALUE', 'string')" => Some(Literal::String(
+            // option_vars.h:161-162
+            "defun,define,defmacro,set!,lambda,if,case,let,flet,let*,letrec,do,do*,define-syntax,let-syntax,letrec-syntax,destructuring-bind,defpackage,defparameter,defstruct,deftype,defvar,do-all-symbols,do-external-symbols,do-symbols,dolist,dotimes,ecase,etypecase,eval-when,labels,macrolet,multiple-value-bind,multiple-value-call,multiple-value-prog1,multiple-value-setq,prog1,progv,typecase,unless,unwind-protect,when,with-input-from-string,with-open-file,with-open-stream,with-output-to-string,with-package-iterator,define-condition,handler-bind,handler-case,restart-bind,restart-case,with-simple-restart,store-value,use-value,muffle-warning,abort,continue,with-slots,with-slots*,with-accessors,defclass,defmethod,print-unreadable-object".to_owned(),
+        )),
+        "macros('B_IMODE_NONE', 'number')" => Some(Literal::Number(0)),
+        "macros('B_IMODE_USE_INSERT', 'number')" => Some(Literal::Number(-1)),
+        "macros('MAX_MCO', 'number')" => Some(Literal::Number(6)),
+        "macros('TAB', 'number')" => Some(Literal::Number(9)),
+        "macros('DFLT_EFM', 'string')" => Some(Literal::String(
+            // option_vars.h:33-34 DFLT_EFM, byte-verified against
+            // `nvim --cmd 'echo string(&efm)'` (VimL '' un-escaped)
+            r#"%*[^"]"%f"%*\D%l: %m,"%f"%*\D%l: %m,%-Gg%\?make[%*\d]: *** [%f:%l:%m,%-Gg%\?make: *** [%f:%l:%m,%-G%f:%l: (Each undeclared identifier is reported only once,%-G%f:%l: for each function it appears in.),%-GIn file included from %f:%l:%c:,%-GIn file included from %f:%l:%c\,,%-GIn file included from %f:%l:%c,%-GIn file included from %f:%l,%-G%*[ ]from %f:%l:%c,%-G%*[ ]from %f:%l:,%-G%*[ ]from %f:%l\,,%-G%*[ ]from %f:%l,%f:%l:%c:%m,%f(%l):%m,%f:%l:%m,"%f"\, line %l%*\D%c%*[^ ] %m,%D%*\a[%*\d]: Entering directory %*[`']%f',%X%*\a[%*\d]: Leaving directory %*[`']%f',%D%*\a: Entering directory %*[`']%f',%X%*\a: Leaving directory %*[`']%f',%DMaking %*\a in %f,%f|%l| %m"#.to_owned(),
+        )),
+        other if other.starts_with("macros(") => panic!(
+            "unmapped option default macro: {other}; add the literal from option_vars.h/globals.h instead of silently emitting default: None"
+        ),
         _ => parse_string(value)
             .map(Literal::String)
             .or_else(|| value.parse::<i64>().ok().map(Literal::Number)),
@@ -232,12 +294,12 @@ fn parse_string_list(value: &str) -> Vec<String> {
     let mut cursor = 0;
     let bytes = value.as_bytes();
     while cursor < bytes.len() {
-        if matches!(bytes[cursor], b'\'' | b'"') {
-            if let Some((string, end)) = decode_quoted(value, cursor) {
-                strings.push(string);
-                cursor = end;
-                continue;
-            }
+        if matches!(bytes[cursor], b'\'' | b'"')
+            && let Some((string, end)) = decode_quoted(value, cursor)
+        {
+            strings.push(string);
+            cursor = end;
+            continue;
         }
         cursor += 1;
     }
@@ -299,7 +361,11 @@ fn decode_quoted(value: &str, start: usize) -> Option<(String, usize)> {
     None
 }
 
-fn parse_fields(source: &str, start: usize, end: usize) -> Result<BTreeMap<String, String>, String> {
+fn parse_fields(
+    source: &str,
+    start: usize,
+    end: usize,
+) -> Result<BTreeMap<String, String>, String> {
     let bytes = source.as_bytes();
     let mut fields = BTreeMap::new();
     let mut cursor = start;
@@ -394,7 +460,10 @@ fn matching_delimiter(source: &str, open: usize, left: u8, right: u8) -> Result<
         }
         cursor += 1;
     }
-    Err(format!("unterminated `{}` beginning at byte {open}", char::from(left)))
+    Err(format!(
+        "unterminated `{}` beginning at byte {open}",
+        char::from(left)
+    ))
 }
 
 fn skip_trivia(source: &str, mut cursor: usize, end: usize) -> Result<usize, String> {
@@ -416,10 +485,10 @@ fn skip_non_code(source: &str, cursor: usize, end: usize) -> Result<Option<usize
     if matches!(bytes[cursor], b'\'' | b'"') {
         return skip_quoted(source, cursor, end).map(Some);
     }
-    if bytes[cursor] == b'[' {
-        if let Some((equals, content_start)) = long_bracket_open(source, cursor) {
-            return find_long_bracket_close(source, content_start, equals, end).map(Some);
-        }
+    if bytes[cursor] == b'['
+        && let Some((equals, content_start)) = long_bracket_open(source, cursor)
+    {
+        return find_long_bracket_close(source, content_start, equals, end).map(Some);
     }
     if cursor + 1 < end && &bytes[cursor..cursor + 2] == b"--" {
         return skip_comment(source, cursor, end).map(Some);
@@ -445,10 +514,10 @@ fn skip_quoted(source: &str, start: usize, end: usize) -> Result<usize, String> 
 
 fn skip_comment(source: &str, start: usize, end: usize) -> Result<usize, String> {
     let after_marker = start + 2;
-    if after_marker < end {
-        if let Some((equals, content_start)) = long_bracket_open(source, after_marker) {
-            return find_long_bracket_close(source, content_start, equals, end);
-        }
+    if after_marker < end
+        && let Some((equals, content_start)) = long_bracket_open(source, after_marker)
+    {
+        return find_long_bracket_close(source, content_start, equals, end);
     }
     Ok(source[after_marker..end]
         .find('\n')
@@ -496,6 +565,8 @@ fn is_identifier_continue(byte: u8) -> bool {
     is_identifier_start(byte) || byte.is_ascii_digit()
 }
 
+// One linear codegen pass per option; splitting would obscure the output shape.
+#[allow(clippy::too_many_lines)]
 fn render(options: &[ParsedOption]) -> Result<String, String> {
     let mut names = HashMap::<String, String>::new();
     for option in options {
@@ -515,10 +586,12 @@ fn render(options: &[ParsedOption]) -> Result<String, String> {
     );
     for option in options {
         output.push_str("    OptionMetadata {\n");
-        output.push_str(&format!("        name: {:?},\n", option.name));
+        let _ = writeln!(output, "        name: {:?},", option.name);
         output.push_str("        short_name: ");
         match &option.short_name {
-            Some(name) => output.push_str(&format!("Some({name:?}),\n")),
+            Some(name) => {
+                let _ = writeln!(output, "Some({name:?}),");
+            }
             None => output.push_str("None,\n"),
         }
         output.push_str("        aliases: &[");
@@ -526,7 +599,7 @@ fn render(options: &[ParsedOption]) -> Result<String, String> {
             if index > 0 {
                 output.push_str(", ");
             }
-            output.push_str(&format!("{alias:?}"));
+            let _ = write!(output, "{alias:?}");
         }
         output.push_str("],\n        scopes: &[");
         for (index, scope) in option.scopes.iter().enumerate() {
@@ -546,27 +619,32 @@ fn render(options: &[ParsedOption]) -> Result<String, String> {
             "boolean" => "OptionType::Boolean",
             "number" => "OptionType::Number",
             "string" | "func" | "expr" => "OptionType::String",
-            other => return Err(format!("unsupported option type `{other}` during rendering")),
+            other => {
+                return Err(format!(
+                    "unsupported option type `{other}` during rendering"
+                ));
+            }
         });
         output.push_str(",\n        upstream_type: ");
-        output.push_str(&format!("{:?},\n", option.value_type));
+        let _ = writeln!(output, "{:?},", option.value_type);
         output.push_str("        default: OptionDefault { value: ");
         match &option.default.value {
             Some(Literal::Boolean(value)) => {
-                output.push_str(&format!("Some(OptionDefaultValue::Boolean({value}))"));
+                let _ = write!(output, "Some(OptionDefaultValue::Boolean({value}))");
             }
             Some(Literal::Number(value)) => {
-                output.push_str(&format!("Some(OptionDefaultValue::Number({value}))"));
+                let _ = write!(output, "Some(OptionDefaultValue::Number({value}))");
             }
             Some(Literal::String(value)) => {
-                output.push_str(&format!("Some(OptionDefaultValue::String({value:?}))"));
+                let _ = write!(output, "Some(OptionDefaultValue::String({value:?}))");
             }
             None => output.push_str("None"),
         }
-        output.push_str(&format!(
-            ", raw: {:?}, conditional: {}, present: {} }},\n",
+        let _ = writeln!(
+            output,
+            ", raw: {:?}, conditional: {}, present: {} }},",
             option.default.raw, option.default.conditional, option.default.present
-        ));
+        );
         output.push_str("        list: ");
         output.push_str(match option.list.as_deref() {
             None => "None",
@@ -578,14 +656,19 @@ fn render(options: &[ParsedOption]) -> Result<String, String> {
             Some("flagscomma") => "Some(OptionListKind::FlagsComma)",
             Some(other) => return Err(format!("unsupported list kind `{other}` during rendering")),
         });
-        output.push_str(&format!(
-            ",\n        deny_duplicates: {},\n        expand: {},\n    }},\n",
+        let _ = writeln!(
+            output,
+            ",\n        deny_duplicates: {},\n        expand: {},\n    }},",
             option.deny_duplicates, option.expand
-        ));
+        );
     }
     output.push_str("];\n\n/// Number of generated upstream options.\npub const OPTION_COUNT: usize = OPTION_METADATA.len();\n\n");
     output.push_str(
-        "/// Looks up option metadata by canonical name, abbreviation, or alias.\npub fn option_metadata(name: &str) -> Option<&'static OptionMetadata> {\n    match name {\n",
+        "/// Looks up option metadata by canonical name, abbreviation, or alias.\n\
+         // Generated match arms are a flat data table; line count is inherent.\n\
+         #[must_use]\n\
+         #[allow(clippy::too_many_lines)]\n\
+         pub fn option_metadata(name: &str) -> Option<&'static OptionMetadata> {\n    match name {\n",
     );
     for (index, option) in options.iter().enumerate() {
         let mut option_names = Vec::with_capacity(2 + option.aliases.len());
@@ -599,9 +682,9 @@ fn render(options: &[ParsedOption]) -> Result<String, String> {
             if name_index > 0 {
                 output.push_str(" | ");
             }
-            output.push_str(&format!("{name:?}"));
+            let _ = write!(output, "{name:?}");
         }
-        output.push_str(&format!(" => Some(&OPTION_METADATA[{index}]),\n"));
+        let _ = writeln!(output, " => Some(&OPTION_METADATA[{index}]),");
     }
     output.push_str("        _ => None,\n    }\n}\n");
     Ok(output)
