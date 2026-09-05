@@ -293,7 +293,7 @@ fn parse_record(line: &str) -> Result<TagMatch, ()> {
 
 /// A tag needle compiled once per search: a `/pattern/` needle holds its
 /// regex program (upstream `search_regcomp` before the record loop, tag.c
-/// find_tags), a literal needle holds its case-folded form.
+/// `find_tags`), a literal needle holds its case-folded form.
 enum TagNeedle {
     Pattern(ox_regex::Prog),
     Literal(String),
@@ -539,6 +539,7 @@ pub fn lookup_search<F: FileIO>(
         let Ok(text) = io.read_to_string(path) else {
             continue;
         };
+        saw_file = true;
         let tag_needle = &needle_matcher;
         let Ok(records) = parse_records(&text, needle.starts_with('/')) else {
             return Err(("E431", format!("Format error in tags file \"{file}\"")));
