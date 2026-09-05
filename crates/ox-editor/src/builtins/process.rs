@@ -2,12 +2,14 @@
 //! `system`/`systemlist` (upstream `eval/funcs.c`, `channel.c`).
 
 use crate::excmd_exec::ExEditorAccess;
+use crate::job::DEFAULT_PTY_SIZE;
 use crate::options::OptionValue;
 use crate::script::FileIO;
 use crate::{Editor, JobCallbacks, JobEvent, JobManager, JobStartOptions};
 use ox_eval::EvalError;
 use ox_eval::Scope;
 use ox_types::{OxStr, Special, Typval};
+use ox_uv::process::PtySize;
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -160,18 +162,59 @@ fn split_shell_words(text: &str) -> Vec<String> {
     text.split_whitespace().map(str::to_owned).collect()
 }
 
+/// The current window's `(columns, rows)` a pty job inherits, `(0, 0)` when
+/// there is no window. `f_jobstart` reads `curwin` for a `term` job
+/// (eval/funcs.c:3505-3506): `w_view_width - win_col_off` by
+/// `w_view_height`. This port models no `win_col_off`, so the frame width is
+/// the text width.
+fn current_window_pty_extent(editor: &Editor) -> (usize, usize) {
+    editor.current_window().map_or((0, 0), |window| {
+        (
+            editor
+                .window_geometry(window)
+                .map_or(0, |geometry| geometry.width),
+            editor.window_text_height(window).unwrap_or(0),
+        )
+    })
+}
+
+/// One pty dimension: `channel_job_start` keeps the `pty_proc_init` default
+/// for a zero extent (channel.c:394-398).
+fn pty_dimension(extent: usize, fallback: u16) -> u16 {
+    if extent == 0 {
+        fallback
+    } else {
+        u16::try_from(extent).unwrap_or(u16::MAX)
+    }
+}
+
 fn call_job_start<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     shell: &[String],
     args: &[Typval],
 ) -> ox_eval::Result<Typval> {
-    let options = normalize_job_options(shell, args)?;
+    let mut options = normalize_job_options(shell, args)?;
     let id = runtime.channel_ids.allocate();
     let Ok(result_id) = i64::try_from(id) else {
         return Ok(Typval::Number(-1));
     };
     let wants_pty = options.pty;
+    // A pty job inherits the current window's geometry: upstream sizes a
+    // `term` job's pty from `curwin` (`f_jobstart`, eval/funcs.c:3505-3506)
+    // and keeps the `pty_proc_init` default for each dimension left at zero
+    // (channel.c:394-398). Every pty channel here owns a terminal buffer, so
+    // a bare `jobstart(..., {'pty': v:true})` takes the same window default.
+    let window_rows = if wants_pty {
+        let (columns, rows) = access.with_ex_editor(|editor| current_window_pty_extent(editor));
+        options.pty_size = PtySize {
+            columns: pty_dimension(columns, DEFAULT_PTY_SIZE.columns),
+            rows: pty_dimension(rows, DEFAULT_PTY_SIZE.rows),
+        };
+        rows
+    } else {
+        0
+    };
     let mut manager = match runtime.jobs.take() {
         Some(manager) => manager,
         None => match JobManager::new() {
@@ -187,17 +230,7 @@ fn call_job_start<F: FileIO, E: ExEditorAccess>(
         // A `:terminal` buffer is pre-sized to the viewport it opens in
         // (`terminal.c` `topts.height = curwin->w_view_height`); a bare pty
         // job's buffer stays single-row.
-        let rows = if term {
-            access.with_ex_editor(|editor| {
-                editor
-                    .current_window()
-                    .and_then(|window| editor.window_text_height(window).ok())
-                    .filter(|rows| *rows > 0)
-                    .unwrap_or(1)
-            })
-        } else {
-            1
-        };
+        let rows = if term { window_rows.max(1) } else { 1 };
         let terminal =
             access.with_ex_editor(
                 |editor| match editor.allocate_terminal_buffer_rows(id, rows) {
@@ -311,6 +344,7 @@ fn run_shell_command<F: FileIO>(
         detached: false,
         pty: false,
         term: false,
+        pty_size: DEFAULT_PTY_SIZE,
         rpc: false,
         stdin_pipe: true,
         stdout_buffered: true,
@@ -456,6 +490,7 @@ fn normalize_job_options(shell: &[String], args: &[Typval]) -> ox_eval::Result<J
         detached,
         pty,
         term,
+        pty_size: DEFAULT_PTY_SIZE,
         rpc,
         stdin_pipe,
         stdout_buffered,
@@ -618,7 +653,7 @@ fn value_bool(value: &Typval) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
 
-    use crate::{Editor, ExExecutor, TestEditorAccess};
+    use crate::{Editor, ExExecutor, Geometry, TestEditorAccess};
     use ox_eval::Scope;
     use ox_types::Typval;
 
@@ -685,5 +720,101 @@ mod tests {
             global_flag(exec.scope(), "exit_seen"),
             "chansend poll must deliver on_exit event"
         );
+    }
+
+    /// Polls the job's pty until the child's `stty size` answer arrives.
+    /// `stty size` prints "rows columns" of its controlling terminal — the
+    /// winsize the pty was spawned with, read back from inside the child.
+    /// The terminal exit message shares the stream, so the answer is the
+    /// one line that parses as two numbers.
+    fn pty_size_seen_by_child(exec: &mut ExExecutor, job: i64) -> Option<(u16, u16)> {
+        let mut output = Vec::new();
+        for _ in 0..100 {
+            if let Ok(bytes) = exec.take_pty_output(u64::try_from(job).unwrap()) {
+                output.extend_from_slice(&bytes);
+            }
+            for line in String::from_utf8_lossy(&output).split(['\r', '\n']) {
+                let mut parts = line.split(' ');
+                if let (Some(rows), Some(columns), None) = (
+                    parts.next().and_then(|part| part.parse::<u16>().ok()),
+                    parts.next().and_then(|part| part.parse::<u16>().ok()),
+                    parts.next(),
+                ) {
+                    return Some((rows, columns));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        None
+    }
+
+    // `f_jobstart` sizes a `term` job's pty from the current window
+    // (eval/funcs.c:3505-3506): a 120x40 window has 39 text rows (the
+    // message row is reserved), so the child must see "39 120".
+    #[test]
+    fn terminal_job_pty_matches_the_window_geometry() {
+        let _guard = crate::PROCESS_STATE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 120, 40).unwrap())
+            .unwrap();
+        let editor = TestEditorAccess::new(editor);
+        let mut exec = ExExecutor::new();
+        exec.execute_script(
+            &editor,
+            "<test>",
+            "let g:job = jobstart(['sh', '-c', 'stty size'], {'term': v:true})",
+        )
+        .unwrap();
+        let job = global_number(exec.scope(), "job").unwrap();
+        assert_eq!(pty_size_seen_by_child(&mut exec, job), Some((39, 120)));
+    }
+
+    // A bare `jobstart(..., {'pty': v:true})` takes the same window default:
+    // every pty channel here owns a terminal buffer, so the pty is sized to
+    // the window it can be displayed in.
+    #[test]
+    fn bare_pty_jobstart_uses_the_window_geometry() {
+        let _guard = crate::PROCESS_STATE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 120, 40).unwrap())
+            .unwrap();
+        let editor = TestEditorAccess::new(editor);
+        let mut exec = ExExecutor::new();
+        exec.execute_script(
+            &editor,
+            "<test>",
+            "let g:job = jobstart(['sh', '-c', 'stty size'], {'pty': v:true})",
+        )
+        .unwrap();
+        let job = global_number(exec.scope(), "job").unwrap();
+        assert_eq!(pty_size_seen_by_child(&mut exec, job), Some((39, 120)));
+    }
+
+    // With no window to inherit from, each dimension keeps the
+    // `pty_proc_init` 80x24 default (channel.c:394-398,
+    // os/pty_proc_unix.c:460-461).
+    #[test]
+    fn pty_jobstart_without_a_window_keeps_the_default_size() {
+        let _guard = crate::PROCESS_STATE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        exec.execute_script(
+            &editor,
+            "<test>",
+            "let g:job = jobstart(['sh', '-c', 'stty size'], {'pty': v:true})",
+        )
+        .unwrap();
+        let job = global_number(exec.scope(), "job").unwrap();
+        assert_eq!(pty_size_seen_by_child(&mut exec, job), Some((24, 80)));
     }
 }

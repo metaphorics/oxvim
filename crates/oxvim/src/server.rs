@@ -87,16 +87,20 @@ impl JobChannelSink {
     }
 }
 
-/// A failed job-channel write reports through the message system instead of
-/// vanishing: queued sends run after `send` returned, so there is no caller
-/// left to receive the error (upstream logs channel write failures).
+/// A failed or missing job-channel write reports through the message system
+/// instead of vanishing: queued sends run after `send` returned, so there is
+/// no caller left to receive the result (upstream logs channel write
+/// failures). `Ok(false)` means the channel no longer exists, e.g. the job
+/// exited while terminal metadata is still alive.
 fn report_job_send(session: &Rc<ApiSession>, sent: Result<bool, String>, channel: u64) {
-    if let Err(error) = sent {
-        let message = format!("channel {channel} write failed: {error}");
-        session.with_editor_mut(|editor| {
-            ox_editor::excmd_exec::push_text_message(editor, message, true, true);
-        });
-    }
+    let message = match sent {
+        Ok(true) => return,
+        Ok(false) => format!("channel {channel} write failed: channel does not exist"),
+        Err(error) => format!("channel {channel} write failed: {error}"),
+    };
+    session.with_editor_mut(|editor| {
+        ox_editor::excmd_exec::push_text_message(editor, message, true, true);
+    });
 }
 
 impl ox_api::ChannelSink for JobChannelSink {
@@ -1579,18 +1583,11 @@ pub fn run_listener(cli: &Cli, address: &str, timer: &mut StartupTimer) -> Resul
                 .map_or("/tmp", String::as_str),
         );
         // A bare temp dir is world-writable: never place a generated listen
-        // socket there directly. Upstream falls back to a uid-owned 0700
-        // tempdir and validates ownership and mode before use
-        // (msgpack_rpc/server.c:116-136 via os/fileio.c:3340-3363).
-        #[cfg(unix)]
-        if directory == std::env::temp_dir() {
-            directory = std::env::temp_dir().join(format!("oxvim.{}", user_id()));
-            make_private_listen_directory(&directory)?;
-        } else {
-            make_listen_directory(&directory)?;
-        }
-        #[cfg(not(unix))]
-        make_listen_directory(&directory)?;
+        // socket there directly. Upstream validates its uid-owned 0700 tempdir
+        // (`/tmp/nvim.<user>`, os/fileio.c:3340-3363) but uses $XDG_RUNTIME_DIR
+        // as-is (msgpack_rpc/server.c:126; os/stdpaths.c:182-186). Apply the
+        // same checks and fall back to the private tempdir if they fail.
+        directory = ensure_listen_directory(&directory)?;
         expanded = directory.join(name).to_string_lossy().into_owned();
         expanded.as_str()
     };
@@ -1725,33 +1722,45 @@ fn user_id() -> u32 {
     ox_sys::current_euid()
 }
 
+/// Checks whether `directory` is a uid-owned 0700 directory, the same
+/// validation upstream applies to `/tmp/nvim.<user>` (os/fileio.c
+/// :3340-3363).
+#[cfg(unix)]
+fn listen_directory_is_private(directory: &std::path::Path) -> bool {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let Ok(metadata) = std::fs::metadata(directory) else {
+        return false;
+    };
+    let mode = metadata.permissions().mode() & 0o777;
+    metadata.is_dir() && user_id() == metadata.uid() && mode == 0o700
+}
+
 /// Creates (or accepts) `directory` as a uid-owned 0700 dir, mirroring
 /// upstream's tempdir validation (`os_mkdir(tmp, 0700)`; valid only while
 /// owned by this uid with mode exactly 0700, os/fileio.c:3340-3363).
 #[cfg(unix)]
 fn make_private_listen_directory(directory: &std::path::Path) -> Result<(), AppError> {
-    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-
-    use std::os::unix::fs::MetadataExt as _;
-    match std::fs::metadata(directory) {
-        Ok(metadata) => {
-            let mode = metadata.permissions().mode() & 0o777;
-            let owned = user_id() == metadata.uid();
-            if !metadata.is_dir() || !owned || mode != 0o700 {
-                return Err(AppError::Server(format!(
-                    "refusing listen directory {}: not a uid-owned 0700 directory",
-                    directory.display()
-                )));
-            }
-        }
-        Err(_) => {
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(directory)
-                .map_err(|error| {
-                    AppError::Server(format!("cannot create private listen directory: {error}"))
-                })?;
-        }
+    use std::os::unix::fs::DirBuilderExt as _;
+    if listen_directory_is_private(directory) {
+        return Ok(());
+    }
+    if directory.exists() {
+        return Err(AppError::Server(format!(
+            "refusing listen directory {}: not a uid-owned 0700 directory",
+            directory.display()
+        )));
+    }
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(directory)
+        .map_err(|error| {
+            AppError::Server(format!("cannot create private listen directory: {error}"))
+        })?;
+    if !listen_directory_is_private(directory) {
+        return Err(AppError::Server(format!(
+            "refusing listen directory {}: not a uid-owned 0700 directory",
+            directory.display()
+        )));
     }
     Ok(())
 }
@@ -1774,6 +1783,45 @@ fn make_listen_directory(directory: &std::path::Path) -> Result<(), AppError> {
     builder
         .create(directory)
         .map_err(|error| AppError::Server(format!("cannot create listen directory: {error}")))
+}
+
+/// Returns a validated directory for a generated listen socket. On Unix this
+/// is `directory` when it is a uid-owned 0700 directory; if it does not
+/// exist it is created with 0700 and re-checked. If the candidate is the
+/// platform temp dir, or if it exists but is not private, fall back to a
+/// uid-qualified `oxvim.<uid>` directory under the temp dir and validate
+/// Upstream validates the fallback tempdir (`/tmp/nvim.<user>`)
+/// (`os/fileio.c:3340-3363`) but uses an explicit `$XDG_RUNTIME_DIR`
+/// unvalidated (`msgpack_rpc/server.c:126` via `os/stdpaths.c:182-186`),
+/// so the XDG check is defense-in-depth.
+fn ensure_listen_directory(directory: &std::path::Path) -> Result<std::path::PathBuf, AppError> {
+    #[cfg(unix)]
+    {
+        let temp_dir = std::env::temp_dir();
+        let fallback = || temp_dir.join(format!("oxvim.{}", user_id()));
+        let candidate = if directory == temp_dir {
+            fallback()
+        } else {
+            directory.to_path_buf()
+        };
+        if listen_directory_is_private(&candidate) {
+            return Ok(candidate);
+        }
+        if !candidate.exists() {
+            make_listen_directory(&candidate)?;
+            if listen_directory_is_private(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        let fallback = fallback();
+        make_private_listen_directory(&fallback)?;
+        Ok(fallback)
+    }
+    #[cfg(not(unix))]
+    {
+        make_listen_directory(directory)?;
+        Ok(directory.to_path_buf())
+    }
 }
 
 #[allow(dead_code)]
@@ -3592,6 +3640,34 @@ mod tests {
     #[test]
     #[expect(
         clippy::unwrap_used,
+        reason = "the test requires a non-existent channel send to succeed"
+    )]
+    fn job_channel_sink_missing_channel_reports_message() {
+        let session = Rc::new(ApiSession::new(Rc::new(RefCell::new(Editor::new()))));
+        let ex = Rc::new(RefCell::new(ox_editor::ExExecutor::new()));
+        let queue = Rc::new(RefCell::new(VecDeque::new()));
+        let deferred = Rc::new(Cell::new(0));
+        let mut sink = JobChannelSink {
+            session: session.clone(),
+            ex,
+            queue,
+            deferred,
+        };
+        // A channel id with no running job: job_send returns Ok(false), which
+        // must surface through the message system.
+        ox_api::ChannelSink::send(&mut sink, 12345, b"stale send\n").unwrap();
+        let reported = session.with_editor(|editor| {
+            editor
+                .messages()
+                .iter()
+                .any(|m| format!("{:?}", m.content).contains("channel 12345 write failed"))
+        });
+        assert!(reported, "missing job-channel write must report a message");
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
         reason = "the test requires editor and Lua dispatch setup to succeed"
     )]
     fn lua_autocmd_once_runs_on_live_editor() {
@@ -3821,5 +3897,46 @@ mod tests {
         let owned = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&path).unwrap());
         std::fs::remove_file(&path).unwrap();
         assert_eq!(user_id(), owned);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "temp-directory fixture must succeed")]
+    fn listen_directory_falls_back_from_untrusted_xdg_runtime() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!("oxvim-listen-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::DirBuilder::new().recursive(true).create(&root).unwrap();
+
+        // A world-writable XDG_RUNTIME_DIR candidate must be rejected in
+        // favor of the validated /tmp/oxvim.<uid> fallback.
+        let xdg_bad = root.join("xdg_bad");
+        std::fs::create_dir(&xdg_bad).unwrap();
+        std::fs::set_permissions(&xdg_bad, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let chosen = ensure_listen_directory(&xdg_bad).unwrap();
+        let expected = std::env::temp_dir().join(format!("oxvim.{}", user_id()));
+        assert_eq!(
+            chosen, expected,
+            "loose XDG runtime dir must fall back to private temp dir"
+        );
+
+        // A missing, valid XDG candidate is created with 0700 and used.
+        let xdg_good = root.join("xdg_good");
+        let chosen = ensure_listen_directory(&xdg_good).unwrap();
+        assert_eq!(
+            chosen, xdg_good,
+            "valid XDG runtime dir should be created and used"
+        );
+        let metadata = std::fs::metadata(&xdg_good).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o700,
+            "created XDG runtime dir must be 0700"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir(&expected);
     }
 }

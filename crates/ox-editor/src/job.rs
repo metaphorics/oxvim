@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ox_types::{DictRef, OxStr, Typval};
-use ox_uv::process::{self, Process, ProcessPipe, SpawnOptions, StdioConfig};
 #[cfg(unix)]
-use ox_uv::process::{PtyHandle, PtySize};
+use ox_uv::process::PtyHandle;
+use ox_uv::process::{self, Process, ProcessPipe, PtySize, SpawnOptions, StdioConfig};
 use ox_uv::{NetEvent, UvLoop};
 
 /// Callback values and their dictionary receiver from `jobstart()` options.
@@ -24,6 +24,13 @@ pub struct JobCallbacks {
     /// Process-exit callback.
     pub exit: Option<Typval>,
 }
+
+/// `pty_proc_init` geometry (os/pty_proc_unix.c:460-461): the size each pty
+/// dimension keeps when `jobstart` supplies none (channel.c:394-398).
+pub const DEFAULT_PTY_SIZE: PtySize = PtySize {
+    columns: 80,
+    rows: 24,
+};
 
 /// Normalized options for one child process.
 #[expect(
@@ -45,6 +52,9 @@ pub struct JobStartOptions {
     pub pty: bool,
     /// Whether the pseudoterminal backs a `:terminal` buffer.
     pub term: bool,
+    /// Geometry a `pty` spawn opens with: the current window's text area
+    /// when the caller supplied one, else [`DEFAULT_PTY_SIZE`].
+    pub pty_size: PtySize,
     /// Whether the channel carries msgpack-rpc.
     pub rpc: bool,
     /// Whether stdin is connected to a writable pipe.
@@ -203,16 +213,9 @@ impl JobManager {
 
         #[cfg(unix)]
         let (process, input, stdout_pipe, stderr_pipe) = if options.pty {
-            let mut spawned = process::spawn_pty(
-                &mut self.loop_,
-                spawn_options,
-                PtySize {
-                    columns: 80,
-                    rows: 24,
-                },
-                on_exit,
-            )
-            .map_err(|error| error.to_string())?;
+            let mut spawned =
+                process::spawn_pty(&mut self.loop_, spawn_options, options.pty_size, on_exit)
+                    .map_err(|error| error.to_string())?;
             let output_queue = Arc::clone(&self.raw);
             spawned
                 .master
@@ -736,6 +739,7 @@ mod tests {
             detached: false,
             pty: false,
             term: false,
+            pty_size: DEFAULT_PTY_SIZE,
             rpc: false,
             stdin_pipe: true,
             stdout_buffered: buffered,
@@ -906,6 +910,35 @@ mod tests {
         assert!(jobs.send(3, b"hello\n".to_vec()).unwrap());
         let (status, _) = jobs.wait(&[3], 2_000).unwrap();
         assert_eq!(status, vec![0]);
+    }
+
+    // `spawn_pty` must open the pty at the caller's geometry, not a fixed
+    // 80x24: `f_jobstart` sizes a `term` job's pty from `curwin`
+    // (eval/funcs.c:3505-3506) and `channel_job_start` keeps the
+    // `pty_proc_init` default only for a dimension left at zero
+    // (channel.c:394-398). `get_size` reads the kernel winsize back, so
+    // this asserts the size the child was actually born with.
+    #[test]
+    fn pty_spawn_uses_the_requested_size() {
+        let mut jobs = JobManager::new().unwrap();
+        let mut pty = options("cat", true);
+        pty.pty = true;
+        pty.pty_size = PtySize {
+            columns: 100,
+            rows: 40,
+        };
+        jobs.start(3, pty).unwrap();
+        let size = match jobs.jobs.get(&3).and_then(|job| job.input.as_ref()) {
+            Some(JobInput::Pty(master)) => master.get_size().unwrap(),
+            _ => panic!("pty job has no pty input"),
+        };
+        assert_eq!(
+            size,
+            PtySize {
+                columns: 100,
+                rows: 40
+            }
+        );
     }
 
     #[test]
