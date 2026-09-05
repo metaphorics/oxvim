@@ -612,7 +612,10 @@ impl NamespaceState {
     ///
     /// Incremental callers use this instead of `rebuild_index` so marks
     /// whose start position did not move keep their entries across a
-    /// splice.
+    /// splice. Callers must finish every geometry change before draining
+    /// any entry: `by_position` still holds each relocated mark's old key
+    /// until this runs. Crossing relocations are safe in any order,
+    /// because each id is removed from its own set.
     fn move_index(&mut self, old: ExtmarkPosition, new: ExtmarkPosition, id: ExtmarkId) {
         self.remove_index(old, id);
         self.insert_index(new, id);

@@ -1807,3 +1807,78 @@ fn extmark_splice_undo_redo_keep_position_index_at_range_edges() {
     assert_eq!(rows_in(&marks, 0, 3), vec![0, 1, 2]);
     assert_eq!(rows_in(&marks, 4, 4), vec![4]);
 }
+
+#[test]
+fn extmark_splice_moves_index_entries_without_rebuild() {
+    // Few-relocated shape: 2 of 100 marks move, so `reconcile_index`
+    // takes the incremental branch (`2 * 2 < 100`) in every namespace.
+    // The fallback-covering test above never executes `move_index`; this
+    // one fails if a relocated entry is dropped or left at its old key.
+    // Per-namespace `query` walks `by_position`, so stale entries fail
+    // the edge queries (`query_all` scans `by_id` and cannot see them).
+    let mut marks = crate::Extmarks::new();
+    let settled = marks.create_namespace("few-settled").unwrap();
+    let shifted = marks.create_namespace("few-shifted").unwrap();
+    for row in 0..50 {
+        marks
+            .set(
+                settled,
+                None,
+                crate::extmark::ExtmarkPlacement::new(crate::extmark::ExtmarkPosition::new(row, 0)),
+            )
+            .unwrap();
+        marks
+            .set(
+                shifted,
+                None,
+                crate::extmark::ExtmarkPlacement::new(crate::extmark::ExtmarkPosition::new(
+                    row + 50,
+                    0,
+                )),
+            )
+            .unwrap();
+    }
+    let rows_in = |marks: &crate::Extmarks,
+                   namespace: crate::extmark::NamespaceId,
+                   first_row: usize,
+                   last_row: usize|
+     -> Vec<usize> {
+        marks
+            .query(
+                namespace,
+                crate::extmark::ExtmarkPosition::new(first_row, 0),
+                crate::extmark::ExtmarkPosition::new(last_row, 0),
+                None,
+            )
+            .unwrap()
+            .iter()
+            .map(|mark| mark.position().row)
+            .collect()
+    };
+    // Newline insertion at row 98 rides rows 98-99 down one row each.
+    let (_, undo) = marks.splice_recording(crate::extmark::TextSplice {
+        start: crate::extmark::ExtmarkPosition::new(98, 0),
+        old_extent: crate::extmark::TextExtent::EMPTY,
+        new_extent: crate::extmark::TextExtent::new(1, 0),
+    });
+    assert_eq!(
+        rows_in(&marks, shifted, 0, 98),
+        (50..=97).collect::<Vec<_>>()
+    );
+    assert_eq!(rows_in(&marks, shifted, 99, 100), vec![99, 100]);
+    assert_eq!(
+        rows_in(&marks, settled, 0, 49),
+        (0..=49).collect::<Vec<_>>()
+    );
+    marks.undo_splice(&undo);
+    assert_eq!(
+        rows_in(&marks, shifted, 0, 98),
+        (50..=98).collect::<Vec<_>>()
+    );
+    marks.redo_splice(&undo);
+    assert_eq!(
+        rows_in(&marks, shifted, 0, 98),
+        (50..=97).collect::<Vec<_>>()
+    );
+    assert_eq!(rows_in(&marks, shifted, 99, 100), vec![99, 100]);
+}
