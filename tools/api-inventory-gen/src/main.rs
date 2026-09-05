@@ -6,10 +6,13 @@
 //! byte-stable: the same blob plus same overlay always produces identical
 //! bytes.
 //!
-//! Run explicitly (never via build.rs):
+//! Run explicitly (never via build.rs) with `--write`, which generates to a
+//! sibling temp file and renames over the target only after generation
+//! succeeds — a shell `>` redirect would truncate the checked-in source
+//! before the generator has validated anything:
 //!
 //! ```text
-//! cargo run -p ox-api-inventory-gen > crates/ox-api/src/api_function_names.rs
+//! cargo run -p ox-api-inventory-gen -- --write
 //! ```
 //!
 //! Use `--check` to compare the generated output against the checked-in file
@@ -344,25 +347,39 @@ fn generate(functions: &[Function]) -> Result<String, GenError> {
 
 const TARGET: &str = "../../crates/ox-api/src/api_function_names.rs";
 
-fn run(check: bool) -> Result<(), GenError> {
+fn run(check: bool, write: bool) -> Result<(), GenError> {
     let metadata = ox_rpc::canonical_metadata().map_err(|e| GenError::Decode(e.to_string()))?;
     let functions = extract_functions(&metadata)?;
     let output = generate(&functions)?;
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let path = std::path::Path::new(manifest_dir).join(TARGET);
 
     if check {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let path = std::path::Path::new(manifest_dir).join(TARGET);
         let existing = std::fs::read_to_string(&path)?;
         if existing != output {
             eprintln!(
                 "ox-api-inventory-gen: checked-in file does not match generated output.\n\
-                 Run `cargo run -p ox-api-inventory-gen > crates/ox-api/src/api_function_names.rs`."
+                 Run `cargo run -p ox-api-inventory-gen -- --write`."
             );
             return Err(GenError::BadShape("drift detected"));
         }
         eprintln!(
             "ox-api-inventory-gen: checked-in file is up to date ({} functions).",
             functions.len()
+        );
+        return Ok(());
+    }
+
+    if write {
+        // Atomic replace: the temp sibling keeps a failed decode, extract,
+        // or write from ever truncating the checked-in source.
+        let temp = path.with_extension("rs.tmp");
+        std::fs::write(&temp, output.as_bytes())?;
+        std::fs::rename(&temp, &path)?;
+        eprintln!(
+            "ox-api-inventory-gen: wrote {} functions to {}.",
+            functions.len(),
+            path.display()
         );
         return Ok(());
     }
@@ -374,8 +391,10 @@ fn run(check: bool) -> Result<(), GenError> {
 }
 
 fn main() -> ExitCode {
-    let check = std::env::args().any(|a| a == "--check");
-    match run(check) {
+    let mut args = std::env::args().skip(1);
+    let check = args.any(|a| a == "--check");
+    let write = args.any(|a| a == "--write");
+    match run(check, write) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("ox-api-inventory-gen: {err}");
@@ -383,6 +402,8 @@ fn main() -> ExitCode {
         }
     }
 }
+
+
 
 #[cfg(test)]
 mod tests {
@@ -393,7 +414,7 @@ mod tests {
     /// fails here, and so does a hand edit of the generated file.
     #[test]
     fn checked_in_inventory_matches_canonical_regeneration() {
-        let result = run(true);
+        let result = run(true, false);
         assert!(
             result.is_ok(),
             "checked-in api_function_names.rs is stale; regenerate with \
