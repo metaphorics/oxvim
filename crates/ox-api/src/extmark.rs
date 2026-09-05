@@ -1,8 +1,9 @@
 //! Namespace and buffer extmark API.
 
 use ox_editor::decoration::{
-    BufCallbackId, CallbackPhase, DecorProviderDef, EndCallbackId, LineCallbackId, ProviderId,
-    RangeCallbackId, StartCallbackId, WinCallbackId,
+    BufCallbackId, ConcealLineCallbackId, DecorProviderDef, EndCallbackId, HlDefCallbackId,
+    LineCallbackId, ProviderId, RangeCallbackId, SpellNavCallbackId, StartCallbackId,
+    WinCallbackId,
 };
 use ox_editor::{
     Extmark, ExtmarkAttributes, ExtmarkEnd, ExtmarkGravity, ExtmarkHighlightMode, ExtmarkId,
@@ -635,37 +636,59 @@ pub fn nvim_create_namespace(session: &ApiSession, name: OxStr) -> Result<i64, A
     Ok(i64::from(id))
 }
 
-/// The callback keys `nvim_set_decoration_provider` accepts, in upstream's
-/// `decor_key_tab` order (`decoration_provider.c:36-42`).
-const PROVIDER_KEYS: &[&str] = &[
-    "on_buf",
-    "on_win",
-    "on_end",
-    "on_hl_def",
-    "on_line",
-    "on_start",
-    "on_range",
+/// Which `DecorProviderDef` field a provider key fills.
+///
+/// The six `on_*` keys feed redraw lifecycle phases; the `_on_*` keys are
+/// stored for parity with upstream (`extmark.c:1082-1084`) but have no
+/// dispatch site yet — their invocation lands with the corresponding redraw
+/// events.
+#[derive(Clone, Copy)]
+enum ProviderSlot {
+    Start,
+    Buf,
+    Win,
+    Line,
+    Range,
+    End,
+    HlDef,
+    SpellNav,
+    ConcealLine,
+}
+
+/// The callback keys `nvim_set_decoration_provider` accepts and the slot each
+/// fills, in upstream's `cbs[]` table order (`extmark.c:1075-1085`).
+const PROVIDER_KEYS: &[(&str, ProviderSlot)] = &[
+    ("on_start", ProviderSlot::Start),
+    ("on_buf", ProviderSlot::Buf),
+    ("on_win", ProviderSlot::Win),
+    ("on_line", ProviderSlot::Line),
+    ("on_range", ProviderSlot::Range),
+    ("on_end", ProviderSlot::End),
+    ("_on_hl_def", ProviderSlot::HlDef),
+    ("_on_spell_nav", ProviderSlot::SpellNav),
+    ("_on_conceal_line", ProviderSlot::ConcealLine),
 ];
 
-/// One parsed `on_*` entry: the phase it serves and its Lua registry ref.
+/// One parsed provider entry: the slot it fills and its Lua registry ref.
 struct ParsedCallback {
-    phase: CallbackPhase,
+    slot: ProviderSlot,
     reference: u32,
 }
 
 /// Validates every entry of `opts` without touching the live provider.
 ///
 /// Returns the incoming Lua refs so a later failure can release them all.
-/// Only the public `on_*` callback keys are accepted; internal keys
-/// (`_on_hl_def` etc.) and non-LuaRef values are rejected rather than stored
-/// and silently ignored.
+/// Only keys in `PROVIDER_KEYS` are accepted and every value must be a Lua
+/// function reference; anything else is rejected rather than stored and
+/// silently ignored.
 fn parse_provider_callbacks(opts: &Dict) -> Result<Vec<ParsedCallback>, ApiError> {
     let mut parsed = Vec::new();
     for (key, value) in opts.iter() {
         let key = key.to_string_lossy().into_owned();
-        if !PROVIDER_KEYS.contains(&key.as_str()) {
+        let Some(&(_, slot)) = PROVIDER_KEYS.iter().find(|(name, _)| *name == key.as_str())
+        else {
             return Err(ApiError::validation(format!("unexpected key: {key}")));
-        }
+        };
         let Object::LuaRef(reference) = value else {
             return Err(ApiError::validation(format!(
                 "Invalid value for '{key}': expected Lua function reference"
@@ -673,20 +696,8 @@ fn parse_provider_callbacks(opts: &Dict) -> Result<Vec<ParsedCallback>, ApiError
         };
         let positive = u32::try_from(*reference)
             .map_err(|_| ApiError::validation("Invalid Lua callback reference"))?;
-        let phase = match key.as_str() {
-            "on_start" => CallbackPhase::Start,
-            "on_buf" => CallbackPhase::Buf,
-            "on_win" => CallbackPhase::Win,
-            "on_line" => CallbackPhase::Line,
-            "on_range" => CallbackPhase::Range,
-            "on_end" => CallbackPhase::End,
-            // `on_hl_def` is in the accepted key table but has no phase to
-            // run in this port, so it is rejected rather than accepted and
-            // ignored.
-            _ => return Err(ApiError::validation(format!("unsupported key: {key}"))),
-        };
         parsed.push(ParsedCallback {
-            phase,
+            slot,
             reference: positive,
         });
     }
@@ -697,13 +708,18 @@ fn callback_ids(parsed: &[ParsedCallback]) -> DecorProviderDef {
     let mut def = DecorProviderDef::default();
     for entry in parsed {
         let reference = u64::from(entry.reference);
-        match entry.phase {
-            CallbackPhase::Start => def.start = Some(StartCallbackId::new(reference)),
-            CallbackPhase::Buf => def.buf = Some(BufCallbackId::new(reference)),
-            CallbackPhase::Win => def.win = Some(WinCallbackId::new(reference)),
-            CallbackPhase::Line => def.line = Some(LineCallbackId::new(reference)),
-            CallbackPhase::Range => def.range = Some(RangeCallbackId::new(reference)),
-            CallbackPhase::End => def.end = Some(EndCallbackId::new(reference)),
+        match entry.slot {
+            ProviderSlot::Start => def.start = Some(StartCallbackId::new(reference)),
+            ProviderSlot::Buf => def.buf = Some(BufCallbackId::new(reference)),
+            ProviderSlot::Win => def.win = Some(WinCallbackId::new(reference)),
+            ProviderSlot::Line => def.line = Some(LineCallbackId::new(reference)),
+            ProviderSlot::Range => def.range = Some(RangeCallbackId::new(reference)),
+            ProviderSlot::End => def.end = Some(EndCallbackId::new(reference)),
+            ProviderSlot::HlDef => def.hl_def = Some(HlDefCallbackId::new(reference)),
+            ProviderSlot::SpellNav => def.spell_nav = Some(SpellNavCallbackId::new(reference)),
+            ProviderSlot::ConcealLine => {
+                def.conceal_line = Some(ConcealLineCallbackId::new(reference));
+            }
         }
     }
     def
@@ -717,6 +733,9 @@ fn def_references(def: &DecorProviderDef) -> Vec<u64> {
         def.line.map(|cb| cb.get()),
         def.range.map(|cb| cb.get()),
         def.end.map(|cb| cb.get()),
+        def.hl_def.map(|cb| cb.get()),
+        def.spell_nav.map(|cb| cb.get()),
+        def.conceal_line.map(|cb| cb.get()),
     ]
     .into_iter()
     .flatten()

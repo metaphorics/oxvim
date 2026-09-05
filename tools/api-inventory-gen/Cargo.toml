@@ -1,5 +1,5 @@
 [package]
-name = "api-inventory-gen"
+name = "ox-api-inventory-gen"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true

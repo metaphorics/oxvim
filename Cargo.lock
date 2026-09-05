@@ -31,14 +31,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "api-inventory-gen"
-version = "0.1.0"
-dependencies = [
- "ox-rpc",
- "ox-types",
-]
-
-[[package]]
 name = "ar_archive_writer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -556,6 +548,14 @@ dependencies = [
  "ox-ui",
  "thiserror 2.0.20",
  "unicode-width",
+]
+
+[[package]]
+name = "ox-api-inventory-gen"
+version = "0.1.0"
+dependencies = [
+ "ox-rpc",
+ "ox-types",
 ]
 
 [[package]]

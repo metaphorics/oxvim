@@ -2352,6 +2352,34 @@ fn extmark_details_order_limit_delete_and_clear() {
 }
 
 #[test]
+fn extmark_decoration_provider_accepts_internal_underscore_keys() {
+    let session = session();
+    let namespace = crate::extmark::nvim_create_namespace(&session, OxStr::from("tests")).unwrap();
+    // Upstream stores the internal `_on_*` hooks alongside the public `on_*`
+    // callbacks (extmark.c:1075-1085); this port stores them too, with
+    // invocation landing when the corresponding redraw events exist.
+    crate::extmark::nvim_set_decoration_provider(
+        &session,
+        namespace,
+        dict(&[
+            ("_on_hl_def", Object::LuaRef(11)),
+            ("_on_spell_nav", Object::LuaRef(12)),
+            ("_on_conceal_line", Object::LuaRef(13)),
+        ]),
+    )
+    .unwrap();
+    // The non-underscore spelling is not an accepted key upstream.
+    assert_eq!(
+        crate::extmark::nvim_set_decoration_provider(
+            &session,
+            namespace,
+            dict(&[("on_hl_def", Object::LuaRef(14))]),
+        ),
+        Err(ApiError::validation("unexpected key: on_hl_def"))
+    );
+}
+
+#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "one extmark lifecycle scenario compares explicit, default, corrupted, and filtered sign details"

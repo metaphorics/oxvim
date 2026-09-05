@@ -99,7 +99,9 @@ semantics (`forceit` from `:edit!`, `:b!`, `:next!`...). The sink stays
 unguarded, so splits, preview windows and internal re-entry keep working.
 Verified: focused oldtest `test_winfixbuf` 126 → 109 failing (remainder is
 missing-command E117s: `:bufdo`/`:cdo`/`:ldo`/`:cfile`/`:vimgrep` family);
-`cargo nextest --workspace` 2985 passed / 1 skipped.
+`cargo nextest --workspace` 2985 passed / 1 skipped (this wave's recorded
+gate, `.outline/diamond/run-1/report.md`; the PR body cites the later
+cumulative 2995 / 1 skipped).
 
 ## Prevention
 

@@ -138,6 +138,18 @@ pub struct RangePhase;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct EndPhase;
 
+/// Marker type for the `_on_hl_def` provider callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HlDefPhase;
+
+/// Marker type for the `_on_spell_nav` provider callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SpellNavPhase;
+
+/// Marker type for the `_on_conceal_line` provider callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ConcealLinePhase;
+
 /// A typed callback handle for one of the decoration-provider phases.
 ///
 /// The type parameter makes `on_buf`, `on_win` and `on_line` (and the other
@@ -183,6 +195,15 @@ pub type RangeCallbackId = CallbackId<RangePhase>;
 
 /// Typed callback handle for the provider `end` phase.
 pub type EndCallbackId = CallbackId<EndPhase>;
+
+/// Typed callback handle for the provider `_on_hl_def` hook.
+pub type HlDefCallbackId = CallbackId<HlDefPhase>;
+
+/// Typed callback handle for the provider `_on_spell_nav` hook.
+pub type SpellNavCallbackId = CallbackId<SpellNavPhase>;
+
+/// Typed callback handle for the provider `_on_conceal_line` hook.
+pub type ConcealLineCallbackId = CallbackId<ConcealLinePhase>;
 
 /// Lifecycle phase that produced an ephemeral decoration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -379,6 +400,18 @@ pub struct DecorProviderDef {
     pub range: Option<RangeCallbackId>,
     /// Optional redraw-end callback.
     pub end: Option<EndCallbackId>,
+    /// Optional `_on_hl_def` highlight-definition callback.
+    ///
+    /// Stored for parity with upstream `DecorProvider.hl_def`
+    /// (`decoration_defs.h:164`); no dispatch site exists yet — invocation
+    /// lands with the corresponding redraw event.
+    pub hl_def: Option<HlDefCallbackId>,
+    /// Optional `_on_spell_nav` spell-navigation callback
+    /// (`decoration_defs.h:165`); stored, not yet invoked.
+    pub spell_nav: Option<SpellNavCallbackId>,
+    /// Optional `_on_conceal_line` callback (`decoration_defs.h:166`);
+    /// stored, not yet invoked.
+    pub conceal_line: Option<ConcealLineCallbackId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

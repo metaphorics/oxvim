@@ -236,13 +236,16 @@ impl LuaHost {
 
 fn configure_package_path(lua: &Lua, runtime_root: &RuntimeRoot) -> mlua::Result<()> {
     let package: Table = lua.globals().get("package")?;
-    let existing: String = package.get("path")?;
     // An unresolved root contributes no entries: `PathBuf::new().join("lua")`
     // is the CWD-relative `lua`, which would shadow later requires with a
-    // planted tree.
+    // planted tree. The LuaJIT default must not survive either: vendored
+    // luaconf.h LUA_PATH_DEFAULT starts with "./?.lua", the same CWD vector.
+    // Upstream resolves modules through `vim._load_package` over 'runtimepath'
+    // (runtime/lua/vim/_init_packages.lua:16-19,48-49), never through CWD.
     if runtime_root.resolve("").as_os_str().is_empty() {
-        return Ok(());
+        return package.set("path", "");
     }
+    let existing: String = package.get("path")?;
     let lua_root = runtime_root.resolve("lua");
     let module = lua_root.join("?.lua");
     let package_init = lua_root.join("?/init.lua");
@@ -262,9 +265,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_runtime_root_contributes_no_package_entries() {
-        // Review finding: an unresolved root fabricated CWD-relative
-        // `lua/?.lua` entries that persist for every later require.
+    fn empty_runtime_root_clears_package_path() {
+        // Review finding: an unresolved root left the LuaJIT default
+        // package.path intact, whose first entry `./?.lua` (vendored
+        // luaconf.h LUA_PATH_DEFAULT) lets a planted CWD tree shadow later
+        // requires.
         let lua = Lua::new();
         let path = |lua: &Lua| {
             lua.globals()
@@ -273,9 +278,9 @@ mod tests {
                 .get::<String>("path")
                 .unwrap()
         };
-        let before = path(&lua);
+        assert!(path(&lua).contains("./?.lua"));
         configure_package_path(&lua, &RuntimeRoot::new(PathBuf::new())).unwrap();
-        assert_eq!(path(&lua), before);
+        assert_eq!(path(&lua), "");
         configure_package_path(&lua, &RuntimeRoot::new(PathBuf::from("/rt"))).unwrap();
         let seeded = path(&lua);
         assert!(seeded.contains("/rt/lua/?.lua"), "{seeded}");

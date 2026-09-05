@@ -1558,8 +1558,11 @@ mod buffer_completion_tests {
         // Test_buffer_completion (test_cmdline.vim:4842-4856): 'Foo'
         // matches every listed buffer containing it, by short name, in
         // buffer-creation order.
-        let editor =
-            editor_with_buffers(&["Xbuf_complete/Foobar.c", "Xbuf_complete/MyFoobar.c", "AFoobar.h"]);
+        let editor = editor_with_buffers(&[
+            "Xbuf_complete/Foobar.c",
+            "Xbuf_complete/MyFoobar.c",
+            "AFoobar.h",
+        ]);
         assert_eq!(
             names(&editor, "Foo"),
             vec![
