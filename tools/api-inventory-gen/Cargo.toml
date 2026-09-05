@@ -1,0 +1,13 @@
+[package]
+name = "api-inventory-gen"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Deterministic generator for crates/ox-api/src/api_function_names.rs from the canonical msgpack blob."
+
+[lints]
+workspace = true
+
+[dependencies]
+ox-rpc = { path = "../../crates/ox-rpc" }
+ox-types = { path = "../../crates/ox-types" }

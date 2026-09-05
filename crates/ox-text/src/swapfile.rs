@@ -58,6 +58,13 @@ impl SwapFile {
     }
 
     /// Serializes block zero, one root pointer block, and one data extent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SwapError::TooLarge`] when the text, its index, or the
+    /// file name exceeds the block-format limits, the buffer's own line
+    /// error if a line is malformed, and the writer's I/O error if a block
+    /// cannot be written.
     pub fn write(&self, mut writer: impl Write) -> Result<(), SwapError> {
         let lines: Vec<Vec<u8>> = (1..=self.buffer.line_count())
             .map(|lnum| self.buffer.line(lnum))
@@ -83,8 +90,8 @@ impl SwapFile {
         let mut pointer = vec![0; PAGE_SIZE];
         pointer[0..2].copy_from_slice(&PTR_ID.to_le_bytes());
         pointer[2..4].copy_from_slice(&1_u16.to_le_bytes());
-        let max = u16::try_from((PAGE_SIZE - PTR_HEADER) / PTR_ENTRY)
-            .map_err(|_| SwapError::TooLarge)?;
+        let max =
+            u16::try_from((PAGE_SIZE - PTR_HEADER) / PTR_ENTRY).map_err(|_| SwapError::TooLarge)?;
         pointer[4..6].copy_from_slice(&max.to_le_bytes());
         pointer[8..16].copy_from_slice(&2_i64.to_le_bytes());
         pointer[16..20].copy_from_slice(&line_count_i32.to_le_bytes());
@@ -105,9 +112,13 @@ impl SwapFile {
             data[index_offset..index_offset + 4].copy_from_slice(&index_u32.to_le_bytes());
         }
         let index_end = DATA_HEADER + lines.len() * 4;
-        let free = text_start.checked_sub(index_end).ok_or(SwapError::TooLarge)?;
+        let free = text_start
+            .checked_sub(index_end)
+            .ok_or(SwapError::TooLarge)?;
         data[4..8].copy_from_slice(
-            &u32::try_from(free).map_err(|_| SwapError::TooLarge)?.to_le_bytes(),
+            &u32::try_from(free)
+                .map_err(|_| SwapError::TooLarge)?
+                .to_le_bytes(),
         );
         data[8..12].copy_from_slice(
             &u32::try_from(text_start)
@@ -125,15 +136,21 @@ impl SwapFile {
     }
 
     /// Reads a native 64-bit little-endian Neovim swap block tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reader's I/O error and [`SwapError::Malformed`] for a
+    /// bad block-zero id, an out-of-range page size, truncated blocks, or
+    /// any other structural violation.
     pub fn read(mut reader: impl Read) -> Result<Self, SwapError> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes)?;
         if bytes.get(0..2) != Some(b"b0") {
             return Err(SwapError::Malformed("block-zero id"));
         }
-        let page_size = usize::try_from(le_u32(&bytes, 12)?)
-            .map_err(|_| SwapError::Malformed("page size"))?;
-        if page_size < ZERO_BLOCK_SIZE || page_size > 1 << 20 {
+        let page_size =
+            usize::try_from(le_u32(&bytes, 12)?).map_err(|_| SwapError::Malformed("page size"))?;
+        if !(ZERO_BLOCK_SIZE..=1 << 20).contains(&page_size) {
             return Err(SwapError::Malformed("page size"));
         }
         let fname_bytes = bytes
@@ -226,15 +243,17 @@ fn read_block(
 }
 
 fn read_data(block: &[u8], lines: &mut Vec<Vec<u8>>) -> Result<(), SwapError> {
-    let count = usize::try_from(le_i64(block, 16)?)
-        .map_err(|_| SwapError::Malformed("data line count"))?;
+    let count =
+        usize::try_from(le_i64(block, 16)?).map_err(|_| SwapError::Malformed("data line count"))?;
     if DATA_HEADER + count * 4 > block.len() {
         return Err(SwapError::Malformed("data index"));
     }
     for index in 0..count {
         let start = usize::try_from(le_u32(block, DATA_HEADER + index * 4)?)
             .map_err(|_| SwapError::Malformed("line index"))?;
-        let tail = block.get(start..).ok_or(SwapError::Malformed("line index"))?;
+        let tail = block
+            .get(start..)
+            .ok_or(SwapError::Malformed("line index"))?;
         let length = tail
             .iter()
             .position(|&byte| byte == 0)

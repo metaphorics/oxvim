@@ -9,6 +9,10 @@ pub struct Signal {
 
 impl Signal {
     /// Allocates an inactive signal watcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::HandleLimit`] when the 32-bit handle identity space is exhausted.
     pub fn new(uv_loop: &mut UvLoop) -> Result<Self> {
         let id = uv_loop.allocate(HandleKind::Signal(SignalState {
             active: false,
@@ -21,6 +25,13 @@ impl Signal {
     }
 
     /// Starts persistent delivery for `signum`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHandle`] if the handle is no longer live,
+    /// [`Error::ClosingHandle`] if close was already requested,
+    /// [`Error::WrongHandleKind`] if it is not a signal handle, or
+    /// [`Error::InvalidSignal`] if `signum` cannot be safely intercepted.
     pub fn start<F>(&self, uv_loop: &mut UvLoop, signum: i32, callback: F) -> Result<()>
     where
         F: FnMut(&mut UvLoop, HandleId, i32) -> std::result::Result<(), CallbackError> + 'static,
@@ -29,12 +40,14 @@ impl Signal {
     }
 
     /// Starts delivery that deactivates before its first callback.
-    pub fn start_oneshot<F>(
-        &self,
-        uv_loop: &mut UvLoop,
-        signum: i32,
-        callback: F,
-    ) -> Result<()>
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHandle`] if the handle is no longer live,
+    /// [`Error::ClosingHandle`] if close was already requested,
+    /// [`Error::WrongHandleKind`] if it is not a signal handle, or
+    /// [`Error::InvalidSignal`] if `signum` cannot be safely intercepted.
+    pub fn start_oneshot<F>(&self, uv_loop: &mut UvLoop, signum: i32, callback: F) -> Result<()>
     where
         F: FnMut(&mut UvLoop, HandleId, i32) -> std::result::Result<(), CallbackError> + 'static,
     {
@@ -42,6 +55,11 @@ impl Signal {
     }
 
     /// Stops signal delivery without closing the handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHandle`] if the handle is no longer live, or
+    /// [`Error::WrongHandleKind`] if it is not a signal handle.
     pub fn stop(&self, uv_loop: &mut UvLoop) -> Result<()> {
         let state = uv_loop.state_mut(self.id)?;
         let HandleKind::Signal(inner) = &mut state.kind else {
@@ -53,7 +71,7 @@ impl Signal {
     }
 
     fn start_inner<F>(
-        &self,
+        self,
         uv_loop: &mut UvLoop,
         signum: i32,
         oneshot: bool,
@@ -62,7 +80,9 @@ impl Signal {
     where
         F: FnMut(&mut UvLoop, HandleId, i32) -> std::result::Result<(), CallbackError> + 'static,
     {
-        let state = uv_loop.state(self.id).ok_or(crate::Error::InvalidHandle(self.id))?;
+        let state = uv_loop
+            .state(self.id)
+            .ok_or(crate::Error::InvalidHandle(self.id))?;
         if state.closing {
             return Err(crate::Error::ClosingHandle(self.id));
         }
@@ -98,8 +118,8 @@ mod platform {
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
-    use mio::unix::SourceFd;
     use mio::Interest;
+    use mio::unix::SourceFd;
     use ox_loop::{DrainState, Loop};
     use signal_hook::iterator::backend::{Handle as SignalHandle, SignalDelivery};
     use signal_hook::iterator::exfiltrator::SignalOnly;
@@ -114,12 +134,8 @@ mod platform {
     impl SignalDriver {
         pub(crate) fn new(event_loop: &mut Loop) -> Result<Self> {
             let (read, write) = UnixStream::pair()?;
-            let delivery = SignalDelivery::with_pipe(
-                read,
-                write,
-                SignalOnly::default(),
-                std::iter::empty::<i32>(),
-            )?;
+            let delivery =
+                SignalDelivery::with_pipe(read, write, SignalOnly, std::iter::empty::<i32>())?;
             let handle = delivery.handle();
             let pending = Arc::new(Mutex::new(Vec::new()));
             let delivery = Rc::new(RefCell::new(delivery));
@@ -145,10 +161,7 @@ mod platform {
         }
 
         pub(crate) fn subscribe(&mut self, signum: i32) -> Result<()> {
-            if signum <= 0
-                || signum >= 128
-                || signal_hook::consts::FORBIDDEN.contains(&signum)
-            {
+            if signum <= 0 || signum >= 128 || signal_hook::consts::FORBIDDEN.contains(&signum) {
                 return Err(Error::InvalidSignal(signum));
             }
             self.handle.add_signal(signum)?;

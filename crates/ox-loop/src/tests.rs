@@ -1,3 +1,6 @@
+// Pure unit-test module: a failed unwrap/expect here IS the assertion —
+// panicking is the correct failure mode, there is no caller to handle Err.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::io::{Read, Write};
 use std::net::{TcpStream as StdTcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +26,10 @@ fn timer_orders_equal_deadlines_cancels_and_rearms() {
         deadline,
         TimerEntry::once(move || first_observed.lock().unwrap().push(1)),
     );
-    let cancelled = timers.insert(deadline, TimerEntry::once(|| panic!("cancelled timer fired")));
+    let cancelled = timers.insert(
+        deadline,
+        TimerEntry::once(|| panic!("cancelled timer fired")),
+    );
     assert!(timers.cancel(cancelled).is_some());
     let second_observed = Arc::clone(&observed);
     timers.insert(
@@ -48,7 +54,10 @@ fn timer_orders_equal_deadlines_cancels_and_rearms() {
         timer.fire();
     }
     assert_eq!(*repeats.lock().unwrap(), 1);
-    assert_eq!(timers.next_deadline(), Some(deadline + Duration::from_millis(5)));
+    assert_eq!(
+        timers.next_deadline(),
+        Some(deadline + Duration::from_millis(5))
+    );
     assert!(timers.cancel(repeat_id).is_some());
 }
 
@@ -119,10 +128,7 @@ fn recursive_wait_drains_only_selected_owner() {
             Event::callback(move || callback_returned.store(true, Ordering::Release)),
         )
         .unwrap();
-    event_loop
-        .events()
-        .put(sibling, Event::Signal(99))
-        .unwrap();
+    event_loop.events().put(sibling, Event::Signal(99)).unwrap();
 
     let condition = Arc::clone(&returned);
     let outcome = event_loop
@@ -193,9 +199,11 @@ fn signal_is_delivered_as_loop_event() {
     let mut event_loop = Loop::with_signals(&[SIGUSR1]).unwrap();
     signal_hook::low_level::raise(SIGUSR1).unwrap();
     let events = event_loop.run_once(Some(Duration::from_secs(1))).unwrap();
-    assert!(events
-        .into_iter()
-        .any(|event| matches!(event, Event::Signal(SIGUSR1))));
+    assert!(
+        events
+            .into_iter()
+            .any(|event| matches!(event, Event::Signal(SIGUSR1)))
+    );
 }
 
 #[cfg(unix)]
@@ -227,7 +235,10 @@ fn internal_sources_never_collide_with_public_tokens() {
 
     let first = alloc_internal(&mut event_loop);
     let second = alloc_internal(&mut event_loop);
-    assert_ne!(first, second, "repeat internal allocations must be distinct");
+    assert_ne!(
+        first, second,
+        "repeat internal allocations must be distinct"
+    );
 
     // A caller-owned source at the first public token registers with no
     // DuplicateReadiness collision against the internal tokens.
@@ -380,7 +391,10 @@ fn partial_read_per_callback_still_drains_edgetriggered_stream() {
         match listener.accept() {
             Ok(accepted) => break accepted,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(Instant::now() < accept_deadline, "listener accept timed out");
+                assert!(
+                    Instant::now() < accept_deadline,
+                    "listener accept timed out"
+                );
                 thread::sleep(Duration::from_millis(1));
             }
             Err(error) => panic!("accept failed: {error}"),
@@ -401,7 +415,10 @@ fn partial_read_per_callback_still_drains_edgetriggered_stream() {
             match server_stream.read(&mut buf) {
                 Ok(0) => Ok(DrainState::Drained), // EOF; nothing more to consume.
                 Ok(n) => {
-                    callback_received.lock().unwrap().extend_from_slice(&buf[..n]);
+                    callback_received
+                        .lock()
+                        .unwrap()
+                        .extend_from_slice(&buf[..n]);
                     // Deliberately stop after one byte: the pump must re-invoke
                     // us until WouldBlock, proving partial reads cannot strand.
                     Ok(DrainState::KeepDraining)

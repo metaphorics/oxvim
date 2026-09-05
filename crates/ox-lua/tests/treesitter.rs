@@ -39,7 +39,10 @@ impl BuiltinHost for NoBuiltins {
         if name.as_bytes() == b"has" {
             return Ok(Typval::Number(0));
         }
-        Err(format!("unexpected Vimscript builtin call: {}", name.to_string_lossy()))
+        Err(format!(
+            "unexpected Vimscript builtin call: {}",
+            name.to_string_lossy()
+        ))
     }
 }
 
@@ -47,7 +50,11 @@ fn parser_from_environment() -> Option<(PathBuf, String)> {
     if let Some(path) = std::env::var_os("OXVIM_TREE_SITTER_PARSER").map(PathBuf::from) {
         let language = std::env::var("OXVIM_TREE_SITTER_LANGUAGE")
             .ok()
-            .or_else(|| path.file_stem().and_then(|stem| stem.to_str()).map(str::to_owned))?;
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(str::to_owned)
+            })?;
         return path.is_file().then_some((path, language));
     }
 
@@ -75,21 +82,29 @@ fn runtime_root() -> RuntimeRoot {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one stateful Tree-sitter scenario exercises parse, node, edit, query, and lifetime boundaries through a single Lua chunk"
+)]
 fn real_parser_exercises_parse_nodes_edit_queries_and_lifetimes() {
     let Some((parser, language)) = parser_from_environment() else {
-        println!("SKIP treesitter real-parser test: set OXVIM_TREE_SITTER_PARSER and OXVIM_TREE_SITTER_LANGUAGE, or provide OXVIM_REF_ROOT with a built Neovim parser");
+        println!(
+            "SKIP treesitter real-parser test: set OXVIM_TREE_SITTER_PARSER and OXVIM_TREE_SITTER_LANGUAGE, or provide OXVIM_REF_ROOT with a built Neovim parser"
+        );
         return;
     };
 
     let scheduler = Rc::new(TestScheduler::default());
     let host = LuaHost::new(runtime_root(), Rc::new(NoBuiltins), scheduler.clone()).unwrap();
     let lua = host.lua();
-    lua.globals().set("parser_path", parser.to_string_lossy().as_ref()).unwrap();
+    lua.globals()
+        .set("parser_path", parser.to_string_lossy().as_ref())
+        .unwrap();
     lua.globals().set("parser_language", language).unwrap();
 
     let result: mlua::Table = lua
         .load(
-            r#"
+            r"
             assert(vim._ts_add_language_from_object(parser_path, parser_language))
             assert(vim._ts_has_language(parser_language))
             assert(vim._ts_get_minimum_language_version() <= vim._ts_get_language_version())
@@ -176,12 +191,15 @@ fn real_parser_exercises_parse_nodes_edit_queries_and_lifetimes() {
             assert(query:inspect().captures[1] == 'node')
 
             return { logs = function() return logs end }
-            "#,
+            ",
         )
         .eval()
         .unwrap();
 
     scheduler.drain().unwrap();
     let logs: mlua::Function = result.get("logs").unwrap();
-    assert!(logs.call::<u32>(()).unwrap() > 0, "real parser should emit scheduled logger records");
+    assert!(
+        logs.call::<u32>(()).unwrap() > 0,
+        "real parser should emit scheduled logger records"
+    );
 }

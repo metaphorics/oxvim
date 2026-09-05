@@ -45,7 +45,11 @@ pub struct TextChunk {
 impl TextChunk {
     #[must_use]
     pub fn new(attr_id: i64, text: impl AsRef<[u8]>, hl_id: i64) -> Self {
-        Self { attr_id, text: OxStr(text.as_ref().to_vec()), hl_id }
+        Self {
+            attr_id,
+            text: OxStr(text.as_ref().to_vec()),
+            hl_id,
+        }
     }
 }
 
@@ -101,7 +105,12 @@ impl RenderedChunkMap {
             }
         }
 
-        Self { columns_by_byte, boundaries, byte_len, rendered_columns: column }
+        Self {
+            columns_by_byte,
+            boundaries,
+            byte_len,
+            rendered_columns: column,
+        }
     }
 
     /// Convert a protocol byte position to a rendered column.
@@ -132,7 +141,9 @@ pub(crate) fn decoded_cell_width(bytes: &[u8], start: usize, column: usize) -> (
         return (1, 1);
     }
     let end = start.saturating_add(expected);
-    let character = std::str::from_utf8(&bytes[start..end]).ok().and_then(|text| text.chars().next());
+    let character = std::str::from_utf8(&bytes[start..end])
+        .ok()
+        .and_then(|text| text.chars().next());
     match character {
         Some(character) => (expected, rendered_char_width(character, column)),
         None => (1, 1),
@@ -322,7 +333,10 @@ impl CmdlineState {
 
     pub fn set_special(&mut self, level: u32, text: impl AsRef<[u8]>, shift: bool) -> bool {
         if let Some(entry) = self.levels.get_mut(&level) {
-            entry.special = Some(CmdlineSpecial { text: OxStr(text.as_ref().to_vec()), shift });
+            entry.special = Some(CmdlineSpecial {
+                text: OxStr(text.as_ref().to_vec()),
+                shift,
+            });
             true
         } else {
             false
@@ -368,7 +382,10 @@ impl CmdlineState {
     }
 
     fn active_mut(&mut self) -> Option<&mut CmdlineLevel> {
-        self.levels.last_key_value().map(|(key, _)| *key).and_then(|key| self.levels.get_mut(&key))
+        self.levels
+            .last_key_value()
+            .map(|(key, _)| *key)
+            .and_then(|key| self.levels.get_mut(&key))
     }
 
     #[must_use]
@@ -379,6 +396,11 @@ impl CmdlineState {
     #[must_use]
     pub fn len(&self) -> usize {
         self.levels.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.levels.is_empty()
     }
 }
 
@@ -451,6 +473,12 @@ pub enum MessageId {
 }
 
 impl MessageId {
+    /// Convert a protocol object into an optional message identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChromeError::InvalidMessageId`] when `value` is neither nil,
+    /// an integer, nor a string.
     pub fn from_object(value: Object) -> Result<Option<Self>, ChromeError> {
         match value {
             Object::Nil => Ok(None),
@@ -547,16 +575,52 @@ impl MessageEntry {
     }
 }
 
+/// A combinable option accepted by [`MessageFlags`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageFlag {
+    ReplaceLast,
+    History,
+    Append,
+    Prompt,
+}
+
+impl MessageFlag {
+    const fn mask(self) -> u8 {
+        match self {
+            Self::ReplaceLast => 1 << 0,
+            Self::History => 1 << 1,
+            Self::Append => 1 << 2,
+            Self::Prompt => 1 << 3,
+        }
+    }
+}
+
+/// Compact set of combinable `msg_show` options.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MessageFlags(u8);
+
+impl MessageFlags {
+    #[must_use]
+    pub const fn contains(self, flag: MessageFlag) -> bool {
+        self.0 & flag.mask() != 0
+    }
+
+    pub fn set(&mut self, flag: MessageFlag, enabled: bool) {
+        if enabled {
+            self.0 |= flag.mask();
+        } else {
+            self.0 &= !flag.mask();
+        }
+    }
+}
+
 /// Input for `msg_show` after RPC decoding.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MessageUpdate {
     pub kind: OxStr,
     pub content: ChunkLine,
-    pub replace_last: bool,
-    pub history: bool,
-    pub append: bool,
+    pub flags: MessageFlags,
     pub id: Object,
-    pub prompt: bool,
 }
 
 /// A complete history entry from `msg_history_show`.
@@ -722,6 +786,12 @@ impl Chrome {
         self.insert_popup = None;
     }
 
+    /// Apply one decoded `msg_show` update.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChromeError::InvalidMessageId`] when the update's message ID
+    /// is neither nil, an integer, nor a string.
     pub fn message_show(&mut self, update: MessageUpdate) -> Result<(), ChromeError> {
         let id = MessageId::from_object(update.id)?;
         let class = classify_message(&update.kind, id.is_some());
@@ -732,11 +802,11 @@ impl Chrome {
         }
         if update.kind.as_bytes() == b"wildlist" {
             self.sticky_wildlist = Some(update.content.clone());
-            if update.history {
+            if update.flags.contains(MessageFlag::History) {
                 self.history.push(HistoryEntry {
                     kind: update.kind,
                     content: update.content,
-                    append: update.append,
+                    append: update.flags.contains(MessageFlag::Append),
                 });
             }
             return Ok(());
@@ -745,8 +815,11 @@ impl Chrome {
         self.sequence = self.sequence.saturating_add(1);
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
-        let key = MessageKey { kind: update.kind.clone(), id };
-        let force_sticky = update.prompt
+        let key = MessageKey {
+            kind: update.kind.clone(),
+            id,
+        };
+        let force_sticky = update.flags.contains(MessageFlag::Prompt)
             || self.cmdline.is_active()
             || is_sticky_kind(&update.kind);
         let lifetime = lifetime_for(class, generation, force_sticky);
@@ -757,7 +830,9 @@ impl Chrome {
                     entry.key.kind == key.kind && entry.key.id.as_ref() == Some(id)
                 })
             })
-        } else if update.append || update.replace_last {
+        } else if update.flags.contains(MessageFlag::Append)
+            || update.flags.contains(MessageFlag::ReplaceLast)
+        {
             self.messages.len().checked_sub(1)
         } else {
             self.messages.iter().position(|entry| entry.key == key)
@@ -765,13 +840,13 @@ impl Chrome {
 
         if let Some(index) = target {
             if let Some(entry) = self.messages.get_mut(index) {
-                if update.append {
+                if update.flags.contains(MessageFlag::Append) {
                     entry.content.extend(update.content.clone());
                 } else {
-                    entry.content = update.content.clone();
+                    entry.content.clone_from(&update.content);
                 }
                 entry.key = key;
-                entry.history |= update.history;
+                entry.history |= update.flags.contains(MessageFlag::History);
                 entry.lifetime = lifetime;
                 entry.sequence = self.sequence;
             }
@@ -779,17 +854,18 @@ impl Chrome {
             self.messages.push(MessageEntry {
                 key,
                 content: update.content.clone(),
-                history: update.history,
+                history: update.flags.contains(MessageFlag::History),
                 lifetime,
                 sequence: self.sequence,
             });
         }
 
-        if update.history && update.kind.as_bytes() != b"search_count" {
+        if update.flags.contains(MessageFlag::History) && update.kind.as_bytes() != b"search_count"
+        {
             self.history.push(HistoryEntry {
                 kind: update.kind,
                 content: update.content,
-                append: update.append,
+                append: update.flags.contains(MessageFlag::Append),
             });
         }
         Ok(())
@@ -819,15 +895,15 @@ impl Chrome {
 
     /// Close one streaming entry and start its four-second expiry.
     pub fn close_stream(&mut self, key: &MessageKey, now: TimeMs) -> bool {
-        if let Some(entry) = self.messages.iter_mut().find(|entry| &entry.key == key) {
-            if entry.lifetime == MessageLifetime::StreamingOpen {
-                self.generation = self.generation.saturating_add(1);
-                entry.lifetime = MessageLifetime::Expiring {
-                    deadline: now.after(EPHEMERAL_LIFETIME_MS),
-                    generation: self.generation,
-                };
-                return true;
-            }
+        if let Some(entry) = self.messages.iter_mut().find(|entry| &entry.key == key)
+            && entry.lifetime == MessageLifetime::StreamingOpen
+        {
+            self.generation = self.generation.saturating_add(1);
+            entry.lifetime = MessageLifetime::Expiring {
+                deadline: now.after(EPHEMERAL_LIFETIME_MS),
+                generation: self.generation,
+            };
+            return true;
         }
         false
     }
@@ -842,7 +918,8 @@ impl Chrome {
 
     /// Sticky messages dismiss on a keypress; open streams remain visible.
     pub fn keypress(&mut self) {
-        self.messages.retain(|entry| entry.lifetime != MessageLifetime::StickyUntilKeypress);
+        self.messages
+            .retain(|entry| entry.lifetime != MessageLifetime::StickyUntilKeypress);
     }
 
     /// Honor `msg_clear` without violating sticky and streaming lifetimes.
@@ -856,8 +933,12 @@ impl Chrome {
     }
 
     pub fn history_show(&mut self, entries: Vec<HistoryEntry>, previous_command: bool) {
-        self.history = entries.clone();
-        self.history_float = Some(HistoryFloat { entries, previous_command, page: 0 });
+        self.history.clone_from(&entries);
+        self.history_float = Some(HistoryFloat {
+            entries,
+            previous_command,
+            page: 0,
+        });
     }
 
     pub fn history_hide(&mut self) {
@@ -883,15 +964,20 @@ impl Chrome {
     /// Describe client-surface rectangles for the current terminal dimensions.
     #[must_use]
     pub fn layout(&self, columns: usize, rows: usize, cursor_row: Option<usize>) -> ChromeLayout {
-        let cmdline = self.cmdline.active().map(|active| cmdline_layout(active, columns, rows, cursor_row));
-        let wildlist = cmdline.and_then(|rect| {
-            self.sticky_wildlist.as_ref().map(|_| rect.above(1))
-        });
-        let wildmenu = cmdline.and_then(|rect| {
-            self.wildmenu.as_ref().map(|_| rect.below(1, rows))
-        });
+        let cmdline = self
+            .cmdline
+            .active()
+            .map(|active| cmdline_layout(active, columns, rows, cursor_row));
+        let wildlist =
+            cmdline.and_then(|rect| self.sticky_wildlist.as_ref().map(|_| rect.above(1)));
+        let wildmenu = cmdline.and_then(|rect| self.wildmenu.as_ref().map(|_| rect.below(1, rows)));
         let messages = (!self.messages.is_empty() || self.search_count.is_some()).then(|| {
-            message_layout(columns, rows, self.visible_messages().entries.len(), self.search_count.is_some())
+            message_layout(
+                columns,
+                rows,
+                self.visible_messages().entries.len(),
+                self.search_count.is_some(),
+            )
         });
         let search_count = messages.and_then(|rect| {
             self.search_count.as_ref().map(|_| Rect {
@@ -902,7 +988,10 @@ impl Chrome {
             })
         });
         let (insert_popup, documentation) = popup_layout(self.insert_popup.as_ref(), columns, rows);
-        let history = self.history_float.as_ref().map(|_| history_layout(columns, rows));
+        let history = self
+            .history_float
+            .as_ref()
+            .map(|_| history_layout(columns, rows));
 
         ChromeLayout {
             cmdline,
@@ -942,11 +1031,17 @@ fn classify_message(kind: &OxStr, has_id: bool) -> MessageClass {
 }
 
 fn is_sticky_kind(kind: &OxStr) -> bool {
-    matches!(kind.as_bytes(), b"emsg" | b"echoerr" | b"lua_error" | b"rpc_error" | b"wmsg" | b"confirm")
+    matches!(
+        kind.as_bytes(),
+        b"emsg" | b"echoerr" | b"lua_error" | b"rpc_error" | b"wmsg" | b"confirm"
+    )
 }
 
 fn is_streaming_kind(kind: &OxStr) -> bool {
-    matches!(kind.as_bytes(), b"shell_out" | b"shell_err" | b"shell_cmd" | b"shell_ret")
+    matches!(
+        kind.as_bytes(),
+        b"shell_out" | b"shell_err" | b"shell_cmd" | b"shell_ret"
+    )
 }
 
 fn lifetime_for(class: MessageClass, generation: u64, force_sticky: bool) -> MessageLifetime {
@@ -956,7 +1051,9 @@ fn lifetime_for(class: MessageClass, generation: u64, force_sticky: bool) -> Mes
     match class {
         MessageClass::Sticky => MessageLifetime::StickyUntilKeypress,
         MessageClass::Streaming => MessageLifetime::StreamingOpen,
-        MessageClass::Progress | MessageClass::Ephemeral => MessageLifetime::PendingBatch { generation },
+        MessageClass::Progress | MessageClass::Ephemeral => {
+            MessageLifetime::PendingBatch { generation }
+        }
         MessageClass::SearchCount => MessageLifetime::PendingBatch { generation },
     }
 }
@@ -973,12 +1070,22 @@ pub struct Rect {
 impl Rect {
     fn above(self, height: usize) -> Self {
         let actual = height.min(self.y);
-        Self { x: self.x, y: self.y.saturating_sub(actual), width: self.width, height: actual }
+        Self {
+            x: self.x,
+            y: self.y.saturating_sub(actual),
+            width: self.width,
+            height: actual,
+        }
     }
 
     fn below(self, height: usize, rows: usize) -> Self {
         let y = self.y.saturating_add(self.height).min(rows);
-        Self { x: self.x, y, width: self.width, height: height.min(rows.saturating_sub(y)) }
+        Self {
+            x: self.x,
+            y,
+            width: self.width,
+            height: height.min(rows.saturating_sub(y)),
+        }
     }
 
     #[must_use]
@@ -988,9 +1095,7 @@ impl Rect {
 
     #[must_use]
     pub fn contains(self, column: usize, row: usize) -> bool {
-        column >= self.x
-            && column < self.x.saturating_add(self.width)
-            && self.contains_row(row)
+        column >= self.x && column < self.x.saturating_add(self.width) && self.contains_row(row)
     }
 }
 
@@ -1042,23 +1147,45 @@ fn cmdline_layout(
         .saturating_add(padding.saturating_mul(2))
         .saturating_add(border);
     let height = desired_height.min(rows);
-    let width = if columns < 60 { columns } else { columns.min(72).max(1) };
-    let x = if columns < 60 { 0 } else { columns.saturating_sub(width) / 2 };
+    let width = if columns < 60 {
+        columns
+    } else {
+        columns.clamp(1, 72)
+    };
+    let x = if columns < 60 {
+        0
+    } else {
+        columns.saturating_sub(width) / 2
+    };
     let top_y = rows / 3;
-    let top = Rect { x, y: top_y.min(rows.saturating_sub(height)), width, height };
+    let top = Rect {
+        x,
+        y: top_y.min(rows.saturating_sub(height)),
+        width,
+        height,
+    };
     let collides = cursor_row.is_some_and(|row| top.contains_row(row));
     let y = if collides {
         (rows.saturating_mul(2) / 3).min(rows.saturating_sub(height))
     } else {
         top.y
     };
-    Rect { x, y, width, height }
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 fn message_layout(columns: usize, rows: usize, visible: usize, search_count: bool) -> Rect {
     let content_height = visible.saturating_add(usize::from(search_count)).max(1);
     let height = content_height.saturating_add(4).min(rows);
-    let width = if columns < 80 { columns } else { columns.min(44) };
+    let width = if columns < 80 {
+        columns
+    } else {
+        columns.min(44)
+    };
     Rect {
         x: columns.saturating_sub(width),
         y: rows.saturating_sub(height),
@@ -1075,24 +1202,40 @@ fn popup_layout(
     let Some(popup) = popup else {
         return (None, None);
     };
-    let longest = popup.items.iter().map(|item| {
-        item.word.as_bytes().len()
-            .saturating_add(item.kind.as_bytes().len())
-            .saturating_add(item.menu.as_bytes().len())
-            .saturating_add(4)
-    }).max().map_or(1, |value| value);
+    let longest = popup
+        .items
+        .iter()
+        .map(|item| {
+            item.word
+                .as_bytes()
+                .len()
+                .saturating_add(item.kind.as_bytes().len())
+                .saturating_add(item.menu.as_bytes().len())
+                .saturating_add(4)
+        })
+        .max()
+        .unwrap_or(1);
     let width = longest.saturating_add(4).min(columns);
     let height = popup.items.len().saturating_add(4).min(rows);
     let x = popup.anchor.column.min(columns.saturating_sub(width));
-    let y = popup.anchor.row.saturating_add(1).min(rows.saturating_sub(height));
-    let menu = Rect { x, y, width, height };
+    let y = popup
+        .anchor
+        .row
+        .saturating_add(1)
+        .min(rows.saturating_sub(height));
+    let menu = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
 
     let documentation = popup.documentation().and_then(|info| {
         let desired = String::from_utf8_lossy(info)
             .lines()
             .map(str::len)
             .max()
-            .map_or(1, |value| value)
+            .unwrap_or(1)
             .saturating_add(4);
         let available_right = columns.saturating_sub(menu.x.saturating_add(menu.width));
         let available_left = menu.x;
@@ -1114,7 +1257,12 @@ fn popup_layout(
         } else {
             menu.x.saturating_sub(doc_width)
         };
-        Some(Rect { x: doc_x, y: menu.y, width: doc_width, height: height.min(rows.saturating_sub(menu.y)) })
+        Some(Rect {
+            x: doc_x,
+            y: menu.y,
+            width: doc_width,
+            height: height.min(rows.saturating_sub(menu.y)),
+        })
     });
     (Some(menu), documentation)
 }
@@ -1189,14 +1337,13 @@ mod tests {
     }
 
     fn update(kind: &str, text: &str) -> MessageUpdate {
+        let mut flags = MessageFlags::default();
+        flags.set(MessageFlag::History, true);
         MessageUpdate {
             kind: OxStr::from(kind),
             content: vec![chunk(text)],
-            replace_last: false,
-            history: true,
-            append: false,
+            flags,
             id: Object::Nil,
-            prompt: false,
         }
     }
 
@@ -1221,18 +1368,37 @@ mod tests {
         assert!(chrome.cmdline_special_char(1, "^V", true));
         assert!(chrome.cmdline_block_show(vec![vec![chunk("line one")]]));
         assert!(chrome.cmdline_block_append(vec![chunk("line two")]));
-        chrome.cmdline_show(2, vec![chunk("nested")], 3, "=", Some("prompt".into()), 0, 9);
+        chrome.cmdline_show(
+            2,
+            vec![chunk("nested")],
+            3,
+            "=",
+            Some("prompt".into()),
+            0,
+            9,
+        );
         assert_eq!(chrome.cmdline.len(), 2);
         assert!(chrome.cmdline_pos(2, 6));
         let active = chrome.cmdline.active();
         assert_eq!(active.map(|entry| entry.level), Some(2));
         assert_eq!(active.map(CmdlineLevel::cursor_column), Some(6));
         assert!(chrome.cmdline_hide(2, true));
-        assert_eq!(chrome.cmdline.last_hide, Some(CmdlineHide { level: 2, aborted: true }));
+        assert_eq!(
+            chrome.cmdline.last_hide,
+            Some(CmdlineHide {
+                level: 2,
+                aborted: true
+            })
+        );
         let restored = chrome.cmdline.active();
         assert_eq!(restored.map(|entry| entry.level), Some(1));
         assert_eq!(restored.map(|entry| entry.block.len()), Some(2));
-        assert_eq!(restored.and_then(|entry| entry.special.as_ref()).map(|special| special.text.as_bytes()), Some(b"^V".as_slice()));
+        assert_eq!(
+            restored
+                .and_then(|entry| entry.special.as_ref())
+                .map(|special| special.text.as_bytes()),
+            Some(b"^V".as_slice())
+        );
         assert!(chrome.cmdline_block_hide());
     }
 
@@ -1242,7 +1408,10 @@ mod tests {
         state.show(1, vec![chunk("a")], 0, ":", None, 0, -1);
         assert!(state.set_special(1, "x", false));
         state.show(1, vec![chunk("ab")], 1, ":", None, 0, -1);
-        assert_eq!(state.active().and_then(|entry| entry.special.as_ref()), None);
+        assert_eq!(
+            state.active().and_then(|entry| entry.special.as_ref()),
+            None
+        );
     }
 
     #[test]
@@ -1250,7 +1419,10 @@ mod tests {
         let mut chrome = Chrome::default();
         chrome.cmdline_show(1, vec![chunk("a界b")], 0, ":", None, 0, -1);
         chrome.popupmenu_show(vec![PopupItem::new("one", "", "", "")], Some(0), 0, 4, -1);
-        assert_eq!(chrome.wildmenu.as_ref().map(|menu| menu.anchor_column), Some(3));
+        assert_eq!(
+            chrome.wildmenu.as_ref().map(|menu| menu.anchor_column),
+            Some(3)
+        );
         assert!(chrome.message_show(update("wildlist", "one  two")).is_ok());
         chrome.popupmenu_hide();
         assert!(chrome.sticky_wildlist.is_some());
@@ -1263,11 +1435,20 @@ mod tests {
         let mut chrome = Chrome::default();
         assert!(chrome.message_show(update("emsg", "bad")).is_ok());
         let mut prompt = update("echo", "continue?");
-        prompt.prompt = true;
+        prompt.flags.set(MessageFlag::Prompt, true);
         assert!(chrome.message_show(prompt).is_ok());
         chrome.cmdline_show(1, vec![chunk("x")], 0, ":", None, 0, -1);
-        assert!(chrome.message_show(update("quickfix", "during command")).is_ok());
-        assert!(chrome.messages.iter().all(|entry| entry.lifetime == MessageLifetime::StickyUntilKeypress));
+        assert!(
+            chrome
+                .message_show(update("quickfix", "during command"))
+                .is_ok()
+        );
+        assert!(
+            chrome
+                .messages
+                .iter()
+                .all(|entry| entry.lifetime == MessageLifetime::StickyUntilKeypress)
+        );
         chrome.keypress();
         assert!(chrome.messages.is_empty());
     }
@@ -1275,16 +1456,28 @@ mod tests {
     #[test]
     fn every_named_sticky_kind_waits_for_keypress() {
         let mut chrome = Chrome::default();
-        for (index, kind) in ["emsg", "echoerr", "lua_error", "rpc_error", "wmsg", "confirm"]
-            .into_iter()
-            .enumerate()
+        for (index, kind) in [
+            "emsg",
+            "echoerr",
+            "lua_error",
+            "rpc_error",
+            "wmsg",
+            "confirm",
+        ]
+        .into_iter()
+        .enumerate()
         {
             let mut message = update(kind, kind);
-            message.id = Object::Integer(index as i64);
+            message.id = Object::Integer(i64::try_from(index).expect("six kinds fit in i64"));
             assert!(chrome.message_show(message).is_ok());
         }
         assert_eq!(chrome.messages.len(), 6);
-        assert!(chrome.messages.iter().all(|entry| entry.lifetime == MessageLifetime::StickyUntilKeypress));
+        assert!(
+            chrome
+                .messages
+                .iter()
+                .all(|entry| entry.lifetime == MessageLifetime::StickyUntilKeypress)
+        );
         chrome.keypress();
         assert!(chrome.messages.is_empty());
     }
@@ -1292,12 +1485,20 @@ mod tests {
     #[test]
     fn every_named_ephemeral_and_unknown_kind_expires() {
         let mut chrome = Chrome::default();
-        for (index, kind) in ["echo", "echomsg", "lua_print", "quickfix", "undo", "empty", "future_kind"]
-            .into_iter()
-            .enumerate()
+        for (index, kind) in [
+            "echo",
+            "echomsg",
+            "lua_print",
+            "quickfix",
+            "undo",
+            "empty",
+            "future_kind",
+        ]
+        .into_iter()
+        .enumerate()
         {
             let mut message = update(kind, kind);
-            message.id = Object::Integer(index as i64);
+            message.id = Object::Integer(i64::try_from(index).expect("seven kinds fit in i64"));
             assert!(chrome.message_show(message).is_ok());
         }
         chrome.finish_batch(TimeMs(0));
@@ -1311,15 +1512,21 @@ mod tests {
     fn ephemeral_timer_starts_when_stable_and_restarts_on_update() {
         let mut chrome = Chrome::default();
         assert!(chrome.message_show(update("echo", "first")).is_ok());
-        assert!(matches!(chrome.messages[0].lifetime, MessageLifetime::PendingBatch { .. }));
+        assert!(matches!(
+            chrome.messages[0].lifetime,
+            MessageLifetime::PendingBatch { .. }
+        ));
         chrome.finish_batch(TimeMs(10));
         chrome.advance_time(TimeMs(4_009));
         assert_eq!(chrome.messages.len(), 1);
 
         let mut replacement = update("echo", "second");
-        replacement.replace_last = true;
+        replacement.flags.set(MessageFlag::ReplaceLast, true);
         assert!(chrome.message_show(replacement).is_ok());
-        assert!(matches!(chrome.messages[0].lifetime, MessageLifetime::PendingBatch { .. }));
+        assert!(matches!(
+            chrome.messages[0].lifetime,
+            MessageLifetime::PendingBatch { .. }
+        ));
         chrome.finish_batch(TimeMs(4_009));
         chrome.advance_time(TimeMs(8_008));
         assert_eq!(chrome.messages.len(), 1);
@@ -1331,16 +1538,16 @@ mod tests {
     fn streaming_appends_then_expires_four_seconds_after_close() {
         let mut chrome = Chrome::default();
         let mut first = update("shell_out", "a");
-        first.history = false;
+        first.flags.set(MessageFlag::History, false);
         assert!(chrome.message_show(first).is_ok());
         let mut second = update("shell_out", "b");
-        second.append = true;
-        second.history = false;
+        second.flags.set(MessageFlag::Append, true);
+        second.flags.set(MessageFlag::History, false);
         assert!(chrome.message_show(second).is_ok());
         assert_eq!(chrome.messages[0].content, vec![chunk("a"), chunk("b")]);
         let mut replacement = update("shell_out", "replacement");
-        replacement.replace_last = true;
-        replacement.history = false;
+        replacement.flags.set(MessageFlag::ReplaceLast, true);
+        replacement.flags.set(MessageFlag::History, false);
         assert!(chrome.message_show(replacement).is_ok());
         assert_eq!(chrome.messages[0].content, vec![chunk("replacement")]);
         let key = chrome.messages[0].key.clone();
@@ -1393,7 +1600,10 @@ mod tests {
         assert!(chrome.message_show(second).is_ok());
         assert_eq!(chrome.messages.len(), 1);
         assert_eq!(chrome.messages[0].content, vec![chunk("90%")]);
-        assert_eq!(chrome.messages[0].lifetime, MessageLifetime::StickyUntilKeypress);
+        assert_eq!(
+            chrome.messages[0].lifetime,
+            MessageLifetime::StickyUntilKeypress
+        );
     }
 
     #[test]
@@ -1406,7 +1616,10 @@ mod tests {
         assert!(chrome.history.is_empty());
         let layout = chrome.layout(80, 24, None);
         assert_eq!(layout.search_count.map(|rect| rect.height), Some(1));
-        assert_eq!(layout.search_count.map(|rect| rect.y), layout.messages.map(|rect| rect.y + rect.height - 1));
+        assert_eq!(
+            layout.search_count.map(|rect| rect.y),
+            layout.messages.map(|rect| rect.y + rect.height - 1)
+        );
     }
 
     #[test]
@@ -1427,7 +1640,10 @@ mod tests {
         let mut chrome = Chrome::default();
         let mut invalid = update("echo", "text");
         invalid.id = Object::Boolean(true);
-        assert!(matches!(chrome.message_show(invalid), Err(ChromeError::InvalidMessageId(Object::Boolean(true)))));
+        assert!(matches!(
+            chrome.message_show(invalid),
+            Err(ChromeError::InvalidMessageId(Object::Boolean(true)))
+        ));
     }
 
     #[test]
@@ -1447,16 +1663,21 @@ mod tests {
 
     #[test]
     fn history_float_keeps_complete_record_and_pages() {
-        let entries: Vec<_> = (0..7).map(|index| HistoryEntry {
-            kind: OxStr::from("echo"),
-            content: vec![chunk(&index.to_string())],
-            append: false,
-        }).collect();
+        let entries: Vec<_> = (0..7)
+            .map(|index| HistoryEntry {
+                kind: OxStr::from("echo"),
+                content: vec![chunk(&index.to_string())],
+                append: false,
+            })
+            .collect();
         let mut chrome = Chrome::default();
         chrome.history_show(entries.clone(), true);
         let history = chrome.history_float.as_mut();
         assert_eq!(history.as_ref().map(|state| state.entries.len()), Some(7));
-        assert_eq!(history.as_ref().map(|state| state.previous_command), Some(true));
+        assert_eq!(
+            history.as_ref().map(|state| state.previous_command),
+            Some(true)
+        );
         if let Some(history) = history {
             history.next_page(3);
             assert_eq!(history.page_entries(3), &entries[3..6]);
@@ -1480,12 +1701,24 @@ mod tests {
             10,
             2,
         );
-        assert_eq!(chrome.insert_popup.as_ref().and_then(InsertPopupState::documentation), Some(b"Print a value".as_slice()));
+        assert_eq!(
+            chrome
+                .insert_popup
+                .as_ref()
+                .and_then(InsertPopupState::documentation),
+            Some(b"Print a value".as_slice())
+        );
         let layout = chrome.layout(80, 24, None);
         assert!(layout.insert_popup.is_some());
         assert!(layout.documentation.is_some());
         chrome.popupmenu_select(None);
-        assert_eq!(chrome.insert_popup.as_ref().and_then(InsertPopupState::documentation), None);
+        assert_eq!(
+            chrome
+                .insert_popup
+                .as_ref()
+                .and_then(InsertPopupState::documentation),
+            None
+        );
     }
 
     #[test]
@@ -1506,10 +1739,19 @@ mod tests {
         let medium = chrome.layout(70, 30, None);
         assert_eq!(medium.messages.map(|rect| rect.width), Some(70));
         let at_message_breakpoint = chrome.layout(80, 30, None);
-        assert_eq!(at_message_breakpoint.messages.map(|rect| rect.width), Some(44));
+        assert_eq!(
+            at_message_breakpoint.messages.map(|rect| rect.width),
+            Some(44)
+        );
         let at_cmdline_breakpoint = chrome.layout(60, 30, None);
-        assert_eq!(at_cmdline_breakpoint.cmdline.map(|rect| rect.width), Some(60));
-        assert_eq!(at_cmdline_breakpoint.cmdline.map(|rect| rect.height), Some(5));
+        assert_eq!(
+            at_cmdline_breakpoint.cmdline.map(|rect| rect.width),
+            Some(60)
+        );
+        assert_eq!(
+            at_cmdline_breakpoint.cmdline.map(|rect| rect.height),
+            Some(5)
+        );
         let narrow = chrome.layout(59, 30, None);
         assert_eq!(narrow.cmdline.map(|rect| rect.width), Some(59));
         assert_eq!(narrow.cmdline.map(|rect| rect.height), Some(3));
@@ -1519,10 +1761,27 @@ mod tests {
     fn narrow_layout_saturates_without_underflow() {
         let mut chrome = Chrome::default();
         chrome.cmdline_show(1, vec![chunk("x")], 0, ":", None, 0, -1);
-        chrome.popupmenu_show(vec![PopupItem::new("long", "k", "m", "docs")], Some(0), 0, 0, 1);
+        chrome.popupmenu_show(
+            vec![PopupItem::new("long", "k", "m", "docs")],
+            Some(0),
+            0,
+            0,
+            1,
+        );
         let layout = chrome.layout(1, 1, Some(0));
-        assert_eq!(layout.cmdline, Some(Rect { x: 0, y: 0, width: 1, height: 1 }));
-        assert_eq!(layout.insert_popup.map(|rect| (rect.width, rect.height)), Some((1, 1)));
+        assert_eq!(
+            layout.cmdline,
+            Some(Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1
+            })
+        );
+        assert_eq!(
+            layout.insert_popup.map(|rect| (rect.width, rect.height)),
+            Some((1, 1))
+        );
     }
 
     #[test]
@@ -1536,7 +1795,11 @@ mod tests {
             ChromeLayer::Messages,
             ChromeLayer::History,
         ];
-        assert!(layers.windows(2).all(|pair| pair[0].z_index() < pair[1].z_index()));
+        assert!(
+            layers
+                .windows(2)
+                .all(|pair| pair[0].z_index() < pair[1].z_index())
+        );
         assert_eq!(ChromeLayer::Messages.z_index(), 200);
         assert!(layers.iter().all(|layer| !layer.description().is_empty()));
     }
@@ -1544,9 +1807,24 @@ mod tests {
     #[test]
     fn chrome_layout_hit_tests_own_surface_coordinates() {
         let layout = ChromeLayout {
-            cmdline: Some(Rect { x: 14, y: 10, width: 72, height: 3 }),
-            wildmenu: Some(Rect { x: 14, y: 14, width: 72, height: 1 }),
-            messages: Some(Rect { x: 56, y: 24, width: 44, height: 6 }),
+            cmdline: Some(Rect {
+                x: 14,
+                y: 10,
+                width: 72,
+                height: 3,
+            }),
+            wildmenu: Some(Rect {
+                x: 14,
+                y: 14,
+                width: 72,
+                height: 1,
+            }),
+            messages: Some(Rect {
+                x: 56,
+                y: 24,
+                width: 44,
+                height: 6,
+            }),
             ..ChromeLayout::default()
         };
         assert!(layout.contains(15, 11));
@@ -1556,7 +1834,7 @@ mod tests {
         assert!(!layout.contains(14, 9));
         assert!(!layout.contains(14, 13));
         assert!(!layout.contains(55, 26));
-        assert!(ChromeLayout::default().contains(3, 3) == false);
+        assert!(!ChromeLayout::default().contains(3, 3));
     }
 
     #[test]
@@ -1564,8 +1842,14 @@ mod tests {
         let source = "  alpha\nβ — 'quoted'  ";
         let mut chrome = Chrome::default();
         assert!(chrome.message_show(update("echomsg", source)).is_ok());
-        assert_eq!(chrome.messages[0].content[0].text.as_bytes(), source.as_bytes());
-        assert_eq!(chrome.history[0].content[0].text.as_bytes(), source.as_bytes());
+        assert_eq!(
+            chrome.messages[0].content[0].text.as_bytes(),
+            source.as_bytes()
+        );
+        assert_eq!(
+            chrome.history[0].content[0].text.as_bytes(),
+            source.as_bytes()
+        );
     }
 
     #[test]
@@ -1590,7 +1874,13 @@ mod tests {
             3,
             1,
         );
-        assert_eq!(chrome.insert_popup.as_ref().and_then(InsertPopupState::documentation), Some(info.as_slice()));
+        assert_eq!(
+            chrome
+                .insert_popup
+                .as_ref()
+                .and_then(InsertPopupState::documentation),
+            Some(info.as_slice())
+        );
         assert!(chrome.layout(40, 12, None).documentation.is_some());
     }
 
@@ -1602,7 +1892,10 @@ mod tests {
         assert!(chrome.message_show(update("shell_out", "open")).is_ok());
         chrome.message_clear();
         assert_eq!(chrome.messages.len(), 2);
-        assert!(chrome.messages.iter().all(|entry| matches!(entry.lifetime, MessageLifetime::StickyUntilKeypress | MessageLifetime::StreamingOpen)));
+        assert!(chrome.messages.iter().all(|entry| matches!(
+            entry.lifetime,
+            MessageLifetime::StickyUntilKeypress | MessageLifetime::StreamingOpen
+        )));
     }
 
     #[test]
@@ -1619,15 +1912,14 @@ mod tests {
     #[test]
     fn shell_return_closes_after_a_stable_batch() {
         let mut chrome = Chrome::default();
-        chrome.message_show(MessageUpdate {
-            kind: OxStr::from("shell_ret"),
-            content: vec![chunk("done")],
-            replace_last: false,
-            history: false,
-            append: false,
-            id: Object::Nil,
-            prompt: false,
-        }).unwrap();
+        chrome
+            .message_show(MessageUpdate {
+                kind: OxStr::from("shell_ret"),
+                content: vec![chunk("done")],
+                flags: MessageFlags::default(),
+                id: Object::Nil,
+            })
+            .unwrap();
         chrome.finish_batch(TimeMs(10));
         chrome.advance_time(TimeMs(4_009));
         assert_eq!(chrome.messages.len(), 1);
@@ -1679,7 +1971,9 @@ mod tests {
         // A clipping rule would answer Some with width 0.
         let chrome = popup_with_documentation("a-long-completion", 0);
         let layout = chrome.layout(20, 24, None);
-        let menu = layout.insert_popup.expect("menu survives a narrow terminal");
+        let menu = layout
+            .insert_popup
+            .expect("menu survives a narrow terminal");
         assert_eq!(menu.width, 20);
         assert_eq!(layout.documentation, None);
     }

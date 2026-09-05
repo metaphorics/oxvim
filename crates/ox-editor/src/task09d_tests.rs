@@ -2,20 +2,21 @@
 
 use ox_text::{Buffer, Position as TextPosition};
 
+use crate::BufferState;
 use crate::decoration::{
     BufCallbackId, CallbackPhase, DecorItem, DecorOrigin, DecorPos, DecorProviderDef, DecorRange,
-    Decorations, LineCallbackId, ProviderId, RangeCallbackId, StartCallbackId,
-    VirtTextChunk as DecorTextChunk, VirtualText as DecorVirtualText, WinCallbackId, WindowId,
+    Decorations, LineCallbackId, ProviderDecorInput, ProviderId, RangeCallbackId, RedrawEntry,
+    RedrawId, StartCallbackId, VirtTextChunk as DecorTextChunk, VirtualText as DecorVirtualText,
+    WinCallbackId, WindowId,
 };
 use crate::extmark::{
-    ExtmarkAttributes, ExtmarkEnd, ExtmarkGravity, ExtmarkId, ExtmarkPlacement,
-    ExtmarkPosition, Extmarks, TextExtent, VirtualTextChunk,
+    ExtmarkAttributes, ExtmarkEnd, ExtmarkGravity, ExtmarkId, ExtmarkPlacement, ExtmarkPosition,
+    Extmarks, TextExtent, VirtualTextChunk,
 };
 use crate::fold::{
-    indent_levels, FoldComputeResult, FoldError, FoldMethod, FoldRefresh, FoldState, Folds,
-    HostFoldKind, Position,
+    FoldComputeResult, FoldError, FoldMethod, FoldRefresh, FoldState, Folds, HostFoldKind,
+    Position, indent_levels,
 };
-use crate::BufferState;
 
 fn placement(row: usize, column: usize, gravity: ExtmarkGravity) -> ExtmarkPlacement {
     let mut placement = ExtmarkPlacement::new(ExtmarkPosition::new(row, column));
@@ -65,14 +66,94 @@ macro_rules! insertion_gravity_test {
     };
 }
 
-insertion_gravity_test!(insert_same_point_right_moves, 2, 4, ExtmarkGravity::Right, 2, 4, TextExtent::new(0, 3), 2, 7);
-insertion_gravity_test!(insert_same_point_left_stays, 2, 4, ExtmarkGravity::Left, 2, 4, TextExtent::new(0, 3), 2, 4);
-insertion_gravity_test!(insert_before_mark_shifts_column, 2, 7, ExtmarkGravity::Right, 2, 4, TextExtent::new(0, 3), 2, 10);
-insertion_gravity_test!(insert_after_mark_leaves_mark, 2, 2, ExtmarkGravity::Right, 2, 4, TextExtent::new(0, 3), 2, 2);
-insertion_gravity_test!(insert_multiline_right_moves_to_new_end, 2, 4, ExtmarkGravity::Right, 2, 4, TextExtent::new(2, 1), 4, 1);
-insertion_gravity_test!(insert_multiline_left_stays_at_start, 2, 4, ExtmarkGravity::Left, 2, 4, TextExtent::new(2, 1), 2, 4);
-insertion_gravity_test!(insert_multiline_suffix_moves_rows, 5, 9, ExtmarkGravity::Right, 2, 4, TextExtent::new(2, 1), 7, 9);
-insertion_gravity_test!(insert_other_row_is_unchanged, 1, 9, ExtmarkGravity::Right, 2, 4, TextExtent::new(2, 1), 1, 9);
+insertion_gravity_test!(
+    insert_same_point_right_moves,
+    2,
+    4,
+    ExtmarkGravity::Right,
+    2,
+    4,
+    TextExtent::new(0, 3),
+    2,
+    7
+);
+insertion_gravity_test!(
+    insert_same_point_left_stays,
+    2,
+    4,
+    ExtmarkGravity::Left,
+    2,
+    4,
+    TextExtent::new(0, 3),
+    2,
+    4
+);
+insertion_gravity_test!(
+    insert_before_mark_shifts_column,
+    2,
+    7,
+    ExtmarkGravity::Right,
+    2,
+    4,
+    TextExtent::new(0, 3),
+    2,
+    10
+);
+insertion_gravity_test!(
+    insert_after_mark_leaves_mark,
+    2,
+    2,
+    ExtmarkGravity::Right,
+    2,
+    4,
+    TextExtent::new(0, 3),
+    2,
+    2
+);
+insertion_gravity_test!(
+    insert_multiline_right_moves_to_new_end,
+    2,
+    4,
+    ExtmarkGravity::Right,
+    2,
+    4,
+    TextExtent::new(2, 1),
+    4,
+    1
+);
+insertion_gravity_test!(
+    insert_multiline_left_stays_at_start,
+    2,
+    4,
+    ExtmarkGravity::Left,
+    2,
+    4,
+    TextExtent::new(2, 1),
+    2,
+    4
+);
+insertion_gravity_test!(
+    insert_multiline_suffix_moves_rows,
+    5,
+    9,
+    ExtmarkGravity::Right,
+    2,
+    4,
+    TextExtent::new(2, 1),
+    7,
+    9
+);
+insertion_gravity_test!(
+    insert_other_row_is_unchanged,
+    1,
+    9,
+    ExtmarkGravity::Right,
+    2,
+    4,
+    TextExtent::new(2, 1),
+    1,
+    9
+);
 
 macro_rules! replacement_gravity_test {
     ($name:ident, $column:expr, $gravity:expr, $expected:expr) => {
@@ -81,25 +162,56 @@ macro_rules! replacement_gravity_test {
             let mut marks = Extmarks::new();
             let (namespace, id) = one_mark(&mut marks, 1, $column, $gravity);
             marks.splice(crate::extmark::TextSplice {
-
                 start: ExtmarkPosition::new(1, 2),
 
                 old_extent: TextExtent::new(0, 4),
 
                 new_extent: TextExtent::new(0, 2),
-
             });
-            assert_eq!(mark_position(&marks, namespace, id), ExtmarkPosition::new(1, $expected));
+            assert_eq!(
+                mark_position(&marks, namespace, id),
+                ExtmarkPosition::new(1, $expected)
+            );
         }
     };
 }
 
-replacement_gravity_test!(replace_interior_left_collapses_to_start, 4, ExtmarkGravity::Left, 2);
-replacement_gravity_test!(replace_interior_right_collapses_to_new_end, 4, ExtmarkGravity::Right, 4);
-replacement_gravity_test!(replace_old_end_left_collapses_to_start, 6, ExtmarkGravity::Left, 2);
-replacement_gravity_test!(replace_old_end_right_moves_to_new_end, 6, ExtmarkGravity::Right, 4);
-replacement_gravity_test!(replace_before_range_is_unchanged, 1, ExtmarkGravity::Right, 1);
-replacement_gravity_test!(replace_after_range_shifts_by_delta, 8, ExtmarkGravity::Right, 6);
+replacement_gravity_test!(
+    replace_interior_left_collapses_to_start,
+    4,
+    ExtmarkGravity::Left,
+    2
+);
+replacement_gravity_test!(
+    replace_interior_right_collapses_to_new_end,
+    4,
+    ExtmarkGravity::Right,
+    4
+);
+replacement_gravity_test!(
+    replace_old_end_left_collapses_to_start,
+    6,
+    ExtmarkGravity::Left,
+    2
+);
+replacement_gravity_test!(
+    replace_old_end_right_moves_to_new_end,
+    6,
+    ExtmarkGravity::Right,
+    4
+);
+replacement_gravity_test!(
+    replace_before_range_is_unchanged,
+    1,
+    ExtmarkGravity::Right,
+    1
+);
+replacement_gravity_test!(
+    replace_after_range_shifts_by_delta,
+    8,
+    ExtmarkGravity::Right,
+    6
+);
 
 #[test]
 fn range_start_and_end_use_independent_gravity() {
@@ -112,17 +224,18 @@ fn range_start_and_end_use_independent_gravity() {
     });
     let id = marks.set(namespace, None, mark).unwrap();
     marks.splice(crate::extmark::TextSplice {
-
         start: ExtmarkPosition::new(1, 2),
 
         old_extent: TextExtent::EMPTY,
 
         new_extent: TextExtent::new(0, 2),
-
     });
     let mark = marks.get(namespace, id).unwrap().unwrap();
     assert_eq!(mark.position(), ExtmarkPosition::new(1, 2));
-    assert_eq!(mark.placement.end.unwrap().position, ExtmarkPosition::new(1, 7));
+    assert_eq!(
+        mark.placement.end.unwrap().position,
+        ExtmarkPosition::new(1, 7)
+    );
 }
 
 #[test]
@@ -146,15 +259,17 @@ fn default_end_gravity_is_left() {
 fn complete_range_deletion_invalidates_when_requested() {
     let mut marks = Extmarks::new();
     let namespace = marks.create_namespace("invalid").unwrap();
-    let mut mark = ExtmarkPlacement::new(ExtmarkPosition::new(1, 2))
-        .with_end(ExtmarkPosition::new(1, 5));
-    mark.attributes.invalidate = true;
+    let mut mark =
+        ExtmarkPlacement::new(ExtmarkPosition::new(1, 2)).with_end(ExtmarkPosition::new(1, 5));
+    mark.attributes
+        .flags
+        .set(crate::ExtmarkFlags::INVALIDATE, true);
     let id = marks.set(namespace, None, mark).unwrap();
     let result = marks.splice(crate::extmark::TextSplice {
-     start: ExtmarkPosition::new(1, 1),
-     old_extent: TextExtent::new(0, 6),
-     new_extent: TextExtent::EMPTY,
- });
+        start: ExtmarkPosition::new(1, 1),
+        old_extent: TextExtent::new(0, 6),
+        new_extent: TextExtent::EMPTY,
+    });
     assert_eq!(result.invalidated, 1);
     assert!(marks.get(namespace, id).unwrap().unwrap().invalid);
 }
@@ -167,18 +282,15 @@ fn complete_range_deletion_without_invalidate_keeps_visible() {
         .set(
             namespace,
             None,
-            ExtmarkPlacement::new(ExtmarkPosition::new(1, 2))
-                .with_end(ExtmarkPosition::new(1, 5)),
+            ExtmarkPlacement::new(ExtmarkPosition::new(1, 2)).with_end(ExtmarkPosition::new(1, 5)),
         )
         .unwrap();
     marks.splice(crate::extmark::TextSplice {
-
         start: ExtmarkPosition::new(1, 1),
 
         old_extent: TextExtent::new(0, 6),
 
         new_extent: TextExtent::EMPTY,
-
     });
     assert!(!marks.get(namespace, id).unwrap().unwrap().invalid);
 }
@@ -187,18 +299,18 @@ fn complete_range_deletion_without_invalidate_keeps_visible() {
 fn partial_range_deletion_does_not_invalidate() {
     let mut marks = Extmarks::new();
     let namespace = marks.create_namespace("partial").unwrap();
-    let mut mark = ExtmarkPlacement::new(ExtmarkPosition::new(1, 1))
-        .with_end(ExtmarkPosition::new(1, 8));
-    mark.attributes.invalidate = true;
+    let mut mark =
+        ExtmarkPlacement::new(ExtmarkPosition::new(1, 1)).with_end(ExtmarkPosition::new(1, 8));
+    mark.attributes
+        .flags
+        .set(crate::ExtmarkFlags::INVALIDATE, true);
     let id = marks.set(namespace, None, mark).unwrap();
     marks.splice(crate::extmark::TextSplice {
-
         start: ExtmarkPosition::new(1, 3),
 
         old_extent: TextExtent::new(0, 2),
 
         new_extent: TextExtent::EMPTY,
-
     });
     assert!(!marks.get(namespace, id).unwrap().unwrap().invalid);
 }
@@ -228,13 +340,24 @@ fn namespace_isolation_allows_equal_local_ids() {
     let first = marks.create_namespace("first").unwrap();
     let second = marks.create_namespace("second").unwrap();
     let first_id = marks
-        .set(first, None, ExtmarkPlacement::new(ExtmarkPosition::new(0, 0)))
+        .set(
+            first,
+            None,
+            ExtmarkPlacement::new(ExtmarkPosition::new(0, 0)),
+        )
         .unwrap();
     let second_id = marks
-        .set(second, None, ExtmarkPlacement::new(ExtmarkPosition::new(1, 0)))
+        .set(
+            second,
+            None,
+            ExtmarkPlacement::new(ExtmarkPosition::new(1, 0)),
+        )
         .unwrap();
     assert_eq!(first_id, second_id);
-    assert_ne!(marks.get(first, first_id).unwrap(), marks.get(second, second_id).unwrap());
+    assert_ne!(
+        marks.get(first, first_id).unwrap(),
+        marks.get(second, second_id).unwrap()
+    );
 }
 
 #[test]
@@ -273,7 +396,10 @@ fn updating_mark_preserves_id_and_changes_position() {
             ExtmarkPlacement::new(ExtmarkPosition::new(3, 4)),
         )
         .unwrap();
-    assert_eq!(mark_position(&marks, namespace, id), ExtmarkPosition::new(3, 4));
+    assert_eq!(
+        mark_position(&marks, namespace, id),
+        ExtmarkPosition::new(3, 4)
+    );
 }
 
 #[test]
@@ -373,11 +499,7 @@ fn query_all_merges_namespaces_in_position_order() {
             .unwrap();
     }
     let columns: Vec<_> = marks
-        .query_all(
-            ExtmarkPosition::new(0, 0),
-            ExtmarkPosition::new(0, 3),
-            None,
-        )
+        .query_all(ExtmarkPosition::new(0, 0), ExtmarkPosition::new(0, 3), None)
         .into_iter()
         .map(|mark| mark.position().column)
         .collect();
@@ -392,16 +514,21 @@ fn virtual_text_preserves_chunk_highlight_order() {
         text: "hint".into(),
         highlight_groups: vec!["First".into(), "Second".into()],
     });
-    assert_eq!(attributes.virtual_text[0].highlight_groups, ["First", "Second"]);
+    assert_eq!(
+        attributes.virtual_text[0].highlight_groups,
+        ["First", "Second"]
+    );
 }
 
 #[test]
 fn virtual_lines_preserve_line_and_chunk_shape() {
-    let mut attributes = ExtmarkAttributes::default();
-    attributes.virtual_lines = vec![
-        vec![VirtualTextChunk::new("one")],
-        vec![VirtualTextChunk::new("two"), VirtualTextChunk::new("three")],
-    ];
+    let attributes = ExtmarkAttributes {
+        virtual_lines: vec![
+            vec![VirtualTextChunk::new("one")],
+            vec![VirtualTextChunk::new("two"), VirtualTextChunk::new("three")],
+        ],
+        ..Default::default()
+    };
     assert_eq!(attributes.virtual_lines.len(), 2);
     assert_eq!(attributes.virtual_lines[1].len(), 2);
 }
@@ -415,7 +542,12 @@ fn highlight_sign_and_priority_round_trip() {
     mark.attributes.sign_text = Some("!".into());
     mark.attributes.priority = 200;
     let id = marks.set(namespace, None, mark).unwrap();
-    let attributes = &marks.get(namespace, id).unwrap().unwrap().placement.attributes;
+    let attributes = &marks
+        .get(namespace, id)
+        .unwrap()
+        .unwrap()
+        .placement
+        .attributes;
     assert_eq!(attributes.highlight_group.as_deref(), Some("Search"));
     assert_eq!(attributes.sign_text.as_deref(), Some("!"));
     assert_eq!(attributes.priority, 200);
@@ -425,17 +557,21 @@ fn highlight_sign_and_priority_round_trip() {
 fn render_ordered_sorts_low_priority_first_then_insertion() {
     let mut marks = Extmarks::new();
     let namespace = marks.create_namespace("order").unwrap();
-    let mut late_high = ExtmarkPlacement::new(ExtmarkPosition::new(0, 0))
-        .with_end(ExtmarkPosition::new(0, 2));
+    let mut late_high =
+        ExtmarkPlacement::new(ExtmarkPosition::new(0, 0)).with_end(ExtmarkPosition::new(0, 2));
     late_high.attributes.highlight_group = Some("Comment".into());
     late_high.attributes.priority = 20;
-    let mut early_low = ExtmarkPlacement::new(ExtmarkPosition::new(0, 0))
-        .with_end(ExtmarkPosition::new(0, 2));
+    let mut early_low =
+        ExtmarkPlacement::new(ExtmarkPosition::new(0, 0)).with_end(ExtmarkPosition::new(0, 2));
     early_low.attributes.highlight_group = Some("String".into());
     early_low.attributes.priority = 10;
     let high_id = marks.set(namespace, None, late_high).unwrap();
     let low_id = marks.set(namespace, None, early_low).unwrap();
-    let ordered: Vec<_> = marks.render_ordered().into_iter().map(|mark| mark.id).collect();
+    let ordered: Vec<_> = marks
+        .render_ordered()
+        .into_iter()
+        .map(|mark| mark.id)
+        .collect();
     assert_eq!(ordered, vec![low_id, high_id]);
 }
 
@@ -443,10 +579,14 @@ fn render_ordered_sorts_low_priority_first_then_insertion() {
 fn invalidated_mark_without_undo_restore_is_deleted() {
     let mut marks = Extmarks::new();
     let namespace = marks.create_namespace("invalidate-delete").unwrap();
-    let mut mark = ExtmarkPlacement::new(ExtmarkPosition::new(0, 1))
-        .with_end(ExtmarkPosition::new(0, 3));
-    mark.attributes.invalidate = true;
-    mark.attributes.undo_restore = false;
+    let mut mark =
+        ExtmarkPlacement::new(ExtmarkPosition::new(0, 1)).with_end(ExtmarkPosition::new(0, 3));
+    mark.attributes
+        .flags
+        .set(crate::ExtmarkFlags::INVALIDATE, true);
+    mark.attributes
+        .flags
+        .set(crate::ExtmarkFlags::UNDO_RESTORE, false);
     let id = marks.set(namespace, None, mark).unwrap();
 
     marks.splice(crate::extmark::TextSplice {
@@ -463,10 +603,17 @@ fn unload_retains_only_invalidatable_marks_as_invalid() {
     let mut marks = Extmarks::new();
     let namespace = marks.create_namespace("invalidate-unload").unwrap();
     let mut retained = ExtmarkPlacement::new(ExtmarkPosition::new(1, 2));
-    retained.attributes.invalidate = true;
+    retained
+        .attributes
+        .flags
+        .set(crate::ExtmarkFlags::INVALIDATE, true);
     let retained_id = marks.set(namespace, None, retained).unwrap();
     let discarded_id = marks
-        .set(namespace, None, ExtmarkPlacement::new(ExtmarkPosition::new(0, 0)))
+        .set(
+            namespace,
+            None,
+            ExtmarkPlacement::new(ExtmarkPosition::new(0, 0)),
+        )
         .unwrap();
 
     marks.invalidate_for_unload();
@@ -481,12 +628,18 @@ fn unload_retains_only_invalidatable_marks_as_invalid() {
 // src/nvim/fold.c:321-361,432-478,535-655,763-829,1122-1275,2841-2862.
 #[test]
 fn indent_levels_divide_spaces_by_shiftwidth() {
-    assert_eq!(indent_levels(&[b"root".as_slice(), b"    child"], 4).unwrap(), vec![0, 1]);
+    assert_eq!(
+        indent_levels(&[b"root".as_slice(), b"    child"], 4).unwrap(),
+        vec![0, 1]
+    );
 }
 
 #[test]
 fn indent_levels_expand_tabs_to_shiftwidth() {
-    assert_eq!(indent_levels(&[b"root".as_slice(), b"\tchild"], 4).unwrap(), vec![0, 1]);
+    assert_eq!(
+        indent_levels(&[b"root".as_slice(), b"\tchild"], 4).unwrap(),
+        vec![0, 1]
+    );
 }
 
 #[test]
@@ -525,12 +678,18 @@ fn indent_levels_trailing_blank_run_resolves_to_zero() {
 fn indent_levels_all_blank_buffer_is_zero() {
     // First and last lines are always defined (fold.c:2852-2854); with no
     // concrete neighbor either side every blank resolves to zero.
-    assert_eq!(indent_levels(&[b"".as_slice(), b"", b""], 4).unwrap(), vec![0, 0, 0]);
+    assert_eq!(
+        indent_levels(&[b"".as_slice(), b"", b""], 4).unwrap(),
+        vec![0, 0, 0]
+    );
 }
 
 #[test]
 fn zero_shiftwidth_is_rejected() {
-    assert_eq!(indent_levels(&[b"x".as_slice()], 0), Err(FoldError::ZeroShiftWidth));
+    assert_eq!(
+        indent_levels(&[b"x".as_slice()], 0),
+        Err(FoldError::ZeroShiftWidth)
+    );
 }
 
 fn nested_manual_folds() -> Folds {
@@ -593,7 +752,13 @@ fn delete_manual_at_prefers_deepest() {
 #[test]
 fn recursive_delete_removes_descendants() {
     let mut folds = nested_manual_folds();
-    assert_eq!(folds.delete_manual_at(Position::new(1, 0), true).unwrap().len(), 2);
+    assert_eq!(
+        folds
+            .delete_manual_at(Position::new(1, 0), true)
+            .unwrap()
+            .len(),
+        2
+    );
     assert!(folds.folds().is_empty());
 }
 
@@ -610,7 +775,12 @@ fn repeated_zo_opens_nested_fold() {
     let mut folds = nested_manual_folds();
     folds.open(Position::new(3, 0)).unwrap();
     folds.open(Position::new(3, 0)).unwrap();
-    assert!(folds.folds().iter().all(|fold| fold.state == FoldState::Open));
+    assert!(
+        folds
+            .folds()
+            .iter()
+            .all(|fold| fold.state == FoldState::Open)
+    );
 }
 
 #[test]
@@ -641,7 +811,12 @@ fn za_toggles_deepest_open_fold_closed() {
 fn z_o_opens_descendants_recursively() {
     let mut folds = nested_manual_folds();
     assert_eq!(folds.open_recursive(Position::new(3, 0)).unwrap(), 2);
-    assert!(folds.folds().iter().all(|fold| fold.state == FoldState::Open));
+    assert!(
+        folds
+            .folds()
+            .iter()
+            .all(|fold| fold.state == FoldState::Open)
+    );
 }
 
 #[test]
@@ -656,7 +831,12 @@ fn z_c_closes_outer_fold_recursively() {
 fn z_r_opens_every_fold() {
     let mut folds = nested_manual_folds();
     assert_eq!(folds.open_all(), 2);
-    assert!(folds.folds().iter().all(|fold| fold.state == FoldState::Open));
+    assert!(
+        folds
+            .folds()
+            .iter()
+            .all(|fold| fold.state == FoldState::Open)
+    );
 }
 
 #[test]
@@ -664,7 +844,12 @@ fn z_m_closes_every_fold() {
     let mut folds = nested_manual_folds();
     folds.open_all();
     assert_eq!(folds.close_all(), 2);
-    assert!(folds.folds().iter().all(|fold| fold.state == FoldState::Closed));
+    assert!(
+        folds
+            .folds()
+            .iter()
+            .all(|fold| fold.state == FoldState::Closed)
+    );
 }
 
 #[test]
@@ -682,7 +867,9 @@ fn edit_invalidation_is_lazy() {
 fn indent_refresh_recomputes_on_requested_tick() {
     let mut folds = Folds::new();
     folds.set_method(FoldMethod::Indent);
-    let refresh = folds.refresh(4, &[b"root".as_slice(), b"        child"]).unwrap();
+    let refresh = folds
+        .refresh(4, &[b"root".as_slice(), b"        child"])
+        .unwrap();
     assert!(matches!(refresh, FoldRefresh::Ready { changedtick: 4, .. }));
     assert_eq!(folds.cached_changedtick(), Some(4));
 }
@@ -747,8 +934,11 @@ fn manual_foldtext_request_carries_depth() {
 // src/nvim/undo.c:2503-2513,2818-2824, and src/nvim/buffer.c:1445-1450.
 fn state_with_lines(lines: &[&[u8]]) -> BufferState {
     BufferState::new(
-        Buffer::from_lines(&lines.iter().map(|line| line.to_vec()).collect::<Vec<_>>(), false)
-            .unwrap(),
+        Buffer::from_lines(
+            &lines.iter().map(|line| line.to_vec()).collect::<Vec<_>>(),
+            false,
+        )
+        .unwrap(),
         true,
     )
 }
@@ -760,8 +950,8 @@ fn text_pos(line: usize) -> TextPosition {
 #[test]
 fn new_buffer_is_unmodified_and_writable() {
     let state = state_with_lines(&[b"a"]);
-    assert!(!state.modified);
-    assert!(!state.readonly);
+    assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
+    assert!(!state.flags.contains(crate::BufferFlags::READONLY));
 }
 
 #[test]
@@ -770,7 +960,7 @@ fn line_replacement_sets_modified() {
     state
         .replace_lines(1, 1, &[b"b".to_vec()], text_pos(1), text_pos(1), 1)
         .unwrap();
-    assert!(state.modified);
+    assert!(state.flags.contains(crate::BufferFlags::MODIFIED));
 }
 
 #[test]
@@ -779,14 +969,14 @@ fn line_append_sets_modified() {
     state
         .append_lines(1, &[b"b".to_vec()], text_pos(1), 1)
         .unwrap();
-    assert!(state.modified);
+    assert!(state.flags.contains(crate::BufferFlags::MODIFIED));
 }
 
 #[test]
 fn line_delete_sets_modified() {
     let mut state = state_with_lines(&[b"a", b"b"]);
     state.delete_lines(2, 2, text_pos(2), 1).unwrap();
-    assert!(state.modified);
+    assert!(state.flags.contains(crate::BufferFlags::MODIFIED));
 }
 
 #[test]
@@ -796,7 +986,7 @@ fn mark_saved_clears_modified_and_records_tick() {
         .replace_lines(1, 1, &[b"b".to_vec()], text_pos(1), text_pos(1), 1)
         .unwrap();
     state.mark_saved();
-    assert!(!state.modified);
+    assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
     assert_eq!(state.saved_changedtick(), state.changedtick());
 }
 
@@ -808,7 +998,7 @@ fn undo_away_from_saved_point_sets_modified() {
         .unwrap();
     state.mark_saved();
     state.undo().unwrap();
-    assert!(state.modified);
+    assert!(state.flags.contains(crate::BufferFlags::MODIFIED));
 }
 
 #[test]
@@ -820,7 +1010,7 @@ fn redo_to_saved_point_clears_modified() {
     state.mark_saved();
     state.undo().unwrap();
     state.redo().unwrap();
-    assert!(!state.modified);
+    assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
 }
 
 #[test]
@@ -830,35 +1020,38 @@ fn undo_to_initial_saved_point_clears_modified() {
         .replace_lines(1, 1, &[b"b".to_vec()], text_pos(1), text_pos(1), 1)
         .unwrap();
     state.undo().unwrap();
-    assert!(!state.modified);
+    assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
 }
 
 #[test]
 fn readonly_is_policy_data_not_mutation_suppression() {
     let mut state = state_with_lines(&[b"a"]);
-    state.readonly = true;
+    state.flags.set(crate::BufferFlags::READONLY, true);
     state
         .replace_lines(1, 1, &[b"b".to_vec()], text_pos(1), text_pos(1), 1)
         .unwrap();
-    assert!(state.readonly && state.modified);
+    assert!(
+        state.flags.contains(crate::BufferFlags::READONLY)
+            && state.flags.contains(crate::BufferFlags::MODIFIED)
+    );
 }
 
 #[test]
 fn eol_content_change_sets_modified() {
     let mut state = state_with_lines(&[b"a"]);
     state.set_eol(true).unwrap();
-    assert!(state.modified);
+    assert!(state.flags.contains(crate::BufferFlags::MODIFIED));
 }
 
 #[test]
 fn restoring_saved_eol_clears_modified_when_undo_matches() {
     let mut state = state_with_lines(&[b"a"]);
     state.set_eol(true).unwrap();
-    assert!(state.modified);
+    assert!(state.flags.contains(crate::BufferFlags::MODIFIED));
     // Restoring the saved final-EOL with no other pending edits returns the
     // buffer to the saved undo point, so 'modified' clears.
     state.set_eol(false).unwrap();
-    assert!(!state.modified);
+    assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
 }
 
 #[test]
@@ -871,7 +1064,7 @@ fn restoring_saved_eol_keeps_modified_with_pending_edits() {
     // Restoring the saved EOL keeps 'modified' set because pending text edits
     // still diverge from the saved undo point.
     state.set_eol(false).unwrap();
-    assert!(state.modified);
+    assert!(state.flags.contains(crate::BufferFlags::MODIFIED));
 }
 
 #[test]
@@ -887,12 +1080,20 @@ fn buffer_pipeline_splices_extmarks_and_invalidates_folds() {
         )
         .unwrap();
     state.folds.set_method(FoldMethod::Indent);
-    state.folds.refresh(state.changedtick(), &[b"a".as_slice(), b"b"]).unwrap();
+    state
+        .folds
+        .refresh(state.changedtick(), &[b"a".as_slice(), b"b"])
+        .unwrap();
     state
         .append_lines(1, &[b"inserted".to_vec()], text_pos(1), 1)
         .unwrap();
     assert_eq!(
-        state.extmarks.get(namespace, id).unwrap().unwrap().position(),
+        state
+            .extmarks
+            .get(namespace, id)
+            .unwrap()
+            .unwrap()
+            .position(),
         ExtmarkPosition::new(2, 0)
     );
     assert!(state.folds.is_dirty());
@@ -920,39 +1121,48 @@ fn row_range(row: u32) -> DecorRange {
     }
 }
 
-fn provider_item(
-    provider: ProviderId,
-    window: WindowId,
-    row: u32,
-    priority: u32,
-) -> DecorItem {
-    DecorItem::for_provider(
+fn provider_item(provider: ProviderId, window: WindowId, row: u32, priority: u32) -> DecorItem {
+    DecorItem::for_provider(ProviderDecorInput {
         provider,
-        CallbackPhase::Line,
+        phase: CallbackPhase::Line,
         window,
-        row_range(row),
+        range: row_range(row),
         priority,
-        None,
-        None,
-        None,
-    )
+        ..ProviderDecorInput::default()
+    })
+}
+
+fn register_provider(decorations: &mut Decorations, def: DecorProviderDef) -> ProviderId {
+    let id = ProviderId::new(
+        u32::try_from(decorations.provider_order().len() + 1)
+            .expect("test provider count fits u32"),
+    );
+    assert_eq!(decorations.replace_provider(id, def).unwrap(), None);
+    id
+}
+
+fn outer_redraw(decorations: &mut Decorations, display_tick: u64) -> RedrawId {
+    match decorations.enter_redraw(display_tick).unwrap() {
+        RedrawEntry::Outermost(id) => id,
+        RedrawEntry::Nested => panic!("expected outermost redraw"),
+    }
 }
 
 #[test]
 fn providers_remain_in_registration_order() {
     let mut decorations = Decorations::new();
-    let first = decorations.register(DecorProviderDef::default()).unwrap();
-    let second = decorations.register(DecorProviderDef::default()).unwrap();
+    let first = register_provider(&mut decorations, DecorProviderDef::default());
+    let second = register_provider(&mut decorations, DecorProviderDef::default());
     assert_eq!(decorations.provider_order(), [first, second]);
 }
 
 #[test]
 fn provider_update_preserves_registration_order() {
     let mut decorations = Decorations::new();
-    let first = decorations.register(DecorProviderDef::default()).unwrap();
-    let second = decorations.register(DecorProviderDef::default()).unwrap();
-    decorations
-        .update(
+    let first = register_provider(&mut decorations, DecorProviderDef::default());
+    let second = register_provider(&mut decorations, DecorProviderDef::default());
+    let previous = decorations
+        .replace_provider(
             first,
             DecorProviderDef {
                 line: Some(LineCallbackId::new(9)),
@@ -960,15 +1170,16 @@ fn provider_update_preserves_registration_order() {
             },
         )
         .unwrap();
+    assert_eq!(previous, Some(DecorProviderDef::default()));
     assert_eq!(decorations.provider_order(), [first, second]);
 }
 
 #[test]
 fn provider_removal_compacts_order_without_reordering() {
     let mut decorations = Decorations::new();
-    let first = decorations.register(DecorProviderDef::default()).unwrap();
-    let middle = decorations.register(DecorProviderDef::default()).unwrap();
-    let last = decorations.register(DecorProviderDef::default()).unwrap();
+    let first = register_provider(&mut decorations, DecorProviderDef::default());
+    let middle = register_provider(&mut decorations, DecorProviderDef::default());
+    let last = register_provider(&mut decorations, DecorProviderDef::default());
     decorations.remove(middle).unwrap();
     assert_eq!(decorations.provider_order(), [first, last]);
 }
@@ -976,103 +1187,134 @@ fn provider_removal_compacts_order_without_reordering() {
 #[test]
 fn phase_plan_keeps_provider_order_per_phase() {
     let mut decorations = Decorations::new();
-    let first = decorations
-        .register(DecorProviderDef {
+    let first = register_provider(
+        &mut decorations,
+        DecorProviderDef {
             start: Some(StartCallbackId::new(1)),
             buf: Some(BufCallbackId::new(2)),
             win: Some(WinCallbackId::new(3)),
             line: Some(LineCallbackId::new(4)),
             ..DecorProviderDef::default()
-        })
-        .unwrap();
-    let second = decorations
-        .register(DecorProviderDef {
+        },
+    );
+    let second = register_provider(
+        &mut decorations,
+        DecorProviderDef {
             line: Some(LineCallbackId::new(5)),
             ..DecorProviderDef::default()
-        })
-        .unwrap();
-    let redraw = decorations.begin_redraw(10).unwrap();
-    let plan = redraw.phase_plans();
-    assert_eq!(plan.start[0].0, first);
-    assert_eq!(plan.buf[0].0, first);
-    assert_eq!(plan.win[0].0, first);
-    assert_eq!(plan.line.iter().map(|entry| entry.0).collect::<Vec<_>>(), vec![first, second]);
+        },
+    );
+    assert_eq!(
+        decorations.phase_provider_ids(CallbackPhase::Start),
+        vec![first]
+    );
+    assert_eq!(
+        decorations.phase_provider_ids(CallbackPhase::Buf),
+        vec![first]
+    );
+    assert_eq!(
+        decorations.phase_provider_ids(CallbackPhase::Win),
+        vec![first]
+    );
+    assert_eq!(
+        decorations.phase_provider_ids(CallbackPhase::Line),
+        vec![first, second]
+    );
 }
 
 #[test]
 fn disabled_provider_is_absent_from_phase_plan() {
     let mut decorations = Decorations::new();
-    let provider = decorations
-        .register(DecorProviderDef {
+    let provider = register_provider(
+        &mut decorations,
+        DecorProviderDef {
             line: Some(LineCallbackId::new(1)),
             ..DecorProviderDef::default()
-        })
-        .unwrap();
+        },
+    );
     decorations.set_enabled(provider, false).unwrap();
-    let redraw = decorations.begin_redraw(1).unwrap();
-    assert!(redraw.phase_plans().line.is_empty());
+    assert!(
+        decorations
+            .phase_provider_ids(CallbackPhase::Line)
+            .is_empty()
+    );
 }
 
 #[test]
 fn ephemeral_decoration_is_visible_only_during_own_redraw() {
     let mut decorations = Decorations::new();
-    let provider = decorations.register(DecorProviderDef::default()).unwrap();
+    let provider = register_provider(&mut decorations, DecorProviderDef::default());
     let window = WindowId(1);
     {
-        let mut redraw = decorations.begin_redraw(1).unwrap();
-        redraw.push_ephemeral(provider_item(provider, window, 2, 10)).unwrap();
-        assert_eq!(redraw.query_line(&[], window, 2).len(), 1);
-        redraw.end().unwrap();
+        let redraw = outer_redraw(&mut decorations, 1);
+        decorations
+            .push_ephemeral(redraw, provider_item(provider, window, 2, 10))
+            .unwrap();
+        assert_eq!(decorations.query_line(redraw, &[], window, 2).len(), 1);
+        decorations.finish_redraw(redraw).unwrap();
     }
-    let redraw = decorations.begin_redraw(2).unwrap();
-    assert!(redraw.query_line(&[], window, 2).is_empty());
+    let redraw = outer_redraw(&mut decorations, 2);
+    assert!(decorations.query_line(redraw, &[], window, 2).is_empty());
 }
 
 #[test]
-fn dropping_redraw_discards_ephemeral_decorations() {
+fn finishing_redraw_discards_ephemeral_decorations() {
     let mut decorations = Decorations::new();
-    let provider = decorations.register(DecorProviderDef::default()).unwrap();
+    let provider = register_provider(&mut decorations, DecorProviderDef::default());
     let window = WindowId(1);
-    {
-        let mut redraw = decorations.begin_redraw(1).unwrap();
-        redraw.push_ephemeral(provider_item(provider, window, 2, 10)).unwrap();
-    }
-    let redraw = decorations.begin_redraw(2).unwrap();
-    assert!(redraw.query_line(&[], window, 2).is_empty());
+    let redraw = outer_redraw(&mut decorations, 1);
+    decorations
+        .push_ephemeral(redraw, provider_item(provider, window, 2, 10))
+        .unwrap();
+    decorations.finish_redraw(redraw).unwrap();
+    let redraw = outer_redraw(&mut decorations, 2);
+    assert!(decorations.query_line(redraw, &[], window, 2).is_empty());
 }
 
 #[test]
 fn query_filters_ephemeral_by_window() {
     let mut decorations = Decorations::new();
-    let provider = decorations.register(DecorProviderDef::default()).unwrap();
-    let mut redraw = decorations.begin_redraw(1).unwrap();
-    redraw
-        .push_ephemeral(provider_item(provider, WindowId(1), 2, 10))
+    let provider = register_provider(&mut decorations, DecorProviderDef::default());
+    let redraw = outer_redraw(&mut decorations, 1);
+    decorations
+        .push_ephemeral(redraw, provider_item(provider, WindowId(1), 2, 10))
         .unwrap();
-    assert!(redraw.query_line(&[], WindowId(2), 2).is_empty());
+    assert!(
+        decorations
+            .query_line(redraw, &[], WindowId(2), 2)
+            .is_empty()
+    );
 }
 
 #[test]
 fn query_filters_ephemeral_by_line() {
     let mut decorations = Decorations::new();
-    let provider = decorations.register(DecorProviderDef::default()).unwrap();
-    let mut redraw = decorations.begin_redraw(1).unwrap();
-    redraw
-        .push_ephemeral(provider_item(provider, WindowId(1), 2, 10))
+    let provider = register_provider(&mut decorations, DecorProviderDef::default());
+    let redraw = outer_redraw(&mut decorations, 1);
+    decorations
+        .push_ephemeral(redraw, provider_item(provider, WindowId(1), 2, 10))
         .unwrap();
-    assert!(redraw.query_line(&[], WindowId(1), 3).is_empty());
+    assert!(
+        decorations
+            .query_line(redraw, &[], WindowId(1), 3)
+            .is_empty()
+    );
 }
 
 #[test]
 fn aggregation_orders_lower_priority_first() {
     let mut decorations = Decorations::new();
-    let provider = decorations.register(DecorProviderDef::default()).unwrap();
+    let provider = register_provider(&mut decorations, DecorProviderDef::default());
     let window = WindowId(1);
-    let mut redraw = decorations.begin_redraw(1).unwrap();
-    redraw.push_ephemeral(provider_item(provider, window, 2, 30)).unwrap();
-    redraw.push_ephemeral(provider_item(provider, window, 2, 10)).unwrap();
-    let priorities: Vec<_> = redraw
-        .query_line(&[], window, 2)
+    let redraw = outer_redraw(&mut decorations, 1);
+    decorations
+        .push_ephemeral(redraw, provider_item(provider, window, 2, 30))
+        .unwrap();
+    decorations
+        .push_ephemeral(redraw, provider_item(provider, window, 2, 10))
+        .unwrap();
+    let priorities: Vec<_> = decorations
+        .query_line(redraw, &[], window, 2)
         .into_iter()
         .map(|item| item.priority)
         .collect();
@@ -1082,7 +1324,7 @@ fn aggregation_orders_lower_priority_first() {
 #[test]
 fn equal_priority_extmark_precedes_provider_output() {
     let mut decorations = Decorations::new();
-    let provider = decorations.register(DecorProviderDef::default()).unwrap();
+    let provider = register_provider(&mut decorations, DecorProviderDef::default());
     let window = WindowId(1);
     let persistent = DecorItem {
         origin: DecorOrigin::Extmark {
@@ -1097,10 +1339,12 @@ fn equal_priority_extmark_precedes_provider_output() {
         virt_text: None,
         virt_lines: None,
     };
-    let mut redraw = decorations.begin_redraw(1).unwrap();
-    redraw.push_ephemeral(provider_item(provider, window, 2, 10)).unwrap();
+    let redraw = outer_redraw(&mut decorations, 1);
+    decorations
+        .push_ephemeral(redraw, provider_item(provider, window, 2, 10))
+        .unwrap();
     assert!(matches!(
-        redraw.query_line(&[persistent], window, 2)[0].origin,
+        decorations.query_line(redraw, &[persistent], window, 2)[0].origin,
         DecorOrigin::Extmark { .. }
     ));
 }
@@ -1108,14 +1352,18 @@ fn equal_priority_extmark_precedes_provider_output() {
 #[test]
 fn equal_priority_providers_follow_registration_order() {
     let mut decorations = Decorations::new();
-    let first = decorations.register(DecorProviderDef::default()).unwrap();
-    let second = decorations.register(DecorProviderDef::default()).unwrap();
+    let first = register_provider(&mut decorations, DecorProviderDef::default());
+    let second = register_provider(&mut decorations, DecorProviderDef::default());
     let window = WindowId(1);
-    let mut redraw = decorations.begin_redraw(1).unwrap();
-    redraw.push_ephemeral(provider_item(second, window, 2, 10)).unwrap();
-    redraw.push_ephemeral(provider_item(first, window, 2, 10)).unwrap();
-    let origins: Vec<_> = redraw
-        .query_line(&[], window, 2)
+    let redraw = outer_redraw(&mut decorations, 1);
+    decorations
+        .push_ephemeral(redraw, provider_item(second, window, 2, 10))
+        .unwrap();
+    decorations
+        .push_ephemeral(redraw, provider_item(first, window, 2, 10))
+        .unwrap();
+    let origins: Vec<_> = decorations
+        .query_line(redraw, &[], window, 2)
         .into_iter()
         .map(|item| item.origin)
         .collect();
@@ -1126,27 +1374,27 @@ fn equal_priority_providers_follow_registration_order() {
 #[test]
 fn aggregation_preserves_winblend_and_virtual_text() {
     let mut decorations = Decorations::new();
-    let provider = decorations.register(DecorProviderDef::default()).unwrap();
+    let provider = register_provider(&mut decorations, DecorProviderDef::default());
     let window = WindowId(1);
-    let item = DecorItem::for_provider(
+    let item = DecorItem::for_provider(ProviderDecorInput {
         provider,
-        CallbackPhase::Line,
+        phase: CallbackPhase::Line,
         window,
-        row_range(2),
-        10,
-        Some(20),
-        Some(DecorVirtualText {
+        range: row_range(2),
+        priority: 10,
+        winblend: Some(20),
+        virt_text: Some(DecorVirtualText {
             chunks: vec![DecorTextChunk {
                 text: "hint".into(),
                 hl_group: Some("Comment".into()),
             }],
             ..DecorVirtualText::default()
         }),
-        None,
-    );
-    let mut redraw = decorations.begin_redraw(1).unwrap();
-    redraw.push_ephemeral(item).unwrap();
-    let output = redraw.query_line(&[], window, 2);
+        ..ProviderDecorInput::default()
+    });
+    let redraw = outer_redraw(&mut decorations, 1);
+    decorations.push_ephemeral(redraw, item).unwrap();
+    let output = decorations.query_line(redraw, &[], window, 2);
     assert_eq!(output[0].winblend, Some(20));
     assert_eq!(output[0].virt_text.as_ref().unwrap().chunks[0].text, "hint");
 }
@@ -1156,16 +1404,17 @@ fn whole_line_deletion_invalidates_point_mark() {
     let mut marks = Extmarks::new();
     let namespace = marks.create_namespace("point-invalid").unwrap();
     let mut point = ExtmarkPlacement::new(ExtmarkPosition::new(2, 3));
-    point.attributes.invalidate = true;
+    point
+        .attributes
+        .flags
+        .set(crate::ExtmarkFlags::INVALIDATE, true);
     let id = marks.set(namespace, None, point).unwrap();
     marks.splice(crate::extmark::TextSplice {
-
         start: ExtmarkPosition::new(2, 0),
 
         old_extent: TextExtent::new(1, 0),
 
         new_extent: TextExtent::EMPTY,
-
     });
     assert!(marks.get(namespace, id).unwrap().unwrap().invalid);
 }
@@ -1174,9 +1423,12 @@ fn whole_line_deletion_invalidates_point_mark() {
 fn undo_restores_invalidated_extmark_range_and_position() {
     let mut state = state_with_lines(&[b"a", b"b", b"c"]);
     let namespace = state.extmarks.create_namespace("undo-invalid").unwrap();
-    let mut placement = ExtmarkPlacement::new(ExtmarkPosition::new(1, 0))
-        .with_end(ExtmarkPosition::new(2, 0));
-    placement.attributes.invalidate = true;
+    let mut placement =
+        ExtmarkPlacement::new(ExtmarkPosition::new(1, 0)).with_end(ExtmarkPosition::new(2, 0));
+    placement
+        .attributes
+        .flags
+        .set(crate::ExtmarkFlags::INVALIDATE, true);
     let id = state.extmarks.set(namespace, None, placement).unwrap();
     state.delete_lines(2, 2, text_pos(2), 1).unwrap();
     assert!(state.extmarks.get(namespace, id).unwrap().unwrap().invalid);
@@ -1184,7 +1436,10 @@ fn undo_restores_invalidated_extmark_range_and_position() {
     let restored = state.extmarks.get(namespace, id).unwrap().unwrap();
     assert!(!restored.invalid);
     assert_eq!(restored.position(), ExtmarkPosition::new(1, 0));
-    assert_eq!(restored.placement.end.unwrap().position, ExtmarkPosition::new(2, 0));
+    assert_eq!(
+        restored.placement.end.unwrap().position,
+        ExtmarkPosition::new(2, 0)
+    );
 }
 
 #[test]
@@ -1193,20 +1448,26 @@ fn row_delete_undo_restores_text_and_all_extmark_states() {
     let mut state = state_with_lines(&rows);
     let namespace = state.extmarks.create_namespace("row-delete-undo").unwrap();
 
-    let mut s1 = ExtmarkPlacement::new(ExtmarkPosition::new(0, 0))
-        .with_end(ExtmarkPosition::new(1, 0));
-    s1.attributes.invalidate = true;
+    let mut s1 =
+        ExtmarkPlacement::new(ExtmarkPosition::new(0, 0)).with_end(ExtmarkPosition::new(1, 0));
+    s1.attributes
+        .flags
+        .set(crate::ExtmarkFlags::INVALIDATE, true);
     let s1_id = state.extmarks.set(namespace, None, s1).unwrap();
-    let mut s2 = ExtmarkPlacement::new(ExtmarkPosition::new(1, 0))
-        .with_end(ExtmarkPosition::new(2, 0));
-    s2.attributes.invalidate = true;
+    let mut s2 =
+        ExtmarkPlacement::new(ExtmarkPosition::new(1, 0)).with_end(ExtmarkPosition::new(2, 0));
+    s2.attributes
+        .flags
+        .set(crate::ExtmarkFlags::INVALIDATE, true);
     let s2_id = state.extmarks.set(namespace, None, s2).unwrap();
-    let mut s3 = ExtmarkPlacement::new(ExtmarkPosition::new(1, 0))
-        .with_end(ExtmarkPosition::new(2, 1));
-    s3.attributes.invalidate = true;
+    let mut s3 =
+        ExtmarkPlacement::new(ExtmarkPosition::new(1, 0)).with_end(ExtmarkPosition::new(2, 1));
+    s3.attributes
+        .flags
+        .set(crate::ExtmarkFlags::INVALIDATE, true);
     let s3_id = state.extmarks.set(namespace, None, s3).unwrap();
-    let before = [s1_id, s2_id, s3_id]
-        .map(|id| state.extmarks.get(namespace, id).unwrap().unwrap().clone());
+    let before =
+        [s1_id, s2_id, s3_id].map(|id| state.extmarks.get(namespace, id).unwrap().unwrap().clone());
     let text_before = state.text().unwrap().to_bytes();
 
     state.delete_lines(2, 3, text_pos(2), 1).unwrap();
@@ -1214,7 +1475,10 @@ fn row_delete_undo_restores_text_and_all_extmark_states() {
 
     assert_eq!(state.text().unwrap().to_bytes(), text_before);
     for (id, expected) in [s1_id, s2_id, s3_id].into_iter().zip(before) {
-        assert_eq!(state.extmarks.get(namespace, id).unwrap().unwrap(), &expected);
+        assert_eq!(
+            state.extmarks.get(namespace, id).unwrap().unwrap(),
+            &expected
+        );
     }
 }
 
@@ -1235,26 +1499,22 @@ fn inserting_lines_above_manual_fold_splices_its_rows() {
 #[test]
 fn range_callbacks_are_present_in_phase_plan_order() {
     let mut decorations = Decorations::new();
-    let first = decorations
-        .register(DecorProviderDef {
+    let first = register_provider(
+        &mut decorations,
+        DecorProviderDef {
             range: Some(RangeCallbackId::new(1)),
             ..DecorProviderDef::default()
-        })
-        .unwrap();
-    let second = decorations
-        .register(DecorProviderDef {
+        },
+    );
+    let second = register_provider(
+        &mut decorations,
+        DecorProviderDef {
             range: Some(RangeCallbackId::new(2)),
             ..DecorProviderDef::default()
-        })
-        .unwrap();
-    let redraw = decorations.begin_redraw(1).unwrap();
+        },
+    );
     assert_eq!(
-        redraw
-            .phase_plans()
-            .range
-            .into_iter()
-            .map(|entry| entry.0)
-            .collect::<Vec<_>>(),
+        decorations.phase_provider_ids(CallbackPhase::Range),
         vec![first, second]
     );
 }
@@ -1276,7 +1536,12 @@ fn undo_splices_extmark_created_after_original_edit() {
         .unwrap();
     state.undo().unwrap();
     assert_eq!(
-        state.extmarks.get(namespace, id).unwrap().unwrap().position(),
+        state
+            .extmarks
+            .get(namespace, id)
+            .unwrap()
+            .unwrap()
+            .position(),
         ExtmarkPosition::new(2, 0)
     );
 }
@@ -1290,5 +1555,5 @@ fn undo_line_edit_preserves_unsaved_eol_modified_state() {
         .replace_lines(1, 1, &[b"b".to_vec()], text_pos(1), text_pos(1), 1)
         .unwrap();
     state.undo().unwrap();
-    assert!(state.modified);
+    assert!(state.flags.contains(crate::BufferFlags::MODIFIED));
 }

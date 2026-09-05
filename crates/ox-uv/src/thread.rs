@@ -38,27 +38,49 @@ pub struct Thread<T> {
 
 impl<T> fmt::Debug for Thread<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("Thread").field("identity", &self.identity).field("detached", &self.detached).finish_non_exhaustive()
+        formatter
+            .debug_struct("Thread")
+            .field("identity", &self.identity)
+            .field("detached", &self.detached)
+            .finish_non_exhaustive()
     }
 }
 
 impl<T> Thread<T> {
     /// Returns this thread's process-local identity.
     /// See `uv.thread_equal()` in `runtime/doc/luvref.txt`.
-    pub fn identity(&self) -> ThreadIdentity { self.identity }
+    #[must_use]
+    pub fn identity(&self) -> ThreadIdentity {
+        self.identity
+    }
 
     /// Waits for the thread and returns its entry value.
     /// See `uv.thread_join()` in `runtime/doc/luvref.txt`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ThreadError::Detached`] if the thread was already detached,
+    /// [`ThreadError::AlreadyJoined`] if the thread was already joined, or
+    /// [`ThreadError::Panicked`] if the thread entry panicked.
     pub fn join(&mut self) -> Result<T, ThreadError> {
-        if self.detached { return Err(ThreadError::Detached); }
+        if self.detached {
+            return Err(ThreadError::Detached);
+        }
         let join = self.join.take().ok_or(ThreadError::AlreadyJoined)?;
         join.join().map_err(|_| ThreadError::Panicked)?
     }
 
     /// Detaches the thread by releasing its standard join handle.
     /// See `uv.thread_detach()` in `runtime/doc/luvref.txt`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ThreadError::Detached`] if the thread was already detached, or
+    /// [`ThreadError::AlreadyJoined`] if the thread was already joined.
     pub fn detach(&mut self) -> Result<(), ThreadError> {
-        if self.detached { return Err(ThreadError::Detached); }
+        if self.detached {
+            return Err(ThreadError::Detached);
+        }
         self.join.take().ok_or(ThreadError::AlreadyJoined)?;
         self.detached = true;
         Ok(())
@@ -66,7 +88,10 @@ impl<T> Thread<T> {
 
     /// Reports whether the thread was explicitly detached.
     /// See `uv.thread_detach()` in `runtime/doc/luvref.txt`.
-    pub fn is_detached(&self) -> bool { self.detached }
+    #[must_use]
+    pub fn is_detached(&self) -> bool {
+        self.detached
+    }
 }
 
 /// Starts an isolated thread with a newly-created event loop.
@@ -74,25 +99,45 @@ impl<T> Thread<T> {
 /// Lua-state isolation remains the binding layer's responsibility. `stack_size`
 /// maps directly to `std::thread::Builder`. See `uv.new_thread()` in
 /// `runtime/doc/luvref.txt`.
+///
+/// # Errors
+///
+/// Returns [`ThreadError::Spawn`] if the OS thread cannot be created, or
+/// [`ThreadError::Loop`] if the per-thread event loop cannot be initialized.
 pub fn new_thread<F, T>(stack_size: Option<usize>, entry: F) -> Result<Thread<T>, ThreadError>
 where
     F: FnOnce(&mut UvLoop) -> T + Send + 'static,
     T: Send + 'static,
 {
     let mut builder = thread::Builder::new().name("ox-uv-thread".into());
-    if let Some(stack_size) = stack_size { builder = builder.stack_size(stack_size); }
-    let join = builder.spawn(move || {
-        let mut uv_loop = UvLoop::new().map_err(|error| ThreadError::Loop(error.to_string()))?;
-        Ok(entry(&mut uv_loop))
-    }).map_err(|error| ThreadError::Spawn(error.to_string()))?;
+    if let Some(stack_size) = stack_size {
+        builder = builder.stack_size(stack_size);
+    }
+    let join = builder
+        .spawn(move || {
+            let mut uv_loop =
+                UvLoop::new().map_err(|error| ThreadError::Loop(error.to_string()))?;
+            Ok(entry(&mut uv_loop))
+        })
+        .map_err(|error| ThreadError::Spawn(error.to_string()))?;
     let identity = ThreadIdentity(join.thread().id());
-    Ok(Thread { identity, join: Some(join), detached: false })
+    Ok(Thread {
+        identity,
+        join: Some(join),
+        detached: false,
+    })
 }
 
 /// Returns the calling thread's identity.
 /// See `uv.thread_self()` in `runtime/doc/luvref.txt`.
-pub fn thread_self() -> ThreadIdentity { ThreadIdentity(thread::current().id()) }
+#[must_use]
+pub fn thread_self() -> ThreadIdentity {
+    ThreadIdentity(thread::current().id())
+}
 
 /// Compares two process-local thread identities.
 /// See `uv.thread_equal()` in `runtime/doc/luvref.txt`.
-pub fn thread_equal(left: ThreadIdentity, right: ThreadIdentity) -> bool { left == right }
+#[must_use]
+pub fn thread_equal(left: ThreadIdentity, right: ThreadIdentity) -> bool {
+    left == right
+}

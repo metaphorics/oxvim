@@ -25,7 +25,10 @@ impl Span {
     /// Return a span covering both input spans.
     #[must_use]
     pub const fn through(self, other: Self) -> Self {
-        Self { start: self.start, end: other.end }
+        Self {
+            start: self.start,
+            end: other.end,
+        }
     }
 }
 
@@ -70,7 +73,10 @@ pub enum TokenKind {
     /// `$NAME` without the leading dollar sign.
     Environment(Vec<u8>),
     /// `&name`, `&g:name`, or `&l:name`.
-    Option { scope: Option<u8>, name: Vec<u8> },
+    Option {
+        scope: Option<u8>,
+        name: Vec<u8>,
+    },
     /// `@r`; the payload is the register-name byte.
     Register(u8),
     LParen,
@@ -128,12 +134,19 @@ impl<'a> Lexer<'a> {
     /// Create a lexer over an expression byte slice.
     #[must_use]
     pub const fn new(source: &'a [u8]) -> Self {
-        Self { source, offset: 0, at_line_start: true }
+        Self {
+            source,
+            offset: 0,
+            at_line_start: true,
+        }
     }
 
     /// Tokenize the complete expression, including one trailing [`TokenKind::Eof`].
     ///
-    /// Fails on the first byte no token can start with.
+    /// # Errors
+    ///
+    /// Returns `E15: Invalid expression` when the source contains a byte
+    /// that cannot start any token.
     pub fn tokenize(self) -> Result<Vec<Token>, EvalError> {
         match self.tokenize_tolerant() {
             (_, Some(error)) => Err(error),
@@ -154,6 +167,7 @@ impl<'a> Lexer<'a> {
     /// decides which answer is upstream's: the expression completed before the
     /// refused byte, so the remainder is trailing garbage (E488), or the
     /// expression needed that byte, so the lexer's own error stands.
+    #[must_use]
     pub fn tokenize_tolerant(mut self) -> (Vec<Token>, Option<EvalError>) {
         let mut tokens = Vec::new();
         loop {
@@ -162,12 +176,18 @@ impl<'a> Lexer<'a> {
             let kind = match self.next_kind() {
                 Ok(kind) => kind,
                 Err(error) => {
-                    tokens.push(Token { kind: TokenKind::Eof, span: Span::new(start, start) });
+                    tokens.push(Token {
+                        kind: TokenKind::Eof,
+                        span: Span::new(start, start),
+                    });
                     return (tokens, Some(error));
                 }
             };
             let eof = matches!(kind, TokenKind::Eof);
-            tokens.push(Token { kind, span: Span::new(start, self.offset) });
+            tokens.push(Token {
+                kind,
+                span: Span::new(start, self.offset),
+            });
             if eof {
                 return (tokens, None);
             }
@@ -179,100 +199,99 @@ impl<'a> Lexer<'a> {
     fn next_kind(&mut self) -> Result<TokenKind, EvalError> {
         let start = self.offset;
         Ok(match self.peek(0) {
-                None => TokenKind::Eof,
-                Some(b'\n') => TokenKind::Eof,
-                Some(b'0') if matches!(self.peek(1), Some(b'z' | b'Z')) => self.lex_blob()?,
-                Some(b'0'..=b'9') => self.lex_number()?,
-                Some(b'\'') => self.lex_single_string()?,
-                Some(b'"') => self.lex_double_string()?,
-                Some(b'$') if matches!(self.peek(1), Some(b'\'' | b'"')) => self.lex_interpolated()?,
-                Some(b'$') => self.lex_environment()?,
-                Some(b'&') if self.peek(1) == Some(b'&') => {
-                    self.offset += 2;
-                    TokenKind::AndAnd
-                }
-                Some(b'&') => self.lex_option()?,
-                Some(b'@') => self.lex_register()?,
-                Some(b'#') if self.peek(1) == Some(b'{') => {
-                    self.offset += 2;
-                    TokenKind::HashLBrace
-                }
-                Some(b'(') => self.one(TokenKind::LParen),
-                Some(b')') => self.one(TokenKind::RParen),
-                Some(b'[') => self.one(TokenKind::LBracket),
-                Some(b']') => self.one(TokenKind::RBracket),
-                Some(b'{') => self.one(TokenKind::LBrace),
-                Some(b'}') => self.one(TokenKind::RBrace),
-                Some(b',') => self.one(TokenKind::Comma),
-                Some(b':') => self.one(TokenKind::Colon),
-                Some(b'+') => self.one(TokenKind::Plus),
-                Some(b'*') => self.one(TokenKind::Star),
-                Some(b'/') => self.one(TokenKind::Slash),
-                Some(b'%') => self.one(TokenKind::Percent),
-                Some(b'-') if self.peek(1) == Some(b'>') => {
-                    self.offset += 2;
-                    TokenKind::Arrow
-                }
-                Some(b'-') => self.one(TokenKind::Minus),
-                Some(b'.') if self.peek(1) == Some(b'.') && self.peek(2) == Some(b'.') => {
-                    self.offset += 3;
-                    TokenKind::DotDotDot
-                }
-                Some(b'.') if self.peek(1) == Some(b'.') => {
-                    self.offset += 2;
-                    TokenKind::DotDot
-                }
-                Some(b'.') => self.one(TokenKind::Dot),
-                Some(b'?') if self.peek(1) == Some(b'?') => {
-                    self.offset += 2;
-                    TokenKind::Coalesce
-                }
-                Some(b'?') => self.one(TokenKind::Question),
-                Some(b'|') if self.peek(1) == Some(b'|') => {
-                    self.offset += 2;
-                    TokenKind::OrOr
-                }
-                Some(b'=') if self.peek(1) == Some(b'=') => {
-                    self.offset += 2;
-                    TokenKind::Equal(self.lex_case_suffix())
-                }
-                Some(b'=') if self.peek(1) == Some(b'~') => {
-                    self.offset += 2;
-                    TokenKind::Match(self.lex_case_suffix())
-                }
-                Some(b'!') if self.peek(1) == Some(b'=') => {
-                    self.offset += 2;
-                    TokenKind::NotEqual(self.lex_case_suffix())
-                }
-                Some(b'!') if self.peek(1) == Some(b'~') => {
-                    self.offset += 2;
-                    TokenKind::NoMatch(self.lex_case_suffix())
-                }
-                Some(b'!') => self.one(TokenKind::Bang),
-                Some(b'>') if self.peek(1) == Some(b'=') => {
-                    self.offset += 2;
-                    TokenKind::GreaterEqual(self.lex_case_suffix())
-                }
-                Some(b'>') => {
-                    self.offset += 1;
-                    TokenKind::Greater(self.lex_case_suffix())
-                }
-                Some(b'<') if self.peek(1) == Some(b'=') => {
-                    self.offset += 2;
-                    TokenKind::LessEqual(self.lex_case_suffix())
-                }
-                Some(b'<') => {
-                    self.offset += 1;
-                    TokenKind::Less(self.lex_case_suffix())
-                }
-                Some(byte) if is_name_start(byte) => self.lex_identifier(),
-                Some(byte) => {
-                    return Err(EvalError::new(
-                        "E15",
-                        start,
-                        format!("invalid character 0x{byte:02x} in expression"),
-                    ));
-                }
+            None | Some(b'\n') => TokenKind::Eof,
+            Some(b'0') if matches!(self.peek(1), Some(b'z' | b'Z')) => self.lex_blob()?,
+            Some(b'0'..=b'9') => self.lex_number()?,
+            Some(b'\'') => self.lex_single_string()?,
+            Some(b'"') => self.lex_double_string()?,
+            Some(b'$') if matches!(self.peek(1), Some(b'\'' | b'"')) => self.lex_interpolated()?,
+            Some(b'$') => self.lex_environment()?,
+            Some(b'&') if self.peek(1) == Some(b'&') => {
+                self.offset += 2;
+                TokenKind::AndAnd
+            }
+            Some(b'&') => self.lex_option()?,
+            Some(b'@') => self.lex_register()?,
+            Some(b'#') if self.peek(1) == Some(b'{') => {
+                self.offset += 2;
+                TokenKind::HashLBrace
+            }
+            Some(b'(') => self.one(TokenKind::LParen),
+            Some(b')') => self.one(TokenKind::RParen),
+            Some(b'[') => self.one(TokenKind::LBracket),
+            Some(b']') => self.one(TokenKind::RBracket),
+            Some(b'{') => self.one(TokenKind::LBrace),
+            Some(b'}') => self.one(TokenKind::RBrace),
+            Some(b',') => self.one(TokenKind::Comma),
+            Some(b':') => self.one(TokenKind::Colon),
+            Some(b'+') => self.one(TokenKind::Plus),
+            Some(b'*') => self.one(TokenKind::Star),
+            Some(b'/') => self.one(TokenKind::Slash),
+            Some(b'%') => self.one(TokenKind::Percent),
+            Some(b'-') if self.peek(1) == Some(b'>') => {
+                self.offset += 2;
+                TokenKind::Arrow
+            }
+            Some(b'-') => self.one(TokenKind::Minus),
+            Some(b'.') if self.peek(1) == Some(b'.') && self.peek(2) == Some(b'.') => {
+                self.offset += 3;
+                TokenKind::DotDotDot
+            }
+            Some(b'.') if self.peek(1) == Some(b'.') => {
+                self.offset += 2;
+                TokenKind::DotDot
+            }
+            Some(b'.') => self.one(TokenKind::Dot),
+            Some(b'?') if self.peek(1) == Some(b'?') => {
+                self.offset += 2;
+                TokenKind::Coalesce
+            }
+            Some(b'?') => self.one(TokenKind::Question),
+            Some(b'|') if self.peek(1) == Some(b'|') => {
+                self.offset += 2;
+                TokenKind::OrOr
+            }
+            Some(b'=') if self.peek(1) == Some(b'=') => {
+                self.offset += 2;
+                TokenKind::Equal(self.lex_case_suffix())
+            }
+            Some(b'=') if self.peek(1) == Some(b'~') => {
+                self.offset += 2;
+                TokenKind::Match(self.lex_case_suffix())
+            }
+            Some(b'!') if self.peek(1) == Some(b'=') => {
+                self.offset += 2;
+                TokenKind::NotEqual(self.lex_case_suffix())
+            }
+            Some(b'!') if self.peek(1) == Some(b'~') => {
+                self.offset += 2;
+                TokenKind::NoMatch(self.lex_case_suffix())
+            }
+            Some(b'!') => self.one(TokenKind::Bang),
+            Some(b'>') if self.peek(1) == Some(b'=') => {
+                self.offset += 2;
+                TokenKind::GreaterEqual(self.lex_case_suffix())
+            }
+            Some(b'>') => {
+                self.offset += 1;
+                TokenKind::Greater(self.lex_case_suffix())
+            }
+            Some(b'<') if self.peek(1) == Some(b'=') => {
+                self.offset += 2;
+                TokenKind::LessEqual(self.lex_case_suffix())
+            }
+            Some(b'<') => {
+                self.offset += 1;
+                TokenKind::Less(self.lex_case_suffix())
+            }
+            Some(byte) if is_name_start(byte) => self.lex_identifier(),
+            Some(byte) => {
+                return Err(EvalError::new(
+                    "E15",
+                    start,
+                    format!("invalid character 0x{byte:02x} in expression"),
+                ));
+            }
         })
     }
 
@@ -358,7 +377,10 @@ impl<'a> Lexer<'a> {
         let start = self.offset;
         self.offset += 1;
         if self.offset == start + 1
-            && matches!(self.source[start], b'g' | b'b' | b'w' | b't' | b's' | b'l' | b'a' | b'v')
+            && matches!(
+                self.source[start],
+                b'g' | b'b' | b'w' | b't' | b's' | b'l' | b'a' | b'v'
+            )
             && self.peek(0) == Some(b':')
             && self.peek(1).is_some_and(is_name_start)
         {
@@ -399,13 +421,13 @@ impl<'a> Lexer<'a> {
         while matches!(self.peek(0), Some(b'0'..=b'9')) {
             self.offset += 1;
         }
+        let integer_end = self.offset;
         if self.peek(0) == Some(b'.') && matches!(self.peek(1), Some(b'0'..=b'9')) {
             self.offset += 1;
             while matches!(self.peek(0), Some(b'0'..=b'9')) {
                 self.offset += 1;
             }
             if matches!(self.peek(0), Some(b'e' | b'E')) {
-                let exponent = self.offset;
                 self.offset += 1;
                 if matches!(self.peek(0), Some(b'+' | b'-')) {
                     self.offset += 1;
@@ -415,8 +437,22 @@ impl<'a> Lexer<'a> {
                     self.offset += 1;
                 }
                 if self.offset == digits {
-                    return Err(EvalError::new("E15", exponent, "missing float exponent"));
+                    // `eval_number` (eval.c:3473-3479): a letter-less
+                    // exponent turns the candidate back into a plain
+                    // number, it is not an error.
+                    self.offset = integer_end;
+                    return self.finish_integer(start, integer_end);
                 }
+            }
+            // `eval_number` (eval.c:3484-3486): a `.` or letter after the
+            // float candidate keeps it a plain number — ":let vers =
+            // 1.2.3" parses 1, then 2, then 3 across two `.` operators.
+            if self
+                .peek(0)
+                .is_some_and(|byte| byte == b'.' || byte.is_ascii_alphabetic())
+            {
+                self.offset = integer_end;
+                return self.finish_integer(start, integer_end);
             }
             let text = std::str::from_utf8(&self.source[start..self.offset])
                 .map_err(|_| EvalError::new("E15", start, "invalid float literal"))?;
@@ -425,9 +461,14 @@ impl<'a> Lexer<'a> {
                 .map(TokenKind::Float)
                 .map_err(|_| EvalError::new("E15", start, "invalid float literal"));
         }
+        self.finish_integer(start, integer_end)
+    }
+
+    /// Parse the digits `[start..end]` with upstream's legacy-octal rule.
+    fn finish_integer(&self, start: usize, end: usize) -> Result<TokenKind, EvalError> {
         let old_octal = self.source[start] == b'0'
-            && self.offset > start + 1
-            && self.source[start + 1..self.offset]
+            && end > start + 1
+            && self.source[start + 1..end]
                 .iter()
                 .all(|byte| matches!(byte, b'0'..=b'7'));
         let (base, digits_start) = if old_octal {
@@ -435,8 +476,12 @@ impl<'a> Lexer<'a> {
         } else {
             (10, start)
         };
-        let digits = &self.source[digits_start..self.offset];
-        let digits = if digits.is_empty() { &self.source[start..self.offset] } else { digits };
+        let digits = &self.source[digits_start..end];
+        let digits = if digits.is_empty() {
+            &self.source[start..end]
+        } else {
+            digits
+        };
         parse_integer(digits, base, start).map(TokenKind::Integer)
     }
 
@@ -452,17 +497,22 @@ impl<'a> Lexer<'a> {
             self.offset += 1;
         }
         if self.offset == digits_start {
-            return Err(EvalError::new("E15", start, "missing digits after numeric prefix"));
+            return Err(EvalError::new(
+                "E15",
+                start,
+                "missing digits after numeric prefix",
+            ));
         }
         let digits = &self.source[digits_start..self.offset];
-        if digits
-            .iter()
-            .any(|byte| match hex_value(*byte) {
-                Some(digit) => u32::from(digit) >= base,
-                None => true,
-            })
-        {
-            return Err(EvalError::new("E15", start, "digit is invalid for numeric base"));
+        if digits.iter().any(|byte| match hex_value(*byte) {
+            Some(digit) => u32::from(digit) >= base,
+            None => true,
+        }) {
+            return Err(EvalError::new(
+                "E15",
+                start,
+                "digit is invalid for numeric base",
+            ));
         }
         parse_integer(digits, base, start).map(TokenKind::Integer)
     }
@@ -482,15 +532,25 @@ impl<'a> Lexer<'a> {
             }
         }
         if matches!(self.peek(0), Some(byte) if is_name_continue(byte)) {
-            return Err(EvalError::new("E973", start, "invalid character in blob literal"));
+            return Err(EvalError::new(
+                "E973",
+                start,
+                "invalid character in blob literal",
+            ));
         }
         if digits.len() % 2 != 0 {
-            return Err(EvalError::new("E973", start, "blob literal should have an even number of hex characters"));
+            return Err(EvalError::new(
+                "E973",
+                start,
+                "blob literal should have an even number of hex characters",
+            ));
         }
         let mut bytes = Vec::with_capacity(digits.len() / 2);
-        for pair in digits.chunks_exact(2) {
-            let high = hex_value(pair[0]).ok_or_else(|| EvalError::new("E973", start, "invalid blob digit"))?;
-            let low = hex_value(pair[1]).ok_or_else(|| EvalError::new("E973", start, "invalid blob digit"))?;
+        for pair in digits.as_chunks::<2>().0 {
+            let high = hex_value(pair[0])
+                .ok_or_else(|| EvalError::new("E973", start, "invalid blob digit"))?;
+            let low = hex_value(pair[1])
+                .ok_or_else(|| EvalError::new("E973", start, "invalid blob digit"))?;
             bytes.push((high << 4) | low);
         }
         Ok(TokenKind::Blob(bytes))
@@ -498,13 +558,25 @@ impl<'a> Lexer<'a> {
 
     fn lex_interpolated(&mut self) -> Result<TokenKind, EvalError> {
         let start = self.offset;
-        let quote = self.peek(1).expect("interpolated quote checked by caller");
+        let Some(quote) = self.peek(1) else {
+            return Err(EvalError::new(
+                "E115",
+                start,
+                "missing quote in interpolated string",
+            ));
+        };
         self.offset += 2;
         let mut parts = Vec::new();
         let mut literal = Vec::new();
         loop {
             match self.peek(0) {
-                None => return Err(EvalError::new(if quote == b'"' { "E114" } else { "E115" }, start, "missing quote in interpolated string")),
+                None => {
+                    return Err(EvalError::new(
+                        if quote == b'"' { "E114" } else { "E115" },
+                        start,
+                        "missing quote in interpolated string",
+                    ));
+                }
                 Some(byte) if byte == quote => {
                     if quote == b'\'' && self.peek(1) == Some(b'\'') {
                         literal.push(b'\'');
@@ -512,28 +584,51 @@ impl<'a> Lexer<'a> {
                         continue;
                     }
                     self.offset += 1;
-                    if !literal.is_empty() { parts.push(InterpolationPart::Literal(literal)); }
+                    if !literal.is_empty() {
+                        parts.push(InterpolationPart::Literal(literal));
+                    }
                     return Ok(TokenKind::Interpolated(parts));
                 }
                 Some(byte) if quote == b'"' && byte == 0x5c => {
                     self.offset += 1;
                     literal.extend(self.lex_escape(start)?);
                 }
-                Some(b'{') if self.peek(1) == Some(b'{') => { literal.push(b'{'); self.offset += 2; }
-                Some(b'}') if self.peek(1) == Some(b'}') => { literal.push(b'}'); self.offset += 2; }
-                Some(b'}') => return Err(EvalError::new("E1278", self.offset, "stray closing brace in interpolated string")),
+                Some(b'{') if self.peek(1) == Some(b'{') => {
+                    literal.push(b'{');
+                    self.offset += 2;
+                }
+                Some(b'}') if self.peek(1) == Some(b'}') => {
+                    literal.push(b'}');
+                    self.offset += 2;
+                }
+                Some(b'}') => {
+                    return Err(EvalError::new(
+                        "E1278",
+                        self.offset,
+                        "stray closing brace in interpolated string",
+                    ));
+                }
                 Some(b'{') => {
-                    if !literal.is_empty() { parts.push(InterpolationPart::Literal(std::mem::take(&mut literal))); }
+                    if !literal.is_empty() {
+                        parts.push(InterpolationPart::Literal(std::mem::take(&mut literal)));
+                    }
                     self.offset += 1;
                     let expression_start = self.offset;
                     let expression_end = self.scan_interpolation_expression(start)?;
                     let expression = self.source[expression_start..expression_end].to_vec();
                     if expression.iter().all(u8::is_ascii_whitespace) {
-                        return Err(EvalError::new("E15", expression_start, "empty interpolated expression"));
+                        return Err(EvalError::new(
+                            "E15",
+                            expression_start,
+                            "empty interpolated expression",
+                        ));
                     }
                     parts.push(InterpolationPart::Expression(expression));
                 }
-                Some(byte) => { literal.push(byte); self.offset += 1; }
+                Some(byte) => {
+                    literal.push(byte);
+                    self.offset += 1;
+                }
             }
         }
     }
@@ -545,25 +640,47 @@ impl<'a> Lexer<'a> {
             if let Some(active) = quote {
                 if active == b'"' && byte == b'\\' {
                     self.offset += 1;
-                    if self.peek(0).is_some() { self.offset += 1; }
+                    if self.peek(0).is_some() {
+                        self.offset += 1;
+                    }
                     continue;
                 }
                 if byte == active {
-                    if active == b'\'' && self.peek(1) == Some(b'\'') { self.offset += 2; continue; }
+                    if active == b'\'' && self.peek(1) == Some(b'\'') {
+                        self.offset += 2;
+                        continue;
+                    }
                     quote = None;
                 }
                 self.offset += 1;
                 continue;
             }
             match byte {
-                b'\'' | b'"' => { quote = Some(byte); self.offset += 1; }
-                b'{' => { braces += 1; self.offset += 1; }
-                b'}' if braces == 0 => { let end = self.offset; self.offset += 1; return Ok(end); }
-                b'}' => { braces -= 1; self.offset += 1; }
+                b'\'' | b'"' => {
+                    quote = Some(byte);
+                    self.offset += 1;
+                }
+                b'{' => {
+                    braces += 1;
+                    self.offset += 1;
+                }
+                b'}' if braces == 0 => {
+                    let end = self.offset;
+                    self.offset += 1;
+                    return Ok(end);
+                }
+                b'}' => {
+                    braces -= 1;
+                    self.offset += 1;
+                }
                 _ => self.offset += 1,
             }
         }
-        Err(EvalError::new("E1279", string_start, "missing closing brace in interpolated string"))
+        Err(EvalError::new(
+            "E1279",
+            string_start,
+            "missing closing brace in interpolated string",
+        ))
     }
 
     fn lex_single_string(&mut self) -> Result<TokenKind, EvalError> {
@@ -630,7 +747,11 @@ impl<'a> Lexer<'a> {
     fn lex_escape(&mut self, string_start: usize) -> Result<Vec<u8>, EvalError> {
         let escape_offset = self.offset.saturating_sub(1);
         let Some(byte) = self.peek(0) else {
-            return Err(EvalError::new("E114", string_start, "unfinished string escape"));
+            return Err(EvalError::new(
+                "E114",
+                string_start,
+                "unfinished string escape",
+            ));
         };
         self.offset += 1;
         let simple = match byte {
@@ -650,21 +771,29 @@ impl<'a> Lexer<'a> {
         if matches!(byte, b'0'..=b'7') {
             let mut value = u32::from(byte - b'0');
             for _ in 1..3 {
-                let Some(next @ b'0'..=b'7') = self.peek(0) else { break };
+                let Some(next @ b'0'..=b'7') = self.peek(0) else {
+                    break;
+                };
                 value = value * 8 + u32::from(next - b'0');
                 self.offset += 1;
             }
-            return Ok(vec![(value & 0xff) as u8]);
+            return Ok(vec![u8::try_from(value & 0xff).unwrap_or(0)]);
         }
         if matches!(byte, b'x' | b'X') {
             let value = self.read_hex_escape(2, escape_offset)?;
-            return Ok(vec![value as u8]);
+            return Ok(vec![u8::try_from(value).map_err(|_| {
+                EvalError::new("E114", escape_offset, "hex escape out of range")
+            })?]);
         }
         if matches!(byte, b'u' | b'U') {
             let limit = if byte == b'u' { 4 } else { 8 };
             let value = self.read_hex_escape(limit, escape_offset)?;
             let Some(character) = char::from_u32(value) else {
-                return Err(EvalError::new("E114", escape_offset, "invalid Unicode escape"));
+                return Err(EvalError::new(
+                    "E114",
+                    escape_offset,
+                    "invalid Unicode escape",
+                ));
             };
             let mut encoded = [0; 4];
             return Ok(character.encode_utf8(&mut encoded).as_bytes().to_vec());
@@ -675,7 +804,11 @@ impl<'a> Lexer<'a> {
                 self.offset += 1;
             }
             if self.peek(0) != Some(b'>') {
-                return Err(EvalError::new("E114", escape_offset, "unfinished special key escape"));
+                return Err(EvalError::new(
+                    "E114",
+                    escape_offset,
+                    "unfinished special key escape",
+                ));
             }
             let name = &self.source[name_start..self.offset];
             self.offset += 1;
@@ -697,7 +830,11 @@ impl<'a> Lexer<'a> {
             self.offset += 1;
         }
         if count == 0 {
-            Err(EvalError::new("E114", offset, "hex escape requires at least one digit"))
+            Err(EvalError::new(
+                "E114",
+                offset,
+                "hex escape requires at least one digit",
+            ))
         } else {
             Ok(value)
         }
@@ -711,16 +848,25 @@ impl<'a> Lexer<'a> {
             self.offset += 1;
         }
         if self.offset == name_start {
-            Err(EvalError::new("E15", start, "environment variable name is missing"))
+            Err(EvalError::new(
+                "E15",
+                start,
+                "environment variable name is missing",
+            ))
         } else {
-            Ok(TokenKind::Environment(self.source[name_start..self.offset].to_vec()))
+            Ok(TokenKind::Environment(
+                self.source[name_start..self.offset].to_vec(),
+            ))
         }
     }
 
     fn lex_option(&mut self) -> Result<TokenKind, EvalError> {
         let start = self.offset;
         self.offset += 1;
-        let scope = if matches!((self.peek(0), self.peek(1)), (Some(b'g' | b'l'), Some(b':'))) {
+        let scope = if matches!(
+            (self.peek(0), self.peek(1)),
+            (Some(b'g' | b'l'), Some(b':'))
+        ) {
             let scope = self.peek(0);
             self.offset += 2;
             scope
@@ -734,7 +880,10 @@ impl<'a> Lexer<'a> {
         if self.offset == name_start {
             Err(EvalError::new("E112", start, "option name is missing"))
         } else {
-            Ok(TokenKind::Option { scope, name: self.source[name_start..self.offset].to_vec() })
+            Ok(TokenKind::Option {
+                scope,
+                name: self.source[name_start..self.offset].to_vec(),
+            })
         }
     }
 
@@ -777,17 +926,42 @@ fn decode_special_key(name: &[u8], offset: usize) -> Result<Vec<u8>, EvalError> 
     const SPECIAL: u8 = 0x80;
     const EXTRA: u8 = 0xfd;
     const MODIFIER: u8 = 0xfc;
+    const MOD_MASK_SHIFT: u8 = 0x02;
+    const MOD_MASK_CTRL: u8 = 0x04;
+    const MOD_MASK_ALT: u8 = 0x08;
     let mut name = name;
-    if name.first() == Some(&b'*') { name = &name[1..]; }
+    let simplify = name.first() != Some(&b'*');
+    if !simplify {
+        name = &name[1..];
+    }
     let mut modifiers = 0u8;
     loop {
-        if name.len() < 2 || name[1] != b'-' { break; }
-        modifiers |= match name[0].to_ascii_lowercase() { b's' => 1, b'c' => 2, b'm' | b'a' => 4, _ => break };
+        if name.len() < 2 || name[1] != b'-' {
+            break;
+        }
+        modifiers |= match name[0].to_ascii_lowercase() {
+            b's' => MOD_MASK_SHIFT,
+            b'c' => MOD_MASK_CTRL,
+            b'm' | b'a' => MOD_MASK_ALT,
+            _ => break,
+        };
         name = &name[2..];
     }
     let lower: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
+    if simplify && modifiers == MOD_MASK_CTRL && name.len() == 1 {
+        let key = name[0].to_ascii_uppercase();
+        if key == b'?' {
+            return Ok(vec![0x7f]);
+        }
+        if (b'@'..=b'_').contains(&key) {
+            return Ok(vec![key & 0x1f]);
+        }
+    }
     let mut output = Vec::new();
-    if modifiers != 0 { output.extend_from_slice(&[SPECIAL, MODIFIER, modifiers]); }
+    if modifiers != 0 {
+        output.extend_from_slice(&[SPECIAL, MODIFIER, modifiers]);
+    }
+
     if let [b'f', digit @ b'1'..=b'9'] = lower.as_slice() {
         output.extend_from_slice(&[SPECIAL, b'k', *digit]);
         return Ok(output);
@@ -807,12 +981,20 @@ fn decode_special_key(name: &[u8], offset: usize) -> Result<Vec<u8>, EvalError> 
         _ => None,
     };
     if let Some((code, literal)) = named {
-        if modifiers == 0 || code == b'H' { output.extend_from_slice(&[SPECIAL, EXTRA, code]); } else { output.push(literal); }
+        if modifiers == 0 || code == b'H' {
+            output.extend_from_slice(&[SPECIAL, EXTRA, code]);
+        } else {
+            output.push(literal);
+        }
         return Ok(output);
     }
     if !name.is_empty() {
         output.extend_from_slice(name);
         return Ok(output);
     }
-    Err(EvalError::new("E114", offset, "unsupported special key escape"))
+    Err(EvalError::new(
+        "E114",
+        offset,
+        "unsupported special key escape",
+    ))
 }

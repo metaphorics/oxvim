@@ -1,12 +1,15 @@
 //! Integration tests for the `#[api]` macro and dispatch conversions.
 
 use ox_api::{
-    ApiError, BufHandle, Dict, IntoObject, LuaRef, Nil, Object, OxStr, Registry, TabHandle, TypeRef,
-    WinHandle, api,
+    ApiError, BufHandle, Dict, IntoObject, LuaRef, Nil, Object, OxStr, Registry, TabHandle,
+    TypeRef, WinHandle, api,
 };
 use ox_editor::Editor;
 
 #[api(since = 3, deprecated_since = 7, method)]
+// Boundary fixture: all 12 wire types must sit in one generated signature, and
+// `#[api]` mandates the `Result` wrapper, so this item accepts both lints.
+#[expect(clippy::too_many_arguments, clippy::unnecessary_wraps)]
 fn nvim_buf_boundary(
     buf: BufHandle,
     boolean: bool,
@@ -38,26 +41,35 @@ fn nvim_buf_boundary(
 }
 
 #[api(since = 1, fast)]
+// `#[api]` mandates `Result<T, ApiError>`; this happy-path fixture never
+// returns `Err`, so the wrapper is macro contract rather than noise.
+#[expect(clippy::unnecessary_wraps)]
 fn nvim_identity(value: Object) -> Result<Object, ApiError> {
     Ok(value)
 }
 
 #[api(since = 2, textlock)]
+// `#[api]` mandates `Result<T, ApiError>`; this happy-path fixture never
+// returns `Err`, so the wrapper is macro contract rather than noise.
+#[expect(clippy::unnecessary_wraps)]
 fn nvim_void() -> Result<(), ApiError> {
     Ok(())
 }
 
 #[api(since = 4)]
 fn nvim_context_create_buffer(
-    editor: &mut Editor,
+    session: &ox_api::ApiSession,
     listed: bool,
 ) -> Result<BufHandle, ApiError> {
-    editor
-        .create_buffer(listed)
+    session
+        .with_editor_mut(|editor| editor.create_buffer(listed))
         .map_err(|error| ApiError::exception(error.to_string()))
 }
 
 #[api(noexport)]
+// `#[api]` mandates `Result<T, ApiError>`; this happy-path helper never
+// returns `Err`, so the wrapper is macro contract rather than noise.
+#[expect(clippy::unnecessary_wraps)]
 fn internal_helper(value: i64) -> Result<i64, ApiError> {
     Ok(value)
 }
@@ -115,7 +127,7 @@ fn generated_metadata_matches_the_rust_signature() {
 
 #[test]
 fn dispatch_unpacks_every_supported_boundary_type() {
-    let mut editor = Editor::new();
+    let session = ox_api::ApiSession::new(std::rc::Rc::new(std::cell::RefCell::new(Editor::new())));
     let arguments = vec![
         Object::Buffer(buffer(1)),
         Object::Boolean(true),
@@ -131,34 +143,34 @@ fn dispatch_unpacks_every_supported_boundary_type() {
         Object::String(OxStr::from("passthrough")),
     ];
 
-    let result = nvim_buf_boundary__API_DISPATCH(&mut editor, &arguments);
+    let result = nvim_buf_boundary__API_DISPATCH(&session, &arguments);
     assert_eq!(result, Ok(Object::Array(arguments)));
-    assert_eq!(nvim_void__API_DISPATCH(&mut editor, &[]), Ok(Object::Nil));
+    assert_eq!(nvim_void__API_DISPATCH(&session, &[]), Ok(Object::Nil));
     assert_eq!(internal_helper(4), Ok(4));
 }
 
 #[test]
 fn context_dispatch_mutates_editor_and_counts_only_wire_arguments() {
-    let mut editor = Editor::new();
+    let session = ox_api::ApiSession::new(std::rc::Rc::new(std::cell::RefCell::new(Editor::new())));
     assert_eq!(
-        nvim_context_create_buffer__API_DISPATCH(&mut editor, &[]),
+        nvim_context_create_buffer__API_DISPATCH(&session, &[]),
         Err(ApiError::exception(
             "Wrong number of arguments: expecting 1 but got 0"
         ))
     );
     assert_eq!(
-        nvim_context_create_buffer__API_DISPATCH(
-            &mut editor,
-            &[Object::Boolean(false)],
-        ),
+        nvim_context_create_buffer__API_DISPATCH(&session, &[Object::Boolean(false)],),
         Ok(Object::Buffer(buffer(1)))
     );
-    assert!(matches!(editor.buffer(buffer(1)), Ok(state) if !state.listed));
+    assert!(session.with_editor(|editor| matches!(
+        editor.buffer(buffer(1)),
+        Ok(state) if !state.flags.contains(ox_editor::BufferFlags::LISTED)
+    )));
 }
 
 #[test]
 fn object_passthrough_round_trips_every_wire_kind() {
-    let mut editor = Editor::new();
+    let session = ox_api::ApiSession::new(std::rc::Rc::new(std::cell::RefCell::new(Editor::new())));
     let values = vec![
         Object::Nil,
         Object::Boolean(false),
@@ -175,7 +187,7 @@ fn object_passthrough_round_trips_every_wire_kind() {
 
     for value in values {
         assert_eq!(
-            nvim_identity__API_DISPATCH(&mut editor, &[value.clone()]),
+            nvim_identity__API_DISPATCH(&session, std::slice::from_ref(&value)),
             Ok(value)
         );
     }
@@ -183,18 +195,21 @@ fn object_passthrough_round_trips_every_wire_kind() {
 
 #[test]
 fn dispatch_errors_match_upstream_generated_text() {
-    let mut editor = Editor::new();
+    let session = ox_api::ApiSession::new(std::rc::Rc::new(std::cell::RefCell::new(Editor::new())));
     assert_eq!(
-        nvim_identity__API_DISPATCH(&mut editor, &[]),
+        nvim_identity__API_DISPATCH(&session, &[]),
         Err(ApiError::exception(
             "Wrong number of arguments: expecting 1 but got 0"
         ))
     );
     assert_eq!(
-        nvim_buf_boundary__API_DISPATCH(&mut editor, &[
-            Object::Buffer(buffer(1)),
-            Object::String(OxStr::from("not-a-boolean")),
-        ]),
+        nvim_buf_boundary__API_DISPATCH(
+            &session,
+            &[
+                Object::Buffer(buffer(1)),
+                Object::String(OxStr::from("not-a-boolean")),
+            ]
+        ),
         Err(ApiError::exception(
             "Wrong number of arguments: expecting 12 but got 2"
         ))
@@ -204,7 +219,7 @@ fn dispatch_errors_match_upstream_generated_text() {
     arguments[0] = Object::Buffer(buffer(1));
     arguments[1] = Object::String(OxStr::from("not-a-boolean"));
     assert_eq!(
-        nvim_buf_boundary__API_DISPATCH(&mut editor, &arguments),
+        nvim_buf_boundary__API_DISPATCH(&session, &arguments),
         Err(ApiError::exception(
             "Wrong type for argument 2 when calling nvim_buf_boundary, expecting Boolean"
         ))
@@ -225,10 +240,10 @@ fn generated_entries_register_explicitly() {
     let names: Vec<_> = registry.iter().map(|entry| entry.0.name).collect();
     assert_eq!(names, ["nvim_identity", "nvim_void"]);
 
-    let mut editor = Editor::new();
+    let session = ox_api::ApiSession::new(std::rc::Rc::new(std::cell::RefCell::new(Editor::new())));
     let result = registry
         .get("nvim_identity")
-        .map(|(_, dispatch)| dispatch(&mut editor, &[Object::Integer(9)]));
+        .map(|(_, dispatch)| dispatch(&session, &[Object::Integer(9)]));
     assert_eq!(result, Some(Ok(Object::Integer(9))));
 }
 
@@ -239,5 +254,8 @@ fn recursive_type_refs_preserve_upstream_spelling() {
 
     assert_eq!(TypeRef::Array.to_string(), "Array");
     assert_eq!(TypeRef::ArrayOf(&INTEGER).to_string(), "ArrayOf(Integer)");
-    assert_eq!(TypeRef::DictOf(&ARRAY).to_string(), "DictOf(ArrayOf(Integer))");
+    assert_eq!(
+        TypeRef::DictOf(&ARRAY).to_string(),
+        "DictOf(ArrayOf(Integer))"
+    );
 }

@@ -13,25 +13,25 @@ pub mod fs_watch;
 mod handle;
 #[cfg(unix)]
 mod ipc;
-#[cfg(unix)]
-mod poll;
 pub mod misc;
 pub mod net;
+#[cfg(unix)]
+mod poll;
 pub mod pool;
 pub mod process;
 mod signal;
-mod timer;
 pub mod thread;
+mod timer;
 mod uv_loop;
 pub mod work;
 
 pub use async_handle::{Async, AsyncSender};
 pub use aux_handles::{Check, Idle, Prepare};
 pub use handle::{Handle, HandleId};
-pub use pool::UvLoopPoster;
 pub use net::{NetError, NetEvent, NetResult, Tcp, Udp};
 #[cfg(unix)]
 pub use poll::{Poll, PollEvents};
+pub use pool::UvLoopPoster;
 pub use signal::Signal;
 pub use timer::Timer;
 pub use uv_loop::{RunMode, UvLoop};
@@ -122,7 +122,7 @@ impl CallbackError {
         Self::Failed(message.into())
     }
 
-    pub(crate) fn panic(payload: Box<dyn std::any::Any + Send>) -> Self {
+    pub(crate) fn panic(payload: &(dyn std::any::Any + Send)) -> Self {
         let message = payload
             .downcast_ref::<&str>()
             .map(|message| (*message).to_owned())
@@ -149,6 +149,8 @@ pub enum CallbackPhase {
     Check,
     /// Deferred close phase.
     Close,
+    /// Network I/O callback.
+    Net,
 }
 
 /// Binding-visible callback error event.

@@ -46,12 +46,16 @@ fn eval<R: FromLuaMulti>(host: &LuaHost, source: &str) -> R {
 fn mpack_uses_fixed_vectors_and_preserves_nil_binary_and_extensions() {
     let host = host();
     let nil: mlua::LuaString = eval(&host, "return vim.mpack.encode(vim.NIL)");
+    assert!(eval::<bool>(&host, "return vim.mpack.NIL == vim.NIL"));
     assert_eq!(nil.as_bytes().as_ref(), [0xc0]);
 
     let array: mlua::LuaString = eval(&host, "return vim.mpack.encode({'a'})");
     assert_eq!(array.as_bytes().as_ref(), [0x91, 0xa1, b'a']);
 
-    host.lua().globals().set("binary_value", host.lua().create_string([0, 255]).unwrap()).unwrap();
+    host.lua()
+        .globals()
+        .set("binary_value", host.lua().create_string([0, 255]).unwrap())
+        .unwrap();
     let roundtrip: (bool, mlua::LuaString) = eval(
         &host,
         "local v = vim.mpack.decode(vim.mpack.encode({vim.NIL, binary_value})); \
@@ -60,8 +64,15 @@ fn mpack_uses_fixed_vectors_and_preserves_nil_binary_and_extensions() {
     assert!(roundtrip.0);
     assert_eq!(roundtrip.1.as_bytes().as_ref(), [0, 255]);
 
-    host.lua().globals().set("raw_ext", host.lua().create_string([0xd4, 42, 0xff]).unwrap()).unwrap();
-    let extension: mlua::LuaString = eval(&host, "return vim.mpack.encode(vim.mpack.decode(raw_ext))");
+    host.lua()
+        .globals()
+        .set(
+            "raw_ext",
+            host.lua().create_string([0xd4, 42, 0xff]).unwrap(),
+        )
+        .unwrap();
+    let extension: mlua::LuaString =
+        eval(&host, "return vim.mpack.encode(vim.mpack.decode(raw_ext))");
     assert_eq!(extension.as_bytes().as_ref(), [0xd4, 42, 0xff]);
 }
 
@@ -76,8 +87,14 @@ fn mpack_distinguishes_arrays_maps_and_rejects_malformed_or_recursive_values() {
     assert_eq!(vectors.0.as_bytes().as_ref(), [0x90]);
     assert_eq!(vectors.1.as_bytes().as_ref(), [0x80]);
 
-    host.lua().globals().set("malformed", host.lua().create_string([0x81]).unwrap()).unwrap();
-    host.lua().globals().set("trailing", host.lua().create_string([0xc0, 0xc0]).unwrap()).unwrap();
+    host.lua()
+        .globals()
+        .set("malformed", host.lua().create_string([0x81]).unwrap())
+        .unwrap();
+    host.lua()
+        .globals()
+        .set("trailing", host.lua().create_string([0xc0, 0xc0]).unwrap())
+        .unwrap();
     let errors: (bool, bool, bool) = eval(
         &host,
         "local recursive = {}; recursive.self = recursive; \
@@ -166,13 +183,24 @@ fn json_encode_covers_shape_formatting_and_scalar_boundaries() {
     assert_eq!(encoded.2, "{\n\t\"a\": 1,\n\t\"b\": 2\n}");
     assert_eq!(encoded.3, r#"{"path":"a\/b"}"#);
 
-    host.lua().globals().set("exact_i64", 9_007_199_254_740_991_i64).unwrap();
+    host.lua()
+        .globals()
+        .set("exact_i64", 9_007_199_254_740_991_i64)
+        .unwrap();
     let scalars: (String, String, String, String) = eval(
         &host,
         "return vim.json.encode(vim.NIL), vim.json.encode(true), \
          vim.json.encode(exact_i64), vim.json.encode('é')",
     );
-    assert_eq!(scalars, ("null".into(), "true".into(), "9007199254740991".into(), "\"é\"".into()));
+    assert_eq!(
+        scalars,
+        (
+            "null".into(),
+            "true".into(),
+            "9007199254740991".into(),
+            "\"é\"".into()
+        )
+    );
 }
 
 #[test]
@@ -223,7 +251,10 @@ fn diff_matches_neovim_unified_and_index_oracles() {
     assert_eq!(indices, (2, 1, 2, 1));
 
     let no_newline: String = eval(&host, "return vim.diff('one\\ntwo\\n','one\\ntwo',{})");
-    assert_eq!(no_newline, "@@ -2 +2 @@\n-two\n+two\n\\ No newline at end of file\n");
+    assert_eq!(
+        no_newline,
+        "@@ -2 +2 @@\n-two\n+two\n\\ No newline at end of file\n"
+    );
 
     let histogram: (i64, i64, i64, i64) = eval(
         &host,
@@ -249,6 +280,61 @@ fn diff_supports_context_callbacks_and_option_errors() {
           pcall(vim.diff,'a','b',{ctxlen=-1})",
     );
     assert_eq!(errors, (false, false, false));
+}
+
+#[test]
+fn vim_text_lazy_ownership_loads_once_and_exposes_functions() {
+    let host = host();
+
+    // Before first access, vim.diff is installed but vim.text is not eagerly
+    // created by Rust. The lazy loader in _init_packages owns vim.text.
+    let pre: (String, bool) = eval(&host, "return type(vim.diff), rawget(vim, 'text') == nil");
+    assert_eq!(pre, ("function".to_owned(), true));
+
+    // First access loads the embedded vim.text module exactly once.
+    let is_required: bool = eval(&host, "return vim.text == require('vim.text')");
+    assert!(is_required);
+
+    // Repeated access returns the same table identity (loaded once, cached).
+    let same_identity: bool = eval(&host, "return vim.text == vim.text");
+    assert!(same_identity);
+
+    // indent, hexencode, hexdecode, and diff are all functions on vim.text.
+    let ftypes: (String, String, String, String) = eval(
+        &host,
+        "return type(vim.text.indent), type(vim.text.hexencode), \
+         type(vim.text.hexdecode), type(vim.text.diff)",
+    );
+    assert_eq!(
+        ftypes,
+        (
+            "function".to_owned(),
+            "function".to_owned(),
+            "function".to_owned(),
+            "function".to_owned(),
+        ),
+    );
+
+    // vim.text.diff delegates to vim.diff; both return the same result.
+    let diff_agree: (String, String) = eval(
+        &host,
+        "return vim.diff('a\\nb\\nc\\n','a\\nx\\nc\\n',{}), \
+         vim.text.diff('a\\nb\\nc\\n','a\\nx\\nc\\n',{})",
+    );
+    assert_eq!(diff_agree.0, diff_agree.1);
+    assert_eq!(diff_agree.0, "@@ -2 +2 @@\n-b\n+x\n");
+
+    // One indent and hex round-trip through the embedded module.
+    let indent: (String, i64) = eval(&host, "return vim.text.indent(2, 'a\\nb\\n')");
+    assert_eq!(indent.0, "  a\n  b\n");
+    assert_eq!(indent.1, 0);
+
+    let hex_roundtrip: (String, String) = eval(
+        &host,
+        "local s = 'Hello'; return vim.text.hexencode(s), vim.text.hexdecode(vim.text.hexencode(s))",
+    );
+    assert_eq!(hex_roundtrip.1, "Hello");
+    assert_eq!(hex_roundtrip.0, "48656C6C6F");
 }
 
 #[test]
@@ -293,7 +379,10 @@ fn regex_reports_byte_spans_no_match_and_line_relative_ranges() {
 #[test]
 fn regex_rejects_invalid_patterns_ranges_and_utf8() {
     let host = host();
-    host.lua().globals().set("invalid_utf8", host.lua().create_string([0xff]).unwrap()).unwrap();
+    host.lua()
+        .globals()
+        .set("invalid_utf8", host.lua().create_string([0xff]).unwrap())
+        .unwrap();
     let errors: (bool, bool, bool, bool) = eval(
         &host,
         "vim.api.nvim_buf_get_lines=function() return {'abc'} end; \
@@ -302,4 +391,45 @@ fn regex_rejects_invalid_patterns_ranges_and_utf8() {
            pcall(re.match_line,re,0,-1), pcall(re.match_line,re,0,0,3,2)",
     );
     assert_eq!(errors, (false, false, false, false));
+}
+
+#[test]
+fn lpeg_exposes_vim_spec_surface_and_shared_module_identity() {
+    let host = host();
+    // test/functional/lua/vim_spec.lua "lpeg"
+    assert_eq!(
+        eval::<i64>(&host, "return vim.lpeg.match(vim.lpeg.R'09'^1, '4504ab')"),
+        5
+    );
+    // stdlib.c registers the same table as vim.lpeg and package.loaded.lpeg.
+    assert!(eval::<bool>(&host, "return require('lpeg') == vim.lpeg"));
+    // vim.glob relies on the pattern metatable arithmetic metamethods.
+    assert!(eval::<bool>(
+        &host,
+        "return type(getmetatable(vim.lpeg.P(1)).__add) == 'function'"
+    ));
+    assert!(eval::<bool>(
+        &host,
+        "return vim.lpeg.version == 'LPeg 1.1.0'"
+    ));
+}
+
+#[test]
+fn lpeg_passes_upstream_lpeg_1_1_0_test_suite() {
+    let host = host();
+    let lua = host.lua();
+    let lpeg_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../third_party/lpeg");
+    // Upstream test.lua does `require "re"` for the regex-like interface;
+    // preload the vendored re.lua under that name.
+    let re_source = std::fs::read_to_string(lpeg_dir.join("re.lua")).unwrap();
+    let re_loader = lua.load(re_source).into_function().unwrap();
+    let package: mlua::Table = lua.globals().get("package").unwrap();
+    let preload: mlua::Table = package.get("preload").unwrap();
+    preload.set("re", re_loader).unwrap();
+
+    let test_source = std::fs::read_to_string(lpeg_dir.join("test.lua")).unwrap();
+    lua.load(test_source)
+        .set_name("=third_party/lpeg/test.lua")
+        .exec()
+        .unwrap();
 }

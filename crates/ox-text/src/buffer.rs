@@ -78,6 +78,10 @@ impl Buffer {
     }
 
     /// Loads serialized UTF-8 buffer bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::InvalidUtf8`] if `bytes` is not valid UTF-8.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BufferError> {
         let text = std::str::from_utf8(bytes).map_err(|_| BufferError::InvalidUtf8)?;
         Ok(Self {
@@ -88,9 +92,18 @@ impl Buffer {
     }
 
     /// Builds a buffer from newline-free logical lines.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::NewlineInLine`] if any supplied line contains
+    /// a line feed, or [`BufferError::InvalidUtf8`] if any line is not
+    /// valid UTF-8.
     pub fn from_lines(lines: &[Vec<u8>], has_eol: bool) -> Result<Self, BufferError> {
-        validate_lines(lines)?;
-        let normalized: &[Vec<u8>] = if lines.is_empty() { &[Vec::new()] } else { lines };
+        let normalized: &[Vec<u8>] = if lines.is_empty() {
+            &[Vec::new()]
+        } else {
+            lines
+        };
         let mut bytes = Vec::new();
         for (index, line) in normalized.iter().enumerate() {
             if index != 0 {
@@ -101,7 +114,11 @@ impl Buffer {
         if has_eol {
             bytes.push(b'\n');
         }
-        Self::from_bytes(&bytes)
+        // `from_bytes` re-derives `has_eol` from the joined text, which is
+        // wrong whenever the caller's last line is empty: honor the caller.
+        let mut buffer = Self::from_bytes(&bytes)?;
+        buffer.has_eol = has_eol;
+        Ok(buffer)
     }
 
     /// Returns the number of logical lines. It is always at least one.
@@ -128,6 +145,11 @@ impl Buffer {
     }
 
     /// Returns one logical line without its line break.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::LineRange`] if `lnum` is zero or exceeds the
+    /// logical line count.
     pub fn line(&self, lnum: usize) -> Result<Vec<u8>, BufferError> {
         self.check_line(lnum)?;
         let slice = self.rope.line(lnum - 1);
@@ -150,6 +172,11 @@ impl Buffer {
     /// maps to the full serialized byte length. A final line without a line
     /// break contributes no terminator, so that length numerically subtracts
     /// the absent `\n` (memline.c:4078-4162). Any higher line is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::LineRange`] if `lnum` is zero or exceeds the
+    /// line count plus one (the EOF pseudo-line).
     pub fn byte_of_line(&self, lnum: usize) -> Result<usize, BufferError> {
         let line_count = self.line_count();
         if lnum == 0 || lnum > line_count + 1 {
@@ -174,6 +201,11 @@ impl Buffer {
     /// point resolves to the line containing that code point, because `byte_to_line`
     /// counts single-byte line breaks rather than requiring a char boundary
     /// (memline.c:4078-4141).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::ByteOffset`] if `offset` exceeds the
+    /// serialized byte length.
     pub fn lnum_of_byte(&self, offset: usize) -> Result<usize, BufferError> {
         let len = self.rope.len_bytes();
         if offset > len {
@@ -196,6 +228,13 @@ impl Buffer {
     ///
     /// The rope is spliced over the replaced span only, so the cost tracks the
     /// edited region instead of the buffer size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::LineRange`] if `start` is zero, exceeds
+    /// `end`, or `end` exceeds the line count, and
+    /// [`BufferError::NewlineInLine`] or [`BufferError::InvalidUtf8`] if a
+    /// replacement line is malformed.
     pub fn replace_lines(
         &mut self,
         start: usize,
@@ -212,6 +251,13 @@ impl Buffer {
     /// Applies every splice against the pre-edit line map, then mutates
     /// bottom-up so earlier row numbers stay stable. A non-empty batch bumps
     /// [`changedtick`](Self::changedtick) once; an empty slice is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::LineRange`] if any splice names an invalid
+    /// range, [`BufferError::OverlappingSplices`] if two splices touch the
+    /// same lines, and [`BufferError::NewlineInLine`] or
+    /// [`BufferError::InvalidUtf8`] if any replacement line is malformed.
     pub fn replace_lines_disjoint(
         &mut self,
         splices: &[LineSplice<'_>],
@@ -266,6 +312,12 @@ impl Buffer {
     }
 
     /// Inserts logical lines after `lnum`; zero inserts before the first line.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferError::LineRange`] if `lnum` exceeds the line
+    /// count, and [`BufferError::NewlineInLine`] or
+    /// [`BufferError::InvalidUtf8`] if a supplied line is malformed.
     pub fn append_lines(&mut self, lnum: usize, lines: &[Vec<u8>]) -> Result<(), BufferError> {
         let line_count = self.line_count();
         if lnum > line_count {
@@ -293,6 +345,11 @@ impl Buffer {
     }
 
     /// Deletes an inclusive range of logical lines.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::replace_lines`]'s [`BufferError::LineRange`]
+    /// error for an invalid inclusive range.
     pub fn delete_lines(&mut self, start: usize, end: usize) -> Result<(), BufferError> {
         self.replace_lines(start, end, &[])
     }

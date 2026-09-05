@@ -37,9 +37,21 @@ pub struct VisualState {
 
 impl VisualState {
     /// Starts a selection at `anchor`.
-    #[must_use] pub fn new(anchor: Position, kind: VisualKind) -> Self { Self { anchor, cursor: anchor, kind, count: 0, prefix: String::new(), wanted: (kind == VisualKind::Block).then_some(anchor.col) } }
+    #[must_use]
+    pub fn new(anchor: Position, kind: VisualKind) -> Self {
+        Self {
+            anchor,
+            cursor: anchor,
+            kind,
+            count: 0,
+            prefix: String::new(),
+            wanted: (kind == VisualKind::Block).then_some(anchor.col),
+        }
+    }
     /// Extends the active endpoint.
-    pub fn extend(&mut self, cursor: Position) { self.cursor = cursor; }
+    pub fn extend(&mut self, cursor: Position) {
+        self.cursor = cursor;
+    }
     /// Extends the active endpoint in a block, preserving the wanted column across
     /// vertical motions and adopting the new column on horizontal motions.
     pub fn extend_block(&mut self, target: Position, from: Position) {
@@ -52,14 +64,44 @@ impl VisualState {
         }
     }
     /// Exchanges the active and fixed endpoints.
-    pub fn swap_ends(&mut self) { std::mem::swap(&mut self.anchor, &mut self.cursor); if self.kind == VisualKind::Block { self.wanted = Some(self.cursor.col); } }
+    pub fn swap_ends(&mut self) {
+        std::mem::swap(&mut self.anchor, &mut self.cursor);
+        if self.kind == VisualKind::Block {
+            self.wanted = Some(self.cursor.col);
+        }
+    }
     /// Exchanges only endpoint columns, moving to the other block corner on the active row.
-    pub fn swap_columns(&mut self) { std::mem::swap(&mut self.anchor.col, &mut self.cursor.col); self.wanted = Some(self.cursor.col); }
+    pub fn swap_columns(&mut self) {
+        std::mem::swap(&mut self.anchor.col, &mut self.cursor.col);
+        self.wanted = Some(self.cursor.col);
+    }
     /// Converts the selection into normalized operator endpoints.
     #[must_use]
     pub fn range(&self) -> EditRange {
-        let (mut start, mut end) = if (self.anchor.lnum, self.anchor.col) <= (self.cursor.lnum, self.cursor.col) { (self.anchor, self.cursor) } else { (self.cursor, self.anchor) };
-        let kind = match self.kind { VisualKind::Character => MotionKind::CharacterWise, VisualKind::Line => { start.col = 0; MotionKind::LineWise }, VisualKind::Block => { if start.col > end.col { std::mem::swap(&mut start.col, &mut end.col); } MotionKind::BlockWise } };
-        EditRange { start, end, kind, inclusive: true }
+        let (mut start, mut end) =
+            if (self.anchor.lnum, self.anchor.col) <= (self.cursor.lnum, self.cursor.col) {
+                (self.anchor, self.cursor)
+            } else {
+                (self.cursor, self.anchor)
+            };
+        let kind = match self.kind {
+            VisualKind::Character => MotionKind::CharacterWise,
+            VisualKind::Line => {
+                start.col = 0;
+                MotionKind::LineWise
+            }
+            VisualKind::Block => {
+                if start.col > end.col {
+                    std::mem::swap(&mut start.col, &mut end.col);
+                }
+                MotionKind::BlockWise
+            }
+        };
+        EditRange {
+            start,
+            end,
+            kind,
+            inclusive: true,
+        }
     }
 }

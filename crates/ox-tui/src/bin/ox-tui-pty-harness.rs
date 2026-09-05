@@ -95,15 +95,20 @@ fn server(script: &str) -> ExitCode {
 }
 
 fn respond(msgid: u32) -> bool {
-    let message = Message::Response { msgid, result: Ok(Object::Nil) };
+    let message = Message::Response {
+        msgid,
+        result: Ok(Object::Nil),
+    };
     let mut output = io::stdout();
     output.write_all(&message.encode_bytes()).is_ok() && output.flush().is_ok()
 }
 
 fn play(script: &str) -> bool {
     for batch in batches(script) {
-        let message =
-            Message::Notification { method: OxStr::from("redraw"), params: batch };
+        let message = Message::Notification {
+            method: OxStr::from("redraw"),
+            params: batch,
+        };
         let mut output = io::stdout();
         if output.write_all(&message.encode_bytes()).is_err() || output.flush().is_err() {
             return false;
@@ -140,7 +145,10 @@ fn chunks(parts: &[&str]) -> Object {
 }
 
 fn resize(columns: i64, rows: i64) -> Object {
-    event("grid_resize", vec![vec![number(1), number(columns), number(rows)]])
+    event(
+        "grid_resize",
+        vec![vec![number(1), number(columns), number(rows)]],
+    )
 }
 
 fn flush() -> Object {
@@ -256,8 +264,14 @@ fn batches(script: &str) -> Vec<Vec<Object>> {
                 msg_show("emsg", "second failure", false, false, number(7)),
                 flush(),
             ],
-            vec![msg_show("shell_out", "stream head", false, false, Object::Nil), flush()],
-            vec![msg_show("shell_out", " and tail", false, true, Object::Nil), flush()],
+            vec![
+                msg_show("shell_out", "stream head", false, false, Object::Nil),
+                flush(),
+            ],
+            vec![
+                msg_show("shell_out", " and tail", false, true, Object::Nil),
+                flush(),
+            ],
         ],
         // The completion menu with a selected row and a documentation preview
         // built from the selected item's info field.
@@ -291,12 +305,7 @@ fn batches(script: &str) -> Vec<Vec<Object>> {
         "narrow" => vec![
             narrow(),
             vec![
-                popupmenu_show(
-                    &[["alphabetagamma", "", "", "documentation body"]],
-                    0,
-                    3,
-                    0,
-                ),
+                popupmenu_show(&[["alphabetagamma", "", "", "documentation body"]], 0, 3, 0),
                 flush(),
             ],
         ],

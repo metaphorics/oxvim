@@ -2,6 +2,7 @@
 //! [`crate::fs_builtins`]; `swapfilelist` additionally needs the `directory`
 //! option its `recover_names` scan walks.
 
+use crate::excmd_exec::ExEditorAccess;
 use ox_types::Typval;
 
 use crate::options::OptionValue;
@@ -10,20 +11,22 @@ use crate::script::FileIO;
 use crate::excmd_exec::EvalHost;
 
 /// Routes one filesystem builtin.
-pub(crate) fn call<F: FileIO>(
-    host: &mut EvalHost<'_, F>,
+pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
     name: &str,
-    args: Vec<Typval>,
+    args: &[Typval],
 ) -> ox_eval::Result<Typval> {
     if name == "swapfilelist" {
         // f_swapfilelist iterates the 'directory' option (recover_names); the
         // option has no static default upstream (it is computed at startup),
         // so an unset store reads as "." — the first entry of every platform
         // default.
-        let directory = match host.editor.options().get_global("directory") {
-            Ok(OptionValue::String(value)) => value.clone(),
-            _ => ".".to_owned(),
-        };
+        let directory =
+            host.access
+                .with_ex_editor(|editor| match editor.options().get_global("directory") {
+                    Ok(OptionValue::String(value)) => value.clone(),
+                    _ => ".".to_owned(),
+                });
         return crate::fs_builtins::swapfilelist(host.runtime.scripts.io(), args.len(), &directory);
     }
     if name == "writefile" {
@@ -35,12 +38,13 @@ pub(crate) fn call<F: FileIO>(
         let in_function = host.runtime.can_add_defer();
         let result = crate::fs_builtins::writefile(
             host.runtime.scripts.io(),
-            &args,
+            args,
             in_function,
             &mut deferred,
         );
         if let Some(path) = deferred {
-            host.runtime.push_deferred_delete(path, crate::fs_builtins::DeleteMode::File);
+            host.runtime
+                .push_deferred_delete(path, crate::fs_builtins::DeleteMode::File);
         }
         return result;
     }
@@ -52,7 +56,7 @@ pub(crate) fn call<F: FileIO>(
         let mut deferred = None;
         let result = crate::fs_builtins::mkdir(
             host.runtime.scripts.io(),
-            &args,
+            args,
             host.runtime.can_add_defer(),
             &mut deferred,
         );

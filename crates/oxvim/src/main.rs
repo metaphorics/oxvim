@@ -82,7 +82,7 @@ fn main() -> ExitCode {
 /// Maps a requested exit code onto a process status the way C `exit()`
 /// does: truncated to the low eight bits.
 fn process_code(code: i64) -> ExitCode {
-    ExitCode::from(code.rem_euclid(256) as u8)
+    u8::try_from(code.rem_euclid(256)).map_or(ExitCode::FAILURE, ExitCode::from)
 }
 
 fn run(mut timer: startuptime::StartupTimer) -> Result<ExitCode, AppError> {
@@ -90,25 +90,34 @@ fn run(mut timer: startuptime::StartupTimer) -> Result<ExitCode, AppError> {
     // main.c prints help and version from inside the argument scan and exits
     // successfully, before any startup work happens.
     if cli.help {
-        io::stdout().lock().write_all(usage::HELP.as_bytes()).map_err(AppError::Io)?;
+        io::stdout()
+            .lock()
+            .write_all(usage::HELP.as_bytes())
+            .map_err(AppError::Io)?;
         return Ok(ExitCode::SUCCESS);
     }
     if cli.version {
         let text = usage::version()?;
-        io::stdout().lock().write_all(text.as_bytes()).map_err(AppError::Io)?;
+        io::stdout()
+            .lock()
+            .write_all(text.as_bytes())
+            .map_err(AppError::Io)?;
         return Ok(ExitCode::SUCCESS);
     }
     timer.mark("parsing arguments");
     // env.c vim_getenv: derive and export $VIM/$VIMRUNTIME before any
     // startup command or executor snapshots the environment.
-    runtime::export_vim_environment()?;
+    runtime::export_vim_environment();
     if cli.api_info {
         let bytes = api_info::encoded().map_err(|error| AppError::Api(error.to_string()))?;
-        io::stdout().lock().write_all(&bytes).map_err(AppError::Io)?;
+        io::stdout()
+            .lock()
+            .write_all(&bytes)
+            .map_err(AppError::Io)?;
         return Ok(ExitCode::SUCCESS);
     }
     if let Some(script) = &cli.lua_script {
-        return runtime::run_lua(script).map(|()| ExitCode::SUCCESS);
+        return runtime::run_lua(script, cli.clean).map(|()| ExitCode::SUCCESS);
     }
     if cli.scriptin.is_some() {
         return Err(AppError::NotWired("normal-mode script"));
@@ -120,10 +129,7 @@ fn run(mut timer: startuptime::StartupTimer) -> Result<ExitCode, AppError> {
     Ok(code)
 }
 
-fn run_editor(
-    cli: &Cli,
-    timer: &mut startuptime::StartupTimer,
-) -> Result<ExitCode, AppError> {
+fn run_editor(cli: &Cli, timer: &mut startuptime::StartupTimer) -> Result<ExitCode, AppError> {
     if cli.batch.is_some() {
         return runtime::run_batch(cli, timer).map(process_code);
     }

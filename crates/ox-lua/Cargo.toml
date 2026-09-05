@@ -23,5 +23,8 @@ thiserror = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-language = "0.1.5"
 
+[build-dependencies]
+cc = "1.4.4"
+
 [lints]
 workspace = true

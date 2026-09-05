@@ -5,7 +5,7 @@ use core::fmt;
 /// The metadata type names exposed by `nvim_get_api_info`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TypeRef {
-    /// MessagePack nil.
+    /// `MessagePack` nil.
     Nil,
     /// Boolean value.
     Boolean,
@@ -83,8 +83,6 @@ pub struct FunctionMetadata {
     pub fast: bool,
     /// Whether the function is forbidden while text is locked.
     pub textlock: bool,
-    /// Whether the function may run while text is locked despite the default restriction.
-    pub textlock_allow: bool,
     /// Public return type.
     pub returns: TypeRef,
     /// Public positional parameter names, types, and optionality.

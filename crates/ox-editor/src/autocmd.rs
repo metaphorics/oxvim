@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ox_types::BufHandle;
+use ox_types::{BufHandle, Dict, Object, OxStr};
 use thiserror::Error;
 
 /// How an event's pattern is interpreted by the editor.
@@ -215,20 +215,30 @@ pub const EVENT_COUNT: usize = Event::ALL.len();
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AugroupId(pub u64);
 
+/// Monotonic identity for one stored autocmd entry, independent of the
+/// optional shared API id. Used by `consume_once` and callback-truthy
+/// deletion to remove exactly the executing entry.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AutocmdEntryId(pub u64);
+
 /// Host-owned action referenced by an autocommand.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AutocmdKind {
     /// Ex source to execute later.
     ExString(String),
+    /// Named zero-argument Vimscript function to invoke later.
+    VimscriptFunction(String),
     /// Lua registry callback identity to invoke later.
     LuaCallback(u64),
 }
 
 /// One action produced by the firing planner.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AutocmdAction {
-    /// Stable definition identity.
-    pub id: u64,
+    /// Per-entry identity of the executing definition.
+    pub entry_id: AutocmdEntryId,
+    /// Shared API id, absent for legacy `:autocmd` entries.
+    pub api_id: Option<u64>,
     /// Event which produced the action.
     pub event: Event,
     /// Host-owned executable payload.
@@ -242,7 +252,7 @@ pub struct AutocmdAction {
     pub group: AugroupId,
     /// Augroup name, absent for the default group.
     pub group_name: Option<String>,
-    /// Original source pattern.
+    /// Canonical source pattern (`<buffer=N>` for buffer-local).
     pub pattern: String,
     /// Selected buffer for a buffer-local pattern.
     pub buffer: Option<BufHandle>,
@@ -252,20 +262,63 @@ pub struct AutocmdAction {
     pub file_name: String,
     /// Optional user-facing description.
     pub description: Option<String>,
+    /// User data supplied by `nvim_exec_autocmds`.
+    pub data: Option<Object>,
+}
+
+impl AutocmdAction {
+    /// Builds the single dictionary argument passed to a Lua autocmd callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutocmdError::IdentifierOverflow`] if the autocmd or augroup
+    /// identifier cannot be represented by the callback's signed integer type.
+    pub fn callback_args(&self) -> Result<Vec<Object>, AutocmdError> {
+        let id = i64::try_from(self.api_id.unwrap_or_default())
+            .map_err(|_| AutocmdError::IdentifierOverflow("autocmd id"))?;
+        let buffer = self.buffer.map_or(Object::Integer(0), Object::Buffer);
+        let mut entries = vec![
+            (OxStr::from("id"), Object::Integer(id)),
+            (
+                OxStr::from("event"),
+                Object::String(OxStr::from(self.event.as_str())),
+            ),
+            (
+                OxStr::from("match"),
+                Object::String(OxStr::from(self.match_name.as_str())),
+            ),
+            (OxStr::from("buf"), buffer),
+            (
+                OxStr::from("file"),
+                Object::String(OxStr::from(self.file_name.as_str())),
+            ),
+        ];
+        if self.group != AugroupId::default() {
+            let group = i64::try_from(self.group.0)
+                .map_err(|_| AutocmdError::IdentifierOverflow("augroup id"))?;
+            entries.push((OxStr::from("group"), Object::Integer(group)));
+        }
+        if let Some(data) = &self.data {
+            entries.push((OxStr::from("data"), data.clone()));
+        }
+        Ok(vec![Object::Dict(Dict(entries))])
+    }
 }
 
 /// One registered autocmd definition exposed to API query layers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutocmdDefinition {
-    /// Stable definition identity.
-    pub id: u64,
+    /// Per-entry identity.
+    pub entry_id: AutocmdEntryId,
+    /// Shared API id, absent for legacy `:autocmd` entries.
+    pub api_id: Option<u64>,
     /// Event matched by the definition.
     pub event: Event,
     /// Destination augroup.
     pub group: AugroupId,
     /// Augroup name, absent for the default group.
     pub group_name: Option<String>,
-    /// Original source pattern.
+    /// Canonical source pattern (`<buffer=N>` for buffer-local).
     pub pattern: String,
     /// Buffer selected by a buffer-local pattern.
     pub buffer: Option<BufHandle>,
@@ -284,6 +337,10 @@ pub trait AutocmdSink {
     /// Host execution failure.
     type Error;
     /// Executes one already-planned action.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the host cannot execute the action.
     fn run(&mut self, action: &AutocmdAction) -> Result<(), Self::Error>;
 }
 
@@ -292,7 +349,7 @@ pub trait AutocmdSink {
 pub struct AutocmdOptions {
     /// Destination augroup, or the default group.
     pub group: AugroupId,
-    /// Buffer substituted for a `<abuf>` pattern.
+    /// Buffer substituted for `<abuf>`, `<buffer>`, and `<buffer=0>`.
     pub buffer: Option<BufHandle>,
     /// Remove after the first firing plan.
     pub once: bool,
@@ -303,48 +360,62 @@ pub struct AutocmdOptions {
 }
 
 /// Event occurrence supplied to the firing planner.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AutocmdContext<'a> {
     /// Buffer associated with the event.
     pub buffer: Option<BufHandle>,
     /// Event match name, normally a buffer or file name.
     pub file_name: Option<&'a str>,
+    /// Explicit event match text when it differs from the associated file.
+    pub match_name: Option<&'a str>,
     /// True when this event may fire nested, false when it is raised inside a
     /// non-`++nested` outer autocmd and must be suppressed entirely.
     ///
     /// The host passes the *outer* autocmd's `++nested` flag, and `true` for a
     /// top-level event. Gating is decided once per event, never per candidate.
     pub nested: bool,
+    /// User data supplied by an explicit API event occurrence.
+    pub data: Option<&'a Object>,
 }
 
-impl<'a> Default for AutocmdContext<'a> {
+impl Default for AutocmdContext<'_> {
     fn default() -> Self {
         Self {
             buffer: None,
             file_name: None,
+            match_name: None,
             // A top-level event is not raised inside a non-nested outer
             // autocmd, so nesting is permitted and no event-level gate applies.
             nested: true,
+            data: None,
         }
     }
 }
 
 /// Ordered actions for one event occurrence.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct FiringPlan {
     /// Actions which may run immediately, in global definition order.
     pub ready: Vec<AutocmdAction>,
 }
 
-/// Selector corresponding to the useful `:autocmd!` forms.
+/// Selector for query and clear operations. Each class is OR-combined
+/// within itself and AND-combined across classes. Pattern comparisons are
+/// exact against the canonical stored pattern.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DeleteAutocmds<'a> {
-    /// Optional exact augroup.
+pub struct AutocmdFilter<'a> {
+    /// Optional exact augroup. `None` matches all groups including
+    /// tombstoned; `Some(id)` matches only live (or default) groups.
     pub group: Option<AugroupId>,
-    /// Optional exact event.
-    pub event: Option<Event>,
-    /// Optional comma-list of exact source patterns.
-    pub pattern: Option<&'a str>,
+    /// Optional event set (OR within). `None` matches all events.
+    pub events: Option<&'a [Event]>,
+    /// Optional exact canonical pattern set (OR within). `None` matches all.
+    pub patterns: Option<&'a [String]>,
+    /// Optional buffer set (OR within). `None` matches all. Only
+    /// buffer-local entries can match a buffer filter.
+    pub buffers: Option<&'a [BufHandle]>,
+    /// Optional shared API id. `None` matches all.
+    pub api_id: Option<u64>,
 }
 
 /// Invalid registration or augroup operation.
@@ -353,18 +424,27 @@ pub enum AutocmdError {
     /// An empty augroup name was requested.
     #[error("augroup name must not be empty")]
     EmptyGroupName,
+    /// An empty event list was requested.
+    #[error("autocmd event list must not be empty")]
+    EmptyEvent,
     /// An empty pattern was requested.
     #[error("autocmd pattern must not be empty")]
     EmptyPattern,
-    /// `<abuf>` was used without a registration buffer.
+    /// `<abuf>` or `<buffer>` was used without a registration buffer.
     #[error("<abuf> requires a buffer handle")]
     MissingBuffer,
+    /// A `<buffer=N>` pattern was malformed.
+    #[error("invalid buffer pattern {0:?}")]
+    InvalidBufferPattern(String),
     /// The selected augroup does not exist.
     #[error("unknown augroup {0:?}")]
     UnknownGroup(AugroupId),
     /// Pattern alternation braces were malformed.
     #[error("unbalanced braces in autocmd pattern")]
     UnbalancedBraces,
+    /// An internal identifier cannot cross the signed API boundary.
+    #[error("{0} exceeds Integer range")]
+    IdentifierOverflow(&'static str),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -374,8 +454,18 @@ enum StoredPattern {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum GroupState {
+    Live(String),
+    Tombstoned,
+}
+
+/// Name returned for entries whose augroup was legacy-deleted.
+const DELETED_GROUP_NAME: &str = "--Deleted--";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Entry {
-    id: u64,
+    id: AutocmdEntryId,
+    api_id: Option<u64>,
     sequence: u64,
     event: Event,
     pattern: StoredPattern,
@@ -387,58 +477,90 @@ struct Entry {
 /// Editor-owned augroups and autocmd definitions.
 #[derive(Clone, Debug)]
 pub struct Autocmds {
-    groups: BTreeMap<AugroupId, (String, u64)>,
+    groups: BTreeMap<AugroupId, GroupState>,
     group_names: BTreeMap<String, AugroupId>,
     entries: Vec<Entry>,
     ignored: BTreeSet<Event>,
+    next_entry_id: u64,
+    next_api_id: u64,
     next_group: u64,
-    next_id: u64,
     next_sequence: u64,
 }
 
 impl Default for Autocmds {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Autocmds {
     /// Creates an autocmd store with Neovim's core augroups and no definitions.
+    /// The `nvim.popupmenu` core group occupies id 1; user groups start at 2.
+    /// Group ids are monotonic and never reused after deletion.
     #[must_use]
     pub fn new() -> Self {
         let popupmenu = AugroupId(1);
         Self {
-            groups: BTreeMap::from([(popupmenu, ("nvim.popupmenu".to_owned(), 1))]),
+            groups: BTreeMap::from([(popupmenu, GroupState::Live("nvim.popupmenu".to_owned()))]),
             group_names: BTreeMap::from([("nvim.popupmenu".to_owned(), popupmenu)]),
             entries: Vec::new(),
             ignored: BTreeSet::new(),
+            next_entry_id: 1,
+            next_api_id: 1,
             next_group: 2,
-            next_id: 1,
             next_sequence: 1,
         }
     }
 
-    /// Creates a group or returns its existing identity. `clear` implements `augroup!`.
+    /// Creates a group or returns its existing identity. `clear` implements
+    /// `augroup!` for API callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutocmdError::EmptyGroupName`] when `name` is empty, or
+    /// [`AutocmdError::UnknownGroup`] if clearing the existing group fails.
     pub fn create_group(&mut self, name: &str, clear: bool) -> Result<AugroupId, AutocmdError> {
-        if name.is_empty() { return Err(AutocmdError::EmptyGroupName); }
+        if name.is_empty() {
+            return Err(AutocmdError::EmptyGroupName);
+        }
         if let Some(id) = self.group_names.get(name).copied() {
-            if clear { self.clear_group(id)?; }
+            if clear {
+                self.clear_group(id)?;
+            }
             return Ok(id);
         }
-        let id = AugroupId(self.next_group);
-        self.next_group = self.next_group.saturating_add(1);
-        let order = id.0;
-        self.groups.insert(id, (name.to_owned(), order));
+        let id = self.allocate_group_id();
+        self.groups.insert(id, GroupState::Live(name.to_owned()));
         self.group_names.insert(name.to_owned(), id);
         Ok(id)
     }
 
-    /// Looks up an augroup by name.
+    /// Looks up a live augroup by name.
     #[must_use]
-    pub fn group(&self, name: &str) -> Option<AugroupId> { self.group_names.get(name).copied() }
+    pub fn group(&self, name: &str) -> Option<AugroupId> {
+        self.group_names.get(name).copied()
+    }
 
-    /// Whether an augroup id exists (the default group always exists).
+    /// Name of a live augroup by id.
+    #[must_use]
+    pub fn group_name(&self, id: AugroupId) -> Option<&str> {
+        match self.groups.get(&id) {
+            Some(GroupState::Live(name)) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Whether a group id exists (live or tombstoned). The default group
+    /// always exists.
     #[must_use]
     pub fn has_group(&self, id: AugroupId) -> bool {
         id == AugroupId::default() || self.groups.contains_key(&id)
+    }
+
+    /// Whether a group id is live (or the default group).
+    #[must_use]
+    pub fn is_live_group(&self, id: AugroupId) -> bool {
+        id == AugroupId::default() || matches!(self.groups.get(&id), Some(GroupState::Live(_)))
     }
 
     /// Whether a group or registered group/event/pattern query exists.
@@ -450,12 +572,16 @@ impl Autocmds {
         let second = fields.next();
         let third = fields.next();
         let (group, event_name, pattern) = if let Some(group) = self.group(first) {
-            let Some(event_name) = second else { return true };
+            let Some(event_name) = second else {
+                return true;
+            };
             (Some(group), event_name, third)
         } else {
             (None, first, second)
         };
-        let Some(event) = Event::from_name(event_name) else { return false };
+        let Some(event) = Event::from_name(event_name) else {
+            return false;
+        };
         self.entries.iter().any(|entry| {
             entry.event == event
                 && group.is_none_or(|group| entry.options.group == group)
@@ -463,123 +589,279 @@ impl Autocmds {
         })
     }
 
-    /// Deletes an augroup and all of its definitions.
-    pub fn delete_group(&mut self, id: AugroupId) -> Result<(), AutocmdError> {
-        let Some((name, _)) = self.groups.remove(&id) else { return Err(AutocmdError::UnknownGroup(id)); };
-        self.group_names.remove(&name);
-        self.entries.retain(|entry| entry.options.group != id);
-        Ok(())
+    /// API deletion: removes the live group, its name, and all entries.
+    /// Returns the removed executable payloads for callback-ref cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutocmdError::UnknownGroup`] if `id` does not identify a
+    /// group.
+    pub fn delete_group(&mut self, id: AugroupId) -> Result<Vec<AutocmdKind>, AutocmdError> {
+        let Some(state) = self.groups.remove(&id) else {
+            return Err(AutocmdError::UnknownGroup(id));
+        };
+        if let GroupState::Live(name) = state {
+            self.group_names.remove(&name);
+        }
+        let mut removed = Vec::new();
+        self.entries.retain(|entry| {
+            if entry.options.group == id {
+                removed.push(entry.kind.clone());
+                false
+            } else {
+                true
+            }
+        });
+        Ok(removed)
+    }
+
+    /// Legacy deletion (`:augroup!`): removes the group name but preserves
+    /// entries under a tombstone. Old entries remain globally queryable;
+    /// recreating the same name allocates a new live group id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutocmdError::UnknownGroup`] if `id` does not identify a
+    /// live group.
+    pub fn delete_group_legacy(&mut self, id: AugroupId) -> Result<(), AutocmdError> {
+        match self.groups.get(&id) {
+            Some(GroupState::Live(name)) => {
+                let name = name.clone();
+                self.group_names.remove(&name);
+                self.groups.insert(id, GroupState::Tombstoned);
+                Ok(())
+            }
+            _ => Err(AutocmdError::UnknownGroup(id)),
+        }
     }
 
     /// Clears every definition in an augroup while preserving the group.
-    pub fn clear_group(&mut self, id: AugroupId) -> Result<usize, AutocmdError> {
-        if id != AugroupId::default() && !self.groups.contains_key(&id) {
+    /// Returns the removed executable payloads for callback-ref cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutocmdError::UnknownGroup`] if `id` does not identify a
+    /// live group.
+    pub fn clear_group(&mut self, id: AugroupId) -> Result<Vec<AutocmdKind>, AutocmdError> {
+        if id != AugroupId::default() && !self.is_live_group(id) {
             return Err(AutocmdError::UnknownGroup(id));
         }
-        let before = self.entries.len();
-        self.entries.retain(|entry| entry.options.group != id);
-        Ok(before - self.entries.len())
+        let mut removed = Vec::new();
+        self.entries.retain(|entry| {
+            if entry.options.group == id {
+                removed.push(entry.kind.clone());
+                false
+            } else {
+                true
+            }
+        });
+        Ok(removed)
     }
 
-    /// Registers one definition for every top-level comma-separated pattern.
-    pub fn register(
+    /// Registers one API batch: one shared API id across every event ×
+    /// pattern entry. Returns the API id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `events` or `patterns` is empty, the destination
+    /// group is not live, a buffer-local pattern lacks a valid buffer, or a
+    /// pattern is malformed.
+    pub fn register_api(
         &mut self,
-        event: Event,
+        events: &[Event],
         patterns: &str,
-        kind: AutocmdKind,
-        options: AutocmdOptions,
-    ) -> Result<Vec<u64>, AutocmdError> {
-        if patterns.is_empty() { return Err(AutocmdError::EmptyPattern); }
-        if options.group != AugroupId::default() && !self.groups.contains_key(&options.group) {
+        kind: &AutocmdKind,
+        options: &AutocmdOptions,
+    ) -> Result<u64, AutocmdError> {
+        if events.is_empty() {
+            return Err(AutocmdError::EmptyEvent);
+        }
+        let parsed = self.parse_registration(patterns, options)?;
+        let api_id = self.next_api_id;
+        self.next_api_id = self.next_api_id.saturating_add(1);
+        self.commit_registration(events, kind, options, parsed, Some(api_id));
+        Ok(api_id)
+    }
+
+    /// Registers legacy `:autocmd` entries. No API id is assigned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `events` or `patterns` is empty, the destination
+    /// group is not live, a buffer-local pattern lacks a valid buffer, or a
+    /// pattern is malformed.
+    pub fn register_legacy(
+        &mut self,
+        events: &[Event],
+        patterns: &str,
+        kind: &AutocmdKind,
+        options: &AutocmdOptions,
+    ) -> Result<(), AutocmdError> {
+        if events.is_empty() {
+            return Err(AutocmdError::EmptyEvent);
+        }
+        let parsed = self.parse_registration(patterns, options)?;
+        self.commit_registration(events, kind, options, parsed, None);
+        Ok(())
+    }
+
+    /// Validates the group and parses every pattern item without mutating
+    /// state. A malformed later pattern leaves entries and counters unchanged.
+    fn parse_registration(
+        &self,
+        patterns: &str,
+        options: &AutocmdOptions,
+    ) -> Result<Vec<(StoredPattern, String)>, AutocmdError> {
+        if options.group != AugroupId::default() && !self.is_live_group(options.group) {
             return Err(AutocmdError::UnknownGroup(options.group));
         }
         let parts = split_pattern_list(patterns)?;
-        let mut ids = Vec::with_capacity(parts.len());
-        for part in parts {
-            if part.is_empty() { return Err(AutocmdError::EmptyPattern); }
-            let stored = if part == "<abuf>" {
-                StoredPattern::Buffer(options.buffer.ok_or(AutocmdError::MissingBuffer)?)
-            } else {
-                StoredPattern::Glob(expand_braces(&part).ok_or(AutocmdError::UnbalancedBraces)?)
-            };
-            let id = self.next_id;
-            self.next_id = self.next_id.saturating_add(1);
-            let sequence = self.next_sequence;
-            self.next_sequence = self.next_sequence.saturating_add(1);
-            self.entries.push(Entry {
-                id,
-                sequence,
-                event,
-                pattern: stored,
-                source_pattern: part,
-                kind: kind.clone(),
-                options: options.clone(),
-            });
-            ids.push(id);
+        if parts.iter().all(String::is_empty) {
+            return Err(AutocmdError::EmptyPattern);
         }
-        Ok(ids)
+        parts
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .map(|part| parse_pattern(&part, options.buffer))
+            .collect()
     }
 
-    /// Removes definitions selected by group, event, and exact source pattern.
-    pub fn delete(&mut self, selector: DeleteAutocmds<'_>) -> Result<usize, AutocmdError> {
-        let patterns = selector.pattern.map(split_pattern_list).transpose()?;
-        let before = self.entries.len();
+    fn commit_registration(
+        &mut self,
+        events: &[Event],
+        kind: &AutocmdKind,
+        options: &AutocmdOptions,
+        parsed: Vec<(StoredPattern, String)>,
+        api_id: Option<u64>,
+    ) {
+        for (stored, source) in parsed {
+            for &event in events {
+                let entry_id = AutocmdEntryId(self.next_entry_id);
+                self.next_entry_id = self.next_entry_id.saturating_add(1);
+                let sequence = self.next_sequence;
+                self.next_sequence = self.next_sequence.saturating_add(1);
+                self.entries.push(Entry {
+                    id: entry_id,
+                    api_id,
+                    sequence,
+                    event,
+                    pattern: stored.clone(),
+                    source_pattern: source.clone(),
+                    kind: kind.clone(),
+                    options: options.clone(),
+                });
+            }
+        }
+    }
+
+    /// Returns definitions matching the filter, in registration order.
+    /// Group filtering accepts only live (or default) groups; a `None` group
+    /// includes tombstoned entries.
+    #[must_use]
+    pub fn query(&self, filter: &AutocmdFilter<'_>) -> Vec<AutocmdDefinition> {
+        self.entries
+            .iter()
+            .filter(|entry| self.entry_matches_filter(entry, filter))
+            .map(|entry| self.definition(entry))
+            .collect()
+    }
+
+    /// Removes definitions matching the filter and returns the removed
+    /// executable payloads for callback-ref cleanup.
+    pub fn clear(&mut self, filter: &AutocmdFilter<'_>) -> Vec<AutocmdKind> {
+        let doomed: BTreeSet<AutocmdEntryId> = self
+            .entries
+            .iter()
+            .filter(|entry| self.entry_matches_filter(entry, filter))
+            .map(|entry| entry.id)
+            .collect();
+        let mut removed = Vec::new();
         self.entries.retain(|entry| {
-            let group_matches = selector.group.is_none_or(|group| entry.options.group == group);
-            let event_matches = selector.event.is_none_or(|event| entry.event == event);
-            let pattern_matches = patterns.as_ref().is_none_or(|items| items.contains(&entry.source_pattern));
-            (group_matches && event_matches && pattern_matches) == false
+            if doomed.contains(&entry.id) {
+                removed.push(entry.kind.clone());
+                false
+            } else {
+                true
+            }
         });
-        Ok(before - self.entries.len())
+        removed
     }
 
-    /// Removes one definition by stable id.
-    pub fn delete_id(&mut self, id: u64) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|entry| entry.id != id);
-        before != self.entries.len()
+    /// Removes every entry sharing one API id. Returns the removed payloads.
+    pub fn delete_api_id(&mut self, api_id: u64) -> Vec<AutocmdKind> {
+        let mut removed = Vec::new();
+        self.entries.retain(|entry| {
+            if entry.api_id == Some(api_id) {
+                removed.push(entry.kind.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 
-    /// Returns definitions in registration order.
+    /// Removes one entry by entry id (callback-truthy deletion).
+    /// Returns the removed payload if the entry existed.
+    pub fn delete_entry(&mut self, entry_id: AutocmdEntryId) -> Option<AutocmdKind> {
+        let mut removed = None;
+        self.entries.retain(|entry| {
+            if entry.id == entry_id {
+                removed = Some(entry.kind.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
+
+    /// Returns all definitions in registration order.
     #[must_use]
     pub fn definitions(&self) -> Vec<AutocmdDefinition> {
         self.entries
             .iter()
-            .map(|entry| AutocmdDefinition {
-                id: entry.id,
-                event: entry.event,
-                group: entry.options.group,
-                group_name: self.groups.get(&entry.options.group).map(|(name, _)| name.clone()),
-                pattern: entry.source_pattern.clone(),
-                buffer: match entry.pattern {
-                    StoredPattern::Buffer(buffer) => Some(buffer),
-                    StoredPattern::Glob(_) => None,
-                },
-                kind: entry.kind.clone(),
-                once: entry.options.once,
-                nested: entry.options.nested,
-                description: entry.options.description.clone(),
-            })
+            .map(|entry| self.definition(entry))
             .collect()
     }
 
     /// Adds an event to the editor's `eventignore` set.
-    pub fn ignore(&mut self, event: Event) { self.ignored.insert(event); }
+    pub fn ignore(&mut self, event: Event) {
+        self.ignored.insert(event);
+    }
     /// Removes an event from the editor's `eventignore` set.
-    pub fn unignore(&mut self, event: Event) { self.ignored.remove(&event); }
+    pub fn unignore(&mut self, event: Event) {
+        self.ignored.remove(&event);
+    }
     /// Whether the event is currently ignored.
     #[must_use]
-    pub fn is_ignored(&self, event: Event) -> bool { self.ignored.contains(&event) }
+    pub fn is_ignored(&self, event: Event) -> bool {
+        self.ignored.contains(&event)
+    }
     /// Number of registered pattern definitions.
     #[must_use]
-    pub fn len(&self) -> usize { self.entries.len() }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
     /// Whether no definitions are registered.
     #[must_use]
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 
-    /// Removes all buffer-local definitions for a wiped buffer.
-    pub fn remove_buffer(&mut self, buffer: BufHandle) {
-        self.entries.retain(|entry| !matches!(entry.pattern, StoredPattern::Buffer(value) if value == buffer));
+    /// Removes all buffer-local definitions for a wiped buffer and returns
+    /// the removed executable payloads for callback-ref cleanup.
+    pub fn remove_buffer(&mut self, buffer: BufHandle) -> Vec<AutocmdKind> {
+        let mut removed = Vec::new();
+        self.entries.retain(|entry| {
+            if matches!(entry.pattern, StoredPattern::Buffer(value) if value == buffer) {
+                removed.push(entry.kind.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 
     /// Builds the firing plan for one event occurrence.
@@ -618,11 +900,19 @@ impl Autocmds {
         if self.ignored.contains(&event) || !context.nested {
             return FiringPlan::default();
         }
-        let mut matched: Vec<&Entry> = self.entries.iter().filter(|entry| {
-            entry.event == event
-                && group.is_none_or(|group| entry.options.group == group)
-                && pattern_matches(&entry.pattern, context.buffer, context.file_name)
-        }).collect();
+        let mut matched: Vec<&Entry> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.event == event
+                    && group.is_none_or(|group| entry.options.group == group)
+                    && pattern_matches(
+                        &entry.pattern,
+                        context.buffer,
+                        context.match_name.or(context.file_name),
+                    )
+            })
+            .collect();
         matched.sort_by_key(|entry| entry.sequence);
         let ready: Vec<AutocmdAction> = matched
             .into_iter()
@@ -631,51 +921,149 @@ impl Autocmds {
         FiringPlan { ready }
     }
 
-    /// Removes the one-shot definition identified by `id` once the host begins
-    /// executing it. Returns `true` when a `++once` definition was removed.
-    pub fn consume_once(&mut self, id: u64) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|entry| !(entry.id == id && entry.options.once));
-        self.entries.len() != before
+    /// Removes the one-shot definition identified by `entry_id` once the host
+    /// begins executing it. Returns the removed payload when a `++once`
+    /// definition was consumed.
+    pub fn consume_once(&mut self, entry_id: AutocmdEntryId) -> Option<AutocmdKind> {
+        let mut removed = None;
+        self.entries.retain(|entry| {
+            if entry.id == entry_id && entry.options.once {
+                removed = Some(entry.kind.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
+
+    /// Whether the entry identified by `entry_id` is still registered.
+    /// Plan executors call this before executing a queued action to detect
+    /// deletion or clearing by an earlier callback in the same firing plan.
+    #[must_use]
+    pub fn is_entry_live(&self, entry_id: AutocmdEntryId) -> bool {
+        self.entries.iter().any(|entry| entry.id == entry_id)
+    }
+    /// Whether any registered definition still owns this Lua callback reference.
+    #[must_use]
+    pub fn uses_lua_callback(&self, reference: u64) -> bool {
+        self.entries.iter().any(
+            |entry| matches!(entry.kind, AutocmdKind::LuaCallback(stored) if stored == reference),
+        )
+    }
+    fn allocate_group_id(&mut self) -> AugroupId {
+        let mut candidate = self.next_group;
+        loop {
+            let id = AugroupId(candidate);
+            if !self.groups.contains_key(&id) {
+                self.next_group = candidate.saturating_add(1);
+                return id;
+            }
+            candidate = candidate.saturating_add(1);
+        }
+    }
+
+    fn group_name_for(&self, id: AugroupId) -> Option<String> {
+        match self.groups.get(&id) {
+            Some(GroupState::Live(name)) => Some(name.clone()),
+            Some(GroupState::Tombstoned) => Some(DELETED_GROUP_NAME.to_owned()),
+            None => None,
+        }
+    }
+
+    fn entry_matches_filter(&self, entry: &Entry, filter: &AutocmdFilter<'_>) -> bool {
+        let group_matches = filter.group.is_none_or(|id| {
+            id == entry.options.group && (id == AugroupId::default() || self.is_live_group(id))
+        });
+        if !group_matches {
+            return false;
+        }
+        let events_match = filter
+            .events
+            .is_none_or(|events| events.contains(&entry.event));
+        if !events_match {
+            return false;
+        }
+        let patterns_match = filter
+            .patterns
+            .is_none_or(|patterns| patterns.contains(&entry.source_pattern));
+        if !patterns_match {
+            return false;
+        }
+        let buffers_match = filter.buffers.is_none_or(|buffers| {
+            matches!(entry.pattern, StoredPattern::Buffer(handle) if buffers.contains(&handle))
+        });
+        if !buffers_match {
+            return false;
+        }
+        filter.api_id.is_none_or(|id| entry.api_id == Some(id))
+    }
+
+    fn definition(&self, entry: &Entry) -> AutocmdDefinition {
+        AutocmdDefinition {
+            entry_id: entry.id,
+            api_id: entry.api_id,
+            event: entry.event,
+            group: entry.options.group,
+            group_name: self.group_name_for(entry.options.group),
+            pattern: entry.source_pattern.clone(),
+            buffer: match entry.pattern {
+                StoredPattern::Buffer(buffer) => Some(buffer),
+                StoredPattern::Glob(_) => None,
+            },
+            kind: entry.kind.clone(),
+            once: entry.options.once,
+            nested: entry.options.nested,
+            description: entry.options.description.clone(),
+        }
     }
 
     fn action(&self, entry: &Entry, context: AutocmdContext<'_>) -> AutocmdAction {
         AutocmdAction {
-            id: entry.id,
+            entry_id: entry.id,
+            api_id: entry.api_id,
             event: entry.event,
             kind: entry.kind.clone(),
             once: entry.options.once,
             nested: entry.options.nested,
             group: entry.options.group,
-            group_name: self.groups.get(&entry.options.group).map(|(name, _)| name.clone()),
+            group_name: self.group_name_for(entry.options.group),
             pattern: entry.source_pattern.clone(),
-            buffer: context.buffer.or_else(|| match entry.pattern {
+            buffer: context.buffer.or(match entry.pattern {
                 StoredPattern::Buffer(buffer) => Some(buffer),
                 StoredPattern::Glob(_) => None,
             }),
-            match_name: context.file_name.map_or_else(String::new, |name| {
-                if entry.event.pattern_kind() == PatternKind::None || name.is_empty() {
-                    name.to_owned()
-                } else {
-                    let path = std::path::Path::new(name);
-                    if path.is_absolute() {
+            match_name: match context.match_name {
+                Some(name) => name.to_owned(),
+                None => context.file_name.map_or_else(String::new, |name| {
+                    if entry.event.pattern_kind() == PatternKind::None || name.is_empty() {
                         name.to_owned()
                     } else {
-                        std::env::current_dir()
-                            .unwrap_or_default()
-                            .join(path)
-                            .to_string_lossy()
-                            .into_owned()
+                        let path = std::path::Path::new(name);
+                        if path.is_absolute() {
+                            name.to_owned()
+                        } else {
+                            std::env::current_dir()
+                                .unwrap_or_default()
+                                .join(path)
+                                .to_string_lossy()
+                                .into_owned()
+                        }
                     }
-                }
-            }),
+                }),
+            },
             file_name: context.file_name.unwrap_or_default().to_owned(),
             description: entry.options.description.clone(),
+            data: context.data.cloned(),
         }
     }
 }
 
-fn pattern_matches(pattern: &StoredPattern, buffer: Option<BufHandle>, file_name: Option<&str>) -> bool {
+fn pattern_matches(
+    pattern: &StoredPattern,
+    buffer: Option<BufHandle>,
+    file_name: Option<&str>,
+) -> bool {
     match pattern {
         StoredPattern::Buffer(expected) => buffer == Some(*expected),
         StoredPattern::Glob(patterns) => {
@@ -692,37 +1080,107 @@ fn pattern_matches(pattern: &StoredPattern, buffer: Option<BufHandle>, file_name
     }
 }
 
+/// Parses one comma-split pattern item into a stored representation and
+/// canonical source string. `<abuf>`, `<buffer>`, `<buffer=0>`, and
+/// `<buffer=N>` resolve to a buffer handle with canonical `<buffer=N>`;
+/// everything else is a literal glob.
+fn parse_pattern(
+    part: &str,
+    fallback: Option<BufHandle>,
+) -> Result<(StoredPattern, String), AutocmdError> {
+    if let Some(handle) = resolve_buffer_pattern(part, fallback)? {
+        let n: i64 = handle.into();
+        return Ok((StoredPattern::Buffer(handle), format!("<buffer={n}>")));
+    }
+    let expanded = expand_braces(part).ok_or(AutocmdError::UnbalancedBraces)?;
+    Ok((StoredPattern::Glob(expanded), part.to_owned()))
+}
+
+fn resolve_buffer_pattern(
+    part: &str,
+    fallback: Option<BufHandle>,
+) -> Result<Option<BufHandle>, AutocmdError> {
+    if part == "<abuf>" || part == "<buffer>" || part == "<buffer=0>" {
+        return fallback.ok_or(AutocmdError::MissingBuffer).map(Some);
+    }
+    if let Some(rest) = part.strip_prefix("<buffer=")
+        && let Some(num_str) = rest.strip_suffix('>')
+    {
+        let n: i64 = num_str
+            .parse()
+            .map_err(|_| AutocmdError::InvalidBufferPattern(part.to_owned()))?;
+        if n == 0 {
+            return fallback.ok_or(AutocmdError::MissingBuffer).map(Some);
+        }
+        let handle = BufHandle::try_from(n)
+            .map_err(|_| AutocmdError::InvalidBufferPattern(part.to_owned()))?;
+        return Ok(Some(handle));
+    }
+    Ok(None)
+}
+
 fn split_pattern_list(patterns: &str) -> Result<Vec<String>, AutocmdError> {
     let mut result = Vec::new();
     let mut current = String::new();
     let mut depth = 0usize;
     let mut escaped = false;
     for ch in patterns.chars() {
-        if escaped { current.push(ch); escaped = false; continue; }
-        if ch == '\\' { escaped = true; current.push(ch); continue; }
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            current.push(ch);
+            continue;
+        }
         match ch {
-            '{' => { depth += 1; current.push(ch); }
+            '{' => {
+                depth += 1;
+                current.push(ch);
+            }
             '}' if depth == 0 => return Err(AutocmdError::UnbalancedBraces),
-            '}' => { depth -= 1; current.push(ch); }
-            ',' if depth == 0 => { result.push(current); current = String::new(); }
+            '}' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                result.push(current);
+                current = String::new();
+            }
             _ => current.push(ch),
         }
     }
-    if escaped { current.push('\\'); }
-    if depth != 0 { return Err(AutocmdError::UnbalancedBraces); }
+    if escaped {
+        current.push('\\');
+    }
+    if depth != 0 {
+        return Err(AutocmdError::UnbalancedBraces);
+    }
     result.push(current);
     Ok(result)
 }
 
-fn expand_braces(pattern: &str) -> Option<Vec<String>> {
+pub(crate) fn expand_braces(pattern: &str) -> Option<Vec<String>> {
     let chars: Vec<char> = pattern.chars().collect();
     let start = chars.iter().position(|ch| *ch == '{');
-    let Some(start) = start else { return Some(vec![pattern.to_owned()]); };
+    let Some(start) = start else {
+        return Some(vec![pattern.to_owned()]);
+    };
     let mut depth = 0usize;
     let mut end = None;
     for (index, ch) in chars.iter().enumerate().skip(start) {
-        if *ch == '{' { depth += 1; }
-        if *ch == '}' { depth = depth.checked_sub(1)?; if depth == 0 { end = Some(index); break; } }
+        if *ch == '{' {
+            depth += 1;
+        }
+        if *ch == '}' {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                end = Some(index);
+                break;
+            }
+        }
     }
     let end = end?;
     let prefix: String = chars[..start].iter().collect();
@@ -731,7 +1189,9 @@ fn expand_braces(pattern: &str) -> Option<Vec<String>> {
     let alternatives = split_pattern_list(&middle).ok()?;
     let mut result = Vec::new();
     for alternative in alternatives {
-        for expanded in expand_braces(&format!("{prefix}{alternative}{suffix}"))? { result.push(expanded); }
+        for expanded in expand_braces(&format!("{prefix}{alternative}{suffix}"))? {
+            result.push(expanded);
+        }
     }
     Some(result)
 }
@@ -747,17 +1207,23 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         match pattern[index] {
             '*' => {
                 next[0] = row[0];
-                for column in 1..=text.len() { next[column] = row[column] || next[column - 1]; }
+                for column in 1..=text.len() {
+                    next[column] = row[column] || next[column - 1];
+                }
             }
             '?' => {
-                for column in 1..=text.len() { next[column] = row[column - 1]; }
+                next[1..].copy_from_slice(&row[..text.len()]);
             }
             '\\' if index + 1 < pattern.len() => {
                 index += 1;
-                for column in 1..=text.len() { next[column] = row[column - 1] && pattern[index] == text[column - 1]; }
+                for column in 1..=text.len() {
+                    next[column] = row[column - 1] && pattern[index] == text[column - 1];
+                }
             }
             literal => {
-                for column in 1..=text.len() { next[column] = row[column - 1] && literal == text[column - 1]; }
+                for column in 1..=text.len() {
+                    next[column] = row[column - 1] && literal == text[column - 1];
+                }
             }
         }
         row = next;

@@ -12,6 +12,9 @@ use syn::{
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+// One bool per documented #[api] attribute flag; the struct copies the
+// attribute surface literally so parse errors can name the exact flag.
+#[allow(clippy::struct_excessive_bools)]
 struct ApiArgs {
     since: Option<u16>,
     deprecated_since: Option<u16>,
@@ -32,11 +35,7 @@ impl ApiArgs {
                     set_number(&mut args.since, &value.value, "since")?;
                 }
                 Meta::NameValue(value) if value.path.is_ident("deprecated_since") => {
-                    set_number(
-                        &mut args.deprecated_since,
-                        &value.value,
-                        "deprecated_since",
-                    )?;
+                    set_number(&mut args.deprecated_since, &value.value, "deprecated_since")?;
                 }
                 Meta::Path(path) if path.is_ident("fast") => {
                     set_flag(&mut args.fast, &path, "fast")?;
@@ -128,7 +127,7 @@ struct Signature {
 fn validate_signature(function: &ItemFn, args: ApiArgs) -> Result<Signature, Error> {
     if function.sig.asyncness.is_some() {
         return Err(Error::new_spanned(
-            &function.sig.asyncness,
+            function.sig.asyncness,
             "#[api] functions cannot be async",
         ));
     }
@@ -150,7 +149,10 @@ fn validate_signature(function: &ItemFn, args: ApiArgs) -> Result<Signature, Err
     let mut parameter_types = Vec::with_capacity(function.sig.inputs.len());
     for (index, input) in function.sig.inputs.iter().enumerate() {
         let FnArg::Typed(parameter) = input else {
-            return Err(Error::new_spanned(input, "#[api] functions cannot have a receiver"));
+            return Err(Error::new_spanned(
+                input,
+                "#[api] functions cannot have a receiver",
+            ));
         };
         let Pat::Ident(name) = parameter.pat.as_ref() else {
             return Err(Error::new_spanned(
@@ -164,7 +166,7 @@ fn validate_signature(function: &ItemFn, args: ApiArgs) -> Result<Signature, Err
                 "#[api] parameters must be plain identifiers",
             ));
         }
-        if index == 0 && is_mut_editor_reference(&parameter.ty) {
+        if index == 0 && is_session_reference(&parameter.ty) {
             has_editor_context = true;
             continue;
         }
@@ -185,12 +187,14 @@ fn validate_signature(function: &ItemFn, args: ApiArgs) -> Result<Signature, Err
     })
 }
 
-fn is_mut_editor_reference(ty: &Type) -> bool {
+/// Whether `ty` is `session: &ApiSession`, the API context parameter every
+/// exported handler receives first.
+fn is_session_reference(ty: &Type) -> bool {
     let Type::Reference(reference) = ty else {
         return false;
     };
-    reference.mutability.is_some()
-        && type_last_ident(&reference.elem).is_some_and(|ident| ident == "Editor")
+    reference.mutability.is_none()
+        && type_last_ident(&reference.elem).is_some_and(|ident| ident == "ApiSession")
 }
 
 fn result_ok_type(output: &ReturnType) -> Result<Type, Error> {
@@ -232,7 +236,7 @@ fn result_ok_type(output: &ReturnType) -> Result<Type, Error> {
             _ => None,
         })
         .collect();
-    if types.len() != 2 || !type_last_ident(types[1]).is_some_and(|ident| ident == "ApiError") {
+    if types.len() != 2 || type_last_ident(types[1]).is_none_or(|ident| ident != "ApiError") {
         return Err(Error::new_spanned(
             arguments,
             "#[api] functions must return Result<T, ApiError>",
@@ -243,29 +247,33 @@ fn result_ok_type(output: &ReturnType) -> Result<Type, Error> {
 
 fn validate_method_receiver(function: &ItemFn, parameter_types: &[Type]) -> Result<(), Error> {
     let name = function.sig.ident.to_string();
-    let expected = if name.starts_with("nvim_buf_") {
+    let expected = if name.starts_with("nvim_buf_") || name.starts_with("buffer_") {
         "BufHandle"
-    } else if name.starts_with("nvim_win_") {
+    } else if name.starts_with("nvim_win_") || name.starts_with("window_") {
         "WinHandle"
-    } else if name.starts_with("nvim_tabpage_") {
+    } else if name.starts_with("nvim_tabpage_") || name.starts_with("tabpage_") {
         "TabHandle"
     } else {
         return Err(Error::new_spanned(
             &function.sig.ident,
-            "#[api(method)] requires an nvim_buf_*, nvim_win_*, or nvim_tabpage_* name",
+            "#[api(method)] requires a buffer, window, or tabpage method name",
         ));
     };
 
     let Some(receiver) = parameter_types.first() else {
         return Err(Error::new_spanned(
             &function.sig.ident,
-            format!("#[api(method)] function `{name}` requires `{expected}` as its first parameter"),
+            format!(
+                "#[api(method)] function `{name}` requires `{expected}` as its first parameter"
+            ),
         ));
     };
-    if !type_last_ident(receiver).is_some_and(|ident| ident == expected) {
+    if type_last_ident(receiver).is_none_or(|ident| ident != expected) {
         return Err(Error::new_spanned(
             receiver,
-            format!("#[api(method)] function `{name}` requires `{expected}` as its first parameter"),
+            format!(
+                "#[api(method)] function `{name}` requires `{expected}` as its first parameter"
+            ),
         ));
     }
     Ok(())
@@ -278,8 +286,8 @@ fn type_last_ident(ty: &Type) -> Option<&syn::Ident> {
     path.path.segments.last().map(|segment| &segment.ident)
 }
 
-fn expand(args: ApiArgs, function: ItemFn) -> Result<TokenStream2, Error> {
-    let signature = validate_signature(&function, args)?;
+fn expand(args: ApiArgs, function: &ItemFn) -> Result<TokenStream2, Error> {
+    let signature = validate_signature(function, args)?;
     if args.noexport {
         return Ok(quote!(#function));
     }
@@ -292,14 +300,15 @@ fn expand(args: ApiArgs, function: ItemFn) -> Result<TokenStream2, Error> {
     let metadata_function = format_ident!("__{}_api_meta", name);
     let dispatch_function = format_ident!("__{}_api_dispatch", name);
     let parameter_names = &signature.parameter_names;
-    let parameter_name_strings: Vec<String> = parameter_names.iter().map(ToString::to_string).collect();
+    let parameter_name_strings: Vec<String> =
+        parameter_names.iter().map(ToString::to_string).collect();
     let parameter_types = &signature.parameter_types;
     let return_type = &signature.return_type;
     let argument_count = parameter_names.len();
     let argument_positions = 1..=argument_count;
     let argument_indexes = 0..argument_count;
     let invocation = if signature.has_editor_context {
-        quote!(#name(_editor #(, #parameter_names)*))
+        quote!(#name(_session #(, #parameter_names)*))
     } else {
         quote!(#name(#(#parameter_names),*))
     };
@@ -309,9 +318,10 @@ fn expand(args: ApiArgs, function: ItemFn) -> Result<TokenStream2, Error> {
             "exported #[api] functions require `since = N`",
         )
     })?;
-    let deprecated_since = match args.deprecated_since {
-        Some(value) => quote!(::core::option::Option::Some(#value)),
-        None => quote!(::core::option::Option::None),
+    let deprecated_since = if let Some(value) = args.deprecated_since {
+        quote!(::core::option::Option::Some(#value))
+    } else {
+        quote!(::core::option::Option::None)
     };
     let method = args.method;
     let fast = args.fast;
@@ -328,7 +338,6 @@ fn expand(args: ApiArgs, function: ItemFn) -> Result<TokenStream2, Error> {
                 method: #method,
                 fast: #fast,
                 textlock: #textlock,
-                textlock_allow: false,
                 returns: <#return_type as ::ox_api::ApiType>::TYPE,
                 params: &[
                     #((#parameter_name_strings, <#parameter_types as ::ox_api::ApiType>::TYPE, false)),*
@@ -341,7 +350,7 @@ fn expand(args: ApiArgs, function: ItemFn) -> Result<TokenStream2, Error> {
         #visibility const #metadata_const: fn() -> ::ox_api::FunctionMetadata = #metadata_function;
 
         fn #dispatch_function(
-            _editor: &mut ::ox_editor::Editor,
+            _session: &::ox_api::ApiSession,
             arguments: &[::ox_api::Object],
         ) -> ::core::result::Result<::ox_api::Object, ::ox_api::ApiError> {
             if arguments.len() != #argument_count {
@@ -377,7 +386,7 @@ fn expand(args: ApiArgs, function: ItemFn) -> Result<TokenStream2, Error> {
 pub fn api(attributes: TokenStream, item: TokenStream) -> TokenStream {
     let result = ApiArgs::parse(TokenStream2::from(attributes)).and_then(|args| {
         let function = syn::parse2::<ItemFn>(TokenStream2::from(item))?;
-        expand(args, function)
+        expand(args, &function)
     });
     match result {
         Ok(tokens) => tokens.into(),
@@ -385,6 +394,9 @@ pub fn api(attributes: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+// Pure unit-test module: expect/panic on generated-token results IS the
+// assertion; an unexpected Err here must fail the test loudly.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #[cfg(test)]
 mod tests {
     use super::{ApiArgs, expand, validate_signature};
@@ -392,17 +404,15 @@ mod tests {
 
     fn error(attributes: proc_macro2::TokenStream, function: proc_macro2::TokenStream) -> String {
         ApiArgs::parse(attributes)
-            .and_then(|args| syn::parse2(function).and_then(|function| expand(args, function)))
+            .and_then(|args| syn::parse2(function).and_then(|function| expand(args, &function)))
             .expect_err("test input should be rejected")
             .to_string()
     }
 
     #[test]
     fn parses_the_exact_attribute_set() {
-        let args = ApiArgs::parse(quote!(
-            since = 1, deprecated_since = 4, fast, method
-        ))
-        .expect("valid attributes");
+        let args = ApiArgs::parse(quote!(since = 1, deprecated_since = 4, fast, method))
+            .expect("valid attributes");
         assert_eq!(args.since, Some(1));
         assert_eq!(args.deprecated_since, Some(4));
         assert!(args.fast && args.method);
@@ -424,36 +434,40 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_only_leading_mutable_editor_context() {
+    fn recognizes_only_leading_session_context() {
         let args = ApiArgs::parse(quote!(since = 1)).expect("valid attributes");
         let leading = syn::parse2(quote!(
-            fn nvim_leading(editor: &mut Editor, value: i64) -> Result<Object, ApiError> {
+            fn nvim_leading(session: &ApiSession, value: i64) -> Result<Object, ApiError> {
                 loop {}
             }
         ))
         .expect("valid function");
         let leading = validate_signature(&leading, args).expect("valid signature");
         assert!(leading.has_editor_context);
-        let leading_names: Vec<_> = leading.parameter_names.iter().map(ToString::to_string).collect();
-        assert_eq!(leading_names, ["value"]);
-
-        let immutable = syn::parse2(quote!(
-            fn nvim_immutable(editor: &Editor, value: i64) -> Result<Object, ApiError> {
-                loop {}
-            }
-        ))
-        .expect("valid function");
-        let immutable = validate_signature(&immutable, args).expect("valid signature");
-        assert!(!immutable.has_editor_context);
-        let immutable_names: Vec<_> = immutable
+        let leading_names: Vec<_> = leading
             .parameter_names
             .iter()
             .map(ToString::to_string)
             .collect();
-        assert_eq!(immutable_names, ["editor", "value"]);
+        assert_eq!(leading_names, ["value"]);
+
+        let mutable = syn::parse2(quote!(
+            fn nvim_mutable(session: &mut ApiSession, value: i64) -> Result<Object, ApiError> {
+                loop {}
+            }
+        ))
+        .expect("valid function");
+        let mutable = validate_signature(&mutable, args).expect("valid signature");
+        assert!(!mutable.has_editor_context);
+        let mutable_names: Vec<_> = mutable
+            .parameter_names
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(mutable_names, ["session", "value"]);
 
         let nonleading = syn::parse2(quote!(
-            fn nvim_nonleading(value: i64, editor: &mut Editor) -> Result<Object, ApiError> {
+            fn nvim_nonleading(value: i64, session: &ApiSession) -> Result<Object, ApiError> {
                 loop {}
             }
         ))
@@ -465,17 +479,21 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect();
-        assert_eq!(nonleading_names, ["value", "editor"]);
+        assert_eq!(nonleading_names, ["value", "session"]);
     }
 
     #[test]
     fn noexport_preserves_only_the_original_function() {
         let args = ApiArgs::parse(quote!(noexport)).expect("valid noexport attribute");
         let function = syn::parse2(quote!(
-            fn internal(value: i64) -> Result<i64, ApiError> { Ok(value) }
+            fn internal(value: i64) -> Result<i64, ApiError> {
+                Ok(value)
+            }
         ))
         .expect("valid function");
-        let expansion = expand(args, function).expect("valid noexport function").to_string();
+        let expansion = expand(args, &function)
+            .expect("valid noexport function")
+            .to_string();
 
         assert!(expansion.contains("fn internal"));
         assert!(!expansion.contains("API_META"));
@@ -486,21 +504,36 @@ mod tests {
     fn validates_method_name_and_receiver_prefix() {
         let args = ApiArgs::parse(quote!(since = 1, method)).expect("valid attributes");
         let function = syn::parse2(quote!(
-            fn nvim_buf_get_name(
-                editor: &mut Editor,
-                buf: BufHandle,
-            ) -> Result<Object, ApiError> { loop {} }
+            fn nvim_buf_get_name(session: &ApiSession, buf: BufHandle) -> Result<Object, ApiError> {
+                loop {}
+            }
         ))
         .expect("valid function");
-        assert!(expand(args, function).is_ok());
+        assert!(expand(args, &function).is_ok());
+        let legacy = syn::parse2(quote!(
+            fn buffer_line_count(session: &ApiSession, buf: BufHandle) -> Result<Object, ApiError> {
+                loop {}
+            }
+        ))
+        .expect("valid function");
+        assert!(
+            expand(
+                ApiArgs::parse(quote!(since = 0, deprecated_since = 1, method))
+                    .expect("valid attributes"),
+                &legacy,
+            )
+            .is_ok()
+        );
 
         let valid = error(
             quote!(since = 1, method),
             quote!(
                 fn nvim_buf_get_name(
-                    editor: &mut Editor,
+                    session: &ApiSession,
                     buf: WinHandle,
-                ) -> Result<Object, ApiError> { loop {} }
+                ) -> Result<Object, ApiError> {
+                    loop {}
+                }
             ),
         );
         assert_eq!(
@@ -510,11 +543,15 @@ mod tests {
 
         let invalid_name = error(
             quote!(since = 1, method),
-            quote!(fn nvim_get_name(buf: BufHandle) -> Result<Object, ApiError> { loop {} }),
+            quote!(
+                fn nvim_get_name(buf: BufHandle) -> Result<Object, ApiError> {
+                    loop {}
+                }
+            ),
         );
         assert_eq!(
             invalid_name,
-            "#[api(method)] requires an nvim_buf_*, nvim_win_*, or nvim_tabpage_* name"
+            "#[api(method)] requires a buffer, window, or tabpage method name"
         );
     }
 
@@ -523,14 +560,22 @@ mod tests {
         assert_eq!(
             error(
                 quote!(since = 1),
-                quote!(fn nvim_bad(value: i64) -> Object { loop {} }),
+                quote!(
+                    fn nvim_bad(value: i64) -> Object {
+                        loop {}
+                    }
+                ),
             ),
             "#[api] functions must return Result<T, ApiError>"
         );
         assert_eq!(
             error(
                 quote!(since = 1),
-                quote!(fn nvim_bad((value, _): (i64, i64)) -> Result<Object, ApiError> { loop {} }),
+                quote!(
+                    fn nvim_bad((value, _): (i64, i64)) -> Result<Object, ApiError> {
+                        loop {}
+                    }
+                ),
             ),
             "#[api] parameters must use identifier patterns"
         );

@@ -112,7 +112,11 @@ impl WatchThread {
     fn stop(&self, uv_loop: &mut UvLoop) -> Result<(), WatchError> {
         let stopped = self.stop_once();
         self.deactivate(uv_loop)?;
-        if stopped { Ok(()) } else { Err(WatchError::Stopped) }
+        if stopped {
+            Ok(())
+        } else {
+            Err(WatchError::Stopped)
+        }
     }
 }
 
@@ -146,6 +150,14 @@ impl FsEvent {
     /// Existence or identity transitions are `rename`; other metadata changes
     /// are `change`. Directory events carry paths relative to the watched
     /// directory. See `uv.fs_event_start()` in `runtime/doc/luvref.txt`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WatchError::Unsupported`] if `watch_entry` and `recursive`
+    /// are both set, [`WatchError::Post`] if the loop is no longer accepting
+    /// completions, [`WatchError::Loop`] if the handle identity space is
+    /// exhausted, or [`WatchError::Spawn`] if the polling thread cannot be
+    /// started.
     pub fn start<C>(
         uv_loop: &mut UvLoop,
         path: impl Into<PathBuf>,
@@ -175,7 +187,8 @@ impl FsEvent {
         let callback = Arc::new(Mutex::new(callback));
         let thread_active = Arc::clone(&active);
         let thread_callback = Arc::clone(&callback);
-        let thread_path = path.clone();
+        let mut thread_path = PathBuf::new();
+        path.clone_into(&mut thread_path);
         let thread = match thread::Builder::new()
             .name("ox-uv-fs-event".into())
             .spawn(move || {
@@ -245,19 +258,30 @@ impl FsEvent {
 
     /// Stops delivery, joins the polling thread, and removes its liveness.
     /// See `uv.fs_event_stop()` in `runtime/doc/luvref.txt`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WatchError::Stopped`] if the watcher was already stopped, or
+    /// [`WatchError::Loop`] if the owning loop rejects the deactivation.
     pub fn stop(&self, uv_loop: &mut UvLoop) -> Result<(), WatchError> {
         self.watch.stop(uv_loop)
     }
 
     /// Returns the monitored path. See `uv.fs_event_getpath()` in `runtime/doc/luvref.txt`.
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 
     /// Returns the options governing this watcher.
-    pub fn options(&self) -> FsEventOptions { self.options }
+    pub fn options(&self) -> FsEventOptions {
+        self.options
+    }
 }
 
 impl Handle for FsEvent {
-    fn id(&self) -> HandleId { self.id }
+    fn id(&self) -> HandleId {
+        self.id
+    }
 
     fn close(&self, uv_loop: &mut UvLoop) -> crate::Result<()> {
         if uv_loop.is_closing(self.id) {
@@ -299,6 +323,13 @@ impl FsPoll {
     /// Starts polling at `interval`; zero milliseconds is normalized to one.
     ///
     /// See `uv.fs_poll_start()` in `runtime/doc/luvref.txt`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WatchError::Post`] if the loop is no longer accepting
+    /// completions, [`WatchError::Loop`] if the handle identity space is
+    /// exhausted, or [`WatchError::Spawn`] if the polling thread cannot be
+    /// started.
     pub fn start<C>(
         uv_loop: &mut UvLoop,
         path: impl Into<PathBuf>,
@@ -324,7 +355,8 @@ impl FsPoll {
         let callback = Arc::new(Mutex::new(callback));
         let thread_active = Arc::clone(&active);
         let thread_callback = Arc::clone(&callback);
-        let thread_path = path.clone();
+        let mut thread_path = PathBuf::new();
+        path.clone_into(&mut thread_path);
         let thread = match thread::Builder::new()
             .name("ox-uv-fs-poll".into())
             .spawn(move || {
@@ -373,16 +405,25 @@ impl FsPoll {
 
     /// Stops delivery, joins the polling thread, and removes its liveness.
     /// See `uv.fs_poll_stop()` in `runtime/doc/luvref.txt`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WatchError::Stopped`] if the watcher was already stopped, or
+    /// [`WatchError::Loop`] if the owning loop rejects the deactivation.
     pub fn stop(&self, uv_loop: &mut UvLoop) -> Result<(), WatchError> {
         self.watch.stop(uv_loop)
     }
 
     /// Returns the monitored path. See `uv.fs_poll_getpath()` in `runtime/doc/luvref.txt`.
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl Handle for FsPoll {
-    fn id(&self) -> HandleId { self.id }
+    fn id(&self) -> HandleId {
+        self.id
+    }
 
     fn close(&self, uv_loop: &mut UvLoop) -> crate::Result<()> {
         if uv_loop.is_closing(self.id) {
@@ -432,7 +473,7 @@ fn event_snapshot(path: &Path, options: FsEventOptions) -> FsResult<EventSnapsho
             .map_err(FsError::from)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(FsError::from)?;
-        children.sort_by_key(|entry| entry.file_name());
+        children.sort_by_key(std::fs::DirEntry::file_name);
         for child in children {
             let child_path = child.path();
             let child_metadata = match fs::symlink_metadata(&child_path) {
@@ -477,13 +518,21 @@ fn event_changes(previous: &EventSnapshot, current: &EventSnapshot) -> Vec<FsEve
                 return None;
             }
             let rename = identity(old) != identity(new);
-            Some(FsEventRecord { filename, change: !rename, rename })
+            Some(FsEventRecord {
+                filename,
+                change: !rename,
+                rename,
+            })
         })
         .collect()
 }
 
-fn snapshot_link(path: &Path) -> FsResult<Stat> { lstat(path) }
-fn snapshot_follow(path: &Path) -> FsResult<Stat> { stat(path) }
+fn snapshot_link(path: &Path) -> FsResult<Stat> {
+    lstat(path)
+}
+fn snapshot_follow(path: &Path) -> FsResult<Stat> {
+    stat(path)
+}
 fn identity(snapshot: Option<&Stat>) -> Option<(u64, u64)> {
     snapshot.map(|value| (value.dev, value.ino))
 }
@@ -521,18 +570,18 @@ fn post_if_active<C, T>(
     active: &Arc<AtomicBool>,
     callback: &Arc<Mutex<C>>,
     result: FsResult<T>,
-)
-where
+) where
     C: FnMut(&mut UvLoop, FsResult<T>) + Send + 'static,
     T: Send + 'static,
 {
     let active = Arc::clone(active);
     let callback = Arc::clone(callback);
     let _ = poster.post(Box::new(move |uv_loop| {
-        if active.load(Ordering::Acquire) && uv_loop.is_active(id) {
-            if let Ok(mut callback) = callback.lock() {
-                callback(uv_loop, result);
-            }
+        if active.load(Ordering::Acquire)
+            && uv_loop.is_active(id)
+            && let Ok(mut callback) = callback.lock()
+        {
+            callback(uv_loop, result);
         }
     }));
 }

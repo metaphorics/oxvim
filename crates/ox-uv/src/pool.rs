@@ -23,6 +23,11 @@ pub type LoopCompletion = Box<dyn FnOnce(&mut UvLoop) + Send + 'static>;
 /// pending phase; it must never execute the completion in `post` itself.
 pub trait LoopPoster: Clone + Send + Sync + 'static {
     /// Marks one asynchronous request or watcher active for loop liveness.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostError`] if the owning loop is no longer accepting
+    /// completions (it has been closed).
     fn begin(&self) -> Result<(), PostError>;
 
     /// Marks a previously begun request or watcher inactive.
@@ -30,6 +35,11 @@ pub trait LoopPoster: Clone + Send + Sync + 'static {
 
     /// Queues one completion for delivery by the owning loop. See
     /// `luv-thread-pool-work-scheduling` in `runtime/doc/luvref.txt`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostError`] if the owning loop is no longer accepting
+    /// completions or if waking the loop fails.
     fn post(&self, completion: LoopCompletion) -> Result<(), PostError>;
 }
 
@@ -107,6 +117,7 @@ impl Pool {
     /// Creates a pool using `UV_THREADPOOL_SIZE`, or four workers by default.
     ///
     /// See `luv-thread-pool-work-scheduling` in `runtime/doc/luvref.txt`.
+    #[must_use]
     pub fn new() -> Self {
         let size = std::env::var("UV_THREADPOOL_SIZE")
             .ok()
@@ -121,8 +132,9 @@ impl Pool {
     ///
     /// Zero is normalized to one so accepted work always makes progress. See
     /// `luv-thread-pool-work-scheduling` in `runtime/doc/luvref.txt`.
+    #[must_use]
     pub fn with_size(size: usize) -> Self {
-        let size = size.max(1).min(MAX_POOL_SIZE);
+        let size = size.clamp(1, MAX_POOL_SIZE);
         let (sender, receiver) = mpsc::channel::<Message>();
         let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(size);
@@ -146,6 +158,7 @@ impl Pool {
     /// Returns the number of workers successfully started.
     ///
     /// See `luv-thread-pool-work-scheduling` in `runtime/doc/luvref.txt`.
+    #[must_use]
     pub fn size(&self) -> usize {
         self.inner.size
     }
@@ -154,6 +167,11 @@ impl Pool {
     ///
     /// Completion is always deferred to the loop, including panic reporting.
     /// See `luv-thread-pool-work-scheduling` in `runtime/doc/luvref.txt`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError::Shutdown`] if the pool is shutting down or the
+    /// owning loop is no longer accepting completions.
     pub fn submit<P, W, C, T>(&self, poster: P, work: W, complete: C) -> Result<(), PoolError>
     where
         P: LoopPoster,
@@ -177,18 +195,18 @@ impl Pool {
                 finish_for_job.end();
             }
         });
-        let sender = self
-            .inner
-            .sender
-            .lock()
-            .map_err(|_| {
-                finish.end();
-                PoolError::Shutdown
-            })?;
+        let sender = self.inner.sender.lock().map_err(|_| {
+            finish.end();
+            PoolError::Shutdown
+        })?;
         let send_result = sender
             .as_ref()
             .ok_or(PoolError::Shutdown)
-            .and_then(|sender| sender.send(Message::Run(job)).map_err(|_| PoolError::Shutdown));
+            .and_then(|sender| {
+                sender
+                    .send(Message::Run(job))
+                    .map_err(|_| PoolError::Shutdown)
+            });
         if send_result.is_err() {
             finish.end();
         }
@@ -249,11 +267,12 @@ impl LoopPoster for UvLoopPoster {
     }
 
     fn end(&self) {
-        let _ = self.inner.outstanding.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |count| count.checked_sub(1),
-        );
+        let _ = self
+            .inner
+            .outstanding
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            });
         let _ = self.inner.waker.wake();
     }
 
@@ -261,7 +280,11 @@ impl LoopPoster for UvLoopPoster {
         if !self.inner.accepting.load(Ordering::Acquire) {
             return Err(PostError);
         }
-        self.inner.pending.lock().map_err(|_| PostError)?.push_back(completion);
+        self.inner
+            .pending
+            .lock()
+            .map_err(|_| PostError)?
+            .push_back(completion);
         self.inner.waker.wake().map_err(|_| PostError)
     }
 }

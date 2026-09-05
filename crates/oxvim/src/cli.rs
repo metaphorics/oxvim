@@ -23,12 +23,12 @@ pub enum UserConfig {
     File(String),
 }
 
-/// Selection for the ShaDa file.
+/// Selection for the `ShaDa` file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShadaConfig {
-    /// Use the default ShaDa path.
+    /// Use the default `ShaDa` path.
     Default,
-    /// Disable ShaDa (`-i NONE`).
+    /// Disable `ShaDa` (`-i NONE`).
     None,
     /// Use this exact file.
     File(String),
@@ -79,10 +79,14 @@ pub struct VerboseConfig {
 
 /// Parsed process arguments.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "fields represent independent command-line flags"
+)]
 pub struct Cli {
     /// User initialization selection.
     pub user_config: UserConfig,
-    /// ShaDa selection.
+    /// `ShaDa` selection.
     pub shada: ShadaConfig,
     /// Factory-default startup.
     pub clean: bool,
@@ -189,7 +193,11 @@ pub struct UsageError {
 impl UsageError {
     /// Upstream `mainerr`: `{program}: {msg}` with a `-h` pointer, exit 1.
     fn main_error(message: impl Into<String>) -> Self {
-        Self { message: message.into(), exit_code: 1, hint: true }
+        Self {
+            message: message.into(),
+            exit_code: 1,
+            hint: true,
+        }
     }
 
     /// Upstream `mainerr(msg, argument, NULL)`, which quotes the argument.
@@ -199,7 +207,11 @@ impl UsageError {
 
     /// Upstream `scripterror`: a bare message on stderr, exit 2.
     fn script_error(message: impl Into<String>) -> Self {
-        Self { message: message.into(), exit_code: 2, hint: false }
+        Self {
+            message: message.into(),
+            exit_code: 2,
+            hint: false,
+        }
     }
 
     /// The process status this failure exits with.
@@ -227,7 +239,11 @@ impl fmt::Display for UsageError {
             return write!(formatter, "{}", self.message);
         }
         let program = program_name();
-        write!(formatter, "{program}: {}\nMore info with \"{program} -h\"", self.message)
+        write!(
+            formatter,
+            "{program}: {}\nMore info with \"{program} -h\"",
+            self.message
+        )
     }
 }
 
@@ -258,8 +274,11 @@ impl Cli {
         while index < args.len() {
             let argument = args[index].clone();
             if !had_minmin && argument.starts_with('+') {
-                let command =
-                    if argument.len() == 1 { "$".to_owned() } else { argument[1..].to_owned() };
+                let command = if argument.len() == 1 {
+                    "$".to_owned()
+                } else {
+                    argument[1..].to_owned()
+                };
                 cli.push_command(command)?;
                 index += 1;
                 continue;
@@ -275,19 +294,14 @@ impl Cli {
             loop {
                 let letter = argument[cursor..].chars().next();
                 cursor += letter.map_or(0, char::len_utf8);
-                let want = cli.scan_option(
-                    letter,
-                    &argument,
-                    &mut cursor,
-                    &mut had_minmin,
-                )?;
+                let want = cli.scan_option(letter, &argument, &mut cursor, &mut had_minmin)?;
                 // main.c prints and exits inside the scan, so a later
                 // unknown option is never reached.
                 if cli.help || cli.version || cli.api_info {
                     return Ok(cli);
                 }
                 match want {
-                    Want::Done if cursor < argument.len() => continue,
+                    Want::Done if cursor < argument.len() => {}
                     Want::Done | Want::Argument => break,
                     Want::Next(letter) => {
                         // main.c rejects garbage between the option letter and
@@ -323,9 +337,7 @@ impl Cli {
             cli.loadplugins = cli.clean;
         }
         // main.c: `if (embedded_mode && (silent_mode || parmp->luaf))`.
-        if cli.embed
-            && (cli.batch.is_some_and(|batch| batch.silent) || cli.lua_script.is_some())
-        {
+        if cli.embed && (cli.batch.is_some_and(|batch| batch.silent) || cli.lua_script.is_some()) {
             return Err(UsageError::main_error("--embed conflicts with -es/-Es/-l"));
         }
         Ok(cli)
@@ -335,6 +347,10 @@ impl Cli {
     ///
     /// `cursor` already points past `letter` and is advanced over any inline
     /// value the option consumes.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one dispatch preserves the upstream option state machine"
+    )]
     fn scan_option(
         &mut self,
         letter: Option<char>,
@@ -354,7 +370,10 @@ impl Cli {
         };
         match letter {
             '-' => self.scan_long_option(argument, cursor, had_minmin),
-            'A' => Err(unsupported(argument, "the 'arabic' option side effects and keymap files")),
+            'A' => Err(unsupported(
+                argument,
+                "the 'arabic' option side effects and keymap files",
+            )),
             'b' => {
                 self.binary = true;
                 Ok(Want::Done)
@@ -480,10 +499,11 @@ impl Cli {
             return Ok(Want::Next('-'));
         } else if prefix("literal") {
             // Upstream no-op: file arguments are always literal (#7679).
-        } else if prefix("remote") {
-            return Err(unsupported(argument, "RPC client channels and vim._cs_remote"));
-        } else if prefix("server") {
-            return Err(unsupported(argument, "RPC client channels and vim._cs_remote"));
+        } else if prefix("remote") || prefix("server") {
+            return Err(unsupported(
+                argument,
+                "RPC client channels and vim._cs_remote",
+            ));
         } else if prefix("noplugin") {
             self.loadplugins = false;
         } else if prefix("cmd") {
@@ -518,22 +538,22 @@ impl Cli {
         args: &[String],
         next: usize,
     ) -> Result<bool, UsageError> {
+        if letter == 'S' {
+            // main.c: no argument, or an argument that is itself an
+            // option, means the default session file.
+            let session = value
+                .filter(|value| !value.starts_with('-'))
+                .map_or("Session.vim", String::as_str);
+            self.push_command(format!("so {session}"))?;
+            return Ok(value.is_some_and(|value| !value.starts_with('-')));
+        }
+
+        let Some(value) = value else {
+            return Err(UsageError::about("Argument missing after", option));
+        };
         match letter {
-            'c' => {
-                let value = value.expect("a missing -c argument already failed");
-                self.push_command(value.clone())?;
-            }
-            'S' => {
-                // main.c: no argument, or an argument that is itself an
-                // option, means the default session file.
-                let session = value
-                    .filter(|value| !value.starts_with('-'))
-                    .map_or("Session.vim", String::as_str);
-                self.push_command(format!("so {session}"))?;
-                return Ok(value.is_some_and(|value| !value.starts_with('-')));
-            }
+            'c' => self.push_command(value.clone())?,
             'i' => {
-                let value = value.expect("a missing -i argument already failed");
                 self.shada = if value == "NONE" {
                     ShadaConfig::None
                 } else {
@@ -541,7 +561,6 @@ impl Cli {
                 };
             }
             'l' => {
-                let value = value.expect("a missing -l argument already failed");
                 // main.c: "-l" implies headless, silent, no swap file, and
                 // skips user config unless one was already requested.
                 self.headless = true;
@@ -552,11 +571,12 @@ impl Cli {
                 if self.shada == ShadaConfig::Default {
                     self.shada = ShadaConfig::None;
                 }
-                self.lua_script =
-                    Some(LuaScript { path: value.clone(), args: args[next + 1..].to_vec() });
+                self.lua_script = Some(LuaScript {
+                    path: value.clone(),
+                    args: args[next + 1..].to_vec(),
+                });
             }
             's' => {
-                let value = value.expect("a missing -s argument already failed");
                 if self.scriptin.is_some() {
                     return Err(UsageError::script_error(format!(
                         "Attempt to open script file again: \"{option} {value}\""
@@ -565,7 +585,6 @@ impl Cli {
                 self.scriptin = Some(value.clone());
             }
             'u' => {
-                let value = value.expect("a missing -u argument already failed");
                 self.user_config = match value.as_str() {
                     "NONE" => UserConfig::None,
                     "NORC" => UserConfig::NoRc,
@@ -578,19 +597,17 @@ impl Cli {
             // separate argument starts with a digit; anything else is the
             // script-recording file, which needs a subsystem oxvim lacks.
             'w' => {
-                let value = value.expect("a missing -w argument already failed");
                 if !value.starts_with(|c: char| c.is_ascii_digit()) {
                     return Err(unsupported(option, "script recording of typed keys"));
                 }
                 let mut cursor = 0;
-                let number = number_argument(&value, &mut cursor, 10);
+                let number = number_argument(value, &mut cursor, 10);
                 self.window_height = Some(i64::try_from(number).unwrap_or(i64::MAX));
             }
             'W' => {
                 return Err(unsupported(option, "script recording of typed keys"));
             }
             '-' => {
-                let value = value.expect("a missing long-option argument already failed");
                 if option.eq_ignore_ascii_case("--cmd") {
                     if self.pre_commands.len() >= MAX_ARG_CMDS {
                         return Err(too_many_commands());
@@ -602,7 +619,7 @@ impl Cli {
                     self.startuptime = Some(value.clone());
                 }
             }
-            other => unreachable!("option -{other} does not take an argument"),
+            _ => return Err(UsageError::about("Unknown option argument", option)),
         }
         Ok(true)
     }
@@ -633,7 +650,9 @@ impl Cli {
 /// not have. Rejecting it keeps the flag detectable; silently accepting it
 /// would make a script believe the effect happened.
 fn unsupported(option: &str, requirement: &str) -> UsageError {
-    UsageError::main_error(format!("Option not supported: \"{option}\": requires {requirement}"))
+    UsageError::main_error(format!(
+        "Option not supported: \"{option}\": requires {requirement}"
+    ))
 }
 
 fn too_many_commands() -> UsageError {
@@ -643,7 +662,10 @@ fn too_many_commands() -> UsageError {
 /// `main.c` `get_number_arg`: read the digits at `cursor`, or return
 /// `default_value` when none are there. `cursor` advances past the digits.
 fn number_argument(argument: &str, cursor: &mut usize, default_value: usize) -> usize {
-    let digits = argument[*cursor..].bytes().take_while(u8::is_ascii_digit).count();
+    let digits = argument[*cursor..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
     if digits == 0 {
         return default_value;
     }
@@ -659,70 +681,286 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(
+        clippy::panic,
+        clippy::too_many_lines,
+        reason = "the table keeps supported forms and their assertions together"
+    )]
     fn parses_each_supported_form() {
         struct Case {
             args: &'static [&'static str],
             check: fn(&Cli) -> bool,
         }
         let cases = [
-            Case { args: &["-u", "NONE"], check: |c| c.user_config == UserConfig::None },
-            Case { args: &["-u", "NORC"], check: |c| c.user_config == UserConfig::NoRc },
-            Case { args: &["-u", "init.vim"], check: |c| c.user_config == UserConfig::File("init.vim".into()) },
-            Case { args: &["-u", ""], check: |c| c.user_config == UserConfig::File(String::new()) },
-            Case { args: &["-i", "NONE"], check: |c| c.shada == ShadaConfig::None },
-            Case { args: &["-i", "state.shada"], check: |c| c.shada == ShadaConfig::File("state.shada".into()) },
-            Case { args: &["--clean"], check: |c| c.clean && c.user_config == UserConfig::None },
-            Case { args: &["--cleanfoo"], check: |c| c.clean },
-            Case { args: &["--embed"], check: |c| c.embed },
-            Case { args: &["--headless"], check: |c| c.headless },
-            Case { args: &["--HEADLESS"], check: |c| c.headless },
-            Case { args: &["--listen", "127.0.0.1:7777"], check: |c| c.listen.as_deref() == Some("127.0.0.1:7777") },
-            Case { args: &["--literal", "file"], check: |c| c.files == ["file"] },
-            Case { args: &["-e"], check: |c| c.batch == Some(BatchMode { silent: false, input_is_text: false }) },
-            Case { args: &["-es"], check: |c| c.batch == Some(BatchMode { silent: true, input_is_text: false }) },
-            Case { args: &["-E"], check: |c| c.batch == Some(BatchMode { silent: false, input_is_text: true }) },
-            Case { args: &["-Es"], check: |c| c.batch == Some(BatchMode { silent: true, input_is_text: true }) },
-            Case { args: &["-e", "-"], check: |c| c.batch == Some(BatchMode { silent: true, input_is_text: false }) && c.no_swap_file && !c.stdin_file },
-            Case { args: &["-"], check: |c| c.stdin_file && c.files.is_empty() },
-            Case { args: &["-s", "script"], check: |c| c.scriptin.as_deref() == Some("script") },
-            Case { args: &["-s", "-"], check: |c| c.scriptin.as_deref() == Some("-") },
-            Case { args: &["+set number"], check: |c| c.commands == ["set number"] },
-            Case { args: &["+"], check: |c| c.commands == ["$"] },
-            Case { args: &["-c", "echo 1"], check: |c| c.commands == ["echo 1"] },
-            Case { args: &["-cecho 1"], check: |c| c.commands == ["echo 1"] },
-            Case { args: &["--cmd", "set loadplugins"], check: |c| c.pre_commands == ["set loadplugins"] },
-            Case { args: &["-V"], check: |c| c.verbose == Some(VerboseConfig { level: 10, file: None }) },
-            Case { args: &["-V3"], check: |c| c.verbose == Some(VerboseConfig { level: 3, file: None }) },
-            Case { args: &["-Vlog.txt"], check: |c| c.verbose == Some(VerboseConfig { level: 10, file: Some("log.txt".into()) }) },
-            Case { args: &["-V3log.txt"], check: |c| c.verbose == Some(VerboseConfig { level: 3, file: Some("log.txt".into()) }) },
-            Case { args: &["--api-info"], check: |c| c.api_info },
-            Case { args: &["--help"], check: |c| c.help },
-            Case { args: &["-h"], check: |c| c.help },
-            Case { args: &["-?"], check: |c| c.help },
-            Case { args: &["--version"], check: |c| c.version },
-            Case { args: &["-v"], check: |c| c.version },
-            Case { args: &["-R"], check: |c| c.readonly },
-            Case { args: &["-m"], check: |c| c.no_write && !c.no_modifiable },
-            Case { args: &["-M"], check: |c| c.no_write && c.no_modifiable },
-            Case { args: &["-n"], check: |c| c.no_swap_file },
-            Case { args: &["-b"], check: |c| c.binary },
-            Case { args: &["-N", "-X", "-f", "-U", "gvimrc"], check: |c| c.files.is_empty() },
-            Case { args: &["-o"], check: |c| c.window_layout == WindowLayout::Horizontal && c.window_count == 0 },
-            Case { args: &["-O2"], check: |c| c.window_layout == WindowLayout::Vertical && c.window_count == 2 },
-            Case { args: &["-p3"], check: |c| c.window_layout == WindowLayout::Tabs && c.window_count == 3 },
-            Case { args: &["-w80"], check: |c| c.window_height == Some(80) },
-            Case { args: &["--startuptime", "log"], check: |c| c.startuptime.as_deref() == Some("log") },
-            Case { args: &["one", "two"], check: |c| c.files == ["one", "two"] },
-            Case { args: &["--", "-mystery"], check: |c| c.files == ["-mystery"] },
-            Case { args: &["--", "+cmd"], check: |c| c.files == ["+cmd"] && c.commands.is_empty() },
+            Case {
+                args: &["-u", "NONE"],
+                check: |c| c.user_config == UserConfig::None,
+            },
+            Case {
+                args: &["-u", "NORC"],
+                check: |c| c.user_config == UserConfig::NoRc,
+            },
+            Case {
+                args: &["-u", "init.vim"],
+                check: |c| c.user_config == UserConfig::File("init.vim".into()),
+            },
+            Case {
+                args: &["-u", ""],
+                check: |c| c.user_config == UserConfig::File(String::new()),
+            },
+            Case {
+                args: &["-i", "NONE"],
+                check: |c| c.shada == ShadaConfig::None,
+            },
+            Case {
+                args: &["-i", "state.shada"],
+                check: |c| c.shada == ShadaConfig::File("state.shada".into()),
+            },
+            Case {
+                args: &["--clean"],
+                check: |c| c.clean && c.user_config == UserConfig::None,
+            },
+            Case {
+                args: &["--cleanfoo"],
+                check: |c| c.clean,
+            },
+            Case {
+                args: &["--embed"],
+                check: |c| c.embed,
+            },
+            Case {
+                args: &["--headless"],
+                check: |c| c.headless,
+            },
+            Case {
+                args: &["--HEADLESS"],
+                check: |c| c.headless,
+            },
+            Case {
+                args: &["--listen", "127.0.0.1:7777"],
+                check: |c| c.listen.as_deref() == Some("127.0.0.1:7777"),
+            },
+            Case {
+                args: &["--literal", "file"],
+                check: |c| c.files == ["file"],
+            },
+            Case {
+                args: &["-e"],
+                check: |c| {
+                    c.batch
+                        == Some(BatchMode {
+                            silent: false,
+                            input_is_text: false,
+                        })
+                },
+            },
+            Case {
+                args: &["-es"],
+                check: |c| {
+                    c.batch
+                        == Some(BatchMode {
+                            silent: true,
+                            input_is_text: false,
+                        })
+                },
+            },
+            Case {
+                args: &["-E"],
+                check: |c| {
+                    c.batch
+                        == Some(BatchMode {
+                            silent: false,
+                            input_is_text: true,
+                        })
+                },
+            },
+            Case {
+                args: &["-Es"],
+                check: |c| {
+                    c.batch
+                        == Some(BatchMode {
+                            silent: true,
+                            input_is_text: true,
+                        })
+                },
+            },
+            Case {
+                args: &["-e", "-"],
+                check: |c| {
+                    c.batch
+                        == Some(BatchMode {
+                            silent: true,
+                            input_is_text: false,
+                        })
+                        && c.no_swap_file
+                        && !c.stdin_file
+                },
+            },
+            Case {
+                args: &["-"],
+                check: |c| c.stdin_file && c.files.is_empty(),
+            },
+            Case {
+                args: &["-s", "script"],
+                check: |c| c.scriptin.as_deref() == Some("script"),
+            },
+            Case {
+                args: &["-s", "-"],
+                check: |c| c.scriptin.as_deref() == Some("-"),
+            },
+            Case {
+                args: &["+set number"],
+                check: |c| c.commands == ["set number"],
+            },
+            Case {
+                args: &["+"],
+                check: |c| c.commands == ["$"],
+            },
+            Case {
+                args: &["-c", "echo 1"],
+                check: |c| c.commands == ["echo 1"],
+            },
+            Case {
+                args: &["-cecho 1"],
+                check: |c| c.commands == ["echo 1"],
+            },
+            Case {
+                args: &["--cmd", "set loadplugins"],
+                check: |c| c.pre_commands == ["set loadplugins"],
+            },
+            Case {
+                args: &["-V"],
+                check: |c| {
+                    c.verbose
+                        == Some(VerboseConfig {
+                            level: 10,
+                            file: None,
+                        })
+                },
+            },
+            Case {
+                args: &["-V3"],
+                check: |c| {
+                    c.verbose
+                        == Some(VerboseConfig {
+                            level: 3,
+                            file: None,
+                        })
+                },
+            },
+            Case {
+                args: &["-Vlog.txt"],
+                check: |c| {
+                    c.verbose
+                        == Some(VerboseConfig {
+                            level: 10,
+                            file: Some("log.txt".into()),
+                        })
+                },
+            },
+            Case {
+                args: &["-V3log.txt"],
+                check: |c| {
+                    c.verbose
+                        == Some(VerboseConfig {
+                            level: 3,
+                            file: Some("log.txt".into()),
+                        })
+                },
+            },
+            Case {
+                args: &["--api-info"],
+                check: |c| c.api_info,
+            },
+            Case {
+                args: &["--help"],
+                check: |c| c.help,
+            },
+            Case {
+                args: &["-h"],
+                check: |c| c.help,
+            },
+            Case {
+                args: &["-?"],
+                check: |c| c.help,
+            },
+            Case {
+                args: &["--version"],
+                check: |c| c.version,
+            },
+            Case {
+                args: &["-v"],
+                check: |c| c.version,
+            },
+            Case {
+                args: &["-R"],
+                check: |c| c.readonly,
+            },
+            Case {
+                args: &["-m"],
+                check: |c| c.no_write && !c.no_modifiable,
+            },
+            Case {
+                args: &["-M"],
+                check: |c| c.no_write && c.no_modifiable,
+            },
+            Case {
+                args: &["-n"],
+                check: |c| c.no_swap_file,
+            },
+            Case {
+                args: &["-b"],
+                check: |c| c.binary,
+            },
+            Case {
+                args: &["-N", "-X", "-f", "-U", "gvimrc"],
+                check: |c| c.files.is_empty(),
+            },
+            Case {
+                args: &["-o"],
+                check: |c| c.window_layout == WindowLayout::Horizontal && c.window_count == 0,
+            },
+            Case {
+                args: &["-O2"],
+                check: |c| c.window_layout == WindowLayout::Vertical && c.window_count == 2,
+            },
+            Case {
+                args: &["-p3"],
+                check: |c| c.window_layout == WindowLayout::Tabs && c.window_count == 3,
+            },
+            Case {
+                args: &["-w80"],
+                check: |c| c.window_height == Some(80),
+            },
+            Case {
+                args: &["--startuptime", "log"],
+                check: |c| c.startuptime.as_deref() == Some("log"),
+            },
+            Case {
+                args: &["one", "two"],
+                check: |c| c.files == ["one", "two"],
+            },
+            Case {
+                args: &["--", "-mystery"],
+                check: |c| c.files == ["-mystery"],
+            },
+            Case {
+                args: &["--", "+cmd"],
+                check: |c| c.files == ["+cmd"] && c.commands.is_empty(),
+            },
         ];
         for case in cases {
-            let parsed = Cli::parse(case.args.iter().copied()).unwrap_or_else(|error| panic!("{:?}: {error}", case.args));
+            let parsed = Cli::parse(case.args.iter().copied())
+                .unwrap_or_else(|error| panic!("{:?}: {error}", case.args));
             assert!((case.check)(&parsed), "failed form: {:?}", case.args);
         }
     }
 
     #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "known-valid clustered options must parse in this test"
+    )]
     fn clustered_short_options_apply_in_order() {
         let parsed = Cli::parse(["-Rnb"]).unwrap();
         assert!(parsed.readonly && parsed.no_swap_file && parsed.binary);
@@ -738,19 +976,34 @@ mod tests {
         // A cluster may end in an option with an inline value.
         let parsed = Cli::parse(["-nV3"]).unwrap();
         assert!(parsed.no_swap_file);
-        assert_eq!(parsed.verbose, Some(VerboseConfig { level: 3, file: None }));
+        assert_eq!(
+            parsed.verbose,
+            Some(VerboseConfig {
+                level: 3,
+                file: None
+            })
+        );
     }
 
     #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "known-valid command forms must parse in this test"
+    )]
     fn post_commands_keep_argv_order_across_c_plus_and_session() {
-        let parsed =
-            Cli::parse(["-c", "one", "--cmd", "pre", "+two", "-cthree", "--cmd", "pre2", "-S", "s.vim"])
-                .unwrap();
+        let parsed = Cli::parse([
+            "-c", "one", "--cmd", "pre", "+two", "-cthree", "--cmd", "pre2", "-S", "s.vim",
+        ])
+        .unwrap();
         assert_eq!(parsed.commands, ["one", "two", "three", "so s.vim"]);
         assert_eq!(parsed.pre_commands, ["pre", "pre2"]);
     }
 
     #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "known-valid precedence cases must parse in this test"
+    )]
     fn noplugin_and_session_flags_parse_with_upstream_semantics() {
         let parsed = Cli::parse(["--noplugin"]).unwrap();
         assert!(!parsed.loadplugins);
@@ -781,20 +1034,42 @@ mod tests {
         assert_eq!(parsed.commands, ["echo 1", "so session.vim", "echo 2"]);
 
         let parsed = Cli::parse(["-e", "-s", "-u", "NONE"]).unwrap();
-        assert_eq!(parsed.batch, Some(BatchMode { silent: true, input_is_text: false }));
+        assert_eq!(
+            parsed.batch,
+            Some(BatchMode {
+                silent: true,
+                input_is_text: false
+            })
+        );
         assert_eq!(parsed.user_config, UserConfig::None);
         assert!(parsed.scriptin.is_none());
 
         let parsed = Cli::parse(["-e", "-s", "file"]).unwrap();
-        assert_eq!(parsed.batch, Some(BatchMode { silent: true, input_is_text: false }));
+        assert_eq!(
+            parsed.batch,
+            Some(BatchMode {
+                silent: true,
+                input_is_text: false
+            })
+        );
         assert_eq!(parsed.files, ["file"]);
         assert!(parsed.scriptin.is_none());
     }
 
     #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the known-valid Lua form must parse in this test"
+    )]
     fn lua_script_consumes_remaining_arguments_verbatim() {
         let parsed = Cli::parse(["-l", "script.lua", "--clean", "file"]).unwrap();
-        assert_eq!(parsed.lua_script, Some(LuaScript { path: "script.lua".into(), args: vec!["--clean".into(), "file".into()] }));
+        assert_eq!(
+            parsed.lua_script,
+            Some(LuaScript {
+                path: "script.lua".into(),
+                args: vec!["--clean".into(), "file".into()]
+            })
+        );
         assert!(!parsed.clean);
         // main.c: "-l" implies headless, no swap file and no user config.
         assert!(parsed.headless && parsed.no_swap_file);
@@ -802,15 +1077,38 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "known-valid window forms must parse in this test"
+    )]
     fn startup_window_count_follows_files_or_explicit_count() {
-        assert_eq!(Cli::parse(["-o", "a", "b", "c"]).unwrap().startup_window_count(), 3);
-        assert_eq!(Cli::parse(["-o2", "a", "b", "c"]).unwrap().startup_window_count(), 2);
-        assert_eq!(Cli::parse(["-o5", "a", "b", "c"]).unwrap().startup_window_count(), 5);
+        assert_eq!(
+            Cli::parse(["-o", "a", "b", "c"])
+                .unwrap()
+                .startup_window_count(),
+            3
+        );
+        assert_eq!(
+            Cli::parse(["-o2", "a", "b", "c"])
+                .unwrap()
+                .startup_window_count(),
+            2
+        );
+        assert_eq!(
+            Cli::parse(["-o5", "a", "b", "c"])
+                .unwrap()
+                .startup_window_count(),
+            5
+        );
         assert_eq!(Cli::parse(["-o"]).unwrap().startup_window_count(), 1);
         assert_eq!(Cli::parse(["-p3"]).unwrap().startup_window_count(), 3);
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "known-invalid forms must fail in this test"
+    )]
     fn reports_upstream_error_text_and_status() {
         struct Case {
             args: &'static [&'static str],
@@ -818,20 +1116,76 @@ mod tests {
             code: u8,
         }
         let cases = [
-            Case { args: &["--unknown"], message: "Unknown option argument: \"--unknown\"", code: 1 },
-            Case { args: &["-Q"], message: "Unknown option argument: \"-Q\"", code: 1 },
-            Case { args: &["-u"], message: "Argument missing after: \"-u\"", code: 1 },
-            Case { args: &["-c"], message: "Argument missing after: \"-c\"", code: 1 },
-            Case { args: &["-i"], message: "Argument missing after: \"-i\"", code: 1 },
-            Case { args: &["--listen"], message: "Argument missing after: \"--listen\"", code: 1 },
-            Case { args: &["--cmd"], message: "Argument missing after: \"--cmd\"", code: 1 },
-            Case { args: &["--startuptime"], message: "Argument missing after: \"--startuptime\"", code: 1 },
-            Case { args: &["-l"], message: "Argument missing after: \"-l\"", code: 1 },
-            Case { args: &["-uxx", "NONE"], message: "Garbage after option argument: \"-uxx\"", code: 1 },
-            Case { args: &["--cmdfoo", "x"], message: "Garbage after option argument: \"--cmdfoo\"", code: 1 },
-            Case { args: &["-s", "a", "-s", "b"], message: "Attempt to open script file again: \"-s b\"", code: 2 },
-            Case { args: &["--embed", "-es"], message: "--embed conflicts with -es/-Es/-l", code: 1 },
-            Case { args: &["-d"], message: "Option not supported: \"-d\": requires a diff engine", code: 1 },
+            Case {
+                args: &["--unknown"],
+                message: "Unknown option argument: \"--unknown\"",
+                code: 1,
+            },
+            Case {
+                args: &["-Q"],
+                message: "Unknown option argument: \"-Q\"",
+                code: 1,
+            },
+            Case {
+                args: &["-u"],
+                message: "Argument missing after: \"-u\"",
+                code: 1,
+            },
+            Case {
+                args: &["-c"],
+                message: "Argument missing after: \"-c\"",
+                code: 1,
+            },
+            Case {
+                args: &["-i"],
+                message: "Argument missing after: \"-i\"",
+                code: 1,
+            },
+            Case {
+                args: &["--listen"],
+                message: "Argument missing after: \"--listen\"",
+                code: 1,
+            },
+            Case {
+                args: &["--cmd"],
+                message: "Argument missing after: \"--cmd\"",
+                code: 1,
+            },
+            Case {
+                args: &["--startuptime"],
+                message: "Argument missing after: \"--startuptime\"",
+                code: 1,
+            },
+            Case {
+                args: &["-l"],
+                message: "Argument missing after: \"-l\"",
+                code: 1,
+            },
+            Case {
+                args: &["-uxx", "NONE"],
+                message: "Garbage after option argument: \"-uxx\"",
+                code: 1,
+            },
+            Case {
+                args: &["--cmdfoo", "x"],
+                message: "Garbage after option argument: \"--cmdfoo\"",
+                code: 1,
+            },
+            Case {
+                args: &["-s", "a", "-s", "b"],
+                message: "Attempt to open script file again: \"-s b\"",
+                code: 2,
+            },
+            Case {
+                args: &["--embed", "-es"],
+                message: "--embed conflicts with -es/-Es/-l",
+                code: 1,
+            },
+            Case {
+                args: &["-d"],
+                message: "Option not supported: \"-d\": requires a diff engine",
+                code: 1,
+            },
         ];
         for case in cases {
             let error = Cli::parse(case.args.iter().copied())
@@ -846,13 +1200,21 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "the boundary test requires valid and invalid parse results"
+    )]
     fn command_count_ceiling_matches_max_arg_cmds() {
         let ten = ["+echo"; MAX_ARG_CMDS];
         assert_eq!(Cli::parse(ten).unwrap().commands.len(), MAX_ARG_CMDS);
 
         let eleven = ["+echo"; MAX_ARG_CMDS + 1];
         let error = Cli::parse(eleven).expect_err("eleven commands must fail");
-        assert!(format!("{error}").contains("Too many \"+command\""), "{error}");
+        assert!(
+            format!("{error}").contains("Too many \"+command\""),
+            "{error}"
+        );
 
         let mut pre = Vec::new();
         for _ in 0..=MAX_ARG_CMDS {
@@ -863,10 +1225,17 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "unsupported forms must fail in this test"
+    )]
     fn unsupported_options_are_rejected_with_their_missing_subsystem() {
         for (args, requirement) in [
             (vec!["-d"], "a diff engine"),
-            (vec!["-A"], "the 'arabic' option side effects and keymap files"),
+            (
+                vec!["-A"],
+                "the 'arabic' option side effects and keymap files",
+            ),
             (vec!["-H"], "keymap file loading"),
             (vec!["-D"], "the Ex debugger"),
             (vec!["-q", "errors"], "the quickfix list and 'errorformat'"),
@@ -875,12 +1244,22 @@ mod tests {
             (vec!["-L"], "swap-file recovery"),
             (vec!["-w", "keys.log"], "script recording of typed keys"),
             (vec!["-W", "keys.log"], "script recording of typed keys"),
-            (vec!["--remote", "file"], "RPC client channels and vim._cs_remote"),
-            (vec!["--remote-expr", "1"], "RPC client channels and vim._cs_remote"),
-            (vec!["--server", "addr"], "RPC client channels and vim._cs_remote"),
+            (
+                vec!["--remote", "file"],
+                "RPC client channels and vim._cs_remote",
+            ),
+            (
+                vec!["--remote-expr", "1"],
+                "RPC client channels and vim._cs_remote",
+            ),
+            (
+                vec!["--server", "addr"],
+                "RPC client channels and vim._cs_remote",
+            ),
             (vec!["--luamod-dev"], "the Lua module preload table"),
         ] {
-            let error = Cli::parse(args.clone()).expect_err(&format!("expected error for {args:?}"));
+            let error =
+                Cli::parse(args.clone()).expect_err(&format!("expected error for {args:?}"));
             let text = format!("{error}");
             assert!(text.contains("Option not supported"), "{args:?}: {text}");
             assert!(text.contains(requirement), "{args:?}: {text}");

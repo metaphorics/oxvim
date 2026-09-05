@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mlua::{
     AnyUserData, FromLuaMulti, Function, IntoLua, Lua, LuaString, MultiValue, Table, UserData,
@@ -13,12 +13,35 @@ use mlua::{
 use ox_uv::fs::{
     self as uvfs, DirEntryType, FileHandle, FsError, FsResult, FsTime, OpenFlags, Stat, StatFs,
 };
-use ox_uv::misc;
-use ox_uv::{CallbackError, Handle, RunMode, Timer, UvLoop};
+use ox_uv::{CallbackError, Handle, RunMode, Timer, UvLoop, misc};
 
 use crate::host::RuntimeRoot;
 use crate::uv_handles::LoopAccess;
-use crate::vim::{call_with_traceback, BuiltinHost, FastCallbackState, Scheduler};
+use crate::vim::{BuiltinHost, FastCallbackState, Scheduler, call_with_traceback};
+
+/// Cloneable capability for advancing the Lua UV loop without blocking.
+///
+/// The loop itself remains private so hosts cannot replace it or run it in a
+/// blocking mode.
+#[derive(Clone)]
+pub struct EventLoopPump {
+    uv_loop: Rc<RefCell<UvLoop>>,
+}
+
+impl EventLoopPump {
+    /// Runs exactly one nested, non-blocking UV turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying UV failure.
+    pub fn run_once(&self) -> mlua::Result<()> {
+        self.uv_loop
+            .borrow_mut()
+            .run_nested(RunMode::NoWait)
+            .map(|_| ())
+            .map_err(mlua::Error::external)
+    }
+}
 
 struct CoreState {
     files: RefCell<HashMap<i64, FileHandle>>,
@@ -27,7 +50,10 @@ struct CoreState {
 
 impl CoreState {
     fn new() -> Self {
-        Self { files: RefCell::new(HashMap::new()), next_file: RefCell::new(3) }
+        Self {
+            files: RefCell::new(HashMap::new()),
+            next_file: RefCell::new(3),
+        }
     }
 
     fn insert_file(&self, file: FileHandle) -> i64 {
@@ -40,7 +66,11 @@ impl CoreState {
 
     /// Looks up a live descriptor, sharing ownership of the underlying file.
     fn file(&self, descriptor: i64) -> FsResult<FileHandle> {
-        self.files.borrow().get(&descriptor).cloned().ok_or_else(bad_file_descriptor)
+        self.files
+            .borrow()
+            .get(&descriptor)
+            .cloned()
+            .ok_or_else(bad_file_descriptor)
     }
 }
 
@@ -52,15 +82,18 @@ struct LuaTimer {
 }
 
 impl UserData for LuaTimer {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the Lua timer API must register its ordered method set on one UserData implementation"
+    )]
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method(
             "start",
             |lua, this, (timeout, repeat, callback): (u64, u64, Function)| {
                 let lua = lua.clone();
-                let context = lua
-                    .app_data_ref::<CallbackContext>()
-                    .ok_or_else(|| mlua::Error::runtime("vim.uv callback context is unavailable"))?;
-                let scheduler = context.scheduler.clone();
+                let context = lua.app_data_ref::<CallbackContext>().ok_or_else(|| {
+                    mlua::Error::runtime("vim.uv callback context is unavailable")
+                })?;
                 let fast = context.fast.clone();
                 drop(context);
                 let timer = this.timer;
@@ -68,59 +101,83 @@ impl UserData for LuaTimer {
                 let event_access = access.clone();
                 access.apply(Box::new(move |uv_loop| {
                     let _ = timer.start(uv_loop, timeout, repeat, move |loop_, _| {
-                        event_access
-                            .callback(loop_, || {
-                                schedule_callback(
-                                    &scheduler,
-                                    &lua,
-                                    callback.clone(),
-                                    MultiValue::new(),
-                                    &fast,
-                                )
-                            })
-                            .map_err(CallbackError::new)
+                        event_access.callback(loop_, || {
+                            let _guard = fast.enter();
+                            call_with_traceback(&lua, &callback, MultiValue::new())
+                                .map(|_| ())
+                                .map_err(|error| CallbackError::new(error.to_string()))
+                        })
                     });
-                }))?;
+                }));
                 Ok(true)
             },
         );
         methods.add_method("stop", |_, this, ()| {
             let timer = this.timer;
-            this.access.apply(Box::new(move |uv_loop| { let _ = timer.stop(uv_loop); }))?;
+            this.access.apply(Box::new(move |uv_loop| {
+                let _ = timer.stop(uv_loop);
+            }));
             Ok(true)
         });
         methods.add_method("again", |_, this, ()| {
             let timer = this.timer;
-            this.access.apply(Box::new(move |uv_loop| { let _ = timer.again(uv_loop); }))?;
+            this.access.apply(Box::new(move |uv_loop| {
+                let _ = timer.again(uv_loop);
+            }));
             Ok(true)
         });
         methods.add_method("set_repeat", |_, this, repeat: u64| {
             let timer = this.timer;
-            this.access.apply(Box::new(move |uv_loop| { let _ = timer.set_repeat(uv_loop, repeat); }))?;
+            this.access.apply(Box::new(move |uv_loop| {
+                let _ = timer.set_repeat(uv_loop, repeat);
+            }));
             Ok(())
         });
         methods.add_method("get_repeat", |_, this, ()| {
-            let uv_loop = this.access.uv_loop.try_borrow().map_err(|_| mlua::Error::runtime("timer repeat is unavailable during its callback"))?;
-            this.timer.get_repeat(&uv_loop).map_err(mlua::Error::external)
+            let uv_loop = this.access.uv_loop.try_borrow().map_err(|_| {
+                mlua::Error::runtime("timer repeat is unavailable during its callback")
+            })?;
+            this.timer
+                .get_repeat(&uv_loop)
+                .map_err(mlua::Error::external)
         });
         methods.add_method("ref", |_, this, ()| {
             let timer = this.timer;
-            this.access.apply(Box::new(move |uv_loop| { let _ = timer.ref_(uv_loop); }))?;
+            this.access.apply(Box::new(move |uv_loop| {
+                let _ = timer.ref_(uv_loop);
+            }));
             Ok(this.clone())
         });
         methods.add_method("unref", |_, this, ()| {
             let timer = this.timer;
-            this.access.apply(Box::new(move |uv_loop| { let _ = timer.unref(uv_loop); }))?;
+            this.access.apply(Box::new(move |uv_loop| {
+                let _ = timer.unref(uv_loop);
+            }));
             Ok(this.clone())
         });
         methods.add_method("has_ref", |_, this, ()| {
-            Ok(this.access.uv_loop.try_borrow().map_or(true, |uv_loop| this.timer.has_ref(&uv_loop)))
+            Ok(this
+                .access
+                .uv_loop
+                .try_borrow()
+                .map_or(true, |uv_loop| this.timer.has_ref(&uv_loop)))
         });
         methods.add_method("is_active", |_, this, ()| {
-            Ok(this.access.uv_loop.try_borrow().map_or(!this.closing.get(), |uv_loop| this.timer.is_active(&uv_loop)))
+            Ok(this
+                .access
+                .uv_loop
+                .try_borrow()
+                .map_or(!this.closing.get(), |uv_loop| {
+                    this.timer.is_active(&uv_loop)
+                }))
         });
         methods.add_method("is_closing", |_, this, ()| {
-            Ok(this.closing.get() || this.access.uv_loop.try_borrow().is_ok_and(|uv_loop| this.timer.is_closing(&uv_loop)))
+            Ok(this.closing.get()
+                || this
+                    .access
+                    .uv_loop
+                    .try_borrow()
+                    .is_ok_and(|uv_loop| this.timer.is_closing(&uv_loop)))
         });
         methods.add_method("close", |lua, this, callback: Option<Function>| {
             if this.closing.replace(true) {
@@ -130,20 +187,28 @@ impl UserData for LuaTimer {
             match callback {
                 Some(callback) => {
                     let lua = lua.clone();
-                    let context = lua
-                        .app_data_ref::<CallbackContext>()
-                        .ok_or_else(|| mlua::Error::runtime("vim.uv callback context is unavailable"))?;
+                    let context = lua.app_data_ref::<CallbackContext>().ok_or_else(|| {
+                        mlua::Error::runtime("vim.uv callback context is unavailable")
+                    })?;
                     let scheduler = context.scheduler.clone();
                     let fast = context.fast.clone();
                     drop(context);
                     this.access.apply(Box::new(move |uv_loop| {
                         let _ = timer.close_with(uv_loop, move |_, _| {
-                            schedule_callback(&scheduler, &lua, callback.clone(), MultiValue::new(), &fast)
-                                .map_err(CallbackError::new)
+                            schedule_callback(
+                                &scheduler,
+                                &lua,
+                                callback.clone(),
+                                MultiValue::new(),
+                                &fast,
+                            )
+                            .map_err(CallbackError::new)
                         });
-                    }))?;
+                    }));
                 }
-                None => this.access.apply(Box::new(move |uv_loop| { let _ = timer.close(uv_loop); }))?,
+                None => this.access.apply(Box::new(move |uv_loop| {
+                    let _ = timer.close(uv_loop);
+                })),
             }
             Ok(())
         });
@@ -169,8 +234,11 @@ pub(crate) fn install(
     fast: FastCallbackState,
     _runtime_root: RuntimeRoot,
     _builtins: Rc<dyn BuiltinHost>,
-) -> mlua::Result<()> {
-    lua.set_app_data(CallbackContext { scheduler: scheduler.clone(), fast: fast.clone() });
+) -> mlua::Result<EventLoopPump> {
+    lua.set_app_data(CallbackContext {
+        scheduler: scheduler.clone(),
+        fast: fast.clone(),
+    });
 
     let uv_loop = Rc::new(RefCell::new(UvLoop::new().map_err(mlua::Error::external)?));
     let loop_access = LoopAccess::new(uv_loop.clone());
@@ -181,147 +249,235 @@ pub(crate) fn install(
     core.set("check_interrupt", lua.create_function(|_, ()| Ok(false))?)?;
 
     let poll_access = loop_access.clone();
-    core.set("loop_poll", lua.create_function(move |_, (timeout, _fast_only): (i64, bool)| {
-        poll_access.poll(timeout)
-    })?)?;
+    core.set(
+        "loop_poll",
+        lua.create_function(move |_, (timeout, _fast_only): (i64, bool)| {
+            poll_access.poll(timeout)
+        })?,
+    )?;
 
     let uv = lua.create_table()?;
 
-    let loop_for_run = uv_loop.clone();
-    uv.set("run", lua.create_function(move |_, mode: Option<String>| {
-        let mode = match mode.as_deref().unwrap_or("default") {
-            "default" => RunMode::Default,
-            "once" => RunMode::Once,
-            "nowait" => RunMode::NoWait,
-            other => return Err(mlua::Error::runtime(format!("invalid run mode: {other}"))),
-        };
-        loop_for_run.borrow_mut().run(mode).map_err(mlua::Error::external)
-    })?)?;
+    // WHY no `run` here: `uv_handles::install` below registers the only
+    // `vim.uv.run` — through `LoopAccess::run`, which drains deferred ops and
+    // pumps thread-pool completions. A stub here would shadow nothing (it runs
+    // first) but leave a second dead registration behind once overwritten.
 
     let stop_access = loop_access.clone();
-    uv.set("stop", lua.create_function(move |_, ()| {
-        stop_access.apply(Box::new(|uv_loop| uv_loop.stop()))?;
-        Ok(())
-    })?)?;
+    uv.set(
+        "stop",
+        lua.create_function(move |_, ()| {
+            stop_access.apply(Box::new(UvLoop::stop));
+            Ok(())
+        })?,
+    )?;
 
     let loop_for_alive = uv_loop.clone();
-    uv.set("loop_alive", lua.create_function(move |_, ()| Ok(loop_for_alive.borrow().loop_alive()))?)?;
+    uv.set(
+        "loop_alive",
+        lua.create_function(move |_, ()| Ok(loop_for_alive.borrow().loop_alive()))?,
+    )?;
 
     let loop_for_now = uv_loop.clone();
-    uv.set("now", lua.create_function(move |_, ()| Ok(loop_for_now.borrow().now()))?)?;
+    uv.set(
+        "now",
+        lua.create_function(move |_, ()| Ok(loop_for_now.borrow().now()))?,
+    )?;
 
     let loop_for_update = uv_loop.clone();
-    uv.set("update_time", lua.create_function(move |_, ()| {
-        loop_for_update.borrow_mut().update_time();
-        Ok(())
-    })?)?;
+    uv.set(
+        "update_time",
+        lua.create_function(move |_, ()| {
+            loop_for_update.borrow_mut().update_time();
+            Ok(())
+        })?,
+    )?;
 
     let loop_for_timer = uv_loop.clone();
     let timer_access = loop_access.clone();
-    uv.set("new_timer", lua.create_function(move |lua, ()| {
-        let timer = Timer::new(&mut loop_for_timer.borrow_mut()).map_err(mlua::Error::external)?;
-        lua.create_userdata(LuaTimer {
-            timer,
-            access: timer_access.clone(),
-            closing: Rc::new(Cell::new(false)),
-        })
-    })?)?;
+    uv.set(
+        "new_timer",
+        lua.create_function(move |lua, ()| {
+            let timer =
+                Timer::new(&mut loop_for_timer.borrow_mut()).map_err(mlua::Error::external)?;
+            lua.create_userdata(LuaTimer {
+                timer,
+                access: timer_access.clone(),
+                closing: Rc::new(Cell::new(false)),
+            })
+        })?,
+    )?;
 
     install_misc(lua, &uv)?;
     install_fs(lua, &uv, &state, &scheduler, &fast)?;
     crate::uv_handles::install(lua, &uv, loop_access, scheduler, fast)?;
     vim.set("uv", uv.clone())?;
     vim.set("loop", uv)?;
-    Ok(())
+    Ok(EventLoopPump { uv_loop })
 }
 
 /// Miscellaneous utilities: `luv-miscellaneous-utilities` in luvref.txt.
 ///
 /// These calls have no async form; failures use the luv `fail` return
 /// `nil, err, name`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the miscellaneous Lua API is an ordered registration table with no independent control flow"
+)]
 fn install_misc(lua: &Lua, uv: &Table) -> mlua::Result<()> {
-    uv.set("hrtime", lua.create_function(|_, ()| Ok(lua_int(misc::hrtime())))?)?;
+    uv.set(
+        "hrtime",
+        lua.create_function(|_, ()| Ok(lua_int(misc::hrtime())))?,
+    )?;
 
-    uv.set("cwd", lua.create_function(|lua, ()| match misc::cwd() {
-        Ok(path) => single_value(lua, path.to_string_lossy().into_owned()),
-        Err(error) => uv_fail(lua, &error),
-    })?)?;
+    uv.set(
+        "sleep",
+        lua.create_function(|_, milliseconds: i64| {
+            let duration = u64::try_from(milliseconds.max(0)).map(Duration::from_millis);
+            let duration = duration.map_err(mlua::Error::external)?;
+            std::thread::sleep(duration);
+            Ok(())
+        })?,
+    )?;
 
-    uv.set("chdir", lua.create_function(|lua, (directory,): (String,)| match misc::chdir(&directory) {
-        Ok(()) => single_value(lua, 0_i64),
-        Err(error) => uv_fail(lua, &error),
-    })?)?;
+    uv.set(
+        "cwd",
+        lua.create_function(|lua, ()| match misc::cwd() {
+            Ok(path) => single_value(lua, path.to_string_lossy().into_owned()),
+            Err(error) => uv_fail(lua, &error),
+        })?,
+    )?;
 
-    uv.set("os_homedir", lua.create_function(|lua, ()| match misc::os_homedir() {
-        Ok(path) => single_value(lua, path.to_string_lossy().into_owned()),
-        Err(error) => uv_fail(lua, &error),
-    })?)?;
+    uv.set(
+        "chdir",
+        lua.create_function(
+            |lua, (directory,): (String,)| match misc::chdir(&directory) {
+                Ok(()) => single_value(lua, 0_i64),
+                Err(error) => uv_fail(lua, &error),
+            },
+        )?,
+    )?;
 
-    uv.set("os_tmpdir", lua.create_function(|_, ()| {
-        Ok(misc::os_tmpdir().to_string_lossy().into_owned())
-    })?)?;
+    uv.set(
+        "os_homedir",
+        lua.create_function(|lua, ()| match misc::os_homedir() {
+            Ok(path) => single_value(lua, path.to_string_lossy().into_owned()),
+            Err(error) => uv_fail(lua, &error),
+        })?,
+    )?;
 
-    uv.set("os_uname", lua.create_function(|lua, ()| {
-        let uname = misc::os_uname();
-        let table = lua.create_table()?;
-        table.set("sysname", uname.sysname.as_str())?;
-        table.set("release", uname.release.as_str())?;
-        table.set("version", uname.version.as_str())?;
-        table.set("machine", uname.machine.as_str())?;
-        Ok(table)
-    })?)?;
+    uv.set(
+        "os_tmpdir",
+        lua.create_function(|_, ()| Ok(misc::os_tmpdir().to_string_lossy().into_owned()))?,
+    )?;
+
+    uv.set(
+        "os_uname",
+        lua.create_function(|lua, ()| {
+            let uname = misc::os_uname();
+            let table = lua.create_table()?;
+            table.set("sysname", uname.sysname.as_str())?;
+            table.set("release", uname.release.as_str())?;
+            table.set("version", uname.version.as_str())?;
+            table.set("machine", uname.machine.as_str())?;
+            Ok(table)
+        })?,
+    )?;
 
     uv.set("getpid", lua.create_function(|_, ()| Ok(misc::getpid()))?)?;
-    uv.set("os_getpid", lua.create_function(|_, ()| Ok(misc::getpid()))?)?;
+    uv.set(
+        "os_getpid",
+        lua.create_function(|_, ()| Ok(misc::getpid()))?,
+    )?;
 
-    uv.set("gettimeofday", lua.create_function(|lua, ()| match misc::gettimeofday() {
-        Ok((seconds, microseconds)) => {
-            let mut values = MultiValue::new();
-            values.push_back(Value::Integer(lua_int(seconds)));
-            values.push_back(Value::Integer(i64::from(microseconds)));
-            Ok(values)
-        }
-        Err(error) => uv_fail(lua, &error),
-    })?)?;
+    uv.set(
+        "gettimeofday",
+        lua.create_function(|lua, ()| match misc::gettimeofday() {
+            Ok((seconds, microseconds)) => {
+                let mut values = MultiValue::new();
+                values.push_back(Value::Integer(lua_int(seconds)));
+                values.push_back(Value::Integer(i64::from(microseconds)));
+                Ok(values)
+            }
+            Err(error) => uv_fail(lua, &error),
+        })?,
+    )?;
 
-    uv.set("exepath", lua.create_function(|lua, ()| match misc::exepath() {
-        Ok(path) => single_value(lua, path.to_string_lossy().into_owned()),
-        Err(error) => uv_fail(lua, &error),
-    })?)?;
+    uv.set(
+        "exepath",
+        lua.create_function(|lua, ()| match misc::exepath() {
+            Ok(path) => single_value(lua, path.to_string_lossy().into_owned()),
+            Err(error) => uv_fail(lua, &error),
+        })?,
+    )?;
 
-    uv.set("uptime", lua.create_function(|lua, ()| match misc::uptime() {
-        Ok(seconds) => single_value(lua, seconds),
-        Err(error) => uv_fail(lua, &error),
-    })?)?;
+    uv.set(
+        "uptime",
+        lua.create_function(|lua, ()| match misc::uptime() {
+            Ok(seconds) => single_value(lua, seconds),
+            Err(error) => uv_fail(lua, &error),
+        })?,
+    )?;
 
-    uv.set("loadavg", lua.create_function(|_, ()| {
-        let (one, five, fifteen) = misc::loadavg();
-        Ok((one, five, fifteen))
-    })?)?;
+    uv.set(
+        "loadavg",
+        lua.create_function(|_, ()| {
+            let (one, five, fifteen) = misc::loadavg();
+            Ok((one, five, fifteen))
+        })?,
+    )?;
 
-    uv.set("get_total_memory", lua.create_function(|_, ()| Ok(lua_int(misc::get_total_memory())))?)?;
-    uv.set("get_free_memory", lua.create_function(|_, ()| Ok(lua_int(misc::get_free_memory())))?)?;
+    uv.set(
+        "get_total_memory",
+        lua.create_function(|_, ()| Ok(lua_int(misc::get_total_memory())))?,
+    )?;
+    uv.set(
+        "get_free_memory",
+        lua.create_function(|_, ()| Ok(lua_int(misc::get_free_memory())))?,
+    )?;
 
-    uv.set("os_getenv", lua.create_function(|lua, (name,): (String,)| match misc::os_getenv(&name) {
-        Some(value) => single_value(lua, value.to_string_lossy().into_owned()),
-        None => uv_fail(
-            lua,
-            &ox_uv::Error::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                "environment variable is not set",
-            )),
-        ),
-    })?)?;
-    uv.set("os_environ", lua.create_function(|lua, ()| {
-        let environment = lua.create_table()?;
-        for (name, value) in std::env::vars_os() {
-            environment.set(
-                name.to_string_lossy().as_ref(),
-                value.to_string_lossy().as_ref(),
-            )?;
-        }
-        Ok(environment)
-    })?)?;
+    uv.set(
+        "os_getenv",
+        lua.create_function(|lua, (name,): (String,)| match misc::os_getenv(&name) {
+            Some(value) => single_value(lua, value.to_string_lossy().into_owned()),
+            None => uv_fail(
+                lua,
+                &ox_uv::Error::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "environment variable is not set",
+                )),
+            ),
+        })?,
+    )?;
+    uv.set(
+        "os_environ",
+        lua.create_function(|lua, ()| {
+            let environment = lua.create_table()?;
+            for (name, value) in std::env::vars_os() {
+                environment.set(
+                    name.to_string_lossy().as_ref(),
+                    value.to_string_lossy().as_ref(),
+                )?;
+            }
+            Ok(environment)
+        })?,
+    )?;
+    uv.set(
+        "os_setenv",
+        lua.create_function(|lua, (name, value): (String, String)| {
+            match misc::os_setenv(&name, &value) {
+                Ok(()) => single_value(lua, true),
+                Err(error) => uv_fail(lua, &error),
+            }
+        })?,
+    )?;
+    uv.set(
+        "os_unsetenv",
+        lua.create_function(|lua, (name,): (String,)| match misc::os_unsetenv(&name) {
+            Ok(()) => single_value(lua, true),
+            Err(error) => uv_fail(lua, &error),
+        })?,
+    )?;
     Ok(())
 }
 
@@ -352,19 +508,15 @@ fn install_fs(
         lua.create_function(move |lua, (path, callback): (String, Option<Function>)| {
             match uvfs::scandir(&path) {
                 Ok(scan) => {
-                    let handle = lua.create_userdata(LuaScandir { entries: RefCell::new(scan) })?;
+                    let handle = lua.create_userdata(LuaScandir {
+                        entries: RefCell::new(scan),
+                    })?;
                     if let Some(callback) = callback {
                         let mut args = MultiValue::new();
                         args.push_back(Value::Nil);
                         args.push_back(Value::UserData(handle.clone()));
-                        schedule_callback(
-                            &scandir_scheduler,
-                            lua,
-                            callback,
-                            args,
-                            &scandir_fast,
-                        )
-                        .map_err(mlua::Error::runtime)?;
+                        schedule_callback(&scandir_scheduler, lua, callback, args, &scandir_fast)
+                            .map_err(mlua::Error::runtime)?;
                     }
                     let mut values = MultiValue::new();
                     values.push_back(Value::UserData(handle));
@@ -372,17 +524,11 @@ fn install_fs(
                 }
                 Err(error) => {
                     if let Some(callback) = callback {
-                        let args = MultiValue::from_vec(vec![
-                            Value::String(lua.create_string(error.to_string())?),
-                        ]);
-                        schedule_callback(
-                            &scandir_scheduler,
-                            lua,
-                            callback,
-                            args,
-                            &scandir_fast,
-                        )
-                        .map_err(mlua::Error::runtime)?;
+                        let args = MultiValue::from_vec(vec![Value::String(
+                            lua.create_string(error.to_string())?,
+                        )]);
+                        schedule_callback(&scandir_scheduler, lua, callback, args, &scandir_fast)
+                            .map_err(mlua::Error::runtime)?;
                     }
                     fs_fail(lua, &error)
                 }
@@ -399,8 +545,9 @@ fn install_fs(
                 Some(entry) => {
                     let mut values = MultiValue::new();
                     values.push_back(Value::String(lua.create_string(entry.name)?));
-                    values
-                        .push_back(Value::String(lua.create_string(entry_type_name(entry.kind))?));
+                    values.push_back(Value::String(
+                        lua.create_string(entry_type_name(entry.kind))?,
+                    ));
                     Ok(values)
                 }
                 None => Ok(MultiValue::new()),
@@ -412,6 +559,10 @@ fn install_fs(
 
 /// Descriptor-based operations: open/close/read/write plus fsync-family,
 /// sendfile, and mkstemp (which produces a new descriptor).
+#[expect(
+    clippy::too_many_lines,
+    reason = "descriptor-based filesystem operations form one ordered Lua API registration group"
+)]
 fn install_fs_file_ops(
     lua: &Lua,
     uv: &Table,
@@ -419,95 +570,181 @@ fn install_fs_file_ops(
     scheduler: &Rc<dyn Scheduler>,
     fast: &FastCallbackState,
 ) -> mlua::Result<()> {
-    register_fs_op(lua, uv, "fs_open", state, scheduler, fast, |lua, state, args| {
-        let (path, flags, mode, callback) =
-            <(String, Value, Option<u32>, Option<Function>)>::from_lua_multi(args, lua)?;
-        let flags = parse_open_flags(flags)?;
-        let result =
-            uvfs::open(&path, flags, mode.unwrap_or(0)).map(|handle| state.insert_file(handle));
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_open",
+        state,
+        scheduler,
+        fast,
+        |lua, state, args| {
+            let (path, flags, mode, callback) =
+                <(String, Value, Option<u32>, Option<Function>)>::from_lua_multi(args, lua)?;
+            let flags = parse_open_flags(flags)?;
+            let result =
+                uvfs::open(&path, flags, mode.unwrap_or(0)).map(|handle| state.insert_file(handle));
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_close", state, scheduler, fast, |lua, state, args| {
-        let (descriptor, callback) = <(i64, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = match state.files.borrow_mut().remove(&descriptor) {
-            Some(handle) => uvfs::close(&handle).map(|()| true),
-            None => Err(bad_file_descriptor()),
-        };
-        Ok((result, callback))
-    })?;
-
-    register_fs_op(lua, uv, "fs_read", state, scheduler, fast, |lua, state, args| {
-        let (descriptor, size, offset, callback) =
-            <(i64, usize, Option<i64>, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = state
-            .file(descriptor)
-            .and_then(|handle| uvfs::read(&handle, size, file_offset(offset)))
-            .and_then(|bytes| lua.create_string(bytes).map_err(|error| lua_error(&error)));
-        Ok((result, callback))
-    })?;
-
-    register_fs_op(lua, uv, "fs_write", state, scheduler, fast, |lua, state, args| {
-        let (descriptor, data, offset, callback) =
-            <(i64, LuaString, Option<i64>, Option<Function>)>::from_lua_multi(args, lua)?;
-        let bytes = data.as_bytes().to_vec();
-        let result = state
-            .file(descriptor)
-            .and_then(|handle| uvfs::write(&handle, &bytes, file_offset(offset)))
-            .map(|count| lua_int(u64::try_from(count).unwrap_or(u64::MAX)));
-        Ok((result, callback))
-    })?;
-
-    register_fs_op(lua, uv, "fs_fstat", state, scheduler, fast, |lua, state, args| {
-        let (descriptor, callback) = <(i64, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = state
-            .file(descriptor)
-            .and_then(|handle| uvfs::fstat(&handle))
-            .and_then(|stat| stat_table(lua, &stat).map_err(|error| lua_error(&error)));
-        Ok((result, callback))
-    })?;
-
-    register_fs_op(lua, uv, "fs_fsync", state, scheduler, fast, |lua, state, args| {
-        let (descriptor, callback) = <(i64, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = state.file(descriptor).and_then(|handle| uvfs::fsync(&handle)).map(|()| true);
-        Ok((result, callback))
-    })?;
-
-    register_fs_op(lua, uv, "fs_fdatasync", state, scheduler, fast, |lua, state, args| {
-        let (descriptor, callback) = <(i64, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result =
-            state.file(descriptor).and_then(|handle| uvfs::fdatasync(&handle)).map(|()| true);
-        Ok((result, callback))
-    })?;
-
-    register_fs_op(lua, uv, "fs_sendfile", state, scheduler, fast, |lua, state, args| {
-        let (out_descriptor, in_descriptor, in_offset, size, callback) =
-            <(i64, i64, Option<i64>, Option<usize>, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = (|| {
-            let out_handle = state.file(out_descriptor)?;
-            let in_handle = state.file(in_descriptor)?;
-            let offset = match in_offset {
-                Some(offset) if offset >= 0 => u64::try_from(offset).unwrap_or(u64::MAX),
-                _ => 0,
+    register_fs_op(
+        lua,
+        uv,
+        "fs_close",
+        state,
+        scheduler,
+        fast,
+        |lua, state, args| {
+            let (descriptor, callback) = <(i64, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = match state.files.borrow_mut().remove(&descriptor) {
+                Some(handle) => uvfs::close(&handle).map(|()| true),
+                None => Err(bad_file_descriptor()),
             };
-            uvfs::sendfile(&out_handle, &in_handle, offset, size.unwrap_or(0))
-                .map(|written| lua_int(u64::try_from(written).unwrap_or(u64::MAX)))
-        })();
-        Ok((result, callback))
-    })?;
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_mkstemp", state, scheduler, fast, |lua, state, args| {
-        let (template, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = uvfs::mkstemp(&template).map(|(handle, path)| {
-            (state.insert_file(handle), path.to_string_lossy().into_owned())
-        });
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_read",
+        state,
+        scheduler,
+        fast,
+        |lua, state, args| {
+            let (descriptor, size, offset, callback) =
+                <(i64, usize, Option<i64>, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = state
+                .file(descriptor)
+                .and_then(|handle| uvfs::read(&handle, size, file_offset(offset)))
+                .and_then(|bytes| lua.create_string(bytes).map_err(|error| lua_error(&error)));
+            Ok((result, callback))
+        },
+    )?;
+
+    register_fs_op(
+        lua,
+        uv,
+        "fs_write",
+        state,
+        scheduler,
+        fast,
+        |lua, state, args| {
+            let (descriptor, data, offset, callback) =
+                <(i64, LuaString, Option<i64>, Option<Function>)>::from_lua_multi(args, lua)?;
+            let bytes = data.as_bytes().to_vec();
+            let result = state
+                .file(descriptor)
+                .and_then(|handle| uvfs::write(&handle, &bytes, file_offset(offset)))
+                .map(|count| lua_int(u64::try_from(count).unwrap_or(u64::MAX)));
+            Ok((result, callback))
+        },
+    )?;
+
+    register_fs_op(
+        lua,
+        uv,
+        "fs_fstat",
+        state,
+        scheduler,
+        fast,
+        |lua, state, args| {
+            let (descriptor, callback) = <(i64, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = state
+                .file(descriptor)
+                .and_then(|handle| uvfs::fstat(&handle))
+                .and_then(|stat| stat_table(lua, &stat).map_err(|error| lua_error(&error)));
+            Ok((result, callback))
+        },
+    )?;
+
+    register_fs_op(
+        lua,
+        uv,
+        "fs_fsync",
+        state,
+        scheduler,
+        fast,
+        |lua, state, args| {
+            let (descriptor, callback) = <(i64, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = state
+                .file(descriptor)
+                .and_then(|handle| uvfs::fsync(&handle))
+                .map(|()| true);
+            Ok((result, callback))
+        },
+    )?;
+
+    register_fs_op(
+        lua,
+        uv,
+        "fs_fdatasync",
+        state,
+        scheduler,
+        fast,
+        |lua, state, args| {
+            let (descriptor, callback) = <(i64, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = state
+                .file(descriptor)
+                .and_then(|handle| uvfs::fdatasync(&handle))
+                .map(|()| true);
+            Ok((result, callback))
+        },
+    )?;
+
+    register_fs_op(
+        lua,
+        uv,
+        "fs_sendfile",
+        state,
+        scheduler,
+        fast,
+        |lua, state, args| {
+            let (out_descriptor, in_descriptor, in_offset, size, callback) =
+                <(i64, i64, Option<i64>, Option<usize>, Option<Function>)>::from_lua_multi(
+                    args, lua,
+                )?;
+            let result = (|| {
+                let out_handle = state.file(out_descriptor)?;
+                let in_handle = state.file(in_descriptor)?;
+                let offset = match in_offset {
+                    Some(offset) if offset >= 0 => u64::try_from(offset).unwrap_or(u64::MAX),
+                    _ => 0,
+                };
+                uvfs::sendfile(&out_handle, &in_handle, offset, size.unwrap_or(0))
+                    .map(|written| lua_int(u64::try_from(written).unwrap_or(u64::MAX)))
+            })();
+            Ok((result, callback))
+        },
+    )?;
+
+    register_fs_op(
+        lua,
+        uv,
+        "fs_mkstemp",
+        state,
+        scheduler,
+        fast,
+        |lua, state, args| {
+            let (template, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = uvfs::mkstemp(&template).map(|(handle, path)| {
+                (
+                    state.insert_file(handle),
+                    path.to_string_lossy().into_owned(),
+                )
+            });
+            Ok((result, callback))
+        },
+    )?;
     Ok(())
 }
 
 /// Attribute operations: permission bits, access checks, truncation, and the
 /// utime family.
+#[expect(
+    clippy::too_many_lines,
+    reason = "filesystem attribute operations form one ordered Lua API registration group"
+)]
 fn install_fs_attribute_ops(
     lua: &Lua,
     uv: &Table,
@@ -515,88 +752,160 @@ fn install_fs_attribute_ops(
     scheduler: &Rc<dyn Scheduler>,
     fast: &FastCallbackState,
 ) -> mlua::Result<()> {
-    register_fs_op(lua, uv, "fs_chmod", state, scheduler, fast, |lua, _state, args| {
-        let (path, mode, callback) =
-            <(String, Option<u32>, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = uvfs::chmod(&path, mode.unwrap_or(0)).map(|()| true);
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_chmod",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (path, mode, callback) =
+                <(String, Option<u32>, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = uvfs::chmod(&path, mode.unwrap_or(0)).map(|()| true);
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_fchmod", state, scheduler, fast, |lua, state, args| {
-        let (descriptor, mode, callback) =
-            <(i64, Option<u32>, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = state
-            .file(descriptor)
-            .and_then(|handle| uvfs::fchmod(&handle, mode.unwrap_or(0)))
-            .map(|()| true);
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_fchmod",
+        state,
+        scheduler,
+        fast,
+        |lua, state, args| {
+            let (descriptor, mode, callback) =
+                <(i64, Option<u32>, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = state
+                .file(descriptor)
+                .and_then(|handle| uvfs::fchmod(&handle, mode.unwrap_or(0)))
+                .map(|()| true);
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_access", state, scheduler, fast, |lua, _state, args| {
-        let (path, mode, callback) =
-            <(String, Value, Option<Function>)>::from_lua_multi(args, lua)?;
-        let (read, write, execute) = access_mode(mode).map_err(mlua::Error::external)?;
-        let result = uvfs::access(&path, read, write, execute);
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_access",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (path, mode, callback) =
+                <(String, Value, Option<Function>)>::from_lua_multi(args, lua)?;
+            let (read, write, execute) = access_mode(mode).map_err(mlua::Error::external)?;
+            let result = uvfs::access(&path, read, write, execute);
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_truncate", state, scheduler, fast, |lua, _state, args| {
-        let (path, length, callback) =
-            <(String, Option<u64>, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = uvfs::truncate(&path, length.unwrap_or(0)).map(|()| true);
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_truncate",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (path, length, callback) =
+                <(String, Option<u64>, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = uvfs::truncate(&path, length.unwrap_or(0)).map(|()| true);
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_ftruncate", state, scheduler, fast, |lua, state, args| {
-        let (descriptor, length, callback) =
-            <(i64, Option<u64>, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = state
-            .file(descriptor)
-            .and_then(|handle| uvfs::ftruncate(&handle, length.unwrap_or(0)))
-            .map(|()| true);
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_ftruncate",
+        state,
+        scheduler,
+        fast,
+        |lua, state, args| {
+            let (descriptor, length, callback) =
+                <(i64, Option<u64>, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = state
+                .file(descriptor)
+                .and_then(|handle| uvfs::ftruncate(&handle, length.unwrap_or(0)))
+                .map(|()| true);
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_utime", state, scheduler, fast, |lua, _state, args| {
-        let (path, atime, mtime, callback) =
-            <(String, Option<Value>, Option<Value>, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = (|| {
-            let current = uvfs::stat(&path)?;
-            let atime = resolve_utime(atime, current.atime)?;
-            let mtime = resolve_utime(mtime, current.mtime)?;
-            uvfs::utime(&path, atime, mtime).map(|()| true)
-        })();
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_utime",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (path, atime, mtime, callback) =
+                <(String, Option<Value>, Option<Value>, Option<Function>)>::from_lua_multi(
+                    args, lua,
+                )?;
+            let result = (|| {
+                let current = uvfs::stat(&path)?;
+                let atime = resolve_utime(atime, current.atime)?;
+                let mtime = resolve_utime(mtime, current.mtime)?;
+                uvfs::utime(&path, atime, mtime).map(|()| true)
+            })();
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_lutime", state, scheduler, fast, |lua, _state, args| {
-        let (path, atime, mtime, callback) =
-            <(String, Option<Value>, Option<Value>, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = (|| {
-            let current = uvfs::lstat(&path)?;
-            let atime = resolve_utime(atime, current.atime)?;
-            let mtime = resolve_utime(mtime, current.mtime)?;
-            uvfs::lutime(&path, atime, mtime).map(|()| true)
-        })();
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_lutime",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (path, atime, mtime, callback) =
+                <(String, Option<Value>, Option<Value>, Option<Function>)>::from_lua_multi(
+                    args, lua,
+                )?;
+            let result = (|| {
+                let current = uvfs::lstat(&path)?;
+                let atime = resolve_utime(atime, current.atime)?;
+                let mtime = resolve_utime(mtime, current.mtime)?;
+                uvfs::lutime(&path, atime, mtime).map(|()| true)
+            })();
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_futime", state, scheduler, fast, |lua, state, args| {
-        let (descriptor, atime, mtime, callback) =
-            <(i64, Option<Value>, Option<Value>, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = (|| {
-            let handle = state.file(descriptor)?;
-            let current = uvfs::fstat(&handle)?;
-            let atime = resolve_utime(atime, current.atime)?;
-            let mtime = resolve_utime(mtime, current.mtime)?;
-            uvfs::futime(&handle, atime, mtime).map(|()| true)
-        })();
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_futime",
+        state,
+        scheduler,
+        fast,
+        |lua, state, args| {
+            let (descriptor, atime, mtime, callback) =
+                <(i64, Option<Value>, Option<Value>, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = (|| {
+                let handle = state.file(descriptor)?;
+                let current = uvfs::fstat(&handle)?;
+                let atime = resolve_utime(atime, current.atime)?;
+                let mtime = resolve_utime(mtime, current.mtime)?;
+                uvfs::futime(&handle, atime, mtime).map(|()| true)
+            })();
+            Ok((result, callback))
+        },
+    )?;
     Ok(())
 }
 
 /// Path-shape operations: directory and link management, copyfile, mkdtemp.
+#[expect(
+    clippy::too_many_lines,
+    reason = "filesystem path operations form one ordered Lua API registration group"
+)]
 fn install_fs_path_ops(
     lua: &Lua,
     uv: &Table,
@@ -604,74 +913,148 @@ fn install_fs_path_ops(
     scheduler: &Rc<dyn Scheduler>,
     fast: &FastCallbackState,
 ) -> mlua::Result<()> {
-    register_fs_op(lua, uv, "fs_mkdir", state, scheduler, fast, |lua, _state, args| {
-        let (path, mode, callback) =
-            <(String, Option<u32>, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = uvfs::mkdir(&path, mode.unwrap_or(0o777)).map(|()| true);
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_mkdir",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (path, mode, callback) =
+                <(String, Option<u32>, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = uvfs::mkdir(&path, mode.unwrap_or(0o777)).map(|()| true);
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_rmdir", state, scheduler, fast, |lua, _state, args| {
-        let (path, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = uvfs::rmdir(&path).map(|()| true);
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_rmdir",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (path, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = uvfs::rmdir(&path).map(|()| true);
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_rename", state, scheduler, fast, |lua, _state, args| {
-        let (from, to, callback) = <(String, String, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = uvfs::rename(&from, &to).map(|()| true);
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_rename",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (from, to, callback) =
+                <(String, String, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = uvfs::rename(&from, &to).map(|()| true);
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_unlink", state, scheduler, fast, |lua, _state, args| {
-        let (path, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = uvfs::unlink(&path).map(|()| true);
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_unlink",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (path, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = uvfs::unlink(&path).map(|()| true);
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_link", state, scheduler, fast, |lua, _state, args| {
-        let (from, to, callback) = <(String, String, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = uvfs::link(&from, &to).map(|()| true);
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_link",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (from, to, callback) =
+                <(String, String, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = uvfs::link(&from, &to).map(|()| true);
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_symlink", state, scheduler, fast, |lua, _state, args| {
-        let (target, link_path, third, fourth) =
-            <(String, String, Option<Value>, Option<Function>)>::from_lua_multi(args, lua)?;
-        // Without a flags table the third parameter is the callback.
-        let (flags, callback) = match third {
-            Some(Value::Function(callback)) => (None, Some(callback)),
-            flags => (flags, fourth),
-        };
-        let directory = symlink_directory(flags).map_err(mlua::Error::external)?;
-        let result = uvfs::symlink(&target, &link_path, directory).map(|()| true);
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_symlink",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (target, link_path, third, fourth) =
+                <(String, String, Option<Value>, Option<Function>)>::from_lua_multi(args, lua)?;
+            // Without a flags table the third parameter is the callback.
+            let (flags, callback) = match third {
+                Some(Value::Function(callback)) => (None, Some(callback)),
+                flags => (flags, fourth),
+            };
+            let directory = symlink_directory(flags).map_err(mlua::Error::external)?;
+            let result = uvfs::symlink(&target, &link_path, directory).map(|()| true);
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_readlink", state, scheduler, fast, |lua, _state, args| {
-        let (path, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = uvfs::readlink(&path).map(|path| path.to_string_lossy().into_owned());
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_readlink",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (path, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = uvfs::readlink(&path).map(|path| path.to_string_lossy().into_owned());
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_copyfile", state, scheduler, fast, |lua, _state, args| {
-        let (from, to, third, fourth) =
-            <(String, String, Option<Value>, Option<Function>)>::from_lua_multi(args, lua)?;
-        // Without a flags table the third parameter is the callback.
-        let (flags, callback) = match third {
-            Some(Value::Function(callback)) => (None, Some(callback)),
-            flags => (flags, fourth),
-        };
-        let exclusive = copyfile_exclusive(flags).map_err(mlua::Error::external)?;
-        let result = uvfs::copyfile(&from, &to, exclusive).map(|_copied| true);
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_copyfile",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (from, to, third, fourth) =
+                <(String, String, Option<Value>, Option<Function>)>::from_lua_multi(args, lua)?;
+            // Without a flags table the third parameter is the callback.
+            let (flags, callback) = match third {
+                Some(Value::Function(callback)) => (None, Some(callback)),
+                flags => (flags, fourth),
+            };
+            let exclusive = copyfile_exclusive(flags).map_err(mlua::Error::external)?;
+            let result = uvfs::copyfile(&from, &to, exclusive).map(|_copied| true);
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_mkdtemp", state, scheduler, fast, |lua, _state, args| {
-        let (template, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = uvfs::mkdtemp(&template).map(|path| path.to_string_lossy().into_owned());
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_mkdtemp",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (template, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = uvfs::mkdtemp(&template).map(|path| path.to_string_lossy().into_owned());
+            Ok((result, callback))
+        },
+    )?;
     Ok(())
 }
 
@@ -683,32 +1066,64 @@ fn install_fs_stat_ops(
     scheduler: &Rc<dyn Scheduler>,
     fast: &FastCallbackState,
 ) -> mlua::Result<()> {
-    register_fs_op(lua, uv, "fs_stat", state, scheduler, fast, |lua, _state, args| {
-        let (path, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result =
-            uvfs::stat(&path).and_then(|stat| stat_table(lua, &stat).map_err(|error| lua_error(&error)));
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_stat",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (path, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = uvfs::stat(&path)
+                .and_then(|stat| stat_table(lua, &stat).map_err(|error| lua_error(&error)));
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_lstat", state, scheduler, fast, |lua, _state, args| {
-        let (path, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result =
-            uvfs::lstat(&path).and_then(|stat| stat_table(lua, &stat).map_err(|error| lua_error(&error)));
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_lstat",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (path, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = uvfs::lstat(&path)
+                .and_then(|stat| stat_table(lua, &stat).map_err(|error| lua_error(&error)));
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_realpath", state, scheduler, fast, |lua, _state, args| {
-        let (path, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result = uvfs::realpath(&path).map(|path| path.to_string_lossy().into_owned());
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_realpath",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (path, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = uvfs::realpath(&path).map(|path| path.to_string_lossy().into_owned());
+            Ok((result, callback))
+        },
+    )?;
 
-    register_fs_op(lua, uv, "fs_statfs", state, scheduler, fast, |lua, _state, args| {
-        let (path, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
-        let result =
-            uvfs::statfs(&path).and_then(|stats| statfs_table(lua, &stats).map_err(|error| lua_error(&error)));
-        Ok((result, callback))
-    })?;
+    register_fs_op(
+        lua,
+        uv,
+        "fs_statfs",
+        state,
+        scheduler,
+        fast,
+        |lua, _state, args| {
+            let (path, callback) = <(String, Option<Function>)>::from_lua_multi(args, lua)?;
+            let result = uvfs::statfs(&path)
+                .and_then(|stats| statfs_table(lua, &stats).map_err(|error| lua_error(&error)));
+            Ok((result, callback))
+        },
+    )?;
     Ok(())
 }
 
@@ -757,9 +1172,8 @@ fn finish_fs<T: mlua::IntoLuaMulti + 'static>(
             Ok(MultiValue::new())
         }
         (Err(error), Some(callback)) => {
-            let args = MultiValue::from_vec(vec![
-                Value::String(lua.create_string(error.to_string())?),
-            ]);
+            let args =
+                MultiValue::from_vec(vec![Value::String(lua.create_string(error.to_string())?)]);
             schedule_callback(scheduler, lua, callback, args, fast)
                 .map_err(mlua::Error::runtime)?;
             Ok(MultiValue::new())
@@ -811,17 +1225,27 @@ fn errno_name(error: &io::Error) -> &'static str {
 }
 
 fn bad_file_descriptor() -> FsError {
-    FsError { name: "EBADF", message: "bad file descriptor".into(), raw_os_error: None }
+    FsError {
+        name: "EBADF",
+        message: "bad file descriptor".into(),
+        raw_os_error: None,
+    }
 }
 
 fn lua_error(error: &mlua::Error) -> FsError {
-    FsError { name: "EINVAL", message: error.to_string(), raw_os_error: None }
+    FsError {
+        name: "EINVAL",
+        message: error.to_string(),
+        raw_os_error: None,
+    }
 }
 
 /// Converts an `fs_read`/`fs_write` offset: `nil` or negative means "use the
 /// current file offset", as in luv.
 fn file_offset(offset: Option<i64>) -> Option<u64> {
-    offset.filter(|value| *value >= 0).and_then(|value| u64::try_from(value).ok())
+    offset
+        .filter(|value| *value >= 0)
+        .and_then(|value| u64::try_from(value).ok())
 }
 
 fn lua_int(value: u64) -> i64 {
@@ -858,21 +1282,27 @@ fn open_flags_from_str(flags: &str) -> FsResult<OpenFlags> {
         "r" => OpenFlags::READ,
         "r+" => OpenFlags::READ_WRITE,
         "w" => OpenFlags::WRITE,
-        "w+" => OpenFlags { read: true, ..OpenFlags::WRITE },
-        "a" => OpenFlags { truncate: false, append: true, ..OpenFlags::WRITE },
-        "a+" => OpenFlags { read: true, truncate: false, append: true, ..OpenFlags::WRITE },
+        "w+" => OpenFlags::WRITE.with(OpenFlags::READ_ACCESS),
+        "a" => OpenFlags::WRITE
+            .with(OpenFlags::APPEND)
+            .without(OpenFlags::TRUNCATE),
+        "a+" => OpenFlags::WRITE
+            .with(OpenFlags::READ_ACCESS)
+            .with(OpenFlags::APPEND)
+            .without(OpenFlags::TRUNCATE),
         _ => {
             return Err(FsError {
                 name: "EINVAL",
                 message: format!("invalid open flags: {flags}"),
                 raw_os_error: None,
-            })
+            });
         }
     };
     if exclusive {
-        parsed.create_new = true;
-        parsed.create = true;
-        parsed.truncate = false;
+        parsed = parsed
+            .with(OpenFlags::CREATE_NEW)
+            .with(OpenFlags::CREATE)
+            .without(OpenFlags::TRUNCATE);
     }
     Ok(parsed)
 }
@@ -893,14 +1323,26 @@ fn open_flags_from_bits(bits: i64) -> FsResult<OpenFlags> {
             });
         }
         let access = bits & 0o3;
-        Ok(OpenFlags {
-            read: access != 1,
-            write: access == 1 || access == 2,
-            append: bits & O_APPEND != 0,
-            truncate: bits & O_TRUNC != 0,
-            create: bits & O_CREAT != 0,
-            create_new: bits & O_EXCL != 0,
-        })
+        let mut flags = OpenFlags::NONE;
+        if access != 1 {
+            flags = flags.with(OpenFlags::READ_ACCESS);
+        }
+        if access == 1 || access == 2 {
+            flags = flags.with(OpenFlags::WRITE_ACCESS);
+        }
+        if bits & O_APPEND != 0 {
+            flags = flags.with(OpenFlags::APPEND);
+        }
+        if bits & O_TRUNC != 0 {
+            flags = flags.with(OpenFlags::TRUNCATE);
+        }
+        if bits & O_CREAT != 0 {
+            flags = flags.with(OpenFlags::CREATE);
+        }
+        if bits & O_EXCL != 0 {
+            flags = flags.with(OpenFlags::CREATE_NEW);
+        }
+        Ok(flags)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -931,7 +1373,7 @@ fn access_mode(mode: Value) -> FsResult<(bool, bool, bool)> {
                             name: "EINVAL",
                             message: format!("invalid access mode character: {other}"),
                             raw_os_error: None,
-                        })
+                        });
                     }
                 }
             }
@@ -951,9 +1393,10 @@ fn symlink_directory(flags: Option<Value>) -> FsResult<bool> {
     match flags {
         None | Some(Value::Nil) => Ok(false),
         Some(Value::Integer(bits)) => Ok(bits & 1 != 0),
-        Some(Value::Table(table)) => {
-            table.get::<Option<bool>>("dir").map_err(|error| lua_error(&error)).map(|dir| dir.unwrap_or(false))
-        }
+        Some(Value::Table(table)) => table
+            .get::<Option<bool>>("dir")
+            .map_err(|error| lua_error(&error))
+            .map(|dir| dir.unwrap_or(false)),
         Some(other) => Err(FsError {
             name: "EINVAL",
             message: format!("invalid symlink flags: {}", other.type_name()),
@@ -986,15 +1429,17 @@ fn resolve_utime(value: Option<Value>, keep: FsTime) -> FsResult<FsTime> {
         None | Some(Value::Nil) => Ok(keep),
         Some(Value::Integer(sec)) => Ok(FsTime { sec, nsec: 0 }),
         Some(Value::Number(seconds)) => Ok(split_seconds(seconds)),
-        Some(Value::String(text)) => match text.to_str().map_err(|error| lua_error(&error))?.as_ref() {
-            "now" => Ok(now_fs_time()),
-            "omit" => Ok(keep),
-            other => Err(FsError {
-                name: "EINVAL",
-                message: format!("invalid utime timestamp: {other}"),
-                raw_os_error: None,
-            }),
-        },
+        Some(Value::String(text)) => {
+            match text.to_str().map_err(|error| lua_error(&error))?.as_ref() {
+                "now" => Ok(now_fs_time()),
+                "omit" => Ok(keep),
+                other => Err(FsError {
+                    name: "EINVAL",
+                    message: format!("invalid utime timestamp: {other}"),
+                    raw_os_error: None,
+                }),
+            }
+        }
         Some(other) => Err(FsError {
             name: "EINVAL",
             message: format!("invalid utime timestamp: {}", other.type_name()),
@@ -1005,12 +1450,20 @@ fn resolve_utime(value: Option<Value>, keep: FsTime) -> FsResult<FsTime> {
 
 fn split_seconds(seconds: f64) -> FsTime {
     let duration = std::time::Duration::from_secs_f64(seconds.max(0.0));
-    FsTime { sec: lua_int(duration.as_secs()), nsec: duration.subsec_nanos() }
+    FsTime {
+        sec: lua_int(duration.as_secs()),
+        nsec: duration.subsec_nanos(),
+    }
 }
 
 fn now_fs_time() -> FsTime {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    FsTime { sec: lua_int(now.as_secs()), nsec: now.subsec_nanos() }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    FsTime {
+        sec: lua_int(now.as_secs()),
+        nsec: now.subsec_nanos(),
+    }
 }
 
 fn fs_time_table(lua: &Lua, time: FsTime) -> mlua::Result<Table> {

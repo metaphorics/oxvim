@@ -5,7 +5,7 @@
 //! `v:lang`/`v:ctype` to the C library. This module is the audited unsafe
 //! boundary for those calls, mirroring `os/lang.c` `get_locale_val`.
 
-use std::ffi::{c_char, c_int, CStr, CString};
+use std::ffi::{CStr, CString, c_char, c_int};
 
 /// Locale category understood by [`current_locale`] and [`set_locale`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,5 +84,9 @@ fn cstr_to_string(value: *const c_char) -> Option<String> {
     // SAFETY: non-NULL `setlocale` results are NUL-terminated strings owned
     // by the C library that remain valid until the next `setlocale` call;
     // copying here closes that window for the caller.
-    Some(unsafe { CStr::from_ptr(value) }.to_string_lossy().into_owned())
+    Some(
+        unsafe { CStr::from_ptr(value) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }

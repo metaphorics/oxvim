@@ -9,7 +9,7 @@ use crate::{Event, MultiQueue, Owner, Result};
 pub enum Work {
     /// Execute during readiness dispatch, before the deferred safe point.
     Fast(Owner, Event),
-    /// Forward to the owner's MultiQueue for safe-point processing.
+    /// Forward to the owner's `MultiQueue` for safe-point processing.
     Deferred(Owner, Event),
 }
 
@@ -28,6 +28,11 @@ pub struct DeferredScheduler {
 
 impl DeferredScheduler {
     /// Posts deferred work and wakes the reactor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error from waking the reactor after the work has
+    /// been queued; the work itself is already enqueued at that point.
     pub fn schedule_deferred(&self, owner: Owner, event: Event) -> Result<()> {
         {
             let mut pending = self
@@ -54,6 +59,7 @@ pub struct WorkQueues {
 
 impl WorkQueues {
     /// Creates inbound work queues backed by the reactor's waker.
+    #[must_use]
     pub fn new(waker: Arc<Waker>) -> Self {
         Self {
             pending: Arc::new(Mutex::new(Pending::default())),
@@ -62,6 +68,7 @@ impl WorkQueues {
     }
 
     /// Returns a cloneable, thread-safe deferred producer.
+    #[must_use]
     pub fn scheduler(&self) -> DeferredScheduler {
         DeferredScheduler {
             pending: Arc::clone(&self.pending),
@@ -70,6 +77,11 @@ impl WorkQueues {
     }
 
     /// Posts fast work and wakes the reactor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error from waking the reactor after the work has
+    /// been queued; the work itself is already enqueued at that point.
     pub fn schedule_fast(&self, owner: Owner, event: Event) -> Result<()> {
         {
             let mut pending = self
@@ -87,7 +99,7 @@ impl WorkQueues {
         Ok(())
     }
 
-    /// Runs fast callbacks now and forwards deferred callbacks to MultiQueue.
+    /// Runs fast callbacks now and forwards deferred callbacks to `MultiQueue`.
     /// This mirrors loop.c:212-218 followed by loop.c:105-117.
     pub(crate) fn transfer(&self, events: &mut MultiQueue) -> Result<()> {
         let (mut channels, mut order) = {

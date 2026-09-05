@@ -10,7 +10,6 @@ fn oxvim() -> Command {
     Command::new(env!("CARGO_BIN_EXE_oxvim"))
 }
 
-
 /// Runs a silent Ex batch session and returns its captured output.
 ///
 /// `-es` is `silent_mode`: `message.c` `msg_puts_printf` (line 3038) drops
@@ -26,7 +25,11 @@ fn batch(arguments: &[&str], input: &str) -> std::process::Output {
 /// `msg_puts_printf` from dropping ordinary message output; it then reaches
 /// stderr.
 fn batch_verbose(arguments: &[&str], input: &str) -> std::process::Output {
-    spawn_batch(&["-es", "-V1", "-u", "NONE", "-i", "NONE"], arguments, input)
+    spawn_batch(
+        &["-es", "-V1", "-u", "NONE", "-i", "NONE"],
+        arguments,
+        input,
+    )
 }
 
 fn spawn_batch(mode: &[&str], arguments: &[&str], input: &str) -> std::process::Output {
@@ -54,8 +57,8 @@ impl TempFile {
     fn new(suffix: &str, contents: &str) -> Self {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir()
-            .join(format!("oxvim-t57-{}-{unique}{suffix}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("oxvim-t57-{}-{unique}{suffix}", std::process::id()));
         std::fs::write(&path, contents).expect("write scratch file");
         Self(path)
     }
@@ -71,23 +74,45 @@ impl Drop for TempFile {
     }
 }
 
+#[expect(
+    clippy::panic,
+    reason = "test assertion primitive: the panic names the metadata field the test expected"
+)]
 fn map_field<'a>(value: &'a Value, name: &str) -> &'a Value {
     value
         .as_map()
         .and_then(|fields| fields.iter().find(|(key, _)| key.as_str() == Some(name)))
-        .map(|(_, value)| value)
-        .unwrap_or_else(|| panic!("missing metadata field {name}"))
+        .map_or_else(
+            || panic!("missing metadata field {name}"),
+            |(_, value)| value,
+        )
 }
 
 #[test]
 fn api_info_is_parseable_metadata() {
     let output = oxvim().arg("--api-info").output().expect("spawn oxvim");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let mut cursor = Cursor::new(&output.stdout);
     let metadata = rmpv::decode::read_value(&mut cursor).expect("decode api metadata");
-    assert_eq!(cursor.position(), output.stdout.len() as u64, "trailing stdout bytes");
-    assert_eq!(map_field(map_field(&metadata, "version"), "api_level").as_i64(), Some(15));
-    assert!(!map_field(&metadata, "functions").as_array().expect("functions array").is_empty());
+    assert_eq!(
+        cursor.position(),
+        output.stdout.len() as u64,
+        "trailing stdout bytes"
+    );
+    assert_eq!(
+        map_field(map_field(&metadata, "version"), "api_level").as_i64(),
+        Some(15)
+    );
+    assert!(
+        !map_field(&metadata, "functions")
+            .as_array()
+            .expect("functions array")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -106,7 +131,11 @@ fn silent_ex_pipeline_prints_buffer_and_quits() {
         .write_all(b"call setline(1, \"x\") | %print | quit!\n")
         .expect("write Ex input");
     let output = child.wait_with_output().expect("wait for oxvim");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(output.stdout, b"x\n");
 }
 
@@ -119,11 +148,24 @@ fn silent_ex_pipeline_prints_buffer_and_quits() {
 fn message_output_follows_the_process_mode() {
     // --headless: no UI, not silent, so :echo reaches stderr.
     let headless = oxvim()
-        .args(["-u", "NONE", "-i", "NONE", "--headless", "-c", "echo \"HELLO\"", "-c", "qall!"])
+        .args([
+            "-u",
+            "NONE",
+            "-i",
+            "NONE",
+            "--headless",
+            "-c",
+            "echo \"HELLO\"",
+            "-c",
+            "qall!",
+        ])
         .output()
         .expect("spawn oxvim");
     assert!(headless.status.success());
-    assert_eq!(headless.stderr, b"HELLO", "--headless :echo belongs on stderr");
+    assert_eq!(
+        headless.stderr, b"HELLO",
+        "--headless :echo belongs on stderr"
+    );
     assert!(headless.stdout.is_empty());
 
     // -es: silent_mode with 'verbose' zero drops the same message entirely.
@@ -147,20 +189,38 @@ fn message_output_follows_the_process_mode() {
 /// message that follows them separates with a newline in their stream.
 #[test]
 fn informative_listings_keep_stdout_in_batch_mode() {
-    let listing = batch(&[], "call setline(1, \"one\")\n%print\nset number?\necho \"gone\"\n");
-    assert!(listing.status.success(), "{}", String::from_utf8_lossy(&listing.stderr));
+    let listing = batch(
+        &[],
+        "call setline(1, \"one\")\n%print\nset number?\necho \"gone\"\n",
+    );
+    assert!(
+        listing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
     assert_eq!(String::from_utf8_lossy(&listing.stdout), "one\nnonumber\n");
-    assert!(listing.stderr.is_empty(), "{}", String::from_utf8_lossy(&listing.stderr));
+    assert!(
+        listing.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
 
     // Under --headless nothing is silent, so the separator lands in the
     // stream of the message it follows: stderr after :echo, stdout between
     // two printed lines, and no trailing newline at exit.
     let headless = oxvim()
         .args([
-            "-u", "NONE", "-i", "NONE", "--headless",
-            "-c", "echo \"E\"",
-            "-c", "set number?",
-            "-c", "qall!",
+            "-u",
+            "NONE",
+            "-i",
+            "NONE",
+            "--headless",
+            "-c",
+            "echo \"E\"",
+            "-c",
+            "set number?",
+            "-c",
+            "qall!",
         ])
         .output()
         .expect("spawn oxvim");
@@ -169,26 +229,51 @@ fn informative_listings_keep_stdout_in_batch_mode() {
     assert_eq!(headless.stderr, b"E\n");
 }
 
-
 #[test]
 fn cquit_and_qall_exit_codes_follow_ex_docmd() {
     // ex_cquit: no count means EXIT_FAILURE; a count is the status.
-    let default = oxvim().args(["-u", "NONE", "--headless", "+cquit"]).output().expect("spawn oxvim");
+    let default = oxvim()
+        .args(["-u", "NONE", "--headless", "+cquit"])
+        .output()
+        .expect("spawn oxvim");
     assert_eq!(default.status.code(), Some(1));
-    let coded = oxvim().args(["-u", "NONE", "--headless", "+cquit 7"]).output().expect("spawn oxvim");
+    let coded = oxvim()
+        .args(["-u", "NONE", "--headless", "+cquit 7"])
+        .output()
+        .expect("spawn oxvim");
     assert_eq!(coded.status.code(), Some(7));
 
     // ex_quitall: clean buffers exit 0, modified ones raise E37 unless !.
-    let clean = oxvim().args(["-u", "NONE", "--headless", "+qall"]).output().expect("spawn oxvim");
+    let clean = oxvim()
+        .args(["-u", "NONE", "--headless", "+qall"])
+        .output()
+        .expect("spawn oxvim");
     assert_eq!(clean.status.code(), Some(0));
     let modified = oxvim()
         .args(["-u", "NONE", "--headless", "+call setline(1, 'x')", "+qall"])
         .output()
         .expect("spawn oxvim");
-    assert_eq!(modified.status.code(), Some(1));
+    // `getout` folds errors into the exit code only in ex mode (`-es`):
+    // headless keeps going after the displayed E37 and exits 0. Upstream
+    // itself never exits 1 here either — it blocks on the hit-enter prompt.
+    assert_eq!(modified.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&modified.stderr).contains("E37"));
+
+    // In ex mode the same E37 folds into the exit status (`getout` adds
+    // `ex_exitval` under `exmode_active`; verified 1 against upstream nvim).
+    let ex_modified = oxvim()
+        .args(["-u", "NONE", "-es", "+call setline(1, 'x')", "+qall"])
+        .output()
+        .expect("spawn oxvim");
+    assert_eq!(ex_modified.status.code(), Some(1));
     let forced = oxvim()
-        .args(["-u", "NONE", "--headless", "+call setline(1, 'x')", "+qall!"])
+        .args([
+            "-u",
+            "NONE",
+            "--headless",
+            "+call setline(1, 'x')",
+            "+qall!",
+        ])
         .output()
         .expect("spawn oxvim");
     assert_eq!(forced.status.code(), Some(0));
@@ -196,22 +281,36 @@ fn cquit_and_qall_exit_codes_follow_ex_docmd() {
 #[test]
 fn lua_entry_receives_script_and_trailing_arguments() {
     let path = std::env::temp_dir().join(format!("oxvim-args-{}.lua", std::process::id()));
-    std::fs::write(&path, "io.write(arg[0], '|', arg[1], '|', arg[2])")
-        .expect("write Lua script");
+    std::fs::write(&path, "io.write(arg[0], '|', arg[1], '|', arg[2])").expect("write Lua script");
     let output = oxvim()
-        .args(["-l", path.to_str().expect("UTF-8 temp path"), "first", "--second"])
+        .args([
+            "-l",
+            path.to_str().expect("UTF-8 temp path"),
+            "first",
+            "--second",
+        ])
         .output()
         .expect("spawn oxvim");
     let _removed = std::fs::remove_file(&path);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(String::from_utf8_lossy(&output.stdout), format!("{}|first|--second", path.display()));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{}|first|--second", path.display())
+    );
 }
 
 #[test]
 fn lua_failure_and_unknown_option_exit_one() {
     let path = std::env::temp_dir().join(format!("oxvim-error-{}.lua", std::process::id()));
     std::fs::write(&path, "error('script failed')").expect("write Lua script");
-    let lua = oxvim().args(["-l", path.to_str().expect("UTF-8 temp path")]).output().expect("spawn oxvim");
+    let lua = oxvim()
+        .args(["-l", path.to_str().expect("UTF-8 temp path")])
+        .output()
+        .expect("spawn oxvim");
     let _removed = std::fs::remove_file(&path);
     assert_eq!(lua.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&lua.stderr).contains("script failed"));
@@ -219,8 +318,7 @@ fn lua_failure_and_unknown_option_exit_one() {
     let usage = oxvim().arg("--unknown").output().expect("spawn oxvim");
     assert_eq!(usage.status.code(), Some(1));
     assert!(
-        String::from_utf8_lossy(&usage.stderr)
-            .contains("Unknown option argument: \"--unknown\"")
+        String::from_utf8_lossy(&usage.stderr).contains("Unknown option argument: \"--unknown\"")
     );
 }
 
@@ -229,7 +327,14 @@ fn lua_failure_and_unknown_option_exit_one() {
 #[test]
 fn batch_runs_pre_and_post_commands_before_reading_stdin() {
     let mut child = oxvim()
-        .args(["-es", "-u", "NONE", "--cmd", "call setline(1, \"PRE\")", "+call setline(2, \"PLUS\")"])
+        .args([
+            "-es",
+            "-u",
+            "NONE",
+            "--cmd",
+            "call setline(1, \"PRE\")",
+            "+call setline(2, \"PLUS\")",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -242,7 +347,11 @@ fn batch_runs_pre_and_post_commands_before_reading_stdin() {
         .write_all(b"%print\n")
         .expect("write Ex input");
     let output = child.wait_with_output().expect("wait for oxvim");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(output.stdout, b"PRE\nPLUS\n");
 }
 
@@ -251,7 +360,10 @@ fn bare_script_option_exits_with_usage_error() {
     let output = oxvim().arg("-s").output().expect("spawn oxvim");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Argument missing after: \"-s\""), "{stderr}");
+    assert!(
+        stderr.contains("Argument missing after: \"-s\""),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -284,7 +396,11 @@ fn noplugin_resets_loadplugins_option() {
         .write_all(b"set loadplugins?\n")
         .expect("write Ex input");
     let output = child.wait_with_output().expect("wait for oxvim");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("noloadplugins"));
 }
 
@@ -315,10 +431,13 @@ fn session_flag_sources_file_after_startup() {
         .expect("write empty Ex input");
     let output = child.wait_with_output().expect("wait for oxvim");
     let _removed = std::fs::remove_file(&path);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("sourced"));
 }
-
 
 /// `-h`/`-?`/`--help` and `-v`/`--version` print and exit 0, upstream's
 /// `usage()`/`version()` followed by `os_exit(0)`.  The version text must
@@ -342,7 +461,10 @@ fn help_and_version_print_and_exit_zero() {
         assert!(text.contains("API level 15"), "{flag}: {text}");
     }
     // main.c prints from inside the scan, so a later bad option never runs.
-    let output = oxvim().args(["--version", "--bogus"]).output().expect("spawn oxvim");
+    let output = oxvim()
+        .args(["--version", "--bogus"])
+        .output()
+        .expect("spawn oxvim");
     assert_eq!(output.status.code(), Some(0));
 }
 
@@ -363,7 +485,11 @@ fn post_commands_keep_argv_order_after_every_pre_command() {
         ],
         "%print\necho g:pre\n",
     );
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     // `:print` is informative listing output (stdout); `:echo` is an ordinary
     // message, which only escapes batch mode because `-V1` set 'verbose'.
     assert_eq!(String::from_utf8_lossy(&output.stdout), "one\ntwo\nthree\n");
@@ -382,8 +508,15 @@ fn readonly_mode_reaches_every_loaded_startup_buffer() {
         &["-R", "-o5", one.text(), two.text()],
         "echo \"W1=\" . &readonly\n2wincmd w\necho \"W2=\" . &readonly\n4wincmd w\necho \"W4=\" . &readonly\n",
     );
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(String::from_utf8_lossy(&output.stderr), "W1=1\nW2=1\nW4=0\n");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "W1=1\nW2=1\nW4=0\n"
+    );
 }
 
 /// Every usage failure is observable: `mainerr` prints `{prog}: {msg}` with a
@@ -393,23 +526,41 @@ fn usage_failures_match_upstream_text_and_status() {
     for (arguments, message) in [
         (vec!["--bogus"], "Unknown option argument: \"--bogus\""),
         (vec!["-Q"], "Unknown option argument: \"-Q\""),
-        (vec!["-uxx", "NONE"], "Garbage after option argument: \"-uxx\""),
-        (vec!["--cmdfoo", "x"], "Garbage after option argument: \"--cmdfoo\""),
+        (
+            vec!["-uxx", "NONE"],
+            "Garbage after option argument: \"-uxx\"",
+        ),
+        (
+            vec!["--cmdfoo", "x"],
+            "Garbage after option argument: \"--cmdfoo\"",
+        ),
         (vec!["-u"], "Argument missing after: \"-u\""),
         (vec!["-c"], "Argument missing after: \"-c\""),
-        (vec!["--startuptime"], "Argument missing after: \"--startuptime\""),
+        (
+            vec!["--startuptime"],
+            "Argument missing after: \"--startuptime\"",
+        ),
     ] {
         let output = oxvim().args(&arguments).output().expect("spawn oxvim");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(1), "{arguments:?}: {stderr}");
         assert!(stderr.contains(message), "{arguments:?}: {stderr}");
-        assert!(stderr.contains("More info with \"oxvim -h\""), "{arguments:?}: {stderr}");
+        assert!(
+            stderr.contains("More info with \"oxvim -h\""),
+            "{arguments:?}: {stderr}"
+        );
     }
     // scripterror: a bare line and status 2, with no "-h" pointer.
-    let output = oxvim().args(["-s", "a", "-s", "b"]).output().expect("spawn oxvim");
+    let output = oxvim()
+        .args(["-s", "a", "-s", "b"])
+        .output()
+        .expect("spawn oxvim");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains("Attempt to open script file again: \"-s b\""), "{stderr}");
+    assert!(
+        stderr.contains("Attempt to open script file again: \"-s b\""),
+        "{stderr}"
+    );
     assert!(!stderr.contains("More info"), "{stderr}");
 }
 
@@ -428,7 +579,11 @@ fn startup_option_flags_reach_their_options() {
     ] {
         let output = batch(&flags, &format!("{query}\n"));
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "{flags:?}: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{flags:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(stdout.trim(), expected, "{flags:?}");
     }
     // A cluster is the same as the separate letters (main.c argv_idx).
@@ -464,7 +619,11 @@ fn window_and_tab_openers_build_the_startup_layout() {
         let mut arguments = vec![flag];
         arguments.extend(files);
         let output = batch_verbose(&arguments, "echo winnr(\"$\") tabpagenr(\"$\") winnr()\n");
-        assert!(output.status.success(), "{flag}: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{flag}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(
             String::from_utf8_lossy(&output.stderr).trim(),
             format!("{windows} {tabs} 1"),
@@ -474,7 +633,10 @@ fn window_and_tab_openers_build_the_startup_layout() {
     // Every window shows the next file, in argv order (edit_buffers).
     let mut arguments = vec!["-o"];
     arguments.extend(files);
-    let output = batch_verbose(&arguments, "echo bufname(\"%\")\n2wincmd w\necho bufname(\"%\")\n");
+    let output = batch_verbose(
+        &arguments,
+        "echo bufname(\"%\")\n2wincmd w\necho bufname(\"%\")\n",
+    );
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
         format!("{}\n{}\n", one.text(), two.text())
@@ -504,7 +666,11 @@ fn improved_ex_mode_reads_stdin_as_buffer_text() {
         .write_all(b"hello\nworld\n")
         .expect("write text input");
     let output = child.wait_with_output().expect("wait for oxvim");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(output.stdout, b"hello\nworld\n");
 }
 
@@ -538,8 +704,15 @@ fn bare_dash_edits_standard_input() {
         .write_all(b"from stdin\n")
         .expect("write stdin text");
     let output = child.wait_with_output().expect("wait for oxvim");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(std::fs::read_to_string(written.text()).expect("read written file"), "from stdin\n");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(written.text()).expect("read written file"),
+        "from stdin\n"
+    );
 
     // "-e -" is silent mode, so stdin stays Ex commands.
     let output = batch(&["-"], "call setline(1, \"ex input\")\n%print\n");
@@ -551,17 +724,29 @@ fn bare_dash_edits_standard_input() {
 fn startuptime_writes_a_timing_log() {
     let log = TempFile::new(".log", "");
     let output = batch(&["--startuptime", log.text()], "");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let text = std::fs::read_to_string(log.text()).expect("read startuptime log");
     assert!(text.starts_with("--- Startup times for process:"), "{text}");
-    for label in ["OXVIM STARTING", "parsing arguments", "opening buffers", "OXVIM STARTED"] {
+    for label in [
+        "OXVIM STARTING",
+        "parsing arguments",
+        "opening buffers",
+        "OXVIM STARTED",
+    ] {
         assert!(text.contains(label), "{label} missing from {text}");
     }
     // Without the flag nothing is written anywhere.
     let quiet = TempFile::new(".log", "");
     let output = batch(&[], "");
     assert!(output.status.success());
-    assert_eq!(std::fs::read_to_string(quiet.text()).expect("read scratch"), "");
+    assert_eq!(
+        std::fs::read_to_string(quiet.text()).expect("read scratch"),
+        ""
+    );
 }
 
 /// Every feature `has()` answers 1 for must have the capability behind it: a
@@ -595,17 +780,37 @@ fn features_reported_present_have_their_capability() {
         ("windows", "split\nlet r = winnr('$')", "2"),
         ("vertsplit", "vsplit\nlet r = winnr('$')", "2"),
         // has("visual"): a Visual selection is the operator's range.
-        ("visual", "call setline(1, 'abcdef')\nnormal! ggv2ld\nlet r = getline(1)", "def"),
+        (
+            "visual",
+            "call setline(1, 'abcdef')\nnormal! ggv2ld\nlet r = getline(1)",
+            "def",
+        ),
         // has("textobjects"): `aw` covers the word and its trailing space.
-        ("textobjects", "call setline(1, 'one two three')\nnormal! ggwdaw\nlet r = getline(1)", "one three"),
+        (
+            "textobjects",
+            "call setline(1, 'one two three')\nnormal! ggwdaw\nlet r = getline(1)",
+            "one three",
+        ),
     ];
     for (feature, script, expected) in cases {
         // A sourced script aborts on the first failing line, so the probe
         // either prints `1|<expected>` or the process reports the command
         // that could not run.
-        let probe = TempFile::new(".vim", &format!("{script}\necho has('{feature}') .. '|' .. r\nqall!\n"));
+        let probe = TempFile::new(
+            ".vim",
+            &format!("{script}\necho has('{feature}') .. '|' .. r\nqall!\n"),
+        );
         let output = oxvim()
-            .args(["-u", "NONE", "-i", "NONE", "--noplugin", "--headless", "-S", probe.text()])
+            .args([
+                "-u",
+                "NONE",
+                "-i",
+                "NONE",
+                "--noplugin",
+                "--headless",
+                "-S",
+                probe.text(),
+            ])
             .output()
             .expect("spawn oxvim");
         assert!(
@@ -634,10 +839,17 @@ fn window_height_flag_sets_the_window_option() {
             "{arguments:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "window=42", "{arguments:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "window=42",
+            "{arguments:?}"
+        );
     }
     // A non-numeric argument still names the missing subsystem.
-    let output = oxvim().args(["-w", "keys.log"]).output().expect("spawn oxvim");
+    let output = oxvim()
+        .args(["-w", "keys.log"])
+        .output()
+        .expect("spawn oxvim");
     assert_eq!(output.status.code(), Some(1));
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("script recording of typed keys"),
@@ -677,7 +889,11 @@ fn upstream_no_op_flags_are_accepted() {
         &["--literal", "-N", "-X", "-f", "-U", gvimrc.text()],
         "call setline(1, \"ran\")\n%print\n",
     );
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "ran\n");
 }
 
@@ -688,24 +904,42 @@ fn upstream_no_op_flags_are_accepted() {
 fn flags_without_their_subsystem_are_rejected_by_name() {
     for (arguments, requirement) in [
         (vec!["-d"], "a diff engine"),
-        (vec!["-A"], "the 'arabic' option side effects and keymap files"),
+        (
+            vec!["-A"],
+            "the 'arabic' option side effects and keymap files",
+        ),
         (vec!["-H"], "keymap file loading"),
         (vec!["-D"], "the Ex debugger"),
-        (vec!["-q", "errors.err"], "the quickfix list and 'errorformat'"),
+        (
+            vec!["-q", "errors.err"],
+            "the quickfix list and 'errorformat'",
+        ),
         (vec!["-t", "sometag"], "the tags subsystem"),
         (vec!["-r"], "swap-file recovery"),
         (vec!["-L"], "swap-file recovery"),
         (vec!["-w", "keys.log"], "script recording of typed keys"),
         (vec!["-W", "keys.log"], "script recording of typed keys"),
-        (vec!["--remote", "file"], "RPC client channels and vim._cs_remote"),
-        (vec!["--remote-send", "iabc"], "RPC client channels and vim._cs_remote"),
-        (vec!["--server", "127.0.0.1:1"], "RPC client channels and vim._cs_remote"),
+        (
+            vec!["--remote", "file"],
+            "RPC client channels and vim._cs_remote",
+        ),
+        (
+            vec!["--remote-send", "iabc"],
+            "RPC client channels and vim._cs_remote",
+        ),
+        (
+            vec!["--server", "127.0.0.1:1"],
+            "RPC client channels and vim._cs_remote",
+        ),
         (vec!["--luamod-dev"], "the Lua module preload table"),
     ] {
         let output = oxvim().args(&arguments).output().expect("spawn oxvim");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(1), "{arguments:?}: {stderr}");
-        assert!(stderr.contains("Option not supported"), "{arguments:?}: {stderr}");
+        assert!(
+            stderr.contains("Option not supported"),
+            "{arguments:?}: {stderr}"
+        );
         assert!(stderr.contains(requirement), "{arguments:?}: {stderr}");
     }
 }
@@ -732,10 +966,19 @@ fn lua_and_vimscript_answer_the_same_builtin_identically() {
     let calls: [(&str, String); 7] = [
         ("jobwait([9999])", "vim.fn.jobwait({9999})".to_owned()),
         ("getline(1)", "vim.fn.getline(1)".to_owned()),
-        ("writefile(['x'],'@')", "vim.fn.writefile({'x'},'@')".to_owned()),
+        (
+            "writefile(['x'],'@')",
+            "vim.fn.writefile({'x'},'@')".to_owned(),
+        ),
         ("readfile('@')", "vim.fn.readfile('@')".to_owned()),
-        ("substitute('aXbXc','X','-','g')", "vim.fn.substitute('aXbXc','X','-','g')".to_owned()),
-        ("system('printf hi')", "vim.fn.system('printf hi')".to_owned()),
+        (
+            "substitute('aXbXc','X','-','g')",
+            "vim.fn.substitute('aXbXc','X','-','g')".to_owned(),
+        ),
+        (
+            "system('printf hi')",
+            "vim.fn.system('printf hi')".to_owned(),
+        ),
         ("bufnr('%')", "vim.fn.bufnr('%')".to_owned()),
     ];
     let path = scratch.text();
@@ -748,7 +991,12 @@ fn lua_and_vimscript_answer_the_same_builtin_identically() {
     let lua = calls
         .iter()
         .enumerate()
-        .map(|(index, (_, call))| format!("print('{index} ' .. vim.fn.string({}))", call.replace('@', path)))
+        .map(|(index, (_, call))| {
+            format!(
+                "print('{index} ' .. vim.fn.string({}))",
+                call.replace('@', path)
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -757,7 +1005,15 @@ fn lua_and_vimscript_answer_the_same_builtin_identically() {
     // numbered answer lines.
     let answers = |config: &TempFile| {
         let output = oxvim()
-            .args(["-i", "NONE", "--headless", "-u", config.text(), "-c", "qall!"])
+            .args([
+                "-i",
+                "NONE",
+                "--headless",
+                "-u",
+                config.text(),
+                "-c",
+                "qall!",
+            ])
             .output()
             .expect("spawn oxvim");
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -770,7 +1026,11 @@ fn lua_and_vimscript_answer_the_same_builtin_identically() {
 
     let from_vimscript = answers(&TempFile::new(".vim", &vimscript));
     let from_lua = answers(&TempFile::new(".lua", &lua));
-    assert_eq!(from_vimscript.len(), calls.len(), "vimscript: {from_vimscript:?}");
+    assert_eq!(
+        from_vimscript.len(),
+        calls.len(),
+        "vimscript: {from_vimscript:?}"
+    );
     assert_eq!(from_lua, from_vimscript);
     assert_eq!(
         from_lua,
@@ -782,6 +1042,117 @@ fn lua_and_vimscript_answer_the_same_builtin_identically() {
             "4 'a-b-c'",
             "5 'hi'",
             "6 1",
+        ],
+    );
+}
+
+/// Real-headless parity for the four routed Search and Register names that
+/// were panics or `E117` before the family dispatchers grew real arms:
+/// `searchpair`, `searchpairpos`, `searchcount`, and `getreginfo`.
+///
+/// Both sides render through `string()`. Dictionary results are converted to
+/// sorted key-value pairs first because hash insertion order is not part of
+/// the API contract. The Vimscript side calls the builtins directly; the Lua
+/// side calls
+/// `builtins::route`→`Family` bridge. The `n` flag on `searchpair`/`searchpairpos`
+/// keeps the cursor at line 1 so `searchcount` sees the same position on both
+/// sides. The `/` register is seeded via `setreg` so `searchcount` has an
+/// effective pattern without relying on a prior interactive search.
+///
+/// Source-grounded fixture: `start`/`end` token vocabulary adapted from
+/// `.references/neovim/test/old/testdir/test_search.vim:289-411`.
+#[test]
+fn lua_and_vimscript_agree_on_routed_search_and_register_families() {
+    let vimscript_setup = [
+        "call setline(1, ['start x', '  start y', '    stmt', '  end', 'end'])",
+        "call cursor(1, 1)",
+        "call setreg('a', 'hello')",
+        "call setreg('/', 'start')",
+    ];
+    let lua_setup = [
+        "vim.fn.setline(1, {'start x', '  start y', '    stmt', '  end', 'end'})",
+        "vim.fn.cursor(1, 1)",
+        "vim.fn.setreg('a', 'hello')",
+        "vim.fn.setreg('/', 'start')",
+    ];
+    let calls: [(&str, &str); 4] = [
+        (
+            "searchpair('start', '', 'end', 'Wn')",
+            "vim.fn.searchpair('start', '', 'end', 'Wn')",
+        ),
+        (
+            "searchpairpos('start', '', 'end', 'Wn')",
+            "vim.fn.searchpairpos('start', '', 'end', 'Wn')",
+        ),
+        (
+            "sort(items(searchcount({})))",
+            "vim.fn.sort(vim.fn.items(vim.fn.searchcount()))",
+        ),
+        (
+            "sort(items(getreginfo('a')))",
+            "vim.fn.sort(vim.fn.items(vim.fn.getreginfo('a')))",
+        ),
+    ];
+
+    let vimscript = vimscript_setup
+        .iter()
+        .map(|line| (*line).to_owned())
+        .chain(
+            calls
+                .iter()
+                .enumerate()
+                .map(|(index, (call, _))| format!("echo '{index} ' . string({call})")),
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lua = lua_setup
+        .iter()
+        .map(|line| (*line).to_owned())
+        .chain(
+            calls
+                .iter()
+                .enumerate()
+                .map(|(index, (_, call))| format!("print('{index} ' .. vim.fn.string({call}))")),
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let answers = |config: &TempFile| {
+        let output = oxvim()
+            .args([
+                "-i",
+                "NONE",
+                "--headless",
+                "-u",
+                config.text(),
+                "-c",
+                "qall!",
+            ])
+            .output()
+            .expect("spawn oxvim");
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        text.lines()
+            .filter(|line| line.starts_with(|first: char| first.is_ascii_digit()))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    let from_vimscript = answers(&TempFile::new(".vim", &vimscript));
+    let from_lua = answers(&TempFile::new(".lua", &lua));
+    assert_eq!(
+        from_vimscript.len(),
+        calls.len(),
+        "vimscript: {from_vimscript:?}"
+    );
+    assert_eq!(from_lua, from_vimscript);
+    assert_eq!(
+        from_lua,
+        [
+            "0 5",
+            "1 [5, 1]",
+            "2 [['current', 1], ['exact_match', 1], ['incomplete', 0], ['maxcount', 999], ['total', 2]]",
+            "3 [['isunnamed', v:false], ['regcontents', ['hello']], ['regtype', 'v']]",
         ],
     );
 }
@@ -813,15 +1184,28 @@ fn lua_and_vimscript_answer_the_same_builtin_identically() {
 /// Every expected value here was produced by `nvim` of the same build against
 /// the same tree in the same throwaway `XDG_CONFIG_HOME`.
 #[test]
+#[expect(
+    clippy::panic,
+    reason = "test assertion primitive: the panic names the flags and the full output when the ORDER line is missing"
+)]
 fn user_config_and_plugin_directories_are_discovered_and_gated_by_their_flags() {
     let root = std::env::temp_dir().join(format!("oxvim-t78-discovery-{}", std::process::id()));
     let config = root.join("cfg/nvim");
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(config.join("plugin")).expect("create config tree");
     std::fs::write(config.join("init.lua"), "vim.g.order = 'init'\n").expect("write init.lua");
-    std::fs::write(config.join("plugin/zz.vim"), "let g:order = get(g:, 'order', '') . ',zz.vim'\n").expect("write zz.vim");
-    std::fs::write(config.join("plugin/broken.vim"), "this is not a command\n").expect("write broken.vim");
-    std::fs::write(config.join("plugin/aa.lua"), "vim.g.order = (vim.g.order or '') .. ',aa.lua'\n").expect("write aa.lua");
+    std::fs::write(
+        config.join("plugin/zz.vim"),
+        "let g:order = get(g:, 'order', '') . ',zz.vim'\n",
+    )
+    .expect("write zz.vim");
+    std::fs::write(config.join("plugin/broken.vim"), "this is not a command\n")
+        .expect("write broken.vim");
+    std::fs::write(
+        config.join("plugin/aa.lua"),
+        "vim.g.order = (vim.g.order or '') .. ',aa.lua'\n",
+    )
+    .expect("write aa.lua");
     let explicit = root.join("explicit.lua");
     std::fs::write(&explicit, "vim.g.order = 'explicit'\n").expect("write explicit.lua");
 
@@ -829,7 +1213,12 @@ fn user_config_and_plugin_directories_are_discovered_and_gated_by_their_flags() 
         let output = oxvim()
             .args(["--headless", "-i", "NONE"])
             .args(flags)
-            .args(["-c", "lua print('ORDER=' .. tostring(vim.g.order))", "-c", "qall!"])
+            .args([
+                "-c",
+                "lua print('ORDER=' .. tostring(vim.g.order))",
+                "-c",
+                "qall!",
+            ])
             .env("HOME", root.join("home"))
             .env("XDG_CONFIG_HOME", root.join("cfg"))
             .env("XDG_DATA_HOME", root.join("data"))
@@ -854,7 +1243,10 @@ fn user_config_and_plugin_directories_are_discovered_and_gated_by_their_flags() 
     assert_eq!(order(&["-u", "NORC"]), ",zz.vim,aa.lua");
     assert_eq!(order(&["--clean"]), "nil");
     assert_eq!(order(&["--noplugin"]), "init");
-    assert_eq!(order(&["--clean", "-u", &explicit.to_string_lossy()]), "explicit");
+    assert_eq!(
+        order(&["--clean", "-u", &explicit.to_string_lossy()]),
+        "explicit"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }

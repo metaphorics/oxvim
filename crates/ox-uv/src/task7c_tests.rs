@@ -1,3 +1,6 @@
+// Pure unit-test module: expect/panic on UV handle results IS the assertion;
+// a failed expect here is a test failure, not a recoverable error.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Task 7c tests: poll handles, IPC write2/pending, extra stdio, vectored fs,
 //! and misc surface. Each test family cites the `runtime/doc/luvref.txt`
 //! sections it exercises.
@@ -7,9 +10,9 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::{Handle, UvLoop};
 use crate::net::{NetEvent, Pipe, PipeHandleKind};
 use crate::process::{self, ExtraStdio, SpawnOptions, StdioConfig};
+use crate::{Handle, UvLoop};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -101,8 +104,7 @@ fn poll_start_rejects_prioritized_as_unsupported() {
 
     let error = poll
         .poll_start(&mut uv_loop, "p")
-        .err()
-        .expect("poll_start(events=\"p\") is rejected");
+        .expect_err("poll_start(events=\"p\") is rejected");
     assert!(
         matches!(error, NetError::Unsupported(_)),
         "expected typed Unsupported, got {error:?}"
@@ -126,10 +128,10 @@ fn ipc_write2_passes_fd_which_receiver_can_use() {
 
     let mut uv_loop = UvLoop::new().expect("create loop");
     let receiver = {
-        let mut child = Pipe::from_stream(&mut uv_loop, pair_b, true, |_, _, event| match event {
-            NetEvent::Read(_) | NetEvent::Eof => {}
-            NetEvent::Error(error) => panic!("ipc receive error: {error}"),
-            _ => {}
+        let mut child = Pipe::from_stream(&mut uv_loop, pair_b, true, |_, _, event| {
+            if let NetEvent::Error(error) = event {
+                panic!("ipc receive error: {error}");
+            }
         })
         .expect("wrap receiver pipe");
         child.read_start(&mut uv_loop).expect("read_start ipc pipe");
@@ -137,13 +139,14 @@ fn ipc_write2_passes_fd_which_receiver_can_use() {
     };
 
     // write2 carries the pipe's write-end file descriptor alongside the data.
-    let sender = Pipe::from_stream(&mut uv_loop, pair_a, true, |_, _, event| match event {
-        NetEvent::Error(error) => panic!("ipc send error: {error}"),
-        _ => {}
+    let sender = Pipe::from_stream(&mut uv_loop, pair_a, true, |_, _, event| {
+        if let NetEvent::Error(error) = event {
+            panic!("ipc send error: {error}")
+        }
     })
     .expect("wrap sender pipe");
     sender
-        .write2(&mut uv_loop, b"hi".to_vec(), &pipe_write, PipeHandleKind::Pipe)
+        .write2(&mut uv_loop, b"hi", &pipe_write, PipeHandleKind::Pipe)
         .expect("write2 sends handle");
 
     // Pump until the receiver's recvmsg has captured the ancillary fd.
@@ -168,7 +171,11 @@ fn ipc_write2_passes_fd_which_receiver_can_use() {
     rustix::io::write(&received_fd, b"through-passed-fd").expect("write through passed fd");
     let mut buf = [0u8; 64];
     let n = rustix::io::read(&pipe_read, &mut buf).expect("read original pipe");
-    assert_eq!(&buf[..n], b"through-passed-fd", "received fd is a working dup of the pipe write end");
+    assert_eq!(
+        &buf[..n],
+        b"through-passed-fd",
+        "received fd is a working dup of the pipe write end"
+    );
 }
 
 /// `write2` on a pipe that was not created with the `ipc` option is rejected
@@ -181,16 +188,16 @@ fn write2_requires_ipc_pipe() {
     let (_, pipe_write) = rustix::pipe::pipe().expect("create pipe");
 
     let mut uv_loop = UvLoop::new().expect("create loop");
-    let sender = Pipe::from_stream(&mut uv_loop, pair_a, false, |_, _, event| match event {
-        NetEvent::Error(error) => panic!("send error: {error}"),
-        _ => {}
+    let sender = Pipe::from_stream(&mut uv_loop, pair_a, false, |_, _, event| {
+        if let NetEvent::Error(error) = event {
+            panic!("send error: {error}")
+        }
     })
     .expect("wrap non-ipc sender pipe");
 
     let error = sender
-        .write2(&mut uv_loop, b"hi".to_vec(), &pipe_write, PipeHandleKind::Pipe)
-        .err()
-        .expect("write2 on a non-IPC pipe is rejected");
+        .write2(&mut uv_loop, b"hi", &pipe_write, PipeHandleKind::Pipe)
+        .expect_err("write2 on a non-IPC pipe is rejected");
     assert!(
         matches!(error, NetError::InvalidState(_)),
         "expected typed InvalidState, got {error:?}"
@@ -209,25 +216,27 @@ fn pending_queue_is_fifo() {
 
     let mut uv_loop = UvLoop::new().expect("create loop");
     let receiver = {
-        let mut child = Pipe::from_stream(&mut uv_loop, pair_b, true, |_, _, event| match event {
-            NetEvent::Error(error) => panic!("ipc receive error: {error}"),
-            _ => {}
+        let mut child = Pipe::from_stream(&mut uv_loop, pair_b, true, |_, _, event| {
+            if let NetEvent::Error(error) = event {
+                panic!("ipc receive error: {error}")
+            }
         })
         .expect("wrap receiver pipe");
         child.read_start(&mut uv_loop).expect("read_start ipc pipe");
         std::cell::RefCell::new(Some(child))
     };
 
-    let sender = Pipe::from_stream(&mut uv_loop, pair_a, true, |_, _, event| match event {
-        NetEvent::Error(error) => panic!("ipc send error: {error}"),
-        _ => {}
+    let sender = Pipe::from_stream(&mut uv_loop, pair_a, true, |_, _, event| {
+        if let NetEvent::Error(error) = event {
+            panic!("ipc send error: {error}")
+        }
     })
     .expect("wrap sender pipe");
     sender
-        .write2(&mut uv_loop, b"a".to_vec(), &write_1, PipeHandleKind::Pipe)
+        .write2(&mut uv_loop, b"a", &write_1, PipeHandleKind::Pipe)
         .expect("write2 #1");
     sender
-        .write2(&mut uv_loop, b"b".to_vec(), &write_2, PipeHandleKind::Pipe)
+        .write2(&mut uv_loop, b"b", &write_2, PipeHandleKind::Pipe)
         .expect("write2 #2");
 
     let deadline = Instant::now() + TIMEOUT;
@@ -247,15 +256,21 @@ fn pending_queue_is_fifo() {
     assert_eq!(child.pending_count(), 2, "both descriptors pending");
 
     // FIFO: the front item reported by pending_type is the one take_fd pops.
-    assert_eq!(child.pending_type(), Some("pipe"), "front item pending type");
-    let first = child.pending_take_fd().expect("take front pending descriptor");
+    assert_eq!(
+        child.pending_type(),
+        Some("pipe"),
+        "front item pending type"
+    );
+    let first = child
+        .pending_take_fd()
+        .expect("take front pending descriptor");
 
     // Prove the taken fd is a dup of the FIRST write end (pipe 1): a write
     // through it must land in read_1, while read_2 stays empty.
     rustix::io::write(&first, b"F").expect("write through front fd");
 
     let probe = |file: &std::fs::File| {
-        use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+        use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
         let _ = fcntl_setfl(file, fcntl_getfl(file).expect("getfl") | OFlags::NONBLOCK);
         let mut byte = [0u8; 1];
         match rustix::io::read(file, &mut byte) {
@@ -266,7 +281,11 @@ fn pending_queue_is_fifo() {
     let read_1 = std::fs::File::from(read_1);
     let read_2 = std::fs::File::from(read_2);
     assert_eq!(probe(&read_1), Some(b'F'), "front-taken fd reaches pipe 1");
-    assert_eq!(probe(&read_2), None, "second pipe must remain untouched by the front take");
+    assert_eq!(
+        probe(&read_2),
+        None,
+        "second pipe must remain untouched by the front take"
+    );
 }
 
 /// `write2` derives the received handle kind from the fd: a TCP stream is
@@ -282,12 +301,15 @@ fn ipc_write2_tcp_roundtrip_reports_tcp_kind() {
 
     let mut uv_loop = UvLoop::new().expect("create loop");
     let receiver = {
-        let mut child = Pipe::from_stream(&mut uv_loop, pair_b, true, |_, _, event| match event {
-            NetEvent::Error(error) => panic!("tcp receiver error: {error}"),
-            _ => {}
+        let mut child = Pipe::from_stream(&mut uv_loop, pair_b, true, |_, _, event| {
+            if let NetEvent::Error(error) = event {
+                panic!("tcp receiver error: {error}")
+            }
         })
         .expect("wrap receiver pipe");
-        child.read_start(&mut uv_loop).expect("read_start receiver pipe");
+        child
+            .read_start(&mut uv_loop)
+            .expect("read_start receiver pipe");
         std::cell::RefCell::new(Some(child))
     };
 
@@ -296,13 +318,14 @@ fn ipc_write2_tcp_roundtrip_reports_tcp_kind() {
     let client = TcpStream::connect(addr).expect("connect tcp client");
     let (mut server, _) = listener.accept().expect("accept tcp server");
 
-    let sender = Pipe::from_stream(&mut uv_loop, pair_a, true, |_, _, event| match event {
-        NetEvent::Error(error) => panic!("tcp sender error: {error}"),
-        _ => {}
+    let sender = Pipe::from_stream(&mut uv_loop, pair_a, true, |_, _, event| {
+        if let NetEvent::Error(error) = event {
+            panic!("tcp sender error: {error}")
+        }
     })
     .expect("wrap sender pipe");
     sender
-        .write2(&mut uv_loop, b"tcp-handshake".to_vec(), &client, PipeHandleKind::Tcp)
+        .write2(&mut uv_loop, b"tcp-handshake", &client, PipeHandleKind::Tcp)
         .expect("write2 sends tcp handle");
 
     let deadline = Instant::now() + TIMEOUT;
@@ -320,9 +343,15 @@ fn ipc_write2_tcp_roundtrip_reports_tcp_kind() {
     let receiver = receiver.borrow();
     let child = receiver.as_ref().expect("receiver pipe");
     assert_eq!(child.pending_count(), 1, "uv.pipe_pending_count()");
-    assert_eq!(child.pending_type(), Some("tcp"), "uv.pipe_pending_type() for tcp");
+    assert_eq!(
+        child.pending_type(),
+        Some("tcp"),
+        "uv.pipe_pending_type() for tcp"
+    );
 
-    let received_fd = child.pending_take_fd().expect("take pending tcp descriptor");
+    let received_fd = child
+        .pending_take_fd()
+        .expect("take pending tcp descriptor");
     rustix::io::write(&received_fd, b"through-tcp-fd").expect("write through received tcp fd");
 
     server
@@ -356,8 +385,7 @@ fn extra_stdio_create_pipe_is_typed_unsupported() {
     }];
 
     let error = process::spawn(&mut uv_loop, options, |_, _| {})
-        .err()
-        .expect("exact-fd extra stdio CreatePipe is rejected");
+        .expect_err("exact-fd extra stdio CreatePipe is rejected");
     assert!(
         matches!(&error, crate::process::ProcessError::Unsupported { .. }),
         "expected typed Unsupported, got {error:?}"
@@ -383,13 +411,20 @@ fn extra_stdio_inherit_fd3_spawns_ok() {
         })
         .expect("Inherit extra stdio spawns")
     };
-    assert_eq!(spawned.extra.len(), 0, "no created endpoints for Inherit entries");
+    assert_eq!(
+        spawned.extra.len(),
+        0,
+        "no created endpoints for Inherit entries"
+    );
 
     let deadline = Instant::now() + TIMEOUT;
     while !exited.load(std::sync::atomic::Ordering::SeqCst) && Instant::now() < deadline {
         uv_loop.run_nowait().expect("pump spawn loop");
     }
-    assert!(exited.load(std::sync::atomic::Ordering::SeqCst), "child never exited");
+    assert!(
+        exited.load(std::sync::atomic::Ordering::SeqCst),
+        "child never exited"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -402,10 +437,13 @@ fn vectored_fs_writev_and_readv_split_correctly() {
     use std::io::Read as _;
 
     let path = temp_path("vectored");
-    let handle = fs::open(&path, fs::OpenFlags::WRITE, 0o644)
-        .expect("open for write");
-    let written = fs::writev(&handle, &[b"Hello".to_vec(), b" ".to_vec(), b"World".to_vec()], None)
-        .expect("uv.fs_write table-of-buffers");
+    let handle = fs::open(&path, fs::OpenFlags::WRITE, 0o644).expect("open for write");
+    let written = fs::writev(
+        &handle,
+        &[b"Hello".to_vec(), b" ".to_vec(), b"World".to_vec()],
+        None,
+    )
+    .expect("uv.fs_write table-of-buffers");
     assert_eq!(written, 11, "writev total");
     fs::close(&handle).expect("close");
 
@@ -436,6 +474,7 @@ fn vectored_fs_writev_and_readv_split_correctly() {
 fn misc_surface_returns_sane_values() {
     use crate::misc;
 
+    const ENV_NAME: &str = "OXVIM_TEST_UV_OS_SETENV";
     assert_eq!(misc::version() & 0xFF, 0, "axis version 0.1.0 patch");
     assert_eq!(misc::version_string(), env!("CARGO_PKG_VERSION"));
 
@@ -446,14 +485,19 @@ fn misc_surface_returns_sane_values() {
     assert!(!passwd.username.is_empty(), "username present");
     assert!(!passwd.homedir.is_empty(), "homedir present");
 
-    const ENV_NAME: &str = "OXVIM_TEST_UV_OS_SETENV";
     misc::os_setenv(ENV_NAME, "value").expect("uv.os_setenv");
-    assert_eq!(std::env::var_os(ENV_NAME).as_deref(), Some(std::ffi::OsStr::new("value")));
+    assert_eq!(
+        std::env::var_os(ENV_NAME).as_deref(),
+        Some(std::ffi::OsStr::new("value"))
+    );
     misc::os_unsetenv(ENV_NAME).expect("uv.os_unsetenv");
     assert_eq!(std::env::var_os(ENV_NAME), None);
 
     let rusage = misc::getrusage().expect("uv.getrusage");
-    assert!(rusage.nvcsw > 0 || rusage.stime.0 > 0 || rusage.utime.0 > 0, "some rusage populated");
+    assert!(
+        rusage.nvcsw > 0 || rusage.stime.0 > 0 || rusage.utime.0 > 0,
+        "some rusage populated"
+    );
 
     let rss = misc::resident_set_memory().expect("uv.resident_set_memory");
     assert!(rss > 0, "RSS positive");
@@ -466,7 +510,10 @@ fn misc_surface_returns_sane_values() {
     let _ = misc::get_available_memory();
 
     let (one, five, fifteen) = misc::loadavg();
-    assert!(one >= 0.0 && five >= 0.0 && fifteen >= 0.0, "loadavg triad non-negative");
+    assert!(
+        one >= 0.0 && five >= 0.0 && fifteen >= 0.0,
+        "loadavg triad non-negative"
+    );
 
     let uptime = misc::uptime().expect("uv.uptime");
     assert!(uptime > 0.0, "uptime positive");

@@ -27,7 +27,7 @@ pub struct FsError {
 }
 
 impl FsError {
-    fn from_io(error: io::Error) -> Self {
+    fn from_io(error: &io::Error) -> Self {
         let raw_os_error = error.raw_os_error();
         Self {
             name: errno_name(raw_os_error, error.kind()),
@@ -37,16 +37,26 @@ impl FsError {
     }
 
     fn invalid(message: impl Into<String>) -> Self {
-        Self { name: "EINVAL", message: message.into(), raw_os_error: None }
+        Self {
+            name: "EINVAL",
+            message: message.into(),
+            raw_os_error: None,
+        }
     }
 
-    fn pool(error: PoolError) -> Self {
-        Self { name: "ECANCELED", message: error.to_string(), raw_os_error: None }
+    fn pool(error: &PoolError) -> Self {
+        Self {
+            name: "ECANCELED",
+            message: error.to_string(),
+            raw_os_error: None,
+        }
     }
 }
 
 impl From<io::Error> for FsError {
-    fn from(error: io::Error) -> Self { Self::from_io(error) }
+    fn from(error: io::Error) -> Self {
+        Self::from_io(&error)
+    }
 }
 
 /// Result returned by filesystem operations.
@@ -57,39 +67,64 @@ pub type FsResult<T> = Result<T, FsError>;
 pub struct FileHandle(Arc<Mutex<Option<File>>>);
 
 impl FileHandle {
-    fn new(file: File) -> Self { Self(Arc::new(Mutex::new(Some(file)))) }
+    fn new(file: File) -> Self {
+        Self(Arc::new(Mutex::new(Some(file))))
+    }
 
     fn with_file<T>(&self, operation: impl FnOnce(&File) -> io::Result<T>) -> FsResult<T> {
-        let guard = self.0.lock().map_err(|_| FsError::invalid("file handle lock is poisoned"))?;
-        let file = guard.as_ref().ok_or_else(|| FsError::invalid("file handle is closed"))?;
-        operation(file).map_err(FsError::from_io)
+        let guard = self
+            .0
+            .lock()
+            .map_err(|_| FsError::invalid("file handle lock is poisoned"))?;
+        let file = guard
+            .as_ref()
+            .ok_or_else(|| FsError::invalid("file handle is closed"))?;
+        operation(file).map_err(|error| FsError::from_io(&error))
     }
 }
 
 /// Portable subset of open options accepted by `fs_open`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OpenFlags {
-    /// Allow reading.
-    pub read: bool,
-    /// Allow writing.
-    pub write: bool,
-    /// Append on every write.
-    pub append: bool,
-    /// Truncate on open.
-    pub truncate: bool,
-    /// Create the file if missing.
-    pub create: bool,
-    /// Fail if the file already exists.
-    pub create_new: bool,
-}
+pub struct OpenFlags(u8);
 
 impl OpenFlags {
+    /// No open options.
+    pub const NONE: Self = Self(0);
+    /// Allow reading, without implying any other option.
+    pub const READ_ACCESS: Self = Self(1 << 0);
+    /// Allow writing, without implying any other option.
+    pub const WRITE_ACCESS: Self = Self(1 << 1);
+    /// Append on every write.
+    pub const APPEND: Self = Self(1 << 2);
+    /// Truncate on open.
+    pub const TRUNCATE: Self = Self(1 << 3);
+    /// Create the file if missing.
+    pub const CREATE: Self = Self(1 << 4);
+    /// Fail if the file already exists.
+    pub const CREATE_NEW: Self = Self(1 << 5);
+
     /// Open for reading only.
-    pub const READ: Self = Self { read: true, write: false, append: false, truncate: false, create: false, create_new: false };
+    pub const READ: Self = Self::READ_ACCESS;
     /// Open for writing (and truncating/creating) only.
-    pub const WRITE: Self = Self { read: false, write: true, append: false, truncate: true, create: true, create_new: false };
+    pub const WRITE: Self = Self(Self::WRITE_ACCESS.0 | Self::TRUNCATE.0 | Self::CREATE.0);
     /// Open for both reading and writing.
-    pub const READ_WRITE: Self = Self { read: true, write: true, append: false, truncate: false, create: false, create_new: false };
+    pub const READ_WRITE: Self = Self(Self::READ_ACCESS.0 | Self::WRITE_ACCESS.0);
+
+    /// Returns these options combined with `other`.
+    #[must_use]
+    pub const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns these options with every option in `other` removed.
+    #[must_use]
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    const fn contains(self, option: Self) -> bool {
+        self.0 & option.0 == option.0
+    }
 }
 
 /// One filesystem timestamp as seconds and nanoseconds since the Unix epoch.
@@ -188,35 +223,69 @@ pub struct DirEntry {
 }
 
 /// Sorted synchronous scandir iterator.
-pub struct Scandir { entries: std::vec::IntoIter<DirEntry> }
+pub struct Scandir {
+    entries: std::vec::IntoIter<DirEntry>,
+}
 
 impl Iterator for Scandir {
     type Item = DirEntry;
-    fn next(&mut self) -> Option<Self::Item> { self.entries.next() }
+    fn next(&mut self) -> Option<Self::Item> {
+        self.entries.next()
+    }
 }
 
 /// Stateful directory stream used by opendir/readdir/closedir.
 #[derive(Debug)]
-pub struct Directory { entries: Vec<DirEntry>, cursor: usize, batch_size: usize, closed: bool }
+pub struct Directory {
+    entries: Vec<DirEntry>,
+    cursor: usize,
+    batch_size: usize,
+    closed: bool,
+}
 
 /// Opens a file. See `uv.fs_open()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] when the path cannot be opened with the requested flags and mode, including errno names such as `ENOENT`, `EACCES`, `EEXIST`, and `EINVAL`.
 pub fn open(path: impl AsRef<Path>, flags: OpenFlags, mode: u32) -> FsResult<FileHandle> {
     let mut options = OpenOptions::new();
-    options.read(flags.read).write(flags.write).append(flags.append)
-        .truncate(flags.truncate).create(flags.create).create_new(flags.create_new);
-    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(mode); }
-    let file = options.open(path).map_err(FsError::from_io)?;
+    options
+        .read(flags.contains(OpenFlags::READ_ACCESS))
+        .write(flags.contains(OpenFlags::WRITE_ACCESS))
+        .append(flags.contains(OpenFlags::APPEND))
+        .truncate(flags.contains(OpenFlags::TRUNCATE))
+        .create(flags.contains(OpenFlags::CREATE))
+        .create_new(flags.contains(OpenFlags::CREATE_NEW));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| FsError::from_io(&error))?;
     Ok(FileHandle::new(file))
 }
 
 /// Closes a file. See `uv.fs_close()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] with `EINVAL` if the handle's lock is poisoned, and with `ENOENT` if the file has already been closed.
 pub fn close(handle: &FileHandle) -> FsResult<()> {
-    let mut guard = handle.0.lock().map_err(|_| FsError::invalid("file handle lock is poisoned"))?;
-    guard.take().ok_or_else(|| FsError::invalid("file handle is already closed"))?;
+    let mut guard = handle
+        .0
+        .lock()
+        .map_err(|_| FsError::invalid("file handle lock is poisoned"))?;
+    guard
+        .take()
+        .ok_or_else(|| FsError::invalid("file handle is already closed"))?;
     Ok(())
 }
 
 /// Reads bytes, optionally at a position. See `uv.fs_read()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] when the handle is closed or locked (`EINVAL`) or when the underlying read fails, carrying the platform errno name (for example `EIO` or `EISDIR`).
 pub fn read(handle: &FileHandle, size: usize, offset: Option<u64>) -> FsResult<Vec<u8>> {
     handle.with_file(|file| {
         let mut data = vec![0; size];
@@ -230,8 +299,14 @@ pub fn read(handle: &FileHandle, size: usize, offset: Option<u64>) -> FsResult<V
 }
 
 /// Writes bytes, optionally at a position. See `uv.fs_write()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] when the handle is closed or locked (`EINVAL`) or when the underlying write fails, carrying the platform errno name (for example `ENOSPC` or `EFBIG`).
 pub fn write(handle: &FileHandle, data: &[u8], offset: Option<u64>) -> FsResult<usize> {
-    handle.with_file(|file| match offset { Some(offset) => write_at(file, data, offset), None => (&*file).write(data) })
+    handle.with_file(|file| match offset {
+        Some(offset) => write_at(file, data, offset),
+        None => (&*file).write(data),
+    })
 }
 
 /// Reads bytes into multiple buffers with a single `readv`/`preadv` call.
@@ -240,6 +315,9 @@ pub fn write(handle: &FileHandle, data: &[u8], offset: Option<u64>) -> FsResult<
 /// one entry per requested buffer, truncated to the number of bytes actually
 /// read into it. This is the table-of-buffers form of `uv.fs_read()` in
 /// `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] when the handle is closed or locked (`EINVAL`) or when the vectored read system call fails; the platform errno is preserved.
 #[cfg(unix)]
 pub fn readv(handle: &FileHandle, sizes: &[usize], offset: Option<u64>) -> FsResult<Vec<Vec<u8>>> {
     use std::io::{Error as IoError, IoSliceMut};
@@ -248,29 +326,39 @@ pub fn readv(handle: &FileHandle, sizes: &[usize], offset: Option<u64>) -> FsRes
     handle.with_file(|file| {
         let fd = file.as_fd();
         let mut buffers: Vec<Vec<u8>> = sizes.iter().map(|size| vec![0u8; *size]).collect();
-        let mut iovecs: Vec<IoSliceMut<'_>> = buffers.iter_mut().map(|buffer| IoSliceMut::new(buffer)).collect();
+        let mut iovecs: Vec<IoSliceMut<'_>> = buffers
+            .iter_mut()
+            .map(|buffer| IoSliceMut::new(buffer))
+            .collect();
         let read_total: usize = match offset {
             Some(offset) => rustix::io::preadv(fd, &mut iovecs, offset),
             None => rustix::io::readv(fd, &mut iovecs),
         }
         .map_err(|error| IoError::from_raw_os_error(error.raw_os_error()))?;
         let mut remaining = read_total;
-        for buffer in buffers.iter_mut() {
+        for buffer in &mut buffers {
             if remaining == 0 {
                 buffer.clear();
-                continue;
+            } else {
+                let take = buffer.len().min(remaining);
+                buffer.truncate(take);
+                remaining -= take;
             }
-            let take = buffer.len().min(remaining);
-            buffer.truncate(take);
-            remaining -= take;
         }
         Ok(buffers)
     })
 }
 
 /// Sequential approximation of [`readv`] for platforms without `readv`/`preadv`.
+///
+/// # Errors
+/// Returns [`FsError`] when the handle is closed or locked (`EINVAL`) or when any underlying read fails, carrying the platform errno name.
 #[cfg(not(unix))]
-pub fn readv(handle: &FileHandle, sizes: &[usize], mut offset: Option<u64>) -> FsResult<Vec<Vec<u8>>> {
+pub fn readv(
+    handle: &FileHandle,
+    sizes: &[usize],
+    mut offset: Option<u64>,
+) -> FsResult<Vec<Vec<u8>>> {
     let mut buffers = Vec::with_capacity(sizes.len());
     for size in sizes {
         let data = read(handle, *size, offset)?;
@@ -286,6 +374,9 @@ pub fn readv(handle: &FileHandle, sizes: &[usize], mut offset: Option<u64>) -> F
 /// the total number of bytes written. This is the table-of-buffers form of
 /// `uv.fs_write()` in `runtime/doc/luvref.txt`, whose `data` argument is a
 /// `buffer` (a string or a sequential table of strings).
+///
+/// # Errors
+/// Returns [`FsError`] when the handle is closed or locked (`EINVAL`) or when the vectored write system call fails; the platform errno is preserved.
 #[cfg(unix)]
 pub fn writev(handle: &FileHandle, buffers: &[Vec<u8>], offset: Option<u64>) -> FsResult<usize> {
     use std::io::{Error as IoError, IoSlice};
@@ -293,7 +384,10 @@ pub fn writev(handle: &FileHandle, buffers: &[Vec<u8>], offset: Option<u64>) -> 
 
     handle.with_file(|file| {
         let fd = file.as_fd();
-        let iovecs: Vec<IoSlice<'_>> = buffers.iter().map(|buffer| IoSlice::new(buffer.as_slice())).collect();
+        let iovecs: Vec<IoSlice<'_>> = buffers
+            .iter()
+            .map(|buffer| IoSlice::new(buffer.as_slice()))
+            .collect();
         match offset {
             Some(offset) => rustix::io::pwritev(fd, &iovecs, offset),
             None => rustix::io::writev(fd, &iovecs),
@@ -303,8 +397,15 @@ pub fn writev(handle: &FileHandle, buffers: &[Vec<u8>], offset: Option<u64>) -> 
 }
 
 /// Sequential approximation of [`writev`] for platforms without `writev`/`pwritev`.
+///
+/// # Errors
+/// Returns [`FsError`] when the handle is closed or locked (`EINVAL`) or when any underlying write fails, carrying the platform errno name.
 #[cfg(not(unix))]
-pub fn writev(handle: &FileHandle, buffers: &[Vec<u8>], mut offset: Option<u64>) -> FsResult<usize> {
+pub fn writev(
+    handle: &FileHandle,
+    buffers: &[Vec<u8>],
+    mut offset: Option<u64>,
+) -> FsResult<usize> {
     let mut total = 0usize;
     for buffer in buffers {
         total += write(handle, buffer, offset)?;
@@ -314,170 +415,468 @@ pub fn writev(handle: &FileHandle, buffers: &[Vec<u8>], mut offset: Option<u64>)
 }
 
 /// Creates a directory. See `uv.fs_mkdir()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] when the directory cannot be created (for example `EEXIST` or `EACCES`) or, on Unix, when applying `mode` via [`chmod`] fails.
 pub fn mkdir(path: impl AsRef<Path>, mode: u32) -> FsResult<()> {
-    fs::create_dir(&path).map_err(FsError::from_io)?;
-    #[cfg(unix)] chmod(path, mode)?;
+    fs::create_dir(&path).map_err(|error| FsError::from_io(&error))?;
+    #[cfg(unix)]
+    chmod(path, mode)?;
     Ok(())
 }
 /// Removes an empty directory. See `uv.fs_rmdir()` in `runtime/doc/luvref.txt`.
-pub fn rmdir(path: impl AsRef<Path>) -> FsResult<()> { fs::remove_dir(path).map_err(FsError::from_io) }
+///
+/// # Errors
+/// Returns [`FsError`] when the directory cannot be removed, carrying the platform errno name (for example `ENOENT` or `ENOTEMPTY`).
+pub fn rmdir(path: impl AsRef<Path>) -> FsResult<()> {
+    fs::remove_dir(path).map_err(|error| FsError::from_io(&error))
+}
 /// Removes a file. See `uv.fs_unlink()` in `runtime/doc/luvref.txt`.
-pub fn unlink(path: impl AsRef<Path>) -> FsResult<()> { fs::remove_file(path).map_err(FsError::from_io) }
+///
+/// # Errors
+/// Returns [`FsError`] when the file cannot be removed, carrying the platform errno name (for example `ENOENT` or `EISDIR`).
+pub fn unlink(path: impl AsRef<Path>) -> FsResult<()> {
+    fs::remove_file(path).map_err(|error| FsError::from_io(&error))
+}
 /// Renames a path. See `uv.fs_rename()` in `runtime/doc/luvref.txt`.
-pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> FsResult<()> { fs::rename(from, to).map_err(FsError::from_io) }
+///
+/// # Errors
+/// Returns [`FsError`] when the rename fails, carrying the platform errno name (for example `ENOENT` or `EXDEV`).
+pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> FsResult<()> {
+    fs::rename(from, to).map_err(|error| FsError::from_io(&error))
+}
 /// Returns followed metadata. See `uv.fs_stat()` in `runtime/doc/luvref.txt`.
-pub fn stat(path: impl AsRef<Path>) -> FsResult<Stat> { fs::metadata(path).map(|m| stat_from_metadata(&m)).map_err(FsError::from_io) }
+///
+/// # Errors
+/// Returns [`FsError`] when metadata for `path` cannot be read, carrying the platform errno name (for example `ENOENT` or `EACCES`).
+pub fn stat(path: impl AsRef<Path>) -> FsResult<Stat> {
+    fs::metadata(path)
+        .map(|m| stat_from_metadata(&m))
+        .map_err(|error| FsError::from_io(&error))
+}
 /// Returns link metadata. See `uv.fs_lstat()` in `runtime/doc/luvref.txt`.
-pub fn lstat(path: impl AsRef<Path>) -> FsResult<Stat> { fs::symlink_metadata(path).map(|m| stat_from_metadata(&m)).map_err(FsError::from_io) }
+///
+/// # Errors
+/// Returns [`FsError`] when link metadata for `path` cannot be read, carrying the platform errno name (for example `ENOENT` or `ELOOP`).
+pub fn lstat(path: impl AsRef<Path>) -> FsResult<Stat> {
+    fs::symlink_metadata(path)
+        .map(|m| stat_from_metadata(&m))
+        .map_err(|error| FsError::from_io(&error))
+}
 /// Returns open-file metadata. See `uv.fs_fstat()` in `runtime/doc/luvref.txt`.
-pub fn fstat(handle: &FileHandle) -> FsResult<Stat> { handle.with_file(|f| f.metadata().map(|m| stat_from_metadata(&m))) }
+///
+/// # Errors
+/// Returns [`FsError`] with `EINVAL` if the handle is closed or locked, or when the underlying metadata read fails.
+pub fn fstat(handle: &FileHandle) -> FsResult<Stat> {
+    handle.with_file(|f| f.metadata().map(|m| stat_from_metadata(&m)))
+}
 /// Creates a hard link. See `uv.fs_link()` in `runtime/doc/luvref.txt`.
-pub fn link(existing: impl AsRef<Path>, new: impl AsRef<Path>) -> FsResult<()> { fs::hard_link(existing, new).map_err(FsError::from_io) }
+///
+/// # Errors
+/// Returns [`FsError`] when the hard link cannot be created, carrying the platform errno name (for example `EEXIST`, `ENOENT`, or `EXDEV`).
+pub fn link(existing: impl AsRef<Path>, new: impl AsRef<Path>) -> FsResult<()> {
+    fs::hard_link(existing, new).map_err(|error| FsError::from_io(&error))
+}
 /// Reads a symbolic link. See `uv.fs_readlink()` in `runtime/doc/luvref.txt`.
-pub fn readlink(path: impl AsRef<Path>) -> FsResult<PathBuf> { fs::read_link(path).map_err(FsError::from_io) }
+///
+/// # Errors
+/// Returns [`FsError`] when the link target cannot be read, carrying the platform errno name (for example `ENOENT` or `EINVAL`).
+pub fn readlink(path: impl AsRef<Path>) -> FsResult<PathBuf> {
+    fs::read_link(path).map_err(|error| FsError::from_io(&error))
+}
 /// Resolves a canonical path. See `uv.fs_realpath()` in `runtime/doc/luvref.txt`.
-pub fn realpath(path: impl AsRef<Path>) -> FsResult<PathBuf> { fs::canonicalize(path).map_err(FsError::from_io) }
+///
+/// # Errors
+/// Returns [`FsError`] when the path cannot be canonicalized, carrying the platform errno name (for example `ENOENT` or `ELOOP`).
+pub fn realpath(path: impl AsRef<Path>) -> FsResult<PathBuf> {
+    fs::canonicalize(path).map_err(|error| FsError::from_io(&error))
+}
 
 /// Creates a symbolic link. See `uv.fs_symlink()` in `runtime/doc/luvref.txt`.
-pub fn symlink(target: impl AsRef<Path>, link_path: impl AsRef<Path>, directory: bool) -> FsResult<()> {
-    #[cfg(unix)] { let _ = directory; std::os::unix::fs::symlink(target, link_path).map_err(FsError::from_io) }
-    #[cfg(windows)] { if directory { std::os::windows::fs::symlink_dir(target, link_path).map_err(FsError::from_io) } else { std::os::windows::fs::symlink_file(target, link_path).map_err(FsError::from_io) } }
-    #[cfg(not(any(unix, windows)))] { let _ = (target, link_path, directory); Err(FsError { name: "ENOSYS", message: "symbolic links are unsupported".into(), raw_os_error: None }) }
+///
+/// # Errors
+/// Returns [`FsError`] when the symbolic link cannot be created (or, on non-Unix/non-Windows platforms, an `ENOSYS` error, as symbolic links are unsupported there).
+pub fn symlink(
+    target: impl AsRef<Path>,
+    link_path: impl AsRef<Path>,
+    directory: bool,
+) -> FsResult<()> {
+    #[cfg(unix)]
+    {
+        let _ = directory;
+        std::os::unix::fs::symlink(target, link_path).map_err(|error| FsError::from_io(&error))
+    }
+    #[cfg(windows)]
+    {
+        if directory {
+            std::os::windows::fs::symlink_dir(target, link_path)
+                .map_err(|error| FsError::from_io(&error))
+        } else {
+            std::os::windows::fs::symlink_file(target, link_path)
+                .map_err(|error| FsError::from_io(&error))
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link_path, directory);
+        Err(FsError {
+            name: "ENOSYS",
+            message: "symbolic links are unsupported".into(),
+            raw_os_error: None,
+        })
+    }
 }
 
 /// Changes path permissions. See `uv.fs_chmod()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] when permissions cannot be changed, carrying the platform errno name (for example `ENOENT`, `EPERM`, or `EACCES`).
 pub fn chmod(path: impl AsRef<Path>, mode: u32) -> FsResult<()> {
-    #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(FsError::from_io) }
-    #[cfg(not(unix))] { let _ = (path, mode); Err(FsError { name: "ENOSYS", message: "chmod is unsupported".into(), raw_os_error: None }) }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .map_err(|error| FsError::from_io(&error))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Err(FsError {
+            name: "ENOSYS",
+            message: "chmod is unsupported".into(),
+            raw_os_error: None,
+        })
+    }
 }
 /// Changes file permissions. See `uv.fs_fchmod()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] with `EINVAL` if the handle is closed or locked, with the platform errno when setting permissions fails, or with `ENOSYS` where chmod is unsupported.
 pub fn fchmod(handle: &FileHandle, mode: u32) -> FsResult<()> {
-    #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; handle.with_file(|f| f.set_permissions(fs::Permissions::from_mode(mode))) }
-    #[cfg(not(unix))] { let _ = (handle, mode); Err(FsError { name: "ENOSYS", message: "fchmod is unsupported".into(), raw_os_error: None }) }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        handle.with_file(|f| f.set_permissions(fs::Permissions::from_mode(mode)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (handle, mode);
+        Err(FsError {
+            name: "ENOSYS",
+            message: "fchmod is unsupported".into(),
+            raw_os_error: None,
+        })
+    }
 }
 
 /// Changes path ownership on Unix. See `uv.fs_chown()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] with `EINVAL` when a UID/GID equals the all-ones sentinel, or carrying the platform errno when the ownership change fails.
 #[cfg(unix)]
 pub fn chown(path: impl AsRef<Path>, uid: Option<u32>, gid: Option<u32>) -> FsResult<()> {
     let (uid, gid) = ownership_ids(uid, gid)?;
-    rustix::fs::chown(path.as_ref(), uid, gid).map_err(|e| FsError::from_io(io::Error::from_raw_os_error(e.raw_os_error())))
+    rustix::fs::chown(path.as_ref(), uid, gid)
+        .map_err(|e| FsError::from_io(&io::Error::from_raw_os_error(e.raw_os_error())))
 }
 /// Changes open-file ownership on Unix. See `uv.fs_fchown()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] with `EINVAL` when a UID/GID equals the all-ones sentinel, the handle is closed or locked, or the ownership change fails.
 #[cfg(unix)]
 pub fn fchown(handle: &FileHandle, uid: Option<u32>, gid: Option<u32>) -> FsResult<()> {
     let (uid, gid) = ownership_ids(uid, gid)?;
-    handle.with_file(|file| rustix::fs::fchown(file, uid, gid).map_err(|e| io::Error::from_raw_os_error(e.raw_os_error())))
+    handle.with_file(|file| {
+        rustix::fs::fchown(file, uid, gid)
+            .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
+    })
 }
 /// Changes symlink ownership on Unix. See `uv.fs_lchown()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] with `EINVAL` when a UID/GID equals the all-ones sentinel, or carrying the platform errno when the symlink ownership change fails.
 #[cfg(unix)]
 pub fn lchown(path: impl AsRef<Path>, uid: Option<u32>, gid: Option<u32>) -> FsResult<()> {
     use rustix::fs::{AtFlags, CWD};
     let (uid, gid) = ownership_ids(uid, gid)?;
-    rustix::fs::chownat(CWD, path.as_ref(), uid, gid, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| FsError::from_io(io::Error::from_raw_os_error(e.raw_os_error())))
+    rustix::fs::chownat(CWD, path.as_ref(), uid, gid, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| FsError::from_io(&io::Error::from_raw_os_error(e.raw_os_error())))
 }
 
 /// Truncates a path. See `uv.fs_truncate()` in `runtime/doc/luvref.txt`.
-pub fn truncate(path: impl AsRef<Path>, length: u64) -> FsResult<()> { OpenOptions::new().write(true).open(path).and_then(|f| f.set_len(length)).map_err(FsError::from_io) }
+///
+/// # Errors
+/// Returns [`FsError`] when the file cannot be opened for writing or resized, carrying the platform errno name (for example `ENOENT` or `EACCES`).
+pub fn truncate(path: impl AsRef<Path>, length: u64) -> FsResult<()> {
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_len(length))
+        .map_err(|error| FsError::from_io(&error))
+}
 /// Truncates an open file. See `uv.fs_ftruncate()` in `runtime/doc/luvref.txt`.
-pub fn ftruncate(handle: &FileHandle, length: u64) -> FsResult<()> { handle.with_file(|f| f.set_len(length)) }
+///
+/// # Errors
+/// Returns [`FsError`] with `EINVAL` if the handle is closed or locked, or carrying the platform errno when resizing fails.
+pub fn ftruncate(handle: &FileHandle, length: u64) -> FsResult<()> {
+    handle.with_file(|f| f.set_len(length))
+}
 /// Flushes file contents and metadata. See `uv.fs_fsync()` in `runtime/doc/luvref.txt`.
-pub fn fsync(handle: &FileHandle) -> FsResult<()> { handle.with_file(File::sync_all) }
+///
+/// # Errors
+/// Returns [`FsError`] with `EINVAL` if the handle is closed or locked, or carrying the platform errno when the flush fails.
+pub fn fsync(handle: &FileHandle) -> FsResult<()> {
+    handle.with_file(File::sync_all)
+}
 /// Flushes file contents. See `uv.fs_fdatasync()` in `runtime/doc/luvref.txt`.
-pub fn fdatasync(handle: &FileHandle) -> FsResult<()> { handle.with_file(File::sync_data) }
+///
+/// # Errors
+/// Returns [`FsError`] with `EINVAL` if the handle is closed or locked, or carrying the platform errno when the flush fails.
+pub fn fdatasync(handle: &FileHandle) -> FsResult<()> {
+    handle.with_file(File::sync_data)
+}
 
 /// Tests requested access bits. See `uv.fs_access()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] when the access check cannot be performed, carrying the platform errno name (for example `ENOENT` or `EACCES`).
 pub fn access(path: impl AsRef<Path>, read: bool, write: bool, execute: bool) -> FsResult<bool> {
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use rustix::fs::Access;
         let mut requested = Access::EXISTS;
-        if read { requested |= Access::READ_OK; }
-        if write { requested |= Access::WRITE_OK; }
-        if execute { requested |= Access::EXEC_OK; }
-        rustix::fs::access(path.as_ref(), requested).map_err(|error| FsError::from_io(io::Error::from_raw_os_error(error.raw_os_error())))?;
+        if read {
+            requested |= Access::READ_OK;
+        }
+        if write {
+            requested |= Access::WRITE_OK;
+        }
+        if execute {
+            requested |= Access::EXEC_OK;
+        }
+        rustix::fs::access(path.as_ref(), requested).map_err(|error| {
+            FsError::from_io(&io::Error::from_raw_os_error(error.raw_os_error()))
+        })?;
         Ok(true)
     }
-    #[cfg(not(unix))] {
-        let metadata = fs::metadata(path).map_err(FsError::from_io)?;
+    #[cfg(not(unix))]
+    {
+        let metadata = fs::metadata(path).map_err(|error| FsError::from_io(&error))?;
         let _ = (read, execute);
-        if write && metadata.permissions().readonly() { Err(FsError { name: "EACCES", message: "path is read-only".into(), raw_os_error: None }) } else { Ok(true) }
+        if write && metadata.permissions().readonly() {
+            Err(FsError {
+                name: "EACCES",
+                message: "path is read-only".into(),
+                raw_os_error: None,
+            })
+        } else {
+            Ok(true)
+        }
     }
 }
 
 /// Returns filesystem capacity data. See `uv.fs_statfs()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] when filesystem capacity cannot be read, carrying the platform errno name, or an `ENOSYS` error where no safe backend exists.
 pub fn statfs(path: impl AsRef<Path>) -> FsResult<StatFs> {
-    #[cfg(unix)] {
-        let value = rustix::fs::statfs(path.as_ref()).map_err(|e| FsError::from_io(io::Error::from_raw_os_error(e.raw_os_error())))?;
-        Ok(StatFs { kind: value.f_type as u64, block_size: value.f_bsize as u64, blocks: value.f_blocks as u64, blocks_free: value.f_bfree as u64, blocks_available: value.f_bavail as u64, files: value.f_files as u64, files_free: value.f_ffree as u64 })
+    #[cfg(unix)]
+    {
+        let value = rustix::fs::statfs(path.as_ref())
+            .map_err(|e| FsError::from_io(&io::Error::from_raw_os_error(e.raw_os_error())))?;
+        Ok(StatFs {
+            kind: value.f_type.cast_unsigned(),
+            block_size: value.f_bsize.cast_unsigned(),
+            blocks: value.f_blocks,
+            blocks_free: value.f_bfree,
+            blocks_available: value.f_bavail,
+            files: value.f_files,
+            files_free: value.f_ffree,
+        })
     }
-    #[cfg(not(unix))] {
+    #[cfg(not(unix))]
+    {
         let _ = path;
-        Err(FsError { name: "ENOSYS", message: "statfs requires a safe platform backend".into(), raw_os_error: None })
+        Err(FsError {
+            name: "ENOSYS",
+            message: "statfs requires a safe platform backend".into(),
+            raw_os_error: None,
+        })
     }
 }
 
 /// Creates a sorted directory iterator. See `uv.fs_scandir()` in `runtime/doc/luvref.txt`.
-pub fn scandir(path: impl AsRef<Path>) -> FsResult<Scandir> { Ok(Scandir { entries: collect_entries(path)?.into_iter() }) }
+///
+/// # Errors
+/// Returns [`FsError`] when the directory cannot be read, carrying the platform errno name (for example `ENOENT` or `EACCES`).
+pub fn scandir(path: impl AsRef<Path>) -> FsResult<Scandir> {
+    Ok(Scandir {
+        entries: collect_entries(path)?.into_iter(),
+    })
+}
 /// Advances a scandir request. See `uv.fs_scandir_next()` in `runtime/doc/luvref.txt`.
-pub fn scandir_next(scan: &mut Scandir) -> Option<DirEntry> { scan.next() }
+pub fn scandir_next(scan: &mut Scandir) -> Option<DirEntry> {
+    scan.next()
+}
 /// Opens a directory stream. See `uv.fs_opendir()` in `runtime/doc/luvref.txt`.
-pub fn opendir(path: impl AsRef<Path>, entries: usize) -> FsResult<Directory> { Ok(Directory { entries: collect_entries(path)?, cursor: 0, batch_size: entries.max(1), closed: false }) }
+///
+/// # Errors
+/// Returns [`FsError`] when the directory cannot be read, carrying the platform errno name (for example `ENOENT` or `EACCES`).
+pub fn opendir(path: impl AsRef<Path>, entries: usize) -> FsResult<Directory> {
+    Ok(Directory {
+        entries: collect_entries(path)?,
+        cursor: 0,
+        batch_size: entries.max(1),
+        closed: false,
+    })
+}
 /// Reads the next directory batch. See `uv.fs_readdir()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] with `EINVAL` when the stream is closed or the cursor range is inconsistent.
 pub fn readdir(directory: &mut Directory) -> FsResult<Vec<DirEntry>> {
-    if directory.closed { return Err(FsError::invalid("directory handle is closed")); }
-    let end = directory.cursor.saturating_add(directory.batch_size).min(directory.entries.len());
-    let result = directory.entries[directory.cursor..end].to_vec(); directory.cursor = end; Ok(result)
+    if directory.closed {
+        return Err(FsError::invalid("directory handle is closed"));
+    }
+    let end = directory
+        .cursor
+        .saturating_add(directory.batch_size)
+        .min(directory.entries.len());
+    let result = directory.entries[directory.cursor..end].to_vec();
+    directory.cursor = end;
+    Ok(result)
 }
 /// Closes a directory stream. See `uv.fs_closedir()` in `runtime/doc/luvref.txt`.
-pub fn closedir(directory: &mut Directory) -> FsResult<()> { if directory.closed { Err(FsError::invalid("directory handle is already closed")) } else { directory.closed = true; Ok(()) } }
+///
+/// # Errors
+/// Returns [`FsError`] with `EINVAL` when the stream is already closed.
+pub fn closedir(directory: &mut Directory) -> FsResult<()> {
+    if directory.closed {
+        Err(FsError::invalid("directory handle is already closed"))
+    } else {
+        directory.closed = true;
+        Ok(())
+    }
+}
 
 /// Copies a file. See `uv.fs_copyfile()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] with `EEXIST` when `exclusive` is set and `to` already exists, or carrying the platform errno when the copy fails.
 pub fn copyfile(from: impl AsRef<Path>, to: impl AsRef<Path>, exclusive: bool) -> FsResult<u64> {
-    if exclusive && to.as_ref().exists() { return Err(FsError { name: "EEXIST", message: "destination exists".into(), raw_os_error: None }); }
-    fs::copy(from, to).map_err(FsError::from_io)
+    if exclusive && to.as_ref().exists() {
+        return Err(FsError {
+            name: "EEXIST",
+            message: "destination exists".into(),
+            raw_os_error: None,
+        });
+    }
+    fs::copy(from, to).map_err(|error| FsError::from_io(&error))
 }
 /// Creates a unique temporary directory from a trailing `XXXXXX` template. See `uv.fs_mkdtemp()` in `runtime/doc/luvref.txt`.
-pub fn mkdtemp(template: impl AsRef<Path>) -> FsResult<PathBuf> { create_temp(template.as_ref(), |path| fs::create_dir(path).map(|()| ())) }
+///
+/// # Errors
+/// Returns [`FsError`] when the template does not end in `XXXXXX` (with `EINVAL`), creation repeatedly collides (with `EEXIST`), or the underlying create fails.
+pub fn mkdtemp(template: impl AsRef<Path>) -> FsResult<PathBuf> {
+    create_temp(template.as_ref(), |path| fs::create_dir(path))
+}
 /// Creates a unique temporary file from a trailing `XXXXXX` template. See `uv.fs_mkstemp()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] when the template does not end in `XXXXXX` (with `EINVAL`), creation repeatedly collides (with `EEXIST`), or the underlying open fails.
 pub fn mkstemp(template: impl AsRef<Path>) -> FsResult<(FileHandle, PathBuf)> {
     let template = template.as_ref();
     let text = template.as_os_str().to_string_lossy();
-    if !text.ends_with("XXXXXX") { return Err(FsError::invalid("temporary path template must end in XXXXXX")); }
+    if !text.ends_with("XXXXXX") {
+        return Err(FsError::invalid(
+            "temporary path template must end in XXXXXX",
+        ));
+    }
     let prefix = &text[..text.len() - 6];
     for _ in 0..1024 {
         let candidate = temp_candidate(prefix);
-        match OpenOptions::new().read(true).write(true).create_new(true).open(&candidate) {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
             Ok(file) => return Ok((FileHandle::new(file), candidate)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
     }
-    Err(FsError { name: "EEXIST", message: "could not create a unique temporary file".into(), raw_os_error: None })
+    Err(FsError {
+        name: "EEXIST",
+        message: "could not create a unique temporary file".into(),
+        raw_os_error: None,
+    })
 }
 
 /// Updates followed path timestamps. See `uv.fs_utime()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] carrying the platform errno when updating the followed-path timestamps fails.
 #[cfg(unix)]
-pub fn utime(path: impl AsRef<Path>, atime: FsTime, mtime: FsTime) -> FsResult<()> { set_times_at(path.as_ref(), atime, mtime, false) }
+pub fn utime(path: impl AsRef<Path>, atime: FsTime, mtime: FsTime) -> FsResult<()> {
+    set_times_at(path.as_ref(), atime, mtime, false)
+}
 /// Updates symlink timestamps. See `uv.fs_lutime()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] carrying the platform errno when updating the symlink timestamps fails.
 #[cfg(unix)]
-pub fn lutime(path: impl AsRef<Path>, atime: FsTime, mtime: FsTime) -> FsResult<()> { set_times_at(path.as_ref(), atime, mtime, true) }
+pub fn lutime(path: impl AsRef<Path>, atime: FsTime, mtime: FsTime) -> FsResult<()> {
+    set_times_at(path.as_ref(), atime, mtime, true)
+}
 /// Updates open-file timestamps. See `uv.fs_futime()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] with `EINVAL` if the handle is closed or locked, or carrying the platform errno when the update fails.
 #[cfg(unix)]
 pub fn futime(handle: &FileHandle, atime: FsTime, mtime: FsTime) -> FsResult<()> {
-    use rustix::fs::{Timestamps, futimens}; use rustix::time::Timespec;
-    handle.with_file(|file| futimens(file, &Timestamps { last_access: Timespec { tv_sec: atime.sec, tv_nsec: i64::from(atime.nsec) }, last_modification: Timespec { tv_sec: mtime.sec, tv_nsec: i64::from(mtime.nsec) } }).map_err(|e| io::Error::from_raw_os_error(e.raw_os_error())))
+    use rustix::fs::{Timestamps, futimens};
+    use rustix::time::Timespec;
+    handle.with_file(|file| {
+        futimens(
+            file,
+            &Timestamps {
+                last_access: Timespec {
+                    tv_sec: atime.sec,
+                    tv_nsec: i64::from(atime.nsec),
+                },
+                last_modification: Timespec {
+                    tv_sec: mtime.sec,
+                    tv_nsec: i64::from(mtime.nsec),
+                },
+            },
+        )
+        .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
+    })
 }
 
 /// Copies a range between open files. See `uv.fs_sendfile()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`FsError`] when the handle is closed or locked (`EINVAL`) or when reading from `input` or writing to `out` fails; a zero-byte write surfaces as `EIO`.
 pub fn sendfile(out: &FileHandle, input: &FileHandle, offset: u64, size: usize) -> FsResult<usize> {
-    let mut copied = 0usize; let mut buffer = vec![0u8; size.min(64 * 1024)];
+    let mut copied = 0usize;
+    let mut buffer = vec![0u8; size.min(64 * 1024)];
     while copied < size {
         let wanted = buffer.len().min(size - copied);
-        let count = input.with_file(|f| read_at(f, &mut buffer[..wanted], offset + copied as u64))?;
-        if count == 0 { break; }
+        let copied_offset = u64::try_from(copied)
+            .map_err(|_| FsError::invalid("sendfile offset exceeds the 64-bit range"))?;
+        let count =
+            input.with_file(|f| read_at(f, &mut buffer[..wanted], offset + copied_offset))?;
+        if count == 0 {
+            break;
+        }
         let mut written = 0;
         while written < count {
             let count_written = out.with_file(|f| (&*f).write(&buffer[written..count]))?;
-            if count_written == 0 { return Err(FsError::from_io(io::Error::from(io::ErrorKind::WriteZero))); }
+            if count_written == 0 {
+                return Err(FsError::from_io(&io::Error::from(io::ErrorKind::WriteZero)));
+            }
             written += count_written;
         }
         copied += count;
@@ -486,146 +885,961 @@ pub fn sendfile(out: &FileHandle, input: &FileHandle, offset: u64, size: usize) 
 }
 
 /// Runs open on the pool. See `uv.fs_open()` in `runtime/doc/luvref.txt`.
-pub fn open_async<P, C>(pool: &Pool, poster: P, path: PathBuf, flags: OpenFlags, mode: u32, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<FileHandle>) + Send + 'static { run_async(pool, poster, move || open(path, flags, mode), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn open_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    flags: OpenFlags,
+    mode: u32,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<FileHandle>) + Send + 'static,
+{
+    run_async(pool, poster, move || open(path, flags, mode), callback)
+}
 /// Runs close on the pool. See `uv.fs_close()` in `runtime/doc/luvref.txt`.
-pub fn close_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || close(&handle), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn close_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    handle: FileHandle,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || close(&handle), callback)
+}
 /// Runs read on the pool. See `uv.fs_read()` in `runtime/doc/luvref.txt`.
-pub fn read_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, size: usize, offset: Option<u64>, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<Vec<u8>>) + Send + 'static { run_async(pool, poster, move || read(&handle, size, offset), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn read_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    handle: FileHandle,
+    size: usize,
+    offset: Option<u64>,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<Vec<u8>>) + Send + 'static,
+{
+    run_async(pool, poster, move || read(&handle, size, offset), callback)
+}
 /// Runs write on the pool. See `uv.fs_write()` in `runtime/doc/luvref.txt`.
-pub fn write_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, data: Vec<u8>, offset: Option<u64>, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<usize>) + Send + 'static { run_async(pool, poster, move || write(&handle, &data, offset), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn write_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    handle: FileHandle,
+    data: Vec<u8>,
+    offset: Option<u64>,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<usize>) + Send + 'static,
+{
+    run_async(
+        pool,
+        poster,
+        move || write(&handle, &data, offset),
+        callback,
+    )
+}
 /// Runs a vectored read on the pool. See `uv.fs_read()` in `runtime/doc/luvref.txt`.
-pub fn readv_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, sizes: Vec<usize>, offset: Option<u64>, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<Vec<Vec<u8>>>) + Send + 'static { run_async(pool, poster, move || readv(&handle, &sizes, offset), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn readv_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    handle: FileHandle,
+    sizes: Vec<usize>,
+    offset: Option<u64>,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<Vec<Vec<u8>>>) + Send + 'static,
+{
+    run_async(
+        pool,
+        poster,
+        move || readv(&handle, &sizes, offset),
+        callback,
+    )
+}
 /// Runs a vectored write on the pool. See `uv.fs_write()` in `runtime/doc/luvref.txt`.
-pub fn writev_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, buffers: Vec<Vec<u8>>, offset: Option<u64>, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<usize>) + Send + 'static { run_async(pool, poster, move || writev(&handle, &buffers, offset), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn writev_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    handle: FileHandle,
+    buffers: Vec<Vec<u8>>,
+    offset: Option<u64>,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<usize>) + Send + 'static,
+{
+    run_async(
+        pool,
+        poster,
+        move || writev(&handle, &buffers, offset),
+        callback,
+    )
+}
 /// Runs mkdir on the pool. See `uv.fs_mkdir()` in `runtime/doc/luvref.txt`.
-pub fn mkdir_async<P, C>(pool: &Pool, poster: P, path: PathBuf, mode: u32, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || mkdir(path, mode), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn mkdir_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    mode: u32,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || mkdir(path, mode), callback)
+}
 /// Runs rmdir on the pool. See `uv.fs_rmdir()` in `runtime/doc/luvref.txt`.
-pub fn rmdir_async<P, C>(pool: &Pool, poster: P, path: PathBuf, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || rmdir(path), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn rmdir_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || rmdir(path), callback)
+}
 /// Runs unlink on the pool. See `uv.fs_unlink()` in `runtime/doc/luvref.txt`.
-pub fn unlink_async<P, C>(pool: &Pool, poster: P, path: PathBuf, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || unlink(path), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn unlink_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || unlink(path), callback)
+}
 /// Runs rename on the pool. See `uv.fs_rename()` in `runtime/doc/luvref.txt`.
-pub fn rename_async<P, C>(pool: &Pool, poster: P, from: PathBuf, to: PathBuf, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || rename(from, to), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn rename_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    from: PathBuf,
+    to: PathBuf,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || rename(from, to), callback)
+}
 /// Runs stat on the pool. See `uv.fs_stat()` in `runtime/doc/luvref.txt`.
-pub fn stat_async<P, C>(pool: &Pool, poster: P, path: PathBuf, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<Stat>) + Send + 'static { run_async(pool, poster, move || stat(path), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn stat_async<P, C>(pool: &Pool, poster: P, path: PathBuf, callback: C) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<Stat>) + Send + 'static,
+{
+    run_async(pool, poster, move || stat(path), callback)
+}
 /// Runs lstat on the pool. See `uv.fs_lstat()` in `runtime/doc/luvref.txt`.
-pub fn lstat_async<P, C>(pool: &Pool, poster: P, path: PathBuf, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<Stat>) + Send + 'static { run_async(pool, poster, move || lstat(path), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn lstat_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<Stat>) + Send + 'static,
+{
+    run_async(pool, poster, move || lstat(path), callback)
+}
 /// Runs fstat on the pool. See `uv.fs_fstat()` in `runtime/doc/luvref.txt`.
-pub fn fstat_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<Stat>) + Send + 'static { run_async(pool, poster, move || fstat(&handle), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn fstat_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    handle: FileHandle,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<Stat>) + Send + 'static,
+{
+    run_async(pool, poster, move || fstat(&handle), callback)
+}
 /// Runs link on the pool. See `uv.fs_link()` in `runtime/doc/luvref.txt`.
-pub fn link_async<P, C>(pool: &Pool, poster: P, from: PathBuf, to: PathBuf, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || link(from, to), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn link_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    from: PathBuf,
+    to: PathBuf,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || link(from, to), callback)
+}
 /// Runs readlink on the pool. See `uv.fs_readlink()` in `runtime/doc/luvref.txt`.
-pub fn readlink_async<P, C>(pool: &Pool, poster: P, path: PathBuf, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<PathBuf>) + Send + 'static { run_async(pool, poster, move || readlink(path), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn readlink_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<PathBuf>) + Send + 'static,
+{
+    run_async(pool, poster, move || readlink(path), callback)
+}
 /// Runs realpath on the pool. See `uv.fs_realpath()` in `runtime/doc/luvref.txt`.
-pub fn realpath_async<P, C>(pool: &Pool, poster: P, path: PathBuf, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<PathBuf>) + Send + 'static { run_async(pool, poster, move || realpath(path), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn realpath_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<PathBuf>) + Send + 'static,
+{
+    run_async(pool, poster, move || realpath(path), callback)
+}
 /// Runs symlink on the pool. See `uv.fs_symlink()` in `runtime/doc/luvref.txt`.
-pub fn symlink_async<P, C>(pool: &Pool, poster: P, target: PathBuf, path: PathBuf, directory: bool, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || symlink(target, path, directory), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn symlink_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    target: PathBuf,
+    path: PathBuf,
+    directory: bool,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(
+        pool,
+        poster,
+        move || symlink(target, path, directory),
+        callback,
+    )
+}
 /// Runs chmod on the pool. See `uv.fs_chmod()` in `runtime/doc/luvref.txt`.
-pub fn chmod_async<P, C>(pool: &Pool, poster: P, path: PathBuf, mode: u32, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || chmod(path, mode), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn chmod_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    mode: u32,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || chmod(path, mode), callback)
+}
 /// Runs fchmod on the pool. See `uv.fs_fchmod()` in `runtime/doc/luvref.txt`.
-pub fn fchmod_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, mode: u32, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || fchmod(&handle, mode), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn fchmod_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    handle: FileHandle,
+    mode: u32,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || fchmod(&handle, mode), callback)
+}
 /// Runs chown on the pool. See `uv.fs_chown()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
 #[cfg(unix)]
-pub fn chown_async<P, C>(pool: &Pool, poster: P, path: PathBuf, uid: Option<u32>, gid: Option<u32>, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || chown(path, uid, gid), callback) }
+pub fn chown_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || chown(path, uid, gid), callback)
+}
 /// Runs fchown on the pool. See `uv.fs_fchown()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
 #[cfg(unix)]
-pub fn fchown_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, uid: Option<u32>, gid: Option<u32>, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || fchown(&handle, uid, gid), callback) }
+pub fn fchown_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    handle: FileHandle,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || fchown(&handle, uid, gid), callback)
+}
 /// Runs lchown on the pool. See `uv.fs_lchown()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
 #[cfg(unix)]
-pub fn lchown_async<P, C>(pool: &Pool, poster: P, path: PathBuf, uid: Option<u32>, gid: Option<u32>, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || lchown(path, uid, gid), callback) }
+pub fn lchown_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || lchown(path, uid, gid), callback)
+}
 /// Runs truncate on the pool. See `uv.fs_truncate()` in `runtime/doc/luvref.txt`.
-pub fn truncate_async<P, C>(pool: &Pool, poster: P, path: PathBuf, length: u64, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || truncate(path, length), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn truncate_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    length: u64,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || truncate(path, length), callback)
+}
 /// Runs ftruncate on the pool. See `uv.fs_ftruncate()` in `runtime/doc/luvref.txt`.
-pub fn ftruncate_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, length: u64, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || ftruncate(&handle, length), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn ftruncate_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    handle: FileHandle,
+    length: u64,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || ftruncate(&handle, length), callback)
+}
 /// Runs fsync on the pool. See `uv.fs_fsync()` in `runtime/doc/luvref.txt`.
-pub fn fsync_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || fsync(&handle), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn fsync_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    handle: FileHandle,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || fsync(&handle), callback)
+}
 /// Runs fdatasync on the pool. See `uv.fs_fdatasync()` in `runtime/doc/luvref.txt`.
-pub fn fdatasync_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || fdatasync(&handle), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn fdatasync_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    handle: FileHandle,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || fdatasync(&handle), callback)
+}
 /// Runs access on the pool. See `uv.fs_access()` in `runtime/doc/luvref.txt`.
-pub fn access_async<P, C>(pool: &Pool, poster: P, path: PathBuf, read_ok: bool, write_ok: bool, execute_ok: bool, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<bool>) + Send + 'static { run_async(pool, poster, move || access(path, read_ok, write_ok, execute_ok), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn access_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    read_ok: bool,
+    write_ok: bool,
+    execute_ok: bool,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<bool>) + Send + 'static,
+{
+    run_async(
+        pool,
+        poster,
+        move || access(path, read_ok, write_ok, execute_ok),
+        callback,
+    )
+}
 /// Runs statfs on the pool. See `uv.fs_statfs()` in `runtime/doc/luvref.txt`.
-pub fn statfs_async<P, C>(pool: &Pool, poster: P, path: PathBuf, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<StatFs>) + Send + 'static { run_async(pool, poster, move || statfs(path), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn statfs_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<StatFs>) + Send + 'static,
+{
+    run_async(pool, poster, move || statfs(path), callback)
+}
 /// Runs scandir on the pool. See `uv.fs_scandir()` in `runtime/doc/luvref.txt`.
-pub fn scandir_async<P, C>(pool: &Pool, poster: P, path: PathBuf, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<Scandir>) + Send + 'static { run_async(pool, poster, move || scandir(path), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn scandir_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<Scandir>) + Send + 'static,
+{
+    run_async(pool, poster, move || scandir(path), callback)
+}
 /// Runs opendir on the pool. See `uv.fs_opendir()` in `runtime/doc/luvref.txt`.
-pub fn opendir_async<P, C>(pool: &Pool, poster: P, path: PathBuf, entries: usize, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<Directory>) + Send + 'static { run_async(pool, poster, move || opendir(path, entries), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn opendir_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    entries: usize,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<Directory>) + Send + 'static,
+{
+    run_async(pool, poster, move || opendir(path, entries), callback)
+}
 /// Runs readdir on the pool while preserving stream ownership. See `uv.fs_readdir()` in `runtime/doc/luvref.txt`.
-pub fn readdir_async<P, C>(pool: &Pool, poster: P, mut directory: Directory, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<(Directory, Vec<DirEntry>)>) + Send + 'static { run_async(pool, poster, move || { let entries = readdir(&mut directory)?; Ok((directory, entries)) }, callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn readdir_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    mut directory: Directory,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<(Directory, Vec<DirEntry>)>) + Send + 'static,
+{
+    run_async(
+        pool,
+        poster,
+        move || {
+            let entries = readdir(&mut directory)?;
+            Ok((directory, entries))
+        },
+        callback,
+    )
+}
 /// Runs closedir on the pool. See `uv.fs_closedir()` in `runtime/doc/luvref.txt`.
-pub fn closedir_async<P, C>(pool: &Pool, poster: P, mut directory: Directory, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || closedir(&mut directory), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn closedir_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    mut directory: Directory,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || closedir(&mut directory), callback)
+}
 /// Runs copyfile on the pool. See `uv.fs_copyfile()` in `runtime/doc/luvref.txt`.
-pub fn copyfile_async<P, C>(pool: &Pool, poster: P, from: PathBuf, to: PathBuf, exclusive: bool, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<u64>) + Send + 'static { run_async(pool, poster, move || copyfile(from, to, exclusive), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn copyfile_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    from: PathBuf,
+    to: PathBuf,
+    exclusive: bool,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<u64>) + Send + 'static,
+{
+    run_async(
+        pool,
+        poster,
+        move || copyfile(from, to, exclusive),
+        callback,
+    )
+}
 /// Runs mkdtemp on the pool. See `uv.fs_mkdtemp()` in `runtime/doc/luvref.txt`.
-pub fn mkdtemp_async<P, C>(pool: &Pool, poster: P, template: PathBuf, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<PathBuf>) + Send + 'static { run_async(pool, poster, move || mkdtemp(template), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn mkdtemp_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    template: PathBuf,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<PathBuf>) + Send + 'static,
+{
+    run_async(pool, poster, move || mkdtemp(template), callback)
+}
 /// Runs mkstemp on the pool. See `uv.fs_mkstemp()` in `runtime/doc/luvref.txt`.
-pub fn mkstemp_async<P, C>(pool: &Pool, poster: P, template: PathBuf, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<(FileHandle, PathBuf)>) + Send + 'static { run_async(pool, poster, move || mkstemp(template), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn mkstemp_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    template: PathBuf,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<(FileHandle, PathBuf)>) + Send + 'static,
+{
+    run_async(pool, poster, move || mkstemp(template), callback)
+}
 /// Runs sendfile on the pool. See `uv.fs_sendfile()` in `runtime/doc/luvref.txt`.
-pub fn sendfile_async<P, C>(pool: &Pool, poster: P, out: FileHandle, input: FileHandle, offset: u64, size: usize, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<usize>) + Send + 'static { run_async(pool, poster, move || sendfile(&out, &input, offset, size), callback) }
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn sendfile_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    out: FileHandle,
+    input: FileHandle,
+    offset: u64,
+    size: usize,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<usize>) + Send + 'static,
+{
+    run_async(
+        pool,
+        poster,
+        move || sendfile(&out, &input, offset, size),
+        callback,
+    )
+}
 /// Runs utime on the pool. See `uv.fs_utime()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
 #[cfg(unix)]
-pub fn utime_async<P, C>(pool: &Pool, poster: P, path: PathBuf, atime: FsTime, mtime: FsTime, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || utime(path, atime, mtime), callback) }
+pub fn utime_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    atime: FsTime,
+    mtime: FsTime,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || utime(path, atime, mtime), callback)
+}
 /// Runs lutime on the pool. See `uv.fs_lutime()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
 #[cfg(unix)]
-pub fn lutime_async<P, C>(pool: &Pool, poster: P, path: PathBuf, atime: FsTime, mtime: FsTime, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || lutime(path, atime, mtime), callback) }
+pub fn lutime_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    path: PathBuf,
+    atime: FsTime,
+    mtime: FsTime,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(pool, poster, move || lutime(path, atime, mtime), callback)
+}
 /// Runs futime on the pool. See `uv.fs_futime()` in `runtime/doc/luvref.txt`.
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
 #[cfg(unix)]
-pub fn futime_async<P, C>(pool: &Pool, poster: P, handle: FileHandle, atime: FsTime, mtime: FsTime, callback: C) -> Result<(), PoolError> where P: LoopPoster, C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static { run_async(pool, poster, move || futime(&handle, atime, mtime), callback) }
+pub fn futime_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    handle: FileHandle,
+    atime: FsTime,
+    mtime: FsTime,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, FsResult<()>) + Send + 'static,
+{
+    run_async(
+        pool,
+        poster,
+        move || futime(&handle, atime, mtime),
+        callback,
+    )
+}
 
 /// Runs any owned filesystem operation on the pool and posts its callback.
 /// See `luv-file-system-operations` in `runtime/doc/luvref.txt`.
-pub fn run_async<P, W, C, T>(pool: &Pool, poster: P, operation: W, callback: C) -> Result<(), PoolError>
-where P: LoopPoster, W: FnOnce() -> FsResult<T> + Send + 'static, C: FnOnce(&mut UvLoop, FsResult<T>) + Send + 'static, T: Send + 'static {
-    pool.submit(poster, operation, move |uv_loop, result| callback(uv_loop, result.unwrap_or_else(|error| Err(FsError::pool(error)))))
+///
+/// # Errors
+/// Returns [`PoolError`] when the pool cannot accept the operation; operation failures are delivered through the callback as [`FsError`].
+pub fn run_async<P, W, C, T>(
+    pool: &Pool,
+    poster: P,
+    operation: W,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    W: FnOnce() -> FsResult<T> + Send + 'static,
+    C: FnOnce(&mut UvLoop, FsResult<T>) + Send + 'static,
+    T: Send + 'static,
+{
+    pool.submit(poster, operation, move |uv_loop, result| {
+        callback(
+            uv_loop,
+            result.unwrap_or_else(|error| Err(FsError::pool(&error))),
+        );
+    })
 }
 
 fn collect_entries(path: impl AsRef<Path>) -> FsResult<Vec<DirEntry>> {
     let mut entries = Vec::new();
-    for entry in fs::read_dir(path).map_err(FsError::from_io)? { let entry = entry.map_err(FsError::from_io)?; let kind = entry.file_type().map(classify_file_type).unwrap_or(DirEntryType::Unknown); entries.push(DirEntry { name: entry.file_name().to_string_lossy().into_owned(), kind }); }
-    entries.sort_by(|left, right| left.name.cmp(&right.name)); Ok(entries)
+    for entry in fs::read_dir(path).map_err(|error| FsError::from_io(&error))? {
+        let entry = entry.map_err(|error| FsError::from_io(&error))?;
+        let kind = entry
+            .file_type()
+            .map_or(DirEntryType::Unknown, classify_file_type);
+        entries.push(DirEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            kind,
+        });
+    }
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(entries)
 }
 #[cfg(unix)]
 fn classify_file_type(kind: fs::FileType) -> DirEntryType {
     use std::os::unix::fs::FileTypeExt;
-    if kind.is_file() { DirEntryType::File } else if kind.is_dir() { DirEntryType::Directory } else if kind.is_symlink() { DirEntryType::Symlink } else if kind.is_fifo() { DirEntryType::Fifo } else if kind.is_socket() { DirEntryType::Socket } else if kind.is_char_device() { DirEntryType::Character } else if kind.is_block_device() { DirEntryType::Block } else { DirEntryType::Unknown }
+    if kind.is_file() {
+        DirEntryType::File
+    } else if kind.is_dir() {
+        DirEntryType::Directory
+    } else if kind.is_symlink() {
+        DirEntryType::Symlink
+    } else if kind.is_fifo() {
+        DirEntryType::Fifo
+    } else if kind.is_socket() {
+        DirEntryType::Socket
+    } else if kind.is_char_device() {
+        DirEntryType::Character
+    } else if kind.is_block_device() {
+        DirEntryType::Block
+    } else {
+        DirEntryType::Unknown
+    }
 }
 #[cfg(not(unix))]
-fn classify_file_type(kind: fs::FileType) -> DirEntryType { if kind.is_file() { DirEntryType::File } else if kind.is_dir() { DirEntryType::Directory } else if kind.is_symlink() { DirEntryType::Symlink } else { DirEntryType::Unknown } }
+fn classify_file_type(kind: fs::FileType) -> DirEntryType {
+    if kind.is_file() {
+        DirEntryType::File
+    } else if kind.is_dir() {
+        DirEntryType::Directory
+    } else if kind.is_symlink() {
+        DirEntryType::Symlink
+    } else {
+        DirEntryType::Unknown
+    }
+}
 fn create_temp<T>(template: &Path, create: impl Fn(&Path) -> io::Result<T>) -> FsResult<PathBuf> {
-    let text = template.as_os_str().to_string_lossy(); if !text.ends_with("XXXXXX") { return Err(FsError::invalid("temporary path template must end in XXXXXX")); }
+    let text = template.as_os_str().to_string_lossy();
+    if !text.ends_with("XXXXXX") {
+        return Err(FsError::invalid(
+            "temporary path template must end in XXXXXX",
+        ));
+    }
     let prefix = &text[..text.len() - 6];
-    for _ in 0..1024 { let candidate = temp_candidate(prefix); match create(&candidate) { Ok(_) => return Ok(candidate), Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue, Err(error) => return Err(error.into()) } }
-    Err(FsError { name: "EEXIST", message: "could not create a unique temporary path".into(), raw_os_error: None })
+    for _ in 0..1024 {
+        let candidate = temp_candidate(prefix);
+        match create(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(FsError {
+        name: "EEXIST",
+        message: "could not create a unique temporary path".into(),
+        raw_os_error: None,
+    })
 }
 fn temp_candidate(prefix: &str) -> PathBuf {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_nanos();
-    PathBuf::from(format!("{prefix}{:06x}", (stamp ^ u128::from(sequence) ^ u128::from(std::process::id())) & 0xff_ffff))
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos();
+    PathBuf::from(format!(
+        "{prefix}{:06x}",
+        (stamp ^ u128::from(sequence) ^ u128::from(std::process::id())) & 0xff_ffff
+    ))
 }
 
 #[cfg(unix)]
-fn read_at(file: &File, data: &mut [u8], offset: u64) -> io::Result<usize> { use std::os::unix::fs::FileExt; file.read_at(data, offset) }
+fn read_at(file: &File, data: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(data, offset)
+}
 #[cfg(windows)]
-fn read_at(file: &File, data: &mut [u8], offset: u64) -> io::Result<usize> { use std::os::windows::fs::FileExt; file.seek_read(data, offset) }
+fn read_at(file: &File, data: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(data, offset)
+}
 #[cfg(not(any(unix, windows)))]
-fn read_at(file: &File, data: &mut [u8], offset: u64) -> io::Result<usize> { let mut file = file.try_clone()?; file.seek(SeekFrom::Start(offset))?; file.read(data) }
+fn read_at(file: &File, data: &mut [u8], offset: u64) -> io::Result<usize> {
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.read(data)
+}
 #[cfg(unix)]
-fn write_at(file: &File, data: &[u8], offset: u64) -> io::Result<usize> { use std::os::unix::fs::FileExt; file.write_at(data, offset) }
+fn write_at(file: &File, data: &[u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.write_at(data, offset)
+}
 #[cfg(windows)]
-fn write_at(file: &File, data: &[u8], offset: u64) -> io::Result<usize> { use std::os::windows::fs::FileExt; file.seek_write(data, offset) }
+fn write_at(file: &File, data: &[u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_write(data, offset)
+}
 #[cfg(not(any(unix, windows)))]
-fn write_at(file: &File, data: &[u8], offset: u64) -> io::Result<usize> { let mut file = file.try_clone()?; file.seek(SeekFrom::Start(offset))?; file.write(data) }
+fn write_at(file: &File, data: &[u8], offset: u64) -> io::Result<usize> {
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write(data)
+}
 
 #[cfg(unix)]
-fn stat_from_metadata(m: &Metadata) -> Stat { use std::os::unix::fs::MetadataExt; Stat { dev: m.dev(), mode: m.mode(), nlink: m.nlink(), uid: m.uid(), gid: m.gid(), rdev: m.rdev(), ino: m.ino(), size: m.size(), blksize: m.blksize(), blocks: m.blocks(), flags: 0, r#gen: 0, atime: FsTime { sec: m.atime(), nsec: m.atime_nsec().try_into().unwrap_or(0) }, mtime: FsTime { sec: m.mtime(), nsec: m.mtime_nsec().try_into().unwrap_or(0) }, ctime: FsTime { sec: m.ctime(), nsec: m.ctime_nsec().try_into().unwrap_or(0) }, birthtime: system_time(m.created().ok()) } }
+fn stat_from_metadata(m: &Metadata) -> Stat {
+    use std::os::unix::fs::MetadataExt;
+    Stat {
+        dev: m.dev(),
+        mode: m.mode(),
+        nlink: m.nlink(),
+        uid: m.uid(),
+        gid: m.gid(),
+        rdev: m.rdev(),
+        ino: m.ino(),
+        size: m.size(),
+        blksize: m.blksize(),
+        blocks: m.blocks(),
+        flags: 0,
+        r#gen: 0,
+        atime: FsTime {
+            sec: m.atime(),
+            nsec: m.atime_nsec().try_into().unwrap_or(0),
+        },
+        mtime: FsTime {
+            sec: m.mtime(),
+            nsec: m.mtime_nsec().try_into().unwrap_or(0),
+        },
+        ctime: FsTime {
+            sec: m.ctime(),
+            nsec: m.ctime_nsec().try_into().unwrap_or(0),
+        },
+        birthtime: system_time(m.created().ok()),
+    }
+}
 #[cfg(not(unix))]
-fn stat_from_metadata(m: &Metadata) -> Stat { Stat { dev: 0, mode: 0, nlink: 0, uid: 0, gid: 0, rdev: 0, ino: 0, size: m.len(), blksize: 0, blocks: 0, flags: 0, r#gen: 0, atime: system_time(m.accessed().ok()), mtime: system_time(m.modified().ok()), ctime: FsTime { sec: 0, nsec: 0 }, birthtime: system_time(m.created().ok()) } }
-fn system_time(value: Option<SystemTime>) -> FsTime { let duration = value.and_then(|v| v.duration_since(UNIX_EPOCH).ok()).unwrap_or(Duration::ZERO); FsTime { sec: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX), nsec: duration.subsec_nanos() } }
+fn stat_from_metadata(m: &Metadata) -> Stat {
+    Stat {
+        dev: 0,
+        mode: 0,
+        nlink: 0,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        ino: 0,
+        size: m.len(),
+        blksize: 0,
+        blocks: 0,
+        flags: 0,
+        r#gen: 0,
+        atime: system_time(m.accessed().ok()),
+        mtime: system_time(m.modified().ok()),
+        ctime: FsTime { sec: 0, nsec: 0 },
+        birthtime: system_time(m.created().ok()),
+    }
+}
+fn system_time(value: Option<SystemTime>) -> FsTime {
+    let duration = value
+        .and_then(|v| v.duration_since(UNIX_EPOCH).ok())
+        .unwrap_or(Duration::ZERO);
+    FsTime {
+        sec: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+        nsec: duration.subsec_nanos(),
+    }
+}
 
 #[cfg(unix)]
-fn set_times_at(path: &Path, atime: FsTime, mtime: FsTime, nofollow: bool) -> FsResult<()> { use rustix::fs::{AtFlags, CWD, Timestamps, utimensat}; use rustix::time::Timespec; let flags = if nofollow { AtFlags::SYMLINK_NOFOLLOW } else { AtFlags::empty() }; utimensat(CWD, path, &Timestamps { last_access: Timespec { tv_sec: atime.sec, tv_nsec: i64::from(atime.nsec) }, last_modification: Timespec { tv_sec: mtime.sec, tv_nsec: i64::from(mtime.nsec) } }, flags).map_err(|e| FsError::from_io(io::Error::from_raw_os_error(e.raw_os_error()))) }
+fn set_times_at(path: &Path, atime: FsTime, mtime: FsTime, nofollow: bool) -> FsResult<()> {
+    use rustix::fs::{AtFlags, CWD, Timestamps, utimensat};
+    use rustix::time::Timespec;
+    let flags = if nofollow {
+        AtFlags::SYMLINK_NOFOLLOW
+    } else {
+        AtFlags::empty()
+    };
+    utimensat(
+        CWD,
+        path,
+        &Timestamps {
+            last_access: Timespec {
+                tv_sec: atime.sec,
+                tv_nsec: i64::from(atime.nsec),
+            },
+            last_modification: Timespec {
+                tv_sec: mtime.sec,
+                tv_nsec: i64::from(mtime.nsec),
+            },
+        },
+        flags,
+    )
+    .map_err(|e| FsError::from_io(&io::Error::from_raw_os_error(e.raw_os_error())))
+}
 #[cfg(unix)]
-fn ownership_ids(uid: Option<u32>, gid: Option<u32>) -> FsResult<(Option<rustix::fs::Uid>, Option<rustix::fs::Gid>)> {
-    if uid == Some(u32::MAX) || gid == Some(u32::MAX) { return Err(FsError::invalid("UID and GID must not be the all-ones sentinel")); }
-    Ok((uid.map(rustix::fs::Uid::from_raw), gid.map(rustix::fs::Gid::from_raw)))
+fn ownership_ids(
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> FsResult<(Option<rustix::fs::Uid>, Option<rustix::fs::Gid>)> {
+    if uid == Some(u32::MAX) || gid == Some(u32::MAX) {
+        return Err(FsError::invalid(
+            "UID and GID must not be the all-ones sentinel",
+        ));
+    }
+    Ok((
+        uid.map(rustix::fs::Uid::from_raw),
+        gid.map(rustix::fs::Gid::from_raw),
+    ))
 }
 
 fn errno_name(raw: Option<i32>, kind: io::ErrorKind) -> &'static str {
@@ -633,23 +1847,47 @@ fn errno_name(raw: Option<i32>, kind: io::ErrorKind) -> &'static str {
     if let Some(raw) = raw {
         use rustix::io::Errno;
         let names = [
-            (Errno::PERM, "EPERM"), (Errno::NOENT, "ENOENT"), (Errno::INTR, "EINTR"),
-            (Errno::IO, "EIO"), (Errno::BADF, "EBADF"), (Errno::AGAIN, "EAGAIN"),
-            (Errno::NOMEM, "ENOMEM"), (Errno::ACCESS, "EACCES"), (Errno::EXIST, "EEXIST"),
-            (Errno::XDEV, "EXDEV"), (Errno::NOTDIR, "ENOTDIR"), (Errno::ISDIR, "EISDIR"),
-            (Errno::INVAL, "EINVAL"), (Errno::NFILE, "ENFILE"), (Errno::MFILE, "EMFILE"),
-            (Errno::FBIG, "EFBIG"), (Errno::NOSPC, "ENOSPC"), (Errno::ROFS, "EROFS"),
-            (Errno::PIPE, "EPIPE"), (Errno::NAMETOOLONG, "ENAMETOOLONG"),
-            (Errno::NOTEMPTY, "ENOTEMPTY"), (Errno::LOOP, "ELOOP"),
-            (Errno::TIMEDOUT, "ETIMEDOUT"), (Errno::CANCELED, "ECANCELED"),
+            (Errno::PERM, "EPERM"),
+            (Errno::NOENT, "ENOENT"),
+            (Errno::INTR, "EINTR"),
+            (Errno::IO, "EIO"),
+            (Errno::BADF, "EBADF"),
+            (Errno::AGAIN, "EAGAIN"),
+            (Errno::NOMEM, "ENOMEM"),
+            (Errno::ACCESS, "EACCES"),
+            (Errno::EXIST, "EEXIST"),
+            (Errno::XDEV, "EXDEV"),
+            (Errno::NOTDIR, "ENOTDIR"),
+            (Errno::ISDIR, "EISDIR"),
+            (Errno::INVAL, "EINVAL"),
+            (Errno::NFILE, "ENFILE"),
+            (Errno::MFILE, "EMFILE"),
+            (Errno::FBIG, "EFBIG"),
+            (Errno::NOSPC, "ENOSPC"),
+            (Errno::ROFS, "EROFS"),
+            (Errno::PIPE, "EPIPE"),
+            (Errno::NAMETOOLONG, "ENAMETOOLONG"),
+            (Errno::NOTEMPTY, "ENOTEMPTY"),
+            (Errno::LOOP, "ELOOP"),
+            (Errno::TIMEDOUT, "ETIMEDOUT"),
+            (Errno::CANCELED, "ECANCELED"),
         ];
-        if let Some((_, name)) = names.into_iter().find(|(errno, _)| errno.raw_os_error() == raw) { return name; }
+        if let Some((_, name)) = names
+            .into_iter()
+            .find(|(errno, _)| errno.raw_os_error() == raw)
+        {
+            return name;
+        }
     }
     match kind {
-        io::ErrorKind::NotFound => "ENOENT", io::ErrorKind::PermissionDenied => "EACCES",
-        io::ErrorKind::AlreadyExists => "EEXIST", io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => "EINVAL",
-        io::ErrorKind::TimedOut => "ETIMEDOUT", io::ErrorKind::Interrupted => "EINTR",
-        io::ErrorKind::WouldBlock => "EAGAIN", io::ErrorKind::WriteZero => "EIO",
-        io::ErrorKind::Unsupported => "ENOSYS", _ => "EIO",
+        io::ErrorKind::NotFound => "ENOENT",
+        io::ErrorKind::PermissionDenied => "EACCES",
+        io::ErrorKind::AlreadyExists => "EEXIST",
+        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => "EINVAL",
+        io::ErrorKind::TimedOut => "ETIMEDOUT",
+        io::ErrorKind::Interrupted => "EINTR",
+        io::ErrorKind::WouldBlock => "EAGAIN",
+        io::ErrorKind::Unsupported => "ENOSYS",
+        _ => "EIO",
     }
 }

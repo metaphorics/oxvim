@@ -8,15 +8,15 @@ publish = false
 [dependencies]
 rmpv = { workspace = true, features = ["with-serde"] }
 serde.workspace = true
-serde_json.workspace = true
+sonic-rs.workspace = true
 serde_yaml = "0.9.34"
+ox-rpc = { path = "../../crates/ox-rpc" }
+ox-tui = { path = "../../crates/ox-tui" }
+ox-types = { path = "../../crates/ox-types" }
 sha2.workspace = true
 similar.workspace = true
 
 [dev-dependencies]
-ox-rpc = { path = "../../crates/ox-rpc" }
-ox-tui = { path = "../../crates/ox-tui" }
-ox-types = { path = "../../crates/ox-types" }
 portable-pty = "0.9.0"
 
 [lints]

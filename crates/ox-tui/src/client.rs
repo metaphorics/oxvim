@@ -10,7 +10,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -117,43 +117,57 @@ pub struct Client {
 
 impl Client {
     /// Spawn `command` with piped stdin, stdout, and stderr.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Spawn`] if the process cannot be started,
+    /// [`ClientError::MissingPipe`] if a stdio pipe is absent, or
+    /// [`ClientError::ThreadSpawn`] if a transport worker cannot be created.
     pub fn spawn(mut command: Command) -> Result<Self, ClientError> {
-        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(|source| ClientError::Spawn { source })?;
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|source| ClientError::Spawn { source })?;
 
-        let stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => return missing_pipe(&mut child, "stdin"),
+        let Some(stdin) = child.stdin.take() else {
+            return missing_pipe(&mut child, "stdin");
         };
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => return missing_pipe(&mut child, "stdout"),
+        let Some(stdout) = child.stdout.take() else {
+            return missing_pipe(&mut child, "stdout");
         };
-        let child_stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => return missing_pipe(&mut child, "stderr"),
+        let Some(child_stderr) = child.stderr.take() else {
+            return missing_pipe(&mut child, "stderr");
         };
 
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let stderr_sink = Arc::clone(&stderr);
         let stderr_reader = thread::Builder::new()
             .name("ox-tui-stderr".into())
-            .spawn(move || drain_stderr(child_stderr, stderr_sink))
+            .spawn(move || drain_stderr(child_stderr, &stderr_sink))
             .map_err(|source| {
                 terminate_child(&mut child);
-                ClientError::ThreadSpawn { worker: "stderr", source }
+                ClientError::ThreadSpawn {
+                    worker: "stderr",
+                    source,
+                }
             })?;
 
         let (sender, incoming) = mpsc::channel();
         let reader = match thread::Builder::new()
             .name("ox-tui-rpc-reader".into())
-            .spawn(move || read_messages(stdout, sender))
+            .spawn(move || read_messages(stdout, &sender))
         {
             Ok(reader) => reader,
             Err(source) => {
                 terminate_child(&mut child);
                 let _ = stderr_reader.join();
-                return Err(ClientError::ThreadSpawn { worker: "RPC reader", source });
+                return Err(ClientError::ThreadSpawn {
+                    worker: "RPC reader",
+                    source,
+                });
             }
         };
 
@@ -174,6 +188,17 @@ impl Client {
     /// Redraw notifications received while waiting are retained for
     /// [`Self::recv_redraw`]. Only one request is outstanding because all
     /// mutation requires `&mut self`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Protocol`] if stdin has already closed,
+    /// [`ClientError::Write`] if the request cannot be written,
+    /// [`ClientError::Read`] on a stdout read failure, [`ClientError::Decode`]
+    /// on malformed msgpack, [`ClientError::Eof`] when the child closes its
+    /// stream, [`ClientError::ReaderStopped`] if the reader thread exits,
+    /// [`ClientError::UnexpectedResponse`] for a mismatched reply id,
+    /// [`ClientError::Remote`] for a server-side rejection, or
+    /// [`ClientError::Protocol`] for unexpected message shapes.
     pub fn request(&mut self, method: OxStr, params: Vec<Object>) -> Result<Object, ClientError> {
         let (msgid, request) = make_request(&mut self.msgids, method, params);
         let stdin = self.stdin.as_mut().ok_or_else(|| {
@@ -190,16 +215,36 @@ impl Client {
     }
 
     /// Attach the external UI with the complete bundled-client extension set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Write`] if the request cannot be written,
+    /// [`ClientError::Read`] on a stdout read failure, [`ClientError::Decode`]
+    /// on malformed msgpack, [`ClientError::Eof`] when the child closes its
+    /// stream, [`ClientError::UnexpectedResponse`] for a mismatched reply id,
+    /// [`ClientError::Remote`] for a server-side rejection, or
+    /// [`ClientError::Protocol`] if the result is not nil.
     pub fn attach(&mut self, width: u16, height: u16) -> Result<(), ClientError> {
         let result = self.request(OxStr::from("nvim_ui_attach"), attach_params(width, height))?;
-        require_nil("nvim_ui_attach", result)
+        require_nil("nvim_ui_attach", &result)
     }
 
     /// Forward terminal input and return the number of bytes consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Write`] if the request cannot be written,
+    /// [`ClientError::Read`] on a stdout read failure, [`ClientError::Decode`]
+    /// on malformed msgpack, [`ClientError::Eof`] when the child closes its
+    /// stream, [`ClientError::UnexpectedResponse`] for a mismatched reply id,
+    /// [`ClientError::Remote`] for a server-side rejection, or
+    /// [`ClientError::Protocol`] if the result is not a non-negative integer.
     pub fn input(&mut self, input: OxStr) -> Result<usize, ClientError> {
         let result = self.request(OxStr::from("nvim_input"), vec![Object::String(input)])?;
         let Object::Integer(consumed) = result else {
-            return Err(ClientError::Protocol("nvim_input returned a non-integer result".into()));
+            return Err(ClientError::Protocol(
+                "nvim_input returned a non-integer result".into(),
+            ));
         };
         usize::try_from(consumed)
             .map_err(|_| ClientError::Protocol("nvim_input returned a negative byte count".into()))
@@ -210,6 +255,15 @@ impl Client {
     /// Grid `0` lets the server decide which window the position targets, as
     /// documented for multigrid clients; the caller suppresses chrome-owned
     /// coordinates before calling this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Write`] if the request cannot be written,
+    /// [`ClientError::Read`] on a stdout read failure, [`ClientError::Decode`]
+    /// on malformed msgpack, [`ClientError::Eof`] when the child closes its
+    /// stream, [`ClientError::UnexpectedResponse`] for a mismatched reply id,
+    /// [`ClientError::Remote`] for a server-side rejection, or
+    /// [`ClientError::Protocol`] if the result is not nil.
     pub fn input_mouse(
         &mut self,
         button: &str,
@@ -229,19 +283,39 @@ impl Client {
                 Object::Integer(i64::from(column)),
             ],
         )?;
-        require_nil("nvim_input_mouse", result)
+        require_nil("nvim_input_mouse", &result)
     }
 
     /// Notify the server that the terminal grid changed size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Write`] if the request cannot be written,
+    /// [`ClientError::Read`] on a stdout read failure, [`ClientError::Decode`]
+    /// on malformed msgpack, [`ClientError::Eof`] when the child closes its
+    /// stream, [`ClientError::UnexpectedResponse`] for a mismatched reply id,
+    /// [`ClientError::Remote`] for a server-side rejection, or
+    /// [`ClientError::Protocol`] if the result is not nil.
     pub fn try_resize(&mut self, width: u16, height: u16) -> Result<(), ClientError> {
         let result = self.request(
             OxStr::from("nvim_ui_try_resize"),
-            vec![Object::Integer(i64::from(width)), Object::Integer(i64::from(height))],
+            vec![
+                Object::Integer(i64::from(width)),
+                Object::Integer(i64::from(height)),
+            ],
         )?;
-        require_nil("nvim_ui_try_resize", result)
+        require_nil("nvim_ui_try_resize", &result)
     }
 
     /// Block until the next decoded redraw notification is available.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Decode`] on malformed msgpack, [`ClientError::Read`]
+    /// on a stdout read failure, [`ClientError::Eof`] when the child closes its
+    /// stream, [`ClientError::ReaderStopped`] if the reader thread exits,
+    /// [`ClientError::Protocol`] for unexpected message shapes, or
+    /// [`ClientError::Remote`] for a malformed redraw notification.
     pub fn recv_redraw(&mut self) -> Result<Vec<RedrawEvent>, ClientError> {
         if let Some(events) = self.redraws.pop_front() {
             return Ok(events);
@@ -271,6 +345,15 @@ impl Client {
     ///
     /// A timeout is not an RPC failure; it gives the terminal loop a chance to
     /// process input and resize events without introducing a second client owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Decode`] on malformed msgpack, [`ClientError::Read`]
+    /// on a stdout read failure, [`ClientError::Eof`] when the child closes its
+    /// stream, [`ClientError::ReaderStopped`] if the reader thread exits,
+    /// [`ClientError::Protocol`] for unexpected message shapes, or
+    /// [`ClientError::Remote`] for a malformed redraw notification.
+    /// `Ok(None)` indicates a timeout, not an error.
     pub fn recv_redraw_timeout(
         &mut self,
         timeout: Duration,
@@ -318,9 +401,18 @@ impl Client {
     ///
     /// A nonzero exit is returned with complete stderr instead of terminating
     /// this process, allowing the upper layer to restore terminal state first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Wait`] if waiting for the child fails,
+    /// [`ClientError::WorkerPanicked`] if a transport worker panicked, or
+    /// [`ClientError::NonZeroExit`] if the child exits with a nonzero status.
     pub fn shutdown(mut self) -> Result<(), ClientError> {
         self.stdin.take();
-        let status = self.child.wait().map_err(|source| ClientError::Wait { source })?;
+        let status = self
+            .child
+            .wait()
+            .map_err(|source| ClientError::Wait { source })?;
         join_worker(&mut self.reader, "RPC reader")?;
         join_worker(&mut self.stderr_reader, "stderr")?;
         if status.success() {
@@ -350,7 +442,10 @@ impl Client {
             match self.child.try_wait() {
                 Ok(Some(status)) => break Some(status),
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
-                Ok(None) | Err(_) => { terminate_child(&mut self.child); break None; }
+                Ok(None) | Err(_) => {
+                    terminate_child(&mut self.child);
+                    break None;
+                }
             }
         };
         let _ = join_worker(&mut self.reader, "RPC reader");
@@ -377,22 +472,29 @@ fn write_message(writer: &mut impl Write, message: &Message) -> Result<(), Clien
         .map_err(|source| ClientError::Write { source })
 }
 
-fn make_request(
-    counter: &mut MsgidCounter,
-    method: OxStr,
-    params: Vec<Object>,
-) -> (u32, Message) {
-    let msgid = counter.next();
-    (msgid, Message::Request { msgid, method, params })
+fn make_request(counter: &mut MsgidCounter, method: OxStr, params: Vec<Object>) -> (u32, Message) {
+    let msgid = counter.next_id();
+    (
+        msgid,
+        Message::Request {
+            msgid,
+            method,
+            params,
+        },
+    )
 }
 
-fn read_messages(mut stdout: impl Read, sender: mpsc::Sender<ReaderEvent>) {
+fn read_messages(mut stdout: impl Read, sender: &mpsc::Sender<ReaderEvent>) {
     let mut decoder = IncrementalDecoder::new();
     let mut buffer = [0; READ_BUFFER_SIZE];
     loop {
         match stdout.read(&mut buffer) {
             Ok(0) => {
-                let event = if decoder.is_empty() { ReaderEvent::Eof } else { ReaderEvent::Decode(DecodeError::Incomplete) };
+                let event = if decoder.is_empty() {
+                    ReaderEvent::Eof
+                } else {
+                    ReaderEvent::Decode(DecodeError::Incomplete)
+                };
                 let _ = sender.send(event);
                 return;
             }
@@ -418,7 +520,7 @@ fn read_messages(mut stdout: impl Read, sender: mpsc::Sender<ReaderEvent>) {
     }
 }
 
-fn drain_stderr(mut stderr: impl Read, sink: Arc<Mutex<Vec<u8>>>) {
+fn drain_stderr(mut stderr: impl Read, sink: &Arc<Mutex<Vec<u8>>>) {
     let mut buffer = [0; 4096];
     loop {
         match stderr.read(&mut buffer) {
@@ -442,9 +544,10 @@ fn handle_request_message(
         Message::Response { msgid, result } if msgid == expected => {
             result.map(Some).map_err(ClientError::Remote)
         }
-        Message::Response { msgid, .. } => {
-            Err(ClientError::UnexpectedResponse { expected, actual: msgid })
-        }
+        Message::Response { msgid, .. } => Err(ClientError::UnexpectedResponse {
+            expected,
+            actual: msgid,
+        }),
         Message::Notification { method, params } => {
             if method.as_bytes() == b"redraw" {
                 redraws.push_back(parse_redraw(params)?);
@@ -461,18 +564,24 @@ fn parse_redraw(entries: Vec<Object>) -> Result<Vec<RedrawEvent>, ClientError> {
     let mut events = Vec::with_capacity(entries.len());
     for entry in entries {
         let Object::Array(mut fields) = entry else {
-            return Err(ClientError::Protocol("redraw event must be an array".into()));
+            return Err(ClientError::Protocol(
+                "redraw event must be an array".into(),
+            ));
         };
         if fields.is_empty() {
             return Err(ClientError::Protocol("redraw event cannot be empty".into()));
         }
         let Object::String(name) = fields.remove(0) else {
-            return Err(ClientError::Protocol("redraw event name must be a string".into()));
+            return Err(ClientError::Protocol(
+                "redraw event name must be a string".into(),
+            ));
         };
         let mut argsets = Vec::with_capacity(fields.len());
         for field in fields {
             let Object::Array(args) = field else {
-                return Err(ClientError::Protocol("redraw event arguments must be arrays".into()));
+                return Err(ClientError::Protocol(
+                    "redraw event arguments must be arrays".into(),
+                ));
             };
             argsets.push(args);
         }
@@ -503,11 +612,13 @@ fn attach_params(width: u16, height: u16) -> Vec<Object> {
     ]
 }
 
-fn require_nil(method: &str, result: Object) -> Result<(), ClientError> {
-    if result == Object::Nil {
+fn require_nil(method: &str, result: &Object) -> Result<(), ClientError> {
+    if result == &Object::Nil {
         Ok(())
     } else {
-        Err(ClientError::Protocol(format!("{method} returned a non-nil result")))
+        Err(ClientError::Protocol(format!(
+            "{method} returned a non-nil result"
+        )))
     }
 }
 
@@ -518,11 +629,16 @@ fn stderr_snapshot(stderr: &Mutex<Vec<u8>>) -> Vec<u8> {
     }
 }
 
-fn join_worker(handle: &mut Option<JoinHandle<()>>, worker: &'static str) -> Result<(), ClientError> {
+fn join_worker(
+    handle: &mut Option<JoinHandle<()>>,
+    worker: &'static str,
+) -> Result<(), ClientError> {
     let Some(handle) = handle.take() else {
         return Ok(());
     };
-    handle.join().map_err(|_| ClientError::WorkerPanicked(worker))
+    handle
+        .join()
+        .map_err(|_| ClientError::WorkerPanicked(worker))
 }
 
 fn missing_pipe<T>(child: &mut Child, name: &'static str) -> Result<T, ClientError> {
@@ -542,7 +658,10 @@ mod tests {
     use super::*;
 
     fn response(msgid: u32, result: Object) -> Message {
-        Message::Response { msgid, result: Ok(result) }
+        Message::Response {
+            msgid,
+            result: Ok(result),
+        }
     }
 
     #[test]
@@ -555,10 +674,10 @@ mod tests {
         let mut wire = Vec::new();
         write_message(&mut wire, &request).unwrap();
         let mut decoder = IncrementalDecoder::new();
-        let decoded = decoder.feed(&wire).unwrap();
-        assert_eq!(decoded, vec![request]);
+        let messages = decoder.feed(&wire).unwrap();
+        assert_eq!(messages, vec![request]);
 
-        let Message::Request { params, .. } = &decoded[0] else {
+        let Message::Request { params, .. } = &messages[0] else {
             panic!("fixture must decode as a request");
         };
         assert_eq!(params[0], Object::Integer(120));
@@ -580,21 +699,27 @@ mod tests {
                 b"ext_termcolors".as_slice(),
             ]
         );
-        assert!(options.iter().all(|(_, value)| value == &Object::Boolean(true)));
+        assert!(
+            options
+                .iter()
+                .all(|(_, value)| value == &Object::Boolean(true))
+        );
     }
 
     #[test]
     fn matching_response_returns_result_and_wrong_id_is_typed() {
         let mut redraws = VecDeque::new();
-        let result = handle_request_message(7, response(7, Object::Integer(3)), &mut redraws)
-            .unwrap();
+        let result =
+            handle_request_message(7, response(7, Object::Integer(3)), &mut redraws).unwrap();
         assert_eq!(result, Some(Object::Integer(3)));
 
-        let error = handle_request_message(7, response(8, Object::Nil), &mut redraws)
-            .unwrap_err();
+        let error = handle_request_message(7, response(8, Object::Nil), &mut redraws).unwrap_err();
         assert!(matches!(
             error,
-            ClientError::UnexpectedResponse { expected: 7, actual: 8 }
+            ClientError::UnexpectedResponse {
+                expected: 7,
+                actual: 8
+            }
         ));
     }
 
@@ -608,9 +733,9 @@ mod tests {
         write_message(&mut wire, &second).unwrap();
 
         let mut decoder = IncrementalDecoder::new();
-        let decoded = decoder.feed(&wire).unwrap();
-        assert!(matches!(decoded[0], Message::Request { msgid: 1, .. }));
-        assert!(matches!(decoded[1], Message::Request { msgid: 2, .. }));
+        let messages = decoder.feed(&wire).unwrap();
+        assert!(matches!(messages[0], Message::Request { msgid: 1, .. }));
+        assert!(matches!(messages[1], Message::Request { msgid: 2, .. }));
     }
 
     #[test]
@@ -623,8 +748,8 @@ mod tests {
             ])],
         };
         let mut decoder = IncrementalDecoder::new();
-        let mut decoded = decoder.feed(&redraw.encode_bytes()).unwrap();
-        let decoded_redraw = decoded.remove(0);
+        let mut messages = decoder.feed(&redraw.encode_bytes()).unwrap();
+        let decoded_redraw = messages.remove(0);
         let mut queued = VecDeque::new();
         assert_eq!(
             handle_request_message(2, decoded_redraw, &mut queued).unwrap(),
@@ -649,8 +774,11 @@ mod tests {
         let mut bytes = request.encode_bytes();
         bytes.pop();
         let (sender, receiver) = mpsc::channel();
-        read_messages(bytes.as_slice(), sender);
-        assert!(matches!(receiver.recv().unwrap(), ReaderEvent::Decode(DecodeError::Incomplete)));
+        read_messages(bytes.as_slice(), &sender);
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ReaderEvent::Decode(DecodeError::Incomplete)
+        ));
     }
 
     #[test]

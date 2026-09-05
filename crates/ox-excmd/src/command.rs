@@ -11,6 +11,10 @@ impl CommandFlags {
     pub const BANG: Self = Self(0x002);
     /// Command accepts arguments.
     pub const EXTRA: Self = Self(0x004);
+    /// File-name expansion is enabled for this command.
+    pub const XFILE: Self = Self(0x008);
+    /// Arguments are not split on whitespace.
+    pub const NOSPC: Self = Self(0x010);
     /// Command defaults to the whole buffer when no range is given.
     pub const DFLALL: Self = Self(0x020);
     /// Command requires an argument.
@@ -38,6 +42,15 @@ impl CommandFlags {
     #[must_use]
     pub const fn bits(self) -> u32 {
         self.0
+    }
+}
+
+impl CommandFlags {
+    /// Builds a mask from raw upstream bits, for hosts that compose a user
+    /// command's flags outside this crate.
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
     }
 }
 
@@ -92,13 +105,24 @@ pub struct CommandSpec {
 
 include!(concat!(env!("OUT_DIR"), "/command_specs.rs"));
 
+/// Parser-facing metadata for one user command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserCommandInfo {
+    /// Canonical user-command name.
+    pub name: String,
+    /// Argument and modifier flags for this command.
+    pub flags: CommandFlags,
+    /// Address domain for this command.
+    pub addr_type: AddrType,
+}
+
 /// Result supplied by a host's user-command registry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UserCommandMatch {
     /// No user command matches.
     None,
-    /// One user command matches, with its canonical name.
-    Match(String),
+    /// One user command matches, with parser metadata.
+    Match(UserCommandInfo),
     /// More than one user command matches the typed prefix.
     Ambiguous,
 }
@@ -125,7 +149,11 @@ pub enum ResolvedCommand {
     /// A generated built-in table entry.
     Builtin(&'static CommandSpec),
     /// A host-provided user command.
-    User(String),
+    User(UserCommandInfo),
+    /// A bare address with no command (`ex_docmd.c:2074-2085`
+    /// `ex_range_without_command`): `:3` and `:/pat/` move the cursor to
+    /// the resolved last address. Synthesized by the parser; never typed.
+    RangeOnly,
 }
 
 impl ResolvedCommand {
@@ -134,16 +162,32 @@ impl ResolvedCommand {
     pub fn name(&self) -> &str {
         match self {
             Self::Builtin(spec) => spec.name,
-            Self::User(name) => name,
+            Self::User(info) => &info.name,
+            // Dispatch keys off the variant, not the string; the empty
+            // name cannot collide with a typed command.
+            Self::RangeOnly => "",
         }
     }
 
-    /// Returns built-in flags, or an empty mask for a user command.
+    /// Returns the argument flags that govern this command.
     #[must_use]
     pub const fn flags(&self) -> CommandFlags {
         match self {
             Self::Builtin(spec) => spec.flags,
-            Self::User(_) => CommandFlags(0),
+            Self::User(info) => info.flags,
+            Self::RangeOnly => {
+                CommandFlags(CommandFlags::RANGE.bits() | CommandFlags::TRLBAR.bits())
+            }
+        }
+    }
+
+    /// Returns the address domain that governs this command.
+    #[must_use]
+    pub const fn addr_type(&self) -> AddrType {
+        match self {
+            Self::Builtin(spec) => spec.addr_type,
+            Self::User(info) => info.addr_type,
+            Self::RangeOnly => AddrType::Lines,
         }
     }
 }
@@ -161,6 +205,14 @@ pub enum ResolveError {
 ///
 /// Built-ins win whenever their prefix matches. User commands are considered
 /// only as the uppercase-name fallback used by `find_ex_command()`.
+///
+/// # Errors
+///
+/// Returns [`ResolveError::NotFound`] when `typed` is empty, equals one of the
+/// suppressed prefixes `ho` or `def`, or matches no built-in by prefix and is
+/// not a user-command name (names starting lowercase never reach the user
+/// registry). Returns [`ResolveError::AmbiguousUserCommand`] when an
+/// uppercase-initial name leaves the provider with an ambiguous prefix.
 pub fn resolve_command<P: UserCommandProvider + ?Sized>(
     typed: &str,
     users: &P,
@@ -169,15 +221,15 @@ pub fn resolve_command<P: UserCommandProvider + ?Sized>(
         return Err(ResolveError::NotFound);
     }
 
-    if typed == "s" {
-        if let Some(spec) = command_spec("substitute") {
-            return Ok(ResolvedCommand::Builtin(spec));
-        }
+    if typed == "s"
+        && let Some(spec) = command_spec("substitute")
+    {
+        return Ok(ResolvedCommand::Builtin(spec));
     }
-    if typed == "k" {
-        if let Some(spec) = command_spec("k") {
-            return Ok(ResolvedCommand::Builtin(spec));
-        }
+    if typed == "k"
+        && let Some(spec) = command_spec("k")
+    {
+        return Ok(ResolvedCommand::Builtin(spec));
     }
 
     if let Some(spec) = COMMANDS.iter().find(|spec| spec.name.starts_with(typed)) {
@@ -187,7 +239,7 @@ pub fn resolve_command<P: UserCommandProvider + ?Sized>(
     if typed.as_bytes().first().is_some_and(u8::is_ascii_uppercase) {
         return match users.resolve_user_command(typed) {
             UserCommandMatch::None => Err(ResolveError::NotFound),
-            UserCommandMatch::Match(name) => Ok(ResolvedCommand::User(name)),
+            UserCommandMatch::Match(info) => Ok(ResolvedCommand::User(info)),
             UserCommandMatch::Ambiguous => Err(ResolveError::AmbiguousUserCommand),
         };
     }

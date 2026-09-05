@@ -8,12 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crossterm::QueueableCommand;
 use crossterm::cursor::MoveTo;
 use crossterm::style::{
     Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use crossterm::QueueableCommand;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
 use thiserror::Error;
@@ -61,6 +61,7 @@ pub enum ProbeAnswer {
 }
 
 impl ProbeAnswer {
+    #[must_use]
     pub const fn is_supported(self) -> bool {
         matches!(self, Self::Supported)
     }
@@ -73,14 +74,54 @@ pub enum PaletteDecision {
     RestoreOnly,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalFeatures(u8);
+
+impl TerminalFeatures {
+    const KITTY_KEYBOARD: u8 = 1 << 0;
+    const SYNCHRONIZED_OUTPUT: u8 = 1 << 1;
+    const UNDERCURL: u8 = 1 << 2;
+    const COLORED_UNDERLINE: u8 = 1 << 3;
+    const OSC52_CLIPBOARD: u8 = 1 << 4;
+
+    #[must_use]
+    pub const fn kitty_keyboard(self) -> bool {
+        self.0 & Self::KITTY_KEYBOARD != 0
+    }
+
+    #[must_use]
+    pub const fn synchronized_output(self) -> bool {
+        self.0 & Self::SYNCHRONIZED_OUTPUT != 0
+    }
+
+    #[must_use]
+    pub const fn undercurl(self) -> bool {
+        self.0 & Self::UNDERCURL != 0
+    }
+
+    #[must_use]
+    pub const fn colored_underline(self) -> bool {
+        self.0 & Self::COLORED_UNDERLINE != 0
+    }
+
+    #[must_use]
+    pub const fn osc52_clipboard(self) -> bool {
+        self.0 & Self::OSC52_CLIPBOARD != 0
+    }
+
+    fn set(&mut self, flag: u8, enabled: bool) {
+        if enabled {
+            self.0 |= flag;
+        } else {
+            self.0 &= !flag;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalCapabilities {
     pub colors: ColorSupport,
-    pub kitty_keyboard: bool,
-    pub synchronized_output: bool,
-    pub undercurl: bool,
-    pub colored_underline: bool,
-    pub osc52_clipboard: bool,
+    pub features: TerminalFeatures,
     pub palette: PaletteDecision,
 }
 
@@ -90,14 +131,11 @@ impl TerminalCapabilities {
     /// output, undercurl, OSC 52) start disabled here and are populated by
     /// [`probe_terminal`] on the live terminal; environment hints only ever
     /// short-circuit color and palette decisions, never the negotiated probes.
+    #[must_use]
     pub fn from_environment(environment: &TerminalEnvironment) -> Self {
         Self {
             colors: detect_color_support(environment),
-            kitty_keyboard: false,
-            synchronized_output: false,
-            undercurl: false,
-            colored_underline: false,
-            osc52_clipboard: false,
+            features: TerminalFeatures::default(),
             palette: osc4_decision(environment.inside_tmux, environment.tmux_passthrough),
         }
     }
@@ -109,11 +147,18 @@ impl TerminalCapabilities {
         undercurl: ProbeAnswer,
         osc52: ProbeAnswer,
     ) {
-        self.kitty_keyboard = kitty.is_supported();
-        self.synchronized_output = sync.is_supported();
-        self.undercurl = undercurl.is_supported();
-        self.colored_underline = undercurl.is_supported();
-        self.osc52_clipboard = osc52.is_supported();
+        self.features
+            .set(TerminalFeatures::KITTY_KEYBOARD, kitty.is_supported());
+        self.features
+            .set(TerminalFeatures::SYNCHRONIZED_OUTPUT, sync.is_supported());
+        self.features
+            .set(TerminalFeatures::UNDERCURL, undercurl.is_supported());
+        self.features.set(
+            TerminalFeatures::COLORED_UNDERLINE,
+            undercurl.is_supported(),
+        );
+        self.features
+            .set(TerminalFeatures::OSC52_CLIPBOARD, osc52.is_supported());
     }
 }
 
@@ -123,6 +168,11 @@ impl TerminalCapabilities {
 /// responses reach the reader, then restored; the caller's
 /// [`TerminalSession::start`] re-enables raw mode for the interactive phase.
 /// Incomplete or unanswered probes remain disabled.
+///
+/// # Errors
+///
+/// Returns an error if raw mode cannot be enabled or if writing, flushing,
+/// polling, registering, or reading the terminal capability exchange fails.
 pub fn probe_terminal<R: Read + AsRawFd, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -146,7 +196,12 @@ fn probe_io<R: Read + AsRawFd, W: Write>(
     policy: ProbePolicy,
 ) -> Result<TerminalCapabilities, TerminalError> {
     let mut capabilities = TerminalCapabilities::from_environment(environment);
-    for query in [KITTY_KEYBOARD_QUERY, SYNC_OUTPUT_QUERY, UNDERCURL_QUERY, OSC52_QUERY] {
+    for query in [
+        KITTY_KEYBOARD_QUERY,
+        SYNC_OUTPUT_QUERY,
+        UNDERCURL_QUERY,
+        OSC52_QUERY,
+    ] {
         writer
             .write_all(query)
             .map_err(|error| TerminalError::io("capability probe write", error))?;
@@ -155,7 +210,8 @@ fn probe_io<R: Read + AsRawFd, W: Write>(
         .flush()
         .map_err(|error| TerminalError::io("capability probe flush", error))?;
 
-    let mut poll = Poll::new().map_err(|error| TerminalError::io("capability probe poll", error))?;
+    let mut poll =
+        Poll::new().map_err(|error| TerminalError::io("capability probe poll", error))?;
     let mut events = Events::with_capacity(8);
     {
         let fd = reader.as_raw_fd();
@@ -188,8 +244,9 @@ fn probe_io<R: Read + AsRawFd, W: Write>(
         if events.is_empty() {
             continue;
         }
-        let read =
-            reader.read(&mut chunk).map_err(|error| TerminalError::io("capability probe read", error))?;
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|error| TerminalError::io("capability probe read", error))?;
         if read == 0 {
             break;
         }
@@ -208,9 +265,9 @@ fn probe_io<R: Read + AsRawFd, W: Write>(
 /// (Smulx) capability, allowing the DCS probe to be skipped.
 fn terminfo_colored_underline(terminfo: Option<&str>) -> bool {
     terminfo.is_some_and(|capabilities| {
-        capabilities
-            .split([',', ':', '\n', '|'])
-            .any(|capability| matches!(capability.trim().split('=').next(), Some("Smulx" | "smulx")))
+        capabilities.split([',', ':', '\n', '|']).any(|capability| {
+            matches!(capability.trim().split('=').next(), Some("Smulx" | "smulx"))
+        })
     })
 }
 
@@ -221,7 +278,9 @@ pub struct ProbePolicy {
 
 impl Default for ProbePolicy {
     fn default() -> Self {
-        Self { timeout: PROBE_TIMEOUT }
+        Self {
+            timeout: PROBE_TIMEOUT,
+        }
     }
 }
 
@@ -245,11 +304,13 @@ pub fn detect_color_support(environment: &TerminalEnvironment) -> ColorSupport {
     }
 }
 
+#[must_use]
 pub fn colorterm_is_truecolor(value: &str) -> bool {
     let value = value.trim();
     value.eq_ignore_ascii_case("truecolor") || value.eq_ignore_ascii_case("24bit")
 }
 
+#[must_use]
 pub fn terminfo_has_truecolor(capabilities: &str) -> bool {
     let mut tc = false;
     let mut rgb = false;
@@ -265,6 +326,7 @@ pub fn terminfo_has_truecolor(capabilities: &str) -> bool {
     tc || rgb || (foreground && background)
 }
 
+#[must_use]
 pub const fn osc4_decision(inside_tmux: bool, tmux_passthrough: bool) -> PaletteDecision {
     match (inside_tmux, tmux_passthrough) {
         (true, true) => PaletteDecision::TmuxPassthrough,
@@ -273,10 +335,13 @@ pub const fn osc4_decision(inside_tmux: bool, tmux_passthrough: bool) -> Palette
     }
 }
 
+#[must_use]
 pub fn parse_kitty_keyboard_response(bytes: &[u8]) -> ProbeAnswer {
     if find_csi(bytes, b'u', |parameters| {
         parameters.first() == Some(&b'?')
-            && parameters[1..].iter().all(|byte| byte.is_ascii_digit() || *byte == b';')
+            && parameters[1..]
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || *byte == b';')
     }) {
         ProbeAnswer::Supported
     } else if find_csi(bytes, b'c', |parameters| parameters.first() == Some(&b'?')) {
@@ -286,10 +351,12 @@ pub fn parse_kitty_keyboard_response(bytes: &[u8]) -> ProbeAnswer {
     }
 }
 
+#[must_use]
 pub fn parse_sync_output_response(bytes: &[u8]) -> ProbeAnswer {
     parse_decrpm(bytes, 2026)
 }
 
+#[must_use]
 pub fn parse_undercurl_response(bytes: &[u8], terminfo_smulx: bool) -> ProbeAnswer {
     if terminfo_smulx || contains(bytes, b"\x1bP1$r4:3m\x1b\\") {
         ProbeAnswer::Supported
@@ -300,6 +367,7 @@ pub fn parse_undercurl_response(bytes: &[u8], terminfo_smulx: bool) -> ProbeAnsw
     }
 }
 
+#[must_use]
 pub fn parse_osc52_response(bytes: &[u8]) -> ProbeAnswer {
     let Some(start) = find_subslice(bytes, b"\x1b]52;") else {
         return ProbeAnswer::Incomplete;
@@ -309,7 +377,7 @@ pub fn parse_osc52_response(bytes: &[u8]) -> ProbeAnswer {
     if !terminated {
         return ProbeAnswer::Incomplete;
     }
-    if payload.iter().any(|byte| *byte == b';') {
+    if payload.contains(&b';') {
         ProbeAnswer::Supported
     } else {
         ProbeAnswer::Unsupported
@@ -325,7 +393,10 @@ fn parse_decrpm(bytes: &[u8], mode: u16) -> ProbeAnswer {
     let Some(end) = find_subslice(response, b"$y") else {
         return ProbeAnswer::Incomplete;
     };
-    match std::str::from_utf8(&response[..end]).ok().and_then(|value| value.parse::<u8>().ok()) {
+    match std::str::from_utf8(&response[..end])
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+    {
         Some(1..=4) => ProbeAnswer::Supported,
         Some(0) => ProbeAnswer::Unsupported,
         _ => ProbeAnswer::Incomplete,
@@ -356,7 +427,9 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
     }
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 #[derive(Debug, Error)]
@@ -399,11 +472,20 @@ pub struct ShutdownSignals {
 
 impl ShutdownSignals {
     /// Register a flag for every signal in [`RESTORE_SIGNALS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if registering any of the signal handler flags fails.
     pub fn install() -> Result<Self, TerminalError> {
         Self::install_for(&RESTORE_SIGNALS)
     }
 
     /// Register a flag for each of `signals`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if registering any signal handler flag fails;
+    /// registrations completed before the failure stay installed.
     pub fn install_for(signals: &[c_int]) -> Result<Self, TerminalError> {
         let mut flags = Vec::with_capacity(signals.len());
         for signal in signals {
@@ -418,6 +500,7 @@ impl ShutdownSignals {
     /// The first delivered signal, in [`RESTORE_SIGNALS`] order, or `None`.
     ///
     /// The flag is consumed, so a signal is reported exactly once.
+    #[must_use]
     pub fn pending(&self) -> Option<c_int> {
         self.flags
             .iter()
@@ -429,6 +512,11 @@ impl ShutdownSignals {
     ///
     /// Returns only if the platform refuses the signal; the caller then exits
     /// through its ordinary path rather than leaving the process alive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform refuses to emulate `signal`'s
+    /// default handler.
     pub fn resume_default(signal: c_int) -> Result<(), TerminalError> {
         signal_hook::low_level::emulate_default_handler(signal)
             .map_err(|error| TerminalError::io("shutdown signal default action", error))
@@ -455,32 +543,82 @@ pub enum UnderlineStyle {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CellAttributes {
-    pub bold: bool,
-    pub italic: bool,
-    pub dim: bool,
-    pub reverse: bool,
+    pub emphasis: CellEmphasis,
     pub underline: UnderlineStyle,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CellEmphasis(u8);
+
+impl CellEmphasis {
+    const BOLD: u8 = 1 << 0;
+    const ITALIC: u8 = 1 << 1;
+    const DIM: u8 = 1 << 2;
+    const REVERSE: u8 = 1 << 3;
+
+    #[must_use]
+    pub const fn bold(self) -> bool {
+        self.0 & Self::BOLD != 0
+    }
+
+    #[must_use]
+    pub const fn italic(self) -> bool {
+        self.0 & Self::ITALIC != 0
+    }
+
+    #[must_use]
+    pub const fn dim(self) -> bool {
+        self.0 & Self::DIM != 0
+    }
+
+    #[must_use]
+    pub const fn reverse(self) -> bool {
+        self.0 & Self::REVERSE != 0
+    }
+
+    pub fn set_bold(&mut self, enabled: bool) {
+        self.set(Self::BOLD, enabled);
+    }
+
+    pub fn set_italic(&mut self, enabled: bool) {
+        self.set(Self::ITALIC, enabled);
+    }
+
+    pub fn set_dim(&mut self, enabled: bool) {
+        self.set(Self::DIM, enabled);
+    }
+
+    pub fn set_reverse(&mut self, enabled: bool) {
+        self.set(Self::REVERSE, enabled);
+    }
+
+    fn set(&mut self, flag: u8, enabled: bool) {
+        if enabled {
+            self.0 |= flag;
+        } else {
+            self.0 &= !flag;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TerminalColor {
+    #[default]
     Default,
     Rgb(Rgb),
     Xterm256(QuantizedColor),
     Ansi16(Ansi16Color),
 }
 
-impl Default for TerminalColor {
-    fn default() -> Self {
-        Self::Default
-    }
-}
-
 impl TerminalColor {
     fn crossterm(self) -> Color {
         match self {
             Self::Default => Color::Reset,
-            Self::Rgb(rgb) => Color::Rgb { r: rgb.r, g: rgb.g, b: rgb.b },
+            Self::Rgb(rgb) => Color::Rgb {
+                r: rgb.r,
+                g: rgb.g,
+                b: rgb.b,
+            },
             Self::Xterm256(color) => Color::AnsiValue(color.index),
             Self::Ansi16(color) => match color {
                 Ansi16Color::Black => Color::Black,
@@ -526,8 +664,13 @@ impl Default for Cell {
 }
 
 impl Cell {
+    #[must_use]
     pub fn continuation() -> Self {
-        Self { text: Vec::new(), continuation: true, ..Self::default() }
+        Self {
+            text: Vec::new(),
+            continuation: true,
+            ..Self::default()
+        }
     }
 }
 
@@ -539,12 +682,23 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// Validates the dimensions and cell invariants, storing a dense frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameError::DimensionsOverflow`] when `width * height`
+    /// overflows the host address space, [`FrameError::CellCount`] when
+    /// `cells` does not exactly fill the frame, and [`FrameError::EmptyCell`]
+    /// when a non-continuation cell has empty text.
     pub fn new(width: u16, height: u16, cells: Vec<Cell>) -> Result<Self, FrameError> {
         let expected = usize::from(width)
             .checked_mul(usize::from(height))
             .ok_or(FrameError::DimensionsOverflow)?;
         if cells.len() != expected {
-            return Err(FrameError::CellCount { expected, actual: cells.len() });
+            return Err(FrameError::CellCount {
+                expected,
+                actual: cells.len(),
+            });
         }
         if let Some((index, _)) = cells
             .iter()
@@ -553,17 +707,24 @@ impl Frame {
         {
             return Err(FrameError::EmptyCell { index });
         }
-        Ok(Self { width, height, cells })
+        Ok(Self {
+            width,
+            height,
+            cells,
+        })
     }
 
+    #[must_use]
     pub const fn width(&self) -> u16 {
         self.width
     }
 
+    #[must_use]
     pub const fn height(&self) -> u16 {
         self.height
     }
 
+    #[must_use]
     pub fn cells(&self) -> &[Cell] {
         &self.cells
     }
@@ -581,7 +742,11 @@ pub struct DamageWriter<W> {
 
 impl<W: Write> DamageWriter<W> {
     pub fn new(writer: W, undercurl: bool) -> Self {
-        Self { writer, previous: None, undercurl }
+        Self {
+            writer,
+            previous: None,
+            undercurl,
+        }
     }
 
     pub fn previous(&self) -> Option<&Frame> {
@@ -598,68 +763,94 @@ impl<W: Write> DamageWriter<W> {
 
     /// Writes only cells whose complete value differs from the retained frame.
     /// The retained snapshot advances only after every queued byte is flushed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if queuing the cursor move, the style attributes, or
+    /// the cell text, or flushing the writer, fails; the retained frame stays
+    /// unchanged.
     pub fn render(&mut self, frame: &Frame) -> Result<usize, TerminalError> {
-        let same_dimensions = self
-            .previous
-            .as_ref()
-            .is_some_and(|previous| previous.width == frame.width && previous.height == frame.height);
+        let same_dimensions = self.previous.as_ref().is_some_and(|previous| {
+            previous.width == frame.width && previous.height == frame.height
+        });
         let mut changed = 0;
+        let mut row: u16 = 0;
+        let mut column: u16 = 0;
         for (index, cell) in frame.cells.iter().enumerate() {
             let unchanged = same_dimensions
-                && self.previous.as_ref().and_then(|previous| previous.cell(index)) == Some(cell);
-            if unchanged || cell.continuation {
-                continue;
-            }
-            let x = (index % usize::from(frame.width)) as u16;
-            let y = (index / usize::from(frame.width)) as u16;
-            self.writer.queue(MoveTo(x, y)).map_err(|error| TerminalError::io("cursor move", error))?;
-            self.writer
-                .queue(SetAttribute(Attribute::Reset))
-                .map_err(|error| TerminalError::io("attribute reset", error))?;
-            self.writer
-                .queue(SetForegroundColor(cell.foreground.crossterm()))
-                .map_err(|error| TerminalError::io("foreground color", error))?;
-            self.writer
-                .queue(SetBackgroundColor(cell.background.crossterm()))
-                .map_err(|error| TerminalError::io("background color", error))?;
-            if cell.attributes.bold {
+                && self
+                    .previous
+                    .as_ref()
+                    .and_then(|previous| previous.cell(index))
+                    == Some(cell);
+            if !unchanged && !cell.continuation {
                 self.writer
-                    .queue(SetAttribute(Attribute::Bold))
-                    .map_err(|error| TerminalError::io("bold attribute", error))?;
-            }
-            if cell.attributes.italic {
+                    .queue(MoveTo(column, row))
+                    .map_err(|error| TerminalError::io("cursor move", error))?;
                 self.writer
-                    .queue(SetAttribute(Attribute::Italic))
-                    .map_err(|error| TerminalError::io("italic attribute", error))?;
-            }
-            if cell.attributes.dim {
+                    .queue(SetAttribute(Attribute::Reset))
+                    .map_err(|error| TerminalError::io("attribute reset", error))?;
                 self.writer
-                    .queue(SetAttribute(Attribute::Dim))
-                    .map_err(|error| TerminalError::io("dim attribute", error))?;
-            }
-            if cell.attributes.reverse {
+                    .queue(SetForegroundColor(cell.foreground.crossterm()))
+                    .map_err(|error| TerminalError::io("foreground color", error))?;
                 self.writer
-                    .queue(SetAttribute(Attribute::Reverse))
-                    .map_err(|error| TerminalError::io("reverse attribute", error))?;
-            }
-            if let Some(attribute) = resolved_underline(cell.attributes.underline, self.undercurl) {
+                    .queue(SetBackgroundColor(cell.background.crossterm()))
+                    .map_err(|error| TerminalError::io("background color", error))?;
+                if cell.attributes.emphasis.bold() {
+                    self.writer
+                        .queue(SetAttribute(Attribute::Bold))
+                        .map_err(|error| TerminalError::io("bold attribute", error))?;
+                }
+                if cell.attributes.emphasis.italic() {
+                    self.writer
+                        .queue(SetAttribute(Attribute::Italic))
+                        .map_err(|error| TerminalError::io("italic attribute", error))?;
+                }
+                if cell.attributes.emphasis.dim() {
+                    self.writer
+                        .queue(SetAttribute(Attribute::Dim))
+                        .map_err(|error| TerminalError::io("dim attribute", error))?;
+                }
+                if cell.attributes.emphasis.reverse() {
+                    self.writer
+                        .queue(SetAttribute(Attribute::Reverse))
+                        .map_err(|error| TerminalError::io("reverse attribute", error))?;
+                }
+                if let Some(attribute) =
+                    resolved_underline(cell.attributes.underline, self.undercurl)
+                {
+                    self.writer
+                        .queue(SetAttribute(attribute))
+                        .map_err(|error| TerminalError::io("underline attribute", error))?;
+                }
+                let safe = terminal_safe_bytes(&cell.text);
                 self.writer
-                    .queue(SetAttribute(attribute))
-                    .map_err(|error| TerminalError::io("underline attribute", error))?;
+                    .write_all(&safe)
+                    .map_err(|error| TerminalError::io("cell text", error))?;
+                changed += 1;
             }
-            let safe = terminal_safe_bytes(&cell.text);
-            self.writer
-                .write_all(&safe)
-                .map_err(|error| TerminalError::io("cell text", error))?;
-            changed += 1;
+            column += 1;
+            if column == frame.width {
+                column = 0;
+                row += 1;
+            }
         }
-        self.writer.flush().map_err(|error| TerminalError::io("frame flush", error))?;
+        self.writer
+            .flush()
+            .map_err(|error| TerminalError::io("frame flush", error))?;
         self.previous = Some(frame.clone());
         Ok(changed)
     }
 
+    /// Queues a full color and attribute reset for the next flush.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if queuing either reset fails.
     pub fn reset_style(&mut self) -> Result<(), TerminalError> {
-        self.writer.queue(ResetColor).map_err(|error| TerminalError::io("color reset", error))?;
+        self.writer
+            .queue(ResetColor)
+            .map_err(|error| TerminalError::io("color reset", error))?;
         self.writer
             .queue(SetAttribute(Attribute::Reset))
             .map_err(|error| TerminalError::io("attribute reset", error))?;
@@ -670,9 +861,8 @@ impl<W: Write> DamageWriter<W> {
 fn resolved_underline(style: UnderlineStyle, undercurl: bool) -> Option<Attribute> {
     match style {
         UnderlineStyle::None => None,
-        UnderlineStyle::Straight => Some(Attribute::Underlined),
         UnderlineStyle::Curl if undercurl => Some(Attribute::Undercurled),
-        UnderlineStyle::Curl => Some(Attribute::Underlined),
+        UnderlineStyle::Straight | UnderlineStyle::Curl => Some(Attribute::Underlined),
     }
 }
 
@@ -698,7 +888,6 @@ fn control_caret(byte: u8) -> [u8; 2] {
         0x1d => b']',
         0x1e => b'^',
         0x1f => b'_',
-        0x7f => b'?',
         _ => b'?',
     };
     [b'^', code]
@@ -747,7 +936,7 @@ fn terminal_safe_bytes(text: &[u8]) -> Vec<u8> {
                     // Lone high byte or truncated multi-byte sequence: raw
                     // high bytes include the C1 control spans, so escape
                     // instead of leaking them into the terminal.
-                    output.extend_from_slice(format!("\\x{:02X}", first).as_bytes());
+                    output.extend_from_slice(format!("\\x{first:02X}").as_bytes());
                     index += 1;
                 }
             }
@@ -757,12 +946,26 @@ fn terminal_safe_bytes(text: &[u8]) -> Vec<u8> {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct SessionState {
-    raw_mode: bool,
-    cursor_configured: bool,
-    kitty_keyboard: bool,
-    synchronized_output: bool,
-    palette_restore_pending: bool,
+struct SessionState(u8);
+
+impl SessionState {
+    const RAW_MODE: u8 = 1 << 0;
+    const CURSOR_CONFIGURED: u8 = 1 << 1;
+    const KITTY_KEYBOARD: u8 = 1 << 2;
+    const SYNCHRONIZED_OUTPUT: u8 = 1 << 3;
+    const PALETTE_RESTORE_PENDING: u8 = 1 << 4;
+
+    const fn has(self, flag: u8) -> bool {
+        self.0 & flag != 0
+    }
+
+    fn set(&mut self, flag: u8, enabled: bool) {
+        if enabled {
+            self.0 |= flag;
+        } else {
+            self.0 &= !flag;
+        }
+    }
 }
 
 pub struct TerminalSession<W: Write> {
@@ -772,24 +975,27 @@ pub struct TerminalSession<W: Write> {
 }
 
 impl<W: Write> TerminalSession<W> {
+    /// Enables raw mode and installs the negotiated terminal setup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if raw mode cannot be enabled or if writing the
+    /// cursor setup, pushing the kitty keyboard protocol, or flushing fails;
+    /// the terminal is restored before the error is reported.
     pub fn start(writer: W, capabilities: TerminalCapabilities) -> Result<Self, TerminalError> {
         enable_raw_mode().map_err(|error| TerminalError::io("raw-mode enable", error))?;
         let mut session = Self {
             writer,
-            state: SessionState {
-                raw_mode: true,
-                palette_restore_pending: true,
-                ..SessionState::default()
-            },
+            state: SessionState(SessionState::RAW_MODE | SessionState::PALETTE_RESTORE_PENDING),
             capabilities,
         };
-        session.state.cursor_configured = true;
+        session.state.set(SessionState::CURSOR_CONFIGURED, true);
         if let Err(error) = session.writer.write_all(CURSOR_SETUP) {
             let _ = session.restore();
             return Err(TerminalError::io("cursor setup", error));
         }
-        if capabilities.kitty_keyboard {
-            session.state.kitty_keyboard = true;
+        if capabilities.features.kitty_keyboard() {
+            session.state.set(SessionState::KITTY_KEYBOARD, true);
             if let Err(error) = session.writer.write_all(KITTY_PUSH) {
                 let _ = session.restore();
                 return Err(TerminalError::io("kitty keyboard push", error));
@@ -810,33 +1016,50 @@ impl<W: Write> TerminalSession<W> {
         &mut self.writer
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if writing the synchronized-output begin sequence
+    /// fails; returns `Ok(false)` without writing when the capability is
+    /// unsupported or synchronization is already active.
     pub fn begin_synchronized_output(&mut self) -> Result<bool, TerminalError> {
-        if !self.capabilities.synchronized_output || self.state.synchronized_output {
+        if !self.capabilities.features.synchronized_output()
+            || self.state.has(SessionState::SYNCHRONIZED_OUTPUT)
+        {
             return Ok(false);
         }
-        self.state.synchronized_output = true;
+        self.state.set(SessionState::SYNCHRONIZED_OUTPUT, true);
         self.writer
             .write_all(SYNC_BEGIN)
             .map_err(|error| TerminalError::io("synchronized-output begin", error))?;
         Ok(true)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if writing the synchronized-output end sequence
+    /// fails; returns `Ok(false)` without writing when synchronization is
+    /// not active.
     pub fn end_synchronized_output(&mut self) -> Result<bool, TerminalError> {
-        if !self.state.synchronized_output {
+        if !self.state.has(SessionState::SYNCHRONIZED_OUTPUT) {
             return Ok(false);
         }
         self.writer
             .write_all(SYNC_END)
             .map_err(|error| TerminalError::io("synchronized-output end", error))?;
-        self.state.synchronized_output = false;
+        self.state.set(SessionState::SYNCHRONIZED_OUTPUT, false);
         Ok(true)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if writing or flushing the OSC 4 palette entries
+    /// fails; returns `Ok(false)` without writing when the palette decision
+    /// is restore-only or `entries` is empty.
     pub fn program_palette(&mut self, entries: &[(u8, Rgb)]) -> Result<bool, TerminalError> {
         if self.capabilities.palette == PaletteDecision::RestoreOnly || entries.is_empty() {
             return Ok(false);
         }
-        self.state.palette_restore_pending = true;
+        self.state.set(SessionState::PALETTE_RESTORE_PENDING, true);
         for (slot, color) in entries {
             match self.capabilities.palette {
                 PaletteDecision::Direct => write!(
@@ -853,59 +1076,69 @@ impl<W: Write> TerminalSession<W> {
             }
             .map_err(|error| TerminalError::io("palette program", error))?;
         }
-        self.writer.flush().map_err(|error| TerminalError::io("palette flush", error))?;
+        self.writer
+            .flush()
+            .map_err(|error| TerminalError::io("palette flush", error))?;
         Ok(true)
     }
 
     /// Restores independent terminal features in the required order and keeps
     /// attempting later steps after an earlier write fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failure among the synchronized-output end, kitty
+    /// keyboard pop, cursor restore, palette restore, flush, and raw-mode
+    /// disable steps; every later step is still attempted.
     pub fn restore(&mut self) -> Result<(), TerminalError> {
         let mut first_error = None;
-        if self.state.synchronized_output {
+        if self.state.has(SessionState::SYNCHRONIZED_OUTPUT) {
             match self.writer.write_all(SYNC_END) {
-                Ok(()) => self.state.synchronized_output = false,
-                Err(error) => first_error = Some(TerminalError::io("synchronized-output restore", error)),
+                Ok(()) => self.state.set(SessionState::SYNCHRONIZED_OUTPUT, false),
+                Err(error) => {
+                    first_error = Some(TerminalError::io("synchronized-output restore", error));
+                }
             }
         }
-        if self.state.kitty_keyboard {
+        if self.state.has(SessionState::KITTY_KEYBOARD) {
             match self.writer.write_all(KITTY_POP) {
-                Ok(()) => self.state.kitty_keyboard = false,
+                Ok(()) => self.state.set(SessionState::KITTY_KEYBOARD, false),
                 Err(error) if first_error.is_none() => {
                     first_error = Some(TerminalError::io("kitty keyboard restore", error));
                 }
                 Err(_) => {}
             }
         }
-        if self.state.cursor_configured {
+        if self.state.has(SessionState::CURSOR_CONFIGURED) {
             match self.writer.write_all(CURSOR_RESTORE) {
-                Ok(()) => self.state.cursor_configured = false,
+                Ok(()) => self.state.set(SessionState::CURSOR_CONFIGURED, false),
                 Err(error) if first_error.is_none() => {
                     first_error = Some(TerminalError::io("cursor restore", error));
                 }
                 Err(_) => {}
             }
         }
-        if self.state.palette_restore_pending {
+        if self.state.has(SessionState::PALETTE_RESTORE_PENDING) {
             let restore = match self.capabilities.palette {
                 PaletteDecision::TmuxPassthrough => TMUX_PALETTE_RESTORE,
                 PaletteDecision::Direct | PaletteDecision::RestoreOnly => PALETTE_RESTORE,
             };
             match self.writer.write_all(restore) {
-                Ok(()) => self.state.palette_restore_pending = false,
+                Ok(()) => self.state.set(SessionState::PALETTE_RESTORE_PENDING, false),
                 Err(error) if first_error.is_none() => {
                     first_error = Some(TerminalError::io("palette restore", error));
                 }
                 Err(_) => {}
             }
         }
-        if let Err(error) = self.writer.flush() {
-            if first_error.is_none() {
-                first_error = Some(TerminalError::io("terminal restore flush", error));
-            }
+        if let Err(error) = self.writer.flush()
+            && first_error.is_none()
+        {
+            first_error = Some(TerminalError::io("terminal restore flush", error));
         }
-        if self.state.raw_mode {
+        if self.state.has(SessionState::RAW_MODE) {
             match disable_raw_mode() {
-                Ok(()) => self.state.raw_mode = false,
+                Ok(()) => self.state.set(SessionState::RAW_MODE, false),
                 Err(error) if first_error.is_none() => {
                     first_error = Some(TerminalError::io("raw-mode restore", error));
                 }
@@ -939,6 +1172,13 @@ pub struct ProcessFailure {
 }
 
 impl ProcessFailure {
+    /// Writes the failure summary line, the captured child stderr, and the
+    /// exit code when present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing the diagnostic message, the child stderr,
+    /// its newline separator, or the exit-code line fails.
     pub fn write_diagnostic(&self, writer: &mut impl Write) -> Result<(), TerminalError> {
         let message = match self.kind {
             ProcessFailureKind::Spawn => {
@@ -967,6 +1207,12 @@ impl ProcessFailure {
     }
 }
 
+/// Restores the terminal, then preserves `failure`'s diagnostics.
+///
+/// # Errors
+///
+/// Returns the restore error when restoring fails, otherwise the error from
+/// writing the diagnostics.
 pub fn restore_after_process_failure<W: Write>(
     session: &mut TerminalSession<W>,
     failure: &ProcessFailure,
@@ -981,20 +1227,30 @@ pub fn restore_after_process_failure<W: Write>(
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     fn capabilities() -> TerminalCapabilities {
+        let mut features = TerminalFeatures::default();
+        features.set(
+            TerminalFeatures::KITTY_KEYBOARD
+                | TerminalFeatures::SYNCHRONIZED_OUTPUT
+                | TerminalFeatures::UNDERCURL
+                | TerminalFeatures::COLORED_UNDERLINE
+                | TerminalFeatures::OSC52_CLIPBOARD,
+            true,
+        );
         TerminalCapabilities {
             colors: ColorSupport::TrueColor,
-            kitty_keyboard: true,
-            synchronized_output: true,
-            undercurl: true,
-            colored_underline: true,
-            osc52_clipboard: true,
+            features,
             palette: PaletteDecision::Direct,
         }
     }
 
     fn cell(text: &str) -> Cell {
-        Cell { text: text.as_bytes().to_vec(), ..Cell::default() }
+        Cell {
+            text: text.as_bytes().to_vec(),
+            ..Cell::default()
+        }
     }
 
     struct FailingWriter;
@@ -1032,46 +1288,83 @@ mod tests {
 
     #[test]
     fn pure_probe_parsers_handle_supported_unsupported_and_partial_replies() {
-        assert_eq!(parse_kitty_keyboard_response(b"noise\x1b[?3u\x1b[?1;2c"), ProbeAnswer::Supported);
-        assert_eq!(parse_kitty_keyboard_response(b"\x1b[?1;2c"), ProbeAnswer::Unsupported);
-        assert_eq!(parse_kitty_keyboard_response(b"\x1b[?3"), ProbeAnswer::Incomplete);
-        assert_eq!(parse_sync_output_response(b"\x1b[?2026;1$y"), ProbeAnswer::Supported);
-        assert_eq!(parse_sync_output_response(b"\x1b[?2026;0$y"), ProbeAnswer::Unsupported);
-        assert_eq!(parse_sync_output_response(b"\x1b[?2026;"), ProbeAnswer::Incomplete);
+        assert_eq!(
+            parse_kitty_keyboard_response(b"noise\x1b[?3u\x1b[?1;2c"),
+            ProbeAnswer::Supported
+        );
+        assert_eq!(
+            parse_kitty_keyboard_response(b"\x1b[?1;2c"),
+            ProbeAnswer::Unsupported
+        );
+        assert_eq!(
+            parse_kitty_keyboard_response(b"\x1b[?3"),
+            ProbeAnswer::Incomplete
+        );
+        assert_eq!(
+            parse_sync_output_response(b"\x1b[?2026;1$y"),
+            ProbeAnswer::Supported
+        );
+        assert_eq!(
+            parse_sync_output_response(b"\x1b[?2026;0$y"),
+            ProbeAnswer::Unsupported
+        );
+        assert_eq!(
+            parse_sync_output_response(b"\x1b[?2026;"),
+            ProbeAnswer::Incomplete
+        );
         assert_eq!(
             parse_undercurl_response(b"\x1bP1$r4:3m\x1b\\", false),
             ProbeAnswer::Supported
         );
         assert_eq!(parse_undercurl_response(b"", true), ProbeAnswer::Supported);
-        assert_eq!(parse_undercurl_response(b"\x1bP0$r\x1b\\", false), ProbeAnswer::Unsupported);
-        assert_eq!(parse_osc52_response(b"\x1b]52;c;YWJj\x07"), ProbeAnswer::Supported);
-        assert_eq!(parse_osc52_response(b"\x1b]52;c;YWJj"), ProbeAnswer::Incomplete);
+        assert_eq!(
+            parse_undercurl_response(b"\x1bP0$r\x1b\\", false),
+            ProbeAnswer::Unsupported
+        );
+        assert_eq!(
+            parse_osc52_response(b"\x1b]52;c;YWJj\x07"),
+            ProbeAnswer::Supported
+        );
+        assert_eq!(
+            parse_osc52_response(b"\x1b]52;c;YWJj"),
+            ProbeAnswer::Incomplete
+        );
     }
 
     #[test]
-    fn live_probe_wires_queries_to_parsers() {
-        let (mut server, mut client) = std::os::unix::net::UnixStream::pair().expect("socket pair");
-        server
-            .write_all(b"\x1b[?3u\x1b[?2026;1$y\x1bP1$r4:3m\x1b\\\x1b]52;c;dGVzdA\x07")
-            .expect("write fixtures");
+    fn live_probe_wires_queries_to_parsers() -> TestResult {
+        let (mut server, mut client) = std::os::unix::net::UnixStream::pair()?;
+        server.write_all(b"\x1b[?3u\x1b[?2026;1$y\x1bP1$r4:3m\x1b\\\x1b]52;c;dGVzdA\x07")?;
         drop(server);
         let mut writer = Vec::new();
         let environment = TerminalEnvironment {
             terminfo: None,
             ..TerminalEnvironment::default()
         };
-        let capabilities =
-            probe_io(&mut client, &mut writer, &environment, ProbePolicy::default())
-                .expect("probe succeeds");
-        assert!(capabilities.kitty_keyboard);
-        assert!(capabilities.synchronized_output);
-        assert!(capabilities.undercurl);
-        assert!(capabilities.colored_underline);
-        assert!(capabilities.osc52_clipboard);
+        let capabilities = probe_io(
+            &mut client,
+            &mut writer,
+            &environment,
+            ProbePolicy::default(),
+        )?;
+        assert!(capabilities.features.kitty_keyboard());
+        assert!(capabilities.features.synchronized_output());
+        assert!(capabilities.features.undercurl());
+        assert!(capabilities.features.colored_underline());
+        assert!(capabilities.features.osc52_clipboard());
         assert!(writer.starts_with(KITTY_KEYBOARD_QUERY));
-        assert!(writer.windows(SYNC_OUTPUT_QUERY.len()).any(|w| w == SYNC_OUTPUT_QUERY));
-        assert!(writer.windows(UNDERCURL_QUERY.len()).any(|w| w == UNDERCURL_QUERY));
+        assert!(
+            writer
+                .windows(SYNC_OUTPUT_QUERY.len())
+                .any(|w| w == SYNC_OUTPUT_QUERY)
+        );
+        assert!(
+            writer
+                .windows(UNDERCURL_QUERY.len())
+                .any(|w| w == UNDERCURL_QUERY)
+        );
         assert!(writer.windows(OSC52_QUERY.len()).any(|w| w == OSC52_QUERY));
+        Ok(())
     }
 
     #[test]
@@ -1083,19 +1376,23 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_probe_response_leaves_features_disabled() {
-        let (mut server, mut client) = std::os::unix::net::UnixStream::pair().expect("socket pair");
-        server.write_all(b"\x1b[\x1b]52;unterminated").expect("write noise");
+    fn unmatched_probe_response_leaves_features_disabled() -> TestResult {
+        let (mut server, mut client) = std::os::unix::net::UnixStream::pair()?;
+        server.write_all(b"\x1b[\x1b]52;unterminated")?;
         drop(server);
         let mut writer = Vec::new();
         let environment = TerminalEnvironment::default();
-        let capabilities =
-            probe_io(&mut client, &mut writer, &environment, ProbePolicy::default())
-                .expect("probe succeeds");
-        assert!(!capabilities.kitty_keyboard);
-        assert!(!capabilities.synchronized_output);
-        assert!(!capabilities.undercurl);
-        assert!(!capabilities.osc52_clipboard);
+        let capabilities = probe_io(
+            &mut client,
+            &mut writer,
+            &environment,
+            ProbePolicy::default(),
+        )?;
+        assert!(!capabilities.features.kitty_keyboard());
+        assert!(!capabilities.features.synchronized_output());
+        assert!(!capabilities.features.undercurl());
+        assert!(!capabilities.features.osc52_clipboard());
+        Ok(())
     }
 
     #[test]
@@ -1109,60 +1406,84 @@ mod tests {
     fn frame_validation_is_typed() {
         assert_eq!(
             Frame::new(2, 1, vec![Cell::default()]),
-            Err(FrameError::CellCount { expected: 2, actual: 1 })
+            Err(FrameError::CellCount {
+                expected: 2,
+                actual: 1
+            })
         );
         assert_eq!(
-            Frame::new(1, 1, vec![Cell { text: Vec::new(), ..Cell::default() }]),
+            Frame::new(
+                1,
+                1,
+                vec![Cell {
+                    text: Vec::new(),
+                    ..Cell::default()
+                }]
+            ),
             Err(FrameError::EmptyCell { index: 0 })
         );
     }
 
     #[test]
-    fn damage_writer_emits_only_changed_cells() {
-        let initial = Frame::new(2, 1, vec![cell("a"), cell("b")]).expect("valid frame");
-        let changed = Frame::new(2, 1, vec![cell("a"), cell("c")]).expect("valid frame");
+    fn damage_writer_emits_only_changed_cells() -> TestResult {
+        let initial = Frame::new(2, 1, vec![cell("a"), cell("b")])?;
+        let changed = Frame::new(2, 1, vec![cell("a"), cell("c")])?;
         let mut writer = DamageWriter::new(Vec::new(), true);
-        assert_eq!(writer.render(&initial).expect("initial render"), 2);
+        assert_eq!(writer.render(&initial)?, 2);
         let first_len = writer.writer.len();
-        assert_eq!(writer.render(&initial).expect("unchanged render"), 0);
+        assert_eq!(writer.render(&initial)?, 0);
         assert_eq!(writer.writer.len(), first_len);
-        assert_eq!(writer.render(&changed).expect("changed render"), 1);
+        assert_eq!(writer.render(&changed)?, 1);
         let delta = &writer.writer[first_len..];
         assert!(delta.windows(4).any(|window| window == b"\x1b[2G") || delta.ends_with(b"c"));
+        Ok(())
     }
 
     #[test]
     fn terminal_safe_bytes_escapes_controls_and_invalid_bytes() {
         // Printable ASCII and multibyte UTF-8 pass through unchanged.
-        assert_eq!(terminal_safe_bytes(b"plain \xe7\x95\x8c"), b"plain \xe7\x95\x8c");
+        assert_eq!(
+            terminal_safe_bytes(b"plain \xe7\x95\x8c"),
+            b"plain \xe7\x95\x8c"
+        );
         // C0 controls become caret notation.
         assert_eq!(terminal_safe_bytes(b"\x00\x01\x1b\x7f"), b"^@^A^[^?");
         // C1 controls and invalid lone bytes become hex escapes.
-        assert_eq!(terminal_safe_bytes(b"\x9b\xff\xc0\xb0"), b"\\x9B\\xFF\\xC0\\xB0");
+        assert_eq!(
+            terminal_safe_bytes(b"\x9b\xff\xc0\xb0"),
+            b"\\x9B\\xFF\\xC0\\xB0"
+        );
         // A validly-encoded C1 control and a lone continuation byte.
         assert_eq!(terminal_safe_bytes(b"a\xc2\x85b\x80"), b"a\\x85b\\x80");
         // Escaping is never skipped: every output byte is printable ASCII.
-        assert!(terminal_safe_bytes(b"\x1b[2J\x00\xfe").iter().all(|b| b.is_ascii()));
+        assert!(
+            terminal_safe_bytes(b"\x1b[2J\x00\xfe")
+                .iter()
+                .all(u8::is_ascii)
+        );
     }
 
     #[test]
-    fn damage_writer_skips_continuation_cells() {
-        let frame = Frame::new(2, 1, vec![cell("界"), Cell::continuation()]).expect("valid frame");
+    fn damage_writer_skips_continuation_cells() -> TestResult {
+        let frame = Frame::new(2, 1, vec![cell("界"), Cell::continuation()])?;
         let mut writer = DamageWriter::new(Vec::new(), false);
         // Only the leading glyph is drawn; the continuation cell is skipped.
-        assert_eq!(writer.render(&frame).expect("render"), 1);
+        assert_eq!(writer.render(&frame)?, 1);
+        Ok(())
     }
 
     #[test]
-    fn damage_writer_escapes_control_bytes_in_cell_text() {
+    fn damage_writer_escapes_control_bytes_in_cell_text() -> TestResult {
         let frame = Frame::new(
             1,
             1,
-            vec![Cell { text: b"a\x1b[2J\x7f\x00\x9b\xff\xc0\xb0".to_vec(), ..Cell::default() }],
-        )
-        .expect("valid frame");
+            vec![Cell {
+                text: b"a\x1b[2J\x7f\x00\x9b\xff\xc0\xb0".to_vec(),
+                ..Cell::default()
+            }],
+        )?;
         let mut writer = DamageWriter::new(Vec::new(), false);
-        writer.render(&frame).expect("render");
+        writer.render(&frame)?;
         let out = &writer.writer;
         // The cell text is re-encoded to a printable visible form...
         let escaped = b"a^[[2J^?^@\\x9B\\xFF\\xC0\\xB0";
@@ -1171,66 +1492,85 @@ mod tests {
             "escaped cell text must be present, got {out:?}"
         );
         // ...and the raw control sequence and control bytes never reach the terminal.
-        assert!(!out.windows(4).any(|window| window == b"\x1b[2J"), "ESC sequence leaked: {out:?}");
+        assert!(
+            !out.windows(4).any(|window| window == b"\x1b[2J"),
+            "ESC sequence leaked: {out:?}"
+        );
         for forbidden in [b"\x00", b"\x7f", b"\x9b", b"\xff", b"\xc0"] {
             assert!(
-                !out.windows(forbidden.len()).any(|window| window == forbidden),
+                !out.windows(forbidden.len())
+                    .any(|window| window == forbidden),
                 "raw byte leaked: {forbidden:?} in {out:?}"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn resize_invalidates_the_retained_frame() {
-        let narrow = Frame::new(1, 1, vec![cell("a")]).expect("valid frame");
-        let wide = Frame::new(2, 1, vec![cell("a"), cell("b")]).expect("valid frame");
+    fn resize_invalidates_the_retained_frame() -> TestResult {
+        let narrow = Frame::new(1, 1, vec![cell("a")])?;
+        let wide = Frame::new(2, 1, vec![cell("a"), cell("b")])?;
         let mut writer = DamageWriter::new(Vec::new(), false);
-        assert_eq!(writer.render(&narrow).expect("narrow render"), 1);
-        assert_eq!(writer.render(&wide).expect("wide render"), 2);
+        assert_eq!(writer.render(&narrow)?, 1);
+        assert_eq!(writer.render(&wide)?, 2);
+        Ok(())
     }
 
     #[test]
-    fn failed_output_does_not_advance_retained_frame() {
-        let frame = Frame::new(1, 1, vec![cell("a")]).expect("valid frame");
+    fn failed_output_does_not_advance_retained_frame() -> TestResult {
+        let frame = Frame::new(1, 1, vec![cell("a")])?;
         let mut writer = DamageWriter::new(FailingWriter, false);
-        let error = writer.render(&frame).expect_err("write must fail");
-        assert!(matches!(error, TerminalError::Io { operation: "cursor move", .. }));
+        let Err(error) = writer.render(&frame) else {
+            return Err("write must fail".into());
+        };
+        assert!(matches!(
+            error,
+            TerminalError::Io {
+                operation: "cursor move",
+                ..
+            }
+        ));
         assert!(writer.previous().is_none());
+        Ok(())
     }
 
     #[test]
     fn undercurl_has_a_plain_underline_fallback() {
-        assert_eq!(resolved_underline(UnderlineStyle::Curl, true), Some(Attribute::Undercurled));
-        assert_eq!(resolved_underline(UnderlineStyle::Curl, false), Some(Attribute::Underlined));
+        assert_eq!(
+            resolved_underline(UnderlineStyle::Curl, true),
+            Some(Attribute::Undercurled)
+        );
+        assert_eq!(
+            resolved_underline(UnderlineStyle::Curl, false),
+            Some(Attribute::Underlined)
+        );
     }
 
     #[test]
-    fn palette_program_and_restore_sequences_are_ordered() {
+    fn palette_program_and_restore_sequences_are_ordered() -> TestResult {
         let mut session = TerminalSession {
             writer: Vec::new(),
-            state: SessionState {
-                raw_mode: false,
-                cursor_configured: true,
-                kitty_keyboard: true,
-                synchronized_output: true,
-                palette_restore_pending: true,
-            },
+            state: SessionState(
+                SessionState::CURSOR_CONFIGURED
+                    | SessionState::KITTY_KEYBOARD
+                    | SessionState::SYNCHRONIZED_OUTPUT
+                    | SessionState::PALETTE_RESTORE_PENDING,
+            ),
             capabilities: capabilities(),
         };
-        session
-            .program_palette(&[(0, Rgb::new(0x16, 0x18, 0x1d))])
-            .expect("palette program");
-        session.restore().expect("restore");
-        let bytes = String::from_utf8(session.writer.clone()).expect("ANSI is UTF-8");
-        let sync = bytes.find("\x1b[?2026l").expect("sync close");
-        let kitty = bytes.find("\x1b[<u").expect("kitty pop");
-        let cursor = bytes.find("\x1b[0 q").expect("cursor reset");
-        let palette = bytes.find("\x1b]104").expect("palette restore");
+        session.program_palette(&[(0, Rgb::new(0x16, 0x18, 0x1d))])?;
+        session.restore()?;
+        let bytes = String::from_utf8(session.writer.clone())?;
+        let sync = bytes.find("\x1b[?2026l").ok_or("missing sync close")?;
+        let kitty = bytes.find("\x1b[<u").ok_or("missing kitty pop")?;
+        let cursor = bytes.find("\x1b[0 q").ok_or("missing cursor reset")?;
+        let palette = bytes.find("\x1b]104").ok_or("missing palette restore")?;
         assert!(sync < kitty && kitty < cursor && cursor < palette);
+        Ok(())
     }
 
     #[test]
-    fn tmux_palette_sequences_use_dcs_passthrough() {
+    fn tmux_palette_sequences_use_dcs_passthrough() -> TestResult {
         let mut tmux_capabilities = capabilities();
         tmux_capabilities.palette = PaletteDecision::TmuxPassthrough;
         let mut session = TerminalSession {
@@ -1238,19 +1578,22 @@ mod tests {
             state: SessionState::default(),
             capabilities: tmux_capabilities,
         };
-        session
-            .program_palette(&[(2, Rgb::new(0x11, 0x22, 0x33))])
-            .expect("tmux palette program");
-        session.restore().expect("tmux palette restore");
-        assert!(session.writer.starts_with(b"\x1bPtmux;\x1b\x1b]4;2;rgb:11/22/33"));
+        session.program_palette(&[(2, Rgb::new(0x11, 0x22, 0x33))])?;
+        session.restore()?;
+        assert!(
+            session
+                .writer
+                .starts_with(b"\x1bPtmux;\x1b\x1b]4;2;rgb:11/22/33")
+        );
         assert!(session.writer.ends_with(TMUX_PALETTE_RESTORE));
+        Ok(())
     }
 
     #[test]
-    fn process_failure_restores_before_preserving_child_stderr() {
+    fn process_failure_restores_before_preserving_child_stderr() -> TestResult {
         let mut session = TerminalSession {
             writer: Vec::new(),
-            state: SessionState { cursor_configured: true, ..SessionState::default() },
+            state: SessionState(SessionState::CURSOR_CONFIGURED),
             capabilities: capabilities(),
         };
         let failure = ProcessFailure {
@@ -1259,10 +1602,15 @@ mod tests {
             exit_code: Some(7),
         };
         let mut diagnostics = Vec::new();
-        restore_after_process_failure(&mut session, &failure, &mut diagnostics).expect("process edge");
+        restore_after_process_failure(&mut session, &failure, &mut diagnostics)?;
         assert!(session.writer.starts_with(CURSOR_RESTORE));
-        assert!(diagnostics.windows(13).any(|window| window == b"server detail"));
+        assert!(
+            diagnostics
+                .windows(13)
+                .any(|window| window == b"server detail")
+        );
         assert!(diagnostics.ends_with(b"Embed exited with code 7.\n"));
+        Ok(())
     }
 
     #[test]
@@ -1288,27 +1636,27 @@ mod tests {
     // process-global and permanent, so raising SIGTERM here would change the
     // disposition every later test in this binary runs under.
     #[test]
-    fn pending_reports_a_delivered_signal_and_ignores_an_undelivered_one() {
+    fn pending_reports_a_delivered_signal_and_ignores_an_undelivered_one() -> TestResult {
         let signals = ShutdownSignals::install_for(&[
             signal_hook::consts::SIGUSR1,
             signal_hook::consts::SIGUSR2,
-        ])
-        .expect("register test signals");
+        ])?;
         assert_eq!(signals.pending(), None, "nothing delivered yet");
 
-        signal_hook::low_level::raise(signal_hook::consts::SIGUSR2).expect("raise SIGUSR2");
+        signal_hook::low_level::raise(signal_hook::consts::SIGUSR2)?;
         // Only the second registration was delivered: a `pending` that returned
         // the first entry regardless of its flag would answer SIGUSR1 here.
         assert_eq!(signals.pending(), Some(signal_hook::consts::SIGUSR2));
         // The report is consumed: a load instead of a swap would repeat it.
         assert_eq!(signals.pending(), None);
 
-        signal_hook::low_level::raise(signal_hook::consts::SIGUSR1).expect("raise SIGUSR1");
-        signal_hook::low_level::raise(signal_hook::consts::SIGUSR2).expect("raise SIGUSR2");
+        signal_hook::low_level::raise(signal_hook::consts::SIGUSR1)?;
+        signal_hook::low_level::raise(signal_hook::consts::SIGUSR2)?;
         // Registration order decides, so scanning from the end would answer
         // SIGUSR2 first.
         assert_eq!(signals.pending(), Some(signal_hook::consts::SIGUSR1));
         assert_eq!(signals.pending(), Some(signal_hook::consts::SIGUSR2));
         assert_eq!(signals.pending(), None);
+        Ok(())
     }
 }

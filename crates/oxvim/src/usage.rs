@@ -5,8 +5,8 @@
 //! mode. Only the flags oxvim actually acts on are listed: a help screen that
 //! advertised a rejected flag would be a lie a script cannot detect.
 
-use crate::api_info;
 use crate::AppError;
+use crate::api_info;
 use ox_types::Object;
 
 /// The one-line usage summary plus every supported option.
@@ -58,7 +58,9 @@ pub fn version() -> Result<String, AppError> {
         .ok_or_else(|| AppError::Api("API metadata has no version".into()))?;
     let number = |name: &str| match field(version, name) {
         Some(Object::Integer(value)) => Ok(*value),
-        _ => Err(AppError::Api(format!("API metadata has no integer version.{name}"))),
+        _ => Err(AppError::Api(format!(
+            "API metadata has no integer version.{name}"
+        ))),
     };
     Ok(format!(
         "OXVIM v{}.{}.{}\nAPI level {} (compatible: {})\nBuild type: {}\n",
@@ -67,12 +69,18 @@ pub fn version() -> Result<String, AppError> {
         number("patch")?,
         number("api_level")?,
         number("api_compatible")?,
-        if cfg!(debug_assertions) { "Debug" } else { "Release" },
+        if cfg!(debug_assertions) {
+            "Debug"
+        } else {
+            "Release"
+        },
     ))
 }
 
 fn field<'a>(value: &'a Object, name: &str) -> Option<&'a Object> {
-    let Object::Dict(dict) = value else { return None };
+    let Object::Dict(dict) = value else {
+        return None;
+    };
     dict.0
         .iter()
         .find(|(key, _)| key.as_bytes() == name.as_bytes())
@@ -84,6 +92,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(clippy::unwrap_used)]
     fn version_reports_the_api_level_from_canonical_metadata() {
         let text = version().unwrap();
         assert!(text.starts_with("OXVIM v0.13.0\n"), "{text}");
@@ -113,7 +122,10 @@ mod tests {
             assert!(parsed.is_ok(), "help advertises rejected {invocation}");
         }
         for rejected in ["-d ", "--remote", "--server", "-q ", "-t ", "-W "] {
-            assert!(!HELP.contains(rejected), "help advertises rejected {rejected}");
+            assert!(
+                !HELP.contains(rejected),
+                "help advertises rejected {rejected}"
+            );
         }
     }
 }

@@ -50,36 +50,45 @@ pub(crate) const POLL_WRITABLE: u8 = 0b0010;
 pub(crate) const POLL_DISCONNECT: u8 = 0b0100;
 pub(crate) const POLL_PRIORITIZED: u8 = 0b1000;
 const EVENT_NAMES: [&str; 16] = [
-    "", "r", "w", "rw", "d", "rd", "wd", "rwd", "p", "rp", "wp", "rwp", "dp", "rdp", "wdp",
-    "rwdp",
+    "", "r", "w", "rw", "d", "rd", "wd", "rwd", "p", "rp", "wp", "rwp", "dp", "rdp", "wdp", "rwdp",
 ];
 
 impl PollEvents {
     /// Builds a mask from raw event bits.
+    #[must_use]
     pub fn from_mask(mask: u8) -> Self {
         Self(mask)
     }
     /// Returns whether the READABLE event is set.
+    #[must_use]
     pub fn readable(self) -> bool {
         self.0 & POLL_READABLE != 0
     }
     /// Returns whether the WRITABLE event is set.
+    #[must_use]
     pub fn writable(self) -> bool {
         self.0 & POLL_WRITABLE != 0
     }
     /// Returns whether the DISCONNECT event is set.
+    #[must_use]
     pub fn disconnect(self) -> bool {
         self.0 & POLL_DISCONNECT != 0
     }
     /// Returns whether the PRIORITIZED event is set.
+    #[must_use]
     pub fn prioritized(self) -> bool {
         self.0 & POLL_PRIORITIZED != 0
     }
     /// Returns the luvref event string for these bits, or `None` when none
     /// are set.
+    #[must_use]
     pub fn name(self) -> Option<&'static str> {
         let index = usize::from(self.0);
-        if index == 0 { None } else { Some(EVENT_NAMES[index]) }
+        if index == 0 {
+            None
+        } else {
+            Some(EVENT_NAMES[index])
+        }
     }
 }
 
@@ -111,9 +120,8 @@ fn poll_interest(mask: u8) -> mio::Interest {
     let writable = mask & POLL_WRITABLE != 0;
     match (readable, writable) {
         (true, true) => mio::Interest::READABLE.add(mio::Interest::WRITABLE),
-        (true, false) => mio::Interest::READABLE,
-        (false, true) => mio::Interest::WRITABLE,
-        (false, false) => mio::Interest::READABLE,
+        (_, true) => mio::Interest::WRITABLE,
+        _ => mio::Interest::READABLE,
     }
 }
 
@@ -150,8 +158,8 @@ fn poll_active(state: &PollState) -> bool {
 }
 
 fn duplicate_nonblocking<F: AsFd>(fd: &F) -> crate::net::NetResult<OwnedFd> {
-    use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
-    let duplicate = rustix::io::dup(fd).map_err(crate::net::errno_error)?;
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    let duplicate = rustix::io::fcntl_dupfd_cloexec(fd, 0).map_err(crate::net::errno_error)?;
     fcntl_setfl(
         &duplicate,
         fcntl_getfl(&duplicate).map_err(crate::net::errno_error)? | OFlags::NONBLOCK,
@@ -172,7 +180,11 @@ pub struct Poll {
 
 impl std::fmt::Debug for Poll {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("Poll").field("id", &self.id).finish()
+        formatter
+            .debug_struct("Poll")
+            .field("id", &self.id)
+            .field("token", &self.token)
+            .finish_non_exhaustive()
     }
 }
 
@@ -182,6 +194,12 @@ impl Poll {
     /// See `uv.new_poll()` in `runtime/doc/luvref.txt`. The caller remains
     /// responsible for the original descriptor; it may be closed immediately
     /// after `poll_stop` or `close`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetError::Io`](crate::net::NetError::Io) if duplicating the
+    /// descriptor or setting it non-blocking fails, or a loop error if handle
+    /// or I/O-token allocation or readiness registration fails.
     pub fn new<F, C>(uv_loop: &mut UvLoop, fd: F, callback: C) -> crate::net::NetResult<Self>
     where
         F: AsFd,
@@ -199,6 +217,10 @@ impl Poll {
     ///
     /// See `uv.new_socket_poll()` in `runtime/doc/luvref.txt` (lines
     /// 1156-1167). On Unix this is identical to [`Poll::new`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Poll::new`].
     pub fn new_socket<F, C>(uv_loop: &mut UvLoop, fd: F, callback: C) -> crate::net::NetResult<Self>
     where
         F: AsFd,
@@ -207,7 +229,12 @@ impl Poll {
         Self::new(uv_loop, fd, callback)
     }
 
-    fn wrap(uv_loop: &mut UvLoop, fd: OwnedFd, mask: u8, callback: PollCallback) -> crate::net::NetResult<Self> {
+    fn wrap(
+        uv_loop: &mut UvLoop,
+        fd: OwnedFd,
+        mask: u8,
+        callback: PollCallback,
+    ) -> crate::net::NetResult<Self> {
         let id = uv_loop.allocate_external(false)?;
         let token = uv_loop.allocate_io_token()?;
         let state = Rc::new(RefCell::new(PollState {
@@ -217,7 +244,12 @@ impl Poll {
             registered: false,
         }));
         register_poll(uv_loop, id, token, &state, &callback)?;
-        Ok(Self { id, token, state, _callback: callback })
+        Ok(Self {
+            id,
+            token,
+            state,
+            _callback: callback,
+        })
     }
 
     /// Starts polling with an `events` mask, firing `callback` on readiness.
@@ -227,8 +259,18 @@ impl Poll {
     /// [`NetError::Unsupported`] because the reactor pipeline this handle is
     /// built on cannot surface real `POLLPRI` readiness (see the module docs).
     /// See `uv.poll_start()` in `runtime/doc/luvref.txt` (lines 1169-1196).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetError::InvalidState`](crate::net::NetError::InvalidState)
+    /// if `events` is not a valid poll mask, [`NetError::Unsupported`](crate::net::NetError::Unsupported)
+    /// if the mask contains `"p"` (PRIORITIZED), [`NetError::Closed`](crate::net::NetError::Closed)
+    /// if the descriptor has already been closed, or an I/O/loop error if
+    /// reactor registration or handle activation fails.
     pub fn poll_start(&mut self, uv_loop: &mut UvLoop, events: &str) -> crate::net::NetResult<()> {
-        let mask = poll_start_mask(events).ok_or_else(|| crate::net::NetError::InvalidState("invalid poll events mask"))?;
+        let mask = poll_start_mask(events).ok_or(crate::net::NetError::InvalidState(
+            "invalid poll events mask",
+        ))?;
         if mask & POLL_PRIORITIZED != 0 {
             return Err(crate::net::NetError::Unsupported(
                 "poll PRIORITIZED ('p') readiness has no reactor equivalent; the loop cannot surface real POLLPRI",
@@ -239,8 +281,16 @@ impl Poll {
             state.mask = mask;
             state.active = true;
             if !state.registered {
-                let fd = state.fd.as_ref().ok_or(crate::net::NetError::Closed)?.as_raw_fd();
-                uv_loop.inner_mut().reactor().register(&mut SourceFd(&fd), self.token, poll_interest(mask))?;
+                let fd = state
+                    .fd
+                    .as_ref()
+                    .ok_or(crate::net::NetError::Closed)?
+                    .as_raw_fd();
+                uv_loop.inner_mut().reactor().register(
+                    &mut SourceFd(&fd),
+                    self.token,
+                    poll_interest(mask),
+                )?;
                 state.registered = true;
             }
         }
@@ -248,8 +298,11 @@ impl Poll {
     }
 
     /// Stops polling the file descriptor.
-    ///
     /// See `uv.poll_stop()` in `runtime/doc/luvref.txt` (lines 1198-1208).
+    ///
+    /// # Errors
+    ///
+    /// Returns a loop error if updating the handle's active state fails.
     pub fn poll_stop(&mut self, uv_loop: &mut UvLoop) -> crate::net::NetResult<()> {
         {
             let mut state = self.state.borrow_mut();
@@ -257,7 +310,10 @@ impl Poll {
             if state.registered {
                 if let Some(fd) = state.fd.as_ref() {
                     let raw = fd.as_raw_fd();
-                    let _ = uv_loop.inner_mut().reactor().deregister(&mut SourceFd(&raw));
+                    let _ = uv_loop
+                        .inner_mut()
+                        .reactor()
+                        .deregister(&mut SourceFd(&raw));
                 }
                 state.registered = false;
             }
@@ -279,22 +335,31 @@ fn register_poll(
     let shared = Rc::clone(state);
     let user_callback = Rc::clone(callback);
     let queue = uv_loop.net_dispatch_queue();
-    uv_loop.inner_mut().on_readiness(token, move |ready, _| {
-        let (fired, active) = {
-            let state = shared.borrow();
-            (fired_events(state.mask, ready), state.active)
-        };
-        if active && fired != 0 {
-            let dispatch_state = Rc::clone(&shared);
-            let dispatch_callback = Rc::clone(&user_callback);
-            let dispatch_ready = PollEvents(fired);
-            queue_batch(&queue, move |uv_loop| {
-                deliver_poll(uv_loop, id, token, &dispatch_state, &dispatch_callback, dispatch_ready)
-            });
-        }
-        Ok(DrainState::Drained)
-    })
-    .map_err(crate::Error::from)?;
+    uv_loop
+        .inner_mut()
+        .on_readiness(token, move |ready, _| {
+            let (fired, active) = {
+                let state = shared.borrow();
+                (fired_events(state.mask, ready), state.active)
+            };
+            if active && fired != 0 {
+                let dispatch_state = Rc::clone(&shared);
+                let dispatch_callback = Rc::clone(&user_callback);
+                let dispatch_ready = PollEvents(fired);
+                queue_batch(&queue, move |uv_loop| {
+                    deliver_poll(
+                        uv_loop,
+                        id,
+                        token,
+                        &dispatch_state,
+                        &dispatch_callback,
+                        dispatch_ready,
+                    );
+                });
+            }
+            Ok(DrainState::Drained)
+        })
+        .map_err(crate::Error::from)?;
     Ok(())
 }
 
@@ -310,11 +375,14 @@ fn sync_poll(
     {
         let state = state.borrow_mut();
         let interests = poll_interest(state.mask);
-        if state.registered {
-            if let Some(fd) = state.fd.as_ref() {
-                let raw = fd.as_raw_fd();
-                uv_loop.inner_mut().reactor().reregister(&mut SourceFd(&raw), token, interests)?;
-            }
+        if state.registered
+            && let Some(fd) = state.fd.as_ref()
+        {
+            let raw = fd.as_raw_fd();
+            uv_loop
+                .inner_mut()
+                .reactor()
+                .reregister(&mut SourceFd(&raw), token, interests)?;
         }
     }
     uv_loop.set_external_active(id, poll_active(&state.borrow()))?;
@@ -353,19 +421,21 @@ fn invoke_poll(callback: &PollCallback, uv_loop: &mut UvLoop, id: HandleId, even
     }
 }
 
-fn close_poll(uv_loop: &mut UvLoop, handle: &Poll) -> crate::Result<()> {
+fn close_poll(uv_loop: &mut UvLoop, handle: &Poll) {
     uv_loop.inner_mut().remove_readiness(handle.token);
     let mut state = handle.state.borrow_mut();
     if state.registered {
         if let Some(fd) = state.fd.as_ref() {
             let raw = fd.as_raw_fd();
-            let _ = uv_loop.inner_mut().reactor().deregister(&mut SourceFd(&raw));
+            let _ = uv_loop
+                .inner_mut()
+                .reactor()
+                .deregister(&mut SourceFd(&raw));
         }
         state.registered = false;
     }
     state.fd = None;
     state.active = false;
-    Ok(())
 }
 
 impl Handle for Poll {
@@ -373,14 +443,44 @@ impl Handle for Poll {
         self.id
     }
     fn close(&self, uv_loop: &mut UvLoop) -> crate::Result<()> {
-        close_poll(uv_loop, self)?;
-        uv_loop.close(self.id, None::<fn(&mut UvLoop, HandleId) -> std::result::Result<(), CallbackError>>)
+        close_poll(uv_loop, self);
+        uv_loop.close(
+            self.id,
+            None::<fn(&mut UvLoop, HandleId) -> std::result::Result<(), CallbackError>>,
+        )
     }
     fn close_with<F>(&self, uv_loop: &mut UvLoop, callback: F) -> crate::Result<()>
     where
         F: FnOnce(&mut UvLoop, HandleId) -> std::result::Result<(), CallbackError> + 'static,
     {
-        close_poll(uv_loop, self)?;
+        close_poll(uv_loop, self);
         uv_loop.close(self.id, Some(callback))
+    }
+}
+
+#[cfg(test)]
+mod duplicate_nonblocking_tests {
+    use super::duplicate_nonblocking;
+    use rustix::fs::{OFlags, fcntl_getfl};
+    use rustix::io::{FdFlags, fcntl_getfd};
+
+    /// `Poll` duplicates the caller's descriptor, so the duplicate must set
+    /// `FD_CLOEXEC` (a plain `dup` copy would leak into later `exec`s) while
+    /// staying non-blocking on the shared open file description.
+    #[test]
+    fn duplicate_is_cloexec_and_nonblocking() -> Result<(), Box<dyn std::error::Error>> {
+        let (read_end, _write_end) = rustix::pipe::pipe()?;
+        let duplicate = duplicate_nonblocking(&read_end)?;
+        let flags = fcntl_getfd(&duplicate)?;
+        assert!(
+            flags.contains(FdFlags::CLOEXEC),
+            "duplicated poll descriptor must set FD_CLOEXEC, got {flags:?}"
+        );
+        let status = fcntl_getfl(&duplicate)?;
+        assert!(
+            status.contains(OFlags::NONBLOCK),
+            "duplicated poll descriptor must stay non-blocking, got {status:?}"
+        );
+        Ok(())
     }
 }

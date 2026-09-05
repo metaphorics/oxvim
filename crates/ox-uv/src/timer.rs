@@ -11,6 +11,10 @@ pub struct Timer {
 
 impl Timer {
     /// Allocates an inactive timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::HandleLimit`] when the 32-bit handle identity space is exhausted.
     pub fn new(uv_loop: &mut UvLoop) -> Result<Self> {
         let id = uv_loop.allocate(HandleKind::Timer(TimerState {
             active: false,
@@ -24,6 +28,13 @@ impl Timer {
     }
 
     /// Starts or restarts the timer; zero timeout fires on the next loop turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::TimeOverflow`] if the timeout exceeds the monotonic clock range,
+    /// [`Error::InvalidHandle`] if the handle is no longer live,
+    /// [`Error::ClosingHandle`] if close was already requested, or
+    /// [`Error::WrongHandleKind`] if it is not a timer handle.
     pub fn start<F>(
         &self,
         uv_loop: &mut UvLoop,
@@ -54,6 +65,12 @@ impl Timer {
     }
 
     /// Stops the timer without changing its repeat value or callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHandle`] if the handle is no longer live,
+    /// [`Error::ClosingHandle`] if close was already requested, or
+    /// [`Error::WrongHandleKind`] if it is not a timer handle.
     pub fn stop(&self, uv_loop: &mut UvLoop) -> Result<()> {
         let timer = timer_state_mut(uv_loop, self.id)?;
         timer.active = false;
@@ -63,6 +80,15 @@ impl Timer {
     }
 
     /// Restarts a previously-started repeating timer from now.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHandle`] if the handle is no longer live,
+    /// [`Error::ClosingHandle`] if close was already requested,
+    /// [`Error::WrongHandleKind`] if it is not a timer handle,
+    /// [`Error::TimerNeverStarted`] if the timer was never started,
+    /// [`Error::TimerNotRepeating`] if the repeat interval is zero, or
+    /// [`Error::TimeOverflow`] if the new deadline exceeds the monotonic clock range.
     pub fn again(&self, uv_loop: &mut UvLoop) -> Result<()> {
         let timer = timer_state_mut(uv_loop, self.id)?;
         if !timer.started {
@@ -83,14 +109,27 @@ impl Timer {
     }
 
     /// Updates the repeat used after the next callback without moving its current deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHandle`] if the handle is no longer live,
+    /// [`Error::ClosingHandle`] if close was already requested, or
+    /// [`Error::WrongHandleKind`] if it is not a timer handle.
     pub fn set_repeat(&self, uv_loop: &mut UvLoop, repeat_ms: u64) -> Result<()> {
         timer_state_mut(uv_loop, self.id)?.repeat = Duration::from_millis(repeat_ms);
         Ok(())
     }
 
     /// Returns the configured repeat interval in milliseconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHandle`] if the handle is no longer live, or
+    /// [`Error::WrongHandleKind`] if it is not a timer handle.
     pub fn get_repeat(&self, uv_loop: &UvLoop) -> Result<u64> {
-        let state = uv_loop.state(self.id).ok_or(Error::InvalidHandle(self.id))?;
+        let state = uv_loop
+            .state(self.id)
+            .ok_or(Error::InvalidHandle(self.id))?;
         let HandleKind::Timer(timer) = &state.kind else {
             return Err(wrong_kind(self.id, "timer"));
         };

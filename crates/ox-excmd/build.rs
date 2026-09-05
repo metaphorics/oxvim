@@ -1,4 +1,7 @@
 #![allow(missing_docs)]
+// Build script: panicking fails the build with the generation error, which
+// is the correct outcome; there is no caller to recover on cargo's behalf.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::env;
 use std::fmt::Write as _;
@@ -16,11 +19,15 @@ struct LuaCommand {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source = env::var_os("OXVIM_REF_ROOT")
         .map(PathBuf::from)
-        .map(|root| root.join("src/nvim/ex_cmds.lua"))
-        .unwrap_or_else(|| {
-            PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"))
+        .map_or_else(
+            || {
+                PathBuf::from(
+                    env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"),
+                )
                 .join("../../codegen/upstream/ex_cmds.lua")
-        });
+            },
+            |root| root.join("src/nvim/ex_cmds.lua"),
+        );
     println!("cargo:rerun-if-env-changed=OXVIM_REF_ROOT");
     println!("cargo:rerun-if-changed={}", source.display());
 
@@ -29,7 +36,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if commands.len() < 400 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("parsed only {} Ex commands from {}", commands.len(), source.display()),
+            format!(
+                "parsed only {} Ex commands from {}",
+                commands.len(),
+                source.display()
+            ),
         )
         .into());
     }
@@ -44,20 +55,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let abbr = &command.name[..min_prefix_len];
         writeln!(
             generated,
-            "    CommandSpec {{ name: {:?}, abbr: {:?}, min_prefix_len: {}, flags: CommandFlags(0x{:x}), addr_type: AddrType::{} }},",
+            "    CommandSpec {{ name: {:?}, abbr: {:?}, min_prefix_len: {}, flags: CommandFlags(0x{:04x}_{:04x}), addr_type: AddrType::{} }},",
             command.name,
             abbr,
             min_prefix_len,
-            command.flags,
+            command.flags >> 16,
+            command.flags & 0xffff,
             addr_type_variant(&command.addr_type)?
         )?;
     }
     generated.push_str("];\n");
 
-    let output = PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "Cargo did not provide OUT_DIR")
-    })?)
-    .join("command_specs.rs");
+    let output =
+        PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Cargo did not provide OUT_DIR")
+        })?)
+        .join("command_specs.rs");
     fs::write(output, generated)?;
     Ok(())
 }
@@ -94,7 +107,11 @@ fn parse_commands(lua: &str) -> Result<Vec<LuaCommand>, io::Error> {
             let addr_type = pending_addr
                 .take()
                 .ok_or_else(|| invalid(&format!("command {name} is missing addr_type")))?;
-            commands.push(LuaCommand { name, flags, addr_type });
+            commands.push(LuaCommand {
+                name,
+                flags,
+                addr_type,
+            });
             continue;
         }
         if let Some(value) = field_value(line, "command") {
@@ -155,7 +172,7 @@ fn field_value<'a>(line: &'a str, field: &str) -> Option<&'a str> {
 
 fn parse_quoted<'a>(value: &'a str, field: &str) -> Result<&'a str, io::Error> {
     let quote = value.as_bytes().first().copied();
-    if !matches!(quote, Some(b'\'') | Some(b'"')) {
+    if !matches!(quote, Some(b'\'' | b'"')) {
         return Err(invalid(&format!("{field} is not a quoted string: {value}")));
     }
     let delimiter = char::from(quote.unwrap_or(b'\''));
@@ -175,7 +192,9 @@ fn parse_flags(value: &str) -> Result<u32, io::Error> {
         .split(',')
         .map(str::trim)
         .filter(|token| !token.is_empty())
-        .try_fold(0_u32, |bits, token| flag_value(token).map(|flag| bits | flag))
+        .try_fold(0_u32, |bits, token| {
+            flag_value(token).map(|flag| bits | flag)
+        })
 }
 
 fn flag_value(name: &str) -> Result<u32, io::Error> {

@@ -1,3 +1,6 @@
+// Pure unit-test module: expect/panic on UV handle results IS the assertion;
+// a failed expect here is a test failure, not a recoverable error.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::thread;
@@ -35,7 +38,11 @@ fn run_modes_respect_liveness_stop_and_unref() {
             Ok(())
         })
         .expect("start repeating");
-    assert!(uv_loop.run_default().expect("default stopped with live timer"));
+    assert!(
+        uv_loop
+            .run_default()
+            .expect("default stopped with live timer")
+    );
     repeating.stop(&mut uv_loop).expect("stop repeating");
     assert!(!uv_loop.loop_alive());
 }
@@ -57,7 +64,11 @@ fn stop_before_run_still_fires_due_timer_once() {
     thread::sleep(Duration::from_millis(5)); // deadline has passed; timer is due
 
     uv_loop.stop();
-    assert!(!uv_loop.run_default().expect("default honoring pending stop"));
+    assert!(
+        !uv_loop
+            .run_default()
+            .expect("default honoring pending stop")
+    );
     assert_eq!(fired.get(), 1, "due timer fired exactly once");
 
     // run_once honors the same pending-stop contract.
@@ -237,7 +248,10 @@ fn async_cross_thread_wakes_and_coalesces() {
     let callback_slot = Rc::clone(&slot);
     let async_handle = Async::new(&mut uv_loop, move |event_loop, _| {
         callback_calls.set(callback_calls.get() + 1);
-        callback_slot.get().expect("installed handle").close(event_loop)?;
+        callback_slot
+            .get()
+            .expect("installed handle")
+            .close(event_loop)?;
         Ok(())
     })
     .expect("async");
@@ -276,11 +290,8 @@ fn signal_oneshot_delivers_one_raise() {
 
     let raiser = thread::spawn(|| {
         thread::sleep(Duration::from_millis(5));
-        rustix::process::kill_process(
-            rustix::process::getpid(),
-            rustix::process::Signal::USR1,
-        )
-        .expect("raise SIGUSR1");
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::USR1)
+            .expect("raise SIGUSR1");
     });
     assert!(!uv_loop.run_default().expect("default"));
     raiser.join().expect("raiser");
@@ -380,7 +391,10 @@ fn callback_failures_and_panics_become_error_events() {
     assert_eq!(first.phase, CallbackPhase::Timer);
     assert_eq!(first.error, CallbackError::new("binding failure"));
     assert_eq!(second.phase, CallbackPhase::Timer);
-    assert_eq!(second.error, CallbackError::Panic("callback panic".to_owned()));
+    assert_eq!(
+        second.error,
+        CallbackError::Panic("callback panic".to_owned())
+    );
 }
 
 #[test]
@@ -415,7 +429,11 @@ fn stop_raised_during_forced_turn_is_consumed() {
         .expect("start stopper");
 
     uv_loop.stop();
-    assert!(!uv_loop.run_default().expect("forced turn consumes pending stop"));
+    assert!(
+        !uv_loop
+            .run_default()
+            .expect("forced turn consumes pending stop")
+    );
     assert!(forced_fired.get());
 
     // A fresh repeating timer must run normally afterward, not exit after one turn.
@@ -434,7 +452,11 @@ fn stop_raised_during_forced_turn_is_consumed() {
         })
         .expect("start repeating timer");
 
-    assert!(!uv_loop.run_default().expect("default should run to completion"));
+    assert!(
+        !uv_loop
+            .run_default()
+            .expect("default should run to completion")
+    );
     assert_eq!(calls.get(), 3, "repeating timer must fire three times");
 }
 
@@ -465,7 +487,6 @@ fn misc_time_and_directory_contracts_are_sane() {
     uv_loop.update_time();
     assert!(uv_loop.now() >= cached);
 }
-
 
 #[cfg(unix)]
 #[test]
@@ -528,11 +549,10 @@ fn pending_stop_cleared_on_forced_turn_error() {
             })
             .expect("start repeating timer");
 
-        assert_eq!(
-            uv_loop
+        assert!(
+            !uv_loop
                 .run_default()
                 .expect("subsequent default should run to completion"),
-            false,
             "stale stop after {mode:?} forced-turn error"
         );
         assert_eq!(

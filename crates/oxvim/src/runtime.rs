@@ -117,31 +117,12 @@ fn interactive_child_arguments(cli: &Cli) -> Vec<String> {
     arguments
 }
 
-/// Resolve the runtime root in process startup order.
-pub fn runtime_root() -> Result<PathBuf, AppError> {
-    if let Some(path) = std::env::var_os("OXVIM_RUNTIME") {
-        return Ok(PathBuf::from(path));
-    }
-    let executable = std::env::current_exe().map_err(AppError::Io)?;
-    if let Some(directory) = executable.parent() {
-        let relative = directory.join("../../runtime");
-        if relative.is_dir() {
-            return Ok(relative);
-        }
-    }
-    // Last resort for $VIMRUNTIME only: a CWD-relative tree is never a
-    // sourced runtime (see [`runtime_root_for_sourcing`]) — auto-sourcing
-    // plugin/ from the launch directory would execute planted files.
-    Ok(PathBuf::from("./runtime"))
-}
-
-/// The runtime root that may reach 'runtimepath' and plugin auto-sourcing:
-/// `$OXVIM_RUNTIME` or the exe-relative tree, never the launch directory.
-/// Upstream resolves $VIMRUNTIME without consulting the CWD at all
+/// The runtime root: `$OXVIM_RUNTIME` or the exe-relative tree, never the
+/// launch directory. Upstream resolves $VIMRUNTIME without consulting the
 /// (os/env.c:884-936); a CWD fallback here would auto-source planted
 /// plugin files with full privileges whenever the binary has no sibling
 /// runtime tree.
-pub fn runtime_root_for_sourcing() -> Result<PathBuf, AppError> {
+pub fn runtime_root() -> Result<PathBuf, AppError> {
     if let Some(path) = std::env::var_os("OXVIM_RUNTIME") {
         return Ok(PathBuf::from(path));
     }
@@ -163,8 +144,12 @@ pub fn runtime_root_for_sourcing() -> Result<PathBuf, AppError> {
 /// on every later read). Explicitly exported values win, like upstream.
 /// `$VIM` strips a trailing `runtime` component (`remove_tail` on
 /// `RUNTIME_DIRNAME`); an unusual layout keeps the runtime path itself.
-pub fn export_vim_environment() -> Result<(), AppError> {
-    let runtime = runtime_root()?;
+pub fn export_vim_environment() {
+    // No trusted tree: leave `$VIM`/`$VIMRUNTIME` unset rather than
+    // exporting a CWD-relative last resort.
+    let Ok(runtime) = runtime_root() else {
+        return;
+    };
     if std::env::var_os("VIMRUNTIME").is_none() {
         ox_sys::set_env("VIMRUNTIME", &runtime);
     }
@@ -178,7 +163,6 @@ pub fn export_vim_environment() -> Result<(), AppError> {
         };
         ox_sys::set_env("VIM", vim);
     }
-    Ok(())
 }
 
 /// Applies the startup option flags to a freshly created editor.
@@ -467,7 +451,7 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
     // user command runs (option.c runtimepath_default layout).
     let default_rtp = ox_editor::default_runtimepath(
         cli.clean,
-        &runtime_root_for_sourcing().unwrap_or_else(|_| PathBuf::new()),
+        &runtime_root().unwrap_or_else(|_| PathBuf::new()),
     );
     editor
         .options_mut()
@@ -625,8 +609,7 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
         .insert(OxStr::from("servername"), Object::String(OxStr::from("")));
     seed_argv(&mut editor);
     let session = Rc::new(ApiSession::new(Rc::new(RefCell::new(editor))));
-    let default_rtp =
-        ox_editor::default_runtimepath(clean, &runtime_root_for_sourcing().unwrap_or_default());
+    let default_rtp = ox_editor::default_runtimepath(clean, &runtime_root().unwrap_or_default());
     session.with_editor_mut(|editor| {
         editor
             .options_mut()
@@ -640,7 +623,7 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
     })?;
     let registry = ox_api::core().map_err(|error| AppError::Api(error.to_string()))?;
     let host = LuaHost::new(
-        RuntimeRoot::new(runtime_root_for_sourcing().unwrap_or_default()),
+        RuntimeRoot::new(runtime_root().unwrap_or_default()),
         Rc::new(ScriptBuiltins),
         Rc::new(ImmediateScheduler),
     )

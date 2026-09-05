@@ -4,13 +4,16 @@
 use ox_text::Buffer;
 
 use crate::indent::{
-    self, CinTrigger, Cino, IndentAmount, IndentExprError, IndentOptions, Method, cinkeys_trigger,
-    cindent, indent_columns, lisp_indent, resolve_method, resolve_options_method, whitespace_for,
+    self, CinTrigger, Cino, IndentAmount, IndentExprError, IndentFlags, IndentOptions, Method,
+    cindent, cinkeys_trigger, indent_columns, lisp_indent, resolve_options_method, whitespace_for,
 };
 use crate::{Editor, ExprEval, IndentEvalContext, NullExprEval, OptionValue};
 
 fn lines(text: &str) -> Vec<Vec<u8>> {
-    text.lines().map(str::as_bytes).map(<[u8]>::to_vec).collect()
+    text.lines()
+        .map(str::as_bytes)
+        .map(<[u8]>::to_vec)
+        .collect()
 }
 
 fn cols(amount: IndentAmount) -> usize {
@@ -24,9 +27,7 @@ fn cino_opts() -> IndentOptions {
     IndentOptions {
         shiftwidth: 4,
         tabstop: 4,
-        expandtab: true,
-        cindent: true,
-        autoindent: true,
+        flags: IndentFlags::EXPANDTAB | IndentFlags::CINDENT | IndentFlags::AUTOINDENT,
         cinoptions: Cino::parse("", 4),
         ..IndentOptions::default()
     }
@@ -61,7 +62,7 @@ fn expandtab_uses_spaces_and_noexpandtab_uses_tabs() {
     let spaces = IndentOptions {
         shiftwidth: 8,
         tabstop: 8,
-        expandtab: true,
+        flags: IndentFlags::EXPANDTAB,
         ..IndentOptions::default()
     };
     assert_eq!(whitespace_for(8, b"", &spaces), b"        ");
@@ -69,7 +70,7 @@ fn expandtab_uses_spaces_and_noexpandtab_uses_tabs() {
     let tabs = IndentOptions {
         shiftwidth: 8,
         tabstop: 8,
-        expandtab: false,
+        flags: IndentFlags::default(),
         ..IndentOptions::default()
     };
     assert_eq!(whitespace_for(8, b"", &tabs), b"\t");
@@ -81,8 +82,7 @@ fn preserveindent_reuses_existing_leading_whitespace() {
     let opts = IndentOptions {
         shiftwidth: 4,
         tabstop: 8,
-        expandtab: false,
-        preserveindent: true,
+        flags: IndentFlags::PRESERVEINDENT,
         ..IndentOptions::default()
     };
     assert_eq!(whitespace_for(10, b"\t  ", &opts), b"\t  \t");
@@ -93,8 +93,7 @@ fn copyindent_reuses_source_whitespace_on_new_lines() {
     let opts = IndentOptions {
         shiftwidth: 4,
         tabstop: 8,
-        expandtab: false,
-        copyindent: true,
+        flags: IndentFlags::COPYINDENT,
         ..IndentOptions::default()
     };
     let source = b"\t    body";
@@ -118,7 +117,10 @@ fn sibling_lines_inside_brace_share_block_indent_not_offset_ramp() {
     assert_eq!(cols(cindent(&source, 2, &opts)), 4);
     assert_eq!(cols(cindent(&source, 3, &opts)), 8);
     assert_eq!(cols(cindent(&source, 4, &opts)), 4);
-    assert_ne!(cols(cindent(&source, 3, &opts)), cols(cindent(&source, 4, &opts)));
+    assert_ne!(
+        cols(cindent(&source, 3, &opts)),
+        cols(cindent(&source, 4, &opts))
+    );
 }
 
 #[test]
@@ -176,7 +178,9 @@ fn rawstring_interior_leaves_indent_alone() {
     let opts = cino_opts();
     match cindent(&source, 2, &opts) {
         IndentAmount::LeaveAlone => {}
-        other => panic!("raw string line should stay untouched, got {other:?}"),
+        other @ IndentAmount::Columns(_) => {
+            panic!("raw string line should stay untouched, got {other:?}")
+        }
     }
     assert_eq!(cols(cindent(&source, 4, &opts)), 4);
 }
@@ -199,9 +203,7 @@ fn lisp_indent_aligns_body_to_opening_list() {
     let opts = IndentOptions {
         shiftwidth: 2,
         tabstop: 8,
-        expandtab: true,
-        lisp: true,
-        autoindent: true,
+        flags: IndentFlags::EXPANDTAB | IndentFlags::LISP | IndentFlags::AUTOINDENT,
         ..IndentOptions::default()
     };
     assert_eq!(cols(lisp_indent(&source, 2, &opts)), 2);
@@ -226,23 +228,33 @@ fn method_precedence_prefers_lisp_expr_cindent_and_equalprg() {
     let mut opts = IndentOptions::default();
     assert_eq!(resolve_options_method(&opts), Method::Cindent);
 
-    opts.lisp = true;
-    assert_eq!(resolve_options_method(&opts), Method::Lisp);
-
-    opts.lispoptions_expr = true;
     opts.indentexpr = "MyIndent()".to_owned();
     assert_eq!(resolve_options_method(&opts), Method::Expr);
 
-    opts.lisp = false;
-    assert_eq!(resolve_options_method(&opts), Method::Expr);
+    // Upstream `fix_indent` (`indent.c:1896-1901`): `lisp` beats `indentexpr`
+    // unless `lispoptions` has `expr:1` (unmodeled — lisp wins here).
+    opts.flags.set(IndentFlags::LISP, true);
+    assert_eq!(resolve_options_method(&opts), Method::Lisp);
 
+    opts.indentexpr.clear();
+    assert_eq!(resolve_options_method(&opts), Method::Lisp);
+
+    opts.flags.set(IndentFlags::LISP, false);
+    assert_eq!(resolve_options_method(&opts), Method::Cindent);
+
+    // `=` with non-empty `equalprg` bypasses internal indent entirely
+    // (upstream `ops.c:3641-3642`): the method resolver has no vote, so the
+    // observable contract is the option read itself — no seam needed.
     let mut editor = Editor::new();
     let buffer = editor.create_buffer(true).unwrap();
     editor
         .options_mut()
         .set_buffer(buffer, "equalprg", OptionValue::String("cat".to_owned()))
         .unwrap();
-    assert_eq!(resolve_method(&editor, buffer), None);
+    assert_eq!(
+        editor.options().get_buffer(buffer, "equalprg").unwrap(),
+        &OptionValue::String("cat".to_owned())
+    );
 }
 
 #[test]
@@ -263,14 +275,7 @@ fn null_expr_eval_is_usable_from_mode_layer() {
     let opts = cino_opts();
     let context = IndentEvalContext::new(&editor, buffer, &source);
     assert_eq!(
-        indent::amount_for(
-            &context,
-            2,
-            Method::Cindent,
-            &opts,
-            &mut eval,
-        )
-        .unwrap(),
+        indent::amount_for(&context, 2, Method::Cindent, &opts, &mut eval,).unwrap(),
         IndentAmount::Columns(4)
     );
 }
@@ -286,13 +291,7 @@ fn expression_error_propagates_from_amount_for() {
         ..IndentOptions::default()
     };
     let context = IndentEvalContext::new(&editor, buffer, &source);
-    let result = indent::amount_for(
-        &context,
-        1,
-        Method::Expr,
-        &opts,
-        &mut eval,
-    );
+    let result = indent::amount_for(&context, 1, Method::Expr, &opts, &mut eval);
     assert!(matches!(result, Err(IndentExprError::Failed(_))));
 }
 
@@ -320,15 +319,10 @@ fn open_forward_indents_brace_member_by_block_indent() {
     let source = lines("{\nstmt;");
     let opts = cino_opts();
     let context = IndentEvalContext::new(&editor, buffer, &source);
-    let whitespace = indent::fix_line_indent(
-        &context,
-        2,
-        CinTrigger::OpenForward,
-        &opts,
-        &mut eval,
-    )
-    .unwrap()
-    .unwrap();
+    let whitespace =
+        indent::fix_line_indent(&context, 2, CinTrigger::OpenForward, &opts, &mut eval)
+            .unwrap()
+            .unwrap();
     assert_eq!(whitespace, b"    ");
 }
 
@@ -340,9 +334,7 @@ fn existing_line_after_opening_brace_uses_block_indent() {
     let opts = IndentOptions {
         shiftwidth: 2,
         tabstop: 8,
-        expandtab: true,
-        cindent: true,
-        autoindent: true,
+        flags: IndentFlags::EXPANDTAB | IndentFlags::CINDENT | IndentFlags::AUTOINDENT,
         cinoptions: Cino::parse("", 2),
         ..IndentOptions::default()
     };
@@ -358,9 +350,7 @@ fn existing_line_continuation_inside_brace_adds_one_shiftwidth() {
     let opts = IndentOptions {
         shiftwidth: 2,
         tabstop: 8,
-        expandtab: true,
-        cindent: true,
-        autoindent: true,
+        flags: IndentFlags::EXPANDTAB | IndentFlags::CINDENT | IndentFlags::AUTOINDENT,
         cinoptions: Cino::parse("", 2),
         ..IndentOptions::default()
     };
@@ -380,29 +370,16 @@ fn existing_line_reindent_matches_open_forward_after_brace() {
     let existing = lines("{\nstmt;");
     let context = IndentEvalContext::new(&editor, buffer, &existing);
     let reindent = indent::amount_for(&context, 2, Method::Cindent, &opts, &mut eval).unwrap();
-    let open_forward = indent::fix_line_indent(
-        &context,
-        2,
-        CinTrigger::OpenForward,
-        &opts,
-        &mut eval,
-    )
-    .unwrap()
-    .unwrap();
+    let open_forward =
+        indent::fix_line_indent(&context, 2, CinTrigger::OpenForward, &opts, &mut eval)
+            .unwrap()
+            .unwrap();
     assert_eq!(reindent, IndentAmount::Columns(4));
     assert_eq!(open_forward, b"    ");
 }
 
 #[test]
 fn amount_for_expr_reads_context_view() {
-    let mut editor = Editor::new();
-    let buffer = editor
-        .create_buffer_with(ox_text::Buffer::from_bytes(b"aaaa\nbbbb").unwrap(), true)
-        .unwrap();
-    // Live buffer stays unindented; staged overlay already shows a 4-space lead
-    // on line 1 that the expression for line 2 must observe.
-    let staged = vec![b"    aaaa".to_vec(), b"bbbb".to_vec()];
-    let context = IndentEvalContext::new(&editor, buffer, &staged);
     struct PriorLeadEval;
     impl ExprEval for PriorLeadEval {
         fn eval_indentexpr(
@@ -417,10 +394,18 @@ fn amount_for_expr_reads_context_view() {
             Ok(i64::try_from(lead).unwrap())
         }
     }
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(ox_text::Buffer::from_bytes(b"aaaa\nbbbb").unwrap(), true)
+        .unwrap();
+    // Live buffer stays unindented; staged overlay already shows a 4-space lead
+    // on line 1 that the expression for line 2 must observe.
+    let staged = vec![b"    aaaa".to_vec(), b"bbbb".to_vec()];
+    let context = IndentEvalContext::new(&editor, buffer, &staged);
     let mut eval = PriorLeadEval;
     let opts = IndentOptions {
         indentexpr: "PriorLead()".to_owned(),
-        expandtab: true,
+        flags: IndentFlags::EXPANDTAB,
         shiftwidth: 4,
         tabstop: 4,
         ..IndentOptions::default()

@@ -13,7 +13,7 @@
 use ox_types::{ApiError, Object, OxStr};
 use rmpv::Value;
 
-use crate::codec::{object_from_value, DecodeError};
+use crate::codec::{DecodeError, object_from_value};
 
 /// A single msgpack-RPC message (`kMessageType*` in `api/private/defs.h`).
 #[derive(Debug, Clone, PartialEq)]
@@ -46,9 +46,14 @@ pub enum Message {
 
 impl Message {
     /// Encode the message to its exact wire bytes.
+    #[must_use]
     pub fn encode_bytes(&self) -> Vec<u8> {
         let frame = match self {
-            Message::Request { msgid, method, params } => Object::Array(vec![
+            Message::Request {
+                msgid,
+                method,
+                params,
+            } => Object::Array(vec![
                 Object::Integer(0),
                 Object::Integer(i64::from(*msgid)),
                 Object::String(method.clone()),
@@ -84,6 +89,12 @@ impl Message {
     ///
     /// Upstream does the header/shape validation in `unpacker.c`'s FSM; here a
     /// value that is not `[kind, ...]` with the right arity is a [`DecodeError::Message`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::Message`] when the value is not an array, is empty,
+    /// has a non-integer kind, has the wrong arity for its kind, or contains a
+    /// field of the wrong type (msgid, method, args, or error pair).
     pub fn from_value(value: Value) -> Result<Message, DecodeError> {
         let Value::Array(mut items) = value else {
             return Err(DecodeError::Message("message must be an array".into()));
@@ -91,8 +102,10 @@ impl Message {
         if items.is_empty() {
             return Err(DecodeError::Message("empty message array".into()));
         }
-        let Some(kind) = int_val(items.remove(0)) else {
-            return Err(DecodeError::Message("message kind must be an integer".into()));
+        let Some(kind) = int_val(&items.remove(0)) else {
+            return Err(DecodeError::Message(
+                "message kind must be an integer".into(),
+            ));
         };
         match kind {
             0 => {
@@ -102,10 +115,14 @@ impl Message {
                         items.len() + 1
                     )));
                 }
-                let msgid = msgid(items.remove(0))?;
+                let msgid = msgid(&items.remove(0))?;
                 let method = ox_str(items.remove(0))?;
                 let params = params(items.remove(0))?;
-                Ok(Message::Request { msgid, method, params })
+                Ok(Message::Request {
+                    msgid,
+                    method,
+                    params,
+                })
             }
             1 => {
                 if items.len() != 3 {
@@ -114,32 +131,29 @@ impl Message {
                         items.len() + 1
                     )));
                 }
-                let msgid = msgid(items.remove(0))?;
+                let msgid = msgid(&items.remove(0))?;
                 let err = items.remove(0);
                 let result = items.remove(0);
                 match err {
-                    Value::Nil => Ok(Message::Response { msgid, result: Ok(object_from_value(result)?) }),
+                    Value::Nil => Ok(Message::Response {
+                        msgid,
+                        result: Ok(object_from_value(result)?),
+                    }),
                     Value::Array(mut pair) => {
                         if pair.len() != 2 {
                             return Err(DecodeError::Message(
                                 "response error must be [type, message]".into(),
                             ));
                         }
-                        let err_type = match int_val(pair.remove(0)) {
-                            Some(t) => t,
-                            None => {
-                                return Err(DecodeError::Message(
-                                    "response error type must be an integer".into(),
-                                ))
-                            }
+                        let Some(err_type) = int_val(&pair.remove(0)) else {
+                            return Err(DecodeError::Message(
+                                "response error type must be an integer".into(),
+                            ));
                         };
-                        let msg = match ox_str(pair.remove(0)) {
-                            Ok(m) => m,
-                            Err(_) => {
-                                return Err(DecodeError::Message(
-                                    "response error message must be a string".into(),
-                                ))
-                            }
+                        let Ok(msg) = ox_str(pair.remove(0)) else {
+                            return Err(DecodeError::Message(
+                                "response error message must be a string".into(),
+                            ));
                         };
                         let api_error = match err_type {
                             0 => ApiError::Exception(msg.to_string_lossy().into_owned()),
@@ -147,12 +161,17 @@ impl Message {
                             other => {
                                 return Err(DecodeError::Message(format!(
                                     "unknown error type code {other}"
-                                )))
+                                )));
                             }
                         };
-                        Ok(Message::Response { msgid, result: Err(api_error) })
+                        Ok(Message::Response {
+                            msgid,
+                            result: Err(api_error),
+                        })
                     }
-                    _ => Err(DecodeError::Message("response error must be nil or [type, message]".into())),
+                    _ => Err(DecodeError::Message(
+                        "response error must be nil or [type, message]".into(),
+                    )),
                 }
             }
             2 => {
@@ -192,7 +211,7 @@ impl MsgidCounter {
 
     /// Issue the next request id, skipping `0` across the `u32` wraparound.
     #[must_use]
-    pub fn next(&mut self) -> u32 {
+    pub fn next_id(&mut self) -> u32 {
         let id = self.next;
         self.next = self.next.wrapping_add(1);
         if self.next == 0 {
@@ -203,14 +222,14 @@ impl MsgidCounter {
 }
 
 /// Extract an `i64` from an integer `Value`, or else a message-shape error.
-fn int_val(v: Value) -> Option<i64> {
+fn int_val(v: &Value) -> Option<i64> {
     match v {
         Value::Integer(i) => i.as_i64(),
         _ => None,
     }
 }
 
-fn msgid(v: Value) -> Result<u32, DecodeError> {
+fn msgid(v: &Value) -> Result<u32, DecodeError> {
     let Some(n) = int_val(v) else {
         return Err(DecodeError::Message("msgid must be an integer".into()));
     };
@@ -264,8 +283,7 @@ mod tests {
             0x05, // msgid 5
             0xb3, // fixstr(19) "nvim_buf_line_count"
             b'n', b'v', b'i', b'm', b'_', b'b', b'u', b'f', b'_', b'l', b'i', b'n', b'e', b'_',
-            b'c', b'o', b'u', b'n', b't',
-            0x91,       // array(1)
+            b'c', b'o', b'u', b'n', b't', 0x91, // array(1)
             0xd4, 0, 1, // fixext1 type 0 (Buffer), value 1
         ];
         assert_eq!(m.encode_bytes(), expected);
@@ -274,7 +292,10 @@ mod tests {
 
     #[test]
     fn response_success_shape() {
-        let m = Message::Response { msgid: 3, result: Ok(Object::Integer(42)) };
+        let m = Message::Response {
+            msgid: 3,
+            result: Ok(Object::Integer(42)),
+        };
         // [1, 3, nil, 42]
         let expected: &[u8] = &[0x94, 0x01, 0x03, 0xc0, 0x2a];
         assert_eq!(m.encode_bytes(), expected);
@@ -289,11 +310,11 @@ mod tests {
         };
         // [1, 7, [1, "bad arg"], nil]
         let expected: &[u8] = &[
-            0x94,       // array(4)
-            0x01,       // 1 (response)
-            0x07,       // msgid 7
-            0x92,       // array(2): error
-            0x01,       //   type 1 = validation
+            0x94, // array(4)
+            0x01, // 1 (response)
+            0x07, // msgid 7
+            0x92, // array(2): error
+            0x01, //   type 1 = validation
             0xa7, b'b', b'a', b'd', b' ', b'a', b'r', b'g', // "bad arg"
             0xc0, // nil result
         ];
@@ -303,7 +324,10 @@ mod tests {
 
     #[test]
     fn notification_wire_shape() {
-        let m = Message::Notification { method: OxStr::from("nvim_echo"), params: vec![] };
+        let m = Message::Notification {
+            method: OxStr::from("nvim_echo"),
+            params: vec![],
+        };
         // [2, "nvim_echo", []]
         let expected: &[u8] = &[
             0x93, // array(3)
@@ -336,11 +360,11 @@ mod tests {
     #[test]
     fn msgid_counter_starts_at_one_and_wraps() {
         let mut c = MsgidCounter::new();
-        assert_eq!(c.next(), 1);
-        assert_eq!(c.next(), 2);
+        assert_eq!(c.next_id(), 1);
+        assert_eq!(c.next_id(), 2);
         // Force wraparound: skip to u32::MAX then confirm 0 is skipped.
         c.next = u32::MAX;
-        assert_eq!(c.next(), u32::MAX);
-        assert_eq!(c.next(), 1);
+        assert_eq!(c.next_id(), u32::MAX);
+        assert_eq!(c.next_id(), 1);
     }
 }

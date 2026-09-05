@@ -64,26 +64,69 @@ fn temp_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("oxvim-uv-{label}-{}", std::process::id()))
 }
 
+/// Restores one process environment binding on drop: a value present before
+/// the test is written back, absence is restored by unsetting. Goes through
+/// the same `ox-uv` seam the bindings use, so restoration needs no `unsafe`.
+struct EnvGuard {
+    name: &'static str,
+    prior: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn take(name: &'static str) -> Self {
+        Self {
+            name,
+            prior: std::env::var_os(name),
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        let _ = match &self.prior {
+            Some(value) => ox_uv::misc::os_setenv(self.name, value),
+            None => ox_uv::misc::os_unsetenv(self.name),
+        };
+    }
+}
+
 #[test]
-fn timer_callback_runs_through_the_scheduler() {
-    let (host, scheduler) = host();
+fn sleep_blocks_and_returns_no_values() {
+    let (host, _scheduler) = host();
+    let started = std::time::Instant::now();
+    let (returns, alias_returns) = host
+        .lua()
+        .load("return select('#', vim.uv.sleep(20)), select('#', vim.loop.sleep(-1))")
+        .eval::<(i64, i64)>()
+        .unwrap();
+
+    assert_eq!(returns, 0);
+    assert_eq!(alias_returns, 0);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(20));
+}
+
+#[test]
+fn timer_callback_runs_synchronously_as_fast_event() {
+    let (host, _scheduler) = host();
     host.lua()
         .load(
-            r#"
+            r"
             timer_fired = false
             local timer = vim.uv.new_timer()
             assert(timer:start(0, 0, function()
+              assert(vim.in_fast_event())
               timer_fired = true
+              vim.uv.stop()
+              timer:stop()
               timer:close()
             end))
             vim.uv.run('default')
-            assert(timer_fired == false)
-            "#,
+            assert(timer_fired)
+            assert(timer:is_closing())
+            ",
         )
         .exec()
         .unwrap();
-    scheduler.drain().unwrap();
-    assert!(host.lua().globals().get::<bool>("timer_fired").unwrap());
 }
 
 #[test]
@@ -92,7 +135,7 @@ fn immediate_timer_callback_can_close_its_handle() {
     let host = LuaHost::new(runtime, Rc::new(TestBuiltins), Rc::new(ImmediateScheduler)).unwrap();
     host.lua()
         .load(
-            r#"
+            r"
             local timer = vim.uv.new_timer()
             timer:start(0, 0, function()
               assert(not timer:is_closing())
@@ -102,7 +145,7 @@ fn immediate_timer_callback_can_close_its_handle() {
             end)
             vim.uv.run('default')
             assert(timer:is_closing())
-            "#,
+            ",
         )
         .exec()
         .unwrap();
@@ -115,7 +158,7 @@ fn immediate_pipe_callback_can_close_process_handles() {
     let host = LuaHost::new(runtime, Rc::new(TestBuiltins), Rc::new(ImmediateScheduler)).unwrap();
     host.lua()
         .load(
-            r#"
+            r"
             local output = vim.uv.new_pipe(false)
             local process
             process = assert(vim.uv.spawn('/bin/true', { stdio = { nil, output, nil } }, function()
@@ -126,7 +169,7 @@ fn immediate_pipe_callback_can_close_process_handles() {
               if chunk == nil and not output:is_closing() then output:close() end
             end)
             vim.uv.run('default')
-            "#,
+            ",
         )
         .exec()
         .unwrap();
@@ -138,7 +181,7 @@ fn signal_binding_supports_luv_module_and_method_forms() {
     let (host, _) = host();
     host.lua()
         .load(
-            r#"
+            r"
             local signal = assert(vim.uv.new_signal())
             assert(vim.uv.signal_start(signal, 'sigpipe', function(signame)
               assert(signame == 'sigpipe')
@@ -152,7 +195,7 @@ fn signal_binding_supports_luv_module_and_method_forms() {
             signal:close()
             assert(signal:is_closing())
             vim.uv.run('nowait')
-            "#,
+            ",
         )
         .exec()
         .unwrap();
@@ -163,7 +206,7 @@ fn wait_primitives_poll_the_owned_uv_loop() {
     let (host, scheduler) = host();
     host.lua()
         .load(
-            r#"
+            r"
             poll_fired = false
             local timer = vim.uv.new_timer()
             timer:start(1, 0, function()
@@ -173,7 +216,7 @@ fn wait_primitives_poll_the_owned_uv_loop() {
             assert(vim._core.check_interrupt() == false)
             vim._core.loop_poll(5, false)
             timer:close()
-            "#,
+            ",
         )
         .exec()
         .unwrap();
@@ -186,7 +229,7 @@ fn phase_handles_support_between_case_cleanup() {
     let (host, _) = host();
     host.lua()
         .load(
-            r#"
+            r"
             for _, constructor in ipairs({
               vim.uv.new_idle,
               vim.uv.new_prepare,
@@ -198,7 +241,7 @@ fn phase_handles_support_between_case_cleanup() {
               assert(handle:is_closing())
             end
             vim.wait(0)
-            "#,
+            ",
         )
         .exec()
         .unwrap();
@@ -209,10 +252,13 @@ fn callback_file_read_preserves_bytes_and_error_first_shape() {
     let path = temp_path("file-read");
     std::fs::write(&path, b"a\0b\n").unwrap();
     let (host, scheduler) = host();
-    host.lua().globals().set("test_path", path.to_string_lossy().as_ref()).unwrap();
+    host.lua()
+        .globals()
+        .set("test_path", path.to_string_lossy().as_ref())
+        .unwrap();
     host.lua()
         .load(
-            r#"
+            r"
             file_result = false
             vim.uv.fs_open(test_path, 'r', 0, function(open_error, fd)
               assert(open_error == nil)
@@ -223,7 +269,7 @@ fn callback_file_read_preserves_bytes_and_error_first_shape() {
                 file_result = true
               end)
             end)
-            "#,
+            ",
         )
         .exec()
         .unwrap();
@@ -237,7 +283,7 @@ fn spawned_cat_echoes_through_created_stdio_pipe() {
     let (host, scheduler) = host();
     host.lua()
         .load(
-            r#"
+            r"
             cat_result = ''
             local input = vim.uv.new_pipe(false)
             local output = vim.uv.new_pipe(false)
@@ -260,12 +306,69 @@ fn spawned_cat_echoes_through_created_stdio_pipe() {
               end)
             end)
             vim.uv.run('default')
-            "#,
+            ",
         )
         .exec()
         .unwrap();
     scheduler.drain().unwrap();
-    assert_eq!(host.lua().globals().get::<String>("cat_result").unwrap(), "cat echo\n");
+    assert_eq!(
+        host.lua().globals().get::<String>("cat_result").unwrap(),
+        "cat echo\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn process_pipe_close_delivers_stdin_eof_and_process_exit() {
+    let runtime = RuntimeRoot::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime"));
+    let host = LuaHost::new(runtime, Rc::new(TestBuiltins), Rc::new(ImmediateScheduler)).unwrap();
+    host.lua()
+        .load(
+            r"
+            pipe_exit_code = nil
+            pipe_exit_signal = nil
+            local input = assert(vim.uv.new_pipe(false))
+            local process
+            process = assert(vim.uv.spawn('/bin/cat', {
+              stdio = { input, nil, nil },
+            }, function(code, signal)
+              pipe_exit_code = code
+              pipe_exit_signal = signal
+              if not process:is_closing() then process:close() end
+            end))
+            pipe_pid = assert(process:get_pid())
+            input:close()
+            input:close()
+            ",
+        )
+        .exec()
+        .unwrap();
+
+    let pid = host.lua().globals().get::<u32>("pipe_pid").unwrap();
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+    let watchdog = std::thread::spawn(move || {
+        let timed_out = cancel_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_err();
+        if timed_out {
+            let _ = ox_uv::process::kill(pid, Some(15));
+        }
+        timed_out
+    });
+
+    let run_result = host.lua().load("vim.uv.run('default')").exec();
+    let _ = cancel_tx.send(());
+    let timed_out = watchdog.join().unwrap();
+    assert!(!timed_out, "closing process stdin did not deliver EOF");
+    run_result.unwrap();
+    assert_eq!(
+        host.lua().globals().get::<i32>("pipe_exit_code").unwrap(),
+        0
+    );
+    assert_eq!(
+        host.lua().globals().get::<i32>("pipe_exit_signal").unwrap(),
+        0
+    );
 }
 
 #[cfg(unix)]
@@ -311,14 +414,14 @@ fn abandoned_spawn_handles_do_not_keep_the_loop_alive() {
     let (host, scheduler) = host();
     host.lua()
         .load(
-            r#"
+            r"
             do
               local input = assert(vim.uv.new_pipe(false))
               assert(vim.uv.spawn('/bin/cat', { stdio = { input, nil, nil } }, function() end))
             end
             collectgarbage('collect')
             vim.uv.run('default')
-            "#,
+            ",
         )
         .exec()
         .unwrap();
@@ -330,7 +433,7 @@ fn tcp_loopback_accepts_reads_and_writes() {
     let (host, scheduler) = host();
     host.lua()
         .load(
-            r#"
+            r"
             tcp_result = ''
             local server = vim.uv.new_tcp()
             assert(server:bind('127.0.0.1', 0))
@@ -362,23 +465,32 @@ fn tcp_loopback_accepts_reads_and_writes() {
               client:write('loopback')
             end)
             vim.uv.run('default')
-            "#,
+            ",
         )
         .exec()
         .unwrap();
     scheduler.drain().unwrap();
-    assert_eq!(host.lua().globals().get::<String>("tcp_result").unwrap(), "loopback");
+    assert_eq!(
+        host.lua().globals().get::<String>("tcp_result").unwrap(),
+        "loopback"
+    );
 }
 
 #[test]
 fn new_thread_uses_an_isolated_lua_global_table() {
     let marker_path = temp_path("thread-isolation");
     let (host, _) = host();
-    host.lua().globals().set("thread_marker", "parent-only").unwrap();
-    host.lua().globals().set("marker_path", marker_path.to_string_lossy().as_ref()).unwrap();
+    host.lua()
+        .globals()
+        .set("thread_marker", "parent-only")
+        .unwrap();
+    host.lua()
+        .globals()
+        .set("marker_path", marker_path.to_string_lossy().as_ref())
+        .unwrap();
     host.lua()
         .load(
-            r#"
+            r"
             local thread = assert(vim.uv.new_thread(function(path)
               assert(thread_marker == nil)
               thread_marker = 'child-only'
@@ -388,7 +500,7 @@ fn new_thread_uses_an_isolated_lua_global_table() {
             end, marker_path))
             assert(thread:join())
             assert(thread_marker == 'parent-only')
-            "#,
+            ",
         )
         .exec()
         .unwrap();
@@ -399,17 +511,20 @@ fn new_thread_uses_an_isolated_lua_global_table() {
 #[test]
 fn failing_fs_open_callback_receives_error_as_first_argument() {
     let (host, scheduler) = host();
-    host.lua().globals().set("missing_path", "/definitely/not/a/real/ox-lua-file").unwrap();
+    host.lua()
+        .globals()
+        .set("missing_path", "/definitely/not/a/real/ox-lua-file")
+        .unwrap();
     host.lua()
         .load(
-            r#"
+            r"
             open_error = nil
             vim.uv.fs_open(missing_path, 'r', 0, function(err, fd)
               assert(err ~= nil, 'error must arrive as the first callback argument')
               assert(fd == nil)
               open_error = err
             end)
-            "#,
+            ",
         )
         .exec()
         .unwrap();
@@ -423,7 +538,7 @@ fn pipe_write_callback_fires_only_when_the_loop_pumps_the_write() {
     let (host, scheduler) = host();
     host.lua()
         .load(
-            r#"
+            r"
             write_fired = false
             local input = vim.uv.new_pipe(false)
             local output = vim.uv.new_pipe(false)
@@ -449,7 +564,7 @@ fn pipe_write_callback_fires_only_when_the_loop_pumps_the_write() {
             assert(write_fired == false, 'write callback fired before completion')
             vim.uv.run('default')
             assert(write_fired == true, 'write callback did not fire after the loop pumped the write')
-            "#,
+            ",
         )
         .exec()
         .unwrap();
@@ -536,7 +651,7 @@ fn nested_run_drains_pipe_close_requested_by_write_callback() {
     let (host, scheduler) = host();
     host.lua()
         .load(
-            r#"
+            r"
             nested_completed = false
             process_exited = false
             local input = assert(vim.uv.new_pipe(false))
@@ -564,12 +679,17 @@ fn nested_run_drains_pipe_close_requested_by_write_callback() {
             input:write('x')
             vim.uv.run('default')
             assert(nested_completed, 'read callback did not complete its nested wait')
-            "#,
+            ",
         )
         .exec()
         .unwrap();
     scheduler.drain().unwrap();
-    assert!(host.lua().globals().get::<bool>("nested_completed").unwrap());
+    assert!(
+        host.lua()
+            .globals()
+            .get::<bool>("nested_completed")
+            .unwrap()
+    );
     assert!(host.lua().globals().get::<bool>("process_exited").unwrap());
 }
 
@@ -578,7 +698,7 @@ fn timer_close_is_idempotent() {
     let (host, scheduler) = host();
     host.lua()
         .load(
-            r#"
+            r"
             local timer = vim.uv.new_timer()
             timer:start(60000, 0, function() end)
             timer:close()
@@ -587,7 +707,7 @@ fn timer_close_is_idempotent() {
             vim.uv.run('nowait')
             timer:close()
             closed_twice = true
-            "#,
+            ",
         )
         .exec()
         .unwrap();
@@ -611,11 +731,14 @@ fn drive(host: &LuaHost, scheduler: &Rc<TestScheduler>, script: &str) {
 fn fs_metadata_surface_round_trips_on_a_real_file() {
     let dir = fresh_dir("meta");
     let (host, scheduler) = host();
-    host.lua().globals().set("test_dir", dir.to_string_lossy().as_ref()).unwrap();
+    host.lua()
+        .globals()
+        .set("test_dir", dir.to_string_lossy().as_ref())
+        .unwrap();
     drive(
         &host,
         &scheduler,
-        r#"
+        r"
         local uv = vim.uv
         local path = test_dir .. '/data.txt'
         local fd = assert(uv.fs_open(path, 'w', tonumber('644', 8)))
@@ -650,7 +773,7 @@ fn fs_metadata_surface_round_trips_on_a_real_file() {
         assert(uv.fs_truncate(path, 2))
         assert(assert(uv.fs_stat(path)).size == 2)
         assert(uv.fs_close(fd2))
-        "#,
+        ",
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -661,11 +784,14 @@ fn fs_directory_surface_round_trips_through_scandir_and_links() {
     std::fs::write(dir.join("a.txt"), b"aa").unwrap();
     std::fs::write(dir.join("b.txt"), b"bbbb").unwrap();
     let (host, scheduler) = host();
-    host.lua().globals().set("test_dir", dir.to_string_lossy().as_ref()).unwrap();
+    host.lua()
+        .globals()
+        .set("test_dir", dir.to_string_lossy().as_ref())
+        .unwrap();
     drive(
         &host,
         &scheduler,
-        r#"
+        r"
         local uv = vim.uv
 
         -- mkdir / rmdir
@@ -724,7 +850,7 @@ fn fs_directory_surface_round_trips_through_scandir_and_links() {
         assert(uv.fs_close(in_fd))
         assert(uv.fs_close(out_fd))
         assert(assert(uv.fs_stat(test_dir .. '/sent')).size == 4)
-        "#,
+        ",
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -733,11 +859,14 @@ fn fs_directory_surface_round_trips_through_scandir_and_links() {
 fn fs_failures_report_luv_shapes_sync_and_async() {
     let dir = fresh_dir("fail");
     let (host, scheduler) = host();
-    host.lua().globals().set("test_dir", dir.to_string_lossy().as_ref()).unwrap();
+    host.lua()
+        .globals()
+        .set("test_dir", dir.to_string_lossy().as_ref())
+        .unwrap();
     drive(
         &host,
         &scheduler,
-        r#"
+        r"
         local uv = vim.uv
 
         -- Sync fail shape: nil, err, name
@@ -769,11 +898,19 @@ fn fs_failures_report_luv_shapes_sync_and_async() {
           assert(resolved == nil)
           async_realpath_error = path_error
         end)
-        "#,
+        ",
     );
-    let error = host.lua().globals().get::<String>("async_stat_error").unwrap();
+    let error = host
+        .lua()
+        .globals()
+        .get::<String>("async_stat_error")
+        .unwrap();
     assert!(error.contains("ENOENT"), "unexpected error string: {error}");
-    let error = host.lua().globals().get::<String>("async_realpath_error").unwrap();
+    let error = host
+        .lua()
+        .globals()
+        .get::<String>("async_realpath_error")
+        .unwrap();
     assert!(error.contains("ENOENT"), "unexpected error string: {error}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -783,11 +920,14 @@ fn fs_async_callbacks_receive_results_after_the_scheduler_drains() {
     let dir = fresh_dir("async");
     std::fs::write(dir.join("payload.bin"), b"round-trip").unwrap();
     let (host, scheduler) = host();
-    host.lua().globals().set("test_dir", dir.to_string_lossy().as_ref()).unwrap();
+    host.lua()
+        .globals()
+        .set("test_dir", dir.to_string_lossy().as_ref())
+        .unwrap();
     drive(
         &host,
         &scheduler,
-        r#"
+        r"
         local uv = vim.uv
         async_result = ''
         uv.fs_open(test_dir .. '/payload.bin', 'r', 0, function(err, fd)
@@ -809,9 +949,12 @@ fn fs_async_callbacks_receive_results_after_the_scheduler_drains() {
           assert(name == 'payload.bin', name)
           async_result = async_result .. 'scanned'
         end)
-        "#,
+        ",
     );
-    assert_eq!(host.lua().globals().get::<String>("async_result").unwrap(), "scanneddone");
+    assert_eq!(
+        host.lua().globals().get::<String>("async_result").unwrap(),
+        "scanneddone"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -821,7 +964,7 @@ fn misc_surface_reports_process_and_system_state() {
     drive(
         &host,
         &scheduler,
-        r#"
+        r"
         local uv = vim.uv
         assert(type(uv.cwd()) == 'string' and vim.startswith(uv.cwd(), '/'))
         assert(type(uv.os_tmpdir()) == 'string' and #uv.os_tmpdir() > 0)
@@ -846,20 +989,55 @@ fn misc_surface_reports_process_and_system_state() {
         local missing, missing_err, missing_name = uv.os_getenv('OXVIM_UNSET_ENV_VAR_12345')
         assert(missing == nil and missing_name == 'ENOENT' and type(missing_err) == 'string')
         misc_ok = true
-        "#,
+        ",
     );
     assert!(host.lua().globals().get::<bool>("misc_ok").unwrap());
+}
+
+#[test]
+fn os_setenv_and_os_unsetenv_round_trip_through_the_process() {
+    const NAME: &str = "OXVIM_UV_OS_SETENV_ROUNDTRIP";
+    let _guard = EnvGuard::take(NAME);
+    let (host, scheduler) = host();
+    host.lua().globals().set("env_name", NAME).unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r"
+        local uv = vim.uv
+        -- Set a fresh variable and read it back.
+        assert(uv.os_setenv(env_name, 'first') == true)
+        assert(uv.os_getenv(env_name) == 'first')
+        -- Replacement wins over the previous value.
+        assert(uv.os_setenv(env_name, 'second') == true)
+        assert(uv.os_getenv(env_name) == 'second')
+        -- os_environ enumerates the live process environment.
+        assert(uv.os_environ()[env_name] == 'second')
+        -- Unset removes it; a later read fails with ENOENT.
+        assert(uv.os_unsetenv(env_name) == true)
+        local value, err, name = uv.os_getenv(env_name)
+        assert(value == nil and name == 'ENOENT' and type(err) == 'string')
+        -- A name the platform refuses is EINVAL, not a silent success.
+        local refused, refused_err, refused_name = uv.os_setenv('', 'x')
+        assert(refused == nil and refused_name == 'EINVAL' and type(refused_err) == 'string')
+        local refused_unset, unset_err, unset_name = uv.os_unsetenv('')
+        assert(refused_unset == nil and unset_name == 'EINVAL' and type(unset_err) == 'string')
+        ",
+    );
 }
 
 #[test]
 fn chdir_round_trips_through_the_process_working_directory() {
     let dir = fresh_dir("chdir");
     let (host, scheduler) = host();
-    host.lua().globals().set("test_dir", dir.to_string_lossy().as_ref()).unwrap();
+    host.lua()
+        .globals()
+        .set("test_dir", dir.to_string_lossy().as_ref())
+        .unwrap();
     drive(
         &host,
         &scheduler,
-        r#"
+        r"
         local uv = vim.uv
         local before = assert(uv.cwd())
         assert(uv.chdir(test_dir) == 0)
@@ -869,7 +1047,7 @@ fn chdir_round_trips_through_the_process_working_directory() {
         assert(uv.chdir(before) == 0)
         assert(assert(uv.cwd()) == before)
         chdir_ok = true
-        "#,
+        ",
     );
     assert!(host.lua().globals().get::<bool>("chdir_ok").unwrap());
     std::fs::remove_dir_all(&dir).unwrap();

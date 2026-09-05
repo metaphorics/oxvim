@@ -11,6 +11,10 @@ macro_rules! phase_handle {
 
         impl $name {
             #[doc = concat!("Allocates an inactive ", $label, " handle.")]
+            ///
+            /// # Errors
+            ///
+            /// Returns [`Error::HandleLimit`] when the 32-bit handle identity space is exhausted.
             pub fn new(uv_loop: &mut UvLoop) -> Result<Self> {
                 let id = uv_loop.allocate(HandleKind::$variant(PhaseState {
                     active: false,
@@ -21,10 +25,15 @@ macro_rules! phase_handle {
             }
 
             /// Starts one callback per applicable loop iteration.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`Error::InvalidHandle`] if the handle is no longer live,
+            /// [`Error::ClosingHandle`] if close was already requested, or
+            /// [`Error::WrongHandleKind`] if it is not the expected phase handle kind.
             pub fn start<F>(&self, uv_loop: &mut UvLoop, callback: F) -> Result<()>
             where
-                F: FnMut(&mut UvLoop, HandleId) -> std::result::Result<(), CallbackError>
-                    + 'static,
+                F: FnMut(&mut UvLoop, HandleId) -> std::result::Result<(), CallbackError> + 'static,
             {
                 let state = uv_loop.state_mut(self.id)?;
                 if state.closing {
@@ -40,6 +49,11 @@ macro_rules! phase_handle {
             }
 
             /// Stops callbacks without closing the handle.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`Error::InvalidHandle`] if the handle is no longer live, or
+            /// [`Error::WrongHandleKind`] if it is not the expected phase handle kind.
             pub fn stop(&self, uv_loop: &mut UvLoop) -> Result<()> {
                 let state = uv_loop.state_mut(self.id)?;
                 let HandleKind::$variant(inner) = &mut state.kind else {

@@ -6,8 +6,8 @@
 #![forbid(unsafe_code)]
 
 mod events;
-mod reactor;
 mod r#loop;
+mod reactor;
 mod signal;
 mod timer;
 mod work;
@@ -28,7 +28,7 @@ pub enum Error {
     /// A caller attempted to claim an internal reactor token.
     #[error("token {0:?} is reserved for an internal event-loop source")]
     ReservedToken(mio::Token),
-    /// An event operation named an owner not present in this MultiQueue.
+    /// An event operation named an owner not present in this `MultiQueue`.
     #[error("unknown event owner {0:?}")]
     UnknownOwner(Owner),
     /// The permanent root queue cannot be removed.

@@ -3,6 +3,7 @@
 mod base64;
 mod diff;
 mod json;
+mod lpeg;
 mod mpack;
 mod regex;
 
@@ -13,6 +14,7 @@ pub(crate) fn install(lua: &Lua) -> mlua::Result<()> {
     let vim: Table = lua.globals().get("vim")?;
     mpack::install(lua, &vim)?;
     json::install(lua, &vim)?;
+    lpeg::install(lua)?;
     diff::install(lua, &vim)?;
     base64::install(lua, &vim)?;
     regex::install(lua, &vim)

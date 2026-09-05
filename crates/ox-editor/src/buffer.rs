@@ -4,25 +4,23 @@ use std::collections::BTreeMap;
 
 use ox_text::buffer::LineSplice;
 use ox_text::{Buffer, BufferError, Cursor, LineEdit, Position, UndoError, UndoStep, UndoTree};
-use ox_types::{Dict, Object, OxStr};
+use ox_types::{Dict, OxStr};
 use thiserror::Error;
 
-use crate::marks::LocalMarks;
-use crate::{Extmarks, Folds};
+use crate::NamespaceId;
 use crate::extmark::{
     ExtmarkError, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, ExtmarkSpliceUndo, TextSplice,
 };
-use crate::NamespaceId;
 use crate::fold::FoldError;
+use crate::marks::LocalMarks;
+use crate::{Extmarks, Folds};
 
-/// A buffer-local user command retained for later command execution.
-#[derive(Clone, Debug, PartialEq)]
-pub struct UserCommandDefinition {
-    /// Command body or callable reference supplied through the API.
-    pub command: Object,
-    /// API options retained with the definition.
-    pub options: Dict,
-}
+/// Neovim reports `b:changedtick` as 2 for a newly created buffer: its
+/// bootstrap counts the initial empty line and the buffer-local dict setup
+/// (`buf_init_changedtick`, `buffer.c:1941`). The editor-owned counter stays a
+/// pure zero-based mutation count, so this offset applies only where the tick
+/// becomes script- or API-visible.
+const INITIAL_CHANGEDTICK: u64 = 2;
 
 /// A channel's intent to receive buffer update events.
 #[derive(Clone, Debug, PartialEq)]
@@ -88,7 +86,7 @@ pub struct BufferTextEditRequest {
     pub start: ExtmarkPosition,
     /// Zero-based exclusive end of the spliced byte range.
     pub end: ExtmarkPosition,
-    /// Raw replacement lines under nvim_buf_set_text semantics.
+    /// Raw replacement lines under `nvim_buf_set_text` semantics.
     ///
     /// Row count is arbitrary. The kernel composes the start-line prefix and
     /// end-line suffix around these lines. An empty vector means deletion and
@@ -109,6 +107,64 @@ impl PreparedBufferTextEdit {
     }
 }
 
+/// Independently combinable buffer status flags.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BufferFlags(u8);
+
+impl BufferFlags {
+    /// Resident text differs from the last saved undo state.
+    pub const MODIFIED: Self = Self(1 << 0);
+    /// Read-only policy data; command layers decide whether to raise
+    /// E37/E89-class errors.
+    pub const READONLY: Self = Self(1 << 1);
+    /// The buffer appears in the buffer list.
+    pub const LISTED: Self = Self(1 << 2);
+    /// The buffer name changed without reading or writing that path.
+    pub const NOTEDITED: Self = Self(1 << 3);
+
+    /// Whether every flag in `other` is enabled.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Enables or disables `flag` without touching the other bits.
+    pub const fn set(&mut self, flag: Self, enabled: bool) {
+        if enabled {
+            self.0 |= flag.0;
+        } else {
+            self.0 &= !flag.0;
+        }
+    }
+}
+
+/// Whether a buffer's text and undo state are resident, and whether a
+/// resident buffer currently has a window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BufferResidency {
+    /// Text and undo state are resident and at least one window displays
+    /// the buffer.
+    Displayed,
+    /// Text and undo state are resident and no window displays the buffer.
+    Hidden,
+    /// Text and undo state are released.
+    Unloaded,
+}
+
+impl BufferResidency {
+    /// Whether text and undo state are resident.
+    #[must_use]
+    pub const fn is_loaded(self) -> bool {
+        !matches!(self, Self::Unloaded)
+    }
+
+    /// Whether resident text currently has no window.
+    #[must_use]
+    pub const fn is_hidden(self) -> bool {
+        matches!(self, Self::Hidden)
+    }
+}
+
 /// Text and buffer-local state owned by [`crate::Editor`].
 #[derive(Clone, Debug)]
 pub struct BufferState {
@@ -118,8 +174,14 @@ pub struct BufferState {
     name: OxStr,
     /// Buffer-local API variables in insertion order.
     variables: Dict,
-    /// Buffer-local user commands keyed by command name.
-    user_commands: BTreeMap<OxStr, UserCommandDefinition>,
+    /// Names of buffer-local variables locked by `:lockvar`, persisted from
+    /// the eval scope so the API (`nvim_buf_set_var`/`nvim_buf_del_var`) can
+    /// reject mutations with "Key is locked: {name}" (upstream
+    /// `dict_check_writable` checks `DI_FLAGS_LOCK`).
+    locked_vars: Vec<OxStr>,
+    /// Bumped by every variable writer; the differential Ex-variable sync
+    /// skips re-reading an unchanged map.
+    variables_version: u64,
     /// Attached RPC channels keyed by channel identity.
     subscriptions: BTreeMap<u64, BufferAttachSubscription>,
     /// Branch-preserving undo history.
@@ -133,14 +195,14 @@ pub struct BufferState {
     extmark_undo: BTreeMap<u64, Vec<ExtmarkSpliceUndo>>,
     /// Lazily computed and manual buffer folds.
     pub folds: Folds,
-    /// Whether resident text differs from the last saved undo state.
-    pub modified: bool,
-    /// Read-only policy data; command layers decide whether to raise E37/E89-class errors.
-    pub readonly: bool,
+    /// Modified/read-only policy and buffer-list membership.
+    pub flags: BufferFlags,
     /// Prefix currently owned by prompt-buffer input (`b_prompt_text`).
     prompt: Vec<u8>,
     /// One-based line containing the live prompt (`b_prompt_start.mark.lnum`).
     prompt_start: usize,
+    /// Monotonic Neovim-compatible text change counter for this buffer lifetime.
+    changedtick: u64,
     /// Text changedtick observed when the buffer was last marked saved.
     saved_changedtick: u64,
     /// Final-EOL state at the last save.
@@ -151,12 +213,11 @@ pub struct BufferState {
     /// the sequence alone cannot tell a saved state from a later edit that
     /// joined the same block.
     saved_undo_state: (u64, usize),
-    /// Whether the buffer appears in the buffer list.
-    pub listed: bool,
-    /// Whether text and undo state are resident.
-    pub loaded: bool,
-    /// Whether a loaded buffer currently has no window.
-    pub hidden: bool,
+    /// Explicit `'modified'` setting, retained until the buffer is marked saved.
+    forced_modified: bool,
+    /// Whether text and undo state are resident, and whether a resident
+    /// buffer currently has no window.
+    pub residency: BufferResidency,
     /// Number of windows displaying the buffer.
     pub attachments: usize,
     /// Text generation last consumed by diagnostics.
@@ -191,30 +252,31 @@ impl BufferState {
     /// Creates a loaded buffer with no window attachments.
     #[must_use]
     pub fn new(text: Buffer, listed: bool) -> Self {
-        let saved_changedtick = text.changedtick();
-        let saved_has_eol = text.has_eol();
+        let mut flags = BufferFlags::default();
+        flags.set(BufferFlags::LISTED, listed);
         let prompt_start = text.line_count().max(1);
+        let saved_has_eol = text.has_eol();
         Self {
             text,
             name: OxStr::from(""),
             variables: Dict(Vec::new()),
-            user_commands: BTreeMap::new(),
+            locked_vars: Vec::new(),
+            variables_version: 1,
             subscriptions: BTreeMap::new(),
             undo: UndoTree::new(),
             marks: LocalMarks::new(),
             extmarks: Extmarks::new(),
             extmark_undo: BTreeMap::new(),
             folds: Folds::new(),
-            modified: false,
-            readonly: false,
+            flags,
+            residency: BufferResidency::Hidden,
             prompt: Vec::new(),
             prompt_start,
-            saved_changedtick,
+            changedtick: 0,
+            saved_changedtick: 0,
             saved_has_eol,
             saved_undo_state: (0, 0),
-            listed,
-            loaded: true,
-            hidden: true,
+            forced_modified: false,
             attachments: 0,
             changedtick_diag: 0,
             changedtick_fold: 0,
@@ -272,21 +334,29 @@ impl BufferState {
     }
 
     /// Returns mutable buffer-local API variables.
-    pub const fn variables_mut(&mut self) -> &mut Dict {
+    pub fn variables_mut(&mut self) -> &mut Dict {
+        self.variables_version = self.variables_version.wrapping_add(1);
         &mut self.variables
     }
 
-    /// Returns stored buffer-local user commands.
+    /// Returns whether a buffer-local variable is locked by `:lockvar`.
     #[must_use]
-    pub const fn user_commands(&self) -> &BTreeMap<OxStr, UserCommandDefinition> {
-        &self.user_commands
+    pub fn is_var_locked(&self, name: &OxStr) -> bool {
+        self.locked_vars
+            .iter()
+            .any(|locked| locked.as_bytes() == name.as_bytes())
     }
 
-    /// Returns mutable stored buffer-local user commands.
-    pub const fn user_commands_mut(
-        &mut self,
-    ) -> &mut BTreeMap<OxStr, UserCommandDefinition> {
-        &mut self.user_commands
+    /// Replaces the set of locked buffer-local variable names, called by the
+    /// eval scope sync to persist `:lockvar` state into editor-owned storage.
+    pub fn set_locked_vars(&mut self, names: Vec<OxStr>) {
+        self.locked_vars = names;
+    }
+
+    /// Returns the variable-map version used by the differential sync.
+    #[must_use]
+    pub const fn variables_version(&self) -> u64 {
+        self.variables_version
     }
 
     /// Returns requested buffer event subscriptions.
@@ -296,16 +366,23 @@ impl BufferState {
     }
 
     /// Returns mutable requested buffer event subscriptions.
-    pub const fn subscriptions_mut(
-        &mut self,
-    ) -> &mut BTreeMap<u64, BufferAttachSubscription> {
+    pub const fn subscriptions_mut(&mut self) -> &mut BTreeMap<u64, BufferAttachSubscription> {
         &mut self.subscriptions
     }
 
-    /// Returns the text change counter maintained by `ox-text`.
+    /// Returns the editor-owned text change counter.
     #[must_use]
     pub const fn changedtick(&self) -> u64 {
-        self.text.changedtick()
+        self.changedtick
+    }
+
+    /// Returns the tick as Neovim exposes it through `b:changedtick` and
+    /// `nvim_buf_get_changedtick`, offset by the bootstrap ticks upstream
+    /// spends creating the buffer. Cache keys and delta contracts inside the
+    /// editor use [`changedtick`](Self::changedtick) instead.
+    #[must_use]
+    pub const fn script_changedtick(&self) -> u64 {
+        self.changedtick.wrapping_add(INITIAL_CHANGEDTICK)
     }
 
     /// Returns the text generation recorded at the last successful save.
@@ -314,21 +391,32 @@ impl BufferState {
         self.saved_changedtick
     }
 
+    /// Forces `'modified'` until the buffer is marked saved.
+    pub fn mark_modified(&mut self) {
+        self.forced_modified = true;
+        self.flags.set(BufferFlags::MODIFIED, true);
+    }
+
     /// Records the current undo state as saved and clears `'modified'`.
     ///
     /// Neovim marks the active undo branch unchanged after writing so that
     /// undoing away from, or returning to, that point restores the flag
     /// (`src/nvim/undo.c:2818-2824`, `src/nvim/bufwrite.c:1727-1738`).
     pub fn mark_saved(&mut self) {
+        self.forced_modified = false;
         self.saved_changedtick = self.changedtick();
         self.saved_has_eol = self.text.has_eol();
         self.saved_undo_state = self.undo_state();
-        self.modified = false;
+        self.flags.set(BufferFlags::MODIFIED, false);
     }
 
     /// Returns resident text, or an unloaded-state error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferStateError::Unloaded`] when the buffer text is not resident.
     pub fn text(&self) -> Result<&Buffer, BufferStateError> {
-        if self.loaded {
+        if self.residency.is_loaded() {
             Ok(&self.text)
         } else {
             Err(BufferStateError::Unloaded)
@@ -338,24 +426,32 @@ impl BufferState {
     /// Replaces unloaded resident text before a window attaches.
     pub fn load(&mut self, text: Buffer) {
         self.text = text;
+        self.bump_changedtick();
         self.prompt_start = self.prompt_start.clamp(1, self.text.line_count().max(1));
         self.undo = UndoTree::new();
         self.extmarks = Extmarks::new();
         self.extmark_undo.clear();
         self.folds = Folds::new();
-        self.modified = false;
-        self.saved_changedtick = self.text.changedtick();
+        self.flags.set(BufferFlags::MODIFIED, false);
+        self.saved_changedtick = self.changedtick();
         self.saved_has_eol = self.text.has_eol();
         self.saved_undo_state = (0, 0);
-        self.loaded = true;
-        self.hidden = self.attachments == 0;
+        self.residency = if self.attachments == 0 {
+            BufferResidency::Hidden
+        } else {
+            BufferResidency::Displayed
+        };
     }
 
     /// Attaches one window to resident text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferStateError::Unloaded`] when the buffer text is not resident.
     pub fn attach(&mut self) -> Result<(), BufferStateError> {
         self.require_loaded()?;
         self.attachments = self.attachments.saturating_add(1);
-        self.hidden = false;
+        self.residency = BufferResidency::Displayed;
         Ok(())
     }
 
@@ -369,20 +465,27 @@ impl BufferState {
         if self.attachments != 0 {
             return;
         }
-        self.hidden = keep_loaded;
-        self.loaded = keep_loaded;
+        self.residency = if keep_loaded {
+            BufferResidency::Hidden
+        } else {
+            BufferResidency::Unloaded
+        };
         if !keep_loaded {
             self.release_resident_state();
         }
     }
 
     /// Unloads text state when no window displays the buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferStateError::Attached`] with the current attachment count
+    /// when one or more windows still display the buffer.
     pub fn unload(&mut self) -> Result<(), BufferStateError> {
         if self.attachments != 0 {
             return Err(BufferStateError::Attached(self.attachments));
         }
-        self.loaded = false;
-        self.hidden = false;
+        self.residency = BufferResidency::Unloaded;
         self.release_resident_state();
         Ok(())
     }
@@ -397,9 +500,10 @@ impl BufferState {
     ) -> Result<(), BufferStateError> {
         self.require_loaded()?;
         self.text.replace_lines(lnum, lnum, &[line])?;
+        self.bump_changedtick();
         self.marks.splice(lnum, 1, 1);
         let _ = self.extmarks.splice_recording(splice);
-        self.splice_folds(lnum, 1, 1);
+        self.splice_folds(lnum, 1, 1)?;
         self.splice_prompt_start(lnum, 1, 1);
         self.bump_derived_ticks();
         Ok(())
@@ -407,6 +511,12 @@ impl BufferState {
 
     /// Replaces an inclusive line range, joining the open undo block or
     /// starting a new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferStateError::Unloaded`] when the buffer text is not resident.
+    /// Returns [`BufferStateError::Text`] when the range is invalid or a
+    /// replacement line contains a newline or invalid UTF-8.
     pub fn replace_lines(
         &mut self,
         start: usize,
@@ -422,18 +532,21 @@ impl BufferState {
             .collect::<Result<Vec<_>, _>>()?;
         let after = lines.to_vec();
         let splice = TextSplice::line_anchored(start.saturating_sub(1), before.len(), after.len());
-        Ok(self.commit_recorded_splice(
-            start,
+        let edit = PreparedBufferTextEdit {
+            start_line: start,
             before,
             after,
             splice,
-            cursor_before,
-            cursor_after,
-            timestamp,
-        ))
+        };
+        self.commit_recorded_splice(edit, cursor_before, cursor_after, timestamp)
     }
 
     /// Inserts logical lines after `after_lnum` with explicit undo cursors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferStateError::Text`] when the insertion point is outside
+    /// the resident text or a supplied line is rejected by the rope.
     pub(crate) fn insert_lines(
         &mut self,
         after_lnum: usize,
@@ -441,23 +554,26 @@ impl BufferState {
         cursor_before: Position,
         cursor_after: Position,
         timestamp: i64,
-    ) -> u64 {
-        let start = after_lnum.saturating_add(1);
+    ) -> Result<u64, BufferStateError> {
         let after = lines.to_vec();
         let splice = TextSplice::line_anchored(after_lnum, 0, after.len());
-        self.commit_recorded_splice(
-            start,
-            Vec::new(),
+        let edit = PreparedBufferTextEdit {
+            start_line: after_lnum.saturating_add(1),
+            before: Vec::new(),
             after,
             splice,
-            cursor_before,
-            cursor_after,
-            timestamp,
-        )
+        };
+        self.commit_validated_splice(edit, cursor_before, cursor_after, timestamp)
     }
 
     /// Inserts logical lines after `lnum`, joining the open undo block or
     /// starting a new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferStateError::Unloaded`] when the buffer text is not resident.
+    /// Returns [`BufferStateError::Text`] when `lnum` is outside the buffer or a
+    /// supplied line contains a newline or invalid UTF-8.
     pub fn append_lines(
         &mut self,
         lnum: usize,
@@ -466,7 +582,7 @@ impl BufferState {
         timestamp: i64,
     ) -> Result<u64, BufferStateError> {
         self.require_loaded()?;
-        Ok(self.insert_lines(
+        self.insert_lines(
             lnum,
             lines,
             cursor,
@@ -475,11 +591,16 @@ impl BufferState {
                 col: cursor.col,
             },
             timestamp,
-        ))
+        )
     }
 
     /// Deletes an inclusive logical-line range, joining the open undo block
     /// or starting a new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferStateError::Unloaded`] when the buffer text is not resident,
+    /// or [`BufferStateError::Text`] when the range is invalid.
     pub fn delete_lines(
         &mut self,
         start: usize,
@@ -492,6 +613,12 @@ impl BufferState {
 
     /// Creates or moves an extmark, binding complete point/range geometry to
     /// the last recorded splice when `bind_to_open_edit` is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ExtmarkError`] when the namespace is unknown, the range end
+    /// precedes its start, or the render-order or namespace-local id space is
+    /// exhausted.
     pub fn set_extmark_recorded(
         &mut self,
         namespace: NamespaceId,
@@ -535,7 +662,13 @@ impl BufferState {
         last.retarget_set(namespace, id, after_position, after_end, false, previous);
     }
 
-    /// Replaces one validated byte range using nvim_buf_set_text semantics.
+    /// Replaces one validated byte range using `nvim_buf_set_text` semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferStateError::Unloaded`] when the buffer text is not resident.
+    /// Returns [`BufferStateError::TextEdit`] when the requested range, byte
+    /// boundaries, UTF-8, or replacement lines are invalid.
     pub fn replace_buffer_text(
         &mut self,
         request: &BufferTextEditRequest,
@@ -544,7 +677,7 @@ impl BufferState {
         timestamp: i64,
     ) -> Result<u64, BufferStateError> {
         let prepared = self.prepare_buffer_text_edit(request)?;
-        Ok(self.commit_buffer_text_edit(prepared, cursor_before, cursor_after, timestamp))
+        self.commit_buffer_text_edit(prepared, cursor_before, cursor_after, timestamp)
     }
 
     pub(crate) fn prepare_buffer_text_edit(
@@ -562,7 +695,10 @@ impl BufferState {
         if replacement.iter().any(|line| line.contains(&b'\n')) {
             return Err(BufferTextEditError::EmbeddedNewline.into());
         }
-        if replacement.iter().any(|line| std::str::from_utf8(line).is_err()) {
+        if replacement
+            .iter()
+            .any(|line| std::str::from_utf8(line).is_err())
+        {
             return Err(BufferTextEditError::InvalidUtf8.into());
         }
 
@@ -615,22 +751,33 @@ impl BufferState {
         cursor_before: Position,
         cursor_after: Position,
         timestamp: i64,
-    ) -> u64 {
-        self.commit_recorded_splice(
-            prepared.start_line,
-            prepared.before,
-            prepared.after,
-            prepared.splice,
-            cursor_before,
-            cursor_after,
-            timestamp,
-        )
+    ) -> Result<u64, BufferStateError> {
+        self.commit_validated_splice(prepared, cursor_before, cursor_after, timestamp)
+    }
+
+    /// Commits a splice whose inputs a prepare phase already validated, so
+    /// the text layer cannot reject them; a rejection would mean the prepare
+    /// and commit snapshots diverged, so the error propagates instead of any
+    /// mutation or undo recording happening silently.
+    fn commit_validated_splice(
+        &mut self,
+        edit: PreparedBufferTextEdit,
+        cursor_before: Position,
+        cursor_after: Position,
+        timestamp: i64,
+    ) -> Result<u64, BufferStateError> {
+        self.commit_recorded_splice(edit, cursor_before, cursor_after, timestamp)
     }
 
     /// Undoes the most recent undo block, replaying the inverse of every edit
     /// it grouped through the text and mark pipeline with the changedtick
     /// advanced. Returns one entry per replayed edit, or `None` when already
     /// at the oldest change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferStateError::Text`] if a recorded line range cannot be
+    /// replayed against the resident text.
     pub fn undo(&mut self) -> Result<Option<Vec<ReplayedEdit>>, BufferStateError> {
         let Ok(step) = self.undo.undo() else {
             return Ok(None);
@@ -641,6 +788,11 @@ impl BufferState {
     /// Redoes the next undo block, replaying each of its stored edits through
     /// the text and mark pipeline with the changedtick advanced. Returns one
     /// entry per replayed edit, or `None` when already at the newest change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferStateError::Text`] if a recorded line range cannot be
+    /// replayed against the resident text.
     pub fn redo(&mut self) -> Result<Option<Vec<ReplayedEdit>>, BufferStateError> {
         let Ok(step) = self.undo.redo() else {
             return Ok(None);
@@ -656,10 +808,12 @@ impl BufferState {
     /// `undo.c:1975`): the target may be behind *or* ahead of the current
     /// state, and may be on another branch, so it is not a run of one-step
     /// undos. `UndoTree::undo_to_seq` picks the route; this applies it.
-    pub fn undo_to_seq(
-        &mut self,
-        seq: u64,
-    ) -> Result<Vec<Vec<ReplayedEdit>>, BufferStateError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferStateError::Undo`] when the target sequence is unavailable,
+    /// or [`BufferStateError::Text`] if a recorded line range cannot be replayed.
+    pub fn undo_to_seq(&mut self, seq: u64) -> Result<Vec<Vec<ReplayedEdit>>, BufferStateError> {
         let steps = self.undo.undo_to_seq(seq)?;
         let mut replayed = Vec::with_capacity(steps.len());
         for step in steps {
@@ -669,6 +823,11 @@ impl BufferState {
     }
 
     /// Reopens the newest undo block so the next edit joins it (`:undojoin`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferStateError::Unloaded`] when the buffer text is not resident,
+    /// or [`BufferStateError::Undo`] when no prior undo block can be joined.
     pub fn undojoin(&mut self) -> Result<(), BufferStateError> {
         self.require_loaded()?;
         self.undo.undojoin().map_err(Into::into)
@@ -694,16 +853,17 @@ impl BufferState {
     /// `undo_to_seq` cannot drift: an undo swaps `after` for `before`,
     /// walks the block's edits backwards and lands on the block's *pre*
     /// cursor, a redo does the reverse in recording order.
-    fn apply_undo_step(
-        &mut self,
-        step: &UndoStep,
-    ) -> Result<Vec<ReplayedEdit>, BufferStateError> {
+    fn apply_undo_step(&mut self, step: &UndoStep) -> Result<Vec<ReplayedEdit>, BufferStateError> {
         let (entry, undoing) = match step {
             UndoStep::Undo(entry) => (entry, true),
             UndoStep::Redo(entry) => (entry, false),
         };
         let count = entry.edits.len();
         let mut replayed = Vec::with_capacity(count);
+        // One replayed block is one text change: the tick advances once for the
+        // whole step, before any fold invalidation keys off it, exactly as the
+        // forward batch path does.
+        self.bump_changedtick();
         for offset in 0..count {
             // Undoing walks the block backwards, so the inverse of the last
             // edit applied is the first one undone.
@@ -714,8 +874,7 @@ impl BufferState {
             } else {
                 (&edit.before, &edit.after)
             };
-            self.replay_text(edit.start, remove, apply)
-                .expect("recorded undo ranges are valid by construction");
+            self.replay_text(edit.start, remove, apply)?;
             self.marks.splice(edit.start, remove.len(), apply.len());
             let recorded = self
                 .extmark_undo
@@ -731,18 +890,24 @@ impl BufferState {
                 debug_assert!(
                     false,
                     "missing extmark undo record for seq {} member {}",
-                    entry.seq,
-                    index
+                    entry.seq, index
                 );
             }
-            self.splice_folds(edit.start, remove.len(), apply.len());
-            let cursor = if undoing { edit.cursor_before } else { edit.cursor_after };
+            self.splice_folds(edit.start, remove.len(), apply.len())?;
+            let cursor = if undoing {
+                edit.cursor_before
+            } else {
+                edit.cursor_after
+            };
             replayed.push(ReplayedEdit {
                 seq: entry.seq,
                 start: edit.start,
                 old_count: remove.len(),
                 new_count: apply.len(),
-                cursor: Position { lnum: cursor.lnum, col: cursor.col },
+                cursor: Position {
+                    lnum: cursor.lnum,
+                    col: cursor.col,
+                },
             });
         }
         self.refresh_modified();
@@ -778,11 +943,16 @@ impl BufferState {
     /// `'modified'` is recomputed from the undo point and saved EOL state, so
     /// restoring the saved EOL (with no other pending edits) clears the flag
     /// again instead of latching it once changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferStateError::Unloaded`] when the buffer text is not resident.
     pub fn set_eol(&mut self, has_eol: bool) -> Result<(), BufferStateError> {
         self.require_loaded()?;
         let changed = self.text.has_eol() != has_eol;
         self.text.set_eol(has_eol);
         if changed {
+            self.bump_changedtick();
             self.folds.invalidate(self.changedtick());
         }
         self.refresh_modified();
@@ -791,7 +961,7 @@ impl BufferState {
     }
 
     fn require_loaded(&self) -> Result<(), BufferStateError> {
-        if self.loaded {
+        if self.residency.is_loaded() {
             Ok(())
         } else {
             Err(BufferStateError::Unloaded)
@@ -800,73 +970,72 @@ impl BufferState {
 
     fn release_resident_state(&mut self) {
         self.text = Buffer::new();
+        self.bump_changedtick();
         self.undo = UndoTree::new();
         self.extmarks.invalidate_for_unload();
         self.extmark_undo.clear();
         self.folds = Folds::new();
-        self.modified = false;
-        self.saved_changedtick = self.text.changedtick();
+        self.flags.set(BufferFlags::MODIFIED, false);
+        self.saved_changedtick = self.changedtick();
         self.saved_has_eol = self.text.has_eol();
         self.saved_undo_state = (0, 0);
         self.subscriptions.clear();
     }
 
+    /// Writes a prepared splice's lines into the resident text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BufferStateError::Text`] when the rope rejects the line
+    /// range or a replacement line.
+    fn write_prepared_lines(
+        &mut self,
+        edit: &PreparedBufferTextEdit,
+    ) -> Result<(), BufferStateError> {
+        if edit.before.is_empty() {
+            self.text
+                .append_lines(edit.start_line.saturating_sub(1), &edit.after)?;
+        } else {
+            // Both operands are bounded by the in-memory line table, so the
+            // inclusive end line cannot overflow.
+            let end = edit.start_line + edit.before.len() - 1;
+            self.text.replace_lines(edit.start_line, end, &edit.after)?;
+        }
+        Ok(())
+    }
+
     fn commit_recorded_splice(
         &mut self,
-        start_line: usize,
-        before: Vec<Vec<u8>>,
-        after: Vec<Vec<u8>>,
-        splice: TextSplice,
+        edit: PreparedBufferTextEdit,
         cursor_before: Position,
         cursor_after: Position,
         timestamp: i64,
-    ) -> u64 {
-        if before.is_empty() {
-            self.text
-                .append_lines(start_line.saturating_sub(1), &after)
-                .expect("prepared append range is valid by construction");
-        } else {
-            let end = start_line
-                .checked_add(before.len())
-                .and_then(|line| line.checked_sub(1))
-                .expect("prepared line range is valid by construction");
-            self.text
-                .replace_lines(start_line, end, &after)
-                .expect("prepared line range is valid by construction");
-        }
-        let seq = self.record_committed_splice(
-            start_line,
-            before,
-            after,
-            splice,
-            cursor_before,
-            cursor_after,
-            timestamp,
-        );
+    ) -> Result<u64, BufferStateError> {
+        self.write_prepared_lines(&edit)?;
+        self.bump_changedtick();
+        let seq = self.record_committed_splice(edit, cursor_before, cursor_after, timestamp)?;
         self.refresh_modified();
         self.bump_derived_ticks();
-        seq
+        Ok(seq)
     }
 
     fn record_committed_splice(
         &mut self,
-        start_line: usize,
-        before: Vec<Vec<u8>>,
-        after: Vec<Vec<u8>>,
-        splice: TextSplice,
+        edit: PreparedBufferTextEdit,
         cursor_before: Position,
         cursor_after: Position,
         timestamp: i64,
-    ) -> u64 {
-        self.marks.splice(start_line, before.len(), after.len());
-        let (_, extmark_undo) = self.extmarks.splice_recording(splice);
-        self.splice_folds(start_line, before.len(), after.len());
-        self.splice_prompt_start(start_line, before.len(), after.len());
+    ) -> Result<u64, BufferStateError> {
+        self.marks
+            .splice(edit.start_line, edit.before.len(), edit.after.len());
+        let (_, extmark_undo) = self.extmarks.splice_recording(edit.splice);
+        self.splice_folds(edit.start_line, edit.before.len(), edit.after.len())?;
+        self.splice_prompt_start(edit.start_line, edit.before.len(), edit.after.len());
         let seq = self.undo.record(
             LineEdit {
-                start: start_line,
-                before,
-                after,
+                start: edit.start_line,
+                before: edit.before,
+                after: edit.after,
                 cursor_before: Cursor {
                     lnum: cursor_before.lnum,
                     col: cursor_before.col,
@@ -879,7 +1048,7 @@ impl BufferState {
             timestamp,
         );
         self.extmark_undo.entry(seq).or_default().push(extmark_undo);
-        seq
+        Ok(seq)
     }
 
     pub(crate) fn commit_prepared_line_preserving_batch(
@@ -888,50 +1057,44 @@ impl BufferState {
         cursor_before: Position,
         cursor_after: Position,
         timestamp: i64,
-    ) -> u64 {
+    ) -> Result<u64, BufferStateError> {
         if prepared.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let splices: Vec<LineSplice<'_>> = prepared
             .iter()
-            .map(|edit| {
-                let end = edit
-                    .start_line
-                    .checked_add(edit.before.len())
-                    .and_then(|line| line.checked_sub(1))
-                    .expect("prepared line range is valid by construction");
-                LineSplice {
-                    start: edit.start_line,
-                    end,
-                    lines: &edit.after,
-                }
+            // The end line cannot overflow: both operands are bounded by the
+            // in-memory line table.
+            .map(|edit| LineSplice {
+                start: edit.start_line,
+                end: edit.start_line + edit.before.len() - 1,
+                lines: &edit.after,
             })
             .collect();
         self.text
             .replace_lines_disjoint(&splices)
-            .expect("prepared line range is valid by construction");
+            .map_err(BufferStateError::from)?;
+        self.bump_changedtick();
         let mut seq = 0;
         for edit in prepared {
             debug_assert!(edit.preserves_line_count());
-            seq = self.record_committed_splice(
-                edit.start_line,
-                edit.before,
-                edit.after,
-                edit.splice,
-                cursor_before,
-                cursor_after,
-                timestamp,
-            );
+            seq = self.record_committed_splice(edit, cursor_before, cursor_after, timestamp)?;
         }
         self.refresh_modified();
         self.bump_derived_ticks();
-        seq
+        Ok(seq)
     }
 
-    fn splice_folds(&mut self, start: usize, old_rows: usize, new_rows: usize) {
+    fn splice_folds(
+        &mut self,
+        start: usize,
+        old_rows: usize,
+        new_rows: usize,
+    ) -> Result<(), BufferStateError> {
         self.folds
-            .splice_rows(start.saturating_sub(1), old_rows, new_rows);
+            .splice_rows(start.saturating_sub(1), old_rows, new_rows)?;
         self.folds.invalidate(self.changedtick());
+        Ok(())
     }
 
     /// Adjusts the prompt row through the same line splice that moves marks.
@@ -940,7 +1103,9 @@ impl BufferState {
         self.prompt_start = if old_count == 0 && self.prompt_start >= start {
             self.prompt_start.saturating_add(new_count)
         } else if self.prompt_start >= old_end {
-            self.prompt_start.saturating_sub(old_count).saturating_add(new_count)
+            self.prompt_start
+                .saturating_sub(old_count)
+                .saturating_add(new_count)
         } else if self.prompt_start >= start {
             start.saturating_add(
                 self.prompt_start
@@ -954,13 +1119,21 @@ impl BufferState {
     }
 
     fn refresh_modified(&mut self) {
-        self.modified = self.undo_state() != self.saved_undo_state
-            || self.text.has_eol() != self.saved_has_eol;
+        self.flags.set(
+            BufferFlags::MODIFIED,
+            self.forced_modified
+                || self.undo_state() != self.saved_undo_state
+                || self.text.has_eol() != self.saved_has_eol,
+        );
     }
 
     fn bump_derived_ticks(&mut self) {
         self.changedtick_diag = self.changedtick_diag.wrapping_add(1);
         self.changedtick_fold = self.changedtick_fold.wrapping_add(1);
+    }
+
+    fn bump_changedtick(&mut self) {
+        self.changedtick = self.changedtick.wrapping_add(1);
     }
 }
 
@@ -1023,7 +1196,7 @@ mod tests {
             state.text().unwrap().to_bytes(),
             state.changedtick(),
             state.undo.current_seq(),
-            state.modified,
+            state.flags.contains(crate::BufferFlags::MODIFIED),
             editor.changelists().len(buffer),
         )
     }
@@ -1147,7 +1320,9 @@ mod tests {
         (
             mark.position().row,
             mark.position().column,
-            mark.placement.end.map(|end| (end.position.row, end.position.column)),
+            mark.placement
+                .end
+                .map(|end| (end.position.row, end.position.column)),
             mark.invalid,
         )
     }
@@ -1171,7 +1346,10 @@ mod tests {
         let id = crate::ExtmarkId::new(1).unwrap();
         let mut invalidate = crate::ExtmarkPlacement::new(ExtmarkPosition::new(0, 3))
             .with_end(ExtmarkPosition::new(0, 6));
-        invalidate.attributes.invalidate = true;
+        invalidate
+            .attributes
+            .flags
+            .set(crate::ExtmarkFlags::INVALIDATE, true);
         state
             .set_extmark_recorded(
                 namespace,
@@ -1186,15 +1364,24 @@ mod tests {
             .set_extmark_recorded(namespace, Some(invalidated), invalidate, true)
             .unwrap();
         state.sync_undo();
-        assert_eq!(range_tuple(&state, namespace, id), (0, 3, Some((0, 6)), false));
+        assert_eq!(
+            range_tuple(&state, namespace, id),
+            (0, 3, Some((0, 6)), false)
+        );
         state.undo().unwrap();
-        assert_eq!(range_tuple(&state, namespace, id), (0, 0, Some((0, 0)), false));
+        assert_eq!(
+            range_tuple(&state, namespace, id),
+            (0, 0, Some((0, 0)), false)
+        );
         assert_eq!(
             range_tuple(&state, namespace, invalidated),
             (0, 0, Some((0, 0)), true)
         );
         state.redo().unwrap();
-        assert_eq!(range_tuple(&state, namespace, id), (0, 3, Some((0, 6)), false));
+        assert_eq!(
+            range_tuple(&state, namespace, id),
+            (0, 3, Some((0, 6)), false)
+        );
         assert_eq!(
             range_tuple(&state, namespace, invalidated),
             (0, 3, Some((0, 6)), false)

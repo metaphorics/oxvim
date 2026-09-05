@@ -6,7 +6,7 @@ use ox_text::Position;
 
 use crate::{
     ApiError, BufHandle, Dict, LuaRef, Object, OxStr, Registry, RegistryError, TabHandle,
-    WinHandle, api,
+    WinHandle, api, session::ApiSession,
 };
 
 fn exception(error: impl std::fmt::Display) -> ApiError {
@@ -17,36 +17,44 @@ fn invalid(field: &str, message: impl std::fmt::Display) -> ApiError {
     ApiError::validation(format!("Invalid 'config.{field}': {message}"))
 }
 
+fn api_integer(value: usize, what: &str) -> Result<i64, ApiError> {
+    i64::try_from(value).map_err(|_| exception(format!("{what} exceeds API integer range")))
+}
+
 fn key<'a>(dict: &'a Dict, name: &str) -> Option<&'a Object> {
     dict.iter()
         .find(|(candidate, _)| candidate.as_bytes() == name.as_bytes())
         .map(|(_, value)| value)
 }
 
-fn resolve_window(editor: &Editor, window: WinHandle) -> Result<WinHandle, ApiError> {
-    let resolved = if window.is_current() {
-        editor
-            .current_window()
-            .ok_or_else(|| ApiError::exception("No current window"))?
-    } else {
-        window
-    };
-    editor.window(resolved).map_err(exception)?;
-    Ok(resolved)
+fn resolve_window(session: &ApiSession, window: WinHandle) -> Result<WinHandle, ApiError> {
+    session.with_editor(|editor| {
+        let resolved = if window.is_current() {
+            editor
+                .current_window()
+                .ok_or_else(|| ApiError::exception("No current window"))?
+        } else {
+            window
+        };
+        editor.window(resolved).map_err(exception)?;
+        Ok(resolved)
+    })
 }
 
-fn resolve_buffer(editor: &Editor, buffer: BufHandle) -> Result<BufHandle, ApiError> {
-    if buffer.is_current() {
-        return editor
-            .current_buffer()
-            .ok_or_else(|| ApiError::exception("No current buffer"));
-    }
-    editor.buffer(buffer).map_err(exception)?;
-    Ok(buffer)
+fn resolve_buffer(session: &ApiSession, buffer: BufHandle) -> Result<BufHandle, ApiError> {
+    session.with_editor(|editor| {
+        if buffer.is_current() {
+            return editor
+                .current_buffer()
+                .ok_or_else(|| ApiError::exception("No current buffer"));
+        }
+        editor.buffer(buffer).map_err(exception)?;
+        Ok(buffer)
+    })
 }
 
-fn window_tabpage(editor: &Editor, window: WinHandle) -> Result<TabHandle, ApiError> {
-    editor.window_tabpage(window).map_err(exception)
+fn window_tabpage(session: &ApiSession, window: WinHandle) -> Result<TabHandle, ApiError> {
+    session.with_editor(|editor| editor.window_tabpage(window).map_err(exception))
 }
 
 fn option_to_object(value: &OptionValue) -> Object {
@@ -60,11 +68,9 @@ fn option_to_object(value: &OptionValue) -> Object {
 fn integer(dict: &Dict, name: &str, required: bool) -> Result<Option<i64>, ApiError> {
     match key(dict, name) {
         Some(Object::Integer(value)) => Ok(Some(*value)),
-        Some(Object::Nil) if required => Err(invalid(name, "field is required")),
-        Some(Object::Nil) => Ok(None),
+        Some(Object::Nil) | None if required => Err(invalid(name, "field is required")),
+        Some(Object::Nil) | None => Ok(None),
         Some(_) => Err(invalid(name, "expected Integer")),
-        None if required => Err(invalid(name, "field is required")),
-        None => Ok(None),
     }
 }
 
@@ -80,14 +86,22 @@ fn positive_size(dict: &Dict, name: &str, required: bool) -> Result<Option<usize
 }
 
 fn coordinate(dict: &Dict, name: &str, required: bool) -> Result<Option<f64>, ApiError> {
+    const RADIX: i64 = 1_i64 << 32;
+
     let value = match key(dict, name) {
         Some(Object::Float(value)) => Some(*value),
-        Some(Object::Integer(value)) => Some(*value as f64),
-        Some(Object::Nil) if required => return Err(invalid(name, "field is required")),
-        Some(Object::Nil) => None,
+        Some(Object::Integer(value)) => {
+            let high = i32::try_from(value.div_euclid(RADIX))
+                .map_err(|_| exception("Integer-to-float conversion invariant violated"))?;
+            let low = u32::try_from(value.rem_euclid(RADIX))
+                .map_err(|_| exception("Integer-to-float conversion invariant violated"))?;
+            Some(f64::from(high).mul_add(4_294_967_296.0, f64::from(low)))
+        }
+        Some(Object::Nil) | None if required => {
+            return Err(invalid(name, "field is required"));
+        }
+        Some(Object::Nil) | None => None,
         Some(_) => return Err(invalid(name, "expected Float or Integer")),
-        None if required => return Err(invalid(name, "field is required")),
-        None => None,
     };
     if value.is_some_and(|value| !value.is_finite()) {
         return Err(invalid(name, "must be finite"));
@@ -105,8 +119,8 @@ fn string(dict: &Dict, name: &str) -> Result<Option<String>, ApiError> {
     }
 }
 
-fn parse_anchor(value: Option<String>, default: Anchor) -> Result<Anchor, ApiError> {
-    match value.as_deref() {
+fn parse_anchor(value: Option<&str>, default: Anchor) -> Result<Anchor, ApiError> {
+    match value {
         None => Ok(default),
         Some("NW") => Ok(Anchor::NorthWest),
         Some("NE") => Ok(Anchor::NorthEast),
@@ -117,12 +131,12 @@ fn parse_anchor(value: Option<String>, default: Anchor) -> Result<Anchor, ApiErr
 }
 
 fn parse_relative(
-    editor: &Editor,
+    session: &ApiSession,
     dict: &Dict,
     default: Option<RelativeTo>,
 ) -> Result<RelativeTo, ApiError> {
     let relative = string(dict, "relative")?;
-    let effective = relative.as_deref().or_else(|| match default {
+    let effective = relative.as_deref().or(match default {
         Some(RelativeTo::Editor) => Some("editor"),
         Some(RelativeTo::Cursor) => Some("cursor"),
         Some(RelativeTo::Window(_)) => Some("win"),
@@ -136,12 +150,12 @@ fn parse_relative(
             let target = match key(dict, "win") {
                 None | Some(Object::Nil) => match default {
                     Some(RelativeTo::Window(window)) => window,
-                    _ => resolve_window(editor, WinHandle::CURRENT)?,
+                    _ => resolve_window(session, WinHandle::CURRENT)?,
                 },
-                Some(Object::Window(window)) => resolve_window(editor, *window)?,
+                Some(Object::Window(window)) => resolve_window(session, *window)?,
                 Some(Object::Integer(window)) => WinHandle::try_from(*window)
                     .map_err(|error| invalid("win", error))
-                    .and_then(|window| resolve_window(editor, window))?,
+                    .and_then(|window| resolve_window(session, window))?,
                 Some(_) => return Err(invalid("win", "expected Window")),
             };
             Ok(RelativeTo::Window(target))
@@ -162,13 +176,20 @@ fn parse_border_piece(value: &Object) -> Result<String, ApiError> {
         // group is accepted and validated but not used: this editor does not
         // style border cells individually.
         Object::Array(items) if items.len() == 2 => {
-            let (Object::String(character), Object::String(_highlight)) = (&items[0], &items[1]) else {
-                return Err(invalid("border", "tuple items must be [character, highlight] strings"));
+            let (Object::String(character), Object::String(_highlight)) = (&items[0], &items[1])
+            else {
+                return Err(invalid(
+                    "border",
+                    "tuple items must be [character, highlight] strings",
+                ));
             };
             String::from_utf8(character.0.clone())
                 .map_err(|_| invalid("border", "characters must be valid UTF-8"))
         }
-        _ => Err(invalid("border", "array items must be strings or highlight tuples")),
+        _ => Err(invalid(
+            "border",
+            "array items must be strings or highlight tuples",
+        )),
     }
 }
 
@@ -202,7 +223,11 @@ fn parse_border(value: Option<&Object>, default: Border) -> Result<Border, ApiEr
     }
 }
 
-fn parse_alignment(dict: &Dict, name: &str, default: TextAlignment) -> Result<TextAlignment, ApiError> {
+fn parse_alignment(
+    dict: &Dict,
+    name: &str,
+    default: TextAlignment,
+) -> Result<TextAlignment, ApiError> {
     match string(dict, name)?.as_deref() {
         None => Ok(default),
         Some("left") => Ok(TextAlignment::Left),
@@ -228,8 +253,9 @@ fn parse_border_text(
         return Ok(default);
     }
     let text = match value {
-        Object::String(value) => String::from_utf8(value.0.clone())
-            .map_err(|_| invalid(name, "must be valid UTF-8"))?,
+        Object::String(value) => {
+            String::from_utf8(value.0.clone()).map_err(|_| invalid(name, "must be valid UTF-8"))?
+        }
         Object::Array(chunks) => {
             let mut text = String::new();
             for chunk in chunks {
@@ -288,10 +314,7 @@ fn parse_margins(value: Option<&Object>, default: Margins) -> Result<Margins, Ap
         return Err(invalid("margins", "expected Array"));
     };
     if values.len() != 4 {
-        return Err(invalid(
-            "margins",
-            "expected [top, right, bottom, left]",
-        ));
+        return Err(invalid("margins", "expected [top, right, bottom, left]"));
     }
     let mut parsed = [0_usize; 4];
     for (index, value) in values.iter().enumerate() {
@@ -312,13 +335,33 @@ fn parse_margins(value: Option<&Object>, default: Margins) -> Result<Margins, Ap
 fn reject_unsupported_keys(dict: &Dict) -> Result<(), ApiError> {
     // The full documented nvim_open_win() config surface (api.txt:3970-4045).
     const SUPPORTED: &[&[u8]] = &[
-        b"relative", b"win", b"anchor", b"row", b"col", b"width", b"height",
-        b"zindex", b"border", b"title", b"title_pos", b"footer", b"footer_pos",
-        b"margins", b"style", b"split", b"focusable", b"external", b"bufpos",
-        b"hide", b"noautocmd",
+        b"relative",
+        b"win",
+        b"anchor",
+        b"row",
+        b"col",
+        b"width",
+        b"height",
+        b"zindex",
+        b"border",
+        b"title",
+        b"title_pos",
+        b"footer",
+        b"footer_pos",
+        b"margins",
+        b"style",
+        b"split",
+        b"focusable",
+        b"external",
+        b"bufpos",
+        b"hide",
+        b"noautocmd",
     ];
     for (name, _) in dict.iter() {
-        if !SUPPORTED.iter().any(|supported| *supported == name.as_bytes()) {
+        if !SUPPORTED
+            .iter()
+            .any(|supported| *supported == name.as_bytes())
+        {
             return Err(ApiError::validation(format!(
                 "Unsupported window configuration key: {}",
                 name.to_string_lossy()
@@ -341,7 +384,7 @@ fn boolean(dict: &Dict, name: &str) -> Result<Option<bool>, ApiError> {
 /// and the `focusable` / `hide` / `noautocmd` booleans.
 fn validate_float_flags(dict: &Dict) -> Result<(), ApiError> {
     match string(dict, "style")?.as_deref() {
-        None | Some("") | Some("minimal") => {}
+        None | Some("" | "minimal") => {}
         Some(value) => return Err(invalid("style", format!("invalid value: {value}"))),
     }
     boolean(dict, "focusable")?;
@@ -351,7 +394,7 @@ fn validate_float_flags(dict: &Dict) -> Result<(), ApiError> {
 }
 
 /// `external` needs the UI layer to display a top-level window; there is no
-/// such layer in this editor, so report a typed NotImplemented error.
+/// such layer in this editor, so report a typed `NotImplemented` error.
 fn reject_external(dict: &Dict) -> Result<(), ApiError> {
     if boolean(dict, "external")? == Some(true) {
         return Err(ApiError::exception(
@@ -377,7 +420,10 @@ fn parse_bufpos(dict: &Dict) -> Result<Option<(i64, i64)>, ApiError> {
     // `parse_float_bufpos`); index only after bounding the length so a
     // one-element array yields a typed Validation error, never a panic.
     if items.len() != 2 {
-        return Err(invalid("bufpos", "expected [line, column] array of length 2"));
+        return Err(invalid(
+            "bufpos",
+            "expected [line, column] array of length 2",
+        ));
     }
     let (Object::Integer(line), Object::Integer(col)) = (&items[0], &items[1]) else {
         return Err(invalid("bufpos", "expected [line, column] integers"));
@@ -409,16 +455,17 @@ fn parse_config_split(dict: &Dict) -> Result<SplitDirection, ApiError> {
 }
 
 fn parse_config(
-    editor: &Editor,
+    session: &ApiSession,
     dict: &Dict,
     current: Option<&WinConfig>,
 ) -> Result<WinConfig, ApiError> {
     reject_unsupported_keys(dict)?;
     reject_external(dict)?;
     validate_float_flags(dict)?;
-    let relative = parse_relative(editor, dict, current.map(|config| config.relative))?;
+    let relative = parse_relative(session, dict, current.map(|config| config.relative))?;
+    let anchor = string(dict, "anchor")?;
     let anchor = parse_anchor(
-        string(dict, "anchor")?,
+        anchor.as_deref(),
         current.map_or(Anchor::NorthWest, |config| config.anchor),
     )?;
     // `bufpos` ([line, column]) anchors the float to buffer text of a
@@ -510,9 +557,12 @@ fn text_alignment(value: TextAlignment) -> &'static str {
     }
 }
 
-fn config_to_dict(config: Option<&WinConfig>) -> Dict {
+fn config_to_dict(config: Option<&WinConfig>) -> Result<Dict, ApiError> {
     let Some(config) = config else {
-        return Dict(vec![(OxStr::from("relative"), Object::String(OxStr::from("")))]);
+        return Ok(Dict(vec![(
+            OxStr::from("relative"),
+            Object::String(OxStr::from("")),
+        )]));
     };
     let (relative, target) = match config.relative {
         RelativeTo::Editor => ("editor", None),
@@ -540,21 +590,33 @@ fn config_to_dict(config: Option<&WinConfig>) -> Dict {
         ),
     };
     let mut result = Dict(vec![
-        (OxStr::from("relative"), Object::String(OxStr::from(relative))),
+        (
+            OxStr::from("relative"),
+            Object::String(OxStr::from(relative)),
+        ),
         (OxStr::from("anchor"), Object::String(OxStr::from(anchor))),
         (OxStr::from("row"), Object::Float(config.row)),
         (OxStr::from("col"), Object::Float(config.col)),
-        (OxStr::from("width"), Object::Integer(config.width as i64)),
-        (OxStr::from("height"), Object::Integer(config.height as i64)),
-        (OxStr::from("zindex"), Object::Integer(i64::from(config.zindex))),
+        (
+            OxStr::from("width"),
+            Object::Integer(api_integer(config.width, "Window width")?),
+        ),
+        (
+            OxStr::from("height"),
+            Object::Integer(api_integer(config.height, "Window height")?),
+        ),
+        (
+            OxStr::from("zindex"),
+            Object::Integer(i64::from(config.zindex)),
+        ),
         (OxStr::from("border"), border),
         (
             OxStr::from("margins"),
             Object::Array(vec![
-                Object::Integer(config.margins.top as i64),
-                Object::Integer(config.margins.right as i64),
-                Object::Integer(config.margins.bottom as i64),
-                Object::Integer(config.margins.left as i64),
+                Object::Integer(api_integer(config.margins.top, "Window margin")?),
+                Object::Integer(api_integer(config.margins.right, "Window margin")?),
+                Object::Integer(api_integer(config.margins.bottom, "Window margin")?),
+                Object::Integer(api_integer(config.margins.left, "Window margin")?),
             ]),
         ),
     ]);
@@ -587,96 +649,124 @@ fn config_to_dict(config: Option<&WinConfig>) -> Dict {
             Object::String(OxStr::from(text_alignment(footer.alignment))),
         );
     }
-    result
+    Ok(result)
 }
 
 fn set_dimension(
-    editor: &mut Editor,
+    session: &ApiSession,
     window: WinHandle,
     width: Option<usize>,
     height: Option<usize>,
 ) -> Result<(), ApiError> {
-    let window = resolve_window(editor, window)?;
-    if let Some(width) = width {
-        editor.set_window_width(window, width).map_err(exception)?;
-    }
-    if let Some(height) = height {
-        editor.set_window_height(window, height).map_err(exception)?;
-    }
-    Ok(())
+    let window = resolve_window(session, window)?;
+    session.with_editor_mut(|editor| {
+        if let Some(width) = width {
+            editor.set_window_width(window, width).map_err(exception)?;
+        }
+        if let Some(height) = height {
+            editor
+                .set_window_height(window, height)
+                .map_err(exception)?;
+        }
+        Ok(())
+    })
 }
 
 #[api(since = 1, method)]
-pub fn nvim_win_get_buf(editor: &mut Editor, win: WinHandle) -> Result<BufHandle, ApiError> {
-    let win = resolve_window(editor, win)?;
-    Ok(editor.window(win).map_err(exception)?.buffer)
+pub fn nvim_win_get_buf(session: &ApiSession, win: WinHandle) -> Result<BufHandle, ApiError> {
+    let win = resolve_window(session, win)?;
+    session.with_editor(|editor| Ok(editor.window(win).map_err(exception)?.buffer))
 }
 
 #[api(since = 5, textlock, method)]
 pub fn nvim_win_set_buf(
-    editor: &mut Editor,
+    session: &ApiSession,
     win: WinHandle,
     buf: BufHandle,
 ) -> Result<(), ApiError> {
-    let win = resolve_window(editor, win)?;
-    let buf = resolve_buffer(editor, buf)?;
-    editor
-        .set_window_buffer(win, buf, BufferRelease::KeepLoaded)
-        .map_err(exception)
+    let win = resolve_window(session, win)?;
+    let buf = resolve_buffer(session, buf)?;
+    session.with_editor_mut(|editor| {
+        editor
+            .set_window_buffer(win, buf, BufferRelease::KeepLoaded)
+            .map_err(exception)
+    })
 }
 
 #[api(since = 1, method)]
-pub fn nvim_win_get_cursor(editor: &mut Editor, win: WinHandle) -> Result<Vec<i64>, ApiError> {
-    let win = resolve_window(editor, win)?;
-    let cursor = editor.window(win).map_err(exception)?.cursor;
-    Ok(vec![cursor.lnum as i64, cursor.col as i64])
+pub fn nvim_win_get_cursor(session: &ApiSession, win: WinHandle) -> Result<Vec<i64>, ApiError> {
+    let win = resolve_window(session, win)?;
+    let cursor = session.with_editor(|editor| -> Result<Position, ApiError> {
+        Ok(editor.window(win).map_err(exception)?.cursor)
+    })?;
+    Ok(vec![
+        api_integer(cursor.lnum, "Cursor line")?,
+        api_integer(cursor.col, "Cursor column")?,
+    ])
 }
 
+/// Largest valid cursor column (upstream `MAXCOL`, src/nvim/pos_defs.h:17-19).
+const MAXCOL: i64 = 0x7fff_ffff;
+
 #[api(since = 1, method)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "RPC dispatch owns decoded array arguments"
+)]
 pub fn nvim_win_set_cursor(
-    editor: &mut Editor,
+    session: &ApiSession,
     win: WinHandle,
     pos: Vec<i64>,
 ) -> Result<(), ApiError> {
     if pos.len() != 2 {
-        return Err(ApiError::validation("Cursor position must have exactly two items"));
+        return Err(ApiError::validation(
+            "Cursor position must have exactly two items",
+        ));
     }
-    let win = resolve_window(editor, win)?;
-    let buffer = editor.window(win).map_err(exception)?.buffer;
-    let text = editor.buffer(buffer).map_err(exception)?.text().map_err(exception)?;
-    let row = usize::try_from(pos[0])
-        .ok()
-        .filter(|row| (1..=text.line_count()).contains(row))
-        .ok_or_else(|| ApiError::validation("Cursor row outside buffer"))?;
-    let line = text.line(row).map_err(exception)?;
-    // Source: src/nvim/api/window.c:122-130 and src/nvim/pos_defs.h:17-19.
-    // `MAXCOL` is the largest valid cursor column; values above it (or
-    // negative) are rejected upstream before the column is silently clamped
-    // to the line length (check_cursor_col).
-    const MAXCOL: i64 = 0x7fff_ffff;
-    if pos[1] < 0 || pos[1] > MAXCOL {
-        return Err(ApiError::validation("Invalid cursor column: out of range"));
-    }
-    let col = (pos[1] as usize).min(line.len());
-    editor
-        .set_window_cursor(win, Position { lnum: row, col })
-        .map_err(exception)
+    let win = resolve_window(session, win)?;
+    let position = session.with_editor(|editor| -> Result<Position, ApiError> {
+        let buffer = editor.window(win).map_err(exception)?.buffer;
+        let text = editor
+            .buffer(buffer)
+            .map_err(exception)?
+            .text()
+            .map_err(exception)?;
+        let row = usize::try_from(pos[0])
+            .ok()
+            .filter(|row| (1..=text.line_count()).contains(row))
+            .ok_or_else(|| ApiError::validation("Cursor row outside buffer"))?;
+        let line = text.line(row).map_err(exception)?;
+        // Source: src/nvim/api/window.c:122-130 and src/nvim/pos_defs.h:17-19.
+        // `MAXCOL` is the largest valid cursor column; values above it (or
+        // negative) are rejected upstream before the column is silently clamped
+        // to the line length (check_cursor_col).
+        if pos[1] < 0 || pos[1] > MAXCOL {
+            return Err(ApiError::validation("Invalid cursor column: out of range"));
+        }
+        let col = usize::try_from(pos[1])
+            .map_err(|_| exception("Cursor column exceeds addressable range"))?
+            .min(line.len());
+        Ok(Position { lnum: row, col })
+    })?;
+    session.with_editor_mut(|editor| editor.set_window_cursor(win, position).map_err(exception))
 }
 
 #[api(since = 1, method)]
-pub fn nvim_win_get_height(editor: &mut Editor, win: WinHandle) -> Result<i64, ApiError> {
-    let win = resolve_window(editor, win)?;
-    if let Some(config) = editor.window_config(win).map_err(exception)? {
-        return i64::try_from(config.height)
-            .map_err(|_| ApiError::exception("Window height exceeds API integer range"));
-    }
-    i64::try_from(editor.window_geometry(win).map_err(exception)?.height)
-        .map_err(|_| ApiError::exception("Window height exceeds API integer range"))
+pub fn nvim_win_get_height(session: &ApiSession, win: WinHandle) -> Result<i64, ApiError> {
+    let win = resolve_window(session, win)?;
+    session.with_editor(|editor| {
+        if let Some(config) = editor.window_config(win).map_err(exception)? {
+            return i64::try_from(config.height)
+                .map_err(|_| ApiError::exception("Window height exceeds API integer range"));
+        }
+        i64::try_from(editor.window_geometry(win).map_err(exception)?.height)
+            .map_err(|_| ApiError::exception("Window height exceeds API integer range"))
+    })
 }
 
 #[api(since = 1, deprecated_since = 15, method)]
 pub fn nvim_win_set_height(
-    editor: &mut Editor,
+    session: &ApiSession,
     win: WinHandle,
     height: i64,
 ) -> Result<(), ApiError> {
@@ -684,23 +774,25 @@ pub fn nvim_win_set_height(
         .ok()
         .filter(|height| *height > 0)
         .ok_or_else(|| ApiError::validation("Height must be greater than zero"))?;
-    set_dimension(editor, win, None, Some(height))
+    set_dimension(session, win, None, Some(height))
 }
 
 #[api(since = 1, method)]
-pub fn nvim_win_get_width(editor: &mut Editor, win: WinHandle) -> Result<i64, ApiError> {
-    let win = resolve_window(editor, win)?;
-    if let Some(config) = editor.window_config(win).map_err(exception)? {
-        return i64::try_from(config.width)
-            .map_err(|_| ApiError::exception("Window width exceeds API integer range"));
-    }
-    i64::try_from(editor.window_geometry(win).map_err(exception)?.width)
-        .map_err(|_| ApiError::exception("Window width exceeds API integer range"))
+pub fn nvim_win_get_width(session: &ApiSession, win: WinHandle) -> Result<i64, ApiError> {
+    let win = resolve_window(session, win)?;
+    session.with_editor(|editor| {
+        if let Some(config) = editor.window_config(win).map_err(exception)? {
+            return i64::try_from(config.width)
+                .map_err(|_| ApiError::exception("Window width exceeds API integer range"));
+        }
+        i64::try_from(editor.window_geometry(win).map_err(exception)?.width)
+            .map_err(|_| ApiError::exception("Window width exceeds API integer range"))
+    })
 }
 
 #[api(since = 1, deprecated_since = 15, method)]
 pub fn nvim_win_set_width(
-    editor: &mut Editor,
+    session: &ApiSession,
     win: WinHandle,
     width: i64,
 ) -> Result<(), ApiError> {
@@ -708,163 +800,224 @@ pub fn nvim_win_set_width(
         .ok()
         .filter(|width| *width > 0)
         .ok_or_else(|| ApiError::validation("Width must be greater than zero"))?;
-    set_dimension(editor, win, Some(width), None)
+    set_dimension(session, win, Some(width), None)
 }
 
 #[api(since = 1, method)]
-pub fn nvim_win_get_position(editor: &mut Editor, win: WinHandle) -> Result<Vec<i64>, ApiError> {
-    let win = resolve_window(editor, win)?;
-    let geometry = editor.window_geometry(win).map_err(exception)?;
-    Ok(vec![geometry.row as i64, geometry.col as i64])
+pub fn nvim_win_get_position(session: &ApiSession, win: WinHandle) -> Result<Vec<i64>, ApiError> {
+    let win = resolve_window(session, win)?;
+    let geometry = session.with_editor(|editor| editor.window_geometry(win).map_err(exception))?;
+    Ok(vec![
+        api_integer(geometry.row, "Window row")?,
+        api_integer(geometry.col, "Window column")?,
+    ])
 }
 
 #[api(since = 1, method)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "RPC dispatch owns decoded string arguments"
+)]
 pub fn nvim_win_get_var(
-    editor: &mut Editor,
+    session: &ApiSession,
     win: WinHandle,
     name: OxStr,
 ) -> Result<Object, ApiError> {
-    let win = resolve_window(editor, win)?;
-    editor
-        .window_variables(win)
-        .map_err(exception)?
-        .get(&name)
-        .cloned()
-        .ok_or_else(|| ApiError::exception(format!("Key not found: {}", name.to_string_lossy())))
+    let win = resolve_window(session, win)?;
+    session.with_editor(|editor| {
+        editor
+            .window_variables(win)
+            .map_err(exception)?
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::exception(format!("Key not found: {}", name.to_string_lossy()))
+            })
+    })
 }
 
 #[api(since = 1, method)]
 pub fn nvim_win_set_var(
-    editor: &mut Editor,
+    session: &ApiSession,
     win: WinHandle,
     name: OxStr,
     value: Object,
 ) -> Result<(), ApiError> {
-    let win = resolve_window(editor, win)?;
-    editor
-        .window_variables_mut(win)
-        .map_err(exception)?
-        .insert(name, value);
-    Ok(())
+    let win = resolve_window(session, win)?;
+    session.with_editor_mut(|editor| {
+        editor
+            .window_variables_mut(win)
+            .map_err(exception)?
+            .insert(name, value);
+        Ok(())
+    })
 }
 
 #[api(since = 1, method)]
-pub fn nvim_win_del_var(
-    editor: &mut Editor,
-    win: WinHandle,
-    name: OxStr,
-) -> Result<(), ApiError> {
-    let win = resolve_window(editor, win)?;
-    let variables = editor.window_variables_mut(win).map_err(exception)?;
-    let Some(index) = variables.iter().position(|(candidate, _)| candidate == &name) else {
-        return Err(ApiError::exception(format!(
-            "Key not found: {}",
-            name.to_string_lossy()
-        )));
-    };
-    variables.0.remove(index);
-    Ok(())
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "RPC dispatch owns decoded string arguments"
+)]
+pub fn nvim_win_del_var(session: &ApiSession, win: WinHandle, name: OxStr) -> Result<(), ApiError> {
+    let win = resolve_window(session, win)?;
+    session.with_editor_mut(|editor| {
+        let variables = editor.window_variables_mut(win).map_err(exception)?;
+        let Some(index) = variables
+            .iter()
+            .position(|(candidate, _)| candidate == &name)
+        else {
+            return Err(ApiError::exception(format!(
+                "Key not found: {}",
+                name.to_string_lossy()
+            )));
+        };
+        variables.0.remove(index);
+        Ok(())
+    })
 }
 
 #[api(since = 1, deprecated_since = 11, method)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "RPC dispatch owns decoded string arguments"
+)]
 pub fn nvim_win_get_option(
-    editor: &mut Editor,
+    session: &ApiSession,
     window: WinHandle,
     name: OxStr,
 ) -> Result<Object, ApiError> {
-    let window = resolve_window(editor, window)?;
+    let window = resolve_window(session, window)?;
     let name = std::str::from_utf8(name.as_bytes())
         .map_err(|_| ApiError::validation("Option name must be valid UTF-8"))?;
-    editor
-        .options()
-        .get_window(window, name)
-        .map(option_to_object)
-        .map_err(exception)
+    session.with_editor(|editor| {
+        editor
+            .options()
+            .get_window(window, name)
+            .map(option_to_object)
+            .map_err(exception)
+    })
 }
 
 #[api(since = 1, deprecated_since = 11, method)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "RPC dispatch owns decoded string arguments"
+)]
 pub fn nvim_win_set_option(
-    editor: &mut Editor,
+    session: &ApiSession,
     window: WinHandle,
     name: OxStr,
     value: Object,
 ) -> Result<(), ApiError> {
-    let window = resolve_window(editor, window)?;
+    let window = resolve_window(session, window)?;
     let name = std::str::from_utf8(name.as_bytes())
         .map_err(|_| ApiError::validation("Option name must be valid UTF-8"))?;
     let metadata = ox_editor::OptionStore::metadata(name).map_err(exception)?;
     let value = crate::global::object_to_legacy_option_value(metadata, name, value)?;
-    editor
-        .options_mut()
-        .set_window(window, name, value)
-        .map_err(exception)
+    session.with_editor_mut(|editor| {
+        editor
+            .options_mut()
+            .set_window(window, name, value)
+            .map_err(exception)
+    })
 }
 
 #[api(since = 1, method)]
-pub fn nvim_win_get_tabpage(
-    editor: &mut Editor,
-    win: WinHandle,
-) -> Result<TabHandle, ApiError> {
-    let win = resolve_window(editor, win)?;
-    window_tabpage(editor, win)
+pub fn nvim_win_get_tabpage(session: &ApiSession, win: WinHandle) -> Result<TabHandle, ApiError> {
+    let win = resolve_window(session, win)?;
+    window_tabpage(session, win)
 }
 
 #[api(since = 1, method)]
-pub fn nvim_win_get_number(editor: &mut Editor, win: WinHandle) -> Result<i64, ApiError> {
-    let win = resolve_window(editor, win)?;
-    let tab = window_tabpage(editor, win)?;
-    let windows = editor.tabpage(tab).map_err(exception)?.windows();
-    windows
-        .iter()
-        .position(|candidate| *candidate == win)
-        .map(|index| index as i64 + 1)
-        .ok_or_else(|| ApiError::exception("Window is not in its owning tabpage"))
+pub fn nvim_win_get_number(session: &ApiSession, win: WinHandle) -> Result<i64, ApiError> {
+    let win = resolve_window(session, win)?;
+    let tab = window_tabpage(session, win)?;
+    session.with_editor(|editor| {
+        let windows = editor.tabpage(tab).map_err(exception)?.windows();
+        let index = windows
+            .iter()
+            .position(|candidate| *candidate == win)
+            .ok_or_else(|| ApiError::exception("Window is not in its owning tabpage"))?;
+        let number = api_integer(index, "Window number")?
+            .checked_add(1)
+            .ok_or_else(|| ApiError::exception("Window number exceeds API integer range"))?;
+        Ok(number)
+    })
 }
 
 #[api(since = 1, method)]
-pub fn nvim_win_is_valid(editor: &mut Editor, win: WinHandle) -> Result<bool, ApiError> {
+pub fn nvim_win_is_valid(session: &ApiSession, win: WinHandle) -> Result<bool, ApiError> {
     if win.is_current() {
-        return Ok(resolve_window(editor, win).is_ok());
+        return Ok(resolve_window(session, win).is_ok());
     }
-    Ok(editor.window(win).is_ok())
+    session.with_editor(|editor| Ok(editor.window(win).is_ok()))
 }
 
 #[api(since = 7, textlock, method)]
-pub fn nvim_win_hide(editor: &mut Editor, win: WinHandle) -> Result<(), ApiError> {
-    let win = resolve_window(editor, win)?;
-    let tab = window_tabpage(editor, win)?;
-    editor.close_window(tab, win, true).map_err(exception)?;
-    Ok(())
+pub fn nvim_win_hide(session: &ApiSession, win: WinHandle) -> Result<(), ApiError> {
+    let win = resolve_window(session, win)?;
+    let tab = window_tabpage(session, win)?;
+    session.with_editor_mut(|editor| {
+        editor.close_window(tab, win, true).map_err(exception)?;
+        Ok(())
+    })
 }
 
 #[api(since = 6, textlock, method)]
-pub fn nvim_win_close(
-    editor: &mut Editor,
-    win: WinHandle,
-    force: bool,
-) -> Result<(), ApiError> {
-    let win = resolve_window(editor, win)?;
-    let tab = window_tabpage(editor, win)?;
+pub fn nvim_win_close(session: &ApiSession, win: WinHandle, force: bool) -> Result<(), ApiError> {
+    let win = resolve_window(session, win)?;
+    let tab = window_tabpage(session, win)?;
     // Buffer modified-state is not modeled yet. Closing still follows normal
     // hidden-buffer retention; `force` has no observable distinction until it is.
     let _ = force;
-    editor.close_window(tab, win, true).map_err(exception)?;
-    Ok(())
+    session.with_editor_mut(|editor| {
+        editor.close_window(tab, win, true).map_err(exception)?;
+        Ok(())
+    })
 }
 
 #[api(since = 7, method)]
 pub fn nvim_win_call(
-    editor: &mut Editor,
+    session: &ApiSession,
     win: WinHandle,
-    _function: LuaRef,
+    function: LuaRef,
 ) -> Result<Object, ApiError> {
-    resolve_window(editor, win)?;
-    Err(ApiError::exception("Not implemented: nvim_win_call"))
+    let win = resolve_window(session, win)?;
+    let reference = usize::try_from(function.0)
+        .map_err(|_| ApiError::exception("Lua callback reference is out of range"))?;
+    // The Lua function runs with `win` current (`nvim/api/window.c:269-286`).
+    // The context switch is session-side save/restore: host closures must not
+    // hold an editor borrow across user code, so the window swap is one
+    // statement on each side of the executor checkout. Entry and restore
+    // failures are swallowed so the callback result is never masked, matching
+    // the restore contract of `Editor::with_window_context`.
+    let caller = session
+        .with_editor(Editor::current_window)
+        .ok_or_else(|| exception("no current tabpage"))?;
+    if caller != win {
+        let _ = session.with_editor_mut(|editor| editor.set_current_window(win));
+    }
+    let outcome = crate::runtime::with_lua_executor(session, |session, executor| {
+        executor
+            .call_ref(session, reference, Vec::new())
+            .map_err(ApiError::exception)
+    });
+    if session.with_editor(Editor::current_window) != Some(caller)
+        && session.with_editor(|editor| editor.window(caller).is_ok())
+    {
+        let _ = session.with_editor_mut(|editor| editor.set_current_window(caller));
+    }
+    // The caller's argument reference is consumed exactly once, after every
+    // value it produced has been copied out (or the failure recorded).
+    crate::runtime::release_lua_callback(session, reference);
+    // Array is the internal retstack carrier. The Lua binding expands it and
+    // therefore preserves the distinction between no return and one nil.
+    Ok(Object::Array(outcome?))
 }
 
 #[api(since = 10, method)]
 pub fn nvim_win_set_hl_ns(
-    editor: &mut Editor,
+    session: &ApiSession,
     win: WinHandle,
     ns_id: i64,
 ) -> Result<(), ApiError> {
@@ -873,53 +1026,64 @@ pub fn nvim_win_set_hl_ns(
             "Namespace must be greater than or equal to -1",
         ));
     }
-    let win = resolve_window(editor, win)?;
-    editor
-        .set_window_highlight_namespace(win, ns_id)
-        .map_err(exception)
+    let win = resolve_window(session, win)?;
+    session.with_editor_mut(|editor| {
+        editor
+            .set_window_highlight_namespace(win, ns_id)
+            .map_err(exception)
+    })
 }
 
 #[api(since = 6, textlock)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "RPC dispatch owns decoded config dictionaries"
+)]
 pub fn nvim_open_win(
-    editor: &mut Editor,
+    session: &ApiSession,
     buf: BufHandle,
     enter: bool,
     config: Dict,
 ) -> Result<WinHandle, ApiError> {
-    let buffer = resolve_buffer(editor, buf)?;
+    let buffer = resolve_buffer(session, buf)?;
     reject_unsupported_keys(&config)?;
     reject_external(&config)?;
     // A `split` config creates a normal (tiled) split window instead of a
     // floating one (api.txt: "- split:", nvim/api/win_config.c:231-244).
     if key(&config, "split").is_some() {
         validate_float_flags(&config)?;
-        return open_split_window(editor, buffer, enter, &config);
+        return open_split_window(session, buffer, enter, &config);
     }
-    let config = parse_config(editor, &config, None)?;
-    let tab = editor
-        .current_tabpage()
-        .ok_or_else(|| ApiError::exception("no current tabpage"))?;
-    let window = editor.open_float(tab, buffer, config).map_err(exception)?;
-    if enter {
-        editor.set_current_window(window).map_err(exception)?;
-    }
-    Ok(window)
+    let config = parse_config(session, &config, None)?;
+    session.with_editor_mut(|editor| {
+        let tab = editor
+            .current_tabpage()
+            .ok_or_else(|| ApiError::exception("no current tabpage"))?;
+        let window = editor.open_float(tab, buffer, config).map_err(exception)?;
+        if enter {
+            editor.set_current_window(window).map_err(exception)?;
+        }
+        Ok(window)
+    })
 }
 
 /// Resolves the window `config.win` selects as the split target, defaulting to
 /// the current window. The target may live on any tabpage (upstream: "Can be
 /// in a different tab page"). Splitting a floating window is rejected
-/// (nvim/api/win_config.c: "Cannot split a floating window").
-fn parse_split_target(editor: &Editor, config: &Dict) -> Result<WinHandle, ApiError> {
+/// (`nvim/api/win_config.c`: "Cannot split a floating window").
+fn parse_split_target(session: &ApiSession, config: &Dict) -> Result<WinHandle, ApiError> {
     let target = match key(config, "win") {
-        None | Some(Object::Nil) => resolve_window(editor, WinHandle::CURRENT)?,
-        Some(Object::Window(window)) => resolve_window(editor, *window)?,
+        None | Some(Object::Nil) => resolve_window(session, WinHandle::CURRENT)?,
+        Some(Object::Window(window)) => resolve_window(session, *window)?,
         Some(Object::Integer(window)) => WinHandle::try_from(*window)
             .map_err(|error| invalid("win", error))
-            .and_then(|window| resolve_window(editor, window))?,
+            .and_then(|window| resolve_window(session, window))?,
         Some(_) => return Err(invalid("win", "expected Window")),
     };
-    if editor.window_config(target).map_err(exception)?.is_some() {
+    let floating = session.with_editor(|editor| -> Result<bool, ApiError> {
+        Ok(editor.window_config(target).map_err(exception)?.is_some())
+    })?;
+    if floating {
         return Err(ApiError::exception("Cannot split a floating window"));
     }
     Ok(target)
@@ -930,82 +1094,133 @@ fn parse_split_target(editor: &Editor, config: &Dict) -> Result<WinHandle, ApiEr
 /// `left`/`right` split vertically with the new window before/after, and
 /// `above`/`below` split horizontally with the new window before/after.
 fn open_split_window(
-    editor: &mut Editor,
+    session: &ApiSession,
     buffer: BufHandle,
     enter: bool,
     config: &Dict,
 ) -> Result<WinHandle, ApiError> {
     let direction = parse_config_split(config)?;
-    let target = parse_split_target(editor, config)?;
+    let target = parse_split_target(session, config)?;
     // `target` may belong to a non-current tabpage; split it there.
-    let tab = window_tabpage(editor, target)?;
-    let window = match direction {
-        SplitDirection::Left => editor.split_left(tab, target, buffer),
-        SplitDirection::Right => editor.split_vertical(tab, target, buffer),
-        SplitDirection::Above => editor.split_above(tab, target, buffer),
-        SplitDirection::Below => editor.split_horizontal(tab, target, buffer),
-    }
-    .map_err(exception)?;
+    let tab = window_tabpage(session, target)?;
+    let window = session
+        .with_editor_mut(|editor| match direction {
+            SplitDirection::Left => editor.split_left(tab, target, buffer, enter),
+            SplitDirection::Right => editor.split_vertical(tab, target, buffer, enter),
+            SplitDirection::Above => editor.split_above(tab, target, buffer, enter),
+            SplitDirection::Below => editor.split_horizontal(tab, target, buffer, enter),
+        })
+        .map_err(exception)?;
     let width = positive_size(config, "width", false)?;
     let height = positive_size(config, "height", false)?;
-    set_dimension(editor, window, width, height)?;
+    set_dimension(session, window, width, height)?;
     if enter {
-        editor.set_current_window(window).map_err(exception)?;
+        session.with_editor_mut(|editor| editor.set_current_window(window).map_err(exception))?;
     }
     Ok(window)
 }
 
 #[api(since = 6, method)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "RPC dispatch owns decoded config dictionaries"
+)]
 pub fn nvim_win_set_config(
-    editor: &mut Editor,
+    session: &ApiSession,
     win: WinHandle,
     config: Dict,
 ) -> Result<(), ApiError> {
-    let win = resolve_window(editor, win)?;
-    let current = editor
-        .window_config(win)
-        .map_err(exception)?
-        .cloned()
-        .ok_or_else(|| {
-            ApiError::validation(
-                "Unsupported window configuration transformation: tiled to floating",
-            )
-        })?;
-    let updated = parse_config(editor, &config, Some(&current))?;
-    editor.set_window_config(win, updated).map_err(exception)
+    let win = resolve_window(session, win)?;
+    let current = session.with_editor(|editor| {
+        editor
+            .window_config(win)
+            .map_err(exception)?
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::validation(
+                    "Unsupported window configuration transformation: tiled to floating",
+                )
+            })
+    })?;
+    let updated = parse_config(session, &config, Some(&current))?;
+    session.with_editor_mut(|editor| editor.set_window_config(win, updated).map_err(exception))
 }
 
 #[api(since = 6, method)]
-pub fn nvim_win_get_config(editor: &mut Editor, win: WinHandle) -> Result<Dict, ApiError> {
-    let win = resolve_window(editor, win)?;
-    let config = editor.window_config(win).map_err(exception)?;
-    Ok(config_to_dict(config))
+pub fn nvim_win_get_config(session: &ApiSession, win: WinHandle) -> Result<Dict, ApiError> {
+    let win = resolve_window(session, win)?;
+    session.with_editor(|editor| config_to_dict(editor.window_config(win).map_err(exception)?))
 }
 
 pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(nvim_win_get_buf__API_META(), nvim_win_get_buf__API_DISPATCH)?;
     registry.register(nvim_win_set_buf__API_META(), nvim_win_set_buf__API_DISPATCH)?;
-    registry.register(nvim_win_get_cursor__API_META(), nvim_win_get_cursor__API_DISPATCH)?;
-    registry.register(nvim_win_set_cursor__API_META(), nvim_win_set_cursor__API_DISPATCH)?;
-    registry.register(nvim_win_get_height__API_META(), nvim_win_get_height__API_DISPATCH)?;
-    registry.register(nvim_win_set_height__API_META(), nvim_win_set_height__API_DISPATCH)?;
-    registry.register(nvim_win_get_width__API_META(), nvim_win_get_width__API_DISPATCH)?;
-    registry.register(nvim_win_set_width__API_META(), nvim_win_set_width__API_DISPATCH)?;
-    registry.register(nvim_win_get_position__API_META(), nvim_win_get_position__API_DISPATCH)?;
+    registry.register(
+        nvim_win_get_cursor__API_META(),
+        nvim_win_get_cursor__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_win_set_cursor__API_META(),
+        nvim_win_set_cursor__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_win_get_height__API_META(),
+        nvim_win_get_height__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_win_set_height__API_META(),
+        nvim_win_set_height__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_win_get_width__API_META(),
+        nvim_win_get_width__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_win_set_width__API_META(),
+        nvim_win_set_width__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_win_get_position__API_META(),
+        nvim_win_get_position__API_DISPATCH,
+    )?;
     registry.register(nvim_win_get_var__API_META(), nvim_win_get_var__API_DISPATCH)?;
     registry.register(nvim_win_set_var__API_META(), nvim_win_set_var__API_DISPATCH)?;
     registry.register(nvim_win_del_var__API_META(), nvim_win_del_var__API_DISPATCH)?;
-    registry.register(nvim_win_get_option__API_META(), nvim_win_get_option__API_DISPATCH)?;
-    registry.register(nvim_win_set_option__API_META(), nvim_win_set_option__API_DISPATCH)?;
-    registry.register(nvim_win_get_tabpage__API_META(), nvim_win_get_tabpage__API_DISPATCH)?;
-    registry.register(nvim_win_get_number__API_META(), nvim_win_get_number__API_DISPATCH)?;
-    registry.register(nvim_win_is_valid__API_META(), nvim_win_is_valid__API_DISPATCH)?;
+    registry.register(
+        nvim_win_get_option__API_META(),
+        nvim_win_get_option__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_win_set_option__API_META(),
+        nvim_win_set_option__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_win_get_tabpage__API_META(),
+        nvim_win_get_tabpage__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_win_get_number__API_META(),
+        nvim_win_get_number__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_win_is_valid__API_META(),
+        nvim_win_is_valid__API_DISPATCH,
+    )?;
     registry.register(nvim_win_hide__API_META(), nvim_win_hide__API_DISPATCH)?;
     registry.register(nvim_win_close__API_META(), nvim_win_close__API_DISPATCH)?;
     registry.register(nvim_win_call__API_META(), nvim_win_call__API_DISPATCH)?;
-    registry.register(nvim_win_set_hl_ns__API_META(), nvim_win_set_hl_ns__API_DISPATCH)?;
+    registry.register(
+        nvim_win_set_hl_ns__API_META(),
+        nvim_win_set_hl_ns__API_DISPATCH,
+    )?;
     registry.register(nvim_open_win__API_META(), nvim_open_win__API_DISPATCH)?;
-    registry.register(nvim_win_set_config__API_META(), nvim_win_set_config__API_DISPATCH)?;
-    registry.register(nvim_win_get_config__API_META(), nvim_win_get_config__API_DISPATCH)?;
+    registry.register(
+        nvim_win_set_config__API_META(),
+        nvim_win_set_config__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_win_get_config__API_META(),
+        nvim_win_get_config__API_DISPATCH,
+    )?;
     Ok(())
 }

@@ -9,8 +9,8 @@ pub mod expand;
 pub mod parser;
 
 pub use command::{
-    COMMANDS, AddrType, CommandFlags, CommandSpec, NoUserCommands, ResolveError, ResolvedCommand,
-    UserCommandMatch, UserCommandProvider, command_spec, resolve_command,
+    AddrType, COMMANDS, CommandFlags, CommandSpec, NoUserCommands, ResolveError, ResolvedCommand,
+    UserCommandInfo, UserCommandMatch, UserCommandProvider, command_spec, resolve_command,
 };
 pub use expand::{CmdlineContext, CmdlineSpecial, ExpansionPart, expand_with, scan_expansions};
 pub use parser::{
@@ -24,6 +24,12 @@ impl ExCommand {
     /// Callers choose when a command's grammar is expression-shaped; the Ex
     /// parser itself preserves the raw tail instead of guessing per-command
     /// execution semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ox_eval::EvalError`] when the tail does not lex or parse as a
+    /// Vimscript expression, carrying the Vim error code, message, and the byte
+    /// offset where parsing failed.
     pub fn parse_expression_args(&self) -> ox_eval::Result<ox_eval::Expr> {
         ox_eval::Parser::new(self.args.as_bytes()).parse()
     }

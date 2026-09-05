@@ -16,12 +16,13 @@ const FIRST_GLOBAL_MARK: char = 'A';
 const LAST_GLOBAL_MARK: char = 'Z';
 const FIRST_NUMBERED_MARK: char = '0';
 const LAST_NUMBERED_MARK: char = '9';
-const SPECIAL_LOCAL_MARKS: [char; 5] = ['\'', '`', '.', '^', ':'];
+const SPECIAL_LOCAL_MARKS: [char; 8] = ['\'', '`', '.', '^', ':', '[', ']', '"'];
 
 /// An invalid named-mark operation.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum MarkError {
-    /// The name is not one of `a-z`, `'`, `` ` ``, `.`, `^`, or `:`.
+    /// The name is not one of `a-z`, `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`,
+    /// or `"`.
     #[error("invalid local mark name '{0}'")]
     InvalidLocal(char),
     /// The name is not in `A-Z` or `0-9`.
@@ -105,28 +106,39 @@ impl LocalMarks {
     }
 
     /// Inserts or replaces a local mark.
-    pub fn set(
-        &mut self,
-        name: char,
-        position: Position,
-    ) -> Result<Option<Position>, MarkError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarkError::InvalidLocal`] if `name` is not one of `a-z`,
+    /// `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, or `"`.
+    pub fn set(&mut self, name: char, position: Position) -> Result<Option<Position>, MarkError> {
         let id = local_mark_id(name)?;
         Ok(self.marks.set(id, position))
     }
 
     /// Gets a local mark.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarkError::InvalidLocal`] if `name` is not one of `a-z`,
+    /// `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, or `"`.
     pub fn get(&self, name: char) -> Result<Option<Position>, MarkError> {
         let id = local_mark_id(name)?;
         Ok(self.marks.get(id))
     }
 
     /// Removes a local mark.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarkError::InvalidLocal`] if `name` is not one of `a-z`,
+    /// `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, or `"`.
     pub fn remove(&mut self, name: char) -> Result<Option<Position>, MarkError> {
         let id = local_mark_id(name)?;
         Ok(self.marks.remove(id))
     }
 
-    /// Iterates over set marks in `a-z`, `'`, `` ` ``, `.`, `^`, `:` order.
+    /// Iterates over set marks in `a-z`, `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, `"` order.
     pub fn iter(&self) -> impl Iterator<Item = (char, Position)> + '_ {
         self.marks
             .iter()
@@ -155,6 +167,10 @@ impl GlobalMarks {
     }
 
     /// Inserts or replaces a global or numbered mark.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarkError::InvalidGlobal`] if `name` is not in `A-Z` or `0-9`.
     pub fn set(
         &mut self,
         name: char,
@@ -165,12 +181,20 @@ impl GlobalMarks {
     }
 
     /// Gets a global or numbered mark.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarkError::InvalidGlobal`] if `name` is not in `A-Z` or `0-9`.
     pub fn get(&self, name: char) -> Result<Option<&MarkLocation>, MarkError> {
         validate_global_mark(name)?;
         Ok(self.marks.get(&name))
     }
 
     /// Removes a global or numbered mark.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MarkError::InvalidGlobal`] if `name` is not in `A-Z` or `0-9`.
     pub fn remove(&mut self, name: char) -> Result<Option<MarkLocation>, MarkError> {
         validate_global_mark(name)?;
         Ok(self.marks.remove(&name))
@@ -348,6 +372,10 @@ impl Changelists {
             .map(|history| history.entries.as_slice())
     }
 
+    /// Removes the change history for `buffer`.
+    pub fn clear(&mut self, buffer: BufHandle) {
+        self.buffers.remove(&buffer);
+    }
     /// Appends a change and leaves the index one past the newest entry.
     ///
     /// Navigation does not branch change history: a later change always appends
@@ -374,9 +402,7 @@ impl Changelists {
     /// Moves one entry toward newer changes in `buffer`.
     pub fn forward(&mut self, buffer: BufHandle) -> Option<Position> {
         let history = self.buffers.get_mut(&buffer)?;
-        if history.entries.is_empty()
-            || history.index >= history.entries.len().saturating_sub(1)
-        {
+        if history.entries.is_empty() || history.index >= history.entries.len().saturating_sub(1) {
             return None;
         }
         history.index += 1;
@@ -416,7 +442,8 @@ fn local_mark_id(name: char) -> Result<u64, MarkError> {
 
 fn local_mark_name(id: u64) -> Option<char> {
     if id < 26 {
-        return char::from_u32(FIRST_LOCAL_MARK as u32 + id as u32);
+        let offset = u32::try_from(id).ok()?;
+        return char::from_u32(FIRST_LOCAL_MARK as u32 + offset);
     }
     let special_index = usize::try_from(id.checked_sub(26)?).ok()?;
     SPECIAL_LOCAL_MARKS.get(special_index).copied()
@@ -453,12 +480,7 @@ fn splice_locations(
     }
 }
 
-fn splice_positions(
-    positions: &mut [Position],
-    start: usize,
-    old_count: usize,
-    new_count: usize,
-) {
+fn splice_positions(positions: &mut [Position], start: usize, old_count: usize, new_count: usize) {
     let mut marks = Marks::new();
     for (index, &position) in positions.iter().enumerate() {
         marks.set(index as u64, position);

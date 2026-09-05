@@ -56,11 +56,11 @@ pub(crate) fn recv_handle<Fd: AsFd>(
     payload.truncate(message.bytes);
     let mut received = None;
     for ancillary in control.drain() {
-        if let RecvAncillaryMessage::ScmRights(mut rights) = ancillary {
-            if let Some(fd) = rights.next() {
-                received = Some(fd);
-                break;
-            }
+        if let RecvAncillaryMessage::ScmRights(mut rights) = ancillary
+            && let Some(fd) = rights.next()
+        {
+            received = Some(fd);
+            break;
         }
     }
     Ok((payload, received))

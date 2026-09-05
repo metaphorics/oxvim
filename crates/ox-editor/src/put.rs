@@ -62,9 +62,7 @@ pub(crate) fn plan_put(
 ) -> Result<PutPlan, RegisterError> {
     let count = count.max(1);
     match content.kind() {
-        RegisterKind::CharacterWise => {
-            plan_characterwise(origin, content, count, cursor_before)
-        }
+        RegisterKind::CharacterWise => plan_characterwise(origin, content, count, cursor_before),
         RegisterKind::LineWise => plan_linewise(origin, content, count, cursor_before),
         RegisterKind::BlockWise { width } => {
             plan_blockwise(lines, origin, content, count, cursor_before, width)
@@ -310,8 +308,14 @@ mod tests {
     #[test]
     fn one_line_count_expands_and_cursor_uses_last_scalar_start() {
         let content = RegisterContent::characterwise("한X".as_bytes()).unwrap();
-        let plan = plan_put(&[b"ab".to_vec()], position(1, 1), &content, 2, position(1, 0))
-            .unwrap();
+        let plan = plan_put(
+            &[b"ab".to_vec()],
+            position(1, 1),
+            &content,
+            2,
+            position(1, 0),
+        )
+        .unwrap();
 
         assert_eq!(splice_replacement(&plan), &["한X한X".as_bytes().to_vec()]);
         assert_eq!(plan.cursor_after, position(1, 8));
@@ -322,8 +326,14 @@ mod tests {
     #[test]
     fn multiline_count_joins_copy_boundaries() {
         let content = RegisterContent::characterwise(b"x\ny").unwrap();
-        let plan = plan_put(&[b"ab".to_vec()], position(1, 1), &content, 2, position(1, 0))
-            .unwrap();
+        let plan = plan_put(
+            &[b"ab".to_vec()],
+            position(1, 1),
+            &content,
+            2,
+            position(1, 0),
+        )
+        .unwrap();
 
         assert_eq!(
             splice_replacement(&plan),
@@ -335,14 +345,25 @@ mod tests {
     #[test]
     fn linewise_count_repeats_vertically_and_finds_first_nonblank() {
         let content = RegisterContent::linewise(vec![b"  x".to_vec(), b"y".to_vec()]).unwrap();
-        let plan = plan_put(&[b"one".to_vec()], position(0, 0), &content, 2, position(1, 0))
-            .unwrap();
+        let plan = plan_put(
+            &[b"one".to_vec()],
+            position(0, 0),
+            &content,
+            2,
+            position(1, 0),
+        )
+        .unwrap();
 
         assert_eq!(
             plan.edits,
             vec![PutEdit::InsertLines {
                 after_lnum: 0,
-                lines: vec![b"  x".to_vec(), b"y".to_vec(), b"  x".to_vec(), b"y".to_vec()],
+                lines: vec![
+                    b"  x".to_vec(),
+                    b"y".to_vec(),
+                    b"  x".to_vec(),
+                    b"y".to_vec()
+                ],
             }]
         );
         assert_eq!(plan.cursor_after, position(1, 2));
@@ -371,13 +392,17 @@ mod tests {
 
     #[test]
     fn blockwise_materializes_uniform_eof_tail_rows() {
-        let content = RegisterContent::blockwise(
-            vec![b"Q".to_vec(), b"R".to_vec(), b"S".to_vec()],
+        let content =
+            RegisterContent::blockwise(vec![b"Q".to_vec(), b"R".to_vec(), b"S".to_vec()], 1)
+                .unwrap();
+        let plan = plan_put(
+            &[b"abc".to_vec()],
+            position(1, 2),
+            &content,
             1,
+            position(1, 1),
         )
         .unwrap();
-        let plan = plan_put(&[b"abc".to_vec()], position(1, 2), &content, 1, position(1, 1))
-            .unwrap();
 
         assert_eq!(splice_replacement(&plan), &[b"Q".to_vec()]);
         assert_eq!(

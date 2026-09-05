@@ -10,24 +10,57 @@ use crate::indent::{ExprEval, IndentEvalContext, IndentExprError};
 use crate::insert::InsertError;
 use crate::ops::OperatorError;
 use crate::{
-    BufferRelease, Editor, Geometry, InsertState, Keys, MapMode, MappingAction, MappingOptions,
-    Mode, ModeError, ModeMachine, NullExprEval, OptionValue, TypeaheadFlags,
+    BufferRelease, Editor, ExExecutor, Geometry, InsertState, Keys, MapMode, MappingAction,
+    MappingOptions, Mode, ModeError, ModeMachine, NullExprEval, OptionValue, TestEditorAccess,
+    TypeaheadFlags, VisualKind,
 };
+use ox_types::{OxStr, Typval};
 
-fn position(lnum: usize, col: usize) -> Position { Position { lnum, col } }
+#[test]
+fn stop_insert_leaves_insert_and_replace_modes() {
+    let mut machine = ModeMachine::default();
 
-fn run(text: &str, cursor: Position, keys: &str) -> (String, Position, &'static str, Editor, ox_types::BufHandle) {
+    machine.enter_insert();
+    machine.stop_insert();
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+
+    machine.enter_replace();
+    machine.stop_insert();
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+}
+
+fn position(lnum: usize, col: usize) -> Position {
+    Position { lnum, col }
+}
+
+fn run(
+    text: &str,
+    cursor: Position,
+    keys: &str,
+) -> (String, Position, &'static str, Editor, ox_types::BufHandle) {
     let mut editor = Editor::new();
-    let buffer = editor.create_buffer_with(Buffer::from_bytes(text.as_bytes()).unwrap(), true).unwrap();
-    let tab = editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(text.as_bytes()).unwrap(), true)
+        .unwrap();
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
     let window = editor.tabpage(tab).unwrap().current_window();
     editor.set_window_cursor(window, cursor).unwrap();
     let mut machine = ModeMachine::default();
     let mut eval = NullExprEval;
     machine.feed_keys(&mut editor, keys, &mut eval).unwrap();
-    let output = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
+    let output =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     let cursor = editor.window(window).unwrap().cursor;
-    let mode = match machine.mode() { Mode::Normal(_) => "normal", Mode::Insert(_) => "insert", Mode::Visual(_) => "visual", Mode::Cmdline(_) => "cmdline", Mode::OperatorPending(_) => "operator" };
+    let mode = match machine.mode() {
+        Mode::Normal(_) => "normal",
+        Mode::Insert(_) => "insert",
+        Mode::Replace(_) => "replace",
+        Mode::Visual(_) => "visual",
+        Mode::Cmdline(_) => "cmdline",
+        Mode::OperatorPending(_) => "operator",
+    };
     (output, cursor, mode, editor, buffer)
 }
 
@@ -43,30 +76,222 @@ macro_rules! behavior {
     };
 }
 
-behavior!(delete_word, "one two", position(1,0), "dw", "two", position(1,0), "normal");
-behavior!(delete_end_word, "one two", position(1,0), "de", " two", position(1,0), "normal");
-behavior!(delete_to_line_end, "one two", position(1,4), "d$", "one ", position(1,3), "normal");
-behavior!(delete_line, "one\ntwo\nthree", position(2,0), "dd", "one\nthree", position(2,0), "normal");
-behavior!(delete_two_lines, "one\ntwo\nthree", position(1,0), "2dd", "three", position(1,0), "normal");
-behavior!(change_inner_quote, "a \"two\" b", position(1,4), "ci\"X\u{1b}", "a \"X\" b", position(1,3), "normal");
-behavior!(delete_inner_parens, "a (two) b", position(1,4), "di(", "a () b", position(1,3), "normal");
-behavior!(delete_around_parens, "a (two) b", position(1,4), "da(", "a  b", position(1,2), "normal");
-behavior!(delete_inner_word, "one two", position(1,5), "diw", "one ", position(1,3), "normal");
-behavior!(delete_around_word, "one two three", position(1,5), "daw", "one three", position(1,4), "normal");
-behavior!(visual_delete, "one", position(1,0), "vld", "e", position(1,0), "normal");
-behavior!(visual_char_delete_with_x, "one", position(1,0), "vlx", "e", position(1,0), "normal");
-behavior!(visual_char_delete_with_capital_x, "one", position(1,0), "vlX", "e", position(1,0), "normal");
-behavior!(visual_line_delete, "one\ntwo\nthree", position(2,0), "Vd", "one\nthree", position(2,0), "normal");
-behavior!(visual_swap_anchor, "one", position(1,0), "vlo", "one", position(1,0), "visual");
-behavior!(insert_plain, "one", position(1,0), "iX\u{1b}", "Xone", position(1,0), "normal");
-behavior!(append_plain, "one", position(1,0), "aX\u{1b}", "oXne", position(1,1), "normal");
-behavior!(append_line, "one", position(1,0), "AX\u{1b}", "oneX", position(1,3), "normal");
-behavior!(insert_newline, "one", position(1,1), "i\nt\u{1b}", "o\ntne", position(2,0), "normal");
-behavior!(insert_backspace, "one", position(1,1), "i\u{8}\u{1b}", "ne", position(1,0), "normal");
-behavior!(insert_backspace_join, "one\ntwo", position(2,0), "i\u{8}\u{1b}", "onetwo", position(1,2), "normal");
-behavior!(move_left_by_unicode_scalars, "A한글あ漢Z", position(1,13), "3h", "A한글あ漢Z", position(1,4), "normal");
-behavior!(move_right_by_unicode_scalars, "A한글あ漢Z", position(1,1), "3l", "A한글あ漢Z", position(1,10), "normal");
-behavior!(combining_mark_motion_is_codepoint_based, "가\u{327}A", position(1,5), "h", "가\u{327}A", position(1,3), "normal");
+behavior!(
+    delete_word,
+    "one two",
+    position(1, 0),
+    "dw",
+    "two",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    delete_end_word,
+    "one two",
+    position(1, 0),
+    "de",
+    " two",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    delete_to_line_end,
+    "one two",
+    position(1, 4),
+    "d$",
+    "one ",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    delete_line,
+    "one\ntwo\nthree",
+    position(2, 0),
+    "dd",
+    "one\nthree",
+    position(2, 0),
+    "normal"
+);
+behavior!(
+    delete_two_lines,
+    "one\ntwo\nthree",
+    position(1, 0),
+    "2dd",
+    "three",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    change_inner_quote,
+    "a \"two\" b",
+    position(1, 4),
+    "ci\"X\u{1b}",
+    "a \"X\" b",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    delete_inner_parens,
+    "a (two) b",
+    position(1, 4),
+    "di(",
+    "a () b",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    delete_around_parens,
+    "a (two) b",
+    position(1, 4),
+    "da(",
+    "a  b",
+    position(1, 2),
+    "normal"
+);
+behavior!(
+    delete_inner_word,
+    "one two",
+    position(1, 5),
+    "diw",
+    "one ",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    delete_around_word,
+    "one two three",
+    position(1, 5),
+    "daw",
+    "one three",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    visual_delete,
+    "one",
+    position(1, 0),
+    "vld",
+    "e",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    visual_char_delete_with_x,
+    "one",
+    position(1, 0),
+    "vlx",
+    "e",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    visual_char_delete_with_capital_x,
+    "one",
+    position(1, 0),
+    "vlX",
+    "e",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    visual_line_delete,
+    "one\ntwo\nthree",
+    position(2, 0),
+    "Vd",
+    "one\nthree",
+    position(2, 0),
+    "normal"
+);
+behavior!(
+    visual_swap_anchor,
+    "one",
+    position(1, 0),
+    "vlo",
+    "one",
+    position(1, 0),
+    "visual"
+);
+behavior!(
+    insert_plain,
+    "one",
+    position(1, 0),
+    "iX\u{1b}",
+    "Xone",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    append_plain,
+    "one",
+    position(1, 0),
+    "aX\u{1b}",
+    "oXne",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    append_line,
+    "one",
+    position(1, 0),
+    "AX\u{1b}",
+    "oneX",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    insert_newline,
+    "one",
+    position(1, 1),
+    "i\nt\u{1b}",
+    "o\ntne",
+    position(2, 0),
+    "normal"
+);
+behavior!(
+    insert_backspace,
+    "one",
+    position(1, 1),
+    "i\u{8}\u{1b}",
+    "ne",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    insert_backspace_join,
+    "one\ntwo",
+    position(2, 0),
+    "i\u{8}\u{1b}",
+    "onetwo",
+    position(1, 2),
+    "normal"
+);
+behavior!(
+    move_left_by_unicode_scalars,
+    "A한글あ漢Z",
+    position(1, 13),
+    "3h",
+    "A한글あ漢Z",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    move_right_by_unicode_scalars,
+    "A한글あ漢Z",
+    position(1, 1),
+    "3l",
+    "A한글あ漢Z",
+    position(1, 10),
+    "normal"
+);
+behavior!(
+    combining_mark_motion_is_codepoint_based,
+    "가\u{327}A",
+    position(1, 5),
+    "h",
+    "가\u{327}A",
+    position(1, 3),
+    "normal"
+);
 
 #[test]
 fn normal_put_dispatches_register_shapes_and_directions() {
@@ -111,11 +336,8 @@ fn normal_put_dispatches_register_shapes_and_directions() {
             "abc\ndef",
             position(2, 1),
             "a",
-            crate::RegisterContent::blockwise(
-                vec![b"Q".to_vec(), b"R".to_vec(), b"S".to_vec()],
-                1,
-            )
-            .unwrap(),
+            crate::RegisterContent::blockwise(vec![b"Q".to_vec(), b"R".to_vec(), b"S".to_vec()], 1)
+                .unwrap(),
             "P",
             "abc\ndQef\n R\n S",
             position(2, 1),
@@ -299,10 +521,7 @@ fn normal_put_multiline_charwise_count_and_cursor() {
         editor.set_window_cursor(window, position(1, 0)).unwrap();
         editor
             .registers_mut()
-            .set(
-                'a',
-                crate::RegisterContent::characterwise(b"x\ny").unwrap(),
-            )
+            .set('a', crate::RegisterContent::characterwise(b"x\ny").unwrap())
             .unwrap();
 
         let mut machine = ModeMachine::default();
@@ -353,6 +572,10 @@ fn normal_blockwise_put_width_padding_with_count() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one EOF-materialization scenario keeps setup, put, undo, and redo assertions on a single editor instance, so phase extraction would only create single-use helpers"
+)]
 fn normal_blockwise_put_eof_materializes_in_one_transaction() {
     let variants = [
         (
@@ -593,11 +816,7 @@ fn normal_blockwise_put_shifts_extmark_columns() {
         .buffer_mut(buffer)
         .unwrap()
         .extmarks
-        .set(
-            ns,
-            None,
-            ExtmarkPlacement::new(ExtmarkPosition::new(0, 2)),
-        )
+        .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(0, 2)))
         .unwrap();
     editor
         .registers_mut()
@@ -625,38 +844,294 @@ fn normal_blockwise_put_shifts_extmark_columns() {
     assert_eq!(mark.position(), ExtmarkPosition::new(0, 3));
 }
 
-behavior!(adjust_number_preserves_embedded_token_neighbors, "abc 12 def", position(1,0), "\u{1}", "abc 13 def", position(1,5), "normal");
-behavior!(adjust_number_applies_count, "10", position(1,0), "5\u{1}", "15", position(1,1), "normal");
-behavior!(adjust_number_ctrl_x_decrements, "13", position(1,0), "\u{18}", "12", position(1,1), "normal");
-behavior!(adjust_number_includes_sign_after_letters, "abc-9xxx", position(1,3), "\u{1}", "abc-8xxx", position(1,4), "normal");
-behavior!(adjust_number_grows_when_order_of_magnitude_increases, "abc999xxx", position(1,2), "\u{1}", "abc1000xxx", position(1,6), "normal");
-behavior!(adjust_number_hex_prefix, "0xff", position(1,0), "\u{1}", "0x100", position(1,4), "normal");
-behavior!(adjust_number_bin_prefix, "0b11", position(1,0), "\u{1}", "0b100", position(1,4), "normal");
-behavior!(adjust_number_prefers_nearest_decimal_over_later_hex, "9 0x10", position(1,0), "\u{1}", "10 0x10", position(1,1), "normal");
-behavior!(adjust_number_ctrl_x_prefers_nearest_decimal_over_later_hex, "9 0x10", position(1,0), "\u{18}", "8 0x10", position(1,0), "normal");
-behavior!(adjust_number_later_hex_wins_when_cursor_is_on_it, "9 0x10", position(1,2), "\u{1}", "9 0x11", position(1,5), "normal");
-behavior!(adjust_number_hex_digit_run_is_hex_not_decimal, "9 0x19", position(1,4), "\u{1}", "9 0x1a", position(1,5), "normal");
-behavior!(adjust_number_prefers_nearest_decimal_over_later_bin, "1 0b01", position(1,0), "\u{1}", "2 0b01", position(1,0), "normal");
-behavior!(adjust_number_clamps_typed_count_to_upstream_max, "0", position(1,0), "9999999999\u{1}", "999999999", position(1,8), "normal");
-behavior!(adjust_number_clamps_typed_count_ctrl_x, "0", position(1,0), "9999999999\u{18}", "-999999999", position(1,9), "normal");
-behavior!(adjust_number_pads_leading_zeros_000, "000", position(1,0), "\u{1}", "001", position(1,2), "normal");
-behavior!(adjust_number_pads_leading_zeros_007, "007", position(1,0), "\u{1}", "008", position(1,2), "normal");
-behavior!(adjust_number_pads_leading_zeros_ctrl_x, "001", position(1,0), "\u{18}", "000", position(1,2), "normal");
-behavior!(adjust_number_hex_prefixed_decrement_keeps_padding, "0x0ff", position(1,0), "\u{18}", "0x0fe", position(1,4), "normal");
-behavior!(adjust_number_bin_prefixed_decrement_keeps_padding, "0b010", position(1,0), "\u{18}", "0b001", position(1,4), "normal");
-behavior!(adjust_number_hex_case_follows_last_alpha_digit, "0xABc", position(1,0), "\u{1}", "0xabd", position(1,4), "normal");
-behavior!(adjust_number_hex_case_follows_uppercase_marker, "0X10", position(1,0), "\u{1}", "0X11", position(1,3), "normal");
-behavior!(adjust_number_hex_mixed_pair_last_lower, "0xAb", position(1,0), "\u{1}", "0xac", position(1,3), "normal");
-behavior!(adjust_number_hex_mixed_pair_last_upper, "0xaB", position(1,0), "\u{1}", "0xAC", position(1,3), "normal");
-behavior!(adjust_number_minus_excluded_from_pad_width, "-007", position(1,0), "\u{1}", "-006", position(1,3), "normal");
-behavior!(adjust_number_i64_max_plus_one, "9223372036854775807", position(1,0), "\u{1}", "9223372036854775808", position(1,18), "normal");
-behavior!(adjust_number_i64_min_minus_one, "-9223372036854775808", position(1,0), "\u{18}", "-9223372036854775809", position(1,19), "normal");
-behavior!(adjust_number_u64_max_plus_one_wraps_negative, "18446744073709551615", position(1,0), "\u{1}", "-18446744073709551615", position(1,20), "normal");
-behavior!(adjust_number_u64_overflow_parse_saturates_to_max, "18446744073709551616", position(1,0), "\u{18}", "18446744073709551615", position(1,19), "normal");
-behavior!(adjust_number_u64_max_minus_one, "18446744073709551615", position(1,0), "\u{18}", "18446744073709551614", position(1,19), "normal");
-behavior!(adjust_number_zero_from_negative, "-1", position(1,0), "\u{1}", "0", position(1,0), "normal");
-behavior!(adjust_number_zero_minus_one_is_negative_one, "0", position(1,0), "\u{18}", "-1", position(1,1), "normal");
-behavior!(adjust_number_i64_min_plus_one, "-9223372036854775808", position(1,0), "\u{1}", "-9223372036854775807", position(1,19), "normal");
+behavior!(
+    adjust_number_preserves_embedded_token_neighbors,
+    "abc 12 def",
+    position(1, 0),
+    "\u{1}",
+    "abc 13 def",
+    position(1, 5),
+    "normal"
+);
+behavior!(
+    adjust_number_applies_count,
+    "10",
+    position(1, 0),
+    "5\u{1}",
+    "15",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    adjust_number_ctrl_x_decrements,
+    "13",
+    position(1, 0),
+    "\u{18}",
+    "12",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    adjust_number_includes_sign_after_letters,
+    "abc-9xxx",
+    position(1, 3),
+    "\u{1}",
+    "abc-8xxx",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    adjust_number_grows_when_order_of_magnitude_increases,
+    "abc999xxx",
+    position(1, 2),
+    "\u{1}",
+    "abc1000xxx",
+    position(1, 6),
+    "normal"
+);
+behavior!(
+    adjust_number_hex_prefix,
+    "0xff",
+    position(1, 0),
+    "\u{1}",
+    "0x100",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    adjust_number_bin_prefix,
+    "0b11",
+    position(1, 0),
+    "\u{1}",
+    "0b100",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    adjust_number_prefers_nearest_decimal_over_later_hex,
+    "9 0x10",
+    position(1, 0),
+    "\u{1}",
+    "10 0x10",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    adjust_number_ctrl_x_prefers_nearest_decimal_over_later_hex,
+    "9 0x10",
+    position(1, 0),
+    "\u{18}",
+    "8 0x10",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    adjust_number_later_hex_wins_when_cursor_is_on_it,
+    "9 0x10",
+    position(1, 2),
+    "\u{1}",
+    "9 0x11",
+    position(1, 5),
+    "normal"
+);
+behavior!(
+    adjust_number_hex_digit_run_is_hex_not_decimal,
+    "9 0x19",
+    position(1, 4),
+    "\u{1}",
+    "9 0x1a",
+    position(1, 5),
+    "normal"
+);
+behavior!(
+    adjust_number_prefers_nearest_decimal_over_later_bin,
+    "1 0b01",
+    position(1, 0),
+    "\u{1}",
+    "2 0b01",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    adjust_number_clamps_typed_count_to_upstream_max,
+    "0",
+    position(1, 0),
+    "9999999999\u{1}",
+    "999999999",
+    position(1, 8),
+    "normal"
+);
+behavior!(
+    adjust_number_clamps_typed_count_ctrl_x,
+    "0",
+    position(1, 0),
+    "9999999999\u{18}",
+    "-999999999",
+    position(1, 9),
+    "normal"
+);
+behavior!(
+    adjust_number_pads_leading_zeros_000,
+    "000",
+    position(1, 0),
+    "\u{1}",
+    "001",
+    position(1, 2),
+    "normal"
+);
+behavior!(
+    adjust_number_pads_leading_zeros_007,
+    "007",
+    position(1, 0),
+    "\u{1}",
+    "008",
+    position(1, 2),
+    "normal"
+);
+behavior!(
+    adjust_number_pads_leading_zeros_ctrl_x,
+    "001",
+    position(1, 0),
+    "\u{18}",
+    "000",
+    position(1, 2),
+    "normal"
+);
+behavior!(
+    adjust_number_hex_prefixed_decrement_keeps_padding,
+    "0x0ff",
+    position(1, 0),
+    "\u{18}",
+    "0x0fe",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    adjust_number_bin_prefixed_decrement_keeps_padding,
+    "0b010",
+    position(1, 0),
+    "\u{18}",
+    "0b001",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    adjust_number_hex_case_follows_last_alpha_digit,
+    "0xABc",
+    position(1, 0),
+    "\u{1}",
+    "0xabd",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    adjust_number_hex_case_follows_uppercase_marker,
+    "0X10",
+    position(1, 0),
+    "\u{1}",
+    "0X11",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    adjust_number_hex_mixed_pair_last_lower,
+    "0xAb",
+    position(1, 0),
+    "\u{1}",
+    "0xac",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    adjust_number_hex_mixed_pair_last_upper,
+    "0xaB",
+    position(1, 0),
+    "\u{1}",
+    "0xAC",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    adjust_number_minus_excluded_from_pad_width,
+    "-007",
+    position(1, 0),
+    "\u{1}",
+    "-006",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    adjust_number_i64_max_plus_one,
+    "9223372036854775807",
+    position(1, 0),
+    "\u{1}",
+    "9223372036854775808",
+    position(1, 18),
+    "normal"
+);
+behavior!(
+    adjust_number_i64_min_minus_one,
+    "-9223372036854775808",
+    position(1, 0),
+    "\u{18}",
+    "-9223372036854775809",
+    position(1, 19),
+    "normal"
+);
+behavior!(
+    adjust_number_u64_max_plus_one_wraps_negative,
+    "18446744073709551615",
+    position(1, 0),
+    "\u{1}",
+    "-18446744073709551615",
+    position(1, 20),
+    "normal"
+);
+behavior!(
+    adjust_number_u64_overflow_parse_saturates_to_max,
+    "18446744073709551616",
+    position(1, 0),
+    "\u{18}",
+    "18446744073709551615",
+    position(1, 19),
+    "normal"
+);
+behavior!(
+    adjust_number_u64_max_minus_one,
+    "18446744073709551615",
+    position(1, 0),
+    "\u{18}",
+    "18446744073709551614",
+    position(1, 19),
+    "normal"
+);
+behavior!(
+    adjust_number_zero_from_negative,
+    "-1",
+    position(1, 0),
+    "\u{1}",
+    "0",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    adjust_number_zero_minus_one_is_negative_one,
+    "0",
+    position(1, 0),
+    "\u{18}",
+    "-1",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    adjust_number_i64_min_plus_one,
+    "-9223372036854775808",
+    position(1, 0),
+    "\u{1}",
+    "-9223372036854775807",
+    position(1, 19),
+    "normal"
+);
 #[test]
 fn adjust_number_splices_exact_token_span_for_extmarks_undo_and_ticks() {
     let mut editor = Editor::new();
@@ -682,7 +1157,11 @@ fn adjust_number_splices_exact_token_span_for_extmarks_undo_and_ticks() {
             .buffer_mut(buffer)
             .unwrap()
             .extmarks
-            .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(0, col)))
+            .set(
+                ns,
+                None,
+                ExtmarkPlacement::new(ExtmarkPosition::new(0, col)),
+            )
             .unwrap()
     };
     let before = mark_at(&mut editor, 2);
@@ -756,7 +1235,11 @@ fn adjust_number_padded_hex_preserves_extmarks_undo_and_ticks() {
             .buffer_mut(buffer)
             .unwrap()
             .extmarks
-            .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(0, col)))
+            .set(
+                ns,
+                None,
+                ExtmarkPlacement::new(ExtmarkPosition::new(0, col)),
+            )
             .unwrap()
     };
     let before = mark_at(&mut editor, 1);
@@ -845,7 +1328,14 @@ fn adjust_number_overflow_parse_splices_max_and_undo() {
     );
     assert_eq!(editor.window(window).unwrap().cursor, position(1, 19));
     assert_eq!(
-        editor.buffer(buffer).unwrap().extmarks.get(ns, mark).unwrap().unwrap().position(),
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .extmarks
+            .get(ns, mark)
+            .unwrap()
+            .unwrap()
+            .position(),
         ExtmarkPosition::new(0, 20)
     );
     assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick + 1);
@@ -857,17 +1347,72 @@ fn adjust_number_overflow_parse_splices_max_and_undo() {
         "18446744073709551616"
     );
     assert_eq!(
-        editor.buffer(buffer).unwrap().extmarks.get(ns, mark).unwrap().unwrap().position(),
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .extmarks
+            .get(ns, mark)
+            .unwrap()
+            .unwrap()
+            .position(),
         ExtmarkPosition::new(0, 5)
     );
 }
 
-behavior!(replace_count_beyond_remaining_characters_is_noop, "ab", position(1,1), "3rX", "ab", position(1,1), "normal");
-behavior!(normal_replace_preserves_cursor_and_repeats_scalars, "abcd", position(1,1), "2rX", "aXXd", position(1,1), "normal");
-behavior!(normal_replace_counts_cjk_scalars_not_bytes, "한글a", position(1,0), "2rX", "XXa", position(1,0), "normal");
-behavior!(visual_charwise_replace_repeats_per_scalar, "abcd", position(1,1), "vlrX", "aXXd", position(1,1), "normal");
-behavior!(visual_charwise_replace_counts_cjk_scalars, "한글a", position(1,0), "vlrX", "XXa", position(1,0), "normal");
-behavior!(visual_blockwise_replace_per_line_scalars, "abcd\nefgh", position(1,0), "\u{16}ljrX", "XXcd\nXXgh", position(1,0), "normal");
+behavior!(
+    replace_count_beyond_remaining_characters_is_noop,
+    "ab",
+    position(1, 1),
+    "3rX",
+    "ab",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    normal_replace_preserves_cursor_and_repeats_scalars,
+    "abcd",
+    position(1, 1),
+    "2rX",
+    "aXXd",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    normal_replace_counts_cjk_scalars_not_bytes,
+    "한글a",
+    position(1, 0),
+    "2rX",
+    "XXa",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    visual_charwise_replace_repeats_per_scalar,
+    "abcd",
+    position(1, 1),
+    "vlrX",
+    "aXXd",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    visual_charwise_replace_counts_cjk_scalars,
+    "한글a",
+    position(1, 0),
+    "vlrX",
+    "XXa",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    visual_blockwise_replace_per_line_scalars,
+    "abcd\nefgh",
+    position(1, 0),
+    "\u{16}ljrX",
+    "XXcd\nXXgh",
+    position(1, 0),
+    "normal"
+);
 #[test]
 fn visual_blockwise_replace_moves_interior_extmark_with_right_gravity() {
     let mut editor = Editor::new();
@@ -892,11 +1437,7 @@ fn visual_blockwise_replace_moves_interior_extmark_with_right_gravity() {
         .buffer_mut(buffer)
         .unwrap()
         .extmarks
-        .set(
-            ns,
-            None,
-            ExtmarkPlacement::new(ExtmarkPosition::new(0, 2)),
-        )
+        .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(0, 2)))
         .unwrap();
 
     let mut machine = ModeMachine::default();
@@ -942,11 +1483,7 @@ fn normal_replace_preserves_exterior_extmark_columns() {
         .buffer_mut(buffer)
         .unwrap()
         .extmarks
-        .set(
-            ns,
-            None,
-            ExtmarkPlacement::new(ExtmarkPosition::new(0, 2)),
-        )
+        .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(0, 2)))
         .unwrap();
 
     let mut machine = ModeMachine::default();
@@ -967,20 +1504,132 @@ fn normal_replace_preserves_exterior_extmark_columns() {
     assert_eq!(mark.position(), ExtmarkPosition::new(0, 2));
 }
 
-behavior!(normal_replace_typed_cr_inserts_one_line_break, "abcdef", position(1,1), "3r\r", "a\nef", position(2,0), "normal");
-behavior!(normal_replace_typed_nl_inserts_one_line_break, "abcdef", position(1,1), "3r\n", "a\nef", position(2,0), "normal");
-behavior!(normal_replace_typed_cr_multibyte_span, "a한글d", position(1,1), "2r\r", "a\nd", position(2,0), "normal");
-behavior!(normal_replace_quoted_cr_embeds_literal_cr, "abcd", position(1,1), "r\u{16}\r", "a\rcd", position(1,1), "normal");
-behavior!(normal_replace_quoted_nl_embeds_nul, "abcd", position(1,1), "r\u{16}\n", "a\x00cd", position(1,1), "normal");
-behavior!(normal_replace_quoted_cr_via_ctrl_q, "abcd", position(1,1), "r\u{11}\r", "a\rcd", position(1,1), "normal");
-behavior!(normal_replace_quote_pending_escape_aborts, "abcd", position(1,1), "r\u{16}\u{1b}", "abcd", position(1,1), "normal");
-behavior!(normal_replace_quoted_ctrl_v_embeds_literal, "abcd", position(1,1), "r\u{16}\u{16}", "a\u{16}cd", position(1,1), "normal");
-behavior!(normal_replace_typed_cr_beyond_remaining_is_noop, "ab", position(1,1), "3r\r", "ab", position(1,1), "normal");
-behavior!(visual_charwise_typed_cr_stays_literal, "abcd", position(1,1), "vlr\r", "a\r\rd", position(1,1), "normal");
-behavior!(visual_charwise_typed_nl_stays_nul, "abcd", position(1,1), "vlr\n", "a\x00\x00d", position(1,1), "normal");
-behavior!(visual_linewise_typed_cr_stays_literal, "abcd", position(1,1), "Vr\r", "\r\r\r\r", position(1,0), "normal");
-behavior!(visual_blockwise_quoted_cr_keeps_literal_cr, "98765\n98765\n98765", position(1,0), "02l\u{16}2jr\u{16}\r", "98\r65\n98\r65\n98\r65", position(1,2), "normal");
-behavior!(visual_blockwise_quoted_nl_keeps_nul, "98765\n98765\n98765", position(1,0), "02l\u{16}2jr\u{16}\n", "98\x0065\n98\x0065\n98\x0065", position(1,2), "normal");
+behavior!(
+    normal_replace_typed_cr_inserts_one_line_break,
+    "abcdef",
+    position(1, 1),
+    "3r\r",
+    "a\nef",
+    position(2, 0),
+    "normal"
+);
+behavior!(
+    normal_replace_typed_nl_inserts_one_line_break,
+    "abcdef",
+    position(1, 1),
+    "3r\n",
+    "a\nef",
+    position(2, 0),
+    "normal"
+);
+behavior!(
+    normal_replace_typed_cr_multibyte_span,
+    "a한글d",
+    position(1, 1),
+    "2r\r",
+    "a\nd",
+    position(2, 0),
+    "normal"
+);
+behavior!(
+    normal_replace_quoted_cr_embeds_literal_cr,
+    "abcd",
+    position(1, 1),
+    "r\u{16}\r",
+    "a\rcd",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    normal_replace_quoted_nl_embeds_nul,
+    "abcd",
+    position(1, 1),
+    "r\u{16}\n",
+    "a\x00cd",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    normal_replace_quoted_cr_via_ctrl_q,
+    "abcd",
+    position(1, 1),
+    "r\u{11}\r",
+    "a\rcd",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    normal_replace_quote_pending_escape_aborts,
+    "abcd",
+    position(1, 1),
+    "r\u{16}\u{1b}",
+    "abcd",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    normal_replace_quoted_ctrl_v_embeds_literal,
+    "abcd",
+    position(1, 1),
+    "r\u{16}\u{16}",
+    "a\u{16}cd",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    normal_replace_typed_cr_beyond_remaining_is_noop,
+    "ab",
+    position(1, 1),
+    "3r\r",
+    "ab",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    visual_charwise_typed_cr_stays_literal,
+    "abcd",
+    position(1, 1),
+    "vlr\r",
+    "a\r\rd",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    visual_charwise_typed_nl_stays_nul,
+    "abcd",
+    position(1, 1),
+    "vlr\n",
+    "a\x00\x00d",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    visual_linewise_typed_cr_stays_literal,
+    "abcd",
+    position(1, 1),
+    "Vr\r",
+    "\r\r\r\r",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    visual_blockwise_quoted_cr_keeps_literal_cr,
+    "98765\n98765\n98765",
+    position(1, 0),
+    "02l\u{16}2jr\u{16}\r",
+    "98\r65\n98\r65\n98\r65",
+    position(1, 2),
+    "normal"
+);
+behavior!(
+    visual_blockwise_quoted_nl_keeps_nul,
+    "98765\n98765\n98765",
+    position(1, 0),
+    "02l\u{16}2jr\u{16}\n",
+    "98\x0065\n98\x0065\n98\x0065",
+    position(1, 2),
+    "normal"
+);
 
 #[test]
 fn normal_replace_typed_cr_full_invariants() {
@@ -1105,7 +1754,10 @@ fn normal_replace_typed_cr_autoindents() {
 fn visual_blockwise_typed_cr_splits_every_row() {
     let mut editor = Editor::new();
     let buffer = editor
-        .create_buffer_with(Buffer::from_bytes(b"123456789\n123456789\n123456789").unwrap(), true)
+        .create_buffer_with(
+            Buffer::from_bytes(b"123456789\n123456789\n123456789").unwrap(),
+            true,
+        )
         .unwrap();
     editor
         .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
@@ -1269,11 +1921,7 @@ fn blockwise_put_batch_one_tick() {
         .buffer_mut(buffer)
         .unwrap()
         .extmarks
-        .set(
-            ns,
-            None,
-            ExtmarkPlacement::new(ExtmarkPosition::new(0, 2)),
-        )
+        .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(0, 2)))
         .unwrap();
     editor
         .registers_mut()
@@ -1334,11 +1982,7 @@ fn normal_join_moves_extmark_with_splice_geometry() {
             .buffer_mut(buffer)
             .unwrap()
             .extmarks
-            .set(
-                ns,
-                None,
-                ExtmarkPlacement::new(ExtmarkPosition::new(1, 0)),
-            )
+            .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(1, 0)))
             .unwrap();
         let mut machine = ModeMachine::default();
         let mut eval = NullExprEval;
@@ -1347,7 +1991,10 @@ fn normal_join_moves_extmark_with_splice_geometry() {
             String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(),
             expected
         );
-        assert_eq!(editor.window(window).unwrap().cursor, position(1, cursor_col));
+        assert_eq!(
+            editor.window(window).unwrap().cursor,
+            position(1, cursor_col)
+        );
         let mark = editor
             .buffer(buffer)
             .unwrap()
@@ -1368,16 +2015,96 @@ fn normal_join_moves_extmark_with_splice_geometry() {
     }
 }
 
-behavior!(join_two_lines_inserts_space_and_cursor, "12345\n1", position(1,0), "J", "12345 1", position(1,5), "normal");
-behavior!(join_on_last_line_is_noop, "12345", position(1,0), "J", "12345", position(1,0), "normal");
-behavior!(join_strips_leading_whitespace, "abc\n  def", position(1,0), "J", "abc def", position(1,3), "normal");
-behavior!(visual_multiline_join, "12345\n222\n333\n444", position(2,0), "VGJ", "12345\n222 333 444", position(2,7), "normal");
-behavior!(join_preserves_one_trailing_space, "left \n  right", position(1,0), "J", "left right", position(1,5), "normal");
-behavior!(join_preserves_two_trailing_spaces, "left  \nright", position(1,0), "J", "left  right", position(1,6), "normal");
-behavior!(join_before_closing_paren_inserts_no_space, "left\n  )", position(1,0), "J", "left)", position(1,4), "normal");
-behavior!(join_trailing_tab_inserts_no_space, "left\t\nright", position(1,0), "J", "left\tright", position(1,5), "normal");
-behavior!(join_empty_right_inserts_no_space, "left\n   ", position(1,0), "J", "left", position(1,4), "normal");
-behavior!(visual_join_before_paren_inserts_no_space, "left\n  )\nkeep", position(1,0), "VjJ", "left)\nkeep", position(1,4), "normal");
+behavior!(
+    join_two_lines_inserts_space_and_cursor,
+    "12345\n1",
+    position(1, 0),
+    "J",
+    "12345 1",
+    position(1, 5),
+    "normal"
+);
+behavior!(
+    join_on_last_line_is_noop,
+    "12345",
+    position(1, 0),
+    "J",
+    "12345",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    join_strips_leading_whitespace,
+    "abc\n  def",
+    position(1, 0),
+    "J",
+    "abc def",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    visual_multiline_join,
+    "12345\n222\n333\n444",
+    position(2, 0),
+    "VGJ",
+    "12345\n222 333 444",
+    position(2, 7),
+    "normal"
+);
+behavior!(
+    join_preserves_one_trailing_space,
+    "left \n  right",
+    position(1, 0),
+    "J",
+    "left right",
+    position(1, 5),
+    "normal"
+);
+behavior!(
+    join_preserves_two_trailing_spaces,
+    "left  \nright",
+    position(1, 0),
+    "J",
+    "left  right",
+    position(1, 6),
+    "normal"
+);
+behavior!(
+    join_before_closing_paren_inserts_no_space,
+    "left\n  )",
+    position(1, 0),
+    "J",
+    "left)",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    join_trailing_tab_inserts_no_space,
+    "left\t\nright",
+    position(1, 0),
+    "J",
+    "left\tright",
+    position(1, 5),
+    "normal"
+);
+behavior!(
+    join_empty_right_inserts_no_space,
+    "left\n   ",
+    position(1, 0),
+    "J",
+    "left",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    visual_join_before_paren_inserts_no_space,
+    "left\n  )\nkeep",
+    position(1, 0),
+    "VjJ",
+    "left)\nkeep",
+    position(1, 4),
+    "normal"
+);
 
 fn run_join_with_options(
     text: &str,
@@ -1413,7 +2140,11 @@ fn run_join_with_options_and_cpoptions(
     }
     editor
         .options_mut()
-        .set_buffer(buffer, "formatoptions", OptionValue::String(formatoptions.to_owned()))
+        .set_buffer(
+            buffer,
+            "formatoptions",
+            OptionValue::String(formatoptions.to_owned()),
+        )
         .unwrap();
     editor
         .options_mut()
@@ -1427,7 +2158,8 @@ fn run_join_with_options_and_cpoptions(
     let mut machine = ModeMachine::default();
     let mut eval = NullExprEval;
     machine.feed_keys(&mut editor, keys, &mut eval).unwrap();
-    let output = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
+    let output =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     let cursor = editor.window(window).unwrap().cursor;
     (output, cursor)
 }
@@ -1475,7 +2207,11 @@ fn formatoptions_j_comment_leader_rules() {
         ("tcqj", "// comment1\n// comment2", "// comment1 comment2"),
         ("tcq", "// comment1\n// comment2", "// comment1 // comment2"),
         ("tcqj", "code\n// comment", "code // comment"),
-        ("tcqj", "i++; // comment1\n           // comment2", "i++; // comment1 comment2"),
+        (
+            "tcqj",
+            "i++; // comment1\n           // comment2",
+            "i++; // comment1 comment2",
+        ),
         ("tcqj", "/* start\n */", "/* start */"),
         ("tcqj", "/* keep */\n// next", "/* keep */ // next"),
     ];
@@ -1488,13 +2224,8 @@ fn formatoptions_j_comment_leader_rules() {
 #[test]
 fn join_comment_block_close_and_trailing_reopen() {
     let comments = "s1:/*,mb:*,ex:*/,://";
-    let (output, _) = run_join_with_options(
-        "/* head\n */\n// next();",
-        "3J",
-        false,
-        "tcqj",
-        comments,
-    );
+    let (output, _) =
+        run_join_with_options("/* head\n */\n// next();", "3J", false, "tcqj", comments);
     assert_eq!(output, "/* head */ // next();");
 
     let (output, _) = run_join_with_options(
@@ -1509,13 +2240,8 @@ fn join_comment_block_close_and_trailing_reopen() {
 
 #[test]
 fn visual_join_comment_and_joinspaces_geometry() {
-    let (output, cursor) = run_join_with_options(
-        "// one\n// two\n// three",
-        "VGJ",
-        false,
-        "tcqj",
-        "://",
-    );
+    let (output, cursor) =
+        run_join_with_options("// one\n// two\n// three", "VGJ", false, "tcqj", "://");
     assert_eq!(output, "// one two three");
     assert_eq!(cursor, position(1, 10));
 
@@ -1546,58 +2272,458 @@ fn join_multiline_cursor_follows_final_boundary_unless_cpo_q() {
     assert_eq!(cursor, position(1, 2));
 }
 
-behavior!(open_below, "one", position(1,0), "oX\u{1b}", "one\nX", position(2,0), "normal");
-behavior!(open_above, "one", position(1,0), "OX\u{1b}", "X\none", position(1,0), "normal");
-behavior!(search_forward, "one two one", position(1,0), "/two\n", "one two one", position(1,4), "normal");
-behavior!(search_end_offset, "one two", position(1,0), "/two/e\n", "one two", position(1,6), "normal");
-behavior!(search_wrap, "one two one", position(1,9), "/two\n", "one two one", position(1,4), "normal");
-behavior!(search_repeat, "one two one two", position(1,0), "/two\nn", "one two one two", position(1,12), "normal");
-behavior!(search_opposite, "one two one two", position(1,12), "/one\nN", "one two one two", position(1,8), "normal");
-behavior!(find_and_repeat, "a-b-c-d", position(1,0), "f-;", "a-b-c-d", position(1,3), "normal");
-behavior!(find_till, "a-b-c", position(1,0), "tc", "a-b-c", position(1,3), "normal");
-behavior!(percent_pair, "a(b(c)d)e", position(1,0), "%", "a(b(c)d)e", position(1,7), "normal");
-behavior!(paragraph_motion, "one\n\ntwo", position(1,0), "}", "one\n\ntwo", position(2,0), "normal");
-behavior!(uppercase_operator, "one two", position(1,0), "gUw", "ONE two", position(1,0), "normal");
-behavior!(lowercase_operator, "ONE TWO", position(1,0), "guw", "one TWO", position(1,0), "normal");
-behavior!(indent_line, "one", position(1,0), ">>", "        one", position(1,8), "normal");
-behavior!(unindent_line, "  one", position(1,0), "<<", "one", position(1,0), "normal");
+behavior!(
+    open_below,
+    "one",
+    position(1, 0),
+    "oX\u{1b}",
+    "one\nX",
+    position(2, 0),
+    "normal"
+);
+behavior!(
+    open_above,
+    "one",
+    position(1, 0),
+    "OX\u{1b}",
+    "X\none",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    search_forward,
+    "one two one",
+    position(1, 0),
+    "/two\n",
+    "one two one",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    search_end_offset,
+    "one two",
+    position(1, 0),
+    "/two/e\n",
+    "one two",
+    position(1, 6),
+    "normal"
+);
+behavior!(
+    search_wrap,
+    "one two one",
+    position(1, 9),
+    "/two\n",
+    "one two one",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    search_repeat,
+    "one two one two",
+    position(1, 0),
+    "/two\nn",
+    "one two one two",
+    position(1, 12),
+    "normal"
+);
+behavior!(
+    search_opposite,
+    "one two one two",
+    position(1, 12),
+    "/one\nN",
+    "one two one two",
+    position(1, 8),
+    "normal"
+);
+behavior!(
+    find_and_repeat,
+    "a-b-c-d",
+    position(1, 0),
+    "f-;",
+    "a-b-c-d",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    find_till,
+    "a-b-c",
+    position(1, 0),
+    "tc",
+    "a-b-c",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    percent_pair,
+    "a(b(c)d)e",
+    position(1, 0),
+    "%",
+    "a(b(c)d)e",
+    position(1, 7),
+    "normal"
+);
+behavior!(
+    paragraph_motion,
+    "one\n\ntwo",
+    position(1, 0),
+    "}",
+    "one\n\ntwo",
+    position(2, 0),
+    "normal"
+);
+behavior!(
+    uppercase_operator,
+    "one two",
+    position(1, 0),
+    "gUw",
+    "ONE two",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    lowercase_operator,
+    "ONE TWO",
+    position(1, 0),
+    "guw",
+    "one TWO",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    indent_line,
+    "one",
+    position(1, 0),
+    ">>",
+    "        one",
+    position(1, 8),
+    "normal"
+);
+behavior!(
+    unindent_line,
+    "  one",
+    position(1, 0),
+    "<<",
+    "one",
+    position(1, 0),
+    "normal"
+);
 
-behavior!(delete_counted_inner_words, "one two three", position(1,0), "d2iw", " three", position(1,0), "normal");
-behavior!(delete_inner_brackets, "a [two] b", position(1,4), "di[", "a [] b", position(1,3), "normal");
-behavior!(delete_inner_braces, "a {two} b", position(1,4), "di{", "a {} b", position(1,3), "normal");
-behavior!(delete_inner_angles, "a <two> b", position(1,4), "di<", "a <> b", position(1,3), "normal");
-behavior!(delete_inner_apostrophe, "a 'two' b", position(1,4), "di'", "a '' b", position(1,3), "normal");
-behavior!(delete_inner_sentence, "One. Two!", position(1,6), "dis", "One. ", position(1,4), "normal");
-behavior!(delete_inner_paragraph, "one\ntwo\n\nthree", position(2,0), "dip", "\nthree", position(1,0), "normal");
-behavior!(delete_word_big, "one-two three", position(1,0), "dW", "three", position(1,0), "normal");
-behavior!(backward_word, "one two", position(1,5), "b", "one two", position(1,4), "normal");
-behavior!(backward_word_end, "one two", position(1,5), "ge", "one two", position(1,2), "normal");
-behavior!(last_nonblank, "one   ", position(1,0), "g_", "one   ", position(1,2), "normal");
-behavior!(find_backward, "a-b-c", position(1,4), "F-", "a-b-c", position(1,3), "normal");
-behavior!(find_reverse_repeat, "a-b-c-d", position(1,6), "F-,", "a-b-c-d", position(1,5), "normal");
-behavior!(search_backward, "one two one", position(1,10), "?two\n", "one two one", position(1,4), "normal");
-behavior!(search_line_offset, "a\nb\nc", position(1,0), "/b/+1\n", "a\nb\nc", position(3,0), "normal");
-behavior!(visual_block_delete, "abcd\nefgh", position(1,0), "\u{16}ljd", "cd\ngh", position(1,0), "normal");
-behavior!(visual_block_delete_with_x, "abcd\nefgh", position(1,0), "\u{16}ljx", "cd\ngh", position(1,0), "normal");
-behavior!(visual_uppercase, "one", position(1,0), "vllU", "ONE", position(1,0), "normal");
-behavior!(visual_reselect, "one", position(1,0), "vldgv", "e", position(1,1), "visual");
+behavior!(
+    delete_counted_inner_words,
+    "one two three",
+    position(1, 0),
+    "d2iw",
+    " three",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    delete_inner_brackets,
+    "a [two] b",
+    position(1, 4),
+    "di[",
+    "a [] b",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    delete_inner_braces,
+    "a {two} b",
+    position(1, 4),
+    "di{",
+    "a {} b",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    delete_inner_angles,
+    "a <two> b",
+    position(1, 4),
+    "di<",
+    "a <> b",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    delete_inner_apostrophe,
+    "a 'two' b",
+    position(1, 4),
+    "di'",
+    "a '' b",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    delete_inner_sentence,
+    "One. Two!",
+    position(1, 6),
+    "dis",
+    "One. ",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    delete_inner_paragraph,
+    "one\ntwo\n\nthree",
+    position(2, 0),
+    "dip",
+    "\nthree",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    delete_word_big,
+    "one-two three",
+    position(1, 0),
+    "dW",
+    "three",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    backward_word,
+    "one two",
+    position(1, 5),
+    "b",
+    "one two",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    backward_word_end,
+    "one two",
+    position(1, 5),
+    "ge",
+    "one two",
+    position(1, 2),
+    "normal"
+);
+behavior!(
+    last_nonblank,
+    "one   ",
+    position(1, 0),
+    "g_",
+    "one   ",
+    position(1, 2),
+    "normal"
+);
+behavior!(
+    find_backward,
+    "a-b-c",
+    position(1, 4),
+    "F-",
+    "a-b-c",
+    position(1, 3),
+    "normal"
+);
+behavior!(
+    find_reverse_repeat,
+    "a-b-c-d",
+    position(1, 6),
+    "F-,",
+    "a-b-c-d",
+    position(1, 5),
+    "normal"
+);
+behavior!(
+    search_backward,
+    "one two one",
+    position(1, 10),
+    "?two\n",
+    "one two one",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    search_line_offset,
+    "a\nb\nc",
+    position(1, 0),
+    "/b/+1\n",
+    "a\nb\nc",
+    position(3, 0),
+    "normal"
+);
+behavior!(
+    visual_block_delete,
+    "abcd\nefgh",
+    position(1, 0),
+    "\u{16}ljd",
+    "cd\ngh",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    visual_block_delete_with_x,
+    "abcd\nefgh",
+    position(1, 0),
+    "\u{16}ljx",
+    "cd\ngh",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    visual_uppercase,
+    "one",
+    position(1, 0),
+    "vllU",
+    "ONE",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    visual_reselect,
+    "one",
+    position(1, 0),
+    "vldgv",
+    "e",
+    position(1, 1),
+    "visual"
+);
 
-behavior!(multiline_delete_promotes_linewise, "one\n\ntwo", position(1,0), "d}", "\ntwo", position(1,0), "normal");
-behavior!(vertical_operator_is_linewise, "abc\ndef\nghi", position(1,1), "dj", "ghi", position(1,0), "normal");
-behavior!(counted_search, "x a a", position(1,0), "2/a\n", "x a a", position(1,4), "normal");
-behavior!(explicit_one_g, "one\ntwo\nthree", position(3,0), "1G", "one\ntwo\nthree", position(1,0), "normal");
-behavior!(screen_bottom_uses_window_height, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(1,0), "L", "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30", position(24,0), "normal");
-behavior!(visual_block_horizontal_corner, "abcd\nefgh", position(1,0), "\u{16}ljO", "abcd\nefgh", position(2,0), "visual");
-behavior!(visual_block_uppercase, "abcd\nefgh", position(1,0), "\u{16}ljU", "ABcd\nEFgh", position(1,0), "normal");
-behavior!(delete_right_is_exclusive, "abc", position(1,0), "dl", "bc", position(1,0), "normal");
-behavior!(delete_counted_right_is_exclusive, "abcd", position(1,0), "d2l", "cd", position(1,0), "normal");
-behavior!(change_word_uses_end_motion, "one two", position(1,0), "cwX\u{1b}", "X two", position(1,0), "normal");
-behavior!(counted_inner_sentences_advance, "One. Two. Three.", position(1,0), "d2is", " Three.", position(1,0), "normal");
-behavior!(backward_search_end_offset, "foo xx foo", position(1,9), "?foo?e\n", "foo xx foo", position(1,9), "normal");
-behavior!(search_end_character_offset, "fooXX\nnext", position(1,0), "/foo/e+2\n", "fooXX\nnext", position(1,4), "normal");
-behavior!(visual_counted_motion, "abcde", position(1,0), "v2ld", "de", position(1,0), "normal");
-behavior!(visual_g_operator, "one two", position(1,0), "vegU", "ONE two", position(1,0), "normal");
-behavior!(visual_text_object, "one two", position(1,5), "viwd", "one ", position(1,3), "normal");
+behavior!(
+    multiline_delete_promotes_linewise,
+    "one\n\ntwo",
+    position(1, 0),
+    "d}",
+    "\ntwo",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    vertical_operator_is_linewise,
+    "abc\ndef\nghi",
+    position(1, 1),
+    "dj",
+    "ghi",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    counted_search,
+    "x a a",
+    position(1, 0),
+    "2/a\n",
+    "x a a",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    explicit_one_g,
+    "one\ntwo\nthree",
+    position(3, 0),
+    "1G",
+    "one\ntwo\nthree",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    screen_bottom_uses_window_height,
+    "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30",
+    position(1, 0),
+    "L",
+    "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30",
+    position(24, 0),
+    "normal"
+);
+behavior!(
+    visual_block_horizontal_corner,
+    "abcd\nefgh",
+    position(1, 0),
+    "\u{16}ljO",
+    "abcd\nefgh",
+    position(2, 0),
+    "visual"
+);
+behavior!(
+    visual_block_uppercase,
+    "abcd\nefgh",
+    position(1, 0),
+    "\u{16}ljU",
+    "ABcd\nEFgh",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    delete_right_is_exclusive,
+    "abc",
+    position(1, 0),
+    "dl",
+    "bc",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    delete_counted_right_is_exclusive,
+    "abcd",
+    position(1, 0),
+    "d2l",
+    "cd",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    change_word_uses_end_motion,
+    "one two",
+    position(1, 0),
+    "cwX\u{1b}",
+    "X two",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    counted_inner_sentences_advance,
+    "One. Two. Three.",
+    position(1, 0),
+    "d2is",
+    " Three.",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    backward_search_end_offset,
+    "foo xx foo",
+    position(1, 9),
+    "?foo?e\n",
+    "foo xx foo",
+    position(1, 9),
+    "normal"
+);
+behavior!(
+    search_end_character_offset,
+    "fooXX\nnext",
+    position(1, 0),
+    "/foo/e+2\n",
+    "fooXX\nnext",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    visual_counted_motion,
+    "abcde",
+    position(1, 0),
+    "v2ld",
+    "de",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    visual_g_operator,
+    "one two",
+    position(1, 0),
+    "vegU",
+    "ONE two",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    visual_text_object,
+    "one two",
+    position(1, 5),
+    "viwd",
+    "one ",
+    position(1, 3),
+    "normal"
+);
 
 // `test/old/testdir/test_cindent.vim` Test_cindent_01: sibling statements inside a
 // brace share the block indent; `=` must not apply a per-line offset ramp.
@@ -1640,115 +2766,246 @@ fn reindent_applies_cindent_not_line_offset_ramp() {
     assert!(matches!(machine.mode(), Mode::Normal(_)));
 }
 
-
-
 #[test]
 fn failed_search_reports_e486() {
     let mut editor = Editor::new();
-    let buffer = editor.create_buffer_with(Buffer::from_bytes(b"one").unwrap(), true).unwrap();
-    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"one").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
     let mut machine = ModeMachine::default();
     let mut eval = NullExprEval;
-    let error = machine.feed_keys(&mut editor, "/missing\n", &mut eval).unwrap_err();
-    assert!(matches!(error, crate::ModeError::Search(crate::SearchError::PatternNotFound(pattern)) if pattern == "missing"));
+    let error = machine
+        .feed_keys(&mut editor, "/missing\n", &mut eval)
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::ModeError::Search(crate::SearchError::PatternNotFound(pattern)) if pattern == "missing")
+    );
 }
 
 #[test]
 fn state_loop_checks_then_executes_typeahead() {
     let mut editor = Editor::new();
-    let buffer = editor.create_buffer_with(Buffer::from_bytes(b"one").unwrap(), true).unwrap();
-    let tab = editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"one").unwrap(), true)
+        .unwrap();
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
     let window = editor.tabpage(tab).unwrap().current_window();
-    editor.typeahead_mut().append(&crate::Keys::from("l"), crate::TypeaheadFlags::default());
+    editor
+        .typeahead_mut()
+        .append(&crate::Keys::from("l"), crate::TypeaheadFlags::default());
     let mut machine = ModeMachine::default();
     let mut eval = NullExprEval;
     assert!(machine.run_once(&mut editor, &mut eval).unwrap());
-    assert_eq!(editor.window(window).unwrap().cursor, position(1,1));
+    assert_eq!(editor.window(window).unwrap().cursor, position(1, 1));
     assert!(!machine.run_once(&mut editor, &mut eval).unwrap());
 }
 
 #[test]
 fn yank_inner_word_updates_zero_and_unnamed_registers() {
-    let (_, _, _, editor, _) = run("one two", position(1,5), "yiw");
-    assert_eq!(editor.registers().get('0').unwrap().unwrap().to_bytes(), b"two");
-    assert_eq!(editor.registers().get('"').unwrap().unwrap().to_bytes(), b"two");
+    let (_, _, _, editor, _) = run("one two", position(1, 5), "yiw");
+    assert_eq!(
+        editor.registers().get('0').unwrap().unwrap().to_bytes(),
+        b"two"
+    );
+    assert_eq!(
+        editor.registers().get('"').unwrap().unwrap().to_bytes(),
+        b"two"
+    );
 }
 
 #[test]
 fn operator_motion_is_one_undo_entry() {
-    let (text, _, _, mut editor, buffer) = run("one two", position(1,0), "dw");
+    let (text, _, _, mut editor, buffer) = run("one two", position(1, 0), "dw");
     assert_eq!(text, "two");
     assert!(editor.buffer_undo(buffer).unwrap().is_some());
-    assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), b"one two");
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"one two"
+    );
     assert!(editor.buffer_undo(buffer).unwrap().is_none());
 }
 
 #[test]
 fn jump_motions_record_only_jump_origins() {
-    let (_, _, _, editor, _) = run("one\ntwo\nthree", position(2,0), "jgg");
+    let (_, _, _, editor, _) = run("one\ntwo\nthree", position(2, 0), "jgg");
     assert_eq!(editor.jumplist().len(), 1);
-    assert_eq!(editor.jumplist().entries()[0].position, position(3,0));
+    assert_eq!(editor.jumplist().entries()[0].position, position(3, 0));
 }
 // Real behavior matrix (replaces earlier padded A/x/l/dd repetition).  Each
 // family cites the upstream function or oldtest that defines it.
 
 // Operator and motion counts multiply (`normal.c:1145-1158`: "If you give a
 // count before AND after the operator, they are multiplied").
-behavior!(counts_before_and_after_operator_multiply, "one two three four five six seven eight", position(1,0), "2d3w", "seven eight", position(1,0), "normal");
+behavior!(
+    counts_before_and_after_operator_multiply,
+    "one two three four five six seven eight",
+    position(1, 0),
+    "2d3w",
+    "seven eight",
+    position(1, 0),
+    "normal"
+);
 
 // `cc` clears the line in place and enters insert (`ops.c:888-901`: OP_CHANGE
 // deletes the other lines, then truncates the first).
-behavior!(change_line_clears_and_enters_insert, "one\ntwo", position(1,0), "cc", "\ntwo", position(1,0), "insert");
+behavior!(
+    change_line_clears_and_enters_insert,
+    "one\ntwo",
+    position(1, 0),
+    "cc",
+    "\ntwo",
+    position(1, 0),
+    "insert"
+);
 
 // An exclusive charwise motion that ends in column zero of the next line backs
 // onto the previous row, so a cross-line `dw` never joins lines
 // (`ops.c:3517-3539`).
-behavior!(cross_line_dw_never_joins, "alpha gamma\nbeta", position(1,6), "dw", "alpha \nbeta", position(1,5), "normal");
-behavior!(cross_line_dw_indent_end_backs_off, "aa bb\ncc", position(1,3), "dw", "aa \ncc", position(1,2), "normal");
+behavior!(
+    cross_line_dw_never_joins,
+    "alpha gamma\nbeta",
+    position(1, 6),
+    "dw",
+    "alpha \nbeta",
+    position(1, 5),
+    "normal"
+);
+behavior!(
+    cross_line_dw_indent_end_backs_off,
+    "aa bb\ncc",
+    position(1, 3),
+    "dw",
+    "aa \ncc",
+    position(1, 2),
+    "normal"
+);
 
 // An exclusive charwise motion that ends past column zero of the next line is
 // allowed to join lines, so `d)` from the start of a sentence deletes the
 // sentence and pulls the next one up (`ops.c:3517-3539`).
-behavior!(delete_sentence_cross_line_joins, "one.\n  two.", position(1,0), "d)", "two.", position(1,0), "normal");
+behavior!(
+    delete_sentence_cross_line_joins,
+    "one.\n  two.",
+    position(1, 0),
+    "d)",
+    "two.",
+    position(1, 0),
+    "normal"
+);
 
 // Quote objects select the pair under the cursor, skip escaped quotes, and
 // include the quotes themselves when `count >= 2` (`textobject.c:1539-1745`,
 // `current_quote`; adjacent pairs never combine).
-behavior!(quote_count_two_includes_quotes, "a \"x y\" b \"p q\" c", position(1,3), "d2i\"", "a  b \"p q\" c", position(1,2), "normal");
-behavior!(quote_object_targets_current_pair, "hi \"pp\" there \"qq\" now", position(1,15), "di\"", "hi \"pp\" there \"\" now", position(1,15), "normal");
-behavior!(quote_object_skips_escaped_quotes, "x \"a \\\"b\\\" c\" y", position(1,3), "ci\"Z\u{1b}", "x \"Z\" y", position(1,3), "normal");
+behavior!(
+    quote_count_two_includes_quotes,
+    "a \"x y\" b \"p q\" c",
+    position(1, 3),
+    "d2i\"",
+    "a  b \"p q\" c",
+    position(1, 2),
+    "normal"
+);
+behavior!(
+    quote_object_targets_current_pair,
+    "hi \"pp\" there \"qq\" now",
+    position(1, 15),
+    "di\"",
+    "hi \"pp\" there \"\" now",
+    position(1, 15),
+    "normal"
+);
+behavior!(
+    quote_object_skips_escaped_quotes,
+    "x \"a \\\"b\\\" c\" y",
+    position(1, 3),
+    "ci\"Z\u{1b}",
+    "x \"Z\" y",
+    position(1, 3),
+    "normal"
+);
 
 // A `.`/`!`/`?` ends a sentence only after trailing `)]"'` closers give way to
 // whitespace; applies to the `)`/`(` motions and the `as`/`is` objects
 // (`textobject.c:103-131`, `find_sent`).
-behavior!(sentence_motion_skips_trailing_closers, "a.) b.", position(1,0), ")", "a.) b.", position(1,4), "normal");
-behavior!(sentence_object_ends_after_closers, "One.) Two.", position(1,7), "dis", "One.) ", position(1,5), "normal");
+behavior!(
+    sentence_motion_skips_trailing_closers,
+    "a.) b.",
+    position(1, 0),
+    ")",
+    "a.) b.",
+    position(1, 4),
+    "normal"
+);
+behavior!(
+    sentence_object_ends_after_closers,
+    "One.) Two.",
+    position(1, 7),
+    "dis",
+    "One.) ",
+    position(1, 5),
+    "normal"
+);
 
 // Block visual keeps its virtual edge columns across short rows; a row without
 // cells at those columns contributes no bytes but keeps the rectangle width
 // (`ops.c:2223-2231`, `block_prep` is_short accounting).
-behavior!(block_ragged_delete_keeps_short_row, "abcdef\nx\nuvwxyz", position(1,2), "\u{16}lljjd", "abf\nx\nuvz", position(1,2), "normal");
-behavior!(block_ragged_uppercase_wide_edges, "abcde\nz\nqrstu", position(1,0), "\u{16}llljjU", "ABCDe\nZ\nQRSTu", position(1,0), "normal");
+behavior!(
+    block_ragged_delete_keeps_short_row,
+    "abcdef\nx\nuvwxyz",
+    position(1, 2),
+    "\u{16}lljjd",
+    "abf\nx\nuvz",
+    position(1, 2),
+    "normal"
+);
+behavior!(
+    block_ragged_uppercase_wide_edges,
+    "abcde\nz\nqrstu",
+    position(1, 0),
+    "\u{16}llljjU",
+    "ABCDe\nZ\nQRSTu",
+    position(1, 0),
+    "normal"
+);
 
 #[test]
 fn nowrap_search_reports_pattern_not_found_at_end() {
     let mut editor = Editor::new();
-    let buffer = editor.create_buffer_with(Buffer::from_bytes(b"one two").unwrap(), true).unwrap();
-    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
-    editor.options_mut().set_global("wrapscan", crate::OptionValue::Boolean(false)).unwrap();
-    let window = editor.tabpage(editor.current_tabpage().unwrap()).unwrap().current_window();
-    editor.set_window_cursor(window, position(1,4)).unwrap();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"one two").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    editor
+        .options_mut()
+        .set_global("wrapscan", crate::OptionValue::Boolean(false))
+        .unwrap();
+    let window = editor
+        .tabpage(editor.current_tabpage().unwrap())
+        .unwrap()
+        .current_window();
+    editor.set_window_cursor(window, position(1, 4)).unwrap();
     let mut machine = ModeMachine::default();
     let mut eval = NullExprEval;
     // 'wrapscan' off stops the search at the buffer end instead of wrapping
     // (`search.c:933-944`).
-    let error = machine.feed_keys(&mut editor, "/two\n", &mut eval).unwrap_err();
-    assert!(matches!(error, crate::ModeError::Search(crate::SearchError::PatternNotFound(pattern)) if pattern == "two"));
+    let error = machine
+        .feed_keys(&mut editor, "/two\n", &mut eval)
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::ModeError::Search(crate::SearchError::PatternNotFound(pattern)) if pattern == "two")
+    );
 }
 
 #[test]
 fn block_ragged_yank_keeps_rectangle_width() {
-    let (_, _, _, editor, _) = run("abcdef\nx\nuvwxyz", position(1,2), "\u{16}lljjy");
+    let (_, _, _, editor, _) = run("abcdef\nx\nuvwxyz", position(1, 2), "\u{16}lljjy");
     let unnamed = editor.registers().get('"').unwrap().unwrap();
     assert_eq!(unnamed.kind(), crate::RegisterKind::BlockWise { width: 3 });
     assert_eq!(unnamed.to_bytes(), b"cde\n\nwxy");
@@ -1758,15 +3015,21 @@ fn block_ragged_yank_keeps_rectangle_width() {
 fn ex_cmdline_completes_and_aborts_without_executing_in_the_machine() {
     let mut editor = Editor::new();
     let buffer = editor.create_buffer(true).unwrap();
-    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
     let mut machine = ModeMachine::default();
     let mut eval = NullExprEval;
 
-    machine.feed_keys(&mut editor, ":echo 1+1\r", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, ":echo 1+1\r", &mut eval)
+        .unwrap();
     assert_eq!(machine.take_ex_command().as_deref(), Some("echo 1+1"));
     assert!(matches!(machine.mode(), Mode::Normal(_)));
 
-    machine.feed_keys(&mut editor, ":quit\u{1b}", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, ":quit\u{1b}", &mut eval)
+        .unwrap();
     assert_eq!(machine.take_ex_command(), None);
     assert!(matches!(machine.mode(), Mode::Normal(_)));
 }
@@ -1775,19 +3038,32 @@ fn ex_cmdline_completes_and_aborts_without_executing_in_the_machine() {
 fn run_once_expands_mapped_keys_before_mode_execution() {
     let mut editor = Editor::new();
     let buffer = editor.create_buffer(true).unwrap();
-    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
-    editor.mappings_mut().map(
-        Keys::from("Q"),
-        MappingAction::Keys(Keys::from("iX\u{1b}")),
-        MappingOptions { modes: MapMode::Normal.into(), ..MappingOptions::default() },
-    ).unwrap();
-    editor.typeahead_mut().append(&Keys::from("Q"), TypeaheadFlags::default());
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    editor
+        .mappings_mut()
+        .map(
+            Keys::from("Q"),
+            MappingAction::Keys(Keys::from("iX\u{1b}")),
+            MappingOptions {
+                modes: MapMode::Normal.into(),
+                ..MappingOptions::default()
+            },
+        )
+        .unwrap();
+    editor
+        .typeahead_mut()
+        .append(&Keys::from("Q"), TypeaheadFlags::default());
     let mut machine = ModeMachine::default();
     let mut eval = NullExprEval;
 
     while machine.run_once(&mut editor, &mut eval).unwrap() {}
 
-    assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), b"X");
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"X"
+    );
     assert!(matches!(machine.mode(), Mode::Normal(_)));
 }
 
@@ -1799,22 +3075,34 @@ fn append_runs_after_the_window_buffer_shrank_under_the_cursor() {
     // indexing the line list with the stale value crashed the process on
     // test_visual.vim.
     let mut editor = Editor::new();
-    let long = editor.create_buffer_with(Buffer::from_bytes(b"one\ntwo\nthree").unwrap(), true).unwrap();
-    let tab = editor.create_tabpage(long, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+    let long = editor
+        .create_buffer_with(Buffer::from_bytes(b"one\ntwo\nthree").unwrap(), true)
+        .unwrap();
+    let tab = editor
+        .create_tabpage(long, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
     let window = editor.tabpage(tab).unwrap().current_window();
     editor.set_window_cursor(window, position(3, 0)).unwrap();
 
-    let short = editor.create_buffer_with(Buffer::from_bytes(b"x").unwrap(), true).unwrap();
-    editor.set_window_buffer(window, short, BufferRelease::KeepLoaded).unwrap();
+    let short = editor
+        .create_buffer_with(Buffer::from_bytes(b"x").unwrap(), true)
+        .unwrap();
+    editor
+        .set_window_buffer(window, short, BufferRelease::KeepLoaded)
+        .unwrap();
 
     let mut machine = ModeMachine::default();
     let mut eval = NullExprEval;
-    machine.feed_keys(&mut editor, "aY\u{1b}", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "aY\u{1b}", &mut eval)
+        .unwrap();
 
-    assert_eq!(editor.buffer(short).unwrap().text().unwrap().to_bytes(), b"xY");
+    assert_eq!(
+        editor.buffer(short).unwrap().text().unwrap().to_bytes(),
+        b"xY"
+    );
     assert_eq!(editor.window(window).unwrap().cursor, position(1, 1));
 }
-
 
 struct FailingIndentEval;
 impl ExprEval for FailingIndentEval {
@@ -1927,11 +3215,11 @@ fn insert_newline_eval_failure_keeps_insert_mode_and_text() {
     let cursor_before = editor.window(window).unwrap().cursor;
     let mut fail = FailingIndentEval;
     let err = machine.feed_keys(&mut editor, "\r", &mut fail).unwrap_err();
-    assert!(matches!(
-        err,
-        ModeError::Insert(InsertError::Indent(_))
-    ));
-    assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), before);
+    assert!(matches!(err, ModeError::Insert(InsertError::Indent(_))));
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        before
+    );
     assert_eq!(editor.window(window).unwrap().cursor, cursor_before);
     assert_eq!(machine.mode(), &Mode::Insert(InsertState));
     let mut ok_eval = NullExprEval;
@@ -1963,19 +3251,33 @@ fn operator_eval_failure_restores_pending_state_and_text() {
     let cursor_before = editor.window(window).unwrap().cursor;
     let tick_before = editor.buffer(buffer).unwrap().changedtick();
     let seq_before = editor.buffer(buffer).unwrap().undo.current_seq();
-    let modified_before = editor.buffer(buffer).unwrap().modified;
+    let modified_before = editor
+        .buffer(buffer)
+        .unwrap()
+        .flags
+        .contains(crate::BufferFlags::MODIFIED);
     let mut fail = FailingIndentEval;
     let err = machine.feed_keys(&mut editor, "G", &mut fail).unwrap_err();
-    assert!(matches!(
-        err,
-        ModeError::Operator(OperatorError::Indent(_))
-    ));
+    assert!(matches!(err, ModeError::Operator(OperatorError::Indent(_))));
     assert_eq!(machine.mode(), &pending);
-    assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), bytes_before);
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        bytes_before
+    );
     assert_eq!(editor.window(window).unwrap().cursor, cursor_before);
     assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick_before);
-    assert_eq!(editor.buffer(buffer).unwrap().undo.current_seq(), seq_before);
-    assert_eq!(editor.buffer(buffer).unwrap().modified, modified_before);
+    assert_eq!(
+        editor.buffer(buffer).unwrap().undo.current_seq(),
+        seq_before
+    );
+    assert_eq!(
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::MODIFIED),
+        modified_before
+    );
     let mut fixed = FixedIndentEval(4);
     machine.feed_keys(&mut editor, "G", &mut fixed).unwrap();
     assert_eq!(
@@ -2007,17 +3309,17 @@ fn reindent_failure_leaves_no_partial_edits() {
         .buffer_mut(buffer)
         .unwrap()
         .extmarks
-        .set(
-            ns,
-            None,
-            ExtmarkPlacement::new(ExtmarkPosition::new(1, 0)),
-        )
+        .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(1, 0)))
         .unwrap();
     let bytes_before = editor.buffer(buffer).unwrap().text().unwrap().to_bytes();
     let cursor_before = editor.window(window).unwrap().cursor;
     let tick_before = editor.buffer(buffer).unwrap().changedtick();
     let seq_before = editor.buffer(buffer).unwrap().undo.current_seq();
-    let modified_before = editor.buffer(buffer).unwrap().modified;
+    let modified_before = editor
+        .buffer(buffer)
+        .unwrap()
+        .flags
+        .contains(crate::BufferFlags::MODIFIED);
     let changelist_before = editor.changelists().len(buffer);
     let extmarks_before = editor.buffer(buffer).unwrap().extmarks.clone();
     let mut eval = ScriptIndentEval {
@@ -2026,16 +3328,26 @@ fn reindent_failure_leaves_no_partial_edits() {
     };
     let mut machine = ModeMachine::default();
     let err = machine.feed_keys(&mut editor, "=G", &mut eval).unwrap_err();
-    assert!(matches!(
-        err,
-        ModeError::Operator(OperatorError::Indent(_))
-    ));
+    assert!(matches!(err, ModeError::Operator(OperatorError::Indent(_))));
     assert_eq!(eval.calls, vec![1, 2]);
-    assert_eq!(editor.buffer(buffer).unwrap().text().unwrap().to_bytes(), bytes_before);
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        bytes_before
+    );
     assert_eq!(editor.window(window).unwrap().cursor, cursor_before);
     assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick_before);
-    assert_eq!(editor.buffer(buffer).unwrap().undo.current_seq(), seq_before);
-    assert_eq!(editor.buffer(buffer).unwrap().modified, modified_before);
+    assert_eq!(
+        editor.buffer(buffer).unwrap().undo.current_seq(),
+        seq_before
+    );
+    assert_eq!(
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::MODIFIED),
+        modified_before
+    );
     assert_eq!(editor.changelists().len(buffer), changelist_before);
     assert_eq!(editor.buffer(buffer).unwrap().extmarks, extmarks_before);
 }
@@ -2096,37 +3408,147 @@ fn reindent_evaluator_observes_staged_prior_lines() {
 }
 
 // Operator-pending `v`/`V` forcing and `/`/`?` search motions.
-behavior!(operator_charwise_force_backward_search, "\n12345\ntest-me", position(1,0), "dv?-m?\n", "me", position(1,0), "normal");
-behavior!(operator_forward_search_delete, "one two three", position(1,0), "d/two\n", "two three", position(1,0), "normal");
-behavior!(operator_charwise_force_vertical_is_not_linewise, "abc\ndef\nghi", position(1,1), "dvj", "aef\nghi", position(1,1), "normal");
-behavior!(operator_linewise_force_search, "one two\nthree", position(1,0), "dV/two\n", "three", position(1,0), "normal");
-behavior!(operator_pending_escape_aborts, "one two", position(1,0), "d\u{1b}l", "one two", position(1,1), "normal");
-behavior!(operator_search_escape_aborts, "one two", position(1,0), "d/two\u{1b}l", "one two", position(1,1), "normal");
-behavior!(operator_search_end_offset_is_inclusive, "one two three", position(1,0), "d/two/e\n", " three", position(1,0), "normal");
-behavior!(operator_search_end_character_offset_is_inclusive, "one two three", position(1,0), "d/two/e+1\n", "three", position(1,0), "normal");
-behavior!(operator_charwise_force_toggles_search_end_inclusive, "one two three", position(1,0), "dv/two/e\n", "o three", position(1,0), "normal");
-behavior!(operator_search_line_offset_is_linewise, "one two\nthree four\nfive", position(1,0), "d/two/+1\n", "five", position(1,0), "normal");
-behavior!(operator_search_zero_line_offset_is_linewise, "one two\nthree four\nfive", position(1,0), "d/two/+0\n", "three four\nfive", position(1,0), "normal");
-behavior!(operator_search_invalid_regex_returns_to_normal, "one two", position(1,0), "d/[\nx", "ne two", position(1,0), "normal");
+behavior!(
+    operator_charwise_force_backward_search,
+    "\n12345\ntest-me",
+    position(1, 0),
+    "dv?-m?\n",
+    "me",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    operator_forward_search_delete,
+    "one two three",
+    position(1, 0),
+    "d/two\n",
+    "two three",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    operator_charwise_force_vertical_is_not_linewise,
+    "abc\ndef\nghi",
+    position(1, 1),
+    "dvj",
+    "aef\nghi",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    operator_linewise_force_search,
+    "one two\nthree",
+    position(1, 0),
+    "dV/two\n",
+    "three",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    operator_pending_escape_aborts,
+    "one two",
+    position(1, 0),
+    "d\u{1b}l",
+    "one two",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    operator_search_escape_aborts,
+    "one two",
+    position(1, 0),
+    "d/two\u{1b}l",
+    "one two",
+    position(1, 1),
+    "normal"
+);
+behavior!(
+    operator_search_end_offset_is_inclusive,
+    "one two three",
+    position(1, 0),
+    "d/two/e\n",
+    " three",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    operator_search_end_character_offset_is_inclusive,
+    "one two three",
+    position(1, 0),
+    "d/two/e+1\n",
+    "three",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    operator_charwise_force_toggles_search_end_inclusive,
+    "one two three",
+    position(1, 0),
+    "dv/two/e\n",
+    "o three",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    operator_search_line_offset_is_linewise,
+    "one two\nthree four\nfive",
+    position(1, 0),
+    "d/two/+1\n",
+    "five",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    operator_search_zero_line_offset_is_linewise,
+    "one two\nthree four\nfive",
+    position(1, 0),
+    "d/two/+0\n",
+    "three four\nfive",
+    position(1, 0),
+    "normal"
+);
+behavior!(
+    operator_search_invalid_regex_returns_to_normal,
+    "one two",
+    position(1, 0),
+    "d/[\nx",
+    "ne two",
+    position(1, 0),
+    "normal"
+);
 
 #[test]
 fn operator_search_missing_match_does_not_mutate() {
     let mut editor = Editor::new();
-    let buffer = editor.create_buffer_with(Buffer::from_bytes(b"one two").unwrap(), true).unwrap();
-    editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
-    editor.options_mut().set_global("wrapscan", crate::OptionValue::Boolean(false)).unwrap();
-    let window = editor.tabpage(editor.current_tabpage().unwrap()).unwrap().current_window();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"one two").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    editor
+        .options_mut()
+        .set_global("wrapscan", crate::OptionValue::Boolean(false))
+        .unwrap();
+    let window = editor
+        .tabpage(editor.current_tabpage().unwrap())
+        .unwrap()
+        .current_window();
     editor.set_window_cursor(window, position(1, 4)).unwrap();
     let mut machine = ModeMachine::default();
     let mut eval = NullExprEval;
     let tick = editor.buffer(buffer).unwrap().changedtick();
-    machine.feed_keys(&mut editor, "d/missing\n", &mut eval).unwrap();
-    assert_eq!(String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(), "one two");
+    machine
+        .feed_keys(&mut editor, "d/missing\n", &mut eval)
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap(),
+        "one two"
+    );
     assert_eq!(editor.window(window).unwrap().cursor, position(1, 4));
     assert_eq!(editor.buffer(buffer).unwrap().changedtick(), tick);
     assert!(matches!(machine.mode(), Mode::Normal(_)));
 }
-
 
 fn insert_control_editor(text: &[u8]) -> (Editor, ox_types::BufHandle, ox_types::WinHandle) {
     let mut editor = Editor::new();
@@ -2155,12 +3577,21 @@ fn place_mark(
         .buffer_mut(buffer)
         .unwrap()
         .extmarks
-        .set(ns, None, ExtmarkPlacement::new(ExtmarkPosition::new(0, column)))
+        .set(
+            ns,
+            None,
+            ExtmarkPlacement::new(ExtmarkPosition::new(0, column)),
+        )
         .unwrap();
     (ns, id)
 }
 
-fn mark_col(editor: &Editor, buffer: ox_types::BufHandle, ns: crate::NamespaceId, id: crate::ExtmarkId) -> usize {
+fn mark_col(
+    editor: &Editor,
+    buffer: ox_types::BufHandle,
+    ns: crate::NamespaceId,
+    id: crate::ExtmarkId,
+) -> usize {
     editor
         .buffer(buffer)
         .unwrap()
@@ -2188,7 +3619,9 @@ fn insert_tab_expandtab_shifts_extmark() {
     let (ns, id) = place_mark(&mut editor, buffer, 2);
     let mut machine = ModeMachine::default();
     let mut eval = NullExprEval;
-    machine.feed_keys(&mut editor, "i\t\t\u{1b}", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "i\t\t\u{1b}", &mut eval)
+        .unwrap();
     assert_eq!(
         editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
         b"    12345"
@@ -2220,7 +3653,9 @@ fn insert_tab_softtabstop_shifts_extmark() {
     let (ns, id) = place_mark(&mut editor, buffer, 2);
     let mut machine = ModeMachine::default();
     let mut eval = NullExprEval;
-    machine.feed_keys(&mut editor, "i\t\u{1b}", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "i\t\u{1b}", &mut eval)
+        .unwrap();
     assert_eq!(
         editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
         b"  12345"
@@ -2247,9 +3682,13 @@ fn insert_ctrl_d_removes_auto_indent_extmark() {
     editor.set_window_cursor(window, position(1, 0)).unwrap();
     let mut machine = ModeMachine::default();
     let mut eval = NullExprEval;
-    machine.feed_keys(&mut editor, "i\t\u{1b}", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "i\t\u{1b}", &mut eval)
+        .unwrap();
     let (ns, id) = place_mark(&mut editor, buffer, 3);
-    machine.feed_keys(&mut editor, "0i\u{4}\u{1b}", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "0i\u{4}\u{1b}", &mut eval)
+        .unwrap();
     assert_eq!(
         editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
         b"12345"
@@ -2272,7 +3711,9 @@ fn insert_ctrl_t_adds_shiftwidth_extmark() {
     let (ns, id) = place_mark(&mut editor, buffer, 2);
     let mut machine = ModeMachine::default();
     let mut eval = NullExprEval;
-    machine.feed_keys(&mut editor, "i\u{14}\u{1b}", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "i\u{14}\u{1b}", &mut eval)
+        .unwrap();
     assert_eq!(
         editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
         b"  12345"
@@ -2314,7 +3755,9 @@ fn insert_ctrl_f_reindents_current_line() {
         .unwrap();
     let mut machine = ModeMachine::default();
     let mut eval = NullExprEval;
-    machine.feed_keys(&mut editor, "i\u{6}\u{1b}", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "i\u{6}\u{1b}", &mut eval)
+        .unwrap();
     assert_eq!(
         editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
         b"int {\n  1M1"
@@ -2432,5 +3875,701 @@ fn reindent_moves_extmarks_on_existing_lines_after_opening_brace() {
             .unwrap()
             .position(),
         ExtmarkPosition::new(2, 5)
+    );
+}
+
+/// `nvim_get_mode` during an insert-mode mapping prefix reports
+/// `blocking=true` and the pending key survives an open (`interactive`)
+/// drain, matching upstream's main loop (#6166, `vim_spec` `nvim_get_mode`).
+#[test]
+fn open_drain_parks_insert_mapping_prefix_as_blocking() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    editor
+        .mappings_mut()
+        .map(
+            Keys::from("xx"),
+            MappingAction::Keys(Keys::from("foo")),
+            MappingOptions {
+                modes: MapMode::Insert.into(),
+                ..MappingOptions::default()
+            },
+        )
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    machine.set_no_more_input(false);
+    let mut eval = NullExprEval;
+
+    editor
+        .typeahead_mut()
+        .append(&Keys::from("ix"), TypeaheadFlags::default());
+    assert!(machine.run_once(&mut editor, &mut eval).unwrap());
+    assert!(matches!(machine.mode(), Mode::Insert(_)));
+    // The front `x` is only the prefix of `xx`: `check` parks and the
+    // machine reports blocking, like upstream's `nvim_get_mode`.
+    assert!(!machine.run_once(&mut editor, &mut eval).unwrap());
+    assert!(machine.is_blocking());
+
+    editor
+        .typeahead_mut()
+        .append(&Keys::from("x"), TypeaheadFlags::default());
+    while machine.run_once(&mut editor, &mut eval).unwrap() {}
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"foo"
+    );
+    assert!(matches!(machine.mode(), Mode::Insert(_)));
+    assert!(!machine.is_blocking());
+}
+
+/// A closed drain (`:normal`, `feedkeys()` with `x`) still resolves the
+/// incomplete mapping like a timeout: the front key is used literally.
+#[test]
+fn closed_drain_times_out_insert_mapping_prefix() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    editor
+        .mappings_mut()
+        .map(
+            Keys::from("xx"),
+            MappingAction::Keys(Keys::from("foo")),
+            MappingOptions {
+                modes: MapMode::Insert.into(),
+                ..MappingOptions::default()
+            },
+        )
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+
+    editor
+        .typeahead_mut()
+        .append(&Keys::from("ix"), TypeaheadFlags::default());
+    assert!(machine.run_once(&mut editor, &mut eval).unwrap());
+    assert!(!machine.run_once(&mut editor, &mut eval).unwrap());
+    assert!(machine.timeout_pending_mapping(&mut editor).unwrap());
+    assert!(machine.run_once(&mut editor, &mut eval).unwrap());
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"x"
+    );
+}
+
+/// `CTRL-\ CTRL-N` leaves Insert mode for Normal (`i_CTRL-\_CTRL-N`), the
+/// exit `vim_spec` exercises before the pending-prefix blocking assertions.
+#[test]
+fn ctrl_bslash_ctrl_n_exits_insert_to_normal() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+
+    machine.feed_keys(&mut editor, "ihello", &mut eval).unwrap();
+    assert!(matches!(machine.mode(), Mode::Insert(_)));
+    machine
+        .feed_keys(&mut editor, "\u{1c}\u{0e}", &mut eval)
+        .unwrap();
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"hello"
+    );
+}
+/// `CTRL-\ CTRL-N` leaves Replace mode for Normal (`R_CTRL-\_CTRL-N`):
+/// `replace_insert` shares Insert's two-key arms (`insert.c:640-661` covers
+/// both), and the typed text before the sequence is kept.
+#[test]
+fn ctrl_bslash_ctrl_n_exits_replace_to_normal() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"abc\n").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+
+    machine.feed_keys(&mut editor, "R", &mut eval).unwrap();
+    assert!(matches!(machine.mode(), Mode::Replace(_)));
+    machine.feed_keys(&mut editor, "X", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "\u{1c}\u{0e}", &mut eval)
+        .unwrap();
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"Xbc\n"
+    );
+}
+/// A `CTRL-\` left pending in Insert must not leak into Replace: entering
+/// Replace clears the half-sequence, so a following `CTRL-N` acts as a lone
+/// key in Replace rather than completing the prior mode's sequence.
+#[test]
+fn pending_ctrl_bslash_does_not_leak_into_replace() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"abc\n").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    machine.feed_keys(&mut editor, "\u{1c}", &mut eval).unwrap();
+    machine.enter_replace();
+    machine.feed_keys(&mut editor, "\u{0e}", &mut eval).unwrap();
+    assert!(
+        matches!(machine.mode(), Mode::Replace(_)),
+        "a cleared pending CTRL-\\ must not exit Replace on lone CTRL-N"
+    );
+}
+
+/// A non-`CTRL-N` follow key completes the two-key sequence with no exit:
+/// the literal backslash byte is written first (upstream `vungetc` +
+/// `s->c = Ctrl_BSL`, `insert.c:651-653`), then the follow key types
+/// normally — over `abc`, `CTRL-\ X` yields `\x1C` replacing `a` and `X`
+/// replacing `b`.
+#[test]
+fn ctrl_bslash_follow_key_types_normally_in_replace() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"abc\n").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+
+    machine.feed_keys(&mut editor, "R", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "\u{1c}X", &mut eval)
+        .unwrap();
+    assert!(matches!(machine.mode(), Mode::Replace(_)));
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"\x1cXc\n"
+    );
+}
+
+/// Insert sibling: `CTRL-\ X` writes the backslash byte first, then the
+/// follow key — the byte precedes the character.
+#[test]
+fn ctrl_bslash_follow_key_types_normally_in_insert() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"ab\n").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "\u{1c}X", &mut eval)
+        .unwrap();
+    assert!(matches!(machine.mode(), Mode::Insert(_)));
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"\x1cXab\n"
+    );
+}
+
+/// `CTRL-\ CTRL-N` abandons the command line without executing it
+/// (`c_CTRL-\_CTRL-N`).
+#[test]
+fn ctrl_bslash_ctrl_n_exits_cmdline_without_executing() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+
+    machine
+        .feed_keys(&mut editor, ":echo 1", &mut eval)
+        .unwrap();
+    assert!(matches!(machine.mode(), Mode::Cmdline(_)));
+    machine
+        .feed_keys(&mut editor, "\u{1c}\u{0e}", &mut eval)
+        .unwrap();
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+    assert_eq!(machine.take_ex_command(), None);
+}
+
+/// `CTRL-\ CTRL-N` stops Visual mode (`v_CTRL-\_CTRL-N`).
+#[test]
+fn ctrl_bslash_ctrl_n_exits_visual_to_normal() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+
+    machine.feed_keys(&mut editor, "v", &mut eval).unwrap();
+    assert!(matches!(machine.mode(), Mode::Visual(_)));
+    machine
+        .feed_keys(&mut editor, "\u{1c}\u{0e}", &mut eval)
+        .unwrap();
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+}
+
+/// A pending Normal-mode prefix (`g`) reports blocking, and completing it
+/// clears the state — the blocking half of `vim_spec`'s `nvim_get_mode`
+/// normal-mode `g` contract.
+#[test]
+fn pending_normal_prefix_blocks_until_completed() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"one\ntwo").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+
+    editor
+        .typeahead_mut()
+        .append(&Keys::from("gg"), TypeaheadFlags::default());
+    assert!(machine.run_once(&mut editor, &mut eval).unwrap());
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+    assert!(machine.is_blocking());
+    assert!(machine.run_once(&mut editor, &mut eval).unwrap());
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+    assert!(!machine.is_blocking());
+    let window = editor.current_window().unwrap();
+    assert_eq!(editor.window(window).unwrap().cursor, position(1, 0));
+}
+
+/// `<C-q>` is a block-Visual alias for `<C-v>` (`vim_spec.lua:2519`).
+/// `Keys::parse_notation` decodes `<C-q>` to U+0011; the normal-mode
+/// dispatch must accept it beside U+0016 and enter `VisualKind::Block`.
+#[test]
+fn ctrl_q_enters_block_visual() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+
+    machine.feed_keys(&mut editor, "\u{11}", &mut eval).unwrap();
+    match machine.mode() {
+        Mode::Visual(state) => {
+            assert_eq!(state.kind, VisualKind::Block);
+            assert_eq!(state.anchor, state.cursor);
+            assert_eq!(state.prefix, "");
+        }
+        other => panic!("expected block Visual after <C-q>, got {other:?}"),
+    }
+}
+
+/// `reset_visual_mode` ends Visual for an API focus change: it discards
+/// pending Visual parser/prefix state, clears pending `CTRL-\` state,
+/// switches to default Normal, and retains the saved `gv` selection
+/// (`end_visual_mode`, `normal.c`).
+#[test]
+fn reset_visual_mode_clears_pending_and_preserves_gv() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"abc\ndef\n").unwrap(), true)
+        .unwrap();
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+
+    // Enter block Visual via <C-q> and extend the selection one column.
+    machine.feed_keys(&mut editor, "\u{11}", &mut eval).unwrap();
+    machine.feed_keys(&mut editor, "l", &mut eval).unwrap();
+
+    // Capture the live selection before pending parser state is set.
+    let (anchor, cursor, kind) = match machine.mode() {
+        Mode::Visual(state) => (state.anchor, state.cursor, state.kind),
+        _ => panic!("expected Visual after <C-q>"),
+    };
+    assert_eq!(kind, VisualKind::Block);
+
+    // Set pending Visual parser state: count `2`, `g` prefix, and pending CTRL-\.
+    machine.feed_keys(&mut editor, "2", &mut eval).unwrap();
+    machine.feed_keys(&mut editor, "g", &mut eval).unwrap();
+    machine.feed_keys(&mut editor, "\u{1c}", &mut eval).unwrap();
+
+    // The encapsulated reset ends Visual, retaining the saved selection.
+    machine.reset_visual_mode();
+
+    // Active mode is default Normal: Visual parser/prefix state is discarded.
+    assert_eq!(*machine.mode(), Mode::default());
+
+    // The direct clear in `reset_visual_mode` (not the transition clear in
+    // `execute_key`, which only fires on a mode change) is what drops the
+    // pending flag here — the pending effect itself is covered by
+    // `ctrl_bslash_ctrl_n_exits_visual_to_normal`.
+
+    // `gv` restores the saved block selection with the same anchor and cursor.
+    machine.feed_keys(&mut editor, "gv", &mut eval).unwrap();
+    match machine.mode() {
+        Mode::Visual(state) => {
+            assert_eq!(state.kind, VisualKind::Block);
+            assert_eq!(state.anchor, anchor);
+            assert_eq!(state.cursor, cursor);
+            // Transient parser fields are clean: the `g` prefix and count
+            // were cleared before saving, so the restored selection starts
+            // with default parser state.
+            assert_eq!(state.prefix, "");
+            assert_eq!(state.count, 0);
+        }
+        _ => panic!("expected Visual after gv"),
+    }
+
+    // A following ordinary Visual key behaves standalone: `l` extends the
+    // selection right one column, not as a `g` continuation (`gl`), which
+    // `resolve` does not recognize and would leave the cursor unmoved.
+    machine.feed_keys(&mut editor, "l", &mut eval).unwrap();
+    match machine.mode() {
+        Mode::Visual(state) => {
+            assert_eq!(
+                state.cursor,
+                position(1, cursor.col + 1),
+                "standalone `l` must extend right, not dispatch as stale `gl`",
+            );
+        }
+        _ => panic!("expected Visual after standalone l"),
+    }
+}
+
+/// `reset_visual_mode` is a no-op outside Visual: it leaves the current mode
+/// and any existing saved `gv` selection unchanged.
+#[test]
+fn reset_visual_mode_is_noop_outside_visual() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+
+    // From default Normal with no saved selection, reset changes nothing.
+    let mode_before = machine.mode().clone();
+    machine.reset_visual_mode();
+    assert_eq!(*machine.mode(), mode_before);
+
+    // Populate `last_visual` by entering and exiting block Visual, then
+    // return to Normal.  Reset from Normal must not clear the saved area.
+    machine
+        .feed_keys(&mut editor, "\u{11}l\u{1b}", &mut eval)
+        .unwrap();
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+
+    machine.reset_visual_mode();
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+
+    // The saved block selection is still available to `gv`.
+    machine.feed_keys(&mut editor, "gv", &mut eval).unwrap();
+    assert!(
+        matches!(machine.mode(), Mode::Visual(state) if state.kind == VisualKind::Block),
+        "gv should restore block Visual after a no-op reset",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// v:register command-state lifecycle
+// ---------------------------------------------------------------------------
+//
+// `v:register` is a read-only editor-owned variable that exposes the
+// normal-mode register prefix so omitted Register-family queries match
+// Neovim. These tests exercise the lifecycle through the existing
+// evaluator/mapping seam (`feed_keys` / `run_once` + typeahead).
+//
+// The helper reads `editor.vvars()` directly because mode tests operate
+// below the ExExecutor scope bridge; the versioned sync that propagates
+// `v:register` into Vimscript/Lua is exercised by the excmd_exec tests.
+
+fn v_register_value(editor: &Editor) -> String {
+    editor
+        .vvars()
+        .get(&ox_types::OxStr::from("register"))
+        .and_then(|value| {
+            if let ox_types::Object::String(s) = value {
+                Some(s.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| panic!("v:register must be a String"))
+}
+
+fn v_register_editor() -> (Editor, ox_types::BufHandle, ModeMachine, NullExprEval) {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"hello world\n").unwrap(), true)
+        .unwrap();
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    (editor, buffer, ModeMachine::default(), NullExprEval)
+}
+
+/// `v:register` starts as `"` (the unnamed default) for a fresh editor.
+#[test]
+fn v_register_seeded_to_unnamed_default() {
+    let (editor, _, _, _) = v_register_editor();
+    assert_eq!(v_register_value(&editor), "\"");
+}
+
+/// Selecting register `a` with `"a` sets `v:register` to `a`, and the
+/// value persists through the yank command (`yiw`) so an omitted
+/// `getreginfo()` query during that command sees `a`.
+#[test]
+fn v_register_set_by_prefix_persists_through_command() {
+    let (mut editor, _, mut machine, mut eval) = v_register_editor();
+    machine.feed_keys(&mut editor, "\"ayiw", &mut eval).unwrap();
+    // After the command completes, `v:register` is still `a` — the reset
+    // happens at the *start* of the *next* command, not at command end.
+    assert_eq!(v_register_value(&editor), "a");
+}
+
+/// The following unprefixed command resets `v:register` to `"` at its
+/// start, matching Neovim's `normal_begin` clearing.
+#[test]
+fn v_register_resets_for_next_unprefixed_command() {
+    let (mut editor, _, mut machine, mut eval) = v_register_editor();
+    machine.feed_keys(&mut editor, "\"ayiw", &mut eval).unwrap();
+    assert_eq!(v_register_value(&editor), "a");
+    // A following unprefixed command (`x`) resets `v:register` to `"`.
+    machine.feed_keys(&mut editor, "x", &mut eval).unwrap();
+    assert_eq!(v_register_value(&editor), "\"");
+}
+
+/// A mapped key that fires during a register-prefixed command preserves
+/// `v:register`: the mapping expansion runs while the mode state is
+/// non-fresh (register is set), so the reset guard does not fire.
+#[test]
+fn v_register_preserved_through_mapping_during_prefixed_command() {
+    let (mut editor, _, mut machine, mut eval) = v_register_editor();
+    // Map `Q` to `yiw` in Normal mode so the register prefix `"a` is
+    // followed by a mapped yank.
+    editor
+        .mappings_mut()
+        .map(
+            Keys::from("Q"),
+            MappingAction::Keys(Keys::from("yiw")),
+            MappingOptions {
+                modes: MapMode::Normal.into(),
+                ..MappingOptions::default()
+            },
+        )
+        .unwrap();
+    // Feed `"a` (register prefix), then `Q` (mapped to `yiw`) via typeahead
+    // so the mapping seam is exercised.
+    editor
+        .typeahead_mut()
+        .append(&Keys::from("\"aQ"), TypeaheadFlags::default());
+    while machine.run_once(&mut editor, &mut eval).unwrap() {}
+    // The prefixed command completed with register `a`; `v:register` is `a`.
+    assert_eq!(v_register_value(&editor), "a");
+}
+
+/// The black-hole register `_` is a valid register name: selecting it
+/// sets `v:register` to `_`, but the following unprefixed command resets
+/// to `"`, so black-hole usage does not corrupt the next command's value.
+#[test]
+fn v_register_black_hole_resets_for_next_command() {
+    let (mut editor, _, mut machine, mut eval) = v_register_editor();
+    // `"_dw` deletes into the black hole; `v:register` becomes `_`.
+    machine.feed_keys(&mut editor, "\"_dw", &mut eval).unwrap();
+    assert_eq!(v_register_value(&editor), "_");
+    // Next unprefixed command resets to `"`.
+    machine.feed_keys(&mut editor, "x", &mut eval).unwrap();
+    assert_eq!(v_register_value(&editor), "\"");
+}
+
+/// An ignored register-prefix key (Escape after `"`) does not corrupt
+/// `v:register`: the prefix is cleared without setting a register, and
+/// the reset default `"` remains in place for the next command.
+#[test]
+fn v_register_ignored_prefix_key_preserves_default() {
+    let (mut editor, _, mut machine, mut eval) = v_register_editor();
+    // `"` enters the register prefix, Escape cancels it.
+    machine
+        .feed_keys(&mut editor, "\"\u{1b}", &mut eval)
+        .unwrap();
+    // The default is still `"` — Escape is not a valid register name.
+    assert_eq!(v_register_value(&editor), "\"");
+    // A following command still sees `"`.
+    machine.feed_keys(&mut editor, "x", &mut eval).unwrap();
+    assert_eq!(v_register_value(&editor), "\"");
+}
+
+/// A count before the register prefix does not prevent the reset: the
+/// count makes the state non-fresh, but the reset fires only when all
+/// three fields (count, prefix, register) are empty. After `"2"ayw`,
+/// `v:register` is `a`, and the next command resets.
+#[test]
+fn v_register_count_before_prefix_then_reset() {
+    let (mut editor, _, mut machine, mut eval) = v_register_editor();
+    machine.feed_keys(&mut editor, "2\"ayw", &mut eval).unwrap();
+    assert_eq!(v_register_value(&editor), "a");
+    machine.feed_keys(&mut editor, "x", &mut eval).unwrap();
+    assert_eq!(v_register_value(&editor), "\"");
+}
+
+// ---------------------------------------------------------------------------
+// v:register through the versioned editor-to-scope evaluator bridge
+// ---------------------------------------------------------------------------
+//
+// The tests above read `editor.vvars()` directly. The reviewer finding
+// requires proving that an omitted Register-family query (`getreginfo()`
+// with no argument) resolves the selected register through the real
+// `ExExecutor::call_builtin` → `sync_editor_into_scope` → `scope.get_scoped`
+// path while a `"a`-prefixed command is active — not just internal vvars.
+
+/// Extracts a cloned dict entry from a `Typval::Dict`, panicking otherwise.
+fn typval_dict_entry(value: &Typval, key: &[u8]) -> Option<Typval> {
+    match value {
+        Typval::Dict(cell) => {
+            let data = cell.borrow();
+            data.entries
+                .iter()
+                .find(|entry| entry.key.as_bytes() == key)
+                .map(|entry| entry.value.clone())
+        }
+        _ => panic!("expected dict, got {value:?}"),
+    }
+}
+
+/// An omitted `getreginfo()` query during a `"a`-prefixed command resolves
+/// register `a` through the versioned editor-to-scope bridge: the mode
+/// machine sets `v:register` to `a` at the prefix transition, and
+/// `ExExecutor::call_builtin` syncs that into the Vim scope so
+/// `query_register_name` reads it from `v:register` — not from an
+/// internal vvars peek.
+#[test]
+fn v_register_omitted_getreginfo_resolves_through_evaluator() {
+    let (editor, _, mut machine, mut eval) = v_register_editor();
+    let editor = TestEditorAccess::new(editor);
+    // Yank "hello" into register a so getreginfo has content to report.
+    machine
+        .feed_keys(&mut editor.editor_mut(), "\"ayiw", &mut eval)
+        .unwrap();
+    // Start a new `"a`-prefixed command. The fresh-command reset fires
+    // (clearing v:register to `"`), then `"a` sets it back to `a`.
+    // After feeding `"a` the mode state is non-fresh: register is `Some('a')`
+    // and the next key will be the operator. This is the window in which an
+    // omitted Register-family query must see `a`.
+    machine
+        .feed_keys(&mut editor.editor_mut(), "\"a", &mut eval)
+        .unwrap();
+    assert_eq!(v_register_value(&editor.editor()), "a");
+    // Call getreginfo() with NO argument (omitted) through the real
+    // ExExecutor evaluator path. This syncs editor→scope and reads
+    // v:register from the scope, resolving the register.
+    let mut exec = ExExecutor::new();
+    let result = exec
+        .call_builtin(&editor, &OxStr::from("getreginfo"), Vec::new())
+        .unwrap();
+    // Register a holds "hello" from the earlier yank; the omitted query
+    // resolved to a, not to the default `"`.
+    assert_eq!(
+        typval_dict_entry(&result, b"regcontents"),
+        Some(Typval::list(vec![Typval::String(OxStr::from("hello"))])),
+        "omitted getreginfo() during \"a prefix resolved register a through the evaluator"
+    );
+    // Complete the prefixed command so the machine is in a clean state.
+    machine
+        .feed_keys(&mut editor.editor_mut(), "yiw", &mut eval)
+        .unwrap();
+    assert_eq!(v_register_value(&editor.editor()), "a");
+}
+
+/// An uppercase `"A` prefix publishes the canonical lowercase `a` to
+/// `v:register` (so omitted queries see `a`), while `state.register`
+/// retains `A` for append semantics. The omitted `getreginfo()` query
+/// through the evaluator resolves to `a`, not `A`.
+#[test]
+fn v_register_uppercase_prefix_canonicalizes_through_evaluator() {
+    let (editor, _, mut machine, mut eval) = v_register_editor();
+    let editor = TestEditorAccess::new(editor);
+    // Yank "hello" into register a so getreginfo has content.
+    machine
+        .feed_keys(&mut editor.editor_mut(), "\"ayiw", &mut eval)
+        .unwrap();
+    // Start a new `"A`-prefixed command. The prefix transition
+    // canonicalizes A→a for v:register while retaining A in state.register.
+    machine
+        .feed_keys(&mut editor.editor_mut(), "\"A", &mut eval)
+        .unwrap();
+    // v:register is the canonical lowercase `a`, not `A`.
+    assert_eq!(v_register_value(&editor.editor()), "a");
+    // The omitted evaluator query resolves to `a` through the scope bridge.
+    let mut exec = ExExecutor::new();
+    let result = exec
+        .call_builtin(&editor, &OxStr::from("getreginfo"), Vec::new())
+        .unwrap();
+    assert_eq!(
+        typval_dict_entry(&result, b"regcontents"),
+        Some(Typval::list(vec![Typval::String(OxStr::from("hello"))])),
+        "omitted getreginfo() during \"A prefix resolved canonical a through the evaluator"
+    );
+    // Complete the command; the append semantics are preserved because
+    // state.register holds `A`, not `a`.
+    machine
+        .feed_keys(&mut editor.editor_mut(), "yiw", &mut eval)
+        .unwrap();
+    let editor_ref = editor.editor();
+    let content = editor_ref.registers().get('a').unwrap().unwrap();
+    assert_eq!(content.to_bytes(), b"hellohello");
+    // v:register is still the canonical `a`.
+    assert_eq!(v_register_value(&editor.editor()), "a");
+}
+
+/// An invalid register-prefix key (Escape after `"`) cancels the prefix
+/// without storing a register, leaving no stale state. The following
+/// unprefixed command (`x`) executes normally with `v:register == "\""` —
+/// no stale invalid register corrupts it.
+#[test]
+fn v_register_invalid_prefix_leaves_no_stale_state() {
+    let (mut editor, buffer, mut machine, mut eval) = v_register_editor();
+    // `"` enters the register prefix, Escape is invalid and cancels it.
+    machine
+        .feed_keys(&mut editor, "\"\u{1b}", &mut eval)
+        .unwrap();
+    // No stale register: v:register is still the default `"`.
+    assert_eq!(v_register_value(&editor), "\"");
+    // The state is fresh (register is None), so the next command is
+    // unprefixed. `x` deletes a character under the cursor without error
+    // — no stale invalid register corrupts it.
+    machine.feed_keys(&mut editor, "x", &mut eval).unwrap();
+    assert_eq!(v_register_value(&editor), "\"");
+    // The delete succeeded: "hello world\n" → "ello world\n".
+    assert_eq!(
+        editor.buffer(buffer).unwrap().text().unwrap().to_bytes(),
+        b"ello world\n",
+        "x executed as an unprefixed command after invalid prefix"
     );
 }

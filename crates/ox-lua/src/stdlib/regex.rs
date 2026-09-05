@@ -28,13 +28,16 @@ impl UserData for LuaRegex {
                 let bytes = line_value.as_bytes();
                 let text = std::str::from_utf8(&bytes)
                     .map_err(|_| mlua::Error::runtime("buffer line is not valid UTF-8"))?;
+                let text_len = i64::try_from(text.len()).map_err(mlua::Error::external)?;
                 let start = checked_offset(start.unwrap_or(0), text.len(), "start")?;
-                let end = checked_offset(end.unwrap_or(text.len() as i64), text.len(), "end")?;
+                let end = checked_offset(end.unwrap_or(text_len), text.len(), "end")?;
                 if start > end {
                     return Err(mlua::Error::runtime("start must not exceed end"));
                 }
                 if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
-                    return Err(mlua::Error::runtime("regex range must use UTF-8 byte boundaries"));
+                    return Err(mlua::Error::runtime(
+                        "regex range must use UTF-8 byte boundaries",
+                    ));
                 }
                 match_span(&this.0, &text[start..end])
             },
@@ -71,6 +74,9 @@ fn match_span(program: &Prog, input: &str) -> mlua::Result<(Option<i64>, Option<
     let text = Text::new(input);
     let matched = ox_regex::try_exec(program, &text).map_err(mlua::Error::external)?;
     matched.map_or(Ok((None, None)), |matched| {
-        Ok((Some(matched.start.byte as i64), Some(matched.end.byte as i64)))
+        Ok((
+            Some(i64::try_from(matched.start.byte).map_err(mlua::Error::external)?),
+            Some(i64::try_from(matched.end.byte).map_err(mlua::Error::external)?),
+        ))
     })
 }

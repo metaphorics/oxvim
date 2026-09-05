@@ -168,7 +168,11 @@ impl MapModes {
             | MapMode::Select as u16
             | MapMode::OperatorPending as u16
             | MapMode::Terminal as u16;
-        if self.0 & HASHED != 0 { first as u16 } else { first as u16 ^ 0x80 }
+        if self.0 & HASHED != 0 {
+            first as u16
+        } else {
+            first as u16 ^ 0x80
+        }
     }
 }
 
@@ -242,6 +246,11 @@ impl MappingAction {
     /// The `<Cmd>`/`:` forms are recognized *before* the notation pass, so the
     /// `<CR>` that terminates them stays a terminator rather than becoming a
     /// carriage return inside the command text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MappingError::ExCommand`] when a command-shaped right-hand
+    /// side contains invalid Ex syntax.
     pub fn parse_rhs(rhs: &str, leader: &str, local_leader: &str) -> Result<Self, MappingError> {
         if rhs.eq_ignore_ascii_case("<nop>") {
             return Ok(Self::Nop);
@@ -249,15 +258,23 @@ impl MappingAction {
         let command = rhs
             .strip_prefix("<Cmd>")
             .and_then(|body| body.strip_suffix("<CR>"))
-            .or_else(|| rhs.strip_prefix(':').and_then(|body| body.strip_suffix("<CR>")));
-        if let Some(command) = command {
-            return Parser::new()
-                .parse(command)
-                .map(|commands| Self::ExCommands {
-                    keys: Keys::parse_notation(rhs, leader, local_leader),
-                    commands,
-                })
-                .map_err(MappingError::ExCommand);
+            .or_else(|| {
+                rhs.strip_prefix(':')
+                    .and_then(|body| body.strip_suffix("<CR>"))
+            });
+        // A `:…<CR>` right-hand side runs as typed keys: `:` opens the
+        // cmdline, `<C-U>` clears it, the text types itself. The pre-parsed
+        // form is only a fast path for bodies that are pure Ex commands;
+        // anything carrying key notation inside (`:<C-U>call f()<CR>`,
+        // matchit's maps) falls back to keys, which is upstream's one true
+        // execution model anyway.
+        if let Some(command) = command
+            && let Ok(commands) = Parser::new().parse(command)
+        {
+            return Ok(Self::ExCommands {
+                keys: Keys::parse_notation(rhs, leader, local_leader),
+                commands,
+            });
         }
         Ok(Self::Keys(Keys::parse_notation(rhs, leader, local_leader)))
     }
@@ -284,6 +301,42 @@ impl MappingAction {
     }
 }
 
+/// Independently combinable mapping registration flags.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MapFlags(u8);
+
+impl MapFlags {
+    /// Produced keys may themselves be mapped. Enabled by default;
+    /// `:noremap` clears it.
+    pub const REMAP: Self = Self(1 << 0);
+    /// Prefer a complete match immediately despite longer candidates.
+    pub const NOWAIT: Self = Self(1 << 1);
+    /// Suppress command echo while the mapping runs.
+    pub const SILENT: Self = Self(1 << 2);
+    /// Whether `<script>` was given (`REMAP_SCRIPT`, `mapping.c:2108,2129`).
+    ///
+    /// It restricts remapping to `<SID>` mappings, and this port has no
+    /// script-local mappings, so execution folds it into [`MapFlags::REMAP`]
+    /// being clear. The flag is still recorded because `maparg()`'s `script`
+    /// key is the only thing that can tell `<script>` from `:noremap` apart.
+    pub const SCRIPT: Self = Self(1 << 3);
+
+    /// Whether every flag in `other` is enabled.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Enables or disables `flag` without touching the other bits.
+    pub const fn set(&mut self, flag: Self, enabled: bool) {
+        if enabled {
+            self.0 |= flag.0;
+        } else {
+            self.0 &= !flag.0;
+        }
+    }
+}
+
 /// Everything `:map` recorded about one mapping besides its lhs and its
 /// decoded action: the flags the input loop reads, and the text and script
 /// context `maparg()` and `:map`'s listing report.
@@ -293,21 +346,10 @@ pub struct MappingOptions {
     pub modes: MapModes,
     /// Global or buffer-local scope.
     pub scope: MapScope,
-    /// Whether produced keys may themselves be mapped.
-    pub remap: bool,
-    /// Prefer a complete match immediately despite longer candidates.
-    pub nowait: bool,
-    /// Suppress command echo while the mapping runs.
-    pub silent: bool,
+    /// Registration and execution flags (`MapFlags`).
+    pub flags: MapFlags,
     /// Optional user-facing description.
     pub description: Option<String>,
-    /// Whether `<script>` was given (`REMAP_SCRIPT`, `mapping.c:2108,2129`).
-    ///
-    /// It restricts remapping to `<SID>` mappings, and this port has no
-    /// script-local mappings, so execution folds it into [`Self::remap`] being
-    /// false. The flag is still recorded because `maparg()`'s `script` key is
-    /// the only thing that can tell `<script>` from `:noremap` apart.
-    pub script: bool,
     /// The right-hand side exactly as written, before `<>` notation was
     /// decoded (`mapblock_T.m_orig_str`), which is what `maparg()`'s `rhs`
     /// key reports in its compatible form (`mapping.c:2114-2117`).
@@ -324,11 +366,8 @@ impl Default for MappingOptions {
         Self {
             modes: MapModes::MAP,
             scope: MapScope::Global,
-            remap: true,
-            nowait: false,
-            silent: false,
+            flags: MapFlags::REMAP,
             description: None,
-            script: false,
             orig_rhs: String::new(),
             script_context: SourceContext::default(),
         }
@@ -392,7 +431,7 @@ pub enum MappingError {
 /// Editor-owned mapping and abbreviation tables.
 #[derive(Clone, Debug)]
 pub struct Mappings {
-    mappings: Vec<Mapping>,
+    entries: Vec<Mapping>,
     abbreviations: Vec<Abbreviation>,
     next_sequence: u64,
     timeout_len_ms: u32,
@@ -409,7 +448,7 @@ impl Mappings {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            mappings: Vec::new(),
+            entries: Vec::new(),
             abbreviations: Vec::new(),
             next_sequence: 1,
             timeout_len_ms: 1_000,
@@ -436,7 +475,7 @@ impl Mappings {
     /// exact-lhs case, which is the one `:map <unique>` is written for.
     #[must_use]
     pub fn conflicts(&self, lhs: &Keys, modes: MapModes, scope: MapScope) -> bool {
-        self.mappings.iter().any(|mapping| {
+        self.entries.iter().any(|mapping| {
             &mapping.lhs == lhs
                 && mapping.options.scope == scope
                 && mapping.options.modes.intersects(modes)
@@ -444,6 +483,11 @@ impl Mappings {
     }
 
     /// Defines or replaces overlapping mode bits for one lhs and scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MappingError::EmptyLhs`] when `lhs` is empty, or
+    /// [`MappingError::EmptyModes`] when `options` selects no modes.
     pub fn map(
         &mut self,
         lhs: Keys,
@@ -456,16 +500,16 @@ impl Mappings {
         if options.modes.is_empty() {
             return Err(MappingError::EmptyModes);
         }
-        for mapping in &mut self.mappings {
+        for mapping in &mut self.entries {
             if mapping.lhs == lhs && mapping.options.scope == options.scope {
                 mapping.options.modes = mapping.options.modes.without(options.modes);
             }
         }
-        self.mappings
+        self.entries
             .retain(|mapping| !mapping.options.modes.is_empty());
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
-        self.mappings.push(Mapping {
+        self.entries.push(Mapping {
             lhs,
             action,
             options,
@@ -475,20 +519,25 @@ impl Mappings {
     }
 
     /// Defines a noremap without a boolean selector at call sites.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MappingError::EmptyLhs`] when `lhs` is empty, or
+    /// [`MappingError::EmptyModes`] when `options` selects no modes.
     pub fn noremap(
         &mut self,
         lhs: Keys,
         action: MappingAction,
         mut options: MappingOptions,
     ) -> Result<(), MappingError> {
-        options.remap = false;
+        options.flags.set(MapFlags::REMAP, false);
         self.map(lhs, action, options)
     }
 
     /// Removes matching mode bits from one lhs and scope.
     pub fn unmap(&mut self, lhs: &Keys, modes: MapModes, scope: MapScope) -> usize {
         let mut changed = 0;
-        for mapping in &mut self.mappings {
+        for mapping in &mut self.entries {
             if &mapping.lhs == lhs
                 && mapping.options.scope == scope
                 && mapping.options.modes.intersects(modes)
@@ -497,7 +546,7 @@ impl Mappings {
                 changed += 1;
             }
         }
-        self.mappings
+        self.entries
             .retain(|mapping| !mapping.options.modes.is_empty());
         changed
     }
@@ -505,13 +554,13 @@ impl Mappings {
     /// Implements `mapclear` for selected modes and one scope.
     pub fn mapclear(&mut self, modes: MapModes, scope: MapScope) -> usize {
         let mut changed = 0;
-        for mapping in &mut self.mappings {
+        for mapping in &mut self.entries {
             if mapping.options.scope == scope && mapping.options.modes.intersects(modes) {
                 mapping.options.modes = mapping.options.modes.without(modes);
                 changed += 1;
             }
         }
-        self.mappings
+        self.entries
             .retain(|mapping| !mapping.options.modes.is_empty());
         changed
     }
@@ -560,7 +609,7 @@ impl Mappings {
         buffer: Option<BufHandle>,
     ) -> Vec<(&Mapping, bool)> {
         let mut found: Vec<(&Mapping, bool)> = self
-            .mappings
+            .entries
             .iter()
             .filter(|mapping| mapping.options.modes.intersects(modes))
             .filter(|mapping| {
@@ -585,7 +634,7 @@ impl Mappings {
     }
 
     fn exact_in_scope(&self, lhs: &[u8], modes: MapModes, scope: MapScope) -> Option<&Mapping> {
-        self.mappings.iter().find(|mapping| {
+        self.entries.iter().find(|mapping| {
             mapping.options.scope == scope
                 && mapping.options.modes.intersects(modes)
                 && mapping.lhs.as_bytes() == lhs
@@ -594,12 +643,7 @@ impl Mappings {
 
     /// Looks up the typeahead bytes using local-first, longest-prefix rules.
     #[must_use]
-    pub fn lookup(
-        &self,
-        typeahead: &[u8],
-        mode: MapMode,
-        buffer: Option<BufHandle>,
-    ) -> Lookup<'_> {
+    pub fn lookup(&self, typeahead: &[u8], mode: MapMode, buffer: Option<BufHandle>) -> Lookup<'_> {
         if let Some(buffer) = buffer {
             let local = self.lookup_scope(typeahead, mode, MapScope::Buffer(buffer));
             if local != Lookup::None {
@@ -621,6 +665,11 @@ impl Mappings {
     }
 
     /// Registers an insert-mode abbreviation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MappingError::InvalidAbbreviation`] when `lhs` is empty,
+    /// contains whitespace, or crosses keyword-character classes.
     pub fn abbreviate(
         &mut self,
         lhs: &str,
@@ -671,13 +720,11 @@ impl Mappings {
         if is_keyword(typed) {
             return None;
         }
-        if let Some(buffer) = buffer {
-            if let Some(found) = self.lookup_abbreviation_scope(
-                before_cursor,
-                MapScope::Buffer(buffer),
-            ) {
-                return Some(found);
-            }
+        if let Some(buffer) = buffer
+            && let Some(found) =
+                self.lookup_abbreviation_scope(before_cursor, MapScope::Buffer(buffer))
+        {
+            return Some(found);
         }
         self.lookup_abbreviation_scope(before_cursor, MapScope::Global)
     }
@@ -685,14 +732,15 @@ impl Mappings {
     /// Removes local mappings and abbreviations when a buffer is wiped.
     pub fn remove_buffer(&mut self, buffer: BufHandle) {
         let scope = MapScope::Buffer(buffer);
-        self.mappings.retain(|mapping| mapping.options.scope != scope);
+        self.entries
+            .retain(|mapping| mapping.options.scope != scope);
         self.abbreviations.retain(|entry| entry.scope != scope);
     }
 
     /// Number of mapping entries.
     #[must_use]
     pub fn mapping_len(&self) -> usize {
-        self.mappings.len()
+        self.entries.len()
     }
 
     /// Number of abbreviation entries.
@@ -704,11 +752,9 @@ impl Mappings {
     fn lookup_scope(&self, input: &[u8], mode: MapMode, scope: MapScope) -> Lookup<'_> {
         let mut full: Option<&Mapping> = None;
         let mut longer = false;
-        for mapping in self
-            .mappings
-            .iter()
-            .filter(|mapping| mapping.options.scope == scope && mapping.options.modes.contains(mode))
-        {
+        for mapping in self.entries.iter().filter(|mapping| {
+            mapping.options.scope == scope && mapping.options.modes.contains(mode)
+        }) {
             let lhs = mapping.lhs.as_bytes();
             if lhs.starts_with(input) && lhs.len() > input.len() {
                 longer = true;
@@ -722,10 +768,12 @@ impl Mappings {
                 full = Some(mapping);
             }
         }
-        if longer && full.is_none_or(|mapping| !mapping.options.nowait) {
+        if longer && full.is_none_or(|mapping| !mapping.options.flags.contains(MapFlags::NOWAIT)) {
             return Lookup::Prefix(full);
         }
-        full.map_or(Lookup::None, |mapping| Lookup::Exact(mapping, mapping.lhs.len()))
+        full.map_or(Lookup::None, |mapping| {
+            Lookup::Exact(mapping, mapping.lhs.len())
+        })
     }
 
     fn lookup_abbreviation_scope(
@@ -775,10 +823,10 @@ fn abbreviation_boundary(before_cursor: &str, lhs: &str) -> bool {
     let Some(previous) = prefix.chars().next_back() else {
         return true;
     };
-    if !is_keyword(last) {
-        previous.is_whitespace()
-    } else {
+    if is_keyword(last) {
         previous.is_whitespace() || is_keyword(previous) != is_keyword(first)
+    } else {
+        previous.is_whitespace()
     }
 }
 

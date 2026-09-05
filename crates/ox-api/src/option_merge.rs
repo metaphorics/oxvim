@@ -62,6 +62,10 @@ impl SetOp {
 
 /// The `:set` grammar bits of one option that the merge depends on, named after
 /// the upstream `kOptFlag*` bits they stand in for.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "mirrors the independent upstream kOptFlag* bits"
+)]
 struct ListFlags {
     /// `kOptFlagComma`: items are comma separated.
     comma: bool,
@@ -85,7 +89,13 @@ fn list_flags(metadata: &OptionMetadata) -> ListFlags {
         Some(OptionListKind::Flags) => (false, false, false, true),
         Some(OptionListKind::FlagsComma) => (true, false, false, true),
     };
-    ListFlags { comma, one_comma, colon, flag_list, nodup: metadata.deny_duplicates }
+    ListFlags {
+        comma,
+        one_comma,
+        colon,
+        flag_list,
+        nodup: metadata.deny_duplicates,
+    }
 }
 
 /// option.c `get_option_newval`: folds `value` into the option's `current`
@@ -109,9 +119,9 @@ pub(crate) fn merge(
                 SetOp::Set => value,
             }))
         }
-        (OptionValue::String(current), OptionValue::String(value)) => {
-            Ok(OptionValue::String(merge_string(&list_flags(metadata), current, &value, op)))
-        }
+        (OptionValue::String(current), OptionValue::String(value)) => Ok(OptionValue::String(
+            merge_string(&list_flags(metadata), current, &value, op),
+        )),
         (_, value) => Err(ApiError::validation(format!(
             "Invalid '{}': expected a valid type, got {}",
             metadata.name,
@@ -158,7 +168,11 @@ fn merge_string(flags: &ListFlags, origval: &str, newval: &str, op: SetOp) -> St
 }
 
 fn finish(flags: &ListFlags, value: String) -> String {
-    if flags.flag_list { remove_dup_flags(flags, value) } else { value }
+    if flags.flag_list {
+        remove_dup_flags(flags, value)
+    } else {
+        value
+    }
 }
 
 /// option.c `stropt_concat_with_comma`.
@@ -169,7 +183,12 @@ fn concat_with_comma(flags: &ListFlags, origval: &str, newval: &str, op: SetOp) 
         // A trailing comma would otherwise double up.
         let bytes = origval.as_bytes();
         let mut keep = origval.len();
-        if comma && keep > 1 && flags.one_comma && bytes[keep - 1] == b',' && bytes[keep - 2] != b'\\' {
+        if comma
+            && keep > 1
+            && flags.one_comma
+            && bytes[keep - 1] == b','
+            && bytes[keep - 2] != b'\\'
+        {
             keep -= 1;
         }
         merged.push_str(&origval[..keep]);
@@ -219,7 +238,8 @@ fn find_dup_item(origval: &str, newval: &str, comma: bool) -> Option<usize> {
     let needle = newval.as_bytes();
     let mut backslashes = 0usize;
     for index in 0..haystack.len() {
-        let starts_item = !comma || index == 0 || (haystack[index - 1] == b',' && backslashes % 2 == 0);
+        let starts_item =
+            !comma || index == 0 || (haystack[index - 1] == b',' && backslashes.is_multiple_of(2));
         if starts_item
             && haystack[index..].starts_with(needle)
             && (!comma || matches!(haystack.get(index + needle.len()), None | Some(b',')))
@@ -294,8 +314,7 @@ fn merge_key_items(origval: &str, newval: &str, op: SetOp) -> Option<String> {
             }
             None => match (op, find_dup_item(&merged, item, true)) {
                 (SetOp::Remove, Some(at)) => remove_comma_item(&mut merged, at, item.len()),
-                (SetOp::Remove, None) => {}
-                (_, Some(_)) => {}
+                (SetOp::Remove, None) | (_, Some(_)) => {}
                 (_, None) => insert_item(&mut merged, item, op),
             },
         }
@@ -333,7 +352,9 @@ fn find_key_item(value: &str, key: &str, from: usize) -> Option<(usize, usize)> 
 /// starting at `skip`. Every removal is after `skip`, so its offset holds.
 fn remove_key_item(value: &mut String, key: &str, skip: Option<usize>) {
     loop {
-        let Some((mut at, mut len)) = find_key_item(value, key, 0) else { return };
+        let Some((mut at, mut len)) = find_key_item(value, key, 0) else {
+            return;
+        };
         if skip == Some(at) {
             let mut next = at + len;
             if value.as_bytes().get(next) == Some(&b',') {
@@ -353,7 +374,7 @@ fn remove_key_item(value: &mut String, key: &str, skip: Option<usize>) {
 fn remove_comma_item(value: &mut String, at: usize, len: usize) {
     let bytes = value.as_bytes();
     if bytes.get(at + len) == Some(&b',') {
-        value.replace_range(at..at + len + 1, "");
+        value.replace_range(at..=(at + len), "");
     } else if at > 0 && bytes[at - 1] == b',' {
         value.replace_range(at - 1..at + len, "");
     } else {
@@ -389,20 +410,19 @@ pub(crate) fn expand_value(metadata: &OptionMetadata, op: SetOp, value: &str) ->
                 let braced = bytes.get(index + 1) == Some(&b'{');
                 let name_start = index + if braced { 2 } else { 1 };
                 let mut end = name_start;
-                while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+                {
                     end += 1;
                 }
                 let closed = !braced || bytes.get(end) == Some(&b'}');
                 let name = &value[name_start..end];
-                match std::env::var_os(name).filter(|_| closed && !name.is_empty()) {
-                    Some(text) => {
-                        expanded.extend_from_slice(text.to_string_lossy().as_bytes());
-                        index = if braced { end + 1 } else { end };
-                    }
-                    None => {
-                        expanded.push(b'$');
-                        index += 1;
-                    }
+                if let Some(text) = std::env::var_os(name).filter(|_| closed && !name.is_empty()) {
+                    expanded.extend_from_slice(text.to_string_lossy().as_bytes());
+                    index = if braced { end + 1 } else { end };
+                } else {
+                    expanded.push(b'$');
+                    index += 1;
                 }
             }
             byte => {

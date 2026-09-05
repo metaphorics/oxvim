@@ -59,14 +59,18 @@ impl UndoEntry {
     /// first edit, which is upstream's header-level `uh_cursor`.
     #[must_use]
     pub fn cursor_before(&self) -> Cursor {
-        self.edits.first().map_or(Cursor::default(), |edit| edit.cursor_before)
+        self.edits
+            .first()
+            .map_or(Cursor::default(), |edit| edit.cursor_before)
     }
 
     /// Cursor to restore when this header is redone: the position after its
     /// last edit.
     #[must_use]
     pub fn cursor_after(&self) -> Cursor {
-        self.edits.last().map_or(Cursor::default(), |edit| edit.cursor_after)
+        self.edits
+            .last()
+            .map_or(Cursor::default(), |edit| edit.cursor_after)
     }
 }
 
@@ -236,6 +240,12 @@ impl UndoTree {
     ///
     /// Nothing recorded yet, or an already-open header, is a silent no-op
     /// upstream; only a `:undojoin` that follows an undo is an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UndoError::JoinAfterUndo`] when the last tree operation
+    /// was an undo, mirroring upstream's refusal to join onto a state below
+    /// the current header.
     pub fn undojoin(&mut self) -> Result<(), UndoError> {
         if !self.synced {
             return Ok(());
@@ -271,11 +281,11 @@ impl UndoTree {
     /// Returns the sequence of the header the edit landed in, which is the
     /// existing one whenever a block is still open.
     pub fn record(&mut self, edit: LineEdit, timestamp: i64) -> u64 {
-        if !self.synced {
-            if let Some(entry) = self.nodes[self.current].entry.as_mut() {
-                entry.edits.push(edit);
-                return entry.seq;
-            }
+        if !self.synced
+            && let Some(entry) = self.nodes[self.current].entry.as_mut()
+        {
+            entry.edits.push(edit);
+            return entry.seq;
         }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
@@ -303,10 +313,13 @@ impl UndoTree {
     /// `u_undo` syncs before undoing so an open block is undone whole
     /// (`undo.c:1825-1828`), and `u_undoredo` leaves the tree synced
     /// (`undo.c:1665`); both live here so the flag cannot be left stale.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UndoError::AtOldest`] when the current state has no
+    /// parent, i.e. the tree is already at the original text.
     pub fn undo(&mut self) -> Result<UndoStep, UndoError> {
-        let parent = self.nodes[self.current]
-            .parent
-            .ok_or(UndoError::AtOldest)?;
+        let parent = self.nodes[self.current].parent.ok_or(UndoError::AtOldest)?;
         let entry = self.nodes[self.current]
             .entry
             .clone()
@@ -324,6 +337,10 @@ impl UndoTree {
     }
 
     /// Reapplies the preferred child branch.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::redo_branch`]'s errors for the preferred branch.
     pub fn redo(&mut self) -> Result<UndoStep, UndoError> {
         let branch = self.nodes[self.current]
             .preferred_child
@@ -332,6 +349,12 @@ impl UndoTree {
     }
 
     /// Reapplies a selected zero-based child branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UndoError::AtNewest`] when the current state has no
+    /// children, and [`UndoError::Branch`] when `branch` is out of range
+    /// for the available children.
     pub fn redo_branch(&mut self, branch: usize) -> Result<UndoStep, UndoError> {
         let available = self.nodes[self.current].children.len();
         let child = *self.nodes[self.current]
@@ -347,10 +370,7 @@ impl UndoTree {
             })?;
         self.nodes[self.current].preferred_child = Some(branch);
         self.current = child;
-        let entry = self.nodes[child]
-            .entry
-            .clone()
-            .ok_or(UndoError::AtNewest)?;
+        let entry = self.nodes[child].entry.clone().ok_or(UndoError::AtNewest)?;
         self.synced = true;
         Ok(UndoStep::Redo(entry))
     }
@@ -366,6 +386,10 @@ impl UndoTree {
     }
 
     /// Navigates to an arbitrary sequence, returning edits in application order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UndoError::UnknownSequence`] when no node carries `seq`.
     pub fn undo_to_seq(&mut self, seq: u64) -> Result<Vec<UndoStep>, UndoError> {
         let target = if seq == 0 {
             0
@@ -428,10 +452,7 @@ impl UndoTree {
     }
 
     fn seq_of(&self, node: usize) -> u64 {
-        self.nodes[node]
-            .entry
-            .as_ref()
-            .map_or(0, |entry| entry.seq)
+        self.nodes[node].entry.as_ref().map_or(0, |entry| entry.seq)
     }
 
     /// The alternate-branch sibling links, by node index.

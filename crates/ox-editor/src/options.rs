@@ -133,6 +133,28 @@ impl From<OptionDefaultValue> for OptionValue {
         }
     }
 }
+impl OptionMetadata {
+    /// Whether this option has no global baseline (`noglob` in options.lua).
+    ///
+    /// `:setglobal` on these options is accepted, but it does not alter the
+    /// value inherited by new buffers or windows.
+    #[must_use]
+    pub fn no_global(&self) -> bool {
+        matches!(
+            self.name,
+            "bufhidden"
+                | "buflisted"
+                | "buftype"
+                | "busy"
+                | "diff"
+                | "filetype"
+                | "modifiable"
+                | "previewwindow"
+                | "readonly"
+                | "syntax"
+        )
+    }
+}
 
 /// A checked option lookup or update failure.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -212,23 +234,49 @@ impl OptionStore {
     }
 
     /// Resolves a canonical name, short name, or historical alias.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptionError::UnknownOption`] if no canonical name, short name,
+    /// or alias matches `name`.
     pub fn metadata(name: &str) -> Result<&'static OptionMetadata, OptionError> {
         option_metadata(name).ok_or_else(|| OptionError::UnknownOption(name.to_owned()))
     }
 
     /// Reads an editor-wide option.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptionError::UnknownOption`] if `name` is not recognized, or
+    /// [`OptionError::WrongScope`] if the option is not declared at global scope.
+    /// Returns [`OptionError::DefaultUnavailable`] if no baseline value exists.
     pub fn get_global(&self, name: &str) -> Result<&OptionValue, OptionError> {
         let metadata = Self::metadata(name)?;
         require_scope(metadata, OptionScope::Global)?;
         self.baseline(metadata)
     }
+    /// Reads the inherited global baseline for any option, regardless of the
+    /// scopes it is declared with.  New buffers and windows fall back to this
+    /// value when they have no local overlay, so `:setglobal` on a local option
+    /// updates the baseline they inherit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptionError::UnknownOption`] if `name` is not recognized, or
+    /// [`OptionError::DefaultUnavailable`] if no baseline value exists.
+    pub fn get_global_baseline(&self, name: &str) -> Result<&OptionValue, OptionError> {
+        let metadata = Self::metadata(name)?;
+        self.baseline(metadata)
+    }
 
     /// Reads a buffer-local option, falling back to its global baseline.
-    pub fn get_buffer(
-        &self,
-        buffer: BufHandle,
-        name: &str,
-    ) -> Result<&OptionValue, OptionError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptionError::UnknownOption`] if `name` is not recognized, or
+    /// [`OptionError::WrongScope`] if the option is not declared at buffer scope.
+    /// Returns [`OptionError::DefaultUnavailable`] if no baseline value exists.
+    pub fn get_buffer(&self, buffer: BufHandle, name: &str) -> Result<&OptionValue, OptionError> {
         let metadata = Self::metadata(name)?;
         require_scope(metadata, OptionScope::Buffer)?;
         if let Some(value) = self
@@ -242,11 +290,13 @@ impl OptionStore {
     }
 
     /// Reads a window-local option, falling back to its global baseline.
-    pub fn get_window(
-        &self,
-        window: WinHandle,
-        name: &str,
-    ) -> Result<&OptionValue, OptionError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptionError::UnknownOption`] if `name` is not recognized, or
+    /// [`OptionError::WrongScope`] if the option is not declared at window scope.
+    /// Returns [`OptionError::DefaultUnavailable`] if no baseline value exists.
+    pub fn get_window(&self, window: WinHandle, name: &str) -> Result<&OptionValue, OptionError> {
         let metadata = Self::metadata(name)?;
         require_scope(metadata, OptionScope::Window)?;
         if let Some(value) = self
@@ -260,6 +310,13 @@ impl OptionStore {
     }
 
     /// Sets an editor-wide option after type and list validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptionError::UnknownOption`] if `name` is not recognized,
+    /// [`OptionError::WrongScope`] if the option is not declared at global scope,
+    /// [`OptionError::TypeMismatch`] if the value type differs, or
+    /// [`OptionError::InvalidList`] if a string-list value is malformed.
     pub fn set_global(&mut self, name: &str, value: OptionValue) -> Result<(), OptionError> {
         let metadata = Self::metadata(name)?;
         require_scope(metadata, OptionScope::Global)?;
@@ -268,7 +325,38 @@ impl OptionStore {
         Ok(())
     }
 
+    /// Updates the global baseline for a buffer-local or window-local option
+    /// that has no global scope, bypassing the scope check that `set_global`
+    /// enforces. Options flagged `noglob` in options.lua have no global
+    /// baseline, so this call validates the value but does not store it (`:setglobal`
+    /// on these options is accepted and has no effect).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptionError::UnknownOption`] if `name` is not recognized,
+    /// [`OptionError::TypeMismatch`] if the value type differs, or
+    /// [`OptionError::InvalidList`] if a string-list value is malformed.
+    pub fn set_global_default(
+        &mut self,
+        name: &str,
+        value: OptionValue,
+    ) -> Result<(), OptionError> {
+        let metadata = Self::metadata(name)?;
+        validate_value(metadata, &value)?;
+        if !metadata.no_global() {
+            self.global.insert(metadata.name, value);
+        }
+        Ok(())
+    }
+
     /// Sets a buffer-local overlay after type and list validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptionError::UnknownOption`] if `name` is not recognized,
+    /// [`OptionError::WrongScope`] if the option is not declared at buffer scope,
+    /// [`OptionError::TypeMismatch`] if the value type differs, or
+    /// [`OptionError::InvalidList`] if a string-list value is malformed.
     pub fn set_buffer(
         &mut self,
         buffer: BufHandle,
@@ -286,6 +374,13 @@ impl OptionStore {
     }
 
     /// Sets a window-local overlay after type and list validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptionError::UnknownOption`] if `name` is not recognized,
+    /// [`OptionError::WrongScope`] if the option is not declared at window scope,
+    /// [`OptionError::TypeMismatch`] if the value type differs, or
+    /// [`OptionError::InvalidList`] if a string-list value is malformed.
     pub fn set_window(
         &mut self,
         window: WinHandle,
@@ -303,6 +398,11 @@ impl OptionStore {
     }
 
     /// Removes a buffer-local overlay and restores fallback behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptionError::UnknownOption`] if `name` is not recognized, or
+    /// [`OptionError::WrongScope`] if the option is not declared at buffer scope.
     pub fn clear_buffer(&mut self, buffer: BufHandle, name: &str) -> Result<bool, OptionError> {
         let metadata = Self::metadata(name)?;
         require_scope(metadata, OptionScope::Buffer)?;
@@ -317,6 +417,11 @@ impl OptionStore {
     }
 
     /// Removes a window-local overlay and restores fallback behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptionError::UnknownOption`] if `name` is not recognized, or
+    /// [`OptionError::WrongScope`] if the option is not declared at window scope.
     pub fn clear_window(&mut self, window: WinHandle, name: &str) -> Result<bool, OptionError> {
         let metadata = Self::metadata(name)?;
         require_scope(metadata, OptionScope::Window)?;
@@ -333,6 +438,37 @@ impl OptionStore {
     /// Drops every local value owned by a wiped buffer.
     pub fn remove_buffer(&mut self, buffer: BufHandle) {
         self.buffers.remove(&buffer);
+    }
+
+    /// Copies current global baselines for every buffer-scoped option that has
+    /// a global baseline into a new buffer's local overlay, so the buffer
+    /// inherits the live global defaults rather than the static compile-time
+    /// defaults. Upstream `buf_alloc` (`buffer.c`) seeds each new buffer from
+    /// the current global option values; this method mirrors that snapshot.
+    /// Options flagged `noglob` in options.lua are skipped because they have no
+    /// global value to inherit.
+    pub fn snapshot_buffer_defaults(&mut self, buffer: BufHandle) {
+        let mut overlay = HashMap::new();
+        for metadata in OPTION_METADATA {
+            if metadata.scopes.contains(&OptionScope::Buffer)
+                && !metadata.no_global()
+                && let Some(value) = self.global.get(metadata.name)
+            {
+                // Global-local integer options use a sentinel "unset" value
+                // for the local copy on new buffers (upstream `option.c:388-391`
+                // sets `b_p_ul = NO_LOCAL_UNDOLEVEL`).  Only `undolevels`
+                // carries the -123_456 sentinel; other global+buf options
+                // inherit the global value.
+                if metadata.name == "undolevels" {
+                    overlay.insert(metadata.name, OptionValue::Number(-123_456));
+                } else {
+                    overlay.insert(metadata.name, value.clone());
+                }
+            }
+        }
+        if !overlay.is_empty() {
+            self.buffers.insert(buffer, overlay);
+        }
     }
 
     /// Drops every local value owned by a closed window.
@@ -400,8 +536,14 @@ fn validate_list(
         | OptionListKind::OneComma
         | OptionListKind::CommaColon
         | OptionListKind::OneCommaColon => {
-            let reject_empty = matches!(kind, OptionListKind::OneComma | OptionListKind::OneCommaColon);
-            let check_colon = matches!(kind, OptionListKind::CommaColon | OptionListKind::OneCommaColon);
+            let reject_empty = matches!(
+                kind,
+                OptionListKind::OneComma | OptionListKind::OneCommaColon
+            );
+            let check_colon = matches!(
+                kind,
+                OptionListKind::CommaColon | OptionListKind::OneCommaColon
+            );
             let items = CommaItems::new(value);
             for item in items {
                 if reject_empty && !value.is_empty() && item.is_empty() {
@@ -459,7 +601,10 @@ fn validate_colon_item(item: &str) -> Result<(), &'static str> {
 
 fn has_duplicate_items(value: &str) -> bool {
     for (index, item) in CommaItems::new(value).enumerate() {
-        if CommaItems::new(value).skip(index + 1).any(|other| other == item) {
+        if CommaItems::new(value)
+            .skip(index + 1)
+            .any(|other| other == item)
+        {
             return true;
         }
     }
@@ -513,4 +658,139 @@ impl<'a> Iterator for CommaItems<'a> {
         }
         Some(remaining)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OptionDefaultValue, option_metadata};
+
+    #[test]
+    fn cpo_has_vim_literal_default() {
+        let metadata = option_metadata("cpo").expect("cpo is a canonical option");
+        assert_eq!(
+            metadata.default.value,
+            Some(OptionDefaultValue::String("aABceFs_"))
+        );
+    }
+}
+
+#[test]
+fn new_buffer_inherits_current_global_for_buffer_local_option() {
+    use super::{OptionStore, OptionValue};
+    use ox_types::BufHandle;
+    let mut store = OptionStore::new();
+    // autoindent is buffer-only; its compile-time default is true.
+    // Lower the global baseline to false, then snapshot into a new buffer.
+    store
+        .set_global_default("autoindent", OptionValue::Boolean(false))
+        .unwrap();
+    let buf = BufHandle::try_from(1).unwrap();
+    store.snapshot_buffer_defaults(buf);
+    assert_eq!(
+        store.get_buffer(buf, "autoindent").unwrap(),
+        &OptionValue::Boolean(false),
+        "new buffer should inherit the current global baseline"
+    );
+}
+
+#[test]
+fn new_buffer_uses_static_default_when_no_global_set() {
+    use super::{OptionStore, OptionValue};
+    use ox_types::BufHandle;
+    let store = OptionStore::new();
+    // Without any set_global_default, the baseline is the compile-time
+    // default (autoindent = true). snapshot copies that into the overlay.
+    let mut store = store;
+    let buf = BufHandle::try_from(1).unwrap();
+    store.snapshot_buffer_defaults(buf);
+    assert_eq!(
+        store.get_buffer(buf, "autoindent").unwrap(),
+        &OptionValue::Boolean(true),
+        "new buffer should get the static default when no global override"
+    );
+}
+
+#[test]
+fn setlocal_does_not_change_global_baseline() {
+    use super::{OptionStore, OptionValue};
+    use ox_types::BufHandle;
+    let mut store = OptionStore::new();
+    store
+        .set_global_default("autoindent", OptionValue::Boolean(false))
+        .unwrap();
+    let buf1 = BufHandle::try_from(1).unwrap();
+    store.snapshot_buffer_defaults(buf1);
+    // setlocal autoindent on buf1
+    store
+        .set_buffer(buf1, "autoindent", OptionValue::Boolean(true))
+        .unwrap();
+    // global baseline should still be false
+    let buf2 = BufHandle::try_from(2).unwrap();
+    store.snapshot_buffer_defaults(buf2);
+    assert_eq!(
+        store.get_buffer(buf2, "autoindent").unwrap(),
+        &OptionValue::Boolean(false),
+        "setlocal must not change the global baseline inherited by new buffers"
+    );
+    assert_eq!(
+        store.get_buffer(buf1, "autoindent").unwrap(),
+        &OptionValue::Boolean(true),
+        "setlocal should set the buffer overlay"
+    );
+}
+
+#[test]
+fn set_global_default_does_not_weaken_set_global_scope_check() {
+    use super::{OptionError, OptionStore, OptionValue};
+    let mut store = OptionStore::new();
+    // set_global must still reject buffer-only options.
+    let result = store.set_global("autoindent", OptionValue::Boolean(false));
+    assert!(
+        matches!(result, Err(OptionError::WrongScope { .. })),
+        "set_global must reject buffer-only options"
+    );
+    // set_global_default accepts it.
+    store
+        .set_global_default("autoindent", OptionValue::Boolean(false))
+        .unwrap();
+}
+
+#[test]
+fn set_global_default_is_no_op_for_noglobal_options() {
+    use super::{OptionStore, OptionValue};
+    let mut store = OptionStore::new();
+    // modifiable is a `noglob` buffer-local option with a default. :setglobal
+    // on it is accepted, but it must not update the global baseline.
+    store
+        .set_global_default("modifiable", OptionValue::Boolean(false))
+        .unwrap();
+    assert_eq!(
+        store.get_global_baseline("modifiable").unwrap(),
+        &OptionValue::Boolean(true),
+        "set_global_default on a noglob option must not store the value"
+    );
+    let buf = ox_types::BufHandle::try_from(1).unwrap();
+    store.snapshot_buffer_defaults(buf);
+    assert_eq!(
+        store.get_buffer(buf, "modifiable").unwrap(),
+        &OptionValue::Boolean(true),
+        "new buffer must not inherit a noglob global baseline"
+    );
+}
+
+#[test]
+fn get_global_baseline_reads_any_option() {
+    use super::{OptionStore, OptionValue};
+    let store = OptionStore::new();
+    // autoindent is buffer-only; get_global rejects it, but the baseline
+    // (the value new buffers inherit) is still readable.
+    assert_eq!(
+        store.get_global_baseline("autoindent").unwrap(),
+        &OptionValue::Boolean(true)
+    );
+    // get_global still rejects the buffer-only option.
+    assert!(matches!(
+        store.get_global("autoindent"),
+        Err(super::OptionError::WrongScope { .. })
+    ));
 }

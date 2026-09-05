@@ -28,10 +28,12 @@ pub struct Rgb {
 }
 
 impl Rgb {
+    #[must_use]
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
 
+    #[must_use]
     pub fn relative_luminance(self) -> f64 {
         fn linear(channel: u8) -> f64 {
             let value = f64::from(channel) / 255.0;
@@ -45,6 +47,7 @@ impl Rgb {
         0.2126 * linear(self.r) + 0.7152 * linear(self.g) + 0.0722 * linear(self.b)
     }
 
+    #[must_use]
     pub fn contrast(self, other: Self) -> f64 {
         let first = self.relative_luminance();
         let second = other.relative_luminance();
@@ -55,6 +58,7 @@ impl Rgb {
 
     /// Returns the closest stable xterm-256 color. Slots 0–15 are deliberately
     /// excluded because applications cannot assume their RGB values.
+    #[must_use]
     pub fn quantize_xterm(self) -> QuantizedColor {
         closest_xterm(self, |_| true)
     }
@@ -67,6 +71,7 @@ pub enum ThemeVariant {
 }
 
 impl ThemeVariant {
+    #[must_use]
     pub fn from_normal_background(background: Rgb) -> Self {
         if background.relative_luminance() >= 0.5 {
             Self::Light
@@ -75,6 +80,7 @@ impl ThemeVariant {
         }
     }
 
+    #[must_use]
     pub fn from_colorfgbg(value: &str) -> Option<Self> {
         let background = value.rsplit(';').next()?.trim().parse::<u8>().ok()?;
         if background > 15 {
@@ -122,6 +128,7 @@ impl ThemeTokens {
         hint: Rgb::new(0x2c, 0x61, 0x5e),
     };
 
+    #[must_use]
     pub const fn for_variant(variant: ThemeVariant) -> Self {
         match variant {
             ThemeVariant::Dark => Self::DARK,
@@ -176,12 +183,52 @@ pub struct MonoTheme {
 impl Default for MonoTheme {
     fn default() -> Self {
         Self {
-            normal: MonoStyle { reverse: false, bold: false, underline: false },
-            subdued: MonoStyle { reverse: false, bold: false, underline: true },
-            selected: MonoStyle { reverse: true, bold: true, underline: false },
-            border: MonoStyle { reverse: false, bold: true, underline: false },
-            error: MonoStyle { reverse: false, bold: true, underline: true },
+            normal: MonoStyle {
+                reverse: false,
+                bold: false,
+                underline: false,
+            },
+            subdued: MonoStyle {
+                reverse: false,
+                bold: false,
+                underline: true,
+            },
+            selected: MonoStyle {
+                reverse: true,
+                bold: true,
+                underline: false,
+            },
+            border: MonoStyle {
+                reverse: false,
+                bold: true,
+                underline: false,
+            },
+            error: MonoStyle {
+                reverse: false,
+                bold: true,
+                underline: true,
+            },
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HighlightAttributes(u8);
+
+impl HighlightAttributes {
+    pub const BOLD: Self = Self(1 << 0);
+    pub const ITALIC: Self = Self(1 << 1);
+    pub const UNDERLINE: Self = Self(1 << 2);
+    pub const UNDERCURL: Self = Self(1 << 3);
+    pub const REVERSE: Self = Self(1 << 4);
+
+    #[must_use]
+    pub const fn contains(self, attribute: Self) -> bool {
+        self.0 & attribute.0 != 0
+    }
+
+    pub fn insert(&mut self, attribute: Self) {
+        self.0 |= attribute.0;
     }
 }
 
@@ -190,24 +237,17 @@ pub struct HighlightStyle {
     pub foreground: Option<Rgb>,
     pub background: Option<Rgb>,
     pub special: Option<Rgb>,
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-    pub undercurl: bool,
-    pub reverse: bool,
+    pub attributes: HighlightAttributes,
 }
 
 impl HighlightStyle {
+    #[must_use]
     pub const fn colors(foreground: Rgb, background: Rgb) -> Self {
         Self {
             foreground: Some(foreground),
             background: Some(background),
             special: None,
-            bold: false,
-            italic: false,
-            underline: false,
-            undercurl: false,
-            reverse: false,
+            attributes: HighlightAttributes(0),
         }
     }
 
@@ -216,11 +256,7 @@ impl HighlightStyle {
             foreground: self.foreground.or(fallback.foreground),
             background: self.background.or(fallback.background),
             special: self.special.or(fallback.special),
-            bold: self.bold,
-            italic: self.italic,
-            underline: self.underline,
-            undercurl: self.undercurl,
-            reverse: self.reverse,
+            attributes: self.attributes,
         }
     }
 }
@@ -296,7 +332,9 @@ impl HighlightGroup {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ThemeError {
-    #[error("ordinary foreground on the accent background is forbidden; use background-colored text")]
+    #[error(
+        "ordinary foreground on the accent background is forbidden; use background-colored text"
+    )]
     ForbiddenForegroundOnAccent,
 }
 
@@ -323,18 +361,22 @@ impl Theme {
         }
     }
 
+    #[must_use]
     pub const fn variant(&self) -> ThemeVariant {
         self.variant
     }
 
+    #[must_use]
     pub const fn tokens(&self) -> ThemeTokens {
         self.tokens
     }
 
+    #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
     }
 
+    #[must_use]
     pub const fn received_highlights(&self) -> bool {
         self.received_highlights
     }
@@ -350,8 +392,7 @@ impl Theme {
         let variant = next
             .get(&HighlightGroup::Normal)
             .and_then(|normal| normal.background)
-            .map(ThemeVariant::from_normal_background)
-            .unwrap_or(self.variant);
+            .map_or(self.variant, ThemeVariant::from_normal_background);
         self.variant = variant;
         self.tokens = ThemeTokens::for_variant(variant);
         self.mapped = next;
@@ -359,17 +400,23 @@ impl Theme {
         self.received_highlights = true;
     }
 
+    #[must_use]
     pub fn style(&self, group: HighlightGroup) -> HighlightStyle {
-        let fallback = fallback_style(self.tokens, group);
+        let (foreground, background) = fallback_pair(self.tokens, group);
         self.mapped
             .get(&group)
             .copied()
             .unwrap_or_default()
-            .with_fallback(fallback)
+            .with_fallback(HighlightStyle::colors(foreground, background))
     }
 
+    /// # Errors
+    ///
+    /// Returns [`ThemeError::ForbiddenForegroundOnAccent`] when ordinary
+    /// foreground text is placed on the accent background.
     pub fn validate_client_style(&self, style: HighlightStyle) -> Result<(), ThemeError> {
-        if style.foreground == Some(self.tokens.fg) && style.background == Some(self.tokens.accent) {
+        if style.foreground == Some(self.tokens.fg) && style.background == Some(self.tokens.accent)
+        {
             Err(ThemeError::ForbiddenForegroundOnAccent)
         } else {
             Ok(())
@@ -377,26 +424,23 @@ impl Theme {
     }
 }
 
-fn fallback_style(tokens: ThemeTokens, group: HighlightGroup) -> HighlightStyle {
+fn fallback_pair(tokens: ThemeTokens, group: HighlightGroup) -> (Rgb, Rgb) {
     match group {
-        HighlightGroup::Normal => HighlightStyle::colors(tokens.fg, tokens.bg),
-        HighlightGroup::NormalFloat => HighlightStyle::colors(tokens.fg, tokens.float_bg),
+        HighlightGroup::Normal => (tokens.fg, tokens.bg),
+        HighlightGroup::NormalFloat | HighlightGroup::Pmenu | HighlightGroup::MsgArea => {
+            (tokens.fg, tokens.float_bg)
+        }
         HighlightGroup::FloatBorder | HighlightGroup::MsgSeparator => {
-            HighlightStyle::colors(tokens.accent, tokens.float_bg)
+            (tokens.accent, tokens.float_bg)
         }
-        HighlightGroup::Pmenu | HighlightGroup::MsgArea => {
-            HighlightStyle::colors(tokens.fg, tokens.float_bg)
-        }
-        HighlightGroup::PmenuSel | HighlightGroup::WildMenu => {
-            HighlightStyle::colors(tokens.bg, tokens.accent)
-        }
+        HighlightGroup::PmenuSel | HighlightGroup::WildMenu => (tokens.bg, tokens.accent),
         HighlightGroup::PmenuKind | HighlightGroup::PmenuExtra => {
-            HighlightStyle::colors(tokens.fg_muted, tokens.float_bg)
+            (tokens.fg_muted, tokens.float_bg)
         }
-        HighlightGroup::PmenuSbar => HighlightStyle::colors(tokens.visual, tokens.float_bg),
-        HighlightGroup::PmenuThumb => HighlightStyle::colors(tokens.accent, tokens.visual),
-        HighlightGroup::ErrorMsg => HighlightStyle::colors(tokens.error, tokens.float_bg),
-        HighlightGroup::WarningMsg => HighlightStyle::colors(tokens.warn, tokens.float_bg),
+        HighlightGroup::PmenuSbar => (tokens.visual, tokens.float_bg),
+        HighlightGroup::PmenuThumb => (tokens.accent, tokens.visual),
+        HighlightGroup::ErrorMsg => (tokens.error, tokens.float_bg),
+        HighlightGroup::WarningMsg => (tokens.warn, tokens.float_bg),
     }
 }
 
@@ -409,7 +453,9 @@ fn fallback_style(tokens: ThemeTokens, group: HighlightGroup) -> HighlightStyle 
 #[must_use]
 pub fn quantize_text(source: Rgb, backgrounds: &[Rgb], floor: f64) -> QuantizedColor {
     closest_xterm(source, |candidate| {
-        backgrounds.iter().all(|background| candidate.contrast(*background) >= floor)
+        backgrounds
+            .iter()
+            .all(|background| candidate.contrast(*background) >= floor)
     })
 }
 
@@ -430,19 +476,25 @@ pub fn quantize_ansi16_text(source: Rgb, background: Ansi16Color, floor: f64) ->
 }
 
 fn closest_xterm(mut source: Rgb, predicate: impl Fn(Rgb) -> bool) -> QuantizedColor {
-    let mut best = QuantizedColor { index: 16, rgb: xterm_rgb(16) };
+    let mut best = QuantizedColor {
+        index: 16,
+        rgb: xterm_rgb(16),
+    };
     let mut best_distance = u32::MAX;
     for index in 16..=255 {
         let candidate = xterm_rgb(index);
         if !predicate(candidate) {
             continue;
         }
-        let red = i32::from(source.r) - i32::from(candidate.r);
-        let green = i32::from(source.g) - i32::from(candidate.g);
-        let blue = i32::from(source.b) - i32::from(candidate.b);
-        let distance = (red * red + green * green + blue * blue) as u32;
+        let red = u32::from(source.r.abs_diff(candidate.r));
+        let green = u32::from(source.g.abs_diff(candidate.g));
+        let blue = u32::from(source.b.abs_diff(candidate.b));
+        let distance = red * red + green * green + blue * blue;
         if distance < best_distance {
-            best = QuantizedColor { index, rgb: candidate };
+            best = QuantizedColor {
+                index,
+                rgb: candidate,
+            };
             best_distance = distance;
         }
     }
@@ -457,16 +509,25 @@ fn closest_xterm(mut source: Rgb, predicate: impl Fn(Rgb) -> bool) -> QuantizedC
     best
 }
 
+#[must_use]
 pub fn xterm_rgb(index: u8) -> Rgb {
     const ANSI: [Rgb; 16] = [
-        Rgb::new(0x00, 0x00, 0x00), Rgb::new(0x80, 0x00, 0x00),
-        Rgb::new(0x00, 0x80, 0x00), Rgb::new(0x80, 0x80, 0x00),
-        Rgb::new(0x00, 0x00, 0x80), Rgb::new(0x80, 0x00, 0x80),
-        Rgb::new(0x00, 0x80, 0x80), Rgb::new(0xc0, 0xc0, 0xc0),
-        Rgb::new(0x80, 0x80, 0x80), Rgb::new(0xff, 0x00, 0x00),
-        Rgb::new(0x00, 0xff, 0x00), Rgb::new(0xff, 0xff, 0x00),
-        Rgb::new(0x00, 0x00, 0xff), Rgb::new(0xff, 0x00, 0xff),
-        Rgb::new(0x00, 0xff, 0xff), Rgb::new(0xff, 0xff, 0xff),
+        Rgb::new(0x00, 0x00, 0x00),
+        Rgb::new(0x80, 0x00, 0x00),
+        Rgb::new(0x00, 0x80, 0x00),
+        Rgb::new(0x80, 0x80, 0x00),
+        Rgb::new(0x00, 0x00, 0x80),
+        Rgb::new(0x80, 0x00, 0x80),
+        Rgb::new(0x00, 0x80, 0x80),
+        Rgb::new(0xc0, 0xc0, 0xc0),
+        Rgb::new(0x80, 0x80, 0x80),
+        Rgb::new(0xff, 0x00, 0x00),
+        Rgb::new(0x00, 0xff, 0x00),
+        Rgb::new(0xff, 0xff, 0x00),
+        Rgb::new(0x00, 0x00, 0xff),
+        Rgb::new(0xff, 0x00, 0xff),
+        Rgb::new(0x00, 0xff, 0xff),
+        Rgb::new(0xff, 0xff, 0xff),
     ];
     const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
@@ -497,10 +558,10 @@ fn nearest_ansi16_index(source: Rgb, predicate: &dyn Fn(Rgb) -> bool) -> u8 {
         if !predicate(candidate) {
             continue;
         }
-        let red = i32::from(source.r) - i32::from(candidate.r);
-        let green = i32::from(source.g) - i32::from(candidate.g);
-        let blue = i32::from(source.b) - i32::from(candidate.b);
-        let distance = (red * red + green * green + blue * blue) as u32;
+        let red = u32::from(source.r.abs_diff(candidate.r));
+        let green = u32::from(source.g.abs_diff(candidate.g));
+        let blue = u32::from(source.b.abs_diff(candidate.b));
+        let distance = red * red + green * green + blue * blue;
         if distance < best_distance {
             best = Some(index);
             best_distance = distance;
@@ -574,7 +635,11 @@ mod tests {
         for group in HighlightGroup::ALL {
             let text = TEXT_GROUPS.contains(&group);
             let surface = SURFACE_ONLY_GROUPS.contains(&group);
-            assert!(text != surface, "{} is classified {text}/{surface}", group.name());
+            assert!(
+                text != surface,
+                "{} is classified {text}/{surface}",
+                group.name()
+            );
         }
     }
 
@@ -613,11 +678,7 @@ mod tests {
         for variant in [ThemeVariant::Dark, ThemeVariant::Light] {
             let theme = ThemeTokens::for_variant(variant);
             for group in TEXT_GROUPS {
-                let style = fallback_style(theme, group);
-                let (Some(foreground), Some(background)) = (style.foreground, style.background)
-                else {
-                    panic!("{} has no fallback pair", group.name());
-                };
+                let (foreground, background) = fallback_pair(theme, group);
                 let direct = foreground.contrast(background);
                 assert!(
                     direct >= TEXT_CONTRAST_FLOOR,
@@ -648,26 +709,42 @@ mod tests {
 
     /// The floor is only worth having if nearest-color selection would in fact
     /// break a pair the client ships. It does, on a sixteen-color terminal:
-    /// FloatBorder's accent lands on yellow beside bright white. If this ever
+    /// `FloatBorder`'s accent lands on yellow beside bright white. If this ever
     /// stops failing, the guard above has become vacuous.
     #[test]
     fn nearest_color_selection_would_break_a_pair_the_floor_saves() {
         let light = ThemeTokens::LIGHT;
         let surface = nearest_ansi16(light.float_bg);
-        let nearest = xterm_rgb(nearest_ansi16(light.accent) as u8)
-            .contrast(xterm_rgb(surface as u8));
-        assert!(nearest < TEXT_CONTRAST_FLOOR, "nearest-color accent-on-float is {nearest:.2}");
+        let nearest =
+            xterm_rgb(nearest_ansi16(light.accent) as u8).contrast(xterm_rgb(surface as u8));
+        assert!(
+            nearest < TEXT_CONTRAST_FLOOR,
+            "nearest-color accent-on-float is {nearest:.2}"
+        );
 
-        let floored = xterm_rgb(quantize_ansi16_text(light.accent, surface, TEXT_CONTRAST_FLOOR) as u8)
-            .contrast(xterm_rgb(surface as u8));
-        assert!(floored >= TEXT_CONTRAST_FLOOR, "floored accent-on-float is {floored:.2}");
+        let floored =
+            xterm_rgb(quantize_ansi16_text(light.accent, surface, TEXT_CONTRAST_FLOOR) as u8)
+                .contrast(xterm_rgb(surface as u8));
+        assert!(
+            floored >= TEXT_CONTRAST_FLOOR,
+            "floored accent-on-float is {floored:.2}"
+        );
     }
 
     #[test]
     fn colorfgbg_uses_only_a_valid_final_palette_entry() {
-        assert_eq!(ThemeVariant::from_colorfgbg("15;0"), Some(ThemeVariant::Dark));
-        assert_eq!(ThemeVariant::from_colorfgbg("0;15"), Some(ThemeVariant::Light));
-        assert_eq!(ThemeVariant::from_colorfgbg(" 0 ; 7 "), Some(ThemeVariant::Light));
+        assert_eq!(
+            ThemeVariant::from_colorfgbg("15;0"),
+            Some(ThemeVariant::Dark)
+        );
+        assert_eq!(
+            ThemeVariant::from_colorfgbg("0;15"),
+            Some(ThemeVariant::Light)
+        );
+        assert_eq!(
+            ThemeVariant::from_colorfgbg(" 0 ; 7 "),
+            Some(ThemeVariant::Light)
+        );
         assert_eq!(ThemeVariant::from_colorfgbg("0;256"), None);
         assert_eq!(ThemeVariant::from_colorfgbg("light"), None);
     }
@@ -679,17 +756,29 @@ mod tests {
         theme.reswap([
             (
                 HighlightGroup::Normal,
-                HighlightStyle { background: Some(ThemeTokens::DARK.bg), ..HighlightStyle::default() },
+                HighlightStyle {
+                    background: Some(ThemeTokens::DARK.bg),
+                    ..HighlightStyle::default()
+                },
             ),
             (
                 HighlightGroup::Pmenu,
-                HighlightStyle { foreground: Some(Rgb::new(1, 2, 3)), ..HighlightStyle::default() },
+                HighlightStyle {
+                    foreground: Some(Rgb::new(1, 2, 3)),
+                    ..HighlightStyle::default()
+                },
             ),
         ]);
         assert_eq!(theme.variant(), ThemeVariant::Dark);
         assert_eq!(theme.generation(), 1);
-        assert_eq!(theme.style(HighlightGroup::Pmenu).foreground, Some(Rgb::new(1, 2, 3)));
-        assert_eq!(theme.style(HighlightGroup::Pmenu).background, Some(ThemeTokens::DARK.float_bg));
+        assert_eq!(
+            theme.style(HighlightGroup::Pmenu).foreground,
+            Some(Rgb::new(1, 2, 3))
+        );
+        assert_eq!(
+            theme.style(HighlightGroup::Pmenu).background,
+            Some(ThemeTokens::DARK.float_bg)
+        );
     }
 
     #[test]
@@ -723,13 +812,25 @@ mod tests {
         assert!((ThemeTokens::LIGHT.bg.contrast(ThemeTokens::LIGHT.accent) - 6.44).abs() < 0.005);
 
         let dark = Theme::new(None);
-        assert!(dark
-            .validate_client_style(HighlightStyle::colors(ThemeTokens::DARK.fg, ThemeTokens::DARK.accent))
-            .is_err());
+        assert!(
+            dark.validate_client_style(HighlightStyle::colors(
+                ThemeTokens::DARK.fg,
+                ThemeTokens::DARK.accent
+            ))
+            .is_err()
+        );
         let light = Theme::new(Some("0;15"));
-        assert!(light
-            .validate_client_style(HighlightStyle::colors(ThemeTokens::LIGHT.fg, ThemeTokens::LIGHT.accent))
-            .is_err());
-        assert_eq!(light.style(HighlightGroup::PmenuSel).foreground, Some(ThemeTokens::LIGHT.bg));
+        assert!(
+            light
+                .validate_client_style(HighlightStyle::colors(
+                    ThemeTokens::LIGHT.fg,
+                    ThemeTokens::LIGHT.accent
+                ))
+                .is_err()
+        );
+        assert_eq!(
+            light.style(HighlightGroup::PmenuSel).foreground,
+            Some(ThemeTokens::LIGHT.bg)
+        );
     }
 }

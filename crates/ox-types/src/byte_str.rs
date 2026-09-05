@@ -31,6 +31,16 @@ impl OxStr {
         String::from_utf8_lossy(&self.0)
     }
 
+    /// Replaces the contents with `bytes`, reusing the existing allocation.
+    ///
+    /// The capacity is retained, so a value that is repeatedly overwritten with
+    /// content no longer than its high-water mark never allocates again. This is
+    /// the primitive behind allocation-free screen-cell reuse.
+    pub fn replace_with(&mut self, bytes: &[u8]) {
+        self.0.clear();
+        self.0.extend_from_slice(bytes);
+    }
+
     fn fmt_escaped(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for &b in &self.0 {
             match b {
@@ -81,7 +91,10 @@ mod tests {
     #[test]
     fn lossy_decode() {
         assert_eq!(OxStr::from("héllo").to_string_lossy().as_ref(), "héllo");
-        assert_eq!(OxStr::from(&[0xFF, b'x'][..]).to_string_lossy().as_ref(), "\u{FFFD}x");
+        assert_eq!(
+            OxStr::from(&[0xFF, b'x'][..]).to_string_lossy().as_ref(),
+            "\u{FFFD}x"
+        );
     }
 
     #[test]

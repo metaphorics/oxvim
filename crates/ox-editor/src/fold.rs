@@ -45,6 +45,10 @@ impl FoldRange {
     /// Creates a range and reverses its endpoints when necessary.
     ///
     /// Neovim reverses manual fold endpoints in `src/nvim/fold.c:535-552`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::EmptyRange`] when the normalized range is empty.
     pub fn normalized(start: Position, end: Position) -> Result<Self, FoldError> {
         let (start, end) = if start <= end {
             (start, end)
@@ -58,6 +62,10 @@ impl FoldRange {
     }
 
     /// Creates a whole-line half-open range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::EmptyRange`] when the two rows are equal.
     pub fn lines(start_row: usize, end_row_exclusive: usize) -> Result<Self, FoldError> {
         Self::normalized(
             Position::new(start_row, 0),
@@ -374,6 +382,10 @@ impl Folds {
     }
 
     /// Sets the nonzero indentation shift width.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::ZeroShiftWidth`] when `shift_width` is zero.
     pub fn set_shift_width(&mut self, shift_width: usize) -> Result<(), FoldError> {
         if shift_width == 0 {
             return Err(FoldError::ZeroShiftWidth);
@@ -394,6 +406,10 @@ impl Folds {
     }
 
     /// Sets non-empty marker byte strings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::EmptyMarker`] when either marker is empty.
     pub fn set_markers(
         &mut self,
         start: impl Into<Vec<u8>>,
@@ -429,34 +445,32 @@ impl Folds {
     /// Starts use right gravity and half-open ends use left gravity, so text
     /// inserted inside a fold extends it while text inserted at its exclusive
     /// end does not. Ranges fully consumed by deletion are removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::CrossingRanges`] if row adjustment produces
+    /// crossing ranges — a contract violation of the non-decreasing splice
+    /// map, since properly nested manual folds cannot cross after adjustment.
     pub(crate) fn splice_rows(
         &mut self,
         start: usize,
         old_rows: usize,
         new_rows: usize,
-    ) {
+    ) -> Result<(), FoldError> {
         if self.method != FoldMethod::Manual {
-            return;
+            return Ok(());
         }
         for fold in &mut self.manual {
-            fold.range.start.row = splice_row(
-                fold.range.start.row,
-                start,
-                old_rows,
-                new_rows,
-                true,
-            );
-            fold.range.end.row = splice_row(
-                fold.range.end.row,
-                start,
-                old_rows,
-                new_rows,
-                false,
-            );
+            fold.range.start.row =
+                splice_row(fold.range.start.row, start, old_rows, new_rows, true);
+            fold.range.end.row = splice_row(fold.range.end.row, start, old_rows, new_rows, false);
         }
         self.manual.retain(|fold| fold.range.start < fold.range.end);
-        normalize_folds(&mut self.manual)
-            .expect("splice_row is a non-decreasing map; manual folds cannot cross");
+        // `splice_row` is a non-decreasing map, so properly nested manual
+        // folds cannot cross after row adjustment; a crossing range would
+        // mean the adjustment map itself broke its own contract.
+        normalize_folds(&mut self.manual)?;
+        Ok(())
     }
 
     /// Returns whether active fold data needs refreshing.
@@ -481,6 +495,13 @@ impl Folds {
     ///
     /// Each line is treated as bytes. Indentation counts ASCII spaces as one
     /// column and advances an ASCII tab to the next shift-width boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::ZeroShiftWidth`] if indent computation runs with a
+    /// zero shift width, [`FoldError::EmptyRange`] or [`FoldError::CrossingRanges`]
+    /// if computed ranges are degenerate, or [`FoldError::WrongHostMethod`] when
+    /// the active method has no host kind.
     pub fn refresh<B: AsRef<[u8]>>(
         &mut self,
         changedtick: u64,
@@ -512,9 +533,8 @@ impl Folds {
                 self.dirty = false;
             }
             FoldMethod::Expr | FoldMethod::Syntax | FoldMethod::Diff => {
-                let kind = match self.method.host_kind() {
-                    Some(kind) => kind,
-                    None => return Err(FoldError::WrongHostMethod),
+                let Some(kind) = self.method.host_kind() else {
+                    return Err(FoldError::WrongHostMethod);
                 };
                 return Ok(FoldRefresh::Host(FoldComputeRequest {
                     kind,
@@ -531,10 +551,16 @@ impl Folds {
     }
 
     /// Applies expr, syntax, or diff ranges returned by the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::WrongHostMethod`] when the result's kind does not
+    /// match the active method, or [`FoldError::StaleResult`] when the result's
+    /// changedtick is no longer current. Returns [`FoldError::CrossingRanges`]
+    /// if the host-supplied ranges cross.
     pub fn apply_host_result(&mut self, result: FoldComputeResult) -> Result<(), FoldError> {
-        let expected_kind = match self.method.host_kind() {
-            Some(kind) => kind,
-            None => return Err(FoldError::WrongHostMethod),
+        let Some(expected_kind) = self.method.host_kind() else {
+            return Err(FoldError::WrongHostMethod);
         };
         if result.request.kind != expected_kind {
             return Err(FoldError::WrongHostMethod);
@@ -554,6 +580,13 @@ impl Folds {
     /// Crossing existing folds expand the new range until the set is properly
     /// nested, matching Neovim's enclosing normalization in
     /// `src/nvim/fold.c:564-655`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::NotManual`] unless the manual method is active,
+    /// [`FoldError::EmptyRange`] if the normalized range is empty,
+    /// [`FoldError::DuplicateRange`] if the range already exists, or
+    /// [`FoldError::CrossingRanges`] if normalization fails.
     pub fn create_manual(
         &mut self,
         start: Position,
@@ -594,6 +627,12 @@ impl Folds {
     }
 
     /// Deletes one exact manual fold, retaining its nested folds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::NotManual`] unless the manual method is active,
+    /// [`FoldError::NoFold`] if no manual fold matches the range, or
+    /// [`FoldError::CrossingRanges`] if normalization fails.
     pub fn delete_manual(&mut self, range: FoldRange) -> Result<Fold, FoldError> {
         self.require_manual()?;
         let index = self
@@ -611,6 +650,12 @@ impl Folds {
     /// With `recursive`, descendants are deleted too. Without it, descendants
     /// remain and are promoted, corresponding to Neovim's recursive deletion
     /// switch at `src/nvim/fold.c:662-725`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::NotManual`] unless the manual method is active,
+    /// [`FoldError::NoFold`] if no fold contains the position, or
+    /// [`FoldError::CrossingRanges`] if normalization fails.
     pub fn delete_manual_at(
         &mut self,
         position: Position,
@@ -627,9 +672,7 @@ impl Folds {
         let mut removed = Vec::new();
         self.manual.retain(|fold| {
             let delete = fold.range == target
-                || (recursive
-                    && target.contains_range(fold.range)
-                    && target != fold.range);
+                || (recursive && target.contains_range(fold.range) && target != fold.range);
             if delete {
                 removed.push(*fold);
             }
@@ -640,6 +683,10 @@ impl Folds {
     }
 
     /// Removes every manual fold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::NotManual`] unless the manual method is active.
     pub fn clear_manual(&mut self) -> Result<usize, FoldError> {
         self.require_manual()?;
         let count = self.manual.len();
@@ -648,10 +695,8 @@ impl Folds {
     }
 
     /// Returns all folds containing a position, outermost first.
-    pub fn containing_folds(
-        &self,
-        position: Position,
-    ) -> impl DoubleEndedIterator<Item = &Fold> {
+    #[must_use]
+    pub fn containing_folds(&self, position: Position) -> impl DoubleEndedIterator<Item = &Fold> {
         self.active()
             .iter()
             .filter(move |fold| fold.range.contains(position))
@@ -708,6 +753,10 @@ impl Folds {
     }
 
     /// Returns a foldtext request for an exact closed fold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::NoFold`] if no closed fold matches the range.
     pub fn fold_text_request(
         &self,
         range: FoldRange,
@@ -727,6 +776,10 @@ impl Folds {
     }
 
     /// Opens the outermost closed fold containing `position`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::NoFold`] if no fold contains the position.
     pub fn open(&mut self, position: Position) -> Result<bool, FoldError> {
         let folds = self.active_mut();
         let mut found = false;
@@ -747,6 +800,10 @@ impl Folds {
     }
 
     /// Closes the deepest currently visible open fold containing `position`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::NoFold`] if no fold contains the position.
     pub fn close(&mut self, position: Position) -> Result<bool, FoldError> {
         let folds = self.active_mut();
         let mut deepest_open = None;
@@ -772,6 +829,10 @@ impl Folds {
     }
 
     /// Opens a closed fold at `position`, otherwise closes the deepest one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::NoFold`] if no fold contains the position.
     pub fn toggle(&mut self, position: Position) -> Result<bool, FoldError> {
         let folds = self.active_mut();
         let mut deepest = None;
@@ -799,6 +860,10 @@ impl Folds {
     ///
     /// Neovim opens nested folds recursively in `src/nvim/fold.c:1226-1234`
     /// and `src/nvim/fold.c:1267-1275`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::NoFold`] if no fold contains the position.
     pub fn open_recursive(&mut self, position: Position) -> Result<usize, FoldError> {
         let folds = self.active_mut();
         let mut deepest = None;
@@ -827,6 +892,10 @@ impl Folds {
     ///
     /// Descendant state is retained so reopening non-recursively remains
     /// deterministic, as in `src/nvim/fold.c:1220-1250`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::NoFold`] if no fold contains the position.
     pub fn close_recursive(&mut self, position: Position) -> Result<usize, FoldError> {
         let fold = self
             .active_mut()
@@ -911,6 +980,10 @@ impl Folds {
 /// blank line resolves to the lower of the nearest concrete level above and
 /// below (looking across runs of blanks); the first and last lines are never
 /// undefined and stay at level zero (`src/nvim/fold.c:2852-2854`).
+///
+/// # Errors
+///
+/// Returns [`FoldError::ZeroShiftWidth`] when `shift_width` is zero.
 pub fn indent_levels<B: AsRef<[u8]>>(
     lines: &[B],
     shift_width: usize,
@@ -999,9 +1072,10 @@ fn marker_levels<B: AsRef<[u8]>>(lines: &[B], start: &[u8], end: &[u8]) -> Vec<u
                 (_, Some(at)) => {
                     line_level = line_level.max(next_level);
                     let explicit = decimal_after(bytes, at + end.len());
-                    next_level = explicit
-                        .map(|value| value.saturating_sub(1))
-                        .unwrap_or_else(|| next_level.saturating_sub(1));
+                    next_level = explicit.map_or_else(
+                        || next_level.saturating_sub(1),
+                        |value| value.saturating_sub(1),
+                    );
                     offset = at + end.len();
                 }
             }
@@ -1034,7 +1108,12 @@ fn decimal_after(bytes: &[u8], start: usize) -> Option<usize> {
 }
 
 fn ranges_from_levels(levels: &[usize]) -> Result<Vec<FoldRange>, FoldError> {
-    let max_level = levels.iter().copied().max().unwrap_or(0).min(MAX_FOLD_DEPTH);
+    let max_level = levels
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .min(MAX_FOLD_DEPTH);
     let mut ranges = Vec::new();
     for depth in 1..=max_level {
         let mut start = None;
@@ -1099,11 +1178,7 @@ fn splice_row(
     if row > old_end || (row == old_end && right_gravity) {
         return new_end.saturating_add(row.saturating_sub(old_end));
     }
-    if right_gravity {
-        new_end
-    } else {
-        start
-    }
+    if right_gravity { new_end } else { start }
 }
 
 fn set_all(folds: &mut [Fold], state: FoldState) -> usize {

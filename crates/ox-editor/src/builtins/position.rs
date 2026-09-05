@@ -9,50 +9,75 @@
 //! Virtual columns follow `plines.c:getvcol`, and the wanted column follows
 //! `move.c:update_curswant`.
 
+use crate::excmd_exec::ExEditorAccess;
 use ox_eval::EvalError;
 use ox_text::Position;
-use ox_types::{BufHandle, Typval, WinHandle};
+use ox_types::{BufHandle, OxStr, Typval, WinHandle};
 use unicode_width::UnicodeWidthChar;
 
-use crate::excmd_exec::{buffer_lines, EvalHost};
+use crate::excmd_exec::{EvalHost, buffer_lines};
 use crate::options::OptionValue;
 use crate::script::FileIO;
-use crate::{Editor, MarkLocation};
+use crate::{Editor, MarkLocation, Mode};
 
 use super::input_string_arg;
 
 /// Upstream `MAXCOL` (`pos_defs.h`): one past every representable column.
 const MAXCOL: i64 = 0x7fff_ffff;
 
+/// Converts an in-memory index into Vim's signed Number domain.
+fn vim_number(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// Routes one position builtin.
-pub(crate) fn call<F: FileIO>(
-    host: &mut EvalHost<'_, F>,
+pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
     name: &str,
-    args: Vec<Typval>,
+    args: &[Typval],
 ) -> ox_eval::Result<Typval> {
     check_arity(name, args.len())?;
-    let editor = &mut *host.editor;
-    match name {
-        "charcol" => get_col(editor, &args, true),
-        "col" => get_col(editor, &args, false),
-        "cursor" => set_cursorpos(editor, &args, false),
-        "getcharpos" => getpos_both(editor, &args, false, true),
-        "getcurpos" => getpos_both(editor, &args, true, false),
-        "getcursorcharpos" => getpos_both(editor, &args, true, true),
-        "getpos" => getpos_both(editor, &args, false, false),
-        "line" => call_line(editor, &args),
-        "setcharpos" => set_position(editor, &args, true),
-        "setcursorcharpos" => set_cursorpos(editor, &args, true),
-        "setpos" => set_position(editor, &args, false),
-        "virtcol" => call_virtcol(editor, &args),
+    // Extract the visual anchor from the mode machine so getpos('v') and
+    // getregion can resolve the start of the visual selection. The mode
+    // machine lives on ExRuntime, not on Editor, so it must be read here
+    // before entering with_ex_editor.
+    let visual_anchor = host.runtime.mode_machine.as_ref().and_then(|machine| {
+        let machine = machine.borrow();
+        if let Mode::Visual(state) = machine.mode() {
+            Some(FPos {
+                lnum: vim_number(state.anchor.lnum),
+                col: vim_number(state.anchor.col),
+                coladd: 0,
+            })
+        } else {
+            None
+        }
+    });
+    host.access.with_ex_editor(|editor| match name {
+        "charcol" => get_col(editor, args, true),
+        "col" => get_col(editor, args, false),
+        "cursor" => set_cursorpos(editor, args, false),
+        "getcharpos" => getpos_both(editor, args, false, true, visual_anchor),
+        "getcurpos" => getpos_both(editor, args, true, false, visual_anchor),
+        "getcursorcharpos" => getpos_both(editor, args, true, true, visual_anchor),
+        "getpos" => getpos_both(editor, args, false, false, visual_anchor),
+        "getregion" => get_region(editor, args),
+        "getregionpos" => get_region_pos(editor, args),
+        "line" => call_line(editor, args),
+        "line2byte" => call_line2byte(editor, args),
+        "setcharpos" => set_position(editor, args, true),
+        "setcursorcharpos" => set_cursorpos(editor, args, true),
+        "setpos" => set_position(editor, args, false),
+        "virtcol" => call_virtcol(editor, args),
         _ => unreachable!("position builtin route and dispatcher disagree"),
-    }
+    })
 }
 
 /// Enforces the `eval.lua` argument counts the way upstream's function table
 /// does before a builtin body runs.
 fn check_arity(name: &str, count: usize) -> ox_eval::Result<()> {
-    let spec = ox_eval::builtin_spec(name).expect("position builtins come from eval.lua");
+    let spec = ox_eval::builtin_spec(name)
+        .ok_or_else(|| EvalError::new("E117", 0, format!("Unknown function: {name}")))?;
     if count < spec.min_args {
         return Err(EvalError::new(
             "E119",
@@ -93,6 +118,7 @@ struct PosWin {
     coladd: i64,
     topline: usize,
     lines: Vec<Vec<u8>>,
+    visual_anchor: Option<FPos>,
 }
 
 impl PosWin {
@@ -112,6 +138,7 @@ impl PosWin {
             coladd,
             topline,
             lines,
+            visual_anchor: None,
         })
     }
 
@@ -125,7 +152,7 @@ impl PosWin {
 
     /// Upstream `b_ml.ml_line_count`.
     fn line_count(&self) -> i64 {
-        self.lines.len() as i64
+        vim_number(self.lines.len())
     }
 
     /// Upstream `w_botline - 1`, the last line the window displays. ox-editor
@@ -136,7 +163,7 @@ impl PosWin {
             .window_geometry(self.window)
             .map_or(1, |geometry| geometry.height);
         let last = self.topline.saturating_add(height.saturating_sub(1));
-        (last as i64).min(self.line_count().max(1))
+        vim_number(last).min(self.line_count().max(1))
     }
 }
 
@@ -169,15 +196,16 @@ fn var2fpos(
         };
         let line = win.line(lnum);
         let len = if charcol {
-            char_count(line) as i64
+            vim_number(char_count(line))
         } else {
-            line.len() as i64
+            vim_number(line.len())
         };
+        let maximum_col = len.saturating_add(1);
         // A column of "$" asks for the last column of the line.
         if matches!(items.get(1), Some(Typval::String(text)) if text.as_bytes() == b"$") {
-            col = len + 1;
+            col = maximum_col;
         }
-        if col == 0 || col > len + 1 {
+        if col == 0 || col > maximum_col {
             return Ok(None);
         }
         let coladd = list_nr(items, 2)?.unwrap_or(0);
@@ -191,16 +219,15 @@ fn var2fpos(
     let name = input_string_arg(value)?;
     let bytes = name.as_bytes();
     let cursor = FPos {
-        lnum: win.cursor.lnum as i64,
-        col: win.cursor.col as i64,
+        lnum: vim_number(win.cursor.lnum),
+        col: vim_number(win.cursor.col),
         coladd: win.coladd,
     };
     let mut pos = FPos::default();
     match bytes.first() {
         Some(b'.') => pos = cursor,
-        // Visual state lives in the mode machine rather than in editor state,
-        // so the eval host only ever reaches upstream's Visual-inactive branch.
-        Some(b'v') if bytes.len() == 1 => pos = cursor,
+        // Visual anchor from the mode machine, or cursor when not in Visual.
+        Some(b'v') if bytes.len() == 1 => pos = win.visual_anchor.unwrap_or(cursor),
         Some(b'\'') => {
             let Some(mark) = bytes.get(1).copied().map(char::from) else {
                 return Ok(None);
@@ -212,8 +239,8 @@ fn var2fpos(
                 return Ok(None);
             }
             pos = FPos {
-                lnum: position.lnum as i64,
-                col: position.col as i64,
+                lnum: vim_number(position.lnum),
+                col: vim_number(position.col),
                 coladd: 0,
             };
         }
@@ -230,7 +257,7 @@ fn var2fpos(
         pos.col = 0;
         match bytes.get(1) {
             Some(b'0') => {
-                pos.lnum = (win.topline.max(1)) as i64;
+                pos.lnum = vim_number(win.topline.max(1));
                 return Ok(Some(pos));
             }
             Some(b'$') => {
@@ -247,9 +274,9 @@ fn var2fpos(
             pos.lnum = cursor.lnum;
             let line = win.line(pos.lnum);
             pos.col = if charcol {
-                char_count(line) as i64
+                vim_number(char_count(line))
             } else {
-                line.len() as i64
+                vim_number(line.len())
             };
         }
         return Ok(Some(pos));
@@ -315,7 +342,7 @@ fn list2fpos(
             return Ok(None);
         };
         let lnum = if lnum == 0 {
-            win.cursor.lnum as i64
+            vim_number(win.cursor.lnum)
         } else {
             lnum
         };
@@ -332,7 +359,7 @@ fn list2fpos(
                 .and_then(|lnum| foreign.get(lnum.wrapping_sub(1)))
                 .map_or(&[], Vec::as_slice)
         };
-        col = charidx_to_byteidx(line, col) + 1;
+        col = charidx_to_byteidx(line, col).saturating_add(1);
     }
     let coladd = list_nr(items, index)?.unwrap_or(-1).max(0);
     *curswant = list_nr(items, index + 1)?.unwrap_or(-1);
@@ -371,6 +398,7 @@ fn getpos_both(
     args: &[Typval],
     getcurpos: bool,
     charcol: bool,
+    visual_anchor: Option<FPos>,
 ) -> ox_eval::Result<Typval> {
     let mut fnum = -1;
     let window = if getcurpos {
@@ -381,16 +409,22 @@ fn getpos_both(
     } else {
         editor.current_window()
     };
-    let win = window.map(|window| PosWin::new(editor, window)).transpose()?;
+    let win = window
+        .map(|window| PosWin::new(editor, window))
+        .transpose()?
+        .map(|mut win| {
+            win.visual_anchor = visual_anchor;
+            win
+        });
     let pos = match (&win, getcurpos) {
         (None, _) => None,
         (Some(win), true) => {
-            let mut col = win.cursor.col as i64;
+            let mut col = vim_number(win.cursor.col);
             if charcol {
-                col = byteidx_to_charidx(win.line(win.cursor.lnum as i64), col);
+                col = byteidx_to_charidx(win.line(vim_number(win.cursor.lnum)), col);
             }
             Some(FPos {
-                lnum: win.cursor.lnum as i64,
+                lnum: vim_number(win.cursor.lnum),
                 col,
                 coladd: win.coladd,
             })
@@ -405,7 +439,7 @@ fn getpos_both(
             if pos.col == MAXCOL {
                 MAXCOL
             } else {
-                pos.col + 1
+                pos.col.saturating_add(1)
             }
         })),
         Typval::Number(pos.map_or(0, |pos| pos.coladd)),
@@ -418,13 +452,324 @@ fn getpos_both(
                 if wanted == MAXCOL {
                     MAXCOL
                 } else {
-                    wanted + 1
+                    wanted.saturating_add(1)
                 }
             }
         };
         items.push(Typval::Number(curswant));
     }
     Ok(Typval::list(items))
+}
+
+// ---------------------------------------------------------------------------
+// Region extraction
+// ---------------------------------------------------------------------------
+
+/// Selection type from the `{opts}` Dict of `getregion()`/`getregionpos()`
+/// (`funcs.c:getregionpos`). `"v"` is charwise, `"V"` is linewise, and
+/// `"\x16"` (Ctrl-V) optionally followed by a width is blockwise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegionType {
+    Char,
+    Line,
+    Block,
+}
+
+/// Parsed `{opts}` Dict for `getregion()`/`getregionpos()`.
+struct RegionOpts {
+    region_type: RegionType,
+    exclusive: bool,
+    block_width: i64,
+    allow_eol: bool,
+}
+
+impl Default for RegionOpts {
+    fn default() -> Self {
+        Self {
+            region_type: RegionType::Char,
+            exclusive: false,
+            block_width: 0,
+            allow_eol: false,
+        }
+    }
+}
+
+/// `funcs.c:getregionpos` argument parsing: both positions must be 4-element
+/// lists, the optional third argument is a Dict with `type`, `exclusive`,
+/// and (for `getregionpos`) `eol`.
+fn parse_region_opts(args: &[Typval]) -> ox_eval::Result<RegionOpts> {
+    let mut opts = RegionOpts::default();
+    let Some(dict) = args.get(2) else {
+        return Ok(opts);
+    };
+    let Typval::Dict(reference) = dict else {
+        return Err(EvalError::new(
+            "E1206",
+            0,
+            "Dictionary required for argument 3",
+        ));
+    };
+    let dict = reference
+        .try_borrow()
+        .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?;
+    if let Some(value) = dict.get(b"exclusive") {
+        opts.exclusive = value.is_truthy();
+    }
+    if let Some(value) = dict.get(b"eol") {
+        opts.allow_eol = value.is_truthy();
+    }
+    if let Some(Typval::String(text)) = dict.get(b"type") {
+        let bytes = text.as_bytes();
+        match bytes.first() {
+            Some(b'v') if bytes.len() == 1 => opts.region_type = RegionType::Char,
+            Some(b'V') if bytes.len() == 1 => opts.region_type = RegionType::Line,
+            Some(&0x16) => {
+                opts.region_type = RegionType::Block;
+                if bytes.len() > 1 {
+                    let rest = &bytes[1..];
+                    let width = std::str::from_utf8(rest)
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    if width > 0 {
+                        opts.block_width = width;
+                    }
+                }
+            }
+            _ => {
+                return Err(EvalError::new("E474", 0, "Invalid argument: type"));
+            }
+        }
+    }
+    Ok(opts)
+}
+
+/// Extracts `[bufnum, lnum, col, off]` from a 4-element position list,
+/// mirroring `funcs.c:list2fpos` with `with_fnum = true`. Returns the
+/// buffer number, a one-based line, a one-based column, and coladd.
+fn parse_pos_list(value: &Typval) -> ox_eval::Result<Option<(i64, i64, i64, i64)>> {
+    let Typval::List(reference) = value else {
+        return Ok(None);
+    };
+    let list = reference
+        .try_borrow()
+        .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?;
+    let items = &list.items;
+    // Upstream `list2fpos` takes `[fnum, lnum, col, off]` plus an ignored
+    // fifth slot when curswant is NULL (`funcs.c:2070` passes NULL).
+    if items.len() < 3 || items.len() > 5 {
+        return Ok(None);
+    }
+    let bufnum = list_nr(items, 0)?.unwrap_or(0);
+    let lnum = list_nr(items, 1)?.unwrap_or(0);
+    let col = list_nr(items, 2)?.unwrap_or(0);
+    let off = list_nr(items, 3)?.unwrap_or(0);
+    Ok(Some((bufnum, lnum, col, off)))
+}
+
+/// `funcs.c:f_getregion`: returns the list of strings from `pos1` to `pos2`
+/// in the buffer named by the positions. The positions are `[bufnum, lnum,
+/// col, off]` lists as produced by `getpos()`.
+///
+/// Upstream normalizes the two positions so `p1` is upper-left, adjusts
+/// columns from 1-based to 0-based, then iterates lines extracting the
+/// selected text. Charwise selections take a byte slice of each line;
+/// linewise selections take the whole line; blockwise selections take a
+/// column range across each line.
+fn get_region(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    let Some((p1, p2, _buf, lines)) = resolve_region(editor, args)? else {
+        return Ok(Typval::list(Vec::new()));
+    };
+    let opts = parse_region_opts(args)?;
+    let mut result = Vec::new();
+    for lnum in p1.lnum..=p2.lnum {
+        let line_idx = usize::try_from(lnum)
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|n| lines.get(n));
+        let text: Vec<u8> = match (opts.region_type, line_idx) {
+            (RegionType::Line, _) => line_idx.map_or(Vec::new(), Clone::clone),
+            (RegionType::Char | RegionType::Block, None) => Vec::new(),
+            (RegionType::Char, Some(line)) => {
+                // Upstream f_getregion: first line starts at p1.col, last
+                // line ends at p2.col, middle lines are taken whole.
+                let start = if lnum == p1.lnum {
+                    usize::try_from(p1.col.max(0)).unwrap_or(0)
+                } else {
+                    0
+                };
+                let mut end = if lnum == p2.lnum {
+                    usize::try_from(p2.col.max(0)).unwrap_or(0)
+                } else {
+                    line.len()
+                };
+                if !opts.exclusive && lnum == p2.lnum {
+                    end = end.saturating_add(1);
+                }
+                let start = start.min(line.len());
+                let end = end.min(line.len()).max(start);
+                line[start..end].to_vec()
+            }
+            (RegionType::Block, Some(line)) => {
+                let start_col = usize::try_from(p1.col.max(0)).unwrap_or(0);
+                let end_col = if opts.block_width > 0 {
+                    start_col.saturating_add(usize::try_from(opts.block_width.max(0)).unwrap_or(0))
+                } else {
+                    usize::try_from(p2.col.max(0))
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                };
+                let start = start_col.min(line.len());
+                let end = end_col.min(line.len()).max(start);
+                line[start..end].to_vec()
+            }
+        };
+        result.push(Typval::String(OxStr(text)));
+    }
+    Ok(Typval::list(result))
+}
+
+/// `funcs.c:f_getregionpos`: returns a list of `[[start_pos, end_pos], ...]`
+/// pairs, one per line in the region. Each position is `[bufnum, lnum, col,
+/// off]` with 1-based `col`.
+fn get_region_pos(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    let Some((p1, p2, buf, lines)) = resolve_region(editor, args)? else {
+        return Ok(Typval::list(Vec::new()));
+    };
+    let opts = parse_region_opts(args)?;
+    let bufnum = i64::from(buf);
+    let mut result = Vec::new();
+    for lnum in p1.lnum..=p2.lnum {
+        let line_idx = usize::try_from(lnum)
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|n| lines.get(n));
+        let line_len = line_idx.map_or(0, Vec::len);
+        let line_cap = i64::try_from(line_len).unwrap_or(i64::MAX);
+        let (start_col, end_col) = match opts.region_type {
+            RegionType::Line => (1, MAXCOL),
+            RegionType::Char => {
+                // Per-line: first line starts at p1.col+1, last line ends
+                // at p2.col+1 (inclusive) or p2.col+1 (exclusive), middle
+                // lines span the whole line.
+                let s = if lnum == p1.lnum {
+                    p1.col.max(0) + 1
+                } else {
+                    1
+                };
+                let e = if lnum == p2.lnum {
+                    p2.col + 1
+                } else {
+                    line_cap + 1
+                };
+                (s, e)
+            }
+            RegionType::Block => {
+                let s = p1.col.max(0) + 1;
+                let e = if opts.block_width > 0 {
+                    p1.col + opts.block_width
+                } else {
+                    p2.col + 1
+                };
+                (s, e)
+            }
+        };
+        let (start_col, end_col) = if opts.allow_eol {
+            (start_col, end_col)
+        } else {
+            let s = if start_col > line_cap + 1 {
+                line_cap + 1
+            } else {
+                start_col
+            };
+            let e = if end_col > line_cap {
+                if s == 0 { 0 } else { line_cap }
+            } else {
+                end_col
+            };
+            (s, e)
+        };
+        let start_pos = Typval::list(vec![
+            Typval::Number(bufnum),
+            Typval::Number(lnum),
+            Typval::Number(start_col),
+            Typval::Number(0),
+        ]);
+        let end_pos = Typval::list(vec![
+            Typval::Number(bufnum),
+            Typval::Number(lnum),
+            Typval::Number(end_col),
+            Typval::Number(0),
+        ]);
+        result.push(Typval::list(vec![start_pos, end_pos]));
+    }
+    Ok(Typval::list(result))
+}
+
+/// A resolved `getregion`/`getregionpos` span: normalized endpoints, the
+/// buffer they live in, and that buffer's lines.
+type RegionSpan = (FPos, FPos, BufHandle, Vec<Vec<u8>>);
+
+/// Shared position parsing for `getregion`/`getregionpos`: extracts two
+/// `[bufnum, lnum, col, off]` lists, normalizes so `p1` is upper-left, and
+/// loads the buffer's lines. A `bufnum` of 0 names the current buffer, as
+/// `list2fpos` resolves it. Positions in different buffers yield no region
+/// (`Ok(None)`): upstream allocates the empty return list first, so the
+/// `fnum1 != fnum2` FAIL answers `[]`, not an error.
+fn resolve_region(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Option<RegionSpan>> {
+    let (buf1, lnum1, col1, off1) = parse_pos_list(&args[0])?
+        .ok_or_else(|| EvalError::new("E1211", 0, "List required for argument 1"))?;
+    let (buf2, lnum2, col2, off2) = parse_pos_list(&args[1])?
+        .ok_or_else(|| EvalError::new("E1211", 0, "List required for argument 2"))?;
+    let window = editor
+        .current_window()
+        .ok_or_else(|| EvalError::new("E957", 0, "no window"))?;
+    let win = PosWin::new(editor, window)?;
+    let current = i64::from(win.buffer);
+    let fnum1 = if buf1 == 0 { current } else { buf1 };
+    let fnum2 = if buf2 == 0 { current } else { buf2 };
+    if fnum1 != fnum2 {
+        return Ok(None);
+    }
+    let buffer = if buf1 != 0 {
+        buflist_findnr(editor, buf1).ok_or_else(|| EvalError::new("E121", 0, "buffer not found"))?
+    } else if buf2 != 0 {
+        buflist_findnr(editor, buf2).ok_or_else(|| EvalError::new("E121", 0, "buffer not found"))?
+    } else {
+        win.buffer
+    };
+    let lines = buffer_lines(editor, buffer).map_err(|error| EvalError::new("E16", 0, error))?;
+    let line_count = vim_number(lines.len());
+    if lnum1 < 1 || lnum1 > line_count {
+        return Err(EvalError::new(
+            "E966",
+            0,
+            format!("Invalid line number: {lnum1}"),
+        ));
+    }
+    if lnum2 < 1 || lnum2 > line_count {
+        return Err(EvalError::new(
+            "E966",
+            0,
+            format!("Invalid line number: {lnum2}"),
+        ));
+    }
+    // Convert to 0-based columns (upstream adjusts after validation).
+    let mut p1 = FPos {
+        lnum: lnum1,
+        col: (col1 - 1).max(0),
+        coladd: off1,
+    };
+    let mut p2 = FPos {
+        lnum: lnum2,
+        col: (col2 - 1).max(0),
+        coladd: off2,
+    };
+    // Normalize: swap so p1 is upper-left.
+    if p1.lnum > p2.lnum || (p1.lnum == p2.lnum && p1.col > p2.col) {
+        std::mem::swap(&mut p1, &mut p2);
+    }
+    Ok(Some((p1, p2, buffer, lines)))
 }
 
 /// `move.c:update_curswant` without its side effect: a window that has asked
@@ -434,23 +779,13 @@ fn getpos_both(
 /// `w_curswant` raw.
 fn effective_curswant(editor: &Editor, win: &PosWin) -> i64 {
     let state = editor.window(win.window);
-    let (curswant, set_curswant) = state.map_or((0, false), |state| {
-        (state.curswant, state.set_curswant)
-    });
+    let (curswant, set_curswant) =
+        state.map_or((0, false), |state| (state.curswant, state.set_curswant));
     if !set_curswant || editor.current_window() != Some(win.window) {
         return curswant;
     }
-    let line = win.line(win.cursor.lnum as i64);
-    let col = win.cursor.col as i64;
-    let (start, end) = getvcol(line, col, tabstop(editor));
-    // `getvcol` puts the cursor at the end of a tab and at the start of
-    // anything else.
-    let vcol = if line.get(win.cursor.col) == Some(&b'\t') {
-        end
-    } else {
-        start
-    };
-    vcol as i64
+    let line = win.line(vim_number(win.cursor.lnum));
+    vim_number(cursor_vcol(line, win.cursor.col, tabstop(editor)))
 }
 
 /// `col()` and `charcol()` (`funcs.c:get_col`).
@@ -483,12 +818,12 @@ fn get_col(editor: &Editor, args: &[Typval], charcol: bool) -> ox_eval::Result<T
     let col = if pos.col == MAXCOL {
         // A `'>` mark can hold MAXCOL; answer the length of the line instead.
         if pos.lnum <= win.line_count() {
-            win.line(pos.lnum).len() as i64 + 1
+            vim_number(win.line(pos.lnum).len()).saturating_add(1)
         } else {
             MAXCOL
         }
     } else {
-        pos.col + 1
+        pos.col.saturating_add(1)
     };
     Ok(Typval::Number(col))
 }
@@ -508,6 +843,49 @@ fn call_line(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
     Ok(Typval::Number(pos.map_or(0, |pos| pos.lnum)))
 }
 
+/// `line2byte()` (`funcs.c:f_line2byte`). Returns the byte count from the
+/// start of the buffer for line `lnum`, including the end-of-line character.
+/// The first line returns 1. Uses `ml_find_line_or_offset` with `no_ff=false`
+/// (upstream `eval.lua:6691`), so `'fileformat'` diverges from
+/// `nvim_buf_get_offset`. An empty buffer (memline-empty: one line, zero
+/// bytes) returns -1 for any lnum, matching the `ml_usedchunks == -1` branch
+/// (`memline.c:4042-4045`).
+fn call_line2byte(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    let window = match args.get(1) {
+        Some(value) => resolve_window_id(editor, value)?,
+        None => editor.current_window(),
+    };
+    let Some(window) = window else {
+        return Ok(Typval::Number(-1));
+    };
+    let win = PosWin::new(editor, window)?;
+    let mut fnum = 0;
+    let Some(pos) = var2fpos(editor, &args[0], true, false, &win, &mut fnum)? else {
+        return Ok(Typval::Number(-1));
+    };
+    let lnum = pos.lnum;
+    let line_count = win.line_count();
+    // Empty memline: one line, zero content. Upstream returns -1 for any
+    // lnum because `ml_usedchunks == -1` and `no_ff` is false (the
+    // `lnum == 1 || lnum == 2` quirk only applies with `no_ff = true`).
+    if line_count <= 1 && win.line(1).is_empty() {
+        return Ok(Typval::Number(-1));
+    }
+    if lnum < 1 || lnum > line_count + 1 {
+        return Ok(Typval::Number(-1));
+    }
+    let state = editor
+        .buffer(win.buffer)
+        .map_err(|error| EvalError::new("E16", 0, error.to_string()))?;
+    let text = state
+        .text()
+        .map_err(|error| EvalError::new("E16", 0, error.to_string()))?;
+    let offset = text
+        .byte_of_line(usize::try_from(lnum).unwrap_or(0))
+        .map_err(|error| EvalError::new("E16", 0, error.to_string()))?;
+    // line2byte is 1-based: the first line returns 1, not 0.
+    Ok(Typval::Number(vim_number(offset) + 1))
+}
 /// `virtcol()` (`funcs.c:f_virtcol`). The optional third argument names a
 /// window only when the second one was given, matching upstream's guard.
 fn call_virtcol(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
@@ -536,10 +914,10 @@ fn call_virtcol(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
     }
     let line = win.line(pos.lnum);
     // getvcol() does not range-check, so upstream clamps the column first.
-    let col = pos.col.clamp(0, line.len() as i64);
+    let col = pos.col.clamp(0, vim_number(line.len()));
     let (start, end) = getvcol(line, col, tabstop(editor));
     let (start, end) = wrap_showbreak(editor, window, start + 1, end + 1);
-    Ok(pair(start as i64, end as i64))
+    Ok(pair(vim_number(start), vim_number(end)))
 }
 
 // ---------------------------------------------------------------------------
@@ -547,11 +925,7 @@ fn call_virtcol(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
 // ---------------------------------------------------------------------------
 
 /// `cursor()` and `setcursorcharpos()` (`funcs.c:set_cursorpos`).
-fn set_cursorpos(
-    editor: &mut Editor,
-    args: &[Typval],
-    charcol: bool,
-) -> ox_eval::Result<Typval> {
+fn set_cursorpos(editor: &mut Editor, args: &[Typval], charcol: bool) -> ox_eval::Result<Typval> {
     let Some(window) = editor.current_window() else {
         return Ok(Typval::Number(-1));
     };
@@ -561,8 +935,15 @@ fn set_cursorpos(
     let mut set_curswant = true;
     let (mut lnum, mut col, coladd);
     if matches!(args[0], Typval::List(_)) {
-        let Some(pos) =
-            list2fpos(editor, &args[0], false, charcol, &win, &mut fnum, &mut curswant)?
+        let Some(pos) = list2fpos(
+            editor,
+            &args[0],
+            false,
+            charcol,
+            &win,
+            &mut fnum,
+            &mut curswant,
+        )?
         else {
             return Err(EvalError::new("E474", 0, "Invalid argument"));
         };
@@ -587,11 +968,11 @@ fn set_cursorpos(
             ));
         }
         if lnum == 0 {
-            lnum = win.cursor.lnum as i64;
+            lnum = vim_number(win.cursor.lnum);
         }
         col = number_value(&args[1])?;
         if charcol {
-            col = charidx_to_byteidx(win.line(lnum), col) + 1;
+            col = charidx_to_byteidx(win.line(lnum), col).saturating_add(1);
         }
         coladd = match args.get(2) {
             Some(value) => number_value(value)?,
@@ -604,8 +985,12 @@ fn set_cursorpos(
         return Ok(Typval::Number(-1));
     }
     let mut pos = FPos {
-        lnum: if lnum > 0 { lnum } else { win.cursor.lnum as i64 },
-        col: if col != MAXCOL { (col - 1).max(0) } else { col },
+        lnum: if lnum > 0 {
+            lnum
+        } else {
+            vim_number(win.cursor.lnum)
+        },
+        col: if col == MAXCOL { col } else { (col - 1).max(0) },
         coladd,
     };
     check_cursor(&win, &mut pos);
@@ -614,11 +999,7 @@ fn set_cursorpos(
 }
 
 /// `setpos()` and `setcharpos()` (`funcs.c:set_position`).
-fn set_position(
-    editor: &mut Editor,
-    args: &[Typval],
-    charcol: bool,
-) -> ox_eval::Result<Typval> {
+fn set_position(editor: &mut Editor, args: &[Typval], charcol: bool) -> ox_eval::Result<Typval> {
     let name = input_string_arg(&args[0])?;
     let Some(window) = editor.current_window() else {
         return Ok(Typval::Number(-1));
@@ -626,8 +1007,15 @@ fn set_position(
     let win = PosWin::new(editor, window)?;
     let mut fnum = i64::from(win.buffer);
     let mut curswant = -1;
-    let Some(mut pos) =
-        list2fpos(editor, &args[1], true, charcol, &win, &mut fnum, &mut curswant)?
+    let Some(mut pos) = list2fpos(
+        editor,
+        &args[1],
+        true,
+        charcol,
+        &win,
+        &mut fnum,
+        &mut curswant,
+    )?
     else {
         return Ok(Typval::Number(-1));
     };
@@ -654,10 +1042,8 @@ fn set_position(
     Err(EvalError::new("E474", 0, "Invalid argument"))
 }
 
-/// `mark.c:setmark_pos` for the marks ox-editor models: `a-z`, the previous
-/// context marks `'` and `` ` ``, and the global `A-Z`/`0-9` marks. Upstream
-/// also writes `[`, `]`, `<`, `>` and `"`, which ox-editor does not store, so
-/// those answer the failure it answers for a name it cannot set.
+/// `mark.c:setmark_pos` for local, operator, previous-context, global, and
+/// numbered marks.
 fn set_mark(editor: &mut Editor, win: &PosWin, name: char, pos: FPos, fnum: i64) -> i64 {
     let position = Position {
         lnum: usize::try_from(pos.lnum).unwrap_or(0),
@@ -680,18 +1066,12 @@ fn set_mark(editor: &mut Editor, win: &PosWin, name: char, pos: FPos, fnum: i64)
     let stored = if name.is_ascii_uppercase() || name.is_ascii_digit() {
         let location = MarkLocation::in_buffer(buffer, position);
         editor.global_marks_mut().set(name, location).is_ok()
-    } else if name.is_ascii_lowercase() {
-        // Upstream writes `b_namedm` of the buffer `fnum` names, not the
-        // current one.
+    } else {
+        // Lowercase and editor-maintained special marks live in the buffer
+        // that `fnum` names.
         editor.set_local_mark(buffer, name, position).is_ok()
-    } else {
-        false
     };
-    if stored {
-        0
-    } else {
-        -1
-    }
+    if stored { 0 } else { -1 }
 }
 
 /// `buffer.c:buflist_findnr`: the live buffer with this number, or `None`.
@@ -733,7 +1113,7 @@ fn place_cursor(
 fn check_cursor(win: &PosWin, pos: &mut FPos) {
     pos.lnum = pos.lnum.clamp(1, win.line_count().max(1));
     let line = win.line(pos.lnum);
-    let len = line.len() as i64;
+    let len = vim_number(line.len());
     if len == 0 {
         pos.col = 0;
     } else if pos.col >= len {
@@ -753,7 +1133,10 @@ fn adjust_to_head_byte(line: &[u8], pos: &mut FPos) {
     if pos.col <= 0 {
         return;
     }
-    let col = pos.col as usize;
+    let Ok(col) = usize::try_from(pos.col) else {
+        pos.col = 0;
+        return;
+    };
     if line.is_empty() || line.len() < col {
         pos.col = 0;
         return;
@@ -766,7 +1149,7 @@ fn adjust_to_head_byte(line: &[u8], pos: &mut FPos) {
         }
         index += length;
     }
-    pos.col = index as i64;
+    pos.col = vim_number(index);
 }
 
 // ---------------------------------------------------------------------------
@@ -776,7 +1159,7 @@ fn adjust_to_head_byte(line: &[u8], pos: &mut FPos) {
 /// `plines.c:getvcol`: the zero-based first and last virtual column of the
 /// character at byte `col`, with the NUL past the end of the line counting as
 /// one cell.
-fn getvcol(line: &[u8], col: i64, tabstop: usize) -> (usize, usize) {
+pub(crate) fn getvcol(line: &[u8], col: i64, tabstop: usize) -> (usize, usize) {
     let target = usize::try_from(col).unwrap_or(0);
     let mut vcol = 0usize;
     let mut index = 0usize;
@@ -796,6 +1179,19 @@ fn getvcol(line: &[u8], col: i64, tabstop: usize) -> (usize, usize) {
     (vcol, vcol + width - 1)
 }
 
+/// Returns the cursor cell selected by Normal mode.
+///
+/// A tab selects its final display cell; every other character selects its
+/// first cell. Keep this rule shared by cursor-state and screen-position reads.
+pub(crate) fn cursor_vcol(line: &[u8], col: usize, tabstop: usize) -> usize {
+    let (start, end) = getvcol(line, vim_number(col), tabstop);
+    if line.get(col) == Some(&b'\t') {
+        end
+    } else {
+        start
+    }
+}
+
 /// Display cells one character cluster occupies
 /// (`plines.c:charsize_fast_impl`), upstream's `win_chartabsize`.
 pub(crate) fn cell_width(character: char, vcol: usize, tabstop: usize) -> usize {
@@ -808,12 +1204,7 @@ pub(crate) fn cell_width(character: char, vcol: usize, tabstop: usize) -> usize 
 
 /// Adds the `'showbreak'` cells that precede every continuation row a long
 /// line wraps onto.
-fn wrap_showbreak(
-    editor: &Editor,
-    window: WinHandle,
-    start: usize,
-    end: usize,
-) -> (usize, usize) {
+fn wrap_showbreak(editor: &Editor, window: WinHandle, start: usize, end: usize) -> (usize, usize) {
     let showbreak = match editor.options().get_window(window, "showbreak") {
         Ok(OptionValue::String(value)) => value.chars().count(),
         _ => 0,
@@ -837,7 +1228,7 @@ fn wrap_showbreak(
 }
 
 /// The effective `'tabstop'`.
-fn tabstop(editor: &Editor) -> usize {
+pub(crate) fn tabstop(editor: &Editor) -> usize {
     match editor.options().get_global("tabstop") {
         Ok(OptionValue::Number(value)) => usize::try_from((*value).max(1)).unwrap_or(8),
         _ => 8,
@@ -852,10 +1243,10 @@ fn tabstop(editor: &Editor) -> usize {
 /// when the encoding is invalid, the way Vim treats a stray byte.
 fn decode_char(bytes: &[u8]) -> (char, usize) {
     for width in 1..=bytes.len().min(4) {
-        if let Ok(text) = std::str::from_utf8(&bytes[..width]) {
-            if let Some(character) = text.chars().next() {
-                return (character, width);
-            }
+        if let Ok(text) = std::str::from_utf8(&bytes[..width])
+            && let Some(character) = text.chars().next()
+        {
+            return (character, width);
         }
     }
     (char::REPLACEMENT_CHARACTER, 1)
@@ -912,9 +1303,9 @@ fn charidx_to_byteidx(line: &[u8], charidx: i64) -> i64 {
     let mut index = 0usize;
     let mut remaining = charidx;
     loop {
-        remaining -= 1;
+        remaining = remaining.saturating_sub(1);
         if index >= line.len() || remaining <= 0 {
-            return index as i64;
+            return vim_number(index);
         }
         index += cluster_len(line, index);
     }
@@ -926,7 +1317,7 @@ fn charidx_to_byteidx(line: &[u8], charidx: i64) -> i64 {
 
 /// `typval.c:tv_get_number_chk`: the numeric value of a typval, or the error
 /// upstream raises for a type that has none.
-fn number_value(value: &Typval) -> ox_eval::Result<i64> {
+pub(super) fn number_value(value: &Typval) -> ox_eval::Result<i64> {
     match value {
         Typval::Number(number) => Ok(*number),
         Typval::Bool(flag) => Ok(i64::from(*flag)),
@@ -937,11 +1328,9 @@ fn number_value(value: &Typval) -> ox_eval::Result<i64> {
         Typval::Dict(_) => Err(EvalError::new("E728", 0, "Using a Dictionary as a Number")),
         Typval::Float(_) => Err(EvalError::new("E805", 0, "Using a Float as a Number")),
         Typval::Blob(_) => Err(EvalError::new("E974", 0, "Using a Blob as a Number")),
-        Typval::Funcref(_) | Typval::Partial(_) => Err(EvalError::new(
-            "E703",
-            0,
-            "Using a Funcref as a Number",
-        )),
+        Typval::Funcref(_) | Typval::Partial(_) => {
+            Err(EvalError::new("E703", 0, "Using a Funcref as a Number"))
+        }
     }
 }
 
@@ -1019,10 +1408,7 @@ fn resolve_window_id(editor: &Editor, value: &Typval) -> ox_eval::Result<Option<
 /// `eval/window.c:find_win_by_nr_or_id`: `0` names the current window.
 /// ox-editor gives windows one identifier rather than upstream's separate
 /// number and id spaces, so every other value is looked up as a handle.
-fn resolve_window_nr_or_id(
-    editor: &Editor,
-    value: &Typval,
-) -> ox_eval::Result<Option<WinHandle>> {
+fn resolve_window_nr_or_id(editor: &Editor, value: &Typval) -> ox_eval::Result<Option<WinHandle>> {
     if number_value(value)? == 0 {
         return Ok(editor.current_window());
     }

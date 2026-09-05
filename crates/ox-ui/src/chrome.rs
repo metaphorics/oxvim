@@ -16,7 +16,12 @@ pub struct ContentChunk {
 impl ContentChunk {
     /// Creates a content chunk.
     #[must_use]
-    pub fn new(hl_id: u64, text: impl Into<OxStr>) -> Self { Self { hl_id, text: text.into() } }
+    pub fn new(hl_id: u64, text: impl Into<OxStr>) -> Self {
+        Self {
+            hl_id,
+            text: text.into(),
+        }
+    }
 
     fn to_object(&self) -> Object {
         Object::Array(vec![
@@ -86,7 +91,12 @@ impl PopupItem {
         menu: impl Into<OxStr>,
         info: impl Into<OxStr>,
     ) -> Self {
-        Self { word: word.into(), kind: kind.into(), menu: menu.into(), info: info.into() }
+        Self {
+            word: word.into(),
+            kind: kind.into(),
+            menu: menu.into(),
+            info: info.into(),
+        }
     }
 
     fn to_object(&self) -> Object {
@@ -132,13 +142,25 @@ pub struct ModeInfo {
 impl ModeInfo {
     fn to_object(&self) -> Object {
         let mut values = vec![
-            (OxStr::from("cursor_shape"), Object::String(self.cursor_shape.clone())),
-            (OxStr::from("cell_percentage"), Object::Integer(i64::from(self.cell_percentage))),
-            (OxStr::from("short_name"), Object::String(self.short_name.clone())),
+            (
+                OxStr::from("cursor_shape"),
+                Object::String(self.cursor_shape.clone()),
+            ),
+            (
+                OxStr::from("cell_percentage"),
+                Object::Integer(i64::from(self.cell_percentage)),
+            ),
+            (
+                OxStr::from("short_name"),
+                Object::String(self.short_name.clone()),
+            ),
             (OxStr::from("name"), Object::String(self.name.clone())),
         ];
         if let Some(attr_id) = self.attr_id {
-            values.push((OxStr::from("attr_id"), Object::Integer(i64::try_from(attr_id).unwrap_or(i64::MAX))));
+            values.push((
+                OxStr::from("attr_id"),
+                Object::Integer(i64::try_from(attr_id).unwrap_or(i64::MAX)),
+            ));
         }
         Object::Dict(ox_types::Dict(values))
     }
@@ -149,6 +171,8 @@ impl ModeInfo {
 pub struct ChromeState {
     /// Last visible message.
     pub message: Option<MessageState>,
+    /// `msg_showmode` content (`-- INSERT --`, `-- VISUAL --`, …).
+    pub showmode: Vec<ContentChunk>,
     /// Active command line.
     pub cmdline: Option<CmdlineState>,
     /// Active command-line block.
@@ -176,6 +200,7 @@ impl Default for ChromeState {
     fn default() -> Self {
         Self {
             message: None,
+            showmode: Vec::new(),
             cmdline: None,
             cmdline_block: Vec::new(),
             popupmenu: None,
@@ -194,51 +219,80 @@ impl Default for ChromeState {
 impl ChromeState {
     /// Creates empty chrome state.
     #[must_use]
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Shows or replaces a message.
     pub fn show_message(&mut self, message: MessageState) {
-        self.pending.push(UiEvent::new("msg_show", vec![
-            Object::String(message.kind.clone()),
-            chunks(&message.content),
-            Object::Boolean(message.replace_last),
-            Object::Boolean(message.history),
-            Object::Boolean(message.append),
-            message.id.clone(),
-            Object::String(message.trigger.clone()),
-        ]));
+        self.pending.push(UiEvent::new(
+            "msg_show",
+            vec![
+                Object::String(message.kind.clone()),
+                chunks(&message.content),
+                Object::Boolean(message.replace_last),
+                Object::Boolean(message.history),
+                Object::Boolean(message.append),
+                message.id.clone(),
+                Object::String(message.trigger.clone()),
+            ],
+        ));
         self.message = Some(message);
     }
 
     /// Clears externally rendered messages.
     pub fn clear_message(&mut self) {
-        if self.message.take().is_some() { self.pending.push(UiEvent::new("msg_clear", vec![])); }
+        if self.message.take().is_some() {
+            self.pending.push(UiEvent::new("msg_clear", vec![]));
+        }
+    }
+
+    /// Sets the `msg_showmode` content (`-- INSERT --`, `-- VISUAL --`, …),
+    /// emitting only when the content changes. An empty slice clears it.
+    pub fn set_showmode(&mut self, content: Vec<ContentChunk>) {
+        if self.showmode == content {
+            return;
+        }
+        self.pending
+            .push(UiEvent::new("msg_showmode", vec![chunks(&content)]));
+        self.showmode = content;
     }
 
     /// Shows a command line.
     pub fn show_cmdline(&mut self, state: CmdlineState) {
-        self.pending.push(UiEvent::new("cmdline_show", vec![
-            chunks(&state.content),
-            integer(state.position),
-            Object::String(state.first_char.clone()),
-            Object::String(state.prompt.clone()),
-            integer(state.indent),
-            integer(state.level),
-            Object::Integer(i64::try_from(state.hl_id).unwrap_or(i64::MAX)),
-        ]));
+        self.pending.push(UiEvent::new(
+            "cmdline_show",
+            vec![
+                chunks(&state.content),
+                integer(state.position),
+                Object::String(state.first_char.clone()),
+                Object::String(state.prompt.clone()),
+                integer(state.indent),
+                integer(state.level),
+                Object::Integer(i64::try_from(state.hl_id).unwrap_or(i64::MAX)),
+            ],
+        ));
         self.cmdline = Some(state);
     }
 
     /// Moves the command-line cursor.
     pub fn set_cmdline_position(&mut self, position: usize, level: usize) {
-        if let Some(state) = self.cmdline.as_mut() { state.position = position; }
-        self.pending.push(UiEvent::new("cmdline_pos", vec![integer(position), integer(level)]));
+        if let Some(state) = self.cmdline.as_mut() {
+            state.position = position;
+        }
+        self.pending.push(UiEvent::new(
+            "cmdline_pos",
+            vec![integer(position), integer(level)],
+        ));
     }
 
     /// Hides the active command line.
     pub fn hide_cmdline(&mut self, level: usize, abort: bool) {
         if self.cmdline.take().is_some() {
-            self.pending.push(UiEvent::new("cmdline_hide", vec![integer(level), Object::Boolean(abort)]));
+            self.pending.push(UiEvent::new(
+                "cmdline_hide",
+                vec![integer(level), Object::Boolean(abort)],
+            ));
         }
     }
 
@@ -246,7 +300,9 @@ impl ChromeState {
     pub fn show_cmdline_block(&mut self, lines: Vec<Vec<ContentChunk>>) {
         self.pending.push(UiEvent::new(
             "cmdline_block_show",
-            vec![Object::Array(lines.iter().map(|line| chunks(line)).collect())],
+            vec![Object::Array(
+                lines.iter().map(|line| chunks(line)).collect(),
+            )],
         ));
         self.cmdline_block = lines;
     }
@@ -264,40 +320,56 @@ impl ChromeState {
     pub fn hide_cmdline_block(&mut self) {
         if !self.cmdline_block.is_empty() {
             self.cmdline_block.clear();
-            self.pending.push(UiEvent::new("cmdline_block_hide", vec![]));
+            self.pending
+                .push(UiEvent::new("cmdline_block_hide", vec![]));
         }
     }
 
     /// Shows a popup menu.
     pub fn show_popupmenu(&mut self, state: PopupmenuState) {
-        self.pending.push(UiEvent::new("popupmenu_show", vec![
-            Object::Array(state.items.iter().map(PopupItem::to_object).collect()),
-            Object::Integer(state.selected),
-            integer(state.row),
-            integer(state.col),
-            Object::Integer(state.grid),
-        ]));
+        self.pending.push(UiEvent::new(
+            "popupmenu_show",
+            vec![
+                Object::Array(state.items.iter().map(PopupItem::to_object).collect()),
+                Object::Integer(state.selected),
+                integer(state.row),
+                integer(state.col),
+                Object::Integer(state.grid),
+            ],
+        ));
         self.popupmenu = Some(state);
     }
 
     /// Changes the selected popup-menu item.
     pub fn select_popupmenu(&mut self, selected: i64) {
-        if let Some(state) = self.popupmenu.as_mut() { state.selected = selected; }
-        self.pending.push(UiEvent::new("popupmenu_select", vec![Object::Integer(selected)]));
+        if let Some(state) = self.popupmenu.as_mut() {
+            state.selected = selected;
+        }
+        self.pending.push(UiEvent::new(
+            "popupmenu_select",
+            vec![Object::Integer(selected)],
+        ));
     }
 
     /// Hides the popup menu.
     pub fn hide_popupmenu(&mut self) {
-        if self.popupmenu.take().is_some() { self.pending.push(UiEvent::new("popupmenu_hide", vec![])); }
+        if self.popupmenu.take().is_some() {
+            self.pending.push(UiEvent::new("popupmenu_hide", vec![]));
+        }
     }
 
     /// Advertises cursor styles when they change.
     pub fn set_mode_info(&mut self, enabled: bool, modes: Vec<ModeInfo>) {
-        if self.mode_info_enabled == enabled && self.mode_info == modes { return; }
-        self.pending.push(UiEvent::new("mode_info_set", vec![
-            Object::Boolean(enabled),
-            Object::Array(modes.iter().map(ModeInfo::to_object).collect()),
-        ]));
+        if self.mode_info_enabled == enabled && self.mode_info == modes {
+            return;
+        }
+        self.pending.push(UiEvent::new(
+            "mode_info_set",
+            vec![
+                Object::Boolean(enabled),
+                Object::Array(modes.iter().map(ModeInfo::to_object).collect()),
+            ],
+        ));
         self.mode_info_enabled = enabled;
         self.mode_info = modes;
     }
@@ -305,98 +377,162 @@ impl ChromeState {
     /// Changes the active mode, emitting only on transition.
     pub fn set_mode(&mut self, name: impl Into<OxStr>, index: usize) {
         let name = name.into();
-        if self.mode.as_ref() == Some(&(name.clone(), index)) { return; }
-        self.pending.push(UiEvent::new("mode_change", vec![Object::String(name.clone()), integer(index)]));
+        if self.mode.as_ref() == Some(&(name.clone(), index)) {
+            return;
+        }
+        self.pending.push(UiEvent::new(
+            "mode_change",
+            vec![Object::String(name.clone()), integer(index)],
+        ));
         self.mode = Some((name, index));
     }
 
     /// Sets title and emits only on change.
     pub fn set_title(&mut self, title: impl Into<OxStr>) {
         let title = title.into();
-        if self.title == title { return; }
+        if self.title == title {
+            return;
+        }
         self.title = title.clone();
-        self.pending.push(UiEvent::new("set_title", vec![Object::String(title)]));
+        self.pending
+            .push(UiEvent::new("set_title", vec![Object::String(title)]));
     }
 
     /// Sets icon label and emits only on change.
     pub fn set_icon(&mut self, icon: impl Into<OxStr>) {
         let icon = icon.into();
-        if self.icon == icon { return; }
+        if self.icon == icon {
+            return;
+        }
         self.icon = icon.clone();
-        self.pending.push(UiEvent::new("set_icon", vec![Object::String(icon)]));
+        self.pending
+            .push(UiEvent::new("set_icon", vec![Object::String(icon)]));
     }
 
     /// Starts or ends busy state.
     pub fn set_busy(&mut self, busy: bool) {
-        if self.busy == busy { return; }
+        if self.busy == busy {
+            return;
+        }
         self.busy = busy;
-        self.pending.push(UiEvent::new(if busy { "busy_start" } else { "busy_stop" }, vec![]));
+        self.pending.push(UiEvent::new(
+            if busy { "busy_start" } else { "busy_stop" },
+            vec![],
+        ));
     }
 
     /// Enables or disables mouse reporting.
     pub fn set_mouse(&mut self, mouse: bool) {
-        if self.mouse == mouse { return; }
+        if self.mouse == mouse {
+            return;
+        }
         self.mouse = mouse;
-        self.pending.push(UiEvent::new(if mouse { "mouse_on" } else { "mouse_off" }, vec![]));
+        self.pending.push(UiEvent::new(
+            if mouse { "mouse_on" } else { "mouse_off" },
+            vec![],
+        ));
     }
 
     /// Emits a bell without persistent state.
     pub fn bell(&mut self, visual: bool) {
-        self.pending.push(UiEvent::new(if visual { "visual_bell" } else { "bell" }, vec![]));
+        self.pending.push(UiEvent::new(
+            if visual { "visual_bell" } else { "bell" },
+            vec![],
+        ));
     }
 
     /// Drains ordered pending state transitions.
-    pub fn take_events(&mut self) -> Vec<UiEvent> { std::mem::take(&mut self.pending) }
+    pub fn take_events(&mut self) -> Vec<UiEvent> {
+        std::mem::take(&mut self.pending)
+    }
 
     /// Builds the current state events needed to initialize a newly attached UI.
     #[must_use]
     pub fn snapshot_events(&self) -> Vec<UiEvent> {
         let mut events = Vec::new();
         if !self.mode_info.is_empty() || self.mode_info_enabled {
-            events.push(UiEvent::new("mode_info_set", vec![
-                Object::Boolean(self.mode_info_enabled),
-                Object::Array(self.mode_info.iter().map(ModeInfo::to_object).collect()),
-            ]));
+            events.push(UiEvent::new(
+                "mode_info_set",
+                vec![
+                    Object::Boolean(self.mode_info_enabled),
+                    Object::Array(self.mode_info.iter().map(ModeInfo::to_object).collect()),
+                ],
+            ));
         }
         if let Some((name, index)) = &self.mode {
-            events.push(UiEvent::new("mode_change", vec![Object::String(name.clone()), integer(*index)]));
+            events.push(UiEvent::new(
+                "mode_change",
+                vec![Object::String(name.clone()), integer(*index)],
+            ));
         }
         if !self.title.as_bytes().is_empty() {
-            events.push(UiEvent::new("set_title", vec![Object::String(self.title.clone())]));
+            events.push(UiEvent::new(
+                "set_title",
+                vec![Object::String(self.title.clone())],
+            ));
         }
         if !self.icon.as_bytes().is_empty() {
-            events.push(UiEvent::new("set_icon", vec![Object::String(self.icon.clone())]));
+            events.push(UiEvent::new(
+                "set_icon",
+                vec![Object::String(self.icon.clone())],
+            ));
         }
-        if self.busy { events.push(UiEvent::new("busy_start", vec![])); }
-        if self.mouse { events.push(UiEvent::new("mouse_on", vec![])); }
+        if self.busy {
+            events.push(UiEvent::new("busy_start", vec![]));
+        }
+        if self.mouse {
+            events.push(UiEvent::new("mouse_on", vec![]));
+        }
         if let Some(message) = &self.message {
-            events.push(UiEvent::new("msg_show", vec![
-                Object::String(message.kind.clone()),
-                chunks(&message.content),
-                Object::Boolean(message.replace_last),
-                Object::Boolean(message.history),
-                Object::Boolean(message.append),
-                message.id.clone(),
-                Object::String(message.trigger.clone()),
-            ]));
+            events.push(UiEvent::new(
+                "msg_show",
+                vec![
+                    Object::String(message.kind.clone()),
+                    chunks(&message.content),
+                    Object::Boolean(message.replace_last),
+                    Object::Boolean(message.history),
+                    Object::Boolean(message.append),
+                    message.id.clone(),
+                    Object::String(message.trigger.clone()),
+                ],
+            ));
+        }
+        if !self.showmode.is_empty() {
+            events.push(UiEvent::new("msg_showmode", vec![chunks(&self.showmode)]));
         }
         if let Some(state) = &self.cmdline {
-            events.push(UiEvent::new("cmdline_show", vec![
-                chunks(&state.content), integer(state.position), Object::String(state.first_char.clone()),
-                Object::String(state.prompt.clone()), integer(state.indent), integer(state.level),
-                Object::Integer(i64::try_from(state.hl_id).unwrap_or(i64::MAX)),
-            ]));
+            events.push(UiEvent::new(
+                "cmdline_show",
+                vec![
+                    chunks(&state.content),
+                    integer(state.position),
+                    Object::String(state.first_char.clone()),
+                    Object::String(state.prompt.clone()),
+                    integer(state.indent),
+                    integer(state.level),
+                    Object::Integer(i64::try_from(state.hl_id).unwrap_or(i64::MAX)),
+                ],
+            ));
         }
         if !self.cmdline_block.is_empty() {
-            events.push(UiEvent::new("cmdline_block_show", vec![Object::Array(
-                self.cmdline_block.iter().map(|line| chunks(line)).collect(),
-            )]));
+            events.push(UiEvent::new(
+                "cmdline_block_show",
+                vec![Object::Array(
+                    self.cmdline_block.iter().map(|line| chunks(line)).collect(),
+                )],
+            ));
         }
         if let Some(state) = &self.popupmenu {
-            events.push(UiEvent::new("popupmenu_show", vec![
-                Object::Array(state.items.iter().map(PopupItem::to_object).collect()),
-                Object::Integer(state.selected), integer(state.row), integer(state.col), Object::Integer(state.grid),
-            ]));
+            events.push(UiEvent::new(
+                "popupmenu_show",
+                vec![
+                    Object::Array(state.items.iter().map(PopupItem::to_object).collect()),
+                    Object::Integer(state.selected),
+                    integer(state.row),
+                    integer(state.col),
+                    Object::Integer(state.grid),
+                ],
+            ));
         }
         events
     }
