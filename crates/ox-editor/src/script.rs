@@ -13,8 +13,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use ox_eval::scope::ScopeMap;
 use ox_eval::Scope;
+use ox_eval::scope::ScopeMap;
 use ox_excmd::Parser as ExParser;
 
 /// Stable identifier assigned to one sourcing event.
@@ -81,21 +81,35 @@ fn unsupported(operation: &'static str) -> io::Error {
 pub trait FileIO {
     /// Reads a complete file as text. Invalid UTF-8 loses bytes to the
     /// replacement character, matching the editor's byte-tolerant default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the file cannot be read.
     fn read_to_string(&self, path: &Path) -> io::Result<String>;
     /// Reads a complete file without decoding it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the file cannot be read.
     fn read_bytes(&self, path: &Path) -> io::Result<Vec<u8>> {
         self.read_to_string(path).map(String::into_bytes)
     }
     /// Reads a range of bytes from a file.  A negative `offset` counts from
     /// the end, `size == -1` reads through end of file, and any other
     /// non-positive `size` yields an empty buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the requested file data cannot be read.
     fn read_bytes_range(&self, path: &Path, offset: i64, size: i64) -> io::Result<Vec<u8>> {
         let bytes = self.read_bytes(path)?;
-        let len = bytes.len() as i64;
         let start = if offset >= 0 {
-            (offset as usize).min(bytes.len())
+            usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(bytes.len())
         } else {
-            ((len + offset).max(0)) as usize
+            let distance = usize::try_from(offset.unsigned_abs()).unwrap_or(usize::MAX);
+            bytes.len().saturating_sub(distance)
         };
         if size <= 0 && size != -1 {
             return Ok(Vec::new());
@@ -103,13 +117,23 @@ pub trait FileIO {
         let end = if size == -1 {
             bytes.len()
         } else {
-            (start + size as usize).min(bytes.len())
+            let count = usize::try_from(size).unwrap_or(usize::MAX);
+            start.saturating_add(count).min(bytes.len())
         };
         Ok(bytes[start..end].to_vec())
     }
     /// Writes a complete file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the file cannot be written.
     fn write_string(&self, path: &Path, contents: &str) -> io::Result<()>;
     /// Writes bytes, optionally appending to an existing file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when writing fails or when this implementation
+    /// cannot represent `contents`.
     fn write_bytes(&self, path: &Path, contents: &[u8], append: bool) -> io::Result<()> {
         if append {
             return Err(unsupported("append is not supported by this FileIO"));
@@ -121,36 +145,77 @@ pub trait FileIO {
     /// Whether the path names a readable regular file.
     fn exists(&self, path: &Path) -> bool;
     /// Returns metadata, following links when requested.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when metadata is unavailable or unsupported.
     fn metadata(&self, _path: &Path, _follow_links: bool) -> io::Result<FileMetadata> {
         Err(unsupported("metadata is not supported by this FileIO"))
     }
     /// Lists a directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the directory cannot be enumerated.
     fn read_dir(&self, _path: &Path) -> io::Result<Vec<FileEntry>> {
-        Err(unsupported("directory enumeration is not supported by this FileIO"))
+        Err(unsupported(
+            "directory enumeration is not supported by this FileIO",
+        ))
     }
     /// Creates one directory or a complete parent chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the directory cannot be created.
     fn create_dir(&self, _path: &Path, _recursive: bool, _mode: u32) -> io::Result<()> {
-        Err(unsupported("directory creation is not supported by this FileIO"))
+        Err(unsupported(
+            "directory creation is not supported by this FileIO",
+        ))
     }
     /// Removes a file or symbolic link.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the file or symbolic link cannot be removed.
     fn remove_file(&self, _path: &Path) -> io::Result<()> {
         Err(unsupported("file removal is not supported by this FileIO"))
     }
     /// Removes an empty directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the directory cannot be removed.
     fn remove_dir(&self, _path: &Path) -> io::Result<()> {
-        Err(unsupported("directory removal is not supported by this FileIO"))
+        Err(unsupported(
+            "directory removal is not supported by this FileIO",
+        ))
     }
     /// Removes a directory tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the directory tree cannot be removed.
     fn remove_dir_all(&self, _path: &Path) -> io::Result<()> {
-        Err(unsupported("recursive removal is not supported by this FileIO"))
+        Err(unsupported(
+            "recursive removal is not supported by this FileIO",
+        ))
     }
     /// Renames a filesystem object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the filesystem object cannot be renamed.
     fn rename(&self, _from: &Path, _to: &Path) -> io::Result<()> {
         Err(unsupported("rename is not supported by this FileIO"))
     }
     /// Copies one regular file or symbolic link without following the link.
     /// The destination is created with the source's permission bits.  A
     /// symlink is recreated at the destination rather than copied through.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the source cannot be copied or the
+    /// destination cannot be created.
     fn copy_file(&self, _from: &Path, _to: &Path) -> io::Result<()> {
         Err(unsupported("file copy is not supported by this FileIO"))
     }
@@ -158,8 +223,14 @@ pub trait FileIO {
     /// fall back to the input path when canonicalization fails.
     fn canonicalize(&self, path: &Path) -> PathBuf;
     /// Replaces Unix permission bits (or readonly state on non-Unix hosts).
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the permissions cannot be changed.
     fn set_permissions(&self, _path: &Path, _mode: u32) -> io::Result<()> {
-        Err(unsupported("permission mutation is not supported by this FileIO"))
+        Err(unsupported(
+            "permission mutation is not supported by this FileIO",
+        ))
     }
 }
 
@@ -182,10 +253,11 @@ impl FileIO for RealFileIO {
         use std::os::unix::fs::FileTypeExt as _;
         let mut file = fs::File::open(path)?;
         let metadata = file.metadata()?;
-        let len = metadata.len() as i64;
+        let len = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
 
         #[cfg(unix)]
-        let is_special = metadata.file_type().is_char_device() || metadata.file_type().is_block_device();
+        let is_special =
+            metadata.file_type().is_char_device() || metadata.file_type().is_block_device();
         #[cfg(not(unix))]
         let is_special = false;
 
@@ -198,12 +270,12 @@ impl FileIO for RealFileIO {
 
         let pos = if offset != 0 {
             let whence = if offset >= 0 {
-                std::io::SeekFrom::Start(offset as u64)
+                std::io::SeekFrom::Start(offset.unsigned_abs())
             } else {
                 std::io::SeekFrom::End(offset)
             };
             match file.seek(whence) {
-                Ok(p) => p as i64,
+                Ok(p) => p,
                 Err(_) => return Ok(Vec::new()),
             }
         } else {
@@ -211,24 +283,39 @@ impl FileIO for RealFileIO {
         };
 
         let remaining = if is_special {
-            if size == -1 { 0 } else { size }
+            if size > 0 {
+                u64::try_from(size).unwrap_or(u64::MAX)
+            } else {
+                0
+            }
         } else {
-            let remaining = (len - pos).max(0);
-            if size == -1 { remaining } else { size.min(remaining) }
+            let available = metadata.len().saturating_sub(pos);
+            if size == -1 {
+                available
+            } else if size > 0 {
+                u64::try_from(size).unwrap_or(u64::MAX).min(available)
+            } else {
+                0
+            }
         };
 
-        if remaining <= 0 {
+        if remaining == 0 {
             return Ok(Vec::new());
         }
 
-        let count = remaining as usize;
+        let count = usize::try_from(remaining).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read range exceeds addressable memory",
+            )
+        })?;
         if is_special {
             let mut buf = vec![0; count];
             file.read_exact(&mut buf)?;
             Ok(buf)
         } else {
             let mut buf = Vec::with_capacity(count);
-            file.take(count as u64).read_to_end(&mut buf)?;
+            file.take(remaining).read_to_end(&mut buf)?;
             Ok(buf)
         }
     }
@@ -241,7 +328,11 @@ impl FileIO for RealFileIO {
         use std::io::Write as _;
         let mut options = fs::OpenOptions::new();
         options.write(true).create(true);
-        if append { options.append(true); } else { options.truncate(true); }
+        if append {
+            options.append(true);
+        } else {
+            options.truncate(true);
+        }
         options.open(path)?.write_all(contents)
     }
 
@@ -250,17 +341,38 @@ impl FileIO for RealFileIO {
     }
 
     fn metadata(&self, path: &Path, follow_links: bool) -> io::Result<FileMetadata> {
-        let metadata = if follow_links { fs::metadata(path)? } else { fs::symlink_metadata(path)? };
+        let metadata = if follow_links {
+            fs::metadata(path)?
+        } else {
+            fs::symlink_metadata(path)?
+        };
         let file_type = metadata.file_type();
-        let kind = if file_type.is_file() { FileKind::File }
-            else if file_type.is_dir() { FileKind::Directory }
-            else if file_type.is_symlink() { FileKind::Symlink }
-            else { FileKind::Other };
+        let kind = if file_type.is_file() {
+            FileKind::File
+        } else if file_type.is_dir() {
+            FileKind::Directory
+        } else if file_type.is_symlink() {
+            FileKind::Symlink
+        } else {
+            FileKind::Other
+        };
         #[cfg(unix)]
-        let mode = { use std::os::unix::fs::PermissionsExt as _; metadata.permissions().mode() };
+        let mode = {
+            use std::os::unix::fs::PermissionsExt as _;
+            metadata.permissions().mode()
+        };
         #[cfg(not(unix))]
-        let mode = if metadata.permissions().readonly() { 0o444 } else { 0o666 };
-        Ok(FileMetadata { kind, len: metadata.len(), modified: metadata.modified().ok(), mode })
+        let mode = if metadata.permissions().readonly() {
+            0o444
+        } else {
+            0o666
+        };
+        Ok(FileMetadata {
+            kind,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            mode,
+        })
     }
 
     fn set_permissions(&self, path: &Path, mode: u32) -> io::Result<()> {
@@ -278,29 +390,51 @@ impl FileIO for RealFileIO {
     }
 
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FileEntry>> {
-        fs::read_dir(path)?.map(|entry| entry.map(|entry| FileEntry { path: entry.path(), name: entry.file_name() })).collect()
+        fs::read_dir(path)?
+            .map(|entry| {
+                entry.map(|entry| FileEntry {
+                    path: entry.path(),
+                    name: entry.file_name(),
+                })
+            })
+            .collect()
     }
 
     fn create_dir(&self, path: &Path, recursive: bool, mode: u32) -> io::Result<()> {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(recursive);
         #[cfg(unix)]
-        { use std::os::unix::fs::DirBuilderExt as _; builder.mode(mode); }
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(mode);
+        }
         builder.create(path)
     }
 
-    fn remove_file(&self, path: &Path) -> io::Result<()> { fs::remove_file(path) }
-    fn remove_dir(&self, path: &Path) -> io::Result<()> { fs::remove_dir(path) }
-    fn remove_dir_all(&self, path: &Path) -> io::Result<()> { fs::remove_dir_all(path) }
-    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> { fs::rename(from, to) }
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
+    }
+    fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        fs::remove_dir(path)
+    }
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        fs::remove_dir_all(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
     fn copy_file(&self, from: &Path, to: &Path) -> io::Result<()> {
         // Recreate symbolic links rather than copying their target, matching
         // `vim_copyfile`'s `readlink` + `symlink` path (fileio.c:2774-2788).
         if let Ok(target) = fs::read_link(from) {
             #[cfg(unix)]
-            { return std::os::unix::fs::symlink(&target, to); }
+            {
+                return std::os::unix::fs::symlink(&target, to);
+            }
             #[cfg(not(unix))]
-            { let _ = target; }
+            {
+                let _ = target;
+            }
         }
         let mut source = fs::File::open(from)?;
         let metadata = source.metadata()?;
@@ -313,7 +447,10 @@ impl FileIO for RealFileIO {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(to, fs::Permissions::from_mode(metadata.permissions().mode()))?;
+            fs::set_permissions(
+                to,
+                fs::Permissions::from_mode(metadata.permissions().mode()),
+            )?;
         }
         #[cfg(not(unix))]
         {
@@ -385,7 +522,7 @@ fn heredoc_spec(line: &str) -> Result<Option<HeredocSpec<'_>>, (&'static str, St
             .unwrap_or(words.len());
         match &words[..modifier_end] {
             "trim" => trim = true,
-            "eval" => {},
+            "eval" => {}
             _ => break,
         }
         words = words[modifier_end..].trim_start_matches([' ', '\t']);
@@ -408,7 +545,10 @@ fn heredoc_spec(line: &str) -> Result<Option<HeredocSpec<'_>>, (&'static str, St
         marker
     };
     if kind == HeredocKind::Let && marker.as_bytes()[0].is_ascii_lowercase() {
-        return Err(("E221", "Marker cannot start with lower case letter".to_owned()));
+        return Err((
+            "E221",
+            "Marker cannot start with lower case letter".to_owned(),
+        ));
     }
     let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
     Ok(Some(HeredocSpec {
@@ -524,7 +664,13 @@ pub fn default_runtimepath(clean: bool, vimruntime: &Path) -> String {
             xdg_dir_list("XDG_DATA_DIRS", "/usr/local/share:/usr/share"),
         )
     };
-    build_runtimepath(config_home.as_deref(), &config_dirs, data_home.as_deref(), &data_dirs, vimruntime)
+    build_runtimepath(
+        config_home.as_deref(),
+        &config_dirs,
+        data_home.as_deref(),
+        &data_dirs,
+        vimruntime,
+    )
 }
 
 /// Assembles the 'runtimepath' entry list from resolved XDG pieces and
@@ -554,7 +700,18 @@ pub(crate) fn build_runtimepath(
     for dir in data_dirs {
         entries.push(joined(dir, &format!("{APPNAME}/site")));
     }
-    entries.push(vimruntime.to_string_lossy().trim_end_matches('/').to_owned());
+    // An unresolved runtime tree contributes no entry (an empty path
+    // would render as an empty comma-list item, which the option setter
+    // rejects at startup).
+    let raw_vimruntime = vimruntime.to_string_lossy();
+    let vimruntime = raw_vimruntime.trim_end_matches('/');
+    if !vimruntime.is_empty() {
+        entries.push(vimruntime.to_owned());
+    } else if raw_vimruntime.starts_with('/') {
+        // A root-only runtime (`/`, `//`) trims to nothing; keep the root
+        // instead of dropping the tree.
+        entries.push("/".to_owned());
+    }
     for dir in data_dirs.iter().rev() {
         entries.push(joined(dir, &format!("{APPNAME}/site/after")));
     }
@@ -586,9 +743,10 @@ fn xdg_home_dir(env: &str, fallback: &str) -> Option<String> {
 
 /// Resolves one colon-separated XDG list, dropping empty entries.
 fn xdg_dir_list(env: &str, fallback: &str) -> Vec<String> {
-    let raw = std::env::var_os(env)
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_else(|| fallback.to_owned());
+    let raw = std::env::var_os(env).map_or_else(
+        || fallback.to_owned(),
+        |value| value.to_string_lossy().into_owned(),
+    );
     raw.split(':')
         .filter(|entry| !entry.is_empty())
         .map(str::to_owned)
@@ -690,7 +848,10 @@ pub fn stdpath(what: StdPath) -> Vec<String> {
             xdg_home_dir("XDG_RUNTIME_DIR", "")
                 .filter(|dir| !dir.is_empty())
                 .unwrap_or_else(|| {
-                    std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_owned()
+                    std::env::temp_dir()
+                        .to_string_lossy()
+                        .trim_end_matches('/')
+                        .to_owned()
                 }),
         ],
         StdPath::ConfigDirs => xdg_dir_list("XDG_CONFIG_DIRS", "/etc/xdg")
@@ -756,6 +917,12 @@ impl<F: FileIO> ScriptCtx<F> {
             .filter(|entry| !entry.is_empty())
             .map(|entry| RuntimeRoot::new(PathBuf::from(entry)))
             .collect();
+    }
+
+    /// Copies runtime search roots from `other`, preserving search order and
+    /// intentional duplicates without sharing mutable sourcing state.
+    pub fn share_runtime_roots_from<G: FileIO>(&mut self, other: &ScriptCtx<G>) {
+        self.runtime_roots.clone_from(&other.runtime_roots);
     }
 
     /// Allocates a fresh SID for one sourcing event.
@@ -860,13 +1027,13 @@ impl<F: FileIO> ScriptCtx<F> {
     /// script being sourced.
     #[must_use]
     pub fn current_context(&self) -> SourceContext {
-        self.source_stack.last().map_or_else(SourceContext::default, |frame| {
-            SourceContext {
+        self.source_stack
+            .last()
+            .map_or_else(SourceContext::default, |frame| SourceContext {
                 sid: frame.sid,
                 seq: frame.seq,
                 lnum: frame.definition_line.saturating_add(frame.current_line),
-            }
-        })
+            })
     }
 
     /// The display name of the current script or line context.
@@ -970,6 +1137,10 @@ impl<F: FileIO> ScriptCtx<F> {
     }
 
     /// Reads a script through the IO seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the script cannot be read.
     pub fn read_script(&self, path: &Path) -> io::Result<String> {
         self.io.read_to_string(path)
     }
@@ -977,7 +1148,7 @@ impl<F: FileIO> ScriptCtx<F> {
     /// Synchronizes the visible `s:` scope into `scope.script` for the SID.
     pub fn load_script_scope(&self, sid: Sid, scope: &mut Scope) {
         if let Some(vars) = self.script_vars(sid) {
-            scope.script = vars.clone();
+            scope.script.clone_from(vars);
         } else {
             scope.script = ScopeMap::new();
         }
@@ -1005,6 +1176,11 @@ impl<F: FileIO> ScriptCtx<F> {
     ///   `EOL_DOS`, and that whole branch sits under `#ifdef USE_CRNL`, which
     ///   is a Windows-only define — so on this platform a sourced
     ///   `let g:v = 4<CR>` keeps its CR and reaches `eval0` as E488.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScriptError`] for malformed heredoc syntax, a missing
+    /// `let` heredoc end marker, or a logical line exceeding the size limit.
     pub fn join_logical_lines(&self, text: &str) -> Result<Vec<LogicalLine>, ScriptError> {
         let physical = text.split('\n').collect::<Vec<_>>();
         let mut logical: Vec<LogicalLine> = Vec::new();
@@ -1028,49 +1204,9 @@ impl<F: FileIO> ScriptCtx<F> {
             if let Some(spec) = spec {
                 let mut joined = content.trim_end_matches([' ', '\t']).to_owned();
                 joined.push('\n');
-                let mut text_indent: Option<&str> = None;
-                let mut found_marker = false;
-                index += 1;
-                while index < physical.len() {
-                    let body = physical[index];
-                    if body.is_empty() && index + 1 == physical.len() && text.ends_with('\n') {
-                        break;
-                    }
-                    let marker_line = if spec.trim {
-                        body.strip_prefix(spec.command_indent).unwrap_or(body)
-                    } else {
-                        body
-                    };
-                    if marker_line == spec.marker {
-                        found_marker = true;
-                        index += 1;
-                        break;
-                    }
-                    if spec.trim && text_indent.is_none() && !body.is_empty() {
-                        let indent_len = body
-                            .find(|character: char| !character.is_ascii_whitespace())
-                            .unwrap_or(body.len());
-                        text_indent = Some(&body[..indent_len]);
-                    }
-                    let body = text_indent.map_or(body, |indent| {
-                        let matching = body
-                            .bytes()
-                            .zip(indent.bytes())
-                            .take_while(|(left, right)| left == right)
-                            .count();
-                        &body[matching..]
-                    });
-                    if joined.len().saturating_add(body.len()).saturating_add(1) > MAX_LOGICAL_LINE {
-                        return Err(ScriptError {
-                            code: "E1389",
-                            message: "continued line too long".to_owned(),
-                            line: Some(index.saturating_add(1)),
-                        });
-                    }
-                    joined.push_str(body);
-                    joined.push('\n');
-                    index += 1;
-                }
+                let (joined, next_index, found_marker) =
+                    Self::consume_heredoc(&physical, index + 1, &spec, joined)?;
+                index = next_index;
                 if !found_marker && spec.kind == HeredocKind::Let {
                     return Err(ScriptError {
                         code: "E990",
@@ -1078,7 +1214,10 @@ impl<F: FileIO> ScriptCtx<F> {
                         line: Some(number),
                     });
                 }
-                logical.push(LogicalLine { text: joined, first_line: number });
+                logical.push(LogicalLine {
+                    text: joined,
+                    first_line: number,
+                });
                 continue;
             }
 
@@ -1119,6 +1258,63 @@ impl<F: FileIO> ScriptCtx<F> {
             index += 1;
         }
         Ok(logical)
+    }
+
+    /// Consumes heredoc body lines after the spec line, returning the joined
+    /// text, the line index just past the heredoc, and whether the end marker
+    /// was found.
+    fn consume_heredoc(
+        physical: &[&str],
+        mut index: usize,
+        spec: &HeredocSpec<'_>,
+        mut joined: String,
+    ) -> Result<(String, usize, bool), ScriptError> {
+        let mut text_indent: Option<&str> = None;
+        let mut found_marker = false;
+        while index < physical.len() {
+            let body = physical[index];
+            if body.is_empty()
+                && index + 1 == physical.len()
+                && physical.last().is_some_and(|last| last.is_empty())
+            {
+                break;
+            }
+            let marker_line = if spec.trim {
+                body.strip_prefix(spec.command_indent).unwrap_or(body)
+            } else {
+                body
+            };
+            if marker_line == spec.marker {
+                found_marker = true;
+                index += 1;
+                break;
+            }
+            if spec.trim && text_indent.is_none() && !body.is_empty() {
+                let indent_len = body
+                    .find(|character: char| !character.is_ascii_whitespace())
+                    .unwrap_or(body.len());
+                text_indent = Some(&body[..indent_len]);
+            }
+            let body = text_indent.map_or(body, |indent| {
+                let matching = body
+                    .bytes()
+                    .zip(indent.bytes())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                &body[matching..]
+            });
+            if joined.len().saturating_add(body.len()).saturating_add(1) > MAX_LOGICAL_LINE {
+                return Err(ScriptError {
+                    code: "E1389",
+                    message: "continued line too long".to_owned(),
+                    line: Some(index.saturating_add(1)),
+                });
+            }
+            joined.push_str(body);
+            joined.push('\n');
+            index += 1;
+        }
+        Ok((joined, index, found_marker))
     }
 
     /// Renders the current source stack into an upstream-style throwpoint

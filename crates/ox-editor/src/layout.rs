@@ -6,6 +6,7 @@
 //! rather than numbers, remain the persistent identity.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use ox_text::Position;
 use ox_types::{BufHandle, Dict, WinHandle};
@@ -26,6 +27,12 @@ pub struct Geometry {
 
 impl Geometry {
     /// Creates a non-empty screen region.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::InvalidDimensions`] when `width` or `height`
+    /// is zero, or [`LayoutError::GeometryOverflow`] when `row + height` or
+    /// `col + width` would exceed `usize`.
     pub fn new(row: usize, col: usize, width: usize, height: usize) -> Result<Self, LayoutError> {
         if width == 0 || height == 0 {
             return Err(LayoutError::InvalidDimensions { width, height });
@@ -47,6 +54,8 @@ impl Geometry {
 pub struct WindowState {
     /// Buffer displayed by the window.
     pub buffer: BufHandle,
+    /// Most recent buffer displayed before the current one.
+    pub alternate_buffer: Option<BufHandle>,
     /// Cursor position in the buffer.
     pub cursor: Position,
     /// One-based first buffer line displayed by the window.
@@ -60,6 +69,12 @@ pub struct WindowState {
     /// Upstream `pos_T.coladd`: virtual cells past the cursor's character,
     /// used by `'virtualedit'`.
     pub coladd: i64,
+    /// Window-local working directory set by `:lcd` (`w_localdir`); `None`
+    /// means the window follows the global directory.
+    pub local_directory: Option<PathBuf>,
+    /// Previous directory for this window's `lcd -` (`w_prevdir`); `None`
+    /// when no `:lcd` has recorded one yet.
+    pub previous_directory: Option<PathBuf>,
 }
 
 impl WindowState {
@@ -68,22 +83,34 @@ impl WindowState {
     pub fn new(buffer: BufHandle, cursor: Position) -> Self {
         Self {
             buffer,
+            alternate_buffer: None,
             cursor,
             topline: 1,
             curswant: 0,
             set_curswant: true,
             coladd: 0,
+            local_directory: None,
+            previous_directory: None,
         }
     }
 }
 
-/// API-visible state that does not affect window layout topology.
+/// Per-window API state: window-local variables, match items, and tag stack.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowApiState {
     /// Window-local variables in insertion order.
     variables: Dict,
+    /// Bumped by every variable writer; the differential Ex-variable sync
+    /// skips re-reading an unchanged map.
+    variables_version: u64,
     /// Highlight namespace selected for this window.
     highlight_namespace: i64,
+    /// Match highlighting items (`match.c` `w_match_head`).
+    matches: Vec<crate::builtins::matches::MatchItem>,
+    /// Next auto-assigned match ID (`w_next_match_id`).
+    next_match_id: i64,
+    /// Per-window tag stack (`w_tagstack`).
+    tag_stack: crate::tags::TagStack,
 }
 
 impl WindowApiState {
@@ -91,6 +118,10 @@ impl WindowApiState {
         Self {
             variables: Dict(Vec::new()),
             highlight_namespace: 0,
+            matches: Vec::new(),
+            next_match_id: 1000,
+            tag_stack: crate::tags::TagStack::new(),
+            variables_version: 1,
         }
     }
 
@@ -101,8 +132,15 @@ impl WindowApiState {
     }
 
     /// Returns mutable window-local variables.
-    pub const fn variables_mut(&mut self) -> &mut Dict {
+    pub fn variables_mut(&mut self) -> &mut Dict {
+        self.variables_version = self.variables_version.wrapping_add(1);
         &mut self.variables
+    }
+
+    /// Returns the variable-map version used by the differential sync.
+    #[must_use]
+    pub const fn variables_version(&self) -> u64 {
+        self.variables_version
     }
 
     /// Returns the selected highlight namespace.
@@ -114,6 +152,39 @@ impl WindowApiState {
     /// Selects the highlight namespace without attempting to render it.
     pub fn set_highlight_namespace(&mut self, namespace: i64) {
         self.highlight_namespace = namespace;
+    }
+
+    /// Returns the match items for this window.
+    #[must_use]
+    pub(crate) fn matches(&self) -> &[crate::builtins::matches::MatchItem] {
+        &self.matches
+    }
+
+    /// Returns mutable access to the match items.
+    pub(crate) fn matches_mut(&mut self) -> &mut Vec<crate::builtins::matches::MatchItem> {
+        &mut self.matches
+    }
+
+    /// Returns the next auto-assigned match ID.
+    #[must_use]
+    pub const fn next_match_id(&self) -> i64 {
+        self.next_match_id
+    }
+
+    /// Sets the next auto-assigned match ID.
+    pub fn set_next_match_id(&mut self, id: i64) {
+        self.next_match_id = id;
+    }
+
+    /// Returns the window tag stack.
+    #[must_use]
+    pub const fn tag_stack(&self) -> &crate::tags::TagStack {
+        &self.tag_stack
+    }
+
+    /// Returns a mutable window tag stack.
+    pub const fn tag_stack_mut(&mut self) -> &mut crate::tags::TagStack {
+        &mut self.tag_stack
     }
 }
 
@@ -236,6 +307,13 @@ pub struct Layout {
 
 impl Layout {
     /// Creates a layout containing one tiled window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::CurrentWindow`] when `window` is
+    /// [`WinHandle::CURRENT`], [`LayoutError::InvalidDimensions`] when the
+    /// geometry has a zero extent, or [`LayoutError::GeometryOverflow`] when
+    /// the geometry leaves the coordinate space.
     pub fn new(
         window: WinHandle,
         state: WindowState,
@@ -273,6 +351,11 @@ impl Layout {
 
     /// Makes a tiled window current. [`WinHandle::CURRENT`] resolves to the
     /// already-current window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window has no
+    /// leaf in the layout.
     pub fn set_current(&mut self, window: WinHandle) -> Result<(), LayoutError> {
         let resolved = self.resolve(window);
         if find_leaf(&self.root, resolved).is_none() {
@@ -283,6 +366,11 @@ impl Layout {
     }
 
     /// Returns immutable state for a tiled window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window has no
+    /// leaf in the layout.
     pub fn window(&self, window: WinHandle) -> Result<&WindowState, LayoutError> {
         let resolved = self.resolve(window);
         find_leaf(&self.root, resolved)
@@ -291,6 +379,11 @@ impl Layout {
     }
 
     /// Returns mutable state for a tiled window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window has no
+    /// leaf in the layout.
     pub fn window_mut(&mut self, window: WinHandle) -> Result<&mut WindowState, LayoutError> {
         let resolved = self.resolve(window);
         find_leaf_mut(&mut self.root, resolved)
@@ -299,6 +392,24 @@ impl Layout {
     }
 
     /// Returns the assigned geometry for a tiled window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window has no
+    /// leaf in the layout.
+    /// The whole layout's frame geometry (the screen area this tabpage
+    /// owns); `:resize` uses its height as upstream uses `Rows`.
+    #[must_use]
+    pub const fn size(&self) -> Geometry {
+        self.root.geometry()
+    }
+
+    /// Returns a window's geometry from the layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the window is not part
+    /// of this layout.
     pub fn window_geometry(&self, window: WinHandle) -> Result<Geometry, LayoutError> {
         let resolved = self.resolve(window);
         find_leaf(&self.root, resolved)
@@ -307,21 +418,29 @@ impl Layout {
     }
 
     /// Returns a window's stable one-based preorder number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window has no
+    /// leaf in the layout.
     pub fn winnr(&self, window: WinHandle) -> Result<usize, LayoutError> {
         let resolved = self.resolve(window);
         let mut next = 1;
-        preorder_number(&self.root, resolved, &mut next)
-            .ok_or(LayoutError::UnknownWindow(resolved))
+        preorder_number(&self.root, resolved, &mut next).ok_or(LayoutError::UnknownWindow(resolved))
     }
 
     /// Resolves a one-based preorder number to a stable handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindowNumber`] when `winnr` is zero or
+    /// exceeds the number of tiled windows.
     pub fn window_by_winnr(&self, winnr: usize) -> Result<WinHandle, LayoutError> {
         if winnr == 0 {
             return Err(LayoutError::UnknownWindowNumber(winnr));
         }
         let mut next = 1;
-        preorder_window(&self.root, winnr, &mut next)
-            .ok_or(LayoutError::UnknownWindowNumber(winnr))
+        preorder_window(&self.root, winnr, &mut next).ok_or(LayoutError::UnknownWindowNumber(winnr))
     }
 
     /// Returns tiled window handles in preorder.
@@ -333,49 +452,120 @@ impl Layout {
     }
 
     /// Splits `target` vertically, placing `window` to its right.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::CurrentWindow`] when `window` is
+    /// [`WinHandle::CURRENT`], [`LayoutError::DuplicateWindow`] when it is
+    /// already tiled, [`LayoutError::UnknownWindow`] when `target` cannot be
+    /// resolved or found, [`LayoutError::InsufficientSpace`] when the target
+    /// extent is below two cells, or an equalization failure
+    /// ([`LayoutError::InvalidDimensions`], [`LayoutError::InsufficientSpace`],
+    /// or [`LayoutError::GeometryOverflow`]) when the split cannot fill the
+    /// root rectangle.
     pub fn split_vertical(
         &mut self,
         target: WinHandle,
         window: WinHandle,
         state: WindowState,
+        enter: bool,
     ) -> Result<(), LayoutError> {
-        self.split(target, window, state, SplitAxis::Vertical)
+        self.split(target, window, state, SplitAxis::Vertical, enter)
     }
 
     /// Splits `target` horizontally, placing `window` below it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::CurrentWindow`] when `window` is
+    /// [`WinHandle::CURRENT`], [`LayoutError::DuplicateWindow`] when it is
+    /// already tiled, [`LayoutError::UnknownWindow`] when `target` cannot be
+    /// resolved or found, [`LayoutError::InsufficientSpace`] when the target
+    /// extent is below two cells, or an equalization failure
+    /// ([`LayoutError::InvalidDimensions`], [`LayoutError::InsufficientSpace`],
+    /// or [`LayoutError::GeometryOverflow`]) when the split cannot fill the
+    /// root rectangle.
     pub fn split_horizontal(
         &mut self,
         target: WinHandle,
         window: WinHandle,
         state: WindowState,
+        enter: bool,
     ) -> Result<(), LayoutError> {
-        self.split(target, window, state, SplitAxis::Horizontal)
+        self.split(target, window, state, SplitAxis::Horizontal, enter)
     }
 
     /// Splits `target` vertically, placing `window` to its left.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::CurrentWindow`] when `window` is
+    /// [`WinHandle::CURRENT`], [`LayoutError::DuplicateWindow`] when it is
+    /// already tiled, [`LayoutError::UnknownWindow`] when `target` cannot be
+    /// resolved or found, [`LayoutError::InsufficientSpace`] when the target
+    /// extent is below two cells, or an equalization failure
+    /// ([`LayoutError::InvalidDimensions`], [`LayoutError::InsufficientSpace`],
+    /// or [`LayoutError::GeometryOverflow`]) when the split cannot fill the
+    /// root rectangle.
     pub fn split_left(
         &mut self,
         target: WinHandle,
         window: WinHandle,
         state: WindowState,
+        enter: bool,
     ) -> Result<(), LayoutError> {
-        self.split_placed(target, window, state, SplitAxis::Vertical, SplitPlacement::Before)
+        self.split_placed(
+            target,
+            window,
+            state,
+            SplitAxis::Vertical,
+            SplitPlacement::Before,
+            enter,
+        )
     }
 
     /// Splits `target` horizontally, placing `window` above it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::CurrentWindow`] when `window` is
+    /// [`WinHandle::CURRENT`], [`LayoutError::DuplicateWindow`] when it is
+    /// already tiled, [`LayoutError::UnknownWindow`] when `target` cannot be
+    /// resolved or found, [`LayoutError::InsufficientSpace`] when the target
+    /// extent is below two cells, or an equalization failure
+    /// ([`LayoutError::InvalidDimensions`], [`LayoutError::InsufficientSpace`],
+    /// or [`LayoutError::GeometryOverflow`]) when the split cannot fill the
+    /// root rectangle.
     pub fn split_above(
         &mut self,
         target: WinHandle,
         window: WinHandle,
         state: WindowState,
+        enter: bool,
     ) -> Result<(), LayoutError> {
-        self.split_placed(target, window, state, SplitAxis::Horizontal, SplitPlacement::Before)
+        self.split_placed(
+            target,
+            window,
+            state,
+            SplitAxis::Horizontal,
+            SplitPlacement::Before,
+            enter,
+        )
     }
 
     /// Closes a tiled window and collapses redundant containers.
     ///
     /// When the current window closes, the window that takes its old preorder
     /// position becomes current, or the preceding window when it was last.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window has no
+    /// leaf, [`LayoutError::LastWindow`] when it is the only tiled window, or
+    /// an equalization failure ([`LayoutError::InvalidDimensions`],
+    /// [`LayoutError::InsufficientSpace`], or
+    /// [`LayoutError::GeometryOverflow`]) when the remaining tree cannot fill
+    /// the root rectangle.
     pub fn close(&mut self, window: WinHandle) -> Result<WindowState, LayoutError> {
         let resolved = self.resolve(window);
         let old_order = self.windows();
@@ -395,8 +585,8 @@ impl Layout {
             .ok_or(LayoutError::LastWindow)?;
 
         let geometry = self.root.geometry();
-        let removed = remove_leaf(&mut self.root, resolved)
-            .ok_or(LayoutError::UnknownWindow(resolved))?;
+        let removed =
+            remove_leaf(&mut self.root, resolved).ok_or(LayoutError::UnknownWindow(resolved))?;
         collapse_containers(&mut self.root);
         equalize_frame(&mut self.root, geometry)?;
 
@@ -407,15 +597,29 @@ impl Layout {
     }
 
     /// Changes one tiled window's width while preserving the root rectangle.
-    pub fn set_window_width(
-        &mut self,
-        window: WinHandle,
-        width: usize,
-    ) -> Result<(), LayoutError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window has no
+    /// leaf, [`LayoutError::InvalidDimensions`] when `width` is zero,
+    /// [`LayoutError::InvalidWindowExtent`] when `width` is below the window's
+    /// minimum extent or exceeds the space its siblings need, or
+    /// [`LayoutError::GeometryOverflow`] when redistribution arithmetic
+    /// overflows.
+    pub fn set_window_width(&mut self, window: WinHandle, width: usize) -> Result<(), LayoutError> {
         self.set_window_extent(window, width, SplitAxis::Vertical)
     }
 
     /// Changes one tiled window's height while preserving the root rectangle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window has no
+    /// leaf, [`LayoutError::InvalidDimensions`] when `height` is zero,
+    /// [`LayoutError::InvalidWindowExtent`] when `height` is below the window's
+    /// minimum extent or exceeds the space its siblings need, or
+    /// [`LayoutError::GeometryOverflow`] when redistribution arithmetic
+    /// overflows.
     pub fn set_window_height(
         &mut self,
         window: WinHandle,
@@ -425,11 +629,25 @@ impl Layout {
     }
 
     /// Changes the root rectangle and equalizes every split below it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::InvalidDimensions`] when the geometry has a zero
+    /// extent, [`LayoutError::GeometryOverflow`] when it leaves the coordinate
+    /// space, or [`LayoutError::InsufficientSpace`] when the new rectangle
+    /// cannot give every leaf at least one cell.
     pub fn resize(&mut self, geometry: Geometry) -> Result<(), LayoutError> {
         equalize_frame(&mut self.root, geometry)
     }
 
     /// Redistributes every split equally within the current root rectangle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::InvalidDimensions`],
+    /// [`LayoutError::InsufficientSpace`], or
+    /// [`LayoutError::GeometryOverflow`] when the tree cannot be validated
+    /// against its current root rectangle.
     pub fn equalize(&mut self) -> Result<(), LayoutError> {
         let geometry = self.root.geometry();
         equalize_frame(&mut self.root, geometry)
@@ -457,8 +675,16 @@ impl Layout {
         };
         if extent == 0 {
             return Err(LayoutError::InvalidDimensions {
-                width: if matches!(axis, SplitAxis::Vertical) { 0 } else { geometry.width },
-                height: if matches!(axis, SplitAxis::Horizontal) { 0 } else { geometry.height },
+                width: if matches!(axis, SplitAxis::Vertical) {
+                    0
+                } else {
+                    geometry.width
+                },
+                height: if matches!(axis, SplitAxis::Horizontal) {
+                    0
+                } else {
+                    geometry.height
+                },
             });
         }
         if extent == current {
@@ -480,8 +706,9 @@ impl Layout {
         window: WinHandle,
         state: WindowState,
         axis: SplitAxis,
+        enter: bool,
     ) -> Result<(), LayoutError> {
-        self.split_placed(target, window, state, axis, SplitPlacement::After)
+        self.split_placed(target, window, state, axis, SplitPlacement::After, enter)
     }
 
     fn split_placed(
@@ -491,6 +718,7 @@ impl Layout {
         state: WindowState,
         axis: SplitAxis,
         placement: SplitPlacement,
+        enter: bool,
     ) -> Result<(), LayoutError> {
         validate_identity(window)?;
         if find_leaf(&self.root, window).is_some() {
@@ -521,7 +749,12 @@ impl Layout {
         // already inside a row of columns is inserted into that row, so
         // equalization divides every sibling on the same axis. When no
         // same-axis container exists, wrap the leaf in a fresh one.
-        if let Err(new_leaf) = insert_into_matching_container(&mut self.root, target, new_leaf, axis, placement) {
+        if let Err(new_leaf) =
+            insert_into_matching_container(&mut self.root, target, new_leaf, axis, placement)
+        {
+            // The helper hands back the leaf it could not place; unbox it so the
+            // wrap paths below move it exactly as before.
+            let new_leaf = *new_leaf;
             let old_leaf = find_leaf_mut(&mut self.root, target)
                 .ok_or(LayoutError::UnknownWindow(target))?
                 .clone();
@@ -547,7 +780,9 @@ impl Layout {
         }
         let geometry = self.root.geometry();
         equalize_frame(&mut self.root, geometry)?;
-        self.current = window;
+        if enter {
+            self.current = window;
+        }
         Ok(())
     }
 }
@@ -677,6 +912,12 @@ pub struct WinConfig {
 
 impl WinConfig {
     /// Creates a valid floating-window configuration with no decoration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::InvalidDimensions`] when `width` or `height` is
+    /// zero, or [`LayoutError::InvalidCoordinate`] when `row` or `col` is not
+    /// finite.
     pub fn new(
         relative: RelativeTo,
         anchor: Anchor,
@@ -708,6 +949,12 @@ impl WinConfig {
     }
 
     /// Revalidates fields after direct configuration changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::InvalidDimensions`] when `width` or `height` is
+    /// zero, or [`LayoutError::InvalidCoordinate`] when `row` or `col` is not
+    /// finite.
     pub fn validate(&self) -> Result<(), LayoutError> {
         if self.width == 0 || self.height == 0 {
             return Err(LayoutError::InvalidDimensions {
@@ -740,7 +987,11 @@ pub struct TabpageState {
     floats: Vec<FloatingWindow>,
     window_api: BTreeMap<WinHandle, WindowApiState>,
     variables: Dict,
+    /// Bumped by every variable writer; the differential Ex-variable sync
+    /// skips re-reading an unchanged map.
+    variables_version: u64,
     current: WinHandle,
+    previous: Option<WinHandle>,
 }
 
 impl TabpageState {
@@ -758,7 +1009,9 @@ impl TabpageState {
             floats: Vec::new(),
             window_api,
             variables: Dict(Vec::new()),
+            variables_version: 1,
             current,
+            previous: None,
         }
     }
 
@@ -769,8 +1022,15 @@ impl TabpageState {
     }
 
     /// Returns mutable tabpage-local variables.
-    pub const fn variables_mut(&mut self) -> &mut Dict {
+    pub fn variables_mut(&mut self) -> &mut Dict {
+        self.variables_version = self.variables_version.wrapping_add(1);
         &mut self.variables
+    }
+
+    /// Returns the variable-map version used by the differential sync.
+    #[must_use]
+    pub const fn variables_version(&self) -> u64 {
+        self.variables_version
     }
 
     /// Returns tiled windows in preorder followed by floating windows in z-order.
@@ -782,6 +1042,11 @@ impl TabpageState {
     }
 
     /// Returns API-visible state for a tiled or floating window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window is
+    /// neither tiled nor floating.
     pub fn window_api_state(&self, window: WinHandle) -> Result<&WindowApiState, LayoutError> {
         let resolved = self.resolve(window);
         self.window_api
@@ -790,6 +1055,11 @@ impl TabpageState {
     }
 
     /// Returns mutable API-visible state for a tiled or floating window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window is
+    /// neither tiled nor floating.
     pub fn window_api_state_mut(
         &mut self,
         window: WinHandle,
@@ -801,6 +1071,17 @@ impl TabpageState {
     }
 
     /// Returns assigned content geometry for a tiled or floating window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window is
+    /// neither tiled nor floating, [`LayoutError::FloatingReferenceCycle`]
+    /// when its float reference chain is cyclic,
+    /// [`LayoutError::InvalidCoordinate`] when the configuration carries a
+    /// non-finite row or column, [`LayoutError::InvalidResolvedPosition`] when
+    /// the resolved content origin is negative, or
+    /// [`LayoutError::GeometryOverflow`] when origin arithmetic or the final
+    /// position exceeds the coordinate domain.
     pub fn window_geometry(&self, window: WinHandle) -> Result<Geometry, LayoutError> {
         let resolved = self.resolve(window);
         if let Ok(geometry) = self.layout.window_geometry(resolved) {
@@ -809,7 +1090,33 @@ impl TabpageState {
         self.resolve_window_geometry(resolved, 0)
     }
 
+    /// Returns the renderable text rows for a tiled window.
+    ///
+    /// This excludes the message row and split statusline that the compositor
+    /// reserves from the layout frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] for a non-tiled window.
+    pub fn tiled_window_text_height(&self, window: WinHandle) -> Result<usize, LayoutError> {
+        let geometry = self.layout.window_geometry(self.resolve(window))?;
+        let root = self.layout.root.geometry();
+        // The work area ends at the root's absolute bottom row (exclusive),
+        // less the message row. `height` alone is relative to the screen,
+        // so a root below row zero would truncate every window under it.
+        let work_bottom = root.row.saturating_add(root.height).saturating_sub(1);
+        let statusline = usize::from(self.layout.window_count() > 1);
+        let frame_end = geometry.row.saturating_add(geometry.height);
+        let content_end = frame_end.min(work_bottom).saturating_sub(statusline);
+        Ok(content_end.saturating_sub(geometry.row).max(1))
+    }
+
     /// Returns floating configuration, or `None` for a tiled window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window is
+    /// neither tiled nor floating.
     pub fn window_config(&self, window: WinHandle) -> Result<Option<&WinConfig>, LayoutError> {
         let resolved = self.resolve(window);
         if let Some(window) = self
@@ -824,6 +1131,13 @@ impl TabpageState {
     }
 
     /// Updates an existing floating window configuration and restores z-order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::InvalidDimensions`] or
+    /// [`LayoutError::InvalidCoordinate`] when `config` fails validation, or
+    /// [`LayoutError::UnknownWindow`] when the resolved window is not
+    /// floating.
     pub fn set_window_config(
         &mut self,
         window: WinHandle,
@@ -842,11 +1156,15 @@ impl TabpageState {
     }
 
     /// Changes a tiled or floating window's width.
-    pub fn set_window_width(
-        &mut self,
-        window: WinHandle,
-        width: usize,
-    ) -> Result<(), LayoutError> {
+    ///
+    /// # Errors
+    ///
+    /// For a floating window, returns [`LayoutError::InvalidDimensions`] when
+    /// `width` is zero. For a tiled window, returns
+    /// [`LayoutError::UnknownWindow`], [`LayoutError::InvalidDimensions`],
+    /// [`LayoutError::InvalidWindowExtent`], or
+    /// [`LayoutError::GeometryOverflow`] as propagated by the tiled layout.
+    pub fn set_window_width(&mut self, window: WinHandle, width: usize) -> Result<(), LayoutError> {
         let resolved = self.resolve(window);
         if let Some(floating) = self
             .floats
@@ -863,6 +1181,14 @@ impl TabpageState {
     }
 
     /// Changes a tiled or floating window's height.
+    ///
+    /// # Errors
+    ///
+    /// For a floating window, returns [`LayoutError::InvalidDimensions`] when
+    /// `height` is zero. For a tiled window, returns
+    /// [`LayoutError::UnknownWindow`], [`LayoutError::InvalidDimensions`],
+    /// [`LayoutError::InvalidWindowExtent`], or
+    /// [`LayoutError::GeometryOverflow`] as propagated by the tiled layout.
     pub fn set_window_height(
         &mut self,
         window: WinHandle,
@@ -895,13 +1221,25 @@ impl TabpageState {
         self.current
     }
 
+    /// Returns the previous window in this tabpage.
+    #[must_use]
+    pub const fn previous_window(&self) -> Option<WinHandle> {
+        self.previous
+    }
+
     /// Returns floating windows from lowest to highest z-index. Equal z-index
     /// windows remain in insertion order.
+    #[must_use]
     pub fn floating_windows(&self) -> impl ExactSizeIterator<Item = &FloatingWindow> {
         self.floats.iter()
     }
 
     /// Returns state for a tiled or floating window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window is
+    /// neither tiled nor floating.
     pub fn window(&self, window: WinHandle) -> Result<&WindowState, LayoutError> {
         let resolved = self.resolve(window);
         if let Some(float) = self
@@ -915,6 +1253,11 @@ impl TabpageState {
     }
 
     /// Returns mutable state for a tiled or floating window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window is
+    /// neither tiled nor floating.
     pub fn window_mut(&mut self, window: WinHandle) -> Result<&mut WindowState, LayoutError> {
         let resolved = self.resolve(window);
         if let Some(index) = self
@@ -928,6 +1271,11 @@ impl TabpageState {
     }
 
     /// Makes a tiled or floating window current.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window is not
+    /// floating and has no leaf in the tiled layout.
     pub fn set_current(&mut self, window: WinHandle) -> Result<(), LayoutError> {
         let resolved = self.resolve(window);
         if self
@@ -935,15 +1283,29 @@ impl TabpageState {
             .iter()
             .any(|candidate| candidate.window == resolved)
         {
-            self.current = resolved;
+            if self.current != resolved {
+                self.previous = Some(self.current);
+                self.current = resolved;
+            }
             return Ok(());
         }
         self.layout.set_current(resolved)?;
-        self.current = resolved;
+        if self.current != resolved {
+            self.previous = Some(self.current);
+            self.current = resolved;
+        }
         Ok(())
     }
 
     /// Adds a floating window while preserving stable z-index ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::CurrentWindow`] when `window` is
+    /// [`WinHandle::CURRENT`], [`LayoutError::InvalidDimensions`] or
+    /// [`LayoutError::InvalidCoordinate`] when `config` fails validation, or
+    /// [`LayoutError::DuplicateWindow`] when the window already exists in
+    /// this tabpage.
     pub fn add_float(
         &mut self,
         window: WinHandle,
@@ -976,6 +1338,11 @@ impl TabpageState {
     }
 
     /// Removes a floating window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window is not
+    /// floating.
     pub fn remove_float(&mut self, window: WinHandle) -> Result<FloatingWindow, LayoutError> {
         let resolved = self.resolve(window);
         let index = self
@@ -985,6 +1352,9 @@ impl TabpageState {
             .ok_or(LayoutError::UnknownWindow(resolved))?;
         let removed = self.floats.remove(index);
         self.window_api.remove(&resolved);
+        if self.previous == Some(resolved) {
+            self.previous = None;
+        }
         if self.current == resolved {
             self.current = self.layout.current_window();
         }
@@ -992,10 +1362,23 @@ impl TabpageState {
     }
 
     /// Closes a tiled window and keeps the tabpage current window valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when the resolved window is not
+    /// tiled (a floating window is not closed by this method),
+    /// [`LayoutError::LastWindow`] when it is the only tiled window, or an
+    /// equalization failure ([`LayoutError::InvalidDimensions`],
+    /// [`LayoutError::InsufficientSpace`], or
+    /// [`LayoutError::GeometryOverflow`]) when the remaining tree cannot fill
+    /// the root rectangle.
     pub fn close_tiled(&mut self, window: WinHandle) -> Result<WindowState, LayoutError> {
         let resolved = self.resolve(window);
         let removed = self.layout.close(resolved)?;
         self.window_api.remove(&resolved);
+        if self.previous == Some(resolved) {
+            self.previous = None;
+        }
         if self.current == resolved {
             self.current = self.layout.current_window();
         }
@@ -1003,83 +1386,157 @@ impl TabpageState {
     }
 
     /// Splits a tiled window vertically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::CurrentWindow`] when `window` is
+    /// [`WinHandle::CURRENT`], [`LayoutError::DuplicateWindow`] when it is
+    /// already tiled or floating, [`LayoutError::UnknownWindow`] when
+    /// `target` cannot be resolved or found, [`LayoutError::InsufficientSpace`]
+    /// when the target extent is below two cells, or an equalization failure
+    /// ([`LayoutError::InvalidDimensions`], [`LayoutError::InsufficientSpace`],
+    /// or [`LayoutError::GeometryOverflow`]) when the split cannot fill the
+    /// root rectangle.
     pub fn split_vertical(
         &mut self,
         target: WinHandle,
         window: WinHandle,
         state: WindowState,
+        enter: bool,
     ) -> Result<(), LayoutError> {
         validate_identity(window)?;
         if self.contains(window) {
             return Err(LayoutError::DuplicateWindow(window));
         }
         let target = self.resolve(target);
-        self.layout.split_vertical(target, window, state)?;
+        self.layout.split_vertical(target, window, state, enter)?;
         self.window_api.insert(window, WindowApiState::new());
-        self.current = window;
+        if enter {
+            self.previous = Some(self.current);
+            self.current = window;
+        }
         Ok(())
     }
 
     /// Splits a tiled window horizontally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::CurrentWindow`] when `window` is
+    /// [`WinHandle::CURRENT`], [`LayoutError::DuplicateWindow`] when it is
+    /// already tiled or floating, [`LayoutError::UnknownWindow`] when
+    /// `target` cannot be resolved or found, [`LayoutError::InsufficientSpace`]
+    /// when the target extent is below two cells, or an equalization failure
+    /// ([`LayoutError::InvalidDimensions`], [`LayoutError::InsufficientSpace`],
+    /// or [`LayoutError::GeometryOverflow`]) when the split cannot fill the
+    /// root rectangle.
     pub fn split_horizontal(
         &mut self,
         target: WinHandle,
         window: WinHandle,
         state: WindowState,
+        enter: bool,
     ) -> Result<(), LayoutError> {
         validate_identity(window)?;
         if self.contains(window) {
             return Err(LayoutError::DuplicateWindow(window));
         }
         let target = self.resolve(target);
-        self.layout.split_horizontal(target, window, state)?;
+        self.layout.split_horizontal(target, window, state, enter)?;
         self.window_api.insert(window, WindowApiState::new());
-        self.current = window;
+        if enter {
+            self.previous = Some(self.current);
+            self.current = window;
+        }
         Ok(())
     }
 
     /// Splits a tiled window, placing the new window to the left of `target`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::CurrentWindow`] when `window` is
+    /// [`WinHandle::CURRENT`], [`LayoutError::DuplicateWindow`] when it is
+    /// already tiled or floating, [`LayoutError::UnknownWindow`] when
+    /// `target` cannot be resolved or found, [`LayoutError::InsufficientSpace`]
+    /// when the target extent is below two cells, or an equalization failure
+    /// ([`LayoutError::InvalidDimensions`], [`LayoutError::InsufficientSpace`],
+    /// or [`LayoutError::GeometryOverflow`]) when the split cannot fill the
+    /// root rectangle.
     pub fn split_left(
         &mut self,
         target: WinHandle,
         window: WinHandle,
         state: WindowState,
+        enter: bool,
     ) -> Result<(), LayoutError> {
         validate_identity(window)?;
         if self.contains(window) {
             return Err(LayoutError::DuplicateWindow(window));
         }
         let target = self.resolve(target);
-        self.layout.split_left(target, window, state)?;
+        self.layout.split_left(target, window, state, enter)?;
         self.window_api.insert(window, WindowApiState::new());
-        self.current = window;
+        if enter {
+            self.previous = Some(self.current);
+            self.current = window;
+        }
         Ok(())
     }
 
     /// Splits a tiled window, placing the new window above `target`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::CurrentWindow`] when `window` is
+    /// [`WinHandle::CURRENT`], [`LayoutError::DuplicateWindow`] when it is
+    /// already tiled or floating, [`LayoutError::UnknownWindow`] when
+    /// `target` cannot be resolved or found, [`LayoutError::InsufficientSpace`]
+    /// when the target extent is below two cells, or an equalization failure
+    /// ([`LayoutError::InvalidDimensions`], [`LayoutError::InsufficientSpace`],
+    /// or [`LayoutError::GeometryOverflow`]) when the split cannot fill the
+    /// root rectangle.
     pub fn split_above(
         &mut self,
         target: WinHandle,
         window: WinHandle,
         state: WindowState,
+        enter: bool,
     ) -> Result<(), LayoutError> {
         validate_identity(window)?;
         if self.contains(window) {
             return Err(LayoutError::DuplicateWindow(window));
         }
         let target = self.resolve(target);
-        self.layout.split_above(target, window, state)?;
+        self.layout.split_above(target, window, state, enter)?;
         self.window_api.insert(window, WindowApiState::new());
-        self.current = window;
+        if enter {
+            self.previous = Some(self.current);
+            self.current = window;
+        }
         Ok(())
     }
 
     /// Resizes and equalizes the tiled layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::InvalidDimensions`] when the geometry has a zero
+    /// extent, [`LayoutError::GeometryOverflow`] when it leaves the coordinate
+    /// space, or [`LayoutError::InsufficientSpace`] when the new rectangle
+    /// cannot give every leaf at least one cell.
     pub fn resize(&mut self, geometry: Geometry) -> Result<(), LayoutError> {
         self.layout.resize(geometry)
     }
 
     /// Equalizes the tiled layout within its current rectangle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::InvalidDimensions`],
+    /// [`LayoutError::InsufficientSpace`], or
+    /// [`LayoutError::GeometryOverflow`] when the tree cannot be validated
+    /// against its current root rectangle.
     pub fn equalize(&mut self) -> Result<(), LayoutError> {
         self.layout.equalize()
     }
@@ -1110,16 +1567,25 @@ impl TabpageState {
             .ok_or(LayoutError::UnknownWindow(window))?;
         let next_depth = depth.saturating_add(1);
         let (origin_row, origin_col) = match floating.config.relative {
-            RelativeTo::Editor => (0.0, 0.0),
+            RelativeTo::Editor => (0, 0),
             RelativeTo::Window(relative) => {
-                let geometry =
-                    self.resolve_window_geometry(self.resolve(relative), next_depth)?;
-                let mut origin_row = geometry.row as f64;
-                let mut origin_col = geometry.col as f64;
+                let geometry = self.resolve_window_geometry(self.resolve(relative), next_depth)?;
+                let mut origin_row =
+                    i128::try_from(geometry.row).map_err(|_| LayoutError::GeometryOverflow)?;
+                let mut origin_col =
+                    i128::try_from(geometry.col).map_err(|_| LayoutError::GeometryOverflow)?;
                 if let Some((line, col)) = floating.config.bufpos {
                     let state = self.window(relative)?;
-                    origin_row += (line as f64 + 1.0) - state.topline as f64;
-                    origin_col += col as f64;
+                    let topline =
+                        i128::try_from(state.topline).map_err(|_| LayoutError::GeometryOverflow)?;
+                    origin_row = origin_row
+                        .checked_add(i128::from(line))
+                        .and_then(|value| value.checked_add(1))
+                        .and_then(|value| value.checked_sub(topline))
+                        .ok_or(LayoutError::GeometryOverflow)?;
+                    origin_col = origin_col
+                        .checked_add(i128::from(col))
+                        .ok_or(LayoutError::GeometryOverflow)?;
                 }
                 (origin_row, origin_col)
             }
@@ -1128,9 +1594,21 @@ impl TabpageState {
                 let geometry = self.resolve_window_geometry(relative, next_depth)?;
                 let state = self.window(relative)?;
                 let cursor_row = state.cursor.lnum.saturating_sub(state.topline);
+                let origin_row = i128::try_from(geometry.row)
+                    .and_then(|row| i128::try_from(cursor_row).map(|cursor| (row, cursor)))
+                    .map_err(|_| LayoutError::GeometryOverflow)?;
+                let origin_col = i128::try_from(geometry.col)
+                    .and_then(|col| i128::try_from(state.cursor.col).map(|cursor| (col, cursor)))
+                    .map_err(|_| LayoutError::GeometryOverflow)?;
                 (
-                    geometry.row as f64 + cursor_row as f64,
-                    geometry.col as f64 + state.cursor.col as f64,
+                    origin_row
+                        .0
+                        .checked_add(origin_row.1)
+                        .ok_or(LayoutError::GeometryOverflow)?,
+                    origin_col
+                        .0
+                        .checked_add(origin_col.1)
+                        .ok_or(LayoutError::GeometryOverflow)?,
                 )
             }
         };
@@ -1147,8 +1625,8 @@ impl TabpageState {
 
 fn floating_content_geometry(
     config: &WinConfig,
-    origin_row: f64,
-    origin_col: f64,
+    origin_row: i128,
+    origin_col: i128,
 ) -> Result<Geometry, LayoutError> {
     config.validate()?;
     let border = usize::from(!matches!(&config.border, Border::None));
@@ -1174,25 +1652,90 @@ fn floating_content_geometry(
         .and_then(|value| value.checked_add(config.margins.bottom))
         .and_then(|value| value.checked_add(border.saturating_mul(2)))
         .ok_or(LayoutError::GeometryOverflow)?;
-    let anchor_row = origin_row + config.row;
-    let anchor_col = origin_col + config.col;
-    let outer_row = match config.anchor {
-        Anchor::NorthWest | Anchor::NorthEast => anchor_row,
-        Anchor::SouthWest | Anchor::SouthEast => anchor_row - outer_height as f64,
-    };
-    let outer_col = match config.anchor {
-        Anchor::NorthWest | Anchor::SouthWest => anchor_col,
-        Anchor::NorthEast | Anchor::SouthEast => anchor_col - outer_width as f64,
-    };
-    let row = outer_row + top_inset as f64;
-    let col = outer_col + left_inset as f64;
-    if !row.is_finite() || !col.is_finite() || row < 0.0 || col < 0.0 {
+
+    let mut row = origin_row
+        .checked_add(floor_coordinate(config.row)?)
+        .ok_or(LayoutError::GeometryOverflow)?;
+    let mut col = origin_col
+        .checked_add(floor_coordinate(config.col)?)
+        .ok_or(LayoutError::GeometryOverflow)?;
+    if matches!(config.anchor, Anchor::SouthWest | Anchor::SouthEast) {
+        row = row
+            .checked_sub(i128::try_from(outer_height).map_err(|_| LayoutError::GeometryOverflow)?)
+            .ok_or(LayoutError::InvalidResolvedPosition)?;
+    }
+    if matches!(config.anchor, Anchor::NorthEast | Anchor::SouthEast) {
+        col = col
+            .checked_sub(i128::try_from(outer_width).map_err(|_| LayoutError::GeometryOverflow)?)
+            .ok_or(LayoutError::InvalidResolvedPosition)?;
+    }
+    row = row
+        .checked_add(i128::try_from(top_inset).map_err(|_| LayoutError::GeometryOverflow)?)
+        .ok_or(LayoutError::GeometryOverflow)?;
+    col = col
+        .checked_add(i128::try_from(left_inset).map_err(|_| LayoutError::GeometryOverflow)?)
+        .ok_or(LayoutError::GeometryOverflow)?;
+    if row < 0 || col < 0 {
         return Err(LayoutError::InvalidResolvedPosition);
     }
-    if row > usize::MAX as f64 || col > usize::MAX as f64 {
-        return Err(LayoutError::GeometryOverflow);
+
+    Geometry::new(
+        usize::try_from(row).map_err(|_| LayoutError::GeometryOverflow)?,
+        usize::try_from(col).map_err(|_| LayoutError::GeometryOverflow)?,
+        config.width,
+        config.height,
+    )
+}
+
+fn floor_coordinate(value: f64) -> Result<i128, LayoutError> {
+    if !value.is_finite() {
+        return Err(LayoutError::InvalidCoordinate);
     }
-    Geometry::new(row.floor() as usize, col.floor() as usize, config.width, config.height)
+
+    let bits = value.to_bits();
+    let negative = value.is_sign_negative();
+    let exponent_bits = (bits >> 52) & 0x7ff;
+    let fraction = bits & ((1_u64 << 52) - 1);
+    if exponent_bits == 0 {
+        return Ok(if negative && fraction != 0 { -1 } else { 0 });
+    }
+
+    let exponent = i32::try_from(exponent_bits).map_err(|_| LayoutError::GeometryOverflow)? - 1023;
+    if exponent < 0 {
+        return Ok(if negative { -1 } else { 0 });
+    }
+
+    let significand = (1_u64 << 52) | fraction;
+    let (magnitude, has_fraction) = if exponent >= 52 {
+        let shift = u32::try_from(exponent - 52).map_err(|_| LayoutError::GeometryOverflow)?;
+        let overflow = if negative {
+            LayoutError::InvalidResolvedPosition
+        } else {
+            LayoutError::GeometryOverflow
+        };
+        (
+            u128::from(significand).checked_shl(shift).ok_or(overflow)?,
+            false,
+        )
+    } else {
+        let shift = u32::try_from(52 - exponent).map_err(|_| LayoutError::GeometryOverflow)?;
+        let whole = significand >> shift;
+        let remainder_mask = (1_u64 << shift) - 1;
+        (u128::from(whole), significand & remainder_mask != 0)
+    };
+
+    if negative {
+        let magnitude = magnitude
+            .checked_add(u128::from(has_fraction))
+            .ok_or(LayoutError::InvalidResolvedPosition)?;
+        if magnitude == 1_u128 << 127 {
+            return Ok(i128::MIN);
+        }
+        return i128::try_from(magnitude)
+            .map(|value| -value)
+            .map_err(|_| LayoutError::InvalidResolvedPosition);
+    }
+    i128::try_from(magnitude).map_err(|_| LayoutError::GeometryOverflow)
 }
 
 fn validate_identity(window: WinHandle) -> Result<(), LayoutError> {
@@ -1270,25 +1813,20 @@ fn resize_window_extent(
         .enumerate()
         .filter(|(index, _)| *index != target_index)
         .map(|(_, child)| minimum_extent(child, axis))
-        .try_fold(0usize, |total, minimum| total.checked_add(minimum))
+        .try_fold(0usize, usize::checked_add)
         .ok_or(LayoutError::GeometryOverflow)?;
     let required = requested
         .checked_add(sibling_minimum)
         .ok_or(LayoutError::GeometryOverflow)?;
     if requested < target_minimum || required > available {
-        return Err(LayoutError::InvalidWindowExtent { requested, available });
+        return Err(LayoutError::InvalidWindowExtent {
+            requested,
+            available,
+        });
     }
     let remaining = available - required;
-    let sibling_base = if sibling_count == 0 {
-        0
-    } else {
-        remaining / sibling_count
-    };
-    let sibling_remainder = if sibling_count == 0 {
-        0
-    } else {
-        remaining % sibling_count
-    };
+    let sibling_base = remaining.checked_div(sibling_count).unwrap_or_default();
+    let sibling_remainder = remaining.checked_rem(sibling_count).unwrap_or_default();
     let distributed_extent = |index: usize, frame: &Frame| {
         if index == target_index {
             requested
@@ -1323,14 +1861,18 @@ fn resize_window_extent(
 fn minimum_extent(frame: &Frame, axis: SplitAxis) -> usize {
     match frame {
         Frame::Leaf(_) => 1,
-        Frame::Row { children, .. } | Frame::Column { children, .. } if matches_axis(frame, axis) => {
+        Frame::Row { children, .. } | Frame::Column { children, .. }
+            if matches_axis(frame, axis) =>
+        {
             children.iter().fold(0usize, |total, child| {
                 total.saturating_add(minimum_extent(child, axis))
             })
         }
-        Frame::Row { children, .. } | Frame::Column { children, .. } => children
-            .iter()
-            .fold(1usize, |minimum, child| minimum.max(minimum_extent(child, axis))),
+        Frame::Row { children, .. } | Frame::Column { children, .. } => {
+            children.iter().fold(1usize, |minimum, child| {
+                minimum.max(minimum_extent(child, axis))
+            })
+        }
     }
 }
 
@@ -1398,7 +1940,9 @@ fn container_at_mut<'a>(frame: &'a mut Frame, path: &[usize]) -> Option<&'a mut 
     for &index in path {
         current = match current {
             Frame::Leaf(_) => return None,
-            Frame::Row { children, .. } | Frame::Column { children, .. } => children.get_mut(index)?,
+            Frame::Row { children, .. } | Frame::Column { children, .. } => {
+                children.get_mut(index)?
+            }
         };
     }
     Some(current)
@@ -1416,25 +1960,25 @@ fn matches_axis(frame: &Frame, axis: SplitAxis) -> bool {
 /// Inserts `new_leaf` as a sibling of `window` inside the target's immediate
 /// parent container, but only when that parent already stacks children along
 /// `axis`. If the immediate parent has the opposite orientation, or `window`
-/// is the root leaf, returns `Err(new_leaf)` so the caller can wrap the
-/// target in a fresh container instead (upstream `win_split_ins`).
+/// is the root leaf, returns `Err(Box::new(new_leaf))` so the caller can wrap
+/// the target in a fresh container instead (upstream `win_split_ins`).
 fn insert_into_matching_container(
     root: &mut Frame,
     window: WinHandle,
     new_leaf: Frame,
     axis: SplitAxis,
     placement: SplitPlacement,
-) -> Result<(), Frame> {
+) -> Result<(), Box<Frame>> {
     let mut path = Vec::new();
     if !collect_container_path(root, window, &mut path) {
-        return Err(new_leaf);
+        return Err(Box::new(new_leaf));
     }
     if path.is_empty() {
-        return Err(new_leaf);
+        return Err(Box::new(new_leaf));
     }
     let parent_path = &path[..path.len() - 1];
     if !container_at(root, parent_path).is_some_and(|parent| matches_axis(parent, axis)) {
-        return Err(new_leaf);
+        return Err(Box::new(new_leaf));
     }
     let target_index = path[path.len() - 1];
     let insert_at = match placement {
@@ -1445,7 +1989,7 @@ fn insert_into_matching_container(
         Some(Frame::Row { children, .. } | Frame::Column { children, .. }) => {
             children.insert(insert_at.min(children.len()), new_leaf);
         }
-        Some(Frame::Leaf(_)) | None => return Err(new_leaf),
+        Some(Frame::Leaf(_)) | None => return Err(Box::new(new_leaf)),
     }
     Ok(())
 }
@@ -1664,5 +2208,58 @@ fn assign_children_geometry(children: &mut [Frame], geometry: Geometry, axis: Sp
         };
         assign_frame_geometry(child, child_geometry);
         offset += extent;
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn state() -> WindowState {
+        WindowState::new(
+            BufHandle::try_from(1).unwrap(),
+            Position { lnum: 1, col: 0 },
+        )
+    }
+
+    fn handles() -> (WinHandle, WinHandle, WinHandle) {
+        (
+            WinHandle::try_from(1000).unwrap(),
+            WinHandle::try_from(1001).unwrap(),
+            WinHandle::try_from(1002).unwrap(),
+        )
+    }
+
+    #[test]
+    fn non_entering_split_keeps_both_current_windows() {
+        // Review finding: the inner layout always selected the new window,
+        // disagreeing with the tabpage when `enter` is false; later close
+        // and float-removal fallbacks read the inner current.
+        let (first, second, third) = handles();
+        let layout = Layout::new(first, state(), Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+        let mut tabpage = TabpageState::new(layout);
+        tabpage
+            .split_horizontal(first, second, state(), false)
+            .unwrap();
+        assert_eq!(tabpage.current_window(), first);
+        assert_eq!(tabpage.layout.current_window(), first);
+        assert_eq!(tabpage.previous_window(), None);
+        tabpage
+            .split_vertical(second, third, state(), true)
+            .unwrap();
+        assert_eq!(tabpage.current_window(), third);
+        assert_eq!(tabpage.layout.current_window(), third);
+        assert_eq!(tabpage.previous_window(), Some(first));
+    }
+
+    #[test]
+    fn text_height_counts_from_the_absolute_root_origin() {
+        // Review finding: a root below row zero truncated every window,
+        // because the work-area bottom was derived from height alone.
+        let (first, _, _) = handles();
+        let layout = Layout::new(first, state(), Geometry::new(10, 0, 80, 24).unwrap()).unwrap();
+        let tabpage = TabpageState::new(layout);
+        assert_eq!(tabpage.tiled_window_text_height(first).unwrap(), 23);
     }
 }

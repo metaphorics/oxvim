@@ -7,8 +7,11 @@ use mlua::{Function, Lua, LuaOptions, MultiValue, StdLib, Table, Value};
 use ox_types::Object;
 use thiserror::Error;
 
-use crate::converter::{lua_to_object, object_to_lua, ConversionError};
-use crate::vim::{call_with_traceback, install_vim_core, BuiltinHost, FastCallbackState, Scheduler};
+use crate::converter::{ConversionError, lua_to_object, object_to_lua};
+use crate::uv_core::EventLoopPump;
+use crate::vim::{
+    BuiltinHost, FastCallbackState, Scheduler, call_with_traceback, install_vim_core,
+};
 use crate::{embedded, stdlib, treesitter, uv_core};
 
 /// Caller-provided root of the checked-out Neovim-compatible runtime tree.
@@ -39,7 +42,11 @@ impl RuntimeRoot {
     #[must_use]
     pub fn runtime_entries(&self, relative: impl AsRef<Path>) -> Vec<PathBuf> {
         let entry = self.resolve(relative);
-        if entry.exists() { vec![entry] } else { Vec::new() }
+        if entry.exists() {
+            vec![entry]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -67,7 +74,7 @@ pub enum ExecError {
 
 impl From<mlua::Error> for ExecError {
     fn from(err: mlua::Error) -> Self {
-        Self::Runtime(err.to_string())
+        Self::Runtime(crate::vim::mlua_error_text(&err))
     }
 }
 
@@ -76,6 +83,7 @@ pub struct LuaHost {
     lua: Lua,
     runtime_root: RuntimeRoot,
     fast_callbacks: FastCallbackState,
+    event_loop: EventLoopPump,
 }
 
 impl LuaHost {
@@ -111,7 +119,7 @@ impl LuaHost {
         stdlib::install(&lua)?;
         embedded::install(&lua)?;
         treesitter::install(&lua, scheduler.clone())?;
-        uv_core::install(
+        let event_loop = uv_core::install(
             &lua,
             scheduler,
             fast_callbacks.clone(),
@@ -126,7 +134,12 @@ impl LuaHost {
         // state, matching upstream's load order.
         let require: Function = lua.globals().get("require")?;
         require.call::<()>("vim._init_packages")?;
-        Ok(Self { lua, runtime_root, fast_callbacks })
+        Ok(Self {
+            lua,
+            runtime_root,
+            fast_callbacks,
+            event_loop,
+        })
     }
 
     /// Borrow the initialized Lua state.
@@ -145,6 +158,12 @@ impl LuaHost {
     #[must_use]
     pub fn fast_callbacks(&self) -> FastCallbackState {
         self.fast_callbacks.clone()
+    }
+
+    /// Clone the non-blocking UV event-loop pump.
+    #[must_use]
+    pub fn event_loop_pump(&self) -> EventLoopPump {
+        self.event_loop.clone()
     }
 
     /// Execute a Lua chunk with `...` bound to `args`, returning the first
@@ -203,9 +222,7 @@ impl LuaHost {
             }
             Some(Value::Nil) => {
                 let message = match error_value {
-                    Some(Value::String(s)) => {
-                        String::from_utf8_lossy(&s.as_bytes()).into_owned()
-                    }
+                    Some(Value::String(s)) => String::from_utf8_lossy(&s.as_bytes()).into_owned(),
                     Some(other) => format!("{other:?}"),
                     None => "loadfile returned nil without an error message".to_string(),
                 };
@@ -220,6 +237,12 @@ impl LuaHost {
 fn configure_package_path(lua: &Lua, runtime_root: &RuntimeRoot) -> mlua::Result<()> {
     let package: Table = lua.globals().get("package")?;
     let existing: String = package.get("path")?;
+    // An unresolved root contributes no entries: `PathBuf::new().join("lua")`
+    // is the CWD-relative `lua`, which would shadow later requires with a
+    // planted tree.
+    if runtime_root.resolve("").as_os_str().is_empty() {
+        return Ok(());
+    }
     let lua_root = runtime_root.resolve("lua");
     let module = lua_root.join("?.lua");
     let package_init = lua_root.join("?/init.lua");
@@ -231,4 +254,30 @@ fn configure_package_path(lua: &Lua, runtime_root: &RuntimeRoot) -> mlua::Result
             package_init.to_string_lossy()
         ),
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_runtime_root_contributes_no_package_entries() {
+        // Review finding: an unresolved root fabricated CWD-relative
+        // `lua/?.lua` entries that persist for every later require.
+        let lua = Lua::new();
+        let path = |lua: &Lua| {
+            lua.globals()
+                .get::<Table>("package")
+                .unwrap()
+                .get::<String>("path")
+                .unwrap()
+        };
+        let before = path(&lua);
+        configure_package_path(&lua, &RuntimeRoot::new(PathBuf::new())).unwrap();
+        assert_eq!(path(&lua), before);
+        configure_package_path(&lua, &RuntimeRoot::new(PathBuf::from("/rt"))).unwrap();
+        let seeded = path(&lua);
+        assert!(seeded.contains("/rt/lua/?.lua"), "{seeded}");
+    }
 }

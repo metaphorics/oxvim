@@ -87,17 +87,17 @@ impl TextSplice {
         } else {
             TextExtent::new(
                 replacement.len() - 1,
-                replacement.last().expect("replacement is nonempty").len(),
+                replacement.last().map_or(0, Vec::len),
             )
         };
-        Self { start, old_extent, new_extent }
+        Self {
+            start,
+            old_extent,
+            new_extent,
+        }
     }
 
-    pub(crate) const fn line_anchored(
-        start_row: usize,
-        old_rows: usize,
-        new_rows: usize,
-    ) -> Self {
+    pub(crate) const fn line_anchored(start_row: usize, old_rows: usize, new_rows: usize) -> Self {
         Self {
             start: ExtmarkPosition::new(start_row, 0),
             old_extent: TextExtent::new(old_rows, 0),
@@ -130,9 +130,15 @@ pub struct NamespaceId(u32);
 
 impl NamespaceId {
     /// Internal namespace used by legacy `:sign` placements.
-    pub(crate) const fn legacy_sign() -> Self { Self(0) }
+    pub(crate) const fn legacy_sign() -> Self {
+        Self(0)
+    }
 
     /// Creates a positive namespace identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtmarkError::UnknownNamespace`] when `value` is zero.
     pub const fn new(value: u32) -> Result<Self, ExtmarkError> {
         if value == 0 {
             Err(ExtmarkError::UnknownNamespace(value))
@@ -159,13 +165,19 @@ impl SignGroup {
     pub(crate) const NAMED_BASE: u32 = 1 << 30;
 
     /// The default unnamed sign group.
-    pub(crate) const fn default_group() -> Self { Self(NamespaceId::legacy_sign()) }
+    pub(crate) const fn default_group() -> Self {
+        Self(NamespaceId::legacy_sign())
+    }
 
     /// Wraps an editor-allocated namespace as a named group.
-    pub(crate) const fn from_namespace(namespace: NamespaceId) -> Self { Self(namespace) }
+    pub(crate) const fn from_namespace(namespace: NamespaceId) -> Self {
+        Self(namespace)
+    }
 
     /// The namespace this group's signs are stored in.
-    pub(crate) const fn namespace(self) -> NamespaceId { self.0 }
+    pub(crate) const fn namespace(self) -> NamespaceId {
+        self.0
+    }
 }
 
 /// A stable identifier unique within one namespace.
@@ -174,6 +186,10 @@ pub struct ExtmarkId(u32);
 
 impl ExtmarkId {
     /// Creates a requested positive id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtmarkError::InvalidExtmarkId`] when `value` is zero.
     pub const fn new(value: u32) -> Result<Self, ExtmarkError> {
         if value == 0 {
             Err(ExtmarkError::InvalidExtmarkId)
@@ -242,24 +258,86 @@ pub enum ExtmarkHighlightMode {
     Blend,
 }
 
+/// Overflow behavior for virtual lines, mirroring `VirtLinesOverflow` in
+/// `decoration_defs.h`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ExtmarkVirtualLinesOverflow {
+    /// Truncate virtual lines that exceed the window height.
+    #[default]
+    Trunc,
+    /// Scroll virtual lines into the buffer.
+    Scroll,
+    /// Wrap virtual lines.
+    Wrap,
+    /// Automatically choose between truncation and scrolling.
+    Auto,
+}
+
+/// Independently combinable extmark rendering and lifetime flags.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExtmarkFlags(u8);
+
+impl ExtmarkFlags {
+    /// The range highlight extends through end-of-line.
+    pub const HIGHLIGHT_EOL: Self = Self(1 << 0);
+    /// `priority` was explicitly supplied.
+    pub const PRIORITY_SET: Self = Self(1 << 1);
+    /// Hide the mark once a deletion consumes its complete configured range.
+    pub const INVALIDATE: Self = Self(1 << 2);
+    /// Restore the mark's exact position when surrounding text is undone.
+    /// Enabled by default (`src/nvim/extmark.c:451-453` semantics).
+    pub const UNDO_RESTORE: Self = Self(1 << 3);
+    /// Publish the rendered position to attached UIs.
+    pub const UI_WATCHED: Self = Self(1 << 4);
+
+    /// Whether every flag in `other` is enabled.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Enables or disables `flag` without touching the other bits.
+    pub const fn set(&mut self, flag: Self, enabled: bool) {
+        if enabled {
+            self.0 |= flag.0;
+        } else {
+            self.0 &= !flag.0;
+        }
+    }
+}
+
 /// Rendering and lifetime attributes attached to an extmark.
 ///
 /// The shapes mirror the virtual-text, virtual-line, highlight, sign, and
 /// priority data in `src/nvim/decoration_defs.h:11-16,29-45,67-80,102-120`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "mirrors upstream decoration_defs.h flag fields; each bool is an independent rendering toggle"
+)]
 pub struct ExtmarkAttributes {
     /// Virtual text rendered at the mark.
     pub virtual_text: Vec<VirtualTextChunk>,
     /// Virtual-text anchor.
     pub virtual_text_position: ExtmarkVirtualTextPosition,
+    /// Fixed window column for overlay virtual text, when `virt_text_win_col` is set.
+    pub virt_text_win_col: Option<usize>,
+    /// Whether virtual text is hidden when the extmark is off-screen.
+    pub virt_text_hide: bool,
+    /// Whether virtual text repeats on wrapped line breaks.
+    pub virt_text_repeat_linebreak: bool,
     /// Virtual lines associated with the mark.
     pub virtual_lines: Vec<VirtualLine>,
+    /// Whether virtual lines render above the buffer line.
+    pub virt_lines_above: bool,
+    /// Whether virtual lines render in the left column.
+    pub virt_lines_leftcol: bool,
+    /// Overflow behavior for virtual lines.
+    pub virt_lines_overflow: ExtmarkVirtualLinesOverflow,
     /// Highlight group applied to the marked span.
     pub highlight_group: Option<String>,
     /// Additional highlight groups stacked after the first.
     pub additional_highlight_groups: Vec<String>,
-    /// Whether the range highlight extends through EOL.
-    pub highlight_eol: bool,
     /// Range-highlight composition, when explicitly supplied.
     pub highlight_mode: Option<ExtmarkHighlightMode>,
     /// Text rendered in the sign column.
@@ -274,16 +352,19 @@ pub struct ExtmarkAttributes {
     pub cursorline_highlight_group: Option<String>,
     /// Legacy sign name, when the mark came from `:sign`.
     pub sign_name: Option<String>,
+    /// Conceal character replacing the marked text.
+    pub conceal: Option<String>,
+    /// Conceal replacement for the entire line, when set.
+    pub conceal_lines: Option<String>,
+    /// Spell-check override: `Some(true)` enables, `Some(false)` disables,
+    /// `None` leaves the buffer default.
+    pub spell: Option<bool>,
+    /// URL attached to the extmark.
+    pub url: Option<String>,
     /// Rendering priority; larger values render later.
     pub priority: u32,
-    /// Whether `priority` was explicitly supplied.
-    pub priority_set: bool,
-    /// Hide the mark after deletion consumes its complete configured range.
-    pub invalidate: bool,
-    /// Restore the exact position of the mark if surrounding text is undone.
-    pub undo_restore: bool,
-    /// Publish the rendered position to attached UIs.
-    pub ui_watched: bool,
+    /// Rendering and lifetime flags (`ExtmarkFlags`).
+    pub flags: ExtmarkFlags,
 }
 
 impl Default for ExtmarkAttributes {
@@ -291,10 +372,15 @@ impl Default for ExtmarkAttributes {
         Self {
             virtual_text: Vec::new(),
             virtual_text_position: ExtmarkVirtualTextPosition::EndOfLine,
+            virt_text_win_col: None,
+            virt_text_hide: false,
+            virt_text_repeat_linebreak: false,
             virtual_lines: Vec::new(),
+            virt_lines_above: false,
+            virt_lines_leftcol: false,
+            virt_lines_overflow: ExtmarkVirtualLinesOverflow::Trunc,
             highlight_group: None,
             additional_highlight_groups: Vec::new(),
-            highlight_eol: false,
             highlight_mode: None,
             sign_text: None,
             sign_highlight_group: None,
@@ -302,11 +388,12 @@ impl Default for ExtmarkAttributes {
             line_highlight_group: None,
             cursorline_highlight_group: None,
             sign_name: None,
+            conceal: None,
+            conceal_lines: None,
+            spell: None,
+            url: None,
             priority: 0,
-            priority_set: false,
-            invalidate: false,
-            undo_restore: true,
-            ui_watched: false,
+            flags: ExtmarkFlags::UNDO_RESTORE,
         }
     }
 }
@@ -521,6 +608,36 @@ impl NamespaceState {
         }
     }
 
+    /// Moves one mark's index entry after an in-place geometry change.
+    ///
+    /// Incremental callers use this instead of `rebuild_index` so marks
+    /// whose start position did not move keep their entries across a
+    /// splice. Callers must finish every geometry change before draining
+    /// any entry: `by_position` still holds each relocated mark's old key
+    /// until this runs. Crossing relocations are safe in any order,
+    /// because each id is removed from its own set.
+    fn move_index(&mut self, old: ExtmarkPosition, new: ExtmarkPosition, id: ExtmarkId) {
+        self.remove_index(old, id);
+        self.insert_index(new, id);
+    }
+
+    /// Reconciles the index after in-place geometry changes.
+    ///
+    /// Each relocation costs two tree operations (remove plus insert)
+    /// against one per mark for a full rebuild, so past the halfway point
+    /// the rebuild is cheaper: worst-case splices (paste at the top of a
+    /// mark-dense file, full-file reindent) fall back instead of
+    /// regressing.
+    fn reconcile_index(&mut self, relocated: &[(ExtmarkId, ExtmarkPosition, ExtmarkPosition)]) {
+        if relocated.len() * 2 > self.by_id.len() {
+            self.rebuild_index();
+        } else {
+            for &(id, old_start, new_start) in relocated {
+                self.move_index(old_start, new_start, id);
+            }
+        }
+    }
+
     fn rebuild_index(&mut self) {
         self.by_position.clear();
         for (&id, mark) in &self.by_id {
@@ -562,15 +679,20 @@ impl Extmarks {
     ///
     /// A nonempty name retrieves its prior allocation; an empty name always
     /// allocates a new anonymous namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtmarkError::NamespaceIdExhausted`] after all namespace ids
+    /// have been allocated.
     pub fn create_namespace(
         &mut self,
         name: impl Into<String>,
     ) -> Result<NamespaceId, ExtmarkError> {
         let name = name.into();
-        if !name.is_empty() {
-            if let Some(&id) = self.named_namespaces.get(&name) {
-                return Ok(id);
-            }
+        if !name.is_empty()
+            && let Some(&id) = self.named_namespaces.get(&name)
+        {
+            return Ok(id);
         }
 
         let raw = self
@@ -587,6 +709,10 @@ impl Extmarks {
     }
 
     /// Ensures a namespace allocated by the editor-global API registry exists locally.
+    ///
+    /// # Errors
+    ///
+    /// This operation is currently infallible.
     pub fn ensure_namespace(&mut self, namespace: NamespaceId) -> Result<(), ExtmarkError> {
         self.highest_namespace = self.highest_namespace.max(namespace.get());
         self.namespaces.entry(namespace).or_default();
@@ -609,6 +735,11 @@ impl Extmarks {
     ///
     /// Passing `None` allocates a fresh stable id. Passing `Some(id)` mirrors
     /// Neovim's explicit-id set/update behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the namespace is unknown, the range end precedes
+    /// its start, or the render-order or namespace-local id space is exhausted.
     pub fn set(
         &mut self,
         namespace: NamespaceId,
@@ -631,18 +762,16 @@ impl Extmarks {
                 .ok_or(ExtmarkError::ExtmarkIdExhausted(namespace.get()))?;
         }
         let state = self.namespace_mut(namespace)?;
-        let id = match requested_id {
-            Some(id) => {
-                state.highest_id = state.highest_id.max(id.get());
-                id
-            }
-            None => {
-                let raw = state.highest_id.checked_add(1).ok_or(
-                    ExtmarkError::ExtmarkIdExhausted(namespace.get()),
-                )?;
-                state.highest_id = raw;
-                ExtmarkId(raw)
-            }
+        let id = if let Some(id) = requested_id {
+            state.highest_id = state.highest_id.max(id.get());
+            id
+        } else {
+            let raw = state
+                .highest_id
+                .checked_add(1)
+                .ok_or(ExtmarkError::ExtmarkIdExhausted(namespace.get()))?;
+            state.highest_id = raw;
+            ExtmarkId(raw)
         };
 
         let old_position = state.by_id.get(&id).map(Extmark::position);
@@ -665,6 +794,11 @@ impl Extmarks {
     }
 
     /// Replaces an existing mark without permitting accidental creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the namespace or extmark is unknown, the range end
+    /// precedes its start, or the render-order space is exhausted.
     pub fn update(
         &mut self,
         namespace: NamespaceId,
@@ -682,6 +816,11 @@ impl Extmarks {
     }
 
     /// Gets a mark by namespace-local id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtmarkError::UnknownNamespace`] when `namespace` is not
+    /// allocated by this store.
     pub fn get(
         &self,
         namespace: NamespaceId,
@@ -691,11 +830,12 @@ impl Extmarks {
     }
 
     /// Deletes a mark, returning whether it existed.
-    pub fn delete(
-        &mut self,
-        namespace: NamespaceId,
-        id: ExtmarkId,
-    ) -> Result<bool, ExtmarkError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtmarkError::UnknownNamespace`] when `namespace` is not
+    /// allocated by this store.
+    pub fn delete(&mut self, namespace: NamespaceId, id: ExtmarkId) -> Result<bool, ExtmarkError> {
         let state = self.namespace_mut(namespace)?;
         if let Some(mark) = state.by_id.remove(&id) {
             state.remove_index(mark.position(), id);
@@ -706,6 +846,11 @@ impl Extmarks {
     }
 
     /// Clears marks whose starts lie within inclusive bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtmarkError::UnknownNamespace`] when `namespace` is not
+    /// allocated by this store.
     pub fn clear(
         &mut self,
         namespace: NamespaceId,
@@ -720,9 +865,10 @@ impl Extmarks {
             .flat_map(|(_, ids)| ids.iter().copied())
             .collect();
         for id in &ids {
-            state.by_id.remove(id);
+            if let Some(mark) = state.by_id.remove(id) {
+                state.remove_index(mark.position(), *id);
+            }
         }
-        state.rebuild_index();
         Ok(ids.len())
     }
 
@@ -731,6 +877,11 @@ impl Extmarks {
     /// When `last < first`, the exact forward order is reversed. `None` means
     /// unlimited and `Some(0)` returns no marks. Only start positions determine
     /// membership, as in Neovim queries without the `overlap` option.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExtmarkError::UnknownNamespace`] when `namespace` is not
+    /// allocated by this store.
     pub fn query(
         &self,
         namespace: NamespaceId,
@@ -815,7 +966,11 @@ impl Extmarks {
                 !mark.invalid
                     && (mark.placement.attributes.highlight_group.is_some()
                         || mark.placement.attributes.has_sign()
-                        || mark.placement.attributes.ui_watched)
+                        || mark
+                            .placement
+                            .attributes
+                            .flags
+                            .contains(ExtmarkFlags::UI_WATCHED))
             })
             .collect();
         marks.sort_by_key(|mark| (mark.placement.attributes.priority, mark.render_order));
@@ -847,7 +1002,17 @@ impl Extmarks {
         for state in self.namespaces.values_mut() {
             let mut kept = BTreeMap::new();
             for (id, mut mark) in std::mem::take(&mut state.by_id) {
-                if mark.placement.attributes.invalidate && mark.placement.attributes.undo_restore {
+                if mark
+                    .placement
+                    .attributes
+                    .flags
+                    .contains(ExtmarkFlags::INVALIDATE)
+                    && mark
+                        .placement
+                        .attributes
+                        .flags
+                        .contains(ExtmarkFlags::UNDO_RESTORE)
+                {
                     mark.placement.position = ExtmarkPosition::new(0, 0);
                     if let Some(end) = &mut mark.placement.end {
                         end.position = ExtmarkPosition::new(0, 0);
@@ -870,25 +1035,37 @@ impl Extmarks {
         let old_end = splice.old_end();
         let new_end = splice.new_end();
         let mut result = SpliceResult::default();
-        let mut undo = ExtmarkSpliceUndo { splice, entries: Vec::new() };
+        let mut undo = ExtmarkSpliceUndo {
+            splice,
+            entries: Vec::new(),
+        };
         for state in self.namespaces.values_mut() {
             let mut removed = Vec::new();
+            let mut relocated = Vec::new();
             for mark in state.by_id.values_mut() {
                 let old_start = mark.position();
                 let old_range_end = mark.placement.end.map(|end| end.position);
                 let old_invalid = mark.invalid;
                 if old_extent != TextExtent::EMPTY
                     && !mark.invalid
-                    && mark.placement.attributes.invalidate
-                    && (old_range_end.is_some_and(|end| {
-                        start <= old_start && end <= old_end
-                    }) || (old_range_end.is_none()
-                        && old_extent.rows > 0
-                        && start <= old_start
-                        && old_start.row < old_end.row))
+                    && mark
+                        .placement
+                        .attributes
+                        .flags
+                        .contains(ExtmarkFlags::INVALIDATE)
+                    && (old_range_end.is_some_and(|end| start <= old_start && end <= old_end)
+                        || (old_range_end.is_none()
+                            && old_extent.rows > 0
+                            && start <= old_start
+                            && old_start.row < old_end.row))
                 {
                     result.invalidated += 1;
-                    if !mark.placement.attributes.undo_restore {
+                    if !mark
+                        .placement
+                        .attributes
+                        .flags
+                        .contains(ExtmarkFlags::UNDO_RESTORE)
+                    {
                         // `undo_restore = false`: delete instead of hiding
                         // (`src/nvim/extmark.c:451-453`).
                         removed.push(mark.id);
@@ -943,15 +1120,42 @@ impl Extmarks {
                         restore_before: true,
                     });
                 }
+                if mark.position() != old_start {
+                    relocated.push((mark.id, old_start, mark.position()));
+                }
             }
             for id in removed {
                 if let Some(mark) = state.by_id.remove(&id) {
                     state.remove_index(mark.position(), id);
                 }
             }
-            state.rebuild_index();
+            state.reconcile_index(&relocated);
         }
         (result, undo)
+    }
+
+    /// Groups flat relocations by namespace and reconciles each index.
+    /// Shared by the undo/redo replay paths so their grouping contract
+    /// cannot diverge.
+    fn reconcile_relocations(
+        &mut self,
+        relocated: Vec<(NamespaceId, ExtmarkId, ExtmarkPosition, ExtmarkPosition)>,
+    ) {
+        let mut by_namespace: BTreeMap<
+            NamespaceId,
+            Vec<(ExtmarkId, ExtmarkPosition, ExtmarkPosition)>,
+        > = BTreeMap::new();
+        for (namespace, id, old_start, new_start) in relocated {
+            by_namespace
+                .entry(namespace)
+                .or_default()
+                .push((id, old_start, new_start));
+        }
+        for (namespace, entries) in &by_namespace {
+            if let Some(state) = self.namespaces.get_mut(namespace) {
+                state.reconcile_index(entries);
+            }
+        }
     }
 
     pub(crate) fn undo_splice(&mut self, undo: &ExtmarkSpliceUndo) {
@@ -975,19 +1179,22 @@ impl Extmarks {
             old_extent: undo.splice.new_extent,
             new_extent: undo.splice.old_extent,
         });
+        let mut relocated = Vec::new();
         for entry in &undo.entries {
             if !entry.restore_before || !restorable.contains(&(entry.namespace, entry.id)) {
                 continue;
             }
-            if let Some(state) = self.namespaces.get_mut(&entry.namespace) {
-                if let Some(mark) = state.by_id.get_mut(&entry.id) {
-                    apply_recorded_geometry(mark, entry.position, entry.end, entry.invalid);
+            if let Some(state) = self.namespaces.get_mut(&entry.namespace)
+                && let Some(mark) = state.by_id.get_mut(&entry.id)
+            {
+                let old_start = mark.position();
+                apply_recorded_geometry(mark, entry.position, entry.end, entry.invalid);
+                if mark.position() != old_start {
+                    relocated.push((entry.namespace, entry.id, old_start, mark.position()));
                 }
             }
         }
-        for state in self.namespaces.values_mut() {
-            state.rebuild_index();
-        }
+        self.reconcile_relocations(relocated);
     }
 
     pub(crate) fn redo_splice(&mut self, undo: &ExtmarkSpliceUndo) {
@@ -1008,24 +1215,27 @@ impl Extmarks {
             })
             .collect();
         self.splice(undo.splice);
+        let mut relocated = Vec::new();
         for entry in &undo.entries {
             if !restorable.contains(&(entry.namespace, entry.id)) {
                 continue;
             }
-            if let Some(state) = self.namespaces.get_mut(&entry.namespace) {
-                if let Some(mark) = state.by_id.get_mut(&entry.id) {
-                    apply_recorded_geometry(
-                        mark,
-                        entry.after_position,
-                        entry.after_end,
-                        entry.after_invalid,
-                    );
+            if let Some(state) = self.namespaces.get_mut(&entry.namespace)
+                && let Some(mark) = state.by_id.get_mut(&entry.id)
+            {
+                let old_start = mark.position();
+                apply_recorded_geometry(
+                    mark,
+                    entry.after_position,
+                    entry.after_end,
+                    entry.after_invalid,
+                );
+                if mark.position() != old_start {
+                    relocated.push((entry.namespace, entry.id, old_start, mark.position()));
                 }
             }
         }
-        for state in self.namespaces.values_mut() {
-            state.rebuild_index();
-        }
+        self.reconcile_relocations(relocated);
     }
 
     fn namespace_state(&self, namespace: NamespaceId) -> Result<&NamespaceState, ExtmarkError> {
