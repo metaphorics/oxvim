@@ -468,8 +468,9 @@ impl Layout {
         target: WinHandle,
         window: WinHandle,
         state: WindowState,
+        enter: bool,
     ) -> Result<(), LayoutError> {
-        self.split(target, window, state, SplitAxis::Vertical)
+        self.split(target, window, state, SplitAxis::Vertical, enter)
     }
 
     /// Splits `target` horizontally, placing `window` below it.
@@ -489,8 +490,9 @@ impl Layout {
         target: WinHandle,
         window: WinHandle,
         state: WindowState,
+        enter: bool,
     ) -> Result<(), LayoutError> {
-        self.split(target, window, state, SplitAxis::Horizontal)
+        self.split(target, window, state, SplitAxis::Horizontal, enter)
     }
 
     /// Splits `target` vertically, placing `window` to its left.
@@ -510,6 +512,7 @@ impl Layout {
         target: WinHandle,
         window: WinHandle,
         state: WindowState,
+        enter: bool,
     ) -> Result<(), LayoutError> {
         self.split_placed(
             target,
@@ -517,6 +520,7 @@ impl Layout {
             state,
             SplitAxis::Vertical,
             SplitPlacement::Before,
+            enter,
         )
     }
 
@@ -537,6 +541,7 @@ impl Layout {
         target: WinHandle,
         window: WinHandle,
         state: WindowState,
+        enter: bool,
     ) -> Result<(), LayoutError> {
         self.split_placed(
             target,
@@ -544,6 +549,7 @@ impl Layout {
             state,
             SplitAxis::Horizontal,
             SplitPlacement::Before,
+            enter,
         )
     }
 
@@ -700,8 +706,9 @@ impl Layout {
         window: WinHandle,
         state: WindowState,
         axis: SplitAxis,
+        enter: bool,
     ) -> Result<(), LayoutError> {
-        self.split_placed(target, window, state, axis, SplitPlacement::After)
+        self.split_placed(target, window, state, axis, SplitPlacement::After, enter)
     }
 
     fn split_placed(
@@ -711,6 +718,7 @@ impl Layout {
         state: WindowState,
         axis: SplitAxis,
         placement: SplitPlacement,
+        enter: bool,
     ) -> Result<(), LayoutError> {
         validate_identity(window)?;
         if find_leaf(&self.root, window).is_some() {
@@ -772,7 +780,9 @@ impl Layout {
         }
         let geometry = self.root.geometry();
         equalize_frame(&mut self.root, geometry)?;
-        self.current = window;
+        if enter {
+            self.current = window;
+        }
         Ok(())
     }
 }
@@ -1090,8 +1100,11 @@ impl TabpageState {
     /// Returns [`LayoutError::UnknownWindow`] for a non-tiled window.
     pub fn tiled_window_text_height(&self, window: WinHandle) -> Result<usize, LayoutError> {
         let geometry = self.layout.window_geometry(self.resolve(window))?;
-        let screen_height = self.layout.root.geometry().height;
-        let work_bottom = screen_height.saturating_sub(1);
+        let root = self.layout.root.geometry();
+        // The work area ends at the root's absolute bottom row (exclusive),
+        // less the message row. `height` alone is relative to the screen,
+        // so a root below row zero would truncate every window under it.
+        let work_bottom = root.row.saturating_add(root.height).saturating_sub(1);
         let statusline = usize::from(self.layout.window_count() > 1);
         let frame_end = geometry.row.saturating_add(geometry.height);
         let content_end = frame_end.min(work_bottom).saturating_sub(statusline);
@@ -1396,7 +1409,7 @@ impl TabpageState {
             return Err(LayoutError::DuplicateWindow(window));
         }
         let target = self.resolve(target);
-        self.layout.split_vertical(target, window, state)?;
+        self.layout.split_vertical(target, window, state, enter)?;
         self.window_api.insert(window, WindowApiState::new());
         if enter {
             self.previous = Some(self.current);
@@ -1429,7 +1442,7 @@ impl TabpageState {
             return Err(LayoutError::DuplicateWindow(window));
         }
         let target = self.resolve(target);
-        self.layout.split_horizontal(target, window, state)?;
+        self.layout.split_horizontal(target, window, state, enter)?;
         self.window_api.insert(window, WindowApiState::new());
         if enter {
             self.previous = Some(self.current);
@@ -1462,7 +1475,7 @@ impl TabpageState {
             return Err(LayoutError::DuplicateWindow(window));
         }
         let target = self.resolve(target);
-        self.layout.split_left(target, window, state)?;
+        self.layout.split_left(target, window, state, enter)?;
         self.window_api.insert(window, WindowApiState::new());
         if enter {
             self.previous = Some(self.current);
@@ -1495,7 +1508,7 @@ impl TabpageState {
             return Err(LayoutError::DuplicateWindow(window));
         }
         let target = self.resolve(target);
-        self.layout.split_above(target, window, state)?;
+        self.layout.split_above(target, window, state, enter)?;
         self.window_api.insert(window, WindowApiState::new());
         if enter {
             self.previous = Some(self.current);
@@ -2195,5 +2208,58 @@ fn assign_children_geometry(children: &mut [Frame], geometry: Geometry, axis: Sp
         };
         assign_frame_geometry(child, child_geometry);
         offset += extent;
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn state() -> WindowState {
+        WindowState::new(
+            BufHandle::try_from(1).unwrap(),
+            Position { lnum: 1, col: 0 },
+        )
+    }
+
+    fn handles() -> (WinHandle, WinHandle, WinHandle) {
+        (
+            WinHandle::try_from(1000).unwrap(),
+            WinHandle::try_from(1001).unwrap(),
+            WinHandle::try_from(1002).unwrap(),
+        )
+    }
+
+    #[test]
+    fn non_entering_split_keeps_both_current_windows() {
+        // Review finding: the inner layout always selected the new window,
+        // disagreeing with the tabpage when `enter` is false; later close
+        // and float-removal fallbacks read the inner current.
+        let (first, second, third) = handles();
+        let layout = Layout::new(first, state(), Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+        let mut tabpage = TabpageState::new(layout);
+        tabpage
+            .split_horizontal(first, second, state(), false)
+            .unwrap();
+        assert_eq!(tabpage.current_window(), first);
+        assert_eq!(tabpage.layout.current_window(), first);
+        assert_eq!(tabpage.previous_window(), None);
+        tabpage
+            .split_vertical(second, third, state(), true)
+            .unwrap();
+        assert_eq!(tabpage.current_window(), third);
+        assert_eq!(tabpage.layout.current_window(), third);
+        assert_eq!(tabpage.previous_window(), Some(first));
+    }
+
+    #[test]
+    fn text_height_counts_from_the_absolute_root_origin() {
+        // Review finding: a root below row zero truncated every window,
+        // because the work-area bottom was derived from height alone.
+        let (first, _, _) = handles();
+        let layout = Layout::new(first, state(), Geometry::new(10, 0, 80, 24).unwrap()).unwrap();
+        let tabpage = TabpageState::new(layout);
+        assert_eq!(tabpage.tiled_window_text_height(first).unwrap(), 23);
     }
 }

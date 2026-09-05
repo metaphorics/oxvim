@@ -121,7 +121,7 @@ fn frame_tree_matches_naive_equal_partition_geometry() {
     let mut layout = Layout::new(w1, WindowState::new(buffer, position(1, 0)), geometry).unwrap();
 
     layout
-        .split_vertical(w1, w2, WindowState::new(buffer, position(1, 0)))
+        .split_vertical(w1, w2, WindowState::new(buffer, position(1, 0)), true)
         .unwrap();
     assert_eq!(
         layout.window_geometry(w1).unwrap(),
@@ -132,7 +132,7 @@ fn frame_tree_matches_naive_equal_partition_geometry() {
         Geometry::new(0, 5, 4, 7).unwrap()
     );
     layout
-        .split_horizontal(w2, w3, WindowState::new(buffer, position(1, 0)))
+        .split_horizontal(w2, w3, WindowState::new(buffer, position(1, 0)), true)
         .unwrap();
     assert_eq!(
         layout.window_geometry(w2).unwrap(),
@@ -170,7 +170,7 @@ fn closing_split_preserves_root_geometry_across_repeated_cycles() {
     for id in 2..=8 {
         let split = window_handle(id);
         layout
-            .split_horizontal(w1, split, WindowState::new(buffer, position(1, 0)))
+            .split_horizontal(w1, split, WindowState::new(buffer, position(1, 0)), true)
             .unwrap();
         layout.close(split).unwrap();
         assert_eq!(layout.window_geometry(w1).unwrap(), geometry);
@@ -187,10 +187,10 @@ fn three_same_axis_splits_equalize_into_equal_thirds() {
     let mut layout = Layout::new(w1, WindowState::new(buffer, position(1, 0)), geometry).unwrap();
 
     layout
-        .split_vertical(w1, w2, WindowState::new(buffer, position(1, 0)))
+        .split_vertical(w1, w2, WindowState::new(buffer, position(1, 0)), true)
         .unwrap();
     layout
-        .split_vertical(w2, w3, WindowState::new(buffer, position(1, 0)))
+        .split_vertical(w2, w3, WindowState::new(buffer, position(1, 0)), true)
         .unwrap();
     layout.equalize().unwrap();
 
@@ -219,13 +219,13 @@ fn split_uses_immediate_parent_axis_not_deepest_matching_ancestor() {
     let mut layout = Layout::new(w1, WindowState::new(buffer, position(1, 0)), geometry).unwrap();
 
     layout
-        .split_vertical(w1, w2, WindowState::new(buffer, position(1, 0)))
+        .split_vertical(w1, w2, WindowState::new(buffer, position(1, 0)), true)
         .unwrap();
     layout
-        .split_horizontal(w2, w3, WindowState::new(buffer, position(1, 0)))
+        .split_horizontal(w2, w3, WindowState::new(buffer, position(1, 0)), true)
         .unwrap();
     layout
-        .split_vertical(w3, w4, WindowState::new(buffer, position(1, 0)))
+        .split_vertical(w3, w4, WindowState::new(buffer, position(1, 0)), true)
         .unwrap();
 
     assert_eq!(
@@ -293,16 +293,16 @@ fn same_axis_split_three_containers_deep_joins_its_immediate_parent() {
     let mut layout = Layout::new(w1, WindowState::new(buffer, position(1, 0)), geometry).unwrap();
 
     layout
-        .split_vertical(w1, w2, WindowState::new(buffer, position(1, 0)))
+        .split_vertical(w1, w2, WindowState::new(buffer, position(1, 0)), true)
         .unwrap();
     layout
-        .split_horizontal(w2, w3, WindowState::new(buffer, position(1, 0)))
+        .split_horizontal(w2, w3, WindowState::new(buffer, position(1, 0)), true)
         .unwrap();
     layout
-        .split_vertical(w3, w4, WindowState::new(buffer, position(1, 0)))
+        .split_vertical(w3, w4, WindowState::new(buffer, position(1, 0)), true)
         .unwrap();
     layout
-        .split_vertical(w3, w5, WindowState::new(buffer, position(1, 0)))
+        .split_vertical(w3, w5, WindowState::new(buffer, position(1, 0)), true)
         .unwrap();
 
     match layout.root() {
