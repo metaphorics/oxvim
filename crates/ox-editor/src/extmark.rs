@@ -1134,6 +1134,30 @@ impl Extmarks {
         (result, undo)
     }
 
+    /// Groups flat relocations by namespace and reconciles each index.
+    /// Shared by the undo/redo replay paths so their grouping contract
+    /// cannot diverge.
+    fn reconcile_relocations(
+        &mut self,
+        relocated: Vec<(NamespaceId, ExtmarkId, ExtmarkPosition, ExtmarkPosition)>,
+    ) {
+        let mut by_namespace: BTreeMap<
+            NamespaceId,
+            Vec<(ExtmarkId, ExtmarkPosition, ExtmarkPosition)>,
+        > = BTreeMap::new();
+        for (namespace, id, old_start, new_start) in relocated {
+            by_namespace
+                .entry(namespace)
+                .or_default()
+                .push((id, old_start, new_start));
+        }
+        for (namespace, entries) in &by_namespace {
+            if let Some(state) = self.namespaces.get_mut(namespace) {
+                state.reconcile_index(entries);
+            }
+        }
+    }
+
     pub(crate) fn undo_splice(&mut self, undo: &ExtmarkSpliceUndo) {
         let restorable: BTreeSet<_> = undo
             .entries
@@ -1170,21 +1194,7 @@ impl Extmarks {
                 }
             }
         }
-        let mut by_namespace: BTreeMap<
-            NamespaceId,
-            Vec<(ExtmarkId, ExtmarkPosition, ExtmarkPosition)>,
-        > = BTreeMap::new();
-        for (namespace, id, old_start, new_start) in relocated {
-            by_namespace
-                .entry(namespace)
-                .or_default()
-                .push((id, old_start, new_start));
-        }
-        for (namespace, entries) in &by_namespace {
-            if let Some(state) = self.namespaces.get_mut(namespace) {
-                state.reconcile_index(entries);
-            }
-        }
+        self.reconcile_relocations(relocated);
     }
 
     pub(crate) fn redo_splice(&mut self, undo: &ExtmarkSpliceUndo) {
@@ -1225,21 +1235,7 @@ impl Extmarks {
                 }
             }
         }
-        let mut by_namespace: BTreeMap<
-            NamespaceId,
-            Vec<(ExtmarkId, ExtmarkPosition, ExtmarkPosition)>,
-        > = BTreeMap::new();
-        for (namespace, id, old_start, new_start) in relocated {
-            by_namespace
-                .entry(namespace)
-                .or_default()
-                .push((id, old_start, new_start));
-        }
-        for (namespace, entries) in &by_namespace {
-            if let Some(state) = self.namespaces.get_mut(namespace) {
-                state.reconcile_index(entries);
-            }
-        }
+        self.reconcile_relocations(relocated);
     }
 
     fn namespace_state(&self, namespace: NamespaceId) -> Result<&NamespaceState, ExtmarkError> {
