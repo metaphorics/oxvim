@@ -256,10 +256,16 @@ fn parse_literal(value: &str) -> Option<Literal> {
             Some(Literal::String("errors.err".to_owned()))
         }
         "macros('DFLT_FO_VIM', 'string')" => Some(Literal::String("tcqj".to_owned())),
-        "macros('DFLT_GFN', 'string')" => Some(Literal::String(
-            // option_vars.h:43 __linux__ branch
-            "Source Code Pro,DejaVu Sans Mono,Courier New,monospace".to_owned(),
-        )),
+        "macros('DFLT_GFN', 'string')" => {
+            // option_vars.h:38-46 selects by target OS, not host.
+            let fonts = match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
+                Ok("windows") => "Cascadia Code,Cascadia Mono,Consolas,Courier New,monospace",
+                Ok("macos") => "SF Mono,Menlo,Monaco,Courier New,monospace",
+                Ok("linux") => "Source Code Pro,DejaVu Sans Mono,Courier New,monospace",
+                _ => "DejaVu Sans Mono,Courier New,monospace",
+            };
+            Some(Literal::String(fonts.to_owned()))
+        }
         "macros('DFLT_HELPFILE', 'string')" => {
             Some(Literal::String("$VIMRUNTIME/doc/help.txt".to_owned()))
         }

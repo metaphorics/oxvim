@@ -731,7 +731,14 @@ impl PairProgram {
         ignorecase: bool,
     ) -> Result<Self, SearchError> {
         let token = |source: &str| {
-            let wrapped = format!("\\({}\\m\\)", pattern_with_case(source, ignorecase));
+            // Hoist a leading engine selector out of the group: ox-regex
+            // only recognizes `\%#=N` at pattern start.
+            let selector_len = source
+                .strip_prefix("\\%#=")
+                .and_then(|rest| rest.chars().next().map(|c| 5 + c.len_utf8()))
+                .unwrap_or(0);
+            let (selector, body) = source.split_at(selector_len);
+            let wrapped = format!("{selector}\\({}\\m\\)", pattern_with_case(body, ignorecase));
             compile_search(&wrapped, Magic::Magic)
         };
         // An empty `middle` gets no program: an empty third branch would
@@ -1442,6 +1449,25 @@ mod tests {
     /// Selections past one full match cycle and backward wraps fall through
     /// to the reference walk: the lazy drivers report `NeedFull` and the
     /// collected list decides with cyclic wrap arithmetic.
+    #[test]
+    fn backward_count_past_eligible_matches_wraps_through_fallback() {
+        // Backward count past the matches before the cursor wraps through
+        // the full-list fallback: only `foo` at byte 0 is eligible, so the
+        // ring cannot satisfy count 2 and the walk takes over.
+        let result = run(
+            &lines(&["foo foo foo"]),
+            Position { lnum: 1, col: 2 },
+            "foo",
+            SearchDirection::Backward,
+            SearchOffset::default(),
+            2,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.target, Position { lnum: 1, col: 8 });
+        assert!(result.wrapped);
+    }
+
     #[test]
     fn public_selection_falls_back_past_one_match_cycle() {
         // Forward count past the only match: wraps to `matches[0]` twice.
