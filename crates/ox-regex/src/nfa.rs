@@ -39,6 +39,93 @@ pub(crate) fn search(prog: &Prog, text: &Text, from: usize) -> Result<Option<Sta
     Ok(None)
 }
 
+/// Visited-set key for one thread visit.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum VisitKey {
+    /// Backreference-free program: captures never influence what a thread
+    /// does next, so instruction and position identify the visit.
+    Plain(usize, usize),
+    /// Backreference present: threads converging with different captures
+    /// diverge again at the backreference, so captures join the key.
+    Captures(usize, usize, Vec<Option<(usize, usize)>>),
+}
+
+/// Mirrors the private capture bookkeeping of `bt::State` for the visited
+/// key. The NFA loop is the only writer of those fields outside `bt`, and
+/// a fallback whose expression may rewrite captures drops the mirror, so
+/// it stays exact for every thread that still carries one.
+#[derive(Clone, Debug)]
+struct CaptureTrace {
+    captures: Vec<Option<(usize, usize)>>,
+    opens: Vec<Option<usize>>,
+}
+
+impl CaptureTrace {
+    fn new(capture_count: usize) -> Self {
+        Self {
+            captures: vec![None; capture_count],
+            opens: vec![None; capture_count],
+        }
+    }
+
+    /// Mirrors `bt::State::open_capture`.
+    fn open(&mut self, index: usize, pos: usize) {
+        if let Some(slot) = self.opens.get_mut(index - 1) {
+            *slot = Some(pos);
+        }
+    }
+
+    /// Mirrors `bt::State::close_capture`.
+    fn close(&mut self, index: usize, pos: usize) {
+        if let (Some(Some(start)), Some(slot)) =
+            (self.opens.get(index - 1), self.captures.get_mut(index - 1))
+        {
+            *slot = Some((*start, pos));
+        }
+    }
+}
+
+/// What the visited set knows about one thread's captures.
+#[derive(Clone, Debug)]
+enum Trace {
+    /// Backreference-free program: captures never influence what a thread
+    /// does next, so instruction and position alone identify a visit and
+    /// the hot path carries no capture state.
+    Plain,
+    /// Backreference present: mirrors `bt::State`'s private capture
+    /// bookkeeping so converging threads prune only when their captures
+    /// agree.
+    Captures(CaptureTrace),
+    /// A fallback rewrote captures beyond this module's sight: the thread
+    /// is never pruned.
+    Opaque,
+}
+
+impl Trace {
+    fn open(&mut self, index: usize, pos: usize) {
+        if let Trace::Captures(captures) = self {
+            captures.open(index, pos);
+        }
+    }
+
+    fn close(&mut self, index: usize, pos: usize) {
+        if let Trace::Captures(captures) = self {
+            captures.close(index, pos);
+        }
+    }
+
+    /// `None` marks a visit that must not prune.
+    fn key(&self, pc: usize, pos: usize) -> Option<VisitKey> {
+        match self {
+            Trace::Plain => Some(VisitKey::Plain(pc, pos)),
+            Trace::Captures(captures) => {
+                Some(VisitKey::Captures(pc, pos, captures.captures.clone()))
+            }
+            Trace::Opaque => None,
+        }
+    }
+}
+
 fn run_candidate(
     prog: &Prog,
     text: &Text,
@@ -48,19 +135,27 @@ fn run_candidate(
 ) -> Result<Option<State>, ExecError> {
     // One dedup set per candidate: cloning it per split point made a greedy
     // walk over a long line quadratic in the line length.
-    let visited: Rc<RefCell<BTreeSet<(usize, usize)>>> = Rc::new(RefCell::new(BTreeSet::new()));
+    let visited: Rc<RefCell<BTreeSet<VisitKey>>> = Rc::new(RefCell::new(BTreeSet::new()));
+    let initial_trace = if prog.has_backref {
+        Trace::Captures(CaptureTrace::new(prog.capture_count))
+    } else {
+        Trace::Plain
+    };
     let mut stack = vec![(
         0usize,
         State::new(candidate, prog.capture_count),
+        initial_trace,
         visited,
     )];
-    while let Some((mut pc, mut state, visited)) = stack.pop() {
+    while let Some((mut pc, mut state, mut trace, visited)) = stack.pop() {
         loop {
             *steps = steps.checked_add(1).ok_or(ExecError::StepLimit)?;
             if *steps > prog.step_limit {
                 return Err(ExecError::StepLimit);
             }
-            if !visited.borrow_mut().insert((pc, state.pos)) {
+            if let Some(key) = trace.key(pc, state.pos)
+                && !visited.borrow_mut().insert(key)
+            {
                 break;
             }
             let Some(inst) = code.get(pc) else {
@@ -99,10 +194,12 @@ fn run_candidate(
                 }
                 Inst::SaveStart(index) => {
                     state.open_capture(*index);
+                    trace.open(*index, state.pos);
                     pc += 1;
                 }
                 Inst::SaveEnd(index) => {
                     state.close_capture(*index);
+                    trace.close(*index, state.pos);
                     pc += 1;
                 }
                 Inst::SetStart => {
@@ -115,13 +212,19 @@ fn run_candidate(
                 }
                 Inst::Jump(target) => pc = *target,
                 Inst::Split(first, second) => {
-                    stack.push((*second, state.clone(), Rc::clone(&visited)));
+                    stack.push((*second, state.clone(), trace.clone(), Rc::clone(&visited)));
                     pc = *first;
                 }
                 Inst::Fallback(expr) => {
                     let results = bt::match_at(prog, text, expr, state, candidate)?;
+                    // Groups inside the fallback rewrite captures this
+                    // module cannot observe: opaque continuations are
+                    // never pruned.
+                    if !fallback_preserves_captures(expr) {
+                        trace = Trace::Opaque;
+                    }
                     for result in results.into_iter().rev() {
-                        stack.push((pc + 1, result, Rc::clone(&visited)));
+                        stack.push((pc + 1, result, trace.clone(), Rc::clone(&visited)));
                     }
                     break;
                 }
@@ -130,6 +233,13 @@ fn run_candidate(
         }
     }
     Ok(None)
+}
+
+/// Whether a fallback expression leaves the thread's captures untouched so
+/// the trace mirror stays valid. Conservative: anything beyond anchors and
+/// backreferences, which only read captures, is treated as rewriting them.
+fn fallback_preserves_captures(expr: &Expr) -> bool {
+    matches!(expr, Expr::Anchor(_) | Expr::Backref(_))
 }
 
 fn compile_expr(expr: &Expr, code: &mut Vec<Inst>) {

@@ -50,6 +50,10 @@ pub struct Prog {
     capture_count: usize,
     ignore_case: bool,
     engine: Engine,
+    /// The pattern contains `\N`: two NFA threads at one (pc, pos) can
+    /// carry different captures and diverge again later, so the NFA's
+    /// visited-set dedup must compare capture vectors (see `nfa`).
+    has_backref: bool,
     step_limit: usize,
     depth_limit: usize,
 }
@@ -163,7 +167,13 @@ impl Text {
                 line_starts.push(offset + 1);
             }
         }
-        Self { bytes, line_starts, cursor: None, visual: None, marks: BTreeMap::new() }
+        Self {
+            bytes,
+            line_starts,
+            cursor: None,
+            visual: None,
+            marks: BTreeMap::new(),
+        }
     }
 
     /// Creates text from buffer lines, inserting one newline between adjacent lines.
@@ -236,8 +246,15 @@ impl Text {
         if !self.valid_boundary(byte) {
             return None;
         }
-        let line = self.line_starts.partition_point(|start| *start <= byte).saturating_sub(1);
-        Some(Position { lnum: line + 1, col: byte - self.line_starts[line], byte })
+        let line = self
+            .line_starts
+            .partition_point(|start| *start <= byte)
+            .saturating_sub(1);
+        Some(Position {
+            lnum: line + 1,
+            col: byte - self.line_starts[line],
+            byte,
+        })
     }
 
     fn valid_boundary(&self, byte: usize) -> bool {
@@ -249,7 +266,9 @@ impl Text {
     }
 
     fn visual_contains(&self, byte: usize) -> bool {
-        self.visual.as_ref().is_some_and(|range| range.contains(&byte))
+        self.visual
+            .as_ref()
+            .is_some_and(|range| range.contains(&byte))
     }
 
     fn mark(&self, name: char) -> Option<usize> {
@@ -264,15 +283,20 @@ impl From<&str> for Text {
 }
 
 /// Parses a Vim pattern and selects its execution engine.
+///
+/// # Errors
+///
+/// Returns [`CompileError::InvalidEngine`] for a malformed `\%#=` engine
+/// selector and the parser's [`CompileError`] (invalid escape, unterminated
+/// group or collection, backref before a closed group, …) for a
+/// syntactically invalid pattern.
 pub fn compile(pattern: &str, magic: Magic) -> Result<Prog, CompileError> {
     let (selection, body) = parse_engine_selector(pattern)?;
     let parsed = Parser::new(body, magic).parse()?;
-    let complex = parsed.features.backref
-        || parsed.features.lookbehind
-        || parsed.features.complex_repeat;
+    let complex =
+        parsed.features.backref || parsed.features.lookbehind || parsed.features.complex_repeat;
     let engine = match selection {
-        Some(Engine::Backtracking) => Engine::Backtracking,
-        Some(Engine::Nfa) => Engine::Nfa,
+        Some(engine) => engine,
         None if complex => Engine::Backtracking,
         None => Engine::Nfa,
     };
@@ -281,6 +305,7 @@ pub fn compile(pattern: &str, magic: Magic) -> Result<Prog, CompileError> {
         capture_count: parsed.captures,
         ignore_case: parsed.ignore_case,
         engine,
+        has_backref: parsed.features.backref,
         step_limit: DEFAULT_STEP_LIMIT,
         depth_limit: DEFAULT_DEPTH_LIMIT,
     })
@@ -299,12 +324,26 @@ pub fn exec_at(prog: &Prog, text: &Text, start: Position) -> Option<Match> {
 }
 
 /// Searches the complete input and reports bounded-execution errors.
+///
+/// # Errors
+///
+/// Propagates [`Self::try_exec_at`]'s [`ExecError`] — the step or depth
+/// limit exhausted while either engine executes the program.
 pub fn try_exec(prog: &Prog, text: &Text) -> Result<Option<Match>, ExecError> {
-    let start = Position { lnum: 1, col: 0, byte: 0 };
+    let start = Position {
+        lnum: 1,
+        col: 0,
+        byte: 0,
+    };
     try_exec_at(prog, text, start)
 }
 
 /// Searches at or after `start` and reports bounded-execution errors.
+///
+/// # Errors
+///
+/// Returns [`ExecError`] when the selected engine exhausts the program's
+/// step or depth limit while searching; a plain no-match is `Ok(None)`.
 pub fn try_exec_at(prog: &Prog, text: &Text, start: Position) -> Result<Option<Match>, ExecError> {
     if text.position(start.byte) != Some(start) {
         return Ok(None);

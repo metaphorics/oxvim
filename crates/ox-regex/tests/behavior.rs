@@ -990,6 +990,38 @@ fn forced_nfa_preserves_lookahead_capture_for_backref() {
 }
 
 #[test]
+fn forced_nfa_keeps_captures_of_converging_branches() {
+    let _spec = "regexp.c:16135-16167 NFA-first; visited dedup must be capture-aware for \\2";
+    let prog = compile("\\%#=2\\(a\\|\\(a\\)\\)\\2", Magic::Magic).unwrap();
+    assert_eq!(prog.engine(), Engine::Nfa);
+    // The first branch leaves only group 1 set; the second thread carries
+    // group 2. Both converge at the same program point after "a", and
+    // deduping on position alone dropped the second thread, so \2 failed
+    // and "aa" went unmatched. Group 1 is the outer group, so the branch-2
+    // path closes it after the alternation as well.
+    let found = exec(&prog, &Text::from("aa")).expect("aa matches");
+    assert_eq!((found.start.byte, found.end.byte), (0, 2));
+    assert_eq!(
+        found
+            .captures
+            .iter()
+            .map(|capture| capture
+                .as_ref()
+                .map(|span| (span.start.byte, span.end.byte)))
+            .collect::<Vec<_>>(),
+        vec![Some((0, 1)), Some((0, 1))]
+    );
+    assert_eq!(exec(&prog, &Text::from("ab")).map(|m| m.end.byte), None);
+    // Unforced, the same pattern routes to the backtracking engine.
+    assert_eq!(
+        compile("\\(a\\|\\(a\\)\\)\\2", Magic::Magic)
+            .unwrap()
+            .engine(),
+        Engine::Backtracking
+    );
+}
+
+#[test]
 fn automatic_engine_routes_pathological_range_to_bt() {
     let _spec = "regexp.c:10969-10973";
     assert_eq!(
@@ -1051,8 +1083,16 @@ fn explicit_recursion_limit_is_typed() {
     assert_eq!(
         try_exec(&prog, &Text::from("aaaa")),
         Ok(Some(Match {
-            start: Position { lnum: 1, col: 0, byte: 0 },
-            end: Position { lnum: 1, col: 4, byte: 4 },
+            start: Position {
+                lnum: 1,
+                col: 0,
+                byte: 0
+            },
+            end: Position {
+                lnum: 1,
+                col: 4,
+                byte: 4
+            },
             captures: vec![],
         }))
     );
