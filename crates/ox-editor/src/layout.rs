@@ -1357,6 +1357,13 @@ impl TabpageState {
         }
         if self.current == resolved {
             self.current = self.layout.current_window();
+            // Closing the current window mirrors upstream's post-free
+            // prevwin reset (win_free, window.c:5590-5596): a `previous`
+            // now equal to the fallback current would make `wincmd p` a
+            // silent no-op.
+            if self.previous.is_some_and(|previous| previous == self.current) {
+                self.previous = None;
+            }
         }
         Ok(removed)
     }
@@ -1381,6 +1388,11 @@ impl TabpageState {
         }
         if self.current == resolved {
             self.current = self.layout.current_window();
+            // Same post-close prevwin reset as remove_float (win_free,
+            // window.c:5590-5596).
+            if self.previous.is_some_and(|previous| previous == self.current) {
+                self.previous = None;
+            }
         }
         Ok(removed)
     }
@@ -2261,5 +2273,26 @@ mod tests {
         let layout = Layout::new(first, state(), Geometry::new(10, 0, 80, 24).unwrap()).unwrap();
         let tabpage = TabpageState::new(layout);
         assert_eq!(tabpage.tiled_window_text_height(first).unwrap(), 23);
+    }
+
+    #[test]
+    fn closing_the_current_window_clears_a_stale_previous() {
+        // Review finding: closing the current window could leave
+        // `previous` equal to the fallback current, making `wincmd p` a
+        // silent no-op; upstream NULLs prevwin in win_free
+        // (window.c:5590-5596).
+        let (first, second, _) = handles();
+        let layout = Layout::new(first, state(), Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+        let mut tabpage = TabpageState::new(layout);
+        tabpage
+            .split_horizontal(first, second, state(), false)
+            .unwrap();
+        // Fallback current after closing `second` is `first`; a previous
+        // pointing at it must be dropped, not preserved.
+        tabpage.current = second;
+        tabpage.previous = Some(first);
+        tabpage.close_tiled(second).unwrap();
+        assert_eq!(tabpage.current_window(), first);
+        assert_eq!(tabpage.previous_window(), None);
     }
 }

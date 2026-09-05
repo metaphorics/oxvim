@@ -600,6 +600,70 @@ fn api_registry_dispatches_against_editor_and_enforces_guards() {
 }
 
 #[test]
+fn decoration_provider_callback_survives_the_api_call() {
+    let (host, _, _) = host();
+    let mut editor = Editor::new();
+    editor.create_buffer(true).unwrap();
+    let session = Rc::new(ox_api::ApiSession::new(Rc::new(RefCell::new(editor))));
+    let registry = ox_api::core().unwrap();
+    bind_api(
+        host.lua(),
+        &registry,
+        ApiDispatchContext::new(Rc::clone(&session)),
+        host.fast_callbacks(),
+    )
+    .unwrap();
+
+    // Register through the real Lua bridge: `on_line` crosses into the API
+    // as a fresh `Object::LuaRef` argument.
+    host.lua()
+        .load(
+            "provider_line_calls = 0 \
+             local ns = vim.api.nvim_create_namespace('provider-lifetime') \
+             vim.api.nvim_set_decoration_provider(ns, { \
+               on_line = function() provider_line_calls = provider_line_calls + 1 end, \
+             }) \
+             return ns",
+        )
+        .eval::<Value>()
+        .unwrap();
+
+    // The argument reference was not freed when the call returned: the id
+    // stored in the provider still resolves and invokes, mirroring upstream
+    // moving the LuaRef into the provider (`extmark.c:1088-1096`).
+    let provider = session.with_editor(|editor| {
+        let ids = editor
+            .decorations()
+            .phase_provider_ids(ox_editor::decoration::CallbackPhase::Line);
+        assert_eq!(ids.len(), 1);
+        ids[0]
+    });
+    let reference = session
+        .with_editor(|editor| {
+            editor
+                .decorations()
+                .phase_callback(provider, ox_editor::decoration::CallbackPhase::Line)
+        })
+        .expect("the provider must keep its on_line callback");
+    let callback = object_to_lua(
+        host.lua(),
+        &Object::LuaRef(i32::try_from(reference).unwrap()),
+    )
+    .unwrap();
+    let Value::Function(function) = callback else {
+        unreachable!("stored provider callback did not resolve to a function");
+    };
+    let _: () = function.call(()).unwrap();
+
+    let calls: i64 = host
+        .lua()
+        .load("return provider_line_calls")
+        .eval()
+        .unwrap();
+    assert_eq!(calls, 1);
+}
+
+#[test]
 fn pcall_error_contains_traceback() {
     let (host, _, _) = host();
     let function: Function = host

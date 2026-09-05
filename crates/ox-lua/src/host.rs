@@ -238,12 +238,15 @@ fn configure_package_path(lua: &Lua, runtime_root: &RuntimeRoot) -> mlua::Result
     let package: Table = lua.globals().get("package")?;
     // An unresolved root contributes no entries: `PathBuf::new().join("lua")`
     // is the CWD-relative `lua`, which would shadow later requires with a
-    // planted tree. The LuaJIT default must not survive either: vendored
-    // luaconf.h LUA_PATH_DEFAULT starts with "./?.lua", the same CWD vector.
-    // Upstream resolves modules through `vim._load_package` over 'runtimepath'
-    // (runtime/lua/vim/_init_packages.lua:16-19,48-49), never through CWD.
+    // planted tree. The LuaJIT defaults must not survive either: vendored
+    // luaconf.h LUA_PATH_DEFAULT starts with "./?.lua" and LUA_CPATH_DEFAULT
+    // with "./?." native suffixes — the same CWD vector for both source and
+    // native modules. Upstream resolves modules through `vim._load_package`
+    // over 'runtimepath' (runtime/lua/vim/_init_packages.lua:16-19,48-49),
+    // never through CWD.
     if runtime_root.resolve("").as_os_str().is_empty() {
-        return package.set("path", "");
+        package.set("path", "")?;
+        return package.set("cpath", "");
     }
     let existing: String = package.get("path")?;
     let lua_root = runtime_root.resolve("lua");
@@ -271,16 +274,22 @@ mod tests {
         // luaconf.h LUA_PATH_DEFAULT) lets a planted CWD tree shadow later
         // requires.
         let lua = Lua::new();
-        let path = |lua: &Lua| {
+        let package_field = |lua: &Lua, field: &str| {
             lua.globals()
                 .get::<Table>("package")
                 .unwrap()
-                .get::<String>("path")
+                .get::<String>(field)
                 .unwrap()
         };
+        let path = |lua: &Lua| package_field(lua, "path");
+        let cpath = |lua: &Lua| package_field(lua, "cpath");
         assert!(path(&lua).contains("./?.lua"));
+        assert!(cpath(&lua).starts_with("./"), "LuaJIT cpath default is CWD-first");
         configure_package_path(&lua, &RuntimeRoot::new(PathBuf::new())).unwrap();
         assert_eq!(path(&lua), "");
+        // The native-module vector must close with the source one: a
+        // planted ./mod.so must not load from an unresolved root.
+        assert_eq!(cpath(&lua), "");
         configure_package_path(&lua, &RuntimeRoot::new(PathBuf::from("/rt"))).unwrap();
         let seeded = path(&lua);
         assert!(seeded.contains("/rt/lua/?.lua"), "{seeded}");
