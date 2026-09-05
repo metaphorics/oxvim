@@ -334,6 +334,10 @@ fn select_lazy_forward(
     // nothing else is yielded it is `matches[0]`, exactly what the
     // full-list walk wraps to.
     let mut first_skipped: Option<MatchSpan> = None;
+    // End byte of the last counted match: the wrapped sweep advances past
+    // match starts, so yields overlapping it are skipped to keep the public
+    // after-end progression both sweeps must share.
+    let mut last_end: Option<usize> = None;
     loop {
         match scan.step(program, from, true)? {
             Step::Found(candidate) => {
@@ -344,7 +348,11 @@ fn select_lazy_forward(
                     }
                     continue;
                 }
+                if last_end.is_some_and(|end| candidate.span.start.byte < end) {
+                    continue;
+                }
                 yielded += 1;
+                last_end = Some(candidate.span.end.byte);
                 if yielded == count {
                     return Ok(Some(Select::Found {
                         span: candidate.span,
@@ -1413,6 +1421,27 @@ mod tests {
     /// Selections past one full match cycle and backward wraps fall through
     /// to the reference walk: the lazy drivers report `NeedFull` and the
     /// collected list decides with cyclic wrap arithmetic.
+    /// The wrapped sweep keeps the public after-end progression: on
+    /// `["aaaa", "b"]` with the cursor past the last match, a counted wrap
+    /// must not offer the overlapping start byte 1.
+    #[test]
+    fn public_wrapped_search_keeps_after_end_progression() {
+        for (count, col) in [(1usize, 0), (2usize, 2)] {
+            let result = run(
+                &lines(&["aaaa", "b"]),
+                Position { lnum: 2, col: 0 },
+                "aa",
+                SearchDirection::Forward,
+                SearchOffset::default(),
+                count,
+                true,
+            )
+            .unwrap();
+            assert_eq!(result.target, Position { lnum: 1, col });
+            assert!(result.wrapped);
+        }
+    }
+
     #[test]
     fn public_selection_falls_back_past_one_match_cycle() {
         // Forward count past the only match: wraps to `matches[0]` twice.
