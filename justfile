@@ -14,11 +14,62 @@ test:
 _guard_binary:
     @test -x target/release/oxvim || { echo "oxvim binary not built yet (later task)" >&2; exit 1; }
 
-# Run upstream Neovim functional tests against oxvim. The make target's cmake
-# wrapper hardcodes the oracle binary, so invoke RunTests.cmake directly with
-# our -D NVIM_PRG.
-functional: _guard_binary
-    cd "{{justfile_directory()}}/.references/neovim/build/test" && cmake -D TEST_TYPE=functional -D BUILD_DIR="{{justfile_directory()}}/.references/neovim/build" -D CI_BUILD=OFF -D NVIM_PRG="{{justfile_directory()}}/target/release/oxvim" -D TEST_DIR="{{justfile_directory()}}/.references/neovim/test" -D ROOT_DIR="{{justfile_directory()}}/.references/neovim" -P "{{justfile_directory()}}/.references/neovim/cmake/RunTests.cmake"
+
+# Build the upstream helper programs beside oxvim. testprg() resolves helpers
+# relative to NVIM_PRG, not the Neovim reference build directory.
+_functional_fixtures:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src="{{justfile_directory()}}/.references/neovim/test/functional/fixtures"
+    out="{{justfile_directory()}}/target/release"
+    mkdir -p "${out}"
+    for name in printenv-test printargs-test shell-test; do
+      if [[ ! -x "${out}/${name}" || "${src}/${name}.c" -nt "${out}/${name}" ]]; then
+        cc -std=c11 -D_DEFAULT_SOURCE -O2 "${src}/${name}.c" -o "${out}/${name}"
+      fi
+    done
+    read -r -a uv_flags <<<"$(pkg-config --cflags --libs libuv)"
+    for name in streams-test tty-test; do
+      if [[ ! -x "${out}/${name}" || "${src}/${name}.c" -nt "${out}/${name}" ]]; then
+        cc -std=c11 -D_DEFAULT_SOURCE -O2 "${src}/${name}.c" -o "${out}/${name}" "${uv_flags[@]}"
+      fi
+    done
+# Run upstream Neovim functional tests against oxvim. Focused runs retain the
+# single-file interface; full runs isolate top-level groups so one slow group
+# cannot consume the whole suite's timeout or delete another group's XDG tree.
+functional: _guard_binary _functional_fixtures
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="{{justfile_directory()}}"
+    run_group() {
+      local group="$1"
+      cmake -D TEST_TYPE=functional \
+      -D TEST_SUMMARY_FILE="${root}/.outline/evidence/functional-${group}.log" \
+        -D BUILD_DIR="${root}/.references/neovim/build" \
+        -D CI_BUILD=OFF \
+        -D NVIM_PRG="${root}/target/release/oxvim" \
+        -D TEST_DIR="${root}/.references/neovim/test" \
+        -D ROOT_DIR="${root}/.references/neovim" \
+        -P "${root}/.references/neovim/cmake/RunTests.cmake"
+    }
+    cd "${root}/.references/neovim/build/test"
+    if [[ -n "${TEST_FILE:-}${TEST_FILTER:-}${TEST_TAG:-}${TEST_FILTER_OUT:-}" ]]; then
+      cmake -D TEST_TYPE=functional \
+        -D BUILD_DIR="${root}/.references/neovim/build" \
+        -D CI_BUILD=OFF \
+        -D NVIM_PRG="${root}/target/release/oxvim" \
+        -D TEST_DIR="${root}/.references/neovim/test" \
+        -D ROOT_DIR="${root}/.references/neovim" \
+        -P "${root}/.references/neovim/cmake/RunTests.cmake"
+      exit
+    fi
+    export -f run_group
+    export root
+    # "example" is the loose example_spec.lua, not a directory: run it by
+    # file after the directory groups.
+    printf '%s\n' api autocmd core editor ex_cmds legacy lua options plugin provider script shada terminal testnvim treesitter ui vimscript |
+      xargs -P 4 -n 1 bash -c 'run_group "$1"' _
+    TEST_FILE=test/functional/example_spec.lua bash -c 'run_group example_spec'
 
 # Run upstream Neovim oldtests against oxvim via NVIM_PRG.
 #
@@ -34,7 +85,7 @@ oldtest *targets: _guard_binary
     #!/usr/bin/env bash
     set -euo pipefail
     ref="{{justfile_directory()}}/.references/neovim"
-    out="{{justfile_directory()}}/target/oldtest"
+    out="{{justfile_directory()}}/.outline/evidence/oldtest"
     scratch="$(mktemp -d)"
     mkdir -p "${scratch:?}/test/old" "${scratch:?}/home" "${out:?}"
     cp -a "${ref:?}/src" "${scratch:?}/src"
@@ -43,11 +94,12 @@ oldtest *targets: _guard_binary
     rm -f -- "${scratch:?}/test/old/testdir/messages" \
              "${scratch:?}/test/old/testdir/test.log" \
              "${scratch:?}/test/old/testdir/test.res"
-    # make's exit status does not track per-test failures here: runtest.vim
-    # writes .res as a pass marker and the results land in `messages`. So keep
-    # going, then decide from the messages file itself.
+    # runnvim.sh:83 guards its `cp -a test.log messages` clobber with a typo
+    # (`test -f message`, no s): without this sentinel any test whose runner
+    # exits nonzero replaces the accumulated census with the errors-only log.
+    touch "${scratch:?}/test/old/testdir/message"
     set +e
-    HOME="${scratch:?}/home" make -C "${scratch:?}/test/old/testdir" \
+    HOME="${scratch:?}/home" make -k -C "${scratch:?}/test/old/testdir" \
         NVIM_PRG="{{justfile_directory()}}/target/release/oxvim" {{targets}}
     set -e
     msg="${scratch:?}/test/old/testdir/messages"
@@ -62,11 +114,15 @@ oldtest *targets: _guard_binary
     rm -rf -- "${scratch:?}"
     # grep exits 1 when it finds nothing, and a clean run has no FAILED line,
     # so each capture must tolerate no match or `set -e` aborts the summary.
-    executed=$(grep -aoE '^Executed [0-9]+ tests?' "${out:?}/messages" | grep -oE '[0-9]+' | tail -1 || true)
-    failed=$(grep -aoE '^[0-9]+ FAILED:' "${out:?}/messages" | grep -oE '[0-9]+' | tail -1 || true)
+    executed=$(grep -aoE '^Executed [0-9]+ tests?' "${out:?}/messages" | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}' || true)
+    failed=$(grep -aoE '^[0-9]+ FAILED:' "${out:?}/messages" | grep -oE '^[0-9]+' | awk '{s+=$1} END{print s+0}' || true)
     skipped=$(grep -ac '^SKIPPED' "${out:?}/messages" || true)
     echo "oldtest: executed=${executed:-0} failed=${failed:-0} skipped=${skipped:-0}"
     echo "results: ${out:?}/messages"
+    if [[ "${executed:-0}" -eq 0 ]]; then
+      printf '%s\n' "oldtest executed no tests: the harness result is invalid." >&2
+      exit 1
+    fi
     [[ "${failed:-0}" -eq 0 ]] || exit 1
 
 # Diff oxvim --api-info schema against upstream.

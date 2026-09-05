@@ -20,13 +20,13 @@ Buffer, window, and tabpage resources are identified by positive 1-based integer
 - `WinHandle`: represents a window viewport displaying a buffer.
 - `TabHandle`: represents a tabpage grouping multiple windows.
 
-Handles are managed through strongly typed stores in `ox-editor`. Handle lookups validate existence and return scoped references. When a buffer or window is deleted, its handle is unregistered and subsequent API calls with that handle return `ApiError::InvalidHandle`.
+Handles are managed through strongly typed stores in `ox-editor`. Handle lookups validate existence and return scoped references. When a buffer or window is deleted, its handle is unregistered and subsequent API calls with that handle return a validation error (`ApiError::Validation`) carrying an "Invalid buffer id" or "Invalid window id" message — the two `ApiError` variants are `Exception` and `Validation`, matching Neovim's `error_types` ids 0 and 1; there is no dedicated invalid-handle variant.
 
 ### Text buffer and undo model
 
 Text storage in `ox-text` is backed by Ropey, providing logarithmic-time line index lookups, insertions, and deletions. Buffers maintain:
 
-- A piece-tree rope structure for text manipulation.
+- A Ropey rope structure for text manipulation.
 - A line index tracking byte and character offsets.
 - A transactional undo tree recording edits, timestamps, and cursor positions.
 - Swapfile and ShaDa serialization routines for session state persistence.
@@ -37,16 +37,16 @@ The `ox-loop` crate implements the event reactor driving the editor process.
 
 ### Reactor loop
 
-The event loop uses `mio` to poll non-blocking file descriptors, network streams, and signal notifications on a single thread. Timers are stored in a binary heap ordered by monotonic deadlines. The reactor calculates the next poll timeout from the earliest timer deadline.
+The event loop uses `mio` to poll non-blocking file descriptors, network streams, and signal notifications on a single thread. Timers are held in a deadline-ordered map keyed by `(Instant, sequence)` so equal deadlines retain stable ordering. The reactor calculates the next poll timeout from the earliest timer deadline.
 
-### MultiQueue scheduling
+### Work ingress and MultiQueue dispatch
 
-To prevent callback re-entrancy and preserve execution order, `MultiQueue` divides work into two distinct priority tiers:
+Work enters the loop through `WorkQueues`, which classifies each posted item as one of two ingress phases:
 
-- Fast queue: handles immediate I/O events, RPC packet decoding, timer expirations, and user input processing.
-- Deferred queue: holds callbacks scheduled for execution at safe synchronization points, such as `vim.schedule` closures and asynchronous Lua handlers.
+- Fast: executed during readiness dispatch, before the deferred safe point. Handles immediate I/O events, RPC packet decoding, timer expirations, and user input processing.
+- Deferred: forwarded to the owner's `MultiQueue` for processing at the check/deferred safe point, such as `vim.schedule` closures and asynchronous Lua handlers.
 
-Deferred callbacks run only when the editor is in an idle, non-reentrant state, matching the safety model of Neovim.
+`MultiQueue` is the owned parent/child queue hierarchy that receives deferred work. Each event is represented in its origin queue and every ancestor, mirroring Neovim's paired child-item and parent-link node so a recursive RPC wait can drain only the selected channel queue while sibling events remain represented in the root. Deferred callbacks run only when the editor is in an idle, non-reentrant state, matching the safety model of Neovim.
 
 ### Signal integration
 
@@ -54,7 +54,7 @@ Operating system signals are captured using `signal-hook` and piped into a dedic
 
 ## Pure-Rust vim.uv engine
 
-The `ox-uv` crate provides a complete implementation of the Libuv API required by Neovim's `vim.uv` and `luv` modules without binding to C libuv or introducing an asynchronous runtime like tokio.
+The `ox-uv` crate provides a pure-Rust implementation of the libuv-style API surface used by Neovim's `vim.uv` and `luv` modules, without binding to C libuv or introducing an asynchronous runtime like tokio. It covers the handle kinds and operations listed below; coverage of the full libuv API is ongoing and not claimed to be complete.
 
 ### Handle lifecycle
 
@@ -88,8 +88,8 @@ The type converter translates between Rust `ox_types::Object` values and Lua typ
 
 Oxvim enforces execution contexts to prevent unsafe re-entrancy:
 
-- Fast callbacks: Callbacks marked as fast run in restricted mode and cannot mutate editor buffers or call blocking APIs.
-- Textlock and fastlock: Non-fast API methods verify locks before executing. Attempting to call state-mutating APIs from invalid contexts produces an `E5560` error.
+- Fast callbacks: Callbacks marked as fast run in restricted mode and cannot mutate editor buffers or call blocking APIs. A depth-counted `FastCallbackState` guard raises `E5560` when a non-fast Vimscript function or API method is invoked from inside a fast callback.
+- Textlock: A depth-counted `TextlockGuard` entered by `ApiDispatchContext::enter_textlock` blocks state-mutating APIs annotated `#[api(textlock)]` while text is locked, raising `E565: Not allowed to change text or change window`.
 
 ### Standard library and Tree-sitter
 
@@ -106,7 +106,7 @@ To maintain strict alignment with Neovim, Oxvim uses automated code generation f
 - Options: `codegen/upstream/options.lua` defines the option inventory, scope rules (global, buffer-local, window-local), types, and flags. Build scripts generate static lookup tables in `ox-editor`.
 - Ex commands: `codegen/upstream/ex_cmds.lua` defines command names, range rules, argument flags, and handlers. Build scripts generate parser match tables in `ox-excmd`.
 - Builtin functions: `codegen/upstream/eval.lua` defines Vimscript function signatures, parameter counts, and evaluation routes for `ox-eval`.
-- API metadata: `crates/ox-rpc/src/api_metadata.msgpack` contains the canonical Neovim API Level 15 metadata used to generate function dispatch tables in `ox-api`.
+- API metadata and dispatch: `crates/ox-rpc/src/api_metadata.msgpack` holds the canonical Neovim API Level 15 metadata, decoded at runtime by `canonical_metadata()` for `--api-info`; the live `nvim_get_api_info` response is assembled from registered signatures by the `ApiMetadata` builder. Function dispatch is generated at compile time by the `#[api]` proc-macro in `ox-api-macros`, which reads each annotated Rust function's signature and attribute flags (`since`, `fast`, `textlock`, `method`) to emit a `FunctionMetadata` constant and a positional `Object`-array dispatch shim. A separate checked-in `api_function_names.rs` table mirrors the full 262-function inventory for registry construction.
 
 ## Differential verification framework
 
@@ -120,7 +120,7 @@ A compiled Neovim 0.13.0-dev binary (`.references/neovim/build/bin/nvim`) serves
 
 The framework employs four verification mechanisms:
 
-1. API schema diff (`apidiff`): Compares the MessagePack payload of `oxvim --api-info` against the oracle, verifying all 262 functions, parameter flags, error types, and metadata fields.
+1. API schema diff (`apidiff`): Compares the MessagePack payload of `oxvim --api-info` against the oracle, verifying all 262 functions, parameter flags, error types, `ui_options`, the Ext handle `types` map, and metadata fields.
 2. Session replay (`replay`): Executes YAML-defined MessagePack-RPC session transcripts (`core.yaml`, `options.yaml`, `eval.yaml`, `channels.yaml`, `ui_attach.yaml`) against both binaries, checking response data and notification ordering.
 3. Interactive PTY smoke tests: Spawns the `oxvim` binary in a real pseudo-terminal, driving keyboard input, modal transitions, Ex commands, and verifying terminal restoration sequences on exit.
 4. Upstream test suites: Harness targets `just functional` and `just oldtest` run Neovim's functional and legacy test suites against Oxvim using the `NVIM_PRG` environment variable.
@@ -131,7 +131,7 @@ Any behavioral divergence in session replay must be justified and recorded with 
 
 ## Terminal user interface and client separation
 
-The bundled terminal interface in `ox-tui` is implemented as an independent client connecting to the embedded server.
+The bundled terminal interface in `ox-tui` is a pure stdio MessagePack-RPC client. It owns only protocol-provided chrome surfaces and never links editor or server-side UI implementation code, connecting to the embedded server over the same RPC channel as any external UI client.
 
 ### Client-owned surfaces
 

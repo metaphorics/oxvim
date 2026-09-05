@@ -1,91 +1,65 @@
 # Compatibility statement
 
-This document details the compatibility status of Oxvim against upstream Neovim, summarizing verified subsystems, active test harnesses, and current architectural limitations.
+Oxvim is a Rust rewrite of the Neovim core. This page states what matches upstream today, the command that checks each claim, and what remains open.
 
 ## Target specification
 
-Oxvim targets functional compatibility with Neovim 0.13.0-dev (API level 15).
+Oxvim targets functional compatibility with Neovim 0.13.0-dev (API level 15): running existing Lua plugins unmodified, serving external MessagePack-RPC user interfaces, and matching upstream behavior for text manipulation, options, expressions, and event loops.
 
-The primary objective is to serve as a drop-in replacement for the Neovim core that executes existing Lua plugins, supports external MessagePack-RPC user interfaces, and maintains exact behavioral semantics across text manipulation, options, expressions, and event loops.
+## Verification commands
 
-## Verified subsystems
+- `just test`: workspace unit, property, and integration suite (`cargo nextest run --workspace`).
+- `just apidiff`: compares the `--api-info` schema against the compiled Neovim oracle.
+- `just replay`: replays recorded YAML MessagePack-RPC sessions against both binaries.
+- `just differential`: release-binary smoke and PTY checks (`cargo nextest run -p differential`).
+- `just functional`: upstream Busted functional suite against Oxvim via `NVIM_PRG`.
+- `just oldtest`: upstream legacy Vimscript suite against Oxvim via `NVIM_PRG`, run on a copy of the testdir with a sandboxed `HOME`.
 
-Subsystem compatibility is verified through automated unit tests, differential schema comparisons, RPC transcript replays, and pseudo-terminal execution checks.
+## Current compatibility
 
-### Workspace test suites
+### API metadata
 
-Over 1,400 unit, property, and integration tests pass across all workspace crates:
+`just apidiff` normalizes both `--api-info` schemas and requires them equal: every public function with its parameter types, optionality flags, return types, deprecation markers, and method flags, plus error type enumerations, UI event definitions, `ui_options`, and the Ext handle `types` map, matches the oracle. The `version.build` field is ignored and is the only permitted difference.
 
-- `ox-types`: Object enums, handle types, typval conversions, and error models.
-- `ox-rpc`: MessagePack encoding, decoding, request dispatch, and notification streams.
-- `ox-loop`: Event reactor polling, timer heaps, and MultiQueue priority scheduling.
-- `ox-uv`: File descriptor management, asynchronous filesystem thread pool, networking, and signal handling.
-- `ox-text`: Piece-tree rope operations, line indexing, transactional undo trees, and ShaDa parsing.
-- `ox-regex`: Backtracking and NFA regex pattern matching.
-- `ox-eval`: Vimscript expression parsing, operator precedence, and variable scopes.
-- `ox-excmd`: Ex command syntax parsing and range resolution.
-- `ox-editor`: Single-writer editor state, window layout splits, and registers.
-- `ox-api`: Strongly typed `nvim_*` API functions and parameter conversion.
-- `ox-lua`: LuaJIT state initialization, type conversion, and standard library modules.
-- `ox-ui`: Grid cell compositing, line grid protocol generation, and highlight attributes.
-- `ox-tui`: Terminal event parsing, screen rendering, and mode switches.
-- `oxvim`: Command-line interface, server loop orchestration, and client startup.
+### MessagePack-RPC replay
 
-### API metadata parity
+`just replay` runs each session against Oxvim and the oracle and requires matching response streams and notification ordering:
 
-The `just apidiff` check validates the `--api-info` output against the compiled Neovim oracle binary. The schema matches exactly:
+- `core.yaml`: API info, buffer creation, line updates, Lua feature detection, `normal! ggdd`, and final buffer contents.
+- `options.yaml`: boolean and integer option assignment plus type validation of rejected values.
+- `eval.yaml`: arithmetic, string functions, list indexing, and dictionary lookups.
+- `channels.yaml`: terminal channel allocation, `nvim_chan_send` routing, and unknown-method error events. Socket channels are not covered.
+- `ui_attach.yaml`: initial redraw events ordered before the attach response, negotiated extension options, default colors, highlight tables, and mode info.
 
-- All 262 public API functions are declared with identical parameter types, return types, deprecation markers, and method associations.
-- Parameter optionality flags and execution mode annotations match upstream declarations.
-- Error type enumerations and UI event definitions align with the oracle schema.
+Known divergences are recorded in `tests/differential/SKIPS.md` and admitted only through `replay --bless --reason`. Two exist today:
 
-### MessagePack-RPC differential replay
+- `core.yaml`: Oxvim's live `nvim_get_api_info` builder assembles an incomplete metadata surface (the canonical `--api-info` schema is complete and passes `apidiff`); all subsequent core smoke responses match upstream.
+- `ui_attach.yaml`: the deterministic compositor/highlight snapshot omits runtime-specific title, cwd, the full default highlight corpus, and secondary mode/mouse frame.
 
-The `just replay` harness executes recorded YAML RPC sessions against both Oxvim and the Neovim oracle, verifying stream data and notification ordering:
+### Release binary differential
 
-- Core operations (`core.yaml`): Buffer creation, line updates, Lua feature detection, normal mode commands (`normal! ggdd`), and final buffer contents match upstream responses.
-- Options (`options.yaml`): Boolean, integer, string, flag, comma-separated list, and colon-delimited map option assignments match upstream behavior. Structured dictionary and array return values from `nvim_set_option_value` match upstream return shapes and type validation checks.
-- Vimscript evaluation (`eval.yaml`): Arithmetic calculations, string functions, list indexing, and dictionary lookups match upstream evaluation streams.
-- Channels (`channels.yaml`): Terminal channel allocation, socket streams, `nvim_chan_send` routing, and unknown-method error event generation match upstream behavior.
-- UI attachment (`ui_attach.yaml`): Initial redraw events are emitted prior to the attach response. Negotiated extension options, default colors, initial highlight tables, and mode info events are verified with a narrow sanctioned difference for renderer-specific metadata.
+`just differential` checks the release binary:
 
-### Interactive terminal execution
+- An embedded smoke check spawns `oxvim --embed` and verifies the MessagePack handshake, channel identity, and API level 15.
+- PTY checks run Oxvim in an 80x24 terminal with `TERM=xterm-256color`: they wait for terminal setup, insert text in Insert mode, drive the `:edit x` command-line overlay with a nested `Ctrl-R =1+1` expression level and cancel both, send `:q!`, and assert exit code 0, cursor-shape restore, and OSC 104 palette reset. Further PTY cases cover command-line overlay nesting and wildmenu protocol levels, message sticky-expiry versus same-id replacement, and colorscheme re-theming at a single batch boundary.
 
-The `just differential` suite runs automated PTY tests against the release binary in a simulated terminal environment:
+### Options and mappings
 
-- Spawns Oxvim in raw terminal mode.
-- Sends keystrokes to enter text in Insert mode.
-- Executes Ex commands (`:echo 1+1<CR>`) through the command line and verifies rendered output.
-- Executes quit commands (`:q!<CR>`) and verifies clean process exit with status code 0.
-- Asserts terminal cleanup sequences, including cursor shape restoration and palette reset (OSC 104).
+- Composite option mutation (`append`, `prepend`, `remove`, the `:set +=`, `:set ^=`, `:set -=` merges, including comma-list, flag-list, `key:value` item, and `$VAR` expansion rules) is implemented in the ox-api option merge and covered by the workspace suite.
+- Key mappings, including `<Nop>`, parsed Ex-command mappings, and mappings backed by Vimscript expressions (`Expr`) or Lua callbacks, execute through the interactive input loop.
 
-## Work in progress
+### Architecture invariants
 
-Two upstream test suites are being incrementally enabled:
+- Buffer text is a Ropey-backed rope with transactional undo (ox-text).
+- The event loop uses `mio` to poll file descriptors and drains the hierarchical `MultiQueue` at deferred safe points; `WorkQueues` classifies each posted item as Fast or Deferred work (ox-loop).
 
-- Upstream functional test suite (`just functional`): Runs Neovim's Busted-based functional test suite against the Oxvim binary using the `NVIM_PRG` harness override.
-- Upstream legacy test suite (`just oldtest`): Runs the legacy Vimscript test harness against the Oxvim binary using `NVIM_PRG`.
+## Known gaps
 
-## Known gaps and current limitations
+- Terminal channels connect and route data, but parsing terminal VT escape sequences into buffer cells is not implemented.
+- Unsetting a local option value with `nil` is not yet supported in the editor options store.
+- Advanced `vim.uv` features (custom polling priorities, non-standard file descriptor redirection, and platform system metrics) return typed `Unsupported` errors.
+- Windows is untested; verification runs on Linux and POSIX-compliant systems.
 
-The following limitations are documented and tracked for upcoming development phases:
+## In-progress upstream suites
 
-### Option mutation operations
-
-`nvim_set_option_value` supports direct value assignment across all option types. However, composite mutation operations (`append`, `prepend`, and `remove`, corresponding to `:set+=` and `:set-=`) currently return a typed `Unsupported` error. Additionally, unsetting local option values via `nil` is not yet supported in the editor options store.
-
-### Expression and callback mappings
-
-Key mappings, `<Nop>`, and parsed Ex-command mappings execute through the interactive input loop. Mappings that evaluate Vimscript expressions (`Expr`) or invoke Lua callbacks (`Callback`) return a typed API error during interactive input dispatch.
-
-### Process-backed job control
-
-In-process terminal channels (`nvim_open_term`, `nvim_chan_send`) are connected and routed. Full asynchronous process execution via `jobstart()` with stdout/stderr callback routing and terminal VT escape sequence parsing into buffer cells is under active development.
-
-### Advanced vim.uv features
-
-The `ox-uv` engine implements the core handle types and asynchronous filesystem operations. Advanced features, including custom polling priorities, non-standard file descriptor redirection, and platform system metrics, return typed `Unsupported` errors rather than failing silently.
-
-### Platform support
-
-Oxvim is tested and verified on Linux and POSIX-compliant operating systems. Windows platform compatibility is currently untested.
+`just functional` (Busted) and `just oldtest` (legacy Vimscript) run Neovim's own suites against the Oxvim binary through `NVIM_PRG`. Both are being enabled test by test.
