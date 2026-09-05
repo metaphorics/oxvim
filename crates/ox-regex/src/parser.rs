@@ -4,7 +4,9 @@ use crate::{CompileError, Magic};
 pub(crate) enum Expr {
     Empty,
     Literal(char),
-    Any { newline: bool },
+    Any {
+        newline: bool,
+    },
     Class(CharClass),
     Concat(Vec<Expr>),
     Alt(Vec<Expr>),
@@ -15,10 +17,17 @@ pub(crate) enum Expr {
         max: Option<usize>,
         greedy: bool,
     },
-    Group { index: Option<usize>, expr: Box<Expr> },
+    Group {
+        index: Option<usize>,
+        expr: Box<Expr>,
+    },
     OptionalSeq(Vec<Expr>),
     Anchor(Anchor),
-    Look { expr: Box<Expr>, kind: LookKind, limit: Option<usize> },
+    Look {
+        expr: Box<Expr>,
+        kind: LookKind,
+        limit: Option<usize>,
+    },
     Backref(usize),
     SetStart,
     SetEnd,
@@ -40,7 +49,7 @@ pub(crate) enum Compare {
     Greater,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Anchor {
     LineStart,
     LineEnd,
@@ -98,6 +107,10 @@ pub(crate) enum ClassKind {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+// Independent feature detectors, not a state machine: each records a
+// different upstream engine-capability observed while parsing, and callers
+// combine them with `||` at engine selection.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Features {
     pub(crate) backref: bool,
     pub(crate) lookbehind: bool,
@@ -159,7 +172,10 @@ impl<'a> Parser<'a> {
             branches.push(self.parse_branch(terminator)?);
         }
         Ok(if branches.len() == 1 {
-            match branches.pop() { Some(branch) => branch, None => Expr::Empty }
+            match branches.pop() {
+                Some(branch) => branch,
+                None => Expr::Empty,
+            }
         } else {
             Expr::Alt(branches)
         })
@@ -171,7 +187,10 @@ impl<'a> Parser<'a> {
             conjunctions.push(self.parse_concat(terminator)?);
         }
         Ok(if conjunctions.len() == 1 {
-            match conjunctions.pop() { Some(concat) => concat, None => Expr::Empty }
+            match conjunctions.pop() {
+                Some(concat) => concat,
+                None => Expr::Empty,
+            }
         } else {
             Expr::And(conjunctions)
         })
@@ -188,7 +207,10 @@ impl<'a> Parser<'a> {
         }
         Ok(match pieces.len() {
             0 => Expr::Empty,
-            1 => match pieces.pop() { Some(piece) => piece, None => Expr::Empty },
+            1 => match pieces.pop() {
+                Some(piece) => piece,
+                None => Expr::Empty,
+            },
             _ => Expr::Concat(pieces),
         })
     }
@@ -220,6 +242,9 @@ impl<'a> Parser<'a> {
         Ok(atom)
     }
 
+    // One linear per-escape dispatch mirroring regatom.c's atom switch; the
+    // arm order is upstream's, so splitting it would fragment the mirror.
+    #[allow(clippy::too_many_lines)]
     fn parse_atom(&mut self) -> Result<Expr, CompileError> {
         let start = self.pos;
         if self.starts_with("\\@") {
@@ -244,17 +269,26 @@ impl<'a> Parser<'a> {
             self.pos += 3;
             return Ok(Expr::SetEnd);
         }
-        if self.at_percent("[") { self.consume_percent("["); let mut atoms = Vec::new();
-        while !self.at_end() && !self.starts_with("]") {
-            atoms.push(self.parse_piece()?);
+        if self.at_percent("[") {
+            self.consume_percent("[");
+            let mut atoms = Vec::new();
+            while !self.at_end() && !self.starts_with("]") {
+                atoms.push(self.parse_piece()?);
+            }
+            if !self.consume_str("]") {
+                return Err(self.error("unclosed optional atom sequence"));
+            }
+            return Ok(Expr::OptionalSeq(atoms));
         }
-        if !self.consume_str("]") {
-            return Err(self.error("unclosed optional atom sequence"));
+        if self.at_percent("(") {
+            self.consume_percent("(");
+            let expr = self.parse_pattern(Some(Terminator::Group))?;
+            self.expect_group_close("unclosed non-capturing group")?;
+            return Ok(Expr::Group {
+                index: None,
+                expr: Box::new(expr),
+            });
         }
-        return Ok(Expr::OptionalSeq(atoms)); }
-        if self.at_percent("(") { self.consume_percent("("); let expr = self.parse_pattern(Some(Terminator::Group))?;
-        self.expect_group_close("unclosed non-capturing group")?;
-        return Ok(Expr::Group { index: None, expr: Box::new(expr) }); }
         if self.at_group_open() {
             self.consume_group_open();
             self.captures += 1;
@@ -265,18 +299,42 @@ impl<'a> Parser<'a> {
             let expr = self.parse_pattern(Some(Terminator::Group))?;
             self.expect_group_close("unclosed capture group")?;
             self.closed_captures = self.closed_captures.max(index);
-            return Ok(Expr::Group { index: Some(index), expr: Box::new(expr) });
+            return Ok(Expr::Group {
+                index: Some(index),
+                expr: Box::new(expr),
+            });
         }
-        if self.at_percent("^") { self.consume_percent("^"); return Ok(Expr::Anchor(Anchor::FileStart)); }
-        if self.at_percent("$") { self.consume_percent("$"); return Ok(Expr::Anchor(Anchor::FileEnd)); }
-        if self.at_percent("V") { self.consume_percent("V"); return Ok(Expr::Anchor(Anchor::Visual)); }
-        if self.at_percent("#") { self.consume_percent("#"); return Ok(Expr::Anchor(Anchor::Cursor)); }
-        if self.at_percent("'") { self.consume_percent("'"); let mark = self.next_char().ok_or_else(|| self.error("missing mark name"))?;
-        return Ok(Expr::Anchor(Anchor::Mark(mark))); }
+        if self.at_percent("^") {
+            self.consume_percent("^");
+            return Ok(Expr::Anchor(Anchor::FileStart));
+        }
+        if self.at_percent("$") {
+            self.consume_percent("$");
+            return Ok(Expr::Anchor(Anchor::FileEnd));
+        }
+        if self.at_percent("V") {
+            self.consume_percent("V");
+            return Ok(Expr::Anchor(Anchor::Visual));
+        }
+        if self.at_percent("#") {
+            self.consume_percent("#");
+            return Ok(Expr::Anchor(Anchor::Cursor));
+        }
+        if self.at_percent("'") {
+            self.consume_percent("'");
+            let mark = self
+                .next_char()
+                .ok_or_else(|| self.error("missing mark name"))?;
+            return Ok(Expr::Anchor(Anchor::Mark(mark)));
+        }
         if let Some(literal) = self.parse_numeric_character()? {
             return Ok(Expr::Literal(literal));
         }
-        if self.at_percent("") { if let Some(anchor) = self.parse_position_anchor()? { return Ok(Expr::Anchor(anchor)); } }
+        if self.at_percent("")
+            && let Some(anchor) = self.parse_position_anchor()?
+        {
+            return Ok(Expr::Anchor(anchor));
+        }
         if self.consume_escaped('<') {
             return Ok(Expr::Anchor(Anchor::WordStart));
         }
@@ -301,9 +359,13 @@ impl<'a> Parser<'a> {
         }
         if self.starts_with("\\_") {
             self.pos += 2;
-            let code = self.next_char().ok_or_else(|| self.error("missing newline class"))?;
-            let (kind, negated) = class_escape(code)
-                .ok_or_else(|| CompileError::InvalidEscape { offset: start, escape: code })?;
+            let code = self
+                .next_char()
+                .ok_or_else(|| self.error("missing newline class"))?;
+            let (kind, negated) = class_escape(code).ok_or(CompileError::InvalidEscape {
+                offset: start,
+                escape: code,
+            })?;
             return Ok(Expr::Class(CharClass {
                 negated,
                 include_newline: true,
@@ -319,16 +381,26 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Any { newline: false });
         }
         if self.at_anchor_start() {
-            self.pos += if self.mode == Magic::VeryNoMagic { 2 } else { 1 };
+            self.pos += if self.mode == Magic::VeryNoMagic {
+                2
+            } else {
+                1
+            };
             return Ok(Expr::Anchor(Anchor::LineStart));
         }
         if self.at_anchor_end() {
-            self.pos += if self.mode == Magic::VeryNoMagic { 2 } else { 1 };
+            self.pos += if self.mode == Magic::VeryNoMagic {
+                2
+            } else {
+                1
+            };
             return Ok(Expr::Anchor(Anchor::LineEnd));
         }
         if self.starts_with("\\") {
             self.pos += 1;
-            let escaped = self.next_char().ok_or_else(|| self.error("trailing backslash"))?;
+            let escaped = self
+                .next_char()
+                .ok_or_else(|| self.error("trailing backslash"))?;
             if ('1'..='9').contains(&escaped) {
                 let index = usize::from(escaped as u8 - b'0');
                 if index > self.closed_captures {
@@ -354,7 +426,9 @@ impl<'a> Parser<'a> {
             };
             return Ok(Expr::Literal(literal));
         }
-        self.next_char().map(Expr::Literal).ok_or_else(|| self.error("expected atom"))
+        self.next_char()
+            .map(Expr::Literal)
+            .ok_or_else(|| self.error("expected atom"))
     }
 
     fn parse_position_anchor(&mut self) -> Result<Option<Anchor>, CompileError> {
@@ -454,12 +528,18 @@ impl<'a> Parser<'a> {
         if !self.consume_str("]") {
             return Err(self.error("unclosed character collection"));
         }
-        Ok(Expr::Class(CharClass { negated, include_newline, items }))
+        Ok(Expr::Class(CharClass {
+            negated,
+            include_newline,
+            items,
+        }))
     }
 
     fn parse_collection_char(&mut self) -> Result<char, CompileError> {
         if self.consume_str("\\") {
-            let escaped = self.next_char().ok_or_else(|| self.error("trailing escape in collection"))?;
+            let escaped = self
+                .next_char()
+                .ok_or_else(|| self.error("trailing escape in collection"))?;
             return Ok(match escaped {
                 'n' => '\n',
                 't' => '\t',
@@ -469,7 +549,8 @@ impl<'a> Parser<'a> {
                 other => other,
             });
         }
-        self.next_char().ok_or_else(|| self.error("missing collection character"))
+        self.next_char()
+            .ok_or_else(|| self.error("missing collection character"))
     }
 
     fn parse_multiplier(&mut self) -> Result<Option<(usize, Option<usize>, bool)>, CompileError> {
@@ -504,12 +585,22 @@ impl<'a> Parser<'a> {
         if !self.consume_str("}") {
             return Err(self.error("unclosed multiplier"));
         }
-        let min = if min_text.is_empty() { 0 } else {
-            min_text.parse::<usize>().map_err(|_| self.error("multiplier is too large"))?
+        let min = if min_text.is_empty() {
+            0
+        } else {
+            min_text
+                .parse::<usize>()
+                .map_err(|_| self.error("multiplier is too large"))?
         };
         let max = if comma {
-            if max_text.is_empty() { None } else {
-                Some(max_text.parse::<usize>().map_err(|_| self.error("multiplier is too large"))?)
+            if max_text.is_empty() {
+                None
+            } else {
+                Some(
+                    max_text
+                        .parse::<usize>()
+                        .map_err(|_| self.error("multiplier is too large"))?,
+                )
             }
         } else if min_text.is_empty() {
             None
@@ -519,16 +610,18 @@ impl<'a> Parser<'a> {
         if max.is_some_and(|value| value < min) {
             return Err(self.error("multiplier maximum is less than minimum"));
         }
-        if max.is_some_and(|value| {
-            (value > 500 || value.saturating_sub(min) > 200) && min < 200
-        }) {
+        if max.is_some_and(|value| (value > 500 || value.saturating_sub(min) > 200) && min < 200) {
             self.features.complex_repeat = true;
         }
         Ok(Some((min, max, greedy)))
     }
 
     fn parse_look_suffix(&mut self) -> Result<Option<(LookKind, Option<usize>)>, CompileError> {
-        let marker = if self.mode == Magic::VeryMagic { "@" } else { "\\@" };
+        let marker = if self.mode == Magic::VeryMagic {
+            "@"
+        } else {
+            "\\@"
+        };
         if !self.consume_str(marker) {
             return Ok(None);
         }
@@ -539,9 +632,11 @@ impl<'a> Parser<'a> {
         let limit = if number_start == self.pos {
             None
         } else {
-            Some(self.pattern[number_start..self.pos]
-                .parse::<usize>()
-                .map_err(|_| self.error("lookbehind limit is too large"))?)
+            Some(
+                self.pattern[number_start..self.pos]
+                    .parse::<usize>()
+                    .map_err(|_| self.error("lookbehind limit is too large"))?,
+            )
         };
         let kind = if self.consume_str("<=") {
             LookKind::Behind
@@ -581,7 +676,11 @@ impl<'a> Parser<'a> {
     }
 
     fn at_group_open(&self) -> bool {
-        if self.mode == Magic::VeryMagic { self.starts_with("(") } else { self.starts_with("\\(") }
+        if self.mode == Magic::VeryMagic {
+            self.starts_with("(")
+        } else {
+            self.starts_with("\\(")
+        }
     }
 
     fn percent_prefix_len(&self) -> usize {
@@ -591,9 +690,11 @@ impl<'a> Parser<'a> {
     fn at_percent(&self, suffix: &str) -> bool {
         let rest = &self.pattern[self.pos..];
         if self.mode == Magic::VeryMagic {
-            rest.strip_prefix('%').is_some_and(|tail| tail.starts_with(suffix))
+            rest.strip_prefix('%')
+                .is_some_and(|tail| tail.starts_with(suffix))
         } else {
-            rest.strip_prefix("\\%").is_some_and(|tail| tail.starts_with(suffix))
+            rest.strip_prefix("\\%")
+                .is_some_and(|tail| tail.starts_with(suffix))
         }
     }
 
@@ -609,11 +710,19 @@ impl<'a> Parser<'a> {
     }
 
     fn expect_group_close(&mut self, message: &'static str) -> Result<(), CompileError> {
-        let close = if self.mode == Magic::VeryMagic { "" } else { "\\" };
+        let close = if self.mode == Magic::VeryMagic {
+            ""
+        } else {
+            "\\"
+        };
         if !close.is_empty() && !self.consume_str(close) {
             return Err(self.error(message));
         }
-        if self.consume_str(")") { Ok(()) } else { Err(self.error(message)) }
+        if self.consume_str(")") {
+            Ok(())
+        } else {
+            Err(self.error(message))
+        }
     }
 
     fn consume_group_open(&mut self) {
@@ -628,7 +737,11 @@ impl<'a> Parser<'a> {
     }
 
     fn consume_collection_open(&mut self) {
-        self.pos += if matches!(self.mode, Magic::Magic | Magic::VeryMagic) { 1 } else { 2 };
+        self.pos += if matches!(self.mode, Magic::Magic | Magic::VeryMagic) {
+            1
+        } else {
+            2
+        };
     }
 
     fn at_dot(&self) -> bool {
@@ -639,7 +752,11 @@ impl<'a> Parser<'a> {
     }
 
     fn consume_dot(&mut self) {
-        self.pos += if matches!(self.mode, Magic::Magic | Magic::VeryMagic) { 1 } else { 2 };
+        self.pos += if matches!(self.mode, Magic::Magic | Magic::VeryMagic) {
+            1
+        } else {
+            2
+        };
     }
 
     fn at_anchor_start(&self) -> bool {
@@ -678,8 +795,7 @@ impl<'a> Parser<'a> {
     fn at_operator(&self, op: char) -> bool {
         let escaped = format!("\\{op}");
         match (self.mode, op) {
-            (Magic::VeryMagic, _) => self.starts_with_char(op),
-            (Magic::Magic, '*') => self.starts_with_char(op),
+            (Magic::VeryMagic, _) | (Magic::Magic, '*') => self.starts_with_char(op),
             (_, _) => self.starts_with(&escaped),
         }
     }
@@ -688,7 +804,11 @@ impl<'a> Parser<'a> {
         if !self.at_operator(op) {
             return false;
         }
-        self.pos += if self.mode == Magic::VeryMagic || (self.mode == Magic::Magic && op == '*') { 1 } else { 2 };
+        self.pos += if self.mode == Magic::VeryMagic || (self.mode == Magic::Magic && op == '*') {
+            1
+        } else {
+            2
+        };
         true
     }
 
@@ -723,8 +843,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    
-
     fn peek_char(&self) -> Option<char> {
         self.pattern[self.pos..].chars().next()
     }
@@ -740,7 +858,10 @@ impl<'a> Parser<'a> {
     }
 
     fn error(&self, message: &'static str) -> CompileError {
-        CompileError::Syntax { offset: self.pos, message }
+        CompileError::Syntax {
+            offset: self.pos,
+            message,
+        }
     }
 }
 

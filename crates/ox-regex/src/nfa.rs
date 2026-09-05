@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 use crate::bt::{self, State};
 use crate::parser::{CharClass, Expr};
@@ -23,8 +25,12 @@ pub(crate) fn search(prog: &Prog, text: &Text, from: usize) -> Result<Option<Sta
     let mut code = Vec::new();
     compile_expr(&prog.expr, &mut code);
     code.push(Inst::Match);
+    let anchored = bt::leading_anchor(&prog.expr);
     let mut steps = 0;
     for candidate in candidate_offsets(text.as_str(), from) {
+        if !bt::anchor_allows(anchored, text, candidate) {
+            continue;
+        }
         if let Some(mut state) = run_candidate(prog, text, &code, candidate, &mut steps)? {
             state.set_search_start(candidate);
             return Ok(Some(state));
@@ -40,14 +46,21 @@ fn run_candidate(
     candidate: usize,
     steps: &mut usize,
 ) -> Result<Option<State>, ExecError> {
-    let mut stack = vec![(0, State::new(candidate, prog.capture_count), BTreeSet::new())];
-    while let Some((mut pc, mut state, mut visited)) = stack.pop() {
+    // One dedup set per candidate: cloning it per split point made a greedy
+    // walk over a long line quadratic in the line length.
+    let visited: Rc<RefCell<BTreeSet<(usize, usize)>>> = Rc::new(RefCell::new(BTreeSet::new()));
+    let mut stack = vec![(
+        0usize,
+        State::new(candidate, prog.capture_count),
+        visited,
+    )];
+    while let Some((mut pc, mut state, visited)) = stack.pop() {
         loop {
             *steps = steps.checked_add(1).ok_or(ExecError::StepLimit)?;
             if *steps > prog.step_limit {
                 return Err(ExecError::StepLimit);
             }
-            if !visited.insert((pc, state.pos)) {
+            if !visited.borrow_mut().insert((pc, state.pos)) {
                 break;
             }
             let Some(inst) = code.get(pc) else {
@@ -55,32 +68,32 @@ fn run_candidate(
             };
             match inst {
                 Inst::Char(expected) => {
-                    if let Some((actual, next)) = next_char(text.as_str(), state.pos) {
-                        if bt::chars_equal(*expected, actual, prog.ignore_case) {
-                            state.pos = next;
-                            pc += 1;
-                            continue;
-                        }
+                    if let Some((actual, next)) = next_char(text.as_str(), state.pos)
+                        && bt::chars_equal(*expected, actual, prog.ignore_case)
+                    {
+                        state.pos = next;
+                        pc += 1;
+                        continue;
                     }
                     break;
                 }
                 Inst::Any { newline } => {
-                    if let Some((actual, next)) = next_char(text.as_str(), state.pos) {
-                        if *newline || actual != '\n' {
-                            state.pos = next;
-                            pc += 1;
-                            continue;
-                        }
+                    if let Some((actual, next)) = next_char(text.as_str(), state.pos)
+                        && (*newline || actual != '\n')
+                    {
+                        state.pos = next;
+                        pc += 1;
+                        continue;
                     }
                     break;
                 }
                 Inst::Class(class) => {
-                    if let Some((actual, next)) = next_char(text.as_str(), state.pos) {
-                        if bt::class_matches(class, actual, prog.ignore_case) {
-                            state.pos = next;
-                            pc += 1;
-                            continue;
-                        }
+                    if let Some((actual, next)) = next_char(text.as_str(), state.pos)
+                        && bt::class_matches(class, actual, prog.ignore_case)
+                    {
+                        state.pos = next;
+                        pc += 1;
+                        continue;
                     }
                     break;
                 }
@@ -102,13 +115,13 @@ fn run_candidate(
                 }
                 Inst::Jump(target) => pc = *target,
                 Inst::Split(first, second) => {
-                    stack.push((*second, state.clone(), visited.clone()));
+                    stack.push((*second, state.clone(), Rc::clone(&visited)));
                     pc = *first;
                 }
                 Inst::Fallback(expr) => {
                     let results = bt::match_at(prog, text, expr, state, candidate)?;
                     for result in results.into_iter().rev() {
-                        stack.push((pc + 1, result, visited.clone()));
+                        stack.push((pc + 1, result, Rc::clone(&visited)));
                     }
                     break;
                 }
@@ -131,12 +144,20 @@ fn compile_expr(expr: &Expr, code: &mut Vec<Inst>) {
             }
         }
         Expr::Alt(branches) => compile_alt(branches, code),
-        Expr::Repeat { expr: _, min, max: Some(max), greedy: _ }
-            if (*max > 500 || max.saturating_sub(*min) > 200) && *min < 200 =>
-        {
+        Expr::Repeat {
+            expr: _,
+            min,
+            max: Some(max),
+            greedy: _,
+        } if (*max > 500 || max.saturating_sub(*min) > 200) && *min < 200 => {
             code.push(Inst::Fallback(expr.clone()));
         }
-        Expr::Repeat { expr, min, max, greedy } => compile_repeat(expr, *min, *max, *greedy, code),
+        Expr::Repeat {
+            expr,
+            min,
+            max,
+            greedy,
+        } => compile_repeat(expr, *min, *max, *greedy, code),
         Expr::Group { index, expr } => {
             if let Some(index) = index {
                 code.push(Inst::SaveStart(*index));
@@ -189,21 +210,22 @@ fn compile_repeat(expr: &Expr, min: usize, max: Option<usize>, greedy: bool, cod
     for _ in 0..min {
         compile_expr(expr, code);
     }
-    match max {
-        Some(maximum) => {
-            for _ in min..maximum {
-                compile_optional(expr, greedy, code);
-            }
+    if let Some(maximum) = max {
+        for _ in min..maximum {
+            compile_optional(expr, greedy, code);
         }
-        None => {
-            let split = code.len();
-            code.push(Inst::Split(0, 0));
-            let body = code.len();
-            compile_expr(expr, code);
-            code.push(Inst::Jump(split));
-            let end = code.len();
-            code[split] = if greedy { Inst::Split(body, end) } else { Inst::Split(end, body) };
-        }
+    } else {
+        let split = code.len();
+        code.push(Inst::Split(0, 0));
+        let body = code.len();
+        compile_expr(expr, code);
+        code.push(Inst::Jump(split));
+        let end = code.len();
+        code[split] = if greedy {
+            Inst::Split(body, end)
+        } else {
+            Inst::Split(end, body)
+        };
     }
 }
 
@@ -213,7 +235,11 @@ fn compile_optional(expr: &Expr, greedy: bool, code: &mut Vec<Inst>) {
     let body = code.len();
     compile_expr(expr, code);
     let end = code.len();
-    code[split] = if greedy { Inst::Split(body, end) } else { Inst::Split(end, body) };
+    code[split] = if greedy {
+        Inst::Split(body, end)
+    } else {
+        Inst::Split(end, body)
+    };
 }
 
 fn next_char(text: &str, offset: usize) -> Option<(char, usize)> {
