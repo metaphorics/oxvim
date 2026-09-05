@@ -798,6 +798,12 @@ fn runtimepath_default_layout_matches_upstream_order() {
         crate::script::build_runtimepath(None, &[], None, &[], std::path::Path::new("/rt")),
         "/rt"
     );
+    // A root-only runtime trims to nothing; keep the root instead of
+    // dropping the tree.
+    assert_eq!(
+        crate::script::build_runtimepath(None, &[], None, &[], std::path::Path::new("/")),
+        "/"
+    );
 }
 
 // runtime.c do_in_runtimepath — runtime search roots follow the

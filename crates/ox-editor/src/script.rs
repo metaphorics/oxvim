@@ -703,12 +703,14 @@ pub(crate) fn build_runtimepath(
     // An unresolved runtime tree contributes no entry (an empty path
     // would render as an empty comma-list item, which the option setter
     // rejects at startup).
-    let vimruntime = vimruntime
-        .to_string_lossy()
-        .trim_end_matches('/')
-        .to_owned();
+    let raw_vimruntime = vimruntime.to_string_lossy();
+    let vimruntime = raw_vimruntime.trim_end_matches('/');
     if !vimruntime.is_empty() {
-        entries.push(vimruntime);
+        entries.push(vimruntime.to_owned());
+    } else if raw_vimruntime.starts_with('/') {
+        // A root-only runtime (`/`, `//`) trims to nothing; keep the root
+        // instead of dropping the tree.
+        entries.push("/".to_owned());
     }
     for dir in data_dirs.iter().rev() {
         entries.push(joined(dir, &format!("{APPNAME}/site/after")));
