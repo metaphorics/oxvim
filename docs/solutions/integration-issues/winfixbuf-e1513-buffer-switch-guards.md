@@ -71,8 +71,8 @@ Guarded seams, each with upstream's exact escape conditions:
 |---|---|---|
 | `command_edit` (+ `:ex`/`:visual`/`:view`/`:drop` aliases) | `do_ecmd`, ex_docmd.c:5987 | target name differs from current buffer (`is_other_file`); bare `:edit` reload is exempt |
 | `command_enew` | ex_docmd.c:5987 | always (new buffer); `enew!` overrides |
-| `command_buffer` / `command_buffer_step` / `command_buffer_absolute` | `do_buffer`, buffer.c:1396 | target handle != current; bang overrides |
-| `edit_argument_file` (`:next`/`:previous`/`:first`/`:last`/`:argument`/`:wnext`/`:wprevious`) | `do_argfile`, arglist.c:619 | entry resolves to a different buffer; bang overrides |
+| `command_buffer` / `command_buffer_step` / `command_buffer_absolute` | `do_buffer`, buffer.c:1397 | target handle != current; bang overrides |
+| `edit_argument_file` (`:next`/`:previous`/`:first`/`:last`/`:argument`/`:wnext`/`:wprevious`) | `do_argfile`, arglist.c:620 | entry resolves to a different buffer; bang overrides |
 | `command_find` | `ex_find`, ex_docmd.c:5941 | always; `find!` overrides |
 | `open_tag_buffer` in-place tail | `do_tag`/`jumpto_tag`, tag.c:308/2633 | `postponed_split == 0` equivalent: `!split && target != current` |
 | `goto_file_under_cursor` (`gf`) | `nv_gotofile`, normal.c:3871 | always — `_disabled` check, NO bang escape |
