@@ -793,6 +793,30 @@ mod tests {
         assert!(events.iter().any(|event| event_name(event) == "exit"));
     }
 
+    // system()'s contract: events drained while waiting for one job must
+    // stay deliverable for the others. run_shell_command re-defers what
+    // wait() collected; this pins that the deferred queue survives the
+    // round-trip and surfaces on a later poll.
+    #[test]
+    fn redeferred_events_survive_a_wait_for_another_job() {
+        let mut jobs = JobManager::new().unwrap();
+        jobs.start(3, options("printf 'out'", true)).unwrap();
+        jobs.start(4, collected("printf 'other'")).unwrap();
+        let (_, events) = jobs.wait(&[3], 2_000).unwrap();
+        jobs.defer_events(events);
+        let mut surfaced = false;
+        for _ in 0..100 {
+            let polled = jobs.poll().unwrap();
+            if !polled.is_empty() && event_name(&polled[0]) == "stdout" {
+                surfaced = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        jobs.wait(&[4], 2_000).unwrap();
+        assert!(surfaced, "re-deferred events must surface on a later poll");
+    }
+
     // `close_input` must close the descriptor, not just drop the handle: the
     // loop holds its own clone of the stream state, so dropping alone left the
     // child's standard input open. `cat` is the exact shape that exposes it —
