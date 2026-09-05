@@ -2440,6 +2440,15 @@ impl ModeMachine {
                 "No identifier under cursor".to_owned(),
             ));
         };
+        // `nv_ident` resolves the identifier first (normal.c:3391), then the
+        // `:tag` it dispatches refuses to leave a 'winfixbuf' window without a
+        // bang (`check_can_set_curbuf_forceit`, tag.c:308 and tag.c:2633).
+        if editor.current_window_fixed_to_buffer() {
+            return Err(ModeError::Vim(
+                "E1513",
+                "Cannot switch buffer. 'winfixbuf' is enabled".to_owned(),
+            ));
+        }
         let needle = String::from_utf8_lossy(ident).into_owned();
         let tags_option = match editor.options().get_global("tags") {
             Ok(OptionValue::String(value)) => value.clone(),

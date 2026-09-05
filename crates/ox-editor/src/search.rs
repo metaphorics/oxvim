@@ -338,10 +338,20 @@ fn select_lazy_forward(
     // match starts, so yields overlapping it are skipped to keep the public
     // after-end progression both sweeps must share.
     let mut last_end: Option<usize> = None;
+    // Track the sweep so the overlap guard resets when the wrapped sweep
+    // begins; the two sweeps cover disjoint buffer regions.
+    let mut prev_sweep = scan.sweep;
     loop {
         match scan.step(program, from, true)? {
             Step::Found(candidate) => {
                 from = scan.advance_after_end(&candidate);
+                if scan.sweep != prev_sweep {
+                    // The wrapped sweep begins: its candidates start before the
+                    // first sweep's initial bound, so the previous last_end
+                    // cannot overlap them. Reset the guard for this sweep.
+                    last_end = None;
+                    prev_sweep = scan.sweep;
+                }
                 if scan.sweep == Sweep::First && candidate.span.start.byte <= cursor_byte {
                     if first_skipped.is_none() {
                         first_skipped = Some(candidate.span);
@@ -1250,31 +1260,40 @@ pub(crate) fn scan_count(
     let mut incomplete = 0i64;
     let mut found_any = false;
     let mut from = 0usize;
-    while let Step::Found(candidate) = scan.step(Program::Single(prog), from, true)? {
-        found_any = true;
-        if deadline.is_some_and(|limit| Instant::now() >= limit) {
-            incomplete = 1;
-            break;
-        }
-        total = total.saturating_add(1);
-        let key = |at: RegexPosition| {
-            (
-                i64::try_from(at.lnum).unwrap_or(i64::MAX),
-                i64::try_from(at.col).unwrap_or(i64::MAX),
-                0i64,
-            )
-        };
-        if key(candidate.span.start) <= pos {
-            current = total;
-            if pos < key(candidate.span.end) {
-                exact_match = true;
+    loop {
+        match scan.step(Program::Single(prog), from, true)? {
+            Step::Found(candidate) => {
+                found_any = true;
+                if deadline.is_some_and(|limit| Instant::now() >= limit) {
+                    incomplete = 1;
+                    break;
+                }
+                total = total.saturating_add(1);
+                let key = |at: RegexPosition| {
+                    (
+                        i64::try_from(at.lnum).unwrap_or(i64::MAX),
+                        i64::try_from(at.col).unwrap_or(i64::MAX),
+                        0i64,
+                    )
+                };
+                if key(candidate.span.start) <= pos {
+                    current = total;
+                    if pos < key(candidate.span.end) {
+                        exact_match = true;
+                    }
+                }
+                if maxcount > 0 && total > maxcount {
+                    incomplete = 2;
+                    break;
+                }
+                from = scan.advance_past(&candidate);
             }
+            Step::TimedOut => {
+                incomplete = 1;
+                break;
+            }
+            Step::Exhausted => break,
         }
-        if maxcount > 0 && total > maxcount {
-            incomplete = 2;
-            break;
-        }
-        from = scan.advance_past(&candidate);
     }
     Ok(CountScan {
         current,
@@ -1704,5 +1723,73 @@ mod tests {
                 .unwrap(),
             Step::Exhausted
         );
+    }
+
+    /// A `TimedOut` step before any candidate is found must set
+    /// `incomplete = 1`, not leave it at 0.
+    #[test]
+    fn count_scan_marks_incomplete_on_step_timeout() {
+        let text = SearchText::new(&lines(&["foo"])).unwrap();
+        let prog = compile_search("foo", Magic::Magic).unwrap();
+        let deadline = Instant::now()
+            .checked_sub(std::time::Duration::from_nanos(1))
+            .expect("now minus one nanosecond is representable");
+        let scan = scan_count(&text, &prog, (1, 0, 0), i64::MAX, Some(deadline)).unwrap();
+        assert!(!scan.found_any);
+        assert_eq!(scan.total, 0);
+        assert_eq!(scan.incomplete, 1);
+    }
+
+    /// When the first sweep found a match, the wrapped sweep must not be
+    /// suppressed by that match's end byte. The lazy path should find the
+    /// wrapped result without falling back to the full-list walk.
+    #[test]
+    fn lazy_forward_wrap_resets_overlap_guard_between_sweeps() {
+        let text = SearchText::new(&lines(&["foo", "foo", "bar", "foo"])).unwrap();
+        let prog = compile_search("foo", Magic::Magic).unwrap();
+        let program = Program::Single(&prog);
+        let cursor = Position { lnum: 3, col: 0 };
+        let cursor_byte = text.byte_of(cursor);
+        let count = 2;
+
+        let lazy = select_lazy(
+            &text,
+            program,
+            cursor,
+            cursor_byte,
+            SearchDirection::Forward,
+            count,
+            true,
+        )
+        .unwrap()
+        .expect("lazy selection must find a match");
+
+        let full = CandidateScan::new(&text, SearchDirection::Forward, None, None)
+            .scan_all(program)
+            .unwrap();
+        let (full_index, full_wrapped) = select_full_index(
+            &full,
+            cursor_byte,
+            SearchDirection::Forward,
+            count,
+            true,
+            "foo",
+        )
+        .unwrap();
+
+        match lazy {
+            Select::Found { span, wrapped } => {
+                assert!(wrapped, "wrapped sweep must set wrapped=true");
+                assert_eq!(
+                    span, full[full_index].span,
+                    "lazy span must equal full scan"
+                );
+                assert_eq!(
+                    wrapped, full_wrapped,
+                    "lazy wrapped flag must equal full scan"
+                );
+            }
+            Select::NeedFull => panic!("lazy path must not fall back to full scan"),
+        }
     }
 }

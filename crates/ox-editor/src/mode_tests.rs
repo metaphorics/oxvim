@@ -4573,3 +4573,63 @@ fn v_register_invalid_prefix_leaves_no_stale_state() {
         "x executed as an unprefixed command after invalid prefix"
     );
 }
+
+/// `CTRL-]` resolves the identifier and dispatches `:tag <ident>` upstream
+/// (`nv_ident`, normal.c:3358); `do_tag` refuses to leave a 'winfixbuf' window
+/// before searching (`check_can_set_curbuf_forceit`, tag.c:308, re-checked in
+/// `jumpto_tag` at tag.c:2633): E1513 and the window keeps its buffer.
+#[test]
+fn ctrl_rbracket_tag_jump_respects_winfixbuf() {
+    let dir = std::env::temp_dir().join(format!("ox-tagjump-wfb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("Xtarget");
+    std::fs::write(&target, "fn target_fn() {}\n").unwrap();
+    let tags = dir.join("tags");
+    std::fs::write(
+        &tags,
+        format!("target_fn\t{}\t/^fn target_fn/\n", target.to_string_lossy()),
+    )
+    .unwrap();
+
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(b"call target_fn()\n").unwrap(), true)
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor
+        .tabpage(editor.current_tabpage().unwrap())
+        .unwrap()
+        .current_window();
+    editor.set_window_cursor(window, position(1, 6)).unwrap();
+    editor
+        .options_mut()
+        .set_global(
+            "tags",
+            OptionValue::String(tags.to_string_lossy().into_owned()),
+        )
+        .unwrap();
+    editor
+        .options_mut()
+        .set_window(window, "winfixbuf", OptionValue::Boolean(true))
+        .unwrap();
+
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    let error = machine
+        .feed_keys(&mut editor, "\u{1d}", &mut eval)
+        .unwrap_err();
+    assert!(
+        matches!(&error, ModeError::Vim("E1513", message) if message.contains("winfixbuf")),
+        "CTRL-] in a 'winfixbuf' window must fail with E1513, got {error:?}"
+    );
+    assert_eq!(
+        editor.current_buffer(),
+        Some(buffer),
+        "the window must keep its buffer"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
