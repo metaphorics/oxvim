@@ -50,6 +50,10 @@ pub struct QuickfixList {
     changedtick: u64,
     context: Typval,
     quickfixtextfunc: Typval,
+    /// 'errorformat' parse state carried across `:caddexpr`-style calls
+    /// (the `qf_dir_stack`/`qf_file_stack`/`qf_multiline` fields of
+    /// `qf_list_T`, quickfix.c:141-148).
+    efm: crate::efm::EfmState,
 }
 
 impl QuickfixList {
@@ -62,6 +66,7 @@ impl QuickfixList {
             changedtick: 0,
             context: Typval::String(OxStr::from("")),
             quickfixtextfunc: Typval::String(OxStr::from("")),
+            efm: crate::efm::EfmState::default(),
         }
     }
 
@@ -483,54 +488,13 @@ fn setqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
         .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
         .items
         .clone();
-    let action = match args.get(1) {
-        None => ' ',
-        Some(Typval::String(value)) if value.as_bytes().len() == 1 => {
-            let action = char::from(value.as_bytes()[0]);
-            if matches!(action, 'a' | 'r' | 'u' | ' ' | 'f') {
-                action
-            } else {
-                return Err(EvalError::new(
-                    "E927",
-                    0,
-                    format!("Invalid action: '{}'", value.to_string_lossy()),
-                ));
-            }
-        }
-        Some(Typval::String(value)) => {
-            return Err(EvalError::new(
-                "E927",
-                0,
-                format!("Invalid action: '{}'", value.to_string_lossy()),
-            ));
-        }
-        Some(_) => return Err(EvalError::new("E1174", 0, "String required for argument 2")),
-    };
+    let action = parse_action(args)?;
     if action == 'f' {
         editor.quickfix_mut().clear();
         return Ok(Typval::Number(0));
     }
 
-    let (what, legacy_title) = match args.get(2) {
-        None => (Vec::new(), None),
-        Some(Typval::Dict(reference)) => {
-            let entries = reference
-                .try_borrow()
-                .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
-                .entries
-                .clone();
-            if !raw_items.is_empty() {
-                return Err(EvalError::new(
-                    "E475",
-                    0,
-                    "Invalid argument: cannot have both a list and a \"what\" argument",
-                ));
-            }
-            (entries, None)
-        }
-        Some(Typval::String(title)) => (Vec::new(), Some(title.clone())),
-        Some(_) => return Err(EvalError::new("E715", 0, "Dictionary required")),
-    };
+    let (what, legacy_title) = what_argument(args, raw_items.is_empty())?;
 
     // A locked `items` list is E742 and a non-List value is E1211;
     // upstream `qf_set_properties` rejects both and leaves the existing
@@ -548,19 +512,62 @@ fn setqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
             return Err(EvalError::new("E1211", 0, "List required for argument 3"));
         }
     };
-    let parsed_items = parse_items(editor, &source_items)?;
     let title = legacy_title
         .or_else(|| dict_string(&what, "title"))
         .unwrap_or_else(|| OxStr::from(":setqflist()"));
+    // `target_for_set` pushes a fresh list for ' ' (or an empty stack);
+    // remember so a failed parse can drop it (quickfix.c:1218-1224).
+    let created = action == ' ' || editor.quickfix().lists.is_empty();
     let target = editor
         .quickfix_mut()
         .target_for_set(action, &what, title)
         .ok_or_else(|| EvalError::new("E475", 0, "Invalid argument"))?;
+
+    // Invalid 'efm'/'lines' value types report -1 like upstream
+    // `qf_setprop_items_from_lines` FAIL.
+    let Some((efm_override, lines)) = efm_and_lines(&what) else {
+        return Ok(Typval::Number(-1));
+    };
+
+    // Parse into the target list's own efm state so directory and file
+    // stacks persist across calls (upstream parses into qf_lists[qf_idx]).
+    let mut efm_state = std::mem::take(&mut editor.quickfix_mut().list_mut(target).efm);
+    let parsed = (|| -> Result<Vec<QuickfixItem>> {
+        let mut parsed_items = parse_items_efm(editor, &source_items, &mut efm_state, None)?;
+        if let Some(line_values) = &lines {
+            // 'r'/'u' free the items set above before parsing lines
+            // (quickfix.c:6965-6967).
+            if matches!(action, 'r' | 'u') {
+                parsed_items.clear();
+            }
+            parsed_items.extend(parse_items_efm(
+                editor,
+                line_values,
+                &mut efm_state,
+                efm_override.as_deref(),
+            )?);
+        }
+        Ok(parsed_items)
+    })();
+    editor.quickfix_mut().list_mut(target).efm = efm_state;
+    let parsed_items = match parsed {
+        Ok(parsed_items) => parsed_items,
+        Err(error) => {
+            if created {
+                let stack = editor.quickfix_mut();
+                stack.lists.remove(target);
+                if stack.current > 0 {
+                    stack.current -= 1;
+                }
+            }
+            return Err(error);
+        }
+    };
     apply_what_fields(
         editor.quickfix_mut().list_mut(target),
         &what,
         action,
-        !source_items.is_empty(),
+        !source_items.is_empty() || lines.is_some(),
         parsed_items,
     );
     Ok(Typval::Number(0))
@@ -591,6 +598,7 @@ fn apply_what_fields(
     if let Some(function) = dict_value(what, "quickfixtextfunc") {
         list.quickfixtextfunc = function.clone();
     }
+
     if dict_value(what, "items").is_some() || has_source_items || what.is_empty() {
         if action == 'a' {
             list.append_items(parsed_items);
@@ -609,7 +617,7 @@ fn apply_what_fields(
 ///
 /// Returns E742 when the argument dictionary is locked and E715 when the
 /// first argument is not a dictionary.
-fn getqflist(editor: &Editor, args: &[Typval]) -> Result<Typval> {
+fn getqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
     if args.is_empty() {
         return Ok(Typval::list(
             editor.quickfix().current().map_or_else(Vec::new, |list| {
@@ -625,7 +633,14 @@ fn getqflist(editor: &Editor, args: &[Typval]) -> Result<Typval> {
         .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
         .entries
         .clone();
+    // 'lines' parses raw text through 'errorformat' (or what.efm) into a
+    // throwaway list and returns early with just 'items' (upstream
+    // qf_get_list_from_lines, quickfix.c:6219-6255).
+    if let Some(di) = dict_value(&what, "lines") {
+        return list_from_lines(editor, &what, di);
+    }
     let all = dict_number(&what, "all").is_some_and(|value| value != 0);
+
     let selected = editor
         .quickfix()
         .select(&what)
@@ -746,69 +761,288 @@ fn push_stack_handles(
 /// Returns E742 when an entry list or dictionary is locked, E948 when buffer
 /// creation fails, and E86 when the new buffer cannot be renamed.
 pub(crate) fn parse_items(editor: &mut Editor, values: &[Typval]) -> Result<Vec<QuickfixItem>> {
+    // The string parser runs against the current list's efm state so
+    // `:caddexpr` continues an in-progress directory stack (upstream parses
+    // into the target list whose stacks persist, quickfix.c:141-148). For a
+    // ' ' command the caller pushes a fresh list after this returns, so
+    // state mutations then land on the previous list — a documented
+    // divergence from upstream, where the new list owns them.
+    let mut taken = editor
+        .quickfix_mut()
+        .current_mut()
+        .map(|list| std::mem::take(&mut list.efm));
+    let mut local = crate::efm::EfmState::default();
+    let result = parse_items_efm(editor, values, taken.as_mut().unwrap_or(&mut local), None);
+    if let Some(state) = taken
+        && let Some(list) = editor.quickfix_mut().current_mut()
+    {
+        list.efm = state;
+    }
+    result
+}
+
+/// `efm::EfmContext` over the editor buffer table: `%b` existence checks and
+/// filename→buffer find-or-create (upstream `buflist_findnr`/`buflist_new`,
+/// quickfix.c:1361, 2350).
+struct EditorEfmContext<'a> {
+    editor: &'a mut Editor,
+}
+
+impl crate::efm::EfmContext for EditorEfmContext<'_> {
+    fn buffer_exists(&mut self, nr: i64) -> bool {
+        BufHandle::try_from(nr).is_ok_and(|handle| self.editor.buffer(handle).is_ok())
+    }
+
+    fn buffer_for_name(&mut self, name: &str) -> i64 {
+        let filename = OxStr::from(name);
+        let existing = self.editor.buffers().into_iter().find(|buffer| {
+            self.editor
+                .buffer(*buffer)
+                .is_ok_and(|state| state.name() == &filename)
+        });
+        let buffer = if let Some(buffer) = existing {
+            buffer
+        } else {
+            let Ok(buffer) = self.editor.create_buffer(true) else {
+                return 0;
+            };
+            if self
+                .editor
+                .buffer_mut(buffer)
+                .map(|state| state.set_name(filename))
+                .is_err()
+            {
+                return 0;
+            }
+            buffer
+        };
+        i64::from(buffer)
+    }
+}
+
+/// The effective 'errorformat': the buffer-local value when set non-empty,
+/// else the global value (quickfix.c:1160-1163).
+fn effective_efm(editor: &Editor) -> String {
+    if let Some(buffer) = editor.current_buffer()
+        && let Ok(OptionValue::String(value)) = editor.options().get_buffer(buffer, "errorformat")
+        && !value.is_empty()
+    {
+        return value.clone();
+    }
+    match editor.options().get_global("errorformat") {
+        Ok(OptionValue::String(value)) => value.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Converts a parsed error line to a list entry (`qf_add_entry` field
+/// mapping, quickfix.c:1959-1986).
+fn parsed_to_item(entry: &crate::efm::ParsedEntry) -> QuickfixItem {
+    QuickfixItem {
+        bufnr: entry.bufnr,
+        module: OxStr::from(entry.module.as_str()),
+        lnum: entry.lnum,
+        col: entry.col,
+        end_lnum: entry.end_lnum,
+        end_col: entry.end_col,
+        vcol: i64::from(entry.vcol),
+        nr: entry.nr,
+        pattern: OxStr::from(entry.pattern.as_str()),
+        text: OxStr::from(entry.text.as_str()),
+        item_type: if entry.item_type == 0 {
+            OxStr::from("")
+        } else {
+            OxStr::from(char::from(entry.item_type).to_string().as_str())
+        },
+        valid: entry.valid,
+        user_data: Typval::Special(Special::Null),
+    }
+}
+
+/// Folds `%C`/`%Z` continuation fields into an existing entry
+/// (`qf_parse_multiline_pfx`, quickfix.c:1712-1746).
+fn apply_continuation(item: &mut QuickfixItem, cont: &crate::efm::Continuation) {
+    if !cont.text.is_empty() {
+        let mut text = item.text.to_string_lossy().into_owned();
+        text.push('\n');
+        text.push_str(&cont.text);
+        item.text = OxStr::from(text.as_str());
+    }
+    if item.nr == -1 {
+        item.nr = cont.nr;
+    }
+    if cont.item_type != 0 && item.item_type.as_bytes().is_empty() {
+        item.item_type = OxStr::from(char::from(cont.item_type).to_string().as_str());
+    }
+    if item.lnum == 0 {
+        item.lnum = cont.lnum;
+    }
+    if item.end_lnum == 0 {
+        item.end_lnum = cont.end_lnum;
+    }
+    if item.col == 0 {
+        item.col = cont.col;
+        item.vcol = i64::from(cont.vcol);
+    }
+    if item.end_col == 0 {
+        item.end_col = cont.end_col;
+    }
+    if item.bufnr == 0 {
+        item.bufnr = cont.bufnr;
+    }
+}
+
+/// Parses quickfix list entries from Vimscript values, running string values
+/// through the 'errorformat' engine (`qf_init_ext`, quickfix.c:1063-1240).
+///
+/// `state` is the target list's parse state; `efm_override` is the `what.efm`
+/// value for `setqflist`/`getqflist` 'lines' (upstream
+/// `qf_setprop_items_from_lines`, quickfix.c:6943-6974).
+///
+/// # Errors
+///
+/// Returns E742 when an entry list or dictionary is locked, E948 when buffer
+/// creation fails, E86 when the new buffer cannot be renamed, and the
+/// 'errorformat' compile/parse errors E372-E379.
+fn parse_items_efm(
+    editor: &mut Editor,
+    values: &[Typval],
+    state: &mut crate::efm::EfmState,
+    efm_override: Option<&str>,
+) -> Result<Vec<QuickfixItem>> {
     let mut items = Vec::new();
+    // Entries produced by string lines accumulate here so a `%C`/`%Z`
+    // continuation can fold into the last one (upstream `qfl->qf_last`).
+    let mut parsed: Vec<crate::efm::ParsedEntry> = Vec::new();
+    // 'errorformat' compiles once per call, like upstream `qf_init`; only
+    // text lines need it.
+    let fmt = values
+        .iter()
+        .any(|value| matches!(value, Typval::String(_)))
+        .then(|| {
+            let spec = match efm_override {
+                Some(spec) => spec.to_owned(),
+                None => effective_efm(editor),
+            };
+            crate::efm::ErrorFormat::compile(&spec)
+                .map_err(|error| EvalError::new(error.code, 0, error.message))
+        })
+        .transpose()?;
     for value in values {
-        let Typval::Dict(reference) = value else {
+        if let (Typval::String(text), Some(fmt)) = (value, fmt.as_ref()) {
+            // Each list item is one or more `\n`-separated lines; an empty
+            // string is a single empty line (upstream qf_get_next_str_line).
+            let lossy = text.to_string_lossy();
+            let lines: Vec<&str> = if lossy.is_empty() {
+                vec![""]
+            } else {
+                lossy.split_terminator('\n').collect()
+            };
+            for line in lines {
+                let outcome = {
+                    let mut ctx = EditorEfmContext {
+                        editor: &mut *editor,
+                    };
+                    crate::efm::parse_line(line, fmt, state, &mut parsed, &mut ctx)
+                        .map_err(|error| EvalError::new(error.code, 0, error.message))?
+                };
+                match outcome {
+                    crate::efm::LineOutcome::Entry(entry) => parsed.push(entry),
+                    crate::efm::LineOutcome::Folded | crate::efm::LineOutcome::Ignored => {}
+                    crate::efm::LineOutcome::FoldOutside(cont) => {
+                        items.extend(parsed.drain(..).map(|entry| parsed_to_item(&entry)));
+                        let Some(item) = items.last_mut() else {
+                            return Err(EvalError::new(
+                                "E685",
+                                0,
+                                "Internal error: %C/%Z without a preceding entry",
+                            ));
+                        };
+                        apply_continuation(item, &cont);
+                    }
+                }
+            }
+            continue;
+        }
+        let Some(dict_entry) = dict_entries(value)? else {
             continue;
         };
-        let entries = reference
-            .try_borrow()
-            .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
-            .entries
-            .clone();
-        let mut bufnr = dict_number(&entries, "bufnr").unwrap_or(0);
-        if bufnr == 0
-            && let Some(filename) = dict_string(&entries, "filename")
-            && !filename.as_bytes().is_empty()
-        {
-            let existing = editor.buffers().into_iter().find(|buffer| {
-                editor
-                    .buffer(*buffer)
-                    .is_ok_and(|state| state.name() == &filename)
-            });
-            let buffer = if let Some(buffer) = existing {
-                buffer
-            } else {
-                let buffer = editor
-                    .create_buffer(true)
-                    .map_err(|error| EvalError::new("E948", 0, error.to_string()))?;
-                editor
-                    .buffer_mut(buffer)
-                    .map_err(|error| EvalError::new("E86", 0, error.to_string()))?
-                    .set_name(filename);
-                buffer
-            };
-            bufnr = i64::from(buffer);
-        }
-        if bufnr != 0
-            && BufHandle::try_from(bufnr)
-                .ok()
-                .is_none_or(|buffer| editor.buffer(buffer).is_err())
-        {
-            bufnr = 0;
-        }
-        let lnum = dict_number(&entries, "lnum").unwrap_or(0);
-        let pattern = dict_string(&entries, "pattern").unwrap_or_else(|| OxStr::from(""));
-        let detected_valid = bufnr != 0 && (lnum != 0 || !pattern.as_bytes().is_empty());
-        items.push(QuickfixItem {
-            bufnr,
-            module: dict_string(&entries, "module").unwrap_or_else(|| OxStr::from("")),
-            lnum,
-            col: dict_number(&entries, "col").unwrap_or(0),
-            end_lnum: dict_number(&entries, "end_lnum").unwrap_or(0),
-            end_col: dict_number(&entries, "end_col").unwrap_or(0),
-            vcol: dict_number(&entries, "vcol").unwrap_or(0),
-            nr: dict_number(&entries, "nr").unwrap_or(0),
-            pattern,
-            text: dict_string(&entries, "text").unwrap_or_else(|| OxStr::from("")),
-            item_type: dict_string(&entries, "type").unwrap_or_else(|| OxStr::from("")),
-            valid: dict_number(&entries, "valid").map_or(detected_valid, |value| value != 0),
-            user_data: dict_value(&entries, "user_data")
-                .cloned()
-                .unwrap_or(Typval::Special(Special::Null)),
-        });
+        items.extend(parsed.drain(..).map(|entry| parsed_to_item(&entry)));
+        items.push(dict_entry_item(editor, &dict_entry)?);
     }
+    items.extend(parsed.drain(..).map(|entry| parsed_to_item(&entry)));
     Ok(items)
+}
+
+/// Borrows a dict value's entries; E742 when locked, `None` when the value
+/// is not a dict (upstream skips non-dict items).
+fn dict_entries(value: &Typval) -> Result<Option<Vec<DictEntry>>> {
+    let Typval::Dict(reference) = value else {
+        return Ok(None);
+    };
+    let entries = reference
+        .try_borrow()
+        .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
+        .entries
+        .clone();
+    Ok(Some(entries))
+}
+
+/// Builds one quickfix item from an entry dict, creating the named buffer
+/// when absent (upstream `qf_add_entry`, quickfix.c:1968-1978).
+#[allow(clippy::too_many_lines)] // one entry mapping, upstream-ordered
+fn dict_entry_item(editor: &mut Editor, entries: &[DictEntry]) -> Result<QuickfixItem> {
+    let mut bufnr = dict_number(entries, "bufnr").unwrap_or(0);
+    if bufnr == 0
+        && let Some(filename) = dict_string(entries, "filename")
+        && !filename.as_bytes().is_empty()
+    {
+        let existing = editor.buffers().into_iter().find(|buffer| {
+            editor
+                .buffer(*buffer)
+                .is_ok_and(|state| state.name() == &filename)
+        });
+        let buffer = if let Some(buffer) = existing {
+            buffer
+        } else {
+            let buffer = editor
+                .create_buffer(true)
+                .map_err(|error| EvalError::new("E948", 0, error.to_string()))?;
+            editor
+                .buffer_mut(buffer)
+                .map_err(|error| EvalError::new("E86", 0, error.to_string()))?
+                .set_name(filename);
+            buffer
+        };
+        bufnr = i64::from(buffer);
+    }
+    if bufnr != 0
+        && BufHandle::try_from(bufnr)
+            .ok()
+            .is_none_or(|buffer| editor.buffer(buffer).is_err())
+    {
+        bufnr = 0;
+    }
+    let lnum = dict_number(entries, "lnum").unwrap_or(0);
+    let pattern = dict_string(entries, "pattern").unwrap_or_else(|| OxStr::from(""));
+    let detected_valid = bufnr != 0 && (lnum != 0 || !pattern.as_bytes().is_empty());
+    Ok(QuickfixItem {
+        bufnr,
+        module: dict_string(entries, "module").unwrap_or_else(|| OxStr::from("")),
+        lnum,
+        col: dict_number(entries, "col").unwrap_or(0),
+        end_lnum: dict_number(entries, "end_lnum").unwrap_or(0),
+        end_col: dict_number(entries, "end_col").unwrap_or(0),
+        vcol: dict_number(entries, "vcol").unwrap_or(0),
+        nr: dict_number(entries, "nr").unwrap_or(0),
+        pattern,
+        text: dict_string(entries, "text").unwrap_or_else(|| OxStr::from("")),
+        item_type: dict_string(entries, "type").unwrap_or_else(|| OxStr::from("")),
+        valid: dict_number(entries, "valid").map_or(detected_valid, |value| value != 0),
+        user_data: dict_value(entries, "user_data")
+            .cloned()
+            .unwrap_or(Typval::Special(Special::Null)),
+    })
 }
 
 fn item_typval(item: &QuickfixItem) -> Typval {
@@ -1164,6 +1398,108 @@ fn format_item(item: &QuickfixItem) -> Vec<u8> {
         item.text.to_string_lossy()
     )
     .into_bytes()
+}
+
+/// Parses the action argument ('a'|'r'|'u'|' '|'f'), E927/E1174 on anything
+/// else.
+fn parse_action(args: &[Typval]) -> Result<char> {
+    match args.get(1) {
+        None => Ok(' '),
+        Some(Typval::String(value)) if value.as_bytes().len() == 1 => {
+            let action = char::from(value.as_bytes()[0]);
+            if matches!(action, 'a' | 'r' | 'u' | ' ' | 'f') {
+                Ok(action)
+            } else {
+                Err(EvalError::new(
+                    "E927",
+                    0,
+                    format!("Invalid action: '{}'", value.to_string_lossy()),
+                ))
+            }
+        }
+        Some(Typval::String(value)) => Err(EvalError::new(
+            "E927",
+            0,
+            format!("Invalid action: '{}'", value.to_string_lossy()),
+        )),
+        Some(_) => Err(EvalError::new("E1174", 0, "String required for argument 2")),
+    }
+}
+
+/// Parses the optional third `what`-dict / legacy-title argument.
+fn what_argument(args: &[Typval], no_items: bool) -> Result<(Vec<DictEntry>, Option<OxStr>)> {
+    match args.get(2) {
+        None => Ok((Vec::new(), None)),
+        Some(Typval::Dict(reference)) => {
+            let entries = reference
+                .try_borrow()
+                .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
+                .entries
+                .clone();
+            if !no_items {
+                return Err(EvalError::new(
+                    "E475",
+                    0,
+                    "Invalid argument: cannot have both a list and a \"what\" argument",
+                ));
+            }
+            Ok((entries, None))
+        }
+        Some(Typval::String(title)) => Ok((Vec::new(), Some(title.clone()))),
+        Some(_) => Err(EvalError::new("E715", 0, "Dictionary required")),
+    }
+}
+
+/// `qf_get_list_from_lines` (quickfix.c:6219-6255): parses raw text through
+/// 'errorformat' (or what.efm) into a throwaway list and returns early with
+/// just 'items'. Invalid value types yield an empty dict like upstream FAIL.
+fn list_from_lines(editor: &mut Editor, what: &[DictEntry], lines: &Typval) -> Result<Typval> {
+    let efm_override = match dict_value(what, "efm") {
+        None => None,
+        Some(Typval::String(value)) => Some(value.to_string_lossy().into_owned()),
+        Some(_) => return Ok(Typval::dict(Vec::new())),
+    };
+    let Typval::List(reference) = lines else {
+        return Ok(Typval::dict(Vec::new()));
+    };
+    let line_values = reference
+        .try_borrow()
+        .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
+        .items
+        .clone();
+    let mut state = crate::efm::EfmState::default();
+    // A failed parse yields an empty items list (quickfix.c:6243-6251).
+    let items = parse_items_efm(editor, &line_values, &mut state, efm_override.as_deref())
+        .unwrap_or_default();
+    Ok(Typval::dict(vec![pair(
+        "items",
+        Typval::list(items.iter().map(item_typval).collect()),
+    )]))
+}
+
+/// Reads the 'efm' and 'lines' keys; `None` selects the -1 return for an
+/// invalid value type ('efm' must be a string and 'lines' a list when
+/// present; upstream `qf_setprop_items_from_lines` FAILs → -1
+/// (quickfix.c:6952-6963)).
+fn efm_and_lines(what: &[DictEntry]) -> Option<(Option<String>, Option<Vec<Typval>>)> {
+    let efm_override = match dict_value(what, "efm") {
+        None => None,
+        Some(Typval::String(value)) => Some(value.to_string_lossy().into_owned()),
+        Some(_) => return None,
+    };
+    let lines = match dict_value(what, "lines") {
+        None => None,
+        Some(Typval::List(reference)) => Some(
+            reference
+                .try_borrow()
+                .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))
+                .ok()?
+                .items
+                .clone(),
+        ),
+        Some(_) => return None,
+    };
+    Some((efm_override, lines))
 }
 
 #[cfg(test)]
