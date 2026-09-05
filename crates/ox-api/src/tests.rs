@@ -2379,6 +2379,133 @@ fn extmark_decoration_provider_accepts_internal_underscore_keys() {
     );
 }
 
+/// A Lua host that records every released callback reference.
+#[derive(Default)]
+struct ReleasingLua {
+    released: Rc<RefCell<Vec<usize>>>,
+}
+
+impl crate::LuaExecutor for ReleasingLua {
+    fn exec(
+        &mut self,
+        _session: &crate::ApiSession,
+        _code: &str,
+        _args: Vec<Object>,
+    ) -> Result<Object, String> {
+        Ok(Object::Nil)
+    }
+
+    fn invoke_callback(
+        &mut self,
+        _session: &crate::ApiSession,
+        _reference: usize,
+        args: Vec<Object>,
+    ) -> Result<Object, String> {
+        Ok(Object::Array(args))
+    }
+
+    fn call_ref(
+        &mut self,
+        _session: &crate::ApiSession,
+        _reference: usize,
+        args: Vec<Object>,
+    ) -> Result<Vec<Object>, String> {
+        Ok(args)
+    }
+
+    fn free_callback(&mut self, reference: usize) -> Result<(), String> {
+        self.released.borrow_mut().push(reference);
+        Ok(())
+    }
+}
+
+#[test]
+fn decoration_provider_failure_releases_incoming_references() {
+    let session = session();
+    let released = Rc::new(RefCell::new(Vec::new()));
+    crate::set_lua_executor(
+        &session,
+        Box::new(ReleasingLua {
+            released: Rc::clone(&released),
+        }),
+        Box::new(ReleasingLua {
+            released: Rc::clone(&released),
+        }),
+    );
+    let namespace = crate::extmark::nvim_create_namespace(&session, OxStr::from("tests")).unwrap();
+
+    // A valid callback ahead of an invalid value: the parsed ref is released
+    // even though validation stopped first (extmark.c frees the request's
+    // refs on every failure before ownership moves into the provider).
+    assert_eq!(
+        crate::extmark::nvim_set_decoration_provider(
+            &session,
+            namespace,
+            dict(&[
+                ("on_line", Object::LuaRef(41)),
+                ("on_buf", Object::Integer(7)),
+            ]),
+        ),
+        Err(ApiError::validation(
+            "Invalid value for 'on_buf': expected Lua function reference"
+        ))
+    );
+    assert_eq!(&*released.borrow(), &[41]);
+
+    // An invalid key ahead of a valid callback: the bridge acquired the
+    // callback's registry slot before validation ran, so it is released too
+    // and repeated failed calls never accumulate registry references.
+    assert_eq!(
+        crate::extmark::nvim_set_decoration_provider(
+            &session,
+            namespace,
+            dict(&[
+                ("unexpected", Object::Integer(0)),
+                ("on_line", Object::LuaRef(42)),
+            ]),
+        ),
+        Err(ApiError::validation("unexpected key: unexpected"))
+    );
+    assert_eq!(&*released.borrow(), &[41, 42]);
+
+    // A failed call leaves a live definition untouched: ref 43 stays owned
+    // by the provider while only the failed call's ref 44 is released.
+    crate::extmark::nvim_set_decoration_provider(
+        &session,
+        namespace,
+        dict(&[("on_line", Object::LuaRef(43))]),
+    )
+    .unwrap();
+    assert_eq!(&*released.borrow(), &[41, 42]);
+    assert_eq!(
+        crate::extmark::nvim_set_decoration_provider(
+            &session,
+            namespace,
+            dict(&[
+                ("on_line", Object::LuaRef(44)),
+                ("on_win", Object::Integer(1)),
+            ]),
+        ),
+        Err(ApiError::validation(
+            "Invalid value for 'on_win': expected Lua function reference"
+        ))
+    );
+    assert_eq!(&*released.borrow(), &[41, 42, 44]);
+    let providers = session.with_editor(|editor| {
+        let ids = editor
+            .decorations()
+            .phase_provider_ids(ox_editor::decoration::CallbackPhase::Line);
+        assert_eq!(ids.len(), 1);
+        ids[0]
+    });
+    assert_eq!(
+        session.with_editor(|editor| editor
+            .decorations()
+            .phase_callback(providers, ox_editor::decoration::CallbackPhase::Line)),
+        Some(43)
+    );
+}
+
 #[test]
 #[expect(
     clippy::too_many_lines,

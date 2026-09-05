@@ -685,8 +685,7 @@ fn parse_provider_callbacks(opts: &Dict) -> Result<Vec<ParsedCallback>, ApiError
     let mut parsed = Vec::new();
     for (key, value) in opts.iter() {
         let key = key.to_string_lossy().into_owned();
-        let Some(&(_, slot)) = PROVIDER_KEYS.iter().find(|(name, _)| *name == key.as_str())
-        else {
+        let Some(&(_, slot)) = PROVIDER_KEYS.iter().find(|(name, _)| *name == key.as_str()) else {
             return Err(ApiError::validation(format!("unexpected key: {key}")));
         };
         let Object::LuaRef(reference) = value else {
@@ -748,17 +747,32 @@ fn release_def(session: &ApiSession, def: &DecorProviderDef) {
     }
 }
 
-/// `nvim_set_decoration_provider` (`extmark.c:1817-1872`): installs the
+/// Releases every Lua reference the incoming options dictionary owns.
+///
+/// The Lua bridge acquires one fresh registry slot per top-level function
+/// value while converting arguments and frees only its result references, so
+/// until a definition is installed the call itself owns the dictionary's
+/// references and must release them on failure.
+fn release_incoming_references(session: &ApiSession, opts: &Dict) {
+    for (_, value) in opts.iter() {
+        if let Object::LuaRef(reference) = value {
+            crate::runtime::release_lua_callback(session, usize::try_from(*reference).unwrap_or(0));
+        }
+    }
+}
+
+/// `nvim_set_decoration_provider` (`extmark.c:1061-1101`): installs the
 /// namespace-owned provider callbacks used during redraws.
 ///
 /// An empty `opts` clears the provider while keeping its stable registration
 /// slot, matching upstream `decor_provider_clear`. Every incoming ref is
-/// validated before the provider changes; on validation failure all incoming
-/// refs are released and the old definition stays live. On success the new
-/// definition is installed atomically and every ref from the previous
-/// definition is released exactly once; a release error is reported only
-/// after all releases are attempted, and never rolls the new definition back
-/// (rolling back would double-own or leak the new refs).
+/// validated before the provider changes; any failure before the new
+/// definition is installed releases every incoming ref at the single cleanup
+/// point in [`nvim_set_decoration_provider`] and leaves the old definition
+/// live. On success the new definition is installed atomically and every ref
+/// from the previous definition is released exactly once; a release error is
+/// reported only after all releases are attempted, and never rolls the new
+/// definition back (rolling back would double-own or leak the new refs).
 #[api(since = 7)]
 #[expect(
     clippy::needless_pass_by_value,
@@ -769,9 +783,21 @@ pub fn nvim_set_decoration_provider(
     ns_id: i64,
     opts: Dict,
 ) -> Result<(), ApiError> {
+    let outcome = install_provider_callbacks(session, ns_id, &opts);
+    if outcome.is_err() {
+        release_incoming_references(session, &opts);
+    }
+    outcome
+}
+
+fn install_provider_callbacks(
+    session: &ApiSession,
+    ns_id: i64,
+    opts: &Dict,
+) -> Result<(), ApiError> {
     let namespace = allocated_namespace(session, ns_id)?;
     let provider = ProviderId::from_namespace(namespace);
-    let incoming = parse_provider_callbacks(&opts)?;
+    let incoming = parse_provider_callbacks(opts)?;
     let old = if incoming.is_empty() {
         session.with_editor_mut(|editor| editor.decorations_mut().clear_provider(provider))
     } else {
