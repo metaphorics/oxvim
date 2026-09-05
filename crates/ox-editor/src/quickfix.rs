@@ -1099,9 +1099,10 @@ pub fn jump(
                     .is_ok_and(|state| Some(state.buffer) != quickfix_buffer)
         });
         if let Some(target) = target {
-            editor
-                .set_current_window(target)
-                .map_err(|error| QuickfixError::editor(&error))?;
+            editor.set_current_window(target).map_err(|error| {
+                restore_idx(editor, previous_idx);
+                QuickfixError::editor(&error)
+            })?;
         }
     }
     editor
