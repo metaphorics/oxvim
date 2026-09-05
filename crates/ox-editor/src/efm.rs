@@ -532,14 +532,17 @@ pub fn parse_line(
                     }
                     fields.namebuf.clear();
                     if let Some(t) = tail.filter(|&t| !line[t..].is_empty()) {
+                        // Set before the guard, exactly like qf_parse_file_pfx
+                        // (quickfix.c:1684): an Ignored return carries the
+                        // flag into the next line's matching, and the clear
+                        // at the top of that line's part loop
+                        // (quickfix.c:984) ends it — a one-line leak that
+                        // is upstream behavior, not a bug to patch.
+                        state.multiscan = true;
                         let s = skipwhite(&line[t..]);
                         if s.len() >= line.len() {
-                            // Flag set only on an actual re-scan: an early
-                            // return must not leak multiscan into the next
-                            // line (state persists across lines).
                             return Ok(LineOutcome::Ignored);
                         }
-                        state.multiscan = true;
                         line = s;
                         continue;
                     }
@@ -1143,6 +1146,22 @@ mod tests {
     }
 
     #[test]
+    fn ignored_multiscan_return_leaks_exactly_one_line_like_upstream() {
+        // qf_parse_file_pfx sets multiscan before the Ignored guard
+        // (quickfix.c:1684) and only the next line's part loop clears it
+        // (:984). Line 2 therefore matches OPQ parts only — the `%f:%l:%m`
+        // alternative is gated out and the line becomes an invalid entry —
+        // while line 3 parses normally after the clear.
+        let (entries, _state, _ctx) =
+            parse_all("%O%rx,%f:%l:%m", &["ax", "f:1:msg", "g:2:ok2"]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].lnum, 0);
+        assert!(!entries[0].valid);
+        assert_eq!(entries[1].lnum, 2);
+        assert_eq!(entries[1].text, "ok2");
+    }
+
+    #[test]
     fn default_efm_parses_file_line_message() {
         // The DFLT_EFM shape: `%f:%l:%m` is one of its alternatives.
         let (entries, _, ctx) = parse_all(
@@ -1156,16 +1175,6 @@ mod tests {
         assert_eq!(ctx.names, ["Xfile1"]);
     }
 
-    #[test]
-    fn ignored_multiscan_return_does_not_leak_into_next_line() {
-        // `%O%rx` ignores lines ending in `x` via the tail guard; the flag
-        // must not survive into the next line, or the second pattern would
-        // be skipped as non-`%O`-family under a leaked multiscan.
-        let (entries, _state, _ctx) = parse_all("%O%rx,%f:%l:%m", &["ax", "f:1:msg"]);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].lnum, 1);
-        assert_eq!(entries[0].text, "msg");
-    }
 
     #[test]
     fn column_format() {
