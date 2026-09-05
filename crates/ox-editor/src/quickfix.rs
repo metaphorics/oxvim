@@ -50,10 +50,6 @@ pub struct QuickfixList {
     changedtick: u64,
     context: Typval,
     quickfixtextfunc: Typval,
-    /// 'errorformat' parse state carried across `:caddexpr`-style calls
-    /// (the `qf_dir_stack`/`qf_file_stack`/`qf_multiline` fields of
-    /// `qf_list_T`, quickfix.c:141-148).
-    efm: crate::efm::EfmState,
 }
 
 impl QuickfixList {
@@ -66,7 +62,6 @@ impl QuickfixList {
             changedtick: 0,
             context: Typval::String(OxStr::from("")),
             quickfixtextfunc: Typval::String(OxStr::from("")),
-            efm: crate::efm::EfmState::default(),
         }
     }
 
@@ -502,12 +497,15 @@ fn setqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
     // which would silently wipe the list.
     let source_items = match dict_value(&what, "items") {
         None => raw_items,
-        Some(Typval::List(reference)) => match reference.try_borrow() {
-            Ok(list) => list.items.clone(),
-            Err(_) => {
+        Some(Typval::List(reference)) => {
+            let list = reference
+                .try_borrow()
+                .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?;
+            if list.lock.locked {
                 return Err(EvalError::new("E742", 0, "Cannot change value"));
             }
-        },
+            list.items.clone()
+        }
         Some(_) => {
             return Err(EvalError::new("E1211", 0, "List required for argument 3"));
         }
@@ -515,25 +513,40 @@ fn setqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
     let title = legacy_title
         .or_else(|| dict_string(&what, "title"))
         .unwrap_or_else(|| OxStr::from(":setqflist()"));
+    // Invalid 'efm'/'lines' value types report -1 like upstream
+    // `qf_setprop_items_from_lines` FAIL; a locked list raises E742
+    // (quickfix.c:6952-6963).
+    let Some((efm_override, lines)) = efm_and_lines(&what)? else {
+        return Ok(Typval::Number(-1));
+    };
+
     // `target_for_set` pushes a fresh list for ' ' (or an empty stack);
     // remember so a failed parse can drop it (quickfix.c:1218-1224).
     let created = action == ' ' || editor.quickfix().lists.is_empty();
+    // A continuation on the first line folds into the existing tail
+    // (upstream seeds `old_last` from the list, quickfix.c:1131).
+    let fold_tail = if matches!(action, 'a' | 'u') && !created {
+        editor
+            .quickfix()
+            .lists
+            .last()
+            .and_then(|list| list.items.last().map(|_| list.items.len() - 1))
+    } else {
+        None
+    };
     let target = editor
         .quickfix_mut()
         .target_for_set(action, &what, title)
         .ok_or_else(|| EvalError::new("E475", 0, "Invalid argument"))?;
 
-    // Invalid 'efm'/'lines' value types report -1 like upstream
-    // `qf_setprop_items_from_lines` FAIL.
-    let Some((efm_override, lines)) = efm_and_lines(&what) else {
-        return Ok(Typval::Number(-1));
-    };
-
-    // Parse into the target list's own efm state so directory and file
-    // stacks persist across calls (upstream parses into qf_lists[qf_idx]).
-    let mut efm_state = std::mem::take(&mut editor.quickfix_mut().list_mut(target).efm);
+    // Parse state is per call, like upstream's stack-local `qfstate_T`
+    // (quickfix.c:1129): directory and file stacks never persist across
+    // commands.
+    let mut efm_state = crate::efm::EfmState::default();
+    let mut deferred: Vec<crate::efm::Continuation> = Vec::new();
     let parsed = (|| -> Result<Vec<QuickfixItem>> {
-        let mut parsed_items = parse_items_efm(editor, &source_items, &mut efm_state, None)?;
+        let mut parsed_items =
+            parse_items_efm(editor, &source_items, &mut efm_state, None, &mut deferred)?;
         if let Some(line_values) = &lines {
             // 'r'/'u' free the items set above before parsing lines
             // (quickfix.c:6965-6967).
@@ -545,11 +558,11 @@ fn setqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
                 line_values,
                 &mut efm_state,
                 efm_override.as_deref(),
+                &mut deferred,
             )?);
         }
         Ok(parsed_items)
     })();
-    editor.quickfix_mut().list_mut(target).efm = efm_state;
     let parsed_items = match parsed {
         Ok(parsed_items) => parsed_items,
         Err(error) => {
@@ -570,6 +583,15 @@ fn setqflist(editor: &mut Editor, args: &[Typval]) -> Result<Typval> {
         !source_items.is_empty() || lines.is_some(),
         parsed_items,
     );
+    // Continuations that arrived before any entry of this call fold into the
+    // pre-existing tail captured above; appending shifted nothing before it.
+    if let Some(idx) = fold_tail
+        && let Some(item) = editor.quickfix_mut().list_mut(target).items.get_mut(idx)
+    {
+        for cont in &deferred {
+            apply_continuation(item, cont);
+        }
+    }
     Ok(Typval::Number(0))
 }
 
@@ -760,23 +782,27 @@ fn push_stack_handles(
 ///
 /// Returns E742 when an entry list or dictionary is locked, E948 when buffer
 /// creation fails, and E86 when the new buffer cannot be renamed.
-pub(crate) fn parse_items(editor: &mut Editor, values: &[Typval]) -> Result<Vec<QuickfixItem>> {
-    // The string parser runs against the current list's efm state so
-    // `:caddexpr` continues an in-progress directory stack (upstream parses
-    // into the target list whose stacks persist, quickfix.c:141-148). For a
-    // ' ' command the caller pushes a fresh list after this returns, so
-    // state mutations then land on the previous list — a documented
-    // divergence from upstream, where the new list owns them.
-    let mut taken = editor
-        .quickfix_mut()
-        .current_mut()
-        .map(|list| std::mem::take(&mut list.efm));
-    let mut local = crate::efm::EfmState::default();
-    let result = parse_items_efm(editor, values, taken.as_mut().unwrap_or(&mut local), None);
-    if let Some(state) = taken
-        && let Some(list) = editor.quickfix_mut().current_mut()
+pub(crate) fn parse_items(
+    editor: &mut Editor,
+    values: &[Typval],
+    fold_tail: Option<usize>,
+) -> Result<Vec<QuickfixItem>> {
+    // Parse state is per call, like upstream's stack-local `qfstate_T`
+    // (quickfix.c:1129): stacks never persist across commands. A
+    // continuation arriving before this call's first entry folds into the
+    // caller-chosen tail (upstream `old_last`, quickfix.c:1131).
+    let mut state = crate::efm::EfmState::default();
+    let mut deferred: Vec<crate::efm::Continuation> = Vec::new();
+    let result = parse_items_efm(editor, values, &mut state, None, &mut deferred);
+    if let Some(idx) = fold_tail
+        && let Some(item) = editor
+            .quickfix_mut()
+            .current_mut()
+            .and_then(|list| list.items.get_mut(idx))
     {
-        list.efm = state;
+        for cont in &deferred {
+            apply_continuation(item, cont);
+        }
     }
     result
 }
@@ -900,15 +926,12 @@ fn apply_continuation(item: &mut QuickfixItem, cont: &crate::efm::Continuation) 
 /// `qf_setprop_items_from_lines`, quickfix.c:6943-6974).
 ///
 /// # Errors
-///
-/// Returns E742 when an entry list or dictionary is locked, E948 when buffer
-/// creation fails, E86 when the new buffer cannot be renamed, and the
-/// 'errorformat' compile/parse errors E372-E379.
 fn parse_items_efm(
     editor: &mut Editor,
     values: &[Typval],
     state: &mut crate::efm::EfmState,
     efm_override: Option<&str>,
+    deferred: &mut Vec<crate::efm::Continuation>,
 ) -> Result<Vec<QuickfixItem>> {
     let mut items = Vec::new();
     // Entries produced by string lines accumulate here so a `%C`/`%Z`
@@ -951,14 +974,14 @@ fn parse_items_efm(
                     crate::efm::LineOutcome::Folded | crate::efm::LineOutcome::Ignored => {}
                     crate::efm::LineOutcome::FoldOutside(cont) => {
                         items.extend(parsed.drain(..).map(|entry| parsed_to_item(&entry)));
-                        let Some(item) = items.last_mut() else {
-                            return Err(EvalError::new(
-                                "E685",
-                                0,
-                                "Internal error: %C/%Z without a preceding entry",
-                            ));
-                        };
-                        apply_continuation(item, &cont);
+                        if let Some(item) = items.last_mut() {
+                            apply_continuation(item, &cont);
+                        } else {
+                            // No entry yet in this call: the caller folds it
+                            // into the pre-existing tail (upstream
+                            // `old_last`, quickfix.c:1131).
+                            deferred.push(*cont);
+                        }
                     }
                 }
             }
@@ -1467,39 +1490,55 @@ fn list_from_lines(editor: &mut Editor, what: &[DictEntry], lines: &Typval) -> R
         .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
         .items
         .clone();
+    // A failed parse yields an empty items list (quickfix.c:6243-6251);
     let mut state = crate::efm::EfmState::default();
-    // A failed parse yields an empty items list (quickfix.c:6243-6251).
-    let items = parse_items_efm(editor, &line_values, &mut state, efm_override.as_deref())
-        .unwrap_or_default();
+    let mut deferred = Vec::new();
+    // A failed parse yields an empty items list (quickfix.c:6243-6251);
+    // continuations have no tail to fold into in a throwaway list.
+    let items = parse_items_efm(
+        editor,
+        &line_values,
+        &mut state,
+        efm_override.as_deref(),
+        &mut deferred,
+    )
+    .unwrap_or_default();
     Ok(Typval::dict(vec![pair(
         "items",
         Typval::list(items.iter().map(item_typval).collect()),
     )]))
 }
 
+
+/// The validated 'efm'/'lines' pair consumed by setqflist.
+type EfmLines = (Option<String>, Option<Vec<Typval>>);
+
 /// Reads the 'efm' and 'lines' keys; `None` selects the -1 return for an
 /// invalid value type ('efm' must be a string and 'lines' a list when
 /// present; upstream `qf_setprop_items_from_lines` FAILs → -1
-/// (quickfix.c:6952-6963)).
-fn efm_and_lines(what: &[DictEntry]) -> Option<(Option<String>, Option<Vec<Typval>>)> {
+/// (quickfix.c:6952-6963)). A locked `lines` list raises E742.
+fn efm_and_lines(
+    what: &[DictEntry],
+) -> std::result::Result<Option<EfmLines>, EvalError> {
     let efm_override = match dict_value(what, "efm") {
         None => None,
         Some(Typval::String(value)) => Some(value.to_string_lossy().into_owned()),
-        Some(_) => return None,
+        Some(_) => return Ok(None),
     };
     let lines = match dict_value(what, "lines") {
         None => None,
-        Some(Typval::List(reference)) => Some(
-            reference
+        Some(Typval::List(reference)) => {
+            let list = reference
                 .try_borrow()
-                .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))
-                .ok()?
-                .items
-                .clone(),
-        ),
-        Some(_) => return None,
+                .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?;
+            if list.lock.locked {
+                return Err(EvalError::new("E742", 0, "Cannot change value"));
+            }
+            Some(list.items.clone())
+        }
+        Some(_) => return Ok(None),
     };
-    Some((efm_override, lines))
+    Ok(Some((efm_override, lines)))
 }
 
 #[cfg(test)]
@@ -1524,6 +1563,64 @@ mod tests {
             pair("lnum", Typval::Number(lnum)),
             pair("text", Typval::String(OxStr::from(text))),
         ])
+    }
+
+    #[test]
+    fn setqflist_locked_lines_raises_e742_not_minus_one() {
+        let (mut editor, _) = setup();
+        let lines = Typval::list(vec![Typval::String(OxStr::from("f:1:m"))]);
+        let Typval::List(reference) = &lines else {
+            unreachable!();
+        };
+        reference.borrow_mut().lock.locked = true;
+        let what = Typval::dict(vec![pair("lines", lines)]);
+        let error = call(
+            &mut editor,
+            "setqflist",
+            &[Typval::list(vec![]), Typval::String(OxStr::from(" ")), what],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "E742");
+    }
+
+    #[test]
+    fn setqflist_invalid_efm_leaves_stack_untouched() {
+        let (mut editor, _) = setup();
+        let buffer = editor.current_buffer().unwrap();
+        call(
+            &mut editor,
+            "setqflist",
+            &[Typval::list(vec![item(buffer, 1, "seed")])],
+        )
+        .unwrap();
+        let before = call(
+            &mut editor,
+            "getqflist",
+            &[Typval::dict(vec![
+                pair("nr", Typval::Number(0)),
+                pair("size", Typval::Number(0)),
+            ])],
+        )
+        .unwrap();
+        // Invalid 'efm' type reports -1 without pushing or truncating.
+        let what = Typval::dict(vec![pair("efm", Typval::Number(1))]);
+        let result = call(
+            &mut editor,
+            "setqflist",
+            &[Typval::list(vec![]), Typval::String(OxStr::from(" ")), what],
+        )
+        .unwrap();
+        assert_eq!(result, Typval::Number(-1));
+        let after = call(
+            &mut editor,
+            "getqflist",
+            &[Typval::dict(vec![
+                pair("nr", Typval::Number(0)),
+                pair("size", Typval::Number(0)),
+            ])],
+        )
+        .unwrap();
+        assert_eq!(before, after);
     }
 
     #[test]

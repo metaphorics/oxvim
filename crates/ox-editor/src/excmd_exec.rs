@@ -16802,7 +16802,18 @@ fn command_quickfix_apply<F: FileIO>(
 ) -> Flow {
     let add = command_name.contains("add");
     let action = if add { 'a' } else { ' ' };
-    let parsed = match crate::quickfix::parse_items(editor, items) {
+    // A leading continuation folds into the current tail only for add
+    // commands; replacing commands target a fresh list (upstream `old_last`
+    // is NULL there, quickfix.c:1131).
+    let fold_tail = if add {
+        editor
+            .quickfix()
+            .current()
+            .and_then(|list| list.items().last().map(|_| list.items().len() - 1))
+    } else {
+        None
+    };
+    let parsed = match crate::quickfix::parse_items(editor, items, fold_tail) {
         Ok(parsed) => parsed,
         Err(error) => return error_flow(runtime, error.code, error.message),
     };

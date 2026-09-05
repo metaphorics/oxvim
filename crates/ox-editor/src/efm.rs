@@ -19,20 +19,20 @@ use ox_regex::{Capture, Magic, Match, Prog, Text};
 /// Index order is load-bearing; `addr[]` and `qf_parse_fmt[]` are indexed by
 /// it. `%f` (0) and `%r` (9) are special-cased.
 const FMT_PAT: [(u8, &str); FMT_PATTERNS] = [
-    (b'f', ".\\+"),       // only used when at end
-    (b'b', "\\d\\+"),     // 1
-    (b'n', "\\d\\+"),     // 2
-    (b'l', "\\d\\+"),     // 3
-    (b'e', "\\d\\+"),     // 4
-    (b'c', "\\d\\+"),     // 5
-    (b'k', "\\d\\+"),     // 6
-    (b't', "."),          // 7
-    (b'm', ".\\+"),       // 8 = FMT_PATTERN_M
-    (b'r', ".*"),         // 9 = FMT_PATTERN_R
-    (b'p', "[-\t .]*"),   // 10
-    (b'v', "\\d\\+"),     // 11
-    (b's', ".\\+"),       // 12
-    (b'o', ".\\+"),       // 13
+    (b'f', ".\\+"),     // only used when at end
+    (b'b', "\\d\\+"),   // 1
+    (b'n', "\\d\\+"),   // 2
+    (b'l', "\\d\\+"),   // 3
+    (b'e', "\\d\\+"),   // 4
+    (b'c', "\\d\\+"),   // 5
+    (b'k', "\\d\\+"),   // 6
+    (b't', "."),        // 7
+    (b'm', ".\\+"),     // 8 = FMT_PATTERN_M
+    (b'r', ".*"),       // 9 = FMT_PATTERN_R
+    (b'p', "[-\t .]*"), // 10
+    (b'v', "\\d\\+"),   // 11
+    (b's', ".\\+"),     // 12
+    (b'o', ".\\+"),     // 13
 ];
 const FMT_PATTERNS: usize = 14;
 const FMT_PATTERN_M: usize = 8;
@@ -49,7 +49,10 @@ pub struct EfmError {
 
 impl EfmError {
     fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 }
 
@@ -268,42 +271,7 @@ fn compile_part(part: &str) -> Result<EfmPart, EfmError> {
             }
             let c = bytes[i];
             if let Some(fi) = FMT_PAT.iter().position(|&(cc, _)| cc == c) {
-                // `efmpat_to_regpat` (quickfix.c:427-479).
-                if addr[fi] != 0 {
-                    return Err(EfmError::new(
-                        "E372",
-                        format!("Too many %{} in format string", c as char),
-                    ));
-                }
-                if (fi != 0
-                    && fi < FMT_PATTERN_R
-                    && matches!(prefix, b'D' | b'X' | b'O' | b'P' | b'Q'))
-                    || (fi == FMT_PATTERN_R
-                        && !matches!(prefix, b'O' | b'P' | b'Q'))
-                {
-                    return Err(EfmError::new(
-                        "E373",
-                        format!("Unexpected %{} in format string", c as char),
-                    ));
-                }
-                round += 1;
-                addr[fi] = round;
-                regpat.extend_from_slice(b"\\(");
-                if c == b'f' && i + 1 < bytes.len() {
-                    if bytes[i + 1] != b'\\' && bytes[i + 1] != b'%' {
-                        // A file name may contain the following literal
-                        // (e.g. ':' in "%f:%l:%m"); non-greedy any-char run
-                        // (quickfix.c:454-462).
-                        regpat.extend_from_slice(b".\\{-1,}");
-                    } else {
-                        // Followed by '\\' or '%': file-name chars only
-                        // (quickfix.c:463-467).
-                        regpat.extend_from_slice(b"\\f\\+");
-                    }
-                } else {
-                    regpat.extend_from_slice(FMT_PAT[fi].1.as_bytes());
-                }
-                regpat.extend_from_slice(b"\\)");
+                push_field_group(bytes, i, fi, prefix, &mut addr, &mut round, &mut regpat)?;
             } else if c == b'*' {
                 // `scanf_fmt_to_regpat` (quickfix.c:483-514).
                 push_scanf_class(part.as_bytes(), &mut i, &mut regpat)?;
@@ -321,17 +289,24 @@ fn compile_part(part: &str) -> Result<EfmPart, EfmError> {
                     flags = c;
                     i += 1;
                     if i >= bytes.len() {
-                        return Err(EfmError::new(
-                            "E376",
-                            "Invalid % in format string prefix",
-                        ));
+                        return Err(EfmError::new("E376", "Invalid % in format string prefix"));
                     }
                 }
                 let p = bytes[i];
                 if matches!(
                     p,
-                    b'D' | b'X' | b'A' | b'E' | b'W' | b'I' | b'N' | b'C' | b'Z' | b'G' | b'O'
-                        | b'P' | b'Q'
+                    b'D' | b'X'
+                        | b'A'
+                        | b'E'
+                        | b'W'
+                        | b'I'
+                        | b'N'
+                        | b'C'
+                        | b'Z'
+                        | b'G'
+                        | b'O'
+                        | b'P'
+                        | b'Q'
                 ) {
                     prefix = p;
                 } else {
@@ -363,16 +338,64 @@ fn compile_part(part: &str) -> Result<EfmPart, EfmError> {
     let regpat = String::from_utf8_lossy(&regpat);
     let prog = ox_regex::compile(&regpat, Magic::Magic)
         .map_err(|e| EfmError::new("E377", e.to_string()))?;
-    Ok(EfmPart { prog, addr, prefix, flags, conthere })
+    Ok(EfmPart {
+        prog,
+        addr,
+        prefix,
+        flags,
+        conthere,
+    })
+}
+
+/// Emits one `%x` field as a capture group and records its capture round
+/// (`efmpat_to_regpat`, quickfix.c:427-479).
+fn push_field_group(
+    bytes: &[u8],
+    i: usize,
+    fi: usize,
+    prefix: u8,
+    addr: &mut [u8; FMT_PATTERNS],
+    round: &mut u8,
+    regpat: &mut Vec<u8>,
+) -> Result<(), EfmError> {
+    let c = bytes[i];
+    if addr[fi] != 0 {
+        return Err(EfmError::new(
+            "E372",
+            format!("Too many %{} in format string", c as char),
+        ));
+    }
+    if (fi != 0 && fi < FMT_PATTERN_R && matches!(prefix, b'D' | b'X' | b'O' | b'P' | b'Q'))
+        || (fi == FMT_PATTERN_R && !matches!(prefix, b'O' | b'P' | b'Q'))
+    {
+        return Err(EfmError::new(
+            "E373",
+            format!("Unexpected %{} in format string", c as char),
+        ));
+    }
+    *round += 1;
+    addr[fi] = *round;
+    regpat.extend_from_slice(b"\\(");
+    if c == b'f' && i + 1 < bytes.len() {
+        if bytes[i + 1] != b'\\' && bytes[i + 1] != b'%' {
+            // A file name may contain the following literal (e.g. ':' in
+            // "%f:%l:%m"); non-greedy any-char run (quickfix.c:454-462).
+            regpat.extend_from_slice(b".\\{-1,}");
+        } else {
+            // Followed by '\\' or '%': file-name chars only
+            // (quickfix.c:463-467).
+            regpat.extend_from_slice(b"\\f\\+");
+        }
+    } else {
+        regpat.extend_from_slice(FMT_PAT[fi].1.as_bytes());
+    }
+    regpat.extend_from_slice(b"\\)");
+    Ok(())
 }
 
 /// Emits the regex for a `%*` scanf-style class (`%*[...]`, `%*\D`, ...) and
 /// advances `i` past it (`scanf_fmt_to_regpat`, quickfix.c:483-514).
-fn push_scanf_class(
-    bytes: &[u8],
-    i: &mut usize,
-    regpat: &mut Vec<u8>,
-) -> Result<(), EfmError> {
+fn push_scanf_class(bytes: &[u8], i: &mut usize, regpat: &mut Vec<u8>) -> Result<(), EfmError> {
     *i += 1;
     if *i >= bytes.len() {
         return Err(EfmError::new("E375", "Unsupported %* in format string"));
@@ -440,7 +463,11 @@ pub fn parse_line(
 ) -> Result<LineOutcome, EfmError> {
     // `restofline:` — a `%r` tail re-scans the remainder of the line.
     loop {
-        let mut fields = Fields { valid: true, enr: -1, ..Fields::default() };
+        let mut fields = Fields {
+            valid: true,
+            enr: -1,
+            ..Fields::default()
+        };
         let mut tail: Option<usize> = None;
         let mut mode = ScanMode {
             multiline: state.multiline,
@@ -505,11 +532,14 @@ pub fn parse_line(
                     }
                     fields.namebuf.clear();
                     if let Some(t) = tail.filter(|&t| !line[t..].is_empty()) {
-                        state.multiscan = true;
                         let s = skipwhite(&line[t..]);
                         if s.len() >= line.len() {
+                            // Flag set only on an actual re-scan: an early
+                            // return must not leak multiscan into the next
+                            // line (state persists across lines).
                             return Ok(LineOutcome::Ignored);
                         }
+                        state.multiscan = true;
                         line = s;
                         continue;
                     }
@@ -670,11 +700,11 @@ fn fmt_field(
             }
             fields.bnr = nr;
         }
-        2 => fields.enr = atoi(text),       // %n
-        3 => fields.lnum = atoi(text),      // %l
-        4 => fields.end_lnum = atoi(text),  // %e
-        5 => fields.col = atoi(text),       // %c
-        6 => fields.end_col = atoi(text),   // %k
+        2 => fields.enr = atoi(text),      // %n
+        3 => fields.lnum = atoi(text),     // %l
+        4 => fields.end_lnum = atoi(text), // %e
+        5 => fields.col = atoi(text),      // %c
+        6 => fields.end_col = atoi(text),  // %k
         7 => {
             // %t: first byte of the match (qf_parse_fmt_t).
             fields.item_type = text.as_bytes().first().copied().unwrap_or(0);
@@ -752,6 +782,12 @@ fn fold_continuation(
             }
             apply_fold(prev, &fields);
         } else {
+            if idx == b'Z' {
+                // A %Z ends the multiline block even when the fold target
+                // lives outside this call (quickfix.c:1728-1731).
+                state.multiline = false;
+                state.multiignore = false;
+            }
             let bufnr = get_fnum(state, &fname, ctx);
             return LineOutcome::FoldOutside(Box::new(Continuation {
                 text: fields.errmsg,
@@ -956,7 +992,10 @@ fn is_abs_name(name: &str) -> bool {
     let b = name.as_bytes();
     b.first() == Some(&b'/')
         || b.first() == Some(&b'~')
-        || (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\'))
+        || (b.len() >= 3
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b':'
+            && matches!(b[2], b'/' | b'\\'))
         || b.starts_with(b"\\\\")
 }
 
@@ -1068,7 +1107,10 @@ mod tests {
 
     impl MockCtx {
         fn new() -> Self {
-            Self { names: Vec::new(), existing: Vec::new() }
+            Self {
+                names: Vec::new(),
+                existing: Vec::new(),
+            }
         }
     }
 
@@ -1112,6 +1154,17 @@ mod tests {
         assert_eq!(entries[0].text, "Line 10");
         assert!(entries[0].valid);
         assert_eq!(ctx.names, ["Xfile1"]);
+    }
+
+    #[test]
+    fn ignored_multiscan_return_does_not_leak_into_next_line() {
+        // `%O%rx` ignores lines ending in `x` via the tail guard; the flag
+        // must not survive into the next line, or the second pattern would
+        // be skipped as non-`%O`-family under a leaked multiscan.
+        let (entries, _state, _ctx) = parse_all("%O%rx,%f:%l:%m", &["ax", "f:1:msg"]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].lnum, 1);
+        assert_eq!(entries[0].text, "msg");
     }
 
     #[test]
