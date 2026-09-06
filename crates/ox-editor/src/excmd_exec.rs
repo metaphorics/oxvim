@@ -1097,42 +1097,6 @@ impl<F: FileIO> ExExecutor<F> {
         self.lua = Some(lua);
     }
 
-    /// Delivers deferred job events through the same invocation path
-    /// jobwait uses (upstream delivers job callbacks on the main loop:
-    /// `process_events` → `channel_write` → `invoke_callback`,
-    /// event/loop.c). Vimscript callbacks run on this stack; a
-    /// Lua-registered callback re-defers instead (see
-    /// [`crate::builtins::process::invoke_job_events`]), because its
-    /// re-entry would fall to the nested executor while this call holds
-    /// the executor `RefCell` -- the borrow-free driver (the tick's
-    /// `deliver_deferred_job_events`) delivers those. Returns whether any
-    /// deferred event was queued for delivery, so callers can redraw even
-    /// without PTY output.
-    ///
-    /// # Errors
-    ///
-    /// Returns the invocation error; everything this stack could not
-    /// deliver was already requeued on the manager.
-    pub fn invoke_deferred_job_events<E: ExEditorAccess>(
-        &mut self,
-        access: &E,
-    ) -> Result<bool, String> {
-        let mut batch = self.take_deferred_job_events();
-        if batch.is_empty() {
-            return Ok(false);
-        }
-        let delivered = batch.len();
-        crate::builtins::process::invoke_job_events(
-            &mut self.runtime,
-            access,
-            &mut self.scope,
-            self.lua.as_ref(),
-            &mut batch,
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(delivered > 0)
-    }
-
     /// Returns a clone of the Lua callback host, if one is installed.
     #[must_use]
     pub fn lua_host(&self) -> Option<Rc<RefCell<dyn LuaExec>>> {

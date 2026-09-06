@@ -4052,11 +4052,11 @@ mod tests {
     }
 
     // A fire-and-forget job's on_exit reaches its handler on the tick path:
-    // flush_pty_output re-defers the drained events, then
-    // invoke_deferred_job_events delivers them through the chansend/jobwait
-    // invocation (upstream delivers job callbacks on the main loop,
-    // event/loop.c). Before this fix the exit event was re-deferred forever
-    // and on_exit never ran.
+    // flush_pty_output re-defers the drained events, then the borrow-free
+    // deliver_deferred_job_events delivers them with no executor borrow
+    // live (upstream delivers job callbacks on the main loop, event/loop.c).
+    // Before this fix the exit event was re-deferred forever and on_exit
+    // never ran.
     #[test]
     #[expect(
         clippy::unwrap_used,
@@ -4093,12 +4093,7 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            if core
-                .ex
-                .borrow_mut()
-                .invoke_deferred_job_events(&*core.session)
-                .unwrap()
-            {
+            if deliver_deferred_job_events(&core.session, &core.ex).unwrap() {
                 delivered = true;
                 break;
             }
@@ -4123,11 +4118,7 @@ mod tests {
             .borrow_mut()
             .flush_pty_output(&*core.session)
             .unwrap();
-        let again = core
-            .ex
-            .borrow_mut()
-            .invoke_deferred_job_events(&*core.session)
-            .unwrap();
+        let again = deliver_deferred_job_events(&core.session, &core.ex).unwrap();
         assert!(!again, "a delivered on_exit must not re-fire");
     }
 
@@ -4176,11 +4167,7 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            let _delivered = core
-                .ex
-                .borrow_mut()
-                .invoke_deferred_job_events(&*core.session)
-                .unwrap();
+            let _delivered = deliver_deferred_job_events(&core.session, &core.ex).unwrap();
             let exits = core
                 .ex
                 .borrow_mut()

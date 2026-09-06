@@ -318,11 +318,11 @@ impl JobManager {
     pub fn defer_events(&mut self, events: Vec<JobEvent>) {
         self.deferred.extend(events);
     }
-    /// Takes the whole deferred queue, keeping relative order (`ExExecutor::
-    /// invoke_deferred_job_events` drains before invoking so no borrow spans
-    /// user code while the manager stays installed; requeue goes through
-    /// [`Self::defer_events`], preserving `take_deferred_and_invoke`'s
-    /// handler-deferred-ahead-of-tail order).
+    /// Takes the whole deferred queue, keeping relative order (the server's
+    /// borrow-free `deliver_deferred_job_events` drains before invoking so
+    /// no borrow spans user code while the manager stays installed; requeue
+    /// goes through [`Self::defer_events`], preserving
+    /// `take_deferred_and_invoke`'s handler-deferred-ahead-of-tail order).
     pub fn drain_deferred(&mut self) -> Vec<JobEvent> {
         std::mem::take(&mut self.deferred)
     }

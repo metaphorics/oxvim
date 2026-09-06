@@ -979,7 +979,17 @@ mod tests {
             args: args("stdout"),
         };
         exec.defer_job_events(vec![lua_event, vim_event]);
-        exec.invoke_deferred_job_events(&editor).unwrap();
+        // The borrow-held seam's split: Vimscript events invoke on this
+        // stack; Lua-registered ones stay undelivered for the borrow-free
+        // driver, exactly as `invoke_job_events` classifies them.
+        let mut redeferred = Vec::new();
+        for event in exec.take_deferred_job_events() {
+            if super::event_lua_reference(&event).is_some() {
+                redeferred.push(event);
+                continue;
+            }
+            exec.invoke_vimscript_job_callback(&editor, event).unwrap();
+        }
         assert_eq!(
             global(exec.scope(), "delivered"),
             Some(Typval::String(OxStr::from("stdout"))),
@@ -988,8 +998,9 @@ mod tests {
         assert_eq!(
             host.borrow().0.get(),
             0,
-            "the Lua host must not be entered from the borrowed delivery"
+            "the Lua host must not be entered from the Vimscript seam"
         );
+        exec.defer_job_events(redeferred);
         let requeued = exec.take_deferred_job_events();
         assert_eq!(
             requeued.len(),
@@ -1003,9 +1014,10 @@ mod tests {
     }
 
     // A Lua-registered event arriving with no Lua host installed keeps the
-    // loud E5108, and the batch that never reached a handler re-defers in
-    // its original order -- the old delivery dropped the offending event
-    // itself, so a later host could never serve it.
+    // loud E5108 through the jobwait flush (`invoke_job_events`), and the
+    // batch that never reached a handler re-defers in its original order --
+    // the old delivery dropped the offending event itself, so a later host
+    // could never serve it.
     #[test]
     fn lua_event_without_a_host_reports_e5108_and_requeues_the_batch() {
         let _guard = crate::PROCESS_STATE_GUARD
@@ -1041,10 +1053,16 @@ mod tests {
             })),
             event(Typval::String(OxStr::from("VimCb"))),
         ]);
+        // `jobwait`'s flush is `invoke_job_events`' only caller: it runs the
+        // leading Vimscript event, then reports E5108 on the hostless
+        // Lua-registered one and requeues the undelivered tail.
         let error = exec
-            .invoke_deferred_job_events(&editor)
+            .evaluate_expression(&editor, "jobwait([g:probe], 0)")
             .expect_err("a Lua-registered event with no host must raise E5108");
-        assert!(error.contains("E5108"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("E5108"),
+            "unexpected error: {error}"
+        );
         assert_eq!(
             global(exec.scope(), "seen"),
             Some(Typval::String(OxStr::from("exit"))),
