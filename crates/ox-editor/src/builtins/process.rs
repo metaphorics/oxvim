@@ -582,21 +582,28 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     events: &mut Vec<JobEvent>,
 ) -> ox_eval::Result<()> {
-    let mut deferred: Vec<JobEvent> = Vec::new();
+    // Lua-registered events defer to the manager the moment they are
+    // classified, not at the end: a Vimscript callback delivered in between
+    // can enqueue newer events (a chansend sweep, a nested wait), and an
+    // end-of-loop re-defer would land the older Lua events behind them -
+    // upstream has one queue and its order is FIFO (multiqueue).
+    let mut lua_deferred = false;
     let mut batch = std::mem::take(events).into_iter();
     while let Some(event) = batch.next() {
         if event_lua_reference(&event).is_some() {
             if lua.is_none() {
-                deferred.push(event);
-                deferred.extend(batch);
-                redefer_job_events(runtime, deferred);
+                redefer_job_events(runtime, vec![event]);
+                redefer_job_events(runtime, batch.collect());
                 return Err(EvalError::new(
                     "E5108",
                     0,
                     "Lua callback host is not installed",
                 ));
             }
-            deferred.push(event);
+            if let Some(jobs) = runtime.jobs.as_mut() {
+                jobs.defer_events(vec![event]);
+            }
+            lua_deferred = true;
             continue;
         }
         let name = match event.callback {
@@ -615,12 +622,11 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
             1,
             Some(event.receiver),
         ) {
-            deferred.extend(batch);
-            redefer_job_events(runtime, deferred);
+            redefer_job_events(runtime, batch.collect());
             return Err(flow_to_eval_error(flow, &name.to_string_lossy()));
         }
     }
-    if lua.is_some() && !deferred.is_empty() {
+    if lua_deferred {
         // The jobwait flush re-deferred Lua-registered callbacks; upstream
         // delivers them before `jobwait` returns (funcs.c:3668/3721), so
         // mark the manager for the first borrow-free boundary after the
@@ -629,7 +635,6 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
             jobs.set_lua_flush_pending();
         }
     }
-    redefer_job_events(runtime, deferred);
     Ok(())
 }
 

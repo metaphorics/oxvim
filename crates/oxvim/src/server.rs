@@ -140,23 +140,28 @@ fn deliver_deferred_job_events(
     ex: &Rc<RefCell<ExExecutor>>,
 ) -> Result<bool, String> {
     let lua = ex.borrow().lua_host();
-    let mut batch = ex.borrow_mut().take_deferred_job_events();
+    let mut batch: VecDeque<JobEvent> = ex.borrow_mut().take_deferred_job_events().into();
     if batch.is_empty() {
         return Ok(false);
     }
     let batch_len = batch.len();
     let mut error = None;
-    while !batch.is_empty() {
-        let event = batch.remove(0);
+    // A hostless Lua event is recoverable - a later host could serve it -
+    // so it parks outside the drain and the loop continues past it: the
+    // report fires once per pass, the rest of the batch still delivers,
+    // and the event re-defers for a later host (the old head-requeue
+    // starved the tail forever; pushing it back into this batch would
+    // re-pop it forever). Script errors keep the flush contract: the
+    // failing event is consumed, the tail re-defers in order, the error
+    // returns.
+    let mut parked: Vec<JobEvent> = Vec::new();
+    while let Some(event) = batch.pop_front() {
         if let Some(reference) = lua_job_reference(&event) {
             let Some(lua) = lua.as_ref() else {
-                // A hostless Lua event is recoverable - a later host could
-                // serve it - so it requeues at the head of the tail, the
-                // same contract `invoke_job_events` keeps for the flush
-                // paths (the old drop stranded it forever).
-                batch.insert(0, event);
+                report_job_callback_error(session, "E5108: Lua callback host is not installed");
                 error = Some("E5108: Lua callback host is not installed".to_owned());
-                break;
+                parked.push(event);
+                continue;
             };
             let args = event
                 .args
@@ -164,24 +169,31 @@ fn deliver_deferred_job_events(
                 .map(ox_editor::excmd_exec::typval_to_object)
                 .collect();
             if let Err(lua_error) = lua.borrow_mut().invoke_callback(reference, args) {
+                // The event reached its handler and the handler failed:
+                // consumed, like upstream's per-event multiqueue processing;
+                // requeueing it would retry every drain.
                 error = Some(format!("E5108: {lua_error}"));
                 break;
             }
         } else {
-            let mut ex = ex.borrow_mut();
-            if let Err(invoke_error) = ex.invoke_vimscript_job_callback(session, event) {
+            let Ok(mut guard) = ex.try_borrow_mut() else {
+                batch.push_front(event);
+                break;
+            };
+            if let Err(invoke_error) = guard.invoke_vimscript_job_callback(session, event) {
                 error = Some(invoke_error);
                 break;
             }
         }
     }
-    if let Some(error) = error {
-        if !batch.is_empty() {
-            ex.borrow_mut().defer_job_events(batch);
-        }
-        return Err(error);
+    parked.extend(batch);
+    if !parked.is_empty() {
+        ex.borrow_mut().defer_job_events(parked);
     }
-    Ok(batch_len > 0)
+    match error {
+        Some(error) => Err(error),
+        None => Ok(batch_len > 0),
+    }
 }
 
 impl ox_api::ChannelSink for JobChannelSink {
