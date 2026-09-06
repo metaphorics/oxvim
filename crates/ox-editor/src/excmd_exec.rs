@@ -11504,10 +11504,15 @@ fn command_sort<F: FileIO>(
         } else if first_char == '"' || first_char == '|' {
             break 'parse;
         } else if !first_char.is_ascii_alphabetic() && pattern.is_none() {
-            let (pat, tail) = take_delimited(args, first_char).unwrap_or_else(|| {
-                let rest = &args[first_len..];
-                (rest.to_owned(), "")
-            });
+            // An unterminated pattern is E654, not a silent open-ended one
+            // (skip_regexp_err, regexp.c:765-774).
+            let Some((pat, tail)) = take_delimited(args, first_char) else {
+                return error_flow(
+                    runtime,
+                    "E654",
+                    format!("Missing delimiter after search pattern: {args}"),
+                );
+            };
             if pat.is_empty() {
                 let search = runtime.mode_machine.as_ref().and_then(|machine| {
                     let borrowed = machine.borrow();

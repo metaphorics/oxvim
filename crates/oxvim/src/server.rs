@@ -308,6 +308,9 @@ pub(crate) fn build_embedded_core(
     mut editor: Editor,
     clean: bool,
 ) -> Result<EmbeddedCore, AppError> {
+    // Stale callbacks from a previous core on this thread must not fire on
+    // the new Lua state (see ox_lua::ui_events::reset).
+    ox_lua::reset_ui_events();
     // option.c set_init_default for 'runtimepath'/'packpath': the
     // runtimepath_default layout over the resolved runtime tree,
     // before any user startup command runs.

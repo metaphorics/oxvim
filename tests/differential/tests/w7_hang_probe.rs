@@ -82,3 +82,58 @@ fn w7_probe_t734_child_exit_shape() {
         String::from_utf8_lossy(&status.stderr)
     );
 }
+
+#[test]
+#[expect(clippy::expect_used, reason = "spawn failure must fail the probe")]
+fn w7_probe_ui_attach_single_delivery_with_rpc_ui() {
+    let mut nvim = Embedded::spawn(&binary(OXVIM)).expect("spawn release oxvim --embed");
+    // Attach an RPC UI first: the chrome snapshot replay bug only shows
+    // when a remote UI keeps the wire path alive across redraws.
+    nvim.request(
+        40,
+        "nvim_ui_attach",
+        vec![80.into(), 24.into(), rmpv::Value::Map(Vec::new())],
+    )
+    .expect("ui attach");
+    let attached = exec_lua(
+        &mut nvim,
+        41,
+        r"
+        local ns = vim.api.nvim_create_namespace('probe')
+        vim.g.count = 0
+        vim.ui_attach(ns, {ext_messages=true}, function(event, kind, ...)
+          -- The probe environment can emit an E739 setup error before the
+          -- callback registers; count only the echo-kind messages.
+          if event == 'msg_show' and kind == 'echo' then
+            vim.g.count = vim.g.count + 1
+            vim.g.last = tostring(kind)
+          end
+        end)
+        return 'ok'
+        ",
+    );
+    assert_eq!(attached, rmpv::Value::from("ok"));
+    // nvim_command (not vim.cmd-inside-exec_lua): the nested-command
+    // truncate/re-push message lifecycle is a separate known drift.
+    nvim.request(42, "nvim_command", vec!["echo 'one'".into()])
+        .expect("echo");
+    // Extra mutating calls force further redraws; a replaying snapshot
+    // would deliver msg_show on each one (upstream: exactly once).
+    exec_lua(
+        &mut nvim,
+        43,
+        "vim.api.nvim_buf_set_lines(0, 0, -1, true, {'a'}) return 'w'",
+    );
+    exec_lua(
+        &mut nvim,
+        44,
+        "vim.api.nvim_buf_set_lines(0, 0, -1, true, {'b'}) return 'w'",
+    );
+    let last = exec_lua(&mut nvim, 45, "return tostring(vim.g.last)");
+    let count = exec_lua(&mut nvim, 45, "return vim.g.count");
+    assert_eq!(
+        count,
+        rmpv::Value::from(1),
+        "msg_show must deliver exactly once with an RPC UI attached (last: {last:?})"
+    );
+}

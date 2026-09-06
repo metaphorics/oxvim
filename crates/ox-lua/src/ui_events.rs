@@ -56,7 +56,13 @@ fn family(event: &str) -> Option<&'static str> {
 struct UiCallback {
     function: StoredCallback,
     families: BTreeSet<&'static str>,
+    /// Consecutive delivery failures; the callback detaches after
+    /// `CB_MAX_ERROR` (executor.h:50, ui.c:866-876).
+    errors: u32,
 }
+
+/// Upstream `CB_MAX_ERROR`: callbacks detach after this many failures.
+const CB_MAX_ERROR: u32 = 3;
 
 thread_local! {
     /// Namespace id → attached callback. One attachment per namespace,
@@ -141,6 +147,11 @@ fn ui_attach(
             "opts table must contain at least one 'true' ext_widget",
         ));
     }
+    // ui_add_cb force-enables ext_cmdline for ext_messages attachments: the
+    // messages callback owns the cmdline area (ui.c:860-862).
+    if families.contains("ext_messages") {
+        families.insert("ext_cmdline");
+    }
     let _ = lua;
     CALLBACKS.with(|callbacks| {
         callbacks.borrow_mut().insert(
@@ -148,6 +159,7 @@ fn ui_attach(
             UiCallback {
                 function: callback,
                 families,
+                errors: 0,
             },
         );
     });
@@ -202,21 +214,42 @@ pub fn deliver_pending_ui_events(lua: &Lua) -> mlua::Result<()> {
     let events = PENDING.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
     for (name, args) in events {
         let family = family(&name);
-        let callbacks: Vec<StoredCallback> = CALLBACKS.with(|callbacks| {
+        let callbacks: Vec<(i64, StoredCallback)> = CALLBACKS.with(|callbacks| {
             callbacks
                 .borrow()
-                .values()
-                .filter(|callback| family.is_some_and(|f| callback.families.contains(f)))
-                .map(|callback| callback.function.clone())
+                .iter()
+                .filter(|(_, callback)| family.is_some_and(|f| callback.families.contains(f)))
+                .map(|(ns, callback)| (*ns, callback.function.clone()))
                 .collect()
         });
-        for function in callbacks {
+        for (ns, function) in callbacks {
             let mut values = Vec::with_capacity(args.len() + 1);
             values.push(Value::String(lua.create_string(name.as_bytes())?));
             for arg in &args {
                 values.push(crate::object_to_lua(lua, arg).map_err(mlua::Error::external)?);
             }
-            function.call::<()>(MultiValue::from_iter(values))?;
+            // A failing callback reports and keeps delivering; only repeated
+            // failure detaches it (ui.c:783-788, 866-876). The triggering API
+            // call must never fail because a callback did.
+            if function.call::<()>(MultiValue::from_iter(values)).is_err() {
+                let detach = CALLBACKS.with(|callbacks| {
+                    callbacks.borrow_mut().get_mut(&ns).is_some_and(|callback| {
+                        callback.errors = callback.errors.saturating_add(1);
+                        callback.errors >= CB_MAX_ERROR
+                    })
+                });
+                if detach {
+                    CALLBACKS.with(|callbacks| {
+                        callbacks.borrow_mut().remove(&ns);
+                    });
+                }
+            } else {
+                CALLBACKS.with(|callbacks| {
+                    if let Some(callback) = callbacks.borrow_mut().get_mut(&ns) {
+                        callback.errors = 0;
+                    }
+                });
+            }
         }
     }
     Ok(())
@@ -228,7 +261,10 @@ pub fn has_attached_callbacks() -> bool {
     CALLBACKS.with(|callbacks| !callbacks.borrow().is_empty())
 }
 
-/// Clears all attachments and queued events (session teardown).
+/// Clears all attachments and queued events. Called when a new Lua core is
+/// built: callbacks hold `mlua::Function` values bound to their creating
+/// state, and one host lives per process, so a fresh core must not inherit
+/// the previous core's callbacks.
 pub fn reset() {
     CALLBACKS.with(|callbacks| callbacks.borrow_mut().clear());
     PENDING.with(|pending| pending.borrow_mut().clear());

@@ -19,7 +19,8 @@ pub use converter::{
 pub use host::{ExecError, HostError, LuaHost, RuntimeRoot};
 pub use typval_bridge::{collect_typval_refs, free_typval_refs, lua_to_typval, typval_to_lua};
 pub use ui_events::{
-    bind_ui_events, deliver_pending_ui_events, enqueue_ui_event, has_attached_callbacks, reset,
+    bind_ui_events, deliver_pending_ui_events, enqueue_ui_event, has_attached_callbacks,
+    reset as reset_ui_events,
 };
 pub use uv_core::EventLoopPump;
 pub use vim::{

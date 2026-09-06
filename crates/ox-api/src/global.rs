@@ -1229,31 +1229,38 @@ pub fn nvim_input_mouse(
         (b"x2", b"press") => 92,
         (b"x2", b"drag") => 93,
         (b"x2", b"release") => 94,
-        (b"wheel", b"up") => 76,
-        (b"wheel", b"down") => 75,
-        // The wheel directions are crossed in the mapping (api/vim.c:439-446):
-        // action "left" enqueues KE_MOUSERIGHT and vice versa.
+        // All four wheel directions are crossed in the mapping
+        // (api/vim.c:431-446, keycodes.h:183-186): action "up" enqueues
+        // KE_MOUSEDOWN, "down" KE_MOUSEUP, "left" KE_MOUSERIGHT, and
+        // "right" KE_MOUSELEFT.
+        (b"wheel", b"up") => 75,
+        (b"wheel", b"down") => 76,
         (b"wheel", b"left") => 78,
         (b"wheel", b"right") => 77,
         // (KE_MOUSEMOVE, keycodes.h:218).
         (b"move", _) => 100,
         _ => return Err(ApiError::validation("invalid button or action")),
     };
-    // The modifier string carries the same letters as key notation, with
-    // optional '-' separators (os/input.c parses them into MOD_MASK bits;
-    // META keeps its distinct bit there, keycodes.h:470).
+    // name_to_mod_mask over mod_mask_table (keycodes.c:31-46, lowercased):
+    // c/s ctrl-shift, a and m both ALT, t META, d CMD, 2/3/4 the click
+    // bits; unknown letters fail VALIDATE with the raw byte (api/vim.c:467).
     let mut mask = 0u8;
-    for byte in modifier.as_bytes().to_ascii_lowercase() {
-        match byte {
+    for byte in modifier.as_bytes() {
+        let lowered = byte.to_ascii_lowercase();
+        match lowered {
             b'-' => {}
             b'c' => mask |= MOD_MASK_CTRL,
             b's' => mask |= MOD_MASK_SHIFT,
-            b'a' => mask |= MOD_MASK_ALT,
-            b'm' => mask |= MOD_MASK_META,
-            other => {
+            b'a' | b'm' => mask |= MOD_MASK_ALT,
+            b't' => mask |= MOD_MASK_META,
+            b'd' => mask |= ox_editor::typeahead::MOD_MASK_CMD,
+            b'2' => mask |= ox_editor::typeahead::MOD_MASK_2CLICK,
+            b'3' => mask |= ox_editor::typeahead::MOD_MASK_3CLICK,
+            b'4' => mask |= ox_editor::typeahead::MOD_MASK_4CLICK,
+            _ => {
                 return Err(ApiError::validation(format!(
                     "Invalid modifier: {}",
-                    char::from(other)
+                    char::from(*byte)
                 )));
             }
         }

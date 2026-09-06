@@ -255,13 +255,12 @@ impl Emitter {
             route_chrome(channel, options, routed_chrome)?;
             frames.insert(channel_id, channel.flush()?);
         }
-        let mut semantic = chrome_events.clone();
-        for event in &initial_chrome_events {
-            if !semantic.contains(event) {
-                semantic.push(event.clone());
-            }
-        }
-        Ok(RedrawOutput(frames, semantic))
+        // The semantic stream for vim.ui_attach callbacks is the events that
+        // fired this pass only: upstream dispatches each ui event exactly
+        // once at emission (ui.c:790-822). The persistent-state snapshot
+        // initializes newly attached RPC UIs (`routed_chrome` above), never
+        // Lua callbacks.
+        Ok(RedrawOutput(frames, chrome_events))
     }
 
     /// Emits a grid resize plus either a full initial image or minimal line diffs.

@@ -175,6 +175,14 @@ pub const MOD_MASK_ALT: u8 = 0x08;
 /// META when distinct from ALT (keycodes.h:470; the notation parser folds
 /// `m` into ALT the way terminals deliver it).
 pub const MOD_MASK_META: u8 = 0x10;
+/// Double-click mask (keycodes.h:471).
+pub const MOD_MASK_2CLICK: u8 = 0x20;
+/// Triple-click mask (keycodes.h:472).
+pub const MOD_MASK_3CLICK: u8 = 0x40;
+/// Quadruple-click mask (keycodes.h:473).
+pub const MOD_MASK_4CLICK: u8 = 0x60;
+/// Command ("super") key mask (keycodes.h:474).
+pub const MOD_MASK_CMD: u8 = 0x80;
 
 fn append_raw(output: &mut Vec<u8>, bytes: &[u8]) {
     for byte in bytes {
