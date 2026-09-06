@@ -26,8 +26,8 @@ use ox_lua::{
     collect_typval_refs, free_lua_ref, free_typval_refs, lua_to_object, lua_to_object_ref,
     lua_to_typval, object_to_lua, typval_to_lua,
 };
-use ox_rpc::{CHAN_STDIO, ChannelId, IncrementalDecoder, Message};
 use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, Typval, WinHandle};
+use ox_rpc::{CHAN_STDIO, ChannelId, IncrementalDecoder, Message};
 use ox_ui::{
     CmdlineState as UiCmdlineState, Compositor, ContentChunk, Emitter, Highlight, HlAttrs,
     MessageState, UiOptions,
@@ -108,7 +108,7 @@ fn report_job_send(session: &Rc<ApiSession>, sent: Result<bool, String>, channel
 /// way upstream treats callback failures (`emsg` in `invoke_callback`,
 /// eval/funcs.c): the loop keeps running, the user sees why the event did
 /// not reach its handler.
-fn report_job_callback_error(session: &Rc<ApiSession>, error: &str) {
+fn report_job_callback_error(session: &ApiSession, error: &str) {
     session.with_editor_mut(|editor| {
         ox_editor::excmd_exec::push_text_message(
             editor,
@@ -150,6 +150,11 @@ fn deliver_deferred_job_events(
         let event = batch.remove(0);
         if let Some(reference) = lua_job_reference(&event) {
             let Some(lua) = lua.as_ref() else {
+                // A hostless Lua event is recoverable - a later host could
+                // serve it - so it requeues at the head of the tail, the
+                // same contract `invoke_job_events` keeps for the flush
+                // paths (the old drop stranded it forever).
+                batch.insert(0, event);
                 error = Some("E5108: Lua callback host is not installed".to_owned());
                 break;
             };
@@ -159,7 +164,7 @@ fn deliver_deferred_job_events(
                 .map(ox_editor::excmd_exec::typval_to_object)
                 .collect();
             if let Err(lua_error) = lua.borrow_mut().invoke_callback(reference, args) {
-                error = Some(format!("E5108: {lua_error:?}"));
+                error = Some(format!("E5108: {lua_error}"));
                 break;
             }
         } else {
@@ -1313,22 +1318,9 @@ impl AppState {
         }
     }
 
-    fn drain_lua_work(&mut self) -> Result<(), AppError> {
-        loop {
-            let work = self.lua_work.borrow_mut().pop_front();
-            let Some(work) = work else { return Ok(()) };
-            // A failing vim.schedule callback reports its error and the
-            // editor keeps running (upstream `nlua_error`,
-            // executor.c:526-544); propagating would disconnect the client
-            // that triggered the drain, or exit an embedded editor.
-            if let Err(error) = work() {
-                let message = error.to_string();
-                let session = self.session.clone();
-                session.with_editor_mut(|editor| {
-                    ox_editor::excmd_exec::push_text_message(editor, message, true, true);
-                });
-            }
-        }
+    /// Drains queued Lua work for this state; see [`drain_lua_work_queue`].
+    fn drain_lua_work(&mut self) -> bool {
+        drain_lua_work_queue(&self.lua_work, &self.session)
     }
 
     /// Release the ephemeral Lua references owned by one reply payload.
@@ -1450,7 +1442,7 @@ impl AppState {
                                         .map_err(|error| AppError::Api(error.to_string()))?;
                                     writes.push((channel.get(), ox_rpc::nvim_error_event(&error)));
                                     writes.extend(redraws);
-                                    self.drain_lua_work()?;
+                                    let _ = self.drain_lua_work();
                                     return Ok(writes);
                                 }
                             }
@@ -1462,7 +1454,7 @@ impl AppState {
             }
             Message::Response { .. } => {}
         }
-        self.drain_lua_work()?;
+        let _ = self.drain_lua_work();
         Ok(writes)
     }
 
@@ -1473,6 +1465,34 @@ impl AppState {
     /// Process exit code requested so far (`:cquit`, else 0).
     fn exit_code(&self) -> i64 {
         self.exit_code
+    }
+}
+
+/// Drains queued Lua work (`vim.schedule` callbacks, deferred channel
+/// sends) until the queue empties. Runs on the RPC turn and on the
+/// background tick's borrow-free phase - upstream services this queue
+/// from the main loop (`loop_put`/`process_events`, event/loop.c), not
+/// from message arrival, so an idle session still makes progress.
+///
+/// A failing work item reports through the message system and the drain
+/// continues (upstream `nlua_error`, executor.c:526-544).
+///
+/// Returns whether at least one work item ran.
+fn drain_lua_work_queue(
+    queue: &Rc<RefCell<VecDeque<Work>>>,
+    session: &Rc<ApiSession>,
+) -> bool {
+    let mut ran = false;
+    loop {
+        let work = queue.borrow_mut().pop_front();
+        let Some(work) = work else { return ran };
+        ran = true;
+        if let Err(error) = work() {
+            let message = error.to_string();
+            session.with_editor_mut(|editor| {
+                ox_editor::excmd_exec::push_text_message(editor, message, true, true);
+            });
+        }
     }
 }
 fn positive_dimension(value: i64, name: &str) -> Result<usize, ApiError> {
@@ -2034,18 +2054,17 @@ impl NetworkRuntime {
     /// → `channel_write` → `invoke_callback`, event/loop.c), so a
     /// fire-and-forget `jobstart`'s `on_exit` fires between input batches.
     /// The tick is this server's main-loop turn: it flushes terminal PTY
-    /// output and delivers deferred job events with no executor [`RefCell`]
-    /// borrow live, so callbacks re-enter the primary executor.
+    /// output, delivers deferred job events with no executor [`RefCell`]
+    /// borrow live so callbacks re-enter the primary executor, then drains
+    /// queued Lua work (`vim.schedule`, deferred channel sends) - upstream
+    /// services that queue from the main loop, not from message arrival,
+    /// so an idle session still makes progress.
     ///
     /// `system()`/`wait()` keep their re-defer semantics untouched.
     ///
     /// # Errors
     ///
     /// Returns the drain, redraw, or stream write failure.
-    ///
-    /// # Panics
-    ///
-    /// Never; `state`/`ex` borrows are dropped before callback reentry.
     fn poll_background(&mut self, uv_loop: &mut UvLoop) -> Result<(), ox_uv::CallbackError> {
         let session = self.state.borrow().session.clone();
         let ex = self.state.borrow().ex.clone();
@@ -2060,7 +2079,12 @@ impl NetworkRuntime {
                 false
             }
         };
-        if !delivered && !changed {
+        // A jobwait flush that no Lua boundary claimed (Vimscript caller)
+        // is served here; the events are already delivered, so only the
+        // marker is taken.
+        let _ = ex.borrow_mut().take_lua_flush_pending();
+        let worked = self.state.borrow_mut().drain_lua_work();
+        if !delivered && !changed && !worked {
             return Ok(());
         }
         let writes = self
@@ -3196,20 +3220,26 @@ impl CommandExecutor for ServerCommandHost {
             return Ok(value);
         }
         // Same tiering as `execute`: the primary executor when it is free,
-        // the nested one when a running command re-enters the API.
-        if let Ok(mut ex) = self.ex.try_borrow_mut() {
-            return ex
+        // the nested one when a running command re-enters the API. The
+        // guard drops at the arm boundary so the pending `jobwait` flush
+        // delivers with no borrow live.
+        let (result, owner) = if let Ok(mut guard) = self.ex.try_borrow_mut() {
+            let result = guard
                 .call_builtin(session, name, args)
                 .map_err(|error| map_api_exec_error(ApiOperation::CallFunction, error));
-        }
-        let Ok(mut nested) = self.nested_ex.try_borrow_mut() else {
+            (result, self.ex.clone())
+        } else if let Ok(mut guard) = self.nested_ex.try_borrow_mut() {
+            let result = guard
+                .call_builtin(session, name, args)
+                .map_err(|error| map_api_exec_error(ApiOperation::CallFunction, error));
+            (result, self.nested_ex.clone())
+        } else {
             return Err(ApiError::exception(
                 "no free Ex executor for a Vimscript builtin call",
             ));
         };
-        nested
-            .call_builtin(session, name, args)
-            .map_err(|error| map_api_exec_error(ApiOperation::CallFunction, error))
+        deliver_pending_lua_flush(session, &owner);
+        result
     }
 
     fn change_directory(&mut self, session: &ApiSession, path: &str) -> Result<(), ApiError> {
@@ -3385,13 +3415,22 @@ fn dispatch_scoped_builtin(
         free_typval_refs(lua, &references);
         return typval_to_lua(lua, &value).map_err(mlua::Error::external);
     }
-    let result = match ex.try_borrow_mut() {
-        Ok(mut ex) => ex.call_builtin(session, &name, converted),
+    let (result, owner) = match ex.try_borrow_mut() {
+        Ok(mut guard) => {
+            let result = guard.call_builtin(session, &name, converted);
+            (result, Rc::clone(ex))
+        }
         Err(_) => match nested_ex.try_borrow_mut() {
-            Ok(mut nested) => nested.call_builtin(session, &name, converted),
-            Err(_) => Err(ExecError::Editor(
-                "no free Ex executor for a Vimscript builtin call".into(),
-            )),
+            Ok(mut guard) => {
+                let result = guard.call_builtin(session, &name, converted);
+                (result, Rc::clone(nested_ex))
+            }
+            Err(_) => (
+                Err(ExecError::Editor(
+                    "no free Ex executor for a Vimscript builtin call".into(),
+                )),
+                Rc::clone(ex),
+            ),
         },
     };
     let is_jobstart = name.as_bytes() == b"jobstart";
@@ -3399,7 +3438,35 @@ fn dispatch_scoped_builtin(
         free_typval_refs(lua, &references);
     }
     let result = result.map_err(mlua::Error::runtime)?;
+    // A `jobwait` flush re-deferred Lua callbacks that upstream delivers
+    // before the builtin returns (multiqueue_process_events,
+    // funcs.c:3668/3721); the executor borrow is released here, so this is
+    // the first boundary that can run them.
+    deliver_pending_lua_flush(session, &owner);
     typval_to_lua(lua, &result).map_err(mlua::Error::external)
+}
+
+/// Delivers a pending `jobwait` Lua flush at a borrow-free boundary, looping
+/// while delivered callbacks re-mark the manager. Delivery is skipped while
+/// the Lua host is borrowed - a Lua chunk holds it across its own execution,
+/// so a `jobwait` called from inside the chunk leaves the marker for the
+/// tick; reentrant `vim.fn` calls made by a callback being delivered meet
+/// the same busy host and defer the same way, which bounds the recursion.
+/// Callback failure reports through the message system, the way the tick
+/// driver treats it.
+fn deliver_pending_lua_flush(session: &ApiSession, owner: &Rc<RefCell<ExExecutor>>) {
+    let host = owner.borrow().lua_host();
+    if let Some(host) = host
+        && host.try_borrow_mut().is_err()
+    {
+        return;
+    }
+    while owner.borrow_mut().take_lua_flush_pending() {
+        if let Err(error) = deliver_deferred_job_events(session, owner) {
+            report_job_callback_error(session, &error);
+            break;
+        }
+    }
 }
 
 /// One scoped `nvim_cmd` from Lua re-entered from Vimscript: the primary
@@ -3696,6 +3763,7 @@ impl Scheduler for LuaScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ox_types::Funcref;
 
     #[test]
     #[expect(
@@ -4435,6 +4503,160 @@ mod tests {
             Typval::Number(1),
             "the Lua on_stdout swept by chansend's poll must be delivered \
              by the borrow-free drain, not dropped"
+        );
+    }
+
+    // The tick driver keeps the hostless Lua event with the requeued tail:
+    // a later host can still serve it (`invoke_job_events`' contract for
+    // the flush paths; the old delivery dropped the offending event).
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "the fixture must build")]
+    fn hostless_lua_event_requeues_through_the_tick_driver() {
+        let session = Rc::new(ApiSession::new(Rc::new(RefCell::new(Editor::new()))));
+        let ex = Rc::new(RefCell::new(ExExecutor::new()));
+        // A job manager must exist for the deferred queue; jobstart
+        // installs one. The executor still has no Lua host.
+        ex.borrow_mut()
+            .execute_script(
+                &*session,
+                "<test>",
+                "let g:probe = jobstart(['sh', '-c', 'exit 0'])",
+            )
+            .unwrap();
+        let Typval::Dict(receiver) = Typval::dict(Vec::new()) else {
+            unreachable!("Typval::dict builds a dict")
+        };
+        let event = JobEvent {
+            callback: Typval::Funcref(Funcref {
+                name: OxStr::from("probe"),
+                args: Vec::new(),
+                dict: None,
+                registry: Some(42),
+            }),
+            receiver,
+            args: Vec::new(),
+        };
+        ex.borrow_mut().defer_job_events(vec![event]);
+        let error = deliver_deferred_job_events(&session, &ex).unwrap_err();
+        assert!(error.contains("E5108"), "{error}");
+        let requeued = ex.borrow_mut().take_deferred_job_events();
+        assert_eq!(
+            requeued.len(),
+            1,
+            "the hostless event must requeue, not drop"
+        );
+        assert!(
+            matches!(&requeued[0].callback, Typval::Funcref(f) if f.registry == Some(42)),
+            "the requeued event is the Lua-registered one"
+        );
+        // Redelivery of the requeued batch is stable: same report, same
+        // requeue, no duplication.
+        ex.borrow_mut().defer_job_events(requeued);
+        assert!(deliver_deferred_job_events(&session, &ex).is_err());
+        assert_eq!(ex.borrow_mut().take_deferred_job_events().len(), 1);
+    }
+
+    // The tick's borrow-free phase services the Lua work queue, so an idle
+    // session (nothing arriving on RPC) still runs vim.schedule callbacks
+    // and deferred channel sends - upstream's main-loop queue, not
+    // message-arrival-driven.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "the fixture must build")]
+    fn lua_work_queue_drains_without_an_rpc_message() {
+        let core = build_embedded_core(Editor::new(), true).unwrap();
+        let ran = Rc::new(std::cell::Cell::new(false));
+        let flag = ran.clone();
+        let order: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let first = order.clone();
+        let last = order.clone();
+        core.lua_work
+            .borrow_mut()
+            .push_back(Box::new(move || -> Result<(), mlua::Error> {
+                first.borrow_mut().push("failing");
+                Err(mlua::Error::RuntimeError("scheduled work failed".to_owned()))
+            }));
+        core.lua_work
+            .borrow_mut()
+            .push_back(Box::new(move || -> Result<(), mlua::Error> {
+                last.borrow_mut().push("ok");
+                flag.set(true);
+                Ok(())
+            }));
+        assert!(drain_lua_work_queue(&core.lua_work, &core.session));
+        assert!(ran.get(), "the queued work item must run");
+        assert_eq!(*order.borrow(), vec!["failing", "ok"]);
+        assert!(
+            core.lua_work.borrow().is_empty(),
+            "the drain must empty the queue"
+        );
+        assert!(
+            !drain_lua_work_queue(&core.lua_work, &core.session),
+            "an empty queue reports no work"
+        );
+    }
+
+    // Upstream runs a job's callbacks before `jobwait` returns
+    // (`multiqueue_process_events`, funcs.c:3668/3721), so the first
+    // borrow-free boundary after the builtin must deliver the Lua flush:
+    // here an API `nvim_call_function` turn with the Lua host free. Pre-
+    // hoist the flush waited for the 10 ms tick and this read zero.
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture, chunk, and dispatch must succeed"
+    )]
+    fn lua_on_exit_flushed_by_jobwait_is_delivered_before_the_call_returns() {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let core = build_embedded_core(editor, true).unwrap();
+        let (_, exec) = core.registry.get("nvim_exec_lua").unwrap();
+        exec(
+            &core.session,
+            &[
+                Object::String(OxStr::from(
+                    r"
+                    vim.g.flushed = 0
+                    local function on_exit()
+                      vim.g.flushed = 1
+                    end
+                    vim.g.id = vim.fn.jobstart({'sh', '-c', 'exit 0'}, {on_exit = on_exit})
+                    ",
+                )),
+                Object::Array(Vec::new()),
+            ],
+        )
+        .unwrap();
+        let Typval::Number(id) = core
+            .ex
+            .borrow_mut()
+            .evaluate_expression(&*core.session, "g:id")
+            .unwrap()
+        else {
+            unreachable!("jobstart returns a channel id");
+        };
+        let (_, call) = core.registry.get("nvim_call_function").unwrap();
+        call(
+            &core.session,
+            &[
+                Object::String(OxStr::from("jobwait")),
+                Object::Array(vec![
+                    Object::Array(vec![Object::Integer(id)]),
+                    Object::Integer(2000),
+                ]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            core.ex
+                .borrow_mut()
+                .evaluate_expression(&*core.session, "g:flushed")
+                .unwrap(),
+            Typval::Number(1),
+            "the on_exit flushed by jobwait must run before the API call \
+             returns, with no tick in between"
         );
     }
 }

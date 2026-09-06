@@ -583,10 +583,12 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
     events: &mut Vec<JobEvent>,
 ) -> ox_eval::Result<()> {
     let mut deferred: Vec<JobEvent> = Vec::new();
-    while !events.is_empty() {
-        if event_lua_reference(&events[0]).is_some() {
+    let mut batch = std::mem::take(events).into_iter();
+    while let Some(event) = batch.next() {
+        if event_lua_reference(&event).is_some() {
             if lua.is_none() {
-                deferred.append(events);
+                deferred.push(event);
+                deferred.extend(batch);
                 redefer_job_events(runtime, deferred);
                 return Err(EvalError::new(
                     "E5108",
@@ -594,10 +596,9 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
                     "Lua callback host is not installed",
                 ));
             }
-            deferred.push(events.remove(0));
+            deferred.push(event);
             continue;
         }
-        let event = events.remove(0);
         let name = match event.callback {
             Typval::String(name) => name,
             Typval::Funcref(funcref) | Typval::Partial(funcref) => funcref.name,
@@ -614,9 +615,18 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
             1,
             Some(event.receiver),
         ) {
-            deferred.append(events);
+            deferred.extend(batch);
             redefer_job_events(runtime, deferred);
             return Err(flow_to_eval_error(flow, &name.to_string_lossy()));
+        }
+    }
+    if lua.is_some() && !deferred.is_empty() {
+        // The jobwait flush re-deferred Lua-registered callbacks; upstream
+        // delivers them before `jobwait` returns (funcs.c:3668/3721), so
+        // mark the manager for the first borrow-free boundary after the
+        // builtin returns.
+        if let Some(jobs) = runtime.jobs.as_mut() {
+            jobs.set_lua_flush_pending();
         }
     }
     redefer_job_events(runtime, deferred);
@@ -1010,6 +1020,45 @@ mod tests {
         assert!(
             matches!(&requeued[0].callback, Typval::Funcref(funcref) if funcref.registry == Some(42)),
             "the re-deferred event must be the Lua-registered one"
+        );
+    }
+
+    #[test]
+    fn job_event_burst_delivers_each_event_once_in_order() {
+        let _guard = crate::PROCESS_STATE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        exec.execute_script(
+            &editor,
+            "<test>",
+            "let g:seen = []\nfunction! Burst(id)\ncall add(g:seen, a:id)\nendfunction\nlet g:probe = jobstart(['sh', '-c', 'exit 0'])",
+        )
+        .unwrap();
+        let Typval::Dict(receiver) = Typval::dict(Vec::new()) else {
+            unreachable!("dictionary fixture")
+        };
+        exec.defer_job_events(
+            (0..1000)
+                .map(|id| JobEvent {
+                    callback: Typval::String(OxStr::from("Burst")),
+                    receiver: receiver.clone(),
+                    args: vec![Typval::Number(id)],
+                })
+                .collect(),
+        );
+        exec.evaluate_expression(&editor, "jobwait([g:probe], 0)")
+            .unwrap();
+        assert_eq!(
+            global(exec.scope(), "seen"),
+            Some(Typval::list((0..1000).map(Typval::Number).collect()))
+        );
+        exec.evaluate_expression(&editor, "jobwait([g:probe], 0)")
+            .unwrap();
+        assert_eq!(
+            global(exec.scope(), "seen"),
+            Some(Typval::list((0..1000).map(Typval::Number).collect()))
         );
     }
 

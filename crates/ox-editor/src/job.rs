@@ -162,6 +162,11 @@ pub struct JobManager {
     /// them (`channel.c` defers callbacks onto the main loop instead of
     /// dropping them, which is what `let _ = poll()` did).
     deferred: Vec<JobEvent>,
+    /// Set when the `jobwait` flush re-defers Lua-registered callbacks:
+    /// upstream runs them before `jobwait` returns (`multiqueue_process_
+    /// events`, funcs.c:3668/3721), so the first borrow-free boundary after
+    /// the builtin returns must deliver them, not the next tick.
+    lua_flush_pending: bool,
 }
 
 impl JobManager {
@@ -177,7 +182,19 @@ impl JobManager {
             jobs: HashMap::new(),
             raw: Arc::new(Mutex::new(VecDeque::new())),
             deferred: Vec::new(),
+            lua_flush_pending: false,
         })
+    }
+
+    /// Marks a `jobwait` Lua flush as awaiting synchronous delivery.
+    pub(crate) fn set_lua_flush_pending(&mut self) {
+        self.lua_flush_pending = true;
+    }
+
+    /// Takes the `jobwait` Lua-flush marker; the caller that delivers the
+    /// flushed callbacks consumes it.
+    pub(crate) fn take_lua_flush_pending(&mut self) -> bool {
+        std::mem::take(&mut self.lua_flush_pending)
     }
 
     /// Spawn a process and register it under the already-allocated channel id.

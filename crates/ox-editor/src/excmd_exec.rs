@@ -1118,6 +1118,17 @@ impl<F: FileIO> ExExecutor<F> {
         }
     }
 
+    /// Takes the `jobwait` Lua-flush marker: `true` when the last `jobwait`
+    /// flush re-deferred Lua-registered callbacks that upstream would have
+    /// delivered before the builtin returned (funcs.c:3668/3721). The first
+    /// borrow-free boundary after the builtin returns delivers them.
+    pub fn take_lua_flush_pending(&mut self) -> bool {
+        self.runtime
+            .jobs
+            .as_mut()
+            .is_some_and(JobManager::take_lua_flush_pending)
+    }
+
     /// Invokes one Vimscript-deferred job callback through this executor.
     ///
     /// Lua-registered callbacks and non-callback typvals are ignored and
