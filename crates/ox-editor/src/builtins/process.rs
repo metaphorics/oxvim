@@ -17,7 +17,6 @@ use std::rc::Rc;
 
 use crate::excmd_exec::{
     EvalHost, ExRuntime, LuaExec, call_user_function_with_self, flow_to_eval_error,
-    typval_to_object,
 };
 
 /// Routes one process builtin.
@@ -72,8 +71,16 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
                 let mut events = manager
                     .poll()
                     .map_err(|message| EvalError::new("E900", 0, message))?;
+                // `f_chansend` only writes: `channel_send` ends in
+                // `wstream_write` (channel.c:661) and no callback fires on
+                // its stack. The polled events go back on the queue for the
+                // main-loop turn -- the tick -- that delivers them
+                // (`schedule_channel_event`, channel.c:729-737); invoking
+                // them here would run Lua callbacks under the borrowed
+                // executor, and their `vim.fn` re-entry would land on the
+                // nested executor's never-pumped job manager.
+                manager.defer_events(std::mem::take(&mut events));
                 runtime.jobs = Some(manager);
-                invoke_or_redefer(runtime, access, scope, lua, &mut events)?;
                 if let Some(bytes) = runtime
                     .jobs
                     .as_mut()
@@ -113,7 +120,7 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
             runtime.jobs = Some(manager);
             let (statuses, mut events) =
                 waited.map_err(|message| EvalError::new("E900", 0, message))?;
-            invoke_or_redefer(runtime, access, scope, lua, &mut events)?;
+            invoke_job_events(runtime, access, scope, lua, &mut events)?;
             Ok(Typval::list(
                 statuses.into_iter().map(Typval::Number).collect(),
             ))
@@ -546,27 +553,28 @@ fn callback_option(value: Option<Typval>) -> ox_eval::Result<Option<Typval>> {
     }
 }
 
-/// Invokes callbacks for polled or deferred job events, delivering from the
-/// front of `events`; on handler failure the unconsumed tail is re-deferred
-/// on the installed manager so a later delivery still serves it.
-fn invoke_or_redefer<F: FileIO, E: ExEditorAccess>(
-    runtime: &mut ExRuntime<F>,
-    access: &E,
-    scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
-    events: &mut Vec<JobEvent>,
-) -> ox_eval::Result<()> {
-    match invoke_job_events(runtime, access, scope, lua, events) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            if let Some(jobs) = runtime.jobs.as_mut() {
-                jobs.defer_events(std::mem::take(events));
-            }
-            Err(error)
-        }
-    }
-}
-
+/// Delivers job events from the front of `events` on the executor this
+/// runs under, and requeues what this stack must not deliver.
+///
+/// The split follows delivery capability. Vimscript callbacks execute on
+/// this same stack -- no executor re-entry -- so the synchronous flush
+/// semantics hold for them: `f_jobwait` processes each waited job's queue
+/// on the main stack before returning statuses (funcs.c:3666-3670 and
+/// 3721, `multiqueue_process_events`, multiqueue.c:153-162). A
+/// Lua-registered callback instead goes through the Lua host and re-enters
+/// the executor `RefCell` that the enclosing `call_builtin` frame holds;
+/// that re-entry falls to the nested executor, whose separate job manager
+/// nothing pumps, so any job the callback starts would strand. Those
+/// events re-defer here -- upstream encodes the same non-recursion in
+/// `on_channel_event`'s `callback_busy` re-enqueue (channel.c:758-762) --
+/// and the borrow-free driver (the tick's `deliver_deferred_job_events`)
+/// delivers them with no borrow live, so their re-entry lands on the
+/// primary executor.
+///
+/// On a Vimscript handler failure, or when a Lua-registered event arrives
+/// with no Lua host installed, everything not yet delivered is re-deferred
+/// on the installed manager in its original relative order and the error
+/// surfaces; a later delivery still serves it.
 pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -574,30 +582,28 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     events: &mut Vec<JobEvent>,
 ) -> ox_eval::Result<()> {
+    let mut deferred: Vec<JobEvent> = Vec::new();
     while !events.is_empty() {
+        if event_lua_reference(&events[0]).is_some() {
+            if lua.is_none() {
+                deferred.append(events);
+                redefer_job_events(runtime, deferred);
+                return Err(EvalError::new(
+                    "E5108",
+                    0,
+                    "Lua callback host is not installed",
+                ));
+            }
+            deferred.push(events.remove(0));
+            continue;
+        }
         let event = events.remove(0);
         let name = match event.callback {
             Typval::String(name) => name,
-            Typval::Funcref(funcref) | Typval::Partial(funcref) => {
-                if let Some(reference) = funcref.registry {
-                    let Some(lua) = lua else {
-                        return Err(EvalError::new(
-                            "E5108",
-                            0,
-                            "Lua callback host is not installed",
-                        ));
-                    };
-                    let args = event.args.iter().map(typval_to_object).collect();
-                    lua.borrow_mut()
-                        .invoke_callback(reference, args)
-                        .map_err(|error| EvalError::new("E5108", 0, format!("{error:?}")))?;
-                    continue;
-                }
-                funcref.name
-            }
+            Typval::Funcref(funcref) | Typval::Partial(funcref) => funcref.name,
             _ => continue,
         };
-        call_user_function_with_self(
+        if let Err(flow) = call_user_function_with_self(
             runtime,
             access,
             scope,
@@ -607,10 +613,37 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
             1,
             1,
             Some(event.receiver),
-        )
-        .map_err(|flow| flow_to_eval_error(flow, &name.to_string_lossy()))?;
+        ) {
+            deferred.append(events);
+            redefer_job_events(runtime, deferred);
+            return Err(flow_to_eval_error(flow, &name.to_string_lossy()));
+        }
     }
+    redefer_job_events(runtime, deferred);
     Ok(())
+}
+
+/// Extracts a Lua registry reference from a job callback, returning `None`
+/// for Vimscript funcrefs and plain string callbacks. A registry reference
+/// re-enters the executor through the Lua host, which is what the
+/// borrow-held delivery must not run; the server's borrow-free driver
+/// keeps the same classification in `lua_job_reference`.
+fn event_lua_reference(event: &JobEvent) -> Option<usize> {
+    match &event.callback {
+        Typval::Funcref(funcref) | Typval::Partial(funcref) => funcref.registry,
+        _ => None,
+    }
+}
+
+/// Puts events this stack must not deliver back on the installed manager's
+/// deferred queue; without a manager there is nothing to serve them from.
+fn redefer_job_events<F: FileIO>(runtime: &mut ExRuntime<F>, events: Vec<JobEvent>) {
+    if events.is_empty() {
+        return;
+    }
+    if let Some(jobs) = runtime.jobs.as_mut() {
+        jobs.defer_events(events);
+    }
 }
 
 fn job_id(value: Option<&Typval>) -> ox_eval::Result<u64> {
@@ -675,9 +708,13 @@ fn value_bool(value: &Typval) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
 
-    use crate::{Editor, ExExecutor, Geometry, TestEditorAccess};
+    use crate::excmd_exec::{LuaExec, LuaExecError};
+    use crate::{Editor, ExExecutor, Geometry, JobEvent, TestEditorAccess};
     use ox_eval::Scope;
-    use ox_types::Typval;
+    use ox_types::{Funcref, Object, OxStr, Typval};
+    use std::cell::{Cell, RefCell};
+    use std::path::Path;
+    use std::rc::Rc;
 
     fn global(scope: &Scope, name: &str) -> Option<Typval> {
         scope
@@ -838,5 +875,192 @@ mod tests {
         .unwrap();
         let job = global_number(exec.scope(), "job").unwrap();
         assert_eq!(pty_size_seen_by_child(&mut exec, job), Some((24, 80)));
+    }
+
+    // chansend's poll exists to collect the pty echo, and the job events it
+    // sweeps up with it must not run on chansend's stack. Upstream's
+    // `f_chansend` only writes (funcs.c:649-694; `channel_send` ends in
+    // `wstream_write`, channel.c:661) and delivery stays on the main loop;
+    // here the swept events re-defer and a later drain -- jobwait here, the
+    // tick in interactive mode -- delivers them. Delivering them inline
+    // under the borrowed executor is what sent a Lua callback's `vim.fn`
+    // re-entry to the nested executor's never-pumped manager.
+    #[test]
+    fn chansend_poll_defers_swept_events_for_a_later_drain() {
+        let _guard = crate::PROCESS_STATE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let editor = TestEditorAccess::new(editor);
+        let mut exec = ExExecutor::new();
+        exec.execute_script(
+            &editor,
+            "<test>",
+            "function! Bcb(id, data, event)\nlet g:seen = 1\nendfunction\nlet g:seen = 0\nlet g:writer = jobstart(['sh', '-c', 'echo ready'], {'on_stdout': 'Bcb'})\nlet g:term = jobstart(['cat'], {'term': v:true})\nsleep 250m\ncall chansend(g:term, \"go\\n\")\nlet g:seen_after_chansend = g:seen\ncall jobwait([g:writer], 2000)\nlet g:seen_after_drain = g:seen",
+        )
+        .unwrap();
+        assert!(
+            !global_flag(exec.scope(), "seen_after_chansend"),
+            "chansend must not deliver swept job events on its own stack"
+        );
+        assert!(
+            global_flag(exec.scope(), "seen_after_drain"),
+            "the swept event must surface on the next drain, not be dropped"
+        );
+    }
+
+    // The delivery split under the executor's borrow: Vimscript callbacks
+    // run on this stack -- upstream's flush processes each waited job's
+    // queue before returning statuses (funcs.c:3721) -- while a
+    // Lua-registered callback, whose invocation re-enters the executor
+    // `RefCell` the enclosing `call_builtin` frame holds and whose `vim.fn`
+    // work would land on the nested executor's never-pumped manager,
+    // re-defers for the borrow-free driver. The Lua host must never be
+    // entered from this stack.
+    #[test]
+    fn job_event_delivery_runs_vimscript_and_defers_lua_registered_events() {
+        struct ProbingLua(Cell<usize>);
+        impl LuaExec for ProbingLua {
+            fn execute_chunk(&mut self, _: &str, _: Vec<Object>) -> Result<Object, LuaExecError> {
+                Err(LuaExecError::Load("unused".to_owned()))
+            }
+            fn execute_file(&mut self, _: &Path) -> Result<(), LuaExecError> {
+                Err(LuaExecError::Load("unused".to_owned()))
+            }
+            fn invoke_callback(
+                &mut self,
+                _: usize,
+                _: Vec<Object>,
+            ) -> Result<Object, LuaExecError> {
+                self.0.set(self.0.get() + 1);
+                Err(LuaExecError::Runtime("must not run here".to_owned()))
+            }
+        }
+        let _guard = crate::PROCESS_STATE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        let host = Rc::new(RefCell::new(ProbingLua(Cell::new(0))));
+        exec.set_lua_exec(host.clone());
+        exec.execute_script(
+            &editor,
+            "<test>",
+            "function! VimCb(id, data, event)\nlet g:delivered = a:event\nendfunction\nlet g:probe = jobstart(['sh', '-c', 'exit 0'])",
+        )
+        .unwrap();
+        let Typval::Dict(receiver) = Typval::dict(Vec::new()) else {
+            unreachable!("Typval::dict builds a dict")
+        };
+        let args = |event: &str| {
+            vec![
+                Typval::Number(1),
+                Typval::list(Vec::new()),
+                Typval::String(OxStr::from(event)),
+            ]
+        };
+        let lua_event = JobEvent {
+            callback: Typval::Funcref(Funcref {
+                name: OxStr::from("probe"),
+                args: Vec::new(),
+                dict: None,
+                registry: Some(42),
+            }),
+            receiver: receiver.clone(),
+            args: args("exit"),
+        };
+        let vim_event = JobEvent {
+            callback: Typval::String(OxStr::from("VimCb")),
+            receiver,
+            args: args("stdout"),
+        };
+        exec.defer_job_events(vec![lua_event, vim_event]);
+        exec.invoke_deferred_job_events(&editor).unwrap();
+        assert_eq!(
+            global(exec.scope(), "delivered"),
+            Some(Typval::String(OxStr::from("stdout"))),
+            "the Vimscript callback must run on this stack"
+        );
+        assert_eq!(
+            host.borrow().0.get(),
+            0,
+            "the Lua host must not be entered from the borrowed delivery"
+        );
+        let requeued = exec.take_deferred_job_events();
+        assert_eq!(
+            requeued.len(),
+            1,
+            "the Lua-registered event must re-defer, not drop"
+        );
+        assert!(
+            matches!(&requeued[0].callback, Typval::Funcref(funcref) if funcref.registry == Some(42)),
+            "the re-deferred event must be the Lua-registered one"
+        );
+    }
+
+    // A Lua-registered event arriving with no Lua host installed keeps the
+    // loud E5108, and the batch that never reached a handler re-defers in
+    // its original order -- the old delivery dropped the offending event
+    // itself, so a later host could never serve it.
+    #[test]
+    fn lua_event_without_a_host_reports_e5108_and_requeues_the_batch() {
+        let _guard = crate::PROCESS_STATE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        exec.execute_script(
+            &editor,
+            "<test>",
+            "function! VimCb(id, data, event)\nlet g:seen = a:event\nendfunction\nlet g:probe = jobstart(['sh', '-c', 'exit 0'])",
+        )
+        .unwrap();
+        let Typval::Dict(receiver) = Typval::dict(Vec::new()) else {
+            unreachable!("Typval::dict builds a dict")
+        };
+        let event = |callback| JobEvent {
+            callback,
+            receiver: receiver.clone(),
+            args: vec![
+                Typval::Number(1),
+                Typval::list(Vec::new()),
+                Typval::String(OxStr::from("exit")),
+            ],
+        };
+        exec.defer_job_events(vec![
+            event(Typval::String(OxStr::from("VimCb"))),
+            event(Typval::Funcref(Funcref {
+                name: OxStr::from("probe"),
+                args: Vec::new(),
+                dict: None,
+                registry: Some(7),
+            })),
+            event(Typval::String(OxStr::from("VimCb"))),
+        ]);
+        let error = exec
+            .invoke_deferred_job_events(&editor)
+            .expect_err("a Lua-registered event with no host must raise E5108");
+        assert!(error.contains("E5108"), "unexpected error: {error}");
+        assert_eq!(
+            global(exec.scope(), "seen"),
+            Some(Typval::String(OxStr::from("exit"))),
+            "events before the Lua-registered one must still deliver"
+        );
+        let requeued = exec.take_deferred_job_events();
+        assert_eq!(
+            requeued.len(),
+            2,
+            "the Lua-registered event and the tail must survive the error"
+        );
+        assert!(
+            requeued.iter().any(
+                |event| matches!(&event.callback, Typval::Funcref(funcref) if funcref.registry == Some(7))
+            ),
+            "the offending Lua-registered event itself must be requeued"
+        );
     }
 }

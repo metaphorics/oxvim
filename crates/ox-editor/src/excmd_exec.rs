@@ -61,7 +61,7 @@ use crate::typeahead::{Keys, Remap, TypeaheadFlags, special_notation};
 use crate::userfunc::{UserFuncError, UserFunctions};
 use crate::{
     BufferRelease, ChannelIds, DirectoryError, DirectoryScope, Editor, EditorError, Geometry,
-    JobManager, Message, MessageKind, Mode, ModeMachine,
+    JobEvent, JobManager, Message, MessageKind, Mode, ModeMachine,
 };
 
 /// `FILETYPE_FILE` … `INDOFF_FILE` (`globals.h:37-60`): the runtime files
@@ -1098,51 +1098,101 @@ impl<F: FileIO> ExExecutor<F> {
     }
 
     /// Delivers deferred job events through the same invocation path
-    /// chansend/jobwait use (upstream delivers job callbacks on the main
-    /// loop: `process_events` → `channel_write` → `invoke_callback`,
-    /// event/loop.c). Returns whether any deferred event was queued for
-    /// delivery, so callers can redraw even without PTY output.
+    /// jobwait uses (upstream delivers job callbacks on the main loop:
+    /// `process_events` → `channel_write` → `invoke_callback`,
+    /// event/loop.c). Vimscript callbacks run on this stack; a
+    /// Lua-registered callback re-defers instead (see
+    /// [`crate::builtins::process::invoke_job_events`]), because its
+    /// re-entry would fall to the nested executor while this call holds
+    /// the executor `RefCell` -- the borrow-free driver (the tick's
+    /// `deliver_deferred_job_events`) delivers those. Returns whether any
+    /// deferred event was queued for delivery, so callers can redraw even
+    /// without PTY output.
     ///
     /// # Errors
     ///
-    /// Returns the invocation error, with uninvoked events requeued.
+    /// Returns the invocation error; everything this stack could not
+    /// deliver was already requeued on the manager.
     pub fn invoke_deferred_job_events<E: ExEditorAccess>(
         &mut self,
         access: &E,
     ) -> Result<bool, String> {
-        // The manager stays installed for the whole delivery: taking it out
-        // would leave `runtime.jobs` empty inside callbacks, so a handler's
-        // `jobstart` would mint a fresh manager that the restore then drops
-        // (Drop terminates its children). Drain and requeue instead, in
-        // borrows short enough never to span user code, keeping the exact
-        // `take_deferred_and_invoke` requeue order (handler-deferred events
-        // ahead of the unconsumed tail).
-        let delivered = match self.runtime.jobs.as_mut() {
-            Some(manager) => {
-                let batch = manager.drain_deferred();
-                if batch.is_empty() {
-                    0
-                } else {
-                    let delivered = batch.len();
-                    let mut batch = batch;
-                    if let Err(error) = crate::builtins::process::invoke_job_events(
-                        &mut self.runtime,
-                        access,
-                        &mut self.scope,
-                        self.lua.as_ref(),
-                        &mut batch,
-                    ) {
-                        if let Some(manager) = self.runtime.jobs.as_mut() {
-                            manager.defer_events(std::mem::take(&mut batch));
-                        }
-                        return Err(error.to_string());
-                    }
-                    delivered
-                }
-            }
-            None => 0,
-        };
+        let mut batch = self.take_deferred_job_events();
+        if batch.is_empty() {
+            return Ok(false);
+        }
+        let delivered = batch.len();
+        crate::builtins::process::invoke_job_events(
+            &mut self.runtime,
+            access,
+            &mut self.scope,
+            self.lua.as_ref(),
+            &mut batch,
+        )
+        .map_err(|error| error.to_string())?;
         Ok(delivered > 0)
+    }
+
+    /// Returns a clone of the Lua callback host, if one is installed.
+    #[must_use]
+    pub fn lua_host(&self) -> Option<Rc<RefCell<dyn LuaExec>>> {
+        self.lua.clone()
+    }
+
+    /// Drains the installed job manager's deferred callback queue.
+    pub fn take_deferred_job_events(&mut self) -> Vec<JobEvent> {
+        match self.runtime.jobs.as_mut() {
+            Some(manager) => manager.drain_deferred(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Requeues deferred job events onto the installed job manager.
+    pub fn defer_job_events(&mut self, events: Vec<JobEvent>) {
+        if let Some(manager) = self.runtime.jobs.as_mut() {
+            manager.defer_events(events);
+        }
+    }
+
+    /// Invokes one Vimscript-deferred job callback through this executor.
+    ///
+    /// Lua-registered callbacks and non-callback typvals are ignored and
+    /// returned as `Ok(())`, so the caller can dispatch them separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handler failure string when the callback throws.
+    pub fn invoke_vimscript_job_callback<E: ExEditorAccess>(
+        &mut self,
+        access: &E,
+        event: JobEvent,
+    ) -> Result<(), String> {
+        let name = match &event.callback {
+            Typval::String(name) => name.clone(),
+            Typval::Funcref(funcref) | Typval::Partial(funcref) => {
+                if funcref.registry.is_some() {
+                    return Ok(());
+                }
+                funcref.name.clone()
+            }
+            _ => return Ok(()),
+        };
+        if name.as_bytes().is_empty() {
+            return Ok(());
+        }
+        call_user_function_with_self(
+            &mut self.runtime,
+            access,
+            &mut self.scope,
+            self.lua.as_ref(),
+            &name.to_string_lossy(),
+            event.args,
+            1,
+            1,
+            Some(event.receiver),
+        )
+        .map_err(|flow| flow_to_eval_error(flow, &name.to_string_lossy()).to_string())?;
+        Ok(())
     }
 
     /// Process exit requested since the last poll (`:cquit` / `:qall`).
@@ -16488,7 +16538,9 @@ pub(crate) fn object_to_typval(value: &Object) -> Typval {
         Object::Tabpage(value) => Typval::Number(i64::from(*value)),
     }
 }
-pub(crate) fn typval_to_object(value: &Typval) -> Object {
+/// Converts one Vimscript [`Typval`] to an API [`Object`].
+#[must_use]
+pub fn typval_to_object(value: &Typval) -> Object {
     match value {
         Typval::Number(value) => Object::Integer(*value),
         Typval::Float(value) => Object::Float(*value),

@@ -13,6 +13,7 @@ use ox_api::{
     ApiSession, AutocmdExecution, AutocmdExecutor, ChannelInfo, CommandExecutor, LuaExecutor,
     Registry, close_channel, register_channel,
 };
+use ox_editor::job::JobEvent;
 use ox_editor::{
     AutocmdAction, AutocmdContext, AutocmdKind, ChannelIds, CmdlineKind, Editor, Event, ExExecutor,
     ExecError, ExecOutcome, Geometry, Keys, LuaExec, LuaExecError, MessageDestination, MessageKind,
@@ -116,6 +117,66 @@ fn report_job_callback_error(session: &Rc<ApiSession>, error: &str) {
             true,
         );
     });
+}
+/// Extracts a Lua registry reference from a deferred job callback, returning
+/// `None` for Vimscript funcrefs and plain string callbacks.
+fn lua_job_reference(event: &JobEvent) -> Option<usize> {
+    match &event.callback {
+        Typval::Funcref(funcref) | Typval::Partial(funcref) => funcref.registry,
+        _ => None,
+    }
+}
+
+/// Delivers one batch of deferred job events without holding the executor
+/// [`RefCell`] across callbacks (upstream `process_events` → `channel_write` →
+/// `invoke_callback`, event/loop.c, runs all callbacks on the main stack).
+///
+/// Phase A drains the batch with a short `ex` borrow. Phase B invokes each
+/// callback with the borrow dropped -- Lua callbacks go straight to the Lua
+/// host, Vimscript callbacks reborrow `ex` for one event. Phase C requeues
+/// the unconsumed tail on handler failure and updates the delivered flag.
+fn deliver_deferred_job_events(
+    session: &ApiSession,
+    ex: &Rc<RefCell<ExExecutor>>,
+) -> Result<bool, String> {
+    let lua = ex.borrow().lua_host();
+    let mut batch = ex.borrow_mut().take_deferred_job_events();
+    if batch.is_empty() {
+        return Ok(false);
+    }
+    let batch_len = batch.len();
+    let mut error = None;
+    while !batch.is_empty() {
+        let event = batch.remove(0);
+        if let Some(reference) = lua_job_reference(&event) {
+            let Some(lua) = lua.as_ref() else {
+                error = Some("E5108: Lua callback host is not installed".to_owned());
+                break;
+            };
+            let args = event
+                .args
+                .iter()
+                .map(ox_editor::excmd_exec::typval_to_object)
+                .collect();
+            if let Err(lua_error) = lua.borrow_mut().invoke_callback(reference, args) {
+                error = Some(format!("E5108: {lua_error:?}"));
+                break;
+            }
+        } else {
+            let mut ex = ex.borrow_mut();
+            if let Err(invoke_error) = ex.invoke_vimscript_job_callback(session, event) {
+                error = Some(invoke_error);
+                break;
+            }
+        }
+    }
+    if let Some(error) = error {
+        if !batch.is_empty() {
+            ex.borrow_mut().defer_job_events(batch);
+        }
+        return Err(error);
+    }
+    Ok(batch_len > 0)
 }
 
 impl ox_api::ChannelSink for JobChannelSink {
@@ -1973,9 +2034,8 @@ impl NetworkRuntime {
     /// → `channel_write` → `invoke_callback`, event/loop.c), so a
     /// fire-and-forget `jobstart`'s `on_exit` fires between input batches.
     /// The tick is this server's main-loop turn: it flushes terminal PTY
-    /// output and delivers deferred job events through the same invocation
-    /// path chansend/jobwait use (`invoke_deferred_job_events`, which runs
-    /// with no editor borrow live so callbacks may re-enter the executor).
+    /// output and delivers deferred job events with no executor [`RefCell`]
+    /// borrow live, so callbacks re-enter the primary executor.
     ///
     /// `system()`/`wait()` keep their re-defer semantics untouched.
     ///
@@ -1988,34 +2048,19 @@ impl NetworkRuntime {
     /// Never; `state`/`ex` borrows are dropped before callback reentry.
     fn poll_background(&mut self, uv_loop: &mut UvLoop) -> Result<(), ox_uv::CallbackError> {
         let session = self.state.borrow().session.clone();
-        let mut changed = self
-            .state
-            .borrow_mut()
-            .ex
+        let ex = self.state.borrow().ex.clone();
+        let changed = ex
             .borrow_mut()
             .flush_pty_output(&*session)
             .map_err(ox_uv::CallbackError::new)?;
-        // Deliver deferred job events on this turn (upstream delivers job
-        // callbacks on the main loop). Bound before matching: a failing user
-        // callback reports (emsg) and continues, the way upstream treats
-        // callback failures (`emsg` in `invoke_callback`, eval/funcs.c),
-        // never tearing down the loop — and never while an editor borrow is
-        // live.
-        let delivered = self
-            .state
-            .borrow_mut()
-            .ex
-            .borrow_mut()
-            .invoke_deferred_job_events(&*session);
-        match delivered {
-            // A delivered batch forces the redraw gate: on_stdout/on_exit
-            // handlers may mutate editor state with no PTY output, and
-            // upstream redraws after processed events (event/loop.c), not
-            // on every loop turn. Idle ticks answer Ok(false) and stay quiet.
-            Ok(delivered) => changed |= delivered,
-            Err(error) => report_job_callback_error(&session, &error),
-        }
-        if !changed {
+        let delivered = match deliver_deferred_job_events(&session, &ex) {
+            Ok(delivered) => delivered,
+            Err(error) => {
+                report_job_callback_error(&session, &error);
+                false
+            }
+        };
+        if !delivered && !changed {
             return Ok(());
         }
         let writes = self
@@ -3304,6 +3349,12 @@ impl CommandExecutor for ExApiExecutor<'_> {
 ///
 /// Temporary Lua function references belong to this call. Release them after
 /// the builtin returns, including conversion and execution failures.
+///
+/// `jobstart` is the exception: on success its callback references transfer
+/// to the job (upstream's job-owned callback refs), so freeing them here
+/// would leave the `on_exit/on_stdout` closures dangling and deliver the wrong
+/// callback. This leaves a known, bounded leak: those refs are not freed when
+/// the job is dropped until a future lifetime pass is added.
 fn dispatch_scoped_builtin(
     lua: &Lua,
     session: &ApiSession,
@@ -3343,7 +3394,10 @@ fn dispatch_scoped_builtin(
             )),
         },
     };
-    free_typval_refs(lua, &references);
+    let is_jobstart = name.as_bytes() == b"jobstart";
+    if !is_jobstart || result.is_err() {
+        free_typval_refs(lua, &references);
+    }
     let result = result.map_err(mlua::Error::runtime)?;
     typval_to_lua(lua, &result).map_err(mlua::Error::external)
 }
@@ -3961,7 +4015,10 @@ mod tests {
 
         let root = std::env::temp_dir().join(format!("oxvim-listen-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::DirBuilder::new().recursive(true).create(&root).unwrap();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .create(&root)
+            .unwrap();
 
         // A world-writable XDG_RUNTIME_DIR candidate must be rejected in
         // favor of the validated /tmp/oxvim.<uid> fallback.
@@ -4138,6 +4195,259 @@ mod tests {
         assert!(
             nested_exit_ran,
             "the nested jobstart's on_exit never ran (reentry failed)"
+        );
+    }
+    // A Lua on_exit handler that starts a nested job must run on the primary
+    // executor: the tick drops the ex RefCell before each callback, so the
+    // nested jobstart does not fall back to the nested manager. Both on_exit
+    // callbacks fire exactly once and no events remain deferred.
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture, script, and tick calls must succeed"
+    )]
+    fn lua_on_exit_starts_nested_job_and_both_exit_exactly_once() {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let core = build_embedded_core(editor, true).unwrap();
+        let lua = core.ex.borrow().lua_host().unwrap();
+        lua.borrow_mut()
+            .execute_chunk(
+                "
+                vim.g.exit_count = 0
+                local exits = {}
+                local function on_exit(id, status, event)
+                  table.insert(exits, status)
+                  vim.g.exit_count = vim.g.exit_count + 1
+                  if #exits < 2 then
+                    vim.fn.jobstart({'sh', '-c', 'exit 0'}, {on_exit = on_exit})
+                  end
+                end
+                vim.fn.jobstart({'sh', '-c', 'exit 0'}, {on_exit = on_exit})
+                ",
+                Vec::new(),
+            )
+            .unwrap();
+        let mut exit_count = Typval::Number(0);
+        for _ in 0..500 {
+            let _ = core
+                .ex
+                .borrow_mut()
+                .flush_pty_output(&*core.session)
+                .unwrap();
+            let _ = deliver_deferred_job_events(&core.session, &core.ex).unwrap();
+            exit_count = core
+                .ex
+                .borrow_mut()
+                .evaluate_expression(&*core.session, "g:exit_count")
+                .unwrap();
+            if exit_count == Typval::Number(2) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            exit_count,
+            Typval::Number(2),
+            "both on_exit callbacks must fire exactly once"
+        );
+        assert!(
+            core.ex.borrow_mut().take_deferred_job_events().is_empty(),
+            "no deferred job events remain after both exits delivered"
+        );
+    }
+
+    // A Lua on_exit handler that calls chansend on a still-running primary
+    // job must reach the primary manager, not the nested fallback, so the
+    // return value is the number of bytes written (not 0).
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture, script, and tick calls must succeed"
+    )]
+    fn lua_on_exit_chansend_reaches_primary_job() {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let core = build_embedded_core(editor, true).unwrap();
+        let lua = core.ex.borrow().lua_host().unwrap();
+        lua.borrow_mut()
+            .execute_chunk(
+                r#"
+                vim.g.send_ok = 0
+                local primary_id = vim.fn.jobstart({'cat'})
+                local function on_exit(id, status, event)
+                  local ok = vim.fn.chansend(primary_id, "done\n")
+                  vim.g.send_ok = ok
+                  vim.fn.jobstop(primary_id)
+                end
+                vim.fn.jobstart({'sh', '-c', 'exit 0'}, {on_exit = on_exit})
+                "#,
+                Vec::new(),
+            )
+            .unwrap();
+        let mut send_ok = Typval::Number(0);
+        for _ in 0..500 {
+            let _ = core
+                .ex
+                .borrow_mut()
+                .flush_pty_output(&*core.session)
+                .unwrap();
+            let _ = deliver_deferred_job_events(&core.session, &core.ex).unwrap();
+            send_ok = core
+                .ex
+                .borrow_mut()
+                .evaluate_expression(&*core.session, "g:send_ok")
+                .unwrap();
+            if send_ok != Typval::Number(0) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_ne!(
+            send_ok,
+            Typval::Number(0),
+            "chansend on the primary job must return non-zero"
+        );
+    }
+
+    // The jobwait flush delivers a Lua on_exit under the enclosing
+    // `call_builtin` borrow, so its re-entry was routed to the nested
+    // executor's never-pumped job manager and the nested job stranded.
+    // The flush now re-defers Lua-registered events; the tick delivers
+    // them with no borrow live, the re-entrant jobstart lands on the
+    // primary executor, and both exits fire exactly once.
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture, script, and tick calls must succeed"
+    )]
+    fn lua_on_exit_via_jobwait_nested_jobstart_does_not_strand() {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let core = build_embedded_core(editor, true).unwrap();
+        let lua = core.ex.borrow().lua_host().unwrap();
+        lua.borrow_mut()
+            .execute_chunk(
+                "
+                vim.g.nested_exited = 0
+                local exits = 0
+                local function on_exit(id, status, event)
+                  exits = exits + 1
+                  if exits == 1 then
+                    vim.fn.jobstart({'sh', '-c', 'exit 0'}, {on_exit = on_exit})
+                  else
+                    vim.g.nested_exited = 1
+                  end
+                end
+                local id = vim.fn.jobstart({'sh', '-c', 'exit 0'}, {on_exit = on_exit})
+                vim.fn.jobwait({id}, 2000)
+                ",
+                Vec::new(),
+            )
+            .unwrap();
+        let mut nested_exited = Typval::Number(0);
+        for _ in 0..500 {
+            let _ = core
+                .ex
+                .borrow_mut()
+                .flush_pty_output(&*core.session)
+                .unwrap();
+            let _ = deliver_deferred_job_events(&core.session, &core.ex).unwrap();
+            nested_exited = core
+                .ex
+                .borrow_mut()
+                .evaluate_expression(&*core.session, "g:nested_exited")
+                .unwrap();
+            if nested_exited == Typval::Number(1) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            nested_exited,
+            Typval::Number(1),
+            "the nested job's on_exit must fire: the re-entrant jobstart \
+             must land on the primary executor, not the nested fallback"
+        );
+        assert!(
+            core.ex.borrow_mut().take_deferred_job_events().is_empty(),
+            "no deferred job events remain after both exits delivered"
+        );
+    }
+
+    // A Lua on_stdout produced while a chansend drains its pty must reach
+    // its handler on the borrow-free tick path: chansend only writes
+    // (upstream `f_chansend`, funcs.c:649-694), so its poll re-defers what
+    // it sweeps and the drain the caller drives afterwards delivers it.
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture, script, and tick calls must succeed"
+    )]
+    fn lua_on_stdout_via_chansend_is_delivered_by_the_next_drain() {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let core = build_embedded_core(editor, true).unwrap();
+        let lua = core.ex.borrow().lua_host().unwrap();
+        lua.borrow_mut()
+            .execute_chunk(
+                r#"
+                vim.g.stdout_seen = 0
+                vim.g.chan_ok = 0
+                local function on_stdout(id, data, event)
+                  vim.g.stdout_seen = 1
+                end
+                local id = vim.fn.jobstart({'cat'}, {on_stdout = on_stdout})
+                vim.g.chan_ok = vim.fn.chansend(id, "ping\n") > 0
+                "#,
+                Vec::new(),
+            )
+            .unwrap();
+        let chan_ok = core
+            .ex
+            .borrow_mut()
+            .evaluate_expression(&*core.session, "g:chan_ok")
+            .unwrap();
+        assert_eq!(
+            chan_ok,
+            Typval::Bool(true),
+            "chansend to the primary job must write its bytes"
+        );
+        let mut stdout_seen = Typval::Number(0);
+        for _ in 0..500 {
+            let _ = core
+                .ex
+                .borrow_mut()
+                .flush_pty_output(&*core.session)
+                .unwrap();
+            let _ = deliver_deferred_job_events(&core.session, &core.ex).unwrap();
+            stdout_seen = core
+                .ex
+                .borrow_mut()
+                .evaluate_expression(&*core.session, "g:stdout_seen")
+                .unwrap();
+            if stdout_seen == Typval::Number(1) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            stdout_seen,
+            Typval::Number(1),
+            "the Lua on_stdout swept by chansend's poll must be delivered \
+             by the borrow-free drain, not dropped"
         );
     }
 }
