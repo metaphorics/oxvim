@@ -1758,11 +1758,11 @@ fn highlight_default_and_link_forms_retain_definitions() {
 fn unimplemented_builtin_returns_not_implemented() {
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::new();
-    // ":redraw" used to stand in here; it is dispatched now, so the probe
-    // moved to ":sort", which the handler table still does not carry.
-    let err = exec.execute_line(&editor, "sort").unwrap_err();
+    // ":sort" used to stand in here; it is dispatched now, so the probe
+    // moved to ":move", which the handler table still does not carry.
+    let err = exec.execute_line(&editor, "move").unwrap_err();
     match err {
-        ExecError::NotImplemented(name) => assert_eq!(name, "sort"),
+        ExecError::NotImplemented(name) => assert_eq!(name, "move"),
         other => panic!("expected NotImplemented, got {other:?}"),
     }
 }

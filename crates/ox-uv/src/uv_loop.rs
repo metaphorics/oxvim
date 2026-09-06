@@ -554,9 +554,7 @@ impl UvLoop {
                 }),
                 _ => false,
             };
-            if deliver
-                && let Some(callback) = self.take_callback(id, phase, allow_inactive)
-            {
+            if deliver && let Some(callback) = self.take_callback(id, phase, allow_inactive) {
                 self.invoke_callback(id, phase, callback);
             }
         }

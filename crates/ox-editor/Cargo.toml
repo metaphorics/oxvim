@@ -13,6 +13,7 @@ ox-excmd = { path = "../ox-excmd" }
 ox-eval = { path = "../ox-eval" }
 similar = { workspace = true }
 ox-regex = { path = "../ox-regex" }
+ox-rpc = { path = "../ox-rpc" }
 ox-uv = { path = "../ox-uv" }
 thiserror.workspace = true
 unicode-width = "0.2.2"

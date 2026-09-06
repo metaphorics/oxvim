@@ -31,9 +31,8 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         // re-expressed as a Typval. Reading the canonical table is
         // infallible in practice; a decode failure is a broken build.
         "api_info" => Ok(crate::excmd_exec::object_to_typval(
-            &ox_rpc::canonical_metadata().map_err(|err| {
-                EvalError::new("E5009", 0, format!("api_info: {err}"))
-            })?,
+            &ox_rpc::canonical_metadata()
+                .map_err(|err| EvalError::new("E5009", 0, format!("api_info: {err}")))?,
         )),
         "hlID" => host
             .access
@@ -546,7 +545,6 @@ mod tests {
     }
 }
 
-
 /// `f_hlID` → `syn_name2id` (eval/funcs.c): the group's 1-based id, 0 when
 /// absent. Upstream assigns ids in `hl_table` allocation order; the port's
 /// name-keyed table yields the sorted position instead, which is stable and
@@ -565,7 +563,7 @@ fn call_hl_id_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typva
         .highlights()
         .keys()
         .position(|candidate| candidate.eq_ignore_ascii_case(&name))
-        .map_or(0, |index| index as i64 + 1);
+        .map_or(0, |index| i64::try_from(index).unwrap_or(i64::MAX) + 1);
     Ok(Typval::Number(id))
 }
 
@@ -618,8 +616,7 @@ mod api_and_highlight_tests {
         for member in ["version", "functions", "ui_events"] {
             assert!(
                 keys.iter().any(|key| key == member),
-                "api_info() missing '{member}' (has {:?})",
-                keys
+                "api_info() missing '{member}' (has {keys:?})"
             );
         }
     }

@@ -399,7 +399,7 @@ impl Editor {
     /// window handles start at Neovim's reserved API window-ID floor.
     #[must_use]
     pub fn new() -> Self {
-        Self {
+        let mut editor = Self {
             buffers: BTreeMap::new(),
             windows: BTreeMap::new(),
             tabpages: BTreeMap::new(),
@@ -463,7 +463,12 @@ impl Editor {
             terminal_buffers: BTreeMap::new(),
             beeped: false,
             search_count: None,
-        }
+        };
+        // init_highlight (highlight_group.c:755-800) runs from main(): every
+        // editor instance carries the startup highlight groups so hlID()/
+        // hlexists() see the same table a live session would.
+        crate::highlight_init::init_highlight(&mut editor);
+        editor
     }
 
     /// Allocates a unique channel ID for a new terminal channel.

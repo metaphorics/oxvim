@@ -16,6 +16,7 @@ pub mod excmd_exec;
 pub mod extmark;
 pub mod fold;
 pub mod fs_builtins;
+pub mod highlight_init;
 pub mod include_search;
 pub mod indent;
 pub mod insert;

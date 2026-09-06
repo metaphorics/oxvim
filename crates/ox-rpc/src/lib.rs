@@ -13,8 +13,8 @@
 //! This crate is pure data handling; I/O and the event loop live in `ox-loop`.
 
 mod channel;
-mod convert;
 mod codec;
+mod convert;
 mod message;
 mod metadata;
 mod redraw;

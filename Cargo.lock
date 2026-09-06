@@ -575,6 +575,7 @@ dependencies = [
  "ox-eval",
  "ox-excmd",
  "ox-regex",
+ "ox-rpc",
  "ox-sys",
  "ox-text",
  "ox-types",

@@ -29,19 +29,17 @@ pub fn typval_to_object(value: &Typval) -> Object {
             Object::Integer(i64::try_from(*id).unwrap_or(i64::MAX))
         }
         Typval::Funcref(function) | Typval::Partial(function) => funcref_to_object(function),
-        Typval::List(values) => values
-            .try_borrow()
-            .map_or(Object::Nil, |data| Object::Array(
-                data.items.iter().map(typval_to_object).collect(),
-            )),
-        Typval::Dict(values) => values
-            .try_borrow()
-            .map_or(Object::Nil, |data| Object::Dict(Dict(
+        Typval::List(values) => values.try_borrow().map_or(Object::Nil, |data| {
+            Object::Array(data.items.iter().map(typval_to_object).collect())
+        }),
+        Typval::Dict(values) => values.try_borrow().map_or(Object::Nil, |data| {
+            Object::Dict(Dict(
                 data.entries
                     .iter()
                     .map(|entry| (entry.key.clone(), typval_to_object(&entry.value)))
                     .collect(),
-            ))),
+            ))
+        }),
     }
 }
 
@@ -57,7 +55,6 @@ fn funcref_to_object(function: &Funcref) -> Object {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ox_types::BufHandle;
 
     #[test]
     fn lua_registered_funcref_becomes_lua_ref_and_others_nil() {
@@ -107,10 +104,7 @@ mod tests {
             typval_to_object(&Typval::Special(Special::Null)),
             Object::Nil
         );
-        assert_eq!(
-            typval_to_object(&Typval::Bool(true)),
-            Object::Boolean(true)
-        );
+        assert_eq!(typval_to_object(&Typval::Bool(true)), Object::Boolean(true));
     }
 
     #[test]
@@ -129,13 +123,10 @@ mod tests {
             Object::Array(vec![Object::Integer(1), Object::LuaRef(3)])
         );
 
-        let dict = Typval::dict(vec![(
-            OxStr::from("buf"),
-            Typval::Number(i64::from(BufHandle::try_from(3).unwrap())),
-        )]);
+        let dict = Typval::dict(vec![(OxStr::from("buf"), Typval::Number(3))]);
         let converted = typval_to_object(&dict);
         let Object::Dict(entries) = converted else {
-            panic!("dict must convert to Object::Dict");
+            unreachable!("typval_to_object maps Typval::Dict to Object::Dict");
         };
         assert_eq!(
             entries.get(&OxStr::from("buf")),

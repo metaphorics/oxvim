@@ -1204,9 +1204,9 @@ pub fn nvim_input_mouse(
     button: OxStr,
     action: OxStr,
     modifier: OxStr,
-    _grid: i64,
-    _row: i64,
-    _col: i64,
+    grid: i64,
+    row: i64,
+    col: i64,
 ) -> Result<(), ApiError> {
     // Upstream validates only button/action/modifier; grid/row/col pass
     // to input_enqueue_mouse unvalidated (api/vim.c:470-473).
@@ -1258,6 +1258,10 @@ pub fn nvim_input_mouse(
             }
         }
     }
+    // Upstream forwards grid/row/col to input_enqueue_mouse; this port's
+    // encoder stops at the key code, so the coordinates are accepted and
+    // discarded (documented deviation, api/vim.c:470-473).
+    let _ = (grid, row, col);
     let mut encoded = Vec::new();
     if mask != 0 {
         encoded.extend_from_slice(&[K_SPECIAL, KS_MODIFIER, mask]);

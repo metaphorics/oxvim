@@ -83,8 +83,9 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         | "changenr" | "deletebufline" | "getbufinfo" | "getbufline" | "getbufvar"
         | "getchangelist" | "last_buffer_nr" | "prompt_getprompt" | "prompt_setprompt"
         | "setbufline" | "setbufvar" | "undotree" => Family::Buffer,
-        "chdir" | "defer" | "eventhandler" | "highlight_exists" | "hlexists" | "shellescape"
-        | "stdpath" | "strdisplaywidth" | "strftime" | "mode" | "swapname" => Family::Environment,
+        "api_info" | "chdir" | "defer" | "eventhandler" | "highlight_exists" | "hlID"
+        | "hlexists" | "shellescape" | "stdpath" | "strdisplaywidth" | "strftime" | "mode"
+        | "swapname" => Family::Environment,
         "eval" | "execute" | "exists" | "expand" | "feedkeys" | "fullcommand" | "funcref"
         | "function" | "luaeval" | "submatch" => Family::Eval,
         "swapfilelist" => Family::FileSystem,

@@ -427,8 +427,6 @@ fn write_and_replace(temp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<
     std::fs::rename(temp, path)
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::run;
@@ -446,4 +444,3 @@ mod tests {
         );
     }
 }
-
