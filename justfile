@@ -43,14 +43,25 @@ functional: _guard_binary _functional_fixtures
     root="{{justfile_directory()}}"
     run_group() {
       local group="$1"
+      # TEST_PARALLEL_GROUP restricts the run to the group's spec dir and gives
+      # it a private Xtest_xdg_<group>/Xtest_tmpdir_<group> tree; without it
+      # every worker runs the whole suite on the shared tree and the first
+      # finisher's REMOVE_RECURSE deletes it under the rest. TEST_FILE
+      # (example_spec) forbids combining the two, so it is only passed for
+      # directory groups. Per-test output goes to stdout, so capture it.
+      local isolation=()
+      if [[ -z "${TEST_FILE:-}" ]]; then
+        isolation=(-D "TEST_PARALLEL_GROUP=${group}")
+      fi
       cmake -D TEST_TYPE=functional \
-      -D TEST_SUMMARY_FILE="${root}/.outline/evidence/functional-${group}.log" \
         -D BUILD_DIR="${root}/.references/neovim/build" \
         -D CI_BUILD=OFF \
         -D NVIM_PRG="${root}/target/release/oxvim" \
         -D TEST_DIR="${root}/.references/neovim/test" \
         -D ROOT_DIR="${root}/.references/neovim" \
-        -P "${root}/.references/neovim/cmake/RunTests.cmake"
+        "${isolation[@]}" \
+        -P "${root}/.references/neovim/cmake/RunTests.cmake" \
+        >"${root}/.outline/evidence/functional-${group}.log" 2>&1
     }
     cd "${root}/.references/neovim/build/test"
     if [[ -n "${TEST_FILE:-}${TEST_FILTER:-}${TEST_TAG:-}${TEST_FILTER_OUT:-}" ]]; then
