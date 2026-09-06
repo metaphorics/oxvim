@@ -379,9 +379,19 @@ fn set_current_window_reports_invalid_id_and_switches_valid_window() {
     let session = session_with(editor);
 
     let invalid = crate::WinHandle::try_from(9_999).unwrap();
+    // Upstream `find_window_by_handle` fails through `VALIDATE_INT` - a
+    // validation-type error, not an exception (api/private/helpers.c:280,
+    // api/private/validate.c:12-19).
     assert_eq!(
         crate::global::nvim_set_current_win(&session, invalid),
-        Err(ApiError::exception("Invalid window id: 9999"))
+        Err(ApiError::validation("Invalid window id: 9999"))
+    );
+    // The 0 sentinel resolves to the current window (helpers.c:280-282):
+    // a no-op, not an error.
+    crate::global::nvim_set_current_win(&session, crate::WinHandle::CURRENT).unwrap();
+    assert_eq!(
+        session.with_editor(Editor::current_window),
+        Some(first_window)
     );
     crate::global::nvim_set_current_win(&session, second_window).unwrap();
     assert_eq!(
@@ -503,8 +513,11 @@ fn set_current_buf_fires_the_buffer_lifecycle_in_order() {
     assert_eq!(actions.borrow().len(), 3, "same buffer must not fire");
 }
 
-/// A nonexistent target fails with `e_nobufnr` before any event
-/// (`api/vim.c:967`, errors.h:133), leaving the current buffer untouched.
+/// A nonexistent target fails through `find_buffer_by_handle`'s
+/// `VALIDATE_INT` before any event (api/vim.c:967,
+/// api/private/helpers.c:263-275): a validation-type `Invalid buffer id`,
+/// not E86 - E86 is `do_buffer`'s error for buffer numbers later in the
+/// switch. The current buffer stays untouched.
 #[test]
 fn set_current_buf_reports_missing_target_without_firing() {
     let (editor, first_buffer, _, _) = editor_with_lines(&["one"]);
@@ -525,10 +538,7 @@ fn set_current_buf_reports_missing_target_without_firing() {
     let missing = crate::BufHandle::try_from(9999).unwrap();
     let result = crate::global::nvim_set_current_buf(&session, missing);
 
-    assert_eq!(
-        result,
-        Err(ApiError::exception("E86: Buffer 9999 does not exist"))
-    );
+    assert_eq!(result, Err(ApiError::validation("Invalid buffer id: 9999")));
     assert!(actions.borrow().is_empty(), "failed lookup must not fire");
     assert_eq!(
         session.with_editor(Editor::current_buffer),
@@ -645,7 +655,7 @@ fn set_current_tabpage_reports_invalid_id_and_switches_valid_tabpage() {
     let invalid = crate::TabHandle::try_from(999).unwrap();
     assert_eq!(
         crate::global::nvim_set_current_tabpage(&session, invalid),
-        Err(ApiError::exception("Invalid tabpage id: 999"))
+        Err(ApiError::validation("Invalid tabpage id: 999"))
     );
     crate::global::nvim_set_current_tabpage(&session, second_tab).unwrap();
     assert_eq!(

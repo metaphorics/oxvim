@@ -26,8 +26,8 @@ use ox_lua::{
     collect_typval_refs, free_lua_ref, free_typval_refs, lua_to_object, lua_to_object_ref,
     lua_to_typval, object_to_lua, typval_to_lua,
 };
-use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, Typval, WinHandle};
 use ox_rpc::{CHAN_STDIO, ChannelId, IncrementalDecoder, Message};
+use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, Typval, WinHandle};
 use ox_ui::{
     CmdlineState as UiCmdlineState, Compositor, ContentChunk, Emitter, Highlight, HlAttrs,
     MessageState, UiOptions,
@@ -1478,10 +1478,7 @@ impl AppState {
 /// continues (upstream `nlua_error`, executor.c:526-544).
 ///
 /// Returns whether at least one work item ran.
-fn drain_lua_work_queue(
-    queue: &Rc<RefCell<VecDeque<Work>>>,
-    session: &Rc<ApiSession>,
-) -> bool {
+fn drain_lua_work_queue(queue: &Rc<RefCell<VecDeque<Work>>>, session: &Rc<ApiSession>) -> bool {
     let mut ran = false;
     loop {
         let work = queue.borrow_mut().pop_front();
@@ -3050,55 +3047,72 @@ impl CommandExecutor for ServerCommandHost {
     ) -> Result<(), ApiError> {
         // Reentrant `nvim_exec2`/`nvim_command` (Vimscript calling the API
         // while a command already runs) executes on the nested executor
-        // instead of panicking on the outer borrow.
-        if let Ok(mut ex) = self.ex.try_borrow_mut() {
-            ex.execute_commands(session, commands)
-                .map_err(|error| map_api_exec_error(ApiOperation::Command, error))?;
-            return Ok(());
-        }
-        let Ok(mut nested) = self.nested_ex.try_borrow_mut() else {
+        // instead of panicking on the outer borrow. The guard drops at the
+        // arm boundary so a pending `jobwait` Lua flush delivers with no
+        // borrow live, like every other entry.
+        let (result, owner) = if let Ok(mut guard) = self.ex.try_borrow_mut() {
+            let result = guard
+                .execute_commands(session, commands)
+                .map_err(|error| map_api_exec_error(ApiOperation::Command, error))
+                .map(|_| ());
+            (result, self.ex.clone())
+        } else if let Ok(mut guard) = self.nested_ex.try_borrow_mut() {
+            let result = guard
+                .execute_commands(session, commands)
+                .map_err(|error| map_api_exec_error(ApiOperation::Command, error))
+                .map(|_| ());
+            (result, self.nested_ex.clone())
+        } else {
             return Err(ApiError::exception(
                 "no free Ex executor for a nested command",
             ));
         };
-        nested
-            .execute_commands(session, commands)
-            .map_err(|error| map_api_exec_error(ApiOperation::Command, error))?;
-        Ok(())
+        deliver_pending_lua_flush(session, &owner);
+        result
     }
 
     fn execute_command(&mut self, session: &ApiSession, command: &str) -> Result<(), ApiError> {
-        if let Ok(mut ex) = self.ex.try_borrow_mut() {
-            ex.execute_line(session, command)
-                .map_err(|error| map_api_exec_error(ApiOperation::Command, error))?;
-            return Ok(());
-        }
-        let Ok(mut nested) = self.nested_ex.try_borrow_mut() else {
+        let (result, owner) = if let Ok(mut guard) = self.ex.try_borrow_mut() {
+            let result = guard
+                .execute_line(session, command)
+                .map_err(|error| map_api_exec_error(ApiOperation::Command, error))
+                .map(|_| ());
+            (result, self.ex.clone())
+        } else if let Ok(mut guard) = self.nested_ex.try_borrow_mut() {
+            let result = guard
+                .execute_line(session, command)
+                .map_err(|error| map_api_exec_error(ApiOperation::Command, error))
+                .map(|_| ());
+            (result, self.nested_ex.clone())
+        } else {
             return Err(ApiError::exception(
                 "no free Ex executor for a nested command",
             ));
         };
-        nested
-            .execute_line(session, command)
-            .map_err(|error| map_api_exec_error(ApiOperation::Command, error))?;
-        Ok(())
+        deliver_pending_lua_flush(session, &owner);
+        result
     }
 
     fn execute_script(&mut self, session: &ApiSession, source: &str) -> Result<(), ApiError> {
-        if let Ok(mut ex) = self.ex.try_borrow_mut() {
-            ex.execute_script(session, "<nvim>", source)
-                .map_err(|error| map_api_exec_error(ApiOperation::Exec2, error))?;
-            return Ok(());
-        }
-        let Ok(mut nested) = self.nested_ex.try_borrow_mut() else {
+        let (result, owner) = if let Ok(mut guard) = self.ex.try_borrow_mut() {
+            let result = guard
+                .execute_script(session, "<nvim>", source)
+                .map_err(|error| map_api_exec_error(ApiOperation::Exec2, error))
+                .map(|_| ());
+            (result, self.ex.clone())
+        } else if let Ok(mut guard) = self.nested_ex.try_borrow_mut() {
+            let result = guard
+                .execute_script(session, "<nvim>", source)
+                .map_err(|error| map_api_exec_error(ApiOperation::Exec2, error))
+                .map(|_| ());
+            (result, self.nested_ex.clone())
+        } else {
             return Err(ApiError::exception(
                 "no free Ex executor for a nested command",
             ));
         };
-        nested
-            .execute_script(session, "<nvim>", source)
-            .map_err(|error| map_api_exec_error(ApiOperation::Exec2, error))?;
-        Ok(())
+        deliver_pending_lua_flush(session, &owner);
+        result
     }
 
     fn define_user_command(
@@ -3195,19 +3209,23 @@ impl CommandExecutor for ServerCommandHost {
     }
 
     fn evaluate(&mut self, session: &ApiSession, expression: &str) -> Result<Typval, ApiError> {
-        if let Ok(mut ex) = self.ex.try_borrow_mut() {
-            return ex
+        let (result, owner) = if let Ok(mut guard) = self.ex.try_borrow_mut() {
+            let result = guard
                 .evaluate_expression(session, expression)
                 .map_err(|error| map_api_exec_error(ApiOperation::Eval, error));
-        }
-        let Ok(mut nested) = self.nested_ex.try_borrow_mut() else {
+            (result, self.ex.clone())
+        } else if let Ok(mut guard) = self.nested_ex.try_borrow_mut() {
+            let result = guard
+                .evaluate_expression(session, expression)
+                .map_err(|error| map_api_exec_error(ApiOperation::Eval, error));
+            (result, self.nested_ex.clone())
+        } else {
             return Err(ApiError::exception(
                 "no free Ex executor for Vimscript expression evaluation",
             ));
         };
-        nested
-            .evaluate_expression(session, expression)
-            .map_err(|error| map_api_exec_error(ApiOperation::Eval, error))
+        deliver_pending_lua_flush(session, &owner);
+        result
     }
 
     fn call_builtin(
@@ -3437,8 +3455,7 @@ fn dispatch_scoped_builtin(
     // A failed spawn returns `Ok(-1)`: no job exists to own the callback
     // references, so they free here with every other non-transferring
     // result (the successful-spawn transfer is the only retention).
-    let failed_spawn = is_jobstart
-        && matches!(&result, Ok(Typval::Number(id)) if *id <= 0);
+    let failed_spawn = is_jobstart && matches!(&result, Ok(Typval::Number(id)) if *id <= 0);
     if !is_jobstart || result.is_err() || failed_spawn {
         free_typval_refs(lua, &references);
     }
@@ -4578,7 +4595,9 @@ mod tests {
             .borrow_mut()
             .push_back(Box::new(move || -> Result<(), mlua::Error> {
                 first.borrow_mut().push("failing");
-                Err(mlua::Error::RuntimeError("scheduled work failed".to_owned()))
+                Err(mlua::Error::RuntimeError(
+                    "scheduled work failed".to_owned(),
+                ))
             }));
         core.lua_work
             .borrow_mut()
@@ -4670,10 +4689,7 @@ mod tests {
     // current (`enter_tabpage` reads `tp_curwin` after the switch,
     // window.c:4767), not to the buffer snapshotted before any handler ran.
     #[test]
-    #[expect(
-        clippy::unwrap_used,
-        reason = "the fixture and chunk must succeed"
-    )]
+    #[expect(clippy::unwrap_used, reason = "the fixture and chunk must succeed")]
     fn tab_enters_bind_to_the_promoted_window_after_a_leave_handler_closes_it() {
         let mut editor = Editor::new();
         let buffer = editor.create_buffer(true).unwrap();
@@ -4731,10 +4747,59 @@ mod tests {
             .evaluate_expression(&*core.session, "g:promoted")
             .unwrap();
         assert_eq!(
-            entered,
-            promoted,
+            entered, promoted,
             "TabEnter must bind to the promoted window's buffer, not the \
              closed window's snapshot"
+        );
+    }
+
+    // The CommandExecutor boundary (nvim_command/nvim_exec2/evaluate) now
+    // delivers a pending jobwait Lua flush like the call_builtin boundary
+    // does: a `:call jobwait(...)` from the API returns only after the Lua
+    // on_exit ran (funcs.c:3668/3721).
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture, chunk, and command must succeed"
+    )]
+    fn lua_on_exit_flushed_by_vimscript_jobwait_delivers_before_the_command_returns() {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let core = build_embedded_core(editor, true).unwrap();
+        let (_, exec) = core.registry.get("nvim_exec_lua").unwrap();
+        exec(
+            &core.session,
+            &[
+                Object::String(OxStr::from(
+                    r"
+                    vim.g.flushed = 0
+                    local function on_exit()
+                      vim.g.flushed = 1
+                    end
+                    vim.g.id = vim.fn.jobstart({'sh', '-c', 'exit 0'}, {on_exit = on_exit})
+                    ",
+                )),
+                Object::Array(Vec::new()),
+            ],
+        )
+        .unwrap();
+        let (_, command) = core.registry.get("nvim_command").unwrap();
+        command(
+            &core.session,
+            &[Object::String(OxStr::from("call jobwait([g:id], 2000)"))],
+        )
+        .unwrap();
+        assert_eq!(
+            core.ex
+                .borrow_mut()
+                .evaluate_expression(&*core.session, "g:flushed")
+                .unwrap(),
+            Typval::Number(1),
+            "the on_exit flushed by a Vimscript jobwait must run before the \\
+             command boundary returns, with no tick in between"
         );
     }
 }

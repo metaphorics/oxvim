@@ -501,12 +501,16 @@ fn exception(error: impl std::fmt::Display) -> ApiError {
 }
 
 fn current_handle_error(error: EditorError) -> ApiError {
+    // Upstream resolves handles through `find_window_by_handle` /
+    // `find_tab_by_handle` (api/private/helpers.c:278-298), whose
+    // `VALIDATE_INT` failure is a validation-type error
+    // (api/private/validate.c:12-19) - the wire type clients branch on.
     match error {
         EditorError::UnknownWindow(window) => {
-            ApiError::exception(format!("Invalid window id: {}", i64::from(window)))
+            ApiError::validation(format!("Invalid window id: {}", i64::from(window)))
         }
         EditorError::UnknownTabpage(tabpage) => {
-            ApiError::exception(format!("Invalid tabpage id: {}", i64::from(tabpage)))
+            ApiError::validation(format!("Invalid tabpage id: {}", i64::from(tabpage)))
         }
         error => exception(error),
     }
@@ -554,18 +558,32 @@ pub fn nvim_set_current_buf(session: &ApiSession, buf: BufHandle) -> Result<(), 
     // Unlike upstream's `switch_to_buf_curwin` probe, the port has no
     // window-search model, so the buffer sequence always runs in the current
     // window — the port-faithful reading of the same switch.
+    //
+    // `find_buffer_by_handle` resolves the 0 sentinel to the current buffer
+    // (api/private/helpers.c:265-267), so set_current_buf(0) is the no-op
+    // the resolved comparison below returns.
+    let buf = if buf.is_current() {
+        let Some(current) = session.with_editor(Editor::current_buffer) else {
+            return Ok(());
+        };
+        current
+    } else {
+        buf
+    };
     let old = session.with_editor(Editor::current_buffer);
     if old == Some(buf) {
         return Ok(());
     }
     // The handle resolves before anything else: `find_buffer_by_handle`
-    // (`api/vim.c:967`) fails the whole call with `e_nobufnr` when the
-    // target never existed, so naming a nonexistent buffer is E86 with no
-    // events fired.
+    // (`api/vim.c:967`) fails the whole call through `VALIDATE_INT` - a
+    // validation-type `Invalid buffer id` (api/private/validate.c:12-19) -
+    // when the target never existed, with no events fired. E86 is
+    // `do_buffer`'s later error for buffer numbers, not the API's
+    // invalid-handle report.
     if session.with_editor(|editor| editor.buffer(buf).is_err()) {
-        return Err(exception(format!(
-            "E86: {}",
-            EditorError::UnknownBuffer(buf)
+        return Err(ApiError::validation(format!(
+            "Invalid buffer id: {}",
+            i64::from(buf)
         )));
     }
     let transition = focus_transition(old, buf, FocusContainer::Buffer);
@@ -591,6 +609,17 @@ pub fn nvim_set_current_win(session: &ApiSession, win: WinHandle) -> Result<(), 
     // Upstream routes through `goto_tabpage_win` (`api/vim.c:1024`,
     // `window.c:4953`): the window's tabpage is entered first, then the
     // window itself; both steps are silent when they change nothing.
+    // `find_window_by_handle` resolves the 0 sentinel to the current window
+    // (api/private/helpers.c:280-282), which the two-step then treats as
+    // the no-op it is.
+    let win = if win.is_current() {
+        let Some(current) = session.with_editor(Editor::current_window) else {
+            return Ok(());
+        };
+        current
+    } else {
+        win
+    };
     let owner = session.with_editor(|editor| {
         editor.tabpages().into_iter().find(|tab| {
             editor
@@ -617,6 +646,17 @@ pub fn nvim_get_current_tabpage(session: &ApiSession) -> Result<TabHandle, ApiEr
 
 #[api(since = 1, textlock)]
 pub fn nvim_set_current_tabpage(session: &ApiSession, tabpage: TabHandle) -> Result<(), ApiError> {
+    // `find_tab_by_handle` resolves the 0 sentinel to the current tabpage
+    // (api/private/helpers.c:292-294); the resolved comparison inside makes
+    // that the documented no-op.
+    let tabpage = if tabpage.is_current() {
+        let Some(current) = session.with_editor(Editor::current_tabpage) else {
+            return Ok(());
+        };
+        current
+    } else {
+        tabpage
+    };
     enter_tabpage(session, tabpage)
 }
 
@@ -641,8 +681,8 @@ fn enter_tabpage(session: &ApiSession, target: TabHandle) -> Result<(), ApiError
             .with_editor_mut(|editor| editor.set_current_tabpage(target))
             .map_err(current_handle_error);
     };
-    let transition = focus_transition(old, new, FocusContainer::Tab);
-    fire_focus_events(session, &transition.leaves, old)?;
+    let leave_transition = focus_transition(old, new, FocusContainer::Tab);
+    fire_focus_events(session, &leave_transition.leaves, old)?;
     // `goto_tabpage_tp` only enters a still-valid tabpage
     // (`window.c:4931-4936`); a handler that closed the target ends the
     // switch without enter events or an error.
@@ -654,9 +694,11 @@ fn enter_tabpage(session: &ApiSession, target: TabHandle) -> Result<(), ApiError
         .map_err(current_handle_error)?;
     // `enter_tabpage` binds its events to the window that is current AFTER
     // the switch (`window.c:4767` reads the tab's `tp_curwin` post-switch);
-    // a leave handler may have closed the snapshot window, so the enters
-    // describe the state actually entered, not the one snapshotted before
-    // any handler ran.
+    // a leave handler may have closed the snapshot window or promoted
+    // another, so both the enter-event set and its binding come from the
+    // state actually entered - recomputed from `old`, because a promoted
+    // window can change whether BufEnter belongs in the sequence at all -
+    // not from the pre-handler snapshot.
     let entered = session.with_editor(|editor| {
         editor
             .tabpage(target)
@@ -664,7 +706,12 @@ fn enter_tabpage(session: &ApiSession, target: TabHandle) -> Result<(), ApiError
             .and_then(|tab| editor.window(tab.current_window()).ok())
             .map(|window| window.buffer)
     });
-    fire_focus_events(session, &transition.enters, entered)
+    if let Some(entered) = entered {
+        let enter_transition = focus_transition(old, entered, FocusContainer::Tab);
+        fire_focus_events(session, &enter_transition.enters, Some(entered))
+    } else {
+        Ok(())
+    }
 }
 
 /// Fires the leave sequence, performs the window switch, and fires the enter
@@ -685,8 +732,8 @@ fn enter_window(session: &ApiSession, target: WinHandle) -> Result<(), ApiError>
             .with_editor_mut(|editor| editor.set_current_window(target))
             .map_err(current_handle_error);
     };
-    let transition = focus_transition(old, new, FocusContainer::Window);
-    fire_focus_events(session, &transition.leaves, old)?;
+    let leave_transition = focus_transition(old, new, FocusContainer::Window);
+    fire_focus_events(session, &leave_transition.leaves, old)?;
     // `goto_tabpage_win` enters only a still-valid window
     // (`window.c:4956`); a handler that closed the target ends the switch
     // without enter events or an error.
@@ -696,7 +743,18 @@ fn enter_window(session: &ApiSession, target: WinHandle) -> Result<(), ApiError>
     session
         .with_editor_mut(|editor| editor.set_current_window(target))
         .map_err(current_handle_error)?;
-    fire_focus_events(session, &transition.enters, Some(new))
+    // `win_enter_ext` fires the enters with `curwin`/`curbuf` already
+    // switched (window.c:5304-5319); a leave handler may have changed the
+    // target window's buffer, so the enter set and binding come from the
+    // buffer live after the switch.
+    let entered =
+        session.with_editor(|editor| editor.window(target).ok().map(|window| window.buffer));
+    if let Some(entered) = entered {
+        let enter_transition = focus_transition(old, entered, FocusContainer::Window);
+        fire_focus_events(session, &enter_transition.enters, Some(entered))
+    } else {
+        Ok(())
+    }
 }
 
 /// Fires `events` for one half of a focus transition, each bound to `buffer`
