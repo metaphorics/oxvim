@@ -1204,13 +1204,12 @@ pub fn nvim_input_mouse(
     button: OxStr,
     action: OxStr,
     modifier: OxStr,
-    grid: i64,
-    row: i64,
-    col: i64,
+    _grid: i64,
+    _row: i64,
+    _col: i64,
 ) -> Result<(), ApiError> {
-    if !(row >= 0 && col >= 0 && grid >= 0) {
-        return Err(ApiError::validation("invalid button or action"));
-    }
+    // Upstream validates only button/action/modifier; grid/row/col pass
+    // to input_enqueue_mouse unvalidated (api/vim.c:470-473).
     // (button, action) resolves to one KE_ extra-key code the way
     // upstream's noremapbuf table does (keycodes.h:148-218; the wheel
     // events are inverted there - Up is the wheel moved down).
@@ -1232,8 +1231,10 @@ pub fn nvim_input_mouse(
         (b"x2", b"release") => 94,
         (b"wheel", b"up") => 76,
         (b"wheel", b"down") => 75,
-        (b"wheel", b"left") => 77,
-        (b"wheel", b"right") => 78,
+        // The wheel directions are crossed in the mapping (api/vim.c:439-446):
+        // action "left" enqueues KE_MOUSERIGHT and vice versa.
+        (b"wheel", b"left") => 78,
+        (b"wheel", b"right") => 77,
         // (KE_MOUSEMOVE, keycodes.h:218).
         (b"move", _) => 100,
         _ => return Err(ApiError::validation("invalid button or action")),
@@ -1249,7 +1250,12 @@ pub fn nvim_input_mouse(
             b's' => mask |= MOD_MASK_SHIFT,
             b'a' => mask |= MOD_MASK_ALT,
             b'm' => mask |= MOD_MASK_META,
-            _ => return Err(ApiError::validation("invalid button or action")),
+            other => {
+                return Err(ApiError::validation(format!(
+                    "Invalid modifier: {}",
+                    char::from(other)
+                )));
+            }
         }
     }
     let mut encoded = Vec::new();
