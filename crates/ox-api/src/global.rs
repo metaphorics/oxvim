@@ -558,6 +558,16 @@ pub fn nvim_set_current_buf(session: &ApiSession, buf: BufHandle) -> Result<(), 
     if old == Some(buf) {
         return Ok(());
     }
+    // The handle resolves before anything else: `find_buffer_by_handle`
+    // (`api/vim.c:967`) fails the whole call with `e_nobufnr` when the
+    // target never existed, so naming a nonexistent buffer is E86 with no
+    // events fired.
+    if session.with_editor(|editor| editor.buffer(buf).is_err()) {
+        return Err(exception(format!(
+            "E86: {}",
+            EditorError::UnknownBuffer(buf)
+        )));
+    }
     let transition = focus_transition(old, buf, FocusContainer::Buffer);
     fire_focus_events(session, &transition.leaves, old)?;
     // `set_curbuf` skips the entry when a handler invalidated the target

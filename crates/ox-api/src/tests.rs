@@ -503,6 +503,85 @@ fn set_current_buf_fires_the_buffer_lifecycle_in_order() {
     assert_eq!(actions.borrow().len(), 3, "same buffer must not fire");
 }
 
+/// A nonexistent target fails with `e_nobufnr` before any event
+/// (`api/vim.c:967`, errors.h:133), leaving the current buffer untouched.
+#[test]
+fn set_current_buf_reports_missing_target_without_firing() {
+    let (editor, first_buffer, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    focus_autocmd(&session, "BufLeave");
+    focus_autocmd(&session, "BufEnter");
+    focus_autocmd(&session, "BufWinEnter");
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: None,
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    let missing = crate::BufHandle::try_from(9999).unwrap();
+    let result = crate::global::nvim_set_current_buf(&session, missing);
+
+    assert_eq!(
+        result,
+        Err(ApiError::exception("E86: Buffer 9999 does not exist"))
+    );
+    assert!(actions.borrow().is_empty(), "failed lookup must not fire");
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(first_buffer)
+    );
+}
+
+/// `set_curbuf` skips the entry when a `BufLeave` handler wiped the target
+/// (`buffer.c:1790-1794`): the leave half already ran, the switch stays
+/// silent instead of erroring, and the caller keeps the old buffer.
+#[test]
+fn set_current_buf_stays_silent_when_a_handler_wipes_the_target() {
+    let (mut editor, first_buffer, _, _) = editor_with_lines(&["one"]);
+    let second_buffer = editor
+        .create_buffer_with(Buffer::from_lines(&[b"two".to_vec()], false).unwrap(), true)
+        .unwrap();
+    let session = session_with(editor);
+    focus_autocmd(&session, "BufLeave");
+    focus_autocmd(&session, "BufEnter");
+    focus_autocmd(&session, "BufWinEnter");
+    let wipe = Rc::new(move |session: &crate::ApiSession| {
+        crate::buffer::nvim_buf_delete(
+            session,
+            second_buffer,
+            dict(&[("force", Object::Boolean(true))]),
+        )
+    });
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: Some(wipe),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::global::nvim_set_current_buf(&session, second_buffer).unwrap();
+
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(first_buffer)
+    );
+    assert_eq!(
+        actions
+            .borrow()
+            .iter()
+            .map(|action| action.event)
+            .collect::<Vec<_>>(),
+        [Event::BufLeave]
+    );
+}
+
 /// `nvim_set_current_tabpage` runs `goto_tabpage_tp` (`api/vim.c:1320`,
 /// `window.c:4920`): `WinLeave`, `TabLeave` on the old tab, `WinEnter`,
 /// `TabEnter` on the new one, with `BufLeave`/`BufEnter` only on a buffer

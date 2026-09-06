@@ -20,7 +20,7 @@ use crate::mapping::Mappings;
 use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError};
 use crate::options::{OptionStore, OptionValue};
 use crate::put::{PutDirection, PutEdit, PutPlan, plan_put, put_origin};
-use crate::register::{RegisterError, Registers};
+use crate::register::{RegisterError, RegisterKind, Registers};
 use crate::typeahead::Typeahead;
 
 pub(crate) const LOWEST_WINDOW_ID: i64 = 1_000;
@@ -3272,10 +3272,33 @@ impl Editor {
         let Some(content) = self.registers.get(name)?.cloned() else {
             return Ok(false);
         };
-        let lines = buffer_lines(self.buffer(buffer)?.text()?)?;
-        cursor.lnum = cursor.lnum.clamp(1, lines.len().max(1));
-        let origin = put_origin(&lines, cursor, content.kind(), direction);
-        let plan = plan_put(&lines, origin, &content, count.max(1), cursor)?;
+        let kind = content.kind();
+        let text = self.buffer(buffer)?.text()?;
+        let line_count = text.line_count();
+        cursor.lnum = cursor.lnum.clamp(1, line_count.max(1));
+        // Fetch only the rows the put indexes: the cursor row for every
+        // non-linewise put, plus the rows below it that a blockwise put
+        // splices into (one per register row).
+        let target_lines = match kind {
+            RegisterKind::LineWise => Vec::new(),
+            RegisterKind::CharacterWise => buffer_lines_between(text, cursor.lnum, cursor.lnum)?,
+            RegisterKind::BlockWise { .. } => {
+                let last = cursor
+                    .lnum
+                    .saturating_add(content.lines().len().saturating_sub(1));
+                buffer_lines_between(text, cursor.lnum, line_count.min(last))?
+            }
+        };
+        let origin_line = target_lines.first().map_or(&[][..], Vec::as_slice);
+        let origin = put_origin(origin_line, line_count, cursor, kind, direction);
+        let plan = plan_put(
+            &target_lines,
+            line_count,
+            origin,
+            &content,
+            count.max(1),
+            cursor,
+        )?;
         self.commit_put_plan(buffer, Some(window), plan, timestamp)?;
         Ok(true)
     }
@@ -3296,8 +3319,23 @@ impl Editor {
         content: &crate::register::RegisterContent,
         timestamp: i64,
     ) -> Result<(), EditorError> {
-        let lines = buffer_lines(self.buffer(buffer)?.text()?)?;
-        let plan = plan_put(&lines, position, content, 1, position)?;
+        let text = self.buffer(buffer)?.text()?;
+        let line_count = text.line_count();
+        // Only a blockwise put reads target rows: one per register row
+        // starting at `position.lnum`; rows past end-of-buffer stay unread
+        // and land in the end-of-buffer tail, as before.
+        let target_lines = if matches!(content.kind(), RegisterKind::BlockWise { .. })
+            && position.lnum >= 1
+            && position.lnum <= line_count
+        {
+            let last = position
+                .lnum
+                .saturating_add(content.lines().len().saturating_sub(1));
+            buffer_lines_between(text, position.lnum, line_count.min(last))?
+        } else {
+            Vec::new()
+        };
+        let plan = plan_put(&target_lines, line_count, position, content, 1, position)?;
         self.commit_put_plan(buffer, None, plan, timestamp)?;
         Ok(())
     }
@@ -4011,9 +4049,13 @@ fn adjust_text_cursor(
     (ExtmarkPosition::new(row, column), 0)
 }
 
-fn buffer_lines(buffer: &Buffer) -> Result<Vec<Vec<u8>>, BufferStateError> {
-    (1..=buffer.line_count())
-        .map(|line| buffer.line(line))
+fn buffer_lines_between(
+    buffer: &Buffer,
+    first: usize,
+    last: usize,
+) -> Result<Vec<Vec<u8>>, BufferStateError> {
+    (first..=last)
+        .map(|lnum| buffer.line(lnum))
         .collect::<Result<Vec<_>, _>>()
         .map_err(BufferStateError::from)
 }
@@ -4097,7 +4139,8 @@ mod tests {
     fn terminal_lines(editor: &Editor, channel: u64) -> Vec<Vec<u8>> {
         let info = editor.terminal_channel(channel).unwrap();
         let state = editor.buffer(info.buffer).unwrap();
-        buffer_lines(state.text().unwrap()).unwrap()
+        let text = state.text().unwrap();
+        buffer_lines_between(text, 1, text.line_count()).unwrap()
     }
 
     #[test]

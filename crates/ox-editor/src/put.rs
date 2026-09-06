@@ -27,9 +27,16 @@ pub(crate) struct PutPlan {
     pub(crate) cursor_after: Position,
 }
 
+/// Resolves the insertion origin for one register put.
+///
+/// `origin_line` is the content of target row `cursor.lnum`, which the caller
+/// must have clamped into `1..=line_count` (empty when the buffer has no rows).
+/// Linewise puts read neither argument; other kinds extend past the scalar at
+/// `cursor.col` for [`PutDirection::After`], which is why they need the row.
 #[must_use]
 pub(crate) fn put_origin(
-    lines: &[Vec<u8>],
+    origin_line: &[u8],
+    line_count: usize,
     cursor: Position,
     kind: RegisterKind,
     direction: PutDirection,
@@ -44,17 +51,25 @@ pub(crate) fn put_origin(
         };
     }
 
-    let lnum = cursor.lnum.clamp(1, lines.len().max(1));
-    let line = lines.get(lnum - 1).map_or(&[][..], Vec::as_slice);
+    let lnum = cursor.lnum.clamp(1, line_count.max(1));
     let col = match direction {
         PutDirection::Before => cursor.col,
-        PutDirection::After => motion::next_char_boundary(line, cursor.col).min(line.len()),
+        PutDirection::After => {
+            motion::next_char_boundary(origin_line, cursor.col).min(origin_line.len())
+        }
     };
     Position { lnum, col }
 }
 
+/// Plans the edits for one register put.
+///
+/// `target_lines[i]` is the content of target row `origin.lnum + i` and
+/// `line_count` is the target row count. Characterwise and linewise plans
+/// read neither argument; only the blockwise plan reads past the origin row,
+/// one row per register row, which is why the slice is threaded at all.
 pub(crate) fn plan_put(
-    lines: &[Vec<u8>],
+    target_lines: &[Vec<u8>],
+    line_count: usize,
     origin: Position,
     content: &RegisterContent,
     count: usize,
@@ -64,9 +79,15 @@ pub(crate) fn plan_put(
     match content.kind() {
         RegisterKind::CharacterWise => plan_characterwise(origin, content, count, cursor_before),
         RegisterKind::LineWise => plan_linewise(origin, content, count, cursor_before),
-        RegisterKind::BlockWise { width } => {
-            plan_blockwise(lines, origin, content, count, cursor_before, width)
-        }
+        RegisterKind::BlockWise { width } => plan_blockwise(
+            target_lines,
+            line_count,
+            origin,
+            content,
+            count,
+            cursor_before,
+            width,
+        ),
     }
 }
 
@@ -162,7 +183,8 @@ fn plan_linewise(
 }
 
 fn plan_blockwise(
-    lines: &[Vec<u8>],
+    target_lines: &[Vec<u8>],
+    line_count: usize,
     origin: Position,
     content: &RegisterContent,
     count: usize,
@@ -186,7 +208,7 @@ fn plan_blockwise(
             .checked_add(padding)
             .ok_or(RegisterError::PositionOverflow)?;
 
-        if let Some(target_line) = lines.get(target) {
+        if let Some(target_line) = target_lines.get(row_index) {
             let shortline = origin.col >= target_line.len();
             let inserted = if shortline {
                 build_short_row(origin.col - target_line.len(), row, padding, count)?
@@ -212,7 +234,7 @@ fn plan_blockwise(
 
     if !tail.is_empty() {
         edits.push(PutEdit::InsertLines {
-            after_lnum: lines.len(),
+            after_lnum: line_count,
             lines: tail,
         });
     }
@@ -308,14 +330,7 @@ mod tests {
     #[test]
     fn one_line_count_expands_and_cursor_uses_last_scalar_start() {
         let content = RegisterContent::characterwise("한X".as_bytes()).unwrap();
-        let plan = plan_put(
-            &[b"ab".to_vec()],
-            position(1, 1),
-            &content,
-            2,
-            position(1, 0),
-        )
-        .unwrap();
+        let plan = plan_put(&[], 0, position(1, 1), &content, 2, position(1, 0)).unwrap();
 
         assert_eq!(splice_replacement(&plan), &["한X한X".as_bytes().to_vec()]);
         assert_eq!(plan.cursor_after, position(1, 8));
@@ -326,14 +341,7 @@ mod tests {
     #[test]
     fn multiline_count_joins_copy_boundaries() {
         let content = RegisterContent::characterwise(b"x\ny").unwrap();
-        let plan = plan_put(
-            &[b"ab".to_vec()],
-            position(1, 1),
-            &content,
-            2,
-            position(1, 0),
-        )
-        .unwrap();
+        let plan = plan_put(&[], 0, position(1, 1), &content, 2, position(1, 0)).unwrap();
 
         assert_eq!(
             splice_replacement(&plan),
@@ -345,14 +353,7 @@ mod tests {
     #[test]
     fn linewise_count_repeats_vertically_and_finds_first_nonblank() {
         let content = RegisterContent::linewise(vec![b"  x".to_vec(), b"y".to_vec()]).unwrap();
-        let plan = plan_put(
-            &[b"one".to_vec()],
-            position(0, 0),
-            &content,
-            2,
-            position(1, 0),
-        )
-        .unwrap();
+        let plan = plan_put(&[], 0, position(0, 0), &content, 2, position(1, 0)).unwrap();
 
         assert_eq!(
             plan.edits,
@@ -375,6 +376,7 @@ mod tests {
         let content = RegisterContent::blockwise(vec![b"Q".to_vec(), b"R".to_vec()], 2).unwrap();
         let plan = plan_put(
             &[b"abcdef".to_vec(), b"a".to_vec()],
+            2,
             position(1, 3),
             &content,
             2,
@@ -397,6 +399,7 @@ mod tests {
                 .unwrap();
         let plan = plan_put(
             &[b"abc".to_vec()],
+            1,
             position(1, 2),
             &content,
             1,
@@ -418,13 +421,27 @@ mod tests {
     fn count_overflow_is_reported_before_expansion() {
         let one_line = RegisterContent::characterwise(b"xx").unwrap();
         assert_eq!(
-            plan_put(&[], position(1, 0), &one_line, usize::MAX, position(1, 0)),
+            plan_put(
+                &[],
+                0,
+                position(1, 0),
+                &one_line,
+                usize::MAX,
+                position(1, 0)
+            ),
             Err(RegisterError::PositionOverflow)
         );
 
         let linewise = RegisterContent::linewise(vec![b"x".to_vec(), b"y".to_vec()]).unwrap();
         assert_eq!(
-            plan_put(&[], position(0, 0), &linewise, usize::MAX, position(1, 0)),
+            plan_put(
+                &[],
+                0,
+                position(0, 0),
+                &linewise,
+                usize::MAX,
+                position(1, 0)
+            ),
             Err(RegisterError::PositionOverflow)
         );
     }
@@ -433,7 +450,7 @@ mod tests {
     fn empty_characterwise_content_produces_empty_plan() {
         let content = RegisterContent::characterwise(b"").unwrap();
         let before = position(1, 0);
-        let plan = plan_put(&[Vec::new()], before, &content, 3, before).unwrap();
+        let plan = plan_put(&[], 0, before, &content, 3, before).unwrap();
 
         assert!(plan.edits.is_empty());
         assert_eq!(plan.cursor_after, before);
