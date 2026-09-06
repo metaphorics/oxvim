@@ -52,6 +52,12 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "winnr" => host
             .access
             .with_ex_editor(|editor| call_winnr_builtin(editor, args)),
+        "bufwinid" => host
+            .access
+            .with_ex_editor(|editor| call_bufwin_builtin(editor, args, false)),
+        "bufwinnr" => host
+            .access
+            .with_ex_editor(|editor| call_bufwin_builtin(editor, args, true)),
         "winsaveview" => host
             .access
             .with_ex_editor(|editor| call_winsaveview(editor, args)),
@@ -111,6 +117,46 @@ fn call_winnr_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typva
             .map_or(0, |index| index + 1)
     };
     Ok(Typval::Number(i64::try_from(number).unwrap_or(i64::MAX)))
+}
+
+/// `bufwinid()` / `bufwinnr()` (`f_bufwinid`, `f_bufwinnr`): the first
+/// window in the CURRENT tab page displaying the buffer named by the
+/// argument, as a window id (`bufwinid`) or a window number in the tab
+/// (`bufwinnr`); -1 when no window displays it.
+fn call_bufwin_builtin(
+    editor: &Editor,
+    args: &[Typval],
+    want_number: bool,
+) -> ox_eval::Result<Typval> {
+    if args.len() != 1 {
+        let (code, message) = if args.is_empty() {
+            ("E119", "Not enough arguments for function")
+        } else {
+            ("E118", "Too many arguments for function")
+        };
+        return Err(EvalError::new(code, 0, message));
+    }
+    let Some(target) = crate::excmd_exec::resolve_buffer_argument(editor, args.first()) else {
+        return Ok(Typval::Number(-1));
+    };
+    let windows = editor
+        .current_tabpage()
+        .and_then(|tab| editor.tabpage_windows(tab).ok())
+        .unwrap_or_default();
+    for (index, window) in windows.iter().enumerate() {
+        let displays = editor
+            .window(*window)
+            .is_ok_and(|state| state.buffer == target);
+        if displays {
+            let value = if want_number {
+                i64::try_from(index + 1).unwrap_or(i64::MAX)
+            } else {
+                i64::from(*window)
+            };
+            return Ok(Typval::Number(value));
+        }
+    }
+    Ok(Typval::Number(-1))
 }
 
 /// `tabpagenr()`: the current tabpage's position, or the tabpage count for
@@ -947,6 +993,44 @@ fn call_setwinvar(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typva
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "editor and buffer setup must succeed for the lookup test"
+    )]
+    fn bufwin_id_and_number_find_first_displaying_window() {
+        let mut editor = Editor::new();
+        let first = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(first, crate::layout::Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let first = editor.current_buffer().unwrap();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .set_window_buffer(
+                editor.current_window().unwrap(),
+                buffer,
+                crate::editor::BufferRelease::KeepLoaded,
+            )
+            .unwrap();
+        // The current window displays `buffer`: bufwinid resolves by handle
+        // and bufwinnr by position in the current tab (f_bufwinid/f_bufwinnr).
+        let id = call_bufwin_builtin(&editor, &[Typval::Number(i64::from(buffer))], false)
+            .unwrap_or(Typval::Number(-1));
+        assert_eq!(
+            id,
+            Typval::Number(i64::from(editor.current_window().unwrap()))
+        );
+        let nr = call_bufwin_builtin(&editor, &[Typval::Number(i64::from(buffer))], true)
+            .unwrap_or(Typval::Number(-1));
+        assert_eq!(nr, Typval::Number(1));
+        // A buffer no window displays answers -1.
+        let absent = call_bufwin_builtin(&editor, &[Typval::Number(i64::from(first))], false)
+            .unwrap_or(Typval::Number(0));
+        assert_eq!(absent, Typval::Number(-1));
+    }
+
+    /// `bufwinid()` / `bufwinnr()`
     use ox_text::Buffer;
 
     use super::*;

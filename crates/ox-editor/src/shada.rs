@@ -241,6 +241,11 @@ fn path_bytes(file: &Path) -> Vec<u8> {
 }
 
 fn store(file: &Path, bytes: &[u8]) -> Result<(), ShadaError> {
+    // os_fileio.c opens the shada file after os_file_mkdir to create the
+    // state tree; a first write into a fresh XDG state home must build it.
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     std::fs::write(file, bytes).map_err(|error| system_error("opening", file, &error.to_string()))
 }
 
