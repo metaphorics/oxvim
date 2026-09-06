@@ -7986,3 +7986,131 @@ fn depth_zero_script_error_displays_and_continues() {
     assert!(global_flag(&executor, "after"));
     assert!(executor.did_emsg());
 }
+
+// ---------------------------------------------------------------------------
+// :sort (ex_cmds.c:ex_sort)
+// ---------------------------------------------------------------------------
+
+/// Reads the current buffer as lossy lines for sort assertions.
+fn sort_lines(editor: &TestEditorAccess) -> Vec<String> {
+    let ed = editor.editor();
+    let buffer = ed.current_buffer().unwrap();
+    let state = ed.buffer(buffer).unwrap();
+    let text = state.text().unwrap();
+    (1..=text.line_count())
+        .map(|lnum| String::from_utf8_lossy(&text.line(lnum).unwrap()).into_owned())
+        .collect()
+}
+
+/// `ex_sort` sorts the whole buffer by default and lands the cursor on the
+/// first line, first non-blank column.
+#[test]
+fn sort_default_orders_whole_buffer() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"cherry".to_vec(), b"apple".to_vec(), b"banana".to_vec()]);
+    executor.execute_line(&editor, "sort").unwrap();
+    assert_eq!(sort_lines(&editor), ["apple", "banana", "cherry"]);
+    let window = editor.editor().current_window().unwrap();
+    assert_eq!(
+        editor.editor().window(window).unwrap().cursor,
+        ox_text::Position { lnum: 1, col: 0 }
+    );
+}
+
+/// `:sort!` reverses the sort order.
+#[test]
+fn sort_bang_reverses() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"apple".to_vec(), b"banana".to_vec(), b"cherry".to_vec()]);
+    executor.execute_line(&editor, "sort!").unwrap();
+    assert_eq!(sort_lines(&editor), ["cherry", "banana", "apple"]);
+}
+
+/// `i` compares case-insensitively; ties keep the original order.
+#[test]
+fn sort_ignorecase() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"Banana".to_vec(), b"apple".to_vec(), b"Cherry".to_vec()]);
+    executor.execute_line(&editor, "sort i").unwrap();
+    assert_eq!(sort_lines(&editor), ["apple", "Banana", "Cherry"]);
+}
+
+/// `n` sorts numerically; lines without a number sort before any number
+/// (`sort_compare`: `is_number` true sorts after false), then by value.
+#[test]
+fn sort_numeric_missing_first_then_negatives() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"10".to_vec(),
+        b"-5".to_vec(),
+        b"foo".to_vec(),
+        b"2".to_vec(),
+    ]);
+    executor.execute_line(&editor, "sort n").unwrap();
+    assert_eq!(sort_lines(&editor), ["foo", "-5", "2", "10"]);
+}
+
+/// `u` dedupes equal full lines (not just equal sort keys) and keeps the
+/// first occurrence in sorted order.
+#[test]
+fn sort_unique_dedupes_full_lines() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"apple".to_vec(),
+        b"banana".to_vec(),
+        b"apple".to_vec(),
+        b"cherry".to_vec(),
+    ]);
+    executor.execute_line(&editor, "sort u").unwrap();
+    assert_eq!(sort_lines(&editor), ["apple", "banana", "cherry"]);
+}
+
+/// `/pat/` sorts on the text after the match; with `r` it sorts on the
+/// matched text itself.
+#[test]
+fn sort_pattern_after_match_and_r() {
+    let lines = [b"aaa 2".to_vec(), b"bbb 1".to_vec(), b"ccc 3".to_vec()];
+
+    let (editor, mut executor) = setup_with_content(&lines);
+    executor.execute_line(&editor, r"sort /^.../").unwrap();
+    assert_eq!(sort_lines(&editor), ["bbb 1", "aaa 2", "ccc 3"]);
+
+    let (editor, mut executor) = setup_with_content(&lines);
+    executor.execute_line(&editor, r"sort r /^.../").unwrap();
+    assert_eq!(sort_lines(&editor), ["aaa 2", "bbb 1", "ccc 3"]);
+}
+
+/// `"` starts a comment: the flags before it apply and the rest is ignored.
+#[test]
+fn sort_stops_at_comment() {
+    let (editor, mut executor) = setup_with_content(&[b"10".to_vec(), b"2".to_vec()]);
+    executor
+        .execute_line(&editor, "sort n \"numeric comment\"")
+        .unwrap();
+    assert_eq!(sort_lines(&editor), ["2", "10"]);
+}
+
+/// The cursor lands on the first non-blank of line 1 (`beginline BL_WHITE`).
+#[test]
+fn sort_cursor_lands_on_first_nonblank() {
+    let (editor, mut executor) = setup_with_content(&[b"  zz".to_vec(), b"  aa".to_vec()]);
+    executor.execute_line(&editor, "sort i").unwrap();
+    assert_eq!(sort_lines(&editor), ["  aa", "  zz"]);
+    let window = editor.editor().current_window().unwrap();
+    assert_eq!(
+        editor.editor().window(window).unwrap().cursor,
+        ox_text::Position { lnum: 1, col: 2 }
+    );
+}
+
+/// Two of `n`/`f`/`b`/`o`/`x` together are rejected with E474.
+#[test]
+fn sort_conflicting_formats_e474() {
+    let (editor, mut executor) = setup_with_content(&[b"1".to_vec(), b"2".to_vec()]);
+    assert_vim_error(executor.execute_line(&editor, "sort no"), "E474");
+}
+
+/// An unknown flag falls through to `semsg(e_invarg2)` - E475.
+#[test]
+fn sort_invalid_flag_e475() {
+    let (editor, mut executor) = setup_with_content(&[b"1".to_vec(), b"2".to_vec()]);
+    assert_vim_error(executor.execute_line(&editor, "sort z"), "E475");
+}

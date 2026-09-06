@@ -56,7 +56,7 @@ use crate::options::{
 use crate::quickfix::QuickfixMove;
 use crate::register::RegisterContent;
 use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid, SourceContext};
-use crate::search::{SearchDirection, SearchError, SearchState};
+use crate::search::{SearchDirection, SearchError, SearchState, pattern_with_case};
 use crate::typeahead::{Keys, Remap, TypeaheadFlags, special_notation};
 use crate::userfunc::{UserFuncError, UserFunctions};
 use crate::{
@@ -2995,6 +2995,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "global" => command_global(runtime, access, scope, lua, command, false),
         "vglobal" => command_global(runtime, access, scope, lua, command, true),
         "substitute" => command_substitute(runtime, access, scope, command),
+        "sort" => access.with_ex_editor(|editor| command_sort(runtime, editor, command)),
         "edit" | "ex" | "visual" | "view" | "drop" => {
             command_edit(runtime, access, scope, lua, command)
         }
@@ -3080,7 +3081,10 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "pclose" => access.with_ex_editor(|editor| command_pclose(runtime, editor)),
         "only" => access.with_ex_editor(|editor| command_only(runtime, editor)),
         "quit" => access.with_ex_editor(|editor| command_close(runtime, editor, command, true)),
-        "qall" => access.with_ex_editor(|editor| command_qall(runtime, editor, command)),
+        "qall" | "quitall" => {
+            access.with_ex_editor(|editor| command_qall(runtime, editor, command))
+        }
+        "wqall" | "xall" => command_wqall(runtime, access, command),
         "cquit" => access.with_ex_editor(|editor| command_cquit(runtime, editor, command)),
         "bnext" => command_buffer_step(runtime, access, scope, lua, command, 1),
         "bprevious" | "bprev" => command_buffer_step(runtime, access, scope, lua, command, -1),
@@ -10411,6 +10415,75 @@ fn command_cquit<F: FileIO>(
     Flow::Quit(code)
 }
 
+/// `:wqall` / `:xall` (`ex_docmd.c` `do_wqall`): write every changed buffer
+/// that has a name, then quit the process. An unnamed modified buffer stops
+/// the pass with E141, and a readonly buffer stops it with E45 unless the
+/// bang overrides - both from `write_changed_all`'s `buf_write` calls.
+fn command_wqall<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    command: &ExCommand,
+) -> Flow {
+    let buffers = access.with_ex_editor(|editor| editor.buffers().clone());
+    for buffer in buffers {
+        let Some((name, modified, readonly)) = access.with_ex_editor(|editor| {
+            editor.buffer(buffer).ok().map(|state| {
+                (
+                    state.name().to_string_lossy().into_owned(),
+                    state.flags.contains(crate::BufferFlags::MODIFIED),
+                    state.flags.contains(crate::BufferFlags::READONLY),
+                )
+            })
+        }) else {
+            continue;
+        };
+        if !modified {
+            continue;
+        }
+        if name.is_empty() {
+            return error_flow(runtime, "E141", "No file name");
+        }
+        if readonly && !command.bang {
+            return error_flow(
+                runtime,
+                "E45",
+                "'readonly' option is set (add ! to override)",
+            );
+        }
+        let mut bytes = match access.with_ex_editor(|editor| {
+            editor
+                .buffer(buffer)
+                .and_then(|state| state.text().map_err(Into::into))
+                .map(ox_text::Buffer::to_bytes)
+        }) {
+            Ok(bytes) => bytes,
+            Err(error) => return error_flow(runtime, "E749", error.to_string()),
+        };
+        if bytes.last().is_some_and(|byte| *byte != b'\n') {
+            bytes.push(b'\n');
+        }
+        let path = PathBuf::from(name);
+        if let Err(error) = runtime
+            .scripts
+            .io()
+            .write_string(&path, &String::from_utf8_lossy(&bytes))
+        {
+            return error_flow(
+                runtime,
+                "E212",
+                format!("Can't open file for writing: {error}"),
+            );
+        }
+        access.with_ex_editor(|editor| {
+            if let Ok(state) = editor.buffer_mut(buffer) {
+                state.mark_saved();
+                state.flags.set(crate::BufferFlags::NOTEDITED, false);
+            }
+        });
+    }
+    Flow::Quit(0)
+}
+
 /// Fires the leave half of a buffer switch, performs the switch, and fires
 /// the enter half (`set_curbuf`, buffer.c:1735, then `enter_buffer`,
 /// buffer.c:1850-1851). A failing leave handler abandons the switch with the
@@ -11351,6 +11424,496 @@ fn command_print<F: FileIO>(
     Flow::Normal
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "sort command covers flag parsing, key extraction, stable sorting, and buffer splice as one upstream unit"
+)]
+fn command_sort<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    command: &ExCommand,
+) -> Flow {
+    let Some(buffer) = editor.current_buffer() else {
+        return error_flow(runtime, "E749", "Empty buffer");
+    };
+    let (start, end) = match resolve_range(editor, command) {
+        Ok(range) => range,
+        Err(message) => return error_flow(runtime, "E16", message),
+    };
+
+    let lines = match buffer_lines(editor, buffer) {
+        Ok(lines) => lines,
+        Err(message) => return error_flow(runtime, "E749", message),
+    };
+    if start > lines.len() || start > end {
+        return Flow::Normal;
+    }
+    let end = end.min(lines.len());
+    let count = end.saturating_sub(start).saturating_add(1);
+    if count <= 1 {
+        return Flow::Normal;
+    }
+    let mut args = &command.args[..];
+    let mut sort_ic = false;
+    let mut sort_rx = false;
+    let mut sort_nr = false;
+    let mut sort_flt = false;
+    let mut sort_what: i32 = 10;
+    let mut unique = false;
+    let reverse = command.bang;
+    let mut pattern: Option<String> = None;
+    let mut formats_seen = 0;
+
+    'parse: while let Some(first_byte) = args.as_bytes().first() {
+        let first_byte = *first_byte;
+        // The slice came from a &str whose first byte matched, so a first
+        // char always exists.
+        let first_char = args.chars().next().unwrap_or('\0');
+        let first_len = first_char.len_utf8();
+        if first_byte == b' ' || first_byte == b'\t' {
+            args = &args[first_len..];
+            continue;
+        }
+        if first_char == 'i' {
+            sort_ic = true;
+        } else if first_char == 'l' {
+            // 'l' is accepted for compatibility; locale collation is not available.
+        } else if first_char == 'r' {
+            sort_rx = true;
+        } else if first_char == 'n' {
+            sort_nr = true;
+            sort_what = 10;
+            formats_seen += 1;
+        } else if first_char == 'f' {
+            sort_flt = true;
+            formats_seen += 1;
+        } else if first_char == 'b' {
+            sort_nr = true;
+            sort_what = 2;
+            formats_seen += 1;
+        } else if first_char == 'o' {
+            sort_nr = true;
+            sort_what = 8;
+            formats_seen += 1;
+        } else if first_char == 'x' {
+            sort_nr = true;
+            sort_what = 16;
+            formats_seen += 1;
+        } else if first_char == 'u' {
+            unique = true;
+        } else if first_char == '"' || first_char == '|' {
+            break 'parse;
+        } else if !first_char.is_ascii_alphabetic() && pattern.is_none() {
+            let (pat, tail) = take_delimited(args, first_char).unwrap_or_else(|| {
+                let rest = &args[first_len..];
+                (rest.to_owned(), "")
+            });
+            if pat.is_empty() {
+                let search = runtime.mode_machine.as_ref().and_then(|machine| {
+                    let borrowed = machine.borrow();
+                    borrowed.search_state().last_pattern().map(String::from)
+                });
+                pattern = search;
+                if pattern.is_none() {
+                    return error_flow(runtime, "E35", "No previous regular expression");
+                }
+            } else {
+                pattern = Some(pat);
+            }
+            args = tail;
+            continue;
+        } else {
+            let rest = skipwhite_trim(args);
+            return error_flow(runtime, "E475", format!("Invalid argument: {rest}"));
+        }
+        args = &args[first_len..];
+    }
+
+    if formats_seen > 1 {
+        return error_flow(runtime, "E474", "Invalid argument");
+    }
+
+    let regex = match &pattern {
+        None => None,
+        Some(pat) => {
+            let ignorecase = matches!(
+                option_value(editor, "ignorecase", SetLayer::Effective),
+                Some(OptionValue::Boolean(true))
+            );
+            let compiled = pattern_with_case(pat, ignorecase);
+            match compile_regex(&compiled, Magic::Magic) {
+                Ok(program) => Some(program),
+                Err(error) => return error_flow(runtime, "E54", error.to_string()),
+            }
+        }
+    };
+
+    let mut items: Vec<(usize, SortKey)> = Vec::with_capacity(count);
+    for (offset, lnum) in (start..=end).enumerate() {
+        let line = &lines[lnum - 1];
+        let len = line.len();
+        let (mut key_start, mut key_end) = (0, len);
+        if let Some(program) = &regex {
+            let text = RegexText::new(String::from_utf8_lossy(line).into_owned());
+            if let Some(matched) = regex_exec_at(
+                program,
+                &text,
+                ox_regex::Position {
+                    lnum: 1,
+                    col: 0,
+                    byte: 0,
+                },
+            ) {
+                if sort_rx {
+                    key_start = matched.start.byte.min(len);
+                    key_end = matched.end.byte.min(len);
+                } else {
+                    key_start = matched.end.byte.min(len);
+                }
+            } else {
+                key_end = 0;
+            }
+        }
+
+        let key = if sort_nr || sort_flt {
+            let slice = &line[key_start..key_end.min(len)];
+            if sort_nr {
+                let found = match sort_what {
+                    16 => slice.iter().position(u8::is_ascii_hexdigit),
+                    2 => slice.iter().position(|byte| matches!(byte, b'0' | b'1')),
+                    _ => slice.iter().position(u8::is_ascii_digit),
+                };
+                let value = if let Some(pos) = found {
+                    let mut pos = pos;
+                    if pos > 0 && slice[pos - 1] == b'-' {
+                        pos -= 1;
+                    }
+                    parse_number(&slice[pos..], sort_what)
+                } else {
+                    0
+                };
+                let is_number = found.is_some();
+                SortKey::Number { is_number, value }
+            } else {
+                let mut rest = slice;
+                rest = skip_leading_white(rest);
+                if let Some(b'+') = rest.first() {
+                    rest = skip_leading_white(&rest[1..]);
+                }
+                let value = if rest.is_empty() {
+                    -f64::MAX
+                } else {
+                    parse_float_prefix(rest)
+                };
+                SortKey::Float { value }
+            }
+        } else {
+            SortKey::Text {
+                text: line[key_start..key_end.min(len)].to_vec(),
+            }
+        };
+        items.push((offset, key));
+    }
+
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by(|a, b| {
+        let cmp = compare_keys(&items[*a].1, &items[*b].1, sort_ic);
+        if cmp == std::cmp::Ordering::Equal {
+            a.cmp(b)
+        } else {
+            cmp
+        }
+    });
+
+    if reverse {
+        order.reverse();
+    }
+    let mut sorted: Vec<Vec<u8>> = Vec::with_capacity(count);
+    let mut last_kept: Option<Vec<u8>> = None;
+    for &source_offset in &order {
+        let source_lnum = start + source_offset;
+        let line = lines[source_lnum - 1].clone();
+        if unique
+            && last_kept
+                .as_deref()
+                .is_some_and(|last| line_compare(&line, last, sort_ic) == std::cmp::Ordering::Equal)
+        {
+            continue;
+        }
+        last_kept = Some(line.clone());
+        sorted.push(line);
+    }
+
+    let cursor_col = sorted.first().map_or(0, |line| {
+        line.iter()
+            .take_while(|b| matches!(b, b' ' | b'\t'))
+            .count()
+    });
+    let cursor = Position {
+        lnum: start,
+        col: cursor_col,
+    };
+
+    if let Err(error) = editor.replace_buffer_lines(crate::LineReplaceRequest {
+        buffer,
+        start,
+        end,
+        lines: &sorted,
+        cursor_before: cursor,
+        cursor_after: cursor,
+        timestamp: 0,
+    }) {
+        return error_flow(runtime, "E16", error.to_string());
+    }
+
+    if let Some(window) = editor.current_window()
+        && let Err(error) = editor.set_window_cursor(window, cursor)
+    {
+        return error_flow(runtime, "E16", error.to_string());
+    }
+
+    Flow::Normal
+}
+
+fn skip_leading_white(input: &[u8]) -> &[u8] {
+    input
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t'))
+        .map_or(&[], |pos| &input[pos..])
+}
+
+fn parse_number(bytes: &[u8], base: i32) -> i64 {
+    let mut digits: Vec<u8> = bytes
+        .iter()
+        .copied()
+        .skip_while(u8::is_ascii_whitespace)
+        .collect();
+    let negative = digits.first() == Some(&b'-');
+    if matches!(digits.first(), Some(b'-' | b'+')) {
+        digits.drain(..1);
+        while digits.first().is_some_and(u8::is_ascii_whitespace) {
+            digits.remove(0);
+        }
+    }
+    let digits: &[u8] = &digits;
+    let digits = match base {
+        16 if digits.len() > 2
+            && (digits.starts_with(b"0x") || digits.starts_with(b"0X"))
+            && digits[2].is_ascii_hexdigit() =>
+        {
+            &digits[2..]
+        }
+        2 if digits.len() > 2
+            && (digits.starts_with(b"0b") || digits.starts_with(b"0B"))
+            && matches!(digits[2], b'0' | b'1') =>
+        {
+            &digits[2..]
+        }
+        8 if digits.len() > 2
+            && (digits.starts_with(b"0o") || digits.starts_with(b"0O"))
+            && matches!(digits[2], b'0'..=b'7') =>
+        {
+            &digits[2..]
+        }
+        _ => digits,
+    };
+    let magnitude = parse_integer_prefix(digits, base);
+    if negative {
+        magnitude.saturating_neg()
+    } else {
+        magnitude
+    }
+}
+
+fn parse_integer_prefix(bytes: &[u8], base: i32) -> i64 {
+    let mut value = 0i64;
+    for byte in bytes {
+        let digit = if base == 16 {
+            (*byte as char).to_digit(16)
+        } else if base == 2 {
+            if matches!(byte, b'0' | b'1') {
+                Some(u32::from(byte - b'0'))
+            } else {
+                None
+            }
+        } else if base == 8 {
+            if matches!(byte, b'0'..=b'7') {
+                Some(u32::from(byte - b'0'))
+            } else {
+                None
+            }
+        } else {
+            (*byte as char).to_digit(10)
+        };
+        let Some(digit) = digit else {
+            break;
+        };
+        value = value
+            .saturating_mul(i64::from(base))
+            .saturating_add(i64::from(digit));
+    }
+    value
+}
+
+fn parse_float_prefix(bytes: &[u8]) -> f64 {
+    let negative = matches!(bytes.first(), Some(b'-'));
+    let rest = if negative { &bytes[1..] } else { bytes };
+    if rest.is_empty() {
+        return if negative { -0.0 } else { 0.0 };
+    }
+    let magnitude = if rest.len() >= 3 && rest[..3].eq_ignore_ascii_case(b"inf") {
+        f64::INFINITY
+    } else if rest.len() >= 3 && rest[..3].eq_ignore_ascii_case(b"nan") {
+        f64::NAN
+    } else if rest.len() > 2 && rest[0] == b'0' && matches!(rest[1], b'x' | b'X') {
+        parse_hex_float_prefix(&rest[2..]).unwrap_or(0.0)
+    } else {
+        parse_decimal_float_prefix(rest).unwrap_or(0.0)
+    };
+    if negative { -magnitude } else { magnitude }
+}
+
+fn parse_hex_float_prefix(bytes: &[u8]) -> Option<f64> {
+    let mut cursor = 0;
+    let mut value = 0.0_f64;
+    let mut digits = 0;
+    while let Some(digit) = bytes
+        .get(cursor)
+        .and_then(|byte| (*byte as char).to_digit(16))
+    {
+        value = value * 16.0 + f64::from(digit);
+        cursor += 1;
+        digits += 1;
+    }
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        let mut factor = 1.0 / 16.0;
+        while let Some(digit) = bytes
+            .get(cursor)
+            .and_then(|byte| (*byte as char).to_digit(16))
+        {
+            value += f64::from(digit) * factor;
+            factor /= 16.0;
+            cursor += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return None;
+    }
+    if matches!(bytes.get(cursor), Some(b'p' | b'P')) {
+        cursor += 1;
+        let negative = matches!(bytes.get(cursor), Some(b'-'));
+        if matches!(bytes.get(cursor), Some(b'-' | b'+')) {
+            cursor += 1;
+        }
+        let mut exp = 0i32;
+        let mut seen = false;
+        while let Some(digit) = bytes
+            .get(cursor)
+            .and_then(|byte| (*byte as char).to_digit(10))
+        {
+            exp = exp
+                .saturating_mul(10)
+                .saturating_add(i32::try_from(digit).unwrap_or(i32::MAX));
+            cursor += 1;
+            seen = true;
+        }
+        if seen {
+            value *= 2f64.powi(if negative { -exp } else { exp });
+        }
+    }
+    Some(value)
+}
+
+fn parse_decimal_float_prefix(bytes: &[u8]) -> Option<f64> {
+    let mut end = 0;
+    let mut digits = 0;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+        digits += 1;
+    }
+    if bytes.get(end) == Some(&b'.') {
+        end += 1;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return None;
+    }
+    if matches!(bytes.get(end), Some(b'e' | b'E')) {
+        let mut cursor = end + 1;
+        if matches!(bytes.get(cursor), Some(b'+' | b'-')) {
+            cursor += 1;
+        }
+        let exponent = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        if cursor > exponent {
+            end = cursor;
+        }
+    }
+    std::str::from_utf8(&bytes[..end])
+        .ok()
+        .and_then(|text| text.parse::<f64>().ok())
+}
+
+fn line_compare(a: &[u8], b: &[u8], ignore_case: bool) -> std::cmp::Ordering {
+    if ignore_case {
+        let a = String::from_utf8_lossy(a).to_lowercase();
+        let b = String::from_utf8_lossy(b).to_lowercase();
+        a.cmp(&b)
+    } else {
+        a.cmp(b)
+    }
+}
+
+#[derive(Clone)]
+enum SortKey {
+    Number { is_number: bool, value: i64 },
+    Float { value: f64 },
+    Text { text: Vec<u8> },
+}
+
+fn compare_keys(a: &SortKey, b: &SortKey, ignore_case: bool) -> std::cmp::Ordering {
+    match (a, b) {
+        (
+            SortKey::Number {
+                is_number: a_num,
+                value: a_val,
+            },
+            SortKey::Number {
+                is_number: b_num,
+                value: b_val,
+            },
+        ) => {
+            if a_num != b_num {
+                return if *a_num {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                };
+            }
+            a_val.cmp(b_val)
+        }
+        (SortKey::Float { value: a_val }, SortKey::Float { value: b_val }) => a_val
+            .partial_cmp(b_val)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (SortKey::Text { text: a_text }, SortKey::Text { text: b_text }) => {
+            if ignore_case {
+                let a = String::from_utf8_lossy(a_text).to_lowercase();
+                let b = String::from_utf8_lossy(b_text).to_lowercase();
+                a.cmp(&b)
+            } else {
+                a_text.cmp(b_text)
+            }
+        }
+        _ => std::cmp::Ordering::Equal,
+    }
+}
 /// `ex_range_without_command` (`ex_docmd.c:2421-2446`): a bare address
 /// moves the cursor to the clamped last line. Line 0 goes to line 1.
 /// Then `beginline(BL_SOL | BL_FIX)` (`insert.c:2430`). `'startofline'`
@@ -12396,9 +12959,22 @@ fn command_highlight<F: FileIO>(
         }
         return Flow::Normal;
     }
-    let mut words = args.split_ascii_whitespace();
+    match apply_highlight_spec(editor, args) {
+        Ok(()) => Flow::Normal,
+        Err((code, message)) => error_flow(runtime, code, message),
+    }
+}
+
+/// Applies one `:highlight`-style spec (`"Group key=..."`, `"default link A B"`)
+/// to the editor table. Shared by the `:highlight` command and startup
+/// `init_highlight` seeding so both paths parse identically.
+pub(crate) fn apply_highlight_spec(
+    editor: &mut Editor,
+    spec: &str,
+) -> Result<(), (&'static str, String)> {
+    let mut words = spec.split_ascii_whitespace();
     let Some(first) = words.next() else {
-        return Flow::Normal;
+        return Err(("E471", "Argument required".to_owned()));
     };
     if first.eq_ignore_ascii_case("clear") {
         if let Some(name) = words.next() {
@@ -12406,12 +12982,12 @@ fn command_highlight<F: FileIO>(
         } else {
             editor.highlights_mut().clear();
         }
-        return Flow::Normal;
+        return Ok(());
     }
 
     let default = first.eq_ignore_ascii_case("default") || first.eq_ignore_ascii_case("def");
     let Some(group_or_link) = (if default { words.next() } else { Some(first) }) else {
-        return error_flow(runtime, "E471", "Argument required");
+        return Err(("E471", "Argument required".to_owned()));
     };
     let link = group_or_link.eq_ignore_ascii_case("link");
     let Some(group) = (if link {
@@ -12419,31 +12995,31 @@ fn command_highlight<F: FileIO>(
     } else {
         Some(group_or_link)
     }) else {
-        return error_flow(runtime, "E412", "Not enough arguments: highlight link");
+        return Err(("E412", "Not enough arguments: highlight link".to_owned()));
     };
     if default && editor.highlights().contains_key(group) {
-        return Flow::Normal;
+        return Ok(());
     }
 
     let mut attributes = BTreeMap::new();
     if link {
         let Some(target) = words.next() else {
-            return error_flow(runtime, "E412", "Not enough arguments: highlight link");
+            return Err(("E412", "Not enough arguments: highlight link".to_owned()));
         };
         if words.next().is_some() {
-            return error_flow(runtime, "E488", "Trailing characters");
+            return Err(("E488", "Trailing characters".to_owned()));
         }
         attributes.insert("link".to_owned(), target.to_owned());
     } else {
         for word in words {
             let Some((key, value)) = word.split_once('=') else {
-                return error_flow(runtime, "E416", format!("Missing equal sign: {word}"));
+                return Err(("E416", format!("Missing equal sign: {word}")));
             };
             attributes.insert(key.to_ascii_lowercase(), value.to_owned());
         }
     }
     editor.highlights_mut().insert(group.to_owned(), attributes);
-    Flow::Normal
+    Ok(())
 }
 
 fn canonical_sign_highlight(name: &str) -> String {
