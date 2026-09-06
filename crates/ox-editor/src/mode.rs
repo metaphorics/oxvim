@@ -263,6 +263,60 @@ struct CursorContext {
     window: WinHandle,
     cursor: Position,
 }
+impl CursorContext {
+    /// Line count of the context buffer, read without cloning anything.
+    fn line_count(&self, editor: &Editor) -> Result<usize, ModeError> {
+        Ok(editor.buffer(self.buffer)?.text()?.line_count())
+    }
+
+    /// One line of the context buffer, read without cloning the rest.
+    fn line(&self, editor: &Editor, lnum: usize) -> Result<Vec<u8>, ModeError> {
+        Ok(editor
+            .buffer(self.buffer)?
+            .text()?
+            .line(lnum)
+            .map_err(BufferStateError::from)?)
+    }
+
+    /// The inclusive `start_lnum..=end_lnum` window of the context buffer,
+    /// materializing only those lines.
+    fn lines_in(
+        &self,
+        editor: &Editor,
+        start_lnum: usize,
+        end_lnum: usize,
+    ) -> Result<Vec<Vec<u8>>, ModeError> {
+        let text = editor.buffer(self.buffer)?.text()?;
+        Ok((start_lnum..=end_lnum)
+            .map(|lnum| text.line(lnum))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(BufferStateError::from)?)
+    }
+
+    /// Identifier under the cursor, read from the cursor line alone.
+    fn ident_under_cursor(&self, editor: &Editor) -> Option<Vec<u8>> {
+        let line = self.line(editor, self.cursor.lnum).ok()?;
+        let mut local = self.cursor;
+        local.lnum = 1;
+        crate::motion::ident_under(std::slice::from_ref(&line), local).map(<[u8]>::to_vec)
+    }
+
+    /// Character-find motion resolved against the cursor line alone; the
+    /// one-line window is rebased onto the absolute cursor line.
+    fn find_under_cursor(
+        &self,
+        editor: &Editor,
+        find: FindMotion,
+        count: usize,
+    ) -> Option<crate::motion::Motion> {
+        let line = self.line(editor, self.cursor.lnum).ok()?;
+        let mut local = self.cursor;
+        local.lnum = 1;
+        let mut motion = resolve_find(std::slice::from_ref(&line), local, find, count)?;
+        motion.target.lnum = self.cursor.lnum;
+        Some(motion)
+    }
+}
 
 impl ModeMachine {
     /// Returns the active mode.
@@ -895,14 +949,14 @@ impl ModeMachine {
             state.prefix.clear();
             if key == 'v' {
                 if let Some(visual) = self.last_visual.clone() {
-                    let window = context(editor)?.window;
+                    let window = cursor_context(editor)?.window;
                     editor.set_window_cursor(window, visual.cursor)?;
                     return Ok(Some(Mode::Visual(visual)));
                 }
                 return Ok(Some(Mode::default()));
             }
             if key == 'H' {
-                let cursor = context(editor)?.cursor;
+                let cursor = cursor_context(editor)?.cursor;
                 return Ok(Some(Mode::Visual(VisualState::new(
                     cursor,
                     VisualKind::Line,
@@ -1048,7 +1102,7 @@ impl ModeMachine {
                 Ok(Some(Mode::Insert(InsertState)))
             }
             'v' | 'V' | '\u{16}' | '\u{11}' => {
-                let cursor = context(editor)?.cursor;
+                let cursor = cursor_context(editor)?.cursor;
                 Ok(Some(Mode::Visual(VisualState::new(
                     cursor,
                     if key == 'v' {
@@ -1079,7 +1133,7 @@ impl ModeMachine {
                 Ok(Some(Mode::default()))
             }
             'p' | 'P' => {
-                let ctx = context(editor)?;
+                let ctx = cursor_context(editor)?;
                 let name = state.register.unwrap_or('"');
                 let direction = if key == 'p' {
                     PutDirection::After
@@ -1090,17 +1144,18 @@ impl ModeMachine {
                 Ok(Some(Mode::default()))
             }
             'J' => {
-                let ctx = context(editor)?;
+                let ctx = cursor_context(editor)?;
+                let line_count = ctx.line_count(editor)?;
                 let end_lnum = ctx
                     .cursor
                     .lnum
                     .saturating_add(count.max(2) - 1)
-                    .min(ctx.lines.len());
+                    .min(line_count);
                 self.join_lines(editor, ctx.cursor.lnum, end_lnum)?;
                 Ok(Some(Mode::default()))
             }
             'x' => {
-                let ctx = context(editor)?;
+                let ctx = cursor_context(editor)?;
                 let end = Position {
                     lnum: ctx.cursor.lnum,
                     col: ctx.cursor.col.saturating_add(count - 1),
@@ -1125,7 +1180,7 @@ impl ModeMachine {
                 Ok(Some(Mode::default()))
             }
             '~' => {
-                let ctx = context(editor)?;
+                let ctx = cursor_context(editor)?;
                 let end = Position {
                     lnum: ctx.cursor.lnum,
                     col: ctx.cursor.col.saturating_add(count - 1),
@@ -1202,7 +1257,7 @@ impl ModeMachine {
                 Ok(None)
             }
             'u' => {
-                let ctx = context(editor)?;
+                let ctx = cursor_context(editor)?;
                 editor.buffer_undo(ctx.buffer)?;
                 Ok(Some(Mode::default()))
             }
@@ -1211,7 +1266,7 @@ impl ModeMachine {
                 Ok(Some(Mode::default()))
             }
             '\u{14}' => {
-                let window = context(editor)?.window;
+                let window = cursor_context(editor)?.window;
                 let old_idx = editor
                     .window_tag_stack(window)
                     .map_or(1, crate::tags::TagStack::curidx);
@@ -1378,10 +1433,9 @@ impl ModeMachine {
             till: matches!(state.prefix.as_str(), "t" | "T"),
             target: key as u8,
         };
-        let ctx = context(editor)?;
-        let Some(motion) = resolve_find(
-            &ctx.lines,
-            ctx.cursor,
+        let ctx = cursor_context(editor)?;
+        let Some(motion) = ctx.find_under_cursor(
+            editor,
             find,
             state.count.saturating_mul(state.motion_count.max(1)),
         ) else {
@@ -1468,13 +1522,14 @@ impl ModeMachine {
             return Ok(None);
         }
         if key == operator_key(state.operator) {
-            let ctx = context(editor)?;
+            let ctx = cursor_context(editor)?;
+            let line_count = ctx.line_count(editor)?;
             let end = Position {
                 lnum: ctx
                     .cursor
                     .lnum
                     .saturating_add(state.count.saturating_mul(state.motion_count.max(1)) - 1)
-                    .min(ctx.lines.len()),
+                    .min(line_count),
                 col: 0,
             };
             let range = EditRange {
@@ -1558,7 +1613,7 @@ impl ModeMachine {
             }
             range.kind = force;
         }
-        let ctx = context(editor)?;
+        let ctx = cursor_context(editor)?;
         ops::apply(
             editor,
             OperatorRequest {
@@ -1648,7 +1703,7 @@ impl ModeMachine {
                 } else {
                     state.swap_ends();
                 }
-                let window = context(editor)?.window;
+                let window = cursor_context(editor)?.window;
                 editor.set_window_cursor(window, state.cursor)?;
                 Ok(None)
             }
@@ -1724,12 +1779,12 @@ impl ModeMachine {
         state: &VisualState,
         input: ReplaceInput,
     ) -> Result<(), ModeError> {
-        let ctx = context(editor)?;
-        if ctx.lines.is_empty() {
+        let ctx = cursor_context(editor)?;
+        let last_lnum = ctx.line_count(editor)?;
+        if last_lnum == 0 {
             return Ok(());
         }
         let range = state.range();
-        let last_lnum = ctx.lines.len();
         let start_lnum = range.start.lnum.min(range.end.lnum).clamp(1, last_lnum);
         let end_lnum = range.start.lnum.max(range.end.lnum).clamp(1, last_lnum);
         let cursor_after = Position {
@@ -1745,8 +1800,9 @@ impl ModeMachine {
         };
         let replacement_scalar = scalar_bytes(input);
         let mut requests = Vec::with_capacity(end_lnum - start_lnum + 1);
+        let lines = ctx.lines_in(editor, start_lnum, end_lnum)?;
         for lnum in start_lnum..=end_lnum {
-            let line = &ctx.lines[lnum - 1];
+            let line = &lines[lnum - start_lnum];
             let (start_col, end_col) = match range.kind {
                 MotionKind::BlockWise => (
                     range.start.col.min(line.len()),
@@ -1824,8 +1880,8 @@ impl ModeMachine {
             till: matches!(state.prefix.as_str(), "t" | "T"),
             target: key as u8,
         };
-        let ctx = context(editor)?;
-        if let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, state.count.max(1)) {
+        let ctx = cursor_context(editor)?;
+        if let Some(motion) = ctx.find_under_cursor(editor, find, state.count.max(1)) {
             editor.set_window_cursor(ctx.window, motion.target)?;
             extend_visual(state, motion.target, ctx.cursor);
             self.last_find = Some(find);
@@ -1871,7 +1927,9 @@ impl ModeMachine {
             return Ok(());
         }
 
-        let ctx = context(editor)?;
+        let ctx = cursor_context(editor)?;
+        let end_lnum = end_lnum.min(ctx.line_count(editor)?);
+        let lines = ctx.lines_in(editor, start_lnum, end_lnum)?;
         let joinspaces = matches!(
             editor.options().get_global("joinspaces"),
             Ok(OptionValue::Boolean(true))
@@ -1895,7 +1953,7 @@ impl ModeMachine {
         };
         let remove_comments = formatoptions.contains('j');
 
-        let first = &ctx.lines[start_lnum - 1];
+        let first = &lines[0];
         let mut joined = first.clone();
         let mut previous_was_comment =
             remove_comments && scan_comment_line(first, &comments).ends_open;
@@ -1903,7 +1961,7 @@ impl ModeMachine {
         let mut last_leading = 0;
         let mut last_suffix_len = 0;
         for lnum in start_lnum + 1..=end_lnum {
-            let line = &ctx.lines[lnum - 1];
+            let line = &lines[lnum - start_lnum];
             let comment = if remove_comments {
                 scan_comment_line(line, &comments)
             } else {
@@ -1962,7 +2020,7 @@ impl ModeMachine {
         operator: Operator,
         eval: &mut dyn ExprEval,
     ) -> Result<Option<Mode>, ModeError> {
-        let ctx = context(editor)?;
+        let ctx = cursor_context(editor)?;
         self.last_visual = Some(state.clone());
         let result = ops::apply(
             editor,
@@ -2135,7 +2193,7 @@ impl ModeMachine {
     ) -> Result<Option<Mode>, ModeError> {
         match self.ctrl_bslash_arm(key) {
             CtrlBslash::Exit => {
-                let ctx = context(editor)?;
+                let ctx = cursor_context(editor)?;
                 insert::normal_cursor(editor, ctx.window, ctx.cursor)?;
                 return Ok(Some(Mode::default()));
             }
@@ -2382,14 +2440,13 @@ impl ModeMachine {
         key: char,
         count: usize,
     ) -> Result<(), ModeError> {
-        let ctx = context(editor)?;
-        let Some(ident) = crate::motion::ident_under(&ctx.lines, ctx.cursor) else {
+        let ctx = cursor_context(editor)?;
+        let Some(ident) = ctx.ident_under_cursor(editor) else {
             return Err(ModeError::Vim(
                 "E349",
                 "No identifier under cursor".to_owned(),
             ));
         };
-        let ident = ident.to_vec();
         let kind = if matches!(key, 'd' | 'D' | '\u{4}') {
             crate::include_search::IdentSearchKind::Define
         } else {
@@ -2418,23 +2475,37 @@ impl ModeMachine {
                 .or_else(|| std::env::current_dir().ok())
         });
 
+        let end_lnum = ctx.line_count(editor)?;
+        let scan_window = if start_lnum <= end_lnum {
+            ctx.lines_in(editor, start_lnum, end_lnum)?
+        } else {
+            Vec::new()
+        };
+        // `collect_hits_with_includes` numbers lines from the slice it walks;
+        // shift reported hits back onto the absolute window base.
         let hits = crate::include_search::collect_hits_with_includes(
-            &ctx.lines,
+            &scan_window,
             &ident,
             true,
             kind,
-            start_lnum,
-            ctx.lines.len(),
+            1,
+            scan_window.len(),
             relative_to.as_deref(),
-        );
+        )
+        .into_iter()
+        .map(|mut hit| {
+            hit.lnum += start_lnum - 1;
+            hit
+        })
+        .collect::<Vec<_>>();
 
         crate::include_search::apply(editor, &hits, action, count, ctx.cursor.lnum, kind)
             .map_err(|error| ModeError::Vim(error.code, error.message))
     }
 
     fn jump_ident_tag(editor: &mut Editor, count: usize) -> Result<(), ModeError> {
-        let ctx = context(editor)?;
-        let Some(ident) = crate::motion::ident_under(&ctx.lines, ctx.cursor) else {
+        let ctx = cursor_context(editor)?;
+        let Some(ident) = ctx.ident_under_cursor(editor) else {
             return Err(ModeError::Vim(
                 "E349",
                 "No identifier under cursor".to_owned(),
@@ -2449,7 +2520,7 @@ impl ModeMachine {
                 "Cannot switch buffer. 'winfixbuf' is enabled".to_owned(),
             ));
         }
-        let needle = String::from_utf8_lossy(ident).into_owned();
+        let needle = String::from_utf8_lossy(&ident).into_owned();
         let tags_option = match editor.options().get_global("tags") {
             Ok(OptionValue::String(value)) => value.clone(),
             _ => "./tags;,tags".to_owned(),
@@ -2492,7 +2563,7 @@ impl ModeMachine {
                 "Cannot switch buffer. 'winfixbuf' is enabled".to_owned(),
             ));
         }
-        let ctx = context(editor)?;
+        let ctx = cursor_context(editor)?;
         let line = editor
             .buffer(ctx.buffer)?
             .text()?
@@ -2536,14 +2607,14 @@ impl ModeMachine {
     }
 
     fn preview_ident_tag(editor: &mut Editor, count: usize) -> Result<(), ModeError> {
-        let ctx = context(editor)?;
-        let Some(ident) = crate::motion::ident_under(&ctx.lines, ctx.cursor) else {
+        let ctx = cursor_context(editor)?;
+        let Some(ident) = ctx.ident_under_cursor(editor) else {
             return Err(ModeError::Vim(
                 "E349",
                 "No identifier under cursor".to_owned(),
             ));
         };
-        let needle = String::from_utf8_lossy(ident).into_owned();
+        let needle = String::from_utf8_lossy(&ident).into_owned();
         let tags_option = match editor.options().get_global("tags") {
             Ok(OptionValue::String(value)) => value.clone(),
             _ => "./tags;,tags".to_owned(),
@@ -2600,8 +2671,8 @@ impl ModeMachine {
         count: usize,
         _visual: bool,
     ) -> Result<bool, ModeError> {
-        let ctx = context(editor)?;
-        let Some(motion) = resolve_find(&ctx.lines, ctx.cursor, find, count) else {
+        let ctx = cursor_context(editor)?;
+        let Some(motion) = ctx.find_under_cursor(editor, find, count) else {
             return Ok(false);
         };
         editor.set_window_cursor(ctx.window, motion.target)?;
@@ -2720,9 +2791,9 @@ impl ModeMachine {
         count: usize,
         input: ReplaceInput,
     ) -> Result<(), ModeError> {
-        let ctx = context(editor)?;
-        let line = &ctx.lines[ctx.cursor.lnum - 1];
-        let Some(end_col) = inclusive_scalar_end(line, ctx.cursor.col, count) else {
+        let ctx = cursor_context(editor)?;
+        let line = ctx.line(editor, ctx.cursor.lnum)?;
+        let Some(end_col) = inclusive_scalar_end(&line, ctx.cursor.col, count) else {
             return Ok(());
         };
         let (replacement, after) = match input {
@@ -2756,8 +2827,8 @@ impl ModeMachine {
     }
 
     fn adjust_number(&mut self, editor: &mut Editor, delta: i64) -> Result<(), ModeError> {
-        let ctx = context(editor)?;
-        let line = ctx.lines[ctx.cursor.lnum - 1].clone();
+        let ctx = cursor_context(editor)?;
+        let line = ctx.line(editor, ctx.cursor.lnum)?;
         let Some((start, end, rendered)) = adjust_number_span(&line, ctx.cursor.col, delta) else {
             return Ok(());
         };
@@ -3097,6 +3168,9 @@ fn cursor_context(editor: &mut Editor) -> Result<CursorContext, ModeError> {
     })
 }
 
+/// Whole-buffer snapshot for consumers that index arbitrary lines (motion and
+/// text-object resolution, search). Hot handlers use [`cursor_context`] and
+/// its windowed accessors instead.
 fn context(editor: &mut Editor) -> Result<Context, ModeError> {
     let tab = editor
         .current_tabpage()
