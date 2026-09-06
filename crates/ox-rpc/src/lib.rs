@@ -13,6 +13,7 @@
 //! This crate is pure data handling; I/O and the event loop live in `ox-loop`.
 
 mod channel;
+mod convert;
 mod codec;
 mod message;
 mod metadata;
@@ -23,6 +24,7 @@ pub use channel::{
     nvim_error_event,
 };
 pub use codec::{DecodeError, IncrementalDecoder, decode, encode};
+pub use convert::typval_to_object;
 pub use message::{Message, MsgidCounter};
 pub use metadata::{ApiMetadata, canonical_metadata};
 pub use redraw::{RedrawBatch, RedrawEvent};

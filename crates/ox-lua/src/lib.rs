@@ -21,5 +21,5 @@ pub use uv_core::EventLoopPump;
 pub use vim::{
     ApiDispatchContext, BuiltinHost, FastCallbackGuard, FastCallbackState, Scheduler,
     TextlockGuard, VariableHost, VariableScope, Work, bind_api, bind_variables,
-    call_with_traceback, install_vim_core,
+    call_with_traceback, error_shim, install_vim_core,
 };

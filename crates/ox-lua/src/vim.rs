@@ -257,6 +257,29 @@ pub fn install_vim_core(
     Ok(state)
 }
 
+/// Lua wrapper factory for Rust natives that signal failure as
+/// `(false, message)`: the wrapper re-raises the message as a *string* error,
+/// so `pcall` never observes an mlua `WrappedFailure` userdata (upstream
+/// raises plain strings; userdata returns make the exec_lua harness reject
+/// with "cannot be serialized over RPC"). Multi-value safe: success returns
+/// pass every value after the flag through untouched.
+///
+/// # Errors
+///
+/// Returns the chunk compilation/registration error.
+pub fn error_shim(lua: &Lua) -> mlua::Result<Function> {
+    lua.load(
+        "return function(native) \
+           return function(...) \
+             local results = { native(...) } \
+             if results[1] == false then error(results[2], 2) end \
+             return unpack(results, 2) \
+           end \
+         end",
+    )
+    .eval()
+}
+
 fn install_builtin_functions(
     lua: &Lua,
     vim: &Table,
@@ -324,10 +347,7 @@ fn dispatch_builtin(
             name.to_string_lossy()
         ))
     {
-        return match error {
-            mlua::Error::RuntimeError(message) => api_failure(lua, message),
-            error => Err(error),
-        };
+        return api_failure(lua, error.to_string());
     }
 
     let mut converted = Vec::with_capacity(args.len());

@@ -1,4 +1,5 @@
-use mlua::{AnyUserData, Lua, LuaString, Table, UserData, UserDataMethods};
+use mlua::{Function, Lua, LuaString, Table, UserData, UserDataMethods, Value};
+
 use ox_regex::{Magic, Prog, Text};
 
 #[derive(Clone, Debug)]
@@ -47,17 +48,24 @@ impl UserData for LuaRegex {
 }
 
 pub(super) fn install(lua: &Lua, vim: &Table) -> mlua::Result<()> {
-    vim.set(
-        "regex",
-        lua.create_function(|lua, pattern: LuaString| -> mlua::Result<AnyUserData> {
-            let bytes = pattern.as_bytes();
-            let pattern = std::str::from_utf8(&bytes)
-                .map_err(|_| mlua::Error::runtime("regex pattern is not valid UTF-8"))?;
-            let program = ox_regex::compile(pattern, Magic::Magic)
-                .map_err(|error| mlua::Error::runtime(format!("couldn't parse regex: {error}")))?;
-            lua.create_userdata(LuaRegex(program))
-        })?,
-    )
+    // Failures return `(false, message)` and pass through the string-error
+    // shim: a bad pattern must reach `pcall` as a string (upstream raises one
+    // via `lua_error`), never an mlua WrappedFailure userdata.
+    let native = lua.create_function(|lua, pattern: LuaString| {
+        let bytes = pattern.as_bytes();
+        let compiled = std::str::from_utf8(&bytes)
+            .map_err(|_| "regex pattern is not valid UTF-8".to_owned())
+            .and_then(|pattern| {
+                ox_regex::compile(pattern, Magic::Magic)
+                    .map_err(|error| format!("couldn't parse regex: {error}"))
+            });
+        match compiled {
+            Ok(program) => Ok((true, Value::UserData(lua.create_userdata(LuaRegex(program))?))),
+            Err(message) => Ok((false, Value::String(lua.create_string(message)?))),
+        }
+    })?;
+    let wrapped: Function = crate::vim::error_shim(lua)?.call(native)?;
+    vim.set("regex", wrapped)
 }
 
 fn checked_offset(value: i64, length: usize, name: &str) -> mlua::Result<usize> {

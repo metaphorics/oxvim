@@ -23,7 +23,7 @@ use ox_editor::{
 use ox_lua::{
     ApiDispatchContext, BuiltinHost, EventLoopPump, LuaHost, RuntimeRoot as LuaRuntimeRoot,
     Scheduler, VariableHost, VariableScope, Work, bind_api, bind_variables, call_with_traceback,
-    collect_typval_refs, free_lua_ref, free_typval_refs, lua_to_object, lua_to_object_ref,
+    collect_typval_refs, error_shim, free_lua_ref, free_typval_refs, lua_to_object, lua_to_object_ref,
     lua_to_typval, object_to_lua, typval_to_lua,
 };
 use ox_rpc::{CHAN_STDIO, ChannelId, IncrementalDecoder, Message};
@@ -166,7 +166,7 @@ fn deliver_deferred_job_events(
             let args = event
                 .args
                 .iter()
-                .map(ox_editor::excmd_exec::typval_to_object)
+                .map(ox_rpc::typval_to_object)
                 .collect();
             if let Err(lua_error) = lua.borrow_mut().invoke_callback(reference, args) {
                 // The event reached its handler and the handler failed:
@@ -3402,6 +3402,34 @@ impl CommandExecutor for ExApiExecutor<'_> {
     }
 }
 
+/// `(false, message)` result for the scoped-call Lua shim
+/// ([`error_shim`]): the shim re-raises the message as a *string* Lua
+/// error, so `pcall` never observes an mlua `WrappedFailure` userdata --
+/// upstream raises plain strings (`nlua_error`), and the exec_lua harness
+/// rejects userdata with "cannot be serialized over RPC".
+fn scoped_failure(lua: &Lua, error: impl std::fmt::Display) -> mlua::Result<(bool, Value)> {
+    Ok((false, Value::String(lua.create_string(error.to_string())?)))
+}
+
+/// Success half of the scoped-call shim contract: convert one builtin result
+/// Typval, reporting conversion failures through [`scoped_failure`].
+fn scoped_typval(lua: &Lua, value: &Typval) -> mlua::Result<(bool, Value)> {
+    match typval_to_lua(lua, value) {
+        Ok(value) => Ok((true, value)),
+        Err(error) => scoped_failure(lua, error),
+    }
+}
+
+/// [`scoped_failure`] for natives returning [`MultiValue`]: the flag rides
+/// as the first value, so one shim serves `(bool, Value)` and multi-value
+/// natives alike.
+fn scoped_failure_multi(lua: &Lua, error: impl std::fmt::Display) -> mlua::Result<MultiValue> {
+    Ok(MultiValue::from_vec(vec![
+        Value::Boolean(false),
+        Value::String(lua.create_string(error.to_string())?),
+    ]))
+}
+
 /// One Vimscript builtin call from a scoped Lua chunk: the primary executor
 /// when it is free, otherwise the nested one, always against the live editor
 /// this Ex frame is executing with -- the same tiering `EditorBuiltins` uses
@@ -3422,7 +3450,7 @@ fn dispatch_scoped_builtin(
     nested_ex: &Rc<RefCell<ExExecutor>>,
     name: &[u8],
     args: &[Value],
-) -> mlua::Result<Value> {
+) -> mlua::Result<(bool, Value)> {
     let name = OxStr(name.to_vec());
     let mut converted = Vec::with_capacity(args.len());
     let mut references = Vec::new();
@@ -3434,16 +3462,21 @@ fn dispatch_scoped_builtin(
             }
             Err(error) => {
                 free_typval_refs(lua, &references);
-                return Err(mlua::Error::runtime(error.to_string()));
+                return scoped_failure(lua, error);
             }
         }
     }
 
-    if let Some(value) =
-        live_mode_builtin(session, &name, &converted).map_err(mlua::Error::external)?
-    {
-        free_typval_refs(lua, &references);
-        return typval_to_lua(lua, &value).map_err(mlua::Error::external);
+    match live_mode_builtin(session, &name, &converted) {
+        Ok(Some(value)) => {
+            free_typval_refs(lua, &references);
+            return scoped_typval(lua, &value);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            free_typval_refs(lua, &references);
+            return scoped_failure(lua, error);
+        }
     }
     let (result, owner) = match ex.try_borrow_mut() {
         Ok(mut guard) => {
@@ -3471,13 +3504,16 @@ fn dispatch_scoped_builtin(
     if !is_jobstart || result.is_err() || failed_spawn {
         free_typval_refs(lua, &references);
     }
-    let result = result.map_err(mlua::Error::runtime)?;
+    let result = match result {
+        Ok(value) => value,
+        Err(error) => return scoped_failure(lua, error),
+    };
     // A `jobwait` flush re-deferred Lua callbacks that upstream delivers
     // before the builtin returns (multiqueue_process_events,
     // funcs.c:3668/3721); the executor borrow is released here, so this is
     // the first boundary that can run them.
     deliver_pending_lua_flush(session, &owner);
-    typval_to_lua(lua, &result).map_err(mlua::Error::external)
+    scoped_typval(lua, &result)
 }
 
 /// Delivers a pending `jobwait` Lua flush at a borrow-free boundary, looping
@@ -3574,31 +3610,45 @@ fn with_scoped_editor_api<T>(
         })
         .collect::<mlua::Result<Vec<_>>>()
         .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+    // Scoped natives signal failure as `(false, message)`; this Lua shim
+    // re-raises the message as a string error, so `pcall` in chunks and the
+    // exec_lua harness never observe an mlua `WrappedFailure` userdata.
+    let shim: Function = error_shim(lua)
+        .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+    // Shared by reference so every scope closure copies the borrow instead
+    // of the first closure moving the shim away from the rest.
+    let shim = &shim;
     // The caller's real session drives every scoped binding: scope closures
     // accept the non-'static `&ApiSession` borrow, and no throwaway session
     // is ever constructed here.
     let result = lua.scope(|scope| {
         vim.set(
             "_getvar",
-            scope.create_function_mut(
+            shim.call::<Function>(scope.create_function_mut(
                 move |lua, (scope, handle, name): (mlua::LuaString, i64, mlua::LuaString)| {
-                    let scope = parse_variable_scope(&scope)?;
+                    let Ok(scope) = parse_variable_scope(&scope) else {
+                        return scoped_failure(lua, "unknown variable scope");
+                    };
                     let name = OxStr(name.as_bytes().to_vec());
                     session.with_editor(|editor| {
-                        match variables(editor, scope, handle)
-                            .map_err(mlua::Error::runtime)?
-                            .get(&name)
-                        {
-                            Some(value) => object_to_lua(lua, value).map_err(mlua::Error::external),
-                            None => Ok(Value::Nil),
+                        let values = match variables(editor, scope, handle) {
+                            Ok(values) => values,
+                            Err(error) => return scoped_failure(lua, error),
+                        };
+                        match values.get(&name) {
+                            Some(value) => match object_to_lua(lua, value) {
+                                Ok(value) => Ok((true, value)),
+                                Err(error) => scoped_failure(lua, error),
+                            },
+                            None => Ok((true, Value::Nil)),
                         }
                     })
                 },
-            )?,
+            )?)?,
         )?;
         vim.set(
             "_setvar",
-            scope.create_function_mut(
+            shim.call::<Function>(scope.create_function_mut(
                 move |lua,
                       (scope, handle, name, value): (
                     mlua::LuaString,
@@ -3606,22 +3656,32 @@ fn with_scoped_editor_api<T>(
                     mlua::LuaString,
                     Value,
                 )| {
-                    let scope = parse_variable_scope(&scope)?;
+                    let Ok(scope) = parse_variable_scope(&scope) else {
+                        return scoped_failure(lua, "unknown variable scope");
+                    };
                     let name = OxStr(name.as_bytes().to_vec());
                     if scope == VariableScope::Vim && !vim_variable_is_writable(name.as_bytes()) {
-                        return Err(mlua::Error::runtime(format!(
-                            "E46: Cannot change read-only variable \"{}\"",
-                            name.to_string_lossy()
-                        )));
+                        return scoped_failure(
+                            lua,
+                            format!(
+                                "E46: Cannot change read-only variable \"{}\"",
+                                name.to_string_lossy()
+                            ),
+                        );
                     }
                     let value = if value.is_nil() {
                         None
                     } else {
-                        Some(lua_to_object(lua, &value).map_err(mlua::Error::external)?)
+                        match lua_to_object(lua, &value) {
+                            Ok(value) => Some(value),
+                            Err(error) => return scoped_failure(lua, error),
+                        }
                     };
                     session.with_editor_mut(|editor| {
-                        let variables =
-                            variables_mut(editor, scope, handle).map_err(mlua::Error::runtime)?;
+                        let variables = match variables_mut(editor, scope, handle) {
+                            Ok(variables) => variables,
+                            Err(error) => return scoped_failure(lua, error),
+                        };
                         if let Some(value) = value {
                             variables.insert(name, value);
                         } else {
@@ -3630,20 +3690,19 @@ fn with_scoped_editor_api<T>(
                                 variables.0.remove(index);
                             }
                         }
-                        Ok::<(), mlua::Error>(())
+                        Ok((true, Value::Nil))
                     })
                 },
-            )?,
+            )?)?,
         )?;
         // Lua→Vimscript reentry runs on the live editor and the
         // primary/nested executor pair, mirroring `EditorBuiltins`' tiering
-        // outside Ex execution. A fast-callback guard is unnecessary here:
         // Ex code can never be running inside a fast callback.
         let call_ex = ex.clone();
         let call_nested = nested_ex.clone();
         vim.set(
             "call",
-            scope.create_function_mut(
+            shim.call::<Function>(scope.create_function_mut(
                 move |lua, (name, args): (mlua::LuaString, Variadic<Value>)| {
                     dispatch_scoped_builtin(
                         lua,
@@ -3654,7 +3713,7 @@ fn with_scoped_editor_api<T>(
                         args.as_slice(),
                     )
                 },
-            )?,
+            )?)?,
         )?;
         let fn_ex = ex.clone();
         let fn_nested = nested_ex.clone();
@@ -3666,9 +3725,10 @@ fn with_scoped_editor_api<T>(
                 let ex = fn_ex.clone();
                 let nested_ex = fn_nested.clone();
                 let name = name.as_bytes().to_vec();
-                scope.create_function_mut(move |lua, args: Variadic<Value>| {
+                let native = scope.create_function_mut(move |lua, args: Variadic<Value>| {
                     dispatch_scoped_builtin(lua, session, &ex, &nested_ex, &name, args.as_slice())
-                })
+                })?;
+                shim.call::<Function>(native)
             })?,
         )?;
         fn_table.set_metatable(Some(fn_metatable))?;
@@ -3679,57 +3739,99 @@ fn with_scoped_editor_api<T>(
                 let nested_ex = nested_ex.clone();
                 api.set(
                     metadata.name,
-                    scope.create_function_mut(move |lua, args: Variadic<Value>| {
-                        let args = args
-                            .iter()
-                            .map(|value| lua_to_object(lua, value).map_err(mlua::Error::external))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let (cmd, opts) = nvim_cmd_args(&args).map_err(mlua::Error::external)?;
-                        let result =
-                            dispatch_scoped_nvim_cmd(session, &cmd_ex, &nested_ex, cmd, opts)?;
-                        object_to_lua(lua, &Object::String(result)).map_err(mlua::Error::external)
-                    })?,
+                    shim.call::<Function>(scope.create_function_mut(
+                        move |lua, args: Variadic<Value>| {
+                            let mut converted = Vec::with_capacity(args.len());
+                            for value in args.iter() {
+                                match lua_to_object(lua, value) {
+                                    Ok(value) => converted.push(value),
+                                    Err(error) => return scoped_failure_multi(lua, error),
+                                }
+                            }
+                            let (cmd, opts) = match nvim_cmd_args(&converted) {
+                                Ok(args) => args,
+                                Err(error) => return scoped_failure_multi(lua, error),
+                            };
+                            let result = match dispatch_scoped_nvim_cmd(
+                                session,
+                                &cmd_ex,
+                                &nested_ex,
+                                cmd,
+                                opts,
+                            ) {
+                                Ok(result) => result,
+                                Err(error) => return scoped_failure_multi(lua, error),
+                            };
+                            match object_to_lua(lua, &Object::String(result)) {
+                                Ok(value) => Ok(MultiValue::from_vec(vec![
+                                    Value::Boolean(true),
+                                    value,
+                                ])),
+                                Err(error) => scoped_failure_multi(lua, error),
+                            }
+                        },
+                    )?)?,
                 )?;
                 continue;
             }
             let params = metadata.params;
             api.set(
                 metadata.name,
-                scope.create_function_mut(move |lua, args: Variadic<Value>| {
-                    let mut args = args
-                        .iter()
-                        .map(|value| lua_to_object(lua, value).map_err(mlua::Error::external))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    while args.len() < params.len() {
-                        let (_, kind, optional) = params[args.len()];
-                        if !optional || kind != ox_api::TypeRef::Dict {
-                            break;
+                shim.call::<Function>(scope.create_function_mut(
+                    move |lua, args: Variadic<Value>| {
+                        let mut converted = Vec::with_capacity(args.len());
+                        for value in args.iter() {
+                            match lua_to_object(lua, value) {
+                                Ok(value) => converted.push(value),
+                                Err(error) => return scoped_failure_multi(lua, error),
+                            }
                         }
-                        args.push(Object::Dict(Dict(Vec::new())));
-                    }
-                    let result = dispatch(session, &args).map_err(mlua::Error::external)?;
-                    // upstream nlua_api_call: nvim_buf_call/nvim_win_call return
-                    // the callback's whole retstack, so an Object::Array result
-                    // is the multi-value marker and expands; every other
-                    // function keeps single-value returns untouched.
-                    if matches!(metadata.name, "nvim_buf_call" | "nvim_win_call") {
-                        let converted = match &result {
-                            Object::Array(values) => values
-                                .iter()
-                                .map(|value| {
-                                    object_to_lua(lua, value).map_err(mlua::Error::external)
-                                })
-                                .collect::<Result<Vec<_>, _>>(),
-                            value => object_to_lua(lua, value)
-                                .map(|value| vec![value])
-                                .map_err(mlua::Error::external),
+                        while converted.len() < params.len() {
+                            let (_, kind, optional) = params[converted.len()];
+                            if !optional || kind != ox_api::TypeRef::Dict {
+                                break;
+                            }
+                            converted.push(Object::Dict(Dict(Vec::new())));
+                        }
+                        let result = match dispatch(session, &converted) {
+                            Ok(result) => result,
+                            Err(error) => return scoped_failure_multi(lua, error),
                         };
-                        free_object_refs(lua, &result);
-                        return Ok(MultiValue::from_vec(converted?));
-                    }
-                    let value = object_to_lua(lua, &result).map_err(mlua::Error::external)?;
-                    Ok(MultiValue::from_vec(vec![value]))
-                })?,
+                        // upstream nlua_api_call: nvim_buf_call/nvim_win_call
+                        // return the callback's whole retstack, so an
+                        // Object::Array result is the multi-value marker and
+                        // expands; every other function keeps single-value
+                        // returns untouched.
+                        if matches!(metadata.name, "nvim_buf_call" | "nvim_win_call") {
+                            let items: &[Object] = match &result {
+                                Object::Array(items) => items,
+                                _ => std::slice::from_ref(&result),
+                            };
+                            let mut values = Vec::with_capacity(items.len());
+                            let mut failure = None;
+                            for value in items {
+                                match object_to_lua(lua, value) {
+                                    Ok(value) => values.push(value),
+                                    Err(error) => {
+                                        failure = Some(error.to_string());
+                                        break;
+                                    }
+                                }
+                            }
+                            free_object_refs(lua, &result);
+                            if let Some(error) = failure {
+                                return scoped_failure_multi(lua, error);
+                            }
+                            values.insert(0, Value::Boolean(true));
+                            return Ok(MultiValue::from_vec(values));
+                        }
+                        let value = match object_to_lua(lua, &result) {
+                            Ok(value) => value,
+                            Err(error) => return scoped_failure_multi(lua, error),
+                        };
+                        Ok(MultiValue::from_vec(vec![Value::Boolean(true), value]))
+                    },
+                )?)?,
             )?;
         }
         Ok(run())
@@ -3759,14 +3861,14 @@ fn with_scoped_editor_api<T>(
     }
 }
 
-fn parse_variable_scope(scope: &mlua::LuaString) -> mlua::Result<VariableScope> {
+fn parse_variable_scope(scope: &mlua::LuaString) -> Result<VariableScope, String> {
     match scope.as_bytes().as_ref() {
         b"g" => Ok(VariableScope::Global),
         b"b" => Ok(VariableScope::Buffer),
         b"w" => Ok(VariableScope::Window),
         b"t" => Ok(VariableScope::Tabpage),
         b"v" => Ok(VariableScope::Vim),
-        _ => Err(mlua::Error::runtime("unknown variable scope")),
+        _ => Err("unknown variable scope".into()),
     }
 }
 
@@ -3947,6 +4049,62 @@ mod tests {
         assert_eq!(
             result,
             Object::Array(vec![Object::Boolean(false), Object::Boolean(true)])
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the test requires editor and Lua dispatch setup to succeed"
+    )]
+    fn scoped_builtin_errors_reach_pcall_as_strings() {
+        // The exec_lua harness (testnvim/exec_lua.lua:44) rejects *userdata*
+        // error values ("cannot be serialized over RPC"), so every scoped
+        // `vim.fn`/`vim.api` failure must surface as a plain string the way
+        // upstream `nlua_error` raises them - never an mlua WrappedFailure.
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let core = build_embedded_core(editor, true).unwrap();
+        let (_, dispatch) = core.registry.get("nvim_exec_lua").unwrap();
+        let result = dispatch(
+            &core.session,
+            &[
+                Object::String(OxStr::from(
+                    r#"
+                    local fn_ok, fn_err = pcall(vim.fn.nosuchvimfunction, 1)
+                    local api_ok, api_err = pcall(vim.api.nvim_buf_get_lines, 9999, 0, -1, false)
+                    local function shape(ok, err)
+                      if ok then return { true, type(err) } end
+                      return { false, type(err), #tostring(err) > 0 }
+                    end
+                    return { shape(fn_ok, fn_err), shape(api_ok, api_err) }
+                    "#,
+                )),
+                Object::Array(Vec::new()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            Object::Array(vec![
+                // `nosuchvimfunction` fails builtin dispatch: pcall must see
+                // a *string*, never an mlua WrappedFailure userdata.
+                Object::Array(vec![
+                    Object::Boolean(false),
+                    Object::String(OxStr::from("string")),
+                    Object::Boolean(true),
+                ]),
+                // An invalid buffer handle fails the API dispatch tier: same
+                // string-error contract for `vim.api` bindings.
+                Object::Array(vec![
+                    Object::Boolean(false),
+                    Object::String(OxStr::from("string")),
+                    Object::Boolean(true),
+                ]),
+            ])
         );
     }
 
