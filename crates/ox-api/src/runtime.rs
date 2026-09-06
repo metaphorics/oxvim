@@ -588,7 +588,8 @@ pub fn set_mode_machine(session: &ApiSession, mode_machine: Rc<RefCell<ModeMachi
     session.with_state_mut(|state| state.mode_machine = Some(mode_machine));
 }
 
-pub(crate) fn mode_machine(session: &ApiSession) -> Option<Rc<RefCell<ModeMachine>>> {
+/// The live input-mode state installed by [`set_mode_machine`], if any.
+pub fn mode_machine(session: &ApiSession) -> Option<Rc<RefCell<ModeMachine>>> {
     session.with_state(|state| state.mode_machine.clone())
 }
 

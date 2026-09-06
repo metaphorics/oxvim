@@ -43,6 +43,12 @@ fn server_start<F: FileIO, E: ExEditorAccess>(
 ) -> ox_eval::Result<Typval> {
     let address = match args.first() {
         None => server_address_new(None),
+        // An empty address is WLOG-failed upstream (server.c:168-171) and
+        // surfaces as the generic start error (eval/funcs.c:6240-6246),
+        // never as a hidden generated name.
+        Some(Typval::String(value)) if value.as_bytes().is_empty() => {
+            return Err(start_failed("Unknown system error"));
+        }
         // `f_serverstart` rejects every non-String argument with `e_invarg`
         // (`eval/funcs.c:6230-6233`); Numbers are not coerced here.
         Some(Typval::String(value)) => prepare_server_address(&value.to_string_lossy()),

@@ -595,6 +595,13 @@ impl AppState {
         }
         timer.mark("loading plugins");
 
+        // main.c:522-523: `shada_read_everything` restores registers, marks,
+        // and history before the buffers open; a missing or unreadable file
+        // is not a startup failure.
+        if self.exiting {
+            return Ok(());
+        }
+        self.shada_read();
         // main.c create_windows()/edit_buffers(): the requested window or
         // tab-page layout is built first, then every positional file becomes
         // a named buffer loaded from disk (upstream also names a buffer when
@@ -1303,7 +1310,55 @@ impl AppState {
             .borrow_mut()
             .run_exit_sequence(&*self.session)
             .map_err(|error| AppError::Ex(error.to_string()))?;
-        self.publish_messages()
+        self.publish_messages()?;
+        // main.c:838-840: the exit ShaDa write; failure must not change the
+        // exit status.
+        self.shada_write();
+        Ok(())
+    }
+
+    /// Startup `ShaDa` read (main.c:522-523). Errors surface as messages, not
+    /// startup failures.
+    fn shada_read(&mut self) {
+        let outcome = self.session.with_editor_mut(|editor| {
+            let machine = ox_api::mode_machine(&self.session);
+            let mut borrowed = machine.as_ref().map(|machine| machine.borrow_mut());
+            let _ = ox_api::mode_machine(&self.session);
+            ox_editor::shada::read_default_file(editor, borrowed.as_deref_mut())
+        });
+        if let Err(error) = outcome {
+            self.session.with_editor_mut(|editor| {
+                editor.push_message(ox_editor::Message {
+                    kind: ox_editor::MessageKind::Error,
+                    content: ox_types::Object::String(ox_types::OxStr::from(
+                        format!("{}{}", error.code, error.message).as_bytes(),
+                    )),
+                    history: false,
+                    leading_newline: false,
+                });
+            });
+        }
+    }
+
+    /// Exit `ShaDa` write (main.c:838-840).
+    fn shada_write(&mut self) {
+        let outcome = self.session.with_editor(|editor| {
+            let machine = ox_api::mode_machine(&self.session);
+            let borrowed = machine.as_ref().map(|machine| machine.borrow());
+            ox_editor::shada::write_default_file(editor, borrowed.as_deref())
+        });
+        if let Err(error) = outcome {
+            self.session.with_editor_mut(|editor| {
+                editor.push_message(ox_editor::Message {
+                    kind: ox_editor::MessageKind::Error,
+                    content: ox_types::Object::String(ox_types::OxStr::from(
+                        format!("{}{}", error.code, error.message).as_bytes(),
+                    )),
+                    history: false,
+                    leading_newline: false,
+                });
+            });
+        }
     }
 
     fn show_in_chrome(&mut self, message: &ox_editor::Message) {
@@ -1660,6 +1715,10 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
             .ex
             .borrow_mut()
             .set_server_host(Box::new(listen_server.clone()));
+        // main.c:359 `server_init`: every startup shape binds a primary
+        // server, with NVIM_LISTEN_ADDRESS adoption (server.c:40-58);
+        // failure is non-fatal (server.c:59-64).
+        bind_primary_server(&listen_server, &state);
         let mut uv_loop = UvLoop::new().map_err(|error| AppError::Server(error.to_string()))?;
         let stdio_poll = bind_stdio(&mut uv_loop, &runtime)?;
         let timer =
@@ -1734,6 +1793,39 @@ fn expand_listen_address(address: &str) -> Result<String, AppError> {
     Ok(directory.join(name).to_string_lossy().into_owned())
 }
 
+/// Binds the per-process primary server (`server_init`, main.c:359) with
+/// `$NVIM_LISTEN_ADDRESS` adoption (server.c:40-58); a bind failure is
+/// reported and non-fatal (server.c:59-64). Leaves an already-set
+/// v:servername untouched.
+fn bind_primary_server(server: &ListenServer, state: &Rc<RefCell<AppState>>) {
+    let requested = std::env::var("NVIM_LISTEN_ADDRESS").ok();
+    let address = requested
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || ox_editor::server_address_new(None),
+            ox_editor::prepare_server_address,
+        );
+    let mut bound = server.clone();
+    if let Err(error) = bound.start(&address) {
+        let session = state.borrow().session.clone();
+        report_server_error(&session, &format!("Failed to start server: {error}"));
+        return;
+    }
+    state.borrow().session.with_editor_mut(|editor| {
+        let unset = match editor.vvars().get(&OxStr::from("servername")) {
+            Some(Object::String(value)) => value.as_bytes().is_empty(),
+            _ => true,
+        };
+        if unset {
+            editor.vvars_mut().insert(
+                OxStr::from("servername"),
+                Object::String(OxStr::from(address.as_str())),
+            );
+        }
+    });
+}
+
 pub fn run_listener(cli: &Cli, address: &str, timer: &mut StartupTimer) -> Result<i64, AppError> {
     let state = Rc::new(RefCell::new(AppState::new(cli, timer)?));
     // main.c getout(): a startup command that quits ends the process before
@@ -1775,6 +1867,13 @@ pub fn run_listener(cli: &Cli, address: &str, timer: &mut StartupTimer) -> Resul
             Object::String(OxStr::from(servername.as_str())),
         );
     });
+    // main.c:359: the primary server binds at every startup; here the
+    // explicit --listen address already owns v:servername and
+    // `bind_primary_server` leaves an occupied name alone.
+    {
+        let state = runtime.borrow().state.clone();
+        bind_primary_server(&listen_server, &state);
+    }
     #[cfg(unix)]
     let stdio_poll = cli
         .embed
@@ -2146,13 +2245,21 @@ impl ServerHost for ListenServer {
         }
         let Ok(mut uv) = self.uv.try_borrow_mut() else {
             // Re-entered from a peer this loop serves: the bind waits for
-            // the next pump, and the requested address is returned
-            // unresolved — an ephemeral-port TCP endpoint reports its port
-            // only once the pump has bound it.
+            // the next pump. Upstream answers with the FINAL address
+            // (f_serverstart returns the watcher's addr, eval/funcs.c:6254-
+            // 6259), so an ephemeral TCP port is resolved now with a probe
+            // bind and the resolved address is what the pump binds — the
+            // registry, the return value, and v:servername stay consistent.
+            let queued = match tcp_endpoint(address) {
+                Some((host, port)) if port.parse::<u16>().is_ok_and(|p| p == 0) => {
+                    resolve_ephemeral_tcp(host).unwrap_or_else(|| address.to_owned())
+                }
+                _ => address.to_owned(),
+            };
             self.pending
                 .borrow_mut()
-                .push(PendingListen::Start(address.to_owned()));
-            return Ok(address.to_owned());
+                .push(PendingListen::Start(queued.clone()));
+            return Ok(queued);
         };
         let callback = self.shared_callback();
         let (bound, listener) = match tcp_endpoint(address) {
@@ -2255,6 +2362,18 @@ fn shared_view(
 /// caller's host text and appends the bound port — a `0`/empty port binds
 /// an ephemeral port and the resolved number is what `serverstart()`
 /// returns (`snprintf(watcher->addr ...)`, `event/socket.c:158-170`).
+/// Resolves an ephemeral TCP port with a probe bind (`std` socket, dropped
+/// before the pump binds the same port): the OS assigns the port the pump
+/// will race to re-bind, matching `socket_watcher_start`'s resolved-address
+/// rewrite (event/socket.c:158-170) for the re-entrant corner.
+fn resolve_ephemeral_tcp(host: &str) -> Option<String> {
+    use std::net::ToSocketAddrs;
+    let address = (host, 0).to_socket_addrs().ok()?.next()?;
+    let listener = std::net::TcpListener::bind(address).ok()?;
+    let bound = listener.local_addr().ok()?;
+    Some(format!("{host}:{}", bound.port()))
+}
+
 fn start_tcp(
     uv_loop: &mut UvLoop,
     host: &str,

@@ -44,8 +44,8 @@ pub use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, WinHandl
 pub use registry::{DispatchFn, Registry, RegistryError, core};
 pub use runtime::{
     AutocmdExecution, AutocmdExecutor, ChannelInfo, ChannelSink, FileIO, LuaExecutor, MatchKind,
-    StdFileIO, close_channel, register_channel, runtime_get_named, set_autocmd_executor,
-    set_channel_sink, set_command_executor, set_file_io, set_job_sink, set_lua_executor,
-    set_mode_machine,
+    StdFileIO, close_channel, mode_machine, register_channel, runtime_get_named,
+    set_autocmd_executor, set_channel_sink, set_command_executor, set_file_io, set_job_sink,
+    set_lua_executor, set_mode_machine,
 };
 pub use ui::nvim_paste;

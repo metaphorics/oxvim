@@ -13,6 +13,7 @@ use ox_types::{OxStr, Typval};
 use crate::builtins::position::{cursor_vcol, number_value, tabstop as position_tabstop};
 use crate::excmd_exec::{EvalHost, typval_number, typval_to_text};
 use crate::layout::Frame;
+use ox_types::WinHandle;
 
 fn one_based_index(number: i64) -> Option<usize> {
     usize::try_from(number).ok()?.checked_sub(1)
@@ -143,7 +144,23 @@ fn call_bufwin_builtin(
         .current_tabpage()
         .and_then(|tab| editor.tabpage_windows(tab).ok())
         .unwrap_or_default();
-    for (index, window) in windows.iter().enumerate() {
+    // bufwinnr numbers tiled windows only (buf_win_common counts
+    // win_has_winnr windows, eval/buffer.c:566-580); bufwinid matches floats
+    // too, so the numbering arm excludes the tabpage's float set.
+    let floats: Vec<WinHandle> = editor
+        .current_tabpage()
+        .and_then(|tab| editor.tabpage(tab).ok())
+        .map(|tab| tab.floating_windows().map(|float| float.window).collect())
+        .unwrap_or_default();
+    let numbered: Vec<&WinHandle> = if want_number {
+        windows
+            .iter()
+            .filter(|window| !floats.contains(window))
+            .collect()
+    } else {
+        windows.iter().collect()
+    };
+    for (index, window) in numbered.into_iter().enumerate() {
         let displays = editor
             .window(*window)
             .is_ok_and(|state| state.buffer == target);

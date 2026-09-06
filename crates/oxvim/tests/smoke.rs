@@ -26,6 +26,21 @@ impl Drop for ScratchDirectory {
     }
 }
 
+fn isolate_xdg(command: &mut Command) {
+    let xdg_root =
+        std::env::temp_dir().join(format!("oxvim-smoke-{}-{}", std::process::id(), line!()));
+    for name in [
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
+    ] {
+        let dir = xdg_root.join(name.split('_').next().unwrap_or(name).to_ascii_lowercase());
+        let _ = std::fs::create_dir_all(&dir);
+        command.env(name, &dir);
+    }
+}
+
 impl Embedded {
     fn spawn() -> Self {
         Self::spawn_with(&[])
@@ -38,6 +53,21 @@ impl Embedded {
     fn spawn_with(arguments: &[&str]) -> Self {
         let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
         let mut command = Command::new(env!("CARGO_BIN_EXE_oxvim"));
+        // Startup now binds a primary server and touches ShaDa: keep every
+        // child inside private XDG trees so tests never touch the
+        // developer's real state.
+        let xdg_root =
+            std::env::temp_dir().join(format!("oxvim-smoke-{}-{}", std::process::id(), line!()));
+        for name in [
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+        ] {
+            let dir = xdg_root.join(name.split('_').next().unwrap_or(name).to_ascii_lowercase());
+            let _ = std::fs::create_dir_all(&dir);
+            command.env(name, &dir);
+        }
         command
             .arg("--embed")
             .args(arguments)
@@ -462,7 +492,9 @@ fn reentrant_current_dir_shares_cd_minus_state() {
 fn lua_variable_and_option_tables_use_editor_state() {
     let mut oxvim = Embedded::spawn();
     let source = r"
-        assert(vim.v.servername == '')
+        -- main.c:359 binds a primary server at every startup, so the
+        -- embedded servername is the bound address (server_spec.lua:62-69).
+        assert(vim.v.servername ~= '')
         assert(vim.g.missing == nil)
 
         vim.g.answer = { value = 42, enabled = true }
@@ -480,7 +512,7 @@ fn lua_variable_and_option_tables_use_editor_state() {
         assert(vim.v.testing == 1)
         local ok, error_message = pcall(function() vim.v.servername = 'changed' end)
         assert(not ok and tostring(error_message):find('E46', 1, true))
-        assert(vim.v.servername == '')
+        assert(vim.v.servername ~= '')
 
         local background = vim.go.background
         vim.o.background = background == 'dark' and 'light' or 'dark'
@@ -678,7 +710,9 @@ fn tcp_listener_allocates_dynamic_channel_and_serves_api_info() {
     let address = reservation.local_addr().expect("reserved address");
     drop(reservation);
     let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_oxvim"))
+    let mut built = Command::new(env!("CARGO_BIN_EXE_oxvim"));
+    isolate_xdg(&mut built);
+    let mut child = built
         .args(["--headless", "--listen", &address.to_string()])
         .env("OXVIM_RUNTIME", runtime)
         .stdin(Stdio::null())
@@ -967,7 +1001,9 @@ fn pipe_listener_reuses_requested_address_and_reports_servername() {
     let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
 
     for generation in 0..2 {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_oxvim"))
+        let mut built = Command::new(env!("CARGO_BIN_EXE_oxvim"));
+        isolate_xdg(&mut built);
+        let mut child = built
             .args(["--headless", "--listen", socket.to_str().unwrap()])
             .env("OXVIM_RUNTIME", &runtime)
             .stdin(Stdio::null())
@@ -1091,7 +1127,9 @@ fn embedded_listener_exits_when_stdio_reaches_eof() {
         std::process::id()
     ));
     let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_oxvim"))
+    let mut built = Command::new(env!("CARGO_BIN_EXE_oxvim"));
+    isolate_xdg(&mut built);
+    let mut child = built
         .args([
             "--embed",
             "--headless",

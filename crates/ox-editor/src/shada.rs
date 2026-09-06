@@ -20,6 +20,7 @@
 //! `shada.c:2703-2735`).
 
 use std::io::Cursor;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,11 +38,11 @@ use crate::search::SearchDirection;
 
 /// A `ShaDa` command failure carrying the upstream message text.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ShadaError {
+pub struct ShadaError {
     /// Upstream error code (`RCERR`, `RERR`, or `SERR`).
-    pub(crate) code: &'static str,
+    pub code: &'static str,
     /// Message text without the code prefix.
-    pub(crate) message: String,
+    pub message: String,
 }
 
 impl ShadaError {
@@ -86,7 +87,7 @@ fn now() -> u64 {
 /// Parsed `'shada'` option text.
 ///
 /// `find_shada_parameter` and `get_shada_parameter` (`shada.c:3733-3760`).
-pub(crate) struct ShadaParams<'s> {
+pub struct ShadaParams<'s> {
     text: &'s str,
 }
 
@@ -171,7 +172,8 @@ impl<'s> ShadaParams<'s> {
 
 /// The `'shada'` text a command runs under, applying `ex_shada`'s override
 /// (`ex_docmd.c:7861-7873`): an empty option behaves as `'100`.
-pub(crate) fn shada_text(editor: &Editor) -> String {
+#[must_use]
+pub fn shada_text(editor: &Editor) -> String {
     let text = match editor.options().get_global("shada") {
         Ok(OptionValue::String(value)) => String::from_utf8_lossy(value.as_bytes()).into_owned(),
         _ => String::new(),
@@ -187,11 +189,8 @@ pub(crate) fn shada_text(editor: &Editor) -> String {
 /// explicit argument wins, then `'shadafile'` (`NONE` disables `ShaDa` for the
 /// session), then the `'n'` flag of `'shada'`, then the default user-state
 /// path. `None` means "`ShaDa` is disabled".
-pub(crate) fn resolve_file(
-    editor: &Editor,
-    argument: &str,
-    params: &ShadaParams,
-) -> Option<PathBuf> {
+#[must_use]
+pub fn resolve_file(editor: &Editor, argument: &str, params: &ShadaParams) -> Option<PathBuf> {
     let argument = argument.trim();
     if !argument.is_empty() {
         return Some(PathBuf::from(argument));
@@ -214,6 +213,47 @@ pub(crate) fn resolve_file(
         }
     }
     default_file()
+}
+
+/// Startup `ShaDa` read (`shada_read_everything`, main.c:522-523): restores
+/// registers, marks, history, and `v:oldfiles` from the default file when
+/// `'shada'` is non-empty and `-i NONE` is not in effect. Missing file is
+/// not an error.
+///
+/// # Errors
+///
+/// Returns the read error when the file exists but cannot be parsed.
+pub fn read_default_file(
+    editor: &mut Editor,
+    machine: Option<&mut ModeMachine>,
+) -> Result<(), ShadaError> {
+    let shada_text = shada_text(editor);
+    let params = ShadaParams::new(&shada_text);
+    let Some(path) = resolve_file(editor, "", &params) else {
+        return Ok(());
+    };
+    if !path.is_file() {
+        return Ok(());
+    }
+    read_shada(editor, machine, &path, false, &shada_text)
+}
+
+/// Exit `ShaDa` write (`shada_write_file`, main.c:838-840): persists the
+/// session to the default file when `'shada'` is non-empty.
+///
+/// # Errors
+///
+/// Returns the write error when the file cannot be written.
+pub fn write_default_file(
+    editor: &Editor,
+    machine: Option<&ModeMachine>,
+) -> Result<(), ShadaError> {
+    let shada_text = shada_text(editor);
+    let params = ShadaParams::new(&shada_text);
+    let Some(path) = resolve_file(editor, "", &params) else {
+        return Ok(());
+    };
+    write_shada(editor, machine, &path, false, &shada_text)
 }
 
 /// `shada_get_default_file` (`shada.c:1269-1277`): `nvim/shada/main.shada`
@@ -241,12 +281,46 @@ fn path_bytes(file: &Path) -> Vec<u8> {
 }
 
 fn store(file: &Path, bytes: &[u8]) -> Result<(), ShadaError> {
-    // os_fileio.c opens the shada file after os_file_mkdir to create the
-    // state tree; a first write into a fresh XDG state home must build it.
+    // os_file_mkdir builds the state tree with 0700 before the first write
+    // (shada.c:2780-2789); the file itself is always 0600 - it carries
+    // registers, marks, and history (kFileCreate|kFileTruncate, shada.c:2795).
     if let Some(parent) = file.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = create_private_dir(parent);
     }
-    std::fs::write(file, bytes).map_err(|error| system_error("opening", file, &error.to_string()))
+    let mut options = std::fs::File::options();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut handle = options
+        .open(file)
+        .map_err(|error| system_error("opening", file, &error.to_string()))?;
+    handle
+        .write_all(bytes)
+        .and_then(|()| handle.flush())
+        .map_err(|error| system_error("writing", file, &error.to_string()))
+}
+
+/// `create_dir_all` with upstream's 0700 (`os_mkdir_recurse`, shada.c:2780-2789):
+/// the shada tree is private to the user.
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if path.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(path)?;
+    let metadata = std::fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
 }
 
 /// Serializes editor state to `file` (`shada_write` + `shada_write_file`,
@@ -311,10 +385,28 @@ pub(crate) fn write_shada(
     } else {
         // shada.c:2560-2566: merge with the old file when it is readable.
         match std::fs::read(file) {
-            Ok(bytes) => match Stream::read(&bytes[..], cap) {
-                Ok(existing) => existing.merge(&fresh),
-                Err(_) => fresh,
-            },
+            Ok(bytes) => {
+                // A partially corrupt old file still merges its healthy
+                // entries (kSDReadStatusMalformed -> continue, shada.c:1796-
+                // 1799); only a fatal envelope error aborts the merge, and
+                // then the original is kept rather than clobbered
+                // (shada.c:2849-2860 refuses the rename for non-ShaDa).
+                let parsed = parse_stream(&bytes[..]);
+                if parsed.fatal.is_some() {
+                    return Ok(());
+                }
+                let mut existing = Stream {
+                    entries: Vec::new(),
+                };
+                for entry in parsed.entries.into_iter().flatten() {
+                    existing.entries.push(StreamEntry {
+                        type_id: entry.type_id,
+                        timestamp: entry.timestamp,
+                        data: entry.data,
+                    });
+                }
+                existing.merge(&fresh)
+            }
             Err(_) => fresh,
         }
     };
@@ -584,6 +676,7 @@ fn history_entries(
 /// One entry parsed from the stream, with its start position.
 struct RawEntry {
     position: u64,
+    timestamp: u64,
     type_id: u64,
     data: Value,
 }
@@ -622,7 +715,7 @@ fn parse_stream(bytes: &[u8]) -> ParsedStream {
                 break;
             }
         };
-        let _timestamp = match read_envelope_uint(&mut cursor, false) {
+        let timestamp = match read_envelope_uint(&mut cursor, false) {
             Ok(Some(value)) => value,
             Ok(None) => break,
             Err(error) => {
@@ -702,6 +795,7 @@ fn parse_stream(bytes: &[u8]) -> ParsedStream {
         }
         stream.entries.push(Ok(RawEntry {
             position: start,
+            timestamp,
             type_id,
             data,
         }));
@@ -900,6 +994,7 @@ impl ApplyState<'_, '_> {
     fn apply(&mut self, entry: RawEntry) {
         let RawEntry {
             position,
+            timestamp: _,
             type_id,
             data,
         } = entry;

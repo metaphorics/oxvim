@@ -228,6 +228,21 @@ impl Embedded {
     /// started; the child is killed before returning the error.
     pub fn spawn(program: &Path) -> Result<Self, String> {
         let mut command = Command::new(program);
+        let xdg_root = std::env::temp_dir().join(format!(
+            "oxvim-embed-{}-{}",
+            std::process::id(),
+            Embedded::next_spawn_id()
+        ));
+        for name in [
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+        ] {
+            let dir = xdg_root.join(name.split('_').next().unwrap_or(name).to_ascii_lowercase());
+            std::fs::create_dir_all(&dir).map_err(|error| format!("create {name}: {error}"))?;
+            command.env(name, &dir);
+        }
         command
             .arg("--embed")
             .env("OXVIM_RUNTIME", root().join("runtime"))
@@ -355,6 +370,15 @@ impl Embedded {
                 return Ok((message, stream));
             }
         }
+    }
+}
+
+impl Embedded {
+    fn next_spawn_id() -> u64 {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed)
     }
 }
 
