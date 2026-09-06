@@ -164,10 +164,17 @@ impl Keys {
     }
 }
 
-const KS_MODIFIER: u8 = 0xfc;
-const MOD_MASK_SHIFT: u8 = 0x02;
-const MOD_MASK_CTRL: u8 = 0x04;
-const MOD_MASK_ALT: u8 = 0x08;
+/// Prefix for a modifier byte applied to a following key (keycodes.h:44).
+pub const KS_MODIFIER: u8 = 0xfc;
+/// Shift modifier mask (keycodes.h:467).
+pub const MOD_MASK_SHIFT: u8 = 0x02;
+/// Ctrl modifier mask (keycodes.h:468).
+pub const MOD_MASK_CTRL: u8 = 0x04;
+/// Alt/Meta modifier mask (keycodes.h:469).
+pub const MOD_MASK_ALT: u8 = 0x08;
+/// META when distinct from ALT (keycodes.h:470; the notation parser folds
+/// `m` into ALT the way terminals deliver it).
+pub const MOD_MASK_META: u8 = 0x10;
 
 fn append_raw(output: &mut Vec<u8>, bytes: &[u8]) {
     for byte in bytes {

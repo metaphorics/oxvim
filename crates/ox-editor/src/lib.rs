@@ -103,8 +103,9 @@ pub use script::{
 };
 pub use search::{SearchDirection, SearchError, SearchOffset, SearchResult, SearchState};
 pub use typeahead::{
-    K_SPECIAL, KE_EVENT, KE_FILLER, KS_EXTRA, KS_SPECIAL, KS_ZERO, Key, KeyDecodeError, Keys,
-    Remap, Typeahead, TypeaheadError, TypeaheadFlags,
+    K_SPECIAL, KE_EVENT, KE_FILLER, KS_EXTRA, KS_MODIFIER, KS_SPECIAL, KS_ZERO, Key,
+    KeyDecodeError, Keys, MOD_MASK_ALT, MOD_MASK_CTRL, MOD_MASK_META, MOD_MASK_SHIFT, Remap,
+    Typeahead, TypeaheadError, TypeaheadFlags,
 };
 pub use userfunc::{
     CallFrame, FunctionSignature, MAX_FUNC_DEPTH, UserFunc, UserFuncError, UserFuncFlags,

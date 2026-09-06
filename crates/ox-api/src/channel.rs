@@ -268,9 +268,15 @@ fn proc_stat_field(pid: i64, field: usize) -> Option<String> {
 /// Gets info describing process `pid` (upstream `nvim_get_proc`,
 /// api/vim.c:1983-2015: NIL when not found, `{name, pid}` from the OS).
 #[api(since = 4)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "`#[api]` requires a `Result` return; upstream has no error path"
+)]
 pub fn nvim_get_proc(_session: &ApiSession, pid: i64) -> Result<Object, ApiError> {
+    // Upstream's VALIDATE_INT block returns NIL, not an error
+    // (api/vim.c:1988-1990).
     if !(pid > 0 && pid <= i32::MAX.into()) {
-        return Err(ApiError::validation(format!("Invalid pid: {pid}")));
+        return Ok(Object::Nil);
     }
     let Some(name) = std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .ok()
@@ -278,21 +284,33 @@ pub fn nvim_get_proc(_session: &ApiSession, pid: i64) -> Result<Object, ApiError
     else {
         return Ok(Object::Nil);
     };
+    // Upstream's helper reports {name, pid, ppid}
+    // (runtime/lua/vim/_core/editor.lua:215-219); ppid is stat field 4.
+    let parent = proc_stat_field(pid, 4)
+        .and_then(|field| field.trim().parse::<i64>().ok())
+        .unwrap_or(0);
     Ok(Object::Dict(Dict(vec![
         (
             OxStr::from("name"),
             Object::String(OxStr::from(name.as_bytes())),
         ),
         (OxStr::from("pid"), Object::Integer(pid)),
+        (OxStr::from("ppid"), Object::Integer(parent)),
     ])))
 }
 
 /// Gets the child process ids of `pid` (upstream `nvim_get_proc_children`,
 /// api/vim.c:1943-1977: syscall children listing, empty when none).
 #[api(since = 4)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "`#[api]` requires a `Result` return; upstream has no error path"
+)]
 pub fn nvim_get_proc_children(_session: &ApiSession, pid: i64) -> Result<Vec<Object>, ApiError> {
+    // Upstream's VALIDATE_INT block jumps to the empty-array end, not an
+    // error (api/vim.c:1949-1952).
     if !(pid > 0 && pid <= i32::MAX.into()) {
-        return Err(ApiError::validation(format!("Invalid pid: {pid}")));
+        return Ok(Vec::new());
     }
     // The kernel's /proc children listing needs CONFIG_PROC_CHILDREN; the
     // portable route upstream falls back to (a `ps` walk) is a PPID scan.

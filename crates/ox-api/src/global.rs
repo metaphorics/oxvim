@@ -5,9 +5,10 @@ use std::rc::Rc;
 
 use ox_editor::{
     AutocmdContext, BufferRelease, Editor, EditorError, Event, FocusContainer, K_SPECIAL,
-    KE_FILLER, KS_EXTRA, KS_SPECIAL, KS_ZERO, Keys, Message, MessageKind, OptionError,
-    OptionListKind, OptionMetadata, OptionScope, OptionType, OptionValue, TypeaheadFlags,
-    UserCommand, focus_transition,
+    KE_FILLER, KS_EXTRA, KS_MODIFIER, KS_SPECIAL, KS_ZERO, Keys, MOD_MASK_ALT, MOD_MASK_CTRL,
+    MOD_MASK_META, MOD_MASK_SHIFT, Message, MessageKind, OptionError, OptionListKind,
+    OptionMetadata, OptionScope, OptionType, OptionValue, TypeaheadFlags, UserCommand,
+    focus_transition,
 };
 use ox_excmd::ExCommand;
 use ox_types::{Special, Typval};
@@ -1210,50 +1211,64 @@ pub fn nvim_input_mouse(
     if !(row >= 0 && col >= 0 && grid >= 0) {
         return Err(ApiError::validation("invalid button or action"));
     }
-    let button = match button.as_bytes() {
-        b"left" => "Left",
-        b"middle" => "Middle",
-        b"right" => "Right",
-        b"wheel" => "ScrollWheel",
-        b"x1" => "X1",
-        b"x2" => "X2",
-        b"move" => "Move",
+    // (button, action) resolves to one KE_ extra-key code the way
+    // upstream's noremapbuf table does (keycodes.h:148-218; the wheel
+    // events are inverted there - Up is the wheel moved down).
+    let code = match (button.as_bytes(), action.as_bytes()) {
+        (b"left", b"press") => 44,
+        (b"left", b"drag") => 45,
+        (b"left", b"release") => 46,
+        (b"middle", b"press") => 47,
+        (b"middle", b"drag") => 48,
+        (b"middle", b"release") => 49,
+        (b"right", b"press") => 50,
+        (b"right", b"drag") => 51,
+        (b"right", b"release") => 52,
+        (b"x1", b"press") => 89,
+        (b"x1", b"drag") => 90,
+        (b"x1", b"release") => 91,
+        (b"x2", b"press") => 92,
+        (b"x2", b"drag") => 93,
+        (b"x2", b"release") => 94,
+        (b"wheel", b"up") => 76,
+        (b"wheel", b"down") => 75,
+        (b"wheel", b"left") => 77,
+        (b"wheel", b"right") => 78,
+        // (KE_MOUSEMOVE, keycodes.h:218).
+        (b"move", _) => 100,
         _ => return Err(ApiError::validation("invalid button or action")),
     };
-    let suffix = if button == "ScrollWheel" {
-        match action.as_bytes() {
-            b"up" => "Up",
-            b"down" => "Down",
-            b"left" => "Left",
-            b"right" => "Right",
+    // The modifier string carries the same letters as key notation, with
+    // optional '-' separators (os/input.c parses them into MOD_MASK bits;
+    // META keeps its distinct bit there, keycodes.h:470).
+    let mut mask = 0u8;
+    for byte in modifier.as_bytes().to_ascii_lowercase() {
+        match byte {
+            b'-' => {}
+            b'c' => mask |= MOD_MASK_CTRL,
+            b's' => mask |= MOD_MASK_SHIFT,
+            b'a' => mask |= MOD_MASK_ALT,
+            b'm' => mask |= MOD_MASK_META,
             _ => return Err(ApiError::validation("invalid button or action")),
         }
-    } else if button == "Move" {
-        // `move` ignores its action, matching upstream's doc note.
-        "Mouse"
-    } else {
-        match action.as_bytes() {
-            b"press" => "Mouse",
-            b"drag" => "Drag",
-            b"release" => "Release",
-            _ => return Err(ApiError::validation("invalid button or action")),
-        }
-    };
-    // Modifier chars accept the optional '-' separators of key notation
-    // (upstream parses "C-A-", "c-a", "CA" alike for the mask).
-    let mut prefix = String::new();
-    for byte in modifier.as_bytes() {
-        if *byte == b'-' {
-            continue;
-        }
-        prefix.push(char::from(byte.to_ascii_uppercase()));
     }
-    let sequence = format!("<{prefix}{button}{suffix}><{row},{col}>");
-    let encoded = Keys::encode(sequence.as_bytes());
+    let mut encoded = Vec::new();
+    if mask != 0 {
+        encoded.extend_from_slice(&[K_SPECIAL, KS_MODIFIER, mask]);
+    }
+    let key = Keys::special(KS_EXTRA, code)
+        .map_err(|_| ApiError::exception("mouse key code out of the special-key range"))?;
+    encoded.extend_from_slice(key.as_bytes());
+    // Upstream stores grid/row/col in the mouse state the key handler
+    // reads (os/input.c:486-511) and never in the key bytes. The port's
+    // normal-mode mouse consumer is not wired yet; the coordinates are
+    // validated here and carried by the event when that lands.
+    let key = Keys::from_encoded(encoded)
+        .map_err(|_| ApiError::exception("mouse key code out of the special-key range"))?;
     session.with_editor_mut(|editor| {
         editor
             .typeahead_mut()
-            .append(&encoded, TypeaheadFlags::default());
+            .append(&key, TypeaheadFlags::default());
     });
     Ok(())
 }
@@ -2589,6 +2604,8 @@ pub fn nvim_parse_expression(
         }
     }
     let source = expr.as_bytes();
+    // On a parse failure `len` reports the prefix consumed before the
+    // error, the length upstream's parser reports (api/vimscript.c:491).
     let mut consumed = source.len();
     let mut parsed = ox_eval::Parser::new(source)
         .with_max_nesting(MAX_CONVERSION_DEPTH)
@@ -2607,9 +2624,13 @@ pub fn nvim_parse_expression(
         .with_max_nesting(MAX_CONVERSION_DEPTH)
         .parse();
     }
+    let reported = match &parsed {
+        Ok(_) => consumed,
+        Err(error) => error.offset.min(consumed),
+    };
     let mut result = Dict(vec![(
         OxStr::from("len"),
-        Object::Integer(i64::try_from(consumed).map_err(exception)?),
+        Object::Integer(i64::try_from(reported).map_err(exception)?),
     )]);
     let ast = match parsed {
         Ok(node) => expression_api_node(&node, source, 0)?,
@@ -2820,7 +2841,9 @@ fn check_stl_option(statusline: &[u8]) -> Result<(), ApiError> {
         }
         if *item == b')' {
             offset = offset.saturating_add(1);
-            depth = depth.saturating_sub(1);
+            // A real decrement: saturating_sub clamped at zero and made
+            // the E542 break unreachable (optionstr.c:305-348 goes to -1).
+            depth -= 1;
             if depth < 0 {
                 break;
             }
@@ -3136,39 +3159,24 @@ pub fn nvim_eval_statusline(
                 builder.push_item(&rendered, false);
                 break;
             }
-            b'(' | b')' | b'@' | b'T' | b'X' | b'C' | b'S' => {
-                if item == b'@' {
-                    let end = format
-                        .get(offset..)
-                        .and_then(|rest| rest.iter().position(|byte| *byte == b'@'))
-                        .map(|position| offset.saturating_add(position));
-                    let Some(end) = end else { break };
-                    offset = end.saturating_add(1);
-                }
-            }
-            b'0'..=b'9' => {
+            b'@' => {
                 let end = format
                     .get(offset..)
-                    .and_then(|rest| rest.iter().position(|byte| !byte.is_ascii_digit()))
-                    .map_or(format.len(), |position| offset.saturating_add(position));
-                let digits = format.get(offset..end).unwrap_or_default();
-                if digits.len() == 1 && matches!(format.get(end), Some(b'(') | None) {
-                    builder.close_highlight();
-                    let group = OxStr::from(format!("User{}", char::from(digits[0])).as_bytes());
-                    builder.current_groups = vec![group];
-                } else if digits.len() == 1 {
-                    let value = i64::from(digits[0])
-                        .checked_sub(i64::from(b'0'))
-                        .ok_or_else(|| exception("Invalid user highlight"))?;
-                    builder.push_item(value.to_string().as_bytes(), false);
-                }
-                offset = end;
-                if format.get(offset).is_some_and(u8::is_ascii_digit) {
-                    offset = offset.saturating_add(1);
-                }
+                    .and_then(|rest| rest.iter().position(|byte| *byte == b'@'))
+                    .map(|position| offset.saturating_add(position));
+                let Some(end) = end else { break };
+                offset = end.saturating_add(1);
             }
+            // Digits are a width for the item that follows
+            // (statusline.c:1279-1312 parses '-'/'0' digits '.' digits
+            // BEFORE the item char); they flow through the general arm, so
+            // `%1*`, `%1(`, and `%3T` parse as width + item instead of
+            // literal digits.
             _ => {
-                let mut cursor = offset;
+                // The outer match already consumed `item`; back up so the
+                // first char (a '-', '0', or leading digit of the minwid
+                // run) is parsed as part of the width grammar.
+                let mut cursor = offset.saturating_sub(1);
                 if format.get(cursor) == Some(&b'-') {
                     cursor = cursor.saturating_add(1);
                 }
@@ -3343,6 +3351,38 @@ pub fn nvim_eval_statusline(
                     b'N' => {
                         numeric = true;
                     }
+                    b'*' => {
+                        // Width switches the user highlight: `%N*` sets
+                        // UserN, bare `%*` restores (statusline.c:1312).
+                        let switched = match minwid {
+                            0 => None,
+                            value => Some(format!("User{value}")),
+                        };
+                        match switched {
+                            Some(group) => {
+                                let group = OxStr::from(group.as_bytes());
+                                builder.current_groups = vec![group];
+                            }
+                            None => builder.close_highlight(),
+                        }
+                        continue;
+                    }
+                    b'(' => {
+                        // `%N(` opens a group whose minwid is its width;
+                        // the builder's group machinery owns the nesting.
+                        let group = OxStr::from(format!("User{}", minwid.max(0)).as_bytes());
+                        builder.current_groups.push(group);
+                        continue;
+                    }
+                    b')' => {
+                        builder.close_highlight();
+                        continue;
+                    }
+                    // Tabline items carry their tab number in minwid
+                    // (statusline_defs.h:44-52). The port has no tabline
+                    // evaluator yet; they parse, render empty, and wait
+                    // for that consumer.
+                    b'T' | b'X' | b'C' | b'S' => {}
                     other => {
                         return Err(ApiError::validation(format!(
                             "E539: Illegal character <{}>",
@@ -3362,8 +3402,7 @@ pub fn nvim_eval_statusline(
                 let minimum = usize::try_from(minwid.unsigned_abs()).unwrap_or(usize::MAX);
                 if minwid > 0 && width < minimum {
                     let pad = minimum.saturating_sub(width);
-                    let fill = fillchar.repeat(pad);
-                    text.splice(0..0, fill);
+                    text.splice(0..0, fillchar.repeat(pad));
                 } else if minwid < 0 && width < minimum {
                     let pad = minimum.saturating_sub(width);
                     text.extend(fillchar.repeat(pad));
