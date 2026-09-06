@@ -30,13 +30,12 @@ fn sync_edit_mode(session: &ApiSession, buffer: BufHandle) -> BufferEditMode {
         })
         .unwrap_or(false);
     let saved = session.with_editor(Editor::edit_mode);
-    let new_mode = if insert
-        && session.with_editor(|editor| editor.current_buffer() == Some(buffer))
-    {
-        BufferEditMode::Insert
-    } else {
-        BufferEditMode::Normal
-    };
+    let new_mode =
+        if insert && session.with_editor(|editor| editor.current_buffer() == Some(buffer)) {
+            BufferEditMode::Insert
+        } else {
+            BufferEditMode::Normal
+        };
     session.with_editor_mut(|editor| editor.set_edit_mode(new_mode));
     saved
 }
