@@ -61,7 +61,7 @@ use crate::typeahead::{Keys, Remap, TypeaheadFlags, special_notation};
 use crate::userfunc::{UserFuncError, UserFunctions};
 use crate::{
     BufferRelease, ChannelIds, DirectoryError, DirectoryScope, Editor, EditorError, Geometry,
-    JobEvent, JobManager, Message, MessageKind, Mode, ModeMachine,
+    JobEvent, JobManager, Message, MessageKind, Mode, ModeMachine, ServerHost,
 };
 
 /// `FILETYPE_FILE` … `INDOFF_FILE` (`globals.h:37-60`): the runtime files
@@ -688,6 +688,10 @@ pub(crate) struct ExRuntime<F: FileIO> {
     pub(crate) const_vars: BTreeSet<String>,
     pub(crate) channel_ids: ChannelIds,
     pub(crate) jobs: Option<JobManager>,
+    /// Process-level listen machinery for the `serverstart`/`serverstop`/
+    /// `serverlist` builtins, installed by the embedder at startup; `None`
+    /// where no event loop serves the process.
+    pub(crate) servers: Option<Box<dyn ServerHost>>,
     pub(crate) current_augroup: AugroupId,
     /// Whether the built-in `nvim.terminal` `TermClose` exit message is active.
     pub(crate) terminal_exit_message: bool,
@@ -764,6 +768,7 @@ impl<F: FileIO> ExRuntime<F> {
             const_vars: BTreeSet::new(),
             channel_ids: ChannelIds::new(),
             jobs: None,
+            servers: None,
             current_augroup: AugroupId::default(),
             terminal_exit_message: true,
             redirection: None,
@@ -1392,6 +1397,12 @@ impl<F: FileIO> ExExecutor<F> {
     /// real mode state and mode changes persist after the command returns.
     pub fn set_mode_machine(&mut self, machine: Rc<RefCell<ModeMachine>>) {
         self.runtime.mode_machine = Some(machine);
+    }
+
+    /// Installs the process-level listen machinery the `serverstart`/
+    /// `serverstop`/`serverlist` builtins resolve through.
+    pub fn set_server_host(&mut self, host: Box<dyn ServerHost>) {
+        self.runtime.servers = Some(host);
     }
 
     /// Write bytes to a job channel's standard input or PTY master.
@@ -2977,6 +2988,8 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
             // contract here is "succeeds without output".
             Flow::Normal
         }
+        "wshada" | "wviminfo" => command_wshada(runtime, access, command),
+        "rshada" | "rviminfo" => command_rshada(runtime, access, command),
         "iabbrev" => command_iabbrev(runtime, access, scope, command),
         "abclear" => {
             // `:abclear` removes abbreviations in both scopes (ex_cmds.lua
@@ -17762,4 +17775,53 @@ fn command_quickfix_apply<F: FileIO>(
         }
     }
     Flow::Normal
+}
+/// `:wshada`/`:wviminfo` (`ex_shada`, `ex_docmd.c:7861-7873`).
+fn command_wshada<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    command: &ExCommand,
+) -> Flow {
+    run_shada_command(runtime, access, command, false)
+}
+
+/// `:rshada`/`:rviminfo` (`ex_shada`, `ex_docmd.c:7861-7873`).
+fn command_rshada<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    command: &ExCommand,
+) -> Flow {
+    run_shada_command(runtime, access, command, true)
+}
+
+/// Shared `ex_shada` body: resolve the file, apply the empty-`'shada'`
+/// override, and report failures as upstream messages. `read` distinguishes
+/// `:rshada` from `:wshada`; `command.bang` is upstream `forceit`/`nomerge`.
+fn run_shada_command<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    command: &ExCommand,
+    read: bool,
+) -> Flow {
+    let bang = command.bang;
+    let machine = runtime.mode_machine.clone();
+    let outcome = access.with_ex_editor(|editor| {
+        let shada_text = crate::shada::shada_text(editor);
+        let params = crate::shada::ShadaParams::new(&shada_text);
+        let Some(path) = crate::shada::resolve_file(editor, command.args.trim(), &params) else {
+            // `shada_filename` returned NULL: `-i NONE`/`--clean` disable ShaDa.
+            return Ok(());
+        };
+        if read {
+            let mut borrowed = machine.as_ref().map(|machine| machine.borrow_mut());
+            crate::shada::read_shada(editor, borrowed.as_deref_mut(), &path, bang, &shada_text)
+        } else {
+            let borrowed = machine.as_ref().map(|machine| machine.borrow());
+            crate::shada::write_shada(editor, borrowed.as_deref(), &path, bang, &shada_text)
+        }
+    });
+    match outcome {
+        Ok(()) => Flow::Normal,
+        Err(error) => error_flow(runtime, error.code, error.message),
+    }
 }

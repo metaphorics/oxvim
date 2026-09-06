@@ -382,6 +382,25 @@ impl ModeMachine {
             .map(String::as_str)
     }
 
+    /// Returns the Ex command-line history, oldest first (`shada.c` dumps it
+    /// on `:wshada`).
+    #[must_use]
+    pub fn cmdline_history_entries(&self) -> &[String] {
+        &self.cmdline_history
+    }
+
+    /// Replaces the Ex command-line history (`shada.c` rebuilds it on
+    /// `:rshada`).
+    pub fn set_cmdline_history(&mut self, history: Vec<String>) {
+        self.cmdline_history = history;
+    }
+
+    /// Restores the last search pattern (`shada.c` `set_search_pattern`,
+    /// applied by `:rshada`).
+    pub fn restore_search_pattern(&mut self, pattern: String, backward: bool) {
+        self.search.restore(pattern, backward);
+    }
+
     /// Enters Insert mode at the current cursor.
     pub fn enter_insert(&mut self) {
         self.mode = Mode::Insert(InsertState);

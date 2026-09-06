@@ -86,6 +86,23 @@ impl SearchState {
         self.pattern.as_deref()
     }
 
+    /// Returns the retained search direction, if a pattern exists.
+    #[must_use]
+    pub const fn last_direction(&self) -> Option<SearchDirection> {
+        self.direction
+    }
+
+    /// Restores a retained pattern from a `ShaDa` search-pattern entry
+    /// (`shada.c` `set_search_pattern`, applied by `:rshada`).
+    pub fn restore(&mut self, pattern: String, backward: bool) {
+        self.pattern = Some(pattern);
+        self.direction = Some(if backward {
+            SearchDirection::Backward
+        } else {
+            SearchDirection::Forward
+        });
+    }
+
     /// Executes and retains a new search expression.
     ///
     /// # Errors

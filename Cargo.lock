@@ -580,6 +580,7 @@ dependencies = [
  "ox-text",
  "ox-types",
  "ox-uv",
+ "rmpv",
  "similar",
  "thiserror 2.0.20",
  "unicode-width",

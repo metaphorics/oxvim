@@ -21,6 +21,7 @@ pub(crate) mod process;
 pub(crate) mod quickfix;
 pub(crate) mod register;
 pub(crate) mod search;
+pub(crate) mod server;
 pub(crate) mod tag;
 pub(crate) mod window;
 
@@ -69,6 +70,8 @@ pub(crate) enum Family {
     Match,
     /// Tags-file queries, served by [`tag`].
     Tag,
+    /// The listening-RPC server, served by [`server`].
+    Server,
 }
 
 /// Maps a builtin name to the family that serves it, or `None` when the name
@@ -109,6 +112,7 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         "matchadd" | "matchaddpos" | "matchdelete" | "clearmatches" | "getmatches"
         | "setmatches" | "matcharg" => Family::Match,
         "taglist" | "gettagstack" | "settagstack" => Family::Tag,
+        "serverstart" | "serverstop" | "serverlist" => Family::Server,
         _ => return predicate_family(name),
     };
     Some(family)
@@ -158,6 +162,7 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         Family::Completion => host
             .access
             .with_ex_editor(|editor| completion::call(editor, name, args)),
+        Family::Server => server::call(host, name, args, scope),
         Family::Match => host
             .access
             .with_ex_editor(|editor| matches::call(editor, name, args)),

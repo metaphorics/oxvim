@@ -34,6 +34,8 @@ pub mod quickfix;
 pub mod register;
 pub mod script;
 pub mod search;
+pub mod server;
+pub mod shada;
 pub mod tags;
 pub mod textobject;
 pub mod typeahead;
@@ -103,6 +105,7 @@ pub use script::{
     ScriptError, ScriptInfo, Sid, SourceFrame, StdPath, default_runtimepath, stdpath,
 };
 pub use search::{SearchDirection, SearchError, SearchOffset, SearchResult, SearchState};
+pub use server::{ServerHost, prepare_server_address, server_address_new};
 pub use typeahead::{
     K_SPECIAL, KE_EVENT, KE_FILLER, KS_EXTRA, KS_MODIFIER, KS_SPECIAL, KS_ZERO, Key,
     KeyDecodeError, Keys, MOD_MASK_ALT, MOD_MASK_CTRL, MOD_MASK_META, MOD_MASK_SHIFT, Remap,

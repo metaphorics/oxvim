@@ -17,8 +17,8 @@ use ox_editor::job::JobEvent;
 use ox_editor::{
     AutocmdAction, AutocmdContext, AutocmdKind, ChannelIds, CmdlineKind, Editor, Event, ExExecutor,
     ExecError, ExecOutcome, Geometry, Keys, LuaExec, LuaExecError, MessageDestination, MessageKind,
-    Mode, ModeMachine, OptionValue, PendingEditMode, TypeaheadFlags, UserCommand, VisualKind,
-    vim_variable_is_writable,
+    Mode, ModeMachine, OptionValue, PendingEditMode, ServerHost, TypeaheadFlags, UserCommand,
+    VisualKind, vim_variable_is_writable,
 };
 use ox_lua::{
     ApiDispatchContext, BuiltinHost, EventLoopPump, LuaHost, RuntimeRoot as LuaRuntimeRoot,
@@ -32,6 +32,8 @@ use ox_ui::{
     CmdlineState as UiCmdlineState, Compositor, ContentChunk, Emitter, Highlight, HlAttrs,
     MessageState, RedrawOutput, UiOptions,
 };
+#[cfg(unix)]
+use ox_uv::dns;
 #[cfg(unix)]
 use ox_uv::net::Pipe;
 use ox_uv::{Handle, HandleId, NetEvent, RunMode, Tcp, UvLoop};
@@ -1645,7 +1647,19 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
 
     #[cfg(unix)]
     {
-        let runtime = Rc::new(RefCell::new(NetworkRuntime::new(state.clone())));
+        let accept_uv = Rc::new(RefCell::new(
+            UvLoop::new().map_err(|error| AppError::Server(error.to_string()))?,
+        ));
+        let runtime = Rc::new(RefCell::new(NetworkRuntime::new(
+            state.clone(),
+            Rc::clone(&accept_uv),
+        )));
+        let listen_server = ListenServer::new(&runtime)?;
+        state
+            .borrow()
+            .ex
+            .borrow_mut()
+            .set_server_host(Box::new(listen_server.clone()));
         let mut uv_loop = UvLoop::new().map_err(|error| AppError::Server(error.to_string()))?;
         let stdio_poll = bind_stdio(&mut uv_loop, &runtime)?;
         let timer =
@@ -1654,6 +1668,15 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
         timer
             .start(&mut uv_loop, 1, 10, move |uv_loop, _| {
                 callback_runtime.borrow_mut().poll_background(uv_loop)
+            })
+            .map_err(|error| AppError::Server(error.to_string()))?;
+        let pump_timer =
+            ox_uv::Timer::new(&mut uv_loop).map_err(|error| AppError::Server(error.to_string()))?;
+        let pump_server = listen_server.clone();
+        pump_timer
+            .start(&mut uv_loop, 1, 10, move |_, _| {
+                pump_server.pump();
+                Ok(())
             })
             .map_err(|error| AppError::Server(error.to_string()))?;
         let run_result = uv_loop
@@ -1665,9 +1688,14 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
         let timer_close = timer
             .close(&mut uv_loop)
             .map_err(|error| AppError::Server(error.to_string()));
+        let pump_close = pump_timer
+            .close(&mut uv_loop)
+            .map_err(|error| AppError::Server(error.to_string()));
         run_result?;
         poll_close?;
         timer_close?;
+        pump_close?;
+        listen_server.close_all();
         if let Some(error) = runtime.borrow_mut().error.take() {
             return Err(AppError::Server(error));
         }
@@ -1686,6 +1714,26 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
 
 /// Serve RPC peers accepted from a TCP address or Unix-domain pipe.
 /// Returns the process exit code requested by `:cquit` (0 otherwise).
+/// A listen value without `:`, `/` or `\\` is a NAME: it joins the runtime
+/// directory as `<dir>/<name>.<pid>.<counter>` (`server_address_new`,
+/// #8519), with the uid-owned-directory checks `ensure_listen_directory`
+/// applies; anything else binds verbatim.
+fn expand_listen_address(address: &str) -> Result<String, AppError> {
+    static LISTEN_NAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if address.contains([':', '/', '\\']) {
+        return Ok(address.to_owned());
+    }
+    let counter = LISTEN_NAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = format!("{}.{}.{counter}", address, std::process::id());
+    let directory = std::path::PathBuf::from(
+        ox_editor::stdpath(ox_editor::StdPath::Run)
+            .first()
+            .map_or("/tmp", String::as_str),
+    );
+    let directory = ensure_listen_directory(&directory)?;
+    Ok(directory.join(name).to_string_lossy().into_owned())
+}
+
 pub fn run_listener(cli: &Cli, address: &str, timer: &mut StartupTimer) -> Result<i64, AppError> {
     let state = Rc::new(RefCell::new(AppState::new(cli, timer)?));
     // main.c getout(): a startup command that quits ends the process before
@@ -1694,48 +1742,32 @@ pub fn run_listener(cli: &Cli, address: &str, timer: &mut StartupTimer) -> Resul
         state.borrow_mut().run_exit()?;
         return Ok(state.borrow().exit_code());
     }
-    let runtime = Rc::new(RefCell::new(NetworkRuntime::new(state)));
+    let accept_uv = Rc::new(RefCell::new(
+        UvLoop::new().map_err(|error| AppError::Server(error.to_string()))?,
+    ));
+    let runtime = Rc::new(RefCell::new(NetworkRuntime::new(
+        state.clone(),
+        Rc::clone(&accept_uv),
+    )));
+    let listen_server = ListenServer::new(&runtime)?;
+    state
+        .borrow()
+        .ex
+        .borrow_mut()
+        .set_server_host(Box::new(listen_server.clone()));
     let mut uv_loop = UvLoop::new().map_err(|error| AppError::Server(error.to_string()))?;
-    let callback_runtime = runtime.clone();
-    let callback = move |uv_loop: &mut UvLoop, id: HandleId, event: NetEvent| {
-        handle_network_event(&callback_runtime, uv_loop, id, event);
-    };
     // Upstream `server_start`: a listen value without ':' or '/' is a NAME,
     // not a path — it is appended to a generated per-process address
     // (`server_address_new`: `<stdpath run>/<name>.<pid>.<counter>`), so
     // same-named listeners in one process tree never collide (#8519).
-    let expanded;
-    let address = if address.contains([':', '/', '\\']) {
-        address
-    } else {
-        static LISTEN_NAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let counter = LISTEN_NAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let name = format!("{}.{}.{counter}", address, std::process::id());
-        let mut directory = std::path::PathBuf::from(
-            ox_editor::stdpath(ox_editor::StdPath::Run)
-                .first()
-                .map_or("/tmp", String::as_str),
-        );
-        // A bare temp dir is world-writable: never place a generated listen
-        // socket there directly. Upstream validates its uid-owned 0700 tempdir
-        // (`/tmp/nvim.<user>`, os/fileio.c:3340-3363) but uses $XDG_RUNTIME_DIR
-        // as-is (msgpack_rpc/server.c:126; os/stdpaths.c:182-186). Apply the
-        // same checks and fall back to the private tempdir if they fail.
-        directory = ensure_listen_directory(&directory)?;
-        expanded = directory.join(name).to_string_lossy().into_owned();
-        expanded.as_str()
-    };
-    let listener = if let Ok(socket) = address.parse::<SocketAddr>() {
-        let mut listener = Tcp::bind(&mut uv_loop, socket, callback)
-            .map_err(|error| AppError::Server(error.to_string()))?;
-        listener
-            .listen(&mut uv_loop, 128)
-            .map_err(|error| AppError::Server(error.to_string()))?;
-        Listener::Tcp(listener)
-    } else {
-        bind_pipe(&mut uv_loop, address, callback)?
-    };
-    let servername = listener.servername()?;
+    let address = expand_listen_address(address)?;
+    // The startup listener binds through the same `ServerHost` the builtins
+    // use, so `serverlist()`/`serverstop()` see it (upstream keeps it in the
+    // same `watchers` array, `server.c:203-204`).
+    let mut server = listen_server.clone();
+    let servername = server
+        .start(&address)
+        .map_err(|error| AppError::Server(format!("Failed to start server: {error}")))?;
     let state = runtime.borrow().state.clone();
     state.borrow().session.with_editor_mut(|editor| {
         editor.vvars_mut().insert(
@@ -1763,10 +1795,32 @@ pub fn run_listener(cli: &Cli, address: &str, timer: &mut StartupTimer) -> Resul
             callback_runtime.borrow_mut().poll_background(uv_loop)
         })
         .map_err(|error| AppError::Server(error.to_string()))?;
+    // The accept pump: every listener — the startup server included — lives
+    // on the accept loop, so this timer is what accepts and serves peers.
+    let pump_timer =
+        ox_uv::Timer::new(&mut uv_loop).map_err(|error| AppError::Server(error.to_string()))?;
+    let pump_server = listen_server.clone();
+    let pump_state = runtime.borrow().state.clone();
+    pump_timer
+        .start(&mut uv_loop, 1, 10, move |uv_loop, _| {
+            pump_server.pump();
+            // A peer's `qa!` lands on the accept loop; only this timer sees
+            // it from the main loop, so the exit decision must stop the main
+            // loop here or the run never ends (upstream: the main loop's own
+            // event processing performs the exit).
+            if pump_state.borrow().should_exit() {
+                uv_loop.stop();
+            }
+            Ok(())
+        })
+        .map_err(|error| AppError::Server(error.to_string()))?;
     let run_result = uv_loop
         .run(RunMode::Default)
         .map_err(|error| AppError::Server(error.to_string()));
     let timer_close_result = background_timer
+        .close(&mut uv_loop)
+        .map_err(|error| AppError::Server(error.to_string()));
+    let pump_close_result = pump_timer
         .close(&mut uv_loop)
         .map_err(|error| AppError::Server(error.to_string()));
     #[cfg(unix)]
@@ -1776,17 +1830,15 @@ pub fn run_listener(cli: &Cli, address: &str, timer: &mut StartupTimer) -> Resul
                 .map_err(|error| AppError::Server(error.to_string()))
         })
         .transpose();
-    let close_result = listener
-        .close(&mut uv_loop)
-        .map_err(|error| AppError::Server(error.to_string()));
     run_result?;
     timer_close_result?;
+    pump_close_result?;
     #[cfg(unix)]
     stdio_close_result?;
     if let Some(error) = runtime.borrow_mut().error.take() {
         return Err(AppError::Server(error));
     }
-    close_result?;
+    listen_server.close_all();
     state.borrow_mut().run_exit()?;
     Ok(state.borrow().exit_code())
 }
@@ -1958,7 +2010,360 @@ fn ensure_listen_directory(directory: &std::path::Path) -> Result<std::path::Pat
     }
 }
 
-#[allow(dead_code)]
+/// One listening socket owned by the accept loop: the effective bound
+/// address paired with its uv handle.
+struct ListenEntry {
+    address: String,
+    listener: Listener,
+}
+
+/// A `ServerHost` request the accept loop could not run synchronously,
+/// because the caller dispatched from a peer the loop itself serves. The
+/// next pump drains it.
+enum PendingListen {
+    Start(String),
+    Stop(String),
+}
+
+/// The dispatch closure every listener handle shares, `Rc`-shared across
+/// bind attempts (`Tcp::bind`/`Pipe::bind` consume their callback by
+/// value).
+type SharedNetCallback = Rc<RefCell<Box<dyn FnMut(&mut UvLoop, HandleId, NetEvent) + 'static>>>;
+
+/// The `ox_editor::ServerHost` the `serverstart()`/`serverstop()`/
+/// `serverlist()` builtins resolve through. Upstream keeps every watcher in
+/// the `watchers` array of `msgpack_rpc/server.c` and binds on the main
+/// loop; this port's builtin dispatch never holds `&mut UvLoop`, so every
+/// listener — the `--listen` startup server included — binds on a private
+/// accept loop instead.
+///
+/// Binding itself is synchronous (`Tcp::bind`/`Pipe::bind` create their
+/// sockets before attaching to the loop), so `serverstart()` resolves a
+/// random TCP port and reports bind failures at the call site exactly as
+/// upstream does. Only accepts, reads and writes wait for the 10 ms pump on
+/// the main loop, and accepted peers adopt the shared [`NetworkRuntime`]
+/// machinery — `accept`, `remove_peer`, the msgpack decoder, channel
+/// registration — so RPC over a `serverstart()`-created socket behaves like
+/// RPC over `--listen` (`connection_cb` -> `channel_from_connection`,
+/// `server.c:274-282`).
+#[derive(Clone)]
+struct ListenServer {
+    runtime: Rc<RefCell<NetworkRuntime>>,
+    uv: Rc<RefCell<UvLoop>>,
+    listeners: Rc<RefCell<Vec<ListenEntry>>>,
+    pending: Rc<RefCell<Vec<PendingListen>>>,
+}
+
+impl ListenServer {
+    fn new(runtime: &Rc<RefCell<NetworkRuntime>>) -> Result<Self, AppError> {
+        Ok(Self {
+            runtime: Rc::clone(runtime),
+            uv: Rc::new(RefCell::new(
+                UvLoop::new().map_err(|error| AppError::Server(error.to_string()))?,
+            )),
+            listeners: Rc::new(RefCell::new(Vec::new())),
+            pending: Rc::new(RefCell::new(Vec::new())),
+        })
+    }
+
+    /// The accept pump: one non-blocking turn of the accept loop, then any
+    /// requests queued while the loop was busy. Driven by a timer on the
+    /// main loop, whose callbacks serialize every borrow of `uv`.
+    fn pump(&self) {
+        if let Ok(mut uv) = self.uv.try_borrow_mut() {
+            let _ = uv.run(RunMode::NoWait);
+        }
+        for op in std::mem::take(&mut *self.pending.borrow_mut()) {
+            match op {
+                PendingListen::Start(address) => {
+                    let mut server = self.clone();
+                    if let Err(error) = server.start(&address) {
+                        let session = self.runtime.borrow().state.borrow().session.clone();
+                        report_server_error(&session, &format!("Failed to start server: {error}"));
+                    }
+                }
+                PendingListen::Stop(address) => self.close_entry(&address),
+            }
+        }
+    }
+
+    /// Removes `address` from the registry and closes its handle on the
+    /// accept loop (`socket_watcher_close` + swap-remove, `server.c:241-248`).
+    fn close_entry(&self, address: &str) {
+        let entry = {
+            let mut listeners = self.listeners.borrow_mut();
+            listeners
+                .iter()
+                .position(|entry| entry.address == address)
+                .map(|index| listeners.remove(index))
+        };
+        if let Some(entry) = entry
+            && let Ok(mut uv) = self.uv.try_borrow_mut()
+        {
+            let _ = entry.listener.close(&mut uv);
+        }
+    }
+
+    /// The dispatch closure every listener handle shares: accepted peers
+    /// land in the same [`NetworkRuntime`] as `--listen` peers.
+    fn shared_callback(&self) -> SharedNetCallback {
+        let runtime = Rc::clone(&self.runtime);
+        Rc::new(RefCell::new(Box::new(move |uv_loop, id, event| {
+            handle_network_event(&runtime, uv_loop, id, event);
+        })))
+    }
+
+    /// Closes every listener on the accept loop; process shutdown.
+    fn close_all(&self) {
+        let entries = std::mem::take(&mut *self.listeners.borrow_mut());
+        if let Ok(mut uv) = self.uv.try_borrow_mut() {
+            for entry in entries {
+                let _ = entry.listener.close(&mut uv);
+            }
+            // Flush deferred closes so bound pipe paths unlink before exit.
+            let _ = uv.run(RunMode::NoWait);
+        }
+    }
+}
+
+impl ServerHost for ListenServer {
+    fn start(&mut self, address: &str) -> Result<String, String> {
+        if address.is_empty() {
+            // `server_start` (`server.c:168-171`): an empty address is a
+            // validation failure, reported through the `result > 0` branch
+            // of `f_serverstart`.
+            return Err("Unknown system error".into());
+        }
+        if self
+            .listeners
+            .borrow()
+            .iter()
+            .any(|entry| entry.address == address)
+        {
+            // Already listening on this address (`server.c:184-193`) ->
+            // result 2, also the `result > 0` branch.
+            return Err("Unknown system error".into());
+        }
+        let Ok(mut uv) = self.uv.try_borrow_mut() else {
+            // Re-entered from a peer this loop serves: the bind waits for
+            // the next pump, and the requested address is returned
+            // unresolved — an ephemeral-port TCP endpoint reports its port
+            // only once the pump has bound it.
+            self.pending
+                .borrow_mut()
+                .push(PendingListen::Start(address.to_owned()));
+            return Ok(address.to_owned());
+        };
+        let callback = self.shared_callback();
+        let (bound, listener) = match tcp_endpoint(address) {
+            Some((host, port)) => start_tcp(&mut uv, host, port, &callback)?,
+            None => start_pipe(&mut uv, address, &callback)?,
+        };
+        self.listeners.borrow_mut().push(ListenEntry {
+            address: bound.clone(),
+            listener,
+        });
+        Ok(bound)
+    }
+
+    fn stop(&mut self, address: &str) -> bool {
+        let found = self
+            .listeners
+            .borrow()
+            .iter()
+            .any(|entry| entry.address == address);
+        if !found {
+            return false;
+        }
+        if self.uv.try_borrow_mut().is_err() {
+            // Busy accept loop: drop the entry now (the registry stays
+            // truthful for `serverlist()`), defer the uv close.
+            self.pending
+                .borrow_mut()
+                .push(PendingListen::Stop(address.to_owned()));
+            return true;
+        }
+        self.close_entry(address);
+        true
+    }
+
+    fn list(&self) -> Vec<String> {
+        self.listeners
+            .borrow()
+            .iter()
+            .map(|entry| entry.address.clone())
+            .collect()
+    }
+}
+
+/// Splits a TCP endpoint at its last colon (`socket_address_tcp_host_end`,
+/// `event/socket.c:29-43`): a leading colon is not a host/port split, and a
+/// Windows drive-letter path (`X:/...`) is a pipe path, not TCP.
+#[must_use]
+fn tcp_endpoint(address: &str) -> Option<(&str, &str)> {
+    let bytes = address.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/' {
+        return None;
+    }
+    let index = address.rfind(':')?;
+    (index > 0).then_some((&address[..index], &address[index + 1..]))
+}
+
+/// Parses the port half of a TCP endpoint (`try_getdigits`,
+/// `event/socket.c:55-58`): empty means "assign a random port"; anything
+/// but digits in range is upstream's `UV_EINVAL`, "invalid argument".
+fn parse_tcp_port(port: &str) -> Result<u16, String> {
+    if port.is_empty() {
+        return Ok(0);
+    }
+    port.parse::<u16>()
+        .map_err(|_| "invalid argument".to_owned())
+}
+
+/// Maps a bind/listen failure to the `%s` suffix of upstream's
+/// `Failed to start server: %s` (`eval/funcs.c:6243`), using the
+/// `uv_strerror` texts the gated specs assert.
+fn bind_error_text(error: &std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "no such file or directory".into(),
+        std::io::ErrorKind::PermissionDenied => "permission denied".into(),
+        std::io::ErrorKind::AddrInUse => "address already in use".into(),
+        std::io::ErrorKind::InvalidInput => "invalid argument".into(),
+        _ => error.to_string(),
+    }
+}
+
+/// [`bind_error_text`] for network handle failures.
+fn net_error_text(error: &ox_uv::NetError) -> String {
+    match error {
+        ox_uv::NetError::Io(io) => bind_error_text(io),
+        _ => error.to_string(),
+    }
+}
+
+/// A per-bind-call view of the shared listener callback.
+fn shared_view(
+    callback: &SharedNetCallback,
+) -> impl FnMut(&mut UvLoop, HandleId, NetEvent) + 'static {
+    let callback = Rc::clone(callback);
+    move |uv_loop, id, event| (callback.borrow_mut())(uv_loop, id, event)
+}
+
+/// Resolves `host:port` and binds the first candidate that listens, the way
+/// `socket_watcher_init` + `socket_watcher_start` do
+/// (`event/socket.c:52-79,142-171`). The returned address keeps the
+/// caller's host text and appends the bound port — a `0`/empty port binds
+/// an ephemeral port and the resolved number is what `serverstart()`
+/// returns (`snprintf(watcher->addr ...)`, `event/socket.c:158-170`).
+fn start_tcp(
+    uv_loop: &mut UvLoop,
+    host: &str,
+    port: &str,
+    callback: &SharedNetCallback,
+) -> Result<(String, Listener), String> {
+    let parsed = parse_tcp_port(port)?;
+    let resolved = dns::getaddrinfo(
+        Some(host),
+        if port.is_empty() { None } else { Some(port) },
+        dns::AddrInfoHints::default(),
+    )
+    .map_err(|error| match error.name {
+        "EAI_NONAME" => "name or service not known".into(),
+        _ => error.message,
+    })?;
+    let mut last = String::from("Unknown system error");
+    for candidate in resolved {
+        let address = SocketAddr::new(candidate.address, parsed.max(candidate.port));
+        let mut listener = match Tcp::bind(uv_loop, address, shared_view(callback)) {
+            Ok(listener) => listener,
+            Err(error) => {
+                last = net_error_text(&error);
+                continue;
+            }
+        };
+        if let Err(error) = listener.listen(uv_loop, 128) {
+            last = net_error_text(&error);
+            continue;
+        }
+        let bound = match listener.local_addr() {
+            Ok(bound) => bound,
+            Err(error) => {
+                last = net_error_text(&error);
+                continue;
+            }
+        };
+        let bound_port = bound.port();
+        return Ok((format!("{host}:{bound_port}"), Listener::Tcp(listener)));
+    }
+    Err(last)
+}
+
+/// Binds a unix-socket listener at `address`, applying upstream's stale-file
+/// recovery (#36581, `event/socket.c:215-247`): a path that exists is probed
+/// with a synchronous connect — a live listener fails the start, a dead
+/// file is removed and the bind retried. The socket is restricted to its
+/// owner before the first accept can happen.
+#[cfg(unix)]
+fn start_pipe(
+    uv_loop: &mut UvLoop,
+    address: &str,
+    callback: &SharedNetCallback,
+) -> Result<(String, Listener), String> {
+    let path = Path::new(address);
+    if path.exists() {
+        match std::os::unix::net::UnixStream::connect(path) {
+            // `socket_alive` (`event/socket.c:101-134`): something answers,
+            // so a live server owns the address.
+            Ok(_probe) => return Err("address already in use".into()),
+            // Dead socket file: remove it and bind afresh.
+            Err(_) => {
+                std::fs::remove_file(path).map_err(|error| bind_error_text(&error))?;
+            }
+        }
+    }
+    let mut listener =
+        Pipe::bind(uv_loop, path, shared_view(callback)).map_err(|error| net_error_text(&error))?;
+    listener
+        .listen(uv_loop, 128)
+        .map_err(|error| net_error_text(&error))?;
+    restrict_pipe_permissions(path)?;
+    Ok((address.to_owned(), Listener::Pipe(listener)))
+}
+
+/// The socket grants full RPC control; bind's default mode is 0777&~umask,
+/// so restrict it to the owner (carried over from the startup `bind_pipe`).
+#[cfg(unix)]
+fn restrict_pipe_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(path)
+        .map_err(|error| format!("listen socket vanished: {error}"))?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("cannot restrict listen socket: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Unix-domain `serverstart` addresses are unsupported off unix.
+#[cfg(not(unix))]
+fn start_pipe(
+    _uv_loop: &mut UvLoop,
+    _address: &str,
+    _callback: &SharedNetCallback,
+) -> Result<(String, Listener), String> {
+    Err("Unix-domain server addresses are unsupported on this platform".into())
+}
+
+/// A deferred start failed at pump time; the loop keeps running and the
+/// user sees why (`emsg`-style, as `report_job_callback_error` does).
+fn report_server_error(session: &ApiSession, message: &str) {
+    session.with_editor_mut(|editor| {
+        ox_editor::excmd_exec::push_text_message(editor, message.to_owned(), true, true);
+    });
+}
+
 enum Listener {
     Tcp(Tcp),
     #[cfg(unix)]
@@ -1966,21 +2371,6 @@ enum Listener {
 }
 
 impl Listener {
-    fn servername(&self) -> Result<String, AppError> {
-        match self {
-            Self::Tcp(listener) => listener
-                .local_addr()
-                .map(|address| address.to_string())
-                .map_err(|error| AppError::Server(error.to_string())),
-            #[cfg(unix)]
-            Self::Pipe(listener) => listener
-                .local_name()
-                .map_err(|error| AppError::Server(error.to_string()))?
-                .map(|path| path.to_string_lossy().into_owned())
-                .ok_or_else(|| AppError::Server("bound pipe has no local name".into())),
-        }
-    }
-
     fn close(&self, uv_loop: &mut UvLoop) -> Result<(), ox_uv::Error> {
         match self {
             Self::Tcp(listener) => listener.close(uv_loop),
@@ -1988,45 +2378,6 @@ impl Listener {
             Self::Pipe(listener) => listener.close(uv_loop),
         }
     }
-}
-
-#[cfg(unix)]
-fn bind_pipe<F>(uv_loop: &mut UvLoop, address: &str, callback: F) -> Result<Listener, AppError>
-where
-    F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static,
-{
-    let mut listener = Pipe::bind(uv_loop, address, callback)
-        .map_err(|error| AppError::Server(error.to_string()))?;
-    listener
-        .listen(uv_loop, 128)
-        .map_err(|error| AppError::Server(error.to_string()))?;
-    // The socket grants full RPC control; bind's default mode is 0777&~umask,
-    // so restrict it to the owner. Refuse to serve if the mode cannot be set.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let path = std::path::Path::new(address);
-        let mode = std::fs::metadata(path)
-            .map_err(|error| AppError::Server(format!("listen socket vanished: {error}")))?
-            .permissions()
-            .mode();
-        if mode & 0o077 != 0 {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
-                |error| AppError::Server(format!("cannot restrict listen socket: {error}")),
-            )?;
-        }
-    }
-    Ok(Listener::Pipe(listener))
-}
-
-#[cfg(not(unix))]
-fn bind_pipe<F>(_uv_loop: &mut UvLoop, _address: &str, _callback: F) -> Result<Listener, AppError>
-where
-    F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static,
-{
-    Err(AppError::Server(
-        "Unix-domain --listen addresses are unsupported on this platform".into(),
-    ))
 }
 
 enum Stream {
@@ -2072,18 +2423,26 @@ struct Peer {
 
 struct NetworkRuntime {
     state: Rc<RefCell<AppState>>,
+    /// The accept loop every listening socket and peer stream lives on; the
+    /// background tick writes to peers through it (see `poll_background`).
+    accept_uv: Rc<RefCell<UvLoop>>,
     peers: HashMap<HandleId, Peer>,
     streams: HashMap<HandleId, Stream>,
     error: Option<String>,
+    /// Set when an accept-loop error must end the process; the next
+    /// `poll_background` stops the main loop.
+    shutdown: bool,
 }
 
 impl NetworkRuntime {
-    fn new(state: Rc<RefCell<AppState>>) -> Self {
+    fn new(state: Rc<RefCell<AppState>>, accept_uv: Rc<RefCell<UvLoop>>) -> Self {
         Self {
             state,
+            accept_uv,
             peers: HashMap::new(),
             streams: HashMap::new(),
             error: None,
+            shutdown: false,
         }
     }
     /// The 10 ms background tick.
@@ -2130,6 +2489,10 @@ impl NetworkRuntime {
             .borrow_mut()
             .redraw()
             .map_err(|error| ox_uv::CallbackError::new(error.to_string()))?;
+        // Peers live on the accept loop, so their writes go through it, not
+        // the main-loop `uv_loop` this tick received. The pump timer and
+        // this tick are both main-loop callbacks, so the borrow is free.
+        let mut accept_uv = self.accept_uv.borrow_mut();
         for (channel, bytes) in writes {
             if channel == CHAN_STDIO.get() {
                 let mut output = io::stdout().lock();
@@ -2147,9 +2510,12 @@ impl NetworkRuntime {
                 && let Some(stream) = self.streams.get_mut(&target)
             {
                 stream
-                    .write(uv_loop, bytes)
+                    .write(&mut accept_uv, bytes)
                     .map_err(|error| ox_uv::CallbackError::new(error.clone()))?;
             }
+        }
+        if self.shutdown {
+            uv_loop.stop();
         }
         Ok(())
     }
@@ -2270,7 +2636,10 @@ fn handle_network_event(
             runtime.remove_peer(uv_loop, id);
         } else {
             runtime.error = Some(error);
-            uv_loop.stop();
+            // `uv_loop` here is the accept loop; stopping it would only
+            // silence the pump. Flag the background tick to stop the main
+            // loop, which ends the process like the old direct stop did.
+            runtime.shutdown = true;
         }
     }
 }
@@ -5035,5 +5404,108 @@ mod tests {
             "the on_exit flushed by a Vimscript jobwait must run before the \\
              command boundary returns, with no tick in between"
         );
+    }
+
+    /// A `ListenServer` over a real `AppState` runtime, with its own accept
+    /// loop. Binds are synchronous, so start/stop/list run without ever
+    /// turning the loop; `close_all` flushes the deferred unlinks.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the test requires editor and listener setup to succeed"
+    )]
+    fn listen_server() -> ListenServer {
+        let cli = Cli::default();
+        let state = Rc::new(RefCell::new(
+            AppState::new(&cli, &mut StartupTimer::start()).unwrap(),
+        ));
+        let accept_uv = Rc::new(RefCell::new(UvLoop::new().unwrap()));
+        let runtime = Rc::new(RefCell::new(NetworkRuntime::new(
+            state,
+            Rc::clone(&accept_uv),
+        )));
+        ListenServer::new(&runtime).unwrap()
+    }
+
+    /// A unique pipe path under the temp dir; tests never share names.
+    fn pipe_path(label: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("oxvim-w2b-{}.{}.sock", std::process::id(), label))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the test requires listener setup to succeed"
+    )]
+    fn listen_server_pipe_start_stop_and_list_track_the_registry() {
+        let mut server = listen_server();
+        let path = pipe_path("registry");
+        let bound = server.start(&path).unwrap();
+        assert_eq!(bound, path);
+        assert_eq!(server.list(), vec![path.clone()]);
+        assert!(server.stop(&path), "stopping a live listener returns true");
+        assert!(server.list().is_empty());
+        assert!(!server.stop(&path), "stopping twice returns false");
+        server.close_all();
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the test requires listener setup to succeed"
+    )]
+    fn listen_server_rejects_empty_and_duplicate_addresses() {
+        let mut server = listen_server();
+        assert_eq!(
+            server.start("").unwrap_err(),
+            "Unknown system error",
+            "empty address is the result > 0 branch (`server.c:168-171`)"
+        );
+        let path = pipe_path("duplicate");
+        server.start(&path).unwrap();
+        assert_eq!(
+            server.start(&path).unwrap_err(),
+            "Unknown system error",
+            "duplicate watcher is the result 2 branch (`server.c:184-193`)"
+        );
+        server.close_all();
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the test requires listener setup to succeed"
+    )]
+    fn listen_server_recovers_a_stale_pipe_file() {
+        // First listener leaves a dead socket file behind (no unlink flush);
+        // the probe-connect recovery (#36581) must remove and rebind it.
+        let path = pipe_path("stale");
+        {
+            let mut first = listen_server();
+            first.start(&path).unwrap();
+            first.close_all();
+        }
+        let mut second = listen_server();
+        assert_eq!(second.start(&path).unwrap(), path);
+        assert_eq!(second.list(), vec![path]);
+        second.close_all();
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the test requires listener setup to succeed"
+    )]
+    #[expect(clippy::expect_used, reason = "port parse failures must fail the test")]
+    fn listen_server_tcp_ephemeral_port_reports_the_bound_address() {
+        let mut server = listen_server();
+        let bound = server.start("127.0.0.1:0").unwrap();
+        let (_host, port) = bound.rsplit_once(':').expect("host:port form");
+        let port: u16 = port.parse().expect("numeric port");
+        assert!(port > 0, "ephemeral port must resolve to a real bind");
+        assert_eq!(server.list(), vec![bound]);
+        server.close_all();
     }
 }
