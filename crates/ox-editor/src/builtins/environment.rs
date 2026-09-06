@@ -27,6 +27,17 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         // `f_defer` through `add_defer` (`eval/userfunc.c` 3390-3484).
         "defer" => call_defer_builtin(host, args),
         "eventhandler" => Ok(Typval::Number(0)),
+        // `f_api_info` (eval/funcs.c:450-454): the metadata Object
+        // re-expressed as a Typval. Reading the canonical table is
+        // infallible in practice; a decode failure is a broken build.
+        "api_info" => Ok(crate::excmd_exec::object_to_typval(
+            &ox_rpc::canonical_metadata().map_err(|err| {
+                EvalError::new("E5009", 0, format!("api_info: {err}"))
+            })?,
+        )),
+        "hlID" => host
+            .access
+            .with_ex_editor(|editor| call_hl_id_builtin(editor, args)),
         "highlight_exists" | "hlexists" => host
             .access
             .with_ex_editor(|editor| call_hlexists_builtin(editor, args)),
@@ -532,5 +543,101 @@ mod tests {
             other => panic!("expected a List, got {other:?}"),
         };
         assert_eq!(order, vec!["second", "first"]);
+    }
+}
+
+
+/// `f_hlID` → `syn_name2id` (eval/funcs.c): the group's 1-based id, 0 when
+/// absent. Upstream assigns ids in `hl_table` allocation order; the port's
+/// name-keyed table yields the sorted position instead, which is stable and
+/// positive but not order-identical to upstream.
+fn call_hl_id_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    if args.len() != 1 {
+        return Err(EvalError::new(
+            if args.is_empty() { "E119" } else { "E118" },
+            0,
+            "hlID() requires one argument",
+        ));
+    }
+    let name = input_string_arg(&args[0])?;
+    let name = name.to_string_lossy();
+    let id = editor
+        .highlights()
+        .keys()
+        .position(|candidate| candidate.eq_ignore_ascii_case(&name))
+        .map_or(0, |index| index as i64 + 1);
+    Ok(Typval::Number(id))
+}
+
+#[cfg(test)]
+mod api_and_highlight_tests {
+    use ox_types::Typval;
+
+    use crate::{Editor, ExExecutor, TestEditorAccess};
+
+    fn run(editor: &TestEditorAccess, exec: &mut ExExecutor, script: &str) {
+        exec.execute_script(editor, "<test>", script).unwrap();
+    }
+
+    fn global_number(exec: &ExExecutor, name: &str) -> Option<i64> {
+        let value = exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, name.as_bytes(), 0)
+            .ok()?;
+        match value {
+            Typval::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    fn global_keys(exec: &ExExecutor, name: &str) -> Option<Vec<String>> {
+        let value = exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, name.as_bytes(), 0)
+            .ok()?;
+        match value {
+            Typval::Dict(dict) => Some(
+                dict.borrow()
+                    .entries
+                    .iter()
+                    .map(|field| field.key.to_string_lossy().into_owned())
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    // f_api_info returns object_to_vim(api_metadata()) (funcs.c:450-454);
+    // the metadata dict always carries these members.
+    #[test]
+    fn api_info_returns_metadata_dict() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        run(&editor, &mut exec, "let g:info = api_info()");
+        let keys = global_keys(&exec, "info").expect("api_info() result is a dict");
+        for member in ["version", "functions", "ui_events"] {
+            assert!(
+                keys.iter().any(|key| key == member),
+                "api_info() missing '{member}' (has {:?})",
+                keys
+            );
+        }
+    }
+
+    // f_hlID -> syn_name2id: a startup group answers a positive id, an
+    // unknown name answers 0, and hlexists() agrees.
+    #[test]
+    fn hl_id_is_positive_for_known_group_and_zero_for_unknown() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        run(
+            &editor,
+            &mut exec,
+            "let g:known = hlID('NonText')\nlet g:unknown = hlID('NoSuchGroupEver')\nlet g:exists = hlexists('NonText')",
+        );
+        let known = global_number(&exec, "known").expect("hlID() number");
+        assert!(known > 0, "hlID('NonText') = {known}, want > 0");
+        assert_eq!(global_number(&exec, "unknown"), Some(0));
+        assert_eq!(global_number(&exec, "exists"), Some(1));
     }
 }
