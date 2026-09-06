@@ -236,14 +236,24 @@ impl LuaHost {
 
 fn configure_package_path(lua: &Lua, runtime_root: &RuntimeRoot) -> mlua::Result<()> {
     let package: Table = lua.globals().get("package")?;
-    // An unresolved root contributes no entries: `PathBuf::new().join("lua")`
-    // is the CWD-relative `lua`, which would shadow later requires with a
-    // planted tree. The LuaJIT defaults must not survive either: vendored
-    // luaconf.h LUA_PATH_DEFAULT starts with "./?.lua" and LUA_CPATH_DEFAULT
-    // with "./?." native suffixes — the same CWD vector for both source and
-    // native modules. Upstream resolves modules through `vim._load_package`
-    // over 'runtimepath' (runtime/lua/vim/_init_packages.lua:16-19,48-49),
-    // never through CWD.
+    // An unresolved root is a runtime-less host (tests, tools): it must
+    // resolve nothing, so both fields clear - an empty root would otherwise
+    // contribute the CWD-relative `lua`, and the LuaJIT defaults
+    // (./?.lua source, ./?.so native, vendored luaconf.h LUA_PATH_DEFAULT /
+    // LUA_CPATH_DEFAULT) keep a planted-tree vector open.
+    //
+    // A resolved root mirrors upstream instead of hardening past it:
+    // runtime entries are prepended to `package.path` and win by
+    // precedence - `vim._load_package` sits at `package.loaders` position 2
+    // (runtime/lua/vim/_init_packages.lua:48-49), ahead of the standard
+    // searchers - while the LuaJIT defaults, CWD entries included, survive
+    // after them exactly as in the reference interpreter. `package.cpath`
+    // stays untouched: `_init_packages.lua:3-13` harvests its `/?.so`-style
+    // suffix trails and `_load_package` resolves native modules over
+    // 'runtimepath' (:25-31) - the system library entries in the default
+    // also serve the standard searcher like upstream. Emptying cpath here
+    // would kill the trail harvest and drop the system entries; both would
+    // be behavior drift, not hardening.
     if runtime_root.resolve("").as_os_str().is_empty() {
         package.set("path", "")?;
         return package.set("cpath", "");
@@ -268,11 +278,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_runtime_root_clears_package_path() {
-        // Review finding: an unresolved root left the LuaJIT default
-        // package.path intact, whose first entry `./?.lua` (vendored
-        // luaconf.h LUA_PATH_DEFAULT) lets a planted CWD tree shadow later
-        // requires.
+    fn configures_package_paths_from_the_runtime_root() {
         let lua = Lua::new();
         let package_field = |lua: &Lua, field: &str| {
             lua.globals()
@@ -283,15 +289,24 @@ mod tests {
         };
         let path = |lua: &Lua| package_field(lua, "path");
         let cpath = |lua: &Lua| package_field(lua, "cpath");
-        assert!(path(&lua).contains("./?.lua"));
-        assert!(cpath(&lua).starts_with("./"), "LuaJIT cpath default is CWD-first");
+        // A runtime-less host resolves nothing: planted CWD trees stay
+        // unreachable for both source and native modules.
         configure_package_path(&lua, &RuntimeRoot::new(PathBuf::new())).unwrap();
         assert_eq!(path(&lua), "");
-        // The native-module vector must close with the source one: a
-        // planted ./mod.so must not load from an unresolved root.
         assert_eq!(cpath(&lua), "");
-        configure_package_path(&lua, &RuntimeRoot::new(PathBuf::from("/rt"))).unwrap();
-        let seeded = path(&lua);
+        // A resolved host prepends its runtime entries, which win by
+        // precedence over the surviving defaults, and leaves cpath alone:
+        // emptying it would starve `vim._so_trails`
+        // (_init_packages.lua:3-13) and drop the system library entries
+        // the standard searcher uses upstream.
+        let fresh = Lua::new();
+        let default_cpath = cpath(&fresh);
+        configure_package_path(&fresh, &RuntimeRoot::new(PathBuf::from("/rt"))).unwrap();
+        let seeded = path(&fresh);
         assert!(seeded.contains("/rt/lua/?.lua"), "{seeded}");
+        let seeded_cpath = cpath(&fresh);
+        assert_eq!(seeded_cpath, default_cpath);
+        assert!(!seeded_cpath.is_empty(), "trails must stay harvestable");
     }
 }
+
