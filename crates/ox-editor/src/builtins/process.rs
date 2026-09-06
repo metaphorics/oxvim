@@ -69,11 +69,11 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
                 .send(id, data)
                 .map_err(|message| EvalError::new("E900", 0, message))?;
             if access.with_ex_editor(|editor| editor.terminal_channel(id).is_some()) {
-                let events = manager
+                let mut events = manager
                     .poll()
                     .map_err(|message| EvalError::new("E900", 0, message))?;
                 runtime.jobs = Some(manager);
-                invoke_job_events(runtime, access, scope, lua, events)?;
+                invoke_or_redefer(runtime, access, scope, lua, &mut events)?;
                 if let Some(bytes) = runtime
                     .jobs
                     .as_mut()
@@ -111,9 +111,9 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
                 }
             }
             runtime.jobs = Some(manager);
-            let (statuses, events) =
+            let (statuses, mut events) =
                 waited.map_err(|message| EvalError::new("E900", 0, message))?;
-            invoke_job_events(runtime, access, scope, lua, events)?;
+            invoke_or_redefer(runtime, access, scope, lua, &mut events)?;
             Ok(Typval::list(
                 statuses.into_iter().map(Typval::Number).collect(),
             ))
@@ -546,14 +546,36 @@ fn callback_option(value: Option<Typval>) -> ox_eval::Result<Option<Typval>> {
     }
 }
 
-fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
+/// Invokes callbacks for polled or deferred job events, delivering from the
+/// front of `events`; on handler failure the unconsumed tail is re-deferred
+/// on the installed manager so a later delivery still serves it.
+fn invoke_or_redefer<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
-    events: Vec<JobEvent>,
+    events: &mut Vec<JobEvent>,
 ) -> ox_eval::Result<()> {
-    for event in events {
+    match invoke_job_events(runtime, access, scope, lua, events) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Some(jobs) = runtime.jobs.as_mut() {
+                jobs.defer_events(std::mem::take(events));
+            }
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    events: &mut Vec<JobEvent>,
+) -> ox_eval::Result<()> {
+    while !events.is_empty() {
+        let event = events.remove(0);
         let name = match event.callback {
             Typval::String(name) => name,
             Typval::Funcref(funcref) | Typval::Partial(funcref) => {

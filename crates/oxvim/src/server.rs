@@ -103,6 +103,21 @@ fn report_job_send(session: &Rc<ApiSession>, sent: Result<bool, String>, channel
     });
 }
 
+/// A failing job-callback delivery reports through the message system the
+/// way upstream treats callback failures (`emsg` in `invoke_callback`,
+/// eval/funcs.c): the loop keeps running, the user sees why the event did
+/// not reach its handler.
+fn report_job_callback_error(session: &Rc<ApiSession>, error: &str) {
+    session.with_editor_mut(|editor| {
+        ox_editor::excmd_exec::push_text_message(
+            editor,
+            format!("job callback delivery failed: {error}"),
+            true,
+            true,
+        );
+    });
+}
+
 impl ox_api::ChannelSink for JobChannelSink {
     fn send(&mut self, channel: u64, bytes: &[u8]) -> Result<(), String> {
         if self.deferred.get() > 0 {
@@ -1952,15 +1967,54 @@ impl NetworkRuntime {
             error: None,
         }
     }
+    /// The 10 ms background tick.
+    ///
+    /// Upstream delivers job callbacks on the main loop (`process_events`
+    /// → `channel_write` → `invoke_callback`, event/loop.c), so a
+    /// fire-and-forget `jobstart`'s `on_exit` fires between input batches.
+    /// The tick is this server's main-loop turn: it flushes terminal PTY
+    /// output and delivers deferred job events through the same invocation
+    /// path chansend/jobwait use (`invoke_deferred_job_events`, which runs
+    /// with no editor borrow live so callbacks may re-enter the executor).
+    ///
+    /// `system()`/`wait()` keep their re-defer semantics untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns the drain, redraw, or stream write failure.
+    ///
+    /// # Panics
+    ///
+    /// Never; `state`/`ex` borrows are dropped before callback reentry.
     fn poll_background(&mut self, uv_loop: &mut UvLoop) -> Result<(), ox_uv::CallbackError> {
         let session = self.state.borrow().session.clone();
-        let changed = self
+        let mut changed = self
             .state
             .borrow_mut()
             .ex
             .borrow_mut()
             .flush_pty_output(&*session)
             .map_err(ox_uv::CallbackError::new)?;
+        // Deliver deferred job events on this turn (upstream delivers job
+        // callbacks on the main loop). Bound before matching: a failing user
+        // callback reports (emsg) and continues, the way upstream treats
+        // callback failures (`emsg` in `invoke_callback`, eval/funcs.c),
+        // never tearing down the loop — and never while an editor borrow is
+        // live.
+        let delivered = self
+            .state
+            .borrow_mut()
+            .ex
+            .borrow_mut()
+            .invoke_deferred_job_events(&*session);
+        match delivered {
+            // A delivered batch forces the redraw gate: on_stdout/on_exit
+            // handlers may mutate editor state with no PTY output, and
+            // upstream redraws after processed events (event/loop.c), not
+            // on every loop turn. Idle ticks answer Ok(false) and stay quiet.
+            Ok(delivered) => changed |= delivered,
+            Err(error) => report_job_callback_error(&session, &error),
+        }
         if !changed {
             return Ok(());
         }
@@ -3938,5 +3992,152 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir(&expected);
+    }
+
+    // A fire-and-forget job's on_exit reaches its handler on the tick path:
+    // flush_pty_output re-defers the drained events, then
+    // invoke_deferred_job_events delivers them through the chansend/jobwait
+    // invocation (upstream delivers job callbacks on the main loop,
+    // event/loop.c). Before this fix the exit event was re-deferred forever
+    // and on_exit never ran.
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture, script, and tick calls must succeed"
+    )]
+    fn tick_delivers_fire_and_forget_on_exit_exactly_once() {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let core = build_embedded_core(editor, true).unwrap();
+        core.ex
+            .borrow_mut()
+            .execute_script(
+                &*core.session,
+                "<test>",
+                "
+                let s:logger = {'exits': []}
+                function! s:logger.on_exit(id, status, event)
+                    let g:exit_status = a:status
+                    call add(self.exits, a:status)
+                endfunction
+                let g:logger = s:logger
+                call jobstart(['sh', '-c', 'exit 7'], s:logger)
+            ",
+            )
+            .unwrap();
+        // Tick turns until the exit event has been delivered.
+        let mut delivered = false;
+        for _ in 0..500 {
+            let _changed = core
+                .ex
+                .borrow_mut()
+                .flush_pty_output(&*core.session)
+                .unwrap();
+            if core
+                .ex
+                .borrow_mut()
+                .invoke_deferred_job_events(&*core.session)
+                .unwrap()
+            {
+                delivered = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(delivered, "the tick must deliver the deferred on_exit");
+        let status = core
+            .ex
+            .borrow_mut()
+            .evaluate_expression(&*core.session, "g:exit_status")
+            .unwrap();
+        assert_eq!(status, Typval::Number(7), "on_exit must carry the code");
+        let exits = core
+            .ex
+            .borrow_mut()
+            .evaluate_expression(&*core.session, "len(g:logger.exits)")
+            .unwrap();
+        assert_eq!(exits, Typval::Number(1), "on_exit must run exactly once");
+        // A second tick finds nothing: the event is not re-delivered.
+        let _changed = core
+            .ex
+            .borrow_mut()
+            .flush_pty_output(&*core.session)
+            .unwrap();
+        let again = core
+            .ex
+            .borrow_mut()
+            .invoke_deferred_job_events(&*core.session)
+            .unwrap();
+        assert!(!again, "a delivered on_exit must not re-fire");
+    }
+
+    // An on_exit handler that starts another job must not deadlock the tick:
+    // the delivery runs with no editor borrow live, so the nested jobstart
+    // re-enters the executor cleanly, and the nested job's own on_exit fires
+    // on a later turn (upstream: callbacks run on the main loop and may
+    // start jobs).
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture, script, and tick calls must succeed"
+    )]
+    fn on_exit_reentry_starts_a_job_without_deadlocking() {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let core = build_embedded_core(editor, true).unwrap();
+        core.ex
+            .borrow_mut()
+            .execute_script(
+                &*core.session,
+                "<test>",
+                "
+                let s:logger = {'exits': []}
+                function! s:logger.on_exit(id, status, event)
+                    call add(self.exits, a:status)
+                    if len(self.exits) < 2
+                        call jobstart(['sh', '-c', 'exit 0'], self)
+                    endif
+                endfunction
+                let g:logger = s:logger
+                call jobstart(['sh', '-c', 'exit 0'], s:logger)
+            ",
+            )
+            .unwrap();
+        // Tick until both the original and the nested on_exit ran. A
+        // manager-clobber (the nested job's fresh manager dropped under the
+        // restore) or a reentry deadlock strands this at 1.
+        let mut nested_exit_ran = false;
+        for _ in 0..1000 {
+            let _flushed = core
+                .ex
+                .borrow_mut()
+                .flush_pty_output(&*core.session)
+                .unwrap();
+            let _delivered = core
+                .ex
+                .borrow_mut()
+                .invoke_deferred_job_events(&*core.session)
+                .unwrap();
+            let exits = core
+                .ex
+                .borrow_mut()
+                .evaluate_expression(&*core.session, "len(g:logger.exits)")
+                .unwrap();
+            if exits == Typval::Number(2) {
+                nested_exit_ran = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            nested_exit_ran,
+            "the nested jobstart's on_exit never ran (reentry failed)"
+        );
     }
 }

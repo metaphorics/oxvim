@@ -318,6 +318,43 @@ impl JobManager {
     pub fn defer_events(&mut self, events: Vec<JobEvent>) {
         self.deferred.extend(events);
     }
+    /// Takes the whole deferred queue, keeping relative order (`ExExecutor::
+    /// invoke_deferred_job_events` drains before invoking so no borrow spans
+    /// user code while the manager stays installed; requeue goes through
+    /// [`Self::defer_events`], preserving `take_deferred_and_invoke`'s
+    /// handler-deferred-ahead-of-tail order).
+    pub fn drain_deferred(&mut self) -> Vec<JobEvent> {
+        std::mem::take(&mut self.deferred)
+    }
+    /// Drain and invoke pending deferred events now.
+    ///
+    /// The whole queue is drained first (`channel_process_callbacks`,
+    /// channel.c:1089-1148): a callback that sends, polls, or stops a job
+    /// mutates the job table or enqueues new events, and iterating live state
+    /// would see it.
+    ///
+    /// `invoke` receives the drained batch by `&mut` and removes the events
+    /// it invoked from the front (`Vec::drain(..n)`), the same call
+    /// chansend/jobwait make on their collected events. Whatever remains in
+    /// the vector after `invoke` returns — an uninvoked tail on a handler
+    /// failure, exactly what upstream keeps queued (`channel.c` requeues
+    /// unprocessed callbacks) — is put back on the queue and surfaces on the
+    /// next poll.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's invocation error after requeuing the tail.
+    pub fn take_deferred_and_invoke(
+        &mut self,
+        invoke: impl FnOnce(&mut Vec<JobEvent>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut events = std::mem::take(&mut self.deferred);
+        let result = invoke(&mut events);
+        // `invoke` drained what it delivered from the front; anything left is
+        // an unconsumed tail (handler failed mid-batch) and stays deliverable.
+        self.deferred.extend(events);
+        result
+    }
 
     /// Wait for the selected jobs, sharing one deadline across the list.
     ///
@@ -811,7 +848,9 @@ mod tests {
         let mut surfaced = false;
         for _ in 0..100 {
             let polled = jobs.poll().unwrap();
-            if !polled.is_empty() && event_name(&polled[0]) == "stdout" {
+            // exit can lead stdout in the re-deferred queue; any position
+            // counts — the pin is that the event surfaces, not its order.
+            if polled.iter().any(|event| event_name(event) == "stdout") {
                 surfaced = true;
                 break;
             }
@@ -1000,5 +1039,97 @@ mod tests {
             jobs.poll().unwrap().is_empty(),
             "deferred events must be drained after one poll"
         );
+    }
+
+    // A fire-and-forget job's exit callback must survive a poll path with no
+    // host: the tick re-defers what it drains, and the drained batch reaches
+    // `take_deferred_and_invoke` exactly once, in arrival order — upstream
+    // delivers job callbacks on the main loop (`process_events` →
+    // `channel_write` → `invoke_callback`).
+    #[test]
+    fn deferred_exit_event_is_delivered_exactly_once_through_the_invoke_host() {
+        let mut jobs = JobManager::new().unwrap();
+        jobs.start(3, options("true", true)).unwrap();
+        // The tick shape: poll without a host, re-defer, repeat until the
+        // exit event surfaces. A blocking wait() would consume the event
+        // itself, which is the path this must not take.
+        let mut events = Vec::new();
+        for _ in 0..500 {
+            let polled = jobs.poll().unwrap();
+            let exited = polled.iter().any(|event| event_name(event) == "exit");
+            events.extend(polled);
+            if exited {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            events.iter().any(|event| event_name(event) == "exit"),
+            "a finished job must queue its exit event"
+        );
+        jobs.defer_events(events);
+        // The invoke host consumes the drained batch and records it.
+        let mut invoked = Vec::new();
+        jobs.take_deferred_and_invoke(|events| {
+            let count = events.len();
+            invoked.extend(events.drain(..count));
+            Ok(())
+        })
+        .unwrap();
+        let exits = invoked
+            .iter()
+            .filter(|event| event_name(event) == "exit")
+            .count();
+        assert_eq!(exits, 1, "on_exit must run exactly once");
+        let status = invoked
+            .iter()
+            .find(|event| event_name(event) == "exit")
+            .and_then(|event| match &event.args[1] {
+                Typval::Number(status) => Some(*status),
+                _ => None,
+            });
+        assert_eq!(status, Some(0), "on_exit must carry the exit code");
+        // The queue is empty afterwards; a second poll is a no-op.
+        let second = jobs.poll().unwrap();
+        assert!(
+            !second.iter().any(|event| event_name(event) == "exit"),
+            "the exit event must not survive its invocation"
+        );
+    }
+
+    // A handler that fails mid-batch must not destroy the uninvoked tail:
+    // `invoke_job_events` drains from the front as it delivers, and
+    // `take_deferred_and_invoke` requeues whatever remains (upstream keeps
+    // unprocessed callbacks queued, `channel.c`).
+    #[test]
+    fn failed_handler_keeps_the_uninvoked_tail_deliverable() {
+        let mut jobs = JobManager::new().unwrap();
+        let options = Typval::dict(Vec::new());
+        let Typval::Dict(reference) = options else {
+            unreachable!()
+        };
+        let event = |name: &str| JobEvent {
+            callback: Typval::String(OxStr::from("Callback")),
+            receiver: reference.clone(),
+            args: vec![
+                Typval::Number(1),
+                Typval::list(Vec::new()),
+                Typval::String(OxStr::from(name)),
+            ],
+        };
+        jobs.defer_events(vec![event("stdout"), event("exit")]);
+        let result = jobs.take_deferred_and_invoke(|events| {
+            // Deliver the first event, then fail: the exit event stays.
+            let _ = events.remove(0);
+            Err("handler failed".to_owned())
+        });
+        assert_eq!(result.unwrap_err(), "handler failed");
+        let requeued = jobs.poll().unwrap();
+        assert_eq!(
+            requeued.len(),
+            1,
+            "the uninvoked tail must survive the failure"
+        );
+        assert_eq!(event_name(&requeued[0]), "exit");
     }
 }
