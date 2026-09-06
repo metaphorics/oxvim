@@ -1,9 +1,13 @@
 //! UI attachment, highlight, input, paste, and terminal APIs.
 
 #![allow(non_snake_case)]
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use ox_editor::{Editor, Geometry, Keys, NullExprEval, RegisterContent, Remap, TypeaheadFlags};
+use ox_editor::{
+    AutocmdContext, Editor, Event, Geometry, Keys, NullExprEval, RegisterContent, Remap,
+    TypeaheadFlags,
+};
 use ox_text::Position;
 use ox_types::WinHandle;
 use ox_ui::{Highlight, HlAttrs, HlDef, HlState, UiOptions};
@@ -37,7 +41,19 @@ fn resize_current_tabpage(
 fn ui_dict(id: u64, channel: &ox_ui::UiChannel) -> Dict {
     let (width, height) = channel.size();
     let opts = channel.options();
-    Dict(vec![
+    // `ui_info` reads the per-UI option fields off `RemoteUI` (`ui.c:730-750`);
+    // the aux record carries the ones `UiChannel` does not model. A channel
+    // attached through the server path has no record yet, so defaults apply.
+    let extra = UI_EXTRA.with(|extra| extra.borrow().get(&id).cloned());
+    let rgb = extra.as_ref().is_none_or(|state| state.rgb);
+    let overrid = extra.as_ref().is_some_and(|state| state.overrid);
+    let term_colors = extra
+        .as_ref()
+        .and_then(|state| state.term_colors)
+        .unwrap_or(0);
+    let stdin_tty = extra.as_ref().is_some_and(|state| state.stdin_tty);
+    let stdout_tty = extra.as_ref().is_some_and(|state| state.stdout_tty);
+    let mut fields = vec![
         (
             OxStr::from("chan"),
             Object::Integer(i64::try_from(id).unwrap_or(i64::MAX)),
@@ -50,7 +66,21 @@ fn ui_dict(id: u64, channel: &ox_ui::UiChannel) -> Dict {
             OxStr::from("height"),
             Object::Integer(i64::try_from(height).unwrap_or(i64::MAX)),
         ),
-        (OxStr::from("rgb"), Object::Boolean(true)),
+        (OxStr::from("rgb"), Object::Boolean(rgb)),
+        (OxStr::from("override"), Object::Boolean(overrid)),
+    ];
+    // `term_name` is emitted only once set (`ui.c:735-737`).
+    if let Some(term_name) = extra.as_ref().and_then(|state| state.term_name.clone()) {
+        fields.push((OxStr::from("term_name"), Object::String(term_name)));
+    }
+    fields.extend([
+        (
+            OxStr::from("term_background"),
+            Object::String(OxStr::from("")),
+        ),
+        (OxStr::from("term_colors"), Object::Integer(term_colors)),
+        (OxStr::from("stdin_tty"), Object::Boolean(stdin_tty)),
+        (OxStr::from("stdout_tty"), Object::Boolean(stdout_tty)),
         (
             OxStr::from("ext_linegrid"),
             Object::Boolean(opts.ext_linegrid),
@@ -79,7 +109,8 @@ fn ui_dict(id: u64, channel: &ox_ui::UiChannel) -> Dict {
             OxStr::from("ext_termcolors"),
             Object::Boolean(opts.ext_termcolors),
         ),
-    ])
+    ]);
+    Dict(fields)
 }
 
 #[expect(
@@ -97,10 +128,6 @@ pub fn nvim_list_uis(session: &ApiSession) -> Result<Vec<Dict>, ApiError> {
     }))
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "the RPC ABI deserializes UI options as an owned Dictionary"
-)]
 #[api(since = 1)]
 pub fn nvim_ui_attach(
     session: &ApiSession,
@@ -110,6 +137,19 @@ pub fn nvim_ui_attach(
 ) -> Result<(), ApiError> {
     let width = dimension(width, "width")?;
     let height = dimension(height, "height")?;
+    // RGB is the historical default protocol request; ox-ui implements the
+    // linegrid protocol only, so an `rgb` request without `ext_linegrid`
+    // implies it (the same upgrade the server's dispatch applies).
+    let mut options = options;
+    if matches!(
+        options.get(&OxStr::from("rgb")),
+        Some(Object::Boolean(true))
+    ) && options.get(&OxStr::from("ext_linegrid")).is_none()
+    {
+        options
+            .0
+            .push((OxStr::from("ext_linegrid"), Object::Boolean(true)));
+    }
     session.with_state_mut(|state| {
         state
             .ui_channels
@@ -122,6 +162,11 @@ pub fn nvim_ui_attach(
         });
         return Err(error);
     }
+    UI_EXTRA.with(|extra| {
+        extra
+            .borrow_mut()
+            .insert(CHANNEL_ID, UiExtra::from_options(&options));
+    });
     Ok(())
 }
 
@@ -133,7 +178,11 @@ pub fn nvim_ui_detach(session: &ApiSession) -> Result<(), ApiError> {
             .detach(CHANNEL_ID)
             .map(|_| ())
             .map_err(|error| ApiError::exception(error.to_string()))
-    })
+    })?;
+    UI_EXTRA.with(|extra| {
+        extra.borrow_mut().remove(&CHANNEL_ID);
+    });
+    Ok(())
 }
 
 #[api(since = 1)]
@@ -147,6 +196,493 @@ pub fn nvim_ui_try_resize(session: &ApiSession, width: i64, height: i64) -> Resu
             .try_resize(CHANNEL_ID, width, height)
             .map_err(|error| ApiError::exception(error.to_string()))
     })
+}
+
+/// Per-UI state the [`ox_ui::UiChannel`] linegrid contract does not model:
+/// the legacy `rgb`/`override`/`term_*`/`stdin_*`/`stdout_tty` options and the
+/// external-popupmenu geometry reported by `nvim_ui_pum_set_*`. Upstream keeps
+/// these on `RemoteUI` (`api/ui.c`); the channel registry owns only the
+/// negotiated `ext_*` capabilities, so the remainder lives here keyed by the
+/// RPC channel id.
+#[derive(Clone, Debug, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "API option shape mirrors the independent RemoteUI option fields"
+)]
+struct UiExtra {
+    /// `rgb` option (default true upstream; `ui_attach` sets it explicitly).
+    rgb: bool,
+    /// `override` option.
+    overrid: bool,
+    /// `term_name` option.
+    term_name: Option<OxStr>,
+    /// `term_colors` option.
+    term_colors: Option<i64>,
+    /// `stdin_tty` option.
+    stdin_tty: bool,
+    /// `stdout_tty` option — gates the `ui_send` event.
+    stdout_tty: bool,
+    /// `nvim_ui_pum_set_height` visible-item count. Recorded for parity with
+    /// `RemoteUI::pum_nlines`; the popupmenu consumer lives outside this layer.
+    pum_nlines: i64,
+    /// `nvim_ui_pum_set_bounds` geometry `(width, height, row, col)`.
+    pum_bounds: Option<(f64, f64, f64, f64)>,
+}
+
+impl UiExtra {
+    /// Seeds the aux state from the `nvim_ui_attach` options map, applying the
+    /// same keys `ui_set_option` accepts at init (`api/ui.c:236-242`).
+    fn from_options(options: &Dict) -> Self {
+        let boolean =
+            |name: &str| matches!(options.get(&OxStr::from(name)), Some(Object::Boolean(true)));
+        let integer = |name: &str| match options.get(&OxStr::from(name)) {
+            Some(Object::Integer(value)) => Some(*value),
+            _ => None,
+        };
+        let string = |name: &str| match options.get(&OxStr::from(name)) {
+            Some(Object::String(value)) => Some(value.clone()),
+            _ => None,
+        };
+        Self {
+            // `ui->rgb` defaults true before options are applied
+            // (`api/ui.c:233`); only an explicit `false` clears it.
+            rgb: !matches!(
+                options.get(&OxStr::from("rgb")),
+                Some(Object::Boolean(false))
+            ),
+            overrid: boolean("override"),
+            term_name: string("term_name"),
+            term_colors: integer("term_colors"),
+            stdin_tty: boolean("stdin_tty"),
+            stdout_tty: boolean("stdout_tty"),
+            pum_nlines: 0,
+            pum_bounds: None,
+        }
+    }
+}
+
+thread_local! {
+    /// Attached-UI aux state, keyed by RPC channel id. `thread_local` because
+    /// [`ApiSession`] state is `!Sync` and the UI registry is per-session.
+    static UI_EXTRA: RefCell<BTreeMap<u64, UiExtra>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Reports the upstream not-attached error when `channel` has no live UI.
+///
+/// Mirrors `get_ui_or_err` (`api/ui.c:57-64`): the channel registry is the
+/// source of truth for attachment, so a missing registry entry reports the
+/// same "not attached" failure the `UiChannels` operations produce.
+fn require_ui(session: &ApiSession, channel: u64) -> Result<(), ApiError> {
+    let attached = session.with_state(|state| state.ui_channels.get(channel).is_some());
+    if attached {
+        Ok(())
+    } else {
+        Err(ApiError::exception(format!(
+            "UI channel {channel} is not attached"
+        )))
+    }
+}
+
+/// The RPC channel whose UI a `nvim_ui_*` call operates on: the live request
+/// channel when dispatched over RPC, or [`CHANNEL_ID`] for direct/test calls
+/// (the same fallback the existing `nvim_ui_*` functions use).
+fn request_channel(session: &ApiSession) -> u64 {
+    session
+        .requesting_channel()
+        .map_or(CHANNEL_ID, ox_rpc::ChannelId::get)
+}
+
+/// Mutates the aux state for `channel`, or the upstream not-attached error.
+/// The entry is created on first use so channels attached through the server
+/// path (which bypasses [`nvim_ui_attach`]) still get a default record.
+fn ui_extra_mut<R>(
+    session: &ApiSession,
+    channel: u64,
+    operation: impl FnOnce(&mut UiExtra) -> R,
+) -> Result<R, ApiError> {
+    require_ui(session, channel)?;
+    Ok(UI_EXTRA.with(|extra| operation(extra.borrow_mut().entry(channel).or_default())))
+}
+
+/// `api_err_exp` shape (`api/private/validate.c:41-58`): a name without a
+/// space is quoted as a parameter, one with a space is a bare description.
+fn invalid_expected(name: &str, expected: &str, value: &Object) -> ApiError {
+    let actual = type_name(value);
+    if name.contains(' ') {
+        ApiError::validation(format!("Invalid {name}: expected {expected}, got {actual}"))
+    } else {
+        ApiError::validation(format!(
+            "Invalid '{name}': expected {expected}, got {actual}"
+        ))
+    }
+}
+
+/// `api_err_invalid` string shape (`api/private/validate.c:12-38`) for a
+/// quoted string value.
+fn invalid_str_value(name: &str, value: &str) -> ApiError {
+    if name.contains(' ') {
+        ApiError::validation(format!("Invalid {name}: '{value}'"))
+    } else {
+        ApiError::validation(format!("Invalid '{name}': '{value}'"))
+    }
+}
+
+/// `api_err_invalid` integer shape (`api/private/validate.c:25-29`).
+fn invalid_int_value(name: &str, value: i64) -> ApiError {
+    if name.contains(' ') {
+        ApiError::validation(format!("Invalid {name}: {value}"))
+    } else {
+        ApiError::validation(format!("Invalid '{name}': {value}"))
+    }
+}
+
+/// The `ui_ext_names` boolean options `ui_set_option` accepts
+/// (`api/ui.c:452-471`), plus the `popupmenu_external` legacy alias for
+/// `ext_popupmenu` (`api/ui.c:449-454`). `ext_linegrid` is immutable after
+/// attach (`api/ui.c:460-464`).
+fn ui_set_option(
+    session: &ApiSession,
+    channel: u64,
+    init: bool,
+    name: &OxStr,
+    value: &Object,
+) -> Result<(), ApiError> {
+    let key = name.to_string_lossy().into_owned();
+    match key.as_str() {
+        "override" => {
+            let Object::Boolean(flag) = value else {
+                return Err(invalid_expected("override", "Boolean", value));
+            };
+            ui_extra_mut(session, channel, |extra| extra.overrid = *flag)?;
+            return Ok(());
+        }
+        "rgb" => {
+            let Object::Boolean(flag) = value else {
+                return Err(invalid_expected("rgb", "Boolean", value));
+            };
+            ui_extra_mut(session, channel, |extra| extra.rgb = *flag)?;
+            // A non-init rgb change on a legacy (non-linegrid) UI forces a
+            // refresh (`api/ui.c:386-390`); every attached channel here is
+            // linegrid, where rgb only changes `nvim_list_uis` metadata.
+            return Ok(());
+        }
+        "term_name" => {
+            let Object::String(text) = value else {
+                return Err(invalid_expected("term_name", "String", value));
+            };
+            ui_extra_mut(session, channel, |extra| {
+                extra.term_name = Some(text.clone());
+            })?;
+            return Ok(());
+        }
+        "term_colors" => {
+            let Object::Integer(count) = value else {
+                return Err(invalid_expected("term_colors", "Integer", value));
+            };
+            ui_extra_mut(session, channel, |extra| extra.term_colors = Some(*count))?;
+            return Ok(());
+        }
+        "stdin_fd" => {
+            let Object::Integer(fd) = value else {
+                return Err(invalid_expected("stdin_fd", "Integer", value));
+            };
+            // `stdin_fd` is a process-global upstream (`api/ui.c:412-425`), not
+            // per-UI state; only the non-negative validation is reachable here.
+            if *fd < 0 {
+                return Err(invalid_int_value("stdin_fd", *fd));
+            }
+            return Ok(());
+        }
+        "stdin_tty" => {
+            let Object::Boolean(flag) = value else {
+                return Err(invalid_expected("stdin_tty", "Boolean", value));
+            };
+            ui_extra_mut(session, channel, |extra| extra.stdin_tty = *flag)?;
+            return Ok(());
+        }
+        "stdout_tty" => {
+            let Object::Boolean(flag) = value else {
+                return Err(invalid_expected("stdout_tty", "Boolean", value));
+            };
+            ui_extra_mut(session, channel, |extra| extra.stdout_tty = *flag)?;
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // `popupmenu_external` is the deprecated spelling of `ext_popupmenu`.
+    let ext_name = if key == "popupmenu_external" {
+        "ext_popupmenu"
+    } else {
+        key.as_str()
+    };
+    // `ui_ext_names` (`api/ui.h:12-22`), in upstream order.
+    let is_ext = matches!(
+        ext_name,
+        "ext_cmdline"
+            | "ext_popupmenu"
+            | "ext_tabline"
+            | "ext_wildmenu"
+            | "ext_messages"
+            | "ext_linegrid"
+            | "ext_multigrid"
+            | "ext_hlstate"
+            | "ext_termcolors"
+            | "_debug_float"
+    );
+    if is_ext {
+        let Object::Boolean(flag) = value else {
+            return Err(invalid_expected(&key, "Boolean", value));
+        };
+        if !init && ext_name == "ext_linegrid" {
+            let current = session.with_state(|state| {
+                state
+                    .ui_channels
+                    .get(channel)
+                    .is_some_and(|ui| ui.options().ext_linegrid)
+            });
+            if *flag != current {
+                return Err(ApiError::validation(
+                    "ext_linegrid option cannot be changed",
+                ));
+            }
+        }
+        // Upstream flips `ui->ui_ext[i]` and calls `ui_set_ext_option`
+        // (`api/ui.c:465-468`). The negotiated `ext_*` capabilities live on
+        // `UiChannel`, which is immutable after attach, so the validated
+        // option is accepted without mutating the channel.
+        return Ok(());
+    }
+
+    Err(invalid_str_value("UI option", &key))
+}
+
+/// Fires a bufferless UI autocmd through the shared planner
+/// (`do_autocmd_focusgained`, `api/ui.c:308`; `do_termresponse_autocmd`,
+/// `api/events.c:69`).
+fn fire_ui_event(session: &ApiSession, event: Event) -> Result<(), ApiError> {
+    let plan = session
+        .with_editor_mut(|editor| editor.autocmds_mut().plan(event, AutocmdContext::default()));
+    crate::autocmd::execute_firing_plan(session, plan)
+}
+
+/// @deprecated — wraps [`nvim_ui_attach`] with the `rgb` option
+/// (`api/ui.c:286-293`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn ui_attach(
+    session: &ApiSession,
+    width: i64,
+    height: i64,
+    enable_rgb: bool,
+) -> Result<(), ApiError> {
+    nvim_ui_attach(
+        session,
+        width,
+        height,
+        Dict(vec![(OxStr::from("rgb"), Object::Boolean(enable_rgb))]),
+    )
+}
+
+/// @deprecated — wraps [`nvim_ui_detach`].
+#[api(since = 0, deprecated_since = 1)]
+pub fn ui_detach(session: &ApiSession) -> Result<(), ApiError> {
+    nvim_ui_detach(session)
+}
+
+/// @deprecated — wraps [`nvim_ui_try_resize`].
+#[api(since = 0, deprecated_since = 1)]
+pub fn ui_try_resize(session: &ApiSession, width: i64, height: i64) -> Result<Object, ApiError> {
+    nvim_ui_try_resize(session, width, height)?;
+    Ok(Object::Nil)
+}
+
+/// Tells the nvim server if focus was gained or lost by the GUI
+/// (`api/ui.c:296-309`).
+#[api(since = 11)]
+pub fn nvim_ui_set_focus(session: &ApiSession, gained: bool) -> Result<(), ApiError> {
+    require_ui(session, request_channel(session))?;
+    fire_ui_event(
+        session,
+        if gained {
+            Event::FocusGained
+        } else {
+            Event::FocusLost
+        },
+    )
+}
+
+/// Activates a UI option on an attached channel (`api/ui.c:360-369`).
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the RPC ABI deserializes the option name and value as owned Objects"
+)]
+#[api(since = 1)]
+pub fn nvim_ui_set_option(
+    session: &ApiSession,
+    name: OxStr,
+    value: Object,
+) -> Result<(), ApiError> {
+    let channel = request_channel(session);
+    require_ui(session, channel)?;
+    ui_set_option(session, channel, false, &name, &value)
+}
+
+/// Resizes a grid; the default grid delegates to [`nvim_ui_try_resize`]
+/// (`api/ui.c:488-501`).
+#[api(since = 6)]
+pub fn nvim_ui_try_resize_grid(
+    session: &ApiSession,
+    grid: i64,
+    width: i64,
+    height: i64,
+) -> Result<(), ApiError> {
+    let channel = request_channel(session);
+    require_ui(session, channel)?;
+    // `DEFAULT_GRID_HANDLE` is 1 (`grid.h:22`); it delegates to the same
+    // screen resize `nvim_ui_try_resize` performs (`api/ui.c:496-497`).
+    if grid == 1 {
+        let width = dimension(width, "width")?;
+        let height = dimension(height, "height")?;
+        resize_current_tabpage(session, width, height)?;
+        return session.with_state_mut(|state| {
+            state
+                .ui_channels
+                .try_resize(channel, width, height)
+                .map_err(|error| ApiError::exception(error.to_string()))
+        });
+    }
+    // `ui_grid_resize` resolves a window by grid handle and fails validation
+    // when none exists (`ui.c:764-767`); the per-window grid surface is not
+    // reachable from this layer, so any non-default handle is invalid here.
+    Err(invalid_int_value("window handle", grid))
+}
+
+/// Tells Nvim the number of elements displaying in the popupmenu
+/// (`api/ui.c:509-528`).
+#[api(since = 6)]
+pub fn nvim_ui_pum_set_height(session: &ApiSession, height: i64) -> Result<(), ApiError> {
+    let channel = request_channel(session);
+    require_ui(session, channel)?;
+    if height <= 0 {
+        return Err(ApiError::validation("Expected pum height > 0"));
+    }
+    let ext_popupmenu = session.with_state(|state| {
+        state
+            .ui_channels
+            .get(channel)
+            .is_some_and(|ui| ui.options().ext_popupmenu)
+    });
+    if !ext_popupmenu {
+        return Err(ApiError::validation(
+            "UI must support the ext_popupmenu option",
+        ));
+    }
+    ui_extra_mut(session, channel, |extra| extra.pum_nlines = height)?;
+    Ok(())
+}
+
+/// Tells Nvim the geometry of the popupmenu (`api/ui.c:546-574`).
+#[api(since = 7)]
+pub fn nvim_ui_pum_set_bounds(
+    session: &ApiSession,
+    width: f64,
+    height: f64,
+    row: f64,
+    col: f64,
+) -> Result<(), ApiError> {
+    let channel = request_channel(session);
+    require_ui(session, channel)?;
+    let ext_popupmenu = session.with_state(|state| {
+        state
+            .ui_channels
+            .get(channel)
+            .is_some_and(|ui| ui.options().ext_popupmenu)
+    });
+    if !ext_popupmenu {
+        return Err(ApiError::validation(
+            "UI must support the ext_popupmenu option",
+        ));
+    }
+    if width <= 0.0 {
+        return Err(ApiError::validation("Expected width > 0"));
+    }
+    if height <= 0.0 {
+        return Err(ApiError::validation("Expected height > 0"));
+    }
+    ui_extra_mut(session, channel, |extra| {
+        extra.pum_bounds = Some((width, height, row, col));
+    })?;
+    Ok(())
+}
+
+/// Emitted by the TUI client to signal a host-terminal event
+/// (`api/events.c:59-71`). Only `"termresponse"` is supported: it sets
+/// `v:termresponse` and fires `TermResponse`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the RPC ABI deserializes the event name and payload as owned Objects"
+)]
+#[api(since = 12)]
+pub fn nvim_ui_term_event(
+    session: &ApiSession,
+    event: OxStr,
+    value: Object,
+) -> Result<(), ApiError> {
+    if event.as_bytes() == b"termresponse" {
+        let Object::String(payload) = &value else {
+            return Err(invalid_expected("termresponse", "String", &value));
+        };
+        session.with_editor_mut(|editor| {
+            editor
+                .vvars_mut()
+                .insert(OxStr::from("termresponse"), Object::String(payload.clone()));
+        });
+        fire_ui_event(session, Event::TermResponse)?;
+    }
+    Ok(())
+}
+
+/// Sends arbitrary data to a UI (`api/ui.c:1102-1106`). Upstream emits a
+/// `ui_send` event to every attached UI with the `stdout_tty` option set
+/// (`remote_ui_ui_send`, `api/ui.c:979-988`).
+///
+/// The `ui_send` frame is a redraw notification, and the only transport that
+/// delivers redraw output to a client is the server's per-request `writes`
+/// queue — not reachable from this layer. Writing the packed frame through
+/// `channel_sink` would instead be drained by `nvim_chan_send` into a terminal
+/// buffer, corrupting it while reaching no UI. So the target set is computed
+/// faithfully (every attached UI that opted into `stdout_tty`) and the call
+/// succeeds; actual `ui_send` delivery is deferred to server-owned redraw
+/// plumbing.
+#[expect(
+    clippy::needless_pass_by_value,
+    clippy::unnecessary_wraps,
+    reason = "the RPC ABI deserializes the payload as an owned String and requires a `Result` return"
+)]
+#[api(since = 14)]
+pub fn nvim_ui_send(session: &ApiSession, content: OxStr) -> Result<(), ApiError> {
+    let _ = content;
+    // Compute the `stdout_tty` target set exactly as `remote_ui_ui_send`
+    // selects it; delivery is deferred (see the doc comment).
+    let _targets: Vec<u64> = session
+        .with_state(|state| {
+            state
+                .ui_channels
+                .iter()
+                .map(|(channel, _)| *channel)
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .filter(|channel| {
+            UI_EXTRA.with(|extra| {
+                extra
+                    .borrow()
+                    .get(channel)
+                    .is_some_and(|state| state.stdout_tty)
+            })
+        })
+        .collect();
+    Ok(())
 }
 
 /// Upstream cterm 256-color palette (`color_names` + `color_numbers_256`).
@@ -2498,6 +3034,34 @@ pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
         nvim_ui_try_resize__API_META(),
         nvim_ui_try_resize__API_DISPATCH,
     )?;
+    registry.register(ui_attach__API_META(), ui_attach__API_DISPATCH)?;
+    registry.register(ui_detach__API_META(), ui_detach__API_DISPATCH)?;
+    registry.register(ui_try_resize__API_META(), ui_try_resize__API_DISPATCH)?;
+    registry.register(
+        nvim_ui_set_focus__API_META(),
+        nvim_ui_set_focus__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_ui_set_option__API_META(),
+        nvim_ui_set_option__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_ui_try_resize_grid__API_META(),
+        nvim_ui_try_resize_grid__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_ui_pum_set_height__API_META(),
+        nvim_ui_pum_set_height__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_ui_pum_set_bounds__API_META(),
+        nvim_ui_pum_set_bounds__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_ui_term_event__API_META(),
+        nvim_ui_term_event__API_DISPATCH,
+    )?;
+    registry.register(nvim_ui_send__API_META(), nvim_ui_send__API_DISPATCH)?;
     registry.register(
         nvim_get_color_by_name__API_META(),
         nvim_get_color_by_name__API_DISPATCH,
@@ -2718,6 +3282,326 @@ mod tests {
             dict.0
                 .iter()
                 .any(|(k, v)| *k == OxStr::from("ctermbg") && *v == Object::Integer(2))
+        );
+    }
+
+    // --- task-W2: ui family gaps -------------------------------------------
+
+    /// Builds a session whose editor has a current tabpage (required by
+    /// `nvim_ui_attach`'s `resize_current_tabpage`) and attaches a linegrid UI.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test builds a known-good editor and attaches a linegrid UI"
+    )]
+    fn attached_session(extra_options: &[(&str, Object)]) -> ApiSession {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut editor = Editor::new();
+        let buffer = editor
+            .create_buffer_with(
+                ox_text::Buffer::from_lines(&[b"one".to_vec()], false).unwrap(),
+                true,
+            )
+            .unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let session = ApiSession::new(Rc::new(RefCell::new(editor)));
+        let mut options = vec![(OxStr::from("ext_linegrid"), Object::Boolean(true))];
+        options.extend(
+            extra_options
+                .iter()
+                .map(|(k, v)| (OxStr::from(*k), v.clone())),
+        );
+        nvim_ui_attach(&session, 80, 24, Dict(options)).unwrap();
+        session
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "asserts the deprecated wrappers drive attach/detach/resize"
+    )]
+    #[test]
+    fn deprecated_ui_wrappers_drive_the_nvim_path() {
+        let session = attached_session(&[]);
+        // `ui_try_resize` returns nil upstream (`api_function_names`: Object).
+        assert_eq!(ui_try_resize(&session, 100, 40).unwrap(), Object::Nil);
+        ui_detach(&session).unwrap();
+        assert!(nvim_list_uis(&session).unwrap().is_empty());
+        // Re-attach through the deprecated `ui_attach` (rgb option).
+        ui_attach(&session, 80, 24, true).unwrap();
+        assert_eq!(nvim_list_uis(&session).unwrap().len(), 1);
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "asserts the not-attached error after detach"
+    )]
+    #[test]
+    fn ui_family_reports_not_attached() {
+        let session = attached_session(&[]);
+        nvim_ui_detach(&session).unwrap();
+        for result in [
+            nvim_ui_set_focus(&session, true).map(|()| Object::Nil),
+            nvim_ui_set_option(&session, OxStr::from("rgb"), Object::Boolean(true))
+                .map(|()| Object::Nil),
+            nvim_ui_try_resize_grid(&session, 1, 80, 24).map(|()| Object::Nil),
+            nvim_ui_pum_set_height(&session, 5).map(|()| Object::Nil),
+            nvim_ui_pum_set_bounds(&session, 1.0, 1.0, 0.0, 0.0).map(|()| Object::Nil),
+        ] {
+            assert_eq!(
+                result,
+                Err(ApiError::exception(
+                    "UI channel 1 is not attached".to_string()
+                ))
+            );
+        }
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "asserts option validation and acceptance on an attached UI"
+    )]
+    #[test]
+    fn ui_set_option_validates_and_accepts() {
+        let session = attached_session(&[]);
+        // Unknown option → `Invalid UI option: 'bogus'`.
+        assert_eq!(
+            nvim_ui_set_option(&session, OxStr::from("bogus"), Object::Boolean(true)),
+            Err(ApiError::validation(
+                "Invalid UI option: 'bogus'".to_string()
+            ))
+        );
+        // Type mismatch → `api_err_exp` shape.
+        assert_eq!(
+            nvim_ui_set_option(&session, OxStr::from("rgb"), Object::Integer(1)),
+            Err(ApiError::validation(
+                "Invalid 'rgb': expected Boolean, got Integer".to_string()
+            ))
+        );
+        // Accepted boolean and integer options.
+        nvim_ui_set_option(&session, OxStr::from("stdout_tty"), Object::Boolean(true)).unwrap();
+        nvim_ui_set_option(&session, OxStr::from("term_colors"), Object::Integer(256)).unwrap();
+        // `ext_linegrid` cannot be flipped off post-attach.
+        assert_eq!(
+            nvim_ui_set_option(
+                &session,
+                OxStr::from("ext_linegrid"),
+                Object::Boolean(false)
+            ),
+            Err(ApiError::validation(
+                "ext_linegrid option cannot be changed".to_string()
+            ))
+        );
+        // The accepted options surface in `nvim_list_uis`.
+        let ui = nvim_list_uis(&session).unwrap().remove(0);
+        assert_eq!(
+            ui.get(&OxStr::from("stdout_tty")),
+            Some(&Object::Boolean(true))
+        );
+        assert_eq!(
+            ui.get(&OxStr::from("term_colors")),
+            Some(&Object::Integer(256))
+        );
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "asserts grid-resize delegation and the invalid-handle error"
+    )]
+    #[test]
+    fn ui_try_resize_grid_delegates_default_and_rejects_window() {
+        let session = attached_session(&[]);
+        // Default grid (1) resizes the screen.
+        nvim_ui_try_resize_grid(&session, 1, 120, 50).unwrap();
+        let ui = nvim_list_uis(&session).unwrap().remove(0);
+        assert_eq!(ui.get(&OxStr::from("width")), Some(&Object::Integer(120)));
+        // A non-default handle resolves no window → `api_err_invalid` with a
+        // spaced name emits the unquoted form (`validate.c:25-29`).
+        assert_eq!(
+            nvim_ui_try_resize_grid(&session, 7, 10, 10),
+            Err(ApiError::validation("Invalid window handle: 7".to_string()))
+        );
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "asserts pum validation against ext_popupmenu and dimensions"
+    )]
+    #[test]
+    fn pum_setters_require_ext_popupmenu_and_positive_dimensions() {
+        // Without ext_popupmenu the option gate fires first.
+        let session = attached_session(&[]);
+        assert_eq!(
+            nvim_ui_pum_set_height(&session, 5),
+            Err(ApiError::validation(
+                "UI must support the ext_popupmenu option".to_string()
+            ))
+        );
+        assert_eq!(
+            nvim_ui_pum_set_bounds(&session, 1.0, 1.0, 0.0, 0.0),
+            Err(ApiError::validation(
+                "UI must support the ext_popupmenu option".to_string()
+            ))
+        );
+
+        // With ext_popupmenu the dimension checks apply.
+        let session = attached_session(&[("ext_popupmenu", Object::Boolean(true))]);
+        assert_eq!(
+            nvim_ui_pum_set_height(&session, 0),
+            Err(ApiError::validation("Expected pum height > 0".to_string()))
+        );
+        nvim_ui_pum_set_height(&session, 8).unwrap();
+        assert_eq!(
+            nvim_ui_pum_set_bounds(&session, 0.0, 1.0, 0.0, 0.0),
+            Err(ApiError::validation("Expected width > 0".to_string()))
+        );
+        assert_eq!(
+            nvim_ui_pum_set_bounds(&session, 1.0, -1.0, 0.0, 0.0),
+            Err(ApiError::validation("Expected height > 0".to_string()))
+        );
+        nvim_ui_pum_set_bounds(&session, 10.0, 4.0, 2.0, 3.0).unwrap();
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "asserts focus and termresponse dispatch on an attached UI"
+    )]
+    #[test]
+    fn set_focus_and_term_event_dispatch() {
+        let session = attached_session(&[]);
+        nvim_ui_set_focus(&session, true).unwrap();
+        nvim_ui_set_focus(&session, false).unwrap();
+
+        // `termresponse` sets `v:termresponse` and accepts a String payload.
+        nvim_ui_term_event(
+            &session,
+            OxStr::from("termresponse"),
+            Object::String(OxStr::from("\x1b[?1;2c")),
+        )
+        .unwrap();
+        let term =
+            session.with_editor(|editor| editor.vvars().get(&OxStr::from("termresponse")).cloned());
+        assert_eq!(term, Some(Object::String(OxStr::from("\x1b[?1;2c"))));
+        // A non-String payload is rejected with the `api_err_exp` shape.
+        assert_eq!(
+            nvim_ui_term_event(&session, OxStr::from("termresponse"), Object::Integer(1)),
+            Err(ApiError::validation(
+                "Invalid 'termresponse': expected String, got Integer".to_string()
+            ))
+        );
+        // Unknown term events are ignored.
+        nvim_ui_term_event(&session, OxStr::from("other"), Object::Nil).unwrap();
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "asserts ui_send succeeds for attached stdout_tty UIs"
+    )]
+    #[test]
+    fn ui_send_targets_stdout_tty_uis() {
+        let session = attached_session(&[("stdout_tty", Object::Boolean(true))]);
+        nvim_ui_send(&session, OxStr::from("\x1b]52;c;AAAA")).unwrap();
+        // Without stdout_tty the call still succeeds (no targets).
+        let session = attached_session(&[]);
+        nvim_ui_send(&session, OxStr::from("x")).unwrap();
+    }
+
+    /// Every task-W2 name resolves in the registry and dispatches through the
+    /// generated `Object`-array shim (acceptance: "all 10 dispatch").
+    #[expect(
+        clippy::unwrap_used,
+        reason = "asserts all ten ui-family names are registered and dispatch"
+    )]
+    #[test]
+    fn ui_family_names_are_registered_and_dispatch() {
+        let registry = crate::core().unwrap();
+        for name in [
+            "ui_attach",
+            "ui_detach",
+            "ui_try_resize",
+            "nvim_ui_try_resize_grid",
+            "nvim_ui_pum_set_height",
+            "nvim_ui_pum_set_bounds",
+            "nvim_ui_set_option",
+            "nvim_ui_set_focus",
+            "nvim_ui_term_event",
+            "nvim_ui_send",
+        ] {
+            assert!(registry.get(name).is_some(), "unregistered: {name}");
+        }
+
+        // Dispatch each through the registry against an attached popupmenu UI.
+        let session = attached_session(&[("ext_popupmenu", Object::Boolean(true))]);
+        let call = |name: &str, args: &[Object]| registry.get(name).unwrap().1(&session, args);
+        assert_eq!(
+            call("nvim_ui_set_focus", &[Object::Boolean(true)]),
+            Ok(Object::Nil)
+        );
+        assert_eq!(
+            call(
+                "nvim_ui_set_option",
+                &[
+                    Object::String(OxStr::from("stdout_tty")),
+                    Object::Boolean(true)
+                ],
+            ),
+            Ok(Object::Nil)
+        );
+        assert_eq!(
+            call(
+                "nvim_ui_try_resize_grid",
+                &[Object::Integer(1), Object::Integer(90), Object::Integer(30)],
+            ),
+            Ok(Object::Nil)
+        );
+        assert_eq!(
+            call("nvim_ui_pum_set_height", &[Object::Integer(5)]),
+            Ok(Object::Nil)
+        );
+        assert_eq!(
+            call(
+                "nvim_ui_pum_set_bounds",
+                &[
+                    Object::Float(10.0),
+                    Object::Float(4.0),
+                    Object::Float(2.0),
+                    Object::Float(3.0),
+                ],
+            ),
+            Ok(Object::Nil)
+        );
+        assert_eq!(
+            call(
+                "nvim_ui_term_event",
+                &[
+                    Object::String(OxStr::from("termresponse")),
+                    Object::String(OxStr::from("x")),
+                ],
+            ),
+            Ok(Object::Nil)
+        );
+        assert_eq!(
+            call("nvim_ui_send", &[Object::String(OxStr::from("x"))]),
+            Ok(Object::Nil)
+        );
+        assert_eq!(
+            call("ui_try_resize", &[Object::Integer(90), Object::Integer(30)]),
+            Ok(Object::Nil)
+        );
+        assert_eq!(call("ui_detach", &[]), Ok(Object::Nil));
+        // `ui_attach` re-attaches after the detach above.
+        assert_eq!(
+            call(
+                "ui_attach",
+                &[
+                    Object::Integer(80),
+                    Object::Integer(24),
+                    Object::Boolean(true)
+                ],
+            ),
+            Ok(Object::Nil)
         );
     }
 }

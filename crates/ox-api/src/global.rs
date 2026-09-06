@@ -11,7 +11,7 @@ use ox_editor::{
 };
 use ox_excmd::ExCommand;
 use ox_types::{Special, Typval};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::option_merge::SetOp;
 use crate::runtime::{with_command_executor, with_lua_executor};
@@ -1186,6 +1186,78 @@ pub fn nvim_input(session: &ApiSession, keys: OxStr) -> Result<i64, ApiError> {
     Ok(count)
 }
 
+/// Sends a mouse event from a GUI (upstream `nvim_input_mouse`,
+/// api/vim.c:406-476: button/action/modifier validation with the single
+/// validation message, then a non-blocking enqueue). The port's input path
+/// is typeahead keys, so the event enqueues as the equivalent key sequence
+/// with the grid recorded in the modifier-free position suffix; multigrid
+/// positioning is a UI-layer feature the port does not wire yet, and `grid`
+/// is validated but not mapped.
+#[api(since = 6, fast)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "`#[api]` requires owned arguments and a `Result` return"
+)]
+pub fn nvim_input_mouse(
+    session: &ApiSession,
+    button: OxStr,
+    action: OxStr,
+    modifier: OxStr,
+    grid: i64,
+    row: i64,
+    col: i64,
+) -> Result<(), ApiError> {
+    if !(row >= 0 && col >= 0 && grid >= 0) {
+        return Err(ApiError::validation("invalid button or action"));
+    }
+    let button = match button.as_bytes() {
+        b"left" => "Left",
+        b"middle" => "Middle",
+        b"right" => "Right",
+        b"wheel" => "ScrollWheel",
+        b"x1" => "X1",
+        b"x2" => "X2",
+        b"move" => "Move",
+        _ => return Err(ApiError::validation("invalid button or action")),
+    };
+    let suffix = if button == "ScrollWheel" {
+        match action.as_bytes() {
+            b"up" => "Up",
+            b"down" => "Down",
+            b"left" => "Left",
+            b"right" => "Right",
+            _ => return Err(ApiError::validation("invalid button or action")),
+        }
+    } else if button == "Move" {
+        // `move` ignores its action, matching upstream's doc note.
+        "Mouse"
+    } else {
+        match action.as_bytes() {
+            b"press" => "Mouse",
+            b"drag" => "Drag",
+            b"release" => "Release",
+            _ => return Err(ApiError::validation("invalid button or action")),
+        }
+    };
+    // Modifier chars accept the optional '-' separators of key notation
+    // (upstream parses "C-A-", "c-a", "CA" alike for the mask).
+    let mut prefix = String::new();
+    for byte in modifier.as_bytes() {
+        if *byte == b'-' {
+            continue;
+        }
+        prefix.push(char::from(byte.to_ascii_uppercase()));
+    }
+    let sequence = format!("<{prefix}{button}{suffix}><{row},{col}>");
+    let encoded = Keys::encode(sequence.as_bytes());
+    session.with_editor_mut(|editor| {
+        editor
+            .typeahead_mut()
+            .append(&encoded, TypeaheadFlags::default());
+    });
+    Ok(())
+}
+
 #[api(since = 1, fast)]
 #[expect(
     clippy::needless_pass_by_value,
@@ -2228,6 +2300,1267 @@ fn validate_echo_chunks(chunks: &[Object]) -> Result<(), ApiError> {
     Ok(())
 }
 
+// api/vim.c:723-727 delegates deletion to the normal buffer splice.
+#[api(since = 1, textlock)]
+pub fn nvim_del_current_line(session: &ApiSession) -> Result<(), ApiError> {
+    let end = session.with_editor(|editor| {
+        let window = editor
+            .current_window()
+            .ok_or_else(|| ApiError::validation("No current window"))?;
+        i64::try_from(editor.window(window).map_err(exception)?.cursor.lnum).map_err(exception)
+    })?;
+    crate::buffer::nvim_buf_set_lines(
+        session,
+        BufHandle::CURRENT,
+        end.saturating_sub(1),
+        end,
+        true,
+        Vec::new(),
+    )
+}
+
+fn global_mark_name(name: &OxStr) -> Result<char, ApiError> {
+    let [byte] = name.as_bytes() else {
+        return Err(ApiError::validation(format!(
+            "Invalid mark name (must be a single char): '{}'",
+            name.to_string_lossy()
+        )));
+    };
+    if !byte.is_ascii_uppercase() && !byte.is_ascii_digit() {
+        return Err(ApiError::validation(format!(
+            "Invalid mark name (must be file/uppercase): '{}'",
+            name.to_string_lossy()
+        )));
+    }
+    Ok(char::from(*byte))
+}
+
+// api/vim.c:2105-2119; helpers.c:1005-1034: deletion sets a zero position,
+// and succeeds even when the valid named slot was already unset.
+#[api(since = 8)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "`#[api]` requires owned arguments and a `Result` return"
+)]
+pub fn nvim_del_mark(session: &ApiSession, name: OxStr) -> Result<bool, ApiError> {
+    let name = global_mark_name(&name)?;
+    session.with_editor_mut(|editor| editor.global_marks_mut().remove(name).map_err(exception))?;
+    Ok(true)
+}
+
+// api/vim.c:2135-2194: never load a file-backed mark just to inspect it.
+#[api(since = 8)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "`#[api]` requires owned arguments and a `Result` return"
+)]
+pub fn nvim_get_mark(
+    session: &ApiSession,
+    name: OxStr,
+    opts: Dict,
+) -> Result<Vec<Object>, ApiError> {
+    reject_keys(&opts, &[])?;
+    let name = global_mark_name(&name)?;
+    session.with_editor(|editor| {
+        let unset = || {
+            vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::String(OxStr::from("")),
+            ]
+        };
+        let Some(mark) = editor.global_marks().get(name).map_err(exception)? else {
+            return Ok(unset());
+        };
+        if mark.position.lnum == 0 {
+            return Ok(unset());
+        }
+        let (buffer, filename) = match &mark.target {
+            ox_editor::MarkTarget::Buffer(buffer) => {
+                let state = editor.buffer(*buffer).map_err(exception)?;
+                (i64::from(*buffer), state.name().clone())
+            }
+            ox_editor::MarkTarget::File(path) => (0, OxStr::from(path.to_string_lossy().as_ref())),
+        };
+        Ok(vec![
+            Object::Integer(i64::try_from(mark.position.lnum).map_err(exception)?),
+            Object::Integer(i64::try_from(mark.position.col).map_err(exception)?),
+            Object::Integer(buffer),
+            Object::String(filename),
+        ])
+    })
+}
+
+// api/vimscript.c:281-350: a String resolves a dict member, whereas an RPC
+// Dict calls the supplied function name directly. call() owns self binding.
+#[api(since = 4)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "`#[api]` requires owned arguments and a `Result` return"
+)]
+pub fn nvim_call_dict_function(
+    session: &ApiSession,
+    dict: Object,
+    fn_name: OxStr,
+    args: Vec<Object>,
+) -> Result<Object, ApiError> {
+    if args.len() > MAX_FUNC_ARGS {
+        return Err(ApiError::validation(
+            "Function called with too many arguments",
+        ));
+    }
+    // Argument shape validates before the executor is acquired, like
+    // upstream's early api_set_error paths (api/vim.c:262-266 checks the
+    // dict before evaluating anything).
+    if !matches!(dict, Object::String(_) | Object::Dict(_)) {
+        return Err(ApiError::validation(
+            "Invalid dict argument: expected String or Dict",
+        ));
+    }
+    with_command_executor(session, |_, executor| {
+        let (dictionary, lookup) = match &dict {
+            Object::String(expression) => (
+                executor.evaluate(
+                    session,
+                    std::str::from_utf8(expression.as_bytes()).map_err(exception)?,
+                )?,
+                true,
+            ),
+            Object::Dict(_) => (object_to_typval(&dict, 0)?, false),
+            _ => unreachable!("validated above"),
+        };
+        let Typval::Dict(entries) = &dictionary else {
+            return Err(ApiError::validation("dict not found"));
+        };
+        if fn_name.as_bytes().is_empty() {
+            return Err(ApiError::validation("Invalid function name: (empty)"));
+        }
+        let function = if lookup {
+            let entries = entries.try_borrow().map_err(exception)?;
+            let value = entries.get(fn_name.as_bytes()).ok_or_else(|| {
+                ApiError::validation(format!("Not found: {}", fn_name.to_string_lossy()))
+            })?;
+            match value {
+                Typval::Funcref(_) => value.clone(),
+                Typval::Partial(_) => {
+                    return Err(ApiError::validation("partial function not supported"));
+                }
+                _ => {
+                    return Err(ApiError::validation(format!(
+                        "Not a function: {}",
+                        fn_name.to_string_lossy()
+                    )));
+                }
+            }
+        } else {
+            Typval::String(OxStr::from(fn_name.as_bytes()))
+        };
+        let arguments = args
+            .iter()
+            .map(|arg| object_to_typval(arg, 0))
+            .collect::<Result<Vec<_>, _>>()?;
+        executor
+            .call_builtin(
+                session,
+                &OxStr::from("call"),
+                vec![function, Typval::list(arguments), dictionary],
+            )
+            .and_then(|value| typval_to_object(&value, 0))
+    })
+}
+
+// option.c:7180-7233 is the return schema; metadata comes from options.lua.
+fn option_info(metadata: &OptionMetadata) -> Dict {
+    let scope = if metadata.scopes.contains(&OptionScope::Buffer) {
+        "buf"
+    } else if metadata.scopes.contains(&OptionScope::Window) {
+        "win"
+    } else {
+        "global"
+    };
+    let default = metadata
+        .default
+        .value
+        .map_or(Object::Nil, |value| option_value_to_object(&value.into()));
+    Dict(vec![
+        (
+            OxStr::from("name"),
+            Object::String(OxStr::from(metadata.name)),
+        ),
+        (
+            OxStr::from("shortname"),
+            Object::String(OxStr::from(metadata.short_name.unwrap_or(""))),
+        ),
+        (
+            OxStr::from("type"),
+            Object::String(OxStr::from(option_type_name(metadata.value_type))),
+        ),
+        (OxStr::from("default"), default),
+        (OxStr::from("scope"), Object::String(OxStr::from(scope))),
+        (
+            OxStr::from("global_local"),
+            Object::Boolean(scope != "global" && metadata.scopes.contains(&OptionScope::Global)),
+        ),
+        (
+            OxStr::from("commalist"),
+            Object::Boolean(
+                metadata
+                    .list
+                    .is_some_and(|kind| kind != OptionListKind::Flags),
+            ),
+        ),
+        (
+            OxStr::from("flaglist"),
+            Object::Boolean(matches!(
+                metadata.list,
+                Some(OptionListKind::Flags | OptionListKind::FlagsComma)
+            )),
+        ),
+        (
+            OxStr::from("allows_duplicates"),
+            Object::Boolean(!metadata.deny_duplicates),
+        ),
+        (OxStr::from("was_set"), Object::Boolean(false)),
+        (OxStr::from("last_set_sid"), Object::Integer(0)),
+        (OxStr::from("last_set_linenr"), Object::Integer(0)),
+        (OxStr::from("last_set_chan"), Object::Integer(0)),
+    ])
+}
+
+#[api(since = 7)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "`#[api]` requires owned arguments and a `Result` return"
+)]
+pub fn nvim_get_all_options_info(_session: &ApiSession) -> Result<Dict, ApiError> {
+    Ok(Dict(
+        ox_editor::OPTION_METADATA
+            .iter()
+            .map(|metadata| {
+                (
+                    OxStr::from(metadata.name),
+                    Object::Dict(option_info(metadata)),
+                )
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+#[api(since = 11)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "`#[api]` requires owned arguments and a `Result` return"
+)]
+pub fn nvim_get_option_info2(
+    session: &ApiSession,
+    name: OxStr,
+    opts: Dict,
+) -> Result<Dict, ApiError> {
+    let name = option_name(&name)?;
+    let metadata = ox_editor::OptionStore::metadata(name).map_err(option_value_error)?;
+    let target = option_target(session, name, &opts)?;
+    get_option_at(session, name, target)?;
+    Ok(option_info(metadata))
+}
+
+// api/vimscript.c:360-499. This parses syntax; no evaluator is invoked.
+#[api(since = 4, fast)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "`#[api]` requires owned arguments and a `Result` return"
+)]
+pub fn nvim_parse_expression(
+    _session: &ApiSession,
+    expr: OxStr,
+    flags: OxStr,
+    hl: bool,
+) -> Result<Dict, ApiError> {
+    for flag in flags.as_bytes() {
+        if !matches!(flag, b'E' | b'l' | b'm') {
+            let label = if *flag == 0 {
+                "\\0".to_owned()
+            } else {
+                char::from(*flag).to_string()
+            };
+            return Err(ApiError::validation(format!(
+                "Invalid flag: '{label}' ({flag})"
+            )));
+        }
+    }
+    let source = expr.as_bytes();
+    let mut consumed = source.len();
+    let mut parsed = ox_eval::Parser::new(source)
+        .with_max_nesting(MAX_CONVERSION_DEPTH)
+        .parse();
+    // Multi permits a following expression, but returns only the first.
+    if flags.as_bytes().contains(&b'm')
+        && let Err(error) = &parsed
+        && error.code == "E488"
+    {
+        consumed = error.offset;
+        parsed = ox_eval::Parser::new(
+            source
+                .get(..consumed)
+                .ok_or_else(|| exception("Invalid parser offset"))?,
+        )
+        .with_max_nesting(MAX_CONVERSION_DEPTH)
+        .parse();
+    }
+    let mut result = Dict(vec![(
+        OxStr::from("len"),
+        Object::Integer(i64::try_from(consumed).map_err(exception)?),
+    )]);
+    let ast = match parsed {
+        Ok(node) => expression_api_node(&node, source, 0)?,
+        Err(error) => {
+            result.0.push((
+                OxStr::from("error"),
+                Object::Dict(Dict(vec![
+                    (
+                        OxStr::from("message"),
+                        Object::String(OxStr::from("E15: Invalid expression: %.*s")),
+                    ),
+                    (
+                        OxStr::from("arg"),
+                        Object::String(OxStr::from(source.get(error.offset..).unwrap_or_default())),
+                    ),
+                ])),
+            ));
+            Object::Nil
+        }
+    };
+    result.0.push((OxStr::from("ast"), ast));
+    if hl {
+        result
+            .0
+            .push((OxStr::from("highlight"), Object::Array(Vec::new())));
+    }
+    Ok(result)
+}
+
+// Node names and local fields: viml/parser/expressions.c:861-900,
+// api/vimscript.c:560-616. The evaluator AST does not retain punctuation nodes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per ExprKind of the parser's grammar; splitting it would scatter the AST mapping"
+)]
+fn expression_api_node(
+    node: &ox_eval::Expr,
+    source: &[u8],
+    depth: usize,
+) -> Result<Object, ApiError> {
+    use ox_eval::parser::{BinaryOp, ExprKind, UnaryOp};
+    if depth > MAX_CONVERSION_DEPTH {
+        return Err(exception("Expression nesting is too deep"));
+    }
+    let mut fields = Vec::new();
+    let mut children = Vec::new();
+    let mut start = node.span.start;
+    let mut len = node.span.end.saturating_sub(start);
+    let convert =
+        |child: &ox_eval::Expr| expression_api_node(child, source, depth.saturating_add(1));
+    let kind = match &node.kind {
+        ExprKind::Literal(Typval::Number(value)) => {
+            fields.push((OxStr::from("ivalue"), Object::Integer(*value)));
+            "Integer"
+        }
+        ExprKind::Literal(Typval::Float(value)) => {
+            fields.push((OxStr::from("fvalue"), Object::Float(*value)));
+            "Float"
+        }
+        ExprKind::Literal(Typval::String(value)) => {
+            fields.push((OxStr::from("svalue"), Object::String(value.clone())));
+            if source.get(start) == Some(&b'\'') {
+                "SingleQuotedString"
+            } else {
+                "DoubleQuotedString"
+            }
+        }
+        ExprKind::Variable(name) => {
+            let bytes = name.as_bytes();
+            let scoped = bytes.get(1) == Some(&b':');
+            let scope = if scoped {
+                i64::from(bytes.first().copied().unwrap_or_default())
+            } else {
+                0
+            };
+            let ident = if scoped {
+                bytes.get(2..).unwrap_or_default()
+            } else {
+                bytes
+            };
+            fields.push((OxStr::from("scope"), Object::Integer(scope)));
+            fields.push((OxStr::from("ident"), Object::String(OxStr::from(ident))));
+            "PlainIdentifier"
+        }
+        ExprKind::Environment(name) => {
+            fields.push((OxStr::from("ident"), Object::String(name.clone())));
+            "Environment"
+        }
+        ExprKind::Option { scope, name } => {
+            let scope = match scope {
+                ox_eval::parser::OptionScope::Effective => 0,
+                ox_eval::parser::OptionScope::Global => i64::from(b'g'),
+                ox_eval::parser::OptionScope::Local => i64::from(b'l'),
+            };
+            fields.push((OxStr::from("scope"), Object::Integer(scope)));
+            fields.push((OxStr::from("ident"), Object::String(name.clone())));
+            "Option"
+        }
+        ExprKind::Register(name) => {
+            fields.push((OxStr::from("name"), Object::Integer(i64::from(*name))));
+            "Register"
+        }
+        ExprKind::Unary { op, expr } => {
+            children.push(convert(expr)?);
+            len = 1;
+            match op {
+                UnaryOp::Not => "Not",
+                UnaryOp::Negate => "UnaryMinus",
+                UnaryOp::Plus => "UnaryPlus",
+            }
+        }
+        ExprKind::Binary { op, left, right } => {
+            children.push(convert(left)?);
+            children.push(convert(right)?);
+            start = left.span.end;
+            while source.get(start).is_some_and(u8::is_ascii_whitespace) {
+                start = start.saturating_add(1);
+            }
+            len = match op {
+                BinaryOp::And | BinaryOp::Or => 2,
+                _ => 1,
+            };
+            match op {
+                BinaryOp::Or => "Or",
+                BinaryOp::And => "And",
+                BinaryOp::Add => "BinaryPlus",
+                BinaryOp::Subtract => "BinaryMinus",
+                BinaryOp::Concat => "Concat",
+                BinaryOp::Multiply => "Multiplication",
+                BinaryOp::Divide => "Division",
+                BinaryOp::Modulo => "Mod",
+            }
+        }
+        ExprKind::List(items) => {
+            for item in items {
+                children.push(convert(item)?);
+            }
+            len = 1;
+            "ListLiteral"
+        }
+        ExprKind::Dict(items) => {
+            for (key, value) in items {
+                children.push(convert(key)?);
+                children.push(convert(value)?);
+            }
+            len = 1;
+            "DictLiteral"
+        }
+        ExprKind::Call { callee, args } => {
+            children.push(convert(callee)?);
+            for arg in args {
+                children.push(convert(arg)?);
+            }
+            start = callee.span.end;
+            len = 1;
+            "Call"
+        }
+        ExprKind::Index { target, index } => {
+            children.push(convert(target)?);
+            children.push(convert(index)?);
+            start = target.span.end;
+            len = 1;
+            "Subscript"
+        }
+        ExprKind::CurlyName(expr) => {
+            children.push(convert(expr)?);
+            len = 1;
+            "CurlyBracesIdentifier"
+        }
+        _ => {
+            return Err(exception(
+                "Expression syntax has no lossless public AST conversion",
+            ));
+        }
+    };
+    fields.push((OxStr::from("type"), Object::String(OxStr::from(kind))));
+    fields.push((
+        OxStr::from("start"),
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(i64::try_from(start).map_err(exception)?),
+        ]),
+    ));
+    fields.push((
+        OxStr::from("len"),
+        Object::Integer(i64::try_from(len).map_err(exception)?),
+    ));
+    if !children.is_empty() {
+        fields.push((OxStr::from("children"), Object::Array(children)));
+    }
+    Ok(Object::Dict(Dict(fields)))
+}
+const STL_ALL: &[u8] = b"fFtcvVlLknoObBrRhHmMyYwWqpPaN{=<$#TXCFS";
+
+// optionstr.c:285-351: reject illegal item chars, unclosed expressions,
+// and unbalanced groups before building anything.
+fn check_stl_option(statusline: &[u8]) -> Result<(), ApiError> {
+    let mut offset = 0;
+    let mut depth = 0i64;
+    while let Some(index) = statusline[offset..].iter().position(|byte| *byte == b'%') {
+        offset = offset.saturating_add(index).saturating_add(1);
+        let Some(item) = statusline.get(offset) else {
+            break;
+        };
+        if matches!(item, b'%' | b'<' | b'=') {
+            offset = offset.saturating_add(1);
+            continue;
+        }
+        if *item == b')' {
+            offset = offset.saturating_add(1);
+            depth = depth.saturating_sub(1);
+            if depth < 0 {
+                break;
+            }
+            continue;
+        }
+        let mut cursor = offset;
+        if statusline.get(cursor) == Some(&b'-') {
+            cursor = cursor.saturating_add(1);
+        }
+        while statusline.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor = cursor.saturating_add(1);
+        }
+        if statusline.get(cursor) == Some(&b'*') {
+            offset = cursor;
+            continue;
+        }
+        if statusline.get(cursor) == Some(&b'.') {
+            cursor = cursor.saturating_add(1);
+            while statusline.get(cursor).is_some_and(u8::is_ascii_digit) {
+                cursor = cursor.saturating_add(1);
+            }
+        }
+        if statusline.get(cursor) == Some(&b'(') {
+            depth = depth.saturating_add(1);
+            offset = cursor;
+            continue;
+        }
+        if !STL_ALL.contains(item) {
+            return Err(ApiError::validation(format!(
+                "E539: Illegal character <{}>",
+                char::from(*item)
+            )));
+        }
+        if *item == b'{' {
+            cursor = cursor.saturating_add(1);
+            let reevaluate = statusline.get(cursor) == Some(&b'%');
+            if reevaluate {
+                cursor = cursor.saturating_add(1);
+                if statusline.get(cursor) == Some(&b'}') {
+                    return Err(ApiError::validation("E539: Illegal character <}>"));
+                }
+            }
+            while let Some(byte) = statusline.get(cursor) {
+                if *byte == b'}'
+                    && (!reevaluate || statusline.get(cursor.wrapping_sub(1)) == Some(&b'%'))
+                {
+                    break;
+                }
+                cursor = cursor.saturating_add(1);
+            }
+            if statusline.get(cursor) != Some(&b'}') {
+                return Err(ApiError::validation(
+                    "E540: Unclosed expression sequence %{",
+                ));
+            }
+        }
+        offset = cursor;
+    }
+    if depth != 0 {
+        return Err(ApiError::validation("E542: Unbalanced groups"));
+    }
+    Ok(())
+}
+
+fn cell_width(text: &[u8]) -> usize {
+    String::from_utf8_lossy(text).width()
+}
+
+// api/vim.c:2221-2387 and statusline.c:1143-1971: a faithful subset of the
+// item grammar over editor state this harness owns. Degraded items and the
+// missing width model are recorded in the task report.
+#[api(since = 8, fast)]
+#[expect(
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines,
+    reason = "`#[api]` requires owned arguments and a `Result` return; the body ports the upstream item grammar in one pass"
+)]
+pub fn nvim_eval_statusline(
+    session: &ApiSession,
+    str: OxStr,
+    opts: Dict,
+) -> Result<Dict, ApiError> {
+    reject_keys(
+        &opts,
+        &[
+            "winid",
+            "maxwidth",
+            "fillchar",
+            "highlights",
+            "use_winbar",
+            "use_tabline",
+            "use_statuscol_lnum",
+        ],
+    )?;
+    let format = str.as_bytes();
+    if !(format.len() >= 2 && format[0] == b'%' && format[1] == b'!') {
+        check_stl_option(format)?;
+    }
+    let fillchar = match dict_string(&opts, "fillchar")? {
+        Some(value) => {
+            let bytes = value.as_bytes();
+            let Some(character) = std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|text| text.chars().next())
+            else {
+                return Err(ApiError::validation(
+                    "fillchar: expected single character, got invalid UTF-8",
+                ));
+            };
+            if character.len_utf8() != bytes.len() {
+                let shown = String::from_utf8_lossy(bytes).into_owned();
+                return Err(ApiError::validation(format!(
+                    "fillchar: expected single character, got {shown}"
+                )));
+            }
+            bytes.to_vec()
+        }
+        None => b" ".to_vec(),
+    };
+    let use_winbar = optional_bool(&opts, "use_winbar")?.unwrap_or(false);
+    let use_tabline = optional_bool(&opts, "use_tabline")?.unwrap_or(false);
+    let statuscol_lnum = dict_handle(&opts, "use_statuscol_lnum", i64::try_from)?;
+    let requested_highlights = optional_bool(&opts, "highlights")?.unwrap_or(false);
+    let window = if use_tabline {
+        current_window(session)?
+    } else {
+        let winid = dict_handle(&opts, "winid", WinHandle::try_from)?;
+        let handle = winid.unwrap_or(WinHandle::CURRENT);
+        let known = session.with_editor(|editor| editor.windows().contains(&handle));
+        if handle != WinHandle::CURRENT && !known {
+            let number = i64::from(handle);
+            return Err(ApiError::exception(format!("unknown winid {number}")));
+        }
+        resolve_window(session, handle)?
+    };
+    let mut use_count = usize::from(use_winbar) + usize::from(use_tabline);
+    if let Some(lnum) = statuscol_lnum {
+        use_count = use_count.saturating_add(1);
+        if lnum <= 0 {
+            return Err(ApiError::validation(
+                "use_statuscol_lnum: expected range > 0",
+            ));
+        }
+        let count = session.with_editor(|editor| {
+            let state = editor
+                .window(window)
+                .map_err(|error| ApiError::validation(error.to_string()))?;
+            let buffer = editor
+                .buffer(state.buffer)
+                .map_err(|error| ApiError::validation(error.to_string()))?;
+            if buffer.residency.is_loaded() {
+                i64::try_from(buffer.text().map_err(exception)?.line_count()).map_err(exception)
+            } else {
+                Ok(0)
+            }
+        })?;
+        if lnum > count {
+            return Err(ApiError::validation(format!(
+                "use_statuscol_lnum: expected range <= {count}"
+            )));
+        }
+    }
+    if use_count > 1 {
+        return Err(ApiError::validation(
+            "Can only use one of 'use_winbar', 'use_tabline' and 'use_statuscol_lnum'",
+        ));
+    }
+    let maxwidth = match dict_handle(&opts, "maxwidth", i64::try_from)? {
+        Some(value) => value,
+        None => session.with_editor(|editor| {
+            i64::try_from(editor.window_geometry(window).map_err(exception)?.width)
+                .map_err(exception)
+        })?,
+    };
+    let context = session.with_editor(|editor| {
+        let state = editor
+            .window(window)
+            .map_err(|error| ApiError::validation(error.to_string()))?;
+        let cursor = state.cursor;
+        let buffer = editor
+            .buffer(state.buffer)
+            .map_err(|error| ApiError::validation(error.to_string()))?;
+        let loaded = buffer.residency.is_loaded();
+        let line_count = if loaded {
+            buffer.text().map_or(0, ox_text::Buffer::line_count)
+        } else {
+            0
+        };
+        let line: Vec<u8> = if loaded {
+            buffer
+                .text()
+                .ok()
+                .and_then(|text| text.line(cursor.lnum.saturating_sub(1)).ok())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let modified = buffer.flags.contains(ox_editor::BufferFlags::MODIFIED);
+        let modifiable = !buffer.flags.contains(ox_editor::BufferFlags::READONLY);
+        let name = buffer.name().clone();
+        let handle = state.buffer;
+        Ok(StatuslineContext {
+            cursor,
+            line_count,
+            line,
+            modified,
+            modifiable,
+            name,
+            handle,
+            readonly: false,
+            filetype: String::new(),
+            arglist: (0, 0),
+        })
+    })?;
+    let mut builder = StlBuilder {
+        out: Vec::new(),
+        alignment: None,
+        truncation: None,
+        highlights: Vec::new(),
+        default_group: OxStr::from(if use_tabline {
+            "TabLineFill"
+        } else if use_winbar {
+            "WinBar"
+        } else {
+            "StatusLine"
+        }),
+        current_groups: Vec::new(),
+    };
+    let mut offset = 0;
+    while offset < format.len() {
+        if format[offset] != b'%' {
+            let literal = format[offset];
+            builder.push_text(&[literal]);
+            offset = offset.saturating_add(1);
+            continue;
+        }
+        offset = offset.saturating_add(1);
+        let Some(item) = format.get(offset).copied() else {
+            break;
+        };
+        offset = offset.saturating_add(1);
+        match item {
+            b'%' => builder.push_text(b"%"),
+            b'<' => builder.truncation = Some(builder.out.len()),
+            b'=' => {
+                builder.alignment.get_or_insert(builder.out.len());
+            }
+            b'#' | b'$' => {
+                let end = format
+                    .get(offset..)
+                    .and_then(|rest| rest.iter().position(|byte| *byte == item))
+                    .map(|position| offset.saturating_add(position));
+                let Some(end) = end else { break };
+                let group = OxStr::from(format.get(offset..end).unwrap_or_default());
+                if item == b'#' {
+                    builder.close_highlight();
+                    builder.current_groups = vec![group];
+                } else {
+                    builder.current_groups.push(group);
+                }
+                offset = end.saturating_add(1);
+            }
+            b'{' => {
+                let mut end = offset;
+                let reevaluate = format.get(end) == Some(&b'%');
+                if reevaluate {
+                    end = end.saturating_add(1);
+                }
+                while let Some(byte) = format.get(end) {
+                    if *byte == b'}'
+                        && (!reevaluate || format.get(end.wrapping_sub(1)) == Some(&b'%'))
+                    {
+                        break;
+                    }
+                    end = end.saturating_add(1);
+                }
+                if format.get(end) != Some(&b'}') {
+                    break;
+                }
+                let source = std::str::from_utf8(format.get(offset..end).unwrap_or_default())
+                    .map_err(|_| ApiError::validation("Expression must be valid UTF-8"))?;
+                let value = with_command_executor(session, |_, executor| {
+                    executor.evaluate(session, source)
+                })?;
+                let rendered = match &value {
+                    Typval::Number(number) => number.to_string().into_bytes(),
+                    Typval::String(text) => text.as_bytes().to_vec(),
+                    other => crate::global::typval_to_object(other, 0)
+                        .ok()
+                        .and_then(|object| {
+                            if let Object::String(text) = object {
+                                Some(text.as_bytes().to_vec())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default(),
+                };
+                builder.push_item(&rendered, false);
+                offset = end.saturating_add(1);
+            }
+            b'!' => {
+                let source = std::str::from_utf8(format.get(offset..).unwrap_or_default())
+                    .map_err(|_| ApiError::validation("Expression must be valid UTF-8"))?;
+                let value = with_command_executor(session, |_, executor| {
+                    executor.evaluate(session, source)
+                })?;
+                let rendered = match &value {
+                    Typval::Number(number) => number.to_string().into_bytes(),
+                    Typval::String(text) => text.as_bytes().to_vec(),
+                    _ => Vec::new(),
+                };
+                builder.push_item(&rendered, false);
+                break;
+            }
+            b'(' | b')' | b'@' | b'T' | b'X' | b'C' | b'S' => {
+                if item == b'@' {
+                    let end = format
+                        .get(offset..)
+                        .and_then(|rest| rest.iter().position(|byte| *byte == b'@'))
+                        .map(|position| offset.saturating_add(position));
+                    let Some(end) = end else { break };
+                    offset = end.saturating_add(1);
+                }
+            }
+            b'0'..=b'9' => {
+                let end = format
+                    .get(offset..)
+                    .and_then(|rest| rest.iter().position(|byte| !byte.is_ascii_digit()))
+                    .map_or(format.len(), |position| offset.saturating_add(position));
+                let digits = format.get(offset..end).unwrap_or_default();
+                if digits.len() == 1 && matches!(format.get(end), Some(b'(') | None) {
+                    builder.close_highlight();
+                    let group = OxStr::from(format!("User{}", char::from(digits[0])).as_bytes());
+                    builder.current_groups = vec![group];
+                } else if digits.len() == 1 {
+                    let value = i64::from(digits[0])
+                        .checked_sub(i64::from(b'0'))
+                        .ok_or_else(|| exception("Invalid user highlight"))?;
+                    builder.push_item(value.to_string().as_bytes(), false);
+                }
+                offset = end;
+                if format.get(offset).is_some_and(u8::is_ascii_digit) {
+                    offset = offset.saturating_add(1);
+                }
+            }
+            _ => {
+                let mut cursor = offset;
+                if format.get(cursor) == Some(&b'-') {
+                    cursor = cursor.saturating_add(1);
+                }
+                let start_digits = cursor;
+                while format.get(cursor).is_some_and(u8::is_ascii_digit) {
+                    cursor = cursor.saturating_add(1);
+                }
+                let minwid =
+                    std::str::from_utf8(format.get(start_digits..cursor).unwrap_or_default())
+                        .unwrap_or("0")
+                        .parse::<i64>()
+                        .unwrap_or(0);
+                let mut maxwid = 9999i64;
+                if format.get(cursor) == Some(&b'.') {
+                    cursor = cursor.saturating_add(1);
+                    let digits_start = cursor;
+                    while format.get(cursor).is_some_and(u8::is_ascii_digit) {
+                        cursor = cursor.saturating_add(1);
+                    }
+                    maxwid =
+                        std::str::from_utf8(format.get(digits_start..cursor).unwrap_or_default())
+                            .unwrap_or("50")
+                            .parse::<i64>()
+                            .unwrap_or(50);
+                }
+                let Some(target) = format.get(cursor).copied() else {
+                    break;
+                };
+                offset = cursor.saturating_add(1);
+                let mut piece: Vec<u8> = Vec::new();
+                let mut fillable = true;
+                let mut numeric = false;
+                match target {
+                    b'f' | b'F' => {
+                        fillable = false;
+                        piece = context.name.as_bytes().to_vec();
+                    }
+                    b't' => {
+                        fillable = false;
+                        let name = context.name.as_bytes();
+                        piece = name.iter().rposition(|byte| *byte == b'/').map_or_else(
+                            || name.to_vec(),
+                            |position| {
+                                name.get(position.saturating_add(1)..)
+                                    .unwrap_or_default()
+                                    .to_vec()
+                            },
+                        );
+                    }
+                    b'l' => {
+                        numeric = true;
+                        piece = context.cursor.lnum.to_string().into_bytes();
+                    }
+                    b'L' => {
+                        numeric = true;
+                        piece = context.line_count.to_string().into_bytes();
+                    }
+                    b'c' => {
+                        numeric = true;
+                        let column = if context.line.is_empty() {
+                            0
+                        } else {
+                            context.cursor.col.saturating_add(1)
+                        };
+                        piece = column.to_string().into_bytes();
+                    }
+                    b'v' => {
+                        numeric = true;
+                        piece = context
+                            .cursor
+                            .col
+                            .saturating_add(1)
+                            .to_string()
+                            .into_bytes();
+                    }
+                    b'V' => {
+                        let column = if context.line.is_empty() {
+                            0
+                        } else {
+                            context.cursor.col.saturating_add(1)
+                        };
+                        piece = format!("-{column}").into_bytes();
+                    }
+                    b'n' => {
+                        numeric = true;
+                        piece = i64::from(context.handle).to_string().into_bytes();
+                    }
+                    b'p' => {
+                        numeric = true;
+                        let percent = if context.line_count == 0 {
+                            0
+                        } else {
+                            context
+                                .cursor
+                                .lnum
+                                .saturating_mul(100)
+                                .checked_div(context.line_count)
+                                .ok_or_else(|| exception("Division by zero"))?
+                        };
+                        piece = percent.to_string().into_bytes();
+                    }
+                    b'P' => {
+                        if context.line_count <= 1 || context.cursor.lnum == 1 {
+                            piece = b"Top".to_vec();
+                        } else if context.cursor.lnum >= context.line_count {
+                            piece = b"Bot".to_vec();
+                        } else {
+                            let span = context.line_count.saturating_sub(1);
+                            let percent = context
+                                .cursor
+                                .lnum
+                                .saturating_sub(1)
+                                .saturating_mul(100)
+                                .checked_div(span)
+                                .ok_or_else(|| exception("Division by zero"))?;
+                            piece = format!("{percent}%").into_bytes();
+                        }
+                    }
+                    b'm' | b'M' => {
+                        if !context.modifiable {
+                            piece = if target == b'M' {
+                                b",-".to_vec()
+                            } else {
+                                b"[-]".to_vec()
+                            };
+                        } else if context.modified {
+                            piece = if target == b'M' {
+                                b",+".to_vec()
+                            } else {
+                                b"[+]".to_vec()
+                            };
+                        }
+                    }
+                    b'r' | b'R' => {
+                        if context.readonly {
+                            piece = if target == b'R' {
+                                b",RO".to_vec()
+                            } else {
+                                b"[RO]".to_vec()
+                            };
+                        }
+                    }
+                    b'y' | b'Y' => {
+                        fillable = false;
+                        if !context.filetype.is_empty() {
+                            piece = if target == b'Y' {
+                                format!(",{}", context.filetype).into_bytes()
+                            } else {
+                                format!("[{}]", context.filetype).into_bytes()
+                            };
+                        }
+                    }
+                    b'b' => {
+                        numeric = true;
+                        let byte = context.line.get(context.cursor.col).copied().unwrap_or(0);
+                        let value = if byte == b'\n' { 0 } else { byte };
+                        piece = value.to_string().into_bytes();
+                    }
+                    b'B' => {
+                        numeric = true;
+                        let byte = context.line.get(context.cursor.col).copied().unwrap_or(0);
+                        let value = if byte == b'\n' { 0 } else { byte };
+                        piece = format!("{value:02X}").into_bytes();
+                    }
+                    b'a' => {
+                        fillable = false;
+                        let (index, total) = context.arglist;
+                        if total > 0 {
+                            piece = format!("({index} of {total})").into_bytes();
+                        }
+                    }
+                    b'N' => {
+                        numeric = true;
+                    }
+                    other => {
+                        return Err(ApiError::validation(format!(
+                            "E539: Illegal character <{}>",
+                            char::from(other)
+                        )));
+                    }
+                }
+                let mut text = piece;
+                let maxwid_cells = usize::try_from(maxwid.max(0)).unwrap_or(usize::MAX);
+                if maxwid > 0
+                    && cell_width(&text)
+                        > maxwid_cells.saturating_mul(fillchar_width(&fillchar).max(1))
+                {
+                    truncate_cells(&mut text, maxwid_cells);
+                }
+                let width = cell_width(&text);
+                let minimum = usize::try_from(minwid.unsigned_abs()).unwrap_or(usize::MAX);
+                if minwid > 0 && width < minimum {
+                    let pad = minimum.saturating_sub(width);
+                    let fill = fillchar.repeat(pad);
+                    text.splice(0..0, fill);
+                } else if minwid < 0 && width < minimum {
+                    let pad = minimum.saturating_sub(width);
+                    text.extend(fillchar.repeat(pad));
+                }
+                let _ = numeric;
+                builder.push_item(&text, fillable);
+            }
+        }
+    }
+    builder.close_highlight();
+    if maxwidth > 0 {
+        let fill_cells = cell_width(&fillchar).max(1);
+        if let Some(at) = builder.alignment {
+            let width = cell_width(&builder.out);
+            if width < usize::try_from(maxwidth.unsigned_abs()).unwrap_or(usize::MAX) {
+                let pad = usize::try_from(maxwidth.unsigned_abs())
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(width)
+                    .saturating_div(fill_cells);
+                let fill = fillchar.repeat(pad);
+                let fill_len = fill.len();
+                builder.out.splice(at..at, fill);
+                builder.shift_highlights(at, isize::try_from(fill_len).unwrap_or(isize::MAX));
+            }
+        }
+        if cell_width(&builder.out) > usize::try_from(maxwidth.unsigned_abs()).unwrap_or(usize::MAX)
+            && let Some(at) = builder.truncation
+        {
+            let tail = builder.out.split_off(at);
+            let mut replacement = b"<".to_vec();
+            replacement.extend(tail);
+            let excess = cell_width(&replacement)
+                .saturating_sub(usize::try_from(maxwidth.unsigned_abs()).unwrap_or(usize::MAX));
+            if excess > 0 {
+                truncate_cells(
+                    &mut replacement,
+                    usize::try_from(maxwidth.unsigned_abs()).unwrap_or(usize::MAX),
+                );
+            }
+            builder.out = replacement;
+            builder.shift_highlights(0, isize::try_from(at).unwrap_or(isize::MAX).wrapping_neg());
+        }
+    }
+    let width = cell_width(&builder.out);
+    let mut result = Dict(vec![
+        (
+            OxStr::from("str"),
+            Object::String(OxStr::from(builder.out.as_slice())),
+        ),
+        (
+            OxStr::from("width"),
+            Object::Integer(i64::try_from(width).map_err(exception)?),
+        ),
+    ]);
+    if requested_highlights {
+        let mut entries = Vec::new();
+        let mut first_covers_zero = false;
+        for segment in &builder.highlights {
+            if segment.0 == 0 {
+                first_covers_zero = true;
+            }
+        }
+        if !first_covers_zero && !builder.highlights.is_empty() {
+            entries.push(highlight_entry(0, &[builder.default_group.clone()]));
+        }
+        for (start, groups) in &builder.highlights {
+            entries.push(highlight_entry(*start, groups));
+        }
+        result
+            .0
+            .push((OxStr::from("highlights"), Object::Array(entries)));
+    }
+    Ok(result)
+}
+
+fn highlight_entry(start: usize, groups: &[OxStr]) -> Object {
+    Object::Dict(Dict(vec![
+        (
+            OxStr::from("start"),
+            Object::Integer(i64::try_from(start).unwrap_or(i64::MAX)),
+        ),
+        (
+            OxStr::from("group"),
+            Object::String(
+                groups
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| OxStr::from(&b""[..])),
+            ),
+        ),
+        (
+            OxStr::from("groups"),
+            Object::Array(
+                groups
+                    .iter()
+                    .map(|group| Object::String(group.clone()))
+                    .collect(),
+            ),
+        ),
+    ]))
+}
+
+fn fillchar_width(fillchar: &[u8]) -> usize {
+    String::from_utf8_lossy(fillchar)
+        .chars()
+        .map(char::width_usize)
+        .sum()
+}
+
+fn truncate_cells(text: &mut Vec<u8>, max_cells: usize) {
+    let mut kept = Vec::new();
+    let mut cells: usize = 0;
+    for character in String::from_utf8_lossy(text).chars() {
+        let width = character.width_usize();
+        if cells.saturating_add(width) > max_cells {
+            break;
+        }
+        cells = cells.saturating_add(width);
+        let mut encoded = [0; 4];
+        kept.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+    }
+    *text = kept;
+}
+
+trait CharWidth {
+    fn width_usize(self) -> usize;
+}
+
+impl CharWidth for char {
+    fn width_usize(self) -> usize {
+        self.width().unwrap_or(0)
+    }
+}
+
+struct StatuslineContext {
+    cursor: ox_text::Position,
+    line_count: usize,
+    line: Vec<u8>,
+    modified: bool,
+    modifiable: bool,
+    name: OxStr,
+    handle: BufHandle,
+    readonly: bool,
+    filetype: String,
+    arglist: (usize, usize),
+}
+
+struct StlBuilder {
+    out: Vec<u8>,
+    alignment: Option<usize>,
+    truncation: Option<usize>,
+    highlights: Vec<(usize, Vec<OxStr>)>,
+    default_group: OxStr,
+    current_groups: Vec<OxStr>,
+}
+
+impl StlBuilder {
+    fn push_text(&mut self, text: &[u8]) {
+        if !self.current_groups.is_empty() {
+            let start = self.out.len();
+            self.highlights.push((start, self.current_groups.clone()));
+        }
+        self.out.extend_from_slice(text);
+    }
+
+    fn push_item(&mut self, text: &[u8], fillable: bool) {
+        let start = self.out.len();
+        if !self.current_groups.is_empty() {
+            self.highlights.push((start, self.current_groups.clone()));
+        }
+        if fillable {
+            for byte in text {
+                if *byte == b' ' {
+                    self.out.extend_from_slice(b" ");
+                } else {
+                    self.out.push(*byte);
+                }
+            }
+        } else {
+            self.out.extend_from_slice(text);
+        }
+    }
+
+    fn close_highlight(&mut self) {
+        self.current_groups.clear();
+    }
+
+    fn shift_highlights(&mut self, at: usize, by: isize) {
+        for (start, _) in &mut self.highlights {
+            if *start >= at {
+                let shifted = (*start).cast_signed().saturating_add(by);
+                *start = shifted.max(0).cast_unsigned();
+            }
+        }
+    }
+}
+
 pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(
         nvim_get_current_buf__API_META(),
@@ -2299,5 +3632,32 @@ pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(nvim_strwidth__API_META(), nvim_strwidth__API_DISPATCH)?;
     registry.register(nvim_err_writeln__API_META(), nvim_err_writeln__API_DISPATCH)?;
     registry.register(nvim_echo__API_META(), nvim_echo__API_DISPATCH)?;
+    registry.register(
+        nvim_del_current_line__API_META(),
+        nvim_del_current_line__API_DISPATCH,
+    )?;
+    registry.register(nvim_del_mark__API_META(), nvim_del_mark__API_DISPATCH)?;
+    registry.register(nvim_get_mark__API_META(), nvim_get_mark__API_DISPATCH)?;
+    registry.register(
+        nvim_call_dict_function__API_META(),
+        nvim_call_dict_function__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_get_all_options_info__API_META(),
+        nvim_get_all_options_info__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_get_option_info2__API_META(),
+        nvim_get_option_info2__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_parse_expression__API_META(),
+        nvim_parse_expression__API_DISPATCH,
+    )?;
+    registry.register(
+        nvim_eval_statusline__API_META(),
+        nvim_eval_statusline__API_DISPATCH,
+    )?;
+    registry.register(nvim_input_mouse__API_META(), nvim_input_mouse__API_DISPATCH)?;
     Ok(())
 }

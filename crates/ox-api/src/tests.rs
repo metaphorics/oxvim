@@ -7928,3 +7928,147 @@ fn open_tabpage_registry_dispatch_returns_new_tabpage() {
         [first_tab, crate::TabHandle::try_from(2).unwrap()]
     );
 }
+
+// ---- task-W4 boundary tests ---------------------------------------------
+
+#[test]
+fn w4_mark_names_validate() {
+    let session = session();
+    let two = OxStr::from("AB");
+    assert_eq!(
+        crate::global::nvim_del_mark(&session, two.clone()),
+        Err(ApiError::validation(
+            "Invalid mark name (must be a single char): 'AB'"
+        ))
+    );
+    let lower = OxStr::from("a");
+    assert_eq!(
+        crate::global::nvim_del_mark(&session, lower.clone()),
+        Err(ApiError::validation(
+            "Invalid mark name (must be file/uppercase): 'a'"
+        ))
+    );
+    // A valid global mark deletes cleanly and reports success even unset.
+    assert!(crate::global::nvim_del_mark(&session, OxStr::from("A")).is_ok());
+}
+
+#[test]
+fn w4_get_mark_unset_reports_zero_position() {
+    let session = session();
+    let mark = crate::global::nvim_get_mark(&session, OxStr::from("B"), dict(&[])).unwrap();
+    assert_eq!(mark[0], Object::Integer(0));
+    assert_eq!(mark[1], Object::Integer(0));
+    assert_eq!(mark[2], Object::Integer(0));
+    assert_eq!(mark[3], Object::String(OxStr::from("")));
+}
+
+#[test]
+fn w4_call_dict_function_rejects_invalid_dict() {
+    let session = session();
+    let result = crate::global::nvim_call_dict_function(
+        &session,
+        Object::Integer(7),
+        OxStr::from("anything"),
+        Vec::new(),
+    );
+    assert_eq!(
+        result,
+        Err(ApiError::validation(
+            "Invalid dict argument: expected String or Dict"
+        ))
+    );
+}
+
+#[test]
+fn w4_options_info_carry_upstream_fields() {
+    let session = session();
+    let all = crate::global::nvim_get_all_options_info(&session).unwrap();
+    let Object::Dict(fields) = all
+        .iter()
+        .find(|(name, _)| name.as_bytes() == b"winminheight".as_slice())
+        .map(|(_, value)| value.clone())
+        .expect("winminheight is a known option")
+    else {
+        panic!("option info is a dict");
+    };
+    for key in ["name", "shortname", "type", "default", "scope", "was_set"] {
+        assert!(
+            fields
+                .iter()
+                .any(|(name, _)| name.as_bytes() == key.as_bytes()),
+            "missing field {key}"
+        );
+    }
+    let single =
+        crate::global::nvim_get_option_info2(&session, OxStr::from("winminheight"), dict(&[]))
+            .unwrap();
+    assert_eq!(single, Dict(fields.iter().cloned().collect::<Vec<_>>()));
+}
+
+#[test]
+fn w4_input_mouse_validates_button_and_action() {
+    let session = session();
+    let bad_button = crate::global::nvim_input_mouse(
+        &session,
+        OxStr::from("thumb"),
+        OxStr::from("press"),
+        OxStr::from(""),
+        0,
+        1,
+        1,
+    );
+    assert_eq!(
+        bad_button,
+        Err(ApiError::validation("invalid button or action"))
+    );
+    let bad_action = crate::global::nvim_input_mouse(
+        &session,
+        OxStr::from("wheel"),
+        OxStr::from("press"),
+        OxStr::from(""),
+        0,
+        1,
+        1,
+    );
+    assert_eq!(
+        bad_action,
+        Err(ApiError::validation("invalid button or action"))
+    );
+    assert!(
+        crate::global::nvim_input_mouse(
+            &session,
+            OxStr::from("left"),
+            OxStr::from("press"),
+            OxStr::from(""),
+            0,
+            1,
+            1
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn w4_eval_statusline_renders_literal_and_filename() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let session = session_with(editor);
+    let result =
+        crate::global::nvim_eval_statusline(&session, OxStr::from("static"), dict(&[])).unwrap();
+    let value = result
+        .iter()
+        .find(|(key, _)| key.as_bytes() == b"str".as_slice());
+    let Some((_, Object::String(rendered))) = value else {
+        panic!("statusline result carries str");
+    };
+    assert_eq!(rendered.as_bytes(), b"static".as_slice());
+    let unknown = crate::global::nvim_eval_statusline(
+        &session,
+        OxStr::from("x"),
+        dict(&[("winid", Object::Integer(9_999))]),
+    );
+    assert!(unknown.is_err(), "unknown winid must fail");
+}

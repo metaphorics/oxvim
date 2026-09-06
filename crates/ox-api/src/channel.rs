@@ -253,6 +253,68 @@ fn runtime_file_strings(session: &ApiSession, name: &str, all: bool) -> Vec<OxSt
         .collect()
 }
 
+/// Reads a field of `/proc/<pid>/stat` split safely past the comm field,
+/// which may itself contain spaces and parentheses.
+fn proc_stat_field(pid: i64, field: usize) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm is parenthesized and may contain ' ' and ')'; the fields after
+    // it start at the LAST ')'.
+    let tail = stat.rsplit_once(')')?.1;
+    tail.split_whitespace()
+        .nth(field.saturating_sub(3))
+        .map(str::to_owned)
+}
+
+/// Gets info describing process `pid` (upstream `nvim_get_proc`,
+/// api/vim.c:1983-2015: NIL when not found, `{name, pid}` from the OS).
+#[api(since = 4)]
+pub fn nvim_get_proc(_session: &ApiSession, pid: i64) -> Result<Object, ApiError> {
+    if !(pid > 0 && pid <= i32::MAX.into()) {
+        return Err(ApiError::validation(format!("Invalid pid: {pid}")));
+    }
+    let Some(name) = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|raw| raw.trim_end().to_owned())
+    else {
+        return Ok(Object::Nil);
+    };
+    Ok(Object::Dict(Dict(vec![
+        (
+            OxStr::from("name"),
+            Object::String(OxStr::from(name.as_bytes())),
+        ),
+        (OxStr::from("pid"), Object::Integer(pid)),
+    ])))
+}
+
+/// Gets the child process ids of `pid` (upstream `nvim_get_proc_children`,
+/// api/vim.c:1943-1977: syscall children listing, empty when none).
+#[api(since = 4)]
+pub fn nvim_get_proc_children(_session: &ApiSession, pid: i64) -> Result<Vec<Object>, ApiError> {
+    if !(pid > 0 && pid <= i32::MAX.into()) {
+        return Err(ApiError::validation(format!("Invalid pid: {pid}")));
+    }
+    // The kernel's /proc children listing needs CONFIG_PROC_CHILDREN; the
+    // portable route upstream falls back to (a `ps` walk) is a PPID scan.
+    let mut children = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Ok(children);
+    };
+    for entry in entries.flatten() {
+        let Ok(candidate) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(candidate_pid) = candidate.parse::<i64>() else {
+            continue;
+        };
+        // stat field 4 is PPID (1-based fields after the comm parenthesis).
+        if proc_stat_field(candidate_pid, 4).is_some_and(|ppid| ppid == pid.to_string()) {
+            children.push(Object::Integer(candidate_pid));
+        }
+    }
+    Ok(children)
+}
+
 pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(nvim_chan_send__API_META(), nvim_chan_send__API_DISPATCH)?;
     registry.register(nvim_subscribe__API_META(), nvim_subscribe__API_DISPATCH)?;
@@ -273,6 +335,11 @@ pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(
         nvim_get_runtime_file__API_META(),
         nvim_get_runtime_file__API_DISPATCH,
+    )?;
+    registry.register(nvim_get_proc__API_META(), nvim_get_proc__API_DISPATCH)?;
+    registry.register(
+        nvim_get_proc_children__API_META(),
+        nvim_get_proc_children__API_DISPATCH,
     )?;
     Ok(())
 }
