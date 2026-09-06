@@ -306,6 +306,7 @@ fn generate(functions: &[Function]) -> Result<String, GenError> {
          // Do not edit by hand; regenerate and review the diff.\n",
     );
     out.push_str("use crate::{FunctionMetadata, TypeRef};\n\n");
+    out.push_str("#[rustfmt::skip]\n");
     out.push_str("pub(crate) const API_FUNCTIONS: &[FunctionMetadata] = &[\n");
 
     for f in functions {
@@ -395,9 +396,18 @@ fn run(check: bool, write: bool) -> Result<(), GenError> {
 }
 
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    let check = args.any(|a| a == "--check");
-    let write = args.any(|a| a == "--write");
+    // One pass: `any()` short-circuits and consumes the iterator, so a
+    // chained `any(--check)` + `any(--write)` never sees `--write` after
+    // `--check`'s scan exhausts it.
+    let mut check = false;
+    let mut write = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--check" => check = true,
+            "--write" => write = true,
+            _ => {}
+        }
+    }
     match run(check, write) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

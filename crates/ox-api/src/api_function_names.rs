@@ -3,6 +3,7 @@
 // Do not edit by hand; regenerate and review the diff.
 use crate::{FunctionMetadata, TypeRef};
 
+#[rustfmt::skip]
 pub(crate) const API_FUNCTIONS: &[FunctionMetadata] = &[
     FunctionMetadata {
         name: "nvim_get_autocmds",
