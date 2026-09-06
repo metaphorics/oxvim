@@ -21,6 +21,7 @@
 use std::fmt;
 use std::fmt::Write as _;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::ExitCode;
 
 use ox_types::{Dict, Object, OxStr};
@@ -371,11 +372,14 @@ fn run(check: bool, write: bool) -> Result<(), GenError> {
     }
 
     if write {
-        // Atomic replace: the temp sibling keeps a failed decode, extract,
-        // or write from ever truncating the checked-in source.
-        let temp = path.with_extension("rs.tmp");
-        std::fs::write(&temp, output.as_bytes())?;
-        std::fs::rename(&temp, &path)?;
+        // Atomic replace per process: each invocation owns its temp sibling,
+        // so concurrent generators never write through the same inode or
+        // race the rename over the target.
+        let temp = path.with_extension(format!("rs.tmp.{}", std::process::id()));
+        if let Err(err) = write_and_replace(&temp, &path, output.as_bytes()) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(err.into());
+        }
         eprintln!(
             "ox-api-inventory-gen: wrote {} functions to {}.",
             functions.len(),
@@ -403,6 +407,16 @@ fn main() -> ExitCode {
     }
 }
 
+/// Writes `bytes` to `temp` and renames it over `path` atomically.
+///
+/// # Errors
+///
+/// Returns the io error from either the write or the rename.
+fn write_and_replace(temp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(temp, bytes)?;
+    std::fs::rename(temp, path)
+}
+
 
 
 #[cfg(test)]
@@ -422,3 +436,4 @@ mod tests {
         );
     }
 }
+
