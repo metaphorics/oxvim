@@ -652,7 +652,19 @@ fn enter_tabpage(session: &ApiSession, target: TabHandle) -> Result<(), ApiError
     session
         .with_editor_mut(|editor| editor.set_current_tabpage(target))
         .map_err(current_handle_error)?;
-    fire_focus_events(session, &transition.enters, Some(new))
+    // `enter_tabpage` binds its events to the window that is current AFTER
+    // the switch (`window.c:4767` reads the tab's `tp_curwin` post-switch);
+    // a leave handler may have closed the snapshot window, so the enters
+    // describe the state actually entered, not the one snapshotted before
+    // any handler ran.
+    let entered = session.with_editor(|editor| {
+        editor
+            .tabpage(target)
+            .ok()
+            .and_then(|tab| editor.window(tab.current_window()).ok())
+            .map(|window| window.buffer)
+    });
+    fire_focus_events(session, &transition.enters, entered)
 }
 
 /// Fires the leave sequence, performs the window switch, and fires the enter

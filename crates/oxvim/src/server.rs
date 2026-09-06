@@ -3434,7 +3434,12 @@ fn dispatch_scoped_builtin(
         },
     };
     let is_jobstart = name.as_bytes() == b"jobstart";
-    if !is_jobstart || result.is_err() {
+    // A failed spawn returns `Ok(-1)`: no job exists to own the callback
+    // references, so they free here with every other non-transferring
+    // result (the successful-spawn transfer is the only retention).
+    let failed_spawn = is_jobstart
+        && matches!(&result, Ok(Typval::Number(id)) if *id <= 0);
+    if !is_jobstart || result.is_err() || failed_spawn {
         free_typval_refs(lua, &references);
     }
     let result = result.map_err(mlua::Error::runtime)?;
@@ -4657,6 +4662,79 @@ mod tests {
             Typval::Number(1),
             "the on_exit flushed by jobwait must run before the API call \
              returns, with no tick in between"
+        );
+    }
+
+    // A TabLeave handler may close the destination tab's current window;
+    // the enter events must then bind to the window promoted as the tab's
+    // current (`enter_tabpage` reads `tp_curwin` after the switch,
+    // window.c:4767), not to the buffer snapshotted before any handler ran.
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture and chunk must succeed"
+    )]
+    fn tab_enters_bind_to_the_promoted_window_after_a_leave_handler_closes_it() {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let core = build_embedded_core(editor, true).unwrap();
+        let (_, exec) = core.registry.get("nvim_exec_lua").unwrap();
+        exec(
+            &core.session,
+            &[
+                Object::String(OxStr::from(
+                    r#"
+                    vim.g.entered = -1
+                    local function step(n, f)
+                      local ok, err = pcall(f)
+                      if not ok then
+                        error('step ' .. n .. ': ' .. tostring(err))
+                      end
+                    end
+                    local t1 = vim.api.nvim_get_current_tabpage()
+                    step(1, function() vim.cmd('tabnew') end)
+                    local t2 = vim.api.nvim_get_current_tabpage()
+                    vim.g.w2 = vim.api.nvim_get_current_win()
+                    local promoted
+                    step(2, function() promoted = vim.api.nvim_create_buf(false, true) end)
+                    vim.g.promoted = promoted
+                    step(3, function()
+                      vim.api.nvim_open_win(promoted, false, {split = 'right'})
+                    end)
+                    step(4, function() vim.api.nvim_set_current_tabpage(t1) end)
+                    step(5, function()
+                      vim.api.nvim_create_autocmd('TabLeave',
+                        {command = 'call nvim_win_close(g:w2, v:true)'})
+                    end)
+                    step(6, function()
+                      vim.api.nvim_create_autocmd('TabEnter',
+                        {command = 'let g:entered = str2nr(expand("<abuf>"))'})
+                    end)
+                    step(7, function() vim.api.nvim_set_current_tabpage(t2) end)
+                    "#,
+                )),
+                Object::Array(Vec::new()),
+            ],
+        )
+        .unwrap();
+        let entered = core
+            .ex
+            .borrow_mut()
+            .evaluate_expression(&*core.session, "g:entered")
+            .unwrap();
+        let promoted = core
+            .ex
+            .borrow_mut()
+            .evaluate_expression(&*core.session, "g:promoted")
+            .unwrap();
+        assert_eq!(
+            entered,
+            promoted,
+            "TabEnter must bind to the promoted window's buffer, not the \
+             closed window's snapshot"
         );
     }
 }
