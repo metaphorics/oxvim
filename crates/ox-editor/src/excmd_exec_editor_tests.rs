@@ -1836,6 +1836,173 @@ fn new_fires_the_creation_sequence_for_the_new_buffer() {
     );
 }
 
+/// Reads back a `g:` list of event names recorded by `call add(g:order, ...)`.
+fn order_events(executor: &ExExecutor<MemoryFileIO>) -> Vec<String> {
+    match global_value(executor, "order") {
+        Some(ox_types::Typval::List(list)) => list
+            .borrow()
+            .items
+            .iter()
+            .map(|value| match value {
+                ox_types::Typval::String(text) => text.to_string_lossy().into_owned(),
+                other => panic!("expected strings, got {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected a List, got {other:?}"),
+    }
+}
+
+/// Registers `call add(g:order, '<event>,')` recorders for the focus events.
+fn record_focus_events(
+    editor: &TestEditorAccess,
+    mut executor: ExExecutor<MemoryFileIO>,
+) -> ExExecutor<MemoryFileIO> {
+    executor.execute_line(editor, "let g:order = []").unwrap();
+    for event in [
+        "BufLeave",
+        "BufEnter",
+        "BufWinEnter",
+        "WinLeave",
+        "WinEnter",
+        "TabLeave",
+        "TabEnter",
+    ] {
+        let line = format!("autocmd {event} * call add(g:order, '{event},')");
+        executor.execute_line(editor, &line).unwrap();
+    }
+    executor
+}
+
+/// `:buffer {nr}` fires `BufLeave` on the abandoned buffer before the switch,
+/// then `BufEnter` and `BufWinEnter` on the entered one (`set_curbuf`,
+/// buffer.c:1735, `enter_buffer`, buffer.c:1850-1851).
+#[test]
+fn autocmd_buffer_switch_fires_bufleave_bufenter_bufwinenter_in_order() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("one.txt", "1");
+    executor.scripts().io().insert("two.txt", "2");
+    executor.execute_line(&editor, "edit one.txt").unwrap();
+    executor.execute_line(&editor, "edit two.txt").unwrap();
+    let mut executor = record_focus_events(&editor, executor);
+
+    let first = editor.editor().buffers()[0];
+    executor.execute_line(&editor, "buffer 1").unwrap();
+    assert_eq!(editor.editor().current_buffer(), Some(first));
+    assert_eq!(
+        order_events(&executor),
+        ["BufLeave,", "BufEnter,", "BufWinEnter,"]
+    );
+}
+
+/// `:bnext` runs the same sequence; a wrapping `:bnext` on the only listed
+/// buffer is upstream's "nothing to do" (`do_buffer`, buffer.c:1657-1659) and
+/// fires nothing, even with unsaved changes, because the same-buffer return
+/// precedes the abandon check.
+#[test]
+fn autocmd_bnext_fires_the_buffer_switch_sequence_and_wrapping_bnext_is_silent() {
+    let (editor, executor) = setup();
+    let first = editor.editor().current_buffer().unwrap();
+    let mut executor = record_focus_events(&editor, executor);
+
+    // One listed buffer: `:bnext` wraps to the current buffer and
+    // `do_buffer` returns "nothing to do" before the abandon check
+    // (buffer.c:1657-1659), so no event fires even though switching is
+    // normally blocked on modified buffers.
+    executor.execute_line(&editor, "bnext").unwrap();
+    assert_eq!(editor.editor().current_buffer(), Some(first));
+    assert!(order_events(&executor).is_empty());
+
+    let second = editor.editor_mut().create_buffer(true).unwrap();
+    executor.execute_line(&editor, "bnext").unwrap();
+    assert_eq!(editor.editor().current_buffer(), Some(second));
+    assert_eq!(
+        order_events(&executor),
+        ["BufLeave,", "BufEnter,", "BufWinEnter,"]
+    );
+
+    executor.execute_line(&editor, "bnext").unwrap();
+    assert_eq!(editor.editor().current_buffer(), Some(first));
+    assert_eq!(
+        order_events(&executor),
+        [
+            "BufLeave,",
+            "BufEnter,",
+            "BufWinEnter,",
+            "BufLeave,",
+            "BufEnter,",
+            "BufWinEnter,",
+        ]
+    );
+}
+
+/// Naming the current buffer with `:buffer` fires no events at all
+/// (`buffer.c:1657-1659`).
+#[test]
+fn autocmd_buffer_command_on_the_current_buffer_is_silent() {
+    let (editor, mut executor) = setup();
+    let first = editor.editor().current_buffer().unwrap();
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    executor
+        .execute_line(&editor, "autocmd BufLeave * call add(g:order, 'BufLeave,')")
+        .unwrap();
+    executor
+        .execute_line(&editor, "autocmd BufEnter * call add(g:order, 'BufEnter,')")
+        .unwrap();
+
+    executor.execute_line(&editor, "buffer 1").unwrap();
+    assert!(order_events(&executor).is_empty());
+
+    editor
+        .editor_mut()
+        .buffer_mut(first)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::MODIFIED, true);
+    executor.execute_line(&editor, "buffer 1").unwrap();
+    assert!(
+        order_events(&executor).is_empty(),
+        "no events while modified"
+    );
+}
+
+/// `:tabnext` runs the tab focus sequence (`goto_tabpage_tp`, window.c:4920):
+/// `BufLeave` on the abandoned buffer, `WinLeave`, `TabLeave`, then
+/// `WinEnter`, `TabEnter` and, on a buffer change, `BufEnter`
+/// (`leave_tabpage`, window.c:4733-4742; `enter_tabpage`, window.c:4793,
+/// 4826, 4828).
+#[test]
+fn autocmd_tabnext_fires_the_tab_focus_sequence_in_order() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "tabnew").unwrap();
+    let mut executor = record_focus_events(&editor, executor);
+
+    let first = editor.editor().buffers()[0];
+    executor.execute_line(&editor, "tabnext").unwrap();
+    assert_eq!(editor.editor().current_buffer(), Some(first));
+    assert_eq!(
+        order_events(&executor),
+        [
+            "BufLeave,",
+            "WinLeave,",
+            "TabLeave,",
+            "WinEnter,",
+            "TabEnter,",
+            "BufEnter,",
+        ]
+    );
+}
+
+/// `:tabnext` on the only tabpage is upstream's no-op
+/// (`goto_tabpage_tp`, window.c:4927) and fires nothing.
+#[test]
+fn autocmd_tabnext_on_the_current_tabpage_is_silent() {
+    let (editor, executor) = setup();
+    let mut executor = record_focus_events(&editor, executor);
+
+    executor.execute_line(&editor, "tabnext").unwrap();
+    assert!(order_events(&executor).is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // The exit sequence: VimLeavePre then VimLeave
 // Citations: main.c getout:753-882 (VimLeavePre at 828, VimLeave at 851),

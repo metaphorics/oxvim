@@ -60,9 +60,9 @@ pub use editor::{
 #[cfg(any(test, feature = "testutils"))]
 pub use excmd_exec::TestEditorAccess;
 pub use excmd_exec::{
-    ExEditorAccess, ExExecutor, ExecError, ExecOutcome, LuaExec, LuaExecError, PendingEditMode,
-    UserCommand, UserCommandComplete, UserCommandRange, VimException, VimExceptionKind,
-    vim_variable_is_writable,
+    ExEditorAccess, ExExecutor, ExecError, ExecOutcome, FocusContainer, FocusTransition, LuaExec,
+    LuaExecError, PendingEditMode, UserCommand, UserCommandComplete, UserCommandRange,
+    VimException, VimExceptionKind, focus_transition, vim_variable_is_writable,
 };
 pub use extmark::{
     Extmark, ExtmarkAttributes, ExtmarkEnd, ExtmarkFlags, ExtmarkGravity, ExtmarkHighlightMode,

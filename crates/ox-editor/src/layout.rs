@@ -1361,7 +1361,10 @@ impl TabpageState {
             // prevwin reset (win_free, window.c:5590-5596): a `previous`
             // now equal to the fallback current would make `wincmd p` a
             // silent no-op.
-            if self.previous.is_some_and(|previous| previous == self.current) {
+            if self
+                .previous
+                .is_some_and(|previous| previous == self.current)
+            {
                 self.previous = None;
             }
         }
@@ -1390,7 +1393,10 @@ impl TabpageState {
             self.current = self.layout.current_window();
             // Same post-close prevwin reset as remove_float (win_free,
             // window.c:5590-5596).
-            if self.previous.is_some_and(|previous| previous == self.current) {
+            if self
+                .previous
+                .is_some_and(|previous| previous == self.current)
+            {
                 self.previous = None;
             }
         }

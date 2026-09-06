@@ -1097,6 +1097,54 @@ impl<F: FileIO> ExExecutor<F> {
         self.lua = Some(lua);
     }
 
+    /// Delivers deferred job events through the same invocation path
+    /// chansend/jobwait use (upstream delivers job callbacks on the main
+    /// loop: `process_events` → `channel_write` → `invoke_callback`,
+    /// event/loop.c). Returns whether any deferred event was queued for
+    /// delivery, so callers can redraw even without PTY output.
+    ///
+    /// # Errors
+    ///
+    /// Returns the invocation error, with uninvoked events requeued.
+    pub fn invoke_deferred_job_events<E: ExEditorAccess>(
+        &mut self,
+        access: &E,
+    ) -> Result<bool, String> {
+        // The manager stays installed for the whole delivery: taking it out
+        // would leave `runtime.jobs` empty inside callbacks, so a handler's
+        // `jobstart` would mint a fresh manager that the restore then drops
+        // (Drop terminates its children). Drain and requeue instead, in
+        // borrows short enough never to span user code, keeping the exact
+        // `take_deferred_and_invoke` requeue order (handler-deferred events
+        // ahead of the unconsumed tail).
+        let delivered = match self.runtime.jobs.as_mut() {
+            Some(manager) => {
+                let batch = manager.drain_deferred();
+                if batch.is_empty() {
+                    0
+                } else {
+                    let delivered = batch.len();
+                    let mut batch = batch;
+                    if let Err(error) = crate::builtins::process::invoke_job_events(
+                        &mut self.runtime,
+                        access,
+                        &mut self.scope,
+                        self.lua.as_ref(),
+                        &mut batch,
+                    ) {
+                        if let Some(manager) = self.runtime.jobs.as_mut() {
+                            manager.defer_events(std::mem::take(&mut batch));
+                        }
+                        return Err(error.to_string());
+                    }
+                    delivered
+                }
+            }
+            None => 0,
+        };
+        Ok(delivered > 0)
+    }
+
     /// Process exit requested since the last poll (`:cquit` / `:qall`).
     pub fn take_quit(&mut self) -> Option<i64> {
         self.last_quit.take()
@@ -2975,9 +3023,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "tabnew" | "tabedit" => {
             access.with_ex_editor(|editor| command_tabnew(runtime, editor, command))
         }
-        "tabnext" | "tabn" => {
-            access.with_ex_editor(|editor| command_tabnext(runtime, editor, command))
-        }
+        "tabnext" | "tabn" => command_tabnext(runtime, access, scope, lua, command),
         "tabonly" => access.with_ex_editor(|editor| command_tabonly(runtime, editor, command)),
         "tabclose" | "tabc" => {
             access.with_ex_editor(|editor| command_tabclose(runtime, editor, command))
@@ -3011,16 +3057,11 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "quit" => access.with_ex_editor(|editor| command_close(runtime, editor, command, true)),
         "qall" => access.with_ex_editor(|editor| command_qall(runtime, editor, command)),
         "cquit" => access.with_ex_editor(|editor| command_cquit(runtime, editor, command)),
-        "bnext" => access.with_ex_editor(|editor| command_buffer_step(runtime, editor, command, 1)),
-        "bprevious" | "bprev" => {
-            access.with_ex_editor(|editor| command_buffer_step(runtime, editor, command, -1))
-        }
-        "bfirst" | "brewind" => {
-            access.with_ex_editor(|editor| command_buffer_absolute(runtime, editor, command, 0))
-        }
-        "blast" => access
-            .with_ex_editor(|editor| command_buffer_absolute(runtime, editor, command, isize::MAX)),
-        "buffer" | "b" => access.with_ex_editor(|editor| command_buffer(runtime, editor, command)),
+        "bnext" => command_buffer_step(runtime, access, scope, lua, command, 1),
+        "bprevious" | "bprev" => command_buffer_step(runtime, access, scope, lua, command, -1),
+        "bfirst" | "brewind" => command_buffer_absolute(runtime, access, scope, lua, command, 0),
+        "blast" => command_buffer_absolute(runtime, access, scope, lua, command, isize::MAX),
+        "buffer" | "b" => command_buffer(runtime, access, scope, lua, command),
         "ls" | "buffers" | "files" => {
             access.with_ex_editor(|editor| command_buffer_list(runtime, editor, command))
         }
@@ -8888,34 +8929,86 @@ fn command_tabnew<F: FileIO>(
     }
 }
 
-fn command_tabnext<F: FileIO>(
+fn command_tabnext<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
 ) -> Flow {
     let argument = command.args.trim();
-    let target = if argument.is_empty() && command.range.is_none() {
-        let tabs = editor.tabpages();
-        let current = editor
-            .current_tabpage()
-            .and_then(|tab| editor.tabpage_index(tab))
-            .unwrap_or(1);
-        let next = if current >= tabs.len() {
-            1
+    let target = access.with_ex_editor(|editor| {
+        if argument.is_empty() && command.range.is_none() {
+            let tabs = editor.tabpages();
+            let current = editor
+                .current_tabpage()
+                .and_then(|tab| editor.tabpage_index(tab))
+                .unwrap_or(1);
+            let next = if current >= tabs.len() {
+                1
+            } else {
+                current + 1
+            };
+            tabs.get(next - 1).copied()
         } else {
-            current + 1
-        };
-        tabs.get(next - 1).copied()
-    } else {
-        tabpage_arg(editor, command).ok()
-    };
+            tabpage_arg(editor, command).ok()
+        }
+    });
     let Some(target) = target else {
         return error_flow(runtime, "E475", format!("Invalid argument: {argument}"));
     };
-    match editor.set_current_tabpage(target) {
-        Ok(()) => Flow::Normal,
-        Err(error) => error_flow(runtime, "E475", error.to_string()),
+    switch_current_tabpage(runtime, access, scope, lua, target)
+}
+
+/// Fires the focus sequence around one tabpage switch (`goto_tabpage_tp`,
+/// window.c:4920): the current tabpage is a no-op, `leave_tabpage`
+/// (window.c:4727) fires the leave events bound to the abandoned buffer, and
+/// `enter_tabpage` answers with the enter events bound to the buffer the
+/// new tabpage displays. A failing leave handler abandons the switch, and an
+/// unknown tabpage fails at the switch itself with E475.
+fn switch_current_tabpage<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    target: TabHandle,
+) -> Flow {
+    if access.with_ex_editor(|editor| editor.current_tabpage()) == Some(target) {
+        return Flow::Normal;
     }
+    let (current, buffer) = access.with_ex_editor(|editor| {
+        let buffer = editor
+            .tabpage(target)
+            .ok()
+            .and_then(|tab| editor.window(tab.current_window()).ok())
+            .map(|window| window.buffer);
+        (editor.current_buffer(), buffer)
+    });
+    let Some(buffer) = buffer else {
+        return match access.with_ex_editor(|editor| editor.set_current_tabpage(target)) {
+            Ok(()) => Flow::Normal,
+            Err(error) => error_flow(runtime, "E475", error.to_string()),
+        };
+    };
+    let transition = focus_transition(current, buffer, FocusContainer::Tab);
+    if !transition.leaves.is_empty()
+        && let Some(current) = current
+    {
+        let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &transition.leaves, current);
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
+    }
+    // `goto_tabpage_tp` only enters a still-valid tabpage
+    // (`window.c:4931-4936`); a handler that closed the target ends the
+    // switch without enter events or an error.
+    if access.with_ex_editor(|editor| editor.tabpage(target).is_err()) {
+        return Flow::Normal;
+    }
+    if let Err(error) = access.with_ex_editor(|editor| editor.set_current_tabpage(target)) {
+        return error_flow(runtime, "E475", error.to_string());
+    }
+    fire_buffer_lifecycle(runtime, access, scope, lua, &transition.enters, buffer)
 }
 fn command_tabclose<F: FileIO>(
     runtime: &mut ExRuntime<F>,
@@ -10293,64 +10386,84 @@ fn command_cquit<F: FileIO>(
     Flow::Quit(code)
 }
 
-fn command_buffer_step<F: FileIO>(
-    runtime: &ExRuntime<F>,
-    editor: &mut Editor,
+/// Fires the leave half of a buffer switch, performs the switch, and fires
+/// the enter half (`set_curbuf`, buffer.c:1735, then `enter_buffer`,
+/// buffer.c:1850-1851). A failing leave handler abandons the switch with the
+/// caller still on the old buffer, matching `set_curbuf`'s `aborting()`
+/// guards, and the switch error keeps E86 for every `:buffer`-family caller.
+fn switch_current_buffer<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    old: Option<BufHandle>,
+    target: BufHandle,
+) -> Flow {
+    // `do_buffer` fails before any event when the target never existed
+    // (E86, errors.h `e_nobufnr`); the silent skip below is only for a
+    // target wiped by a BufLeave handler mid-transition.
+    if !access.with_ex_editor(|editor| editor.buffer(target).is_ok()) {
+        return error_flow(
+            runtime,
+            "E86",
+            format!("Buffer {} does not exist", i64::from(target)),
+        );
+    }
+    let transition = focus_transition(old, target, FocusContainer::Buffer);
+    if !transition.leaves.is_empty()
+        && let Some(old) = old
+    {
+        let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &transition.leaves, old);
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
+    }
+    // `set_curbuf` skips the entry when a handler invalidated the target
+    // (`buffer.c:1790-1794`), so a wiped target leaves the caller where it
+    // is instead of surfacing an error after handlers ran.
+    if !access.with_ex_editor(|editor| editor.buffer(target).is_ok()) {
+        return Flow::Normal;
+    }
+    if let Err(error) =
+        access.with_ex_editor(|editor| editor.set_current_buffer(target, BufferRelease::KeepLoaded))
+    {
+        return error_flow(runtime, "E86", error.to_string());
+    }
+    fire_buffer_lifecycle(runtime, access, scope, lua, &transition.enters, target)
+}
+
+fn command_buffer_step<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
     step: isize,
 ) -> Flow {
-    let buffers = editor.buffers();
+    let (buffers, current) =
+        access.with_ex_editor(|editor| (editor.buffers(), editor.current_buffer()));
     if buffers.is_empty() {
         return error_flow(runtime, "E85", "There is no listed buffer");
     }
-    if let Some(current) = editor.current_buffer()
-        && editor
-            .buffer(current)
-            .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
-        && !command.bang
-    {
-        return error_flow(
-            runtime,
-            "E37",
-            "No write since last change (add ! to override)",
-        );
-    }
-    let current = editor.current_buffer();
     let current_index = current
         .and_then(|current| buffers.iter().position(|buffer| *buffer == current))
         .unwrap_or(0);
     let next = (current_index.cast_signed() + step)
         .rem_euclid(buffers.len().cast_signed())
         .cast_unsigned();
-    // 'winfixbuf' pins the window (`do_buffer`, buffer.c:1397).
-    if current != Some(buffers[next])
-        && let Some(flow) = winfixbuf_blocks(runtime, editor, command.bang)
-    {
-        return flow;
+    let target = buffers[next];
+    // `do_buffer` answers "nothing to do" before the abandon and 'winfixbuf'
+    // checks when the target is already current (`buffer.c:1657-1659`), so a
+    // wrapping `:bnext` on the only listed buffer stays silent.
+    if current == Some(target) {
+        return Flow::Normal;
     }
-    match editor.set_current_buffer(buffers[next], BufferRelease::KeepLoaded) {
-        Ok(()) => Flow::Normal,
-        Err(error) => error_flow(runtime, "E86", error.to_string()),
-    }
-}
-
-/// `:bf[irst]`/`:br[ewind]` and `:bl[ast]` (`ex_buffer_all`, buffer.c):
-/// jump to the first or last listed buffer; the 'winfixbuf' guard matches
-/// `do_buffer`'s (buffer.c:1397).
-fn command_buffer_absolute<F: FileIO>(
-    runtime: &ExRuntime<F>,
-    editor: &mut Editor,
-    command: &ExCommand,
-    target: isize,
-) -> Flow {
-    let buffers = editor.buffers();
-    if buffers.is_empty() {
-        return error_flow(runtime, "E85", "There is no listed buffer");
-    }
-    if let Some(current) = editor.current_buffer()
-        && editor
-            .buffer(current)
-            .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+    if let Some(current) = current
+        && access.with_ex_editor(|editor| {
+            editor
+                .buffer(current)
+                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        })
         && !command.bang
     {
         return error_flow(
@@ -10359,20 +10472,60 @@ fn command_buffer_absolute<F: FileIO>(
             "No write since last change (add ! to override)",
         );
     }
+    // 'winfixbuf' pins the window (`do_buffer`, buffer.c:1397).
+    if let Some(flow) =
+        access.with_ex_editor(|editor| winfixbuf_blocks(runtime, editor, command.bang))
+    {
+        return flow;
+    }
+    switch_current_buffer(runtime, access, scope, lua, current, target)
+}
+
+/// `:bf[irst]`/`:br[ewind]` and `:bl[ast]` (`ex_buffer_all`, buffer.c):
+/// jump to the first or last listed buffer; the 'winfixbuf' guard matches
+/// `do_buffer`'s (buffer.c:1397).
+fn command_buffer_absolute<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    command: &ExCommand,
+    target: isize,
+) -> Flow {
+    let (buffers, current) =
+        access.with_ex_editor(|editor| (editor.buffers(), editor.current_buffer()));
+    if buffers.is_empty() {
+        return error_flow(runtime, "E85", "There is no listed buffer");
+    }
     let index = if target == isize::MAX {
         buffers.len() - 1
     } else {
         0
     };
-    if editor.current_buffer() != Some(buffers[index])
-        && let Some(flow) = winfixbuf_blocks(runtime, editor, command.bang)
+    if current == Some(buffers[index]) {
+        return Flow::Normal;
+    }
+    if let Some(current) = current
+        && access.with_ex_editor(|editor| {
+            editor
+                .buffer(current)
+                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        })
+        && !command.bang
+    {
+        return error_flow(
+            runtime,
+            "E37",
+            "No write since last change (add ! to override)",
+        );
+    }
+    // 'winfixbuf' pins the window (`do_buffer`, buffer.c:1397).
+    if let Some(flow) =
+        access.with_ex_editor(|editor| winfixbuf_blocks(runtime, editor, command.bang))
     {
         return flow;
     }
-    match editor.set_current_buffer(buffers[index], BufferRelease::KeepLoaded) {
-        Ok(()) => Flow::Normal,
-        Err(error) => error_flow(runtime, "E86", error.to_string()),
-    }
+    switch_current_buffer(runtime, access, scope, lua, current, buffers[index])
 }
 
 /// `:fir[st]`/`:rew[ind]` and `:la[st]`: display the first or last argument
@@ -10408,9 +10561,11 @@ fn command_argument<F: FileIO>(
     do_argfile(runtime, editor, command.bang, count.saturating_sub(1))
 }
 
-fn command_buffer<F: FileIO>(
+fn command_buffer<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
 ) -> Flow {
     let arg = command.args.trim();
@@ -10418,28 +10573,51 @@ fn command_buffer<F: FileIO>(
         .count
         .and_then(|value| i64::try_from(value).ok())
         .or_else(|| arg.parse::<i64>().ok());
-    let handle = if let Some(handle) = requested.and_then(|value| BufHandle::try_from(value).ok()) {
-        handle
-    } else {
-        let matches: Vec<BufHandle> = editor
-            .buffers()
-            .into_iter()
-            .filter(|handle| {
-                editor
-                    .buffer(*handle)
-                    .is_ok_and(|buffer| buffer_name_matches(buffer.name(), arg))
-            })
-            .collect();
-        match matches.as_slice() {
-            [handle] => *handle,
-            [] => return error_flow(runtime, "E94", format!("No matching buffer for {arg}")),
-            _ => return error_flow(runtime, "E93", format!("More than one match for {arg}")),
+    let handle = access.with_ex_editor(|editor| {
+        if let Some(handle) = requested.and_then(|value| BufHandle::try_from(value).ok()) {
+            Ok(handle)
+        } else {
+            let matches: Vec<BufHandle> = editor
+                .buffers()
+                .into_iter()
+                .filter(|handle| {
+                    editor
+                        .buffer(*handle)
+                        .is_ok_and(|buffer| buffer_name_matches(buffer.name(), arg))
+                })
+                .collect();
+            match matches.as_slice() {
+                [handle] => Ok(*handle),
+                [] => Err(error_flow(
+                    runtime,
+                    "E94",
+                    format!("No matching buffer for {arg}"),
+                )),
+                _ => Err(error_flow(
+                    runtime,
+                    "E93",
+                    format!("More than one match for {arg}"),
+                )),
+            }
         }
+    });
+    let handle = match handle {
+        Ok(handle) => handle,
+        Err(flow) => return flow,
     };
-    if let Some(current) = editor.current_buffer()
-        && editor
-            .buffer(current)
-            .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+    let current = access.with_ex_editor(|editor| editor.current_buffer());
+    // `do_buffer` answers "nothing to do" before the abandon and 'winfixbuf'
+    // checks when the target is already current (`buffer.c:1657-1659`), so
+    // naming the current buffer fires no events.
+    if current == Some(handle) {
+        return Flow::Normal;
+    }
+    if let Some(current) = current
+        && access.with_ex_editor(|editor| {
+            editor
+                .buffer(current)
+                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        })
         && !command.bang
     {
         return error_flow(
@@ -10449,16 +10627,13 @@ fn command_buffer<F: FileIO>(
         );
     }
     // 'winfixbuf' pins the window: switching to another buffer needs the
-    // bang (`do_buffer`, buffer.c:1397); staying is always allowed.
-    if editor.current_buffer() != Some(handle)
-        && let Some(flow) = winfixbuf_blocks(runtime, editor, command.bang)
+    // bang (`do_buffer`, buffer.c:1397).
+    if let Some(flow) =
+        access.with_ex_editor(|editor| winfixbuf_blocks(runtime, editor, command.bang))
     {
         return flow;
     }
-    match editor.set_current_buffer(handle, BufferRelease::KeepLoaded) {
-        Ok(()) => Flow::Normal,
-        Err(error) => error_flow(runtime, "E86", error.to_string()),
-    }
+    switch_current_buffer(runtime, access, scope, lua, current, handle)
 }
 
 #[derive(Clone, Copy)]
@@ -11885,6 +12060,93 @@ fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
     }
     runtime.autocmd_busy -= 1;
     flow
+}
+
+/// Which container a focus switch moves, deciding which leave/enter events
+/// the switch fires. Upstream resolves this per event-raising site rather
+/// than per caller, so one function here keeps every firing path on the same
+/// ordered sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FocusContainer {
+    /// The buffer displayed by the current window (`:buffer` family).
+    Buffer,
+    /// The current window inside one tabpage (`nvim_set_current_win` on a
+    /// window of the current tabpage, `win_enter_ext`).
+    Window,
+    /// The current tabpage (`:tabnext`, `nvim_set_current_tabpage`,
+    /// `goto_tabpage_tp`).
+    Tab,
+}
+
+/// The two halves of one focus switch. Leave events fire before the switch
+/// and bind to the abandoned buffer; enter events fire after the switch and
+/// bind to the entered buffer.
+#[derive(Debug, Eq, PartialEq)]
+pub struct FocusTransition {
+    /// Events fired before the switch, all bound to the abandoned buffer.
+    pub leaves: Vec<Event>,
+    /// Events fired after the switch, all bound to the entered buffer.
+    pub enters: Vec<Event>,
+}
+
+/// Computes the ordered autocmd sequence for moving focus to a container
+/// that displays `new`, coming from `old` (`None` only when no buffer is
+/// current). Buffer events are conditional on the buffer actually changing;
+/// container events always fire. Upstream: a buffer switch fires `BufLeave`
+/// on the old buffer (`set_curbuf`, buffer.c:1735) then `BufEnter` and
+/// `BufWinEnter` on the new one (`enter_buffer`, buffer.c:1850-1851), and is
+/// silent when the target is already current (`buffer.c:1657-1659`). A
+/// window switch fires `BufLeave` only when the target shows another
+/// buffer, then `WinLeave` (`window.c:5259`, `5265`) and answers with
+/// `WinEnter` and, on a buffer change, `BufEnter` (`window.c:5317`,
+/// `5319`). A tabpage switch adds `TabLeave` after `WinLeave`
+/// (`leave_tabpage`, window.c:4733-4742) and `TabEnter` after `WinEnter`
+/// (`enter_tabpage`, window.c:4793, `4826`, `4828`).
+#[must_use]
+pub fn focus_transition(
+    old: Option<BufHandle>,
+    new: BufHandle,
+    container: FocusContainer,
+) -> FocusTransition {
+    let changed = old.is_none_or(|old| old != new);
+    let mut leaves = Vec::new();
+    let mut enters = Vec::new();
+    match container {
+        FocusContainer::Buffer => {
+            if changed && old.is_some() {
+                leaves.push(Event::BufLeave);
+                enters.push(Event::BufEnter);
+                enters.push(Event::BufWinEnter);
+            }
+        }
+        FocusContainer::Window => {
+            if changed && old.is_some() {
+                leaves.push(Event::BufLeave);
+            }
+            if old.is_some() {
+                leaves.push(Event::WinLeave);
+            }
+            enters.push(Event::WinEnter);
+            if changed {
+                enters.push(Event::BufEnter);
+            }
+        }
+        FocusContainer::Tab => {
+            if changed && old.is_some() {
+                leaves.push(Event::BufLeave);
+            }
+            if old.is_some() {
+                leaves.push(Event::WinLeave);
+                leaves.push(Event::TabLeave);
+            }
+            enters.push(Event::WinEnter);
+            enters.push(Event::TabEnter);
+            if changed {
+                enters.push(Event::BufEnter);
+            }
+        }
+    }
+    FocusTransition { leaves, enters }
 }
 
 /// Fires `events` for one buffer lifecycle occurrence — a fresh `:edit`/`:new`

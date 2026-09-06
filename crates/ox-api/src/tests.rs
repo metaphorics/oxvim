@@ -390,6 +390,169 @@ fn set_current_window_reports_invalid_id_and_switches_valid_window() {
     );
 }
 
+/// Records one planned action per fired event so order assertions can name
+/// the event sequence directly.
+fn focus_autocmd(session: &crate::ApiSession, event: &str) -> i64 {
+    crate::autocmd::nvim_create_autocmd(
+        session,
+        Object::String(OxStr::from(event)),
+        dict(&[
+            ("pattern", Object::String(OxStr::from("*"))),
+            ("command", Object::String(OxStr::from("echo fired"))),
+        ]),
+    )
+    .unwrap()
+}
+
+/// `nvim_set_current_win` follows upstream `goto_tabpage_win`
+/// (`api/vim.c:1024`, `window.c:4953`): a different window in the current
+/// tabpage runs `win_enter_ext` — `BufLeave` only when the target shows
+/// another buffer, then `WinLeave`, `WinEnter`, and `BufEnter`
+/// (window.c:5259, 5265, 5317, 5319). The current window is a no-op
+/// (window.c:5248-5250).
+#[test]
+fn set_current_win_fires_winleave_winenter_in_order() {
+    let (mut editor, first_buffer, tab, first_window) = editor_with_lines(&["one"]);
+    let second_buffer = editor
+        .create_buffer_with(Buffer::from_lines(&[b"two".to_vec()], false).unwrap(), true)
+        .unwrap();
+    editor
+        .split_vertical(tab, first_window, second_buffer, true)
+        .unwrap();
+    let session = session_with(editor);
+    focus_autocmd(&session, "BufLeave");
+    focus_autocmd(&session, "WinLeave");
+    focus_autocmd(&session, "WinEnter");
+    focus_autocmd(&session, "BufEnter");
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: None,
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::global::nvim_set_current_win(&session, first_window).unwrap();
+    assert_eq!(
+        session.with_editor(Editor::current_window),
+        Some(first_window)
+    );
+    assert_eq!(
+        actions
+            .borrow()
+            .iter()
+            .map(|action| action.event)
+            .collect::<Vec<_>>(),
+        [
+            Event::BufLeave,
+            Event::WinLeave,
+            Event::WinEnter,
+            Event::BufEnter
+        ]
+    );
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(first_buffer)
+    );
+
+    crate::global::nvim_set_current_win(&session, first_window).unwrap();
+    assert_eq!(actions.borrow().len(), 4, "current window must not fire");
+}
+
+/// `nvim_set_current_buf` reaches the same `do_buffer` switch as `:buffer`
+/// (`api/vim.c`), so it fires `BufLeave` before the switch and `BufEnter`,
+/// `BufWinEnter` after it (buffer.c:1735, 1850-1851); naming the current
+/// buffer fires nothing (buffer.c:1657-1659).
+#[test]
+fn set_current_buf_fires_the_buffer_lifecycle_in_order() {
+    let (mut editor, _first_buffer, _, _) = editor_with_lines(&["one"]);
+    let second_buffer = editor
+        .create_buffer_with(Buffer::from_lines(&[b"two".to_vec()], false).unwrap(), true)
+        .unwrap();
+    let session = session_with(editor);
+    focus_autocmd(&session, "BufLeave");
+    focus_autocmd(&session, "BufEnter");
+    focus_autocmd(&session, "BufWinEnter");
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: None,
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::global::nvim_set_current_buf(&session, second_buffer).unwrap();
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(second_buffer)
+    );
+    assert_eq!(
+        actions
+            .borrow()
+            .iter()
+            .map(|action| action.event)
+            .collect::<Vec<_>>(),
+        [Event::BufLeave, Event::BufEnter, Event::BufWinEnter,]
+    );
+
+    crate::global::nvim_set_current_buf(&session, second_buffer).unwrap();
+    assert_eq!(actions.borrow().len(), 3, "same buffer must not fire");
+}
+
+/// `nvim_set_current_tabpage` runs `goto_tabpage_tp` (`api/vim.c:1320`,
+/// `window.c:4920`): `WinLeave`, `TabLeave` on the old tab, `WinEnter`,
+/// `TabEnter` on the new one, with `BufLeave`/`BufEnter` only on a buffer
+/// change (window.c:4733-4742, 4793, 4826, 4828). The current tabpage is a
+/// no-op (window.c:4927).
+#[test]
+fn set_current_tabpage_fires_the_tab_sequence_in_order() {
+    let (mut editor, buffer, first_tab, _) = editor_with_lines(&["one"]);
+    let second_tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    editor.set_current_tabpage(first_tab).unwrap();
+    let session = session_with(editor);
+    focus_autocmd(&session, "WinLeave");
+    focus_autocmd(&session, "TabLeave");
+    focus_autocmd(&session, "WinEnter");
+    focus_autocmd(&session, "TabEnter");
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: None,
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::global::nvim_set_current_tabpage(&session, second_tab).unwrap();
+    assert_eq!(
+        session.with_editor(Editor::current_tabpage),
+        Some(second_tab)
+    );
+    assert_eq!(
+        actions
+            .borrow()
+            .iter()
+            .map(|action| action.event)
+            .collect::<Vec<_>>(),
+        [
+            Event::WinLeave,
+            Event::TabLeave,
+            Event::WinEnter,
+            Event::TabEnter
+        ]
+    );
+
+    crate::global::nvim_set_current_tabpage(&session, second_tab).unwrap();
+    assert_eq!(actions.borrow().len(), 4, "current tabpage must not fire");
+}
+
 #[test]
 fn set_current_tabpage_reports_invalid_id_and_switches_valid_tabpage() {
     let (mut editor, buffer, first_tab, _) = editor_with_lines(&["one"]);
