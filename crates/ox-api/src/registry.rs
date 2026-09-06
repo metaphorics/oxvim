@@ -114,7 +114,7 @@ impl Registry {
 /// # Errors
 ///
 /// Returns an error if two implementation modules accidentally register the same public name.
-pub fn core() -> Result<Registry, RegistryError> {
+pub fn implemented() -> Result<Registry, RegistryError> {
     let mut implemented = Registry::new();
     crate::autocmd::register(&mut implemented)?;
     crate::buffer::register(&mut implemented)?;
@@ -129,7 +129,19 @@ pub fn core() -> Result<Registry, RegistryError> {
     crate::tabpage::register(&mut implemented)?;
     crate::ui::register(&mut implemented)?;
     crate::global::register(&mut implemented)?;
+    Ok(implemented)
+}
 
+/// Builds the wire registry: every advertised name dispatches, with
+/// anything no module registered answering through `unavailable_dispatch`
+/// (the "API function is not implemented" gap). Tests that pin coverage
+/// must use [`implemented`] instead, or they measure the backfill.
+///
+/// # Errors
+///
+/// Returns an error if a module registration fails or two advertised names collide.
+pub fn core() -> Result<Registry, RegistryError> {
+    let implemented = implemented()?;
     let mut registry = Registry::new();
     for &metadata in API_FUNCTIONS {
         let dispatch = implemented

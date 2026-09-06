@@ -664,6 +664,496 @@ pub fn nvim_get_option_info(_session: &ApiSession, name: OxStr) -> Result<Dict, 
     ]))
 }
 
+// Legacy `vim_*`, `buffer_*`, `window_*`, and `tabpage_*` names.
+//
+// Upstream exports these as pure aliases of the modern handlers:
+// `src/nvim/api/dispatch_deprecated.lua` maps each modern name to its legacy
+// alias, and `src/gen/gen_api_dispatch.lua:256-282` registers a shallow copy
+// of the modern function (identical parameters and return type, same handler)
+// under the alias name with `since = 0`, `deprecated_since = 1`, `lua = false`,
+// and `eval = false`. Each shim below therefore forwards 1:1 to the modern
+// crate function; handle sentinels (0 = current) resolve inside those paths,
+// exactly as they do for the modern RPC names.
+
+/// Alias of `nvim_command` (`dispatch_deprecated.lua:16`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_command(session: &ApiSession, cmd: OxStr) -> Result<(), ApiError> {
+    crate::global::nvim_command(session, cmd)
+}
+
+/// Alias of `nvim_command_output` (deprecated.c:50, `dispatch_deprecated.lua:17`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_command_output(session: &ApiSession, command: OxStr) -> Result<OxStr, ApiError> {
+    nvim_command_output(session, command)
+}
+
+/// Alias of `nvim_call_function` (`dispatch_deprecated.lua:15`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_call_function(
+    session: &ApiSession,
+    fn_name: OxStr,
+    args: Vec<Object>,
+) -> Result<Object, ApiError> {
+    crate::global::nvim_call_function(session, fn_name, args)
+}
+
+/// Alias of `nvim_del_current_line` (`dispatch_deprecated.lua:18`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_del_current_line(session: &ApiSession) -> Result<(), ApiError> {
+    crate::global::nvim_del_current_line(session)
+}
+
+/// Alias of `nvim_err_write` (deprecated.c:975, `dispatch_deprecated.lua:19`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_err_write(session: &ApiSession, str: OxStr) -> Result<(), ApiError> {
+    nvim_err_write(session, str)
+}
+
+/// Alias of `nvim_err_writeln` (deprecated.c:984, `dispatch_deprecated.lua:20`):
+/// unlike `vim_err_write` the message is always newline-terminated.
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_report_error(session: &ApiSession, str: OxStr) -> Result<(), ApiError> {
+    crate::global::nvim_err_writeln(session, str)
+}
+
+/// Alias of `nvim_feedkeys` (`dispatch_deprecated.lua:22`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_feedkeys(
+    session: &ApiSession,
+    keys: OxStr,
+    mode: OxStr,
+    escape_ks: bool,
+) -> Result<(), ApiError> {
+    crate::ui::nvim_feedkeys(session, keys, mode, escape_ks)
+}
+
+/// Alias of `nvim_get_api_info` (`dispatch_deprecated.lua:23`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_get_api_info(session: &ApiSession) -> Result<Vec<Object>, ApiError> {
+    crate::global::nvim_get_api_info(session)
+}
+
+/// Alias of `nvim_get_color_by_name` (`dispatch_deprecated.lua:24`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_name_to_color(name: OxStr) -> Result<i64, ApiError> {
+    crate::ui::nvim_get_color_by_name(name)
+}
+
+/// Alias of `nvim_get_color_map` (`dispatch_deprecated.lua:25`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_get_color_map() -> Result<Dict, ApiError> {
+    crate::ui::nvim_get_color_map()
+}
+
+/// Alias of `nvim_get_current_buf` (`dispatch_deprecated.lua:26`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_get_current_buffer(session: &ApiSession) -> Result<BufHandle, ApiError> {
+    crate::global::nvim_get_current_buf(session)
+}
+
+/// Alias of `nvim_get_current_line` (`dispatch_deprecated.lua:27`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_get_current_line(session: &ApiSession) -> Result<OxStr, ApiError> {
+    crate::buffer::nvim_get_current_line(session)
+}
+
+/// Alias of `nvim_get_current_tabpage` (`dispatch_deprecated.lua:28`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_get_current_tabpage(session: &ApiSession) -> Result<TabHandle, ApiError> {
+    crate::global::nvim_get_current_tabpage(session)
+}
+
+/// Alias of `nvim_get_current_win` (`dispatch_deprecated.lua:29`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_get_current_window(session: &ApiSession) -> Result<WinHandle, ApiError> {
+    crate::global::nvim_get_current_win(session)
+}
+
+/// Alias of `nvim_get_option` (`dispatch_deprecated.lua:30`): global option value.
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_get_option(session: &ApiSession, name: OxStr) -> Result<Object, ApiError> {
+    crate::global::nvim_get_option(session, name)
+}
+
+/// Alias of `nvim_set_option` (`dispatch_deprecated.lua:45`): global option value.
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_set_option(session: &ApiSession, name: OxStr, value: Object) -> Result<(), ApiError> {
+    crate::global::nvim_set_option(session, name, value)
+}
+
+/// Alias of `nvim_get_var` (`dispatch_deprecated.lua:31`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_get_var(session: &ApiSession, name: OxStr) -> Result<Object, ApiError> {
+    crate::global::nvim_get_var(session, name)
+}
+
+/// Alias of `nvim_get_vvar` (`dispatch_deprecated.lua:32`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_get_vvar(session: &ApiSession, name: OxStr) -> Result<Object, ApiError> {
+    crate::global::nvim_get_vvar(session, name)
+}
+
+/// Alias of `nvim_input` (`dispatch_deprecated.lua:33`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_input(session: &ApiSession, keys: OxStr) -> Result<i64, ApiError> {
+    crate::global::nvim_input(session, keys)
+}
+
+/// Alias of `nvim_list_bufs` (`dispatch_deprecated.lua:34`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_get_buffers(session: &ApiSession) -> Result<Vec<BufHandle>, ApiError> {
+    crate::global::nvim_list_bufs(session)
+}
+
+/// Alias of `nvim_list_runtime_paths` (`dispatch_deprecated.lua:35`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_list_runtime_paths(session: &ApiSession) -> Result<Vec<OxStr>, ApiError> {
+    crate::channel::nvim_list_runtime_paths(session)
+}
+
+/// Alias of `nvim_list_tabpages` (`dispatch_deprecated.lua:36`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_get_tabpages(session: &ApiSession) -> Result<Vec<TabHandle>, ApiError> {
+    crate::global::nvim_list_tabpages(session)
+}
+
+/// Alias of `nvim_list_wins` (`dispatch_deprecated.lua:37`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_get_windows(session: &ApiSession) -> Result<Vec<WinHandle>, ApiError> {
+    crate::global::nvim_list_wins(session)
+}
+
+/// Alias of `nvim_out_write` (deprecated.c:966, `dispatch_deprecated.lua:38`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_out_write(session: &ApiSession, str: OxStr) -> Result<(), ApiError> {
+    nvim_out_write(session, str)
+}
+
+/// Alias of `nvim_replace_termcodes` (`dispatch_deprecated.lua:39`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_replace_termcodes(
+    session: &ApiSession,
+    str: OxStr,
+    from_part: bool,
+    do_lt: bool,
+    special: bool,
+) -> Result<OxStr, ApiError> {
+    crate::global::nvim_replace_termcodes(session, str, from_part, do_lt, special)
+}
+
+/// Alias of `nvim_set_current_buf` (`dispatch_deprecated.lua:40`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_set_current_buffer(session: &ApiSession, buf: BufHandle) -> Result<(), ApiError> {
+    crate::global::nvim_set_current_buf(session, buf)
+}
+
+/// Alias of `nvim_set_current_dir` (`dispatch_deprecated.lua:41`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_change_directory(session: &ApiSession, dir: OxStr) -> Result<(), ApiError> {
+    crate::global::nvim_set_current_dir(session, dir)
+}
+
+/// Alias of `nvim_set_current_line` (`dispatch_deprecated.lua:42`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_set_current_line(session: &ApiSession, line: OxStr) -> Result<(), ApiError> {
+    crate::buffer::nvim_set_current_line(session, line)
+}
+
+/// Alias of `nvim_set_current_tabpage` (`dispatch_deprecated.lua:43`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_set_current_tabpage(session: &ApiSession, tabpage: TabHandle) -> Result<(), ApiError> {
+    crate::global::nvim_set_current_tabpage(session, tabpage)
+}
+
+/// Alias of `nvim_set_current_win` (`dispatch_deprecated.lua:44`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_set_current_window(session: &ApiSession, win: WinHandle) -> Result<(), ApiError> {
+    crate::global::nvim_set_current_win(session, win)
+}
+
+/// Alias of `nvim_strwidth` (`dispatch_deprecated.lua:46`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_strwidth(session: &ApiSession, text: OxStr) -> Result<i64, ApiError> {
+    crate::global::nvim_strwidth(session, text)
+}
+
+/// Alias of `nvim_subscribe` (`dispatch_deprecated.lua:47`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_subscribe(session: &ApiSession, event: OxStr) -> Result<(), ApiError> {
+    crate::channel::nvim_subscribe(session, event)
+}
+
+/// Alias of `nvim_unsubscribe` (`dispatch_deprecated.lua:54`).
+#[api(since = 0, deprecated_since = 1)]
+pub fn vim_unsubscribe(session: &ApiSession, event: OxStr) -> Result<(), ApiError> {
+    crate::channel::nvim_unsubscribe(session, event)
+}
+
+// Legacy `buffer_*` aliases (dispatch_deprecated.lua:2-14); each forwards to
+// the modern `nvim_buf_*` path, so the buffer-id-0 sentinel resolves to the
+// current buffer exactly as the modern name does.
+
+/// Alias of `nvim_buf_add_highlight` (deprecated.c:143, `dispatch_deprecated.lua:2`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn buffer_add_highlight(
+    session: &ApiSession,
+    buffer: BufHandle,
+    ns_id: i64,
+    hl_group: OxStr,
+    line: i64,
+    col_start: i64,
+    col_end: i64,
+) -> Result<i64, ApiError> {
+    nvim_buf_add_highlight(session, buffer, ns_id, hl_group, line, col_start, col_end)
+}
+
+/// Alias of `nvim_buf_clear_highlight` (deprecated.c:109, `dispatch_deprecated.lua:3`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn buffer_clear_highlight(
+    session: &ApiSession,
+    buffer: BufHandle,
+    ns_id: i64,
+    line_start: i64,
+    line_end: i64,
+) -> Result<(), ApiError> {
+    nvim_buf_clear_highlight(session, buffer, ns_id, line_start, line_end)
+}
+
+/// Alias of `nvim_buf_get_lines` (`dispatch_deprecated.lua:4`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn buffer_get_lines(
+    session: &ApiSession,
+    buffer: BufHandle,
+    start: i64,
+    end: i64,
+    strict_indexing: bool,
+) -> Result<Vec<OxStr>, ApiError> {
+    crate::buffer::nvim_buf_get_lines(session, buffer, start, end, strict_indexing)
+}
+
+/// Alias of `nvim_buf_get_mark` (`dispatch_deprecated.lua:5`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn buffer_get_mark(
+    session: &ApiSession,
+    buffer: BufHandle,
+    name: OxStr,
+) -> Result<Vec<i64>, ApiError> {
+    crate::buffer::nvim_buf_get_mark(session, buffer, name)
+}
+
+/// Alias of `nvim_buf_get_name` (`dispatch_deprecated.lua:6`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn buffer_get_name(session: &ApiSession, buffer: BufHandle) -> Result<OxStr, ApiError> {
+    crate::buffer::nvim_buf_get_name(session, buffer)
+}
+
+/// Alias of `nvim_buf_get_number` (deprecated.c:75, `dispatch_deprecated.lua:7`):
+/// upstream returns `buf->b_fnum`, which equals the buffer object id.
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn buffer_get_number(session: &ApiSession, buffer: BufHandle) -> Result<i64, ApiError> {
+    nvim_buf_get_number(session, buffer)
+}
+
+/// Alias of `nvim_buf_get_option` (`dispatch_deprecated.lua:8`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn buffer_get_option(
+    session: &ApiSession,
+    buffer: BufHandle,
+    name: OxStr,
+) -> Result<Object, ApiError> {
+    crate::buffer::nvim_buf_get_option(session, buffer, name)
+}
+
+/// Alias of `nvim_buf_get_var` (`dispatch_deprecated.lua:9`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn buffer_get_var(
+    session: &ApiSession,
+    buffer: BufHandle,
+    name: OxStr,
+) -> Result<Object, ApiError> {
+    crate::buffer::nvim_buf_get_var(session, buffer, name)
+}
+
+/// Alias of `nvim_buf_is_valid` (`dispatch_deprecated.lua:10`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn buffer_is_valid(session: &ApiSession, buffer: BufHandle) -> Result<bool, ApiError> {
+    crate::buffer::nvim_buf_is_valid(session, buffer)
+}
+
+/// Alias of `nvim_buf_set_lines` (`dispatch_deprecated.lua:12`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn buffer_set_lines(
+    session: &ApiSession,
+    buffer: BufHandle,
+    start: i64,
+    end: i64,
+    strict_indexing: bool,
+    replacement: Vec<OxStr>,
+) -> Result<(), ApiError> {
+    crate::buffer::nvim_buf_set_lines(session, buffer, start, end, strict_indexing, replacement)
+}
+
+/// Alias of `nvim_buf_set_name` (`dispatch_deprecated.lua:13`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn buffer_set_name(
+    session: &ApiSession,
+    buffer: BufHandle,
+    name: OxStr,
+) -> Result<(), ApiError> {
+    crate::buffer::nvim_buf_set_name(session, buffer, name)
+}
+
+/// Alias of `nvim_buf_set_option` (`dispatch_deprecated.lua:14`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn buffer_set_option(
+    session: &ApiSession,
+    buffer: BufHandle,
+    name: OxStr,
+    value: Object,
+) -> Result<(), ApiError> {
+    crate::buffer::nvim_buf_set_option(session, buffer, name, value)
+}
+
+// Legacy `window_*` aliases (dispatch_deprecated.lua:55-67); window-id 0
+// resolves to the current window inside the modern `nvim_win_*` paths.
+
+/// Alias of `nvim_win_get_buf` (`dispatch_deprecated.lua:55`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn window_get_buffer(session: &ApiSession, win: WinHandle) -> Result<BufHandle, ApiError> {
+    crate::window::nvim_win_get_buf(session, win)
+}
+
+/// Alias of `nvim_win_get_cursor` (`dispatch_deprecated.lua:56`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn window_get_cursor(session: &ApiSession, win: WinHandle) -> Result<Vec<i64>, ApiError> {
+    crate::window::nvim_win_get_cursor(session, win)
+}
+
+/// Alias of `nvim_win_set_cursor` (`dispatch_deprecated.lua:64`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn window_set_cursor(
+    session: &ApiSession,
+    win: WinHandle,
+    pos: Vec<i64>,
+) -> Result<(), ApiError> {
+    crate::window::nvim_win_set_cursor(session, win, pos)
+}
+
+/// Alias of `nvim_win_get_height` (`dispatch_deprecated.lua:57`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn window_get_height(session: &ApiSession, win: WinHandle) -> Result<i64, ApiError> {
+    crate::window::nvim_win_get_height(session, win)
+}
+
+/// Alias of `nvim_win_set_height` (deprecated.c:1018, `dispatch_deprecated.lua:65`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn window_set_height(
+    session: &ApiSession,
+    win: WinHandle,
+    height: i64,
+) -> Result<(), ApiError> {
+    crate::window::nvim_win_set_height(session, win, height)
+}
+
+/// Alias of `nvim_win_get_width` (`dispatch_deprecated.lua:62`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn window_get_width(session: &ApiSession, win: WinHandle) -> Result<i64, ApiError> {
+    crate::window::nvim_win_get_width(session, win)
+}
+
+/// Alias of `nvim_win_set_width` (deprecated.c:1042, `dispatch_deprecated.lua:67`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn window_set_width(session: &ApiSession, win: WinHandle, width: i64) -> Result<(), ApiError> {
+    crate::window::nvim_win_set_width(session, win, width)
+}
+
+/// Alias of `nvim_win_get_option` (`dispatch_deprecated.lua:58`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn window_get_option(
+    session: &ApiSession,
+    window: WinHandle,
+    name: OxStr,
+) -> Result<Object, ApiError> {
+    crate::window::nvim_win_get_option(session, window, name)
+}
+
+/// Alias of `nvim_win_set_option` (`dispatch_deprecated.lua:66`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn window_set_option(
+    session: &ApiSession,
+    window: WinHandle,
+    name: OxStr,
+    value: Object,
+) -> Result<(), ApiError> {
+    crate::window::nvim_win_set_option(session, window, name, value)
+}
+
+/// Alias of `nvim_win_get_position` (`dispatch_deprecated.lua:59`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn window_get_position(session: &ApiSession, win: WinHandle) -> Result<Vec<i64>, ApiError> {
+    crate::window::nvim_win_get_position(session, win)
+}
+
+/// Alias of `nvim_win_get_tabpage` (`dispatch_deprecated.lua:60`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn window_get_tabpage(session: &ApiSession, win: WinHandle) -> Result<TabHandle, ApiError> {
+    crate::window::nvim_win_get_tabpage(session, win)
+}
+
+/// Alias of `nvim_win_get_var` (`dispatch_deprecated.lua:61`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn window_get_var(
+    session: &ApiSession,
+    win: WinHandle,
+    name: OxStr,
+) -> Result<Object, ApiError> {
+    crate::window::nvim_win_get_var(session, win, name)
+}
+
+/// Alias of `nvim_win_is_valid` (`dispatch_deprecated.lua:63`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn window_is_valid(session: &ApiSession, win: WinHandle) -> Result<bool, ApiError> {
+    crate::window::nvim_win_is_valid(session, win)
+}
+
+// Legacy `tabpage_*` aliases (dispatch_deprecated.lua:48-51); tabpage-id 0
+// resolves to the current tabpage inside the modern `nvim_tabpage_*` paths.
+
+/// Alias of `nvim_tabpage_get_var` (`dispatch_deprecated.lua:48`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn tabpage_get_var(
+    session: &ApiSession,
+    tabpage: TabHandle,
+    name: OxStr,
+) -> Result<Object, ApiError> {
+    crate::tabpage::nvim_tabpage_get_var(session, tabpage, name)
+}
+
+/// Alias of `nvim_tabpage_get_win` (`dispatch_deprecated.lua:49`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn tabpage_get_window(session: &ApiSession, tabpage: TabHandle) -> Result<WinHandle, ApiError> {
+    crate::tabpage::nvim_tabpage_get_win(session, tabpage)
+}
+
+/// Alias of `nvim_tabpage_list_wins` (`dispatch_deprecated.lua:51`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn tabpage_get_windows(
+    session: &ApiSession,
+    tabpage: TabHandle,
+) -> Result<Vec<WinHandle>, ApiError> {
+    crate::tabpage::nvim_tabpage_list_wins(session, tabpage)
+}
+
+/// Alias of `nvim_tabpage_is_valid` (`dispatch_deprecated.lua:50`).
+#[api(since = 0, deprecated_since = 1, method)]
+pub fn tabpage_is_valid(session: &ApiSession, tabpage: TabHandle) -> Result<bool, ApiError> {
+    crate::tabpage::nvim_tabpage_is_valid(session, tabpage)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "generated-style registration list; one entry per deprecated alias"
+)]
 pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(
         buffer_line_count__API_META(),
@@ -728,6 +1218,165 @@ pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(nvim_out_write__API_META(), nvim_out_write__API_DISPATCH)?;
     registry.register(nvim_err_write__API_META(), nvim_err_write__API_DISPATCH)?;
     registry.register(nvim_notify__API_META(), nvim_notify__API_DISPATCH)?;
+    registry.register(
+        buffer_add_highlight__API_META(),
+        buffer_add_highlight__API_DISPATCH,
+    )?;
+    registry.register(
+        buffer_clear_highlight__API_META(),
+        buffer_clear_highlight__API_DISPATCH,
+    )?;
+    registry.register(buffer_get_lines__API_META(), buffer_get_lines__API_DISPATCH)?;
+    registry.register(buffer_get_mark__API_META(), buffer_get_mark__API_DISPATCH)?;
+    registry.register(buffer_get_name__API_META(), buffer_get_name__API_DISPATCH)?;
+    registry.register(
+        buffer_get_number__API_META(),
+        buffer_get_number__API_DISPATCH,
+    )?;
+    registry.register(
+        buffer_get_option__API_META(),
+        buffer_get_option__API_DISPATCH,
+    )?;
+    registry.register(buffer_get_var__API_META(), buffer_get_var__API_DISPATCH)?;
+    registry.register(buffer_is_valid__API_META(), buffer_is_valid__API_DISPATCH)?;
+    registry.register(buffer_set_lines__API_META(), buffer_set_lines__API_DISPATCH)?;
+    registry.register(buffer_set_name__API_META(), buffer_set_name__API_DISPATCH)?;
+    registry.register(
+        buffer_set_option__API_META(),
+        buffer_set_option__API_DISPATCH,
+    )?;
+    registry.register(tabpage_get_var__API_META(), tabpage_get_var__API_DISPATCH)?;
+    registry.register(
+        tabpage_get_window__API_META(),
+        tabpage_get_window__API_DISPATCH,
+    )?;
+    registry.register(
+        tabpage_get_windows__API_META(),
+        tabpage_get_windows__API_DISPATCH,
+    )?;
+    registry.register(tabpage_is_valid__API_META(), tabpage_is_valid__API_DISPATCH)?;
+    registry.register(
+        vim_call_function__API_META(),
+        vim_call_function__API_DISPATCH,
+    )?;
+    registry.register(
+        vim_change_directory__API_META(),
+        vim_change_directory__API_DISPATCH,
+    )?;
+    registry.register(vim_command__API_META(), vim_command__API_DISPATCH)?;
+    registry.register(
+        vim_command_output__API_META(),
+        vim_command_output__API_DISPATCH,
+    )?;
+    registry.register(
+        vim_del_current_line__API_META(),
+        vim_del_current_line__API_DISPATCH,
+    )?;
+    registry.register(vim_err_write__API_META(), vim_err_write__API_DISPATCH)?;
+    registry.register(vim_feedkeys__API_META(), vim_feedkeys__API_DISPATCH)?;
+    registry.register(vim_get_api_info__API_META(), vim_get_api_info__API_DISPATCH)?;
+    registry.register(vim_get_buffers__API_META(), vim_get_buffers__API_DISPATCH)?;
+    registry.register(
+        vim_get_color_map__API_META(),
+        vim_get_color_map__API_DISPATCH,
+    )?;
+    registry.register(
+        vim_get_current_buffer__API_META(),
+        vim_get_current_buffer__API_DISPATCH,
+    )?;
+    registry.register(
+        vim_get_current_line__API_META(),
+        vim_get_current_line__API_DISPATCH,
+    )?;
+    registry.register(
+        vim_get_current_tabpage__API_META(),
+        vim_get_current_tabpage__API_DISPATCH,
+    )?;
+    registry.register(
+        vim_get_current_window__API_META(),
+        vim_get_current_window__API_DISPATCH,
+    )?;
+    registry.register(vim_get_option__API_META(), vim_get_option__API_DISPATCH)?;
+    registry.register(vim_get_tabpages__API_META(), vim_get_tabpages__API_DISPATCH)?;
+    registry.register(vim_get_var__API_META(), vim_get_var__API_DISPATCH)?;
+    registry.register(vim_get_vvar__API_META(), vim_get_vvar__API_DISPATCH)?;
+    registry.register(vim_get_windows__API_META(), vim_get_windows__API_DISPATCH)?;
+    registry.register(vim_input__API_META(), vim_input__API_DISPATCH)?;
+    registry.register(
+        vim_list_runtime_paths__API_META(),
+        vim_list_runtime_paths__API_DISPATCH,
+    )?;
+    registry.register(
+        vim_name_to_color__API_META(),
+        vim_name_to_color__API_DISPATCH,
+    )?;
+    registry.register(vim_out_write__API_META(), vim_out_write__API_DISPATCH)?;
+    registry.register(
+        vim_replace_termcodes__API_META(),
+        vim_replace_termcodes__API_DISPATCH,
+    )?;
+    registry.register(vim_report_error__API_META(), vim_report_error__API_DISPATCH)?;
+    registry.register(
+        vim_set_current_buffer__API_META(),
+        vim_set_current_buffer__API_DISPATCH,
+    )?;
+    registry.register(
+        vim_set_current_line__API_META(),
+        vim_set_current_line__API_DISPATCH,
+    )?;
+    registry.register(
+        vim_set_current_tabpage__API_META(),
+        vim_set_current_tabpage__API_DISPATCH,
+    )?;
+    registry.register(
+        vim_set_current_window__API_META(),
+        vim_set_current_window__API_DISPATCH,
+    )?;
+    registry.register(vim_set_option__API_META(), vim_set_option__API_DISPATCH)?;
+    registry.register(vim_strwidth__API_META(), vim_strwidth__API_DISPATCH)?;
+    registry.register(vim_subscribe__API_META(), vim_subscribe__API_DISPATCH)?;
+    registry.register(vim_unsubscribe__API_META(), vim_unsubscribe__API_DISPATCH)?;
+    registry.register(
+        window_get_buffer__API_META(),
+        window_get_buffer__API_DISPATCH,
+    )?;
+    registry.register(
+        window_get_cursor__API_META(),
+        window_get_cursor__API_DISPATCH,
+    )?;
+    registry.register(
+        window_get_height__API_META(),
+        window_get_height__API_DISPATCH,
+    )?;
+    registry.register(
+        window_get_option__API_META(),
+        window_get_option__API_DISPATCH,
+    )?;
+    registry.register(
+        window_get_position__API_META(),
+        window_get_position__API_DISPATCH,
+    )?;
+    registry.register(
+        window_get_tabpage__API_META(),
+        window_get_tabpage__API_DISPATCH,
+    )?;
+    registry.register(window_get_var__API_META(), window_get_var__API_DISPATCH)?;
+    registry.register(window_get_width__API_META(), window_get_width__API_DISPATCH)?;
+    registry.register(window_is_valid__API_META(), window_is_valid__API_DISPATCH)?;
+    registry.register(
+        window_set_cursor__API_META(),
+        window_set_cursor__API_DISPATCH,
+    )?;
+    registry.register(
+        window_set_height__API_META(),
+        window_set_height__API_DISPATCH,
+    )?;
+    registry.register(
+        window_set_option__API_META(),
+        window_set_option__API_DISPATCH,
+    )?;
+    registry.register(window_set_width__API_META(), window_set_width__API_DISPATCH)?;
+
     Ok(())
 }
 #[cfg(test)]
@@ -764,5 +1413,27 @@ mod tests {
         let ns = nvim_buf_add_highlight(&session, buffer, -1, OxStr::from("Question"), 0, 0, -1)
             .unwrap();
         assert!(ns > 0);
+    }
+
+    /// Every advertised API name has a registry dispatch: the metadata
+    /// tables generate both, but an unregistered `#[api]` entry still
+    /// answers "not implemented" on the wire (the dispatch probe's 85-name
+    /// gap class). This sweep is the permanent pin against that drift.
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test asserts the registry builds without error"
+    )]
+    fn every_advertised_api_name_dispatches() {
+        let registry = crate::registry::implemented().unwrap();
+        let missing: Vec<&str> = crate::api_function_names::API_FUNCTIONS
+            .iter()
+            .map(|entry| entry.name)
+            .filter(|name| registry.get(name).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "advertised but unregistered: {missing:?}"
+        );
     }
 }
