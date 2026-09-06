@@ -21,7 +21,7 @@ use ox_eval::BuiltinHost as EvalBuiltins;
 use ox_eval::{Builtins, Scope};
 use ox_lua::{
     ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work, bind_api,
-    bind_variables,
+    bind_variables, bind_with,
 };
 use ox_text::Buffer;
 use ox_types::{BufHandle, Object, OxStr, Typval};
@@ -635,7 +635,22 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
         host.fast_callbacks(),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
-    bind_variables(host.lua(), Rc::new(EditorVariables { session }))
+    bind_variables(
+        host.lua(),
+        Rc::new(EditorVariables {
+            session: session.clone(),
+        }),
+    )
+    .map_err(|error| AppError::Lua(error.to_string()))?;
+    bind_with(
+        host.lua(),
+        ApiDispatchContext::new(session.clone()),
+        host.fast_callbacks(),
+    )
+    .map_err(|error| AppError::Lua(error.to_string()))?;
+    let ui_context = ApiDispatchContext::new(session);
+    let ui_fast = host.fast_callbacks();
+    ox_lua::bind_ui_events(host.lua(), &ui_context, &ui_fast)
         .map_err(|error| AppError::Lua(error.to_string()))?;
     let lua = host.lua();
     let arguments = lua

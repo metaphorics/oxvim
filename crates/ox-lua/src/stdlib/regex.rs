@@ -60,7 +60,10 @@ pub(super) fn install(lua: &Lua, vim: &Table) -> mlua::Result<()> {
                     .map_err(|error| format!("couldn't parse regex: {error}"))
             });
         match compiled {
-            Ok(program) => Ok((true, Value::UserData(lua.create_userdata(LuaRegex(program))?))),
+            Ok(program) => Ok((
+                true,
+                Value::UserData(lua.create_userdata(LuaRegex(program))?),
+            )),
             Err(message) => Ok((false, Value::String(lua.create_string(message)?))),
         }
     })?;

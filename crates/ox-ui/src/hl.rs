@@ -687,10 +687,7 @@ mod tests {
             state.check_group(&OxStr::from("Penultimate")),
             Ok(MAX_GROUP_ID - 1)
         );
-        assert_eq!(
-            state.check_group(&OxStr::from("Last")),
-            Ok(MAX_GROUP_ID)
-        );
+        assert_eq!(state.check_group(&OxStr::from("Last")), Ok(MAX_GROUP_ID));
         assert_eq!(
             state.check_group(&OxStr::from("Over")),
             Err(HlError::TooManyGroups)

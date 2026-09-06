@@ -22,15 +22,15 @@ use ox_editor::{
 };
 use ox_lua::{
     ApiDispatchContext, BuiltinHost, EventLoopPump, LuaHost, RuntimeRoot as LuaRuntimeRoot,
-    Scheduler, VariableHost, VariableScope, Work, bind_api, bind_variables, call_with_traceback,
-    collect_typval_refs, error_shim, free_lua_ref, free_typval_refs, lua_to_object, lua_to_object_ref,
-    lua_to_typval, object_to_lua, typval_to_lua,
+    Scheduler, VariableHost, VariableScope, Work, bind_api, bind_variables, bind_with,
+    call_with_traceback, collect_typval_refs, error_shim, free_lua_ref, free_typval_refs,
+    lua_to_object, lua_to_object_ref, lua_to_typval, object_to_lua, typval_to_lua,
 };
 use ox_rpc::{CHAN_STDIO, ChannelId, IncrementalDecoder, Message};
 use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, Typval, WinHandle};
 use ox_ui::{
     CmdlineState as UiCmdlineState, Compositor, ContentChunk, Emitter, Highlight, HlAttrs,
-    MessageState, UiOptions,
+    MessageState, RedrawOutput, UiOptions,
 };
 #[cfg(unix)]
 use ox_uv::net::Pipe;
@@ -163,11 +163,7 @@ fn deliver_deferred_job_events(
                 parked.push(event);
                 continue;
             };
-            let args = event
-                .args
-                .iter()
-                .map(ox_rpc::typval_to_object)
-                .collect();
+            let args = event.args.iter().map(ox_rpc::typval_to_object).collect();
             if let Err(lua_error) = lua.borrow_mut().invoke_callback(reference, args) {
                 // The event reached its handler and the handler failed:
                 // consumed, like upstream's per-event multiqueue processing;
@@ -372,6 +368,16 @@ pub(crate) fn build_embedded_core(
         lua.fast_callbacks(),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
+    bind_with(
+        lua.lua(),
+        ApiDispatchContext::new(session.clone()),
+        lua.fast_callbacks(),
+    )
+    .map_err(|error| AppError::Lua(error.to_string()))?;
+    let ui_context = ApiDispatchContext::new(session.clone());
+    let ui_fast = lua.fast_callbacks();
+    ox_lua::bind_ui_events(lua.lua(), &ui_context, &ui_fast)
+        .map_err(|error| AppError::Lua(error.to_string()))?;
     bind_variables(
         lua.lua(),
         Rc::new(EditorVariables {
@@ -1105,12 +1111,32 @@ impl AppState {
                 })
             })
             .map_err(|error| ApiError::exception(error.to_string()))?;
-        self.session
+        let output = self
+            .session
             .with_render_state(|ui_channels, highlights, chrome| {
                 self.emitter
                     .redraw(ui_channels, &self.compositor, highlights, chrome)
                     .map_err(|error| ApiError::exception(error.to_string()))
-            })
+            })?;
+        let RedrawOutput(frames, semantic) = output;
+        // vim.ui_attach callbacks (upstream ui_add_cb via the event loop):
+        // queued at emission, invoked here with no editor or render-state
+        // borrow held.
+        if ox_lua::has_attached_callbacks() {
+            for event in &semantic {
+                ox_lua::enqueue_ui_event(&event.name.to_string_lossy(), event.args.clone());
+            }
+            self.deliver_ui_event_callbacks()?;
+        }
+        Ok(frames)
+    }
+
+    /// Invokes queued UI-event callbacks on the Lua host. The editor and
+    /// render-state borrows must be released: callbacks may call any API.
+    fn deliver_ui_event_callbacks(&mut self) -> Result<(), ApiError> {
+        let lua = self.lua.borrow().lua().clone();
+        ox_lua::deliver_pending_ui_events(&lua)
+            .map_err(|error| ApiError::exception(error.to_string()))
     }
 
     /// Mirrors the input mode onto the command-line chrome: shows the escaped
@@ -3405,7 +3431,7 @@ impl CommandExecutor for ExApiExecutor<'_> {
 /// `(false, message)` result for the scoped-call Lua shim
 /// ([`error_shim`]): the shim re-raises the message as a *string* Lua
 /// error, so `pcall` never observes an mlua `WrappedFailure` userdata --
-/// upstream raises plain strings (`nlua_error`), and the exec_lua harness
+/// upstream raises plain strings (`nlua_error`), and the `exec_lua` harness
 /// rejects userdata with "cannot be serialized over RPC".
 fn scoped_failure(lua: &Lua, error: impl std::fmt::Display) -> mlua::Result<(bool, Value)> {
     Ok((false, Value::String(lua.create_string(error.to_string())?)))
@@ -3613,8 +3639,8 @@ fn with_scoped_editor_api<T>(
     // Scoped natives signal failure as `(false, message)`; this Lua shim
     // re-raises the message as a string error, so `pcall` in chunks and the
     // exec_lua harness never observe an mlua `WrappedFailure` userdata.
-    let shim: Function = error_shim(lua)
-        .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+    let shim: Function =
+        error_shim(lua).map_err(|error| LuaExecError::Runtime(error.to_string()))?;
     // Shared by reference so every scope closure copies the borrow instead
     // of the first closure moving the shim away from the rest.
     let shim = &shim;
@@ -3753,20 +3779,15 @@ fn with_scoped_editor_api<T>(
                                 Err(error) => return scoped_failure_multi(lua, error),
                             };
                             let result = match dispatch_scoped_nvim_cmd(
-                                session,
-                                &cmd_ex,
-                                &nested_ex,
-                                cmd,
-                                opts,
+                                session, &cmd_ex, &nested_ex, cmd, opts,
                             ) {
                                 Ok(result) => result,
                                 Err(error) => return scoped_failure_multi(lua, error),
                             };
                             match object_to_lua(lua, &Object::String(result)) {
-                                Ok(value) => Ok(MultiValue::from_vec(vec![
-                                    Value::Boolean(true),
-                                    value,
-                                ])),
+                                Ok(value) => {
+                                    Ok(MultiValue::from_vec(vec![Value::Boolean(true), value]))
+                                }
                                 Err(error) => scoped_failure_multi(lua, error),
                             }
                         },
@@ -4057,6 +4078,46 @@ mod tests {
         clippy::unwrap_used,
         reason = "the test requires editor and Lua dispatch setup to succeed"
     )]
+    fn ui_attach_validates_and_registers() {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let core = build_embedded_core(editor, true).unwrap();
+        let (_, dispatch) = core.registry.get("nvim_exec_lua").unwrap();
+        let run = |chunk: &str| {
+            dispatch(
+                &core.session,
+                &[
+                    Object::String(OxStr::from(chunk)),
+                    Object::Array(Vec::new()),
+                ],
+            )
+        };
+        // nlua_ui_attach validation (executor.c:807-862): bad ns, bad opts
+        // key, no-true-widget, and the working attach/detach pair.
+        assert!(run("vim.ui_attach(999, {ext_popupmenu=true}, function() end)").is_err());
+        assert!(
+            run(
+                "vim.ui_attach(vim.api.nvim_create_namespace 'x', {ext_bogus=true}, function() end)"
+            )
+            .is_err()
+        );
+        assert!(
+            run("vim.ui_attach(vim.api.nvim_create_namespace 'x', {}, function() end)").is_err()
+        );
+        assert_eq!(
+            run("local ns = vim.api.nvim_create_namespace 'probe' vim.ui_attach(ns, {ext_messages=true}, function() end) return 'attached'").unwrap(),
+            Object::String(OxStr::from("attached"))
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the test requires editor and Lua dispatch setup to succeed"
+    )]
     fn scoped_builtin_errors_reach_pcall_as_strings() {
         // The exec_lua harness (testnvim/exec_lua.lua:44) rejects *userdata*
         // error values ("cannot be serialized over RPC"), so every scoped
@@ -4073,7 +4134,7 @@ mod tests {
             &core.session,
             &[
                 Object::String(OxStr::from(
-                    r#"
+                    r"
                     local fn_ok, fn_err = pcall(vim.fn.nosuchvimfunction, 1)
                     local api_ok, api_err = pcall(vim.api.nvim_buf_get_lines, 9999, 0, -1, false)
                     local function shape(ok, err)
@@ -4081,7 +4142,7 @@ mod tests {
                       return { false, type(err), #tostring(err) > 0 }
                     end
                     return { shape(fn_ok, fn_err), shape(api_ok, api_err) }
-                    "#,
+                    ",
                 )),
                 Object::Array(Vec::new()),
             ],

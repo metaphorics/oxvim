@@ -177,6 +177,13 @@ impl ApiSession {
         operation(&self.state.borrow())
     }
 
+    /// Whether `id` was allocated by `nvim_create_namespace`
+    /// (upstream `ns_initialized`, the check `vim.ui_attach` runs).
+    #[must_use]
+    pub fn namespace_is_initialized(&self, id: u32) -> bool {
+        self.with_state(|state| id > 0 && id < state.next_namespace)
+    }
+
     /// Shortest-scope mutable state borrow; the closure must not run
     /// reentrant host code or outlive its statement.
     pub fn with_state_mut<R>(&self, operation: impl FnOnce(&mut SessionState) -> R) -> R {

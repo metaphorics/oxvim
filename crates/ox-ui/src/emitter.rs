@@ -29,6 +29,16 @@ pub enum EmitterError {
     Position(isize),
 }
 
+/// One redraw pass: encoded frames per UI channel plus the semantic event
+/// stream (for `vim.ui_attach` callbacks).
+pub struct RedrawOutput(pub BTreeMap<u64, Vec<u8>>, pub Vec<UiEvent>);
+
+impl RedrawOutput {
+    fn default_empty(events: Vec<UiEvent>) -> Self {
+        Self(BTreeMap::new(), events)
+    }
+}
+
 /// Stateful redraw bridge retaining the last grid sent to each channel.
 #[derive(Clone, Debug, Default)]
 pub struct Emitter {
@@ -101,9 +111,11 @@ impl Emitter {
         compositor: &Compositor,
         highlights: &mut HlState,
         chrome: &mut ChromeState,
-    ) -> Result<BTreeMap<u64, Vec<u8>>, EmitterError> {
+    ) -> Result<RedrawOutput, EmitterError> {
         if channels.is_empty() {
-            return Ok(BTreeMap::new());
+            // No RPC UI attached; semantic events still surface to Lua
+            // callbacks (vim.ui_attach works without a remote UI).
+            return Ok(RedrawOutput::default_empty(chrome.take_events()));
         }
         let chrome_events = chrome.take_events();
         let mut initial_chrome_events = chrome.snapshot_events();
@@ -243,7 +255,13 @@ impl Emitter {
             route_chrome(channel, options, routed_chrome)?;
             frames.insert(channel_id, channel.flush()?);
         }
-        Ok(frames)
+        let mut semantic = chrome_events.clone();
+        for event in &initial_chrome_events {
+            if !semantic.contains(event) {
+                semantic.push(event.clone());
+            }
+        }
+        Ok(RedrawOutput(frames, semantic))
     }
 
     /// Emits a grid resize plus either a full initial image or minimal line diffs.

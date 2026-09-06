@@ -169,7 +169,8 @@ fn emitter_sends_win_extmark_to_each_split_grid() {
             &mut highlights,
             &mut ChromeState::new(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
     let decoded = decode(&frames[&1]).unwrap();
     let Object::Array(frame) = decoded else {
         panic!("redraw frame")
@@ -437,7 +438,8 @@ fn shared_buffer_modified_flag_updates_both_split_statuslines() {
         .unwrap();
     let messages = emitter
         .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
-        .unwrap();
+        .unwrap()
+        .0;
     let initial_frame = decode(&messages[&1]).unwrap();
     assert_unmodified_statuslines(&initial_frame);
 
@@ -452,7 +454,8 @@ fn shared_buffer_modified_flag_updates_both_split_statuslines() {
         .unwrap();
     let messages = emitter
         .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
-        .unwrap();
+        .unwrap()
+        .0;
     let modified_frame = decode(&messages[&1]).unwrap();
     assert_modified_statusline_diff(&modified_frame);
 
@@ -467,7 +470,8 @@ fn shared_buffer_modified_flag_updates_both_split_statuslines() {
         .unwrap();
     let messages = emitter
         .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
-        .unwrap();
+        .unwrap()
+        .0;
     let cleared_frame = decode(&messages[&1]).unwrap();
     assert_cleared_statuslines(&cleared_frame);
 

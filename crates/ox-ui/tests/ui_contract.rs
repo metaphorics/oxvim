@@ -475,7 +475,8 @@ fn capabilities_route_multigrid_and_messages_per_channel() {
 
     let frames = Emitter::new()
         .redraw(&mut channels, &compositor, &mut HlState::new(), &mut chrome)
-        .unwrap();
+        .unwrap()
+        .0;
     let names_one = event_names(decode(&frames[&1]).unwrap());
     let names_two = event_names(decode(&frames[&2]).unwrap());
     assert!(names_one.contains(&"win_pos".to_owned()));
@@ -517,7 +518,8 @@ fn multigrid_initializes_grid_one_and_filters_external_message_layer() {
     });
     let frame = Emitter::new()
         .redraw(&mut channels, &compositor, &mut HlState::new(), &mut chrome)
-        .unwrap();
+        .unwrap()
+        .0;
     let decoded = decode(&frame[&7]).unwrap();
     let names = event_names(decoded.clone());
     assert!(has_grid_resize(&decoded, 1));
@@ -557,7 +559,8 @@ fn clearing_fallback_message_emits_blanking_grid_line() {
     chrome.clear_message();
     let frame = emitter
         .redraw(&mut channels, &compositor, &mut HlState::new(), &mut chrome)
-        .unwrap();
+        .unwrap()
+        .0;
     assert!(event_names(decode(&frame[&8]).unwrap()).contains(&"grid_line".to_owned()));
 }
 
@@ -584,7 +587,8 @@ fn showmode_fallback_renders_on_last_row_without_regular_message() -> Result<(),
     let mut emitter = Emitter::new();
     let frame = emitter
         .redraw(&mut channels, &compositor, &mut HlState::new(), &mut chrome)
-        .unwrap();
+        .unwrap()
+        .0;
     let decoded = decode(&frame[&1]).unwrap();
     let names = event_names(decoded.clone());
     assert!(names.contains(&"grid_line".to_owned()));
@@ -670,7 +674,8 @@ fn showmode_emits_msg_showmode_event_with_ext_messages() {
     let mut emitter = Emitter::new();
     let frame = emitter
         .redraw(&mut channels, &compositor, &mut HlState::new(), &mut chrome)
-        .unwrap();
+        .unwrap()
+        .0;
     let names = event_names(decode(&frame[&1]).unwrap());
     assert!(names.contains(&"msg_showmode".to_owned()));
 }
@@ -715,7 +720,8 @@ fn initial_redraw_emits_startup_metadata_once() {
 
     let first = emitter
         .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
-        .unwrap();
+        .unwrap()
+        .0;
     let first_names = event_names(decode(&first[&12]).unwrap());
     for required in [
         "option_set",
@@ -732,7 +738,8 @@ fn initial_redraw_emits_startup_metadata_once() {
 
     let second = emitter
         .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
-        .unwrap();
+        .unwrap()
+        .0;
     let second_names = event_names(decode(&second[&12]).unwrap());
     for startup in ["option_set", "default_colors_set", "mode_info_set"] {
         assert!(
@@ -792,7 +799,8 @@ fn multigrid_without_ext_messages_renders_message_once_via_compositor_grid() {
             &mut HlState::new(),
             &mut ChromeState::new(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
     let decoded = decode(&frames[&9]).unwrap();
     // The compositor message grid is the single render path (msg_set_pos + its own grid).
     assert!(event_names(decoded.clone()).contains(&"msg_set_pos".to_owned()));
@@ -830,7 +838,8 @@ fn float_compindex_is_distinct_ordered_and_stable_not_channel_id() {
             &mut HlState::new(),
             &mut ChromeState::new(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
     let decoded = decode(&frame[&7]).unwrap();
     // Two equal-z-index floats get distinct compindexes in compositor (insertion) order,
     // independent of the channel id.
@@ -847,7 +856,8 @@ fn float_compindex_is_distinct_ordered_and_stable_not_channel_id() {
             &mut HlState::new(),
             &mut ChromeState::new(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
     let decoded2 = decode(&frame2[&7]).unwrap();
     assert_eq!(win_float_compindexes(&decoded2), compindexes);
 }
@@ -986,12 +996,14 @@ fn steady_state_redraw_emits_no_grid_lines_and_never_reseeds() {
 
     let _ = emitter
         .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
-        .unwrap();
+        .unwrap()
+        .0;
 
     // Second identical redraw: no changes, no grid traffic.
     let quiet = emitter
         .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
-        .unwrap();
+        .unwrap()
+        .0;
     for frame in quiet.values() {
         if let Ok(events) = decode(frame) {
             let names = event_names(events);
@@ -1007,7 +1019,8 @@ fn steady_state_redraw_emits_no_grid_lines_and_never_reseeds() {
     let changed = compositor_with_lines(&["Zline", "", ""]);
     let single = emitter
         .redraw(&mut channels, &changed, &mut highlights, &mut chrome)
-        .unwrap();
+        .unwrap()
+        .0;
     let mut grid_lines = 0;
     for frame in single.values() {
         if let Ok(events) = decode(frame) {
@@ -1220,7 +1233,8 @@ fn multigrid_steady_state_reuses_default_grid_without_stale_content() {
     // First redraw seeds the default grid (grid_resize expected here).
     let _ = emitter
         .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
-        .unwrap();
+        .unwrap()
+        .0;
 
     // Mutate to shorter content and refresh the same compositor in place.
     editor
@@ -1241,7 +1255,8 @@ fn multigrid_steady_state_reuses_default_grid_without_stale_content() {
 
     let second = emitter
         .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
-        .unwrap();
+        .unwrap()
+        .0;
     for frame in second.values() {
         if let Ok(events) = decode(frame) {
             let names = event_names(events);

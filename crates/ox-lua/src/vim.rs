@@ -1,17 +1,17 @@
 //! C-side core of the global `vim` Lua table.
 
-use std::cell::Cell;
-use std::rc::Rc;
-
+use crate::converter::{free_lua_ref, lua_to_object, object_to_lua, object_to_lua_legacy};
+use crate::typval_bridge::{collect_typval_refs, free_typval_refs, lua_to_typval, typval_to_lua};
 use mlua::{
     FromLuaMulti, Function, Lua, LuaString, MetaMethod, MultiValue, Table, UserData,
     UserDataMethods, Value, Variadic,
 };
 use ox_api::Registry;
-use ox_types::{Object, OxStr, Typval};
-
-use crate::converter::{free_lua_ref, lua_to_object, object_to_lua, object_to_lua_legacy};
-use crate::typval_bridge::{collect_typval_refs, free_typval_refs, lua_to_typval, typval_to_lua};
+use ox_editor::BufferRelease;
+use ox_types::{BufHandle, Object, OxStr, Typval, WinHandle};
+use std::cell::Cell;
+use std::path::PathBuf;
+use std::rc::Rc;
 
 /// A deferred Lua callback owned by the eventual main-loop adapter.
 pub type Work = Box<dyn FnOnce() -> mlua::Result<()> + 'static>;
@@ -260,7 +260,7 @@ pub fn install_vim_core(
 /// Lua wrapper factory for Rust natives that signal failure as
 /// `(false, message)`: the wrapper re-raises the message as a *string* error,
 /// so `pcall` never observes an mlua `WrappedFailure` userdata (upstream
-/// raises plain strings; userdata returns make the exec_lua harness reject
+/// raises plain strings; userdata returns make the `exec_lua` harness reject
 /// with "cannot be serialized over RPC"). Multi-value safe: success returns
 /// pass every value after the flag through untouched.
 ///
@@ -627,6 +627,354 @@ pub fn bind_api(
         })?,
     )?;
     Ok(())
+}
+
+/// Install `vim._with_c`, the C-side implementation of `vim.with`.
+///
+/// # Errors
+///
+/// Returns an error if the `vim` table is unavailable or the native function
+/// cannot be created or installed.
+pub fn bind_with(
+    lua: &Lua,
+    context: ApiDispatchContext,
+    fast_state: FastCallbackState,
+) -> mlua::Result<()> {
+    let vim: Table = lua.globals().get("vim")?;
+    let with = lua.create_function(move |lua, (opts, callback): (Table, Function)| {
+        with_c(lua, &context, &fast_state, &opts, &callback)
+    })?;
+    vim.set("_with_c", with)
+}
+
+fn truthy(value: &Value) -> bool {
+    !matches!(value, Value::Nil | Value::Boolean(false))
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the range guard above proves the float is an in-range integer"
+)]
+fn as_i64(value: &Value) -> mlua::Result<i64> {
+    match value {
+        Value::Integer(n) => Ok(*n),
+        Value::Number(n)
+            if n.fract() == 0.0
+                && *n >= -9_223_372_036_854_775_808.0
+                && *n <= 9_223_372_036_854_775_807.0 =>
+        {
+            // The guard proves the value is an in-range integer, so the
+            // truncating cast cannot lose information.
+            Ok(*n as i64)
+        }
+        _ => Err(mlua::Error::runtime("expected integer")),
+    }
+}
+
+fn validate_win(session: &ox_api::ApiSession, handle: WinHandle) -> Option<WinHandle> {
+    session.with_editor(|editor| {
+        if handle.is_current() {
+            editor.current_window()
+        } else {
+            editor.window(handle).is_ok().then_some(handle)
+        }
+    })
+}
+
+fn validate_buf(session: &ox_api::ApiSession, handle: BufHandle) -> Option<BufHandle> {
+    session.with_editor(|editor| {
+        if handle.is_current() {
+            editor.current_buffer()
+        } else {
+            editor.buffer(handle).is_ok().then_some(handle)
+        }
+    })
+}
+
+/// The parsed `vim.with` option table (`nlua_with`'s context fields).
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the vim.with option set is boolean flags by upstream definition"
+)]
+struct WithCOptions {
+    buf_arg: Option<i64>,
+    win_arg: Option<i64>,
+    keepcwd: bool,
+    silent: bool,
+    emsg_silent: bool,
+    unsilent: bool,
+}
+
+impl WithCOptions {
+    fn parse(opts: &Table) -> mlua::Result<Self> {
+        let mut parsed = Self {
+            buf_arg: None,
+            win_arg: None,
+            keepcwd: false,
+            silent: false,
+            emsg_silent: false,
+            unsilent: false,
+        };
+        for pair in opts.pairs::<Value, Value>() {
+            let (key, value) = pair?;
+            let Value::String(key) = key else {
+                continue;
+            };
+            match key.as_bytes().as_ref() {
+                b"buf" => parsed.buf_arg = Some(as_i64(&value)?),
+                b"win" => parsed.win_arg = Some(as_i64(&value)?),
+                b"keepcwd" => parsed.keepcwd = truthy(&value),
+                b"silent" => parsed.silent = truthy(&value),
+                b"emsg_silent" => parsed.emsg_silent = truthy(&value),
+                b"unsilent" => parsed.unsilent = truthy(&value),
+                // No-op flags in this port; recognized and ignored. Unknown
+                // keys mirror upstream nlua_with: also ignored. log_level has
+                // no equivalent here either.
+                _ => {}
+            }
+        }
+        Ok(parsed)
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "mirrors upstream nlua_with's single save/switch/call/restore body"
+)]
+fn with_c(
+    _lua: &Lua,
+    context: &ApiDispatchContext,
+    fast_state: &FastCallbackState,
+    opts: &Table,
+    callback: &Function,
+) -> mlua::Result<MultiValue> {
+    fast_state.guard("vim._with_c")?;
+
+    let WithCOptions {
+        buf_arg,
+        win_arg,
+        keepcwd,
+        silent,
+        emsg_silent,
+        unsilent,
+    } = WithCOptions::parse(opts)?;
+
+    let message_silent = (silent || emsg_silent) && !unsilent;
+    let session = context.session();
+
+    let win_handle = match win_arg {
+        Some(n) => {
+            let handle =
+                WinHandle::try_from(n).map_err(|e| mlua::Error::runtime(format!("win: {e}")))?;
+            Some(
+                validate_win(session, handle)
+                    .ok_or_else(|| mlua::Error::runtime("win: invalid window handle"))?,
+            )
+        }
+        None => None,
+    };
+    let buf_handle = match buf_arg {
+        Some(n) => {
+            let handle =
+                BufHandle::try_from(n).map_err(|e| mlua::Error::runtime(format!("buf: {e}")))?;
+            Some(
+                validate_buf(session, handle)
+                    .ok_or_else(|| mlua::Error::runtime("buf: invalid buffer handle"))?,
+            )
+        }
+        None => None,
+    };
+
+    // Snapshot the caller context and decide whether/where to switch.
+    let (
+        caller,
+        previous_before,
+        _caller_buffer,
+        message_routing,
+        process_cwd,
+        target_window,
+        entered,
+    ) = session.with_editor(|editor| {
+        let caller = editor.current_window();
+        let previous_before = editor.previous_window();
+        let caller_buffer = caller.and_then(|w| editor.window(w).ok().map(|s| s.buffer));
+        let message_routing = editor.message_routing;
+        let process_cwd = std::env::current_dir().ok();
+
+        let mut target_window = None;
+        let mut entered = None;
+        match (win_handle, buf_handle, caller) {
+            (Some(w), _, Some(c)) if w != c => {
+                target_window = Some(w);
+            }
+            (Some(_), _, _) => {
+                target_window = caller;
+            }
+            (None, Some(b), Some(c)) => {
+                let visible = editor
+                    .windows()
+                    .into_iter()
+                    .find(|w| editor.window(*w).is_ok_and(|s| s.buffer == b));
+                match visible {
+                    Some(w) if w != c => {
+                        target_window = Some(w);
+                        entered = Some((w, b));
+                    }
+                    _ if caller_buffer == Some(b) => {
+                        target_window = Some(c);
+                    }
+                    _ => {
+                        target_window = Some(c);
+                        entered = Some((c, caller_buffer.unwrap_or(b)));
+                    }
+                }
+            }
+            (None, None, Some(c)) if keepcwd => {
+                target_window = Some(c);
+            }
+            _ => {}
+        }
+        (
+            caller,
+            previous_before,
+            caller_buffer,
+            message_routing,
+            process_cwd,
+            target_window,
+            entered,
+        )
+    });
+
+    if (win_handle.is_some() || buf_handle.is_some()) && caller.is_none() {
+        return Err(mlua::Error::runtime("no current tabpage"));
+    }
+
+    let target_local = target_window.and_then(|w| {
+        keepcwd.then(|| {
+            session.with_editor(|editor| {
+                editor
+                    .window(w)
+                    .ok()
+                    .map(|s| (s.local_directory.clone(), s.previous_directory.clone()))
+            })
+        })
+    });
+
+    // Apply message-silent cmdmod state.
+    let saved_routing = if message_silent == message_routing.silent {
+        None
+    } else {
+        let mut routing = message_routing;
+        routing.silent = message_silent;
+        session.with_editor_mut(|editor| editor.message_routing = routing);
+        Some(message_routing)
+    };
+
+    // Enter the target context.
+    let mut switched = false;
+    if let Some(target) = target_window {
+        if Some(target) != caller {
+            session.with_editor_mut(|editor| {
+                switched = editor.set_current_window(target).is_ok();
+            });
+            if !switched {
+                // Restore and return without running the callback, matching the
+                // upstream "switch failed" no-op.
+                if let Some(routing) = saved_routing {
+                    session.with_editor_mut(|editor| editor.message_routing = routing);
+                }
+                return Ok(MultiValue::new());
+            }
+        }
+        if let (Some((window, _)), Some(buffer)) = (entered, buf_handle)
+            && Some(window) == caller
+        {
+            // Hidden buffer target: take over the caller window.
+            session.with_editor_mut(|editor| {
+                let _ = editor.set_current_buffer(buffer, BufferRelease::KeepLoaded);
+            });
+        }
+    }
+
+    // The callback runs in the target's effective directory. keepcwd is
+    // enforced on the way out, not before the callback.
+    let result = callback.call::<MultiValue>(());
+
+    restore_with_c_context(
+        session,
+        entered,
+        caller,
+        previous_before,
+        keepcwd,
+        target_window,
+        target_local.flatten(),
+    );
+
+    if keepcwd && let Some(cwd) = &process_cwd {
+        let _ = std::env::set_current_dir(cwd);
+    }
+
+    if let Some(routing) = saved_routing {
+        session.with_editor_mut(|editor| editor.message_routing = routing);
+    }
+
+    match result {
+        Ok(values) => Ok(values),
+        Err(error) => Err(mlua::Error::RuntimeError(mlua_error_text(&error))),
+    }
+}
+
+/// Puts the caller's window/buffer context back the way `ctx_restore` does
+/// (context.c), swallowing failures so a callback result is never masked.
+#[allow(clippy::too_many_arguments, reason = "restoration state snapshot")]
+fn restore_with_c_context(
+    session: &ox_api::ApiSession,
+    entered: Option<(WinHandle, BufHandle)>,
+    caller: Option<WinHandle>,
+    previous_before: Option<WinHandle>,
+    keepcwd: bool,
+    target_window: Option<WinHandle>,
+    target_local: Option<(Option<PathBuf>, Option<PathBuf>)>,
+) {
+    if let Some((window, buffer)) = entered {
+        session.with_editor_mut(|editor| {
+            if editor.window(window).is_ok_and(|s| s.buffer != buffer)
+                && editor.buffer(buffer).is_ok()
+            {
+                let _ = editor.set_window_buffer(window, buffer, BufferRelease::KeepLoaded);
+            }
+            if editor.current_window() != Some(window) && editor.window(window).is_ok() {
+                let _ = editor.set_current_window(window);
+            }
+        });
+    }
+
+    if keepcwd
+        && let Some(target) = target_window
+        && let Some((local, previous)) = target_local
+    {
+        session.with_editor_mut(|editor| {
+            if let Ok(state) = editor.window_mut(target) {
+                state.local_directory = local;
+                state.previous_directory = previous;
+            }
+        });
+    }
+
+    if let Some(caller) = caller {
+        session.with_editor_mut(|editor| {
+            if editor.current_window() != Some(caller) && editor.window(caller).is_ok() {
+                let _ = editor.set_current_window(caller);
+            }
+        });
+    }
+
+    if let Some(caller) = caller {
+        let prior_previous = session.with_editor(ox_editor::Editor::previous_window);
+        if prior_previous == Some(caller) {
+            session.with_editor_mut(|editor| editor.set_previous_window(previous_before));
+        }
+    }
 }
 
 /// Call a Lua function through `xpcall` with a handler that keeps mlua's

@@ -15,6 +15,6 @@ pub use chrome::{
 pub use compositor::{
     ComposeOutcome, Compositor, CompositorError, Layer, LayerKind, MESSAGE_ZINDEX, WatchedExtmark,
 };
-pub use emitter::{Emitter, EmitterError};
+pub use emitter::{Emitter, EmitterError, RedrawOutput};
 pub use grid::{Cell, Grid, GridError, GridLine};
 pub use hl::{Highlight, HlAttrs, HlDef, HlError, HlEvent, HlInfo, HlState, premix_color};

@@ -3,14 +3,14 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use mlua::{ErrorContext, Function, MultiValue, Value};
-use ox_editor::{Editor, Geometry};
+use ox_editor::{DirectoryScope, Editor, Geometry};
 use ox_lua::{
     ApiDispatchContext, BuiltinHost, CONVERSION_RECURSION_LIMIT, ConversionError, ExecError,
-    LuaHost, RuntimeRoot, Scheduler, Work, bind_api, call_with_traceback, lua_to_object,
+    LuaHost, RuntimeRoot, Scheduler, Work, bind_api, bind_with, call_with_traceback, lua_to_object,
     lua_to_typval, object_to_lua, typval_to_lua,
 };
 use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, Special, TabHandle, Typval, WinHandle};
@@ -63,6 +63,110 @@ fn host() -> (LuaHost, Rc<FakeBuiltins>, Rc<FakeScheduler>) {
     (host, builtins, scheduler)
 }
 
+/// Builds a `LuaHost` with `vim.api` and `vim._with_c` wired to a real editor session.
+fn with_c_host() -> (LuaHost, Rc<ox_api::ApiSession>, Rc<FakeBuiltins>) {
+    let builtins = Rc::new(FakeBuiltins::default());
+    let scheduler = Rc::new(FakeScheduler::default());
+    let host = LuaHost::new(runtime_root(), builtins.clone(), scheduler).unwrap();
+
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let session = Rc::new(ox_api::ApiSession::new(Rc::new(RefCell::new(editor))));
+
+    let registry = ox_api::core().unwrap();
+    let context = ApiDispatchContext::new(Rc::clone(&session));
+    bind_api(
+        host.lua(),
+        &registry,
+        context.clone(),
+        host.fast_callbacks(),
+    )
+    .unwrap();
+    bind_with(host.lua(), context, host.fast_callbacks()).unwrap();
+
+    (host, session, builtins)
+}
+
+#[derive(Default)]
+struct CwdBuiltins {
+    calls: RefCell<Vec<(OxStr, Vec<Typval>)>>,
+    session: RefCell<Option<Rc<ox_api::ApiSession>>>,
+}
+
+impl CwdBuiltins {
+    fn set_session(&self, session: Rc<ox_api::ApiSession>) {
+        self.session.borrow_mut().replace(session);
+    }
+}
+
+impl BuiltinHost for CwdBuiltins {
+    fn call(&self, name: &OxStr, args: Vec<Typval>) -> Result<Typval, String> {
+        match name.as_bytes() {
+            b"getcwd" => {
+                let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+                Ok(Typval::String(OxStr::from(cwd.to_string_lossy().as_ref())))
+            }
+            b"chdir" => {
+                if args.is_empty() {
+                    return Err("chdir requires a path".to_owned());
+                }
+                let path = match &args[0] {
+                    Typval::String(s) => Path::new(s.to_string_lossy().as_ref()).to_path_buf(),
+                    _ => return Err("chdir path must be a string".to_owned()),
+                };
+                let scope = match args.get(1) {
+                    Some(Typval::String(s)) if s.as_bytes() == b"global" => DirectoryScope::Global,
+                    Some(Typval::String(s))
+                        if s.as_bytes() == b"win" || s.as_bytes() == b"window" =>
+                    {
+                        DirectoryScope::Window
+                    }
+                    _ => DirectoryScope::Global,
+                };
+                if let Some(session) = self.session.borrow().clone() {
+                    session.with_editor_mut(|editor| {
+                        let _ = editor.change_directory(&path, scope);
+                    });
+                }
+                Ok(Typval::String(OxStr::from("")))
+            }
+            _ => {
+                self.calls.borrow_mut().push((name.clone(), args));
+                Ok(Typval::String(OxStr::from("called")))
+            }
+        }
+    }
+}
+
+fn with_c_cwd_host() -> (LuaHost, Rc<ox_api::ApiSession>, Rc<CwdBuiltins>) {
+    let builtins = Rc::new(CwdBuiltins::default());
+    let scheduler = Rc::new(FakeScheduler::default());
+    let host = LuaHost::new(runtime_root(), builtins.clone(), scheduler).unwrap();
+
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let session = Rc::new(ox_api::ApiSession::new(Rc::new(RefCell::new(editor))));
+    builtins.set_session(Rc::clone(&session));
+
+    let registry = ox_api::core().unwrap();
+    let context = ApiDispatchContext::new(Rc::clone(&session));
+    bind_api(
+        host.lua(),
+        &registry,
+        context.clone(),
+        host.fast_callbacks(),
+    )
+    .unwrap();
+    bind_with(host.lua(), context, host.fast_callbacks()).unwrap();
+
+    (host, session, builtins)
+}
 #[test]
 fn opens_upstream_luajit_library_set_and_runtime_path() {
     let (host, _, _) = host();
@@ -977,4 +1081,150 @@ fn exec_file_error_contains_message() {
     let text = error.to_string();
     assert!(text.contains("file boom"), "{text}");
     assert!(matches!(error, ExecError::Load(_)));
+}
+
+#[test]
+#[expect(
+    clippy::panic,
+    reason = "shape failures must fail the test with the observed value"
+)]
+fn with_c_switches_buffer_context() {
+    let (mut host, _session, _builtins) = with_c_host();
+
+    let second = host
+        .exec("return vim.api.nvim_create_buf(true, false)", vec![])
+        .unwrap();
+    let Object::Integer(second) = second else {
+        panic!("expected buffer handle integer, got {second:?}");
+    };
+
+    let Object::Integer(current) = host
+        .exec("return vim.api.nvim_get_current_buf()", vec![])
+        .unwrap()
+    else {
+        panic!("expected current buffer handle integer");
+    };
+
+    let observed = host
+        .exec(
+            &format!(
+                "return vim._with_c({{buf = {second}}}, function()\n\
+                 return vim.api.nvim_get_current_buf()\n\
+                 end)"
+            ),
+            vec![],
+        )
+        .unwrap();
+    let Object::Integer(observed) = observed else {
+        panic!("expected buffer handle inside _with_c, got {observed:?}");
+    };
+
+    assert_eq!(observed, second);
+
+    let Object::Integer(restored) = host
+        .exec("return vim.api.nvim_get_current_buf()", vec![])
+        .unwrap()
+    else {
+        panic!("expected current buffer handle after _with_c");
+    };
+    assert_eq!(restored, current);
+}
+#[test]
+fn with_c_returns_multiple_values() {
+    let (mut host, _session, _builtins) = with_c_host();
+
+    let third = host
+        .exec(
+            "local a, b, c = vim._with_c({}, function()\n\
+             return 1, 2, \"three\"\n\
+             end)\n\
+             return c",
+            vec![],
+        )
+        .unwrap();
+
+    assert_eq!(third, Object::String(OxStr::from("three")));
+}
+
+#[test]
+fn with_c_propagates_callback_error_as_string() {
+    let (mut host, _session, _builtins) = with_c_host();
+
+    let error = host
+        .exec(
+            "vim._with_c({}, function()\n\
+             error('callback boom')\n\
+             end)",
+            vec![],
+        )
+        .unwrap_err();
+
+    let text = error.to_string();
+    assert!(text.contains("callback boom"), "{text}");
+}
+
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+#[expect(
+    clippy::panic,
+    reason = "shape failures must fail the test with the observed value"
+)]
+fn with_c_keepcwd_restores_directory() {
+    let (mut host, _session, _builtins) = with_c_cwd_host();
+
+    let original = std::env::current_dir().unwrap();
+    let third = std::env::temp_dir().join(format!("ox-lua-with-c-third-{}", std::process::id()));
+    std::fs::create_dir_all(&third).unwrap();
+    let _cleanup = TempDir(third.clone());
+
+    let third_str = third.to_string_lossy().into_owned();
+
+    let after_without = host
+        .exec(
+            &format!(
+                "local third = {third_str:?}; vim._with_c({{}}, function()\n\
+                 vim.fn.chdir(third, 'global')\n\
+                 end);\n\
+                 return vim.fn.getcwd()"
+            ),
+            vec![],
+        )
+        .unwrap();
+    let Object::String(after_without) = after_without else {
+        panic!("expected string cwd, got {after_without:?}");
+    };
+
+    assert_eq!(
+        Path::new(std::str::from_utf8(after_without.as_bytes()).unwrap()),
+        third.as_path()
+    );
+
+    std::env::set_current_dir(&original).unwrap();
+
+    let after_with = host
+        .exec(
+            &format!(
+                "local third = {third_str:?}; vim._with_c({{keepcwd = true}}, function()\n\
+                 vim.fn.chdir(third, 'global')\n\
+                 end);\n\
+                 return vim.fn.getcwd()"
+            ),
+            vec![],
+        )
+        .unwrap();
+    let Object::String(after_with) = after_with else {
+        panic!("expected string cwd, got {after_with:?}");
+    };
+
+    assert_eq!(
+        Path::new(std::str::from_utf8(after_with.as_bytes()).unwrap()),
+        original.as_path()
+    );
 }

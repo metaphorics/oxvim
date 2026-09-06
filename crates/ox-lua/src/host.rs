@@ -309,4 +309,3 @@ mod tests {
         assert!(!seeded_cpath.is_empty(), "trails must stay harvestable");
     }
 }
-
