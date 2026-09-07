@@ -330,7 +330,15 @@ pub fn open_startup_buffers(
     } else if cli.stdin_file {
         open_stdin_buffer(editor)?;
     }
-    let buffers = open_startup_files(editor, &cli.files, cli.readonly)?;
+    let buffers = open_startup_files(
+        editor,
+        &cli.files,
+        StartupFlags {
+            readonly: cli.readonly,
+            no_modifiable: cli.no_modifiable,
+            binary: cli.binary,
+        },
+    )?;
     if cli.window_layout != WindowLayout::Single {
         create_startup_windows(editor, cli, &buffers)?;
     }
@@ -348,10 +356,21 @@ pub fn open_startup_buffers(
 /// loads for a named file while that mode is on, so the second and later
 /// files of `-R -o a b` are read-only too. Windows padded with fresh empty
 /// buffers stay writable, because upstream requires `b_ffname != NULL`.
+/// Startup flags that ride on every named file buffer (`-R` is
+/// `readonlymode`, `-M` resets `modifiable` per `reset_modifiable`, `-b`
+/// sets binary I/O): `open_buffer` (buffer.c:258) applies them while it
+/// loads each named file, so the second and later files of `-R -o a b`
+/// (or `-M`/`-b` equivalents) match the first.
+struct StartupFlags {
+    readonly: bool,
+    no_modifiable: bool,
+    binary: bool,
+}
+
 fn open_startup_files(
     editor: &mut Editor,
     files: &[String],
-    readonly: bool,
+    flags: StartupFlags,
 ) -> Result<Vec<BufHandle>, AppError> {
     let first_into_current = editor.current_buffer().is_some_and(|current| {
         editor.buffer(current).is_ok_and(|state| {
@@ -380,10 +399,26 @@ fn open_startup_files(
             state.set_name(OxStr::from(file.as_str()));
             state.mark_saved();
         }
-        if readonly {
+        // Per-file overlays, including the buffer reused for the first
+        // file (re-applying is idempotent): `apply_startup_options` only
+        // saw the initial buffer, but every named startup file loads
+        // under these flags.
+        if flags.readonly {
             editor
                 .options_mut()
                 .set_buffer(handle, "readonly", OptionValue::Boolean(true))
+                .map_err(|error| AppError::Editor(error.to_string()))?;
+        }
+        if flags.no_modifiable {
+            editor
+                .options_mut()
+                .set_buffer(handle, "modifiable", OptionValue::Boolean(false))
+                .map_err(|error| AppError::Editor(error.to_string()))?;
+        }
+        if flags.binary {
+            editor
+                .options_mut()
+                .set_buffer(handle, "binary", OptionValue::Boolean(true))
                 .map_err(|error| AppError::Editor(error.to_string()))?;
         }
         handles.push(handle);

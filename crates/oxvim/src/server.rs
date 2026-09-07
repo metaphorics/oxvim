@@ -846,8 +846,10 @@ impl AppState {
             }
         };
         drop(caller);
-        let result = result?;
+        // Absorb before propagating: user code may have recorded a quit
+        // before failing, and that quit must still end the process.
         self.absorb_pending_quit();
+        let result = result?;
         let redraws = if name == "nvim_ui_attach"
             || name == "nvim_ui_try_resize"
             || method_is_mutating(&name)
@@ -1641,6 +1643,9 @@ impl AppState {
             Message::Response { .. } => {}
         }
         let _ = self.drain_lua_work();
+        // Scheduled callbacks above can record quits after `dispatch`
+        // already polled; absorb them before the loop's `should_exit`.
+        self.absorb_pending_quit();
         Ok(writes)
     }
 
@@ -1779,6 +1784,9 @@ fn method_is_mutating(method: &str) -> bool {
 /// Serve channel 1 over stdin/stdout until the peer closes its write side.
 /// Returns the process exit code requested by `:cquit` (0 otherwise).
 pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
+    // Adopted before any startup command can spawn a child that would
+    // inherit the endpoint (see `take_listen_env`).
+    let adopted_listen = take_listen_env();
     let state = Rc::new(RefCell::new(AppState::new(cli, timer)?));
     if state.borrow().should_exit() {
         state.borrow_mut().run_exit()?;
@@ -1836,7 +1844,7 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
         // main.c:359 `server_init`: every startup shape binds a primary
         // server, with NVIM_LISTEN_ADDRESS adoption (server.c:40-58);
         // failure is non-fatal (server.c:59-64).
-        bind_primary_server(&listen_server, &state);
+        bind_primary_server(&listen_server, &state, adopted_listen);
         let mut uv_loop = UvLoop::new().map_err(|error| AppError::Server(error.to_string()))?;
         let stdio_poll = bind_stdio(&mut uv_loop, &runtime)?;
         let timer =
@@ -1915,9 +1923,21 @@ fn expand_listen_address(address: &str) -> Result<String, AppError> {
 /// `$NVIM_LISTEN_ADDRESS` adoption (server.c:40-58); a bind failure is
 /// reported and non-fatal (server.c:59-64). Leaves an already-set
 /// v:servername untouched.
-fn bind_primary_server(server: &ListenServer, state: &Rc<RefCell<AppState>>) {
+/// Reads `$NVIM_LISTEN_ADDRESS` once and unsets it: the address is
+/// input-only and must not leak to startup commands, `:jobstart`, or
+/// `:terminal` children (`server.c:76-79`).
+fn take_listen_env() -> Option<String> {
     let requested = std::env::var("NVIM_LISTEN_ADDRESS").ok();
-    let address = requested
+    ox_sys::unset_env("NVIM_LISTEN_ADDRESS");
+    requested.filter(|value| !value.is_empty())
+}
+
+fn bind_primary_server(
+    server: &ListenServer,
+    state: &Rc<RefCell<AppState>>,
+    adopted: Option<String>,
+) {
+    let address = adopted
         .as_deref()
         .filter(|value| !value.is_empty())
         .map_or_else(
@@ -1945,6 +1965,11 @@ fn bind_primary_server(server: &ListenServer, state: &Rc<RefCell<AppState>>) {
 }
 
 pub fn run_listener(cli: &Cli, address: &str, timer: &mut StartupTimer) -> Result<i64, AppError> {
+    // No primary bind here: the explicit address below is the only
+    // endpoint (`server_init` ignores the environment when an address is
+    // given, server.c:42-54). Dropped before startup so no child can
+    // inherit it.
+    drop(take_listen_env());
     let state = Rc::new(RefCell::new(AppState::new(cli, timer)?));
     // main.c getout(): a startup command that quits ends the process before
     // the event loop starts, mirroring `run_stdio`.
@@ -1985,13 +2010,6 @@ pub fn run_listener(cli: &Cli, address: &str, timer: &mut StartupTimer) -> Resul
             Object::String(OxStr::from(servername.as_str())),
         );
     });
-    // main.c:359: the primary server binds at every startup; here the
-    // explicit --listen address already owns v:servername and
-    // `bind_primary_server` leaves an occupied name alone.
-    {
-        let state = runtime.borrow().state.clone();
-        bind_primary_server(&listen_server, &state);
-    }
     #[cfg(unix)]
     let stdio_poll = cli
         .embed
@@ -2728,6 +2746,9 @@ impl NetworkRuntime {
         // marker is taken.
         let _ = ex.borrow_mut().take_lua_flush_pending();
         let worked = self.state.borrow_mut().drain_lua_work();
+        // Job `on_exit` and scheduled callbacks above run user code that
+        // can record quits; promote them before the exit check stops us.
+        self.state.borrow_mut().absorb_pending_quit();
         if self.shutdown || self.state.borrow().should_exit() {
             uv_loop.stop();
             return Ok(());
