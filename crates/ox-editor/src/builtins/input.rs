@@ -2,6 +2,7 @@
 //! of a terminal (upstream `ex_getln.c`, `getchar.c`).
 
 use crate::Editor;
+use crate::editor::PromptDialog;
 use crate::excmd_exec::ExEditorAccess;
 use crate::script::FileIO;
 use crate::typeahead::{K_SPECIAL, KS_EXTRA, Key};
@@ -22,10 +23,33 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
     name: &str,
     args: &[Typval],
 ) -> ox_eval::Result<Typval> {
+    let (minimum, maximum) = match name {
+        "confirm" => (1, 4),
+        "inputlist" => (1, 1),
+        "input" | "inputdialog" => (1, 3),
+        _ => (0, 2),
+    };
+    if args.len() < minimum {
+        return Err(EvalError::new(
+            "E119",
+            0,
+            format!("Not enough arguments for function: {name}"),
+        ));
+    }
+    if args.len() > maximum {
+        return Err(EvalError::new(
+            "E118",
+            0,
+            format!("Too many arguments for function: {name}"),
+        ));
+    }
     match name {
         "getchar" | "getcharstr" => host
             .access
             .with_ex_editor(|editor| call_getchar_builtin(editor, name, args)),
+        "confirm" => host
+            .access
+            .with_ex_editor(|editor| call_confirm_builtin(editor, args)),
         "input" | "inputdialog" | "inputlist" => host
             .access
             .with_ex_editor(|editor| call_input_builtin(editor, name, args)),
@@ -34,52 +58,313 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
 }
 
 fn call_input_builtin(editor: &mut Editor, name: &str, args: &[Typval]) -> ox_eval::Result<Typval> {
-    let default = args
+    if name == "inputlist" {
+        return call_inputlist_builtin(editor, args);
+    }
+    let mut prompt = OxStr::from("");
+    let mut reply = OxStr::from("");
+    let mut cancelreturn = Typval::String(OxStr::from(""));
+    let mut completion = None;
+    let mut highlight_callback = None;
+    if let Some(Typval::Dict(options)) = args.first() {
+        if args.len() != 1 {
+            return Err(EvalError::new(
+                "E5050",
+                0,
+                "{opts} must be the only argument",
+            ));
+        }
+        let options = options
+            .try_borrow()
+            .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?;
+        if let Some(value) = options.get(b"prompt") {
+            prompt = input_string_arg(value)?;
+        }
+        if let Some(value) = options.get(b"default") {
+            reply = input_string_arg(value)?;
+        }
+        if let Some(value) = options.get(b"cancelreturn") {
+            cancelreturn = value.clone();
+        }
+        completion = options
+            .get(b"completion")
+            .map(input_string_arg)
+            .transpose()?;
+        highlight_callback = options.get(b"highlight").cloned();
+    } else {
+        if let Some(value) = args.first() {
+            prompt = input_string_arg(value)?;
+        }
+        if let Some(value) = args.get(1) {
+            reply = input_string_arg(value)?;
+        }
+        if let Some(value) = args.get(2) {
+            let value = input_string_arg(value)?;
+            if name == "inputdialog" {
+                cancelreturn = Typval::String(value);
+            } else {
+                completion = Some(value);
+            }
+        }
+    }
+    let message = if let Some(last_newline) = prompt.0.iter().rposition(|byte| *byte == b'\n') {
+        let suffix = prompt.0.split_off(last_newline.saturating_add(1));
+        std::mem::replace(&mut prompt, OxStr(suffix))
+    } else {
+        OxStr::from("")
+    };
+    editor.prompt_dialog = Some(PromptDialog {
+        separator: !message.as_bytes().is_empty(),
+        message,
+        prompt,
+        cursor: reply.as_bytes().len(),
+        reply,
+        highlight: editor.echo_highlight.clone(),
+        completion,
+        highlight_callback,
+        cancelreturn,
+        buttons: None,
+        number: false,
+        result: None,
+    });
+    drain_prompt(editor)
+}
+
+fn call_inputlist_builtin(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    let Some(Typval::List(lines)) = args.first() else {
+        return Err(EvalError::new(
+            "E686",
+            0,
+            "Argument of inputlist() must be a List",
+        ));
+    };
+    let mut text = Vec::new();
+    {
+        let lines = lines
+            .try_borrow()
+            .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?;
+        for line in &lines.items {
+            text.extend_from_slice(input_string_arg(line)?.as_bytes());
+            text.push(b'\n');
+        }
+    }
+    editor.prompt_dialog = Some(PromptDialog {
+        message: OxStr(text),
+        prompt: OxStr::from("Type number and <Enter> (q or empty cancels): "),
+        reply: OxStr::from(""),
+        cursor: 0,
+        highlight: OxStr::from(""),
+        separator: true,
+        completion: None,
+        highlight_callback: None,
+        cancelreturn: Typval::Number(0),
+        buttons: None,
+        number: true,
+        result: None,
+    });
+    drain_prompt(editor)
+}
+
+fn call_confirm_builtin(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    let message = args
+        .first()
+        .map(input_string_arg)
+        .transpose()?
+        .unwrap_or_else(|| OxStr::from(""));
+    let buttons = args
         .get(1)
         .map(input_string_arg)
         .transpose()?
         .unwrap_or_else(|| OxStr::from(""));
-    let cancel = args
+    let default = args
         .get(2)
-        .map(input_string_arg)
+        .map(super::position::number_value)
         .transpose()?
-        .unwrap_or_else(|| OxStr::from(""));
-    let mut bytes = Vec::new();
-    let mut cancelled = false;
+        .unwrap_or(1);
+    if let Some(value) = args.get(3) {
+        input_string_arg(value)?;
+    }
+    if editor.message_routing.silent {
+        return Ok(Typval::Number(default));
+    }
+    let buttons = if buttons.as_bytes().is_empty() {
+        "&Ok".into()
+    } else {
+        buttons.to_string_lossy()
+    };
+    let (choices, hotkeys) = confirm_choices(&buttons, default);
+    let mut text = vec![b'\n'];
+    text.extend_from_slice(message.as_bytes());
+    text.push(b'\n');
+    editor.prompt_dialog = Some(PromptDialog {
+        message: OxStr(text),
+        prompt: OxStr::from(choices.as_str()),
+        reply: OxStr::from(""),
+        cursor: 0,
+        highlight: OxStr::from("MoreMsg"),
+        separator: true,
+        completion: None,
+        highlight_callback: None,
+        cancelreturn: Typval::Number(0),
+        buttons: Some((hotkeys, default)),
+        number: false,
+        result: None,
+    });
+    drain_prompt(editor)
+}
+
+fn drain_prompt(editor: &mut Editor) -> ox_eval::Result<Typval> {
     while let Some(key) = editor
         .typeahead_mut()
         .pop()
         .map_err(|error| EvalError::new("E475", 0, error.to_string()))?
     {
-        match key {
-            Key::Byte(b'\r' | b'\n') => break,
-            Key::Byte(0x1b) => {
-                cancelled = true;
-                break;
-            }
-            Key::Byte(0x08 | 0x7f) => {
-                bytes.pop();
-            }
-            Key::Byte(byte) => bytes.push(byte),
-            Key::Special(_, _) => {}
+        if let Some(result) = editor.feed_prompt_key(key)? {
+            return Ok(result);
         }
     }
-    if name == "inputlist" {
-        if cancelled || bytes == b"q" {
-            return Ok(Typval::Number(0));
+    // The synchronous EvalHost cannot suspend yet. Keep result=None so the
+    // host can distinguish exhaustion from acceptance and resume this prompt.
+    Ok(editor.prompt_dialog.as_ref().map_or(
+        Typval::String(OxStr::from("")),
+        |dialog| match &dialog.buttons {
+            Some((_, default)) => Typval::Number(*default),
+            None if dialog.number => Typval::Number(0),
+            None => Typval::String(dialog.reply.clone()),
+        },
+    ))
+}
+
+impl Editor {
+    /// Returns the retained message-area prompt, including pending input.
+    #[must_use]
+    pub fn prompt_dialog(&self) -> Option<&PromptDialog> {
+        self.prompt_dialog.as_ref()
+    }
+
+    /// Removes a prompt after the host restores the surrounding command line.
+    pub fn clear_prompt_dialog(&mut self) {
+        self.prompt_dialog = None;
+    }
+
+    /// Updates the `:echohl` group used by subsequent prompts.
+    pub fn set_echo_highlight(&mut self, group: OxStr) {
+        self.echo_highlight = group;
+    }
+
+    /// Consumes one key from the normal typeahead source for a retained prompt.
+    ///
+    /// `None` means more input is required, never an accepted empty reply.
+    /// Completion and highlight callbacks must run outside the editor borrow.
+    ///
+    /// # Errors
+    ///
+    /// Returns the evaluation error the prompt's cancel/accept handler
+    /// produced, mirroring `vgetc`-driven prompt loops upstream.
+    pub fn feed_prompt_key(&mut self, key: Key) -> ox_eval::Result<Option<Typval>> {
+        let key = match key {
+            Key::Special(KS_EXTRA, b'R' | b'N') => Key::Byte(b'\r'),
+            Key::Special(KS_EXTRA, b'T') => Key::Byte(b'\t'),
+            Key::Special(KS_EXTRA, b'E') => Key::Byte(0x1b),
+            Key::Special(KS_EXTRA, b'B' | b'D') => Key::Byte(0x08),
+            key => key,
+        };
+        let Some(dialog) = self.prompt_dialog.as_mut() else {
+            return Ok(None);
+        };
+        if dialog.result.is_some() {
+            return Ok(dialog.result.clone());
         }
-        return Ok(Typval::Number(
-            String::from_utf8_lossy(&bytes).parse().unwrap_or(0),
-        ));
+        if matches!(key, Key::Byte(0x03 | 0x1b)) {
+            dialog.result = Some(dialog.cancelreturn.clone());
+        } else if let Some((hotkeys, default)) = &dialog.buttons {
+            match key {
+                Key::Byte(b'\r' | b'\n' | 0) => dialog.result = Some(Typval::Number(*default)),
+                Key::Byte(byte) => {
+                    dialog.reply.0.push(byte);
+                    match std::str::from_utf8(dialog.reply.as_bytes()) {
+                        Ok(text) => {
+                            if let Some(character) = text.chars().next()
+                                && let Some(index) = hotkeys.iter().position(|hotkey| {
+                                    hotkey.to_lowercase().eq(character.to_lowercase())
+                                })
+                            {
+                                let choice =
+                                    i64::try_from(index.saturating_add(1)).map_err(|error| {
+                                        EvalError::new("E475", 0, error.to_string())
+                                    })?;
+                                dialog.result = Some(Typval::Number(choice));
+                            }
+                            dialog.reply.0.clear();
+                        }
+                        Err(error) if error.error_len().is_some() => dialog.reply.0.clear(),
+                        Err(_) => {}
+                    }
+                }
+                Key::Special(_, _) => {}
+            }
+        } else {
+            match key {
+                Key::Byte(b'\r' | b'\n') => {
+                    dialog.result = Some(if dialog.number {
+                        Typval::Number(dialog.reply.to_string_lossy().parse().unwrap_or(0))
+                    } else {
+                        Typval::String(dialog.reply.clone())
+                    });
+                }
+                Key::Byte(b'q') if dialog.number => dialog.result = Some(Typval::Number(0)),
+                Key::Byte(0x08 | 0x7f) => {
+                    if let Some(start) = dialog.reply.0.iter().rposition(|byte| byte & 0xc0 != 0x80)
+                    {
+                        dialog.reply.0.truncate(start);
+                    }
+                }
+                Key::Byte(0x15) => dialog.reply.0.clear(),
+                Key::Byte(byte) => dialog.reply.0.push(byte),
+                Key::Special(_, _) => {}
+            }
+            dialog.cursor = dialog.reply.as_bytes().len();
+        }
+        Ok(dialog.result.clone())
     }
-    if cancelled {
-        return Ok(Typval::String(cancel));
+}
+
+fn confirm_choices(buttons: &str, default: i64) -> (String, Vec<char>) {
+    let mut display = String::new();
+    let mut hotkeys = Vec::new();
+    for (index, button) in buttons.split('\n').enumerate() {
+        if index != 0 {
+            display.push_str(", ");
+        }
+        let mut hotkey = button.chars().next().unwrap_or('\0');
+        let mut first = !button.contains('&');
+        let mut chars = button.chars();
+        while let Some(character) = chars.next() {
+            if character != '&' && !first {
+                display.push(character);
+                continue;
+            }
+            first = false;
+            let character = if character == '&' {
+                let Some(next) = chars.next() else { break };
+                if next == '&' {
+                    display.push('&');
+                    continue;
+                }
+                next
+            } else {
+                character
+            };
+            hotkey = character;
+            let selected = i64::try_from(index.saturating_add(1)) == Ok(default);
+            display.push(if selected { '[' } else { '(' });
+            display.push(character);
+            display.push(if selected { ']' } else { ')' });
+        }
+        hotkeys.push(hotkey);
     }
-    Ok(Typval::String(if bytes.is_empty() {
-        default
-    } else {
-        OxStr(bytes)
-    }))
+    display.push_str(": ");
+    (display, hotkeys)
 }
 
 fn call_getchar_builtin(

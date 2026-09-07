@@ -132,6 +132,38 @@ pub struct Message {
     pub leading_newline: bool,
 }
 
+/// Message-area content and command-line state of an input dialog.
+///
+/// The prefix includes its final newline; the suffix is the command-line
+/// prompt (`ex_getln.c:4695-4717`). Renderers must not flatten their attributes.
+#[derive(Clone, Debug)]
+pub struct PromptDialog {
+    /// Echoed message prefix, preceding the command-line prompt.
+    pub message: OxStr,
+    /// Last prompt line, preceding the editable reply.
+    pub prompt: OxStr,
+    /// Editable bytes, initially the default string.
+    pub reply: OxStr,
+    /// Byte offset of the insertion cursor within the reply.
+    pub cursor: usize,
+    /// Named highlight group for the message and prompt, not the reply.
+    pub highlight: OxStr,
+    /// Whether message scrolling needs a separator above this content.
+    pub separator: bool,
+    /// Requested command-line completion specification.
+    pub completion: Option<OxStr>,
+    /// Optional command-line highlight callback.
+    pub highlight_callback: Option<ox_types::Typval>,
+    /// Cancellation result, copied without coercion.
+    pub cancelreturn: ox_types::Typval,
+    /// Button accelerators and default result; absent for editable input.
+    pub buttons: Option<(Vec<char>, i64)>,
+    /// Numeric input rather than a string result.
+    pub number: bool,
+    /// Completed reply; absence means the host must keep waiting.
+    pub result: Option<ox_types::Typval>,
+}
+
 /// Failures while mutating [`Editor`] state.
 #[derive(Debug, Error)]
 pub enum EditorError {
@@ -329,6 +361,10 @@ pub struct Editor {
     /// message stays retained for `execute()`, `:redir` and `:silent` even
     /// when its destination is [`MessageDestination::Suppressed`].
     messages: Vec<Message>,
+    /// Prompt state retained while the host collects interactive input.
+    pub(crate) prompt_dialog: Option<PromptDialog>,
+    /// Current `:echohl` group, snapshotted when a prompt starts.
+    pub(crate) echo_highlight: OxStr,
     /// Sink decision recorded for each entry of `messages`, index for index.
     ///
     /// Both vectors are only ever pushed by [`Editor::push_message`] and
@@ -450,6 +486,8 @@ impl Editor {
             sign_definitions: BTreeMap::new(),
             sign_groups: BTreeMap::new(),
             messages: Vec::new(),
+            prompt_dialog: None,
+            echo_highlight: OxStr::from(""),
             message_destinations: Vec::new(),
             message_routing: MessageRouting::default(),
             current_tab: None,

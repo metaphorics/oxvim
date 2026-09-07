@@ -93,7 +93,9 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         | "function" | "luaeval" | "submatch" => Family::Eval,
         "swapfilelist" => Family::FileSystem,
         "foldclosed" | "foldclosedend" | "foldlevel" => Family::Fold,
-        "getchar" | "getcharstr" | "input" | "inputdialog" | "inputlist" => Family::Input,
+        "confirm" | "getchar" | "getcharstr" | "input" | "inputdialog" | "inputlist" => {
+            Family::Input
+        }
         "maparg" | "mapcheck" | "hasmapto" => Family::Mapping,
         "charcol" | "col" | "cursor" | "getcharpos" | "getcurpos" | "getcursorcharpos"
         | "getpos" | "getregion" | "getregionpos" | "line" | "line2byte" | "setcharpos"
