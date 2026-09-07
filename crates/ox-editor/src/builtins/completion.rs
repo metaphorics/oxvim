@@ -1588,3 +1588,900 @@ mod buffer_completion_tests {
         assert_eq!(names(&editor, "."), vec!["keep.c".to_owned()]);
     }
 }
+
+// ===========================================================================
+// Insert-mode keyword completion
+// ===========================================================================
+//
+// Single-writer, main-thread state machine porting the upstream subset the
+// functional suite exercises: keyword completion entered with `CTRL-N`/
+// `CTRL-P` (optionally after `CTRL-X`), cyclic navigation, `CTRL-E` cancel,
+// `CTRL-Y` accept, and the showmode/popup mirrors. Upstream citations are
+// into `.references/neovim/src/nvim/insexpand.c` unless noted otherwise.
+//
+// The session lives on [`crate::ModeMachine`] (wired by the caller); every
+// buffer edit goes through [`Editor::replace_buffer_text`] like the
+// surrounding insert code, and no runtime-state borrow is held across edits.
+
+use ox_text::Position;
+use ox_types::{BufHandle, WinHandle};
+
+use crate::{BufferStateError, BufferTextEditRequest, ExtmarkPosition, ModeError};
+
+/// `CTRL-E` (`ins_compl_prep` `c` values ride the raw control characters).
+const CTRL_E: char = '\u{05}';
+/// `CTRL-N`.
+const CTRL_N: char = '\u{0e}';
+/// `CTRL-P`.
+const CTRL_P: char = '\u{10}';
+/// `CTRL-X`.
+const CTRL_X: char = '\u{18}';
+/// `CTRL-Y`.
+const CTRL_Y: char = '\u{19}';
+
+/// `ctrl_x_msgs[CTRL_X_NORMAL]` (`insexpand.c:118`).
+const MSG_KEYWORD: &str = " Keyword completion (^N^P)";
+/// `ctrl_x_msgs[CTRL_X_NOT_DEFINED_YET]`, shown while `CTRL-X` waits for its
+/// second key (`insexpand.c:119`).
+const MSG_CTRL_X: &str = " ^X mode (^]^D^E^F^I^K^L^N^O^P^Rs^U^V^Y)";
+/// `ctrl_x_msgs[CTRL_X_LOCAL_MSG]`, shown when the completion interrupted a
+/// `CTRL-X` submode (`insexpand.c:133`, picked at `insexpand.c:6165-6166`).
+const MSG_KEYWORD_LOCAL: &str = " Keyword Local completion (^N^P)";
+/// No candidate beyond the typed text (`insexpand.c:6216`).
+const MSG_NOT_FOUND: &str = "Pattern not found";
+/// Cycling back onto the typed text (`insexpand.c:6222`).
+const MSG_BACK_AT_ORIGINAL: &str = "Back at original";
+/// A single candidate besides the typed text (`insexpand.c:6228`).
+const MSG_ONLY_MATCH: &str = "The only match";
+/// Upstream default for the 'complete' option (`options.lua`).
+const DEFAULT_COMPLETE: &str = ".,w,b,u,t,i";
+/// Source-scan bound. Upstream interrupts the scan when input is pending
+/// (`os_breakcheck`/`got_int`, `insexpand.c:992-1000`, checked at
+/// `insexpand.c:4884-4895`); the single-threaded port has no pending-input
+/// notion on this path, so each source stops after this many collected
+/// words instead.
+const MAX_SOURCE_MATCHES: usize = 50_000;
+
+/// One popup-menu row in the public four-string layout
+/// (`pumitem_T` fields as filled by `ins_compl_build_compl_array`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletionPumItem {
+    /// Inserted word (`pum_text`).
+    pub word: OxStr,
+    /// Display kind (`kind`).
+    pub kind: OxStr,
+    /// Menu annotation (`menu`).
+    pub menu: OxStr,
+    /// Extra information (`info`).
+    pub info: OxStr,
+}
+
+/// Popup display snapshot: `compl_match_array` plus the `pum_row`/`pum_col`
+/// anchor from `popupmenu.c` (`pum_win_row`/`wcol` at `popupmenu.c:333-339`,
+/// `pum_col = cursor_col` at `popupmenu.c:236`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletionPum {
+    /// Visible candidate rows, in list order.
+    pub items: Vec<CompletionPumItem>,
+    /// Selected row index or `-1`.
+    pub selected: i64,
+    /// Anchor row (cursor grid row).
+    pub row: usize,
+    /// Anchor column (leader-end grid column).
+    pub col: usize,
+}
+
+/// What one insert-mode key did to the completion session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletionOutcome {
+    /// The key was consumed by the completion state machine and must not be
+    /// inserted (`ins_compl_prep` returning true, `insexpand.c:2900-2903`).
+    Handled,
+    /// Completion stopped and the key must continue down the ordinary insert
+    /// path (`ins_compl_prep` returning false, `insexpand.c:2915-2921`).
+    Release,
+}
+
+/// Navigation direction (`compl_direction`, `ins_compl_key2dir`,
+/// `insexpand.c:5619-5630`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Direction {
+    Forward,
+    Backward,
+}
+
+/// One 'complete' source (`cpt` entry classified by its flag byte).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceKind {
+    /// `.` — words from the current buffer.
+    CurrentBuffer,
+    /// `w`/`b` — words from other listed buffers.
+    OtherBuffers,
+}
+
+/// Insert-mode completion state. `matches[0]` mirrors the original-text
+/// entry (`insexpand.c:6179-6187`); the rest follow source scan order, which
+/// equals upstream's list order for both directions (`ins_compl_add` inserts
+/// backward-found words before the original text, `insexpand.c:970-971`).
+#[derive(Clone, Debug)]
+pub struct CompletionSession {
+    /// `compl_started`: a candidate list exists and navigation is live.
+    active: bool,
+    /// `ctrl_x_mode == CTRL_X_NOT_DEFINED_YET`: `CTRL-X` typed, waiting for
+    /// its second key (`insexpand.c:395-416`).
+    ctrl_x_pending: bool,
+    /// `compl_orig_text`: the typed leader, captured at entry.
+    leader: Vec<u8>,
+    /// Candidate list; `[0]` is the original text.
+    matches: Vec<Vec<u8>>,
+    /// `compl_curr_match` as an index into `matches`; `-1` before the first
+    /// move.
+    selected: i64,
+    /// `compl_col`: byte column where the leader starts on its line.
+    start_col: usize,
+    /// Cursor position tracked through the machine's own edits; the caller's
+    /// snapshot goes stale after the first mutation.
+    cursor: Position,
+    /// Bytes currently inserted beyond the leader (`get_compl_len()`).
+    inserted: usize,
+    /// Popup mirror; `None` hides the menu.
+    pum: Option<CompletionPum>,
+    /// `edit_submode` (`insexpand.c:6164-6170`).
+    submode: Option<&'static str>,
+    /// `edit_submode_extra` (`ins_compl_show_statusmsg`,
+    /// `insexpand.c:6211-6260`).
+    extra: Option<String>,
+}
+
+impl Default for CompletionSession {
+    fn default() -> Self {
+        Self {
+            active: false,
+            ctrl_x_pending: false,
+            leader: Vec::new(),
+            matches: Vec::new(),
+            selected: -1,
+            start_col: 0,
+            cursor: Position { lnum: 1, col: 0 },
+            inserted: 0,
+            pum: None,
+            submode: None,
+            extra: None,
+        }
+    }
+}
+
+impl CompletionSession {
+    /// Creates an idle session.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True while a `CTRL-X` sequence waits or a completion list is live.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.active || self.ctrl_x_pending
+    }
+
+    /// `showmode()` override while completion owns the mode line: `--` +
+    /// `edit_submode` + `" "` + `edit_submode_extra` (the pieces upstream
+    /// stores in `edit_submode`/`edit_submode_extra` and `drawscreen.c`
+    /// composes behind `--`). `None` falls back to the plain insert banner.
+    #[must_use]
+    pub fn showmode_override(&self) -> Option<String> {
+        if self.ctrl_x_pending {
+            return Some(format!("--{MSG_CTRL_X}"));
+        }
+        if !self.active {
+            return None;
+        }
+        let mut text = String::from("--");
+        text.push_str(self.submode?);
+        if let Some(extra) = &self.extra {
+            text.push(' ');
+            text.push_str(extra);
+        }
+        Some(text)
+    }
+
+    /// Popup mirror for `ChromeState.popupmenu`.
+    #[must_use]
+    pub fn pum(&self) -> Option<&CompletionPum> {
+        self.pum.as_ref()
+    }
+
+    /// Clears every artifact: `ins_compl_free` + `ins_compl_clear`
+    /// (`insexpand.c:2208-2238`). Leaving Insert mode in any way calls this,
+    /// which hides the popup on the next chrome sync.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// One insert-mode keystroke. `Handled` keys are consumed; `Release`
+    /// keys must continue down the ordinary insert path.
+    pub fn handle_insert_key(
+        &mut self,
+        editor: &mut Editor,
+        buffer: BufHandle,
+        window: WinHandle,
+        cursor: Position,
+        key: char,
+        timestamp: i64,
+    ) -> Result<CompletionOutcome, ModeError> {
+        // `CTRL-X` opens the submode and sets the banner (`ins_ctrl_x`,
+        // `insexpand.c:395-416`).
+        if key == CTRL_X && !self.active {
+            if !self.ctrl_x_pending {
+                self.ctrl_x_pending = true;
+            }
+            return Ok(CompletionOutcome::Handled);
+        }
+
+        // Second key of a `CTRL-X` sequence (`set_ctrl_x_mode`,
+        // `insexpand.c:2615-2736`). Only the keyword sources are ported;
+        // any other second key ends the sequence without inserting the key,
+        // matching upstream's consumed-but-unported sources.
+        if self.ctrl_x_pending {
+            self.ctrl_x_pending = false;
+            if key == CTRL_N || key == CTRL_P {
+                // `^N`/`^P` through `CTRL-X` complete with the LOCAL banner
+                // (`insexpand.c:6165-6166`).
+                self.start(editor, buffer, window, cursor, key, true, timestamp)?;
+            }
+            return Ok(CompletionOutcome::Handled);
+        }
+
+        // Live completion: completion keys cycle, `CTRL-E`/`CTRL-Y` finish,
+        // everything else stops the session and falls through
+        // (`ins_compl_prep` active branch, `insexpand.c:2915-2921`).
+        if self.active {
+            match key {
+                CTRL_N => {
+                    self.cycle(editor, buffer, window, Direction::Forward, timestamp)?;
+                    return Ok(CompletionOutcome::Handled);
+                }
+                CTRL_P => {
+                    self.cycle(editor, buffer, window, Direction::Backward, timestamp)?;
+                    return Ok(CompletionOutcome::Handled);
+                }
+                CTRL_E => {
+                    self.stop_restore(editor, buffer, window, timestamp)?;
+                    return Ok(CompletionOutcome::Handled);
+                }
+                CTRL_Y => {
+                    self.stop_keep();
+                    return Ok(CompletionOutcome::Handled);
+                }
+                _ => {
+                    self.stop_keep();
+                    return Ok(CompletionOutcome::Release);
+                }
+            }
+        }
+
+        // Plain `CTRL-N`/`CTRL-P` start keyword completion
+        // (`ins_complete`, `insexpand.c:6282-6304`).
+        if key == CTRL_N || key == CTRL_P {
+            self.start(editor, buffer, window, cursor, key, false, timestamp)?;
+            return Ok(CompletionOutcome::Handled);
+        }
+        Ok(CompletionOutcome::Release)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "session start mirrors ins_compl_start's inputs"
+    )]
+    /// Entry: capture the leader, scan the sources, then make the first
+    /// move (`ins_compl_start` + first `ins_compl_next`,
+    /// `insexpand.c:6085-6208`, `6282-6304`).
+    fn start(
+        &mut self,
+        editor: &mut Editor,
+        buffer: BufHandle,
+        window: WinHandle,
+        cursor: Position,
+        key: char,
+        local: bool,
+        timestamp: i64,
+    ) -> Result<(), ModeError> {
+        let line = line_bytes(editor, buffer, cursor.lnum)?;
+        let col = cursor.col.min(line.len());
+        // Leader capture: scan back over keyword bytes (`get_normal_compl_info`
+        // walks `vim_isIDc`, `insexpand.c:5693-5697`; the port uses the ASCII
+        // keyword class because 'iskeyword' is not modeled).
+        let mut start_col = col;
+        while start_col > 0 && is_word_byte(line[start_col - 1]) {
+            start_col -= 1;
+        }
+        let leader = line[start_col..col].to_vec();
+
+        self.submode = Some(if local {
+            MSG_KEYWORD_LOCAL
+        } else {
+            MSG_KEYWORD
+        });
+        let sources = complete_sources(editor);
+
+        // Original-text entry first, then every source in option order
+        // (`insexpand.c:6179-6187`, `4769-4964`).
+        let mut matches = vec![leader.clone()];
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        seen.insert(leader.clone());
+        let ignorecase = option_is_true(editor, "ignorecase", false);
+        for source in sources {
+            match source {
+                SourceKind::CurrentBuffer => scan_buffer_words(
+                    editor,
+                    buffer,
+                    &leader,
+                    ignorecase,
+                    cursor.lnum,
+                    col,
+                    &mut matches,
+                    &mut seen,
+                ),
+                SourceKind::OtherBuffers => {
+                    scan_other_buffer_words(
+                        editor,
+                        buffer,
+                        &leader,
+                        ignorecase,
+                        &mut matches,
+                        &mut seen,
+                    );
+                }
+            }
+        }
+
+        self.leader = leader;
+        self.matches = matches;
+        self.start_col = start_col;
+        self.cursor = cursor;
+        self.inserted = 0;
+        self.selected = -1;
+        self.active = true;
+
+        let direction = if key == CTRL_P {
+            Direction::Backward
+        } else {
+            Direction::Forward
+        };
+        self.cycle(editor, buffer, window, direction, timestamp)
+    }
+
+    /// One `ins_compl_next` step (`insexpand.c:5431-5560`): move to the
+    /// neighboring entry of the cyclic list and show it
+    /// (`ins_compl_make_cyclic`, `insexpand.c:1351-1369`).
+    fn cycle(
+        &mut self,
+        editor: &mut Editor,
+        buffer: BufHandle,
+        window: WinHandle,
+        direction: Direction,
+        timestamp: i64,
+    ) -> Result<(), ModeError> {
+        let len = self.matches.len();
+        let next = match (self.selected, direction) {
+            // First move: forward lands on the first candidate, backward on
+            // the last (`compl_old_match->cp_next`/`cp_prev`,
+            // `insexpand.c:4940-4949`).
+            (-1, Direction::Forward) => usize::from(len > 1),
+            (-1, Direction::Backward) => len - 1,
+            (index, dir) => {
+                let index = usize::try_from(index.max(0)).unwrap_or(0).min(len - 1);
+                match dir {
+                    Direction::Forward => (index + 1) % len,
+                    Direction::Backward => (index + len - 1) % len,
+                }
+            }
+        };
+        self.show_match(editor, buffer, window, next, timestamp)?;
+        self.selected = i64::try_from(next).unwrap_or(i64::MAX);
+        self.update_status();
+        self.refresh_pum(editor);
+        Ok(())
+    }
+
+    /// Swap the inserted tail for the new candidate's tail
+    /// (`ins_compl_insert`, `insexpand.c:5200-5254`): the leader stays in
+    /// the buffer, only the bytes beyond it change.
+    fn show_match(
+        &mut self,
+        editor: &mut Editor,
+        buffer: BufHandle,
+        window: WinHandle,
+        index: usize,
+        timestamp: i64,
+    ) -> Result<(), ModeError> {
+        let word = self.matches[index].clone();
+        let split = self.leader.len().min(word.len());
+        let tail = word[split..].to_vec();
+        let lnum = self.cursor.lnum;
+        let leader_end_col = self.start_col + self.leader.len();
+        let end_col = leader_end_col + self.inserted;
+        let after_col = leader_end_col + tail.len();
+        if end_col != leader_end_col || !tail.is_empty() {
+            let after = Position {
+                lnum,
+                col: after_col,
+            };
+            editor.replace_buffer_text(
+                buffer,
+                &BufferTextEditRequest {
+                    start: ExtmarkPosition::new(lnum - 1, leader_end_col),
+                    end: ExtmarkPosition::new(lnum - 1, end_col),
+                    replacement: vec![tail],
+                },
+                self.cursor,
+                after,
+                timestamp,
+            )?;
+            editor.set_window_cursor(window, after)?;
+            self.cursor = after;
+        }
+        self.inserted = after_col - leader_end_col;
+        Ok(())
+    }
+
+    /// `ins_compl_show_statusmsg` (`insexpand.c:6211-6260`). `matches[i]`
+    /// carries `cp_number == i` (the original text is numbered 0 at
+    /// `insexpand.c:1052`, the rest in list order).
+    fn update_status(&mut self) {
+        if self.matches.len() <= 1 {
+            self.extra = Some(String::from(MSG_NOT_FOUND));
+        } else if self.selected == 0 {
+            self.extra = Some(String::from(MSG_BACK_AT_ORIGINAL));
+        } else if self.matches.len() == 2 {
+            self.extra = Some(String::from(MSG_ONLY_MATCH));
+        } else {
+            let total = self.matches.len() - 1;
+            self.extra = Some(format!(
+                "match {selected} of {total}",
+                selected = self.selected
+            ));
+        }
+    }
+
+    /// Stop completion keeping the shown match (`CTRL-Y` and every released
+    /// key: `ins_compl_stop` only restores the leader for `CTRL-E`,
+    /// `insexpand.c:2740-2886`).
+    fn stop_keep(&mut self) {
+        self.active = false;
+        self.ctrl_x_pending = false;
+        self.submode = None;
+        self.extra = None;
+        self.pum = None;
+    }
+
+    /// `CTRL-E`: delete the inserted tail so exactly the typed leader
+    /// remains, then stop (`ins_compl_stop`, `insexpand.c:2822-2839`).
+    fn stop_restore(
+        &mut self,
+        editor: &mut Editor,
+        buffer: BufHandle,
+        window: WinHandle,
+        timestamp: i64,
+    ) -> Result<(), ModeError> {
+        if self.inserted > 0 {
+            let lnum = self.cursor.lnum;
+            let leader_end_col = self.start_col + self.leader.len();
+            let end_col = leader_end_col + self.inserted;
+            let after = Position {
+                lnum,
+                col: leader_end_col,
+            };
+            editor.replace_buffer_text(
+                buffer,
+                &BufferTextEditRequest {
+                    start: ExtmarkPosition::new(lnum - 1, leader_end_col),
+                    end: ExtmarkPosition::new(lnum - 1, end_col),
+                    replacement: Vec::new(),
+                },
+                self.cursor,
+                after,
+                timestamp,
+            )?;
+            editor.set_window_cursor(window, after)?;
+            self.cursor = after;
+        }
+        self.stop_keep();
+        Ok(())
+    }
+
+    /// Rebuild the popup mirror. Displayed when 'completeopt' allows it
+    /// (`pum_wanted`, `insexpand.c:1402-1407`) and at least one candidate
+    /// exists (`pum_enough_matches`, `insexpand.c:1411-1429`). The anchor
+    /// pins the leader end so cycling does not move the menu.
+    fn refresh_pum(&mut self, editor: &Editor) {
+        if !self.active || self.matches.len() < 2 || !menu_wanted(editor) {
+            self.pum = None;
+            return;
+        }
+        let items = self.matches[1..]
+            .iter()
+            .map(|word| CompletionPumItem {
+                word: OxStr::from(String::from_utf8_lossy(word).as_ref()),
+                kind: OxStr::from(""),
+                menu: OxStr::from(""),
+                info: OxStr::from(""),
+            })
+            .collect();
+        let selected = if self.selected <= 0 {
+            -1
+        } else {
+            self.selected - 1
+        };
+        self.pum = Some(CompletionPum {
+            items,
+            selected,
+            row: self.cursor.lnum.saturating_sub(1),
+            col: self.start_col + self.leader.len(),
+        });
+    }
+}
+
+/// ASCII keyword byte (`vim_isIDc` with the default 'iskeyword' class).
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// 'ignorecase' lookup with the upstream default (off).
+fn option_is_true(editor: &Editor, name: &str, fallback: bool) -> bool {
+    match editor.options().get_global(name) {
+        Ok(OptionValue::Boolean(value)) => *value,
+        _ => fallback,
+    }
+}
+
+/// `pum_wanted` (`insexpand.c:1402-1407`): 'completeopt' must contain
+/// "menu" or "menuone"; upstream defaults the option to `menu,preview`.
+fn menu_wanted(editor: &Editor) -> bool {
+    match editor.options().get_global("completeopt") {
+        Ok(OptionValue::String(value)) => value
+            .split(',')
+            .any(|item| item == "menu" || item == "menuone"),
+        _ => true,
+    }
+}
+
+/// Source order for keyword completion: the 'complete' option left to right
+/// (`ins_compl_get_exp` walks the copied option string,
+/// `insexpand.c:4792-4794,4825-4849`). Only the ported flags survive: `.`
+/// (current buffer) and `w`/`b` (other listed buffers); `u`/`t`/`i` and the
+/// file/func flags need scans this port does not implement and are skipped,
+/// the way upstream skips exhausted entries (`INS_COMPL_CPT_CONT`).
+fn complete_sources(editor: &Editor) -> Vec<SourceKind> {
+    let option = match editor.options().get_global("complete") {
+        Ok(OptionValue::String(value)) => value.clone(),
+        _ => String::from(DEFAULT_COMPLETE),
+    };
+    let mut sources = Vec::new();
+    for entry in option.split(',') {
+        let Some(flag) = entry.trim().chars().next() else {
+            continue;
+        };
+        let kind = match flag {
+            '.' => SourceKind::CurrentBuffer,
+            'w' | 'b' => SourceKind::OtherBuffers,
+            _ => continue,
+        };
+        if !sources.contains(&kind) {
+            sources.push(kind);
+        }
+    }
+    sources
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the scan carries its whole search context like get_next_default_completion"
+)]
+/// Current-buffer keyword scan. `get_next_default_completion` runs the
+/// leader-anchored word search in the completion direction from the cursor
+/// and wraps around the buffer (`insexpand.c:4396-4399`, wrap detection at
+/// `4408-4426`): forward order is document order from the cursor onward,
+/// backward order the reverse. Prefix matching honors 'ignorecase'
+/// (`ins_compl_equal`, `insexpand.c:1166-1176`); duplicates and the typed
+/// text itself are dropped by the add rules (`ins_compl_add`,
+/// `insexpand.c:1006-1044`).
+fn scan_buffer_words(
+    editor: &Editor,
+    buffer: BufHandle,
+    leader: &[u8],
+    ignorecase: bool,
+    cursor_lnum: usize,
+    cursor_col: usize,
+    matches: &mut Vec<Vec<u8>>,
+    seen: &mut std::collections::HashSet<Vec<u8>>,
+) {
+    let Ok(state) = editor.buffer(buffer) else {
+        return;
+    };
+    let Ok(text) = state.text() else {
+        return;
+    };
+    let line_count = text.line_count();
+    if cursor_lnum > line_count {
+        for lnum in 1..=line_count {
+            let Ok(line) = text.line(lnum) else {
+                continue;
+            };
+            scan_line(&line, 0, leader, ignorecase, matches, seen);
+            if matches.len() >= MAX_SOURCE_MATCHES {
+                return;
+            }
+        }
+        return;
+    }
+    // Forward visit order (`get_next_default_completion`'s wrapping search,
+    // `insexpand.c:4396-4426`): words on the cursor line from the cursor
+    // onward, then the lines below, then wrap through the top including the
+    // cursor line's words before the leader. Backward is the exact reverse.
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    segments.push((cursor_lnum, cursor_col));
+    if cursor_lnum < line_count {
+        segments.extend((cursor_lnum + 1..=line_count).map(|lnum| (lnum, 0)));
+    }
+    for lnum in 1..cursor_lnum {
+        segments.push((lnum, 0));
+    }
+    segments.push((cursor_lnum, 0));
+    for (lnum, from_col) in segments {
+        let Ok(line) = text.line(lnum) else {
+            continue;
+        };
+        scan_line(&line, from_col, leader, ignorecase, matches, seen);
+        if matches.len() >= MAX_SOURCE_MATCHES {
+            return;
+        }
+    }
+}
+
+/// Other-listed-buffer keyword scan ('w'/'b' sources): upstream scans those
+/// buffers from the beginning with nowrapscan (`insexpand.c:4368-4377`).
+fn scan_other_buffer_words(
+    editor: &Editor,
+    current: BufHandle,
+    leader: &[u8],
+    ignorecase: bool,
+    matches: &mut Vec<Vec<u8>>,
+    seen: &mut std::collections::HashSet<Vec<u8>>,
+) {
+    for handle in editor.buffers() {
+        if handle == current {
+            continue;
+        }
+        let Ok(state) = editor.buffer(handle) else {
+            continue;
+        };
+        let Ok(text) = state.text() else {
+            continue;
+        };
+        for lnum in 1..=text.line_count() {
+            let Ok(line) = text.line(lnum) else {
+                break;
+            };
+            scan_line(&line, 0, leader, ignorecase, matches, seen);
+            if matches.len() >= MAX_SOURCE_MATCHES {
+                return;
+            }
+        }
+        if matches.len() >= MAX_SOURCE_MATCHES {
+            return;
+        }
+    }
+}
+
+/// One line's keyword runs in byte order (`find_word_start`/`find_word_end`
+/// iterated from `from_col`).
+fn scan_line(
+    line: &[u8],
+    from_col: usize,
+    leader: &[u8],
+    ignorecase: bool,
+    matches: &mut Vec<Vec<u8>>,
+    seen: &mut std::collections::HashSet<Vec<u8>>,
+) {
+    let mut index = from_col.min(line.len());
+    while index < line.len() {
+        if !is_word_byte(line[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < line.len() && is_word_byte(line[index]) {
+            index += 1;
+        }
+        add_word(&line[start..index], leader, ignorecase, matches, seen);
+        if matches.len() >= MAX_SOURCE_MATCHES {
+            return;
+        }
+    }
+}
+
+/// `ins_compl_add` admission rules (`insexpand.c:1006-1044`): a candidate
+/// joins the list only when it starts with the leader ('ignorecase'
+/// honored, `ins_compl_equal`, `insexpand.c:1166-1176`) and is not already
+/// present (exact-byte dedup, which also drops the typed text itself — the
+/// original-text entry seeds the set at `insexpand.c:6185-6187`).
+fn add_word(
+    word: &[u8],
+    leader: &[u8],
+    ignorecase: bool,
+    matches: &mut Vec<Vec<u8>>,
+    seen: &mut std::collections::HashSet<Vec<u8>>,
+) {
+    if word.is_empty() || word.len() < leader.len() {
+        return;
+    }
+    let prefix_matches = if ignorecase {
+        word[..leader.len()].eq_ignore_ascii_case(leader)
+    } else {
+        word[..leader.len()] == *leader
+    };
+    if !prefix_matches || seen.contains(word) {
+        return;
+    }
+    seen.insert(word.to_vec());
+    matches.push(word.to_vec());
+}
+
+/// Reads one buffer line as bytes.
+fn line_bytes(editor: &Editor, buffer: BufHandle, lnum: usize) -> Result<Vec<u8>, ModeError> {
+    Ok(editor
+        .buffer(buffer)?
+        .text()?
+        .line(lnum)
+        .map_err(BufferStateError::from)?)
+}
+
+#[cfg(test)]
+mod completion_engine_tests {
+    use super::{CTRL_E, CTRL_N, CTRL_X, CompletionOutcome, CompletionSession};
+    use crate::layout::Geometry;
+    use ox_text::{Buffer, Position};
+
+    fn editor_with(text: &[u8]) -> (crate::Editor, ox_types::BufHandle, ox_types::WinHandle) {
+        let mut editor = crate::Editor::new();
+        let buffer = editor
+            .create_buffer_with(Buffer::from_bytes(text).unwrap(), true)
+            .unwrap();
+        let tab = editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let window = editor.tabpage(tab).unwrap().current_window();
+        (editor, buffer, window)
+    }
+
+    fn line(editor: &crate::Editor, buffer: ox_types::BufHandle, lnum: usize) -> String {
+        String::from_utf8(
+            editor
+                .buffer(buffer)
+                .unwrap()
+                .text()
+                .unwrap()
+                .line(lnum)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ctrl_n_inserts_first_match_and_reports_only_match() {
+        let (mut editor, buffer, window) = editor_with(b"include\nin");
+        let mut session = CompletionSession::new();
+        let outcome = session
+            .handle_insert_key(
+                &mut editor,
+                buffer,
+                window,
+                Position { lnum: 2, col: 2 },
+                CTRL_N,
+                0,
+            )
+            .unwrap();
+        assert_eq!(outcome, CompletionOutcome::Handled);
+        assert_eq!(line(&editor, buffer, 2), "include");
+        assert_eq!(
+            session.showmode_override().as_deref(),
+            Some("-- Keyword completion (^N^P) The only match")
+        );
+        let pum = session.pum().unwrap();
+        assert_eq!(pum.items.len(), 1);
+        assert_eq!(pum.items[0].word.to_string_lossy().as_ref(), "include");
+        assert_eq!(pum.selected, 0);
+        assert_eq!((pum.row, pum.col), (1, 2));
+    }
+
+    #[test]
+    fn cycling_wraps_through_original_and_ctrl_e_restores_leader() {
+        let (mut editor, buffer, window) = editor_with(b"ab abc");
+        let mut session = CompletionSession::new();
+        let cursor = Position { lnum: 1, col: 2 };
+        session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_N, 0)
+            .unwrap();
+        assert_eq!(line(&editor, buffer, 1), "abc abc");
+        session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_N, 0)
+            .unwrap();
+        // Wrapped back onto the original text.
+        assert_eq!(line(&editor, buffer, 1), "ab abc");
+        assert_eq!(
+            session.showmode_override().as_deref(),
+            Some("-- Keyword completion (^N^P) Back at original")
+        );
+        assert_eq!(session.pum().unwrap().selected, -1);
+        session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_E, 0)
+            .unwrap();
+        assert_eq!(line(&editor, buffer, 1), "ab abc");
+        assert!(!session.is_active());
+        assert!(session.pum().is_none());
+        assert!(session.showmode_override().is_none());
+    }
+
+    #[test]
+    fn ctrl_x_ctrl_n_completes_with_local_banner() {
+        let (mut editor, buffer, window) = editor_with(b"foo\nf");
+        let mut session = CompletionSession::new();
+        let cursor = Position { lnum: 2, col: 1 };
+        session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_X, 0)
+            .unwrap();
+        assert_eq!(
+            session.showmode_override().as_deref(),
+            Some("-- ^X mode (^]^D^E^F^I^K^L^N^O^P^Rs^U^V^Y)")
+        );
+        session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_N, 0)
+            .unwrap();
+        assert_eq!(line(&editor, buffer, 2), "foo");
+        assert_eq!(
+            session.showmode_override().as_deref(),
+            Some("-- Keyword Local completion (^N^P) The only match")
+        );
+    }
+
+    #[test]
+    fn no_match_reports_pattern_not_found_without_pum() {
+        let (mut editor, buffer, window) = editor_with(b"abc\nzz");
+        let mut session = CompletionSession::new();
+        session
+            .handle_insert_key(
+                &mut editor,
+                buffer,
+                window,
+                Position { lnum: 2, col: 2 },
+                CTRL_N,
+                0,
+            )
+            .unwrap();
+        assert_eq!(line(&editor, buffer, 2), "zz");
+        assert_eq!(
+            session.showmode_override().as_deref(),
+            Some("-- Keyword completion (^N^P) Pattern not found")
+        );
+        assert!(session.pum().is_none());
+    }
+
+    #[test]
+    fn empty_leader_scans_bounded_and_inserts_full_words() {
+        let (mut editor, buffer, window) = editor_with(b"ab cd");
+        let mut session = CompletionSession::new();
+        session
+            .handle_insert_key(
+                &mut editor,
+                buffer,
+                window,
+                Position { lnum: 1, col: 0 },
+                CTRL_N,
+                0,
+            )
+            .unwrap();
+        assert_eq!(line(&editor, buffer, 1), "abab cd");
+        assert_eq!(session.pum().unwrap().items.len(), 2);
+    }
+}

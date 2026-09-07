@@ -30,7 +30,7 @@ use ox_rpc::{CHAN_STDIO, ChannelId, IncrementalDecoder, Message};
 use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, Typval, WinHandle};
 use ox_ui::{
     CmdlineState as UiCmdlineState, Compositor, ContentChunk, Emitter, Highlight, HlAttrs,
-    MessageState, RedrawOutput, UiOptions,
+    MessageState, PopupItem, PopupmenuState, RedrawOutput, UiOptions,
 };
 #[cfg(unix)]
 use ox_uv::dns;
@@ -1266,6 +1266,13 @@ impl AppState {
     fn sync_chrome(&mut self) -> Result<(), ApiError> {
         let mode = self.mode.borrow().mode().clone();
         self.sync_cmdline_chrome(&mode)?;
+        let (completion_showmode, completion_pum) = {
+            let machine = self.mode.borrow();
+            (
+                machine.completion.showmode_override(),
+                machine.completion.pum().cloned(),
+            )
+        };
         // Showmode: emit `-- INSERT --`, `-- REPLACE --`, `-- VISUAL --` etc.
         // mirroring Neovim's `showmode()` (`drawscreen.c:901`) gated by
         // `p_smd`. The highlight is `ModeMsg` (HLF_CM), defaulting to bold.
@@ -1301,12 +1308,37 @@ impl AppState {
                     .map_err(|error| ApiError::exception(error.to_string())),
             }
         })?;
-        let showmode_content = match showmode_text {
-            Some(text) => vec![ContentChunk::new(mode_msg_id, OxStr::from(text))],
-            None => Vec::new(),
+        let showmode_content = if let Some(text) = completion_showmode {
+            vec![ContentChunk::new(mode_msg_id, OxStr::from(text.as_str()))]
+        } else {
+            match showmode_text {
+                Some(text) => vec![ContentChunk::new(mode_msg_id, OxStr::from(text))],
+                None => Vec::new(),
+            }
         };
         self.session.with_render_state(|_, _, chrome| {
             chrome.set_showmode(showmode_content);
+            match completion_pum {
+                Some(pum) => chrome.show_popupmenu(PopupmenuState {
+                    items: pum
+                        .items
+                        .iter()
+                        .map(|item| {
+                            PopupItem::new(
+                                item.word.clone(),
+                                item.kind.clone(),
+                                item.menu.clone(),
+                                item.info.clone(),
+                            )
+                        })
+                        .collect(),
+                    selected: pum.selected,
+                    row: pum.row,
+                    col: pum.col,
+                    grid: 1, // default grid
+                }),
+                None => chrome.hide_popupmenu(),
+            }
         });
         Ok(())
     }

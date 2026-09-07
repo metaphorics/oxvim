@@ -4,6 +4,7 @@ use ox_text::Position;
 use ox_types::{BufHandle, WinHandle};
 use thiserror::Error;
 
+use crate::builtins::completion::{CompletionOutcome, CompletionSession};
 use crate::indent::{self, CinTrigger, ExprEval, IndentExprError};
 use crate::insert;
 use crate::motion::{FindDirection, FindMotion, resolve, resolve_find};
@@ -210,6 +211,8 @@ pub struct ModeMachine {
     /// (`nv_normal`, `normal.c`), which exits Insert, Cmdline, or Visual to
     /// Normal mode.
     pending_ctrl_bslash: bool,
+    /// Insert-mode completion session (`insexpand.c` port).
+    pub completion: CompletionSession,
     /// `CTRL-V` in command-line mode: insert the next character literally.
     pending_cmdline_literal: bool,
     /// Insert mode temporarily yielded to one Normal-mode command with `CTRL-O`.
@@ -241,6 +244,7 @@ impl Default for ModeMachine {
             map_pending: false,
             no_more_input: true,
             pending_ctrl_bslash: false,
+            completion: CompletionSession::new(),
             pending_cmdline_literal: false,
             one_normal_command: false,
             recording: None,
@@ -2141,12 +2145,14 @@ impl ModeMachine {
         eval: &mut dyn ExprEval,
     ) -> Result<Option<Mode>, ModeError> {
         if key == '\u{0f}' {
+            self.completion.reset();
             self.one_normal_command = true;
             return Ok(Some(Mode::default()));
         }
         let ctx = cursor_context(editor)?;
         match self.ctrl_bslash_arm(key) {
             CtrlBslash::Exit => {
+                self.completion.reset();
                 insert::normal_cursor(editor, ctx.window, ctx.cursor)?;
                 return Ok(Some(Mode::default()));
             }
@@ -2175,8 +2181,18 @@ impl ModeMachine {
         key: char,
         eval: &mut dyn ExprEval,
     ) -> Result<Option<Mode>, ModeError> {
+        let timestamp = self.timestamp;
+        match self
+            .completion
+            .handle_insert_key(editor, ctx.buffer, ctx.window, ctx.cursor, key, timestamp)
+        {
+            Ok(CompletionOutcome::Handled) => return Ok(None),
+            Ok(CompletionOutcome::Release) => {}
+            Err(error) => return Err(error),
+        }
         match key {
             '\u{1b}' => {
+                self.completion.reset();
                 insert::normal_cursor(editor, ctx.window, ctx.cursor)?;
                 Ok(Some(Mode::default()))
             }
