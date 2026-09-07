@@ -289,6 +289,7 @@ fn startup_command_errors_display_and_continue_with_exit_zero() {
         .output()
         .expect("spawn oxvim");
     assert_eq!(stray.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&stray.stderr).contains("E587"));
     let thrown = oxvim()
         .args(["-u", "NONE", "--headless", "+throw 'boom'", "+qall!"])
         .output()
