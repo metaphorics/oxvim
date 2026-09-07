@@ -279,6 +279,82 @@ fn write_sets_buffer_name_and_clears_modified() {
     assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
 }
 
+/// A no-op `BufWriteCmd` replaces the write (`bufwrite.c:454-475`): no file
+/// appears, the buffer stays modified, and the command still succeeds
+/// silently — the handler owns the write, so there is no save bookkeeping.
+#[test]
+fn buf_write_cmd_noop_keeps_modified_and_writes_nothing() {
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    executor
+        .execute_line(&editor, "au BufWriteCmd * let g:cmd_ran = 1")
+        .unwrap();
+    executor
+        .execute_line(&editor, "au BufWritePost * let g:post_ran = 1")
+        .unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::MODIFIED, true);
+    executor.execute_line_core(&editor, "write out.txt").unwrap();
+    assert_eq!(executor.scripts().io().content("out.txt"), None);
+    assert!(
+        editor.editor().buffer(buffer).unwrap().flags.contains(crate::BufferFlags::MODIFIED),
+        "a handler-owned write leaves the modified state the handler left",
+    );
+    assert_eq!(
+        executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"cmd_ran", 0)
+            .ok(),
+        Some(&ox_types::Typval::Number(1)),
+        "the handler ran, so the skip is a replacement, not a missed match",
+    );
+    assert!(
+        executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"post_ran", 0)
+            .is_err(),
+        "no post hook runs after a replacement write",
+    );
+}
+
+/// `BufWriteCmd` replaces the whole pre/write/post sequence
+/// (`bufwrite.c:392-422`): neither `BufWritePre` nor `BufWritePost` fires
+/// when a handler owns the write.
+#[test]
+fn buf_write_cmd_suppresses_pre_and_post() {
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    executor
+        .execute_line(&editor, "au BufWriteCmd * let g:cmd_ran = 1")
+        .unwrap();
+    executor
+        .execute_line(&editor, "au BufWritePre * let g:pre_ran = 1")
+        .unwrap();
+    executor
+        .execute_line(&editor, "au BufWritePost * let g:post_ran = 1")
+        .unwrap();
+    executor.execute_line_core(&editor, "write out.txt").unwrap();
+    assert_eq!(
+        executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"cmd_ran", 0)
+            .ok(),
+        Some(&ox_types::Typval::Number(1)),
+    );
+    for probe in [b"pre_ran".as_slice(), b"post_ran".as_slice()] {
+        assert!(
+            executor
+                .scope()
+                .get_scoped(ox_eval::scope::ScopeKind::Global, probe, 0)
+                .is_err(),
+            "replacement writes suppress the surrounding hooks",
+        );
+    }
+}
+
 #[test]
 fn update_modified_buffer_uses_write_checks_and_bang() {
     let (editor, mut executor) = setup_with_content(&[b"resident".to_vec()]);
@@ -8155,6 +8231,88 @@ fn nested_global_write_survives_outer_sync() {
     );
 }
 
+/// Same-key outer/nested writes converge on the later (nested) writer: every
+/// user-code entry flushes outer dirt first (see `run_autocmd_plan`), so the
+/// nested scope mirrors the outer write, the nested write lands on top, and
+/// the outer write-back afterwards carries nothing stale. Upstream has one
+/// scope, so last-writer-wins is the only order.
+#[test]
+fn nested_same_key_write_wins_after_flush() {
+    let mut editor = Editor::new();
+    let mut outer = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut outer).unwrap();
+    outer
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"shared",
+            0,
+            ox_types::Typval::Number(1),
+        )
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &outer).unwrap();
+    let mut nested = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut nested).unwrap();
+    assert_eq!(
+        nested
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"shared", 0)
+            .ok(),
+        Some(&ox_types::Typval::Number(1)),
+        "a nested reader sees the flushed outer write, like upstream's one scope",
+    );
+    nested
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"shared",
+            0,
+            ox_types::Typval::Number(2),
+        )
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &nested).unwrap();
+    sync_scope_into_editor(&mut editor, &outer).unwrap();
+    assert_eq!(
+        editor.gvars().get(&ox_types::OxStr::from("shared")),
+        Some(&ox_types::Object::Integer(2)),
+        "the later nested write survives the outer write-back",
+    );
+}
+
+/// The delete half of the same protocol: an outer removal flushed before
+/// reentry stays removed, and a nested write after it is not resurrected
+/// into — or deleted by — the outer write-back.
+#[test]
+fn outer_delete_then_nested_add_keeps_nested_value() {
+    let mut editor = Editor::new();
+    let mut outer = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut outer).unwrap();
+    outer
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"gone",
+            0,
+            ox_types::Typval::Number(1),
+        )
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &outer).unwrap();
+    assert!(outer.remove_pair(ox_eval::scope::ScopeKind::Global, b"gone"));
+    sync_scope_into_editor(&mut editor, &outer).unwrap();
+    let mut nested = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut nested).unwrap();
+    nested
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"gone",
+            0,
+            ox_types::Typval::Number(2),
+        )
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &nested).unwrap();
+    sync_scope_into_editor(&mut editor, &outer).unwrap();
+    assert_eq!(
+        editor.gvars().get(&ox_types::OxStr::from("gone")),
+        Some(&ox_types::Object::Integer(2)),
+    );
+}
+
 #[test]
 fn displayed_plan_error_continues_to_later_actions_at_depth_zero() {
     // Upstream runs the whole group through one `do_cmdline`: at trylevel
@@ -8233,11 +8391,15 @@ fn plan_abort_rules_follow_try_depth_inheritance() {
     executor
         .execute_line(&editor, "au BufWritePost * let g:after_throw = 1")
         .unwrap();
-    // The postlude swallows the plan flow by design (the write itself
-    // stays `Ok`); what matters here is the later action never ran.
-    executor
-        .execute_line_core(&editor, "write out.txt")
-        .unwrap();
+    // `buf_write` (`bufwrite.c:1861-1866`): an aborting post handler fails
+    // the command while the completed file write stands.
+    let result = executor.execute_line_core(&editor, "write out.txt");
+    assert!(result.is_err(), "a throwing BufWritePost must fail the write");
+    assert_eq!(
+        executor.scripts().io().content("out.txt"),
+        Some("hi\n".to_owned()),
+        "the completed file write stands despite the post failure",
+    );
     assert!(
         executor
             .scope()

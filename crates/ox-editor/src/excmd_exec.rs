@@ -9017,27 +9017,48 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
             Ok(perform) => perform,
             Err(flow) => return flow,
         };
-    if perform_write {
-        let mut bytes = match access.with_ex_editor(|editor| {
-            editor
-                .buffer(buffer)
-                .and_then(|state| state.text().map_err(Into::into))
-                .map(ox_text::Buffer::to_bytes)
-        }) {
-            Ok(bytes) => bytes,
-            Err(error) => return error_flow(runtime, "E749", error.to_string()),
-        };
-        if bytes.last().is_some_and(|byte| *byte != b'\n') {
-            bytes.push(b'\n');
+    if !perform_write {
+        // `buf_write_do_autocmds` (`bufwrite.c:454-475`): a matching
+        // `BufWriteCmd` returns before the file write, so there is no save
+        // bookkeeping, no `BufWritePost`, and no written message. The
+        // buffer keeps whatever modified state the handler left: when it
+        // is still modified the write fails with no message and no error,
+        // matching upstream's bare `FAIL`. Only the never-edited flags
+        // clear, and only when overwriting the buffer's own file, mirroring
+        // the `BF_WRITE_MASK` reset.
+        let overwriting = access.with_ex_editor(|editor| {
+            editor.buffer(buffer).is_ok_and(|state| {
+                state.name().to_string_lossy().as_ref() == target.as_ref()
+            })
+        });
+        if overwriting {
+            access.with_ex_editor(|editor| {
+                if let Ok(state) = editor.buffer_mut(buffer) {
+                    state.flags.set(crate::BufferFlags::NOTEDITED, false);
+                }
+            });
         }
-        let contents = String::from_utf8_lossy(&bytes);
-        if let Err(error) = runtime.scripts.io().write_string(&path, &contents) {
-            return error_flow(
-                runtime,
-                "E212",
-                format!("Can't open file for writing: {error}"),
-            );
-        }
+        return Flow::Normal;
+    }
+    let mut bytes = match access.with_ex_editor(|editor| {
+        editor
+            .buffer(buffer)
+            .and_then(|state| state.text().map_err(Into::into))
+            .map(ox_text::Buffer::to_bytes)
+    }) {
+        Ok(bytes) => bytes,
+        Err(error) => return error_flow(runtime, "E749", error.to_string()),
+    };
+    if bytes.last().is_some_and(|byte| *byte != b'\n') {
+        bytes.push(b'\n');
+    }
+    let contents = String::from_utf8_lossy(&bytes);
+    if let Err(error) = runtime.scripts.io().write_string(&path, &contents) {
+        return error_flow(
+            runtime,
+            "E212",
+            format!("Can't open file for writing: {error}"),
+        );
     }
     access.with_ex_editor(|editor| {
         if let Ok(state) = editor.buffer_mut(buffer) {
@@ -9046,8 +9067,10 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
             state.flags.set(crate::BufferFlags::NOTEDITED, false);
         }
     });
-    buf_write_postlude(runtime, access, scope, lua, buffer, target.as_ref());
-    Flow::Normal
+    // `buf_write` (`bufwrite.c:1861-1866`): the post autocommands run only
+    // after the write, and an aborting handler fails the command even
+    // though the file is written — so the postlude's flow is the return.
+    buf_write_postlude(runtime, access, scope, lua, buffer, target.as_ref())
 }
 
 /// `buf_write` event prelude (`bufwrite.c`): `BufWriteCmd` handlers replace
@@ -9098,8 +9121,11 @@ fn buf_write_prelude<F: FileIO, E: ExEditorAccess>(
     }
 }
 
-/// `buf_write` epilogue: `BufWritePost` after the save is recorded. Its flow
-/// never aborts the write, so there is nothing to return.
+/// `buf_write` epilogue (`bufwrite.c:1861-1866`): `BufWritePost` after the
+/// save is recorded. Only an aborting handler flow (a throw or interrupt —
+/// plain handler errors already display-and-continue inside the plan loop)
+/// reaches the caller, failing the command while the completed write
+/// stands; anything else is `Normal`.
 fn buf_write_postlude<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -9107,7 +9133,7 @@ fn buf_write_postlude<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     buffer: BufHandle,
     target: &str,
-) {
+) -> Flow {
     fire_buffer_lifecycle_with(
         runtime,
         access,
@@ -9116,7 +9142,7 @@ fn buf_write_postlude<F: FileIO, E: ExEditorAccess>(
         &[Event::BufWritePost],
         buffer,
         Some(target),
-    );
+    )
 }
 
 /// `:[range]write !cmd` (`ex_cmds.c` `ex_write` → `do_bang(1, eap, false,
@@ -13205,6 +13231,17 @@ fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     plan: FiringPlan,
 ) -> Flow {
+    // No user code runs with unflushed scope dirt: an action may reenter
+    // through another executor (a `:lua` payload reaching a pooled host,
+    // a nested API firing), whose read sync mirrors the live map. Flushing
+    // first makes outer writes visible to nested readers and refreshes the
+    // mirror, so the outer write-back after reentry only carries writes
+    // made after it — the later nested write wins (`bufwrite.c` has one
+    // scope, so last-writer-wins is the only order). Same flush discipline
+    // as the Lua entries below.
+    if let Err(error) = access.with_ex_editor(|editor| sync_scope_into_editor(editor, scope)) {
+        return exec_error_flow(runtime, error);
+    }
     // `autocmd_busy` (`autocmd.c:1657`): one plan counts as one busy span,
     // matching `apply_autocmds` which sets and restores it around the group.
     runtime.autocmd_busy += 1;
@@ -15707,8 +15744,13 @@ pub(crate) fn sync_scope_into_editor(editor: &mut Editor, scope: &Scope) -> Resu
         // Merge, never replace: a reentrant executor may have written the
         // live map after this scope mirrored it (`let g:outer = 1` outside
         // an autocmd that sets `g:nested = 2` must keep both). Only keys
-        // added, changed, or removed since the mirror sync back; on a
-        // write-write conflict the outer writer wins.
+        // added, changed, or removed since the mirror sync back.
+        // Write-write conflicts cannot carry stale outer values here:
+        // every user-code entry flushes first (see `run_autocmd_plan`),
+        // so dirt present at this sync postdates any nested write and the
+        // outer value is the later one. The outer-wins tiebreak below only
+        // covers genuinely simultaneous dirt, where either order converges
+        // on the next sync.
         let current = scope_to_dict(&scope.global);
         let baseline = scope_to_dict(&scope.global_mirror.borrow());
         let live = editor.gvars_mut();
