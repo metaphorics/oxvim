@@ -340,9 +340,10 @@ impl<'a> Builtins<'a> {
             // (testing.c); this port has no cycle collector to force, so the
             // callable's whole observable contract is "succeeds, returns 0".
             "test_garbagecollect_now" => Ok(Typval::Number(0)),
-            // Mirrors the Family::Environment route for hosts without the
-            // editor builtin layer: no swap subsystem, so '' is every
-            // buffer's honest swapname().
+            // `f_swapname` (eval/funcs.c:7215-7226) for a host with no
+            // editor: `tv_get_buf` finds no buffer, so the answer is the
+            // NULL string — the empty string. Editor-backed hosts route
+            // through `swapname_builtin` in ox-editor's `excmd_exec`.
             "swapname" => Ok(Typval::String(OxStr::from(""))),
             "xor" => binary_number(&args, |left, right| left ^ right),
             _ => Err(EvalError::not_implemented(OxStr::from(name))),

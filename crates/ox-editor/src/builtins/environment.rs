@@ -45,8 +45,6 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
             .with_ex_editor(|editor| call_shellescape_builtin(editor, args)),
         "mode" => call_mode_builtin(host, args),
         "swapname" => {
-            // `f_swapname` with this port's absent swap subsystem: every
-            // buffer answers "no swap file".
             if args.len() > 1 {
                 return Err(EvalError::new(
                     "E118",
@@ -54,7 +52,7 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
                     "Too many arguments for function: swapname",
                 ));
             }
-            Ok(Typval::String(OxStr::from("")))
+            crate::excmd_exec::swapname_builtin(host.runtime, host.access, args)
         }
         "stdpath" => call_stdpath_builtin(args),
         "strdisplaywidth" => host

@@ -906,7 +906,7 @@ pub(crate) fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
     matches_at(pattern, value, 0, 0)
 }
 
-fn split_path_list(paths: &str) -> Vec<String> {
+pub(crate) fn split_path_list(paths: &str) -> Vec<String> {
     let mut output = Vec::new();
     let mut current = String::new();
     let mut escaped = false;

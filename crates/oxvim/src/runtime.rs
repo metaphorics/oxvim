@@ -215,6 +215,23 @@ pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppEr
             .set_global("write", OptionValue::Boolean(false))
             .map_err(editor_error)?;
     }
+    // option.c:367: 'directory' defaults to the XDG state swap dir with a
+    // trailing `//` (full-path swap names, `stdpaths_user_state_subpath`),
+    // overriding options.lua's empty shipped default; the directory is
+    // created when missing, like every stdpaths default.
+    if let Ok(OptionValue::String(current)) = editor.options().get_global("directory")
+        && current.is_empty()
+        && let Some(state) = ox_editor::script::stdpath(ox_editor::script::StdPath::State)
+            .into_iter()
+            .next()
+            .map(|dir| ox_editor::script::expand_home(&dir))
+    {
+        let _ = std::fs::create_dir_all(format!("{state}/swap"));
+        editor
+            .options_mut()
+            .set_global("directory", OptionValue::String(format!("{state}/swap//")))
+            .map_err(editor_error)?;
+    }
     // "-R" also slows the swap file down (`p_uc = 10000`); "-n" turns it off.
     if cli.readonly {
         editor
@@ -526,10 +543,16 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
         // and only when stdin is not a tty (main.c:674-676: "nvim -es +cmd"
         // in a tty executes and exits, it doesn't wait for input).
         if !input_is_text && !io::stdin().is_terminal() {
+            // A fresh buffer, never the one `-` already filled: upstream's
+            // `read_stdin` (main.c:552-554) consumes the stream before the Ex
+            // loop reads it (main.c:676-679), so the Ex loop sees EOF and runs
+            // nothing. Reusing `input` here would re-execute the buffer text
+            // as Ex commands.
+            let mut commands = String::new();
             io::stdin()
-                .read_to_string(&mut input)
+                .read_to_string(&mut commands)
                 .map_err(AppError::Io)?;
-            let lines = input.lines().collect::<Vec<_>>();
+            let lines = commands.lines().collect::<Vec<_>>();
             if let Some(code) = execute_lines(&mut executor, &session, &lines)? {
                 exit_code = code;
             }

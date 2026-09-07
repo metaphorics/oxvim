@@ -754,7 +754,8 @@ fn xdg_dir_list(env: &str, fallback: &str) -> Vec<String> {
 }
 
 /// Expands a leading `~/` through `$HOME`, leaving other paths untouched.
-fn expand_home(path: &str) -> String {
+#[must_use]
+pub fn expand_home(path: &str) -> String {
     path.strip_prefix("~/").map_or_else(
         || path.to_owned(),
         |rest| {
