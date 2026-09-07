@@ -49,6 +49,14 @@ pub struct SearchResult {
     pub has_line_offset: bool,
     /// Whether selecting this match crossed an end of the buffer.
     pub wrapped: bool,
+    /// Inclusive raw match start, unaffected by any parsed offset
+    /// (`incsearch_state_T.match_start`, `ex_getln.c:119,536`). `'incsearch'`
+    /// and `'hlsearch'` highlight this span, never the offset-adjusted
+    /// `target` (`SEARCH_NOOF`, `ex_getln.c:487`).
+    pub match_start: Position,
+    /// Exclusive raw match end (`incsearch_state_T.match_end`,
+    /// `ex_getln.c:120,539`, computed by `set_search_match`, `ex_getln.c:260-270`).
+    pub match_end: Position,
 }
 
 /// Search compilation, execution, and lookup failures.
@@ -125,7 +133,9 @@ impl SearchState {
         } else {
             pattern.to_owned()
         };
-        let result = run(lines, cursor, &pattern, direction, offset, count, wrapscan)?;
+        let result = run(
+            lines, cursor, &pattern, direction, offset, count, wrapscan, None,
+        )?;
         self.pattern = Some(pattern);
         self.direction = Some(direction);
         self.offset = offset;
@@ -166,6 +176,54 @@ impl SearchState {
             self.offset,
             count,
             wrapscan,
+            None,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "preview mirrors searchit's parameter list plus the deadline"
+    )]
+    /// Runs a bounded, side-effect-free search for `'incsearch'` preview
+    /// (`may_do_incsearch_highlighting`, `ex_getln.c:437-584`).
+    ///
+    /// Behaves like [`Self::search`] — an empty `expression` reuses the
+    /// retained pattern — but never retains anything itself: every keystroke
+    /// of a still-open command line calls this, and upstream wraps the whole
+    /// attempt in `save_last_search_pattern`/`restore_last_search_pattern`
+    /// (`ex_getln.c:442,449,567,604`) specifically so a cancelled or
+    /// in-progress preview never becomes the pattern `n`/`N` or a later
+    /// `:%s` repeats. Taking `&self` gets this for free. `deadline` bounds
+    /// the scan the way `may_do_incsearch_highlighting`'s half-second
+    /// `profile_setlimit(500)` does (`ex_getln.c:495`): a search that runs
+    /// past it is treated as not found, the same outcome upstream's
+    /// `SEARCH_PEEK`/timeout path produces, never as a hang.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an empty expression has no retained pattern, the
+    /// buffer is not valid UTF-8, regex compilation fails, or no match exists
+    /// (including a deadline reached before one was found).
+    pub fn preview(
+        &self,
+        lines: &[Vec<u8>],
+        cursor: Position,
+        expression: &str,
+        direction: SearchDirection,
+        count: usize,
+        wrapscan: bool,
+        deadline: Option<Instant>,
+    ) -> Result<SearchResult, SearchError> {
+        let (pattern, offset) = parse_expression(expression, direction);
+        let pattern = if pattern.is_empty() {
+            self.pattern
+                .as_deref()
+                .ok_or(SearchError::NoPreviousPattern)?
+        } else {
+            pattern
+        };
+        run(
+            lines, cursor, pattern, direction, offset, count, wrapscan, deadline,
         )
     }
 }
@@ -227,6 +285,10 @@ fn rfind_unescaped(expression: &str, delimiter: char) -> Option<usize> {
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one search invocation mirrors searchit's parameter list"
+)]
 fn run(
     lines: &[Vec<u8>],
     cursor: Position,
@@ -235,6 +297,7 @@ fn run(
     offset: SearchOffset,
     count: usize,
     wrapscan: bool,
+    deadline: Option<Instant>,
 ) -> Result<SearchResult, SearchError> {
     let text = SearchText::new(lines)?;
     let prog = compile_search(pattern, Magic::Magic)?;
@@ -254,11 +317,12 @@ fn run(
         direction,
         count,
         wrapscan,
+        deadline,
     )?;
     let (span, wrapped) = match found {
         Some(Select::Found { span, wrapped }) => (span, wrapped),
         Some(Select::NeedFull) => {
-            let matches = CandidateScan::new(&text, SearchDirection::Forward, None, None)
+            let matches = CandidateScan::new(&text, SearchDirection::Forward, None, deadline)
                 .scan_all(program)?;
             let (index, wrapped) =
                 select_full_index(&matches, cursor_byte, direction, count, wrapscan, pattern)?;
@@ -267,6 +331,12 @@ fn run(
         None => return Err(SearchError::PatternNotFound(pattern.to_owned())),
     };
     let selected = span;
+    // `s->match_start`/`s->match_end` (`ex_getln.c:119-120,536-539`): the
+    // raw match extent, computed before any offset is applied below, so
+    // `'incsearch'`/`'hlsearch'` highlighting is never shifted by a
+    // `/pattern/e+1`-style search offset (`SEARCH_NOOF`, `ex_getln.c:487`).
+    let match_start = editor_position(position_of(&text, selected.start.byte));
+    let match_end = editor_position(position_of(&text, selected.end.byte));
     let mut base_byte = if offset.use_end {
         previous_boundary(text.as_str(), selected.end.byte)
     } else {
@@ -292,6 +362,8 @@ fn run(
         line_delta: offset.line_delta,
         has_line_offset: offset.has_line_offset,
         wrapped,
+        match_start,
+        match_end,
     })
 }
 
@@ -304,6 +376,10 @@ enum Select {
     NeedFull,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "selection mirrors searchit's loop inputs one-to-one"
+)]
 /// Selects the count-th eligible match without collecting the list,
 /// stopping as soon as the answer is known. Returns `None` when no match
 /// exists at all. `count` is already normalized to at least one.
@@ -315,13 +391,20 @@ fn select_lazy(
     direction: SearchDirection,
     count: usize,
     wrapscan: bool,
+    deadline: Option<Instant>,
 ) -> Result<Option<Select>, SearchError> {
     match direction {
-        SearchDirection::Forward => {
-            select_lazy_forward(text, program, cursor, cursor_byte, count, wrapscan)
-        }
+        SearchDirection::Forward => select_lazy_forward(
+            text,
+            program,
+            cursor,
+            cursor_byte,
+            count,
+            wrapscan,
+            deadline,
+        ),
         SearchDirection::Backward => {
-            select_lazy_backward(text, program, cursor_byte, count, wrapscan)
+            select_lazy_backward(text, program, cursor_byte, count, wrapscan, deadline)
         }
     }
 }
@@ -339,8 +422,9 @@ fn select_lazy_forward(
     cursor_byte: usize,
     count: usize,
     wrapscan: bool,
+    deadline: Option<Instant>,
 ) -> Result<Option<Select>, SearchError> {
-    let mut scan = CandidateScan::new(text, SearchDirection::Forward, None, None);
+    let mut scan = CandidateScan::new(text, SearchDirection::Forward, None, deadline);
     if wrapscan {
         scan = scan.with_wrap();
     }
@@ -387,8 +471,11 @@ fn select_lazy_forward(
                     }));
                 }
             }
-            // Without a deadline the timeout arm is unreachable; like
-            // `scan_all`, a stop ends the sweep with what it found.
+            // A stop with no deadline set always reaches `Step::Exhausted`;
+            // `Step::TimedOut` merges into the same arm so a bounded
+            // `'incsearch'` preview (`SearchState::preview`) degrades to
+            // "not found" instead of hanging, matching upstream's
+            // half-second `do_search` deadline (`ex_getln.c:495`).
             Step::Exhausted | Step::TimedOut => {
                 // Same-line matches at or before the cursor are skipped by
                 // eligibility and sit outside the wrapped sweep; when
@@ -436,8 +523,9 @@ fn select_lazy_backward(
     cursor_byte: usize,
     count: usize,
     wrapscan: bool,
+    deadline: Option<Instant>,
 ) -> Result<Option<Select>, SearchError> {
-    let mut scan = CandidateScan::new(text, SearchDirection::Forward, None, None);
+    let mut scan = CandidateScan::new(text, SearchDirection::Forward, None, deadline);
     let mut from = 0usize;
     let mut ring: VecDeque<Candidate> = VecDeque::new();
     let mut pushed = 0usize;
@@ -1401,6 +1489,7 @@ mod tests {
             SearchOffset::default(),
             1,
             true,
+            None,
         )
         .unwrap()
     }
@@ -1454,6 +1543,7 @@ mod tests {
                 SearchOffset::default(),
                 count,
                 true,
+                None,
             )
             .unwrap();
             assert_eq!(result.target, Position { lnum: 1, col });
@@ -1475,6 +1565,7 @@ mod tests {
                 SearchOffset::default(),
                 count,
                 true,
+                None,
             )
             .unwrap();
             assert_eq!(result.target, Position { lnum: 1, col });
@@ -1498,6 +1589,7 @@ mod tests {
             SearchOffset::default(),
             2,
             true,
+            None,
         )
         .unwrap();
         assert_eq!(result.target, Position { lnum: 1, col: 8 });
@@ -1515,6 +1607,7 @@ mod tests {
             SearchOffset::default(),
             3,
             true,
+            None,
         )
         .unwrap();
         assert_eq!(result.target, Position { lnum: 1, col: 0 });
@@ -1528,6 +1621,7 @@ mod tests {
             SearchOffset::default(),
             1,
             true,
+            None,
         )
         .unwrap();
         assert_eq!(result.target, Position { lnum: 1, col: 0 });
@@ -1777,6 +1871,7 @@ mod tests {
             SearchDirection::Forward,
             count,
             true,
+            None,
         )
         .unwrap()
         .expect("lazy selection must find a match");

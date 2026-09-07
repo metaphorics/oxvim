@@ -14,9 +14,9 @@ use crate::search::{SearchDirection, SearchState};
 use crate::textobject;
 use crate::typeahead::{K_SPECIAL, KE_FILLER, KS_SPECIAL, KS_ZERO, Keys};
 use crate::{
-    BufferRelease, BufferStateError, BufferTextEditRequest, Editor, EditorError, ExtmarkPosition,
-    Key, KeyDecodeError, MarkLocation, MotionKind, OperatorRequest, OptionValue, SearchError,
-    VisualKind, VisualState,
+    BufferRelease, BufferStateError, BufferTextEditRequest, Editor, EditorError, ExtmarkId,
+    ExtmarkPlacement, ExtmarkPosition, Key, KeyDecodeError, MarkLocation, MotionKind,
+    OperatorRequest, OptionValue, SearchError, VisualKind, VisualState,
 };
 use crate::{
     KS_EXTRA, Lookup, MapFlags, MapMode, MappingAction, MappingOptions, Remap, TypeaheadError,
@@ -69,6 +69,22 @@ pub struct CmdlineState {
     pub text: String,
     /// Match occurrence requested before entering command-line mode.
     pub count: usize,
+    /// Cursor position when the command line was entered
+    /// (`incsearch_state_T.search_start`/`save_cursor`, `ex_getln.c:114-115`,
+    /// both initialized to it by `init_incsearch_state`, `ex_getln.c:249,254-255`).
+    /// `'incsearch'` previews search from here every keystroke, and every
+    /// exit restores the cursor to here first (`finish_incsearch_highlighting`,
+    /// `ex_getln.c:650,657`) so the command that actually runs next — the
+    /// real search on Enter, or nothing on cancel — always starts from where
+    /// the command line was opened, never from wherever the preview scrolled.
+    pub preview_start: Position,
+    /// Window `w_topline` saved alongside `preview_start`
+    /// (`incsearch_state_T.old_viewstate`, `ex_getln.c:118,257`, restored by
+    /// `restore_viewstate`, `ex_getln.c:235-245,659`).
+    pub preview_topline: usize,
+    /// The currently placed `'incsearch'` highlight extmark, if a preview
+    /// match is showing (`incsearch_state_T.did_incsearch`, `ex_getln.c:121`).
+    pub preview_mark: Option<ExtmarkId>,
 }
 /// State retained between an operator and its motion or text object.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -329,6 +345,10 @@ impl ModeMachine {
         &mut self.mode
     }
 
+    /// Internal extmark namespace for transient `'incsearch'` preview
+    /// highlights. Stable by name: repeated `create_namespace` calls return
+    /// the same [`NamespaceId`] so old preview marks can be deleted.
+    const INCSEARCH_NAMESPACE: &str = "ox-incsearch";
     /// Whether the current mode is waiting for a key that completes a command.
     ///
     /// Two upstream states block: an incomplete multi-key command prefix
@@ -1133,20 +1153,46 @@ impl ModeMachine {
                     },
                 ))))
             }
-            '/' | '?' => Ok(Some(Mode::Cmdline(CmdlineState {
-                kind: CmdlineKind::Search(if key == '/' {
-                    SearchDirection::Forward
-                } else {
-                    SearchDirection::Backward
-                }),
-                text: String::new(),
-                count,
-            }))),
-            ':' => Ok(Some(Mode::Cmdline(CmdlineState {
-                kind: CmdlineKind::Ex,
-                text: String::new(),
-                count,
-            }))),
+            '/' | '?' => {
+                let ctx = cursor_context(editor)?;
+                let topline = editor.window(ctx.window)?.topline;
+                Ok(Some(Mode::Cmdline(CmdlineState {
+                    kind: CmdlineKind::Search(if key == '/' {
+                        SearchDirection::Forward
+                    } else {
+                        SearchDirection::Backward
+                    }),
+                    text: String::new(),
+                    count,
+                    preview_start: ctx.cursor,
+                    preview_topline: topline,
+                    preview_mark: None,
+                })))
+            }
+            ':' => {
+                // `:` opens without a window in Ex-only embeddings (a bare
+                // editor under `feedkeys`); preview state then defaults and
+                // the preview gate skips it, since there is nothing to
+                // highlight.
+                let (preview_start, preview_topline) = match cursor_context(editor) {
+                    Ok(ctx) => {
+                        let topline = editor.window(ctx.window)?.topline;
+                        (ctx.cursor, topline)
+                    }
+                    Err(ModeError::Editor(EditorError::UnknownTabpage(_))) => {
+                        (ox_text::Position { lnum: 1, col: 0 }, 0)
+                    }
+                    Err(error) => return Err(error),
+                };
+                Ok(Some(Mode::Cmdline(CmdlineState {
+                    kind: CmdlineKind::Ex,
+                    text: String::new(),
+                    count,
+                    preview_start,
+                    preview_topline,
+                    preview_mark: None,
+                })))
+            }
             'n' | 'N' => {
                 self.repeat_search(editor, key == 'N', count)?;
                 Ok(Some(Mode::default()))
@@ -1734,15 +1780,22 @@ impl ModeMachine {
                 state.prefix = "r".into();
                 Ok(None)
             }
-            '/' | '?' => Ok(Some(Mode::Cmdline(CmdlineState {
-                kind: CmdlineKind::Search(if key == '/' {
-                    SearchDirection::Forward
-                } else {
-                    SearchDirection::Backward
-                }),
-                text: String::new(),
-                count: state.count,
-            }))),
+            '/' | '?' => {
+                let ctx = cursor_context(editor)?;
+                let topline = editor.window(ctx.window)?.topline;
+                Ok(Some(Mode::Cmdline(CmdlineState {
+                    kind: CmdlineKind::Search(if key == '/' {
+                        SearchDirection::Forward
+                    } else {
+                        SearchDirection::Backward
+                    }),
+                    text: String::new(),
+                    count: state.count,
+                    preview_start: ctx.cursor,
+                    preview_topline: topline,
+                    preview_mark: None,
+                })))
+            }
             'J' => {
                 let range = state.range();
                 let start_lnum = range.start.lnum.min(range.end.lnum);
@@ -2340,6 +2393,7 @@ impl ModeMachine {
         if self.pending_cmdline_literal {
             self.pending_cmdline_literal = false;
             state.text.push(key);
+            self.update_incsearch_preview(editor, state)?;
             return Ok(None);
         }
         if key == '\u{16}' {
@@ -2354,17 +2408,33 @@ impl ModeMachine {
             self.pending_ctrl_bslash = false;
             if key == '\u{0e}' {
                 // `c_CTRL-\_CTRL-N`: leave the command line for Normal mode.
+                Self::restore_incsearch_view(editor, state)?;
                 return Ok(Some(Mode::default()));
             }
             return Ok(None);
         }
         match key {
-            '\u{1b}' => Ok(Some(Mode::default())),
+            // `<Esc>` and `CTRL-C` both cancel like `getcmdline`'s `gotesc`
+            // path (`ex_getln.c:940,649-650`): restore the saved cursor and
+            // view and drop the preview highlight before leaving.
+            '\u{1b}' | '\u{3}' => {
+                Self::restore_incsearch_view(editor, state)?;
+                Ok(Some(Mode::default()))
+            }
             '\u{8}' | '\u{7f}' => {
                 state.text.pop();
+                self.update_incsearch_preview(editor, state)?;
                 Ok(None)
             }
             '\n' | '\r' => {
+                // Tear down the preview before running anything else
+                // (`finish_incsearch_highlighting`, `ex_getln.c:648-659`,
+                // called before command execution resumes at
+                // `ex_getln.c:940`): the real search below must start from
+                // `preview_start`, not from wherever the preview scrolled,
+                // and the highlight must be gone even if the real search
+                // then fails.
+                Self::restore_incsearch_view(editor, state)?;
                 match state.kind {
                     CmdlineKind::Search(direction) => {
                         let ctx = context(editor)?;
@@ -2389,10 +2459,158 @@ impl ModeMachine {
             }
             ch if !ch.is_control() => {
                 state.text.push(ch);
+                self.update_incsearch_preview(editor, state)?;
                 Ok(None)
             }
             _ => Ok(None),
         }
+    }
+
+    /// Restores the view `'incsearch'` saved at command-line entry and drops
+    /// any preview highlight extmark, unconditionally
+    /// (`restore_viewstate`/`finish_incsearch_highlighting`,
+    /// `ex_getln.c:235-245,648-659`). Called both every keystroke, before a
+    /// fresh preview attempt (`ex_getln.c:530-531`), and from every exit out
+    /// of [`Self::cmdline`] — Enter, Escape, `CTRL-C`, `CTRL-\ CTRL-N` — so a
+    /// stale highlight can never survive into Normal mode. `search_start`
+    /// and `save_cursor` are the same saved position here
+    /// ([`CmdlineState::preview_start`]): cycling to a different search
+    /// start mid-line (`CTRL-G`/`CTRL-T`, `ex_getln.c:1677`) is not ported,
+    /// so the `setpcmark`-on-divergence branch (`ex_getln.c:652-656`) never
+    /// applies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorError::NoCurrentTabpage`] when command-line mode is
+    /// somehow active with no live window, or an editor error from moving
+    /// the cursor or topline back.
+    fn restore_incsearch_view(
+        editor: &mut Editor,
+        state: &mut CmdlineState,
+    ) -> Result<(), ModeError> {
+        // With no window there is no view to restore: the preview never
+        // ran (Ex-only embeddings under `feedkeys` have no window).
+        let Some(window) = editor.current_window() else {
+            return Ok(());
+        };
+        editor.set_window_cursor(window, state.preview_start)?;
+        editor.set_window_topline(window, state.preview_topline)?;
+        let Some(id) = state.preview_mark.take() else {
+            return Ok(());
+        };
+        let Some(buffer) = editor.current_buffer() else {
+            return Ok(());
+        };
+        if let Ok(buf_state) = editor.buffer_mut(buffer)
+            && let Ok(namespace) = buf_state
+                .extmarks
+                .create_namespace(Self::INCSEARCH_NAMESPACE)
+        {
+            let _ = buf_state.extmarks.delete(namespace, id);
+        }
+        Ok(())
+    }
+
+    /// Runs one `'incsearch'` preview attempt after a command-line edit
+    /// (`may_do_incsearch_highlighting`, `ex_getln.c:437-584`).
+    ///
+    /// Eligibility mirrors `do_incsearch_highlighting` (`ex_getln.c:403-434`):
+    /// a search command line (`/`, `?`) is always eligible; an Ex command
+    /// line is eligible only when [`ox_excmd::parse_preview_pattern`]
+    /// recognizes it (the `substitute`/`smagic`/`snomagic`/`sort`/`uniq`/
+    /// `vimgrep`-family/`global`/`vglobal` commands, `ex_getln.c:315-350`) —
+    /// a plain `/pattern` line always previews, while a destructive command
+    /// such as `:sort` is only ever recognized here for its pattern text and
+    /// never dispatched; nothing about it executes during preview. Address
+    /// ranges and the `smagic`/`snomagic` magic override on that recognized
+    /// pattern are read-only metadata this port does not act on: the
+    /// preview always searches the whole buffer, unrestricted by range,
+    /// matching this task's scope of search-pattern preview only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only from [`Self::restore_incsearch_view`] or
+    /// reading buffer context; an ineligible line, an empty pattern, or a
+    /// pattern with no match all resolve to "no preview" rather than erroring.
+    fn update_incsearch_preview(
+        &self,
+        editor: &mut Editor,
+        state: &mut CmdlineState,
+    ) -> Result<(), ModeError> {
+        // Incsearch needs a window to move and highlight in. Ex-only
+        // embeddings (a bare editor under `feedkeys`) have none, and
+        // upstream's `may_do_incsearch_highlighting` cannot fire there.
+        if editor.current_tabpage().is_none() {
+            return Ok(());
+        }
+        Self::restore_incsearch_view(editor, state)?;
+        if !option_bool(editor, "incsearch", true) {
+            return Ok(());
+        }
+        let direction = match state.kind {
+            CmdlineKind::Search(direction) => direction,
+            CmdlineKind::Ex => SearchDirection::Forward,
+        };
+        let pattern = match state.kind {
+            CmdlineKind::Search(_) => {
+                // `use_last_pat` for a bare `/`/`?` requires `skiplen > 0`
+                // (`ex_getln.c:463`), which never holds for a search command
+                // line: an empty pattern here previews nothing rather than
+                // reusing the last search pattern.
+                if state.text.is_empty() {
+                    return Ok(());
+                }
+                state.text.clone()
+            }
+            CmdlineKind::Ex => {
+                let Some(preview) = ox_excmd::parse_preview_pattern(&state.text) else {
+                    return Ok(());
+                };
+                if preview.pattern.is_empty() && !preview.use_last_pattern {
+                    return Ok(());
+                }
+                preview.pattern
+            }
+        };
+        let ctx = context(editor)?;
+        // `profile_setlimit(500)` (`ex_getln.c:495`): bounds the scan so a
+        // pathological pattern degrades to "not found" on every keystroke
+        // instead of hanging input.
+        let deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+        let Ok(result) = self.search.preview(
+            &ctx.lines,
+            state.preview_start,
+            &pattern,
+            direction,
+            1,
+            option_bool(editor, "wrapscan", true),
+            deadline,
+        ) else {
+            return Ok(());
+        };
+        editor.set_window_cursor(ctx.window, result.target)?;
+        let mut placement = ExtmarkPlacement::new(ExtmarkPosition::new(
+            result.match_start.lnum.saturating_sub(1),
+            result.match_start.col,
+        ))
+        .with_end(ExtmarkPosition::new(
+            result.match_end.lnum.saturating_sub(1),
+            result.match_end.col,
+        ));
+        // `'incsearch'` uses the dedicated `IncSearch` group, distinct from
+        // the persistent `'hlsearch'` `Search` group applied elsewhere
+        // (`ex_getln.c:487` comment; `screen.c` `HLF_I` vs `HLF_L`): this is
+        // a transient preview span, never `'hlsearch'` state.
+        placement.attributes.highlight_group = Some("IncSearch".to_owned());
+        if let Ok(buf_state) = editor.buffer_mut(ctx.buffer)
+            && let Ok(namespace) = buf_state
+                .extmarks
+                .create_namespace(Self::INCSEARCH_NAMESPACE)
+            && let Ok(id) = buf_state.extmarks.set(namespace, None, placement)
+        {
+            state.preview_mark = Some(id);
+        }
+        Ok(())
     }
 
     fn move_command(

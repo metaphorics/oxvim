@@ -122,6 +122,46 @@ pub struct Range {
     pub kind: RangeKind,
 }
 
+/// Forced `'magic'` override recognized while extracting an Ex command's
+/// `'incsearch'` preview pattern (`parse_pattern_and_range`,
+/// `ex_getln.c:319-323`): only `smagic`/`snomagic` set one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreviewMagic {
+    /// No override: the command's own default magic setting applies.
+    Default,
+    /// `smagic`: force `'magic'` on for this command's pattern.
+    ForceMagic,
+    /// `snomagic`: force `'magic'` off for this command's pattern.
+    ForceNomagic,
+}
+
+/// Syntax-only extraction of the search pattern and address range a
+/// preview-eligible Ex command line would use for `'incsearch'`, produced by
+/// [`parse_preview_pattern`]. Mirrors `parse_pattern_and_range`
+/// (`ex_getln.c:276-398`) without resolving addresses to line numbers or
+/// executing anything — evaluation and search stay with the host, which
+/// alone has the buffer and cursor this needs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreviewPattern {
+    /// Forced magic override; [`PreviewMagic::Default`] otherwise.
+    pub magic: PreviewMagic,
+    /// Parsed address range, unresolved to line numbers.
+    pub range: Option<Range>,
+    /// Whether an absent range defaults to the current line (`:s`-family,
+    /// `ex_getln.c:391-394`) rather than leaving the whole buffer
+    /// unrestricted.
+    pub default_current_line: bool,
+    /// Search delimiter character that closed (or would close) the pattern.
+    pub delimiter: char,
+    /// Pattern text between the delimiters, raw and un-escaped.
+    pub pattern: String,
+    /// Whether `pattern` is empty specifically because of a closed,
+    /// back-to-back delimiter pair (`//`), which reuses the last search
+    /// pattern (`ex_getln.c:360` `use_last_pat`) rather than meaning no
+    /// pattern has been typed yet.
+    pub use_last_pattern: bool,
+}
+
 /// A recognized command modifier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModifierKind {
@@ -743,6 +783,162 @@ fn modifier(typed: &str) -> Option<(ModifierKind, bool)> {
     ];
     MODIFIERS.iter().find_map(|(name, min_len, kind, count)| {
         (typed.len() >= *min_len && name.starts_with(typed)).then_some((*kind, *count))
+    })
+}
+
+/// Whether `typed` is a valid abbreviation of `full`, replicating
+/// `strncmp(cmd, full, MAX(p - cmd, min_len)) == 0` (`ex_getln.c:315-350`):
+/// `typed` must be at least `min_len` bytes and a genuine prefix of `full`.
+fn is_abbrev(typed: &str, full: &str, min_len: usize) -> bool {
+    typed.len() >= min_len && full.as_bytes().get(..typed.len()) == Some(typed.as_bytes())
+}
+
+/// Scans a possibly unterminated delimited pattern for `'incsearch'`
+/// preview purposes, mirroring `skip_regexp_ex` as `parse_pattern_and_range`
+/// uses it (`ex_getln.c:359-364`): an unescaped closing delimiter ends the
+/// pattern; running off the end of `input` takes the rest of the line
+/// instead of erroring — this only recognizes a command line, it never
+/// requires one to be complete. Returns the pattern text and whether it is
+/// empty specifically because of a closed, back-to-back delimiter pair
+/// (`//`), which reuses the last search pattern.
+fn scan_preview_pattern(input: &str, delim_pos: usize, delimiter: char) -> (String, bool) {
+    let mut cursor = delim_pos + delimiter.len_utf8();
+    let pattern_start = cursor;
+    let mut escaped = false;
+    while let Some(ch) = input[cursor..].chars().next() {
+        if !escaped && ch == delimiter {
+            let pattern = input[pattern_start..cursor].to_owned();
+            let use_last_pattern = pattern.is_empty();
+            return (pattern, use_last_pattern);
+        }
+        escaped = !escaped && ch == '\\';
+        cursor += ch.len_utf8();
+    }
+    (input[pattern_start..cursor].to_owned(), false)
+}
+
+/// Syntax-only extraction of the search pattern and address range a
+/// preview-eligible Ex command line would use, mirroring
+/// `parse_pattern_and_range` (`ex_getln.c:276-398`). This NEVER resolves or
+/// executes the command — only recognizes whether `'incsearch'` may preview
+/// it, and if so, what to search for. Returns `None` for every other
+/// command, and for a previewable command with no pattern typed yet
+/// (`ex_getln.c:311-313,333-335,344-346,362-364`).
+///
+/// The previewable command families and their minimum typed abbreviation
+/// are exactly upstream's (`ex_getln.c:315-350`): `substitute`/`smagic`/
+/// `vglobal` (any prefix), `snomagic` (3), `sort`/`uniq` (3), `vimgrep` (3),
+/// `vimgrepadd` (8), `lvimgrep` (2), `lvimgrepadd` (9), `global` (any
+/// prefix). A destructive command among these is only ever recognized here,
+/// never dispatched: the caller runs a read-only search with the returned
+/// pattern and stops.
+#[must_use]
+pub fn parse_preview_pattern(input: &str) -> Option<PreviewPattern> {
+    let mut cursor = 0usize;
+    // Skip command modifiers silently (`parse_command_modifiers`,
+    // `ex_getln.c:301`).
+    parse_modifiers(input, &mut cursor).ok()?;
+    cursor = skip_ascii_space(input, cursor);
+    // Skip over the range to find the command (`skip_range`,
+    // `ex_docmd.c:3313-3361`); `parse_range`/`parse_address` already
+    // tolerate an unterminated `/pattern` address the same permissive way.
+    let range = parse_range(input, &mut cursor).ok()?;
+    cursor = skip_ascii_space(input, cursor);
+    let bytes = input.as_bytes();
+    let cmd_start = cursor;
+    if !matches!(
+        bytes.get(cmd_start).copied(),
+        Some(b's' | b'g' | b'v' | b'l' | b'u')
+    ) {
+        return None;
+    }
+    let mut name_end = cmd_start;
+    while bytes.get(name_end).is_some_and(u8::is_ascii_alphabetic) {
+        name_end += 1;
+    }
+    let name = &input[cmd_start..name_end];
+    // `if (*skipwhite(p) == NUL) return false;` (`ex_getln.c:311-313`): the
+    // command name alone, with nothing after it yet, previews nothing.
+    if skip_ascii_space(input, name_end) >= input.len() {
+        return None;
+    }
+    let first = bytes[cmd_start];
+    let (magic, default_current_line, delim_optional, mut p) = if is_abbrev(name, "substitute", 1)
+        || is_abbrev(name, "smagic", 1)
+        || is_abbrev(name, "snomagic", 3)
+        || is_abbrev(name, "vglobal", 1)
+    {
+        let magic = if name.starts_with("sm") {
+            PreviewMagic::ForceMagic
+        } else if name.starts_with("sn") {
+            PreviewMagic::ForceNomagic
+        } else {
+            PreviewMagic::Default
+        };
+        // `:s` defaults its range to the current line; `cmd[1] != 'o'`
+        // (`ex_getln.c:391`) excludes `:sort`, which shares the `s` prefix.
+        let default_current_line = first == b's' && name.as_bytes().get(1) != Some(&b'o');
+        (magic, default_current_line, false, name_end)
+    } else if is_abbrev(name, "sort", 3) || is_abbrev(name, "uniq", 3) {
+        // Skip over `!` and whitespace-separated alpha flags
+        // (`ex_getln.c:326-335`).
+        let mut p = name_end;
+        if bytes.get(p) == Some(&b'!') {
+            p = skip_ascii_space(input, p + 1);
+        }
+        loop {
+            p = skip_ascii_space(input, p);
+            if bytes.get(p).is_some_and(u8::is_ascii_alphabetic) {
+                p += 1;
+            } else {
+                break;
+            }
+        }
+        if p >= input.len() {
+            return None;
+        }
+        (PreviewMagic::Default, false, false, p)
+    } else if is_abbrev(name, "vimgrep", 3)
+        || is_abbrev(name, "vimgrepadd", 8)
+        || is_abbrev(name, "lvimgrep", 2)
+        || is_abbrev(name, "lvimgrepadd", 9)
+        || is_abbrev(name, "global", 1)
+    {
+        let mut p = name_end;
+        if bytes.get(p) == Some(&b'!') {
+            p += 1;
+            if skip_ascii_space(input, p) >= input.len() {
+                return None;
+            }
+        }
+        // Only the `g`/`v` global commands require a punctuation delimiter;
+        // the `vimgrep` family also accepts a bare space-delimited word
+        // (`ex_getln.c:340-350` `delim_optional`).
+        (PreviewMagic::Default, false, first != b'g', p)
+    } else {
+        return None;
+    };
+    p = skip_ascii_space(input, p);
+    let delimiter = input[p..].chars().next()?;
+    let (pattern, use_last_pattern) =
+        if delim_optional && (delimiter.is_alphanumeric() || delimiter == '_') {
+            let end = input[p..]
+                .find(char::is_whitespace)
+                .map_or(input.len(), |offset| p + offset);
+            (input[p..end].to_owned(), false)
+        } else {
+            scan_preview_pattern(input, p, delimiter)
+        };
+    if pattern.is_empty() && !use_last_pattern {
+        return None;
+    }
+    Some(PreviewPattern {
+        magic,
+        range,
+        default_current_line,
+        delimiter,
+        pattern,
+        use_last_pattern,
     })
 }
 
