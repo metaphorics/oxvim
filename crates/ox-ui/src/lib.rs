@@ -7,6 +7,7 @@ pub mod compositor;
 pub mod emitter;
 pub mod grid;
 pub mod hl;
+pub mod tabline;
 
 pub use channel::{UiChannel, UiChannelError, UiChannels, UiEvent, UiOptions};
 pub use chrome::{

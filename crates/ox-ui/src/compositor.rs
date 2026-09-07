@@ -158,6 +158,12 @@ pub struct Compositor {
     width: usize,
     height: usize,
     layers: Vec<Layer>,
+    /// Resolved tabline runs for the top row: (column, text, hl id).
+    /// Refreshed on every `refresh_from_editor`; empty means no tabline.
+    tabline_row: Vec<(usize, String, u64)>,
+    /// Whether the previous refresh painted a tabline row; drives the
+    /// one-frame blank that clears stale cells on a 1-to-0 transition.
+    tabline_was_shown: bool,
 }
 
 impl Compositor {
@@ -168,6 +174,8 @@ impl Compositor {
             width,
             height,
             layers: Vec::new(),
+            tabline_row: Vec::new(),
+            tabline_was_shown: false,
         }
     }
 
@@ -194,6 +202,7 @@ impl Compositor {
     /// Removes all layers.
     pub fn clear(&mut self) {
         self.layers.clear();
+        self.tabline_row.clear();
     }
 
     /// Returns layers in insertion order.
@@ -286,6 +295,12 @@ impl Compositor {
             cterm_explicit: true,
             ..Highlight::default()
         })?;
+        // The tabline reserves the top rows of the default grid
+        // (`tabline_height`, window.c:7416-7429); windows shift down by it.
+        let tabline = crate::tabline::tabline_layout(editor, width);
+        let tabline_top = tabline.height;
+        self.tabline_was_shown = !self.tabline_row.is_empty();
+        self.tabline_row = resolve_tabline_row(&tabline.cells, highlights)?;
         let mut retired: Vec<Layer> = std::mem::take(&mut self.layers);
         self.width = width;
         self.height = height;
@@ -300,11 +315,19 @@ impl Compositor {
             let grid_id = window_grid_id(window);
             let (layer_row, grid_height) = if is_float {
                 (
-                    isize::try_from(geometry.row).unwrap_or(isize::MAX),
+                    isize::try_from(geometry.row + tabline_top).unwrap_or(isize::MAX),
                     geometry.height.max(1),
                 )
             } else {
-                tiled_window_grid_geometry(geometry, height, tiled_split)
+                let (row, grid_height) = tiled_window_grid_geometry(
+                    geometry,
+                    height.saturating_sub(tabline_top),
+                    tiled_split,
+                );
+                (
+                    row.saturating_add(isize::try_from(tabline_top).unwrap_or(isize::MAX)),
+                    grid_height,
+                )
             };
             let kind = if is_float {
                 LayerKind::Float
@@ -588,6 +611,9 @@ impl Compositor {
         });
         let mut cursor = None;
         let mut highlight_events = Vec::new();
+        // Painted before the layers: a 1-to-0 transition blanks row 0 so
+        // the window layers repaint it in the same frame.
+        self.paint_tabline_row(output)?;
         for index in order {
             let layer = &self.layers[index];
             for source_row in 0..layer.grid.height() {
@@ -657,6 +683,32 @@ impl Compositor {
         })
     }
 
+    /// Paints the tabline runs onto the default grid's top row. A 1-to-0
+    /// tabline transition blanks the row once so `emit_grid`'s diff clears
+    /// the stale cells; a steady no-tabline frame leaves row 0 to the
+    /// window layers, which own it whenever no tabline is shown.
+    /// # Errors
+    ///
+    /// Returns [`CompositorError::Grid`] when the default grid write falls
+    /// outside the composed area.
+    pub fn paint_tabline_row(&self, output: &mut Grid) -> Result<(), CompositorError> {
+        if self.width == 0 {
+            return Ok(());
+        }
+        if self.tabline_row.is_empty() {
+            if self.tabline_was_shown {
+                output.write_text(0, 0, &" ".repeat(self.width), 0)?;
+            }
+            return Ok(());
+        }
+        for (col, text, hl_id) in &self.tabline_row {
+            if *col < self.width {
+                output.write_text(0, *col, text, *hl_id)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the grid id assigned to an editor window in a multigrid stream.
     #[must_use]
     pub fn window_grid(&self, window: WinHandle, editor: &Editor) -> Option<i64> {
@@ -683,6 +735,37 @@ fn take_layer(retired: &mut Vec<Layer>, id: i64) -> Option<Layer> {
         .iter()
         .position(|layer| layer.grid.id() == id)
         .map(|index| retired.swap_remove(index))
+}
+
+/// Resolves tabline cell runs to concrete highlight ids: `TabLine`,
+/// `TabLineSel`, and `TabLineFill` resolve through their groups (defined
+/// with the reference binary's defaults when absent), and the window-count
+/// cell composes `Title` over the enclosing tab's attr
+/// (`statusline.c:671`).
+fn resolve_tabline_row(
+    cells: &[crate::tabline::TablineCell],
+    highlights: &mut HlState,
+) -> Result<Vec<(usize, String, u64)>, CompositorError> {
+    use crate::tabline::TablineHl;
+    let mut tab_id = 0u64;
+    let mut resolved = Vec::with_capacity(cells.len());
+    for cell in cells {
+        let name = cell.hl.group_name();
+        let id = match highlights.group_id(&OxStr::from(name)) {
+            Some(id) => id,
+            None => highlights.define_group(name, cell.hl.default_highlight())?,
+        };
+        let id = match cell.hl {
+            TablineHl::Tab | TablineHl::TabSel => {
+                tab_id = id;
+                id
+            }
+            TablineHl::Fill => id,
+            TablineHl::Count => highlights.combine(tab_id, id)?.0,
+        };
+        resolved.push((cell.col, cell.text.clone(), id));
+    }
+    Ok(resolved)
 }
 
 /// Content rectangle for a tiled window: one statusline under each split

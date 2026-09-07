@@ -156,6 +156,7 @@ impl Emitter {
                         }
                     }
                 }
+                compositor.paint_tabline_row(&mut default_grid)?;
                 let cmdline_cursor = if options.ext_cmdline {
                     None
                 } else {
