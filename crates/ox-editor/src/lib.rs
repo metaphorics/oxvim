@@ -37,6 +37,7 @@ pub mod search;
 pub mod server;
 pub mod shada;
 pub mod tags;
+pub mod terminal_screen;
 pub mod textobject;
 pub mod typeahead;
 pub mod userfunc;
@@ -68,9 +69,10 @@ pub use excmd_exec::{
     VimException, VimExceptionKind, focus_transition, vim_variable_is_writable,
 };
 pub use extmark::{
-    Extmark, ExtmarkAttributes, ExtmarkEnd, ExtmarkFlags, ExtmarkGravity, ExtmarkHighlightMode,
-    ExtmarkId, ExtmarkPlacement, ExtmarkPosition, ExtmarkVirtualLinesOverflow,
-    ExtmarkVirtualTextPosition, Extmarks, NamespaceId, VirtualLine, VirtualTextChunk,
+    Extmark, ExtmarkAttributes, ExtmarkEnd, ExtmarkError, ExtmarkFlags, ExtmarkGravity,
+    ExtmarkHighlightMode, ExtmarkId, ExtmarkPlacement, ExtmarkPosition,
+    ExtmarkVirtualLinesOverflow, ExtmarkVirtualTextPosition, Extmarks, NamespaceId, VirtualLine,
+    VirtualTextChunk,
 };
 pub use fold::Folds;
 pub use indent::{ExprEval, IndentEvalContext, IndentExprError, NullExprEval};

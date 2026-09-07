@@ -361,6 +361,10 @@ pub struct ExtmarkAttributes {
     pub spell: Option<bool>,
     /// URL attached to the extmark.
     pub url: Option<String>,
+    /// Terminal-emulator pen for the marked span (`hl_get_term_attr`,
+    /// `terminal.c`): resolved to a synthesized highlight group at paint
+    /// time, so SGR output needs no pre-registered group name.
+    pub terminal_pen: Option<crate::terminal_screen::CellAttrs>,
     /// Rendering priority; larger values render later.
     pub priority: u32,
     /// Rendering and lifetime flags (`ExtmarkFlags`).
@@ -392,6 +396,7 @@ impl Default for ExtmarkAttributes {
             conceal_lines: None,
             spell: None,
             url: None,
+            terminal_pen: None,
             priority: 0,
             flags: ExtmarkFlags::UNDO_RESTORE,
         }

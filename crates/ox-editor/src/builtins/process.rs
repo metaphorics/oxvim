@@ -212,15 +212,15 @@ fn call_job_start<F: FileIO, E: ExEditorAccess>(
     // and keeps the `pty_proc_init` default for each dimension left at zero
     // (channel.c:394-398). Every pty channel here owns a terminal buffer, so
     // a bare `jobstart(..., {'pty': v:true})` takes the same window default.
-    let window_rows = if wants_pty {
+    let (window_rows, window_cols) = if wants_pty {
         let (columns, rows) = access.with_ex_editor(|editor| current_window_pty_extent(editor));
         options.pty_size = PtySize {
             columns: pty_dimension(columns, DEFAULT_PTY_SIZE.columns),
             rows: pty_dimension(rows, DEFAULT_PTY_SIZE.rows),
         };
-        rows
+        (rows, columns)
     } else {
-        0
+        (0, 0)
     };
     let mut manager = match runtime.jobs.take() {
         Some(manager) => manager,
@@ -234,22 +234,37 @@ fn call_job_start<F: FileIO, E: ExEditorAccess>(
     if let Ok(_pid) = started
         && wants_pty
     {
-        // A `:terminal` buffer is pre-sized to the viewport it opens in
-        // (`terminal.c` `topts.height = curwin->w_view_height`); a bare pty
-        // job's buffer stays single-row.
+        // `jobstart({term=true})` attaches the terminal to the current
+        // buffer (`f_jobstart`, eval/funcs.c:3529 `buf_T *const buf =
+        // curbuf`); `:terminal` reaches here right after its own `enew`.
+        // A bare pty job keeps a hidden single-row buffer. The emulator is
+        // pre-sized to the viewport it opens in (`terminal.c` `topts`).
+        let attach = if term {
+            access.with_ex_editor(|editor| editor.current_buffer())
+        } else {
+            None
+        };
         let rows = if term { window_rows.max(1) } else { 1 };
-        let terminal =
-            access.with_ex_editor(
-                |editor| match editor.allocate_terminal_buffer_rows(id, rows) {
-                    Ok(buffer) => {
-                        if let Some(pty) = manager.pty_slave(id).map(str::to_owned) {
-                            editor.set_terminal_channel_pty(id, Some(pty));
-                        }
-                        Some(buffer)
+        let cols = if term {
+            window_cols.max(1)
+        } else {
+            usize::from(DEFAULT_PTY_SIZE.columns)
+        };
+        let terminal = access.with_ex_editor(|editor| {
+            match editor.allocate_terminal_buffer_rows(
+                id,
+                attach,
+                crate::terminal_screen::ScreenSize::new(rows, cols),
+            ) {
+                Ok(buffer) => {
+                    if let Some(pty) = manager.pty_slave(id).map(str::to_owned) {
+                        editor.set_terminal_channel_pty(id, Some(pty));
                     }
-                    Err(_) => None,
-                },
-            );
+                    Some(buffer)
+                }
+                Err(_) => None,
+            }
+        });
         if let Some(buffer) = terminal {
             manager.set_terminal_buffer(id, buffer);
         }

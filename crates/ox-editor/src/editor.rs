@@ -179,6 +179,9 @@ pub enum EditorError {
     /// A fold operation failed.
     #[error(transparent)]
     Fold(#[from] FoldError),
+    /// An extmark store operation failed.
+    #[error(transparent)]
+    Extmark(#[from] crate::ExtmarkError),
 }
 
 /// What to do with an old buffer after its last window switches away.
@@ -245,14 +248,14 @@ pub struct TerminalChannelInfo {
     pub pty: Option<String>,
     /// Buffer displaying the terminal channel output.
     pub buffer: BufHandle,
-    /// Bytes of the last line if it has not yet ended with a newline; this
-    /// mirrors the text visible in `buffer` so the next chunk can complete it.
-    pub pending: Option<Vec<u8>>,
-    /// Viewport rows pre-allocated for the terminal (`terminal.c`
-    /// `topts.height`): output overwrites these before scrollback grows.
-    pub initial_rows: usize,
-    /// Rows already carrying terminal output.
-    pub filled_rows: usize,
+    /// Parsed screen behind the buffer. This is the authoritative terminal
+    /// state: buffer lines are a projection of it, never a second copy
+    /// (upstream keeps the same split between libvterm's screen and
+    /// `refresh_screen`, `terminal.c:2614-2652`).
+    pub screen: crate::terminal_screen::TerminalScreen,
+    /// Bytes owed to the child in answer to its queries, drained by the job
+    /// layer (upstream `term_output_callback`, `terminal.c:461-464`).
+    pub replies: Vec<u8>,
 }
 
 /// All mutable editor state under a single `&mut self` discipline.
@@ -501,11 +504,16 @@ impl Editor {
     /// Returns [`EditorError::HandleExhausted`] when the buffer handle space
     /// is exhausted.
     pub fn allocate_terminal_buffer(&mut self, channel: u64) -> Result<BufHandle, EditorError> {
-        self.allocate_terminal_buffer_rows(channel, 1)
+        self.allocate_terminal_buffer_rows(
+            channel,
+            None,
+            crate::terminal_screen::ScreenSize::new(1, 80),
+        )
     }
 
-    /// Allocate a terminal channel buffer pre-filled with `rows` empty lines,
-    /// the viewport height a `:terminal` opens with.
+    /// Attach a terminal to `attach`, or allocate a hidden buffer for a bare
+    /// PTY. `jobstart({term=true})` attaches to curbuf; `:terminal` first runs
+    /// `enew` (`terminal.c:585-611`, `eval/funcs.c:3529-3591`).
     ///
     /// # Errors
     ///
@@ -514,20 +522,29 @@ impl Editor {
     pub fn allocate_terminal_buffer_rows(
         &mut self,
         channel: u64,
-        rows: usize,
+        attach: Option<BufHandle>,
+        size: crate::terminal_screen::ScreenSize,
     ) -> Result<BufHandle, EditorError> {
-        let rows = rows.max(1);
-        let text = Buffer::from_lines(&vec![Vec::new(); rows], false)
-            .map_err(|error| EditorError::Buffer(BufferStateError::Text(error)))?;
-        let buffer = self.create_buffer_with(text, false)?;
+        let size = crate::terminal_screen::ScreenSize::new(size.rows, size.cols);
+        let lines = vec![Vec::new(); size.rows];
+        let buffer = if let Some(buffer) = attach {
+            let state = self.buffer_mut(buffer)?;
+            let count = state.text()?.line_count();
+            let cursor = Position { lnum: 1, col: 0 };
+            state.replace_lines(1, count, &lines, cursor, cursor, 0)?;
+            state.flags.set(crate::BufferFlags::MODIFIED, false);
+            buffer
+        } else {
+            let text = Buffer::from_lines(&lines, false).map_err(BufferStateError::Text)?;
+            self.create_buffer_with(text, false)?
+        };
         self.terminal_buffers.insert(
             channel,
             TerminalChannelInfo {
                 pty: None,
                 buffer,
-                pending: Some(Vec::new()),
-                initial_rows: rows,
-                filled_rows: 0,
+                screen: crate::terminal_screen::TerminalScreen::new(size),
+                replies: Vec::new(),
             },
         );
         Ok(buffer)
@@ -540,13 +557,9 @@ impl Editor {
         }
     }
 
-    /// Append raw PTY output to the terminal channel's buffer.
-    ///
-    /// Until the pre-allocated viewport rows carry output, complete lines
-    /// overwrite those rows so the buffer stays viewport-sized (upstream
-    /// `refresh_screen`); once full, lines extend the buffer as scrollback.
-    /// A chunk ending mid-line leaves its tail as the pending partial on the
-    /// next output row, replaced when the line completes.
+    /// Feed raw PTY output to the channel's persistent emulator and project
+    /// its damaged rows into the buffer (`terminal.c:1382-1420,2614-2652`).
+    /// Parsing and projection run without invoking callbacks or user code.
     ///
     /// # Errors
     ///
@@ -559,60 +572,89 @@ impl Editor {
         channel: u64,
         bytes: &[u8],
     ) -> Result<(), EditorError> {
-        if bytes.is_empty() {
+        let Some(buffer) = self.terminal_buffers.get(&channel).map(|info| info.buffer) else {
             return Ok(());
+        };
+        let limit = match self.options.get_buffer(buffer, "scrollback") {
+            Ok(OptionValue::Number(value)) if *value >= 0 => usize::try_from(*value).ok(),
+            _ => None,
+        };
+        let Some(info) = self.terminal_buffers.get_mut(&channel) else {
+            return Ok(());
+        };
+        if let Some(limit) = limit {
+            info.screen.set_scrollback_limit(limit);
         }
-        let (buffer, had_partial, data, initial_rows, filled_rows) =
-            match self.terminal_buffers.get_mut(&channel) {
-                Some(info) => {
-                    let buffer = info.buffer;
-                    let had_partial = info.pending.is_some();
-                    let mut data = info.pending.take().unwrap_or_default();
-                    data.extend_from_slice(bytes);
-                    (
-                        buffer,
-                        had_partial,
-                        data,
-                        info.initial_rows,
-                        info.filled_rows,
-                    )
-                }
-                None => return Ok(()),
+        info.screen.write(bytes);
+        info.replies.extend(info.screen.take_replies());
+        let cursor = info.screen.cursor();
+        let cursor_line = info.screen.line_of_row(cursor.row);
+        let cursor_col = info.screen.cursor_byte_column();
+        let topline = info.screen.scrollback_len().saturating_add(1);
+        let total = info.screen.line_count();
+        if let Some(damage) = info.screen.take_damage() {
+            let rebuild =
+                damage.resync || damage.scrollback_deleted != 0 || damage.scrollback_pushed != 0;
+            let first = if rebuild {
+                1
+            } else {
+                info.screen.line_of_row(damage.rows.start)
             };
-
-        let mut segments: Vec<&[u8]> = data.split(|byte| *byte == b'\n').collect();
-        let ends_newline = data.last() == Some(&b'\n');
-        if ends_newline {
-            let _ = segments.pop();
+            let rows = if rebuild {
+                (0..info.screen.scrollback_len())
+                    .map(|row| info.screen.render_scrollback(row))
+                    .chain((0..info.screen.rows()).map(|row| info.screen.render_row(row)))
+                    .collect::<Vec<_>>()
+            } else {
+                damage
+                    .rows
+                    .map(|row| info.screen.render_row(row))
+                    .collect::<Vec<_>>()
+            };
+            if !rows.is_empty() {
+                let state = self
+                    .buffers
+                    .get_mut(&buffer)
+                    .ok_or(EditorError::UnknownBuffer(buffer))?;
+                project_terminal_rows(state, first, &rows)?;
+            }
         }
-        let partial = if ends_newline {
-            None
-        } else {
-            segments.pop().map(<[u8]>::to_vec)
-        };
-
-        let strip_cr = |line: &[u8]| line.strip_suffix(b"\r").unwrap_or(line).to_vec();
-        let lines: Vec<Vec<u8>> = segments.iter().map(|&line| strip_cr(line)).collect();
-
-        let filled = {
-            let state = self.buffer_mut(buffer)?;
-            let count = state.text()?.line_count();
-            write_terminal_rows(
-                state,
-                count,
-                &lines,
-                partial.as_deref(),
-                had_partial,
-                initial_rows,
-                filled_rows,
-            )
-            .map_err(EditorError::Buffer)?
-        };
-        if let Some(info) = self.terminal_buffers.get_mut(&channel) {
-            info.pending = partial;
-            info.filled_rows = filled;
+        // Focused terminal input follows the emulator, while terminal-normal
+        // mode retains the user's scrollback position (terminal.c:2658-2667).
+        if self.edit_mode != BufferEditMode::Normal {
+            for (&window, &tab) in &self.windows {
+                if let Some(page) = self.tabpages.get_mut(&tab)
+                    && let Ok(state) = page.window_mut(window)
+                    && state.buffer == buffer
+                {
+                    state.cursor = Position {
+                        lnum: cursor_line.min(total),
+                        col: cursor_col,
+                    };
+                    state.topline = topline;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Parsed screen of a displayed terminal buffer.
+    #[must_use]
+    pub fn terminal_screen(
+        &self,
+        buffer: BufHandle,
+    ) -> Option<&crate::terminal_screen::TerminalScreen> {
+        self.terminal_buffers
+            .values()
+            .find(|info| info.buffer == buffer)
+            .map(|info| &info.screen)
+    }
+
+    /// Take terminal-emulator replies after the editor borrow has ended.
+    pub fn take_terminal_replies(&mut self, channel: u64) -> Vec<u8> {
+        self.terminal_buffers
+            .get_mut(&channel)
+            .map_or_else(Vec::new, |info| std::mem::take(&mut info.replies))
     }
 
     /// Look up the editor-owned terminal channel metadata.
@@ -3730,90 +3772,66 @@ fn viewport_height(tabpage: &TabpageState, window: WinHandle) -> usize {
         .unwrap_or(1)
         .max(1)
 }
-
-/// Writes PTY output rows into a terminal buffer.
+/// Projects the emulator's damaged rows into a terminal buffer.
 ///
-/// While `filled_rows < initial_rows` the pre-allocated viewport rows are
-/// overwritten (upstream `refresh_screen`); after that, lines extend the
-/// buffer as scrollback. A trailing partial line lands on the next row to be
-/// completed by the following chunk.
+/// Each row replaces its buffer line in place, growing the buffer when the
+/// emulator has more rows than the buffer holds; runs written with a
+/// non-default pen become extmarks in a dedicated namespace carrying the
+/// pen, which the compositor resolves to a synthesized highlight group
+/// (`hl_get_term_attr`, `terminal.c:1432-1442`).
 ///
 /// # Errors
 ///
-/// Returns the buffer text mutation failure.
-fn write_terminal_rows(
+/// Returns buffer text mutation and extmark store failures.
+fn project_terminal_rows(
     state: &mut crate::BufferState,
-    mut count: usize,
-    lines: &[Vec<u8>],
-    partial: Option<&[u8]>,
-    had_partial: bool,
-    initial_rows: usize,
-    mut filled_rows: usize,
-) -> Result<usize, BufferStateError> {
-    let mut next_row = filled_rows.saturating_add(1);
-    let mut extended = false;
-    for (index, line) in lines.iter().enumerate() {
-        if next_row <= initial_rows {
-            let focus = ox_text::Position {
-                lnum: next_row,
-                col: 0,
-            };
-            state.replace_lines(
-                next_row,
-                next_row,
-                std::slice::from_ref(line),
-                focus,
-                focus,
-                0,
-            )?;
-            filled_rows = next_row;
-            next_row += 1;
-        } else if index == 0 && had_partial && !extended {
-            let focus = ox_text::Position {
-                lnum: count,
-                col: 0,
-            };
-            state.replace_lines(count, count, std::slice::from_ref(line), focus, focus, 0)?;
-        } else {
-            let focus = ox_text::Position {
-                lnum: count,
-                col: 0,
-            };
-            state.append_lines(count, std::slice::from_ref(line), focus, 0)?;
-            count += 1;
-            extended = true;
+    first_line: usize,
+    rows: &[crate::terminal_screen::RenderedRow],
+) -> Result<(), EditorError> {
+    let namespace = state.extmarks.create_namespace("terminal-screen")?;
+    let last_line = first_line + rows.len().saturating_sub(1);
+    let focus = ox_text::Position { lnum: 1, col: 0 };
+    let line_count = state.text()?.line_count();
+    let covered = (last_line.min(line_count) + 1).saturating_sub(first_line);
+    if covered > 0 {
+        let texts: Vec<Vec<u8>> = rows[..covered].iter().map(|row| row.text.clone()).collect();
+        state.replace_lines(
+            first_line,
+            first_line + covered - 1,
+            &texts,
+            focus,
+            focus,
+            0,
+        )?;
+    }
+    if covered < rows.len() {
+        let texts: Vec<Vec<u8>> = rows[covered..].iter().map(|row| row.text.clone()).collect();
+        state.append_lines(line_count, &texts, focus, 0)?;
+    }
+    // The previous generation's marks on the rewritten span are removed so a
+    // repaint cannot stack them; the column bound only has to order past the
+    // span ends.
+    state.extmarks.clear(
+        namespace,
+        crate::ExtmarkPosition::new(first_line - 1, 0),
+        crate::ExtmarkPosition::new(last_line, usize::MAX),
+    )?;
+    for (offset, row) in rows.iter().enumerate() {
+        let line = first_line - 1 + offset;
+        for span in &row.spans {
+            if span.attrs.is_default() {
+                continue;
+            }
+            let mut placement =
+                crate::ExtmarkPlacement::new(crate::ExtmarkPosition::new(line, span.start));
+            placement.end = Some(crate::ExtmarkEnd::new(crate::ExtmarkPosition::new(
+                line, span.end,
+            )));
+            placement.attributes.terminal_pen = Some(span.attrs);
+            state.extmarks.set(namespace, None, placement)?;
         }
     }
-    if let Some(tail) = partial {
-        let tail = tail.to_vec();
-        if next_row <= initial_rows {
-            let focus = ox_text::Position {
-                lnum: next_row,
-                col: 0,
-            };
-            state.replace_lines(
-                next_row,
-                next_row,
-                std::slice::from_ref(&tail),
-                focus,
-                focus,
-                0,
-            )?;
-        } else if had_partial && !extended && lines.is_empty() {
-            let focus = ox_text::Position {
-                lnum: count,
-                col: 0,
-            };
-            state.replace_lines(count, count, std::slice::from_ref(&tail), focus, focus, 0)?;
-        } else {
-            let focus = ox_text::Position {
-                lnum: count,
-                col: 0,
-            };
-            state.append_lines(count, std::slice::from_ref(&tail), focus, 0)?;
-        }
-    }
-    Ok(filled_rows)
+    Ok(())
 }
 
 fn cursor_visible_topline(topline: usize, cursor: usize, height: usize) -> usize {
@@ -4148,11 +4166,21 @@ mod tests {
         buffer_lines_between(text, 1, text.line_count()).unwrap()
     }
 
+    /// Chunk boundaries never survive the emulator: the projected rows are
+    /// the rendered screen, so split writes merge into one `hello` row.
+    /// The trailing empty row is the cursor's own line after the final
+    /// line feed, exactly where upstream's terminal buffer leaves it.
     #[test]
     fn terminal_buffer_merges_partial_line_chunks() {
         let mut editor = Editor::new();
         let channel = editor.allocate_channel_id();
-        editor.allocate_terminal_buffer(channel).unwrap();
+        editor
+            .allocate_terminal_buffer_rows(
+                channel,
+                None,
+                crate::terminal_screen::ScreenSize::new(3, 80),
+            )
+            .unwrap();
 
         editor.append_terminal_buffer(channel, b"hel").unwrap();
         editor.append_terminal_buffer(channel, b"lo\n").unwrap();
@@ -4160,34 +4188,56 @@ mod tests {
         editor.append_terminal_buffer(channel, b"ld\n").unwrap();
 
         let lines = terminal_lines(&editor, channel);
-        assert_eq!(lines, vec![b"hello".to_vec(), b"world".to_vec()]);
+        // A bare LF keeps the column (LNM off), so `world` renders at the
+        // column the cursor kept; children emit \r\n to reset it.
+        assert_eq!(
+            lines,
+            vec![b"hello".to_vec(), b"     world".to_vec(), Vec::new()]
+        );
     }
 
     #[test]
     fn terminal_buffer_appends_trailing_newline_without_blank_line() {
         let mut editor = Editor::new();
         let channel = editor.allocate_channel_id();
-        editor.allocate_terminal_buffer(channel).unwrap();
+        editor
+            .allocate_terminal_buffer_rows(
+                channel,
+                None,
+                crate::terminal_screen::ScreenSize::new(3, 80),
+            )
+            .unwrap();
 
         editor.append_terminal_buffer(channel, b"first\n").unwrap();
         editor.append_terminal_buffer(channel, b"second\n").unwrap();
 
         let lines = terminal_lines(&editor, channel);
-        assert_eq!(lines, vec![b"first".to_vec(), b"second".to_vec()]);
+        assert_eq!(
+            lines,
+            vec![b"first".to_vec(), b"     second".to_vec(), Vec::new()]
+        );
     }
 
+    /// `\r` resets the column before `\n` advances the row, so CRLF pairs
+    /// project as clean rows exactly like the child terminal renders them.
     #[test]
     fn terminal_buffer_strips_carriage_returns_from_complete_lines() {
         let mut editor = Editor::new();
         let channel = editor.allocate_channel_id();
-        editor.allocate_terminal_buffer(channel).unwrap();
+        editor
+            .allocate_terminal_buffer_rows(
+                channel,
+                None,
+                crate::terminal_screen::ScreenSize::new(3, 80),
+            )
+            .unwrap();
 
         editor
             .append_terminal_buffer(channel, b"one\r\ntwo\r\n")
             .unwrap();
 
         let lines = terminal_lines(&editor, channel);
-        assert_eq!(lines, vec![b"one".to_vec(), b"two".to_vec()]);
+        assert_eq!(lines, vec![b"one".to_vec(), b"two".to_vec(), Vec::new()]);
     }
 
     #[test]

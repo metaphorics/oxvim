@@ -11,6 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::grid::{Grid, GridError};
 use crate::hl::{Highlight, HlAttrs, HlError, HlEvent, HlState};
+use ox_editor::terminal_screen::{CellFlags, TermColor};
 
 /// Fixed stacking priority of the message grid.
 pub const MESSAGE_ZINDEX: u32 = 200;
@@ -771,6 +772,11 @@ fn apply_extmark_highlights(
             };
             mark_id = highlights.combine(mark_id, group_id)?.0;
         }
+        if mark_id == 0
+            && let Some(pen) = attributes.terminal_pen
+        {
+            mark_id = terminal_pen_group(highlights, pen)?;
+        }
         if mark_id == 0 {
             continue;
         }
@@ -785,6 +791,87 @@ fn apply_extmark_highlights(
         }
     }
     Ok(())
+}
+/// Resolves one terminal pen to a highlight group (`hl_get_term_attr`,
+/// `terminal.c:1432-1442`): the SGR state becomes the group definition,
+/// cached under a stable name so repeated rows share one group.
+fn terminal_pen_group(
+    highlights: &mut HlState,
+    pen: ox_editor::terminal_screen::CellAttrs,
+) -> Result<u64, CompositorError> {
+    let name = format!(
+        "TermPen{}{}{:04x}",
+        terminal_pen_color(pen.foreground),
+        terminal_pen_color(pen.background),
+        pen.flags.without(CellFlags::WIDE).bits(),
+    );
+    if let Some(id) = highlights.group_id(&OxStr::from(name.as_str())) {
+        return Ok(id);
+    }
+    let (fg_rgb, fg_index) = terminal_pen_channel(pen.foreground);
+    let (bg_rgb, bg_index) = terminal_pen_channel(pen.background);
+    let flags = pen.flags;
+    let rgb = HlAttrs {
+        foreground: fg_rgb,
+        background: bg_rgb,
+        bold: flags.contains(CellFlags::BOLD),
+        italic: flags.contains(CellFlags::ITALIC),
+        underline: flags.contains(CellFlags::UNDERLINE),
+        undercurl: flags.contains(CellFlags::UNDERCURL),
+        underdouble: flags.contains(CellFlags::UNDERDOUBLE),
+        reverse: flags.contains(CellFlags::REVERSE),
+        strikethrough: flags.contains(CellFlags::STRIKETHROUGH),
+        blink: flags.contains(CellFlags::BLINK),
+        dim: flags.contains(CellFlags::FAINT),
+        ..HlAttrs::default()
+    };
+    let indexed = fg_index.is_some() || bg_index.is_some();
+    let cterm = HlAttrs {
+        foreground: fg_index,
+        background: bg_index,
+        bold: rgb.bold,
+        italic: rgb.italic,
+        underline: rgb.underline,
+        undercurl: rgb.undercurl,
+        underdouble: rgb.underdouble,
+        reverse: rgb.reverse,
+        strikethrough: rgb.strikethrough,
+        blink: rgb.blink,
+        dim: rgb.dim,
+        ..HlAttrs::default()
+    };
+    let id = highlights.define_group(
+        OxStr::from(name.as_str()),
+        Highlight {
+            rgb,
+            cterm,
+            cterm_explicit: indexed,
+            default_flag: false,
+            info: Vec::new(),
+        },
+    )?;
+    Ok(id)
+}
+
+/// Encodes one pen channel for the cache name.
+fn terminal_pen_color(color: TermColor) -> String {
+    match color {
+        TermColor::Default => "d".to_owned(),
+        TermColor::Indexed(index) => format!("i{index:02x}"),
+        TermColor::Rgb(red, green, blue) => format!("r{red:02x}{green:02x}{blue:02x}"),
+    }
+}
+
+/// Splits one pen channel into its RGB and indexed representations.
+fn terminal_pen_channel(color: TermColor) -> (Option<u32>, Option<u32>) {
+    match color {
+        TermColor::Default => (None, None),
+        TermColor::Indexed(index) => (Some(u32::from(index)), Some(u32::from(index))),
+        TermColor::Rgb(red, green, blue) => (
+            Some((u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue)),
+            None,
+        ),
+    }
 }
 
 fn wrapped_segments(line: &str, width: usize) -> Vec<(String, usize)> {

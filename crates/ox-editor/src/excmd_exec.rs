@@ -8177,18 +8177,12 @@ fn command_terminal<F: FileIO, E: ExEditorAccess>(
             return flow;
         }
     }
-    let (_, buffer) = match crate::builtins::process::start_terminal(
-        runtime,
-        access,
-        command.args.trim_start(),
-    ) {
-        Ok(terminal) => terminal,
-        Err(error) => return eval_error_flow(runtime, error),
-    };
-    let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufNew], buffer);
-    if !matches!(flow, Flow::Normal) {
-        return flow;
-    }
+    // Upstream `:terminal` runs `enew` before `jobstart({term=true})`
+    // (`runtime/lua/vim/_core/ex_cmd.lua:252-264`), so the terminal attaches
+    // to a fresh buffer instead of the one being edited (`terminal.c:585-611`,
+    // `eval/funcs.c:3529` attaches to `curbuf`). `command_enew` carries the
+    // `'winfixbuf'`, E37 and `'hidden'` gates, fires `BufNew`/`BufAdd`, and
+    // enters the buffer, so the jump mark is captured before it runs.
     access.with_ex_editor(|editor| {
         let origin = editor.current_window().and_then(|window| {
             editor
@@ -8202,11 +8196,21 @@ fn command_terminal<F: FileIO, E: ExEditorAccess>(
                 .push(crate::marks::MarkLocation::in_buffer(buffer, position));
         }
     });
-    if let Err(error) =
-        access.with_ex_editor(|editor| editor.set_current_buffer(buffer, BufferRelease::KeepLoaded))
-    {
-        return error_flow(runtime, "E948", error.to_string());
+    let mut fresh = command.clone();
+    fresh.args.clear();
+    fresh.usefilter = false;
+    let flow = command_enew(runtime, access, scope, lua, &fresh);
+    if !matches!(flow, Flow::Normal) {
+        return flow;
     }
+    let (_, buffer) = match crate::builtins::process::start_terminal(
+        runtime,
+        access,
+        command.args.trim_start(),
+    ) {
+        Ok(terminal) => terminal,
+        Err(error) => return eval_error_flow(runtime, error),
+    };
     fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::TermOpen], buffer)
 }
 
