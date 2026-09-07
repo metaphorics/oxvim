@@ -280,6 +280,90 @@ pub fn error_shim(lua: &Lua) -> mlua::Result<Function> {
     .eval()
 }
 
+/// Lua wrapper factory for Rust natives that signal failure as
+/// `(false, message)` *and* return tree-sitter-style userdata: the wrapper
+/// re-raises the message as a *string* error and, for every userdata value it
+/// sees (one table level deep), rewires the shared metatable so method lookups
+/// return flag-raising wrappers. This is the userdata-method counterpart of
+/// [`error_shim`]: mlua wraps every `Err` a `UserData` method closure returns
+/// into `WrappedFailure` userdata, the metatable hides behind
+/// `__metatable = false`, and its `__index` is a generated closure holding the
+/// methods table as an upvalue — so the rewire goes through
+/// `debug.getmetatable`, replaces `__index`, and delegates to the original to
+/// fetch, wrap (once, memoized per key), and return each method.
+///
+/// Multi-value safe; LuaJIT-5.1 primitives only (no `table.pack`).
+///
+/// # Errors
+///
+/// Returns the chunk compilation/registration error.
+pub fn userdata_error_shim(lua: &Lua) -> mlua::Result<Function> {
+    const SHIM: &str = r"
+        local rewire, taint
+
+        local function raise(native)
+          return function(...)
+            local results = { native(...) }
+            if results[1] == false then error(results[2], 2) end
+            for index = 1, #results do taint(results[index], 2) end
+            return unpack(results, 2)
+          end
+        end
+
+        local function rewire(value)
+          local mt = debug.getmetatable(value)
+          if mt ~= nil and not mt.__ox_string_errors then
+            mt.__ox_string_errors = true
+            local methods = mt.__index
+            if type(methods) == 'table' then
+              local names = {}
+              for name, method in pairs(methods) do
+                if type(method) == 'function' then
+                  names[#names + 1] = name
+                end
+              end
+              for _, name in ipairs(names) do
+                methods[name] = raise(methods[name])
+              end
+            elseif type(methods) == 'function' then
+              local original_index = methods
+              local wrapped = {}
+              mt.__index = function(self, key)
+                local cached = wrapped[key]
+                if cached ~= nil then return cached end
+                local method = original_index(self, key)
+                if type(method) == 'function' then
+                  method = raise(method)
+                  wrapped[key] = method
+                end
+                return method
+              end
+            end
+          end
+        end
+
+        function taint(value, depth)
+          if type(value) == 'userdata' then
+            rewire(value)
+          elseif type(value) == 'table' and depth > 0 then
+            for _, item in pairs(value) do taint(item, depth - 1) end
+          end
+        end
+
+        return function(native)
+          return raise(native)
+        end
+    ";
+    if let Some(factory) =
+        lua.named_registry_value::<Option<Function>>("__oxvim_userdata_error_shim")?
+    {
+        return Ok(factory);
+    }
+    let factory: Function = lua.load(SHIM).eval()?;
+    lua.set_named_registry_value("__oxvim_userdata_error_shim", factory.clone())?;
+    Ok(factory)
+}
+
 fn install_builtin_functions(
     lua: &Lua,
     vim: &Table,

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use libloading::Library;
 use mlua::{
-    AnyUserData, Function, IntoLua, Lua, MetaMethod, MultiValue, Table, UserData, UserDataMethods,
-    Value, Variadic,
+    AnyUserData, FromLuaMulti, Function, IntoLua, IntoLuaMulti, Lua, MetaMethod, MultiValue, Table,
+    UserData, UserDataMethods, Value, Variadic,
 };
 use tree_sitter::{
     InputEdit, Language, LogType, Node, ParseOptions, Parser, Point, Query, QueryCursor, Range,
@@ -79,6 +79,88 @@ fn runtime_error(message: impl Into<String>) -> mlua::Error {
 
 fn checked_u32(value: i64, what: &str) -> mlua::Result<u32> {
     u32::try_from(value).map_err(|_| runtime_error(format!("{what} out of bounds")))
+}
+
+/// The message a Rust-side failure must carry into Lua: the plain runtime
+/// message, never mlua's `runtime error: ` Display prefix (upstream raises
+/// bare strings through `nlua_error`).
+fn error_message(error: &mlua::Error) -> String {
+    match error {
+        mlua::Error::RuntimeError(message) => message.clone(),
+        mlua::Error::CallbackError { cause, .. } => error_message(cause),
+        error => error.to_string(),
+    }
+}
+
+/// Failure protocol for the string-error shims: `(false, message)` instead of
+/// `Err`, because mlua pushes every `Err` a callback returns as
+/// `WrappedFailure` userdata, which the `exec_lua` harness rejects with
+/// "cannot be serialized over RPC". The Lua `userdata_error_shim` wrapper
+/// re-raises the message as a string.
+fn failure_values(lua: &Lua, error: &mlua::Error) -> mlua::Result<MultiValue> {
+    Ok(MultiValue::from_iter([
+        Value::Boolean(false),
+        Value::String(lua.create_string(error_message(error))?),
+    ]))
+}
+
+fn success_values(values: MultiValue) -> MultiValue {
+    std::iter::once(Value::Boolean(true))
+        .chain(values)
+        .collect()
+}
+
+/// Flag-protocol combinator for `add_method` closures: converts the closure's
+/// `Err` (and argument-conversion errors) into `(false, message)` values so
+/// the metatable's string-error wrapper can raise them.
+fn string_errors<T, A, R, M>(method: M) -> impl Fn(&Lua, &T, MultiValue) -> mlua::Result<MultiValue>
+where
+    A: FromLuaMulti,
+    R: IntoLuaMulti,
+    M: Fn(&Lua, &T, A) -> mlua::Result<R> + 'static,
+{
+    move |lua, this, args| match A::from_lua_multi(args, lua)
+        .and_then(|args| method(lua, this, args))
+    {
+        Ok(result) => result.into_lua_multi(lua).map(success_values),
+        Err(error) => failure_values(lua, &error),
+    }
+}
+
+/// [`string_errors`] for `add_method_mut` closures.
+fn string_errors_mut<T, A, R, M>(
+    method: M,
+) -> impl Fn(&Lua, &mut T, MultiValue) -> mlua::Result<MultiValue>
+where
+    A: FromLuaMulti,
+    R: IntoLuaMulti,
+    M: Fn(&Lua, &mut T, A) -> mlua::Result<R> + 'static,
+{
+    move |lua, this, args| match A::from_lua_multi(args, lua)
+        .and_then(|args| method(lua, this, args))
+    {
+        Ok(result) => result.into_lua_multi(lua).map(success_values),
+        Err(error) => failure_values(lua, &error),
+    }
+}
+
+/// A plain `vim`-table function that signals failure as `(false, message)`
+/// and passes through the `userdata_error_shim` wrapper, so failures reach
+/// `pcall` as strings and returned userdata arrives with its metatable
+/// rewired.
+fn string_error_function<A, R, M>(lua: &Lua, function: M) -> mlua::Result<Function>
+where
+    A: FromLuaMulti,
+    R: IntoLuaMulti,
+    M: Fn(&Lua, A) -> mlua::Result<R> + 'static,
+{
+    let native = lua.create_function(move |lua, args: MultiValue| {
+        match A::from_lua_multi(args, lua).and_then(|args| function(lua, args)) {
+            Ok(result) => result.into_lua_multi(lua).map(success_values),
+            Err(error) => failure_values(lua, &error),
+        }
+    })?;
+    crate::vim::userdata_error_shim(lua)?.call(native)
 }
 
 fn point(row: i64, column: i64) -> mlua::Result<Point> {
@@ -184,111 +266,119 @@ impl NodeHandle {
 fn add_logging_methods<M: UserDataMethods<ParserHandle>>(methods: &mut M) {
     methods.add_method_mut(
         "_set_logger",
-        |_, this, (lex, parse, callback): (bool, bool, Function)| {
-            let scheduler = this.scheduler.clone();
-            let callback_for_log = callback.clone();
-            let error = this.logger_error.clone();
-            this.parser.set_logger(Some(Box::new(move |kind, message| {
-                let enabled = match kind {
-                    LogType::Lex => lex,
-                    LogType::Parse => parse,
-                };
-                if !enabled {
-                    return;
-                }
-                let callback = callback_for_log.clone();
-                let kind = match kind {
-                    LogType::Lex => "lex",
-                    LogType::Parse => "parse",
-                };
-                let message = message.to_owned();
-                if let Err(schedule_error) = scheduler
-                    .schedule_deferred(Box::new(move || callback.call::<()>((kind, message))))
-                {
-                    *error.borrow_mut() = Some(format!(
-                        "treesitter logger callback scheduling failed: {schedule_error}"
-                    ));
-                }
-            })));
-            this.logger = Some(callback);
-            Ok(())
-        },
+        string_errors_mut(
+            |_, this: &mut ParserHandle, (lex, parse, callback): (bool, bool, Function)| {
+                let scheduler = this.scheduler.clone();
+                let callback_for_log = callback.clone();
+                let error = this.logger_error.clone();
+                this.parser.set_logger(Some(Box::new(move |kind, message| {
+                    let enabled = match kind {
+                        LogType::Lex => lex,
+                        LogType::Parse => parse,
+                    };
+                    if !enabled {
+                        return;
+                    }
+                    let callback = callback_for_log.clone();
+                    let kind = match kind {
+                        LogType::Lex => "lex",
+                        LogType::Parse => "parse",
+                    };
+                    let message = message.to_owned();
+                    if let Err(schedule_error) = scheduler
+                        .schedule_deferred(Box::new(move || callback.call::<()>((kind, message))))
+                    {
+                        *error.borrow_mut() = Some(format!(
+                            "treesitter logger callback scheduling failed: {schedule_error}"
+                        ));
+                    }
+                })));
+                this.logger = Some(callback);
+                Ok(())
+            },
+        ),
     );
-    methods.add_method("_logger", |_, this, ()| Ok(this.logger.clone()));
+    methods.add_method(
+        "_logger",
+        string_errors(|_, this: &ParserHandle, ()| Ok(this.logger.clone())),
+    );
 }
 
 impl UserData for ParserHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(MetaMethod::ToString, |_, _, ()| Ok("<parser>"));
-        methods.add_method_mut("reset", |_, this, ()| {
-            this.parser.reset();
-            Ok(())
-        });
-        methods.add_method_mut("set_included_ranges", |_, this, values: Table| {
-            let ranges = values
-                .sequence_values::<Value>()
-                .map(|value| value.and_then(range_from_value))
-                .collect::<mlua::Result<Vec<_>>>()?;
-            this.parser
-                .set_included_ranges(&ranges)
-                .map_err(|error| runtime_error(error.to_string()))
-        });
+        methods.add_method_mut(
+            "reset",
+            string_errors_mut(|_, this: &mut ParserHandle, ()| {
+                this.parser.reset();
+                Ok(())
+            }),
+        );
+        methods.add_method_mut(
+            "set_included_ranges",
+            string_errors_mut(|_, this: &mut ParserHandle, values: Table| {
+                let ranges = values
+                    .sequence_values::<Value>()
+                    .map(|value| value.and_then(range_from_value))
+                    .collect::<mlua::Result<Vec<_>>>()?;
+                this.parser
+                    .set_included_ranges(&ranges)
+                    .map_err(|error| runtime_error(error.to_string()))
+            }),
+        );
         methods.add_method(
             "included_ranges",
-            |lua, this, include_bytes: Option<bool>| {
+            string_errors(|lua, this: &ParserHandle, include_bytes: Option<bool>| {
                 ranges_table(
                     lua,
                     this.parser.included_ranges(),
                     include_bytes.unwrap_or(false),
                 )
-            },
+            }),
         );
-        methods.add_method_mut(
-            "parse",
-            |lua, this, (old, input, include_bytes, timeout): (Option<AnyUserData>, Value, Option<bool>, Option<u64>)| {
-                let bytes = match input {
-                    Value::String(string) => string.as_bytes().to_vec(),
-                    Value::Integer(_) | Value::Number(_) => {
-                        return Err(runtime_error("expected either string or buffer handle; buffer parsing is unavailable"));
-                    }
-                    _ => return Err(runtime_error("expected either string or buffer handle")),
-                };
-                let old_tree = old
-                    .as_ref()
-                    .map(AnyUserData::borrow::<TreeHandle>)
-                    .transpose()?;
-                let old_tree_ref = old_tree.as_ref().map(|tree| &tree.0.tree);
-                let timeout = timeout.unwrap_or(0);
-                let parsed = if timeout == 0 {
-                    this.parser.parse(&bytes, old_tree_ref)
-                } else {
-                    let started = Instant::now();
-                    let deadline = Duration::from_nanos(timeout);
-                    let length = bytes.len();
-                    let mut input = |offset: usize, _: Point| {
-                        if offset < length { &bytes[offset..] } else { &[] }
-                    };
-                    let mut progress = parse_deadline_callback(started, deadline);
-                    let options = ParseOptions::new().progress_callback(&mut progress);
-                    this.parser.parse_with_options(&mut input, old_tree_ref, Some(options))
+        methods.add_method_mut("parse", string_errors_mut(|lua, this: &mut ParserHandle, (old, input, include_bytes, timeout): (Option<AnyUserData>, Value, Option<bool>, Option<u64>)| {
+            let bytes = match input {
+                Value::String(string) => string.as_bytes().to_vec(),
+                Value::Integer(_) | Value::Number(_) => {
+                    return Err(runtime_error("expected either string or buffer handle; buffer parsing is unavailable"));
                 }
-                .ok_or_else(|| runtime_error("Language was unset, has an incompatible ABI, or parsing timed out."))?;
-                if let Some(message) = this.logger_error.borrow_mut().take() {
-                    return Err(runtime_error(message));
-                }
-                let changed = if let Some(old_tree) = old_tree.as_ref() {
-                    old_tree.0.tree.changed_ranges(&parsed).collect::<Vec<_>>()
-                } else {
-                    parsed.included_ranges()
+                _ => return Err(runtime_error("expected either string or buffer handle")),
+            };
+            let old_tree = old
+                .as_ref()
+                .map(AnyUserData::borrow::<TreeHandle>)
+                .transpose()?;
+            let old_tree_ref = old_tree.as_ref().map(|tree| &tree.0.tree);
+            let timeout = timeout.unwrap_or(0);
+            let parsed = if timeout == 0 {
+                this.parser.parse(&bytes, old_tree_ref)
+            } else {
+                let started = Instant::now();
+                let deadline = Duration::from_nanos(timeout);
+                let length = bytes.len();
+                let mut input = |offset: usize, _: Point| {
+                    if offset < length { &bytes[offset..] } else { &[] }
                 };
-                let tree = TreeHandle(Arc::new(TreeData {
-                    tree: parsed,
-                    source: Arc::from(bytes),
-                    language: this.language.clone(),
-                }));
-                Ok((tree, ranges_table(lua, changed, include_bytes.unwrap_or(false))?))
-            },
-        );
+                let mut progress = parse_deadline_callback(started, deadline);
+                let options = ParseOptions::new().progress_callback(&mut progress);
+                this.parser.parse_with_options(&mut input, old_tree_ref, Some(options))
+            }
+            .ok_or_else(|| runtime_error("Language was unset, has an incompatible ABI, or parsing timed out."))?;
+            if let Some(message) = this.logger_error.borrow_mut().take() {
+                return Err(runtime_error(message));
+            }
+            let changed = if let Some(old_tree) = old_tree.as_ref() {
+                old_tree.0.tree.changed_ranges(&parsed).collect::<Vec<_>>()
+            } else {
+                parsed.included_ranges()
+            };
+            let tree = TreeHandle(Arc::new(TreeData {
+                tree: parsed,
+                source: Arc::from(bytes),
+                language: this.language.clone(),
+            }));
+            Ok((tree, ranges_table(lua, changed, include_bytes.unwrap_or(false))?))
+        }));
         add_logging_methods(methods);
     }
 }
@@ -300,51 +390,60 @@ impl UserData for TreeHandle {
             let other = other.borrow::<TreeHandle>()?;
             Ok(Arc::ptr_eq(&this.0, &other.0))
         });
-        methods.add_method("copy", |_, this, ()| {
-            Ok(TreeHandle(Arc::new(TreeData {
-                tree: this.0.tree.clone(),
-                source: this.0.source.clone(),
-                language: this.0.language.clone(),
-            })))
-        });
-        methods.add_method("root", |_, this, ()| {
-            Ok(NodeHandle {
-                tree: this.clone(),
-                path: Vec::new(),
-            })
-        });
+        methods.add_method(
+            "copy",
+            string_errors(|_, this: &TreeHandle, ()| {
+                Ok(TreeHandle(Arc::new(TreeData {
+                    tree: this.0.tree.clone(),
+                    source: this.0.source.clone(),
+                    language: this.0.language.clone(),
+                })))
+            }),
+        );
+        methods.add_method(
+            "root",
+            string_errors(|_, this: &TreeHandle, ()| {
+                Ok(NodeHandle {
+                    tree: this.clone(),
+                    path: Vec::new(),
+                })
+            }),
+        );
         methods.add_method(
             "included_ranges",
-            |lua, this, include_bytes: Option<bool>| {
+            string_errors(|lua, this: &TreeHandle, include_bytes: Option<bool>| {
                 ranges_table(
                     lua,
                     this.0.tree.included_ranges(),
                     include_bytes.unwrap_or(false),
                 )
-            },
+            }),
         );
-        methods.add_method("edit", |_, this, args: Variadic<i64>| {
-            if args.len() != 9 {
-                return Err(runtime_error("not enough args to tree:edit()"));
-            }
-            let mut tree = this.0.tree.clone();
-            tree.edit(&InputEdit {
-                start_byte: usize::try_from(args[0])
-                    .map_err(|_| runtime_error("start byte out of bounds"))?,
-                old_end_byte: usize::try_from(args[1])
-                    .map_err(|_| runtime_error("old end byte out of bounds"))?,
-                new_end_byte: usize::try_from(args[2])
-                    .map_err(|_| runtime_error("new end byte out of bounds"))?,
-                start_position: point(args[3], args[4])?,
-                old_end_position: point(args[5], args[6])?,
-                new_end_position: point(args[7], args[8])?,
-            });
-            Ok(TreeHandle(Arc::new(TreeData {
-                tree,
-                source: this.0.source.clone(),
-                language: this.0.language.clone(),
-            })))
-        });
+        methods.add_method(
+            "edit",
+            string_errors(|_, this: &TreeHandle, args: Variadic<i64>| {
+                if args.len() != 9 {
+                    return Err(runtime_error("not enough args to tree:edit()"));
+                }
+                let mut tree = this.0.tree.clone();
+                tree.edit(&InputEdit {
+                    start_byte: usize::try_from(args[0])
+                        .map_err(|_| runtime_error("start byte out of bounds"))?,
+                    old_end_byte: usize::try_from(args[1])
+                        .map_err(|_| runtime_error("old end byte out of bounds"))?,
+                    new_end_byte: usize::try_from(args[2])
+                        .map_err(|_| runtime_error("new end byte out of bounds"))?,
+                    start_position: point(args[3], args[4])?,
+                    old_end_position: point(args[5], args[6])?,
+                    new_end_position: point(args[7], args[8])?,
+                });
+                Ok(TreeHandle(Arc::new(TreeData {
+                    tree,
+                    source: this.0.source.clone(),
+                    language: this.0.language.clone(),
+                })))
+            }),
+        );
     }
 }
 
@@ -352,128 +451,176 @@ fn push_optional_node(value: Option<NodeHandle>) -> Option<NodeHandle> {
     value
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "node navigation methods form one ordered UserData registration group; splitting would scatter the traversal API"
+)]
 fn add_navigation_methods<M: UserDataMethods<NodeHandle>>(methods: &mut M) {
-    methods.add_method("child", |_, this, index: i64| {
-        let index = checked_u32(index, "child index")?;
-        let node = this.resolve()?.child(index);
-        Ok(push_optional_node(this.related(node)?))
-    });
-    methods.add_method("named_child", |_, this, index: i64| {
-        let index = checked_u32(index, "child index")?;
-        let node = this.resolve()?.named_child(index);
-        Ok(push_optional_node(this.related(node)?))
-    });
-    methods.add_method("parent", |_, this, ()| {
-        let node = this.resolve()?.parent();
-        Ok(push_optional_node(this.related(node)?))
-    });
-    methods.add_method("next_sibling", |_, this, ()| {
-        let node = this.resolve()?.next_sibling();
-        Ok(push_optional_node(this.related(node)?))
-    });
-    methods.add_method("prev_sibling", |_, this, ()| {
-        let node = this.resolve()?.prev_sibling();
-        Ok(push_optional_node(this.related(node)?))
-    });
-    methods.add_method("next_named_sibling", |_, this, ()| {
-        let node = this.resolve()?.next_named_sibling();
-        Ok(push_optional_node(this.related(node)?))
-    });
-    methods.add_method("prev_named_sibling", |_, this, ()| {
-        let node = this.resolve()?.prev_named_sibling();
-        Ok(push_optional_node(this.related(node)?))
-    });
+    methods.add_method(
+        "child",
+        string_errors(|_, this: &NodeHandle, index: i64| {
+            let index = checked_u32(index, "child index")?;
+            let node = this.resolve()?.child(index);
+            Ok(push_optional_node(this.related(node)?))
+        }),
+    );
+    methods.add_method(
+        "named_child",
+        string_errors(|_, this: &NodeHandle, index: i64| {
+            let index = checked_u32(index, "child index")?;
+            let node = this.resolve()?.named_child(index);
+            Ok(push_optional_node(this.related(node)?))
+        }),
+    );
+    methods.add_method(
+        "parent",
+        string_errors(|_, this: &NodeHandle, ()| {
+            let node = this.resolve()?.parent();
+            Ok(push_optional_node(this.related(node)?))
+        }),
+    );
+    methods.add_method(
+        "next_sibling",
+        string_errors(|_, this: &NodeHandle, ()| {
+            let node = this.resolve()?.next_sibling();
+            Ok(push_optional_node(this.related(node)?))
+        }),
+    );
+    methods.add_method(
+        "prev_sibling",
+        string_errors(|_, this: &NodeHandle, ()| {
+            let node = this.resolve()?.prev_sibling();
+            Ok(push_optional_node(this.related(node)?))
+        }),
+    );
+    methods.add_method(
+        "next_named_sibling",
+        string_errors(|_, this: &NodeHandle, ()| {
+            let node = this.resolve()?.next_named_sibling();
+            Ok(push_optional_node(this.related(node)?))
+        }),
+    );
+    methods.add_method(
+        "prev_named_sibling",
+        string_errors(|_, this: &NodeHandle, ()| {
+            let node = this.resolve()?.prev_named_sibling();
+            Ok(push_optional_node(this.related(node)?))
+        }),
+    );
     methods.add_method(
         "descendant_for_range",
-        |_, this, (sr, sc, er, ec): (i64, i64, i64, i64)| {
-            let node = this
-                .resolve()?
-                .descendant_for_point_range(point(sr, sc)?, point(er, ec)?);
-            Ok(push_optional_node(this.related(node)?))
-        },
+        string_errors(
+            |_, this: &NodeHandle, (sr, sc, er, ec): (i64, i64, i64, i64)| {
+                let node = this
+                    .resolve()?
+                    .descendant_for_point_range(point(sr, sc)?, point(er, ec)?);
+                Ok(push_optional_node(this.related(node)?))
+            },
+        ),
     );
     methods.add_method(
         "named_descendant_for_range",
-        |_, this, (sr, sc, er, ec): (i64, i64, i64, i64)| {
-            let node = this
-                .resolve()?
-                .named_descendant_for_point_range(point(sr, sc)?, point(er, ec)?);
-            Ok(push_optional_node(this.related(node)?))
-        },
+        string_errors(
+            |_, this: &NodeHandle, (sr, sc, er, ec): (i64, i64, i64, i64)| {
+                let node = this
+                    .resolve()?
+                    .named_descendant_for_point_range(point(sr, sc)?, point(er, ec)?);
+                Ok(push_optional_node(this.related(node)?))
+            },
+        ),
     );
     methods.add_method(
         "child_with_descendant",
-        |_, this, descendant: AnyUserData| {
+        string_errors(|_, this: &NodeHandle, descendant: AnyUserData| {
             let descendant = descendant.borrow::<NodeHandle>()?;
             if !Arc::ptr_eq(&this.tree.0, &descendant.tree.0) {
                 return Ok(None);
             }
             let node = this.resolve()?.child_with_descendant(descendant.resolve()?);
             this.related(node)
-        },
+        }),
     );
-    methods.add_method("field", |_, this, name: String| {
-        let node = this.resolve()?;
-        let mut result = Vec::new();
-        for index in 0..node.child_count() {
-            let index =
-                u32::try_from(index).map_err(|_| runtime_error("child index out of bounds"))?;
-            if node.field_name_for_child(index) == Some(name.as_str())
-                && let Some(child) = node.child(index)
-            {
-                result.push(NodeHandle::from_node(this.tree.clone(), child)?);
+    methods.add_method(
+        "field",
+        string_errors(|_, this: &NodeHandle, name: String| {
+            let node = this.resolve()?;
+            let mut result = Vec::new();
+            for index in 0..node.child_count() {
+                let index =
+                    u32::try_from(index).map_err(|_| runtime_error("child index out of bounds"))?;
+                if node.field_name_for_child(index) == Some(name.as_str())
+                    && let Some(child) = node.child(index)
+                {
+                    result.push(NodeHandle::from_node(this.tree.clone(), child)?);
+                }
             }
-        }
-        Ok(result)
-    });
-    methods.add_method("named_children", |_, this, ()| {
-        let node = this.resolve()?;
-        let mut result = Vec::new();
-        for index in 0..node.named_child_count() {
-            let index =
-                u32::try_from(index).map_err(|_| runtime_error("child index out of bounds"))?;
-            if let Some(child) = node.named_child(index) {
-                result.push(NodeHandle::from_node(this.tree.clone(), child)?);
+            Ok(result)
+        }),
+    );
+    methods.add_method(
+        "named_children",
+        string_errors(|_, this: &NodeHandle, ()| {
+            let node = this.resolve()?;
+            let mut result = Vec::new();
+            for index in 0..node.named_child_count() {
+                let index =
+                    u32::try_from(index).map_err(|_| runtime_error("child index out of bounds"))?;
+                if let Some(child) = node.named_child(index) {
+                    result.push(NodeHandle::from_node(this.tree.clone(), child)?);
+                }
             }
-        }
-        Ok(result)
-    });
+            Ok(result)
+        }),
+    );
 }
 
 fn add_geometry_methods<M: UserDataMethods<NodeHandle>>(methods: &mut M) {
-    methods.add_method("range", |lua, this, include_bytes: Option<bool>| {
-        let range = this.resolve()?.range();
-        if include_bytes.unwrap_or(false) {
-            Ok(MultiValue::from_vec(vec![
-                range.start_point.row.into_lua(lua)?,
-                range.start_point.column.into_lua(lua)?,
-                range.start_byte.into_lua(lua)?,
-                range.end_point.row.into_lua(lua)?,
-                range.end_point.column.into_lua(lua)?,
-                range.end_byte.into_lua(lua)?,
-            ]))
-        } else {
-            Ok(MultiValue::from_vec(vec![
-                range.start_point.row.into_lua(lua)?,
-                range.start_point.column.into_lua(lua)?,
-                range.end_point.row.into_lua(lua)?,
-                range.end_point.column.into_lua(lua)?,
-            ]))
-        }
-    });
-    methods.add_method("start", |_, this, ()| {
-        let n = this.resolve()?;
-        let p = n.start_position();
-        Ok((p.row, p.column, n.start_byte()))
-    });
-    methods.add_method("end_", |_, this, ()| {
-        let n = this.resolve()?;
-        let p = n.end_position();
-        Ok((p.row, p.column, n.end_byte()))
-    });
+    methods.add_method(
+        "range",
+        string_errors(|lua, this: &NodeHandle, include_bytes: Option<bool>| {
+            let range = this.resolve()?.range();
+            if include_bytes.unwrap_or(false) {
+                Ok(MultiValue::from_vec(vec![
+                    range.start_point.row.into_lua(lua)?,
+                    range.start_point.column.into_lua(lua)?,
+                    range.start_byte.into_lua(lua)?,
+                    range.end_point.row.into_lua(lua)?,
+                    range.end_point.column.into_lua(lua)?,
+                    range.end_byte.into_lua(lua)?,
+                ]))
+            } else {
+                Ok(MultiValue::from_vec(vec![
+                    range.start_point.row.into_lua(lua)?,
+                    range.start_point.column.into_lua(lua)?,
+                    range.end_point.row.into_lua(lua)?,
+                    range.end_point.column.into_lua(lua)?,
+                ]))
+            }
+        }),
+    );
+    methods.add_method(
+        "start",
+        string_errors(|_, this: &NodeHandle, ()| {
+            let n = this.resolve()?;
+            let p = n.start_position();
+            Ok((p.row, p.column, n.start_byte()))
+        }),
+    );
+    methods.add_method(
+        "end_",
+        string_errors(|_, this: &NodeHandle, ()| {
+            let n = this.resolve()?;
+            let p = n.end_position();
+            Ok((p.row, p.column, n.end_byte()))
+        }),
+    );
 }
 
 impl UserData for NodeHandle {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "node methods must register together on one userdata builder; the closures share the resolve/related helpers"
+    )]
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(MetaMethod::ToString, |_, this, ()| {
             Ok(format!("<node {}>", this.resolve()?.kind()))
@@ -485,175 +632,246 @@ impl UserData for NodeHandle {
         methods.add_meta_method(MetaMethod::Len, |_, this, ()| {
             Ok(this.resolve()?.child_count())
         });
-        methods.add_method("id", |lua, this, ()| {
-            lua.create_string(this.resolve()?.id().to_ne_bytes())
-        });
+        methods.add_method(
+            "id",
+            string_errors(|lua, this: &NodeHandle, ()| {
+                lua.create_string(this.resolve()?.id().to_ne_bytes())
+            }),
+        );
         add_geometry_methods(methods);
-        methods.add_method("type", |_, this, ()| Ok(this.resolve()?.kind().to_owned()));
-        methods.add_method("symbol", |_, this, ()| Ok(this.resolve()?.kind_id()));
-        methods.add_method("named", |_, this, ()| Ok(this.resolve()?.is_named()));
-        methods.add_method("missing", |_, this, ()| Ok(this.resolve()?.is_missing()));
-        methods.add_method("extra", |_, this, ()| Ok(this.resolve()?.is_extra()));
-        methods.add_method("has_changes", |_, this, ()| {
-            Ok(this.resolve()?.has_changes())
-        });
-        methods.add_method("has_error", |_, this, ()| Ok(this.resolve()?.has_error()));
-        methods.add_method("sexpr", |_, this, ()| Ok(this.resolve()?.to_sexp()));
-        methods.add_method("child_count", |_, this, ()| {
-            Ok(this.resolve()?.child_count())
-        });
-        methods.add_method("named_child_count", |_, this, ()| {
-            Ok(this.resolve()?.named_child_count())
-        });
-        methods.add_method("byte_length", |_, this, ()| {
-            let n = this.resolve()?;
-            Ok(n.end_byte() - n.start_byte())
-        });
-        methods.add_method("tree", |_, this, ()| Ok(this.tree.clone()));
-        methods.add_method("root", |_, this, ()| {
-            Ok(NodeHandle {
-                tree: this.tree.clone(),
-                path: Vec::new(),
-            })
-        });
-        methods.add_method("equal", |_, this, other: AnyUserData| {
-            let other = other.borrow::<NodeHandle>()?;
-            Ok(Arc::ptr_eq(&this.tree.0, &other.tree.0) && this.path == other.path)
-        });
+        methods.add_method(
+            "type",
+            string_errors(|_, this: &NodeHandle, ()| Ok(this.resolve()?.kind().to_owned())),
+        );
+        methods.add_method(
+            "symbol",
+            string_errors(|_, this: &NodeHandle, ()| Ok(this.resolve()?.kind_id())),
+        );
+        methods.add_method(
+            "named",
+            string_errors(|_, this: &NodeHandle, ()| Ok(this.resolve()?.is_named())),
+        );
+        methods.add_method(
+            "missing",
+            string_errors(|_, this: &NodeHandle, ()| Ok(this.resolve()?.is_missing())),
+        );
+        methods.add_method(
+            "extra",
+            string_errors(|_, this: &NodeHandle, ()| Ok(this.resolve()?.is_extra())),
+        );
+        methods.add_method(
+            "has_changes",
+            string_errors(|_, this: &NodeHandle, ()| Ok(this.resolve()?.has_changes())),
+        );
+        methods.add_method(
+            "has_error",
+            string_errors(|_, this: &NodeHandle, ()| Ok(this.resolve()?.has_error())),
+        );
+        methods.add_method(
+            "sexpr",
+            string_errors(|_, this: &NodeHandle, ()| Ok(this.resolve()?.to_sexp())),
+        );
+        methods.add_method(
+            "child_count",
+            string_errors(|_, this: &NodeHandle, ()| Ok(this.resolve()?.child_count())),
+        );
+        methods.add_method(
+            "named_child_count",
+            string_errors(|_, this: &NodeHandle, ()| Ok(this.resolve()?.named_child_count())),
+        );
+        methods.add_method(
+            "byte_length",
+            string_errors(|_, this: &NodeHandle, ()| {
+                let n = this.resolve()?;
+                Ok(n.end_byte() - n.start_byte())
+            }),
+        );
+        methods.add_method(
+            "tree",
+            string_errors(|_, this: &NodeHandle, ()| Ok(this.tree.clone())),
+        );
+        methods.add_method(
+            "root",
+            string_errors(|_, this: &NodeHandle, ()| {
+                Ok(NodeHandle {
+                    tree: this.tree.clone(),
+                    path: Vec::new(),
+                })
+            }),
+        );
+        methods.add_method(
+            "equal",
+            string_errors(|_, this: &NodeHandle, other: AnyUserData| {
+                let other = other.borrow::<NodeHandle>()?;
+                Ok(Arc::ptr_eq(&this.tree.0, &other.tree.0) && this.path == other.path)
+            }),
+        );
         add_navigation_methods(methods);
-        methods.add_method("iter_children", |lua, this, ()| {
-            let source = this.clone();
-            let index = Rc::new(Cell::new(0u32));
-            lua.create_function_mut(move |_, ()| {
-                let current = index.get();
-                let node = source.resolve()?;
-                let Some(child) = node.child(current) else {
-                    return Ok((None, None));
-                };
-                index.set(current.saturating_add(1));
-                let field = node.field_name_for_child(current).map(str::to_owned);
-                Ok((
-                    Some(NodeHandle::from_node(source.tree.clone(), child)?),
-                    field,
-                ))
-            })
-        });
-        methods.add_method("__has_ancestor", |_, this, predicate: Table| {
-            let types = predicate
-                .sequence_values::<String>()
-                .skip(2)
-                .collect::<mlua::Result<HashSet<_>>>()?;
-            let mut node = this.resolve()?;
-            while let Some(parent) = node.parent() {
-                if types.contains(parent.kind()) {
-                    return Ok(true);
+        methods.add_method(
+            "iter_children",
+            string_errors(|lua, this: &NodeHandle, ()| {
+                let source = this.clone();
+                let index = Rc::new(Cell::new(0u32));
+                string_error_function(lua, move |_, ()| {
+                    let current = index.get();
+                    let node = source.resolve()?;
+                    let Some(child) = node.child(current) else {
+                        return Ok((None, None));
+                    };
+                    index.set(current.saturating_add(1));
+                    let field = node.field_name_for_child(current).map(str::to_owned);
+                    Ok((
+                        Some(NodeHandle::from_node(source.tree.clone(), child)?),
+                        field,
+                    ))
+                })
+            }),
+        );
+        methods.add_method(
+            "__has_ancestor",
+            string_errors(|_, this: &NodeHandle, predicate: Table| {
+                let types = predicate
+                    .sequence_values::<String>()
+                    .skip(2)
+                    .collect::<mlua::Result<HashSet<_>>>()?;
+                let mut node = this.resolve()?;
+                while let Some(parent) = node.parent() {
+                    if types.contains(parent.kind()) {
+                        return Ok(true);
+                    }
+                    node = parent;
                 }
-                node = parent;
-            }
-            Ok(false)
-        });
+                Ok(false)
+            }),
+        );
     }
 }
 
 impl UserData for QueryHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(MetaMethod::ToString, |_, _, ()| Ok("<query>"));
-        methods.add_method_mut("disable_capture", |_, this, name: String| {
-            this.query.disable_capture(&name);
-            Ok(())
-        });
-        methods.add_method_mut("disable_pattern", |_, this, index: i64| {
-            let index =
-                usize::try_from(index).map_err(|_| runtime_error("pattern index out of bounds"))?;
-            if index == 0 || index > this.query.pattern_count() {
-                return Err(runtime_error("pattern index out of bounds"));
-            }
-            this.query.disable_pattern(index - 1);
-            Ok(())
-        });
-        methods.add_method("inspect", |lua, this, ()| {
-            let result = lua.create_table()?;
-            let captures = lua.create_table()?;
-            for (index, name) in this.query.capture_names().iter().enumerate() {
-                captures.raw_set(index + 1, *name)?;
-            }
-            result.set("captures", captures)?;
-            let patterns = lua.create_table()?;
-            for index in 0..this.query.pattern_count() {
-                let predicates = lua.create_table()?;
-                for (pred_index, predicate) in
-                    this.query.general_predicates(index).iter().enumerate()
-                {
-                    let values = lua.create_table()?;
-                    values.raw_set(1, predicate.operator.as_ref())?;
-                    for (arg_index, arg) in predicate.args.iter().enumerate() {
-                        match arg {
-                            tree_sitter::QueryPredicateArg::Capture(id) => values.raw_set(
-                                arg_index + 2,
-                                usize::try_from(*id)
-                                    .map_err(|_| runtime_error("capture id out of bounds"))?
-                                    + 1,
-                            )?,
-                            tree_sitter::QueryPredicateArg::String(value) => {
-                                values.raw_set(arg_index + 2, value.as_ref())?;
+        methods.add_method_mut(
+            "disable_capture",
+            string_errors_mut(|_, this: &mut QueryHandle, name: String| {
+                this.query.disable_capture(&name);
+                Ok(())
+            }),
+        );
+        methods.add_method_mut(
+            "disable_pattern",
+            string_errors_mut(|_, this: &mut QueryHandle, index: i64| {
+                let index = usize::try_from(index)
+                    .map_err(|_| runtime_error("pattern index out of bounds"))?;
+                if index == 0 || index > this.query.pattern_count() {
+                    return Err(runtime_error("pattern index out of bounds"));
+                }
+                this.query.disable_pattern(index - 1);
+                Ok(())
+            }),
+        );
+        methods.add_method(
+            "inspect",
+            string_errors(|lua, this: &QueryHandle, ()| {
+                let result = lua.create_table()?;
+                let captures = lua.create_table()?;
+                for (index, name) in this.query.capture_names().iter().enumerate() {
+                    captures.raw_set(index + 1, *name)?;
+                }
+                result.set("captures", captures)?;
+                let patterns = lua.create_table()?;
+                for index in 0..this.query.pattern_count() {
+                    let predicates = lua.create_table()?;
+                    for (pred_index, predicate) in
+                        this.query.general_predicates(index).iter().enumerate()
+                    {
+                        let values = lua.create_table()?;
+                        values.raw_set(1, predicate.operator.as_ref())?;
+                        for (arg_index, arg) in predicate.args.iter().enumerate() {
+                            match arg {
+                                tree_sitter::QueryPredicateArg::Capture(id) => values.raw_set(
+                                    arg_index + 2,
+                                    usize::try_from(*id)
+                                        .map_err(|_| runtime_error("capture id out of bounds"))?
+                                        + 1,
+                                )?,
+                                tree_sitter::QueryPredicateArg::String(value) => {
+                                    values.raw_set(arg_index + 2, value.as_ref())?;
+                                }
                             }
                         }
+                        predicates.raw_set(pred_index + 1, values)?;
                     }
-                    predicates.raw_set(pred_index + 1, values)?;
+                    patterns.raw_set(index + 1, predicates)?;
                 }
-                patterns.raw_set(index + 1, predicates)?;
-            }
-            result.set("patterns", patterns)?;
-            Ok(result)
-        });
+                result.set("patterns", patterns)?;
+                Ok(result)
+            }),
+        );
     }
 }
 
 impl UserData for MatchHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("info", |_, this, ()| Ok((this.id, this.pattern_index + 1)));
-        methods.add_method("captures", |lua, this, ()| {
-            let result = lua.create_table()?;
-            for (capture, node) in &this.captures {
-                let index = usize::try_from(*capture)
-                    .map_err(|_| runtime_error("capture id out of bounds"))?
-                    + 1;
-                let nodes = match result.raw_get::<Value>(index)? {
-                    Value::Table(table) => table,
-                    _ => lua.create_table()?,
-                };
-                nodes.raw_set(nodes.raw_len() + 1, node.clone())?;
-                result.raw_set(index, nodes)?;
-            }
-            Ok(result)
-        });
+        methods.add_method(
+            "info",
+            string_errors(|_, this: &MatchHandle, ()| Ok((this.id, this.pattern_index + 1))),
+        );
+        methods.add_method(
+            "captures",
+            string_errors(|lua, this: &MatchHandle, ()| {
+                let result = lua.create_table()?;
+                for (capture, node) in &this.captures {
+                    let index = usize::try_from(*capture)
+                        .map_err(|_| runtime_error("capture id out of bounds"))?
+                        + 1;
+                    let nodes = match result.raw_get::<Value>(index)? {
+                        Value::Table(table) => table,
+                        _ => lua.create_table()?,
+                    };
+                    nodes.raw_set(nodes.raw_len() + 1, node.clone())?;
+                    result.raw_set(index, nodes)?;
+                }
+                Ok(result)
+            }),
+        );
     }
 }
 
 impl UserData for CursorHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method_mut("remove_match", |_, this, id: i64| {
-            this.removed.insert(checked_u32(id, "match id")?);
-            Ok(())
-        });
-        methods.add_method_mut("next_match", |_, this, ()| {
-            while let Some(value) = this.matches.get(this.next_match).cloned() {
-                this.next_match += 1;
-                if !this.removed.contains(&value.id) {
-                    return Ok(Some(value));
+        methods.add_method_mut(
+            "remove_match",
+            string_errors_mut(|_, this: &mut CursorHandle, id: i64| {
+                this.removed.insert(checked_u32(id, "match id")?);
+                Ok(())
+            }),
+        );
+        methods.add_method_mut(
+            "next_match",
+            string_errors_mut(|_, this: &mut CursorHandle, ()| {
+                while let Some(value) = this.matches.get(this.next_match).cloned() {
+                    this.next_match += 1;
+                    if !this.removed.contains(&value.id) {
+                        return Ok(Some(value));
+                    }
                 }
-            }
-            Ok(None)
-        });
-        methods.add_method_mut("next_capture", |_, this, ()| {
-            while let Some((index, node, matched)) = this.captures.get(this.next_capture).cloned() {
-                this.next_capture += 1;
-                if !this.removed.contains(&matched.id) {
-                    return Ok((Some(index + 1), Some(node), Some(matched)));
+                Ok(None)
+            }),
+        );
+        methods.add_method_mut(
+            "next_capture",
+            string_errors_mut(|_, this: &mut CursorHandle, ()| {
+                while let Some((index, node, matched)) =
+                    this.captures.get(this.next_capture).cloned()
+                {
+                    this.next_capture += 1;
+                    if !this.removed.contains(&matched.id) {
+                        return Ok((Some(index + 1), Some(node), Some(matched)));
+                    }
                 }
-            }
-            Ok((None, None, None))
-        });
+                Ok((None, None, None))
+            }),
+        );
     }
 }
 
@@ -847,7 +1065,8 @@ pub(crate) fn install(lua: &Lua, scheduler: Rc<dyn Scheduler>) -> mlua::Result<(
     let registry = languages.clone();
     vim.set(
         "_ts_add_language_from_object",
-        lua.create_function(
+        string_error_function(
+            lua,
             move |_, (path, name, symbol): (String, String, Option<String>)| {
                 if registry.borrow().contains_key(&name) {
                     return Ok(true);
@@ -874,7 +1093,7 @@ pub(crate) fn install(lua: &Lua, scheduler: Rc<dyn Scheduler>) -> mlua::Result<(
     let registry = languages.clone();
     vim.set(
         "_create_ts_parser",
-        lua.create_function(move |_, name: String| {
+        string_error_function(lua, move |_, name: String| {
             let language = registry_language(&registry, &name)?;
             let mut parser = Parser::new();
             parser.set_language(&language.language).map_err(|error| {
@@ -893,7 +1112,7 @@ pub(crate) fn install(lua: &Lua, scheduler: Rc<dyn Scheduler>) -> mlua::Result<(
     let registry = languages.clone();
     vim.set(
         "_ts_parse_query",
-        lua.create_function(move |_, (name, source): (String, String)| {
+        string_error_function(lua, move |_, (name, source): (String, String)| {
             let language = registry_language(&registry, &name)?;
             let query = Query::new(&language.language, &source)
                 .map_err(|error| runtime_error(error.to_string()))?;
@@ -907,7 +1126,7 @@ pub(crate) fn install(lua: &Lua, scheduler: Rc<dyn Scheduler>) -> mlua::Result<(
     let registry = languages.clone();
     vim.set(
         "_ts_inspect_language",
-        lua.create_function(move |lua, name: String| {
+        string_error_function(lua, move |lua, name: String| {
             let language = registry_language(&registry, &name)?;
             inspect_language(lua, &language.language)
         })?,
@@ -915,7 +1134,8 @@ pub(crate) fn install(lua: &Lua, scheduler: Rc<dyn Scheduler>) -> mlua::Result<(
 
     vim.set(
         "_create_ts_querycursor",
-        lua.create_function(
+        string_error_function(
+            lua,
             move |_, (node, query, options): (AnyUserData, AnyUserData, Option<Table>)| {
                 let node = node.borrow::<NodeHandle>()?;
                 let query = query.borrow::<QueryHandle>()?;
