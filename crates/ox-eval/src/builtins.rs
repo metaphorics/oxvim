@@ -4383,7 +4383,7 @@ fn flatten_into(
     Ok(())
 }
 
-fn deep_copy(value: &Typval) -> Result<Typval> {
+pub(crate) fn deep_copy(value: &Typval) -> Result<Typval> {
     fn copy(
         value: &Typval,
         lists: &mut HashMap<usize, ox_types::ListRef>,

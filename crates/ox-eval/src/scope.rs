@@ -91,6 +91,24 @@ impl ScopeKind {
 /// `Object`-valued rather than `Typval`-valued.
 pub type ScopeMap = Vec<(OxStr, Typval)>;
 
+/// Deep snapshot of a scope map for the write-back mirror. Containers are
+/// copied by value (cycle-aware, like `:h copy()`'s `deepcopy()`), so an
+/// in-place container mutation through an aliased read (`call add(g:l, x)`)
+/// differs from the mirror at sync time instead of hiding inside shared
+/// backing. A value too deep to copy (`E698`) falls back to a shared clone:
+/// only pathological nesting keeps the old blindness, never an error.
+#[must_use]
+pub fn snapshot_map(map: &ScopeMap) -> ScopeMap {
+    map.iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                super::builtins::deep_copy(value).unwrap_or_else(|_| value.clone()),
+            )
+        })
+        .collect()
+}
+
 /// Option namespace for `&`, `&g:`, and `&l:` forms.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum OptionScope {

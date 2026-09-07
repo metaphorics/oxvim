@@ -298,10 +298,17 @@ fn buf_write_cmd_noop_keeps_modified_and_writes_nothing() {
         .unwrap()
         .flags
         .set(crate::BufferFlags::MODIFIED, true);
-    executor.execute_line_core(&editor, "write out.txt").unwrap();
+    executor
+        .execute_line_core(&editor, "write out.txt")
+        .unwrap();
     assert_eq!(executor.scripts().io().content("out.txt"), None);
     assert!(
-        editor.editor().buffer(buffer).unwrap().flags.contains(crate::BufferFlags::MODIFIED),
+        editor
+            .editor()
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::MODIFIED),
         "a handler-owned write leaves the modified state the handler left",
     );
     assert_eq!(
@@ -336,7 +343,9 @@ fn buf_write_cmd_suppresses_pre_and_post() {
     executor
         .execute_line(&editor, "au BufWritePost * let g:post_ran = 1")
         .unwrap();
-    executor.execute_line_core(&editor, "write out.txt").unwrap();
+    executor
+        .execute_line_core(&editor, "write out.txt")
+        .unwrap();
     assert_eq!(
         executor
             .scope()
@@ -8394,7 +8403,10 @@ fn plan_abort_rules_follow_try_depth_inheritance() {
     // `buf_write` (`bufwrite.c:1861-1866`): an aborting post handler fails
     // the command while the completed file write stands.
     let result = executor.execute_line_core(&editor, "write out.txt");
-    assert!(result.is_err(), "a throwing BufWritePost must fail the write");
+    assert!(
+        result.is_err(),
+        "a throwing BufWritePost must fail the write"
+    );
     assert_eq!(
         executor.scripts().io().content("out.txt"),
         Some("hi\n".to_owned()),

@@ -9027,9 +9027,9 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
         // clear, and only when overwriting the buffer's own file, mirroring
         // the `BF_WRITE_MASK` reset.
         let overwriting = access.with_ex_editor(|editor| {
-            editor.buffer(buffer).is_ok_and(|state| {
-                state.name().to_string_lossy().as_ref() == target.as_ref()
-            })
+            editor
+                .buffer(buffer)
+                .is_ok_and(|state| state.name().to_string_lossy().as_ref() == target.as_ref())
         });
         if overwriting {
             access.with_ex_editor(|editor| {
@@ -15516,7 +15516,9 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
     let global_version = editor.gvars_version();
     if scope.synced.get(ScopeKind::Global) != global_version {
         scope.global = dict_to_scope(editor.gvars());
-        scope.global_mirror.borrow_mut().clone_from(&scope.global);
+        // By value, not shared: an in-place container mutation through an
+        // aliased read must differ from the mirror at write-back time.
+        *scope.global_mirror.borrow_mut() = ox_eval::scope::snapshot_map(&scope.global);
         scope.synced.set(ScopeKind::Global, global_version);
         scope.synced.clear_dirty(ScopeKind::Global);
     }
@@ -15764,7 +15766,7 @@ pub(crate) fn sync_scope_into_editor(editor: &mut Editor, scope: &Scope) -> Resu
                 live.0.retain(|live_key| live_key.0 != *key);
             }
         }
-        scope.global_mirror.borrow_mut().clone_from(&scope.global);
+        *scope.global_mirror.borrow_mut() = ox_eval::scope::snapshot_map(&scope.global);
         scope.synced.set(ScopeKind::Global, editor.gvars_version());
         scope.synced.clear_dirty(ScopeKind::Global);
     }
