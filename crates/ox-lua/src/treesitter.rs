@@ -1057,6 +1057,96 @@ fn collect_query_cursor(
     })
 }
 
+/// Walks every capture `query` produces over `node`'s subtree and writes it
+/// as a persistent (non-ephemeral) highlight extmark through
+/// `vim.api.nvim_buf_set_extmark`, so the result lands in the buffer's real
+/// extmark store — the only source `crates/ox-ui/src/compositor.rs`
+/// `apply_extmark_highlights` paints from. Upstream drives this from
+/// ephemeral, redraw-triggered `on_range`/`on_win` decoration-provider
+/// callbacks (`runtime/lua/vim/treesitter/highlighter.lua:343-503`,
+/// `469-479` for the `nvim_buf_set_extmark(..., ephemeral = true, ...)`
+/// call); this port's compositor never dispatches decoration providers
+/// during redraw (`nvim_set_decoration_provider`,
+/// `crates/ox-api/src/extmark.rs:764-786`, stores callbacks but nothing
+/// invokes them), so this emits real, painted extmarks instead of relying
+/// on that path.
+///
+/// Group naming mirrors `TSHighlighterQuery:get_hl_from_capture`
+/// (`highlighter.lua:38-49`): a capture named `_foo` (or empty) carries no
+/// highlight; otherwise the group is `"@" .. name` (the bare capture name).
+/// Oxvim's `HlState::group_id` (`crates/ox-ui/src/hl.rs:394`) is an exact-match
+/// lookup with no dotted-suffix fallback, and the default `colors/vim.lua`
+/// registers only bare `@name` links (not `@name.lang`), so emitting the bare
+/// name is the form that resolves to color here.
+/// Priority mirrors the same file's `on_range_impl` (`highlighter.lua:456`:
+/// `local priority = (tonumber(metadata.priority) or metadata[capture] and
+/// metadata[capture].priority) or vim.hl.priorities.treesitter`): a
+/// `(#set! priority N)` directive on the pattern wins, otherwise the
+/// default treesitter priority is 100 (`runtime/lua/vim/hl.lua`
+/// `priorities.treesitter`).
+///
+/// Standard predicates (`#eq?`, `#not-eq?`, `#any-eq?`, `#match?`,
+/// `#not-match?`, `#any-of?`, `#not-any-of?`) are already evaluated by the
+/// tree-sitter engine itself inside `QueryCursor::captures`/`::matches`
+/// (`tree-sitter` 0.26.12 `binding_rust/lib.rs:3416-3467`,
+/// `satisfies_text_predicates`), the same mechanism [`collect_query_cursor`]
+/// already relies on, so no predicate re-evaluation happens here. Custom
+/// Lua-registered predicates (`vim.treesitter.query.add_predicate`, e.g.
+/// `#has-ancestor?`) are a Lua-only concept upstream and are out of scope:
+/// their `general_predicates` entries are not consulted, so a pattern that
+/// depends on one highlights unconditionally rather than being filtered.
+fn emit_highlight_extmarks(
+    lua: &Lua,
+    node: &NodeHandle,
+    query: &QueryHandle,
+    bufnr: i64,
+    ns: i64,
+) -> mlua::Result<()> {
+    let vim: Table = lua.globals().get("vim")?;
+    let api: Table = vim.get("api")?;
+    let set_extmark: Function = api.get("nvim_buf_set_extmark")?;
+
+    let resolved = node.resolve()?;
+    let mut cursor = QueryCursor::new();
+    let mut iterator = cursor.captures(&query.query, resolved, node.tree.0.source.as_ref());
+    while let Some((matched, capture_index)) = iterator.next() {
+        let capture = matched.captures[*capture_index];
+        let capture_slot = usize::try_from(capture.index)
+            .map_err(|_| runtime_error("capture index out of bounds"))?;
+        let Some(name) = query.query.capture_names().get(capture_slot).copied() else {
+            continue;
+        };
+        if name.is_empty() || name.starts_with('_') {
+            continue;
+        }
+        let priority = query
+            .query
+            .property_settings(matched.pattern_index)
+            .iter()
+            .find(|property| &*property.key == "priority")
+            .and_then(|property| property.value.as_deref())
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(100);
+        let range = capture.node.range();
+        let start_row =
+            i64::try_from(range.start_point.row).map_err(|_| runtime_error("row out of bounds"))?;
+        let start_col = i64::try_from(range.start_point.column)
+            .map_err(|_| runtime_error("column out of bounds"))?;
+        let end_row =
+            i64::try_from(range.end_point.row).map_err(|_| runtime_error("row out of bounds"))?;
+        let end_col = i64::try_from(range.end_point.column)
+            .map_err(|_| runtime_error("column out of bounds"))?;
+        let opts = lua.create_table()?;
+        opts.set("hl_group", format!("@{name}"))?;
+        opts.set("end_row", end_row)?;
+        opts.set("end_col", end_col)?;
+        opts.set("priority", priority)?;
+        opts.set("strict", false)?;
+        set_extmark.call::<i64>((bufnr, ns, start_row, start_col, opts))?;
+    }
+    Ok(())
+}
+
 /// Install Neovim's tree-sitter C-facing fields on the existing `vim` table.
 pub(crate) fn install(lua: &Lua, scheduler: Rc<dyn Scheduler>) -> mlua::Result<()> {
     let vim: Table = lua.globals().get("vim")?;
@@ -1140,6 +1230,18 @@ pub(crate) fn install(lua: &Lua, scheduler: Rc<dyn Scheduler>) -> mlua::Result<(
                 let node = node.borrow::<NodeHandle>()?;
                 let query = query.borrow::<QueryHandle>()?;
                 collect_query_cursor(&node, &query, options.as_ref())
+            },
+        )?,
+    )?;
+
+    vim.set(
+        "_ts_emit_highlights",
+        string_error_function(
+            lua,
+            move |lua, (node, query, bufnr, ns): (AnyUserData, AnyUserData, i64, i64)| {
+                let node = node.borrow::<NodeHandle>()?;
+                let query = query.borrow::<QueryHandle>()?;
+                emit_highlight_extmarks(lua, &node, &query, bufnr, ns)
             },
         )?,
     )?;

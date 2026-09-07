@@ -89,11 +89,61 @@ pub fn nvim_buf_add_highlight(
     col_end: i64,
 ) -> Result<i64, ApiError> {
     const MAXCOL: i64 = 0x7fff_ffff;
-    let namespace = if ns_id <= 0 {
-        crate::extmark::nvim_create_namespace(session, OxStr::from("nvim.buf.add_highlight"))?
-    } else {
-        ns_id
+    const MAXLNUM: i64 = 0x7fff_ffff;
+    if !(0..MAXLNUM).contains(&line) {
+        return Err(ApiError::validation("Invalid line number: out of range"));
+    }
+    if !(0..=MAXCOL).contains(&col_start) {
+        return Err(ApiError::validation("Invalid 'column': out of range"));
+    }
+    // src2ns (deprecated.c:88-97): ns_id == 0 mints a fresh anonymous
+    // namespace and the mint is returned to the caller; ns_id < 0 is the
+    // "ungrouped" case and must leave the caller's ns_id untouched (upstream
+    // stores it under the raw sentinel 0x7fffffff, which never round-trips
+    // through `nvim_create_namespace`/`ns_initialized`, so this port mints
+    // its own throwaway anonymous namespace to hold the mark instead — the
+    // storage namespace is never returned, so callers keep observing the
+    // original negative ns_id).
+    // `deprecated.c:158-166`: ns_id 0 or negative mints a storage
+    // namespace; only 0 rewrites the returned id to the minted one.
+    let (storage_ns, return_ns) = match ns_id {
+        positive if positive > 0 => (ns_id, ns_id),
+        zero_or_negative => {
+            let minted = crate::extmark::nvim_create_namespace(session, OxStr::from(""))?;
+            if zero_or_negative == 0 {
+                (minted, minted)
+            } else {
+                (minted, ns_id)
+            }
+        }
     };
+    let (buffer, line_count) =
+        session.with_editor(|editor| -> Result<(BufHandle, usize), ApiError> {
+            let resolved = if buffer.is_current() {
+                editor
+                    .current_buffer()
+                    .ok_or_else(|| ApiError::validation("No current buffer"))?
+            } else {
+                buffer
+            };
+            let state = editor.buffer(resolved).map_err(|_| {
+                ApiError::validation(format!("Invalid buffer id: {}", i64::from(resolved)))
+            })?;
+            let count = state
+                .text()
+                .map_err(|error| ApiError::exception(error.to_string()))?
+                .line_count();
+            Ok((resolved, count))
+        })?;
+    if usize::try_from(line).map_or(true, |row| row >= line_count) {
+        // extmark_set safety check (deprecated.c:166-169): a line beyond the
+        // buffer is a silent no-op, not an error.
+        return Ok(return_ns);
+    }
+    if hl_group.as_bytes().is_empty() {
+        return Ok(return_ns);
+    }
+    ensure_highlight_group_defined(session, &hl_group);
     let (end_row, end_col) = if (0..MAXCOL).contains(&col_end) {
         (line, col_end)
     } else {
@@ -104,8 +154,8 @@ pub fn nvim_buf_add_highlight(
         (OxStr::from("end_row"), Object::Integer(end_row)),
         (OxStr::from("end_col"), Object::Integer(end_col)),
     ]);
-    crate::extmark::nvim_buf_set_extmark(session, buffer, namespace, line, col_start, opts)?;
-    Ok(namespace)
+    crate::extmark::nvim_buf_set_extmark(session, buffer, storage_ns, line, col_start, opts)?;
+    Ok(return_ns)
 }
 
 #[api(since = 5, deprecated_since = 8, method)]
@@ -283,6 +333,24 @@ fn hl_by_id(editor: &Editor, hl_id: i64) -> Option<(&String, &HighlightDefinitio
     }
     let index = usize::try_from(hl_id - 1).ok()?;
     editor.highlights().iter().nth(index)
+}
+
+/// Auto-vivifies a highlight group the way `syn_check_group`
+/// (`highlight_group.c`) interns an unknown group name passed to
+/// `nvim_buf_add_highlight`: if `name` is not already a key in the editor's
+/// highlight table (matched case-insensitively, mirroring [`hl_by_name`]),
+/// insert an empty, uncolored definition so the name resolves to a stable id
+/// without overwriting any spec a prior `:highlight` command already set.
+fn ensure_highlight_group_defined(session: &ApiSession, name: &OxStr) {
+    let Ok(name) = std::str::from_utf8(name.as_bytes()) else {
+        return;
+    };
+    session.with_editor_mut(|editor| {
+        let highlights = editor.highlights_mut();
+        if !highlights.keys().any(|key| key.eq_ignore_ascii_case(name)) {
+            highlights.insert(name.to_owned(), HighlightDefinition::default());
+        }
+    });
 }
 
 fn api_type_name(value: &Object) -> &'static str {
@@ -1412,7 +1480,9 @@ mod tests {
         let (session, buffer) = session_with_lines(&["hello", "world"]);
         let ns = nvim_buf_add_highlight(&session, buffer, -1, OxStr::from("Question"), 0, 0, -1)
             .unwrap();
-        assert!(ns > 0);
+        // `src2ns` (deprecated.c:88-97): a negative ns stays negative in the
+        // return value; the mark lives in a throwaway storage namespace.
+        assert_eq!(ns, -1);
     }
 
     /// Every advertised API name has a registry dispatch: the metadata
