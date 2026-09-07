@@ -91,22 +91,54 @@ impl ScopeKind {
 /// `Object`-valued rather than `Typval`-valued.
 pub type ScopeMap = Vec<(OxStr, Typval)>;
 
-/// Deep snapshot of a scope map for the write-back mirror. Containers are
-/// copied by value (cycle-aware, like `:h copy()`'s `deepcopy()`), so an
-/// in-place container mutation through an aliased read (`call add(g:l, x)`)
-/// differs from the mirror at sync time instead of hiding inside shared
-/// backing. A value too deep to copy (`E698`) falls back to a shared clone:
-/// only pathological nesting keeps the old blindness, never an error.
-#[must_use]
-pub fn snapshot_map(map: &ScopeMap) -> ScopeMap {
-    map.iter()
-        .map(|(key, value)| {
-            (
-                key.clone(),
-                super::builtins::deep_copy(value).unwrap_or_else(|_| value.clone()),
-            )
-        })
-        .collect()
+/// Deep copy of one scope value for the write-back mirror: containers copy
+/// by value (cycle-aware, like `:h copy()`'s `deepcopy()`), so an in-place
+/// container mutation through an aliased read (`call add(g:l, x)`) differs
+/// from the mirror at sync time instead of hiding inside shared backing.
+///
+/// # Errors
+/// Returns the copy failure, except for `E698` (over-deep nesting, plus the
+/// two defensive empty-container construction branches that share the
+/// code), which falls back to a shared clone: only values no deep copy can
+/// produce keep the old blindness, never a borrow conflict.
+pub fn snapshot_value(value: &Typval) -> Result<Typval> {
+    match super::builtins::deep_copy(value) {
+        Ok(copy) => Ok(copy),
+        Err(error) if error.code == "E698" => Ok(value.clone()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Refreshes a write-back mirror entry-wise against the live map: entries
+/// still equal keep their accurate snapshot (no copy), changed entries
+/// re-snapshot by value, and dropped keys leave. One index build plus one
+/// pass, with copies for changed values only.
+///
+/// # Errors
+///
+/// Returns [`snapshot_value`] failures other than `E698`.
+pub fn refresh_mirror(mirror: &mut ScopeMap, current: &ScopeMap) -> Result<()> {
+    use std::collections::{HashMap, HashSet};
+
+    let live_keys: HashSet<&OxStr> = current.iter().map(|(key, _)| key).collect();
+    mirror.retain(|(key, _)| live_keys.contains(key));
+    // Owned keys: the index outlives the mutable updates below.
+    let mut slots: HashMap<OxStr, usize> = mirror
+        .iter()
+        .enumerate()
+        .map(|(index, (key, _))| (key.clone(), index))
+        .collect();
+    for (key, value) in current {
+        match slots.get(key).copied() {
+            Some(index) if mirror[index].1 == *value => {}
+            Some(index) => mirror[index].1 = snapshot_value(value)?,
+            None => {
+                slots.insert(key.clone(), mirror.len());
+                mirror.push((key.clone(), snapshot_value(value)?));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Option namespace for `&`, `&g:`, and `&l:` forms.
