@@ -1291,6 +1291,41 @@ impl AppState {
         Ok(())
     }
 
+    /// Builds the showmode message chunks: a live completion session
+    /// overrides the modal -style text, mirroring Neovim's
+    /// `showmode()` (`drawscreen.c:901`) gated by `p_smd`.
+    /// Chrome mode name for one editor mode: visual line/block/char
+    /// all report `visual` upstream (the shape lives in `mode_info`),
+    /// and search cmdlines report `cmdline_normal` (`cmdline_hover`
+    /// is mouse-only, `cursor_shape.c:38`).
+    fn chrome_mode_name(mode: &Mode) -> &'static str {
+        match mode {
+            Mode::Normal(_) => "normal",
+            Mode::Insert(_) => "insert",
+            Mode::Replace(_) => "replace",
+            Mode::Visual(_) => "visual",
+            Mode::Cmdline(state) => match state.kind {
+                CmdlineKind::Ex | CmdlineKind::Search(_) => "cmdline_normal",
+            },
+            Mode::OperatorPending(_) => "operator",
+        }
+    }
+
+    fn showmode_chunks(
+        mode_msg_id: u64,
+        completion_showmode: Option<&str>,
+        showmode_text: Option<&str>,
+    ) -> Vec<ContentChunk> {
+        if let Some(text) = completion_showmode {
+            vec![ContentChunk::new(mode_msg_id, OxStr::from(text))]
+        } else {
+            match showmode_text {
+                Some(text) => vec![ContentChunk::new(mode_msg_id, OxStr::from(text))],
+                None => Vec::new(),
+            }
+        }
+    }
+
     fn sync_chrome(&mut self) -> Result<(), ApiError> {
         let mode = self.mode.borrow().mode().clone();
         let (completion_showmode, completion_pum) = {
@@ -1302,22 +1337,7 @@ impl AppState {
         };
         // Chrome tracks the full mode name so painters can detect
         // command-line mode (`emitter.rs` matches `cmdline*` prefixes).
-        let mode_name: &str = match &mode {
-            Mode::Normal(_) => "normal",
-            Mode::Insert(_) => "insert",
-            Mode::Replace(_) => "replace",
-            // Visual line/block/char all report the `visual` mode
-            // upstream; the shape lives in mode_info, not the name.
-            Mode::Visual(_) => "visual",
-            Mode::Cmdline(state) => match state.kind {
-                // MODE_CMDLINE resolves through SHAPE_IDX_C/CI/CR only
-                // (cursor_get_mode_idx, cursor_shape.c:318-339);
-                // `cmdline_hover` is a mouse-only entry (cursor_shape.c:38)
-                // never sent in mode_change.
-                CmdlineKind::Ex | CmdlineKind::Search(_) => "cmdline_normal",
-            },
-            Mode::OperatorPending(_) => "operator",
-        };
+        let mode_name = Self::chrome_mode_name(&mode);
         let mode_index = ox_ui::emitter::mode_index(mode_name);
         self.session
             .with_render_state(|_, _, chrome| chrome.set_mode(mode_name, mode_index));
@@ -1357,14 +1377,8 @@ impl AppState {
                     .map_err(|error| ApiError::exception(error.to_string())),
             }
         })?;
-        let showmode_content = if let Some(text) = completion_showmode {
-            vec![ContentChunk::new(mode_msg_id, OxStr::from(text.as_str()))]
-        } else {
-            match showmode_text {
-                Some(text) => vec![ContentChunk::new(mode_msg_id, OxStr::from(text))],
-                None => Vec::new(),
-            }
-        };
+        let showmode_content =
+            Self::showmode_chunks(mode_msg_id, completion_showmode.as_deref(), showmode_text);
         self.session.with_render_state(|_, _, chrome| {
             chrome.set_showmode(showmode_content);
         });

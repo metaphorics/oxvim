@@ -173,24 +173,7 @@ pub fn export_vim_environment() {
 /// buffer that exists at this point (upstream's `curbuf`).
 pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppError> {
     let editor_error = |error: OptionError| AppError::Editor(error.to_string());
-    // main.c `command_line_scan` routes every ShaDa-file request through the
-    // option itself: `-i {file}` at 1430-1432, and `--clean` at 1194-1196,
-    // both via `set_option_value_give_err(kOptShadafile, ...)`, before any
-    // `--cmd` runs. `-l` defaults a still-empty 'shadafile' to `NONE`
-    // (main.c:1438-1442); cli.rs collapses that to `None` while scanning.
-    // `shada_filename` (`shada.c:1289-1316`) then resolves reads and writes
-    // through 'shadafile' alone, and `NONE` disables ShaDa for the session.
-    match &cli.shada {
-        ShadaConfig::None => editor
-            .options_mut()
-            .set_global("shadafile", OptionValue::String("NONE".into()))
-            .map_err(editor_error)?,
-        ShadaConfig::File(path) => editor
-            .options_mut()
-            .set_global("shadafile", OptionValue::String(path.clone()))
-            .map_err(editor_error)?,
-        ShadaConfig::Default => {}
-    }
+    apply_shada_option(editor, &cli.shada, editor_error)?;
     // option.c set_init_default_shell (182-199): the static 'shell' default is
     // the bare name "sh", and startup replaces it with $SHELL when that is set
     // and non-empty, quoting it if it holds a space. The absolute path is the
@@ -233,38 +216,7 @@ pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppEr
             .set_global("write", OptionValue::Boolean(false))
             .map_err(editor_error)?;
     }
-    // option.c:367: 'directory' defaults to the XDG state swap dir with a
-    // trailing `//` (full-path swap names, `stdpaths_user_state_subpath`),
-    // overriding options.lua's empty shipped default; the directory is
-    // created when missing, like every stdpaths default.
-    if let Ok(OptionValue::String(current)) = editor.options().get_global("directory")
-        && current.is_empty()
-        && let Some(state) = ox_editor::script::stdpath(ox_editor::script::StdPath::State)
-            .into_iter()
-            .next()
-            .map(|dir| ox_editor::script::expand_home(&dir))
-    {
-        // The swap tree holds buffer snapshots: create it owner-only
-        // and fail loudly instead of installing an untrusted path
-        // ( 0700, shada.c:2782-2793).
-        let swap = format!("{state}/swap");
-        std::fs::create_dir_all(&swap).map_err(AppError::Io)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&swap, std::fs::Permissions::from_mode(0o700))
-                .map_err(AppError::Io)?;
-        }
-        // 'directory' is a comma-separated list; a comma inside the state
-        // path is escaped exactly like set_string_default's escape_commas
-        // (option.c:367 via stdpaths.c:267-295).
-        let escaped = format!("{state}/swap//").replace(',', r"\,");
-        editor
-            .options_mut()
-            .set_global("directory", OptionValue::String(escaped))
-            .map_err(editor_error)?;
-    }
-    // "-R" also slows the swap file down (`p_uc = 10000`); "-n" turns it off.
+    seed_default_swap_directory(editor, editor_error)?;
     if cli.readonly {
         editor
             .options_mut()
@@ -299,6 +251,80 @@ pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppEr
                 .set_buffer(buffer, name, value)
                 .map_err(editor_error)?;
         }
+    }
+    Ok(())
+}
+/// Routes the startup `shadafile` request through the option itself.
+///
+/// # Errors
+///
+/// Returns the option failure.
+fn apply_shada_option(
+    editor: &mut Editor,
+    shada: &ShadaConfig,
+    editor_error: impl Fn(ox_editor::OptionError) -> AppError,
+) -> Result<(), AppError> {
+    // main.c `command_line_scan` routes every ShaDa-file request through the
+    // option itself: `-i {file}` at 1430-1432, and `--clean` at 1194-1196,
+    // both via `set_option_value_give_err(kOptShadafile, ...)`, before any
+    // `--cmd` runs. `-l` defaults a still-empty 'shadafile' to `NONE`
+    // (main.c:1438-1442); cli.rs collapses that to `None` while scanning.
+    // `shada_filename` (`shada.c:1289-1316`) then resolves reads and writes
+    // through 'shadafile' alone, and `NONE` disables ShaDa for the session.
+    match shada {
+        ShadaConfig::None => editor
+            .options_mut()
+            .set_global("shadafile", OptionValue::String("NONE".into()))
+            .map_err(editor_error)?,
+        ShadaConfig::File(path) => editor
+            .options_mut()
+            .set_global("shadafile", OptionValue::String(path.clone()))
+            .map_err(editor_error)?,
+        ShadaConfig::Default => {}
+    }
+    Ok(())
+}
+
+/// Seeds the default `'directory'` (option.c:367) with the XDG state swap
+/// dir plus trailing `//`, creating the tree owner-only when missing.
+///
+/// # Errors
+///
+/// Returns the directory-creation, permission, or option failure.
+fn seed_default_swap_directory(
+    editor: &mut Editor,
+    editor_error: impl Fn(ox_editor::OptionError) -> AppError,
+) -> Result<(), AppError> {
+    // option.c:367: 'directory' defaults to the XDG state swap dir with a
+    // trailing `//` (full-path swap names, `stdpaths_user_state_subpath`),
+    // overriding options.lua's empty shipped default; the directory is
+    // created when missing, like every stdpaths default.
+    if let Ok(OptionValue::String(current)) = editor.options().get_global("directory")
+        && current.is_empty()
+        && let Some(state) = ox_editor::script::stdpath(ox_editor::script::StdPath::State)
+            .into_iter()
+            .next()
+            .map(|dir| ox_editor::script::expand_home(&dir))
+    {
+        // The swap tree holds buffer snapshots: create it owner-only
+        // and fail loudly instead of installing an untrusted path
+        // (`os_mkdir_recurse` 0700, shada.c:2782-2793).
+        let swap = format!("{state}/swap");
+        std::fs::create_dir_all(&swap).map_err(AppError::Io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&swap, std::fs::Permissions::from_mode(0o700))
+                .map_err(AppError::Io)?;
+        }
+        // 'directory' is a comma-separated list; a comma inside the state
+        // path is escaped exactly like set_string_default's escape_commas
+        // (option.c:367 via stdpaths.c:267-295).
+        let escaped = format!("{state}/swap//").replace(',', r"\,");
+        editor
+            .options_mut()
+            .set_global("directory", OptionValue::String(escaped))
+            .map_err(editor_error)?;
     }
     Ok(())
 }

@@ -680,10 +680,6 @@ pub(crate) enum DeferredOp {
     Delete(PathBuf, crate::fs_builtins::DeleteMode),
 }
 
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "the runtime mirrors upstream interpreter globals one-to-one"
-)]
 pub(crate) struct ExRuntime<F: FileIO> {
     pub(crate) scripts: ScriptCtx<F>,
     pub(crate) functions: UserFunctions,
@@ -15370,7 +15366,7 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
     let global_version = editor.gvars_version();
     if scope.synced.get(ScopeKind::Global) != global_version {
         scope.global = dict_to_scope(editor.gvars());
-        *scope.global_mirror.borrow_mut() = scope.global.clone();
+        scope.global_mirror.borrow_mut().clone_from(&scope.global);
         scope.synced.set(ScopeKind::Global, global_version);
         scope.synced.clear_dirty(ScopeKind::Global);
     }
@@ -15613,7 +15609,7 @@ pub(crate) fn sync_scope_into_editor(editor: &mut Editor, scope: &Scope) -> Resu
                 live.0.retain(|live_key| live_key.0 != *key);
             }
         }
-        *scope.global_mirror.borrow_mut() = scope.global.clone();
+        scope.global_mirror.borrow_mut().clone_from(&scope.global);
         scope.synced.set(ScopeKind::Global, editor.gvars_version());
         scope.synced.clear_dirty(ScopeKind::Global);
     }
