@@ -1631,6 +1631,62 @@ const CTRL_P: char = '\u{10}';
 const CTRL_X: char = '\u{18}';
 /// `CTRL-Y`.
 const CTRL_Y: char = '\u{19}';
+/// `CTRL-D`.
+const CTRL_D: char = '\u{04}';
+/// `CTRL-F`.
+const CTRL_F: char = '\u{06}';
+/// `CTRL-I`.
+const CTRL_I: char = '\u{09}';
+/// `CTRL-K`.
+const CTRL_K: char = '\u{0b}';
+/// `CTRL-L`.
+const CTRL_L: char = '\u{0c}';
+/// `CTRL-O`.
+const CTRL_O: char = '\u{0f}';
+/// `CTRL-Q`.
+const CTRL_Q: char = '\u{11}';
+/// `CTRL-R`.
+const CTRL_R: char = '\u{12}';
+/// `CTRL-S`.
+const CTRL_S: char = '\u{13}';
+/// `CTRL-T`.
+const CTRL_T: char = '\u{14}';
+/// `CTRL-U`.
+const CTRL_U: char = '\u{15}';
+/// `CTRL-V`.
+const CTRL_V: char = '\u{16}';
+/// `CTRL-Z`.
+const CTRL_Z: char = '\u{1a}';
+/// `CTRL-]`.
+const CTRL_RSB: char = '\u{1d}';
+
+/// Whether the key is a `CTRL-X` submode selector: exactly the case list
+/// `set_ctrl_x_mode` consumes (`insexpand.c:2615-2736`). Anything else is
+/// an ordinary key upstream does not consume.
+fn is_ctrl_x_submode_key(key: char) -> bool {
+    matches!(
+        key,
+        CTRL_D
+            | CTRL_E
+            | CTRL_F
+            | CTRL_I
+            | CTRL_K
+            | CTRL_L
+            | CTRL_N
+            | CTRL_O
+            | CTRL_P
+            | CTRL_Q
+            | CTRL_R
+            | CTRL_S
+            | CTRL_T
+            | CTRL_U
+            | CTRL_V
+            | CTRL_Y
+            | CTRL_Z
+            | CTRL_RSB
+            | 's'
+    )
+}
 
 /// `ctrl_x_msgs[CTRL_X_NORMAL]` (`insexpand.c:118`).
 const MSG_KEYWORD: &str = " Keyword completion (^N^P)";
@@ -1745,6 +1801,10 @@ pub struct CompletionSession {
     /// `edit_submode_extra` (`ins_compl_show_statusmsg`,
     /// `insexpand.c:6211-6260`).
     extra: Option<String>,
+    /// Match-list length the cached `pum` items were built from
+    /// (`usize::MAX` forces a rebuild): navigation only moves the
+    /// selection instead of re-allocating every candidate per key.
+    pum_built_for: usize,
 }
 
 impl Default for CompletionSession {
@@ -1761,6 +1821,7 @@ impl Default for CompletionSession {
             pum: None,
             submode: None,
             extra: None,
+            pum_built_for: usize::MAX,
         }
     }
 }
@@ -1834,16 +1895,22 @@ impl CompletionSession {
 
         // Second key of a `CTRL-X` sequence (`set_ctrl_x_mode`,
         // `insexpand.c:2615-2736`). Only the keyword sources are ported;
-        // any other second key ends the sequence without inserting the key,
-        // matching upstream's consumed-but-unported sources.
+        // other submode selectors are consumed-but-unported, while an
+        // ordinary key is NOT consumed: upstream's `set_ctrl_x_mode`
+        // returns false for it and the key continues through Insert
+        // handling.
         if self.ctrl_x_pending {
             self.ctrl_x_pending = false;
             if key == CTRL_N || key == CTRL_P {
                 // `^N`/`^P` through `CTRL-X` complete with the LOCAL banner
                 // (`insexpand.c:6165-6166`).
                 self.start(editor, buffer, window, cursor, key, true, timestamp)?;
+                return Ok(CompletionOutcome::Handled);
             }
-            return Ok(CompletionOutcome::Handled);
+            if is_ctrl_x_submode_key(key) {
+                return Ok(CompletionOutcome::Handled);
+            }
+            return Ok(CompletionOutcome::Release);
         }
 
         // Live completion: completion keys cycle, `CTRL-E`/`CTRL-Y` finish,
@@ -1851,6 +1918,14 @@ impl CompletionSession {
         // (`ins_compl_prep` active branch, `insexpand.c:2915-2921`).
         if self.active {
             match key {
+                CTRL_X => {
+                    // The inserted match stays (`ins_compl_stop` only
+                    // restores the leader for CTRL-E); the submode arms
+                    // for its second key.
+                    self.stop_keep();
+                    self.ctrl_x_pending = true;
+                    return Ok(CompletionOutcome::Handled);
+                }
                 CTRL_N => {
                     self.cycle(editor, buffer, window, Direction::Forward, timestamp)?;
                     return Ok(CompletionOutcome::Handled);
@@ -1916,6 +1991,7 @@ impl CompletionSession {
         } else {
             MSG_KEYWORD
         });
+        self.pum_built_for = usize::MAX;
         let sources = complete_sources(editor);
 
         // Original-text entry first, then every source in option order
@@ -2113,6 +2189,23 @@ impl CompletionSession {
             self.pum = None;
             return;
         }
+        let selected = if self.selected <= 0 {
+            -1
+        } else {
+            self.selected - 1
+        };
+        let row = self.cursor.lnum.saturating_sub(1);
+        let col = self.start_col + self.leader.len();
+        // Navigation reuses the cached items: the match list is fixed for
+        // the session, so only selection and anchor move per key.
+        if self.pum_built_for == self.matches.len()
+            && let Some(pum) = self.pum.as_mut()
+        {
+            pum.selected = selected;
+            pum.row = row;
+            pum.col = col;
+            return;
+        }
         let items = self.matches[1..]
             .iter()
             .map(|word| CompletionPumItem {
@@ -2122,16 +2215,12 @@ impl CompletionSession {
                 info: OxStr::from(""),
             })
             .collect();
-        let selected = if self.selected <= 0 {
-            -1
-        } else {
-            self.selected - 1
-        };
+        self.pum_built_for = self.matches.len();
         self.pum = Some(CompletionPum {
             items,
             selected,
-            row: self.cursor.lnum.saturating_sub(1),
-            col: self.start_col + self.leader.len(),
+            row,
+            col,
         });
     }
 }
@@ -2456,6 +2545,66 @@ mod completion_engine_tests {
         assert_eq!(pum.items[0].word.to_string_lossy().as_ref(), "include");
         assert_eq!(pum.selected, 0);
         assert_eq!((pum.row, pum.col), (1, 2));
+    }
+
+    #[test]
+    fn ctrl_x_then_ordinary_key_releases() {
+        // `set_ctrl_x_mode` consumes only submode selectors
+        // (`insexpand.c:2615-2736`): an ordinary key ends the pending
+        // state and flows back into Insert handling.
+        let (mut editor, buffer, window) = editor_with(b"alpha\nal");
+        let mut session = CompletionSession::new();
+        let outcome = session
+            .handle_insert_key(
+                &mut editor,
+                buffer,
+                window,
+                Position { lnum: 2, col: 2 },
+                CTRL_X,
+                0,
+            )
+            .unwrap();
+        assert_eq!(outcome, CompletionOutcome::Handled);
+        let outcome = session
+            .handle_insert_key(
+                &mut editor,
+                buffer,
+                window,
+                Position { lnum: 2, col: 2 },
+                'a',
+                1,
+            )
+            .unwrap();
+        assert_eq!(outcome, CompletionOutcome::Release);
+        assert_eq!(line(&editor, buffer, 2), "al");
+        assert!(session.pum().is_none());
+    }
+
+    #[test]
+    fn ctrl_x_after_active_session_rearms_submode() {
+        // CTRL-N, then CTRL-X: the live session stops with the match
+        // kept and a fresh submode sequence arms for its second key.
+        let (mut editor, buffer, window) = editor_with(b"alpha\nalpaca\nal");
+        let mut session = CompletionSession::new();
+        let cursor = Position { lnum: 3, col: 2 };
+        let outcome = session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_N, 0)
+            .unwrap();
+        assert_eq!(outcome, CompletionOutcome::Handled);
+        assert!(session.pum().is_some());
+        let outcome = session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_X, 1)
+            .unwrap();
+        assert_eq!(outcome, CompletionOutcome::Handled);
+        assert!(session.pum().is_none());
+        let outcome = session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_N, 2)
+            .unwrap();
+        assert_eq!(outcome, CompletionOutcome::Handled);
+        assert_eq!(
+            session.showmode_override().as_deref(),
+            Some("-- Keyword Local completion (^N^P) match 1 of 2")
+        );
     }
 
     #[test]
