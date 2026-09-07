@@ -244,7 +244,17 @@ pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppEr
             .next()
             .map(|dir| ox_editor::script::expand_home(&dir))
     {
-        let _ = std::fs::create_dir_all(format!("{state}/swap"));
+        // The swap tree holds buffer snapshots: create it owner-only
+        // and fail loudly instead of installing an untrusted path
+        // ( 0700, shada.c:2782-2793).
+        let swap = format!("{state}/swap");
+        std::fs::create_dir_all(&swap).map_err(AppError::Io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&swap, std::fs::Permissions::from_mode(0o700))
+                .map_err(AppError::Io)?;
+        }
         // 'directory' is a comma-separated list; a comma inside the state
         // path is escaped exactly like set_string_default's escape_commas
         // (option.c:367 via stdpaths.c:267-295).
