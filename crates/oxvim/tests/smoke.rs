@@ -1114,6 +1114,80 @@ fn embedded_listener_serves_stdio_and_cleans_up_on_exit() {
     clippy::expect_used,
     clippy::unwrap_used,
     clippy::panic,
+    reason = "listener setup, transport, and process polling are assertions in this smoke test"
+)]
+#[test]
+fn embedded_listener_exits_when_socket_peer_quits() {
+    use std::os::unix::net::UnixStream;
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let socket = std::env::temp_dir().join(format!(
+        "oxvim-embed-peer-quit-{}-{unique}.sock",
+        std::process::id()
+    ));
+    let socket_text = socket.to_string_lossy().into_owned();
+    let mut oxvim = Embedded::spawn_with(&["--headless", "--listen", &socket_text]);
+    assert_eq!(
+        oxvim.request("nvim_get_vvar", vec![Value::from("servername")]),
+        Value::from(socket_text),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let stream = loop {
+        match UnixStream::connect(&socket) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Err(error) => panic!("connect embedded listener: {error}"),
+        }
+    };
+    let mut writer = stream.try_clone().expect("clone peer stream");
+    let mut reader = BufReader::new(stream);
+    assert_eq!(
+        stream_request(
+            &mut writer,
+            &mut reader,
+            1,
+            "nvim_exec_lua",
+            vec![Value::from("return 1 + 1"), Value::Array(vec![])],
+        ),
+        Value::from(2),
+    );
+    let quit = Value::Array(vec![
+        Value::from(2),
+        Value::from("nvim_command"),
+        Value::Array(vec![Value::from("qa!")]),
+    ]);
+    rmpv::encode::write_value(&mut writer, &quit).expect("encode peer quit");
+    writer.flush().expect("flush peer quit");
+
+    // stdin stays open: only the socket peer asked to exit.
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = oxvim.child.try_wait().expect("poll embedded listener") {
+            assert!(status.success(), "embedded listener exited with {status}");
+            break;
+        }
+        if Instant::now() >= exit_deadline {
+            let _ = oxvim.child.kill();
+            let _ = oxvim.child.wait();
+            panic!("embedded listener did not exit after a socket peer quit");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !socket.exists(),
+        "embedded listener left its socket path behind"
+    );
+}
+
+#[cfg(unix)]
+#[expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
     reason = "listener setup, process polling, and exit state are assertions in this smoke test"
 )]
 #[test]
