@@ -245,9 +245,13 @@ pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppEr
             .map(|dir| ox_editor::script::expand_home(&dir))
     {
         let _ = std::fs::create_dir_all(format!("{state}/swap"));
+        // 'directory' is a comma-separated list; a comma inside the state
+        // path is escaped exactly like set_string_default's escape_commas
+        // (option.c:367 via stdpaths.c:267-295).
+        let escaped = format!("{state}/swap//").replace(',', r"\,");
         editor
             .options_mut()
-            .set_global("directory", OptionValue::String(format!("{state}/swap//")))
+            .set_global("directory", OptionValue::String(escaped))
             .map_err(editor_error)?;
     }
     // "-R" also slows the swap file down (`p_uc = 10000`); "-n" turns it off.

@@ -1282,10 +1282,11 @@ impl AppState {
             // upstream; the shape lives in mode_info, not the name.
             Mode::Visual(_) => "visual",
             Mode::Cmdline(state) => match state.kind {
-                CmdlineKind::Ex => "cmdline_normal",
-                // Upstream names both search directions `cmdline_hover`
-                // (`mode_names[]`, `ui_compositor.c` `ui_default_colors`).
-                CmdlineKind::Search(_) => "cmdline_hover",
+                // MODE_CMDLINE resolves through SHAPE_IDX_C/CI/CR only
+                // (cursor_get_mode_idx, cursor_shape.c:318-339);
+                // `cmdline_hover` is a mouse-only entry (cursor_shape.c:38)
+                // never sent in mode_change.
+                CmdlineKind::Ex | CmdlineKind::Search(_) => "cmdline_normal",
             },
             Mode::OperatorPending(_) => "operator",
         };
@@ -1648,11 +1649,25 @@ impl AppState {
     }
 
     fn stdio_closed(&mut self) {
-        // Stdin EOF — plain or the embedded server's primary channel —
-        // ends the main loop through `getout(0)` (main.c:935). The exit
-        // code keeps whatever a startup command already requested; the
-        // embed path separately records `preserve_exit` for its swapfiles.
+        // Plain stdin EOF ends the main loop through `getout(0)`; the
+        // exit code keeps whatever a startup command already requested.
+        // (Upstream `--headless` without a quit stays alive waiting on
+        // its channels; exiting cleanly is a deliberate batch-mode
+        // deviation recorded in the ledger.)
         self.exiting = true;
+    }
+
+    /// The embedded server's primary channel closing is abnormal
+    /// termination: `exit_on_closed_chan` -> `exit_event` ->
+    /// `preserve_exit` (msgpack_rpc/channel.c:528-529,
+    /// event/proc.c:426-433) keeps modified buffers' swapfiles, and
+    /// `getout(1)` exits with status 1 (main.c:888-936).
+    fn primary_channel_closed(&mut self) {
+        if !self.exiting {
+            self.exiting = true;
+            self.exit_code = 1;
+            self.ex.borrow_mut().preserve_exit();
+        }
     }
 
     /// Process exit code requested so far (`:cquit`, else 0).
@@ -2063,7 +2078,11 @@ fn bind_stdio(
                 let mut bytes = vec![0; 64 * 1024].into_boxed_slice();
                 match input.read(&mut bytes) {
                     Ok(0) => {
-                        callback_runtime.borrow().state.borrow_mut().stdio_closed();
+                        callback_runtime
+                            .borrow()
+                            .state
+                            .borrow_mut()
+                            .primary_channel_closed();
                         uv_loop.stop();
                         break;
                     }

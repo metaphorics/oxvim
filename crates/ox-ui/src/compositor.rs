@@ -897,6 +897,8 @@ fn terminal_pen_group(
     let rgb = HlAttrs {
         foreground: fg_rgb,
         background: bg_rgb,
+        fg_indexed: fg_index.is_some(),
+        bg_indexed: bg_index.is_some(),
         bold: flags.contains(CellFlags::BOLD),
         italic: flags.contains(CellFlags::ITALIC),
         underline: flags.contains(CellFlags::UNDERLINE),
@@ -912,6 +914,8 @@ fn terminal_pen_group(
     let cterm = HlAttrs {
         foreground: fg_index,
         background: bg_index,
+        fg_indexed: indexed,
+        bg_indexed: indexed,
         bold: rgb.bold,
         italic: rgb.italic,
         underline: rgb.underline,

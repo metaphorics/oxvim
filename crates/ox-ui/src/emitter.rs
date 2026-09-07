@@ -367,7 +367,7 @@ const MODES: &[(&str, &str, &str, i64, i64, i64, i64)] = &[
     ("cmdline_replace", "cr", "horizontal", 20, 0, 0, 0),
     ("operator", "o", "block", 0, 0, 0, 0),
     ("visual_select", "ve", "block", 0, 0, 0, 0),
-    ("cmdline_hover", "c", "block", 0, 0, 0, 0),
+    ("cmdline_hover", "e", "block", 0, 0, 0, 0),
     ("statusline_hover", "s", "block", 0, 0, 0, 0),
     ("statusline_drag", "sd", "block", 0, 0, 0, 0),
     ("vsep_hover", "vs", "block", 0, 0, 0, 0),
@@ -375,7 +375,7 @@ const MODES: &[(&str, &str, &str, i64, i64, i64, i64)] = &[
     ("more", "m", "block", 0, 0, 0, 0),
     ("more_lastline", "ml", "block", 0, 0, 0, 0),
     ("showmatch", "sm", "block", 0, 0, 0, 0),
-    ("terminal", "t", "block", 0, 500, 500, 0),
+    ("terminal", "t", "block", 0, 0, 0, 0),
 ];
 
 /// Index of `name` in the canonical mode table; upstream `mode_change`

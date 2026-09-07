@@ -7375,7 +7375,8 @@ fn permute_swap_name(candidate: &Path) -> Option<PathBuf> {
 /// dialog, so existence is the whole check. `None` is `mf_fname == NULL`:
 /// no entry produced a usable name.
 fn findswapname<F: FileIO>(
-    runtime: &ExRuntime<F>,
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
     file_name: &str,
     dirs: &[String],
 ) -> Option<PathBuf> {
@@ -7385,10 +7386,23 @@ fn findswapname<F: FileIO>(
         };
         while runtime.scripts.io().exists(&candidate) {
             let Some(next) = permute_swap_name(&candidate) else {
-                // E326: too many swap files found (memline.c:3643).
-                return None;
+                // E326: too many swap files in this directory; the next
+                // 'directory' entry gets its chance (memline.c:3637-3644
+                // breaks only the permutation loop; ml_open_file:520-527
+                // continues with the next entry).
+                push_text_message(
+                    editor,
+                    "E326: Too many swap files found".to_owned(),
+                    true,
+                    true,
+                );
+                candidate = PathBuf::new();
+                break;
             };
             candidate = next;
+        }
+        if candidate.as_os_str().is_empty() {
+            continue;
         }
         return Some(candidate);
     }
@@ -7437,7 +7451,7 @@ fn swap_candidate(editor: &Editor, buffer: BufHandle) -> Option<SwapBuffer> {
 /// 'directory', or no usable entry (memline.c:3650-3667).
 fn buffer_swap_name<F: FileIO>(
     runtime: &mut ExRuntime<F>,
-    editor: &Editor,
+    editor: &mut Editor,
     buffer: BufHandle,
 ) -> Option<PathBuf> {
     if let Some(name) = runtime.swap_names.get(&buffer) {
@@ -7462,7 +7476,7 @@ fn buffer_swap_name<F: FileIO>(
     if dirs.is_empty() {
         return None;
     }
-    let name = findswapname(runtime, &candidate.file_name, &dirs)?;
+    let name = findswapname(runtime, editor, &candidate.file_name, &dirs)?;
     runtime.swap_names.insert(buffer, name.clone());
     Some(name)
 }

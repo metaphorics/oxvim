@@ -1700,9 +1700,10 @@ enum SourceKind {
 }
 
 /// Insert-mode completion state. `matches[0]` mirrors the original-text
-/// entry (`insexpand.c:6179-6187`); the rest follow source scan order, which
-/// equals upstream's list order for both directions (`ins_compl_add` inserts
-/// backward-found words before the original text, `insexpand.c:970-971`).
+/// entry (`insexpand.c:6179-6187`); the rest follow source scan order.
+/// Both directions share this list: CTRL-N steps toward the back,
+/// CTRL-P toward the front from the last entry (`cp_next`/`cp_prev`,
+/// `insexpand.c:4940-4949`).
 #[derive(Clone, Debug)]
 pub struct CompletionSession {
     /// `compl_started`: a candidate list exists and navigation is live.
@@ -2215,10 +2216,13 @@ fn scan_buffer_words(
         }
         return;
     }
-    // Forward visit order (`get_next_default_completion`'s wrapping search,
-    // `insexpand.c:4396-4426`): words on the cursor line from the cursor
-    // onward, then the lines below, then wrap through the top including the
-    // cursor line's words before the leader. Backward is the exact reverse.
+    // One shared visit order (`get_next_default_completion`'s wrapping
+    // search, `insexpand.c:4396-4426`): words on the cursor line from the
+    // cursor onward, then the lines below, then wrap through the top
+    // including the cursor line's words before the leader. CTRL-P shares
+    // this list and traverses it backward: the first step lands on the
+    // last entry (`compl_old_match->cp_prev`, `insexpand.c:4940-4949`),
+    // which is the nearest word above the cursor.
     let mut segments: Vec<(usize, usize)> = Vec::new();
     segments.push((cursor_lnum, cursor_col));
     if cursor_lnum < line_count {
@@ -2339,7 +2343,7 @@ fn line_bytes(editor: &Editor, buffer: BufHandle, lnum: usize) -> Result<Vec<u8>
 
 #[cfg(test)]
 mod completion_engine_tests {
-    use super::{CTRL_E, CTRL_N, CTRL_X, CompletionOutcome, CompletionSession};
+    use super::{CTRL_E, CTRL_N, CTRL_P, CTRL_X, CompletionOutcome, CompletionSession};
     use crate::layout::Geometry;
     use ox_text::{Buffer, Position};
 
@@ -2393,6 +2397,50 @@ mod completion_engine_tests {
         assert_eq!(pum.items[0].word.to_string_lossy().as_ref(), "include");
         assert_eq!(pum.selected, 0);
         assert_eq!((pum.row, pum.col), (1, 2));
+    }
+
+    #[test]
+    fn ctrl_p_reverses_candidate_order() {
+        // One shared list, traversed backward: the first CTRL-P lands on
+        // the last entry (`cp_prev`, insexpand.c:4940-4949), the nearest
+        // word above the cursor; the next CTRL-P steps toward the front.
+        let (mut editor, buffer, window) = editor_with(b"alpha\nalpaca\nalpine\nal");
+        let mut session = CompletionSession::new();
+        let outcome = session
+            .handle_insert_key(
+                &mut editor,
+                buffer,
+                window,
+                Position { lnum: 4, col: 2 },
+                CTRL_P,
+                0,
+            )
+            .unwrap();
+        assert_eq!(outcome, CompletionOutcome::Handled);
+        let pum = session.pum().expect("backward scan shows the pum");
+        // Shared forward order after the leader: alpha, alpaca, alpine.
+        // First CTRL-P lands on the last entry: `alpine`, nearest above.
+        assert_eq!(line(&editor, buffer, 4), "alpine");
+        let words: Vec<String> = pum
+            .items
+            .iter()
+            .map(|item| item.word.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(words, vec!["alpha", "alpaca", "alpine"]);
+        assert_eq!(pum.selected, 2);
+        // A second CTRL-P steps one entry toward the front: `alpaca`.
+        let outcome = session
+            .handle_insert_key(
+                &mut editor,
+                buffer,
+                window,
+                Position { lnum: 4, col: 6 },
+                CTRL_P,
+                1,
+            )
+            .unwrap();
+        assert_eq!(outcome, CompletionOutcome::Handled);
+        assert_eq!(line(&editor, buffer, 4), "alpaca");
     }
 
     #[test]

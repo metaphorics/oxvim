@@ -1159,10 +1159,10 @@ fn embedded_listener_exits_when_stdio_reaches_eof() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = child.try_wait().expect("poll embedded EOF listener") {
-            assert!(
-                status.success(),
-                "embedded EOF listener exited with {status}"
-            );
+            // A closed primary channel is abnormal termination:
+            // preserve_exit + getout(1) (msgpack_rpc/channel.c:528-529,
+            // main.c:888-936); verified against the reference binary.
+            assert_eq!(status.code(), Some(1), "exited with {status}");
             break;
         }
         if Instant::now() >= deadline {

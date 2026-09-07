@@ -2598,7 +2598,7 @@ impl ModeMachine {
             state.preview_start,
             &pattern,
             direction,
-            1,
+            state.count.max(1),
             option_bool(editor, "wrapscan", true),
             deadline,
         ) else {
