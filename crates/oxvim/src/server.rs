@@ -806,15 +806,22 @@ impl AppState {
     }
 
     fn execute_ex(&mut self, command: &str) -> Result<(), AppError> {
-        let outcome = self
-            .ex
-            .borrow_mut()
-            .execute_line_core(&*self.session, command)
-            .map_err(|error| AppError::Ex(error.to_string()))?;
-        if let Some(pending) = self.ex.borrow_mut().take_pending_edit_mode() {
+        // The pending mode applies on both paths: upstream stages
+        // `restart_edit` the moment `:startinsert` runs and no error
+        // cancels it (`ex_docmd.c` only saves/zeroes it around `:normal`),
+        // so a failing tail command must not drop the staged switch.
+        let outcome = self.ex.borrow_mut().execute_line_core(&*self.session, command);
+        // The temporary borrow ends with this statement, so the absorb
+        // below may borrow the host mutably.
+        let pending = self.ex.borrow_mut().take_pending_edit_mode();
+        if let Some(pending) = pending {
+            // A failing mode switch must not swallow a quit the command
+            // recorded: absorb first, then report the apply error.
+            self.absorb_pending_quit();
             Self::apply_pending_edit_mode(&self.session, &self.mode, pending)
                 .map_err(|error| AppError::Api(error.to_string()))?;
         }
+        let outcome = outcome.map_err(|error| AppError::Ex(error.to_string()))?;
         if let ExecOutcome::Quit(code) = outcome {
             self.exiting = true;
             self.exit_code = code;
@@ -1057,14 +1064,13 @@ impl AppState {
         };
         let command = std::str::from_utf8(command.as_bytes())
             .map_err(|_| ApiError::validation("Ex command must be valid UTF-8"))?;
-        let outcome = self
-            .ex
-            .borrow_mut()
-            .execute_line(&*self.session, command)
-            .map_err(|error| map_api_exec_error(ApiOperation::Command, error))?;
+        // Staged mode switches survive command errors (see `execute_ex`):
+        // drain the request before reporting the outcome.
+        let outcome = self.ex.borrow_mut().execute_line(&*self.session, command);
         if let Some(pending) = self.ex.borrow_mut().take_pending_edit_mode() {
             Self::apply_pending_edit_mode(&self.session, &self.mode, pending)?;
         }
+        let outcome = outcome.map_err(|error| map_api_exec_error(ApiOperation::Command, error))?;
         if let ExecOutcome::Quit(code) = outcome {
             self.exiting = true;
             self.exit_code = code;
@@ -1079,10 +1085,11 @@ impl AppState {
             executor: &mut ex,
             outcome: ExecOutcome::Completed,
         };
-        let result = ox_api::execute_nvim_cmd(&self.session, cmd, opts, &mut executor)?;
+        let result = ox_api::execute_nvim_cmd(&self.session, cmd, opts, &mut executor);
         if let Some(pending) = executor.executor.take_pending_edit_mode() {
             Self::apply_pending_edit_mode(&self.session, &self.mode, pending)?;
         }
+        let result = result?;
         if let ExecOutcome::Quit(code) = executor.outcome {
             self.exiting = true;
             self.exit_code = code;
