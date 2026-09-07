@@ -132,6 +132,11 @@ pub struct Scope {
     pub options_local: ScopeMap,
     /// `@r` register contents.
     pub registers: ScopeMap,
+    /// Baseline `g:` snapshot backing merge-on-write: `sync_scope_into_editor`
+    /// writes back only keys changed since this mirror, so a reentrant
+    /// executor's concurrent additions survive the outer sync. Bookkeeping
+    /// like the stamps: writable through `&Scope`.
+    pub global_mirror: std::cell::RefCell<ScopeMap>,
     /// Variables `:lockvar` marked, upstream's `DI_FLAGS_LOCK`.
     pub locked: Vec<LockMark>,
     /// Editor variable-map stamps recorded by the differential sync; a map

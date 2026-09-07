@@ -1743,6 +1743,8 @@ pub struct CompletionPum {
     pub row: usize,
     /// Anchor column (leader-end grid column).
     pub col: usize,
+    /// Match-list generation from the owning session.
+    pub revision: u64,
 }
 
 /// What one insert-mode key did to the completion session.
@@ -1814,6 +1816,9 @@ pub struct CompletionSession {
     /// `insexpand.c:399-400`): the next `CTRL-N`/`CTRL-P` continues
     /// under the plain banner, without `CONT_LOCAL`.
     interrupted: bool,
+    /// Match-list generation, bumped by every `start`: lets sync layers
+    /// tell a rebuilt list from mere navigation without comparing items.
+    pum_revision: u64,
 }
 
 impl Default for CompletionSession {
@@ -1832,6 +1837,7 @@ impl Default for CompletionSession {
             extra: None,
             pum_built_for: usize::MAX,
             interrupted: false,
+            pum_revision: 0,
         }
     }
 }
@@ -2007,6 +2013,7 @@ impl CompletionSession {
             MSG_KEYWORD
         });
         self.pum_built_for = usize::MAX;
+        self.pum_revision = self.pum_revision.wrapping_add(1);
         let sources = complete_sources(editor);
 
         // Original-text entry first, then every source in option order
@@ -2219,6 +2226,7 @@ impl CompletionSession {
             pum.selected = selected;
             pum.row = row;
             pum.col = col;
+            pum.revision = self.pum_revision;
             return;
         }
         let items = self.matches[1..]
@@ -2231,11 +2239,13 @@ impl CompletionSession {
             })
             .collect();
         self.pum_built_for = self.matches.len();
+        let revision = self.pum_revision;
         self.pum = Some(CompletionPum {
             items,
             selected,
             row,
             col,
+            revision,
         });
     }
 }

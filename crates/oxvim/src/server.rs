@@ -273,6 +273,11 @@ pub struct AppState {
     /// Process exit code requested by `:cquit` (0 for plain quits).
     exit_code: i64,
     rendered_messages: usize,
+    /// Last popupmenu push `(revision, selected, row, col)`: an unchanged
+    /// completion state sends no new `popupmenu_show`, so attached UIs
+    /// and the fallback painter stop re-receiving the whole item list
+    /// on every redraw.
+    last_pum: Option<(u64, i64, usize, usize)>,
     /// Stdout/stderr message output for the modes with no attached UI.
     printf: PrintfSink,
     lua_work: Rc<RefCell<VecDeque<Work>>>,
@@ -362,6 +367,11 @@ pub(crate) fn build_embedded_core(
     nested_ex
         .borrow_mut()
         .share_user_functions_from(&ex.borrow());
+    // One swap ledger, one quit bus, one exit flag for the session:
+    // reentrant executors preserve into the same ledger and fire the
+    // exit events exactly once.
+    nested_ex.borrow_mut().share_quit_bus_from(&ex.borrow());
+    nested_ex.borrow_mut().share_session_from(&ex.borrow());
     let mut lua = LuaHost::new(
         LuaRuntimeRoot::new(runtime_root().unwrap_or_default()),
         Rc::new(EditorBuiltins {
@@ -539,6 +549,7 @@ impl AppState {
             exiting: false,
             exit_code: 0,
             rendered_messages: 0,
+            last_pum: None,
             printf: PrintfSink::default(),
             lua_work,
             emitter: Emitter::new(),
@@ -1356,25 +1367,52 @@ impl AppState {
         };
         self.session.with_render_state(|_, _, chrome| {
             chrome.set_showmode(showmode_content);
+        });
+        // Push the list only when it is new; navigation within one
+        // list travels as a selection update, like upstream's
+        // `popupmenu_show` once plus `popupmenu_select`. (Showmode
+        // above always pushes: its text changes independently.)
+        let pum_key = completion_pum
+            .as_ref()
+            .map(|pum| (pum.revision, pum.selected, pum.row, pum.col));
+        if pum_key == self.last_pum {
+            return Ok(());
+        }
+        self.last_pum = pum_key;
+        self.session.with_render_state(|_, _, chrome| {
             match completion_pum {
-                Some(pum) => chrome.show_popupmenu(PopupmenuState {
-                    items: pum
-                        .items
-                        .iter()
-                        .map(|item| {
-                            PopupItem::new(
-                                item.word.clone(),
-                                item.kind.clone(),
-                                item.menu.clone(),
-                                item.info.clone(),
-                            )
-                        })
-                        .collect(),
-                    selected: pum.selected,
-                    row: pum.row,
-                    col: pum.col,
-                    grid: 1, // default grid
-                }),
+                Some(pum) => {
+                    let shown = chrome.popupmenu.as_ref();
+                    let same_list = shown.is_some_and(|shown| {
+                        shown.revision == pum.revision
+                            && shown.row == pum.row
+                            && shown.col == pum.col
+                    });
+                    if same_list {
+                        chrome.select_popupmenu(pum.selected);
+                    } else {
+                        chrome.show_popupmenu(PopupmenuState {
+                            items: pum
+                                .items
+                                .iter()
+                                .map(|item| {
+                                    PopupItem::new(
+                                        item.word.clone(),
+                                        item.kind.clone(),
+                                        item.menu.clone(),
+                                        item.info.clone(),
+                                    )
+                                })
+                                .collect(),
+                            selected: pum.selected,
+                            row: pum.row,
+                            col: pum.col,
+                            grid: 1, // default grid
+                            revision: pum.revision,
+                            widths: (0, 0, 0),
+                        });
+                    }
+                }
                 None => chrome.hide_popupmenu(),
             }
         });
@@ -3376,6 +3414,8 @@ fn fresh_executors(
         primary.share_runtime_roots_from(&source);
         primary.share_quit_bus_from(&source);
         nested.share_quit_bus_from(&source);
+        primary.share_session_from(&source);
+        nested.share_session_from(&source);
         nested.share_runtime_roots_from(&source);
     }
     primary.set_channel_ids(channel_ids.clone());

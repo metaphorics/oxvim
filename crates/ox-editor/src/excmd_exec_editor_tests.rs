@@ -29,6 +29,7 @@ use std::rc::Rc;
 
 use ox_text::Buffer;
 
+use crate::excmd_exec::{sync_editor_into_scope, sync_scope_into_editor};
 use crate::script::{FileIO, FileKind, FileMetadata};
 use crate::{
     AutocmdFilter, AutocmdKind, AutocmdOptions, Editor, Event, ExExecutor, ExecError, ExecOutcome,
@@ -8113,4 +8114,43 @@ fn sort_conflicting_formats_e474() {
 fn sort_invalid_flag_e475() {
     let (editor, mut executor) = setup_with_content(&[b"1".to_vec(), b"2".to_vec()]);
     assert_vim_error(executor.execute_line(&editor, "sort z"), "E475");
+}
+
+#[test]
+fn nested_global_write_survives_outer_sync() {
+    // A reentrant executor's `g:` write must survive the outer
+    // executor's whole-map sync: only keys changed since the mirror
+    // sync back.
+    let mut editor = Editor::new();
+    let mut outer = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut outer).unwrap();
+    outer
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"outer",
+            0,
+            ox_types::Typval::Number(1),
+        )
+        .unwrap();
+    let mut nested = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut nested).unwrap();
+    nested
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"nested",
+            0,
+            ox_types::Typval::Number(2),
+        )
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &nested).unwrap();
+    sync_scope_into_editor(&mut editor, &outer).unwrap();
+    let gvars = editor.gvars();
+    assert_eq!(
+        gvars.get(&ox_types::OxStr::from("outer")),
+        Some(&ox_types::Object::Integer(1))
+    );
+    assert_eq!(
+        gvars.get(&ox_types::OxStr::from("nested")),
+        Some(&ox_types::Object::Integer(2))
+    );
 }

@@ -1054,21 +1054,9 @@ fn apply_popupmenu_fallback(
         .group_id(&OxStr::from("PmenuThumb"))
         .unwrap_or(pmenu_sbar);
 
-    let mut word_width = 0;
-    let mut kind_width = 0;
-    let mut menu_width = 0;
-    for item in &state.items {
-        let word = item.word.to_string_lossy();
-        word_width = word_width.max(UnicodeWidthStr::width(word.as_ref()));
-        let kind = item.kind.to_string_lossy();
-        if !kind.is_empty() {
-            kind_width = kind_width.max(UnicodeWidthStr::width(kind.as_ref()) + 1);
-        }
-        let menu = item.menu.to_string_lossy();
-        if !menu.is_empty() {
-            menu_width = menu_width.max(UnicodeWidthStr::width(menu.as_ref()) + 1);
-        }
-    }
+    // Widths arrive precomputed with the list (`show_popupmenu`
+    // measures once per list, not once per redraw).
+    let (word_width, kind_width, menu_width) = state.widths;
     let natural_width = word_width + kind_width + menu_width;
     let total_width = natural_width.max(PUM_MIN_WIDTH);
 

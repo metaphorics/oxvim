@@ -705,7 +705,9 @@ pub(crate) struct ExRuntime<F: FileIO> {
     /// (`ex_docmd.c:7860-7884`): unset, enabled, or explicitly disabled.
     pub(crate) filetype: FiletypeState,
     /// `getout` (`main.c`:753) has begun, so `VimLeavePre`/`VimLeave` are done.
-    pub(crate) exiting: bool,
+    /// Shared across executors: a nested `:qall` that already fired the
+    /// exit events must suppress the primary's second firing.
+    pub(crate) exiting: Rc<RefCell<bool>>,
     /// `do_one_cmd`'s view of the command it is running, which
     /// `do_errthrow`'s `cmdname` argument (`ex_docmd.c:2385-2387`) and
     /// `append_command` (`ex_docmd.c:2993`) both read.
@@ -760,15 +762,18 @@ pub(crate) struct ExRuntime<F: FileIO> {
     /// Per-buffer swapfile names chosen this session (`mf_fname`): computed
     /// on first use and pinned, so `:swapname`, `swapname()`, `:preserve`,
     /// and exit handling all agree which file carries the buffer's changes.
-    pub(crate) swap_names: HashMap<BufHandle, PathBuf>,
+    /// Shared across the session's executors (primary, nested, forks), so
+    /// a swapfile written reentrantly is cleaned up exactly once.
+    pub(crate) swap_names: Rc<RefCell<HashMap<BufHandle, PathBuf>>>,
     /// Swapfiles written by `:preserve` or the exit sequence
     /// (`mf_set_names`): `ml_close_all(true)` on the normal `getout` path
     /// removes exactly these (`os_exit`, main.c:738), while `preserve_exit`
-    /// leaves them on disk.
-    pub(crate) swap_written: BTreeSet<PathBuf>,
+    /// leaves them on disk. Shared like `swap_names`.
+    pub(crate) swap_written: Rc<RefCell<BTreeSet<PathBuf>>>,
     /// `preserve_exit` (main.c:888): the abnormal-termination path, where
-    /// swapfiles are written and kept instead of removed.
-    pub(crate) preserve_exit: bool,
+    /// swapfiles are written and kept instead of removed. Shared like
+    /// `swap_names`.
+    pub(crate) preserve_exit: Rc<RefCell<bool>>,
     /// Upstream `trylevel` (`ex_eval.c`): nonzero while a `:try` block is
     /// active. When zero, errors display but do not abort script execution
     /// (`cause_errthrow` returns false, `should_abort` returns false). When
@@ -790,7 +795,7 @@ impl<F: FileIO> ExRuntime<F> {
             terminal_exit_message: true,
             redirection: None,
             filetype: FiletypeState::default(),
-            exiting: false,
+            exiting: Rc::new(RefCell::new(false)),
             executing: ExecutingCommand::default(),
             active_autocmd: ActiveAutocmdContext::default(),
             autocmd_busy: 0,
@@ -803,9 +808,9 @@ impl<F: FileIO> ExRuntime<F> {
             did_emsg: false,
             try_depth: 0,
             mode_machine: None,
-            swap_names: HashMap::new(),
-            swap_written: BTreeSet::new(),
-            preserve_exit: false,
+            swap_names: Rc::new(RefCell::new(HashMap::new())),
+            swap_written: Rc::new(RefCell::new(BTreeSet::new())),
+            preserve_exit: Rc::new(RefCell::new(false)),
         }
     }
 
@@ -1128,6 +1133,16 @@ impl<F: FileIO> ExExecutor<F> {
     /// executor of a session pair, and inherit it in forks.
     pub fn share_quit_bus_from<G: FileIO>(&mut self, other: &ExExecutor<G>) {
         self.quit_bus = Rc::clone(&other.quit_bus);
+    }
+
+    /// Shares the session-level swap ledger and exit flag with `other`,
+    /// so reentrant and forked executors preserve into one ledger, clean
+    /// up once, and fire the exit events exactly once per process.
+    pub fn share_session_from<G: FileIO>(&mut self, other: &ExExecutor<G>) {
+        self.runtime.swap_names = Rc::clone(&other.runtime.swap_names);
+        self.runtime.swap_written = Rc::clone(&other.runtime.swap_written);
+        self.runtime.preserve_exit = Rc::clone(&other.runtime.preserve_exit);
+        self.runtime.exiting = Rc::clone(&other.runtime.exiting);
     }
 
     /// Installs the Lua host used by `:lua`, `:luafile`, and `:luado`.
@@ -2023,7 +2038,7 @@ impl<F: FileIO> ExExecutor<F> {
         access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
         let lua = self.lua.clone();
         fire_exit_autocmds(&mut self.runtime, access, &mut self.scope, lua.as_ref());
-        if self.runtime.preserve_exit {
+        if *self.runtime.preserve_exit.borrow() {
             // `preserve_exit` (main.c:917-929): `ml_close_notmod` removes
             // the swapfiles of unmodified buffers, `ml_sync_all` flushes the
             // rest, and `ml_close_all(false)` leaves them on disk.
@@ -2034,7 +2049,7 @@ impl<F: FileIO> ExExecutor<F> {
             // `os_exit` -> `ml_close_all(true)` (main.c:738): every swapfile
             // written this session is removed; `os_remove` failures are
             // ignored upstream (memfile.c:178-179).
-            for path in std::mem::take(&mut self.runtime.swap_written) {
+            for path in std::mem::take(&mut *self.runtime.swap_written.borrow_mut()) {
                 let _ = std::fs::remove_file(path);
             }
         }
@@ -2046,7 +2061,7 @@ impl<F: FileIO> ExExecutor<F> {
     /// — where `run_exit_sequence` writes swapfiles and keeps them instead
     /// of removing them (`ml_sync_all` + `ml_close_all(false)`).
     pub fn preserve_exit(&mut self) {
-        self.runtime.preserve_exit = true;
+        *self.runtime.preserve_exit.borrow_mut() = true;
     }
 }
 
@@ -7474,8 +7489,8 @@ fn buffer_swap_name<F: FileIO>(
     editor: &mut Editor,
     buffer: BufHandle,
 ) -> Option<PathBuf> {
-    if let Some(name) = runtime.swap_names.get(&buffer) {
-        return Some(name.clone());
+    if let Some(name) = runtime.swap_names.borrow().get(&buffer).cloned() {
+        return Some(name);
     }
     let candidate = swap_candidate(editor, buffer)?;
     let no_updatecount = matches!(
@@ -7497,7 +7512,7 @@ fn buffer_swap_name<F: FileIO>(
         return None;
     }
     let name = findswapname(runtime, editor, &candidate.file_name, &dirs)?;
-    runtime.swap_names.insert(buffer, name.clone());
+    runtime.swap_names.borrow_mut().insert(buffer, name.clone());
     Some(name)
 }
 
@@ -7599,7 +7614,7 @@ fn preserve_one_swapfile<F: FileIO>(
         .write_to(&name)
     {
         Ok(()) => {
-            runtime.swap_written.insert(name);
+            runtime.swap_written.borrow_mut().insert(name);
             if report {
                 push_text_message(editor, "File preserved".to_owned(), false, false);
             }
@@ -7635,9 +7650,9 @@ fn preserve_modified_swapfiles<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &m
         };
         if candidate.modified {
             preserve_one_swapfile(runtime, editor, buffer, false);
-        } else if let Some(name) = runtime.swap_names.get(&buffer).cloned() {
+        } else if let Some(name) = runtime.swap_names.borrow().get(&buffer).cloned() {
             // An unmodified buffer's swapfile is not needed for recovery.
-            if runtime.swap_written.remove(&name) {
+            if runtime.swap_written.borrow_mut().remove(&name) {
                 let _ = std::fs::remove_file(&name);
             }
         }
@@ -13340,10 +13355,10 @@ fn fire_exit_autocmds<F: FileIO, E: ExEditorAccess>(
     scope: &mut Scope,
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
 ) {
-    if runtime.exiting {
+    if *runtime.exiting.borrow() {
         return;
     }
-    runtime.exiting = true;
+    *runtime.exiting.borrow_mut() = true;
     for event in [Event::VimLeavePre, Event::VimLeave] {
         let plan = access
             .with_ex_editor(|editor| editor.autocmds_mut().plan(event, AutocmdContext::default()));
@@ -15355,6 +15370,7 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
     let global_version = editor.gvars_version();
     if scope.synced.get(ScopeKind::Global) != global_version {
         scope.global = dict_to_scope(editor.gvars());
+        *scope.global_mirror.borrow_mut() = scope.global.clone();
         scope.synced.set(ScopeKind::Global, global_version);
         scope.synced.clear_dirty(ScopeKind::Global);
     }
@@ -15579,7 +15595,25 @@ fn option_matches(value: &OptionValue, existing: &Typval) -> bool {
 /// write.
 pub(crate) fn sync_scope_into_editor(editor: &mut Editor, scope: &Scope) -> Result<(), ExecError> {
     if scope.synced.is_dirty(ScopeKind::Global) {
-        *editor.gvars_mut() = scope_to_dict(&scope.global);
+        // Merge, never replace: a reentrant executor may have written the
+        // live map after this scope mirrored it (`let g:outer = 1` outside
+        // an autocmd that sets `g:nested = 2` must keep both). Only keys
+        // added, changed, or removed since the mirror sync back; on a
+        // write-write conflict the outer writer wins.
+        let current = scope_to_dict(&scope.global);
+        let baseline = scope_to_dict(&scope.global_mirror.borrow());
+        let live = editor.gvars_mut();
+        for (key, value) in &current.0 {
+            if baseline.get(key) != Some(value) {
+                live.insert(key.clone(), value.clone());
+            }
+        }
+        for (key, _) in &baseline.0 {
+            if current.get(key).is_none() {
+                live.0.retain(|live_key| live_key.0 != *key);
+            }
+        }
+        *scope.global_mirror.borrow_mut() = scope.global.clone();
         scope.synced.set(ScopeKind::Global, editor.gvars_version());
         scope.synced.clear_dirty(ScopeKind::Global);
     }

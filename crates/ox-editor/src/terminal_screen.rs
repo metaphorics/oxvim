@@ -1114,14 +1114,16 @@ impl TerminalScreen {
                 self.cursor.col = self.csi.count(1, 1).saturating_sub(1).min(last_col);
                 self.pending_wrap = false;
             }
-            // CHT and CBT
+            // CHT and CBT: the repeat count saturates at the tab stops
+            // a screen holds, so a hostile parameter cannot spin billions
+            // of no-op iterations past the line boundary.
             b'I' => {
-                for _ in 0..self.csi.count(0, 1) {
+                for _ in 0..self.csi.count(0, 1).min(last_col.saturating_add(1)) {
                     self.tab();
                 }
             }
             b'Z' => {
-                for _ in 0..self.csi.count(0, 1) {
+                for _ in 0..self.csi.count(0, 1).min(last_col.saturating_add(1)) {
                     let col = self.cursor.col;
                     self.cursor.col = col.saturating_sub(1) / TAB_WIDTH * TAB_WIDTH;
                 }
@@ -1499,6 +1501,17 @@ mod tests {
 
     fn text(screen: &TerminalScreen, row: usize) -> String {
         String::from_utf8_lossy(&screen.render_row(row).text).into_owned()
+    }
+
+    #[test]
+    fn hostile_tab_repeat_saturates_at_the_line_edge() {
+        // A child-sent `CSI 4294967295 I/Z` must stop at the boundary,
+        // not spin billions of iterations.
+        let mut screen = screen(24, 80);
+        screen.write(b"\x1b[4294967295I");
+        assert_eq!(screen.cursor().col, 79);
+        screen.write(b"\x1b[4294967295Z");
+        assert_eq!(screen.cursor().col, 0);
     }
 
     #[test]
