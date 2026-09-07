@@ -1265,7 +1265,6 @@ impl AppState {
 
     fn sync_chrome(&mut self) -> Result<(), ApiError> {
         let mode = self.mode.borrow().mode().clone();
-        self.sync_cmdline_chrome(&mode)?;
         let (completion_showmode, completion_pum) = {
             let machine = self.mode.borrow();
             (
@@ -1273,6 +1272,27 @@ impl AppState {
                 machine.completion.pum().cloned(),
             )
         };
+        // Chrome tracks the full mode name so painters can detect
+        // command-line mode (`emitter.rs` matches `cmdline*` prefixes).
+        let mode_name: &str = match &mode {
+            Mode::Normal(_) => "normal",
+            Mode::Insert(_) => "insert",
+            Mode::Replace(_) => "replace",
+            // Visual line/block/char all report the `visual` mode
+            // upstream; the shape lives in mode_info, not the name.
+            Mode::Visual(_) => "visual",
+            Mode::Cmdline(state) => match state.kind {
+                CmdlineKind::Ex => "cmdline_normal",
+                // Upstream names both search directions `cmdline_hover`
+                // (`mode_names[]`, `ui_compositor.c` `ui_default_colors`).
+                CmdlineKind::Search(_) => "cmdline_hover",
+            },
+            Mode::OperatorPending(_) => "operator",
+        };
+        let mode_index = ox_ui::emitter::mode_index(mode_name);
+        self.session
+            .with_render_state(|_, _, chrome| chrome.set_mode(mode_name, mode_index));
+        self.sync_cmdline_chrome(&mode)?;
         // Showmode: emit `-- INSERT --`, `-- REPLACE --`, `-- VISUAL --` etc.
         // mirroring Neovim's `showmode()` (`drawscreen.c:901`) gated by
         // `p_smd`. The highlight is `ModeMsg` (HLF_CM), defaulting to bold.

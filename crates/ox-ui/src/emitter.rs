@@ -4,13 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ox_types::{Object, OxStr};
 use thiserror::Error;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::channel::{UiChannelError, UiChannels, UiEvent, UiOptions};
 use crate::chrome::{ChromeState, ContentChunk};
 use crate::compositor::{Compositor, CompositorError, Layer, LayerKind, WatchedExtmark};
 use crate::grid::{Grid, GridError, GridLine};
-use crate::hl::{Highlight, HlEvent, HlState};
+use crate::hl::{Highlight, HlAttrs, HlError, HlEvent, HlInfo, HlState};
 
 /// Emitter failures.
 #[derive(Debug, Error)]
@@ -24,6 +24,9 @@ pub enum EmitterError {
     /// Grid construction failed.
     #[error(transparent)]
     Grid(#[from] GridError),
+    /// Highlight interning failed.
+    #[error(transparent)]
+    Hl(#[from] HlError),
     /// A float position coordinate is outside the i32 screen coordinate range.
     #[error("grid coordinate {0} is outside the i32 screen coordinate range")]
     Position(isize),
@@ -129,6 +132,7 @@ impl Emitter {
             let first_redraw = self.initialized.insert(channel_id);
             channel.begin();
             let options = channel.options();
+            ensure_chrome_highlights(highlights)?;
             if first_redraw {
                 emit_startup_metadata(channel, options)?;
             }
@@ -155,7 +159,7 @@ impl Emitter {
                 let cmdline_cursor = if options.ext_cmdline {
                     None
                 } else {
-                    apply_cmdline_fallback(&mut default_grid, chrome)?
+                    apply_cmdline_fallback(&mut default_grid, highlights, chrome)?
                 };
                 self.emit_grid(channel_id, channel, &default_grid)?;
                 let float_compindex = float_compindexes(compositor);
@@ -190,13 +194,16 @@ impl Emitter {
                 let message_cursor = if options.ext_messages {
                     None
                 } else {
-                    apply_message_fallback(&mut output, chrome)?
+                    apply_message_fallback(&mut output, highlights, chrome)?
                 };
                 let cmdline_cursor = if options.ext_cmdline {
                     None
                 } else {
-                    apply_cmdline_fallback(&mut output, chrome)?
+                    apply_cmdline_fallback(&mut output, highlights, chrome)?
                 };
+                if !options.ext_popupmenu {
+                    apply_popupmenu_fallback(&mut output, highlights, chrome)?;
+                }
                 self.emit_grid(channel_id, channel, &output)?;
                 if let Some((row, col)) = cmdline_cursor.or(message_cursor).or(composed.cursor) {
                     channel.emit(UiEvent::new(
@@ -347,10 +354,40 @@ impl Emitter {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "startup metadata must remain in protocol emission order"
-)]
+/// The canonical mode table: the sole source of `mode_info_set` entries
+/// and of the index every `mode_change` event carries.
+const MODES: &[(&str, &str, &str, i64, i64, i64, i64)] = &[
+    ("normal", "n", "block", 0, 0, 0, 0),
+    ("visual", "v", "block", 0, 0, 0, 0),
+    ("insert", "i", "vertical", 25, 0, 0, 0),
+    ("replace", "r", "horizontal", 20, 0, 0, 0),
+    ("cmdline_normal", "c", "block", 0, 0, 0, 0),
+    ("cmdline_insert", "ci", "vertical", 25, 0, 0, 0),
+    ("cmdline_replace", "cr", "horizontal", 20, 0, 0, 0),
+    ("operator", "o", "block", 0, 0, 0, 0),
+    ("visual_select", "ve", "block", 0, 0, 0, 0),
+    ("cmdline_hover", "c", "block", 0, 0, 0, 0),
+    ("statusline_hover", "s", "block", 0, 0, 0, 0),
+    ("statusline_drag", "sd", "block", 0, 0, 0, 0),
+    ("vsep_hover", "vs", "block", 0, 0, 0, 0),
+    ("vsep_drag", "vd", "block", 0, 0, 0, 0),
+    ("more", "m", "block", 0, 0, 0, 0),
+    ("more_lastline", "ml", "block", 0, 0, 0, 0),
+    ("showmatch", "sm", "block", 0, 0, 0, 0),
+    ("terminal", "t", "block", 0, 500, 500, 0),
+];
+
+/// Index of `name` in the canonical mode table; upstream `mode_change`
+/// events carry this index, and UIs validate the pair against
+/// `mode_info_set`. `normal` and any unlisted name answer index 0.
+#[must_use]
+pub fn mode_index(name: &str) -> usize {
+    MODES
+        .iter()
+        .position(|(mode, ..)| *mode == name)
+        .unwrap_or(0)
+}
+
 fn emit_startup_metadata(
     channel: &mut crate::channel::UiChannel,
     options: UiOptions,
@@ -405,54 +442,36 @@ fn emit_startup_metadata(
         ],
     ))?;
 
-    let modes = [
-        ("normal", "n", "block", 0, 0, 0, 0),
-        ("visual", "v", "block", 0, 0, 0, 0),
-        ("insert", "i", "vertical", 25, 0, 0, 0),
-        ("replace", "r", "horizontal", 20, 0, 0, 0),
-        ("cmdline_normal", "c", "block", 0, 0, 0, 0),
-        ("cmdline_insert", "ci", "vertical", 25, 0, 0, 0),
-        ("cmdline_replace", "cr", "horizontal", 20, 0, 0, 0),
-        ("operator", "o", "block", 0, 0, 0, 0),
-        ("visual_select", "ve", "block", 0, 0, 0, 0),
-        ("cmdline_hover", "c", "block", 0, 0, 0, 0),
-        ("statusline_hover", "s", "block", 0, 0, 0, 0),
-        ("statusline_drag", "sd", "block", 0, 0, 0, 0),
-        ("vsep_hover", "vs", "block", 0, 0, 0, 0),
-        ("vsep_drag", "vd", "block", 0, 0, 0, 0),
-        ("more", "m", "block", 0, 0, 0, 0),
-        ("more_lastline", "ml", "block", 0, 0, 0, 0),
-        ("showmatch", "sm", "block", 0, 0, 0, 0),
-        ("terminal", "t", "block", 0, 500, 500, 0),
-    ]
-    .into_iter()
-    .map(
-        |(name, short_name, cursor_shape, cell_percentage, blinkwait, blinkon, blinkoff)| {
-            Object::Dict(ox_types::Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from(name))),
-                (
-                    OxStr::from("short_name"),
-                    Object::String(OxStr::from(short_name)),
-                ),
-                (
-                    OxStr::from("cursor_shape"),
-                    Object::String(OxStr::from(cursor_shape)),
-                ),
-                (
-                    OxStr::from("cell_percentage"),
-                    Object::Integer(cell_percentage),
-                ),
-                (OxStr::from("blinkwait"), Object::Integer(blinkwait)),
-                (OxStr::from("blinkon"), Object::Integer(blinkon)),
-                (OxStr::from("blinkoff"), Object::Integer(blinkoff)),
-                (OxStr::from("attr_id"), Object::Integer(0)),
-                (OxStr::from("attr_id_lm"), Object::Integer(0)),
-                (OxStr::from("hl_id"), Object::Integer(0)),
-                (OxStr::from("id_lm"), Object::Integer(0)),
-            ]))
-        },
-    )
-    .collect();
+    let modes = MODES
+        .iter()
+        .copied()
+        .map(
+            |(name, short_name, cursor_shape, cell_percentage, blinkwait, blinkon, blinkoff)| {
+                Object::Dict(ox_types::Dict(vec![
+                    (OxStr::from("name"), Object::String(OxStr::from(name))),
+                    (
+                        OxStr::from("short_name"),
+                        Object::String(OxStr::from(short_name)),
+                    ),
+                    (
+                        OxStr::from("cursor_shape"),
+                        Object::String(OxStr::from(cursor_shape)),
+                    ),
+                    (
+                        OxStr::from("cell_percentage"),
+                        Object::Integer(cell_percentage),
+                    ),
+                    (OxStr::from("blinkwait"), Object::Integer(blinkwait)),
+                    (OxStr::from("blinkon"), Object::Integer(blinkon)),
+                    (OxStr::from("blinkoff"), Object::Integer(blinkoff)),
+                    (OxStr::from("attr_id"), Object::Integer(0)),
+                    (OxStr::from("attr_id_lm"), Object::Integer(0)),
+                    (OxStr::from("hl_id"), Object::Integer(0)),
+                    (OxStr::from("id_lm"), Object::Integer(0)),
+                ]))
+            },
+        )
+        .collect();
     channel.emit(UiEvent::new(
         "mode_info_set",
         vec![Object::Boolean(true), Object::Array(modes)],
@@ -563,89 +582,649 @@ fn route_chrome(
     Ok(())
 }
 
+/// Default maximum popup menu height when the `pumheight` option is unset.
+///
+/// Mirrors `PUM_DEF_HEIGHT` in `.references/neovim/src/nvim/popupmenu.c:92`.
+const PUM_DEF_HEIGHT: usize = 10;
+
+/// Default minimum popup menu width (`pumwidth` option default).
+///
+/// Upstream `options.lua` defines `pumwidth` with default `15`.
+const PUM_MIN_WIDTH: usize = 15;
+
+/// String drawn for multi-line messages waiting for a key press.
+///
+/// Mirrors `hit_return_msg` in `.references/neovim/src/nvim/message.c:1624`.
+const HIT_ENTER_PROMPT: &str = "Press ENTER or type command to continue";
+
+/// Ensures the highlight groups chrome fallbacks paint with are interned.
+///
+/// These groups are the producer's responsibility, but the fallback path must
+/// not paint with attribute `0` when the producer has not yet defined them.
+fn ensure_chrome_highlights(highlights: &mut HlState) -> Result<(), HlError> {
+    define_group_if_missing(highlights, "Question", question_highlight())?;
+    define_group_if_missing(highlights, "Pmenu", pmenu_highlight())?;
+    define_group_if_missing(highlights, "PmenuSel", pmenu_sel_highlight())?;
+    define_group_if_missing(highlights, "PmenuSbar", pmenu_sbar_highlight())?;
+    define_group_if_missing(highlights, "PmenuThumb", pmenu_thumb_highlight())?;
+    define_group_if_missing(highlights, "ErrorMsg", error_msg_highlight())?;
+    define_group_if_missing(highlights, "MsgArea", Highlight::default())?;
+    define_group_if_missing(highlights, "MoreMsg", more_msg_highlight())?;
+    Ok(())
+}
+
+fn define_group_if_missing(
+    highlights: &mut HlState,
+    name: &str,
+    highlight: Highlight,
+) -> Result<u64, HlError> {
+    if let Some(id) = highlights.group_id(&OxStr::from(name)) {
+        Ok(id)
+    } else {
+        highlights.define_group(name, highlight)
+    }
+}
+
+fn named_highlight(name: &str, rgb: HlAttrs, cterm: HlAttrs, cterm_explicit: bool) -> Highlight {
+    Highlight {
+        rgb,
+        cterm,
+        cterm_explicit,
+        info: vec![HlInfo {
+            kind: OxStr::from("ui"),
+            hi_name: Some(OxStr::from(name)),
+            ui_name: Some(OxStr::from(name)),
+            id: None,
+        }],
+        ..Highlight::default()
+    }
+}
+
+fn question_highlight() -> Highlight {
+    named_highlight(
+        "Question",
+        HlAttrs {
+            foreground: Some(0x00_73_73),
+            ..HlAttrs::default()
+        },
+        HlAttrs {
+            foreground: Some(6),
+            fg_indexed: true,
+            ..HlAttrs::default()
+        },
+        true,
+    )
+}
+
+fn pmenu_highlight() -> Highlight {
+    named_highlight(
+        "Pmenu",
+        HlAttrs {
+            background: Some(0xc4_c6_cd),
+            ..HlAttrs::default()
+        },
+        HlAttrs {
+            reverse: true,
+            ..HlAttrs::default()
+        },
+        true,
+    )
+}
+
+fn pmenu_sel_highlight() -> Highlight {
+    named_highlight(
+        "PmenuSel",
+        HlAttrs {
+            reverse: true,
+            ..HlAttrs::default()
+        },
+        HlAttrs {
+            reverse: true,
+            underline: true,
+            ..HlAttrs::default()
+        },
+        true,
+    )
+}
+
+fn pmenu_sbar_highlight() -> Highlight {
+    // Upstream links PmenuSbar to Pmenu, but for the fallback we keep it
+    // as a distinct group so the symbolic resolver can tell track from item.
+    named_highlight(
+        "PmenuSbar",
+        HlAttrs {
+            background: Some(0xc4_c6_cd),
+            ..HlAttrs::default()
+        },
+        HlAttrs {
+            reverse: true,
+            ..HlAttrs::default()
+        },
+        true,
+    )
+}
+
+fn pmenu_thumb_highlight() -> Highlight {
+    named_highlight(
+        "PmenuThumb",
+        HlAttrs {
+            background: Some(0x9b_9e_a4),
+            ..HlAttrs::default()
+        },
+        HlAttrs {
+            background: Some(8),
+            bg_indexed: true,
+            ..HlAttrs::default()
+        },
+        true,
+    )
+}
+
+fn error_msg_highlight() -> Highlight {
+    named_highlight(
+        "ErrorMsg",
+        HlAttrs {
+            foreground: Some(0x59_00_08),
+            ..HlAttrs::default()
+        },
+        HlAttrs {
+            foreground: Some(1),
+            fg_indexed: true,
+            ..HlAttrs::default()
+        },
+        true,
+    )
+}
+
+fn more_msg_highlight() -> Highlight {
+    named_highlight(
+        "MoreMsg",
+        HlAttrs {
+            foreground: Some(0x00_5f_00),
+            ..HlAttrs::default()
+        },
+        HlAttrs {
+            foreground: Some(2),
+            fg_indexed: true,
+            ..HlAttrs::default()
+        },
+        true,
+    )
+}
 fn apply_message_fallback(
     grid: &mut Grid,
+    highlights: &HlState,
     chrome: &ChromeState,
 ) -> Result<Option<(usize, usize)>, GridError> {
+    let msg_area_id = highlights.group_id(&OxStr::from("MsgArea")).unwrap_or(0);
     if let Some(message) = &chrome.message {
-        write_chunks(grid, &message.content)?;
-        let text = message
+        if message
             .content
             .iter()
-            .map(|chunk| chunk.text.to_string_lossy())
-            .collect::<String>();
-        let last = text.lines().next_back().unwrap_or_default();
-        return Ok(text.contains('\n').then_some((
-            grid.height().saturating_sub(1),
-            UnicodeWidthStr::width(last).min(grid.width().saturating_sub(1)),
-        )));
+            .all(|chunk| chunk.text.to_string_lossy().is_empty())
+        {
+            return Ok(None);
+        }
+        let question_id = highlights.group_id(&OxStr::from("Question")).unwrap_or(0);
+        let logical = message_lines(&message.content);
+        let mut visual: Vec<Vec<(String, u64)>> = Vec::new();
+        for line in logical {
+            visual.extend(wrap_fragments(&line, grid.width()));
+        }
+        if visual.is_empty() {
+            return Ok(None);
+        }
+        if visual.len() == 1 {
+            let floor = message_floor(grid, chrome);
+            paint_message_line(grid, floor, &visual[0], msg_area_id)?;
+            return Ok(None);
+        }
+        let prompt = wrap_fragments(&[(HIT_ENTER_PROMPT.to_owned(), question_id)], grid.width());
+        let floor = message_floor(grid, chrome);
+        // The message area owns `floor + 1` rows; a prompt that wraps past
+        // that keeps its tail (upstream draws the prompt bottom-aligned in
+        // the message area, `msg_scroll_up`, message.c), never past it.
+        let available = floor + 1;
+        let displayed = visual.len().min(available.saturating_sub(prompt.len()));
+        let start = visual.len().saturating_sub(displayed);
+        let displayed_content = &visual[start..];
+        let prompt_avail = available - displayed;
+        let prompt_start = prompt.len().saturating_sub(prompt_avail);
+        let shown_prompt = &prompt[prompt_start..];
+        let total = displayed + shown_prompt.len();
+        let first_row = available.saturating_sub(total);
+        let scroll_rows = isize::try_from(total).unwrap_or(0);
+        if scroll_rows > 0 {
+            grid.scroll(0, grid.height(), 0, grid.width(), scroll_rows, 0)?;
+        }
+        for (i, line) in displayed_content.iter().enumerate() {
+            paint_message_line(grid, first_row + i, line, msg_area_id)?;
+        }
+        for (i, line) in shown_prompt.iter().enumerate() {
+            paint_message_line(grid, first_row + displayed + i, line, msg_area_id)?;
+        }
+        if let Some(last) = shown_prompt.last() {
+            let row = first_row + displayed + shown_prompt.len() - 1;
+            let col = line_width(last).min(grid.width());
+            Ok(Some((row, col)))
+        } else {
+            Ok(None)
+        }
+    } else if !chrome.showmode.is_empty() {
+        let floor = message_floor(grid, chrome);
+        let line = chunks_to_fragments(&chrome.showmode);
+        let visual = wrap_fragments(&line, grid.width());
+        if let Some(first) = visual.first() {
+            paint_message_line(grid, floor, first, msg_area_id)?;
+        }
+        Ok(None)
+    } else {
+        Ok(None)
     }
-    if !chrome.showmode.is_empty() {
-        write_chunks(grid, &chrome.showmode)?;
+}
+
+fn paint_message_line(
+    grid: &mut Grid,
+    row: usize,
+    line: &[(String, u64)],
+    msg_area_id: u64,
+) -> Result<(), GridError> {
+    if grid.width() == 0 {
+        return Ok(());
     }
-    Ok(None)
+    let fill_id = line.last().map_or(
+        msg_area_id,
+        |(_, hl_id)| {
+            if *hl_id == 0 { msg_area_id } else { *hl_id }
+        },
+    );
+    grid.write_text(row, 0, &" ".repeat(grid.width()), fill_id)?;
+    let mut col = 0;
+    for (text, hl_id) in line {
+        if !text.is_empty() {
+            let write_id = if *hl_id == 0 { msg_area_id } else { *hl_id };
+            col = grid.write_text(row, col, text, write_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn message_floor(grid: &Grid, chrome: &ChromeState) -> usize {
+    let reserved = usize::from(chrome.cmdline.is_some() || cmdline_mode_active(chrome));
+    grid.height().saturating_sub(1).saturating_sub(reserved)
+}
+
+fn cmdline_mode_active(chrome: &ChromeState) -> bool {
+    matches!(&chrome.mode, Some((name, _)) if name.as_bytes().starts_with(b"cmdline"))
+}
+
+fn chunks_to_fragments(chunks: &[ContentChunk]) -> Vec<(String, u64)> {
+    chunks
+        .iter()
+        .map(|chunk| (chunk.text.to_string_lossy().into_owned(), chunk.hl_id))
+        .collect()
+}
+
+fn message_lines(chunks: &[ContentChunk]) -> Vec<Vec<(String, u64)>> {
+    let mut lines: Vec<Vec<(String, u64)>> = Vec::new();
+    let mut current: Vec<(String, u64)> = Vec::new();
+    for chunk in chunks {
+        let text = chunk.text.to_string_lossy().into_owned();
+        let mut run = String::new();
+        for c in text.chars() {
+            if c == '\n' {
+                if !run.is_empty() {
+                    current.push((std::mem::take(&mut run), chunk.hl_id));
+                }
+                if current.is_empty() {
+                    current.push((String::new(), chunk.hl_id));
+                }
+                lines.push(std::mem::take(&mut current));
+            } else {
+                run.push(c);
+            }
+        }
+        if !run.is_empty() {
+            current.push((std::mem::take(&mut run), chunk.hl_id));
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn wrap_fragments(fragments: &[(String, u64)], width: usize) -> Vec<Vec<(String, u64)>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<Vec<(String, u64)>> = Vec::new();
+    let mut current: Vec<(String, u64)> = Vec::new();
+    let mut col = 0;
+    for (text, hl_id) in fragments {
+        if text.is_empty() {
+            current.push((String::new(), *hl_id));
+            continue;
+        }
+        let mut byte = 0;
+        while byte < text.len() {
+            let remaining = width.saturating_sub(col);
+            if remaining == 0 {
+                lines.push(std::mem::take(&mut current));
+                col = 0;
+                continue;
+            }
+            let mut end = byte;
+            let mut w = 0;
+            for (i, c) in text[byte..].char_indices() {
+                let cw = UnicodeWidthChar::width(c).unwrap_or(1);
+                if w + cw > remaining {
+                    break;
+                }
+                w += cw;
+                end = byte + i + c.len_utf8();
+                if w == remaining {
+                    break;
+                }
+            }
+            if end == byte {
+                if !current.is_empty() {
+                    lines.push(std::mem::take(&mut current));
+                    col = 0;
+                    continue;
+                }
+                let c = text[byte..].chars().next().unwrap_or('\0');
+                let len = c.len_utf8().max(1);
+                let piece = if text.len() >= byte + len {
+                    text[byte..byte + len].to_owned()
+                } else {
+                    text[byte..].to_owned()
+                };
+                current.push((piece, *hl_id));
+                byte = (byte + len).min(text.len());
+                col += UnicodeWidthChar::width(c).unwrap_or(1);
+            } else {
+                current.push((text[byte..end].to_owned(), *hl_id));
+                byte = end;
+                col += w;
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn line_width(line: &[(String, u64)]) -> usize {
+    line.iter()
+        .map(|(text, _)| UnicodeWidthStr::width(text.as_str()))
+        .sum()
 }
 
 fn apply_cmdline_fallback(
     grid: &mut Grid,
+    _highlights: &HlState,
     chrome: &ChromeState,
 ) -> Result<Option<(usize, usize)>, GridError> {
-    let Some(cmdline) = &chrome.cmdline else {
-        return Ok(None);
-    };
     if grid.height() == 0 {
         return Ok(None);
     }
     let row = grid.height() - 1;
-    let mut col = 0;
-    col = grid.write_text(
-        row,
-        col,
-        &cmdline.first_char.to_string_lossy(),
-        cmdline.hl_id,
-    )?;
-    col = grid.write_text(row, col, &cmdline.prompt.to_string_lossy(), cmdline.hl_id)?;
-    if cmdline.indent != 0 {
-        grid.set_hl_span(row, col, col + cmdline.indent, cmdline.hl_id)?;
-        col += cmdline.indent;
-    }
-    let mut cursor = None;
-    let mut remaining = cmdline.position;
-    for chunk in &cmdline.content {
-        let text = chunk.text.to_string_lossy();
-        let mut split = remaining.min(text.len());
-        while !text.is_char_boundary(split) {
-            split -= 1;
+    if let Some(cmdline) = &chrome.cmdline {
+        grid.write_text(row, 0, &" ".repeat(grid.width()), 0)?;
+        let mut col = 0;
+        col = grid.write_text(
+            row,
+            col,
+            &cmdline.first_char.to_string_lossy(),
+            cmdline.hl_id,
+        )?;
+        col = grid.write_text(row, col, &cmdline.prompt.to_string_lossy(), cmdline.hl_id)?;
+        if cmdline.indent != 0 {
+            grid.set_hl_span(row, col, col + cmdline.indent, cmdline.hl_id)?;
+            col += cmdline.indent;
         }
-        let (before, after) = text.split_at(split);
-        col = grid.write_text(row, col, before, chunk.hl_id)?;
-        remaining -= split;
-        if remaining == 0 && cursor.is_none() {
-            cursor = Some((row, col));
+        let mut cursor = None;
+        let mut remaining = cmdline.position;
+        for chunk in &cmdline.content {
+            let text = chunk.text.to_string_lossy();
+            let mut split = remaining.min(text.len());
+            while !text.is_char_boundary(split) {
+                split -= 1;
+            }
+            let (before, after) = text.split_at(split);
+            col = grid.write_text(row, col, before, chunk.hl_id)?;
+            remaining = remaining.saturating_sub(split);
+            if remaining == 0 && cursor.is_none() {
+                cursor = Some((row, col));
+            }
+            col = grid.write_text(row, col, after, chunk.hl_id)?;
         }
-        col = grid.write_text(row, col, after, chunk.hl_id)?;
+        Ok(cursor.or(Some((row, col))))
+    } else if cmdline_mode_active(chrome) {
+        grid.write_text(row, 0, &" ".repeat(grid.width()), 0)?;
+        Ok(Some((row, 0)))
+    } else if !chrome.cmdline_block.is_empty() {
+        let block = &chrome.cmdline_block;
+        let rows = block.len().min(grid.height());
+        for (i, line) in block.iter().rev().take(rows).enumerate() {
+            let r = row.saturating_sub(i);
+            grid.write_text(r, 0, &" ".repeat(grid.width()), 0)?;
+            let mut col = 0;
+            for chunk in line {
+                col = grid.write_text(r, col, &chunk.text.to_string_lossy(), chunk.hl_id)?;
+            }
+        }
+        Ok(Some((row, 0)))
+    } else {
+        Ok(None)
     }
-    Ok(cursor.or(Some((row, col))))
 }
 
-fn write_chunks(grid: &mut Grid, chunks: &[ContentChunk]) -> Result<(), GridError> {
-    if grid.height() == 0 || grid.width() == 0 {
+#[expect(
+    clippy::too_many_lines,
+    reason = "the popupmenu rows, scrollbar, and truncation rules form one draw pass"
+)]
+fn apply_popupmenu_fallback(
+    grid: &mut Grid,
+    highlights: &HlState,
+    chrome: &ChromeState,
+) -> Result<(), GridError> {
+    let Some(state) = &chrome.popupmenu else {
+        return Ok(());
+    };
+    if grid.height() == 0 || grid.width() == 0 || state.items.is_empty() {
         return Ok(());
     }
-    let text = chunks
-        .iter()
-        .map(|chunk| chunk.text.to_string_lossy())
-        .collect::<String>();
-    let lines: Vec<&str> = text.lines().collect();
-    let visible = lines.len().min(grid.height());
-    let first_row = grid.height() - visible;
-    let first_line = lines.len() - visible;
-    let spaces = " ".repeat(grid.width());
-    for (offset, line) in lines[first_line..].iter().enumerate() {
-        let row = first_row + offset;
-        grid.write_text(row, 0, &spaces, 0)?;
-        grid.write_text(row, 0, line, chunks.first().map_or(0, |chunk| chunk.hl_id))?;
+    if state.row >= grid.height() || state.col >= grid.width() {
+        return Ok(());
     }
+
+    let pmenu = highlights.group_id(&OxStr::from("Pmenu")).unwrap_or(0);
+    let pmenu_sel = highlights
+        .group_id(&OxStr::from("PmenuSel"))
+        .unwrap_or(pmenu);
+    let pmenu_sbar = highlights
+        .group_id(&OxStr::from("PmenuSbar"))
+        .unwrap_or(pmenu);
+    let pmenu_thumb = highlights
+        .group_id(&OxStr::from("PmenuThumb"))
+        .unwrap_or(pmenu_sbar);
+
+    let mut word_width = 0;
+    let mut kind_width = 0;
+    let mut menu_width = 0;
+    for item in &state.items {
+        let word = item.word.to_string_lossy();
+        word_width = word_width.max(UnicodeWidthStr::width(word.as_ref()));
+        let kind = item.kind.to_string_lossy();
+        if !kind.is_empty() {
+            kind_width = kind_width.max(UnicodeWidthStr::width(kind.as_ref()) + 1);
+        }
+        let menu = item.menu.to_string_lossy();
+        if !menu.is_empty() {
+            menu_width = menu_width.max(UnicodeWidthStr::width(menu.as_ref()) + 1);
+        }
+    }
+    let natural_width = word_width + kind_width + menu_width;
+    let total_width = natural_width.max(PUM_MIN_WIDTH);
+
+    let selected = if state.selected < 0 {
+        -1
+    } else {
+        state
+            .selected
+            .min(i64::try_from(state.items.len()).unwrap_or(i64::MAX) - 1)
+    };
+
+    // Upstream pum_row is one row below the cursor row (pum_win_row).
+    let first_row = state.row + 1;
+    // Reserve the bottom row for the status line.
+    let available_height = grid.height().saturating_sub(first_row).saturating_sub(1);
+    let pum_size = state.items.len();
+    let pum_height = pum_size.min(available_height).min(PUM_DEF_HEIGHT);
+    if pum_height == 0 {
+        return Ok(());
+    }
+
+    let pum_scrollbar = pum_size > pum_height;
+    let available_width = grid.width().saturating_sub(state.col);
+    let pum_width = if pum_scrollbar {
+        total_width.min(available_width.saturating_sub(1))
+    } else {
+        total_width.min(available_width)
+    };
+    if pum_width == 0 {
+        return Ok(());
+    }
+
+    // pum_first: keep a few context lines around the selected item.
+    // Mirrors popupmenu.c:1075-1128.
+    let context = pum_height / 2;
+    let mut pum_first: usize = 0;
+    if pum_height > 2 && selected >= 0 {
+        let selected_i64 = selected;
+        let scroll_down = selected_i64 - i64::try_from(context).unwrap_or(0);
+        let pum_first_i64 = i64::try_from(pum_first).unwrap_or(0);
+        if pum_first_i64 > scroll_down {
+            pum_first = usize::try_from(scroll_down.max(0)).unwrap_or(0);
+        } else {
+            let scroll_up = selected_i64 + i64::try_from(context).unwrap_or(0)
+                - i64::try_from(pum_height).unwrap_or(0)
+                + 1;
+            if pum_first_i64 < scroll_up {
+                pum_first = usize::try_from(scroll_up.max(0)).unwrap_or(0);
+            }
+        }
+        let max_first = i64::try_from(pum_size.saturating_sub(pum_height)).unwrap_or(0);
+        pum_first = pum_first.min(usize::try_from(max_first.max(0)).unwrap_or(0));
+    } else if selected >= 0 {
+        let first = selected - i64::try_from(pum_height).unwrap_or(0) + 1;
+        pum_first = usize::try_from(first.max(0)).unwrap_or(0);
+        let max_first = i64::try_from(pum_size.saturating_sub(pum_height)).unwrap_or(0);
+        pum_first = pum_first.min(usize::try_from(max_first.max(0)).unwrap_or(0));
+    }
+
+    let scroll_range = pum_size.saturating_sub(pum_height);
+    let thumb_height = if pum_scrollbar {
+        (pum_height * pum_height / pum_size).max(1)
+    } else {
+        0
+    };
+    let thumb_pos = if pum_scrollbar && scroll_range > 0 {
+        (pum_first * (pum_height - thumb_height) + scroll_range / 2) / scroll_range
+    } else {
+        0
+    };
+
+    for i in 0..pum_height {
+        let idx = pum_first + i;
+        if idx >= pum_size {
+            break;
+        }
+        let item = &state.items[idx];
+        let is_selected = selected >= 0 && idx == usize::try_from(selected).unwrap_or(usize::MAX);
+        let row = first_row + i;
+        let row_attr = if is_selected { pmenu_sel } else { pmenu };
+
+        if state.col + pum_width <= grid.width() {
+            grid.write_text(row, state.col, &" ".repeat(pum_width), row_attr)?;
+        }
+
+        let mut col = state.col;
+        let word = item.word.to_string_lossy();
+        write_truncated(grid, row, col, word.as_ref(), word_width, row_attr)?;
+        col += word_width;
+
+        if kind_width > 0 {
+            let kind = item.kind.to_string_lossy();
+            let text = kind.as_ref();
+            let text_width = UnicodeWidthStr::width(text).min(kind_width - 1);
+            write_truncated(
+                grid,
+                row,
+                col + 1,
+                &text[..char_prefix_end(text, text_width)],
+                text_width,
+                row_attr,
+            )?;
+            col += kind_width;
+        }
+
+        if menu_width > 0 {
+            let menu = item.menu.to_string_lossy();
+            let text = menu.as_ref();
+            let text_width = UnicodeWidthStr::width(text).min(menu_width - 1);
+            write_truncated(
+                grid,
+                row,
+                col + 1,
+                &text[..char_prefix_end(text, text_width)],
+                text_width,
+                row_attr,
+            )?;
+        }
+
+        if pum_scrollbar {
+            let thumb = i >= thumb_pos && i < thumb_pos + thumb_height;
+            let sbar_attr = if thumb { pmenu_thumb } else { pmenu_sbar };
+            let sbar_col = state.col + pum_width;
+            if sbar_col < grid.width() {
+                grid.put(row, sbar_col, " ", sbar_attr, 1)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn char_prefix_end(text: &str, max_width: usize) -> usize {
+    let mut end = 0;
+    let mut w = 0;
+    for (i, c) in text.char_indices() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(1);
+        if w + cw > max_width {
+            break;
+        }
+        w += cw;
+        end = i + c.len_utf8();
+    }
+    end
+}
+
+fn write_truncated(
+    grid: &mut Grid,
+    row: usize,
+    start_col: usize,
+    text: &str,
+    max_width: usize,
+    hl_id: u64,
+) -> Result<(), GridError> {
+    if max_width == 0 || start_col >= grid.width() {
+        return Ok(());
+    }
+    let end = char_prefix_end(text, max_width);
+    grid.write_text(row, start_col, &text[..end], hl_id)?;
     Ok(())
 }
 
