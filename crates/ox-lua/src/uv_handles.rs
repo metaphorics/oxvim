@@ -15,6 +15,8 @@ use mlua::{
     Variadic,
 };
 use ox_uv::dns::{self, AddrInfoHints};
+use ox_uv::fs::FsResult;
+use ox_uv::fs_watch::{FsEvent, FsEventOptions, FsEventRecord};
 use ox_uv::net::{NetEvent, Tcp, Udp};
 #[cfg(unix)]
 use ox_uv::net::{Pipe, Tty, TtyMode};
@@ -1205,6 +1207,176 @@ impl UserData for LuaSignal {
     }
 }
 
+/// Queued filesystem event in `Send`-owned form. The watcher thread posts
+/// records through the loop poster, but the Lua callback is `!Send`, so
+/// delivery splits into a cross-thread queue plus a loop-thread drain in
+/// the shared `after_run` hook (same shape as the process-exit drain).
+type FsQueueItem = Result<(String, bool, bool), String>;
+
+struct FsEventRoute {
+    queue: Arc<Mutex<VecDeque<FsQueueItem>>>,
+    callback: Function,
+}
+
+struct LuaFsEvent {
+    state: Rc<RefCell<Option<FsEvent>>>,
+    access: LoopAccess,
+    routes: Rc<RefCell<HashMap<u64, FsEventRoute>>>,
+    next_id: Rc<Cell<u64>>,
+    id: Rc<Cell<Option<u64>>>,
+    closing: Rc<Cell<bool>>,
+}
+
+impl LuaFsEvent {
+    fn options(flags: &Table) -> FsEventOptions {
+        FsEventOptions {
+            watch_entry: flags.get::<bool>("watch_entry").unwrap_or(false),
+            stat: flags.get::<bool>("stat").unwrap_or(false),
+            recursive: flags.get::<bool>("recursive").unwrap_or(false),
+        }
+    }
+
+    fn start(
+        &self,
+        lua: &Lua,
+        path: String,
+        flags: &Table,
+        callback: Function,
+    ) -> mlua::Result<MultiValue> {
+        if self.state.borrow().is_some() {
+            return Err(mlua::Error::runtime("fs event already started"));
+        }
+        // luv surfaces an unstartable path as `nil, err, name` so
+        // `vim._watch` can notify on ENOENT; the backend itself only
+        // fails asynchronously after this point.
+        if std::fs::metadata(&path).is_err() {
+            return Ok(MultiValue::from_vec(vec![
+                Value::Nil,
+                Value::String(
+                    lua.create_string(format!("ENOENT: no such file or directory: {path}"))?,
+                ),
+                Value::String(lua.create_string("ENOENT")?),
+            ]));
+        }
+        let options = Self::options(flags);
+        // The backend rejects this combination (`WatchError::Unsupported`);
+        // fail synchronously like luv instead of registering a dead route.
+        if options.watch_entry && options.recursive {
+            return Ok(MultiValue::from_vec(vec![
+                Value::Nil,
+                Value::String(
+                    lua.create_string("ENOTSUP: watch_entry cannot be combined with recursive")?,
+                ),
+                Value::String(lua.create_string("ENOTSUP")?),
+            ]));
+        }
+        let id = self.next_id.get();
+        self.next_id.set(id.wrapping_add(1));
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        self.routes.borrow_mut().insert(
+            id,
+            FsEventRoute {
+                queue: queue.clone(),
+                callback,
+            },
+        );
+        self.id.set(Some(id));
+        let state = self.state.clone();
+        let access = self.access.clone();
+        let fail_routes = self.routes.clone();
+        let fail_id = self.id.clone();
+        access.apply(Box::new(move |uv_loop| {
+            let event_callback = move |_: &mut UvLoop, result: FsResult<FsEventRecord>| {
+                let item = match result {
+                    Ok(record) => Ok((
+                        record.filename.to_string_lossy().into_owned(),
+                        record.change,
+                        record.rename,
+                    )),
+                    Err(error) => Err(error.to_string()),
+                };
+                if let Ok(mut pending) = queue.lock() {
+                    pending.push_back(item);
+                }
+            };
+            if let Ok(event) = FsEvent::start(uv_loop, path, options, event_callback) {
+                *state.borrow_mut() = Some(event);
+            } else {
+                // Backend failures (spawn/post/loop) are near-impossible
+                // here, but never leave a registered route that fires
+                // nothing: `stop`/`close` stay coherent.
+                fail_routes.borrow_mut().remove(&id);
+                fail_id.set(None);
+            }
+        }));
+        Ok(MultiValue::from_vec(vec![Value::Integer(0)]))
+    }
+
+    fn stop(&self) -> i32 {
+        let state = self.state.clone();
+        self.access.apply(Box::new(move |uv_loop| {
+            if let Some(event) = state.borrow().as_ref() {
+                let _ = event.stop(uv_loop);
+            }
+        }));
+        if let Some(id) = self.id.take() {
+            self.routes.borrow_mut().remove(&id);
+        }
+        0
+    }
+}
+impl UserData for LuaFsEvent {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method(
+            "start",
+            |lua, this, (path, flags, callback): (String, Table, Function)| {
+                this.start(lua, path, &flags, callback)
+            },
+        );
+        methods.add_method("stop", |_, this, ()| Ok(this.stop()));
+        methods.add_method("is_closing", |_, this, ()| Ok(this.closing.get()));
+        methods.add_method("close", |_, this, ()| {
+            let state = this.state.clone();
+            if let Some(id) = this.id.take() {
+                this.routes.borrow_mut().remove(&id);
+            }
+            this.closing.set(true);
+            this.access.apply(Box::new(move |uv_loop| {
+                if let Some(event) = state.borrow_mut().take() {
+                    let _ = event.close(uv_loop);
+                }
+            }));
+            Ok(())
+        });
+    }
+}
+
+fn install_fs_event(
+    lua: &Lua,
+    uv: &Table,
+    access: &LoopAccess,
+    routes: &Rc<RefCell<HashMap<u64, FsEventRoute>>>,
+    next_id: &Rc<Cell<u64>>,
+) -> mlua::Result<()> {
+    let event_access = access.clone();
+    let event_routes = routes.clone();
+    let event_next = next_id.clone();
+    uv.set(
+        "new_fs_event",
+        lua.create_function(move |lua, ()| {
+            lua.create_userdata(LuaFsEvent {
+                state: Rc::new(RefCell::new(None)),
+                access: event_access.clone(),
+                routes: event_routes.clone(),
+                next_id: event_next.clone(),
+                id: Rc::new(Cell::new(None)),
+                closing: Rc::new(Cell::new(false)),
+            })
+        })?,
+    )?;
+    Ok(())
+}
+
 fn install_aux(
     lua: &Lua,
     uv: &Table,
@@ -1323,10 +1495,16 @@ pub(crate) fn install(
         routes: RefCell::new(HashMap::new()),
     });
     let pending_processes: Rc<RefCell<Vec<PendingProcess>>> = Rc::new(RefCell::new(Vec::new()));
+    let fs_event_routes: Rc<RefCell<HashMap<u64, FsEventRoute>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    let fs_event_next: Rc<Cell<u64>> = Rc::new(Cell::new(0));
 
     let completion_pending = pending_processes.clone();
     let completion_lua = lua.clone();
     let completion_fast = fast.clone();
+    let fs_drain_routes = fs_event_routes.clone();
+    let fs_drain_lua = lua.clone();
+    let fs_drain_fast = fast.clone();
     access.set_after_run(Rc::new(move || {
         loop {
             let completed = {
@@ -1355,6 +1533,45 @@ pub(crate) fn install(
             args.push_back(Value::Integer(i64::from(signal)));
             let _guard = completion_fast.enter();
             call_with_traceback(&completion_lua, &process.callback, args)?;
+        }
+        // Filesystem events drain here rather than in a second hook: the
+        // watcher callback is `Send`-confined to plain data, so the queued
+        // records are collected first (no borrow is held across the Lua
+        // call, keeping reentrant `stop`/`close` panic-free) and then
+        // delivered with the same traceback reporting as exits.
+        let ready: Vec<(Function, Vec<FsQueueItem>)> = fs_drain_routes
+            .borrow()
+            .values()
+            .map(|route| {
+                let items = route
+                    .queue
+                    .lock()
+                    .map(|mut pending| Vec::from(std::mem::take(&mut *pending)))
+                    .unwrap_or_default();
+                (route.callback.clone(), items)
+            })
+            .collect();
+        for (callback, items) in ready {
+            for event in items {
+                let mut args = MultiValue::new();
+                match event {
+                    Ok((filename, change, rename)) => {
+                        args.push_back(Value::Nil);
+                        args.push_back(Value::String(fs_drain_lua.create_string(filename)?));
+                        let events = fs_drain_lua.create_table()?;
+                        events.set("change", change)?;
+                        events.set("rename", rename)?;
+                        args.push_back(Value::Table(events));
+                    }
+                    Err(message) => {
+                        args.push_back(Value::String(fs_drain_lua.create_string(message)?));
+                        args.push_back(Value::Nil);
+                        args.push_back(Value::Nil);
+                    }
+                }
+                let _guard = fs_drain_fast.enter();
+                call_with_traceback(&fs_drain_lua, &callback, args)?;
+            }
         }
         Ok(())
     }));
@@ -1607,6 +1824,7 @@ pub(crate) fn install(
     )?;
 
     install_aux(lua, uv, &access, &fast)?;
+    install_fs_event(lua, uv, &access, &fs_event_routes, &fs_event_next)?;
     install_udp_tty(lua, uv, access, fast)?;
     Ok(())
 }

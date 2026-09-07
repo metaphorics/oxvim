@@ -201,6 +201,32 @@ fn signal_binding_supports_luv_module_and_method_forms() {
         .unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn fs_event_binding_lifecycle_reports_enoent_and_closes() {
+    let (host, _) = host();
+    let dir = std::env::temp_dir()
+        .to_str()
+        .expect("temp dir must be UTF-8")
+        .to_owned();
+    host.lua()
+        .load(format!(
+            r"
+            local handle = assert(vim.uv.new_fs_event())
+            local ok, err, name = handle:start('/definitely/not/here-oxvim', {{}}, function() end)
+            assert(ok == nil and name == 'ENOENT', tostring(err))
+            assert(handle:start('{dir}', {{}}, function() end) == 0)
+            assert(handle:stop() == 0)
+            assert(not handle:is_closing())
+            handle:close()
+            assert(handle:is_closing())
+            vim.uv.run('nowait')
+            "
+        ))
+        .exec()
+        .unwrap();
+}
+
 #[test]
 fn wait_primitives_poll_the_owned_uv_loop() {
     let (host, scheduler) = host();
