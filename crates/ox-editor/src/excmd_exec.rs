@@ -5,7 +5,7 @@
 //! narrow host adapters needed by `ox-eval` and `ox-regex`.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -1054,7 +1054,7 @@ pub(crate) fn drain_typeahead<F: FileIO, E: ExEditorAccess>(
 }
 
 /// Runs the mapping right-hand sides [`ModeMachine::check`] cannot.
-fn run_mapping_action<F: FileIO, E: ExEditorAccess>(
+pub(crate) fn run_mapping_action<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
@@ -1062,6 +1062,12 @@ fn run_mapping_action<F: FileIO, E: ExEditorAccess>(
     action: MappingAction,
     options: &MappingOptions,
 ) -> Flow {
+    // Same entry discipline as every other user-code boundary (see
+    // `run_autocmd_plan`): a mapping right-hand side may reenter through
+    // another executor, so scope dirt flushes before it runs.
+    if let Err(error) = access.with_ex_editor(|editor| sync_scope_into_editor(editor, scope)) {
+        return exec_error_flow(runtime, error);
+    }
     match action {
         MappingAction::ExCommands { commands, .. } => {
             let program = program_from_commands(&commands, runtime.scripts.current_line().max(1));
@@ -1581,7 +1587,7 @@ impl<F: FileIO> ExExecutor<F> {
             &args,
         );
         self.runtime.try_depth -= 1;
-        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &self.scope))?;
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
         result
     }
 
@@ -1608,7 +1614,7 @@ impl<F: FileIO> ExExecutor<F> {
             expression,
         );
         self.runtime.try_depth -= 1;
-        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &self.scope))?;
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
         match result {
             Ok(value) => Ok(value),
             Err(Flow::Exception(exception)) => Err(ExecError::Vim(exception)),
@@ -1703,7 +1709,7 @@ impl<F: FileIO> ExExecutor<F> {
             program.len(),
         );
         self.finish_quit(access, &flow);
-        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &self.scope))?;
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
         flow_to_result(flow)
     }
 
@@ -1751,7 +1757,7 @@ impl<F: FileIO> ExExecutor<F> {
                 Err(flow) => flow,
             };
             executor.finish_quit(access, &flow);
-            access.with_ex_editor(|editor| sync_scope_into_editor(editor, &executor.scope))?;
+            access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut executor.scope))?;
             flow_to_result(flow)
         })
     }
@@ -1823,7 +1829,7 @@ impl<F: FileIO> ExExecutor<F> {
             program.len(),
         );
         self.finish_quit(access, &flow);
-        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &self.scope))?;
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
         flow_to_result(flow)
     }
 
@@ -1914,7 +1920,7 @@ impl<F: FileIO> ExExecutor<F> {
             }
         }
         self.finish_quit(access, &flow);
-        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &self.scope))?;
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
         flow_to_result(flow)
     }
 
@@ -1982,7 +1988,7 @@ impl<F: FileIO> ExExecutor<F> {
                     );
                     self.finish_quit(access, &flow);
                     access
-                        .with_ex_editor(|editor| sync_scope_into_editor(editor, &self.scope))
+                        .with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))
                         .and_then(|()| flow_to_result(flow))
                 }
                 Err(error) => Err(error),
@@ -2061,7 +2067,7 @@ impl<F: FileIO> ExExecutor<F> {
                 let _ = std::fs::remove_file(path);
             }
         }
-        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &self.scope))
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))
     }
 
     /// `preserve_exit` (main.c:888): the abnormal-termination path — a
@@ -9005,13 +9011,22 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
     }
     let name = command.args.trim();
     let path = if name.is_empty() {
+        // Keep the exact name bytes: a lossy round-trip here would redirect
+        // the write, the existence gate, and the overwrite bookkeeping to a
+        // replacement-character filename for non-UTF-8 buffer names.
         let existing = access.with_ex_editor(|editor| {
             editor
                 .buffer(buffer)
-                .map(|state| state.name().to_string_lossy().into_owned())
+                .map(|state| state.name().as_bytes().to_vec())
         });
         let existing = match existing {
-            Ok(name) => name,
+            Ok(bytes) => {
+                #[cfg(unix)]
+                let name: std::ffi::OsString = std::os::unix::ffi::OsStringExt::from_vec(bytes);
+                #[cfg(not(unix))]
+                let name: std::ffi::OsString = String::from_utf8_lossy(&bytes).into_owned().into();
+                name
+            }
             Err(error) => return error_flow(runtime, "E32", error.to_string()),
         };
         if existing.is_empty() {
@@ -9041,7 +9056,7 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
         };
     runtime.write_silent_fail = false;
     if !perform_write {
-        return command_write_did_cmd(runtime, access, buffer, target.as_ref());
+        return command_write_did_cmd(runtime, access, buffer, &path);
     }
     let mut bytes = match access.with_ex_editor(|editor| {
         editor
@@ -9065,7 +9080,15 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
     }
     access.with_ex_editor(|editor| {
         if let Ok(state) = editor.buffer_mut(buffer) {
-            state.set_name(OxStr::from(path.to_string_lossy().as_ref()));
+            // The saved name keeps the written path's exact bytes: a lossy
+            // round-trip would rename a non-UTF-8 buffer on its own write,
+            // and the next overwrite check would compare against the wrong
+            // name.
+            #[cfg(unix)]
+            let saved = OxStr(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()).to_vec());
+            #[cfg(not(unix))]
+            let saved: OxStr = OxStr::from(path.to_string_lossy().as_ref());
+            state.set_name(saved);
             state.mark_saved();
             state.flags.set(crate::BufferFlags::NOTEDITED, false);
         }
@@ -9091,12 +9114,12 @@ fn command_write_did_cmd<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     buffer: BufHandle,
-    target: &str,
+    target: &Path,
 ) -> Flow {
     let overwriting = access.with_ex_editor(|editor| {
         editor
             .buffer(buffer)
-            .is_ok_and(|state| state.name().to_string_lossy().as_ref() == target)
+            .is_ok_and(|state| write_overwrites_buffer(state.name(), target))
     });
     if overwriting {
         access.with_ex_editor(|editor| {
@@ -9112,6 +9135,35 @@ fn command_write_did_cmd<F: FileIO, E: ExEditorAccess>(
                 .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
         });
     Flow::Normal
+}
+
+/// Whether the write target names the buffer's own file. Both sides expand
+/// to absolute paths first (upstream's `FullName_save` before `path_equal`
+/// with `kPathCmpLiteral`). On Unix both sides compare as bytes, so
+/// relative-versus-absolute spellings match while distinct non-UTF-8
+/// names that collapse to one replacement string never compare equal;
+/// other targets fall back to a lossy rendering, where a collision can
+/// still match. `..` segments are not
+/// cleaned (`Path` equality drops `.` but not `..`), so `a/../b` and `b`
+/// stay distinct where upstream's full expansion matches them.
+fn write_overwrites_buffer(name: &OxStr, target: &Path) -> bool {
+    fn absolute(path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+        }
+    }
+    #[cfg(not(unix))]
+    let lossy: String;
+    #[cfg(unix)]
+    let stored: &std::ffi::OsStr = std::os::unix::ffi::OsStrExt::from_bytes(name.as_bytes());
+    #[cfg(not(unix))]
+    let stored: &std::ffi::OsStr = {
+        lossy = String::from_utf8_lossy(name.as_bytes());
+        lossy.as_ref()
+    };
+    absolute(Path::new(stored)) == absolute(target)
 }
 
 /// `buf_write` event prelude (`bufwrite.c`): `BufWriteCmd` handlers replace
@@ -13727,7 +13779,12 @@ pub(crate) fn apply_highlight_spec(
         if let Some(name) = words.next() {
             editor.highlights_mut().remove(name);
         } else {
+            // Upstream `:highlight clear` restores the default groups
+            // (`highlight_init_*`, highlight_group.c `init_highlight`),
+            // it does not leave the table empty: color schemes start
+            // from `hi clear` and only override.
             editor.highlights_mut().clear();
+            crate::highlight_init::init_highlight(editor);
         }
         return Ok(());
     }
@@ -15793,8 +15850,16 @@ fn option_matches(value: &OptionValue, existing: &Typval) -> bool {
 /// and no `assign`. A flag can only be set by a scope-side mutation that
 /// happened after the last read sync, so skipping a clean map cannot drop a
 /// write.
-pub(crate) fn sync_scope_into_editor(editor: &mut Editor, scope: &Scope) -> Result<(), ExecError> {
-    if scope.synced.is_dirty(ScopeKind::Global) {
+#[expect(
+    clippy::too_many_lines,
+    reason = "one sync contract over all scope kinds; do not split by size"
+)]
+pub(crate) fn sync_scope_into_editor(
+    editor: &mut Editor,
+    scope: &mut Scope,
+) -> Result<(), ExecError> {
+    let dirty = scope.synced.is_dirty(ScopeKind::Global);
+    if dirty {
         // Merge, never replace: a reentrant executor may have written the
         // live map after this scope mirrored it (`let g:outer = 1` outside
         // an autocmd that sets `g:nested = 2` must keep both). Only keys
@@ -15833,8 +15898,40 @@ pub(crate) fn sync_scope_into_editor(editor: &mut Editor, scope: &Scope) -> Resu
                 }
             }
         }
+    }
+    // Pull reentrant writes back into the scope whenever this scope wrote
+    // or the live map moved underneath it: the merge preserves live-only
+    // keys in the editor, but without this the scope map would keep
+    // missing them past the version stamp below, and later commands would
+    // skip their read sync and read stale state. Matching entries keep
+    // their Typvals (and metadata); only missing-or-differing keys convert
+    // from live. A clean scope over an unmoved map skips everything.
+    if dirty || scope.synced.get(ScopeKind::Global) != editor.gvars_version() {
+        {
+            let live = editor.gvars();
+            let live_keys: HashSet<&OxStr> = live.0.iter().map(|(key, _)| key).collect();
+            scope.global.retain(|(key, _)| live_keys.contains(key));
+            let mut pulls = Vec::new();
+            for (key, value) in &live.0 {
+                let stale = match scope.global.iter().find(|(slot, _)| slot == key) {
+                    Some((_, current)) => typval_to_object(current) != *value,
+                    None => true,
+                };
+                if stale {
+                    pulls.push((key.clone(), object_to_typval(value)));
+                }
+            }
+            for (key, value) in pulls {
+                match scope.global.iter_mut().find(|(slot, _)| slot == &key) {
+                    Some((_, slot)) => *slot = value,
+                    None => scope.global.push((key, value)),
+                }
+            }
+        }
         refresh_global_mirror(scope)?;
         scope.synced.set(ScopeKind::Global, editor.gvars_version());
+    }
+    if dirty {
         scope.synced.clear_dirty(ScopeKind::Global);
     }
     // The cached `b:` map belongs to the buffer the read sync mirrored. When

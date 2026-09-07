@@ -93,7 +93,7 @@ fn call_getcompletion(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typva
         "filetype" => complete_filetypes(&pat),
         "syntax" => complete_syntaxes(&pat),
         "compiler" => complete_compilers(&pat),
-        "highlight" => complete_highlights(&pat),
+        "highlight" => complete_highlights(editor, &pat),
         "messages" => complete_messages(&pat),
         "filetypecmd" => complete_filetypecmd(&pat),
         _ => Vec::new(),
@@ -1459,74 +1459,13 @@ fn complete_compilers(pat: &str) -> Vec<OxStr> {
     prefix_filter(compilers, pat)
 }
 
-fn complete_highlights(pat: &str) -> Vec<OxStr> {
-    let groups = &[
-        "ColorColumn",
-        "Conceal",
-        "Cursor",
-        "CursorColumn",
-        "CursorIM",
-        "CursorLine",
-        "CursorLineFold",
-        "CursorLineNr",
-        "CursorLineSign",
-        "DiffAdd",
-        "DiffChange",
-        "DiffDelete",
-        "DiffText",
-        "Directory",
-        "EndOfBuffer",
-        "ErrorMsg",
-        "FoldColumn",
-        "Folded",
-        "IncSearch",
-        "LineNr",
-        "LineNrAbove",
-        "LineNrBelow",
-        "MatchParen",
-        "ModeMsg",
-        "MoreMsg",
-        "MsgArea",
-        "NonText",
-        "Normal",
-        "Pmenu",
-        "PmenuExtra",
-        "PmenuExtraSel",
-        "PmenuKind",
-        "PmenuKindSel",
-        "PmenuMatch",
-        "PmenuMatchSel",
-        "PmenuSbar",
-        "PmenuSel",
-        "PmenuThumb",
-        "Question",
-        "QuickFixLine",
-        "Search",
-        "SignColumn",
-        "SpecialKey",
-        "SpellBad",
-        "SpellCap",
-        "SpellLocal",
-        "SpellRare",
-        "StatusLine",
-        "StatusLineNC",
-        "Substitute",
-        "TabLine",
-        "TabLineFill",
-        "TabLineSel",
-        "TermCursor",
-        "TermCursorNC",
-        "Title",
-        "VertSplit",
-        "Visual",
-        "VisualNOS",
-        "WarningMsg",
-        "Whitespace",
-        "WildMenu",
-        "WinBar",
-        "WinSeparator",
-    ];
-    prefix_filter(groups, pat)
+// Upstream `get_highlight_completion` walks the live highlight table, so
+// startup defaults (including the `Diagnostic*` set from
+// `highlight_init`) and user-defined groups all complete. A fixed list
+// rots on every new group; enumerate `Editor::highlights` instead.
+fn complete_highlights(editor: &Editor, pat: &str) -> Vec<OxStr> {
+    let groups: Vec<&str> = editor.highlights().keys().map(String::as_str).collect();
+    prefix_filter(&groups, pat)
 }
 
 fn complete_messages(pat: &str) -> Vec<OxStr> {
@@ -1809,8 +1748,8 @@ pub struct CompletionSession {
     /// `insexpand.c:6211-6260`).
     extra: Option<String>,
     /// Match-list length the cached `pum` items were built from
-    /// (`usize::MAX` forces a rebuild): navigation only moves the
-    /// selection instead of re-allocating every candidate per key.
+    /// (`usize::MAX` forces a rebuild): navigation moves the selection
+    /// within the built list; a new match list rebuilds it.
     pum_built_for: usize,
     /// The armed `CTRL-X` interrupted a live session (`CONT_INTRPT`,
     /// `insexpand.c:399-400`): the next `CTRL-N`/`CTRL-P` continues
@@ -1884,9 +1823,14 @@ impl CompletionSession {
 
     /// Clears every artifact: `ins_compl_free` + `ins_compl_clear`
     /// (`insexpand.c:2208-2238`). Leaving Insert mode in any way calls this,
-    /// which hides the popup on the next chrome sync.
+    /// which hides the popup on the next chrome sync. The match-list
+    /// generation survives monotonically: a restarted session must never
+    /// reuse a predecessor's cache key, or sync layers keep showing the
+    /// old list.
     pub fn reset(&mut self) {
+        let revision = self.pum_revision.wrapping_add(1);
         *self = Self::new();
+        self.pum_revision = revision;
     }
 
     /// One insert-mode keystroke. `Handled` keys are consumed; `Release`
@@ -1930,6 +1874,10 @@ impl CompletionSession {
             if is_ctrl_x_submode_key(key) {
                 return Ok(CompletionOutcome::Handled);
             }
+            // An ordinary key ends the `CTRL-X` attempt (`set_ctrl_x_mode`
+            // returns false): the interruption marker dies with it, so a
+            // later unrelated `CTRL-X` sequence starts fresh and local.
+            self.interrupted = false;
             return Ok(CompletionOutcome::Release);
         }
 
@@ -2746,6 +2694,51 @@ mod completion_engine_tests {
             Some("-- Keyword completion (^N^P) Pattern not found")
         );
         assert!(session.pum().is_none());
+    }
+
+    #[test]
+    fn reset_keeps_revision_monotonic() {
+        // A restarted session must never reuse its predecessor's cache
+        // key, or sync layers keep showing the old list.
+        let mut session = CompletionSession::new();
+        let first = session.pum_revision;
+        session.reset();
+        let second = session.pum_revision;
+        session.reset();
+        assert_ne!(first, second);
+        assert_ne!(second, session.pum_revision);
+    }
+
+    #[test]
+    fn ordinary_key_after_interrupt_restarts_local() {
+        // CTRL-N, CTRL-X (interrupts the live session), ordinary key
+        // (ends the attempt): the next CTRL-X CTRL-N completes local
+        // again, not as an interrupted continuation.
+        let (mut editor, buffer, window) = editor_with(b"alpha\nalpaca\nal");
+        let mut session = CompletionSession::new();
+        let cursor = Position { lnum: 3, col: 2 };
+        session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_N, 0)
+            .unwrap();
+        session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_X, 1)
+            .unwrap();
+        assert!(session.interrupted);
+        let outcome = session
+            .handle_insert_key(&mut editor, buffer, window, cursor, 'x', 2)
+            .unwrap();
+        assert_eq!(outcome, CompletionOutcome::Release);
+        assert!(!session.interrupted);
+        session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_X, 3)
+            .unwrap();
+        session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_N, 4)
+            .unwrap();
+        assert_eq!(
+            session.showmode_override().as_deref(),
+            Some("-- Keyword Local completion (^N^P) match 1 of 2")
+        );
     }
 
     #[test]
