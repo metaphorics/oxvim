@@ -29,11 +29,12 @@ use std::rc::Rc;
 
 use ox_text::Buffer;
 
-use crate::excmd_exec::{sync_editor_into_scope, sync_scope_into_editor};
+use crate::excmd_exec::{run_autocmd_plan, sync_editor_into_scope, sync_scope_into_editor};
 use crate::script::{FileIO, FileKind, FileMetadata};
 use crate::{
-    AutocmdFilter, AutocmdKind, AutocmdOptions, Editor, Event, ExExecutor, ExecError, ExecOutcome,
-    Geometry, Lookup, MapMode, Mode, ModeMachine, TestEditorAccess, VimExceptionKind,
+    AutocmdContext, AutocmdFilter, AutocmdKind, AutocmdOptions, Editor, Event, ExExecutor,
+    ExecError, ExecOutcome, Geometry, Lookup, MapMode, Mode, ModeMachine, TestEditorAccess,
+    VimExceptionKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -8322,6 +8323,283 @@ fn outer_delete_then_nested_add_keeps_nested_value() {
     );
 }
 
+/// The mirror refresh must land updates in the vector, not just push new
+/// keys: replace a value, sync, revert to the earlier value, sync. A
+/// refresh that only pushes would leave the stale snapshot behind and the
+/// revert would compare equal and never reach the live map.
+#[test]
+fn mirror_update_arm_replaces_stale_snapshot() {
+    let mut editor = Editor::new();
+    let mut scope = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut scope).unwrap();
+    for value in [1, 2, 1] {
+        scope
+            .set_scoped(
+                ox_eval::scope::ScopeKind::Global,
+                b"k",
+                0,
+                ox_types::Typval::Number(value),
+            )
+            .unwrap();
+        sync_scope_into_editor(&mut editor, &scope).unwrap();
+        assert_eq!(
+            editor.gvars().get(&ox_types::OxStr::from("k")),
+            Some(&ox_types::Object::Integer(value)),
+            "live must follow every write, including a revert",
+        );
+    }
+}
+
+/// Own-file `BufWriteCmd` that leaves the buffer modified: upstream's bare
+/// `FAIL` shows no message, the `|` chain continues, and the buffer stays
+/// modified (verified against the reference binary). The internal failure
+/// is recorded for the advance gates, not surfaced.
+#[test]
+fn buf_write_cmd_own_file_silent_fail_keeps_chain_and_modified() {
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("owned.txt"));
+    executor
+        .execute_line(&editor, "au BufWriteCmd * let g:cmd_ran = 1")
+        .unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::MODIFIED, true);
+    executor
+        .execute_line_core(&editor, "write | let g:after = 1")
+        .unwrap();
+    assert_eq!(executor.scripts().io().content("owned.txt"), None);
+    assert!(
+        editor
+            .editor()
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::MODIFIED),
+        "a handler-owned overwrite leaves the modified state the handler left",
+    );
+    for probe in [b"cmd_ran".as_slice(), b"after".as_slice()] {
+        assert_eq!(
+            executor
+                .scope()
+                .get_scoped(ox_eval::scope::ScopeKind::Global, probe, 0)
+                .ok(),
+            Some(&ox_types::Typval::Number(1)),
+            "handler ran and the bar chain continued past the silent fail",
+        );
+    }
+}
+
+/// `:wq` after a silently failed handler-owned write stays put without
+/// `E37`: upstream's `do_write != FAIL` gate aborts the quit, and there is
+/// no message to report.
+#[test]
+fn wq_after_silent_fail_stays_without_e37() {
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("owned.txt"));
+    executor
+        .execute_line(&editor, "au BufWriteCmd * let g:cmd_ran = 1")
+        .unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::MODIFIED, true);
+    match executor.execute_line(&editor, "wq") {
+        Ok(ExecOutcome::Completed) => {}
+        other => panic!("silent-fail :wq must stay put quietly, got {other:?}"),
+    }
+    assert_eq!(editor.editor().current_buffer(), Some(buffer));
+    assert!(
+        editor
+            .editor()
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::MODIFIED),
+    );
+}
+
+/// `:wnext` after a silently failed handler-owned write does not advance:
+/// the same `do_write != FAIL` gate guards the arglist step
+/// (`ex_cmds.c:2106`).
+#[test]
+fn wnext_after_silent_fail_does_not_advance() {
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("a.txt"));
+    executor.execute_line(&editor, "args a.txt b.txt").unwrap();
+    executor
+        .execute_line(&editor, "au BufWriteCmd * let g:cmd_ran = 1")
+        .unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::MODIFIED, true);
+    match executor.execute_line(&editor, "wnext") {
+        Ok(ExecOutcome::Completed) => {}
+        other => panic!("silent-fail :wnext must stay put quietly, got {other:?}"),
+    }
+    assert_eq!(editor.editor().current_buffer(), Some(buffer));
+}
+
+/// `NOTEDITED` clears when a handler-owned write overwrites the buffer's
+/// own file, mirroring the `BF_WRITE_MASK` reset; and an existing target
+/// with a never-edited buffer still raises `E13` without `!`.
+#[test]
+fn buf_write_cmd_overwrite_clears_not_edited_and_e13_gates() {
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("owned.txt"));
+    executor
+        .execute_line(&editor, "au BufWriteCmd * let g:cmd_ran = 1")
+        .unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::NOTEDITED, true);
+    executor.execute_line_core(&editor, "write").unwrap();
+    assert!(
+        !editor
+            .editor()
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::NOTEDITED),
+        "overwriting handler-owned write clears the never-edited mark",
+    );
+    executor.scripts().io().insert("owned.txt", "disk");
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::NOTEDITED, true);
+    assert_vim_error(executor.execute_line(&editor, "write"), "E13");
+}
+
+/// The outer/nested protocol with container values: a nested list replace
+/// lands by value, and the mirror tracks it through a revert.
+#[test]
+fn nested_list_replace_tracks_through_revert() {
+    let mut editor = Editor::new();
+    let mut outer = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut outer).unwrap();
+    outer
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"l",
+            0,
+            ox_types::Typval::list(vec![ox_types::Typval::Number(1)]),
+        )
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &outer).unwrap();
+    let mut nested = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut nested).unwrap();
+    for values in [vec![1, 2], vec![1]] {
+        let items = values
+            .iter()
+            .map(|n| ox_types::Typval::Number(*n))
+            .collect();
+        nested
+            .set_scoped(
+                ox_eval::scope::ScopeKind::Global,
+                b"l",
+                0,
+                ox_types::Typval::list(items),
+            )
+            .unwrap();
+        sync_scope_into_editor(&mut editor, &nested).unwrap();
+        sync_scope_into_editor(&mut editor, &outer).unwrap();
+        let expected = ox_types::Object::Array(
+            values
+                .iter()
+                .map(|n| ox_types::Object::Integer(*n))
+                .collect(),
+        );
+        assert_eq!(
+            editor.gvars().get(&ox_types::OxStr::from("l")),
+            Some(&expected),
+            "container protocol values track through a revert",
+        );
+    }
+}
+
+/// The plan-entry flush through the real wiring: dirt staged with no
+/// host-call sync between it and the plan must be visible to a scope that
+/// read-syncs after the plan ran (upstream: one scope, always visible).
+#[test]
+fn plan_entry_flush_feeds_nested_scope_reads() {
+    let (editor, mut outer) = setup_with_content(&[b"hi".to_vec()]);
+    outer
+        .execute_line(&editor, "au BufWritePost * let g:from_handler = 1")
+        .unwrap();
+    outer
+        .runtime_scope_mut()
+        .1
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"x",
+            0,
+            ox_types::Typval::Number(1),
+        )
+        .unwrap();
+    let buffer = editor.editor().current_buffer().unwrap();
+    let plan = editor.editor_mut().autocmds_mut().plan(
+        Event::BufWritePost,
+        AutocmdContext {
+            buffer: Some(buffer),
+            file_name: Some("out.txt"),
+            ..AutocmdContext::default()
+        },
+    );
+    let (runtime, scope) = outer.runtime_scope_mut();
+    run_autocmd_plan(runtime, &editor, scope, None, plan);
+    let mut nested = ox_eval::scope::Scope::new();
+    let live = editor.editor();
+    sync_editor_into_scope(&live, &mut nested).unwrap();
+    assert_eq!(
+        nested
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"x", 0)
+            .ok(),
+        Some(&ox_types::Typval::Number(1)),
+        "entry flush makes staged dirt visible to nested readers",
+    );
+    assert_eq!(
+        outer
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"from_handler", 0)
+            .ok(),
+        Some(&ox_types::Typval::Number(1)),
+        "the plan action itself ran",
+    );
+}
+
 #[test]
 fn displayed_plan_error_continues_to_later_actions_at_depth_zero() {
     // Upstream runs the whole group through one `do_cmdline`: at trylevel
@@ -8403,10 +8681,13 @@ fn plan_abort_rules_follow_try_depth_inheritance() {
     // `buf_write` (`bufwrite.c:1861-1866`): an aborting post handler fails
     // the command while the completed file write stands.
     let result = executor.execute_line_core(&editor, "write out.txt");
-    assert!(
-        result.is_err(),
-        "a throwing BufWritePost must fail the write"
-    );
+    match result {
+        Err(ExecError::Vim(exception)) => assert!(
+            matches!(exception.kind, VimExceptionKind::Throw),
+            "an aborting post handler fails the command as a throw",
+        ),
+        other => panic!("a throwing BufWritePost must fail the write, got {other:?}"),
+    }
     assert_eq!(
         executor.scripts().io().content("out.txt"),
         Some("hi\n".to_owned()),
