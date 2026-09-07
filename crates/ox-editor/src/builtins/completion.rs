@@ -1662,7 +1662,12 @@ const CTRL_RSB: char = '\u{1d}';
 
 /// Whether the key is a `CTRL-X` submode selector: exactly the case list
 /// `set_ctrl_x_mode` consumes (`insexpand.c:2615-2736`). Anything else is
-/// an ordinary key upstream does not consume.
+/// an ordinary key upstream does not consume. One deliberate
+/// approximation: upstream releases `CTRL-R` when `=` is peeked next
+/// (`insexpand.c:2644-2649`) for expression-register insertion, which
+/// this port has no Insert-mode handling for yet — a released `CTRL-R`
+/// is dropped either way today, so deferring the decision changes
+/// nothing observable.
 fn is_ctrl_x_submode_key(key: char) -> bool {
     matches!(
         key,
@@ -1805,6 +1810,10 @@ pub struct CompletionSession {
     /// (`usize::MAX` forces a rebuild): navigation only moves the
     /// selection instead of re-allocating every candidate per key.
     pum_built_for: usize,
+    /// The armed `CTRL-X` interrupted a live session (`CONT_INTRPT`,
+    /// `insexpand.c:399-400`): the next `CTRL-N`/`CTRL-P` continues
+    /// under the plain banner, without `CONT_LOCAL`.
+    interrupted: bool,
 }
 
 impl Default for CompletionSession {
@@ -1822,6 +1831,7 @@ impl Default for CompletionSession {
             submode: None,
             extra: None,
             pum_built_for: usize::MAX,
+            interrupted: false,
         }
     }
 }
@@ -1903,8 +1913,12 @@ impl CompletionSession {
             self.ctrl_x_pending = false;
             if key == CTRL_N || key == CTRL_P {
                 // `^N`/`^P` through `CTRL-X` complete with the LOCAL banner
-                // (`insexpand.c:6165-6166`).
-                self.start(editor, buffer, window, cursor, key, true, timestamp)?;
+                // (`insexpand.c:6165-6166`) — unless the armed `CTRL-X`
+                // interrupted a live session, which continues non-local
+                // (`CONT_INTRPT` without `CONT_LOCAL`, `insexpand.c:2706-2710`).
+                let local = !self.interrupted;
+                self.interrupted = false;
+                self.start(editor, buffer, window, cursor, key, local, timestamp)?;
                 return Ok(CompletionOutcome::Handled);
             }
             if is_ctrl_x_submode_key(key) {
@@ -1921,9 +1935,10 @@ impl CompletionSession {
                 CTRL_X => {
                     // The inserted match stays (`ins_compl_stop` only
                     // restores the leader for CTRL-E); the submode arms
-                    // for its second key.
+                    // for its second key, marked as interrupting.
                     self.stop_keep();
                     self.ctrl_x_pending = true;
+                    self.interrupted = true;
                     return Ok(CompletionOutcome::Handled);
                 }
                 CTRL_N => {
@@ -2603,7 +2618,7 @@ mod completion_engine_tests {
         assert_eq!(outcome, CompletionOutcome::Handled);
         assert_eq!(
             session.showmode_override().as_deref(),
-            Some("-- Keyword Local completion (^N^P) match 1 of 2")
+            Some("-- Keyword completion (^N^P) match 1 of 2")
         );
     }
 

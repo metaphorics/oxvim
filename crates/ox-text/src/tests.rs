@@ -512,6 +512,17 @@ fn swap_write_reserves_owner_only_rewrites_and_refuses_links() {
     SwapFile::new("/tmp/example.txt", buffer)
         .write_to(&path)
         .unwrap();
+    // A foreign regular file at the candidate path is never
+    // truncated, even though it is not a link.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, b"foreign").unwrap();
+    let buffer = Buffer::from_bytes(b"evil\n").unwrap();
+    assert!(
+        SwapFile::new("/tmp/example.txt", buffer)
+            .write_to(&path)
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"foreign");
     // A link at the candidate path fails instead of redirecting.
     std::fs::remove_file(&path).unwrap();
     let victim = dir.join("victim");

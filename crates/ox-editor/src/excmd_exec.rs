@@ -903,6 +903,11 @@ pub struct ExExecutor<F: FileIO = RealFileIO> {
     scope: Scope,
     lua: Option<Rc<RefCell<dyn LuaExec>>>,
     last_quit: Option<i64>,
+    /// Process-level quit bus shared with forked executors: `finish_quit`
+    /// records here as well as in `last_quit`, so a `:qall` inside a
+    /// doubly-nested autocmd is drained by the host's absorb pass even
+    /// though the forked executor itself is unreachable afterward.
+    quit_bus: Rc<RefCell<Option<i64>>>,
 }
 
 impl ExExecutor<RealFileIO> {
@@ -1114,7 +1119,15 @@ impl<F: FileIO> ExExecutor<F> {
             scope: Scope::new(),
             lua: None,
             last_quit: None,
+            quit_bus: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// Shares the process-level quit bus with `other`, so quits recorded
+    /// by a forked executor reach the host absorb pass. Call on every
+    /// executor of a session pair, and inherit it in forks.
+    pub fn share_quit_bus_from<G: FileIO>(&mut self, other: &ExExecutor<G>) {
+        self.quit_bus = Rc::clone(&other.quit_bus);
     }
 
     /// Installs the Lua host used by `:lua`, `:luafile`, and `:luado`.
@@ -1198,6 +1211,12 @@ impl<F: FileIO> ExExecutor<F> {
     /// Process exit requested since the last poll (`:cquit` / `:qall`).
     pub fn take_quit(&mut self) -> Option<i64> {
         self.last_quit.take()
+    }
+
+    /// Process exit recorded by this executor or any executor sharing its
+    /// quit bus, since the last poll.
+    pub fn take_shared_quit(&mut self) -> Option<i64> {
+        self.quit_bus.borrow_mut().take()
     }
     /// Shares one user-command registry with `other`, so a nested executor
     /// sees every definition the primary one carries and vice versa.
@@ -1986,6 +2005,7 @@ impl<F: FileIO> ExExecutor<F> {
         }
         if let Flow::Quit(code) = *flow {
             self.last_quit = Some(code);
+            *self.quit_bus.borrow_mut() = Some(code);
         }
         let lua = self.lua.clone();
         fire_exit_autocmds(&mut self.runtime, access, &mut self.scope, lua.as_ref());

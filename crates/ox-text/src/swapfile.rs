@@ -241,7 +241,7 @@ impl SwapFile {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = Self::reserve_swapfile(path)?;
+        let mut file = Self::reserve_swapfile(path, &self.file_name)?;
         self.write(&mut file)?;
         file.sync_all()?;
         Ok(())
@@ -250,7 +250,7 @@ impl SwapFile {
     /// Atomically reserves a new swapfile or re-opens one already reserved:
     /// the create half refuses symlinks and pre-existing files, the re-open
     /// half still refuses symlinks, and both enforce owner-only permissions.
-    fn reserve_swapfile(path: &Path) -> Result<std::fs::File, SwapError> {
+    fn reserve_swapfile(path: &Path, expected_fname: &str) -> Result<std::fs::File, SwapError> {
         #[cfg(unix)]
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -269,9 +269,15 @@ impl SwapFile {
         match created {
             Ok(file) => Ok(file),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                // A file this writer reserved on an earlier preserve: re-open
+                // A file this writer reserved on an earlier preserve: verify
+                // it is still that swapfile (block-zero id, byte-order magic,
+                // and target name), so a foreign file, hardlink, or link
+                // target planted at the path is never truncated. Then re-open
                 // for truncation without following links, and re-assert the
                 // owner-only mode in case it predates this reservation.
+                if !Self::is_own_swapfile(path, expected_fname) {
+                    return Err(SwapError::Malformed("swapfile identity"));
+                }
                 #[cfg(unix)]
                 let file = std::fs::OpenOptions::new()
                     .write(true)
@@ -288,8 +294,45 @@ impl SwapFile {
         }
     }
 
+    /// Whether `path` still holds this writer's swapfile: block-zero id,
+    /// byte-order magic, and the target file name all match. The magic and
+    /// name gate rejects foreign files and link targets alike; on
+    /// Linux/macOS the reserve path already refused symlinks outright via
+    /// `O_NOFOLLOW`.
+    fn is_own_swapfile(path: &Path, expected_fname: &str) -> bool {
+        use std::io::Read;
+
+        // Block zero through the byte-order magic words.
+        let mut head = vec![0; 1024];
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return false;
+        };
+        let Ok(read) = file.read(&mut head) else {
+            return false;
+        };
+        if read < 1020 {
+            return false;
+        }
+        if head.get(0..2) != Some(b"b0") {
+            return false;
+        }
+        if le_i64(&head, 1008).ok() != Some(B0_MAGIC_LONG)
+            || le_u32(&head, 1016).ok() != Some(B0_MAGIC_INT)
+        {
+            return false;
+        }
+        let stored = head[B0_FNAME..B0_FNAME + B0_FNAME_LEN]
+            .iter()
+            .take_while(|&&byte| byte != 0)
+            .copied()
+            .collect::<Vec<u8>>();
+        stored == expected_fname.as_bytes()
+    }
+
     /// `O_NOFOLLOW` without taking a `libc` dependency: the flag value is a
-    /// stable kernel ABI constant on every Unix target this port supports.
+    /// stable kernel ABI constant on Linux and macOS. Other Unix targets
+    /// keep `create_new` atomicity but not link refusal (the magic and name
+    /// gate in `is_own_swapfile` still rejects foreign targets there).
     #[cfg(unix)]
     fn libc_nofollow() -> i32 {
         #[cfg(target_os = "linux")]
@@ -339,7 +382,7 @@ impl SwapFile {
         let file_name = String::from_utf8_lossy(&fname_bytes[..fname_len]).into_owned();
         let mut lines = Vec::new();
         let mut visited = BTreeSet::new();
-        read_block(&bytes, page_size, 1, 1, &mut visited, &mut lines)?;
+        read_block(&bytes, page_size, 1, 1, &mut visited, &mut lines, 0)?;
         let buffer = Buffer::from_lines(&lines, true)?;
         Ok(Self {
             file_name,
@@ -405,6 +448,11 @@ fn capped_nul(bytes: &[u8], cap: usize) -> Vec<u8> {
     output
 }
 
+/// Maximum pointer-block nesting: real trees stay shallower than a
+/// handful of levels, so a deeper chain is a crafted stack-exhaustion
+/// attempt, not a swapfile.
+const MAX_BLOCK_DEPTH: usize = 32;
+
 fn read_block(
     bytes: &[u8],
     page_size: usize,
@@ -412,7 +460,11 @@ fn read_block(
     page_count: usize,
     visited: &mut BTreeSet<usize>,
     lines: &mut Vec<Vec<u8>>,
+    depth: usize,
 ) -> Result<(), SwapError> {
+    if depth > MAX_BLOCK_DEPTH {
+        return Err(SwapError::Malformed("block depth"));
+    }
     if !visited.insert(block_number) {
         return Err(SwapError::Malformed("block cycle"));
     }
@@ -422,8 +474,13 @@ fn read_block(
     let extent = page_count
         .checked_mul(page_size)
         .ok_or(SwapError::Malformed("block extent"))?;
+    // The sum is untrusted arithmetic too (debug builds panic on
+    // overflow); checked, like every other bound on this path.
+    let end = offset
+        .checked_add(extent)
+        .ok_or(SwapError::Malformed("block extent"))?;
     let block = bytes
-        .get(offset..offset + extent)
+        .get(offset..end)
         .ok_or(SwapError::Malformed("truncated block"))?;
     let id = le_u16(block, 0)?;
     if id == DATA_ID {
@@ -449,6 +506,7 @@ fn read_block(
                 child_pages,
                 visited,
                 lines,
+                depth + 1,
             )?;
         }
         Ok(())

@@ -61,37 +61,30 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "chansend" | "jobsend" => {
             let id = job_id(args.first())?;
             let data = channel_bytes(args.get(1))?;
-            let Some(mut manager) = runtime.jobs.take() else {
+            let Some(manager) = runtime.jobs.take() else {
                 return Ok(Typval::Number(0));
             };
-            let sent = manager
-                .send(id, data)
-                .map_err(|message| EvalError::new("E900", 0, message))?;
-            if access.with_ex_editor(|editor| editor.terminal_channel(id).is_some()) {
-                let mut events = manager
-                    .poll()
-                    .map_err(|message| EvalError::new("E900", 0, message))?;
-                // `f_chansend` only writes: `channel_send` ends in
-                // `wstream_write` (channel.c:661) and no callback fires on
-                // its stack. The polled events go back on the queue for the
-                // main-loop turn -- the tick -- that delivers them
-                // (`schedule_channel_event`, channel.c:729-737); invoking
-                // them here would run Lua callbacks under the borrowed
-                // executor, and their `vim.fn` re-entry would land on the
-                // nested executor's never-pumped job manager.
-                manager.defer_events(std::mem::take(&mut events));
-                runtime.jobs = Some(manager);
-                if let Some(bytes) = runtime
+            let terminal = access.with_ex_editor(|editor| editor.terminal_channel(id).is_some());
+            // `f_chansend` only writes: `channel_send` ends in
+            // `wstream_write` (channel.c:661) and no callback fires on
+            // its stack. The polled events go back on the queue for the
+            // main-loop turn -- the tick -- that delivers them
+            // (`schedule_channel_event`, channel.c:729-737); invoking
+            // them here would run Lua callbacks under the borrowed
+            // executor, and their `vim.fn` re-entry would land on the
+            // nested executor's never-pumped job manager.
+            let (manager, sent) = chansend_send(manager, id, data, terminal);
+            runtime.jobs = Some(manager);
+            let sent = sent?;
+            if terminal
+                && let Some(bytes) = runtime
                     .jobs
                     .as_mut()
                     .and_then(|jobs| jobs.take_pty_output(id))
-                {
-                    access
-                        .with_ex_editor(|editor| editor.append_terminal_buffer(id, &bytes))
-                        .ok();
-                }
-            } else {
-                runtime.jobs = Some(manager);
+            {
+                access
+                    .with_ex_editor(|editor| editor.append_terminal_buffer(id, &bytes))
+                    .ok();
             }
             Ok(Typval::Number(i64::from(sent)))
         }
@@ -202,6 +195,33 @@ fn pty_dimension(extent: usize, fallback: u16) -> u16 {
 /// reused. (`:terminal` always arrives here through its own `enew`, so
 /// these only bite direct `jobstart({term: true})` callers.) Returns
 /// whether the spawn must not proceed (the message is already shown).
+/// Runs the fallible half of `chansend`/`jobsend` with an owned
+/// manager and hands it back for restore on every path: dropping the
+/// manager would close every live non-detached child, so `?` must never
+/// run while the caller owes a restore.
+fn chansend_send(
+    mut manager: JobManager,
+    id: u64,
+    data: Vec<u8>,
+    terminal: bool,
+) -> (JobManager, Result<bool, EvalError>) {
+    let sent = match manager.send(id, data) {
+        Ok(sent) => sent,
+        Err(message) => return (manager, Err(EvalError::new("E900", 0, message))),
+    };
+    if terminal {
+        match manager.poll() {
+            Ok(events) => {
+                manager.defer_events(events);
+                (manager, Ok(sent))
+            }
+            Err(message) => (manager, Err(EvalError::new("E900", 0, message))),
+        }
+    } else {
+        (manager, Ok(sent))
+    }
+}
+
 fn term_attach_rejected<E: ExEditorAccess>(access: &E, manager: &mut JobManager) -> bool {
     let current = access.with_ex_editor(|editor| editor.current_buffer());
     let Some(buffer) = current else {
@@ -278,8 +298,10 @@ fn call_job_start<F: FileIO, E: ExEditorAccess>(
     };
     let term = options.term;
     if term && term_attach_rejected(access, &mut manager) {
+        // Guard rejections answer 0: upstream initializes the return to
+        // 0 (funcs.c:3369) and only not-executable answers -1.
         runtime.jobs = Some(manager);
-        return Ok(Typval::Number(-1));
+        return Ok(Typval::Number(0));
     }
     let started = manager.start(id, options);
     if let Ok(_pid) = started

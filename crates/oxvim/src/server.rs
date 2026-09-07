@@ -339,6 +339,9 @@ pub(crate) fn build_embedded_core(
     let lua_work = Rc::new(RefCell::new(VecDeque::new()));
     let ex = Rc::new(RefCell::new(ExExecutor::new()));
     let nested_ex = Rc::new(RefCell::new(ExExecutor::new()));
+    // One quit bus for the session pair: forked executors inherit it
+    // from their source, so `absorb_pending_quit` sees every quit.
+    nested_ex.borrow_mut().share_quit_bus_from(&ex.borrow());
     // Runtime searches follow &runtimepath (the seeded default includes
     // the runtime tree, matching the previous single-root setup).
     ex.borrow_mut()
@@ -623,6 +626,9 @@ impl AppState {
                 return Ok(());
             }
         }
+        if self.exiting {
+            return Ok(());
+        }
         self.fire_vim_enter()
     }
 
@@ -630,18 +636,27 @@ impl AppState {
     /// `do_source` picks between `nlua_exec_file` and the Ex parser.
     fn source_config_file(&mut self, path: &Path) -> Result<(), AppError> {
         if path.extension().is_some_and(|extension| extension == "lua") {
-            return self
-                .lua
+            self.lua
                 .borrow_mut()
                 .exec_file(path)
-                .map_err(|error| AppError::Lua(error.to_string()));
+                .map_err(|error| AppError::Lua(error.to_string()))?;
+            // A quit inside init.lua must stop startup before buffers and
+            // VimEnter, not whenever the next absorb happens to run.
+            self.absorb_pending_quit();
+            return Ok(());
         }
         let source = fs::read_to_string(path).map_err(AppError::Io)?;
         let name = path.to_string_lossy().into_owned();
-        self.ex
+        let outcome = self
+            .ex
             .borrow_mut()
             .execute_script_core(&*self.session, &name, &source)
             .map_err(|error| AppError::Ex(error.to_string()))?;
+        if let ExecOutcome::Quit(code) = outcome {
+            self.exiting = true;
+            self.exit_code = code;
+        }
+        self.absorb_pending_quit();
         Ok(())
     }
 
@@ -795,11 +810,11 @@ impl AppState {
     /// body executed and recorded its quit, nothing drained it, and the
     /// stdio loop then blocked reading a pipe the peer never closes.
     fn absorb_pending_quit(&mut self) {
-        let quit = self
-            .ex
-            .borrow_mut()
-            .take_quit()
-            .or_else(|| self.nested_ex.borrow_mut().take_quit());
+        // One borrow per statement: the  temporaries must drop
+        // before the next borrow of the same executor.
+        let quit = self.ex.borrow_mut().take_quit();
+        let quit = quit.or_else(|| self.nested_ex.borrow_mut().take_quit());
+        let quit = quit.or_else(|| self.ex.borrow_mut().take_shared_quit());
         if let Some(code) = quit {
             self.exiting = true;
             self.exit_code = code;
@@ -1487,7 +1502,13 @@ impl AppState {
                 .borrow_mut()
                 .run_typeahead(&*self.session, &self.mode);
             self.mode.borrow_mut().set_no_more_input(true);
-            let outcome = result.map_err(|error| ApiError::exception(error.to_string()))?;
+            let outcome = match result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.absorb_pending_quit();
+                    return Err(ApiError::exception(error.to_string()));
+                }
+            };
             let repeats = self.mode.borrow_mut().take_paste_repeats();
             let (outcome, repeats) = (outcome, repeats);
             if let ExecOutcome::Quit(code) = outcome {
@@ -1631,6 +1652,7 @@ impl AppState {
                                     writes.push((channel.get(), ox_rpc::nvim_error_event(&error)));
                                     writes.extend(redraws);
                                     let _ = self.drain_lua_work();
+                                    self.absorb_pending_quit();
                                     return Ok(writes);
                                 }
                             }
@@ -1842,9 +1864,11 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
             .borrow_mut()
             .set_server_host(Box::new(listen_server.clone()));
         // main.c:359 `server_init`: every startup shape binds a primary
-        // server, with NVIM_LISTEN_ADDRESS adoption (server.c:40-58);
-        // failure is non-fatal (server.c:59-64).
-        bind_primary_server(&listen_server, &state, adopted_listen.as_deref());
+        // server, with NVIM_LISTEN_ADDRESS adoption (server.c:40-58).
+        // An adopted failure aborts startup; a generated one only
+        // reports (server.c:61-73, #30282).
+        bind_primary_server(&listen_server, &state, adopted_listen.as_deref())
+            .map_err(AppError::Server)?;
         let mut uv_loop = UvLoop::new().map_err(|error| AppError::Server(error.to_string()))?;
         let stdio_poll = bind_stdio(&mut uv_loop, &runtime)?;
         let timer =
@@ -1932,20 +1956,30 @@ fn take_listen_env() -> Option<String> {
     requested.filter(|value| !value.is_empty())
 }
 
+/// Binds the primary server; returns whether startup may continue.
+/// A user-supplied address (adopted `$NVIM_LISTEN_ADDRESS`) that fails
+/// to bind is fatal (`mainerr`, main.c:359-372), exactly like `--listen`
+/// (server.c:61-73). Only the autogenerated address degrades to a
+/// report: a broken `$XDG_RUNTIME_DIR` must not refuse the editor
+/// (#30282).
 fn bind_primary_server(
     server: &ListenServer,
     state: &Rc<RefCell<AppState>>,
     adopted: Option<&str>,
-) {
+) -> Result<(), String> {
     let address = adopted.filter(|value| !value.is_empty()).map_or_else(
         || ox_editor::server_address_new(None),
         ox_editor::prepare_server_address,
     );
     let mut bound = server.clone();
     if let Err(error) = bound.start(&address) {
+        let message = format!("Failed to start server: {error}");
+        if adopted.is_some() {
+            return Err(message);
+        }
         let session = state.borrow().session.clone();
-        report_server_error(&session, &format!("Failed to start server: {error}"));
-        return;
+        report_server_error(&session, &message);
+        return Ok(());
     }
     state.borrow().session.with_editor_mut(|editor| {
         let unset = match editor.vvars().get(&OxStr::from("servername")) {
@@ -1959,6 +1993,7 @@ fn bind_primary_server(
             );
         }
     });
+    Ok(())
 }
 
 pub fn run_listener(cli: &Cli, address: &str, timer: &mut StartupTimer) -> Result<i64, AppError> {
@@ -3339,6 +3374,8 @@ fn fresh_executors(
         primary.share_user_functions_from(&source);
         nested.share_user_functions_from(&source);
         primary.share_runtime_roots_from(&source);
+        primary.share_quit_bus_from(&source);
+        nested.share_quit_bus_from(&source);
         nested.share_runtime_roots_from(&source);
     }
     primary.set_channel_ids(channel_ids.clone());

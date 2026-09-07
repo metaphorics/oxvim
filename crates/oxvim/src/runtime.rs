@@ -368,6 +368,36 @@ struct StartupFlags {
     binary: bool,
 }
 
+/// Applies the startup flags to one named file buffer. Runs in both
+/// load branches below: the buffer reused for the first file as well as
+/// every fresh one, since `apply_startup_options` only saw whichever
+/// buffer was current before any file loaded.
+fn apply_startup_file_overlays(
+    editor: &mut Editor,
+    handle: BufHandle,
+    flags: StartupFlags,
+) -> Result<(), AppError> {
+    if flags.readonly {
+        editor
+            .options_mut()
+            .set_buffer(handle, "readonly", OptionValue::Boolean(true))
+            .map_err(|error| AppError::Editor(error.to_string()))?;
+    }
+    if flags.no_modifiable {
+        editor
+            .options_mut()
+            .set_buffer(handle, "modifiable", OptionValue::Boolean(false))
+            .map_err(|error| AppError::Editor(error.to_string()))?;
+    }
+    if flags.binary {
+        editor
+            .options_mut()
+            .set_buffer(handle, "binary", OptionValue::Boolean(true))
+            .map_err(|error| AppError::Editor(error.to_string()))?;
+    }
+    Ok(())
+}
+
 fn open_startup_files(
     editor: &mut Editor,
     files: &[String],
@@ -390,6 +420,7 @@ fn open_startup_files(
                 state.load(text);
                 state.set_name(OxStr::from(file.as_str()));
             }
+            apply_startup_file_overlays(editor, current, flags)?;
             handles.push(current);
             continue;
         }
@@ -400,28 +431,7 @@ fn open_startup_files(
             state.set_name(OxStr::from(file.as_str()));
             state.mark_saved();
         }
-        // Per-file overlays, including the buffer reused for the first
-        // file (re-applying is idempotent): `apply_startup_options` only
-        // saw the initial buffer, but every named startup file loads
-        // under these flags.
-        if flags.readonly {
-            editor
-                .options_mut()
-                .set_buffer(handle, "readonly", OptionValue::Boolean(true))
-                .map_err(|error| AppError::Editor(error.to_string()))?;
-        }
-        if flags.no_modifiable {
-            editor
-                .options_mut()
-                .set_buffer(handle, "modifiable", OptionValue::Boolean(false))
-                .map_err(|error| AppError::Editor(error.to_string()))?;
-        }
-        if flags.binary {
-            editor
-                .options_mut()
-                .set_buffer(handle, "binary", OptionValue::Boolean(true))
-                .map_err(|error| AppError::Editor(error.to_string()))?;
-        }
+        apply_startup_file_overlays(editor, handle, flags)?;
         handles.push(handle);
     }
     Ok(handles)
@@ -518,6 +528,9 @@ fn create_startup_windows(
 ///
 /// Returns the exit code the last executed command asked for.
 pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
+    // No listener runs here, but startup commands can spawn children:
+    // consume the endpoint before anything can inherit it.
+    ox_sys::unset_env("NVIM_LISTEN_ADDRESS");
     // `main.c` consumes stdin only after the startup commands have run:
     // `--cmd` executes in `exe_pre_commands` (main.c:465), stdin-as-text is
     // read in `read_stdin` (main.c:552), and stdin-as-Ex-commands is
