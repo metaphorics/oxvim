@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
@@ -281,8 +281,14 @@ fn read_startup_file(file: &str) -> Result<Buffer, AppError> {
 /// This is `main.c` `create_windows()` followed by `edit_buffers()`, and it
 /// runs on both startup paths so a layout flag means the same thing in batch
 /// mode as it does under a UI.
-pub fn open_startup_buffers(editor: &mut Editor, cli: &Cli) -> Result<(), AppError> {
-    if cli.stdin_file {
+pub fn open_startup_buffers(
+    editor: &mut Editor,
+    cli: &Cli,
+    stdin_text: Option<&str>,
+) -> Result<(), AppError> {
+    if let Some(text) = stdin_text {
+        load_stdin_text(editor, text.as_bytes())?;
+    } else if cli.stdin_file {
         open_stdin_buffer(editor)?;
     }
     let buffers = open_startup_files(editor, &cli.files, cli.readonly)?;
@@ -346,16 +352,11 @@ fn open_startup_files(
     Ok(handles)
 }
 
-/// Reads standard input into the startup buffer, upstream's `EDIT_STDIN` for
-/// a bare `-` argument. The buffer stays nameless, like upstream's.
-fn open_stdin_buffer(editor: &mut Editor) -> Result<(), AppError> {
-    let mut input = Vec::new();
-    io::stdin()
-        .lock()
-        .read_to_end(&mut input)
-        .map_err(AppError::Io)?;
-    let text =
-        Buffer::from_bytes(&input).map_err(|error| AppError::Ex(format!("E474: {error}")))?;
+/// Loads stdin bytes into the startup buffer. Both stdin paths share this:
+/// `open_stdin_buffer` for a bare `-` argument and `stdin_text` for content
+/// `run_batch` already read. The buffer stays nameless, like upstream's.
+fn load_stdin_text(editor: &mut Editor, input: &[u8]) -> Result<(), AppError> {
+    let text = Buffer::from_bytes(input).map_err(|error| AppError::Ex(format!("E474: {error}")))?;
     let current = editor
         .current_buffer()
         .ok_or_else(|| AppError::Editor("no current buffer at startup".into()))?;
@@ -363,6 +364,17 @@ fn open_stdin_buffer(editor: &mut Editor) -> Result<(), AppError> {
         state.load(text);
     }
     Ok(())
+}
+
+/// Reads standard input into the startup buffer, upstream's `EDIT_STDIN` for
+/// a bare `-` argument.
+fn open_stdin_buffer(editor: &mut Editor) -> Result<(), AppError> {
+    let mut input = Vec::new();
+    io::stdin()
+        .lock()
+        .read_to_end(&mut input)
+        .map_err(AppError::Io)?;
+    load_stdin_text(editor, &input)
 }
 
 /// Builds the `-o`/`-O`/`-p` layout, upstream `main.c` `create_windows()`.
@@ -431,11 +443,13 @@ fn create_startup_windows(
 ///
 /// Returns the exit code the last executed command asked for.
 pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
-    let mut input = String::new();
-    io::stdin()
-        .read_to_string(&mut input)
-        .map_err(AppError::Io)?;
-
+    // `main.c` consumes stdin only after the startup commands have run:
+    // `--cmd` executes in `exe_pre_commands` (main.c:465), stdin-as-text is
+    // read in `read_stdin` (main.c:552), and stdin-as-Ex-commands is
+    // consumed at the very end of startup (main.c:670-685), after the
+    // `-c`/`+cmd` arguments (main.c:606) and VimEnter (main.c:620). Reading
+    // eagerly here would block on a pipe that stays open and starve a
+    // `--cmd 'qa!'` that upstream honours before any stdin traffic.
     let mut editor = Editor::new();
     let buffer = editor
         .create_buffer(true)
@@ -478,6 +492,16 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
         }
         timer.mark("sourcing vimrc file(s)");
         let input_is_text = cli.batch.is_some_and(|batch| batch.input_is_text);
+        let mut input = String::new();
+        // stdin becomes buffer content only when it is source content, not
+        // Ex commands: an explicit `-` argument (upstream `had_stdin_file`),
+        // or the implicit pipe read of `-E`/`-Es` (`edit_stdin`,
+        // main.c:1088-1095: not headless, not a tty, no `-s {scriptin}`).
+        if cli.stdin_file || (input_is_text && !cli.headless && !io::stdin().is_terminal()) {
+            io::stdin()
+                .read_to_string(&mut input)
+                .map_err(AppError::Io)?;
+        }
         if input_is_text {
             let text = Buffer::from_bytes(input.as_bytes())
                 .map_err(|error| AppError::Ex(format!("E474: {error}")))?;
@@ -489,14 +513,22 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
                 Ok::<(), AppError>(())
             })?;
         } else {
-            session.with_editor_mut(|editor| open_startup_buffers(editor, cli))?;
+            session.with_editor_mut(|editor| {
+                open_startup_buffers(editor, cli, cli.stdin_file.then_some(input.as_str()))
+            })?;
         }
         timer.mark("opening buffers");
         if let Some(code) = execute_lines(&mut executor, &session, &cli.commands)? {
             exit_code = code;
             break 'startup;
         }
-        if !input_is_text {
+        // The Ex-commands read sits at the end of startup (main.c:670-685)
+        // and only when stdin is not a tty (main.c:674-676: "nvim -es +cmd"
+        // in a tty executes and exits, it doesn't wait for input).
+        if !input_is_text && !io::stdin().is_terminal() {
+            io::stdin()
+                .read_to_string(&mut input)
+                .map_err(AppError::Io)?;
             let lines = input.lines().collect::<Vec<_>>();
             if let Some(code) = execute_lines(&mut executor, &session, &lines)? {
                 exit_code = code;

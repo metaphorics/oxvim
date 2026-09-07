@@ -610,7 +610,7 @@ impl AppState {
             return Ok(());
         }
         self.session
-            .with_editor_mut(|editor| open_startup_buffers(editor, cli))?;
+            .with_editor_mut(|editor| open_startup_buffers(editor, cli, None))?;
         timer.mark("opening buffers");
         for command in &cli.commands {
             self.execute_ex(command)?;
