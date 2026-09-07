@@ -326,6 +326,10 @@ fn buffer_bytes(lua: &Lua, bufnr: i64) -> mlua::Result<Vec<u8>> {
 }
 
 impl UserData for ParserHandle {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one registration closure per parser method; splitting would scatter the method table"
+    )]
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(MetaMethod::ToString, |_, _, ()| Ok("<parser>"));
         methods.add_method_mut(

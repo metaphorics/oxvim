@@ -658,6 +658,7 @@ pub fn bind_api(
         api.set(name, binding)?;
     }
 
+    let redraw_context = context.clone();
     // api/vim.c `nvim__get_runtime` is an internal, so it is absent from the
     // canonical API metadata the registry is built from, but the package loader
     // in runtime/lua/vim/_init_packages.lua reaches 'runtimepath' through it.
@@ -689,6 +690,78 @@ pub fn bind_api(
     })?;
     let runtime_binding: Function = wrap_api.call(native_runtime)?;
     api.set("nvim__get_runtime", runtime_binding)?;
+    // api/vim.c `nvim__redraw` is an internal like `nvim__get_runtime`
+    // above: absent from the canonical metadata, bound here by hand. The
+    // validation matrix mirrors upstream exactly (its strings are
+    // test-visible, e.g. api/vim_spec.lua's `nvim__redraw` block); paint
+    // effects coalesce into the next regular sync, which repaints
+    // unconditionally, so a separate redraw mark would have no consumer.
+    let native_redraw = lua.create_function(move |lua, opts: Table| {
+        let session = redraw_context.session();
+        let fail = |message: String| -> mlua::Result<(bool, Value)> {
+            Ok((false, Value::String(lua.create_string(message)?)))
+        };
+        let window = match opts
+            .get::<Option<i64>>("win")
+            .map_err(|error| mlua::Error::runtime(error.to_string()))?
+        {
+            Some(number) => {
+                let handle = WinHandle::try_from(number)
+                    .map(|handle| validate_win(session, handle))
+                    .ok()
+                    .flatten();
+                if handle.is_none() {
+                    return fail(format!("Invalid window id: {number}"));
+                }
+                handle
+            }
+            None => None,
+        };
+        let buffer = match opts
+            .get::<Option<i64>>("buf")
+            .map_err(|error| mlua::Error::runtime(error.to_string()))?
+        {
+            Some(number) => {
+                let handle = BufHandle::try_from(number)
+                    .map(|handle| validate_buf(session, handle))
+                    .ok()
+                    .flatten();
+                if handle.is_none() {
+                    return fail(format!("Invalid buffer id: {number}"));
+                }
+                handle
+            }
+            None => None,
+        };
+        if window.is_some() && buffer.is_some() {
+            return fail("cannot use both 'buf' and 'win'".to_owned());
+        }
+        let action = ["cursor", "flush", "range", "valid", "tabline", "statusline"]
+            .into_iter()
+            .chain(["statuscolumn", "winbar"])
+            .any(|key| opts.contains_key(key).unwrap_or(false));
+        if !action {
+            return fail("at least one action required".to_owned());
+        }
+        if opts.contains_key("range").unwrap_or(false) {
+            let valid = opts
+                .get::<Table>("range")
+                .ok()
+                .filter(|range| range.raw_len() == 2)
+                .and_then(|range| {
+                    let first: i64 = range.get(1).ok()?;
+                    let second: i64 = range.get(2).ok()?;
+                    (first >= 0 && second >= -1).then_some(())
+                })
+                .is_some();
+            if !valid {
+                return fail("Invalid 'range': Expected 2-tuple of Integers".to_owned());
+            }
+        }
+        Ok((true, Value::Nil))
+    })?;
+    let redraw_binding: Function = wrap_api.call(native_redraw)?;
+    api.set("nvim__redraw", redraw_binding)?;
     // Ex-to-Lua calls replace `vim.api` temporarily, and user code can replace
     // `tostring`, so both lookups must happen when `print` runs.
     lua.globals().set(
