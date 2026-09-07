@@ -8154,3 +8154,95 @@ fn nested_global_write_survives_outer_sync() {
         Some(&ox_types::Object::Integer(2))
     );
 }
+
+#[test]
+fn displayed_plan_error_continues_to_later_actions_at_depth_zero() {
+    // Upstream runs the whole group through one `do_cmdline`: at trylevel
+    // 0 a displayed error continues to the next action — only an
+    // interrupt stops matching (`autocmd.c:1871`). The failing entry is
+    // a Lua callback without an installed host, whose error reaches the
+    // plan loop undisplayed (the instruction loop never sees it).
+    let (editor, mut executor) = setup_with_content(&[b"hi".to_vec()]);
+    editor
+        .editor_mut()
+        .autocmds_mut()
+        .register_api(
+            &[Event::BufWritePost],
+            "*",
+            &AutocmdKind::LuaCallback(1),
+            &AutocmdOptions::default(),
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "au BufWritePost * let g:post_after_error = 1")
+        .unwrap();
+    executor
+        .execute_line_core(&editor, "write out.txt")
+        .unwrap();
+    assert_eq!(
+        executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"post_after_error", 0)
+            .ok(),
+        Some(&ox_types::Typval::Number(1)),
+        "later action must run after a displayed plan error at depth 0",
+    );
+}
+
+#[test]
+fn plan_abort_rules_follow_try_depth_inheritance() {
+    // `try_depth` is inherited, never reset (`ex_docmd.c:724`): past depth
+    // 0 the same failing entry cannot display, so the plan still breaks —
+    // throw-unwind parity for API callers. An explicit `:throw` aborts at
+    // any depth.
+    for (use_core, expect_run) in [(true, true), (false, false)] {
+        let (editor, mut executor) = setup_with_content(&[b"hi".to_vec()]);
+        editor
+            .editor_mut()
+            .autocmds_mut()
+            .register_api(
+                &[Event::BufWritePost],
+                "*",
+                &AutocmdKind::LuaCallback(1),
+                &AutocmdOptions::default(),
+            )
+            .unwrap();
+        executor
+            .execute_line(&editor, "au BufWritePost * let g:depth_pin = 1")
+            .unwrap();
+        if use_core {
+            executor
+                .execute_line_core(&editor, "write out.txt")
+                .unwrap();
+        } else {
+            let _ = executor.execute_line(&editor, "write out.txt");
+        }
+        assert_eq!(
+            executor
+                .scope()
+                .get_scoped(ox_eval::scope::ScopeKind::Global, b"depth_pin", 0)
+                .ok(),
+            expect_run.then_some(&ox_types::Typval::Number(1)),
+            "use_core={use_core}",
+        );
+    }
+    let (editor, mut executor) = setup_with_content(&[b"hi".to_vec()]);
+    executor
+        .execute_line(&editor, "au BufWritePost * throw 'boom'")
+        .unwrap();
+    executor
+        .execute_line(&editor, "au BufWritePost * let g:after_throw = 1")
+        .unwrap();
+    // The postlude swallows the plan flow by design (the write itself
+    // stays `Ok`); what matters here is the later action never ran.
+    executor
+        .execute_line_core(&editor, "write out.txt")
+        .unwrap();
+    assert!(
+        executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"after_throw", 0)
+            .is_err(),
+        "explicit :throw must still abort later plan actions",
+    );
+}

@@ -13194,8 +13194,10 @@ fn run_lua_autocmd_callback<F: FileIO, E: ExEditorAccess>(
 }
 
 /// Executes one [`FiringPlan`] in order, acknowledging `++once` definitions
-/// as each action starts and stopping at the first non-normal flow
-/// (`autocmd.c` `apply_autocmds_group` runs the matched list in sequence).
+/// as each action starts. Upstream runs the whole group through one
+/// `do_cmdline`: at trylevel 0 a displayed error continues to the next
+/// action — only an interrupt stops matching (`autocmd.c:1871`) — while
+/// an undisplayed exception aborts the group.
 fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -13274,6 +13276,15 @@ fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
             break;
         }
         if !matches!(action_flow, Flow::Normal) {
+            // Re-attempting display here never double-pushes: actions whose
+            // errors the instruction loop already showed arrive here
+            // undisplayable, so only a first display pushes. `try_depth`
+            // is inherited, never reset (`ex_docmd.c:724`), so past depth
+            // 0 nothing displays and the break preserves throw-unwind
+            // parity for API callers.
+            if display_error_message(runtime, access, &action_flow) {
+                continue;
+            }
             flow = action_flow;
             break;
         }

@@ -2207,9 +2207,11 @@ fn autocmd_vimscript_failure_carries_source_label() {
 /// nested Ex work on the nested executor (or a fork of it) while the
 /// primary is borrowed. `--noplugin` keeps bundled autocmds (notably
 /// `nvim.autoread`'s match-all `BufWritePost` watcher) out of the firing
-/// plans: a failing earlier entry aborts the plan upstream-style, which
-/// would mask these assertions. `request` panics on any RPC error, so
-/// reaching the readbacks is itself the regression assertion.
+/// plans: at API depth a throwing earlier entry aborts the plan
+/// upstream-style (`ex_docmd.c:724` inherits `trylevel`, so nothing
+/// displays past depth 0), which would mask these assertions. `request`
+/// panics on any RPC error, so reaching the readbacks is itself the
+/// regression assertion.
 #[expect(
     clippy::expect_used,
     reason = "g: readback shape is an assertion in the smoke harness"
