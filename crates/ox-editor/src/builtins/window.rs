@@ -47,6 +47,9 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "win_gotoid" => host
             .access
             .with_ex_editor(|editor| call_win_gotoid_builtin(editor, args)),
+        "win_gettype" => host
+            .access
+            .with_ex_editor(|editor| call_win_gettype_builtin(editor, args)),
         "winbufnr" => host
             .access
             .with_ex_editor(|editor| call_winbufnr_builtin(editor, args)),
@@ -470,6 +473,66 @@ fn call_win_gotoid_builtin(editor: &mut Editor, args: &[Typval]) -> ox_eval::Res
             .map_err(|error| EvalError::new("E957", 0, error.to_string()))?;
     }
     Ok(Typval::Number(1))
+}
+
+/// `win_gettype([{nr}])`: the window's kind (`f_win_gettype`,
+/// `eval/window.c:705-729`). Lookup matches upstream: ids at or above
+/// `LOWEST_WINDOW_ID` resolve by handle, smaller numbers are current-
+/// tabpage positions, and anything unresolvable answers `"unknown"`.
+/// The kind order matches upstream too: preview, floating, command,
+/// quickfix/loclist, else `""`. Two arms cannot fire in this model and
+/// are documented, not faked: there is no context-switch window (never
+/// `"autocmd"`) and no tracked command-line window buffer (never
+/// `"command"`).
+fn call_win_gettype_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    if args.len() > 1 {
+        return Err(EvalError::new(
+            "E118",
+            0,
+            "Too many arguments for function: win_gettype",
+        ));
+    }
+    let window = match args.first() {
+        None => editor.current_window(),
+        Some(value) => {
+            let nr = number_value(value)?;
+            if nr >= LOWEST_WINDOW_ID {
+                editor.find_window_by_id(nr)
+            } else {
+                let windows = editor
+                    .current_tabpage()
+                    .and_then(|tab| editor.tabpage_windows(tab).ok())
+                    .unwrap_or_default();
+                one_based_index(nr).and_then(|index| windows.get(index).copied())
+            }
+        }
+    };
+    let Some(window) = window else {
+        return Ok(Typval::String(OxStr::from("unknown")));
+    };
+    if matches!(
+        editor.options().get_window(window, "previewwindow"),
+        Ok(OptionValue::Boolean(true))
+    ) {
+        return Ok(Typval::String(OxStr::from("preview")));
+    }
+    if editor.window_config(window).ok().flatten().is_some() {
+        return Ok(Typval::String(OxStr::from("popup")));
+    }
+    let buffer_quickfix = editor
+        .window(window)
+        .ok()
+        .and_then(|state| editor.options().get_buffer(state.buffer, "buftype").ok())
+        .is_some_and(|value| matches!(value, OptionValue::String(text) if text == "quickfix"));
+    if buffer_quickfix {
+        let kind = if editor.loclist(window).is_some() {
+            "loclist"
+        } else {
+            "quickfix"
+        };
+        return Ok(Typval::String(OxStr::from(kind)));
+    }
+    Ok(Typval::String(OxStr::from("")))
 }
 
 fn call_window_builtin(editor: &Editor, name: &str, args: &[Typval]) -> Typval {

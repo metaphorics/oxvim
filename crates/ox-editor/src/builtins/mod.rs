@@ -106,10 +106,9 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         "getqflist" | "setqflist" | "getloclist" | "setloclist" => Family::Quickfix,
         "screenattr" | "screenchar" | "screenchars" | "screenstring" | "screencol" | "bufwinid"
         | "bufwinnr" | "screenrow" | "tabpagenr" | "tabpagewinnr" | "win_getid" | "win_gotoid"
-        | "winbufnr" | "winheight" | "winnr" | "winwidth" | "winsaveview" | "winrestview"
-        | "winline" | "wincol" | "getwinvar" | "setwinvar" | "winlayout" | "getwininfo" => {
-            Family::Window
-        }
+        | "win_gettype" | "winbufnr" | "winheight" | "winnr" | "winwidth" | "winsaveview"
+        | "winrestview" | "winline" | "wincol" | "getwinvar" | "setwinvar" | "winlayout"
+        | "getwininfo" => Family::Window,
 
         "getreg" | "getregtype" | "setreg" | "getreginfo" => Family::Register,
         "complete" | "complete_info" | "getcompletion" => Family::Completion,
