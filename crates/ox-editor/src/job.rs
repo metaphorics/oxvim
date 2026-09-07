@@ -544,6 +544,24 @@ impl JobManager {
         }
     }
 
+    /// The terminal job projecting into `buffer`, if any, with whether it
+    /// is still running (`terminal_running`, os/shell.c): a live channel
+    /// rejects a second attach, a completed one is closed and reused
+    /// (`f_jobstart`, eval/funcs.c:3491-3498).
+    #[must_use]
+    pub fn terminal_job_for_buffer(&self, buffer: ox_types::BufHandle) -> Option<(u64, bool)> {
+        self.jobs.iter().find_map(|(id, job)| {
+            (job.terminal_buffer == Some(buffer)).then(|| (*id, job.status < 0))
+        })
+    }
+
+    /// Drop a completed job's terminal binding so its buffer is reusable.
+    pub fn clear_terminal_buffer(&mut self, id: u64) {
+        if let Some(job) = self.jobs.get_mut(&id) {
+            job.terminal_buffer = None;
+        }
+    }
+
     /// Enable or disable the default terminal process-exit message.
     pub fn set_terminal_exit_message(&mut self, id: u64, enabled: bool) {
         if let Some(job) = self.jobs.get_mut(&id) {

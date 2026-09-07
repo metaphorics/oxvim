@@ -588,6 +588,13 @@ impl Editor {
         Ok(buffer)
     }
 
+    /// Drop a completed terminal channel's emulator state so its buffer
+    /// accepts a new terminal (`buf_close_terminal` after
+    /// `terminal_running` answers false).
+    pub fn close_terminal_channel(&mut self, channel: u64) {
+        self.terminal_buffers.remove(&channel);
+    }
+
     /// Record or update the pty slave path for an existing terminal channel.
     pub fn set_terminal_channel_pty(&mut self, channel: u64, pty: Option<String>) {
         if let Some(info) = self.terminal_buffers.get_mut(&channel) {

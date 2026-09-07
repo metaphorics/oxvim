@@ -230,6 +230,54 @@ fn call_job_start<F: FileIO, E: ExEditorAccess>(
         },
     };
     let term = options.term;
+    if term {
+        // `jobstart(..., {term: true})` guards (`f_jobstart`,
+        // eval/funcs.c:3486-3498) run before the spawn: a modified
+        // current buffer is rejected instead of destroyed, a running
+        // terminal rejects a second attach, and a completed terminal is
+        // closed so its buffer is reused. (`:terminal` always arrives
+        // here through its own `enew`, so these only bite direct
+        // `jobstart({term: true})` callers.)
+        let current = access.with_ex_editor(|editor| editor.current_buffer());
+        if let Some(buffer) = current {
+            let modified = access.with_ex_editor(|editor| {
+                editor
+                    .buffer(buffer)
+                    .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+            });
+            if modified {
+                access.with_ex_editor(|editor| {
+                    crate::excmd_exec::push_text_message(
+                        editor,
+                        "jobstart(...,{term=true}) requires unmodified buffer".to_owned(),
+                        true,
+                        true,
+                    );
+                });
+                runtime.jobs = Some(manager);
+                return Ok(Typval::Number(-1));
+            }
+            if let Some((previous, running)) = manager.terminal_job_for_buffer(buffer) {
+                if running {
+                    access.with_ex_editor(|editor| {
+                        crate::excmd_exec::push_text_message(
+                            editor,
+                            format!(
+                                "Terminal already connected to buffer {}",
+                                i64::from(buffer)
+                            ),
+                            true,
+                            true,
+                        );
+                    });
+                    runtime.jobs = Some(manager);
+                    return Ok(Typval::Number(-1));
+                }
+                manager.clear_terminal_buffer(previous);
+                access.with_ex_editor(|editor| editor.close_terminal_channel(previous));
+            }
+        }
+    }
     let started = manager.start(id, options);
     if let Ok(_pid) = started
         && wants_pty
@@ -267,6 +315,21 @@ fn call_job_start<F: FileIO, E: ExEditorAccess>(
         });
         if let Some(buffer) = terminal {
             manager.set_terminal_buffer(id, buffer);
+        } else if started.is_ok() {
+            // The child started but owns no terminal: stop it rather than
+            // leave an orphan with nowhere to project (the `:terminal`
+            // path still reports its own E475 downstream).
+            let _ = manager.stop(id);
+            access.with_ex_editor(|editor| {
+                crate::excmd_exec::push_text_message(
+                    editor,
+                    "jobstart(...,{term=true}) failed to attach the terminal buffer".to_owned(),
+                    true,
+                    true,
+                );
+            });
+            runtime.jobs = Some(manager);
+            return Ok(Typval::Number(-1));
         }
     }
     runtime.jobs = Some(manager);
