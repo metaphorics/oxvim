@@ -578,7 +578,7 @@ impl AppState {
             });
         }
         for command in &cli.pre_commands {
-            self.execute_ex(command)?;
+            self.run_startup_command(command);
             if self.exiting {
                 return Ok(());
             }
@@ -633,7 +633,7 @@ impl AppState {
             .with_editor_mut(|editor| open_startup_buffers(editor, cli, None))?;
         timer.mark("opening buffers");
         for command in &cli.commands {
-            self.execute_ex(command)?;
+            self.run_startup_command(command);
             if self.exiting {
                 return Ok(());
             }
@@ -648,10 +648,15 @@ impl AppState {
     /// `do_source` picks between `nlua_exec_file` and the Ex parser.
     fn source_config_file(&mut self, path: &Path) -> Result<(), AppError> {
         if path.extension().is_some_and(|extension| extension == "lua") {
-            self.lua
+            let result = self
+                .lua
                 .borrow_mut()
                 .exec_file(path)
-                .map_err(|error| AppError::Lua(error.to_string()))?;
+                .map_err(|error| AppError::Lua(error.to_string()));
+            if let Err(error) = result {
+                self.absorb_pending_quit();
+                self.display_startup_error(error);
+            }
             // A quit inside init.lua must stop startup before buffers and
             // VimEnter, not whenever the next absorb happens to run.
             self.absorb_pending_quit();
@@ -659,11 +664,22 @@ impl AppState {
         }
         let source = fs::read_to_string(path).map_err(AppError::Io)?;
         let name = path.to_string_lossy().into_owned();
+        // An uncaught error aborts the file, never the startup: upstream
+        // shows `file[line]` context and keeps going (verified against
+        // the reference binary).
         let outcome = self
             .ex
             .borrow_mut()
             .execute_script_core(&*self.session, &name, &source)
-            .map_err(|error| AppError::Ex(error.to_string()))?;
+            .map_err(|error| AppError::Ex(error.to_string()));
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.absorb_pending_quit();
+                self.display_startup_error(error);
+                return Ok(());
+            }
+        };
         if let ExecOutcome::Quit(code) = outcome {
             self.exiting = true;
             self.exit_code = code;
@@ -808,6 +824,31 @@ impl AppState {
         Ok(())
     }
 
+    /// Runs one startup Ex command, turning an escaping error into a
+    /// displayed message instead of aborting startup. Upstream runs every
+    /// `--cmd`/`-c`/`+cmd` line through its own `do_cmdline`: even an
+    /// uncaught exception prints and startup continues with exit 0
+    /// (verified `+break`, `+throw`, and `--cmd throw` against the
+    /// reference binary). Only the `Err` arm is touched: quits travel
+    fn run_startup_command(&mut self, command: &str) {
+        if let Err(error) = self.execute_ex(command) {
+            self.absorb_pending_quit();
+            self.display_startup_error(error);
+        }
+    }
+
+    /// Shows a startup failure as a message and lets startup continue.
+    /// Only the inner error text is pushed: the `oxvim: ... failed:`
+    /// wrapper belongs to fatal process errors, not the message list.
+    fn display_startup_error(&mut self, error: AppError) {
+        let text = match error {
+            AppError::Ex(inner) | AppError::Api(inner) | AppError::Lua(inner) => inner,
+            error => error.to_string(),
+        };
+        self.session.with_editor_mut(|editor| {
+            ox_editor::excmd_exec::push_text_message(editor, text, true, true);
+        });
+    }
     /// Absorbs a quit that user code recorded while it ran.
     ///
     /// Upstream reaches `getout` from wherever `:qall` runs — an
