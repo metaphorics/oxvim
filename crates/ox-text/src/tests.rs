@@ -477,6 +477,62 @@ fn swap_snapshot_block_round_trip() {
 }
 
 #[test]
+fn swap_hostile_data_count_is_malformed() {
+    // A hostile data-block line count must fail closed, not panic on
+    // `count * 4` overflow in debug builds.
+    let buffer = Buffer::from_bytes(b"one\n").unwrap();
+    let swap = SwapFile::new("/tmp/example.txt", buffer);
+    let mut encoded = Vec::new();
+    swap.write(&mut encoded).unwrap();
+    // Layout: block zero, pointer block, then the data block: the
+    // hostile count goes into the data header.
+    assert!(encoded.len() > 8192 + 24);
+    encoded[8192 + 16..8192 + 24].copy_from_slice(&i64::MAX.to_le_bytes());
+    let error = SwapFile::read(IoCursor::new(encoded)).unwrap_err();
+    assert!(matches!(error, SwapError::Malformed(_)));
+}
+
+#[test]
+fn swap_write_reserves_owner_only_rewrites_and_refuses_links() {
+    let dir = std::env::temp_dir().join(format!("oxvim-swap-reserve-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("test.swp");
+    let buffer = Buffer::from_bytes(b"one\n").unwrap();
+    SwapFile::new("/tmp/example.txt", buffer.clone())
+        .write_to(&path)
+        .unwrap();
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&path).unwrap().permissions()
+        ) & 0o777,
+        0o600
+    );
+    // The update path re-opens the reserved file.
+    SwapFile::new("/tmp/example.txt", buffer)
+        .write_to(&path)
+        .unwrap();
+    // A link at the candidate path fails instead of redirecting.
+    std::fs::remove_file(&path).unwrap();
+    let victim = dir.join("victim");
+    std::fs::write(&victim, b"victim").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&victim, &path).unwrap();
+    #[cfg(unix)]
+    {
+        let buffer = Buffer::from_bytes(b"evil\n").unwrap();
+        assert!(
+            SwapFile::new("/tmp/example.txt", buffer)
+                .write_to(&path)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn shada_round_trip_size_limit_and_merge() {
     let old = ShaDaEntry::new(
         ShaDaEntryType::Register,

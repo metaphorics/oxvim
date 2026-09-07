@@ -223,9 +223,17 @@ impl SwapFile {
     /// returns (`mf_sync` `MFS_FLUSH` — the `do_fsync` half of `ml_preserve`,
     /// `memline.c:1763`).
     ///
+    /// New files are reserved atomically (`O_EXCL`, `memfile.c:157-160`)
+    /// without following symlinks (`O_NOFOLLOW`, `:765-776`) and with
+    /// owner-only permissions (`fileio.c:435-444`): a pre-existing link
+    /// or file the writer did not create fails instead of redirecting
+    /// the snapshot. Rewrites of a file this writer already reserved
+    /// re-open it, still refusing to follow links.
+    ///
     /// # Errors
     ///
-    /// Returns the parent-directory creation, serialization, or sync failure.
+    /// Returns the parent-directory creation, reservation, serialization,
+    /// or sync failure.
     pub fn write_to(&self, path: &Path) -> Result<(), SwapError> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -233,11 +241,64 @@ impl SwapFile {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = std::fs::File::create(path)?;
+        let mut file = Self::reserve_swapfile(path)?;
         self.write(&mut file)?;
         file.sync_all()?;
         Ok(())
     }
+
+/// Atomically reserves a new swapfile or re-opens one already reserved:
+/// the create half refuses symlinks and pre-existing files, the re-open
+/// half still refuses symlinks, and both enforce owner-only permissions.
+fn reserve_swapfile(path: &Path) -> Result<std::fs::File, SwapError> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    #[cfg(unix)]
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(Self::libc_nofollow())
+        .open(path);
+    #[cfg(not(unix))]
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path);
+    match created {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A file this writer reserved on an earlier preserve: re-open
+            // for truncation without following links, and re-assert the
+            // owner-only mode in case it predates this reservation.
+            #[cfg(unix)]
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(Self::libc_nofollow())
+                .open(path)?;
+            #[cfg(not(unix))]
+            let file = std::fs::OpenOptions::new().write(true).open(path)?;
+            #[cfg(unix)]
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.set_len(0)?;
+            Ok(file)
+        }
+        Err(error) => Err(SwapError::Io(error)),
+    }
+}
+
+/// `O_NOFOLLOW` without taking a `libc` dependency: the flag value is a
+/// stable kernel ABI constant on every Unix target this port supports.
+#[cfg(unix)]
+fn libc_nofollow() -> i32 {
+    #[cfg(target_os = "linux")]
+    return 0o400_000;
+    #[cfg(target_os = "macos")]
+    return 0x100;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return 0;
+}
 
     /// Reads a native 64-bit little-endian Neovim swap block tree.
     ///
@@ -399,7 +460,11 @@ fn read_block(
 fn read_data(block: &[u8], lines: &mut Vec<Vec<u8>>) -> Result<(), SwapError> {
     let count =
         usize::try_from(le_i64(block, 16)?).map_err(|_| SwapError::Malformed("data line count"))?;
-    if DATA_HEADER + count * 4 > block.len() {
+    let index_end = count
+        .checked_mul(4)
+        .and_then(|index| DATA_HEADER.checked_add(index))
+        .ok_or(SwapError::Malformed("data index"))?;
+    if index_end > block.len() {
         return Err(SwapError::Malformed("data index"));
     }
     for index in 0..count {
