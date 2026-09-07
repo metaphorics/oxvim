@@ -262,10 +262,7 @@ fn call_job_start<F: FileIO, E: ExEditorAccess>(
                     access.with_ex_editor(|editor| {
                         crate::excmd_exec::push_text_message(
                             editor,
-                            format!(
-                                "Terminal already connected to buffer {}",
-                                i64::from(buffer)
-                            ),
+                            format!("Terminal already connected to buffer {}", i64::from(buffer)),
                             true,
                             true,
                         );

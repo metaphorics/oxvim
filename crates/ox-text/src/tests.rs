@@ -504,9 +504,8 @@ fn swap_write_reserves_owner_only_rewrites_and_refuses_links() {
         .unwrap();
     #[cfg(unix)]
     assert_eq!(
-        std::os::unix::fs::PermissionsExt::mode(
-            &std::fs::metadata(&path).unwrap().permissions()
-        ) & 0o777,
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&path).unwrap().permissions())
+            & 0o777,
         0o600
     );
     // The update path re-opens the reserved file.

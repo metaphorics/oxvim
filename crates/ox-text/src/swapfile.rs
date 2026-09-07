@@ -247,58 +247,58 @@ impl SwapFile {
         Ok(())
     }
 
-/// Atomically reserves a new swapfile or re-opens one already reserved:
-/// the create half refuses symlinks and pre-existing files, the re-open
-/// half still refuses symlinks, and both enforce owner-only permissions.
-fn reserve_swapfile(path: &Path) -> Result<std::fs::File, SwapError> {
-    #[cfg(unix)]
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    /// Atomically reserves a new swapfile or re-opens one already reserved:
+    /// the create half refuses symlinks and pre-existing files, the re-open
+    /// half still refuses symlinks, and both enforce owner-only permissions.
+    fn reserve_swapfile(path: &Path) -> Result<std::fs::File, SwapError> {
+        #[cfg(unix)]
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    #[cfg(unix)]
-    let created = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(Self::libc_nofollow())
-        .open(path);
-    #[cfg(not(unix))]
-    let created = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path);
-    match created {
-        Ok(file) => Ok(file),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            // A file this writer reserved on an earlier preserve: re-open
-            // for truncation without following links, and re-assert the
-            // owner-only mode in case it predates this reservation.
-            #[cfg(unix)]
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(Self::libc_nofollow())
-                .open(path)?;
-            #[cfg(not(unix))]
-            let file = std::fs::OpenOptions::new().write(true).open(path)?;
-            #[cfg(unix)]
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            file.set_len(0)?;
-            Ok(file)
+        #[cfg(unix)]
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(Self::libc_nofollow())
+            .open(path);
+        #[cfg(not(unix))]
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path);
+        match created {
+            Ok(file) => Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A file this writer reserved on an earlier preserve: re-open
+                // for truncation without following links, and re-assert the
+                // owner-only mode in case it predates this reservation.
+                #[cfg(unix)]
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(Self::libc_nofollow())
+                    .open(path)?;
+                #[cfg(not(unix))]
+                let file = std::fs::OpenOptions::new().write(true).open(path)?;
+                #[cfg(unix)]
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                file.set_len(0)?;
+                Ok(file)
+            }
+            Err(error) => Err(SwapError::Io(error)),
         }
-        Err(error) => Err(SwapError::Io(error)),
     }
-}
 
-/// `O_NOFOLLOW` without taking a `libc` dependency: the flag value is a
-/// stable kernel ABI constant on every Unix target this port supports.
-#[cfg(unix)]
-fn libc_nofollow() -> i32 {
-    #[cfg(target_os = "linux")]
-    return 0o400_000;
-    #[cfg(target_os = "macos")]
-    return 0x100;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    return 0;
-}
+    /// `O_NOFOLLOW` without taking a `libc` dependency: the flag value is a
+    /// stable kernel ABI constant on every Unix target this port supports.
+    #[cfg(unix)]
+    fn libc_nofollow() -> i32 {
+        #[cfg(target_os = "linux")]
+        return 0o400_000;
+        #[cfg(target_os = "macos")]
+        return 0x100;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        return 0;
+    }
 
     /// Reads a native 64-bit little-endian Neovim swap block tree.
     ///
