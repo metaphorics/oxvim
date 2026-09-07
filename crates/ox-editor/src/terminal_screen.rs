@@ -492,12 +492,14 @@ impl TerminalScreen {
     pub fn cursor_byte_column(&self) -> usize {
         let start = self.cursor.row.saturating_mul(self.size.cols);
         let end = start.saturating_add(self.cursor.col.min(self.size.cols));
-        self.cells
+        let bytes: usize = self
+            .cells
             .get(start..end)
             .unwrap_or(&[])
             .iter()
             .map(|cell| cell.ch.map_or(1, char::len_utf8))
-            .sum()
+            .sum();
+        bytes.min(self.render_row(self.cursor.row).text.len())
     }
     /// Resize the screen, keeping content anchored at the top.
     ///
@@ -1521,6 +1523,13 @@ mod tests {
         screen.write(b"ab");
 
         assert_eq!(text(&screen, 0), "ab");
+    }
+
+    #[test]
+    fn cursor_byte_column_stops_at_rendered_text() {
+        let mut screen = screen(2, 20);
+        screen.write(b"ab\x1b[6G");
+        assert_eq!(screen.cursor_byte_column(), 2);
     }
 
     #[test]

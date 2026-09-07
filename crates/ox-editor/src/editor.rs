@@ -701,6 +701,11 @@ impl Editor {
         self.terminal_buffers.get(&channel)
     }
 
+    /// Returns all editor-owned terminal channel identifiers in ascending order.
+    pub fn terminal_channel_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.terminal_buffers.keys().copied()
+    }
+
     /// Whether `buffer` is owned by a terminal channel.
     #[must_use]
     pub fn is_terminal_buffer(&self, buffer: BufHandle) -> bool {

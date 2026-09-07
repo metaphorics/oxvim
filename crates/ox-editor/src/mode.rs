@@ -2894,12 +2894,33 @@ impl ModeMachine {
             .current_tabpage()
             .ok_or(EditorError::UnknownTabpage(ox_types::TabHandle::CURRENT))?;
         let created = editor
-            .split_above(tab, origin_window, handle, true)
-            .map_err(|error| ModeError::Vim("E36", error.to_string()))?;
-        editor
-            .options_mut()
-            .set_window(created, "previewwindow", OptionValue::Boolean(true))
-            .map_err(|error| ModeError::Vim("E474", error.to_string()))?;
+            .tabpage_windows(tab)
+            .map_err(|error| ModeError::Vim("E36", error.to_string()))?
+            .into_iter()
+            .find(|&window| {
+                editor
+                    .options()
+                    .get_window(window, "previewwindow")
+                    .is_ok_and(|value| matches!(value, OptionValue::Boolean(true)))
+            });
+        let created = if let Some(created) = created {
+            editor
+                .set_current_window(created)
+                .map_err(|error| ModeError::Vim("E36", error.to_string()))?;
+            editor
+                .set_current_buffer(handle, crate::BufferRelease::KeepLoaded)
+                .map_err(|error| ModeError::Vim("E1513", error.to_string()))?;
+            created
+        } else {
+            let created = editor
+                .split_above(tab, origin_window, handle, true)
+                .map_err(|error| ModeError::Vim("E36", error.to_string()))?;
+            editor
+                .options_mut()
+                .set_window(created, "previewwindow", OptionValue::Boolean(true))
+                .map_err(|error| ModeError::Vim("E474", error.to_string()))?;
+            created
+        };
         let lines = (1..=editor.buffer(handle)?.text()?.line_count())
             .filter_map(|lnum| editor.buffer(handle).ok()?.text().ok()?.line(lnum).ok())
             .collect::<Vec<_>>();

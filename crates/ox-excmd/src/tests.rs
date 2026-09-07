@@ -696,6 +696,16 @@ fn vimgrepadd_pattern_bar_is_not_a_separator() {
 }
 
 #[test]
+fn vimgrep_accepts_non_ascii_undelimited_pattern() {
+    let commands = Parser::new()
+        .parse("vimgrep ünïcode *.rs")
+        .unwrap_or_default();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].command.name(), "vimgrep");
+    assert_eq!(commands[0].args, "ünïcode *.rs");
+}
+
+#[test]
 fn lvimgrep_pattern_with_flags_splits_after_files() {
     let commands = Parser::new()
         .parse("lvimgrep /a|b/g file | print")

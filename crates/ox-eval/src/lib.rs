@@ -4,7 +4,7 @@
 pub mod builtins;
 pub mod error;
 pub mod eval;
-mod find_file;
+pub mod find_file;
 mod fuzzy;
 pub mod lexer;
 pub mod parser;

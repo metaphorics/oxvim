@@ -581,6 +581,19 @@ fn get_region(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
         return Ok(Typval::list(Vec::new()));
     };
     let opts = parse_region_opts(args)?;
+    let tab_width = tabstop(editor);
+    let (block_start, block_end) = if opts.region_type == RegionType::Block {
+        block_columns(
+            &lines,
+            &p1,
+            &p2,
+            opts.block_width,
+            opts.exclusive,
+            tab_width,
+        )
+    } else {
+        (0, 0)
+    };
     let mut result = Vec::new();
     for lnum in p1.lnum..=p2.lnum {
         let line_idx = usize::try_from(lnum)
@@ -611,17 +624,8 @@ fn get_region(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
                 line[start..end].to_vec()
             }
             (RegionType::Block, Some(line)) => {
-                let start_col = usize::try_from(p1.col.max(0)).unwrap_or(0);
-                let end_col = if opts.block_width > 0 {
-                    start_col.saturating_add(usize::try_from(opts.block_width.max(0)).unwrap_or(0))
-                } else {
-                    usize::try_from(p2.col.max(0))
-                        .unwrap_or(0)
-                        .saturating_add(1)
-                };
-                let start = start_col.min(line.len());
-                let end = end_col.min(line.len()).max(start);
-                line[start..end].to_vec()
+                let block = block_prep(line, block_start, block_end, tab_width);
+                block_text(line, &block)
             }
         };
         result.push(Typval::String(OxStr(text)));
@@ -632,11 +636,29 @@ fn get_region(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
 /// `funcs.c:f_getregionpos`: returns a list of `[[start_pos, end_pos], ...]`
 /// pairs, one per line in the region. Each position is `[bufnum, lnum, col,
 /// off]` with 1-based `col`.
+fn position_column(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+#[expect(clippy::too_many_lines, reason = "position conversion mirrors funcs.c")]
 fn get_region_pos(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
     let Some((p1, p2, buf, lines)) = resolve_region(editor, args)? else {
         return Ok(Typval::list(Vec::new()));
     };
     let opts = parse_region_opts(args)?;
+    let tab_width = tabstop(editor);
+    let (block_start, block_end) = if opts.region_type == RegionType::Block {
+        block_columns(
+            &lines,
+            &p1,
+            &p2,
+            opts.block_width,
+            opts.exclusive,
+            tab_width,
+        )
+    } else {
+        (0, 0)
+    };
     let bufnum = i64::from(buf);
     let mut result = Vec::new();
     for lnum in p1.lnum..=p2.lnum {
@@ -646,8 +668,8 @@ fn get_region_pos(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
             .and_then(|n| lines.get(n));
         let line_len = line_idx.map_or(0, Vec::len);
         let line_cap = i64::try_from(line_len).unwrap_or(i64::MAX);
-        let (start_col, end_col) = match opts.region_type {
-            RegionType::Line => (1, MAXCOL),
+        let (start_col, end_col, start_coladd, end_coladd) = match opts.region_type {
+            RegionType::Line => (1, MAXCOL, 0, 0),
             RegionType::Char => {
                 // Per-line: first line starts at p1.col+1, last line ends
                 // at p2.col+1 (inclusive) or p2.col+1 (exclusive), middle
@@ -662,20 +684,66 @@ fn get_region_pos(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
                 } else {
                     line_cap + 1
                 };
-                (s, e)
+                (s, e, 0, 0)
             }
             RegionType::Block => {
-                let s = p1.col.max(0) + 1;
-                let e = if opts.block_width > 0 {
-                    p1.col + opts.block_width
+                let mut block = line_idx.map_or_else(
+                    || block_prep(&[], block_start, block_end, tab_width),
+                    |line| block_prep(line, block_start, block_end, tab_width),
+                );
+                let line = line_idx.map_or(&[][..], |line| line.as_slice());
+                let (mut start, mut start_add) = if block.is_one_char {
+                    (
+                        position_column(previous_char_start(line, block.textcol)) + 1,
+                        position_column(block.start_char_vcols)
+                            - (position_column(block.start_vcol) - position_column(block_start)),
+                    )
+                } else if block.start_vcol < block_start {
+                    block.is_one_char = true;
+                    (
+                        MAXCOL,
+                        position_column(block_start) - position_column(block.start_vcol),
+                    )
+                } else if block.startspaces > 0 {
+                    (
+                        position_column(previous_char_start(line, block.textcol)) + 1,
+                        position_column(block.start_char_vcols)
+                            - position_column(block.startspaces),
+                    )
                 } else {
-                    p2.col + 1
+                    (position_column(block.textcol) + 1, 0)
                 };
-                (s, e)
+                let (mut end, mut end_add) = if block.is_one_char {
+                    (
+                        start,
+                        start_add
+                            + position_column(block.startspaces)
+                            + position_column(block.endspaces),
+                    )
+                } else if block.endspaces > 0 {
+                    (
+                        position_column(block.textcol) + position_column(block.textlen) + 1,
+                        position_column(block.endspaces),
+                    )
+                } else {
+                    (
+                        position_column(block.textcol) + position_column(block.textlen),
+                        0,
+                    )
+                };
+                if !opts.allow_eol && start > line_cap {
+                    start = 0;
+                    start_add = 0;
+                }
+                if !opts.allow_eol && end > line_cap {
+                    end = if start == 0 { 0 } else { line_cap };
+                    end_add = 0;
+                }
+                (start, end, start_add, end_add)
             }
         };
-        let (start_col, end_col) = if opts.allow_eol {
-            (start_col, end_col)
+        let (start_col, end_col, start_coladd, end_coladd) = if opts.allow_eol {
+            (start_col, end_col, start_coladd, end_coladd)
         } else {
             let s = if start_col > line_cap + 1 {
                 line_cap + 1
@@ -687,23 +755,146 @@ fn get_region_pos(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
             } else {
                 end_col
             };
-            (s, e)
+            let start_add = if s == 0 { 0 } else { start_coladd };
+            let end_add = if e == 0 || e == line_cap {
+                0
+            } else {
+                end_coladd
+            };
+            (s, e, start_add, end_add)
         };
         let start_pos = Typval::list(vec![
             Typval::Number(bufnum),
             Typval::Number(lnum),
             Typval::Number(start_col),
-            Typval::Number(0),
+            Typval::Number(start_coladd),
         ]);
         let end_pos = Typval::list(vec![
             Typval::Number(bufnum),
             Typval::Number(lnum),
             Typval::Number(end_col),
-            Typval::Number(0),
+            Typval::Number(end_coladd),
         ]);
         result.push(Typval::list(vec![start_pos, end_pos]));
     }
     Ok(Typval::list(result))
+}
+
+fn block_columns(
+    lines: &[Vec<u8>],
+    p1: &FPos,
+    p2: &FPos,
+    width: i64,
+    exclusive: bool,
+    tab_width: usize,
+) -> (usize, usize) {
+    let first = lines
+        .get(usize::try_from(p1.lnum.saturating_sub(1)).unwrap_or(0))
+        .map_or((0, 0), |line| getvvcol(line, p1.col, p1.coladd, tab_width));
+    let second = lines
+        .get(usize::try_from(p2.lnum.saturating_sub(1)).unwrap_or(0))
+        .map_or(first, |line| getvvcol(line, p2.col, p2.coladd, tab_width));
+    let start = first.0.min(second.0);
+    let mut end = first.1.max(second.1);
+    if width > 0 {
+        end = start.saturating_add(usize::try_from(width - 1).unwrap_or(0));
+    } else if exclusive && first.1 < second.0 && second.0 > 0 && second.1 > first.1 {
+        end = second.0 - 1;
+    }
+    (start, end)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BlockDef {
+    start_vcol: usize,
+    end_vcol: usize,
+    start_char_vcols: usize,
+    end_char_vcols: usize,
+    startspaces: usize,
+    endspaces: usize,
+    textcol: usize,
+    textlen: usize,
+    is_short: bool,
+    is_one_char: bool,
+}
+
+fn block_prep(line: &[u8], start_vcol: usize, end_vcol: usize, tab_width: usize) -> BlockDef {
+    let mut block = BlockDef {
+        start_vcol,
+        end_vcol: 0,
+        ..BlockDef::default()
+    };
+    let mut index = 0;
+    let mut vcol = 0;
+    let mut incr = 0;
+    while vcol < start_vcol && index < line.len() {
+        let (character, _) = decode_char(&line[index..]);
+        let length = cluster_len(line, index);
+        incr = cell_width(character, vcol, tab_width);
+        vcol += incr;
+        index += length;
+    }
+    block.start_vcol = vcol;
+    block.start_char_vcols = incr;
+    let pstart = index;
+    if block.start_vcol < start_vcol {
+        block.end_vcol = block.start_vcol;
+        block.is_short = true;
+        block.endspaces = end_vcol - start_vcol + 1;
+    } else {
+        block.startspaces = block.start_vcol - start_vcol;
+        let mut pend = pstart;
+        block.end_vcol = block.start_vcol;
+        if block.end_vcol > end_vcol {
+            block.is_one_char = true;
+            block.startspaces = end_vcol - start_vcol + 1;
+        } else {
+            let mut previous_end = pend;
+            while block.end_vcol <= end_vcol && index < line.len() {
+                previous_end = index;
+                let (character, _) = decode_char(&line[index..]);
+                let length = cluster_len(line, index);
+                incr = cell_width(character, block.end_vcol, tab_width);
+                block.end_vcol += incr;
+                index += length;
+                pend = index;
+            }
+            if block.end_vcol <= end_vcol {
+                block.is_short = true;
+            } else {
+                let mut spaces = block.end_vcol - end_vcol - 1;
+                if spaces != 0 {
+                    spaces = incr - spaces;
+                    if pend != pstart {
+                        pend = previous_end;
+                    }
+                }
+                block.endspaces = spaces;
+            }
+        }
+        block.end_char_vcols = incr;
+        block.textlen = pend - pstart;
+    }
+    block.textcol = pstart;
+    block
+}
+
+fn block_text(line: &[u8], block: &BlockDef) -> Vec<u8> {
+    let mut output = Vec::with_capacity(block.startspaces + block.textlen + block.endspaces);
+    output.extend(std::iter::repeat_n(b' ', block.startspaces));
+    output.extend_from_slice(&line[block.textcol..block.textcol + block.textlen]);
+    output.extend(std::iter::repeat_n(b' ', block.endspaces));
+    output
+}
+
+fn previous_char_start(line: &[u8], index: usize) -> usize {
+    let mut previous = 0;
+    let mut current = 0;
+    while current < index {
+        previous = current;
+        current += cluster_len(line, current);
+    }
+    previous
 }
 
 /// A resolved `getregion`/`getregionpos` span: normalized endpoints, the
@@ -757,12 +948,12 @@ fn resolve_region(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Option<Re
     // Convert to 0-based columns (upstream adjusts after validation).
     let mut p1 = FPos {
         lnum: lnum1,
-        col: (col1 - 1).max(0),
+        col: col1.saturating_sub(1).max(0),
         coladd: off1,
     };
     let mut p2 = FPos {
         lnum: lnum2,
-        col: (col2 - 1).max(0),
+        col: col2.saturating_sub(1).max(0),
         coladd: off2,
     };
     // Normalize: swap so p1 is upper-left.
@@ -1177,6 +1368,24 @@ pub(crate) fn getvcol(line: &[u8], col: i64, tabstop: usize) -> (usize, usize) {
         index += length;
     };
     (vcol, vcol + width - 1)
+}
+
+fn getvvcol(line: &[u8], col: i64, coladd: i64, tabstop: usize) -> (usize, usize) {
+    let (start, end) = getvcol(line, col, tabstop);
+    let offset = usize::try_from(coladd).unwrap_or(0);
+    let target = usize::try_from(col).unwrap_or(0);
+    if target < line.len() {
+        let (character, _) = decode_char(&line[target..]);
+        let width = cell_width(character, start, tabstop);
+        if character != '\t' && width > 1 && offset < width {
+            return (start, end);
+        }
+        if character == '\t' {
+            let column = start.saturating_add(offset);
+            return (column, column);
+        }
+    }
+    (start.saturating_add(offset), end.saturating_add(offset))
 }
 
 /// Returns the cursor cell selected by Normal mode.

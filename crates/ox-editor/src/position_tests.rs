@@ -1357,6 +1357,89 @@ fn getregion_blockwise_with_width() {
     assert_eq!(strings(&exec, "region"), vec!["12", "45"]);
 }
 
+#[test]
+fn getregion_blockwise_uses_virtual_columns_for_tabs() {
+    let (editor, _buffer, _window) = editor_with_window();
+    let exec = run(
+        &editor,
+        "set tabstop=8\n\
+         call setline(1, [\"a\\tb\"])\n\
+         let g:region = getregion([0, 1, 3, 0], [0, 1, 3, 0], {'type': \"\\x16\"})",
+    );
+    assert_eq!(strings(&exec, "region"), vec!["b"]);
+}
+
+#[test]
+fn getregion_blockwise_pads_part_of_a_tab() {
+    let (editor, _buffer, _window) = editor_with_window();
+    let exec = run(
+        &editor,
+        "set tabstop=8\n\
+         call setline(1, [\"a\\tb\"])\n\
+         let g:region = getregion([0, 1, 2, 1], [0, 1, 2, 2], {'type': \"\\x16\"})",
+    );
+    assert_eq!(strings(&exec, "region"), vec!["  "]);
+}
+
+#[test]
+fn getregion_blockwise_pads_a_short_line_beyond_eol() {
+    let (editor, _buffer, _window) = editor_with_window();
+    let exec = run(
+        &editor,
+        "call setline(1, ['abc'])\n\
+         let g:region = getregion([0, 1, 4, 4], [0, 1, 4, 6], {'type': \"\\x16\"})",
+    );
+    assert_eq!(strings(&exec, "region"), vec!["   "]);
+}
+
+#[test]
+fn getregion_blockwise_does_not_pad_a_line_ending_inside_the_block() {
+    let (editor, _buffer, _window) = editor_with_window();
+    let exec = run(
+        &editor,
+        "call setline(1, ['ab'])\n\
+         let g:region = getregion([0, 1, 1, 0], [0, 1, 1, 0], {'type': \"\\x166\"})",
+    );
+    assert_eq!(strings(&exec, "region"), vec!["ab"]);
+}
+
+#[test]
+fn getregionpos_blockwise_reports_tab_coladd() {
+    let (editor, _buffer, _window) = editor_with_window();
+    let exec = run(
+        &editor,
+        "set tabstop=8\n\
+         call setline(1, [\"a\\tb\"])\n\
+         let g:region = getregionpos([0, 1, 2, 1], [0, 1, 2, 2], {'type': \"\\x16\"})\n\
+         let g:start = g:region[0][0]\n\
+         let g:end = g:region[0][1]",
+    );
+    assert_eq!(numbers(&exec, "start"), vec![1, 1, 2, 1]);
+    assert_eq!(numbers(&exec, "end"), vec![1, 1, 2, 3]);
+}
+
+#[test]
+fn getregion_blockwise_selects_a_wide_character_by_display_column() {
+    let (editor, _buffer, _window) = editor_with_window();
+    let exec = run(
+        &editor,
+        "call setline(1, ['日本語'])\n\
+         let g:region = getregion([0, 1, 4, 0], [0, 1, 4, 0], {'type': \"\\x16\"})",
+    );
+    assert_eq!(strings(&exec, "region"), vec!["本"]);
+}
+
+#[test]
+fn getregion_extreme_column_does_not_overflow() {
+    let (editor, _buffer, _window) = editor_with_window();
+    let code = error_code(
+        &editor,
+        "call setline(1, ['abc'])\n\
+         call getregion([0, 1, -9223372036854775808, 0], [0, 1, 1, 0])",
+    );
+    assert!(!code.is_empty());
+}
+
 // funcs.c:f_getregion — exclusive opts trims the end column on the last
 // line: "1234" cols 1-3 exclusive returns "23" not "234".
 #[test]

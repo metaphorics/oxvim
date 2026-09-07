@@ -129,7 +129,7 @@ impl Emitter {
         }
         let mut frames = BTreeMap::new();
         for (&channel_id, channel) in channels.iter_mut() {
-            let first_redraw = self.initialized.insert(channel_id);
+            let first_redraw = !self.initialized.contains(&channel_id);
             channel.begin();
             let options = channel.options();
             ensure_chrome_highlights(highlights)?;
@@ -262,6 +262,7 @@ impl Emitter {
             };
             route_chrome(channel, options, routed_chrome)?;
             frames.insert(channel_id, channel.flush()?);
+            self.initialized.insert(channel_id);
         }
         // The semantic stream for vim.ui_attach callbacks is the events that
         // fired this pass only: upstream dispatches each ui event exactly

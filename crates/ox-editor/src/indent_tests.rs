@@ -124,6 +124,13 @@ fn sibling_lines_inside_brace_share_block_indent_not_offset_ramp() {
 }
 
 #[test]
+fn tab_indented_control_head_is_recognized() {
+    let source = lines("{\n\tif (test)\n\t\tcmd;\n}");
+    let opts = cino_opts();
+    assert_eq!(cols(cindent(&source, 3, &opts)), 8);
+}
+
+#[test]
 fn case_and_default_labels_use_cinoptions_offsets() {
     let source = lines(
         "switch (x) {\n\

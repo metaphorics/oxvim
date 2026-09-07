@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,7 @@ struct Embedded {
     output: BufReader<ChildStdout>,
     next_id: i64,
     pending: VecDeque<Value>,
+    _xdg: ScratchDirectory,
 }
 
 struct ScratchDirectory(std::path::PathBuf);
@@ -26,9 +28,19 @@ impl Drop for ScratchDirectory {
     }
 }
 
-fn isolate_xdg(command: &mut Command) {
-    let xdg_root =
-        std::env::temp_dir().join(format!("oxvim-smoke-{}-{}", std::process::id(), line!()));
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn scratch_xdg_root() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "oxvim-smoke-{}-{}-{}",
+        std::process::id(),
+        line!(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn isolate_xdg(command: &mut Command) -> ScratchDirectory {
+    let xdg_root = scratch_xdg_root();
     for name in [
         "XDG_STATE_HOME",
         "XDG_RUNTIME_HOME",
@@ -39,6 +51,7 @@ fn isolate_xdg(command: &mut Command) {
         let _ = std::fs::create_dir_all(&dir);
         command.env(name, &dir);
     }
+    ScratchDirectory(xdg_root)
 }
 
 impl Embedded {
@@ -53,21 +66,10 @@ impl Embedded {
     fn spawn_with(arguments: &[&str]) -> Self {
         let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
         let mut command = Command::new(env!("CARGO_BIN_EXE_oxvim"));
+        let xdg = isolate_xdg(&mut command);
         // Startup now binds a primary server and touches ShaDa: keep every
         // child inside private XDG trees so tests never touch the
         // developer's real state.
-        let xdg_root =
-            std::env::temp_dir().join(format!("oxvim-smoke-{}-{}", std::process::id(), line!()));
-        for name in [
-            "XDG_STATE_HOME",
-            "XDG_RUNTIME_HOME",
-            "XDG_DATA_HOME",
-            "XDG_CONFIG_HOME",
-        ] {
-            let dir = xdg_root.join(name.split('_').next().unwrap_or(name).to_ascii_lowercase());
-            let _ = std::fs::create_dir_all(&dir);
-            command.env(name, &dir);
-        }
         command
             .arg("--embed")
             .args(arguments)
@@ -86,6 +88,7 @@ impl Embedded {
             output,
             next_id: 1,
             pending: VecDeque::new(),
+            _xdg: xdg,
         }
     }
 
@@ -711,7 +714,7 @@ fn tcp_listener_allocates_dynamic_channel_and_serves_api_info() {
     drop(reservation);
     let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
     let mut built = Command::new(env!("CARGO_BIN_EXE_oxvim"));
-    isolate_xdg(&mut built);
+    let _xdg = isolate_xdg(&mut built);
     let mut child = built
         .args(["--headless", "--listen", &address.to_string()])
         .env("OXVIM_RUNTIME", runtime)
@@ -1002,7 +1005,7 @@ fn pipe_listener_reuses_requested_address_and_reports_servername() {
 
     for generation in 0..2 {
         let mut built = Command::new(env!("CARGO_BIN_EXE_oxvim"));
-        isolate_xdg(&mut built);
+        let _xdg = isolate_xdg(&mut built);
         let mut child = built
             .args(["--headless", "--listen", socket.to_str().unwrap()])
             .env("OXVIM_RUNTIME", &runtime)
@@ -1202,7 +1205,7 @@ fn embedded_listener_exits_when_stdio_reaches_eof() {
     ));
     let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
     let mut built = Command::new(env!("CARGO_BIN_EXE_oxvim"));
-    isolate_xdg(&mut built);
+    let _xdg = isolate_xdg(&mut built);
     let mut child = built
         .args([
             "--embed",

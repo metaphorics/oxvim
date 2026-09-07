@@ -717,7 +717,7 @@ fn parse_vimgrep_pattern(input: &str, start: usize) -> Result<(String, usize), P
     let Some(&first) = bytes.get(start) else {
         return Err(error(ErrorCode::E488, start, "search pattern required"));
     };
-    if first.is_ascii_alphanumeric() || first == b'_' {
+    if !first.is_ascii() || first.is_ascii_alphanumeric() || first == b'_' {
         // ":filter foo cmd" / ":vimgrep foo fname": bare pattern up to space.
         let pattern_start = start;
         let mut cursor = start;

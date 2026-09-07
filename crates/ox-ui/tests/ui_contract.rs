@@ -750,6 +750,53 @@ fn initial_redraw_emits_startup_metadata_once() {
 }
 
 #[test]
+fn failed_first_redraw_retries_startup_metadata() {
+    let mut compositor = Compositor::new(8, 3);
+    compositor.push_layer(Layer::new(
+        Grid::new(1, 1, 1).unwrap(),
+        isize::MAX,
+        0,
+        0,
+        LayerKind::Float,
+    ));
+    let mut channels = UiChannels::new();
+    channels
+        .attach(
+            12,
+            8,
+            3,
+            UiOptions {
+                ext_linegrid: true,
+                ext_multigrid: true,
+                ..UiOptions::default()
+            },
+        )
+        .unwrap();
+    let mut emitter = Emitter::new();
+    let mut highlights = HlState::new();
+    let mut chrome = ChromeState::new();
+
+    assert!(
+        emitter
+            .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
+            .is_err()
+    );
+
+    compositor.clear();
+    let frame = emitter
+        .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
+        .unwrap()
+        .0;
+    let names = event_names(decode(&frame[&12]).unwrap());
+    for startup in ["option_set", "default_colors_set", "mode_info_set"] {
+        assert!(
+            names.contains(&startup.to_owned()),
+            "retry must emit startup event {startup}: {names:?}"
+        );
+    }
+}
+
+#[test]
 fn mode_events_emit_only_on_transition_and_preserve_order() {
     let mut chrome = ChromeState::new();
     chrome.set_mode_info(

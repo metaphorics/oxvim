@@ -76,6 +76,9 @@ fn call_getcompletion(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typva
     let completion_type = super::input_string_arg(&args[1])?;
     let pat = pattern.to_string_lossy();
     let ctype = completion_type.to_string_lossy();
+    let filtered = args.get(2).is_none_or(Typval::is_truthy);
+    // `cmdexpand.c:4139-4147`: false keeps wildignore/suffixes; file expansion is not modeled here.
+    let _ = filtered;
 
     let matches = match ctype.as_ref() {
         "command" => complete_commands(&pat),
@@ -101,9 +104,19 @@ fn call_getcompletion(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typva
 }
 
 fn prefix_filter(candidates: &[&str], pat: &str) -> Vec<OxStr> {
+    let pattern = if pat.contains(['*', '?', '[']) {
+        pat.to_owned()
+    } else {
+        format!("{pat}*")
+    };
+    let Some(regex) = ox_eval::find_file::glob_to_regex(&pattern)
+        .and_then(|regex| ox_regex::compile(&regex, ox_regex::Magic::Magic).ok())
+    else {
+        return Vec::new();
+    };
     candidates
         .iter()
-        .filter(|c| c.starts_with(pat))
+        .filter(|c| ox_regex::exec(&regex, &ox_regex::Text::new(**c)).is_some())
         .map(|c| OxStr::from(*c))
         .collect()
 }
@@ -2260,6 +2273,9 @@ fn scan_other_buffer_words(
         let Ok(state) = editor.buffer(handle) else {
             continue;
         };
+        if !state.flags.contains(crate::BufferFlags::LISTED) {
+            continue;
+        }
         let Ok(text) = state.text() else {
             continue;
         };
@@ -2302,6 +2318,49 @@ fn scan_line(
         if matches.len() >= MAX_SOURCE_MATCHES {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ox_text::Buffer;
+
+    #[test]
+    fn command_completion_accepts_wildcard_patterns() {
+        let commands = complete_commands("*add");
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.as_bytes() == b"packadd")
+        );
+        assert!(
+            complete_commands("pack")
+                .iter()
+                .any(|command| command.as_bytes() == b"packadd")
+        );
+    }
+
+    #[test]
+    fn other_buffer_completion_skips_unlisted_buffers() {
+        let mut editor = Editor::new();
+        let current = editor
+            .create_buffer_with(
+                Buffer::from_lines(&[b"current".to_vec()], false).unwrap(),
+                true,
+            )
+            .unwrap();
+        let hidden = editor
+            .create_buffer_with(
+                Buffer::from_lines(&[b"hiddenword".to_vec()], false).unwrap(),
+                false,
+            )
+            .unwrap();
+        let mut matches = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        scan_other_buffer_words(&editor, current, b"hidden", false, &mut matches, &mut seen);
+        assert!(!matches.iter().any(|word| word == b"hiddenword"));
+        assert!(editor.buffer(hidden).is_ok());
     }
 }
 

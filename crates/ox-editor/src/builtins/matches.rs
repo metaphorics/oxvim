@@ -288,8 +288,8 @@ fn call_setmatches(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typv
         .or_else(|| editor.current_window())
         .ok_or_else(|| EvalError::new("E957", 0, "Invalid window"))?;
 
-    editor.clear_matches(window);
     let mut failed = false;
+    let mut matches = Vec::new();
     for item in &list.items {
         let Typval::Dict(dict) = item else {
             failed = true;
@@ -320,19 +320,23 @@ fn call_setmatches(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typv
                 }
             }
         }
-        editor.add_match(
-            window,
-            MatchItem {
-                id,
-                priority,
-                group,
-                pattern,
-                positions,
-                conceal_char: conceal,
-            },
-        );
+        matches.push(MatchItem {
+            id,
+            priority,
+            group,
+            pattern,
+            positions,
+            conceal_char: conceal,
+        });
     }
-    Ok(Typval::Number(if failed { -1 } else { 0 }))
+    if failed {
+        return Ok(Typval::Number(-1));
+    }
+    editor.clear_matches(window);
+    for item in matches {
+        editor.add_match(window, item);
+    }
+    Ok(Typval::Number(0))
 }
 
 fn call_matcharg(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
@@ -417,4 +421,41 @@ fn dict_get_string(dict: &ox_types::DictData, key: &str) -> Option<String> {
 
 fn dict_get_number(dict: &ox_types::DictData, key: &str) -> Option<i64> {
     dict_get(dict, key).and_then(typval_number)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Editor, Geometry};
+
+    #[expect(clippy::unwrap_used, reason = "test constructs a valid match state")]
+    #[test]
+    fn setmatches_keeps_existing_matches_when_input_is_malformed() {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        let tab = editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let window = editor.tabpage(tab).unwrap().current_window();
+        editor.add_match(
+            window,
+            MatchItem {
+                id: 9,
+                priority: 10,
+                group: "Search".to_owned(),
+                pattern: Some("old".to_owned()),
+                positions: Vec::new(),
+                conceal_char: None,
+            },
+        );
+        let result = call(
+            &mut editor,
+            "setmatches",
+            &[Typval::list(vec![Typval::Number(1)])],
+        )
+        .unwrap();
+        assert_eq!(result, Typval::Number(-1));
+        assert_eq!(editor.get_matches(window).len(), 1);
+        assert_eq!(editor.get_matches(window)[0].id, 9);
+    }
 }

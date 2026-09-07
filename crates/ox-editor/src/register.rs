@@ -734,15 +734,82 @@ impl Registers {
                 let Some(slot) = self.named.get_mut(index) else {
                     return Err(RegisterError::InvalidName(name));
                 };
-                if let Some(existing) = slot {
-                    existing.append_from_setreg(&content);
+                append_slot_from_setreg(slot, content);
+                Ok(())
+            }
+            RegisterName::Named { index, .. } => {
+                let Some(slot) = self.named.get_mut(index) else {
+                    return Err(RegisterError::InvalidName(name));
+                };
+                append_slot_from_setreg_if(slot, content, append);
+                Ok(())
+            }
+            RegisterName::Numbered(index) => {
+                let Some(slot) = self.numbered.get_mut(index) else {
+                    return Err(RegisterError::InvalidName(name));
+                };
+                append_slot_from_setreg_if(slot, content, append);
+                Ok(())
+            }
+            RegisterName::Unnamed => {
+                let Some(slot) = self.numbered.get_mut(0) else {
+                    return Err(RegisterError::InvalidName(name));
+                };
+                append_slot_from_setreg_if(slot, content, append);
+                self.unnamed_target = Some(UnnamedTarget::Slot('0'));
+                Ok(())
+            }
+            RegisterName::SmallDelete => {
+                append_slot_from_setreg_if(&mut self.small_delete, content, append);
+                Ok(())
+            }
+            RegisterName::Expression => {
+                let incoming = content.to_bytes();
+                if append {
+                    if let Some(existing) = &mut self.expression_source {
+                        existing.extend_from_slice(&incoming);
+                    } else {
+                        self.expression_source = Some(incoming);
+                    }
                 } else {
-                    *slot = Some(content);
+                    self.expression_source = Some(incoming);
                 }
+                Ok(())
+            }
+            RegisterName::SearchPattern => {
+                append_slot_from_setreg_if(&mut self.search_pattern, content, append);
+                Ok(())
+            }
+            RegisterName::CommandLine => {
+                append_slot_from_setreg_if(&mut self.command_line, content, append);
+                Ok(())
+            }
+            RegisterName::InsertContent => {
+                append_slot_from_setreg_if(&mut self.insert_content, content, append);
                 Ok(())
             }
             _ => self.set(name, content),
         }
+    }
+}
+
+fn append_slot_from_setreg(slot: &mut Option<RegisterContent>, content: RegisterContent) {
+    if let Some(existing) = slot {
+        existing.append_from_setreg(&content);
+    } else {
+        *slot = Some(content);
+    }
+}
+
+fn append_slot_from_setreg_if(
+    slot: &mut Option<RegisterContent>,
+    content: RegisterContent,
+    append: bool,
+) {
+    if append {
+        append_slot_from_setreg(slot, content);
+    } else {
+        *slot = Some(content);
     }
 }
 

@@ -127,7 +127,33 @@ pub fn nvim_unsubscribe(session: &ApiSession, event: OxStr) -> Result<(), ApiErr
 
 #[api(since = 4)]
 pub fn nvim_list_chans(session: &ApiSession) -> Result<Vec<Dict>, ApiError> {
-    session.with_state(|state| state.channels.values().map(channel_dict).collect())
+    let mut channels = session.with_state(|state| {
+        state
+            .channels
+            .values()
+            .map(channel_dict)
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    let terminal_channels = session.with_editor(|editor| {
+        editor
+            .terminal_channel_ids()
+            .map(|id| terminal_channel_dict(editor, id))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    channels.extend(terminal_channels.into_iter().flatten());
+    channels.sort_by_key(
+        |dict| match dict.0.iter().find(|(key, _)| *key == OxStr::from("id")) {
+            Some((_, Object::Integer(id))) => *id,
+            _ => i64::MAX,
+        },
+    );
+    channels.dedup_by_key(
+        |dict| match dict.0.iter().find(|(key, _)| *key == OxStr::from("id")) {
+            Some((_, Object::Integer(id))) => *id,
+            _ => i64::MAX,
+        },
+    );
+    Ok(channels)
 }
 
 #[api(since = 4)]
@@ -146,29 +172,33 @@ pub fn nvim_get_chan_info(session: &ApiSession, chan: i64) -> Result<Dict, ApiEr
     if let Some(info) = registered {
         return Ok(info);
     }
-    session.with_editor(|editor| {
-        let Some(term) = editor.terminal_channel(key) else {
-            return Ok(Dict(Vec::new()));
-        };
-        let id = i64::try_from(key)
-            .map_err(|_| ApiError::exception("channel id exceeds API Integer range"))?;
-        let mut values = vec![
-            (OxStr::from("id"), Object::Integer(id)),
-            (OxStr::from("stream"), Object::String(OxStr::from("job"))),
-            (OxStr::from("mode"), Object::String(OxStr::from("terminal"))),
-        ];
-        if let Some(pty) = &term.pty {
-            values.push((
-                OxStr::from("pty"),
-                Object::String(OxStr::from(pty.as_str())),
-            ));
-        }
+    Ok(session
+        .with_editor(|editor| terminal_channel_dict(editor, key))?
+        .unwrap_or_else(|| Dict(Vec::new())))
+}
+
+fn terminal_channel_dict(editor: &ox_editor::Editor, key: u64) -> Result<Option<Dict>, ApiError> {
+    let Some(term) = editor.terminal_channel(key) else {
+        return Ok(None);
+    };
+    let id = i64::try_from(key)
+        .map_err(|_| ApiError::exception("channel id exceeds API Integer range"))?;
+    let mut values = vec![
+        (OxStr::from("id"), Object::Integer(id)),
+        (OxStr::from("stream"), Object::String(OxStr::from("job"))),
+        (OxStr::from("mode"), Object::String(OxStr::from("terminal"))),
+    ];
+    if let Some(pty) = &term.pty {
         values.push((
-            OxStr::from("buffer"),
-            Object::Integer(i64::from(term.buffer)),
+            OxStr::from("pty"),
+            Object::String(OxStr::from(pty.as_str())),
         ));
-        Ok(Dict(values))
-    })
+    }
+    values.push((
+        OxStr::from("buffer"),
+        Object::Integer(i64::from(term.buffer)),
+    ));
+    Ok(Some(Dict(values)))
 }
 
 fn utf8(value: &OxStr, field: &str) -> Result<String, ApiError> {
@@ -406,6 +436,20 @@ mod tests {
             panic!("mode must be a String");
         };
         assert_eq!(mode.to_string_lossy(), "terminal");
+    }
+
+    #[expect(clippy::unwrap_used, reason = "test asserts decoded channel state")]
+    #[test]
+    fn nvim_list_chans_includes_terminal_channel_metadata() {
+        let mut editor = Editor::new();
+        editor.allocate_terminal_buffer(7).unwrap();
+        let session = session_with(editor);
+        let listed = nvim_list_chans(&session)
+            .unwrap()
+            .into_iter()
+            .find(|dict| dict_field(dict, "id") == Object::Integer(7))
+            .unwrap();
+        assert_eq!(listed, nvim_get_chan_info(&session, 7).unwrap());
     }
 
     #[expect(clippy::unwrap_used, reason = "test asserts decoded channel state")]

@@ -4633,3 +4633,81 @@ fn ctrl_rbracket_tag_jump_respects_winfixbuf() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn ctrl_w_brace_reuses_the_preview_window() {
+    let dir = std::env::temp_dir().join(format!("ox-tagpreview-reuse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let first = dir.join("first");
+    let second = dir.join("second");
+    std::fs::write(&first, "fn first_target() {}\n").unwrap();
+    std::fs::write(&second, "fn second_target() {}\n").unwrap();
+    let tags = dir.join("tags");
+    std::fs::write(
+        &tags,
+        format!(
+            "first_target\t{}\t/^fn first_target/\nsecond_target\t{}\t/^fn second_target/\n",
+            first.to_string_lossy(),
+            second.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(
+            Buffer::from_bytes(b"first_target second_target\n").unwrap(),
+            true,
+        )
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let origin = editor.current_window().unwrap();
+    editor
+        .options_mut()
+        .set_global(
+            "tags",
+            OptionValue::String(tags.to_string_lossy().into_owned()),
+        )
+        .unwrap();
+
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine
+        .feed_keys(&mut editor, "\u{17}}", &mut eval)
+        .unwrap();
+    assert_eq!(
+        editor
+            .tabpage_windows(editor.current_tabpage().unwrap())
+            .unwrap()
+            .len(),
+        2
+    );
+    machine
+        .feed_keys(&mut editor, "w\u{17}}", &mut eval)
+        .unwrap();
+
+    let windows = editor
+        .tabpage_windows(editor.current_tabpage().unwrap())
+        .unwrap();
+    assert_eq!(windows.len(), 2);
+    assert_eq!(editor.current_window(), Some(origin));
+    let preview = windows
+        .into_iter()
+        .find(|&window| window != origin)
+        .unwrap();
+    let preview_buffer = editor.window(preview).unwrap().buffer;
+    assert_eq!(
+        editor
+            .buffer(preview_buffer)
+            .unwrap()
+            .text()
+            .unwrap()
+            .to_bytes(),
+        b"fn second_target() {}\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -736,7 +736,8 @@ fn add_directory(path: &str) -> Option<String> {
 /// `file_pat_to_reg_pat(pat, end, NULL, false)` (`fileio.c`) on a platform
 /// without `BACKSLASH_IN_FILENAME`. `None` mirrors upstream's E219/E220
 /// failure, which `do_path_expand` treats as "expand nothing".
-fn glob_to_regex(pattern: &str) -> Option<String> {
+#[must_use]
+pub fn glob_to_regex(pattern: &str) -> Option<String> {
     let bytes = pattern.as_bytes();
     if bytes.is_empty() {
         return Some("^$".to_owned());

@@ -614,6 +614,26 @@ fn registers_rotate_append_and_concatenate() {
 }
 
 #[test]
+fn setreg_append_applies_to_numbered_and_small_delete_registers() {
+    let mut registers = Registers::new();
+    registers
+        .set_from_setreg('1', RegisterContent::characterwise(b"a").unwrap(), false)
+        .unwrap();
+    registers
+        .set_from_setreg('1', RegisterContent::characterwise(b"b").unwrap(), true)
+        .unwrap();
+    assert_eq!(registers.get('1').unwrap().unwrap().to_bytes(), b"ab");
+
+    registers
+        .set_from_setreg('-', RegisterContent::characterwise(b"a").unwrap(), false)
+        .unwrap();
+    registers
+        .set_from_setreg('-', RegisterContent::characterwise(b"b").unwrap(), true)
+        .unwrap();
+    assert_eq!(registers.get('-').unwrap().unwrap().to_bytes(), b"ab");
+}
+
+#[test]
 fn unnamed_register_alias_transitions_through_every_writer() {
     let mut registers = Registers::new();
 

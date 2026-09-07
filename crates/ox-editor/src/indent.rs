@@ -599,11 +599,11 @@ fn first_nonblank(bytes: &[u8]) -> usize {
 fn trim_code(code: &[u8]) -> &[u8] {
     let start = code
         .iter()
-        .position(|byte| *byte != b' ')
+        .position(|byte| !matches!(byte, b' ' | b'\t'))
         .unwrap_or(code.len());
     let end = code
         .iter()
-        .rposition(|byte| *byte != b' ')
+        .rposition(|byte| !matches!(byte, b' ' | b'\t'))
         .map_or(start, |index| index + 1);
     &code[start..end]
 }

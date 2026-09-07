@@ -11,7 +11,7 @@
 use crate::excmd_exec::{EvalHost, ExEditorAccess};
 use crate::script::FileIO;
 use crate::server::{prepare_server_address, server_address_new};
-use ox_eval::{EvalError, Scope, ScopeKind};
+use ox_eval::{EvalError, Scope, ScopeKind, builtin_spec};
 use ox_types::{OxStr, Typval};
 
 /// Routes one server builtin.
@@ -24,6 +24,22 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
     args: &[Typval],
     scope: &mut Scope,
 ) -> ox_eval::Result<Typval> {
+    let spec = builtin_spec(name)
+        .ok_or_else(|| EvalError::new("E117", 0, format!("Unknown function: {name}")))?;
+    if args.len() < spec.min_args {
+        return Err(EvalError::new(
+            "E119",
+            0,
+            format!("Not enough arguments for function: {name}"),
+        ));
+    }
+    if spec.max_args.is_some_and(|max| args.len() > max) {
+        return Err(EvalError::new(
+            "E118",
+            0,
+            format!("Too many arguments for function: {name}"),
+        ));
+    }
     match name {
         "serverstart" => server_start(host, scope, args),
         "serverstop" => server_stop(host, scope, args),
@@ -411,5 +427,18 @@ mod tests {
             Some(Typval::List(items)) => assert!(items.borrow().items.is_empty()),
             other => panic!("expected list, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn server_builtins_report_arity_errors() {
+        let (editor, mut exec, _state) = harness();
+        let too_many = exec
+            .execute_script(&editor, "<test>", "call serverlist('x', 'y')")
+            .unwrap_err();
+        assert_eq!(error_code(&too_many), "E118");
+        let too_few = exec
+            .execute_script(&editor, "<test>", "call serverstop()")
+            .unwrap_err();
+        assert_eq!(error_code(&too_few), "E119");
     }
 }
