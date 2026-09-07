@@ -84,18 +84,24 @@ fn runtime_root() -> RuntimeRoot {
     RuntimeRoot::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime"))
 }
 
+/// These tests pin the real parser boundary: a missing parser shared
+/// object fails loudly instead of reporting a green suite that ran
+/// nothing.
+fn require_parser() -> (PathBuf, String) {
+    parser_from_environment().unwrap_or_else(|| {
+        panic!(
+            "treesitter integration test needs a parser .so: set OXVIM_TREE_SITTER_PARSER              (+ OXVIM_TREE_SITTER_LANGUAGE) or OXVIM_REF_ROOT to a built Neovim checkout"
+        )
+    })
+}
+
 #[test]
 #[expect(
     clippy::too_many_lines,
     reason = "one stateful Tree-sitter scenario exercises parse, node, edit, query, and lifetime boundaries through a single Lua chunk"
 )]
 fn real_parser_exercises_parse_nodes_edit_queries_and_lifetimes() {
-    let Some((parser, language)) = parser_from_environment() else {
-        println!(
-            "SKIP treesitter real-parser test: set OXVIM_TREE_SITTER_PARSER and OXVIM_TREE_SITTER_LANGUAGE, or provide OXVIM_REF_ROOT with a built Neovim parser"
-        );
-        return;
-    };
+    let (parser, language) = require_parser();
 
     let scheduler = Rc::new(TestScheduler::default());
     let host = LuaHost::new(runtime_root(), Rc::new(NoBuiltins), scheduler.clone()).unwrap();
@@ -209,12 +215,7 @@ fn real_parser_exercises_parse_nodes_edit_queries_and_lifetimes() {
 
 #[test]
 fn failing_treesitter_calls_reach_pcall_as_strings() {
-    let Some((parser, language)) = parser_from_environment() else {
-        println!(
-            "SKIP treesitter string-error test: no parser .so found (OXVIM_TREE_SITTER_PARSER, OXVIM_REF_ROOT, or .references/neovim)"
-        );
-        return;
-    };
+    let (parser, language) = require_parser();
 
     let scheduler = Rc::new(TestScheduler::default());
     let host = LuaHost::new(runtime_root(), Rc::new(NoBuiltins), scheduler.clone()).unwrap();
@@ -269,4 +270,136 @@ fn failing_treesitter_calls_reach_pcall_as_strings() {
     )
     .eval::<()>()
     .unwrap();
+}
+
+#[test]
+fn incremental_parse_reports_exact_changed_ranges() {
+    let (parser, language) = require_parser();
+    let scheduler = Rc::new(TestScheduler::default());
+    let host = LuaHost::new(runtime_root(), Rc::new(NoBuiltins), scheduler.clone()).unwrap();
+    let lua = host.lua();
+    lua.globals()
+        .set("parser_path", parser.to_string_lossy().as_ref())
+        .unwrap();
+    lua.globals().set("parser_language", language).unwrap();
+
+    lua.load(
+        r#"
+        assert(vim._ts_add_language_from_object(parser_path, parser_language))
+        PARSER = vim._create_ts_parser(parser_language)
+        SOURCE = 'local value = 1\n'
+        FIRST, INITIAL = PARSER:parse(nil, SOURCE, true)
+        "#,
+    )
+    .eval::<()>()
+    .unwrap();
+    let initial: i64 = lua.load(r#"return #INITIAL"#).eval().unwrap();
+    assert!(initial > 0, "initial parse has ranges");
+    lua.load(
+        r#"
+        SAME_TREE, SAME = PARSER:parse(FIRST, SOURCE, true)
+        "#,
+    )
+    .eval::<()>()
+    .unwrap();
+    let same: i64 = lua.load(r#"return #SAME"#).eval().unwrap();
+    assert_eq!(same, 0, "identical reparse reports no changes");
+    lua.load(
+        r#"
+        -- The old tree records the edit first (`tree:edit`), then the
+        -- reparse reports exactly the changed span in new coordinates.
+        EDITED_SOURCE = 'local value = true\n'
+        EDITED_OLD = FIRST:edit(14, 15, 18, 0, 14, 0, 15, 0, 18)
+        SECOND, CHANGED = PARSER:parse(EDITED_OLD, EDITED_SOURCE, true)
+        "#,
+    )
+    .eval::<()>()
+    .unwrap();
+    let changed: i64 = lua.load(r#"return #CHANGED"#).eval().unwrap();
+    assert_eq!(changed, 1, "one changed span");
+    let span: mlua::Table = lua.load(r#"return CHANGED[1]"#).eval().unwrap();
+    let get = |index: i64| -> i64 { span.raw_get(index).unwrap() };
+    assert_eq!((get(1), get(2), get(3)), (0, 14, 14));
+    assert_eq!((get(4), get(5), get(6)), (0, 18, 18));
+    lua.load(
+        r#"
+        THIRD, QUADS = PARSER:parse(EDITED_OLD, EDITED_SOURCE)
+        "#,
+    )
+    .eval::<()>()
+    .unwrap();
+    let quad_len: i64 = lua.load(r#"return #QUADS[1]"#).eval().unwrap();
+    assert_eq!(quad_len, 4, "byte-free entries are row/col quads");
+    let quads: i64 = lua.load(r#"return #QUADS"#).eval().unwrap();
+    assert!(quads > 0, "quad reparse reports changes");
+    lua.load(
+        r#"
+        RANGE_REJECTED = not pcall(function()
+          PARSER:set_included_ranges({ { 'x' } })
+        end)
+        "#,
+    )
+    .eval::<()>()
+    .unwrap();
+    let rejected: bool = lua.load(r#"return RANGE_REJECTED"#).eval().unwrap();
+    assert!(rejected, "malformed included ranges fail");
+    scheduler.drain().unwrap();
+}
+
+#[test]
+fn emit_highlights_filters_groups_coords_and_priority() {
+    let (parser, language) = require_parser();
+    let scheduler = Rc::new(TestScheduler::default());
+    let host = LuaHost::new(runtime_root(), Rc::new(NoBuiltins), scheduler.clone()).unwrap();
+    let lua = host.lua();
+    lua.globals()
+        .set("parser_path", parser.to_string_lossy().as_ref())
+        .unwrap();
+    lua.globals().set("parser_language", language).unwrap();
+
+    lua.load(
+        r#"
+        assert(vim._ts_add_language_from_object(parser_path, parser_language))
+        local parser = vim._create_ts_parser(parser_language)
+        local tree = parser:parse(nil, 'local value = 1\n')
+        local root = tree:root()
+        local query = vim._ts_parse_query(parser_language,
+          '((identifier) @variable) ((number) @_hidden) ((chunk) @scope) ((identifier) @important (#set! "priority" "250"))')
+
+        local recorded = {}
+        vim.api.nvim_buf_set_extmark = function(bufnr, ns, row, col, opts)
+          recorded[#recorded + 1] =
+            { bufnr = bufnr, ns = ns, row = row, col = col, opts = opts }
+          return 1
+        end
+        vim._ts_emit_highlights(root, query, 7, 9)
+        assert(#recorded == 3)
+
+        local seen = {}
+        for _, call in ipairs(recorded) do
+          assert(call.bufnr == 7 and call.ns == 9)
+          local group = call.opts.hl_group
+          assert(group ~= '@_hidden')
+          assert(call.opts.strict == false)
+          seen[group] = call
+        end
+        assert(seen['@variable'] ~= nil)
+        assert(seen['@scope'] ~= nil)
+        assert(seen['@important'] ~= nil)
+
+        -- Identifier coordinates track the source text.
+        local variable = seen['@variable']
+        assert(variable.row == 0 and variable.col == 6)
+        assert(variable.opts.end_row == 0 and variable.opts.end_col == 11)
+        assert(variable.opts.priority == 100)
+
+        -- Explicit priority survives; the chunk spans both lines.
+        assert(seen['@important'].opts.priority == 250)
+        local scope = seen['@scope']
+        assert(scope.row == 0 and scope.opts.end_row == 1)
+        "#,
+    )
+    .eval::<()>()
+    .unwrap();
+    scheduler.drain().unwrap();
 }

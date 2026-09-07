@@ -2,9 +2,9 @@ use std::collections::HashSet;
 
 use crate::{
     AddressBase, COMMANDS, CmdlineContext, CmdlineSpecial, CommandFlags, ErrorCode, ExpansionPart,
-    ModifierKind, Parser, RangeKind, RangeSeparator, ResolvedCommand, UserCommandInfo,
-    UserCommandMatch, UserCommandProvider, command_spec, expand_with, resolve_command,
-    scan_expansions,
+    ModifierKind, Parser, PreviewMagic, RangeKind, RangeSeparator, ResolvedCommand,
+    UserCommandInfo, UserCommandMatch, UserCommandProvider, command_spec, expand_with,
+    parse_preview_pattern, resolve_command, scan_expansions,
 };
 
 fn parse_one(input: &str) -> crate::ExCommand {
@@ -1255,4 +1255,56 @@ fn unknown_command_error_offset_is_byte_accurate() -> Result<(), String> {
     };
     assert_eq!(error.offset, 3);
     Ok(())
+}
+
+/// `parse_preview_pattern` classification contract
+/// (`parse_pattern_and_range`, `ex_getln.c:276-398`): every whitelisted
+/// family resolves its magic, range default, and pattern, and anything
+/// else previews nothing.
+#[test]
+fn preview_pattern_classifies_families() {
+    let parsed = parse_preview_pattern("s/foo/").expect("substitute previews");
+    assert_eq!(parsed.magic, PreviewMagic::Default);
+    assert!(parsed.range.is_none());
+    assert!(parsed.default_current_line);
+    assert_eq!(parsed.delimiter, '/');
+    assert_eq!(parsed.pattern, "foo");
+    assert!(!parsed.use_last_pattern);
+
+    let parsed = parse_preview_pattern("s//").expect("empty pair reuses");
+    assert!(parsed.use_last_pattern);
+    assert!(parsed.pattern.is_empty());
+
+    let parsed = parse_preview_pattern("sm/foo/").expect("smagic previews");
+    assert_eq!(parsed.magic, PreviewMagic::ForceMagic);
+    let parsed = parse_preview_pattern("snom/foo/").expect("snomagic previews");
+    assert_eq!(parsed.magic, PreviewMagic::ForceNomagic);
+
+    let parsed = parse_preview_pattern("%s/foo/").expect("explicit range");
+    assert!(parsed.range.is_some());
+    let parsed = parse_preview_pattern("1,3g/x/").expect("ranged global");
+    assert!(parsed.range.is_some());
+
+    let parsed = parse_preview_pattern("sort n /foo/").expect("sort previews");
+    assert_eq!(parsed.magic, PreviewMagic::Default);
+    assert!(!parsed.default_current_line);
+    assert_eq!(parsed.pattern, "foo");
+    let parsed = parse_preview_pattern("uniq /x/").expect("uniq previews");
+    assert_eq!(parsed.pattern, "x");
+
+    let parsed = parse_preview_pattern("g/foo/").expect("global previews");
+    assert_eq!(parsed.pattern, "foo");
+    let parsed = parse_preview_pattern("v/bar/").expect("vglobal previews");
+    assert_eq!(parsed.pattern, "bar");
+    let parsed = parse_preview_pattern("g//").expect("global reuse");
+    assert!(parsed.use_last_pattern);
+    let parsed = parse_preview_pattern("vimgrep foo").expect("bare vimgrep word");
+    assert_eq!(parsed.pattern, "foo");
+
+    for bare in ["s", "sort", "g", "echo foo", "w", "edit foo"] {
+        assert!(
+            parse_preview_pattern(bare).is_none(),
+            "{bare:?} previews nothing"
+        );
+    }
 }
