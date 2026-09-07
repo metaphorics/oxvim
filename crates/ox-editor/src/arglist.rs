@@ -69,7 +69,7 @@ impl ArgList {
         self.index.min(self.names.len().saturating_sub(1))
     }
 
-    /// Redefines the whole list (`do_arglist` AL_SET): the index restarts
+    /// Redefines the whole list (`do_arglist` `AL_SET)`: the index restarts
     /// at the first entry, matching `alist_set` after a clear.
     pub fn set(&mut self, names: Vec<OxStr>) {
         self.names = names;
@@ -82,6 +82,21 @@ impl ArgList {
         self.index = index;
     }
 
+    /// Inserts `names` so that `after` existing entries stay before them
+    /// (`alist_add_list`, arglist.c 320-349): `after` is clamped to the
+    /// list length, and a current index at or past the insertion point
+    /// shifts right by the inserted count so it keeps addressing the same
+    /// entry.
+    pub fn insert_at(&mut self, after: usize, names: Vec<OxStr>) {
+        let old_len = self.names.len();
+        let after = after.min(old_len);
+        let count = names.len();
+        self.names.splice(after..after, names);
+        if old_len > 0 && self.index >= after {
+            self.index += count;
+        }
+    }
+
     /// Bounds-checks a target index the way `do_argfile` does and returns
     /// the entry index.
     ///
@@ -89,16 +104,27 @@ impl ArgList {
     /// E163 when the list holds at most one entry, E164 before the first
     /// entry, E165 beyond the last entry.
     pub fn check_target(&self, target: i64) -> std::result::Result<usize, ArgRangeError> {
-        if target < 0 || target >= self.names.len() as i64 {
-            if self.names.len() <= 1 {
-                return Err(ArgRangeError { code: "E163", message: "There is only one file to edit" });
-            }
-            if target < 0 {
-                return Err(ArgRangeError { code: "E164", message: "Cannot go before first file" });
-            }
-            return Err(ArgRangeError { code: "E165", message: "Cannot go beyond last file" });
+        if let Ok(index) = usize::try_from(target)
+            && index < self.names.len()
+        {
+            return Ok(index);
         }
-        Ok(target as usize)
+        if self.names.len() <= 1 {
+            return Err(ArgRangeError {
+                code: "E163",
+                message: "There is only one file to edit",
+            });
+        }
+        if target < 0 {
+            return Err(ArgRangeError {
+                code: "E164",
+                message: "Cannot go before first file",
+            });
+        }
+        Err(ArgRangeError {
+            code: "E165",
+            message: "Cannot go beyond last file",
+        })
     }
 }
 
@@ -109,13 +135,15 @@ pub(crate) fn is_arglist_builtin(name: &str) -> bool {
 
 /// Dispatches `argc`/`argv`/`argidx`/`arglistid` against the editor's
 /// argument list. Arity comes from the generated `eval.lua` metadata.
-pub(crate) fn call(editor: &Editor, name: &str, args: Vec<Typval>) -> Result<Typval> {
+pub(crate) fn call(editor: &Editor, name: &str, args: &[Typval]) -> Result<Typval> {
     check_arity(name, args.len())?;
     match name {
-        "argc" => argc(editor, &args),
-        "argv" => argv(editor, &args),
-        "argidx" => Ok(Typval::Number(editor.arglist().index() as i64)),
-        "arglistid" => arglistid(editor, &args),
+        "argc" => argc(editor, args),
+        "argv" => argv(editor, args),
+        "argidx" => Ok(Typval::Number(
+            i64::try_from(editor.arglist().index()).unwrap_or(i64::MAX),
+        )),
+        "arglistid" => arglistid(editor, args),
         _ => unreachable!("arglist builtin predicate and dispatcher disagree"),
     }
 }
@@ -123,10 +151,18 @@ pub(crate) fn call(editor: &Editor, name: &str, args: Vec<Typval>) -> Result<Typ
 fn check_arity(name: &str, count: usize) -> Result<()> {
     let spec = builtin_spec(name).ok_or_else(|| EvalError::not_implemented(OxStr::from(name)))?;
     if count < spec.min_args {
-        return Err(EvalError::new("E119", 0, format!("Not enough arguments for function: {name}")));
+        return Err(EvalError::new(
+            "E119",
+            0,
+            format!("Not enough arguments for function: {name}"),
+        ));
     }
     if spec.max_args.is_some_and(|maximum| count > maximum) {
-        return Err(EvalError::new("E118", 0, format!("Too many arguments for function: {name}")));
+        return Err(EvalError::new(
+            "E118",
+            0,
+            format!("Too many arguments for function: {name}"),
+        ));
     }
     Ok(())
 }
@@ -135,12 +171,15 @@ fn argc(editor: &Editor, args: &[Typval]) -> Result<Typval> {
     // f_argc (arglist.c 1201): no argument or -1 reports the global list's
     // count; every resolvable window shares that list here, and an
     // unresolvable window argument reports -1.
-    if let Some(value) = args.first() {
-        if number_arg(value)? != -1 && resolve_window(editor, value).is_none() {
-            return Ok(Typval::Number(-1));
-        }
+    if let Some(value) = args.first()
+        && number_arg(value)? != -1
+        && resolve_window(editor, value).is_none()
+    {
+        return Ok(Typval::Number(-1));
     }
-    Ok(Typval::Number(editor.arglist().len() as i64))
+    Ok(Typval::Number(
+        i64::try_from(editor.arglist().len()).unwrap_or(i64::MAX),
+    ))
 }
 
 fn argv(editor: &Editor, args: &[Typval]) -> Result<Typval> {
@@ -157,19 +196,28 @@ fn argv(editor: &Editor, args: &[Typval]) -> Result<Typval> {
         Some(value) => number_arg(value)?,
     };
     if index == -1 {
-        return Ok(if list_available { name_list(arglist.names()) } else { Typval::list(Vec::new()) });
+        return Ok(if list_available {
+            name_list(arglist.names())
+        } else {
+            Typval::list(Vec::new())
+        });
     }
-    if list_available && index >= 0 {
-        if let Some(name) = arglist.name(index as usize) {
-            return Ok(Typval::String(name.clone()));
-        }
+    if list_available
+        && let Ok(index) = usize::try_from(index)
+        && let Some(name) = arglist.name(index)
+    {
+        return Ok(Typval::String(name.clone()));
     }
     Ok(Typval::String(OxStr::from("")))
 }
 
-
 fn name_list(names: &[OxStr]) -> Typval {
-    Typval::list(names.iter().map(|name| Typval::String(name.clone())).collect())
+    Typval::list(
+        names
+            .iter()
+            .map(|name| Typval::String(name.clone()))
+            .collect(),
+    )
 }
 
 fn resolve_window(editor: &Editor, value: &Typval) -> Option<WinHandle> {
@@ -236,6 +284,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+    use crate::TestEditorAccess;
     use crate::script::{FileEntry, FileIO, FileKind, FileMetadata};
     use crate::{Editor, ExExecutor, Geometry};
 
@@ -252,7 +301,9 @@ mod tests {
         }
 
         fn insert(&self, path: &str, content: &str) {
-            self.files.borrow_mut().insert(PathBuf::from(path), content.to_owned());
+            self.files
+                .borrow_mut()
+                .insert(PathBuf::from(path), content.to_owned());
         }
     }
 
@@ -266,7 +317,9 @@ mod tests {
         }
 
         fn write_string(&self, path: &Path, contents: &str) -> std::io::Result<()> {
-            self.files.borrow_mut().insert(path.to_path_buf(), contents.to_owned());
+            self.files
+                .borrow_mut()
+                .insert(path.to_path_buf(), contents.to_owned());
             Ok(())
         }
 
@@ -277,24 +330,42 @@ mod tests {
         fn metadata(&self, path: &Path, _follow_links: bool) -> std::io::Result<FileMetadata> {
             let len = self.files.borrow().get(path).map_or(0, String::len) as u64;
             if len == 0 && !self.files.borrow().contains_key(path) {
-                return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "file not found"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "file not found",
+                ));
             }
-            Ok(FileMetadata { kind: FileKind::File, len, modified: None, mode: 0 })
+            Ok(FileMetadata {
+                kind: FileKind::File,
+                len,
+                modified: None,
+                mode: 0,
+            })
         }
 
         fn read_dir(&self, path: &Path) -> std::io::Result<Vec<FileEntry>> {
             // expand_glob walks "" for relative patterns but the seam sees
             // "."; treat them as the same directory.
-            let directory = if path.as_os_str() == "." { Path::new("") } else { path };
+            let directory = if path.as_os_str() == "." {
+                Path::new("")
+            } else {
+                path
+            };
             let mut names = BTreeSet::new();
             for key in self.files.borrow().keys() {
-                if key.parent() == Some(directory) {
-                    if let Some(name) = key.file_name() {
-                        names.insert(name.to_os_string());
-                    }
+                if key.parent() == Some(directory)
+                    && let Some(name) = key.file_name()
+                {
+                    names.insert(name.to_os_string());
                 }
             }
-            Ok(names.into_iter().map(|name| FileEntry { path: directory.join(&name), name }).collect())
+            Ok(names
+                .into_iter()
+                .map(|name| FileEntry {
+                    path: directory.join(&name),
+                    name,
+                })
+                .collect())
         }
 
         fn canonicalize(&self, path: &Path) -> PathBuf {
@@ -302,21 +373,24 @@ mod tests {
         }
 
         fn copy_file(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-            let content = self.files
-                .borrow()
-                .get(from)
-                .cloned()
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "file not found"))?;
+            let content = self.files.borrow().get(from).cloned().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "file not found")
+            })?;
             self.files.borrow_mut().insert(to.to_path_buf(), content);
             Ok(())
         }
     }
 
-    fn setup() -> (Editor, ExExecutor<MemoryFileIO>) {
+    fn setup() -> (TestEditorAccess, ExExecutor<MemoryFileIO>) {
         let mut editor = Editor::new();
         let buffer = editor.create_buffer(true).unwrap();
-        editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
-        (editor, ExExecutor::with_io(MemoryFileIO::new()))
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        (
+            TestEditorAccess::new(editor),
+            ExExecutor::with_io(MemoryFileIO::new()),
+        )
     }
 
     fn global(executor: &ExExecutor<MemoryFileIO>, name: &str) -> Typval {
@@ -325,16 +399,20 @@ mod tests {
             .global
             .iter()
             .find(|(key, _)| key.as_bytes() == name.as_bytes())
-            .map(|(_, value)| value.clone())
-            .unwrap_or_else(|| panic!("g:{name} was not assigned"))
+            .map_or_else(
+                || panic!("g:{name} was not assigned"),
+                |(_, value)| value.clone(),
+            )
     }
 
     fn text(value: Typval) -> String {
-        let Typval::String(value) = value else { panic!("expected a string") };
+        let Typval::String(value) = value else {
+            panic!("expected a string")
+        };
         value.to_string_lossy().into_owned()
     }
 
-    fn script(executor: &mut ExExecutor<MemoryFileIO>, editor: &mut Editor, source: &str) {
+    fn script(executor: &mut ExExecutor<MemoryFileIO>, editor: &TestEditorAccess, source: &str) {
         executor
             .execute_script(editor, "<arglist-test>", source)
             .unwrap_or_else(|error| panic!("script failed: {error}\n{source}"));
@@ -344,25 +422,50 @@ mod tests {
     fn check_target_reports_the_do_argfile_error_shape() {
         // do_argfile (arglist.c 606-616).
         let mut list = ArgList::new();
-        assert_eq!(list.check_target(0), Err(ArgRangeError { code: "E163", message: "There is only one file to edit" }));
+        assert_eq!(
+            list.check_target(0),
+            Err(ArgRangeError {
+                code: "E163",
+                message: "There is only one file to edit"
+            })
+        );
         list.set(vec![OxStr::from("only")]);
-        assert_eq!(list.check_target(1), Err(ArgRangeError { code: "E163", message: "There is only one file to edit" }));
+        assert_eq!(
+            list.check_target(1),
+            Err(ArgRangeError {
+                code: "E163",
+                message: "There is only one file to edit"
+            })
+        );
         list.set(vec![OxStr::from("a"), OxStr::from("b")]);
-        assert_eq!(list.check_target(-1), Err(ArgRangeError { code: "E164", message: "Cannot go before first file" }));
-        assert_eq!(list.check_target(2), Err(ArgRangeError { code: "E165", message: "Cannot go beyond last file" }));
+        assert_eq!(
+            list.check_target(-1),
+            Err(ArgRangeError {
+                code: "E164",
+                message: "Cannot go before first file"
+            })
+        );
+        assert_eq!(
+            list.check_target(2),
+            Err(ArgRangeError {
+                code: "E165",
+                message: "Cannot go beyond last file"
+            })
+        );
         assert_eq!(list.check_target(1), Ok(1));
         assert_eq!(list.index(), 0);
     }
 
     #[test]
     fn argc_argv_argidx_and_arglistid_report_the_global_list() {
-        let (mut editor, mut executor) = setup();
+        let (editor, mut executor) = setup();
         editor
+            .editor_mut()
             .arglist_mut()
             .set(vec![OxStr::from("one.vim"), OxStr::from("two.vim")]);
         script(
             &mut executor,
-            &mut editor,
+            &editor,
             "let g:c = argc()\n\
              let g:negc = argc(-1)\n\
              let g:badwin = argc(99)\n\
@@ -378,16 +481,22 @@ mod tests {
         assert_eq!(global(&executor, "c"), Typval::Number(2));
         assert_eq!(global(&executor, "negc"), Typval::Number(2));
         assert_eq!(global(&executor, "badwin"), Typval::Number(-1));
-        // Window handles are allocated from one; 1000 does not resolve.
-        assert_eq!(global(&executor, "win"), Typval::Number(-1));
+        // A valid window handle selects that window's argument list.
+        assert_eq!(global(&executor, "win"), Typval::Number(2));
         assert_eq!(
             global(&executor, "all"),
-            Typval::list(vec![Typval::String(OxStr::from("one.vim")), Typval::String(OxStr::from("two.vim"))])
+            Typval::list(vec![
+                Typval::String(OxStr::from("one.vim")),
+                Typval::String(OxStr::from("two.vim"))
+            ])
         );
         assert_eq!(text(global(&executor, "zero")), "one.vim");
         assert_eq!(
             global(&executor, "minus"),
-            Typval::list(vec![Typval::String(OxStr::from("one.vim")), Typval::String(OxStr::from("two.vim"))])
+            Typval::list(vec![
+                Typval::String(OxStr::from("one.vim")),
+                Typval::String(OxStr::from("two.vim"))
+            ])
         );
         assert_eq!(text(global(&executor, "past")), "");
         assert_eq!(global(&executor, "idx"), Typval::Number(0));
@@ -397,9 +506,9 @@ mod tests {
 
     #[test]
     fn argc_rejects_wrong_arity() {
-        let (mut editor, mut executor) = setup();
+        let (editor, mut executor) = setup();
         let error = executor
-            .execute_script(&mut editor, "<arity>", "let g:x = argc(1, 2)")
+            .execute_script(&editor, "<arity>", "let g:x = argc(1, 2)")
             .unwrap_err()
             .to_string();
         assert!(error.contains("E118"), "unexpected error: {error}");
@@ -407,20 +516,24 @@ mod tests {
 
     #[test]
     fn args_redefines_lists_and_moves_through_entries() {
-        let (mut editor, mut executor) = setup();
-        executor.scripts().io(); // the IO seam is shared with :args edits
+        let (editor, mut executor) = setup();
         script(
             &mut executor,
-            &mut editor,
+            &editor,
             "args one.vim two.vim three.vim\nlet g:first = expand('%')\nlet g:idx = argidx()",
         );
         assert_eq!(text(global(&executor, "first")), "one.vim");
         assert_eq!(global(&executor, "idx"), Typval::Number(0));
-        script(&mut executor, &mut editor, "next\nlet g:second = expand('%')\nlet g:idx = argidx()");
+        script(
+            &mut executor,
+            &editor,
+            "next\nlet g:second = expand('%')\nlet g:idx = argidx()",
+        );
         assert_eq!(text(global(&executor, "second")), "two.vim");
         assert_eq!(global(&executor, "idx"), Typval::Number(1));
-        script(&mut executor, &mut editor, "args");
+        script(&mut executor, &editor, "args");
         let listing = editor
+            .editor()
             .messages()
             .last()
             .map(|message| match &message.content {
@@ -433,16 +546,25 @@ mod tests {
 
     #[test]
     fn next_and_previous_report_out_of_range_errors() {
-        let (mut editor, mut executor) = setup();
-        script(&mut executor, &mut editor, "args a.vim b.vim\nnext");
-        assert_eq!(editor.arglist().index(), 1);
-        let error = executor.execute_script(&mut editor, "<e165>", "next").unwrap_err().to_string();
+        let (editor, mut executor) = setup();
+        script(&mut executor, &editor, "args a.vim b.vim\nnext");
+        assert_eq!(editor.editor().arglist().index(), 1);
+        let error = executor
+            .execute_script(&editor, "<e165>", "next")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("E165"), "unexpected error: {error}");
-        script(&mut executor, &mut editor, "previous");
-        assert_eq!(editor.arglist().index(), 0);
-        let error = executor.execute_script(&mut editor, "<e164>", "previous").unwrap_err().to_string();
+        script(&mut executor, &editor, "previous");
+        assert_eq!(editor.editor().arglist().index(), 0);
+        let error = executor
+            .execute_script(&editor, "<e164>", "previous")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("E164"), "unexpected error: {error}");
-        let error = executor.execute_script(&mut editor, "<e163>", "args solo.vim\nnext").unwrap_err().to_string();
+        let error = executor
+            .execute_script(&editor, "<e163>", "args solo.vim\nnext")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("E163"), "unexpected error: {error}");
     }
 
@@ -452,19 +574,22 @@ mod tests {
         // index itself is already past the list end; an ordinary count
         // that runs before the first entry reports E164 through
         // do_argfile.
-        let (mut editor, mut executor) = setup();
-        script(&mut executor, &mut editor, "args a.vim b.vim c.vim\nnext\nnext");
-        assert_eq!(editor.arglist().index(), 2);
-        let error = executor.execute_script(&mut editor, "<e164b>", "99previous").unwrap_err().to_string();
+        let (editor, mut executor) = setup();
+        script(&mut executor, &editor, "args a.vim b.vim c.vim\nnext\nnext");
+        assert_eq!(editor.editor().arglist().index(), 2);
+        let error = executor
+            .execute_script(&editor, "<e164b>", "99previous")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("E164"), "unexpected error: {error}");
     }
 
     #[test]
     fn argdo_executes_the_command_in_every_entry() {
-        let (mut editor, mut executor) = setup();
+        let (editor, mut executor) = setup();
         script(
             &mut executor,
-            &mut editor,
+            &editor,
             "args one.vim two.vim three.vim\n\
              let g:seen = []\n\
              argdo call add(g:seen, expand('%'))",
@@ -477,47 +602,66 @@ mod tests {
                 Typval::String(OxStr::from("three.vim")),
             ])
         );
-        assert_eq!(editor.arglist().index(), 2);
+        assert_eq!(editor.editor().arglist().index(), 2);
     }
 
     #[test]
     fn argdo_range_limits_the_visited_entries() {
-        let (mut editor, mut executor) = setup();
+        let (editor, mut executor) = setup();
         script(
             &mut executor,
-            &mut editor,
+            &editor,
             "args a.vim b.vim c.vim d.vim\n\
              let g:seen = []\n\
              2,3argdo call add(g:seen, expand('%'))",
         );
         assert_eq!(
             global(&executor, "seen"),
-            Typval::list(vec![Typval::String(OxStr::from("b.vim")), Typval::String(OxStr::from("c.vim"))])
+            Typval::list(vec![
+                Typval::String(OxStr::from("b.vim")),
+                Typval::String(OxStr::from("c.vim"))
+            ])
         );
     }
 
     #[test]
     fn argdo_requires_a_command_and_tolerates_empty_lists() {
-        let (mut editor, mut executor) = setup();
-        let error = executor.execute_script(&mut editor, "<e471>", "argdo").unwrap_err().to_string();
+        let (editor, mut executor) = setup();
+        let error = executor
+            .execute_script(&editor, "<e471>", "argdo")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("E471"), "unexpected error: {error}");
-        script(&mut executor, &mut editor, "argdo echo x");
+        script(&mut executor, &editor, "argdo echo x");
     }
 
     #[test]
     fn next_revisits_buffers_without_duplicating_them() {
-        let (mut editor, mut executor) = setup();
-        script(&mut executor, &mut editor, "args one.vim two.vim\nnext\nprevious");
+        let (editor, mut executor) = setup();
+        script(
+            &mut executor,
+            &editor,
+            "args one.vim two.vim\nnext\nprevious",
+        );
         let named = editor
+            .editor()
             .buffers()
             .into_iter()
             .filter(|&buffer| {
-                editor.buffer(buffer).is_ok_and(|state| state.name().as_bytes() == b"one.vim")
+                editor
+                    .editor()
+                    .buffer(buffer)
+                    .is_ok_and(|state| state.name().as_bytes() == b"one.vim")
             })
             .count();
         assert_eq!(named, 1);
-        let current = editor.current_buffer().unwrap();
-        assert!(editor.buffer(current).is_ok_and(|state| state.name().as_bytes() == b"one.vim"));
+        let current = editor.editor().current_buffer().unwrap();
+        assert!(
+            editor
+                .editor()
+                .buffer(current)
+                .is_ok_and(|state| state.name().as_bytes() == b"one.vim")
+        );
     }
 
     #[test]
@@ -526,16 +670,25 @@ mod tests {
         // expand to sorted matches, unmatched names stay literal.
         let mut editor = Editor::new();
         let buffer = editor.create_buffer(true).unwrap();
-        editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let editor = TestEditorAccess::new(editor);
         let io = MemoryFileIO::new();
         io.insert("b2.vim", "");
         io.insert("b1.vim", "");
         io.insert("a.vim", "");
         let mut executor = ExExecutor::with_io(io);
-        script(&mut executor, &mut editor, "args b*.vim missing.vim a.vim");
+        script(&mut executor, &editor, "args b*.vim missing.vim a.vim");
         assert_eq!(
-            editor.arglist().names(),
-            [OxStr::from("b1.vim"), OxStr::from("b2.vim"), OxStr::from("missing.vim"), OxStr::from("a.vim")].as_slice()
+            editor.editor().arglist().names(),
+            [
+                OxStr::from("b1.vim"),
+                OxStr::from("b2.vim"),
+                OxStr::from("missing.vim"),
+                OxStr::from("a.vim")
+            ]
+            .as_slice()
         );
     }
 
@@ -546,5 +699,118 @@ mod tests {
         assert_eq!(split_file_list("a b"), vec!["a", "b"]);
         assert_eq!(split_file_list("a\\ b c"), vec!["a b", "c"]);
         assert_eq!(split_file_list("  spaced   out  "), vec!["spaced", "out"]);
+    }
+
+    #[test]
+    fn clearjumps_empties_the_jumplist() {
+        // ex_clearjumps (mark.c 1107-1112): the entries are freed and the
+        // index reset.
+        let (editor, mut executor) = setup();
+        let buffer = editor.editor().current_buffer().unwrap();
+        for lnum in 1..=3 {
+            editor
+                .editor_mut()
+                .jumplist_mut()
+                .push(crate::MarkLocation::in_buffer(
+                    buffer,
+                    ox_text::Position { lnum, col: 0 },
+                ));
+        }
+        assert_eq!(editor.editor().jumplist().len(), 3);
+        script(&mut executor, &editor, "clearjumps");
+        assert_eq!(editor.editor().jumplist().len(), 0);
+        assert_eq!(editor.editor().jumplist().index(), 0);
+    }
+
+    #[test]
+    fn argadd_inserts_after_current_or_the_addressed_entry() {
+        // ex_argadd (arglist.c 750-756): without a count the names go after
+        // the current entry (`w_arg_idx + 1`); with a count they go after
+        // the addressed entry (`eap->line2`), so `:1argadd` on "a b c"
+        // yields "a new b c" (`:h :argadd`).
+        let (editor, mut executor) = setup();
+        script(&mut executor, &editor, "args a.txt b.txt c.txt\nnext");
+        assert_eq!(editor.editor().arglist().index(), 1);
+        script(&mut executor, &editor, "argadd d.txt e.txt");
+        assert_eq!(
+            editor.editor().arglist().names(),
+            [
+                OxStr::from("a.txt"),
+                OxStr::from("b.txt"),
+                OxStr::from("d.txt"),
+                OxStr::from("e.txt"),
+                OxStr::from("c.txt"),
+            ]
+            .as_slice()
+        );
+        // The insertion point was past the current index, so the index is
+        // unmoved and still addresses b.txt.
+        assert_eq!(editor.editor().arglist().index(), 1);
+        script(&mut executor, &editor, "1argadd x.txt");
+        assert_eq!(
+            editor.editor().arglist().names(),
+            [
+                OxStr::from("a.txt"),
+                OxStr::from("x.txt"),
+                OxStr::from("b.txt"),
+                OxStr::from("d.txt"),
+                OxStr::from("e.txt"),
+                OxStr::from("c.txt"),
+            ]
+            .as_slice()
+        );
+        // b.txt sat at the insertion point, so the index shifts right to
+        // keep addressing it (arglist.c 344-346).
+        assert_eq!(editor.editor().arglist().index(), 2);
+        // The bang is accepted and ignored.
+        script(&mut executor, &editor, "argadd! y.txt");
+        assert_eq!(editor.editor().arglist().len(), 7);
+    }
+
+    #[test]
+    fn bare_argadd_keeps_whitespace_names_whole() {
+        // `do_arglist` substitutes the current buffer's name whole
+        // (arg_escaped=false, arglist.c:265-275 + 417-424): a name with
+        // spaces is ONE argument; explicit command arguments still split.
+        let (editor, mut executor) = setup();
+        let buffer = editor.editor().current_buffer().unwrap();
+        editor
+            .editor_mut()
+            .buffer_mut(buffer)
+            .unwrap()
+            .set_name(OxStr::from("my file.txt"));
+        script(&mut executor, &editor, "argadd");
+        assert_eq!(
+            editor.editor().arglist().names(),
+            [OxStr::from("my file.txt")]
+        );
+        script(&mut executor, &editor, "argadd two words.txt");
+        assert_eq!(
+            editor.editor().arglist().names(),
+            [
+                OxStr::from("my file.txt"),
+                OxStr::from("two"),
+                OxStr::from("words.txt")
+            ]
+        );
+    }
+
+    #[test]
+    fn bare_argadd_appends_the_current_buffer_name() {
+        // `do_arglist` substitutes the current buffer's name for an empty
+        // argument (arglist.c 417-424): bare `:argadd` grows the list by
+        // exactly that entry.
+        let (editor, mut executor) = setup();
+        let buffer = editor.editor().current_buffer().unwrap();
+        editor
+            .editor_mut()
+            .buffer_mut(buffer)
+            .unwrap()
+            .set_name(OxStr::from("named.txt"));
+        script(&mut executor, &editor, "argadd");
+        assert_eq!(
+            editor.editor().arglist().names(),
+            [OxStr::from("named.txt")]
+        );
     }
 }

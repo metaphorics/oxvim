@@ -10,7 +10,7 @@ mod platform {
     use signal_hook::iterator::backend::SignalDelivery;
     use signal_hook::iterator::exfiltrator::SignalOnly;
 
-    use super::*;
+    use super::{Event, MultiQueue, Owner, Reactor, Result};
     use crate::SIGNAL_TOKEN;
 
     /// Signal-hook self-pipe integrated as a normal mio readiness source.
@@ -20,25 +20,30 @@ mod platform {
 
     impl Signals {
         /// Creates signal delivery for the supplied platform signal numbers.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`Error::InvalidSignal`] for a non-positive number, a
+        /// number `>= 128`, or a forbidden signal, and an I/O error if the
+        /// self-pipe pair or the signal delivery cannot be created.
         pub fn new(signal_numbers: &[i32]) -> Result<Self> {
             if let Some(signal) = signal_numbers.iter().copied().find(|signal| {
-                *signal <= 0
-                    || *signal >= 128
-                    || signal_hook::consts::FORBIDDEN.contains(signal)
+                *signal <= 0 || *signal >= 128 || signal_hook::consts::FORBIDDEN.contains(signal)
             }) {
                 return Err(crate::Error::InvalidSignal(signal));
             }
             let (read, write) = UnixStream::pair()?;
-            let delivery = SignalDelivery::with_pipe(
-                read,
-                write,
-                SignalOnly::default(),
-                signal_numbers.iter().copied(),
-            )?;
+            let delivery =
+                SignalDelivery::with_pipe(read, write, SignalOnly, signal_numbers.iter().copied())?;
             Ok(Self { delivery })
         }
 
         /// Registers the signal self-pipe in the reactor's internal token range.
+        ///
+        /// # Errors
+        ///
+        /// Propagates the I/O error from registering the self-pipe's read
+        /// end on [`SIGNAL_TOKEN`].
         pub fn register(&mut self, reactor: &Reactor) -> Result<()> {
             // SourceFd is only the Unix registration adapter; Signals owns the
             // pipe. A future Windows adapter can keep this interface unchanged.
@@ -48,6 +53,11 @@ mod platform {
         }
 
         /// Moves all coalesced pending signals into `owner`'s event queue.
+        ///
+        /// # Errors
+        ///
+        /// Propagates [`MultiQueue::put`]'s error if `owner` does not
+        /// identify an existing queue.
         pub fn drain(&mut self, events: &mut MultiQueue, owner: Owner) -> Result<()> {
             for signal in self.delivery.pending() {
                 events.put(owner, Event::Signal(signal))?;

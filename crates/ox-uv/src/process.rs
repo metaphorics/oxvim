@@ -18,6 +18,8 @@ use std::cell::RefCell;
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
 #[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::rc::Rc;
 
 #[cfg(unix)]
@@ -175,7 +177,7 @@ impl std::fmt::Debug for ProcessPipes {
             .field("stdin", &self.stdin.as_ref().map(ProcessPipe::id))
             .field("stdout", &self.stdout.as_ref().map(ProcessPipe::id))
             .field("stderr", &self.stderr.as_ref().map(ProcessPipe::id))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -227,11 +229,9 @@ enum ChildStream {
 #[cfg(unix)]
 impl ChildStream {
     fn set_nonblocking(&self) -> io::Result<()> {
-        use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+        use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
         match self {
-            ChildStream::In(stream) => {
-                fcntl_setfl(stream, fcntl_getfl(stream)? | OFlags::NONBLOCK)
-            }
+            ChildStream::In(stream) => fcntl_setfl(stream, fcntl_getfl(stream)? | OFlags::NONBLOCK),
             ChildStream::Out(stream) => {
                 fcntl_setfl(stream, fcntl_getfl(stream)? | OFlags::NONBLOCK)
             }
@@ -266,7 +266,7 @@ struct ProcessPipeState {
 fn process_pipe_interest(state: &ProcessPipeState) -> Interest {
     match &state.io {
         Some(ChildStream::In(_)) => interest(false, state.writes.wants_write()),
-        Some(ChildStream::Out(_)) | Some(ChildStream::Err(_)) => {
+        Some(ChildStream::Out(_) | ChildStream::Err(_)) => {
             interest(state.reading, state.writes.wants_write())
         }
         None => Interest::READABLE,
@@ -293,13 +293,16 @@ pub struct ProcessPipe {
     id: HandleId,
     token: Token,
     state: Rc<RefCell<ProcessPipeState>>,
-    _callback: CallbackCell,
+    callback: CallbackCell,
 }
 
 #[cfg(unix)]
 impl std::fmt::Debug for ProcessPipe {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ProcessPipe").field("id", &self.id).finish()
+        formatter
+            .debug_struct("ProcessPipe")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -339,7 +342,12 @@ impl ProcessPipe {
             return Err(error);
         }
 
-        Ok(Self { id, token, state, _callback: callback })
+        Ok(Self {
+            id,
+            token,
+            state,
+            callback,
+        })
     }
 
     /// Replaces the event callback used for reads, writes, and shutdown completion.
@@ -347,7 +355,7 @@ impl ProcessPipe {
     where
         F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static,
     {
-        *self._callback.borrow_mut() = Some(Box::new(callback));
+        *self.callback.borrow_mut() = Some(Box::new(callback));
     }
 
     /// Starts reading bytes from this endpoint, installing `callback`.
@@ -355,6 +363,11 @@ impl ProcessPipe {
     /// Readable events emit [`NetEvent::Read`] until [`NetEvent::Eof`]. The
     /// endpoint must be a stdout or stderr pipe; child stdin is write-only.
     /// See `luvref.txt`, `uv.read_start()` (lines 1948-1992).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pipe is closed, is the child's standard input,
+    /// or its reactor registration cannot be updated.
     pub fn read_start<F>(&mut self, uv_loop: &mut UvLoop, callback: F) -> NetResult<()>
     where
         F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static,
@@ -364,6 +377,11 @@ impl ProcessPipe {
     }
 
     /// Starts reading while retaining the callback installed with `set_callback`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pipe is closed, is the child's standard input,
+    /// or its reactor registration cannot be updated.
     pub fn read_start_current(&mut self, uv_loop: &mut UvLoop) -> NetResult<()> {
         {
             let mut state = self.state.borrow_mut();
@@ -379,6 +397,11 @@ impl ProcessPipe {
     }
 
     /// Stops reading bytes from this endpoint. See `uv.read_stop()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pipe is closed or its reactor registration
+    /// cannot be updated.
     pub fn read_stop(&mut self, uv_loop: &mut UvLoop) -> NetResult<()> {
         {
             let mut state = self.state.borrow_mut();
@@ -396,6 +419,12 @@ impl ProcessPipe {
     /// synchronously so callers may close the pipe immediately after; a
     /// partially buffered remainder resumes on writable readiness with a
     /// [`NetEvent::WriteComplete`]. See `luvref.txt`, `uv.write()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pipe is closed, is not the child's standard
+    /// input, cannot accept another queued write, or its reactor registration
+    /// cannot be updated.
     pub fn write(&mut self, uv_loop: &mut UvLoop, data: Vec<u8>) -> NetResult<WriteId> {
         let id;
         let mut events = Vec::new();
@@ -405,7 +434,9 @@ impl ProcessPipe {
                 return Err(NetError::Closed);
             }
             if !matches!(state.io, Some(ChildStream::In(_))) {
-                return Err(NetError::InvalidState("child stdout/stderr cannot be written"));
+                return Err(NetError::InvalidState(
+                    "child stdout/stderr cannot be written",
+                ));
             }
             id = state.writes.push(data)?;
             let ProcessPipeState { io, writes, .. } = &mut *state;
@@ -418,8 +449,8 @@ impl ProcessPipe {
                 uv_loop,
                 self.id,
                 self.token,
-                Rc::clone(&self.state),
-                Rc::clone(&self._callback),
+                &self.state,
+                &self.callback,
                 events,
             );
         }
@@ -438,6 +469,11 @@ impl ProcessPipe {
     }
 
     /// Finishes pending writes and closes the child-stdin stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pipe is closed, is not the child's standard
+    /// input, still has pending writes, or its loop handle cannot be deactivated.
     pub fn shutdown(&mut self, uv_loop: &mut UvLoop) -> NetResult<()> {
         let result = {
             let mut state = self.state.borrow_mut();
@@ -445,17 +481,28 @@ impl ProcessPipe {
                 return if state.io.is_none() {
                     Err(NetError::Closed)
                 } else {
-                    Err(NetError::InvalidState("child stdout/stderr cannot be shut down"))
+                    Err(NetError::InvalidState(
+                        "child stdout/stderr cannot be shut down",
+                    ))
                 };
             }
             if !state.writes.pending.is_empty() {
-                return Err(NetError::InvalidState("cannot shut down with pending writes"));
+                return Err(NetError::InvalidState(
+                    "cannot shut down with pending writes",
+                ));
             }
             state.io = None;
             Ok(())
         };
-        invoke(&self._callback, uv_loop, self.id, NetEvent::ShutdownComplete(result));
-        uv_loop.set_external_active(self.id, false).map_err(NetError::from)
+        invoke(
+            &self.callback,
+            uv_loop,
+            self.id,
+            NetEvent::ShutdownComplete(result),
+        );
+        uv_loop
+            .set_external_active(self.id, false)
+            .map_err(NetError::from)
     }
 }
 
@@ -468,7 +515,10 @@ fn register_process_pipe_mio(
     let mut state = state.borrow_mut();
     let interests = process_pipe_interest(&state);
     let fd = state.io.as_ref().ok_or(NetError::Closed)?.as_raw_fd();
-    uv_loop.inner_mut().reactor().register(&mut SourceFd(&fd), token, interests)?;
+    uv_loop
+        .inner_mut()
+        .reactor()
+        .register(&mut SourceFd(&fd), token, interests)?;
     state.registered = true;
     Ok(())
 }
@@ -492,7 +542,14 @@ fn register_process_pipe_readiness(
                 let dispatch_state = Rc::clone(&shared);
                 let dispatch_callback = Rc::clone(&user_callback);
                 queue_batch(&queue, move |uv_loop| {
-                    deliver_process_pipe(uv_loop, id, token, dispatch_state, dispatch_callback, events)
+                    deliver_process_pipe(
+                        uv_loop,
+                        id,
+                        token,
+                        &dispatch_state,
+                        &dispatch_callback,
+                        events,
+                    );
                 });
             }
             Ok(DrainState::Drained)
@@ -547,7 +604,10 @@ fn sync_process_pipe(
         let interests = process_pipe_interest(&state);
         if state.registered {
             let fd = state.io.as_ref().ok_or(NetError::Closed)?.as_raw_fd();
-            uv_loop.inner_mut().reactor().reregister(&mut SourceFd(&fd), token, interests)?;
+            uv_loop
+                .inner_mut()
+                .reactor()
+                .reregister(&mut SourceFd(&fd), token, interests)?;
         }
     }
     uv_loop.set_external_active(id, active)?;
@@ -583,15 +643,18 @@ fn process_pipe_ready(state: &mut ProcessPipeState, ready: Readiness) -> Vec<Net
             }
             if ready.write_closed && !state.writes.pending.is_empty() {
                 while let Some(write) = state.writes.pending.pop_front() {
-                    events.push(NetEvent::WriteComplete { id: write.id, result: Err(NetError::Closed) });
+                    events.push(NetEvent::WriteComplete {
+                        id: write.id,
+                        result: Err(NetError::Closed),
+                    });
                 }
             }
         }
         Some(ChildStream::Out(stream)) => {
-            process_pipe_drain(ready, &mut state.reading, stream, &mut events)
+            process_pipe_drain(ready, &mut state.reading, stream, &mut events);
         }
         Some(ChildStream::Err(stream)) => {
-            process_pipe_drain(ready, &mut state.reading, stream, &mut events)
+            process_pipe_drain(ready, &mut state.reading, stream, &mut events);
         }
         None => {}
     }
@@ -603,21 +666,21 @@ fn deliver_process_pipe(
     uv_loop: &mut UvLoop,
     id: HandleId,
     token: Token,
-    state: Rc<RefCell<ProcessPipeState>>,
-    callback: CallbackCell,
+    state: &Rc<RefCell<ProcessPipeState>>,
+    callback: &CallbackCell,
     events: Vec<NetEvent>,
 ) {
     if !live(uv_loop, id) {
         return;
     }
-    if let Err(error) = sync_process_pipe(uv_loop, id, token, &state) {
-        invoke(&callback, uv_loop, id, NetEvent::Error(error));
+    if let Err(error) = sync_process_pipe(uv_loop, id, token, state) {
+        invoke(callback, uv_loop, id, NetEvent::Error(error));
     }
     for event in events {
         if !live(uv_loop, id) {
             break;
         }
-        invoke(&callback, uv_loop, id, event);
+        invoke(callback, uv_loop, id, event);
     }
 }
 
@@ -625,17 +688,26 @@ fn deliver_process_pipe(
 fn close_process_pipe(uv_loop: &mut UvLoop, handle: &ProcessPipe) -> crate::Result<()> {
     uv_loop.inner_mut().remove_readiness(handle.token);
     let mut state = handle.state.borrow_mut();
-    if state.registered {
-        if let Some(stream) = state.io.as_ref() {
-            let fd = stream.as_raw_fd();
-            uv_loop.inner_mut().reactor().deregister(&mut SourceFd(&fd))?;
+    let deregister_result = if state.registered {
+        match state.io.as_ref() {
+            Some(stream) => {
+                let fd = stream.as_raw_fd();
+                uv_loop
+                    .inner_mut()
+                    .reactor()
+                    .deregister(&mut SourceFd(&fd))
+                    .map_err(Into::into)
+            }
+            None => Ok(()),
         }
-        state.registered = false;
-    }
+    } else {
+        Ok(())
+    };
+    state.registered = false;
     state.io = None;
     state.reading = false;
     state.writes.clear();
-    Ok(())
+    deregister_result
 }
 
 #[cfg(unix)]
@@ -645,21 +717,21 @@ impl Handle for ProcessPipe {
     }
 
     fn close(&self, uv_loop: &mut UvLoop) -> crate::Result<()> {
-        close_process_pipe(uv_loop, self)?;
-        uv_loop.close(
+        let cleanup_result = close_process_pipe(uv_loop, self);
+        let close_result = uv_loop.close(
             self.id,
             None::<fn(&mut UvLoop, HandleId) -> std::result::Result<(), crate::CallbackError>>,
-        )
+        );
+        cleanup_result.and(close_result)
     }
 
     fn close_with<F>(&self, uv_loop: &mut UvLoop, callback: F) -> crate::Result<()>
     where
-        F: FnOnce(&mut UvLoop, HandleId)
-                -> std::result::Result<(), crate::CallbackError>
-            + 'static,
+        F: FnOnce(&mut UvLoop, HandleId) -> std::result::Result<(), crate::CallbackError> + 'static,
     {
-        close_process_pipe(uv_loop, self)?;
-        uv_loop.close(self.id, Some(callback))
+        let cleanup_result = close_process_pipe(uv_loop, self);
+        let close_result = uv_loop.close(self.id, Some(callback));
+        cleanup_result.and(close_result)
     }
 }
 
@@ -676,7 +748,9 @@ fn build_process_pipes(
     };
 
     let stdin = match stdin {
-        Some(stream) => Some(ProcessPipe::attach(uv_loop, ChildStream::In(stream)).map_err(map_error)?),
+        Some(stream) => {
+            Some(ProcessPipe::attach(uv_loop, ChildStream::In(stream)).map_err(map_error)?)
+        }
         None => None,
     };
 
@@ -709,7 +783,11 @@ fn build_process_pipes(
         None => None,
     };
 
-    Ok(ProcessPipes { stdin, stdout, stderr })
+    Ok(ProcessPipes {
+        stdin,
+        stdout,
+        stderr,
+    })
 }
 
 /// Builds blocking endpoints on platforms without a safe loop registration path.
@@ -720,7 +798,11 @@ fn build_process_pipes(
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
 ) -> Result<ProcessPipes, ProcessError> {
-    Ok(ProcessPipes { stdin, stdout, stderr })
+    Ok(ProcessPipes {
+        stdin,
+        stdout,
+        stderr,
+    })
 }
 
 /// Process and PTY operation failures.
@@ -785,6 +867,7 @@ impl Process {
     /// Returns the child PID.
     ///
     /// See `luvref.txt`, `uv.process_get_pid()` (lines 1489-1498).
+    #[must_use]
     pub fn pid(&self) -> u32 {
         self.pid
     }
@@ -792,6 +875,11 @@ impl Process {
     /// Sends a signal to this process, defaulting to SIGTERM.
     ///
     /// See `luvref.txt`, `uv.process_kill()` (lines 1457-1472).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the child has already exited, the signal is invalid
+    /// or unsupported, or the platform fails to deliver it.
     pub fn kill(&self, signal: Option<i32>) -> Result<(), ProcessError> {
         let state = lock_recover(&self.child);
         if matches!(&*state, ChildState::Exited) {
@@ -843,9 +931,7 @@ impl Handle for Process {
 
     fn close_with<F>(&self, uv_loop: &mut UvLoop, callback: F) -> crate::Result<()>
     where
-        F: FnOnce(&mut UvLoop, HandleId)
-                -> std::result::Result<(), crate::CallbackError>
-            + 'static,
+        F: FnOnce(&mut UvLoop, HandleId) -> std::result::Result<(), crate::CallbackError> + 'static,
     {
         uv_loop.close(self.id, Some(callback))?;
         terminate_and_reap(&self.child);
@@ -873,9 +959,8 @@ struct PreparedExtra {
     parents: Vec<ExtraPipe>,
 }
 
-fn prepare_extra_stdio(options: &SpawnOptions) -> Result<PreparedExtra, ProcessError> {
-    if options
-        .extra_stdio
+fn prepare_extra_stdio(extra_stdio: &[ExtraStdio]) -> Result<PreparedExtra, ProcessError> {
+    if extra_stdio
         .iter()
         .any(|entry| entry.fd > 2 && entry.config == StdioConfig::CreatePipe)
     {
@@ -884,12 +969,20 @@ fn prepare_extra_stdio(options: &SpawnOptions) -> Result<PreparedExtra, ProcessE
             reason: "installing a created pipe at child fd >= 3 requires a parent descriptor-table dup that the no-unsafe policy cannot honor",
         });
     }
-    Ok(PreparedExtra { parents: Vec::new() })
+    Ok(PreparedExtra {
+        parents: Vec::new(),
+    })
 }
 
 /// The child waiter only reaps and posts. The callback itself is invoked by the
 /// owning loop, never by the waiter. See `luvref.txt`, `uv.spawn()` and
 /// `uv.spawn-options` (lines 1340-1455).
+///
+/// # Errors
+///
+/// Returns an error if the platform cannot honor an option, an exact extra
+/// created-pipe descriptor is requested, command or pipe setup fails, the loop
+/// cannot allocate its process handle, or the waiter thread cannot be started.
 pub fn spawn<F>(
     uv_loop: &mut UvLoop,
     options: SpawnOptions,
@@ -898,23 +991,36 @@ pub fn spawn<F>(
 where
     F: FnOnce(&mut UvLoop, ProcessExitResult) + Send + 'static,
 {
-    validate_platform_options(&options)?;
+    let SpawnOptions {
+        program,
+        args,
+        environment,
+        cwd,
+        stdio,
+        extra_stdio,
+        detached,
+        uid,
+        gid,
+        hide,
+    } = options;
+    #[cfg(not(unix))]
+    validate_platform_options(uid, gid, detached, hide)?;
 
-    let mut command = Command::new(&options.program);
-    command.args(&options.args);
-    if let Some(environment) = &options.environment {
+    let mut command = Command::new(program);
+    command.args(&args);
+    if let Some(environment) = environment {
         command.env_clear();
         command.envs(environment.iter().map(|(name, value)| (name, value)));
     }
-    if let Some(cwd) = &options.cwd {
+    if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    command.stdin(map_stdio(options.stdio[0])?);
-    command.stdout(map_stdio(options.stdio[1])?);
-    command.stderr(map_stdio(options.stdio[2])?);
-    configure_platform_command(&mut command, &options);
+    command.stdin(map_stdio(stdio[0])?);
+    command.stdout(map_stdio(stdio[1])?);
+    command.stderr(map_stdio(stdio[2])?);
+    configure_platform_command(&mut command, uid, gid, detached, hide);
 
-    let prepared = prepare_extra_stdio(&options)?;
+    let prepared = prepare_extra_stdio(&extra_stdio)?;
     let mut child = command
         .spawn()
         .map_err(|error| ProcessError::io("spawn", error))?;
@@ -934,30 +1040,47 @@ where
     let pipes = match build_process_pipes(uv_loop, child_stdin, child_stdout, child_stderr) {
         Ok(pipes) => pipes,
         Err(error) => {
-            let process = Process { id: handle_id, pid, child: Arc::clone(&state) };
+            let process = Process {
+                id: handle_id,
+                pid,
+                child: Arc::clone(&state),
+            };
             let _ = process.close(uv_loop);
             terminate_and_reap(&state);
             return Err(error);
         }
     };
-    let process = Process { id: handle_id, pid, child: Arc::clone(&state) };
+    let process = Process {
+        id: handle_id,
+        pid,
+        child: Arc::clone(&state),
+    };
     let waiter_state = Arc::clone(&state);
     let waiter_poster = uv_loop.completion_poster();
 
     let waiter = std::thread::Builder::new()
         .name(format!("ox-uv-process-{pid}"))
-        .spawn(move || wait_and_post(waiter_state, waiter_poster, handle_id, on_exit));
+        .spawn(move || wait_and_post(&waiter_state, &waiter_poster, handle_id, on_exit));
     if let Err(error) = waiter {
         let _ = process.close(uv_loop);
         return Err(ProcessError::io("start process waiter", error));
     }
 
-    Ok(SpawnedProcess { process, pipes, extra })
+    Ok(SpawnedProcess {
+        process,
+        pipes,
+        extra,
+    })
 }
 
 /// Sends a signal to an arbitrary PID, defaulting to SIGTERM.
 ///
 /// See `luvref.txt`, `uv.kill()` (lines 1474-1487).
+///
+/// # Errors
+///
+/// Returns an error if `pid` is invalid, `signal` is invalid or unsupported,
+/// or the platform fails to deliver it.
 pub fn kill(pid: u32, signal: Option<i32>) -> Result<(), ProcessError> {
     #[cfg(unix)]
     {
@@ -977,6 +1100,11 @@ pub fn kill(pid: u32, signal: Option<i32>) -> Result<(), ProcessError> {
 /// Sends a signal through a process handle.
 ///
 /// See `luvref.txt`, `uv.process_kill()` (lines 1457-1472).
+///
+/// # Errors
+///
+/// Returns an error if the process has exited, the signal is invalid or
+/// unsupported, or the platform fails to deliver it.
 pub fn process_kill(process: &Process, signal: Option<i32>) -> Result<(), ProcessError> {
     process.kill(signal)
 }
@@ -984,6 +1112,7 @@ pub fn process_kill(process: &Process, signal: Option<i32>) -> Result<(), Proces
 /// Returns the current process ID.
 ///
 /// See `luvref.txt`, `uv.os_getpid()` (lines 4462-4466).
+#[must_use]
 pub fn getpid() -> u32 {
     crate::misc::getpid()
 }
@@ -991,10 +1120,11 @@ pub fn getpid() -> u32 {
 /// Returns the parent process ID, or zero when the platform exposes no parent.
 ///
 /// See `luvref.txt`, `uv.os_getppid()` (lines 4468-4472).
+#[must_use]
 pub fn getppid() -> u32 {
     #[cfg(unix)]
     {
-        rustix::process::getppid().map_or(0, |pid| pid.as_raw_pid() as u32)
+        rustix::process::getppid().map_or(0, |pid| pid.as_raw_pid().unsigned_abs())
     }
 
     #[cfg(not(unix))]
@@ -1007,6 +1137,11 @@ pub fn getppid() -> u32 {
 ///
 /// PID zero selects the current process. See `luvref.txt`,
 /// `uv.os_getpriority()` (lines 4474-4482).
+///
+/// # Errors
+///
+/// Returns an error if `pid` is invalid, the platform cannot read its priority,
+/// or this target has no supported process-priority API.
 pub fn os_getpriority(pid: u32) -> Result<i32, ProcessError> {
     #[cfg(unix)]
     {
@@ -1029,6 +1164,12 @@ pub fn os_getpriority(pid: u32) -> Result<i32, ProcessError> {
 ///
 /// PID zero selects the current process. See `luvref.txt`,
 /// `uv.os_setpriority()` (lines 4484-4494).
+///
+/// # Errors
+///
+/// Returns an error if `priority` is outside `-20..=19`, `pid` is invalid, the
+/// platform cannot set its priority, or this target has no supported
+/// process-priority API.
 pub fn os_setpriority(pid: u32, priority: i32) -> Result<(), ProcessError> {
     if !(-20..=19).contains(&priority) {
         return Err(ProcessError::InvalidPriority(priority));
@@ -1067,6 +1208,8 @@ pub struct SpawnedPty {
     pub process: Process,
     /// Loop-managed, nonblocking parent-side PTY master.
     pub master: PtyHandle,
+    /// Slave terminal path assigned to the child.
+    pub pty_slave: Option<String>,
 }
 
 /// A spawned PTY child and the parent-side PTY master.
@@ -1076,6 +1219,8 @@ pub struct SpawnedPty {
     pub process: Process,
     /// Parent-side PTY master.
     pub master: Box<dyn portable_pty::MasterPty + Send>,
+    /// Slave terminal path assigned to the child.
+    pub pty_slave: Option<String>,
 }
 
 impl std::fmt::Debug for SpawnedPty {
@@ -1084,7 +1229,8 @@ impl std::fmt::Debug for SpawnedPty {
             .debug_struct("SpawnedPty")
             .field("process", &self.process)
             .field("master", &"portable PTY master")
-            .finish()
+            .field("pty_slave", &self.pty_slave)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1133,13 +1279,16 @@ pub struct PtyHandle {
     id: HandleId,
     token: Token,
     state: Rc<RefCell<PtyState>>,
-    _callback: CallbackCell,
+    callback: CallbackCell,
 }
 
 #[cfg(unix)]
 impl std::fmt::Debug for PtyHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("PtyHandle").field("id", &self.id).finish()
+        formatter
+            .debug_struct("PtyHandle")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1153,8 +1302,8 @@ impl PtyHandle {
             feature: "PTY master fd",
             reason: "the native portable-pty backend exposed no Unix master descriptor",
         })?;
-        let mut fd = filedescriptor::FileDescriptor::dup(&BorrowedUnixFd(raw))
-            .map_err(|error| {
+        let mut fd =
+            filedescriptor::FileDescriptor::dup(&BorrowedUnixFd(raw)).map_err(|error| {
                 ProcessError::io(
                     "duplicate PTY master fd",
                     io::Error::other(error.to_string()),
@@ -1183,7 +1332,10 @@ impl PtyHandle {
         // loop-level allocation made so far.
         if let Err(error) = register_pty_mio(uv_loop, token, &state) {
             rollback_pty(uv_loop, None, token, &state);
-            return Err(ProcessError::io("PTY handle", io::Error::other(error.to_string())));
+            return Err(ProcessError::io(
+                "PTY handle",
+                io::Error::other(error.to_string()),
+            ));
         }
 
         let id = match uv_loop.allocate_external(false) {
@@ -1196,10 +1348,18 @@ impl PtyHandle {
 
         if let Err(error) = register_pty_readiness(uv_loop, id, token, &state, &callback) {
             rollback_pty(uv_loop, Some(id), token, &state);
-            return Err(ProcessError::io("PTY handle", io::Error::other(error.to_string())));
+            return Err(ProcessError::io(
+                "PTY handle",
+                io::Error::other(error.to_string()),
+            ));
         }
 
-        Ok(Self { id, token, state, _callback: callback })
+        Ok(Self {
+            id,
+            token,
+            state,
+            callback,
+        })
     }
 
     /// Starts reading output from the session, installing `callback`.
@@ -1207,6 +1367,11 @@ impl PtyHandle {
     /// Readable bytes surface as [`NetEvent::Read`] until [`NetEvent::Eof`];
     /// a terminated session whose slave has closed reads as end-of-file.
     /// See `luvref.txt`, `uv.read_start()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PTY is closed or its reactor registration cannot
+    /// be updated.
     pub fn read_start<F>(&mut self, uv_loop: &mut UvLoop, callback: F) -> NetResult<()>
     where
         F: FnMut(&mut UvLoop, HandleId, NetEvent) + 'static,
@@ -1218,11 +1383,16 @@ impl PtyHandle {
             }
             state.reading = true;
         }
-        *self._callback.borrow_mut() = Some(Box::new(callback));
+        *self.callback.borrow_mut() = Some(Box::new(callback));
         sync_pty(uv_loop, self.id, self.token, &self.state)
     }
 
     /// Stops reading session output. See `luvref.txt`, `uv.read_stop()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PTY is closed or its reactor registration cannot
+    /// be updated.
     pub fn read_stop(&mut self, uv_loop: &mut UvLoop) -> NetResult<()> {
         {
             let mut state = self.state.borrow_mut();
@@ -1239,6 +1409,11 @@ impl PtyHandle {
     /// A small write is flushed synchronously; a partially buffered remainder
     /// resumes on writable readiness and reports a [`NetEvent::WriteComplete`].
     /// See `luvref.txt`, `uv.write()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PTY is closed, cannot accept another queued
+    /// write, or its reactor registration cannot be updated.
     pub fn write(&mut self, uv_loop: &mut UvLoop, data: Vec<u8>) -> NetResult<WriteId> {
         let id;
         let mut events = Vec::new();
@@ -1258,8 +1433,8 @@ impl PtyHandle {
                 uv_loop,
                 self.id,
                 self.token,
-                Rc::clone(&self.state),
-                Rc::clone(&self._callback),
+                &self.state,
+                &self.callback,
                 events,
             );
         }
@@ -1268,6 +1443,10 @@ impl PtyHandle {
     }
 
     /// Resizes the pseudoterminal window. See `luvref.txt`, `uv.tty_set_size()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PTY is closed or the platform cannot resize it.
     pub fn resize(&self, size: PtySize) -> Result<(), ProcessError> {
         let state = self.state.borrow();
         let master = state.master.as_ref().ok_or_else(closed_pty_error)?;
@@ -1282,12 +1461,20 @@ impl PtyHandle {
     }
 
     /// Returns the current pseudoterminal window geometry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PTY is closed or the platform cannot read its
+    /// current size.
     pub fn get_size(&self) -> Result<PtySize, ProcessError> {
         let state = self.state.borrow();
         let master = state.master.as_ref().ok_or_else(closed_pty_error)?;
         master
             .get_size()
-            .map(|size| PtySize { rows: size.rows, columns: size.cols })
+            .map(|size| PtySize {
+                rows: size.rows,
+                columns: size.cols,
+            })
             .map_err(|error| ProcessError::io("read PTY size", io::Error::other(error.to_string())))
     }
 }
@@ -1339,7 +1526,10 @@ fn register_pty_mio(
     let mut state = state.borrow_mut();
     let interests = pty_interest(&state);
     let fd = state.fd.as_ref().ok_or(NetError::Closed)?.as_raw_fd();
-    uv_loop.inner_mut().reactor().register(&mut SourceFd(&fd), token, interests)?;
+    uv_loop
+        .inner_mut()
+        .reactor()
+        .register(&mut SourceFd(&fd), token, interests)?;
     state.registered = true;
     Ok(())
 }
@@ -1363,7 +1553,14 @@ fn register_pty_readiness(
                 let dispatch_state = Rc::clone(&shared);
                 let dispatch_callback = Rc::clone(&user_callback);
                 queue_batch(&queue, move |uv_loop| {
-                    deliver_pty(uv_loop, id, token, dispatch_state, dispatch_callback, events)
+                    deliver_pty(
+                        uv_loop,
+                        id,
+                        token,
+                        &dispatch_state,
+                        &dispatch_callback,
+                        events,
+                    );
                 });
             }
             Ok(DrainState::Drained)
@@ -1385,7 +1582,10 @@ fn rollback_pty(
         if state.registered {
             if let Some(fd) = state.fd.as_ref() {
                 let raw = fd.as_raw_fd();
-                let _ = uv_loop.inner_mut().reactor().deregister(&mut SourceFd(&raw));
+                let _ = uv_loop
+                    .inner_mut()
+                    .reactor()
+                    .deregister(&mut SourceFd(&raw));
             }
             state.registered = false;
         }
@@ -1419,7 +1619,10 @@ fn sync_pty(
         let interests = pty_interest(&state);
         if state.registered {
             let fd = state.fd.as_ref().ok_or(NetError::Closed)?.as_raw_fd();
-            uv_loop.inner_mut().reactor().reregister(&mut SourceFd(&fd), token, interests)?;
+            uv_loop
+                .inner_mut()
+                .reactor()
+                .reregister(&mut SourceFd(&fd), token, interests)?;
         }
     }
     uv_loop.set_external_active(id, active)?;
@@ -1429,10 +1632,10 @@ fn sync_pty(
 #[cfg(unix)]
 fn pty_ready(state: &mut PtyState, ready: Readiness) -> Vec<NetEvent> {
     let mut events = Vec::new();
-    if ready.writable {
-        if let Some(fd) = state.fd.as_mut() {
-            drive_writes(fd, &mut state.writes, &mut events);
-        }
+    if ready.writable
+        && let Some(fd) = state.fd.as_mut()
+    {
+        drive_writes(fd, &mut state.writes, &mut events);
     }
     if ready.readable && state.reading {
         if let Some(fd) = state.fd.as_mut() {
@@ -1448,7 +1651,10 @@ fn pty_ready(state: &mut PtyState, ready: Readiness) -> Vec<NetEvent> {
     }
     if ready.write_closed && !state.writes.pending.is_empty() {
         while let Some(write) = state.writes.pending.pop_front() {
-            events.push(NetEvent::WriteComplete { id: write.id, result: Err(NetError::Closed) });
+            events.push(NetEvent::WriteComplete {
+                id: write.id,
+                result: Err(NetError::Closed),
+            });
         }
     }
     events
@@ -1459,21 +1665,21 @@ fn deliver_pty(
     uv_loop: &mut UvLoop,
     id: HandleId,
     token: Token,
-    state: Rc<RefCell<PtyState>>,
-    callback: CallbackCell,
+    state: &Rc<RefCell<PtyState>>,
+    callback: &CallbackCell,
     events: Vec<NetEvent>,
 ) {
     if !live(uv_loop, id) {
         return;
     }
-    if let Err(error) = sync_pty(uv_loop, id, token, &state) {
-        invoke(&callback, uv_loop, id, NetEvent::Error(error));
+    if let Err(error) = sync_pty(uv_loop, id, token, state) {
+        invoke(callback, uv_loop, id, NetEvent::Error(error));
     }
     for event in events {
         if !live(uv_loop, id) {
             break;
         }
-        invoke(&callback, uv_loop, id, event);
+        invoke(callback, uv_loop, id, event);
     }
 }
 
@@ -1484,7 +1690,10 @@ fn close_pty(uv_loop: &mut UvLoop, handle: &PtyHandle) -> crate::Result<()> {
     if state.registered {
         if let Some(fd) = state.fd.as_ref() {
             let raw = fd.as_raw_fd();
-            uv_loop.inner_mut().reactor().deregister(&mut SourceFd(&raw))?;
+            uv_loop
+                .inner_mut()
+                .reactor()
+                .deregister(&mut SourceFd(&raw))?;
         }
         state.registered = false;
     }
@@ -1511,9 +1720,7 @@ impl Handle for PtyHandle {
 
     fn close_with<F>(&self, uv_loop: &mut UvLoop, callback: F) -> crate::Result<()>
     where
-        F: FnOnce(&mut UvLoop, HandleId)
-                -> std::result::Result<(), crate::CallbackError>
-            + 'static,
+        F: FnOnce(&mut UvLoop, HandleId) -> std::result::Result<(), crate::CallbackError> + 'static,
     {
         close_pty(uv_loop, self)?;
         uv_loop.close(self.id, Some(callback))
@@ -1539,7 +1746,7 @@ fn build_pty_master(
 /// Spawns a child attached to a native pseudoterminal.
 ///
 /// `portable-pty` owns the platform-specific, safe child setup required for a
-/// controlling terminal on Unix and ConPTY on Windows. On Unix the returned
+/// controlling terminal on Unix and `ConPTY` on Windows. On Unix the returned
 /// master is a loop-managed [`PtyHandle`] that pumps through the owning loop;
 /// elsewhere it is the platform `MasterPty`. PTY stdio is necessarily the slave
 /// terminal, so `options.stdio` is ignored. PTY identity changes and detached
@@ -1548,6 +1755,12 @@ fn build_pty_master(
 ///
 /// PTY spawning extends the process semantics in `luvref.txt`, `uv.spawn()` /
 /// `uv.spawn-options` (lines 1340-1452).
+///
+/// # Errors
+///
+/// Returns an error if PTY-incompatible identity or detached options are set,
+/// the platform cannot open or spawn the PTY, the child PID is unavailable, the
+/// loop cannot allocate or wrap its handles, or the waiter thread cannot start.
 pub fn spawn_pty<F>(
     uv_loop: &mut UvLoop,
     options: SpawnOptions,
@@ -1557,13 +1770,23 @@ pub fn spawn_pty<F>(
 where
     F: FnOnce(&mut UvLoop, ProcessExitResult) + Send + 'static,
 {
-    if options.uid.is_some() || options.gid.is_some() {
+    let SpawnOptions {
+        program,
+        args,
+        environment,
+        cwd,
+        detached,
+        uid,
+        gid,
+        ..
+    } = options;
+    if uid.is_some() || gid.is_some() {
         return Err(ProcessError::Unsupported {
             feature: "PTY spawn uid/gid",
             reason: "portable-pty 0.9.0 does not expose safe child identity controls",
         });
     }
-    if options.detached {
+    if detached {
         return Err(ProcessError::Unsupported {
             feature: "detached PTY spawn",
             reason: "a PTY child must remain its controlling-terminal session leader",
@@ -1579,35 +1802,39 @@ where
         })
         .map_err(|error| ProcessError::io("open PTY", io::Error::other(error.to_string())))?;
 
-    let mut command = portable_pty::CommandBuilder::new(options.program.as_os_str());
-    command.args(&options.args);
-    if let Some(environment) = &options.environment {
+    let mut command = portable_pty::CommandBuilder::new(program.as_os_str());
+    command.args(&args);
+    if let Some(environment) = environment {
         command.env_clear();
-        for (name, value) in environment {
+        for (name, value) in &environment {
             command.env(name, value);
         }
     }
-    if let Some(cwd) = &options.cwd {
-        command.cwd(cwd.as_os_str());
-    }
-
-    let mut portable_child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| {
-            ProcessError::io("spawn PTY child", io::Error::other(error.to_string()))
-        })?;
-    let pid = match portable_child.process_id() {
-        Some(pid) => pid,
-        None => {
-            let _ = portable_child.kill();
-            let _ = portable_child.wait();
-            return Err(ProcessError::Unsupported {
-                feature: "PTY child PID",
-                reason: "the native portable-pty backend returned no process identifier",
-            });
-        }
+    let cwd = match cwd {
+        Some(cwd) => cwd,
+        None => std::env::current_dir()
+            .map_err(|error| ProcessError::io("resolve PTY child cwd", error))?,
     };
+    command.cwd(cwd.as_os_str());
+
+    let mut portable_child = pair.slave.spawn_command(command).map_err(|error| {
+        ProcessError::io("spawn PTY child", io::Error::other(error.to_string()))
+    })?;
+    let Some(pid) = portable_child.process_id() else {
+        let _ = portable_child.kill();
+        let _ = portable_child.wait();
+        return Err(ProcessError::Unsupported {
+            feature: "PTY child PID",
+            reason: "the native portable-pty backend returned no process identifier",
+        });
+    };
+    #[cfg(unix)]
+    let pty_slave = pair
+        .master
+        .tty_name()
+        .map(|path| path.to_string_lossy().into_owned());
+    #[cfg(not(unix))]
+    let pty_slave = None;
     drop(pair.slave);
 
     let child_state = ChildState::Portable(portable_child);
@@ -1620,7 +1847,11 @@ where
             return Err(error.into());
         }
     };
-    let process = Process { id: handle_id, pid, child: Arc::clone(&state) };
+    let process = Process {
+        id: handle_id,
+        pid,
+        child: Arc::clone(&state),
+    };
     let master = match build_pty_master(uv_loop, pair.master) {
         Ok(master) => master,
         Err(error) => {
@@ -1633,7 +1864,7 @@ where
 
     let waiter = std::thread::Builder::new()
         .name(format!("ox-uv-pty-{pid}"))
-        .spawn(move || wait_and_post(waiter_state, waiter_poster, handle_id, on_exit));
+        .spawn(move || wait_and_post(&waiter_state, &waiter_poster, handle_id, on_exit));
     if let Err(error) = waiter {
         let _ = process.close(uv_loop);
         return Err(ProcessError::io("start PTY waiter", error));
@@ -1642,6 +1873,7 @@ where
     Ok(SpawnedPty {
         process,
         master,
+        pty_slave,
     })
 }
 
@@ -1656,10 +1888,21 @@ fn map_stdio(config: StdioConfig) -> Result<Stdio, ProcessError> {
 
 #[cfg(unix)]
 fn duplicate_standard_descriptor(fd: u8) -> Result<Stdio, ProcessError> {
-    let duplicate = match fd {
-        0 => rustix::io::dup(std::io::stdin()),
-        1 => rustix::io::dup(std::io::stdout()),
-        2 => rustix::io::dup(std::io::stderr()),
+    Ok(Stdio::from(duplicate_standard_owned(fd)?))
+}
+
+/// Duplicates standard descriptor `fd` (0, 1, or 2) as an owned descriptor.
+///
+/// The duplicate is created with `F_DUPFD_CLOEXEC`, setting `FD_CLOEXEC`
+/// atomically so the parent-side copy cannot leak into children spawned
+/// later. Sharing the open file description preserves the access mode and
+/// status flags of the original.
+#[cfg(unix)]
+fn duplicate_standard_owned(fd: u8) -> Result<OwnedFd, ProcessError> {
+    match fd {
+        0 => rustix::io::fcntl_dupfd_cloexec(std::io::stdin(), 0),
+        1 => rustix::io::fcntl_dupfd_cloexec(std::io::stdout(), 0),
+        2 => rustix::io::fcntl_dupfd_cloexec(std::io::stderr(), 0),
         _ => {
             return Err(ProcessError::Unsupported {
                 feature: "inherit standard descriptor",
@@ -1667,8 +1910,7 @@ fn duplicate_standard_descriptor(fd: u8) -> Result<Stdio, ProcessError> {
             });
         }
     }
-    .map_err(|error| ProcessError::io("duplicate inherited descriptor", error))?;
-    Ok(Stdio::from(duplicate))
+    .map_err(|error| ProcessError::io("duplicate inherited descriptor", error))
 }
 
 #[cfg(not(unix))]
@@ -1679,14 +1921,14 @@ fn duplicate_standard_descriptor(_fd: u8) -> Result<Stdio, ProcessError> {
     })
 }
 
-#[cfg(unix)]
-fn validate_platform_options(_options: &SpawnOptions) -> Result<(), ProcessError> {
-    Ok(())
-}
-
 #[cfg(windows)]
-fn validate_platform_options(options: &SpawnOptions) -> Result<(), ProcessError> {
-    if options.uid.is_some() || options.gid.is_some() {
+fn validate_platform_options(
+    uid: Option<u32>,
+    gid: Option<u32>,
+    _detached: bool,
+    _hide: bool,
+) -> Result<(), ProcessError> {
+    if uid.is_some() || gid.is_some() {
         return Err(ProcessError::Unsupported {
             feature: "spawn uid/gid",
             reason: "Windows does not support Unix child identities",
@@ -1696,8 +1938,13 @@ fn validate_platform_options(options: &SpawnOptions) -> Result<(), ProcessError>
 }
 
 #[cfg(not(any(unix, windows)))]
-fn validate_platform_options(options: &SpawnOptions) -> Result<(), ProcessError> {
-    if options.uid.is_some() || options.gid.is_some() || options.detached || options.hide {
+fn validate_platform_options(
+    uid: Option<u32>,
+    gid: Option<u32>,
+    detached: bool,
+    hide: bool,
+) -> Result<(), ProcessError> {
+    if uid.is_some() || gid.is_some() || detached || hide {
         return Err(ProcessError::Unsupported {
             feature: "platform spawn options",
             reason: "uid, gid, detached, and hide are unavailable on this target",
@@ -1707,20 +1954,32 @@ fn validate_platform_options(options: &SpawnOptions) -> Result<(), ProcessError>
 }
 
 #[cfg(unix)]
-fn configure_platform_command(command: &mut Command, options: &SpawnOptions) {
-    if let Some(gid) = options.gid {
+fn configure_platform_command(
+    command: &mut Command,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    detached: bool,
+    _hide: bool,
+) {
+    if let Some(gid) = gid {
         command.gid(gid);
     }
-    if let Some(uid) = options.uid {
+    if let Some(uid) = uid {
         command.uid(uid);
     }
-    if options.detached {
+    if detached {
         command.process_group(0);
     }
 }
 
 #[cfg(windows)]
-fn configure_platform_command(command: &mut Command, options: &SpawnOptions) {
+fn configure_platform_command(
+    command: &mut Command,
+    _uid: Option<u32>,
+    _gid: Option<u32>,
+    detached: bool,
+    hide: bool,
+) {
     use std::os::windows::process::CommandExt as _;
 
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
@@ -1728,10 +1987,10 @@ fn configure_platform_command(command: &mut Command, options: &SpawnOptions) {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let mut flags = 0;
-    if options.detached {
+    if detached {
         flags |= CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS;
     }
-    if options.hide {
+    if hide {
         flags |= CREATE_NO_WINDOW;
     }
     if flags != 0 {
@@ -1740,11 +1999,18 @@ fn configure_platform_command(command: &mut Command, options: &SpawnOptions) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn configure_platform_command(_command: &mut Command, _options: &SpawnOptions) {}
+fn configure_platform_command(
+    _command: &mut Command,
+    _uid: Option<u32>,
+    _gid: Option<u32>,
+    _detached: bool,
+    _hide: bool,
+) {
+}
 
 fn wait_and_post<F>(
-    child: Arc<Mutex<ChildState>>,
-    poster: UvLoopPoster,
+    child: &Arc<Mutex<ChildState>>,
+    poster: &UvLoopPoster,
     handle_id: HandleId,
     on_exit: F,
 ) where
@@ -1752,9 +2018,11 @@ fn wait_and_post<F>(
 {
     loop {
         let result = {
-            let mut state = lock_recover(&child);
+            let mut state = lock_recover(child);
             let result = match &mut *state {
-                ChildState::Standard(child) => child.try_wait().map(|status| status.map(exit_values)),
+                ChildState::Standard(child) => {
+                    child.try_wait().map(|status| status.map(exit_values))
+                }
                 ChildState::Portable(child) => {
                     #[cfg(unix)]
                     {
@@ -1772,12 +2040,14 @@ fn wait_and_post<F>(
                             }
                             None => child
                                 .try_wait()
-                                .map(|status| status.map(portable_exit_values)),
+                                .map(|status| status.as_ref().map(portable_exit_values)),
                         }
                     }
                     #[cfg(not(unix))]
                     {
-                        child.try_wait().map(|status| status.map(portable_exit_values))
+                        child
+                            .try_wait()
+                            .map(|status| status.as_ref().map(portable_exit_values))
                     }
                 }
                 ChildState::Exited => return,
@@ -1851,8 +2121,7 @@ fn send_unix_signal(pid: u32, signal: Option<i32>) -> Result<(), ProcessError> {
     }
     let signal = rustix::process::Signal::from_named_raw(number)
         .ok_or(ProcessError::InvalidSignal(number))?;
-    rustix::process::kill_process(pid, signal)
-        .map_err(|error| ProcessError::io("kill", error))
+    rustix::process::kill_process(pid, signal).map_err(|error| ProcessError::io("kill", error))
 }
 
 #[cfg(unix)]
@@ -1886,7 +2155,7 @@ fn exit_values(status: ExitStatus) -> ProcessExit {
     }
 }
 
-fn portable_exit_values(status: portable_pty::ExitStatus) -> ProcessExit {
+fn portable_exit_values(status: &portable_pty::ExitStatus) -> ProcessExit {
     ProcessExit {
         code: i64::from(status.exit_code()),
         signal: 0,
@@ -1904,18 +2173,27 @@ mod transaction_tests {
         ids.len()
     }
 
-    fn spawn_child_with_pipes() -> (Option<ChildStdin>, Option<ChildStdout>, Option<ChildStderr>, std::process::Child) {
+    type SpawnChildWithPipesResult = Result<
+        (
+            Option<ChildStdin>,
+            Option<ChildStdout>,
+            Option<ChildStderr>,
+            std::process::Child,
+        ),
+        Box<dyn std::error::Error>,
+    >;
+
+    fn spawn_child_with_pipes() -> SpawnChildWithPipesResult {
         let mut child = Command::new("/bin/sleep")
             .arg("10")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn sleeper");
+            .spawn()?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        (stdin, stdout, stderr, child)
+        Ok((stdin, stdout, stderr, child))
     }
 
     fn reap_child(mut child: std::process::Child) {
@@ -1924,19 +2202,18 @@ mod transaction_tests {
     }
 
     #[test]
-    fn process_pipe_rolls_back_on_readiness_failure() {
-        let mut uv_loop = UvLoop::new().expect("create loop");
+    fn process_pipe_rolls_back_on_readiness_failure() -> Result<(), Box<dyn std::error::Error>> {
+        let mut uv_loop = UvLoop::new()?;
 
-        let (_, stdout, _, child) = spawn_child_with_pipes();
-        let stdout = stdout.expect("stdout pipe");
+        let (_, stdout, _, child) = spawn_child_with_pipes()?;
+        let stdout = stdout.ok_or("child stdout pipe was not created")?;
 
         // Steal a token and pre-register a callback at the next token so that
         // ProcessPipe::attach fails when it tries to install its readiness.
-        let token = uv_loop.allocate_io_token().expect("allocate token");
+        let token = uv_loop.allocate_io_token()?;
         uv_loop
             .inner_mut()
-            .on_readiness(Token(token.0 + 1), |_, _| Ok(DrainState::Drained))
-            .expect("pre-register dummy callback");
+            .on_readiness(Token(token.0 + 1), |_, _| Ok(DrainState::Drained))?;
 
         let baseline = count_handles(&mut uv_loop);
 
@@ -1950,54 +2227,59 @@ mod transaction_tests {
         assert_eq!(after, baseline, "rolled-back pipe handle must not remain");
 
         reap_child(child);
+        Ok(())
     }
 
     #[test]
-    fn build_process_pipes_rolls_back_siblings_on_failure() {
-        let mut uv_loop = UvLoop::new().expect("create loop");
+    fn build_process_pipes_rolls_back_siblings_on_failure() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut uv_loop = UvLoop::new()?;
 
-        let (stdin, stdout, stderr, child) = spawn_child_with_pipes();
+        let (stdin, stdout, stderr, child) = spawn_child_with_pipes()?;
 
         // Pre-register a callback at the token that the second pipe (stdout)
         // will try to consume, forcing a failure mid-construction.
-        let token = uv_loop.allocate_io_token().expect("allocate token");
+        let token = uv_loop.allocate_io_token()?;
         uv_loop
             .inner_mut()
-            .on_readiness(Token(token.0 + 2), |_, _| Ok(DrainState::Drained))
-            .expect("pre-register dummy callback");
+            .on_readiness(Token(token.0 + 2), |_, _| Ok(DrainState::Drained))?;
 
         let baseline = count_handles(&mut uv_loop);
 
-        let result = build_process_pipes(
-            &mut uv_loop,
-            stdin,
-            stdout,
-            stderr,
+        let result = build_process_pipes(&mut uv_loop, stdin, stdout, stderr);
+        assert!(
+            result.is_err(),
+            "build must fail when a sibling pipe cannot register"
         );
-        assert!(result.is_err(), "build must fail when a sibling pipe cannot register");
 
         let _ = uv_loop.run_nowait();
 
         let after = count_handles(&mut uv_loop);
-        assert_eq!(after, baseline, "all rolled-back pipe handles must be removed");
+        assert_eq!(
+            after, baseline,
+            "all rolled-back pipe handles must be removed"
+        );
 
         reap_child(child);
+        Ok(())
     }
 
     #[test]
-    fn pty_handle_rolls_back_on_readiness_failure() {
-        let mut uv_loop = UvLoop::new().expect("create loop");
+    fn pty_handle_rolls_back_on_readiness_failure() -> Result<(), Box<dyn std::error::Error>> {
+        let mut uv_loop = UvLoop::new()?;
 
-        let pair = portable_pty::native_pty_system()
-            .openpty(portable_pty::PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
-            .expect("open pty");
+        let pair = portable_pty::native_pty_system().openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
         drop(pair.slave);
 
-        let token = uv_loop.allocate_io_token().expect("allocate token");
+        let token = uv_loop.allocate_io_token()?;
         uv_loop
             .inner_mut()
-            .on_readiness(Token(token.0 + 1), |_, _| Ok(DrainState::Drained))
-            .expect("pre-register dummy callback");
+            .on_readiness(Token(token.0 + 1), |_, _| Ok(DrainState::Drained))?;
 
         let baseline = count_handles(&mut uv_loop);
 
@@ -2008,5 +2290,28 @@ mod transaction_tests {
 
         let after = count_handles(&mut uv_loop);
         assert_eq!(after, baseline, "rolled-back PTY handle must not remain");
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod standard_descriptor_tests {
+    use super::duplicate_standard_owned;
+    use rustix::io::{FdFlags, fcntl_getfd};
+
+    /// Duplicated standard descriptors must carry `FD_CLOEXEC` so the extra
+    /// parent-side copy cannot survive into children spawned later; a plain
+    /// `dup` copy leaks into every subsequent `exec`.
+    #[test]
+    fn duplicates_carry_cloexec() -> Result<(), Box<dyn std::error::Error>> {
+        for fd in 0..=2u8 {
+            let duplicate = duplicate_standard_owned(fd)?;
+            let flags = fcntl_getfd(&duplicate)?;
+            assert!(
+                flags.contains(FdFlags::CLOEXEC),
+                "duplicate of descriptor {fd} must set FD_CLOEXEC, got {flags:?}"
+            );
+        }
+        Ok(())
     }
 }

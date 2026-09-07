@@ -32,8 +32,8 @@
 use std::io::{Cursor, ErrorKind, Write};
 
 use ox_types::{
-    BufHandle, Dict, HandleError, Object, OxStr, TabHandle, WinHandle, EXT_TYPE_BUFFER,
-    EXT_TYPE_TABPAGE, EXT_TYPE_WINDOW,
+    BufHandle, Dict, EXT_TYPE_BUFFER, EXT_TYPE_TABPAGE, EXT_TYPE_WINDOW, HandleError, Object,
+    OxStr, TabHandle, WinHandle,
 };
 use rmp::encode::{write_array_len, write_map_len, write_str_len};
 use rmpv::{Integer, Value};
@@ -43,7 +43,7 @@ use crate::message::Message;
 /// An error produced while decoding msgpack into [`Object`] / [`Message`].
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
-    /// The byte stream is not valid MessagePack (reserved/invalid marker,
+    /// The byte stream is not valid `MessagePack` (reserved/invalid marker,
     /// depth-limit overrun, ...).
     #[error("malformed msgpack: {0}")]
     Malformed(String),
@@ -151,18 +151,18 @@ pub(crate) fn write_object<W: Write>(out: &mut W, obj: &Object) -> Result<(), rm
 /// writes: a single byte for `0..=0x7f` (fixext1), otherwise `mpack_uint`.
 fn handle_payload(handle: i64) -> Vec<u8> {
     // `handle` is always non-negative by construction: it comes from an
-    // `i64::from(&handle)` of a handle type that rejects negatives.
+    // `i64::from(&handle)` of a handle type that rejects negatives. Index the
+    // big-endian representation so every byte is extracted without a lossy
+    // narrowing cast; the four width branches mirror upstream mpack_uint.
+    let bytes = handle.to_be_bytes();
     if handle <= 0x7f {
-        vec![handle as u8]
+        vec![bytes[7]]
+    } else if handle <= 0xff {
+        vec![0xcc, bytes[7]]
+    } else if handle <= 0xffff {
+        vec![0xcd, bytes[6], bytes[7]]
     } else {
-        let h = handle as u32;
-        if h <= 0xff {
-            vec![0xcc, h as u8]
-        } else if h <= 0xffff {
-            vec![0xcd, (h >> 8) as u8, h as u8]
-        } else {
-            vec![0xce, (h >> 24) as u8, (h >> 16) as u8, (h >> 8) as u8, h as u8]
-        }
+        vec![0xce, bytes[4], bytes[5], bytes[6], bytes[7]]
     }
 }
 
@@ -173,7 +173,9 @@ pub fn object_from_value(value: Value) -> Result<Object, DecodeError> {
         Value::Boolean(b) => Ok(Object::Boolean(b)),
         Value::Integer(i) => match i.as_i64() {
             Some(n) => Ok(Object::Integer(n)),
-            None => Err(DecodeError::IntegerOutOfRange(i.as_u64().unwrap_or(u64::MAX))),
+            None => Err(DecodeError::IntegerOutOfRange(
+                i.as_u64().unwrap_or(u64::MAX),
+            )),
         },
         Value::F32(f) => Ok(Object::Float(f64::from(f))),
         Value::F64(f) => Ok(Object::Float(f)),
@@ -195,7 +197,7 @@ pub fn object_from_value(value: Value) -> Result<Object, DecodeError> {
                     other => {
                         return Err(DecodeError::Message(format!(
                             "dict key is not a string: {other:?}"
-                        )))
+                        )));
                     }
                 };
                 out.push((key, object_from_value(v)?));
@@ -208,9 +210,15 @@ pub fn object_from_value(value: Value) -> Result<Object, DecodeError> {
                 return Ok(Object::Nil);
             };
             match ext_type {
-                EXT_TYPE_BUFFER => BufHandle::try_from(handle).map(Object::Buffer).map_err(DecodeError::Handle),
-                EXT_TYPE_WINDOW => WinHandle::try_from(handle).map(Object::Window).map_err(DecodeError::Handle),
-                EXT_TYPE_TABPAGE => TabHandle::try_from(handle).map(Object::Tabpage).map_err(DecodeError::Handle),
+                EXT_TYPE_BUFFER => BufHandle::try_from(handle)
+                    .map(Object::Buffer)
+                    .map_err(DecodeError::Handle),
+                EXT_TYPE_WINDOW => WinHandle::try_from(handle)
+                    .map(Object::Window)
+                    .map_err(DecodeError::Handle),
+                EXT_TYPE_TABPAGE => TabHandle::try_from(handle)
+                    .map(Object::Tabpage)
+                    .map_err(DecodeError::Handle),
                 _ => Ok(Object::Nil),
             }
         }
@@ -224,9 +232,9 @@ fn ext_payload_uint(payload: &[u8]) -> Option<i64> {
         [b] => Some(i64::from(b)),
         [0xcc, low] => Some(i64::from(low)),
         [0xcd, hi, lo] => Some(i64::from(u16::from_be_bytes([hi, lo]))),
-        [0xce, a, b, c, d] => Some(i64::from(u32::from_be_bytes([a, b, c, d]))),
-        [0xcf, a, b, c, d, e, f, g, h] => {
-            i64::try_from(u64::from_be_bytes([a, b, c, d, e, f, g, h])).ok()
+        [0xce, b0, b1, b2, b3] => Some(i64::from(u32::from_be_bytes([b0, b1, b2, b3]))),
+        [0xcf, b0, b1, b2, b3, b4, b5, b6, b7] => {
+            i64::try_from(u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7])).ok()
         }
         _ => None,
     }
@@ -236,6 +244,7 @@ fn ext_payload_uint(payload: &[u8]) -> Option<i64> {
 ///
 /// Encoding into an in-memory `Vec<u8>` cannot fail; any `Result` from the
 /// generic writer is discarded and the buffer is returned regardless.
+#[must_use]
 pub fn encode(obj: &Object) -> Vec<u8> {
     let mut out = Vec::new();
     let _res = write_object(&mut out, obj);
@@ -247,6 +256,13 @@ pub fn encode(obj: &Object) -> Vec<u8> {
 /// Trailing bytes are left undecoded (callers feeding a stream should use
 /// [`IncrementalDecoder`]); this is a convenience for known-single-object
 /// payloads and tests.
+///
+/// # Errors
+///
+/// Returns [`DecodeError::Incomplete`] if `bytes` ends mid-value, or
+/// [`DecodeError::Malformed`] for any other msgpack decode failure. Errors from
+/// [`object_from_value`] (integer out of range, bad handle, bad dict key) are
+/// propagated unchanged.
 pub fn decode(bytes: &[u8]) -> Result<Object, DecodeError> {
     object_from_value(decode_one(bytes)?)
 }
@@ -290,18 +306,31 @@ impl IncrementalDecoder {
     /// A decoder with the default [`DEFAULT_DECODE_LIMIT`] staging cap.
     #[must_use]
     pub fn new() -> Self {
-        Self { buf: Vec::new(), limit: DEFAULT_DECODE_LIMIT }
+        Self {
+            buf: Vec::new(),
+            limit: DEFAULT_DECODE_LIMIT,
+        }
     }
 
     /// A decoder with a custom staging cap.
     #[must_use]
     pub fn with_limit(limit: usize) -> Self {
-        Self { buf: Vec::new(), limit }
+        Self {
+            buf: Vec::new(),
+            limit,
+        }
     }
 
     /// Feed a byte slice, decoding any complete messages it completes.
     ///
     /// On error the internal buffer is cleared so the decoder can be reused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::Oversized`] when buffered input exceeds the
+    /// configured limit without resolving a frame, [`DecodeError::Malformed`]
+    /// for unparseable input, and any [`DecodeError::Message`] shape error from
+    /// [`Message::from_value`].
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Message>, DecodeError> {
         if !bytes.is_empty() {
             self.buf.extend_from_slice(bytes);
@@ -315,7 +344,9 @@ impl IncrementalDecoder {
                 let mut cursor = Cursor::new(&self.buf[..]);
                 match rmpv::decode::read_value_with_max_depth(&mut cursor, MAX_MESSAGE_DEPTH) {
                     Ok(value) => {
-                        let consumed = cursor.position() as usize;
+                        let consumed = usize::try_from(cursor.position()).map_err(|_| {
+                            DecodeError::Malformed("cursor position overflow".into())
+                        })?;
                         self.buf.drain(..consumed);
                         out.push(Message::from_value(value)?);
                     }
@@ -446,8 +477,7 @@ mod tests {
             method: OxStr::from("nvim_get_mode"),
             params: vec![],
         };
-        let frames: Vec<u8> =
-            [m1.encode_bytes(), m2.encode_bytes()].concat();
+        let frames: Vec<u8> = [m1.encode_bytes(), m2.encode_bytes()].concat();
         for split in 0..=frames.len() {
             let mut dec = IncrementalDecoder::new();
             let mut got = dec.feed(&frames[..split]).unwrap();
@@ -462,17 +492,17 @@ mod tests {
         let mut dec = IncrementalDecoder::new();
         let mut counter = MsgidCounter::new();
         let a = Message::Request {
-            msgid: counter.next(),
+            msgid: counter.next_id(),
             method: OxStr::from("a"),
             params: vec![],
         };
         let b = Message::Request {
-            msgid: counter.next(),
+            msgid: counter.next_id(),
             method: OxStr::from("b"),
             params: vec![],
         };
         let c = Message::Request {
-            msgid: counter.next(),
+            msgid: counter.next_id(),
             method: OxStr::from("c"),
             params: vec![],
         };
@@ -499,7 +529,10 @@ mod tests {
         let _ = nested.pop();
 
         // Decoder is still usable afterwards.
-        let ok = Message::Notification { method: OxStr::from("t"), params: vec![] };
+        let ok = Message::Notification {
+            method: OxStr::from("t"),
+            params: vec![],
+        };
         assert_eq!(dec.feed(&ok.encode_bytes()).unwrap(), vec![ok]);
     }
 
@@ -510,9 +543,12 @@ mod tests {
         // Oversized error.
         let mut dec = IncrementalDecoder::with_limit(10);
         let mut input = vec![0xdb, 0x00, 0x00, 0x01, 0x2c]; // str32 len 300
-        input.extend(std::iter::repeat(b'a').take(11));
+        input.extend(std::iter::repeat_n(b'a', 11));
         let err = dec.feed(&input).unwrap_err();
-        assert!(matches!(err, DecodeError::Oversized { limit: 10 }), "{err:?}");
+        assert!(
+            matches!(err, DecodeError::Oversized { limit: 10 }),
+            "{err:?}"
+        );
         assert!(dec.is_empty());
     }
 

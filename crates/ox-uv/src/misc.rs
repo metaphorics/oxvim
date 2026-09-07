@@ -28,6 +28,11 @@ pub fn hrtime() -> u64 {
 }
 
 /// Returns Unix seconds and microseconds within the current second.
+///
+/// # Errors
+///
+/// Returns [`Error::ClockBeforeEpoch`] if the system wall clock reports a
+/// time before the Unix epoch.
 pub fn gettimeofday() -> Result<(u64, u32)> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -36,6 +41,7 @@ pub fn gettimeofday() -> Result<(u64, u32)> {
 }
 
 /// Returns the four fields documented by `uv.os_uname()`.
+#[must_use]
 pub fn os_uname() -> Uname {
     let value = rustix::system::uname();
     Uname {
@@ -47,27 +53,45 @@ pub fn os_uname() -> Uname {
 }
 
 /// Returns the current user's platform home directory.
+///
+/// # Errors
+///
+/// Returns [`Error::MissingEnvironment`] if the home directory cannot be
+/// determined from the `HOME` (Unix) or `USERPROFILE` (Windows) environment
+/// variable.
 #[allow(deprecated)]
 pub fn os_homedir() -> Result<PathBuf> {
     std::env::home_dir().ok_or(Error::MissingEnvironment(home_variable()))
 }
 
 /// Returns the platform temporary directory.
+#[must_use]
 pub fn os_tmpdir() -> PathBuf {
     std::env::temp_dir()
 }
 
 /// Returns the current process identifier.
+#[must_use]
 pub fn getpid() -> u32 {
     std::process::id()
 }
 
 /// Returns the current working directory.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] if the current working directory cannot be read
+/// (e.g. it has been removed or permissions are insufficient).
 pub fn cwd() -> Result<PathBuf> {
     Ok(std::env::current_dir()?)
 }
 
 /// Changes the process-wide current working directory.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] if the path does not exist or the process lacks
+/// permission to enter it.
 pub fn chdir(path: impl AsRef<Path>) -> Result<()> {
     std::env::set_current_dir(path)?;
     Ok(())
@@ -98,20 +122,26 @@ fn home_variable() -> &'static str {
 /// `runtime/doc/luvref.txt` (lines 329-349). There is no upstream libuv ABI
 /// being mirrored, so the ox-uv crate version is surfaced instead and the
 /// interpretation is documented here rather than implying a libuv release.
+#[must_use]
 pub fn version() -> u32 {
-    (0 << 16) | (1 << 8) | 0
+    1 << 8
 }
 
 /// The ox-uv engine version as a string, e.g. `"0.1.0"`.
 ///
 /// See `uv.version_string()` in `runtime/doc/luvref.txt` (lines 351-361).
 /// The string reports the ox-uv engine version rather than a libuv release.
+#[must_use]
 pub fn version_string() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
 /// Returns the path of the current executable. See `uv.exepath()` in
 /// `runtime/doc/luvref.txt` (lines 4034-4038).
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] if the current executable path cannot be determined.
 pub fn exepath() -> Result<PathBuf> {
     Ok(std::env::current_exe()?)
 }
@@ -137,6 +167,12 @@ pub struct Passwd {
 /// On Unix the entry matching the real user id is read from `/etc/passwd`; on
 /// Windows the username and home directory are reported and the remaining
 /// fields are `None`, matching `uv.os_get_passwd()`.
+///
+/// # Errors
+///
+/// Returns [`Error::MissingEnvironment`] if the home directory cannot be
+/// determined, or if the username is not available from `/etc/passwd` or the
+/// `USER` (Unix) / `USERNAME` (Windows) environment variable.
 pub fn os_get_passwd() -> Result<Passwd> {
     #[cfg(unix)]
     {
@@ -152,18 +188,21 @@ pub fn os_get_passwd() -> Result<Passwd> {
         if let Ok(passwd_file) = std::fs::read_to_string("/etc/passwd") {
             for line in passwd_file.lines() {
                 let fields: Vec<&str> = line.split(':').collect();
-                if fields.len() >= 7 {
-                    if let Ok(entry_uid) = fields[2].parse::<u32>() {
-                        if entry_uid == uid {
-                            passwd.username = fields[0].to_owned();
-                            passwd.gid = fields[3].parse::<u32>().ok();
-                            passwd.shell = if fields[6].is_empty() { None } else { Some(fields[6].to_owned()) };
-                            if !fields[5].is_empty() {
-                                passwd.homedir = fields[5].to_owned();
-                            }
-                            break;
-                        }
+                if fields.len() >= 7
+                    && let Ok(entry_uid) = fields[2].parse::<u32>()
+                    && entry_uid == uid
+                {
+                    fields[0].clone_into(&mut passwd.username);
+                    passwd.gid = fields[3].parse::<u32>().ok();
+                    passwd.shell = if fields[6].is_empty() {
+                        None
+                    } else {
+                        Some(fields[6].to_owned())
+                    };
+                    if !fields[5].is_empty() {
+                        fields[5].clone_into(&mut passwd.homedir);
                     }
+                    break;
                 }
             }
         }
@@ -194,18 +233,44 @@ pub fn os_get_passwd() -> Result<Passwd> {
 /// Sets an environment variable in the current process.
 ///
 /// See `uv.os_setenv()` in `runtime/doc/luvref.txt` (lines 4406-4417). Process
-/// environment mutation is centralized in the audited `ox-sys` boundary.
+/// environment mutation is centralized in the audited `ox-sys` boundary, and a
+/// refusal there (empty or NUL-bearing name, NUL in the value) surfaces as
+/// `EINVAL`, matching luv's `UV_EINVAL` failure.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] with [`InvalidInput`](std::io::ErrorKind::InvalidInput)
+/// if the name is empty, contains a NUL byte, or the value contains a NUL byte.
 pub fn os_setenv(name: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Result<()> {
-    ox_sys::set_env(name, value);
-    Ok(())
+    if ox_sys::set_env(name, value) {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "environment variable name or value is invalid",
+        )))
+    }
 }
 
 /// Unsets an environment variable in the current process.
 ///
-/// See `uv.os_unsetenv()` in `runtime/doc/luvref.txt` (lines 4419-4427).
+/// See `uv.os_unsetenv()` in `runtime/doc/luvref.txt` (lines 4419-4427). An
+/// unset of a name that is not set still succeeds, like upstream; only a name
+/// the platform refuses is an error.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] with [`InvalidInput`](std::io::ErrorKind::InvalidInput)
+/// if the name is empty or contains a NUL byte.
 pub fn os_unsetenv(name: impl AsRef<OsStr>) -> Result<()> {
-    ox_sys::unset_env(name);
-    Ok(())
+    if ox_sys::unset_env(name) {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "environment variable name is invalid",
+        )))
+    }
 }
 
 /// Resource-usage snapshot corresponding to `uv.getrusage()` in
@@ -248,6 +313,7 @@ pub struct Rusage {
 
 impl Rusage {
     /// Times as seconds and microseconds.
+    #[must_use]
     pub fn utime_sec(&self) -> (u64, u32) {
         self.utime
     }
@@ -259,6 +325,12 @@ impl Rusage {
 /// `/proc/self/status`, and `/proc/self/io`; fields the kernel does not
 /// expose there (integral sizes, swaps, IPC, signals) are zero, matching the
 /// partially-populated tables libuv documents on macOS/Windows.
+///
+/// # Errors
+///
+/// On Linux this always succeeds, returning zero for any fields whose source
+/// file is absent or unparseable. On other platforms returns
+/// [`Error::Unsupported`].
 pub fn getrusage() -> Result<Rusage> {
     #[cfg(target_os = "linux")]
     {
@@ -268,19 +340,37 @@ pub fn getrusage() -> Result<Rusage> {
         // utime is field 14, stime field 15 (1-indexed), 100 Hz clock ticks.
         if let Some(rest) = stat.split(')').nth(1) {
             let fields: Vec<&str> = rest.split_whitespace().collect();
-            let utime_ticks = fields.get(11).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-            let stime_ticks = fields.get(12).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            let utime_ticks = fields
+                .get(11)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let stime_ticks = fields
+                .get(12)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
             usage.utime = ticks_to_time(utime_ticks);
             usage.stime = ticks_to_time(stime_ticks);
         }
         let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
         for line in status.lines() {
             if line.starts_with("VmHWM:") {
-                usage.maxrss = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                usage.maxrss = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
             } else if line.starts_with("voluntary_ctxt_switches:") {
-                usage.nvcsw = line.split_whitespace().last().and_then(|v| v.parse().ok()).unwrap_or(0);
+                usage.nvcsw = line
+                    .split_whitespace()
+                    .last()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
             } else if line.starts_with("nonvoluntary_ctxt_switches:") {
-                usage.nivcsw = line.split_whitespace().last().and_then(|v| v.parse().ok()).unwrap_or(0);
+                usage.nivcsw = line
+                    .split_whitespace()
+                    .last()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
             }
         }
         if let Ok(io) = std::fs::read_to_string("/proc/self/io") {
@@ -308,20 +398,31 @@ pub fn getrusage() -> Result<Rusage> {
 fn ticks_to_time(ticks: u64) -> (u64, u32) {
     const HZ_MS: u64 = 10; // 100 Hz -> 10 ms per tick
     let milliseconds = ticks * HZ_MS;
-    (milliseconds / 1000, ((milliseconds % 1000) * 1000) as u32)
+    let subsec_micros = u32::try_from((milliseconds % 1000) * 1000).unwrap_or(u32::MAX);
+    (milliseconds / 1000, subsec_micros)
 }
 
 /// Returns the resident set size (RSS) in bytes for the current process.
 ///
 /// See `uv.resident_set_memory()` in `runtime/doc/luvref.txt`
 /// (lines 4102-4106). Reads `VmRSS` (kB) from `/proc/self/status` on Linux.
+///
+/// # Errors
+///
+/// On Linux returns [`Error::Io`] if `/proc/self/status` cannot be read, the
+/// `VmRSS` line is missing, or its value is unparseable. On other platforms
+/// returns [`Error::Unsupported`].
 pub fn resident_set_memory() -> Result<u64> {
     #[cfg(target_os = "linux")]
     {
         let status = std::fs::read_to_string("/proc/self/status")?;
         for line in status.lines() {
             if let Some(value) = line.strip_prefix("VmRSS:") {
-                let kb: u64 = value.split_whitespace().next().and_then(|v| v.parse().ok()).ok_or(Error::Io(io_error("unparseable VmRSS")))?;
+                let kb: u64 = value
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .ok_or(Error::Io(io_error("unparseable VmRSS")))?;
                 return Ok(kb.saturating_mul(1024));
             }
         }
@@ -341,8 +442,9 @@ pub fn resident_set_memory() -> Result<u64> {
 ///
 /// See `uv.get_total_memory()` in `runtime/doc/luvref.txt` (lines 4070-4074).
 /// Reads `MemTotal` (kB) from `/proc/meminfo` on Linux.
+#[must_use]
 pub fn get_total_memory() -> u64 {
-    meminfo_kb("MemTotal") .saturating_mul(1024)
+    meminfo_kb("MemTotal").saturating_mul(1024)
 }
 
 /// Returns the current free system memory in bytes.
@@ -350,6 +452,7 @@ pub fn get_total_memory() -> u64 {
 /// See `uv.get_free_memory()` in `runtime/doc/luvref.txt` (lines 4076-4080).
 /// Reads `MemAvailable` (kB) from `/proc/meminfo` on Linux, falling back to
 /// `MemFree`.
+#[must_use]
 pub fn get_free_memory() -> u64 {
     meminfo_kb("MemAvailable").saturating_mul(1024)
 }
@@ -360,6 +463,7 @@ pub fn get_free_memory() -> u64 {
 /// See `uv.get_constrained_memory()` in `runtime/doc/luvref.txt`
 /// (lines 4082-4090). On Linux this reads the cgroup v2 `memory.max` or cgroup
 /// v1 `memory.limit_in_bytes` limit.
+#[must_use]
 pub fn get_constrained_memory() -> u64 {
     #[cfg(target_os = "linux")]
     {
@@ -377,6 +481,7 @@ pub fn get_constrained_memory() -> u64 {
 ///
 /// See `uv.get_available_memory()` in `runtime/doc/luvref.txt`
 /// (lines 4092-4100).
+#[must_use]
 pub fn get_available_memory() -> u64 {
     let free = get_free_memory();
     let constrained = get_constrained_memory();
@@ -390,21 +495,22 @@ pub fn get_available_memory() -> u64 {
 /// Reads a `kb` value from `/proc/meminfo`, returning zero when absent.
 #[cfg(target_os = "linux")]
 fn meminfo_kb(key: &str) -> u64 {
-    std::fs::read_to_string("/proc/meminfo")
-        .map(|info| {
-            info.lines()
-                .find_map(|line| {
-                    let trimmed = line.trim_start();
-                    if let Some(rest) = trimmed.strip_prefix(key) {
-                        let value = rest.trim_start_matches(':').trim_start();
-                        value.split_whitespace().next().and_then(|v| v.parse::<u64>().ok())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0)
-        })
-        .unwrap_or(0)
+    std::fs::read_to_string("/proc/meminfo").map_or(0, |info| {
+        info.lines()
+            .find_map(|line| {
+                let trimmed = line.trim_start();
+                if let Some(rest) = trimmed.strip_prefix(key) {
+                    let value = rest.trim_start_matches(':').trim_start();
+                    value
+                        .split_whitespace()
+                        .next()
+                        .and_then(|v| v.parse::<u64>().ok())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
+    })
 }
 
 /// Reads the process cgroup memory limit on Linux.
@@ -421,15 +527,16 @@ fn cgroup_memory_limit() -> Option<u64> {
             let path = line.rsplit(':').next()?;
             let rel = path.trim_start_matches('/');
             if !rel.is_empty() {
-                if let Ok(max) = std::fs::read_to_string(format!("/sys/fs/cgroup/{rel}/memory.max")) {
-                    if let Ok(bytes) = max.trim().parse::<u64>() {
-                        return Some(bytes);
-                    }
+                if let Ok(max) = std::fs::read_to_string(format!("/sys/fs/cgroup/{rel}/memory.max"))
+                    && let Ok(bytes) = max.trim().parse::<u64>()
+                {
+                    return Some(bytes);
                 }
-                if let Ok(limit) = std::fs::read_to_string(format!("/sys/fs/cgroup/{rel}/memory.limit_in_bytes")) {
-                    if let Ok(bytes) = limit.trim().parse::<u64>() {
-                        return Some(bytes);
-                    }
+                if let Ok(limit) =
+                    std::fs::read_to_string(format!("/sys/fs/cgroup/{rel}/memory.limit_in_bytes"))
+                    && let Ok(bytes) = limit.trim().parse::<u64>()
+                {
+                    return Some(bytes);
                 }
             }
         }
@@ -439,18 +546,17 @@ fn cgroup_memory_limit() -> Option<u64> {
 
 /// Returns the system load average as a triad. See `uv.loadavg()` in
 /// `runtime/doc/luvref.txt` (lines 4367-4371). Reads `/proc/loadavg` on Linux.
+#[must_use]
 pub fn loadavg() -> (f64, f64, f64) {
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_to_string("/proc/loadavg")
-            .map(|content| {
-                let parts: Vec<&str> = content.split_whitespace().collect();
-                let one = parts.first().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-                let five = parts.get(1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
-                let fifteen = parts.get(2).and_then(|v| v.parse().ok()).unwrap_or(0.0);
-                (one, five, fifteen)
-            })
-            .unwrap_or((0.0, 0.0, 0.0))
+        std::fs::read_to_string("/proc/loadavg").map_or((0.0, 0.0, 0.0), |content| {
+            let parts: Vec<&str> = content.split_whitespace().collect();
+            let one = parts.first().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            let five = parts.get(1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            let fifteen = parts.get(2).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            (one, five, fifteen)
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -461,6 +567,11 @@ pub fn loadavg() -> (f64, f64, f64) {
 
 /// Returns the system uptime in seconds. See `uv.uptime()` in
 /// `runtime/doc/luvref.txt` (lines 4279-4283). Reads `/proc/uptime` on Linux.
+///
+/// # Errors
+///
+/// On Linux returns [`Error::Io`] if `/proc/uptime` cannot be read or is
+/// unparseable. On other platforms returns [`Error::Unsupported`].
 pub fn uptime() -> Result<f64> {
     #[cfg(target_os = "linux")]
     {
@@ -514,7 +625,12 @@ pub struct CpuInfo {
 /// Returns information about the CPU(s) on the system.
 ///
 /// On Linux the model/speed come from `/proc/cpuinfo` and the times from
-/// `/proc/stat` (10 ms per USER_HZ tick). See `uv.cpu_info()`.
+/// `/proc/stat` (10 ms per `USER_HZ` tick). See `uv.cpu_info()`.
+///
+/// # Errors
+///
+/// On Linux returns [`Error::Io`] if `/proc/stat` cannot be read or contains
+/// no CPU lines. On other platforms returns [`Error::Unsupported`].
 pub fn cpu_info() -> Result<Vec<CpuInfo>> {
     #[cfg(target_os = "linux")]
     {
@@ -523,26 +639,29 @@ pub fn cpu_info() -> Result<Vec<CpuInfo>> {
         let mut cpus = Vec::new();
         for line in stat.lines() {
             let mut parts = line.split_whitespace();
-            if let Some(header) = parts.next() {
-                if let Some(index) = header.strip_prefix("cpu") {
-                    if index.is_empty() || !index.chars().all(|c| c.is_ascii_digit()) {
-                        continue;
-                    }
-                    let values: Vec<u64> = parts.filter_map(|v| v.parse().ok()).collect();
-                    let get = |i: usize| values.get(i).copied().unwrap_or(0);
-                    let ticks = |i: usize| get(i).saturating_mul(10);
-                    cpus.push(CpuInfo {
-                        model: models.get(index.parse::<usize>().unwrap_or(0)).cloned().unwrap_or_default(),
-                        speed: 0.0,
-                        times: CpuTimes {
-                            user: ticks(0),
-                            nice: ticks(1),
-                            sys: ticks(2),
-                            idle: ticks(3),
-                            irq: ticks(5),
-                        },
-                    });
+            if let Some(header) = parts.next()
+                && let Some(index) = header.strip_prefix("cpu")
+            {
+                if index.is_empty() || !index.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
                 }
+                let values: Vec<u64> = parts.filter_map(|v| v.parse().ok()).collect();
+                let get = |i: usize| values.get(i).copied().unwrap_or(0);
+                let ticks = |i: usize| get(i).saturating_mul(10);
+                cpus.push(CpuInfo {
+                    model: models
+                        .get(index.parse::<usize>().unwrap_or(0))
+                        .cloned()
+                        .unwrap_or_default(),
+                    speed: 0.0,
+                    times: CpuTimes {
+                        user: ticks(0),
+                        nice: ticks(1),
+                        sys: ticks(2),
+                        idle: ticks(3),
+                        irq: ticks(5),
+                    },
+                });
             }
         }
         if cpus.is_empty() {
@@ -577,7 +696,11 @@ fn cpuinfo_models() -> Vec<String> {
                     continue;
                 }
                 if let Some(model) = trimmed.strip_prefix("model name") {
-                    let section = model.split(':').nth(1).map(|v| v.trim().to_owned()).unwrap_or_default();
+                    let section = model
+                        .split(':')
+                        .nth(1)
+                        .map(|v| v.trim().to_owned())
+                        .unwrap_or_default();
                     if !section.is_empty() {
                         current = section;
                     }
@@ -592,7 +715,7 @@ fn cpuinfo_models() -> Vec<String> {
 }
 
 fn io_error(message: &'static str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, message)
+    std::io::Error::other(message)
 }
 
 /// Prints all handles associated with the loop to stderr in the luvref
@@ -605,11 +728,17 @@ pub fn print_all_handles(uv_loop: &mut UvLoop) {
     let mut ids: Vec<HandleId> = Vec::new();
     uv_loop.walk(|_, id| ids.push(id));
     for id in ids {
-        let Some(state) = uv_loop.state(id) else { continue };
+        let Some(state) = uv_loop.state(id) else {
+            continue;
+        };
         let mut flags = String::new();
-        if state.referenced { flags.push('R'); }
+        if state.referenced {
+            flags.push('R');
+        }
         let active = state.is_active();
-        if active { flags.push('A'); }
+        if active {
+            flags.push('A');
+        }
         eprintln!("[{}] {} handle-{:?}", flags, state.kind.name(), id);
     }
 }
@@ -622,8 +751,12 @@ pub fn print_active_handles(uv_loop: &mut UvLoop) {
     let mut ids: Vec<HandleId> = Vec::new();
     uv_loop.walk(|_, id| ids.push(id));
     for id in ids {
-        let Some(state) = uv_loop.state(id) else { continue };
-        if !state.is_active() { continue; }
+        let Some(state) = uv_loop.state(id) else {
+            continue;
+        };
+        if !state.is_active() {
+            continue;
+        }
         eprintln!("[A] {} handle-{:?}", state.kind.name(), id);
     }
 }

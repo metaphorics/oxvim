@@ -1,4 +1,4 @@
-//! Stress regression for the LuaRef / auxiliary-stack lifecycle.
+//! Stress regression for the `LuaRef` / auxiliary-stack lifecycle.
 //!
 //! mlua pins every Rust-held Lua value in one auxiliary thread whose stack
 //! caps near 8000 slots; retaining one handle per event exhausts it with
@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 use mlua::{Function, Lua, Value};
 use ox_lua::{
-    free_lua_ref, lua_to_object, object_to_lua, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work,
+    BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work, free_lua_ref, lua_to_object, object_to_lua,
 };
 use ox_types::{Object, OxStr, Typval};
 
@@ -49,7 +49,9 @@ impl BuiltinHost for FakeBuiltins {
 }
 
 fn host() -> (LuaHost, Rc<FakeScheduler>) {
-    let scheduler = Rc::new(FakeScheduler { queue: RefCell::new(VecDeque::new()) });
+    let scheduler = Rc::new(FakeScheduler {
+        queue: RefCell::new(VecDeque::new()),
+    });
     let root = RuntimeRoot::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime"));
     let host = LuaHost::new(root, Rc::new(FakeBuiltins), scheduler.clone()).expect("host");
     (host, scheduler)
@@ -118,7 +120,10 @@ fn exec_results_stay_bounded_when_caller_releases_refs() {
     let mut baseline = None;
     for cycle in 0..CYCLES {
         let result = host
-            .exec("local t = {1, 2, 3}; return function() return t end", vec![])
+            .exec(
+                "local t = {1, 2, 3}; return function() return t end",
+                vec![],
+            )
             .expect("exec cycle");
         // Server-shaped ownership: the reply encoder consumes the result and
         // releases every LuaRef it contains (ox-rpc encodes `<Lua N>` text).
@@ -167,11 +172,21 @@ fn uv_timer_and_pipe_callback_cycles_stay_bounded() {
 }
 
 #[test]
+#[expect(
+    clippy::panic,
+    reason = "asserts the LuaRef lifecycle round-trip yields the expected Object variant"
+)]
 fn freed_lua_refs_recycle_slots_and_fail_to_reload() {
     let (host, _) = host();
     let lua = host.lua();
-    let first: Function = lua.load("return function(x) return x + 1 end").eval().unwrap();
-    let second: Function = lua.load("return function(x) return x + 2 end").eval().unwrap();
+    let first: Function = lua
+        .load("return function(x) return x + 1 end")
+        .eval()
+        .unwrap();
+    let second: Function = lua
+        .load("return function(x) return x + 2 end")
+        .eval()
+        .unwrap();
     let a = match lua_to_object(lua, &Value::Function(first)).unwrap() {
         Object::LuaRef(reference) => reference,
         other => panic!("expected LuaRef, got {other:?}"),
@@ -195,7 +210,10 @@ fn freed_lua_refs_recycle_slots_and_fail_to_reload() {
     assert!(object_to_lua(lua, &Object::LuaRef(a)).is_err());
 
     // The freed slot is recycled by the next store instead of growing.
-    let third: Function = lua.load("return function(x) return x + 3 end").eval().unwrap();
+    let third: Function = lua
+        .load("return function(x) return x + 3 end")
+        .eval()
+        .unwrap();
     let c = match lua_to_object(lua, &Value::Function(third)).unwrap() {
         Object::LuaRef(reference) => reference,
         other => panic!("expected LuaRef, got {other:?}"),
@@ -215,7 +233,7 @@ fn freed_lua_refs_recycle_slots_and_fail_to_reload() {
     assert_eq!(kept.call::<i64>(1).unwrap(), 3);
 }
 
-/// Collect every LuaRef id in an object graph.
+/// Collect every `LuaRef` id in an object graph.
 fn object_refs(object: &Object) -> Vec<i32> {
     let mut refs = Vec::new();
     collect_refs(object, &mut refs);

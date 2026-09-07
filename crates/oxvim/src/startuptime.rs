@@ -29,7 +29,11 @@ impl StartupTimer {
     #[must_use]
     pub fn start() -> Self {
         let origin = Instant::now();
-        let mut timer = Self { origin, marks: [("", origin); MAX_MARKS], count: 0 };
+        let mut timer = Self {
+            origin,
+            marks: [("", origin); MAX_MARKS],
+            count: 0,
+        };
         timer.mark("--- OXVIM STARTING ---");
         timer
     }
@@ -47,7 +51,10 @@ impl StartupTimer {
     pub fn finish(mut self, path: &str) -> io::Result<()> {
         self.mark("--- OXVIM STARTED ---");
         let mut file = io::BufWriter::new(fs::File::create(path)?);
-        writeln!(file, "--- Startup times for process: Primary (or UI client) ---")?;
+        writeln!(
+            file,
+            "--- Startup times for process: Primary (or UI client) ---"
+        )?;
         writeln!(file)?;
         writeln!(file, "times in msec")?;
         writeln!(file, " clock   self+sourced   self:  sourced script")?;
@@ -69,6 +76,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(clippy::unwrap_used, clippy::panic)]
     fn log_carries_the_header_and_every_mark_in_order() {
         let path =
             std::env::temp_dir().join(format!("oxvim-startuptime-{}.log", std::process::id()));
@@ -106,7 +114,11 @@ mod tests {
         let mut last = -1.0_f64;
         for line in &mark_lines {
             let mut columns = line.split_whitespace();
-            let clock = columns.next().unwrap().parse::<f64>().unwrap_or_else(|_| panic!("{line}"));
+            let clock = columns
+                .next()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap_or_else(|_| panic!("{line}"));
             let delta = columns
                 .next()
                 .unwrap()

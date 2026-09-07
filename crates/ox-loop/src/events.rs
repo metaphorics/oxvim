@@ -54,6 +54,7 @@ impl Default for MultiQueue {
 
 impl MultiQueue {
     /// Creates a root queue with no children.
+    #[must_use]
     pub fn new() -> Self {
         let root = Owner(0);
         let mut queues = HashMap::new();
@@ -75,11 +76,17 @@ impl MultiQueue {
     }
 
     /// Returns the root owner.
+    #[must_use]
     pub fn root(&self) -> Owner {
         self.root
     }
 
     /// Creates an empty queue owned by `parent`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnknownOwner`] if `parent` does not identify an
+    /// existing queue.
     pub fn child(&mut self, parent: Owner) -> Result<Owner> {
         if !self.queues.contains_key(&parent) {
             return Err(Error::UnknownOwner(parent));
@@ -97,6 +104,11 @@ impl MultiQueue {
     }
 
     /// Enqueues an event and mirrors its position into every ancestor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnknownOwner`] if `owner` does not identify an
+    /// existing queue.
     pub fn put(&mut self, owner: Owner, event: Event) -> Result<()> {
         if !self.queues.contains_key(&owner) {
             return Err(Error::UnknownOwner(owner));
@@ -122,6 +134,11 @@ impl MultiQueue {
     }
 
     /// Drains only events owned by `owner` or one of its descendants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnknownOwner`] if `owner` does not identify an
+    /// existing queue.
     pub fn process_events(&mut self, owner: Owner) -> Result<Vec<Event>> {
         if !self.queues.contains_key(&owner) {
             return Err(Error::UnknownOwner(owner));
@@ -161,6 +178,12 @@ impl MultiQueue {
     }
 
     /// Removes a child owner, all descendants, and their pending events.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RootOwnerRemoval`] if `owner` is the root (the root
+    /// queue can never be removed) and [`Error::UnknownOwner`] if `owner`
+    /// does not identify an existing queue.
     pub fn remove_owner(&mut self, owner: Owner) -> Result<()> {
         if owner == self.root {
             return Err(Error::RootOwnerRemoval);
@@ -187,7 +210,9 @@ impl MultiQueue {
             self.origins.remove(event_id);
         }
         for queue in self.queues.values_mut() {
-            queue.entries.retain(|event_id| !removed_events.contains(event_id));
+            queue
+                .entries
+                .retain(|event_id| !removed_events.contains(event_id));
         }
         self.queues
             .retain(|candidate, _| !removed_owners.contains(candidate));
@@ -195,6 +220,11 @@ impl MultiQueue {
     }
 
     /// Reports whether an owner has no pending events.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnknownOwner`] if `owner` does not identify an
+    /// existing queue.
     pub fn is_empty(&self, owner: Owner) -> Result<bool> {
         self.queues
             .get(&owner)
@@ -203,6 +233,11 @@ impl MultiQueue {
     }
 
     /// Returns the count of pending events visible to an owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnknownOwner`] if `owner` does not identify an
+    /// existing queue.
     pub fn len(&self, owner: Owner) -> Result<usize> {
         self.queues
             .get(&owner)

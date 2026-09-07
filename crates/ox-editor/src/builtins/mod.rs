@@ -8,20 +8,27 @@
 
 pub(crate) mod assert;
 pub(crate) mod buffer;
+pub(crate) mod completion;
 pub(crate) mod environment;
 pub(crate) mod eval;
 pub(crate) mod filesystem;
 pub(crate) mod fold;
 pub(crate) mod input;
 pub(crate) mod mapping;
+pub(crate) mod matches;
 pub(crate) mod position;
 pub(crate) mod process;
+pub(crate) mod quickfix;
+pub(crate) mod register;
+pub(crate) mod search;
+pub(crate) mod server;
+pub(crate) mod tag;
 pub(crate) mod window;
 
-use ox_eval::{is_buffer_builtin, EvalError, Scope};
+use ox_eval::{EvalError, Scope, is_buffer_builtin};
 use ox_types::{OxStr, Special, Typval};
 
-use crate::excmd_exec::EvalHost;
+use crate::excmd_exec::{EvalHost, ExEditorAccess};
 use crate::script::FileIO;
 
 /// One family of editor-stateful builtins.
@@ -51,34 +58,65 @@ pub(crate) enum Family {
     Process,
     /// Window geometry, window identity, screen cells.
     Window,
+    /// Buffer search from the cursor.
+    Search,
+    /// Quickfix list queries, served by [`crate::quickfix`].
+    Quickfix,
+    /// Register reads and writes, served by [`register`].
+    Register,
+    /// Insert-completion and `getcompletion`, served by [`completion`].
+    Completion,
+    /// Match highlighting, served by [`matches`].
+    Match,
+    /// Tags-file queries, served by [`tag`].
+    Tag,
+    /// The listening-RPC server, served by [`server`].
+    Server,
 }
 
 /// Maps a builtin name to the family that serves it, or `None` when the name
 /// needs no editor state and the typval-only dispatcher owns it.
 pub(crate) fn route(name: &str) -> Option<Family> {
     let family = match name {
-        "assert_equal" | "assert_equalfile" | "assert_exception" | "assert_fails"
-        | "assert_false" | "assert_inrange" | "assert_match" | "assert_notequal"
-        | "assert_notmatch" | "assert_report" | "assert_true" => Family::Assert,
-        "append" | "bufexists" | "bufname" | "bufnr" | "changenr" | "getbufvar"
-        | "last_buffer_nr" | "prompt_getprompt" | "prompt_setprompt" | "setbufvar"
-        | "undotree" => Family::Buffer,
-        "chdir" | "eventhandler" | "highlight_exists" | "hlexists" | "shellescape" | "stdpath"
-        | "strdisplaywidth" | "strftime" => Family::Environment,
+        "assert_beeps" | "assert_nobeep" | "assert_equal" | "assert_equalfile"
+        | "assert_exception" | "assert_fails" | "assert_false" | "assert_inrange"
+        | "assert_match" | "assert_notequal" | "assert_notmatch" | "assert_report"
+        | "assert_true" => Family::Assert,
+        "append" | "appendbufline" | "bufadd" | "bufexists" | "bufload" | "bufname" | "bufnr"
+        | "changenr" | "deletebufline" | "getbufinfo" | "getbufline" | "getbufvar"
+        | "getchangelist" | "last_buffer_nr" | "prompt_getprompt" | "prompt_setprompt"
+        | "setbufline" | "setbufvar" | "undotree" => Family::Buffer,
+        "api_info" | "chdir" | "defer" | "eventhandler" | "highlight_exists" | "hlID"
+        | "hlexists" | "shellescape" | "stdpath" | "strdisplaywidth" | "strftime" | "mode"
+        | "swapname" => Family::Environment,
         "eval" | "execute" | "exists" | "expand" | "feedkeys" | "fullcommand" | "funcref"
         | "function" | "luaeval" | "submatch" => Family::Eval,
         "swapfilelist" => Family::FileSystem,
         "foldclosed" | "foldclosedend" | "foldlevel" => Family::Fold,
-        "getchar" | "getcharstr" | "input" | "inputdialog" | "inputlist" => Family::Input,
-        "maparg" => Family::Mapping,
-        "charcol" | "col" | "cursor" | "getcharpos" | "getcurpos" | "getcursorcharpos"
-        | "getpos" | "line" | "setcharpos" | "setcursorcharpos" | "setpos" | "virtcol" => {
-            Family::Position
+        "confirm" | "getchar" | "getcharstr" | "input" | "inputdialog" | "inputlist" => {
+            Family::Input
         }
+        "maparg" | "mapcheck" | "hasmapto" => Family::Mapping,
+        "charcol" | "col" | "cursor" | "getcharpos" | "getcurpos" | "getcursorcharpos"
+        | "getpos" | "getregion" | "getregionpos" | "line" | "line2byte" | "setcharpos"
+        | "setcursorcharpos" | "setpos" | "virtcol" => Family::Position,
         "chansend" | "jobpid" | "jobsend" | "jobstart" | "jobstop" | "jobwait" | "system"
         | "systemlist" => Family::Process,
-        "screenattr" | "screenchar" | "screenchars" | "screenstring" | "tabpagenr" | "win_getid"
-        | "winheight" | "winnr" | "winwidth" => Family::Window,
+        "search" | "searchpair" | "searchpairpos" | "searchcount" => Family::Search,
+        "getqflist" | "setqflist" | "getloclist" | "setloclist" => Family::Quickfix,
+        "screenattr" | "screenchar" | "screenchars" | "screenstring" | "screencol" | "bufwinid"
+        | "bufwinnr" | "screenrow" | "tabpagenr" | "tabpagewinnr" | "win_getid" | "win_gotoid"
+        | "winbufnr" | "winheight" | "winnr" | "winwidth" | "winsaveview" | "winrestview"
+        | "winline" | "wincol" | "getwinvar" | "setwinvar" | "winlayout" | "getwininfo" => {
+            Family::Window
+        }
+
+        "getreg" | "getregtype" | "setreg" | "getreginfo" => Family::Register,
+        "complete" | "complete_info" | "getcompletion" => Family::Completion,
+        "matchadd" | "matchaddpos" | "matchdelete" | "clearmatches" | "getmatches"
+        | "setmatches" | "matcharg" => Family::Match,
+        "taglist" | "gettagstack" | "settagstack" => Family::Tag,
+        "serverstart" | "serverstop" | "serverlist" => Family::Server,
         _ => return predicate_family(name),
     };
     Some(family)
@@ -99,15 +137,17 @@ fn predicate_family(name: &str) -> Option<Family> {
 }
 
 /// Serves `name` from the family [`route`] chose for it.
-pub(crate) fn call<F: FileIO>(
-    host: &mut EvalHost<'_, F>,
+pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
     family: Family,
     name: &str,
-    args: Vec<Typval>,
+    args: &[Typval],
     scope: &mut Scope,
 ) -> ox_eval::Result<Typval> {
     match family {
-        Family::ArgList => crate::arglist::call(host.editor, name, args),
+        Family::ArgList => host
+            .access
+            .with_ex_editor(|editor| crate::arglist::call(editor, name, args)),
         Family::Assert => assert::call(host, name, args, scope),
         Family::Buffer => buffer::call(host, name, args, scope),
         Family::Environment => environment::call(host, name, args),
@@ -118,6 +158,19 @@ pub(crate) fn call<F: FileIO>(
         Family::Mapping => mapping::call(host, name, args, scope),
         Family::Position => position::call(host, name, args),
         Family::Process => process::call(host, name, args, scope),
+        Family::Search => search::call(host, name, args, scope),
+        Family::Quickfix => host
+            .access
+            .with_ex_editor(|editor| crate::quickfix::call(editor, name, args)),
+        Family::Register => register::call(host, name, args, scope),
+        Family::Completion => host
+            .access
+            .with_ex_editor(|editor| completion::call(editor, name, args)),
+        Family::Server => server::call(host, name, args, scope),
+        Family::Match => host
+            .access
+            .with_ex_editor(|editor| matches::call(editor, name, args)),
+        Family::Tag => tag::call(host, name, args),
         Family::Window => window::call(host, name, args),
     }
 }

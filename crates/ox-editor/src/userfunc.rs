@@ -4,11 +4,13 @@
 //! so command/control state has one owner. This module owns names, definition
 //! flags, argument binding, local scopes, and `maxfuncdepth` enforcement.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::rc::Rc;
 
-use ox_eval::scope::ScopeMap;
 use ox_eval::Scope;
+use ox_eval::scope::ScopeMap;
 use ox_types::{OxStr, Typval};
 
 use crate::script::{Sid, SourceContext};
@@ -16,17 +18,34 @@ use crate::script::{Sid, SourceContext};
 /// Upstream's default `'maxfuncdepth'`.
 pub const MAX_FUNC_DEPTH: usize = 100;
 
-/// Flags accepted after a `:function` signature.
+/// Independently combinable flags accepted after a `:function` signature.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct UserFuncFlags {
+pub struct UserFuncFlags(u8);
+
+impl UserFuncFlags {
     /// Abort the function after an uncaught error.
-    pub abort: bool,
+    pub const ABORT: Self = Self(1 << 0);
     /// The function accepts an Ex line range as one invocation.
-    pub range: bool,
+    pub const RANGE: Self = Self(1 << 1);
     /// The function expects a dictionary receiver (`self`).
-    pub dict: bool,
+    pub const DICT: Self = Self(1 << 2);
     /// The function may capture its defining local scope.
-    pub closure: bool,
+    pub const CLOSURE: Self = Self(1 << 3);
+
+    /// Whether every flag in `other` is enabled.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Enables or disables `flag` without touching the other bits.
+    pub const fn set(&mut self, flag: Self, enabled: bool) {
+        if enabled {
+            self.0 |= flag.0;
+        } else {
+            self.0 &= !flag.0;
+        }
+    }
 }
 
 /// One user-defined function.
@@ -65,10 +84,6 @@ pub struct CallFrame {
     caller_argument: ScopeMap,
     /// One-based function-body line currently executing.
     pub current_line: usize,
-    /// The defining function's [`UserFunc::context`], carried so the script
-    /// context of a command inside the body can be answered without a
-    /// registry lookup.
-    context: SourceContext,
 }
 
 /// User-function definition/call failure.
@@ -113,10 +128,10 @@ pub struct FunctionSignature {
     pub flags: UserFuncFlags,
 }
 
-/// Executor-owned user-function registry and active call stack.
+/// Executor-owned user-function definitions and active call stack.
 #[derive(Clone, Debug, Default)]
 pub struct UserFunctions {
-    functions: BTreeMap<String, UserFunc>,
+    functions: Rc<RefCell<BTreeMap<String, UserFunc>>>,
     call_stack: Vec<CallFrame>,
 }
 
@@ -128,6 +143,14 @@ impl UserFunctions {
     }
 
     /// Parses `Name(arg, ...) abort range dict closure`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Vim error for a malformed declaration: `E124`/`E125`
+    /// for missing parentheses, `E128`/`E129` for an invalid name, `E475`/
+    /// `E1068` for a malformed parameter list, `E853` for a duplicate
+    /// parameter, `E989` for a non-default argument after a default, and
+    /// `E488` for trailing characters.
     pub fn parse_signature(source: &str) -> Result<FunctionSignature, UserFuncError> {
         let source = source.trim();
         let open = source
@@ -140,95 +163,16 @@ impl UserFunctions {
         let name = source[..open].trim();
         validate_function_name(name)?;
 
-        let mut args: Vec<String> = Vec::new();
-        let mut default_args: Vec<String> = Vec::new();
-        let mut varargs = false;
-        let arg_text = &source[open + 1..close];
-        let pieces = split_argument_ranges(arg_text);
-        let last = pieces.len() - 1;
-        for (index, (start, end)) in pieces.into_iter().enumerate() {
-            let raw = &arg_text[start..end];
-            let argument = raw.trim();
-            if argument.is_empty() {
-                if index == last {
-                    // `F(a,)`: upstream tolerates a trailing comma.
-                    break;
-                }
-                if arg_text.trim().is_empty() {
-                    break;
-                }
-                return Err(UserFuncError::new(
-                    "E475",
-                    format!("Invalid argument: {arg_text}"),
-                ));
-            }
-            if varargs {
-                // `...` sets mustend upstream; anything after it is invalid.
-                return Err(UserFuncError::new(
-                    "E475",
-                    format!("Invalid argument: {}", &source[open + 1..]),
-                ));
-            }
-            if argument == "..." {
-                varargs = true;
-                continue;
-            }
-            if index != last && raw.trim_end().len() != raw.len() {
-                // get_function_args: no white space allowed before the
-                // separating comma.
-                let rest = &arg_text[start + raw.trim_end().len()..];
-                return Err(UserFuncError::new(
-                    "E1068",
-                    format!("No white space allowed before ',': {rest}"),
-                ));
-            }
-            let (parameter, default) = match argument.split_once('=') {
-                Some((parameter, rest)) => (parameter.trim(), Some(rest.trim())),
-                None => (argument, None),
-            };
-            if !is_identifier(parameter) || parameter == "firstline" || parameter == "lastline" {
-                return Err(UserFuncError::new(
-                    "E125",
-                    format!("Illegal argument: {argument}"),
-                ));
-            }
-            if args.iter().any(|existing| existing == parameter) {
-                return Err(UserFuncError::new(
-                    "E853",
-                    format!("Duplicate argument name: {parameter}"),
-                ));
-            }
-            match default {
-                Some(expression) => {
-                    // get_function_args syntax-checks the default with eval1
-                    // (parse without evaluation) at definition time.
-                    if ox_eval::Parser::new(expression.as_bytes()).parse().is_err() {
-                        return Err(UserFuncError::new(
-                            "E475",
-                            format!("Invalid argument: {}", &source[open + 1..]),
-                        ));
-                    }
-                    default_args.push(expression.to_owned());
-                }
-                None => {
-                    if !default_args.is_empty() {
-                        return Err(UserFuncError::new(
-                            "E989",
-                            "Non-default argument follows default argument",
-                        ));
-                    }
-                }
-            }
-            args.push(parameter.to_owned());
-        }
+        let (args, default_args, varargs) =
+            parse_arguments(&source[open + 1..close], &source[open + 1..])?;
 
         let mut flags = UserFuncFlags::default();
         for flag in source[close + 1..].split_ascii_whitespace() {
             match flag {
-                "abort" => flags.abort = true,
-                "range" => flags.range = true,
-                "dict" => flags.dict = true,
-                "closure" => flags.closure = true,
+                "abort" => flags.set(UserFuncFlags::ABORT, true),
+                "range" => flags.set(UserFuncFlags::RANGE, true),
+                "dict" => flags.set(UserFuncFlags::DICT, true),
+                "closure" => flags.set(UserFuncFlags::CLOSURE, true),
                 _ => {
                     return Err(UserFuncError::new(
                         "E488",
@@ -259,6 +203,11 @@ impl UserFunctions {
     }
 
     /// Defines a function. `replace` implements `:function!`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `E122` when a function with the canonical name already
+    /// exists and `replace` is false.
     pub fn define(
         &mut self,
         signature: FunctionSignature,
@@ -268,18 +217,19 @@ impl UserFunctions {
         scope: &Scope,
     ) -> Result<String, UserFuncError> {
         let name = Self::canonical_name(&signature.name, context.sid);
-        if self.functions.contains_key(&name) && !replace {
+        let mut functions = self.functions.borrow_mut();
+        if functions.contains_key(&name) && !replace {
             return Err(UserFuncError::new(
                 "E122",
                 format!("Function {name} already exists, add ! to replace it"),
             ));
         }
-        let captured = if signature.flags.closure {
+        let captured = if signature.flags.contains(UserFuncFlags::CLOSURE) {
             scope.local.clone()
         } else {
             ScopeMap::new()
         };
-        self.functions.insert(
+        functions.insert(
             name.clone(),
             UserFunc {
                 name: name.clone(),
@@ -297,25 +247,38 @@ impl UserFunctions {
 
     /// Removes a function by canonical name.
     pub fn remove(&mut self, name: &str, sid: Sid) -> bool {
-        self.functions.remove(&Self::canonical_name(name, sid)).is_some()
+        self.functions
+            .borrow_mut()
+            .remove(&Self::canonical_name(name, sid))
+            .is_some()
     }
 
     /// Looks up a function, resolving script-local spelling in `sid`.
     #[must_use]
-    pub fn get(&self, name: &str, sid: Sid) -> Option<&UserFunc> {
-        self.functions.get(&Self::canonical_name(name, sid))
+    pub fn get(&self, name: &str, sid: Sid) -> Option<UserFunc> {
+        self.functions
+            .borrow()
+            .get(&Self::canonical_name(name, sid))
+            .cloned()
     }
 
     /// Clones a function for execution without holding a registry borrow.
     #[must_use]
     pub fn resolve(&self, name: &str, sid: Sid) -> Option<UserFunc> {
-        self.get(name, sid).cloned()
+        self.get(name, sid)
     }
 
     /// Whether a canonical or script-local function exists.
     #[must_use]
     pub fn contains(&self, name: &str, sid: Sid) -> bool {
-        self.get(name, sid).is_some()
+        self.functions
+            .borrow()
+            .contains_key(&Self::canonical_name(name, sid))
+    }
+
+    /// Shares definitions with another executor without sharing call frames.
+    pub fn share_definitions_from(&mut self, other: &Self) {
+        self.functions = Rc::clone(&other.functions);
     }
 
     /// Whether the named function is present on the active call stack.
@@ -326,14 +289,22 @@ impl UserFunctions {
     }
 
     /// All functions in canonical name order.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &UserFunc)> {
+    pub fn iter(&self) -> impl Iterator<Item = (String, UserFunc)> {
         self.functions
+            .borrow()
             .iter()
-            .map(|(name, function)| (name.as_str(), function))
+            .map(|(name, function)| (name.clone(), function.clone()))
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     /// Begins one call, replacing `l:` and `a:` with frame-local maps.
     /// Returns an owned function descriptor for the executor to run.
+    ///
+    /// # Errors
+    ///
+    /// Returns `E132` at the `maxfuncdepth` limit, `E117` for an unknown
+    /// function, and `E118`/`E119` for a wrong argument count.
     pub fn begin_call(
         &mut self,
         name: &str,
@@ -349,57 +320,62 @@ impl UserFunctions {
                 "Function call depth is higher than 'maxfuncdepth'",
             ));
         }
-        let function = self.resolve(name, sid).ok_or_else(|| {
-            UserFuncError::new("E117", format!("Unknown function: {name}"))
-        })?;
+        let function = self
+            .resolve(name, sid)
+            .ok_or_else(|| UserFuncError::new("E117", format!("Unknown function: {name}")))?;
         // check_user_func_argcount: required = uf_args - uf_def_args;
         // calls may omit any trailing defaulted parameters.
         let required = function.args.len() - function.default_args.len();
-        if values.len() < required || (!function.varargs && values.len() > function.args.len())
-        {
+        if values.len() < required || (!function.varargs && values.len() > function.args.len()) {
             let relation = if values.len() < required {
                 "Not enough"
             } else {
                 "Too many"
             };
             return Err(UserFuncError::new(
-                if values.len() < required { "E119" } else { "E118" },
+                if values.len() < required {
+                    "E119"
+                } else {
+                    "E118"
+                },
                 format!("{relation} arguments for function: {}", function.name),
             ));
         }
 
         let caller_local = std::mem::take(&mut scope.local);
         let caller_argument = std::mem::take(&mut scope.argument);
-        scope.local = function.captured.clone();
-        scope.argument = ScopeMap::new();
+        scope.local.clone_from(&function.captured);
         for (parameter, value) in function.args.iter().zip(values.iter()) {
-            scope.argument.push((OxStr::from(parameter.as_str()), value.clone()));
+            scope
+                .argument
+                .push((OxStr::from(parameter.as_str()), value.clone()));
         }
-        let extras = values.into_iter().skip(function.args.len()).collect::<Vec<_>>();
+        let extras = values
+            .into_iter()
+            .skip(function.args.len())
+            .collect::<Vec<_>>();
         scope
             .argument
-            .push((OxStr::from("0"), Typval::Number(extras.len() as i64)));
+            .push((OxStr::from("0"), Typval::Number(vim_number(extras.len()))));
         scope
             .argument
             .push((OxStr::from("000"), Typval::list(extras.clone())));
         for (index, value) in extras.into_iter().enumerate() {
-            scope.argument.push((
-                OxStr((index + 1).to_string().into_bytes()),
-                value,
-            ));
+            scope
+                .argument
+                .push((OxStr((index + 1).to_string().into_bytes()), value));
         }
         scope.argument.push((
             OxStr::from("firstline"),
-            Typval::Number(first_line as i64),
+            Typval::Number(vim_number(first_line)),
         ));
         scope.argument.push((
             OxStr::from("lastline"),
-            Typval::Number(last_line as i64),
+            Typval::Number(vim_number(last_line)),
         ));
 
         self.call_stack.push(CallFrame {
             name: function.name.clone(),
-            context: function.context,
             caller_local,
             caller_argument,
             current_line: 0,
@@ -410,8 +386,8 @@ impl UserFunctions {
     /// Ends one call and restores the caller's `l:`/`a:` scopes.
     pub fn end_call(&mut self, scope: &mut Scope) -> Option<CallFrame> {
         let frame = self.call_stack.pop()?;
-        scope.local = frame.caller_local.clone();
-        scope.argument = frame.caller_argument.clone();
+        scope.local.clone_from(&frame.caller_local);
+        scope.argument.clone_from(&frame.caller_argument);
         Some(frame)
     }
 
@@ -428,7 +404,6 @@ impl UserFunctions {
         &self.call_stack
     }
 
-
     /// Upstream-style call-stack throwpoint prefix.
     #[must_use]
     pub fn throwpoint_prefix(&self) -> String {
@@ -438,6 +413,102 @@ impl UserFunctions {
             .collect::<Vec<_>>()
             .join("..")
     }
+}
+
+/// Parses the parameter list between the signature parentheses into
+/// `(args, default_args, varargs)`.
+fn parse_arguments(
+    arg_text: &str,
+    source_tail: &str,
+) -> Result<(Vec<String>, Vec<String>, bool), UserFuncError> {
+    let mut args: Vec<String> = Vec::new();
+    let mut default_args: Vec<String> = Vec::new();
+    let mut varargs = false;
+    let pieces = split_argument_ranges(arg_text);
+    let last = pieces.len() - 1;
+    for (index, (start, end)) in pieces.into_iter().enumerate() {
+        let raw = &arg_text[start..end];
+        let argument = raw.trim();
+        if argument.is_empty() {
+            if index == last {
+                // `F(a,)`: upstream tolerates a trailing comma.
+                break;
+            }
+            if arg_text.trim().is_empty() {
+                break;
+            }
+            return Err(UserFuncError::new(
+                "E475",
+                format!("Invalid argument: {arg_text}"),
+            ));
+        }
+        if varargs {
+            // `...` sets mustend upstream; anything after it is invalid.
+            return Err(UserFuncError::new(
+                "E475",
+                format!("Invalid argument: {source_tail}"),
+            ));
+        }
+        if argument == "..." {
+            varargs = true;
+            continue;
+        }
+        if index != last && raw.trim_end().len() != raw.len() {
+            // get_function_args: no white space allowed before the
+            // separating comma.
+            let rest = &arg_text[start + raw.trim_end().len()..];
+            return Err(UserFuncError::new(
+                "E1068",
+                format!("No white space allowed before ',': {rest}"),
+            ));
+        }
+        let (parameter, default) = match argument.split_once('=') {
+            Some((parameter, rest)) => (parameter.trim(), Some(rest.trim())),
+            None => (argument, None),
+        };
+        if !is_identifier(parameter) || parameter == "firstline" || parameter == "lastline" {
+            return Err(UserFuncError::new(
+                "E125",
+                format!("Illegal argument: {argument}"),
+            ));
+        }
+        if args.iter().any(|existing| existing == parameter) {
+            return Err(UserFuncError::new(
+                "E853",
+                format!("Duplicate argument name: {parameter}"),
+            ));
+        }
+        match default {
+            Some(expression) => {
+                // get_function_args syntax-checks the default with eval1
+                // (parse without evaluation) at definition time.
+                if ox_eval::Parser::new(expression.as_bytes()).parse().is_err() {
+                    return Err(UserFuncError::new(
+                        "E475",
+                        format!("Invalid argument: {source_tail}"),
+                    ));
+                }
+                default_args.push(expression.to_owned());
+            }
+            None => {
+                if !default_args.is_empty() {
+                    return Err(UserFuncError::new(
+                        "E989",
+                        "Non-default argument follows default argument",
+                    ));
+                }
+            }
+        }
+        args.push(parameter.to_owned());
+    }
+    Ok((args, default_args, varargs))
+}
+
+/// Total `usize` -> `i64` conversion for `Typval::Number` line/count values;
+/// saturates at `i64::MAX`, the crate-wide sentinel for values beyond the
+/// `i64` domain.
+fn vim_number(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn validate_function_name(name: &str) -> Result<(), UserFuncError> {

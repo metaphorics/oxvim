@@ -81,9 +81,24 @@ pub struct DnsError {
 }
 
 impl DnsError {
-    fn invalid(message: impl Into<String>) -> Self { Self { name: "EAI_NONAME", message: message.into() } }
-    fn io(error: io::Error) -> Self { Self { name: "EAI_FAIL", message: error.to_string() } }
-    fn pool(error: PoolError) -> Self { Self { name: "ECANCELED", message: error.to_string() } }
+    fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            name: "EAI_NONAME",
+            message: message.into(),
+        }
+    }
+    fn io(error: &io::Error) -> Self {
+        Self {
+            name: "EAI_FAIL",
+            message: error.to_string(),
+        }
+    }
+    fn pool(error: &PoolError) -> Self {
+        Self {
+            name: "ECANCELED",
+            message: error.to_string(),
+        }
+    }
 }
 
 /// Result type for DNS operations.
@@ -94,25 +109,82 @@ pub type DnsResult<T> = Result<T, DnsError>;
 /// `addrconfig`, `v4mapped`, `all`, named protocols/services, and canonical-name
 /// discovery require libc APIs and are intentionally outside this safe subset.
 /// See `uv.getaddrinfo()` in `runtime/doc/luvref.txt`.
-pub fn getaddrinfo(host: Option<&str>, service: Option<&str>, hints: AddrInfoHints) -> DnsResult<Vec<AddrInfo>> {
-    if host.is_none() && service.is_none() { return Err(DnsError::invalid("host and service cannot both be absent")); }
-    let port = match service { Some(value) => value.parse::<u16>().map_err(|_| DnsError::invalid("only numeric services are supported"))?, None => 0 };
-    let host = match host { Some(value) => value.to_owned(), None if hints.passive => match hints.family { AddressFamily::Inet6 => "::".into(), _ => "0.0.0.0".into() }, None => match hints.family { AddressFamily::Inet6 => "::1".into(), _ => "127.0.0.1".into() } };
+///
+/// # Errors
+///
+/// Returns [`DnsError`] when both host and service are absent, the service is
+/// not a numeric port, `numeric_host` is set but the host is not an IP literal,
+/// the underlying `ToSocketAddrs` lookup fails, or no resolved address matches
+/// the requested address family.
+pub fn getaddrinfo(
+    host: Option<&str>,
+    service: Option<&str>,
+    hints: AddrInfoHints,
+) -> DnsResult<Vec<AddrInfo>> {
+    if host.is_none() && service.is_none() {
+        return Err(DnsError::invalid("host and service cannot both be absent"));
+    }
+    let port = match service {
+        Some(value) => value
+            .parse::<u16>()
+            .map_err(|_| DnsError::invalid("only numeric services are supported"))?,
+        None => 0,
+    };
+    let host = match host {
+        Some(value) => value.to_owned(),
+        None if hints.passive => match hints.family {
+            AddressFamily::Inet6 => "::".into(),
+            _ => "0.0.0.0".into(),
+        },
+        None => match hints.family {
+            AddressFamily::Inet6 => "::1".into(),
+            _ => "127.0.0.1".into(),
+        },
+    };
     let addresses: Vec<SocketAddr> = if hints.numeric_host {
-        vec![SocketAddr::new(host.parse::<IpAddr>().map_err(|_| DnsError::invalid("numeric_host requires an IP literal"))?, port)]
+        vec![SocketAddr::new(
+            host.parse::<IpAddr>()
+                .map_err(|_| DnsError::invalid("numeric_host requires an IP literal"))?,
+            port,
+        )]
     } else {
-        (host.as_str(), port).to_socket_addrs().map_err(DnsError::io)?.collect()
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|e| DnsError::io(&e))?
+            .collect()
     };
     let mut seen = HashSet::new();
     let mut result = Vec::new();
     for address in addresses {
-        let family = if address.is_ipv4() { AddressFamily::Inet } else { AddressFamily::Inet6 };
-        if hints.family != AddressFamily::Unspecified && hints.family != family { continue; }
+        let family = if address.is_ipv4() {
+            AddressFamily::Inet
+        } else {
+            AddressFamily::Inet6
+        };
+        if hints.family != AddressFamily::Unspecified && hints.family != family {
+            continue;
+        }
         if seen.insert(address) {
-            result.push(AddrInfo { address: address.ip(), family, port: address.port(), socket_type: hints.socket_type, protocol: match hints.socket_type { SocketType::Stream => "tcp", SocketType::Datagram => "udp" }, canonical_name: None });
+            result.push(AddrInfo {
+                address: address.ip(),
+                family,
+                port: address.port(),
+                socket_type: hints.socket_type,
+                protocol: match hints.socket_type {
+                    SocketType::Stream => "tcp",
+                    SocketType::Datagram => "udp",
+                },
+                canonical_name: None,
+            });
         }
     }
-    if result.is_empty() { Err(DnsError::invalid("no addresses matched the requested family")) } else { Ok(result) }
+    if result.is_empty() {
+        Err(DnsError::invalid(
+            "no addresses matched the requested family",
+        ))
+    } else {
+        Ok(result)
+    }
 }
 
 /// Returns the portable numeric host and service for an address.
@@ -120,20 +192,74 @@ pub fn getaddrinfo(host: Option<&str>, service: Option<&str>, hints: AddrInfoHin
 /// Safe Rust's standard library does not expose reverse DNS; numeric output is
 /// the portable `getnameinfo` form and avoids libc. See `uv.getnameinfo()` in
 /// `runtime/doc/luvref.txt`.
+///
+/// # Errors
+///
+/// This function does not currently return an error; the [`Result`] wrapper is
+/// reserved for future libc-backed reverse-lookup failures.
 pub fn getnameinfo(address: SocketAddr) -> DnsResult<NameInfo> {
-    Ok(NameInfo { host: address.ip().to_string(), service: address.port().to_string() })
+    Ok(NameInfo {
+        host: address.ip().to_string(),
+        service: address.port().to_string(),
+    })
 }
 
 /// Resolves on the shared pool and posts completion to the loop.
 /// See `uv.getaddrinfo()` in `runtime/doc/luvref.txt`.
-pub fn getaddrinfo_async<P, C>(pool: &Pool, poster: P, host: Option<String>, service: Option<String>, hints: AddrInfoHints, callback: C) -> Result<(), PoolError>
-where P: LoopPoster, C: FnOnce(&mut UvLoop, DnsResult<Vec<AddrInfo>>) + Send + 'static {
-    pool.submit(poster, move || getaddrinfo(host.as_deref(), service.as_deref(), hints), move |uv_loop, result| callback(uv_loop, result.unwrap_or_else(|error| Err(DnsError::pool(error)))))
+///
+/// # Errors
+///
+/// Returns [`PoolError`] when the thread pool is shutting down and cannot
+/// accept new work.
+pub fn getaddrinfo_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    host: Option<String>,
+    service: Option<String>,
+    hints: AddrInfoHints,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, DnsResult<Vec<AddrInfo>>) + Send + 'static,
+{
+    pool.submit(
+        poster,
+        move || getaddrinfo(host.as_deref(), service.as_deref(), hints),
+        move |uv_loop, result| {
+            callback(
+                uv_loop,
+                result.unwrap_or_else(|error| Err(DnsError::pool(&error))),
+            );
+        },
+    )
 }
 
 /// Produces name information on the pool and posts completion to the loop.
 /// See `uv.getnameinfo()` in `runtime/doc/luvref.txt`.
-pub fn getnameinfo_async<P, C>(pool: &Pool, poster: P, address: SocketAddr, callback: C) -> Result<(), PoolError>
-where P: LoopPoster, C: FnOnce(&mut UvLoop, DnsResult<NameInfo>) + Send + 'static {
-    pool.submit(poster, move || getnameinfo(address), move |uv_loop, result| callback(uv_loop, result.unwrap_or_else(|error| Err(DnsError::pool(error)))))
+///
+/// # Errors
+///
+/// Returns [`PoolError`] when the thread pool is shutting down and cannot
+/// accept new work.
+pub fn getnameinfo_async<P, C>(
+    pool: &Pool,
+    poster: P,
+    address: SocketAddr,
+    callback: C,
+) -> Result<(), PoolError>
+where
+    P: LoopPoster,
+    C: FnOnce(&mut UvLoop, DnsResult<NameInfo>) + Send + 'static,
+{
+    pool.submit(
+        poster,
+        move || getnameinfo(address),
+        move |uv_loop, result| {
+            callback(
+                uv_loop,
+                result.unwrap_or_else(|error| Err(DnsError::pool(&error))),
+            );
+        },
+    )
 }

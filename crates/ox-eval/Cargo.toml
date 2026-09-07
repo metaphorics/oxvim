@@ -12,7 +12,10 @@ workspace = true
 ox-sys = { path = "../ox-sys" }
 ox-types = { path = "../ox-types" }
 serde_json.workspace = true
+sha2.workspace = true
+stacker = "0.1.25"
 thiserror.workspace = true
+unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 
 [dev-dependencies]

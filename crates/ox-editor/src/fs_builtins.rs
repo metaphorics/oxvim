@@ -9,7 +9,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use ox_eval::{builtin_spec, EvalError};
+use ox_eval::{EvalError, builtin_spec};
 use ox_types::{OxStr, Typval};
 
 use crate::script::{FileIO, FileKind};
@@ -17,9 +17,22 @@ use crate::script::{FileIO, FileKind};
 pub(crate) fn is_filesystem_builtin(name: &str) -> bool {
     matches!(
         name,
-        "mkdir" | "delete" | "rename" | "filecopy" | "readblob" | "glob" | "globpath"
-            | "readfile" | "writefile" | "filereadable" | "isdirectory" | "getftime"
-            | "getfsize" | "getfperm" | "filewritable" | "setfperm"
+        "mkdir"
+            | "delete"
+            | "rename"
+            | "filecopy"
+            | "readblob"
+            | "glob"
+            | "globpath"
+            | "readfile"
+            | "writefile"
+            | "filereadable"
+            | "isdirectory"
+            | "getftime"
+            | "getfsize"
+            | "getftype"
+            | "filewritable"
+            | "setfperm"
     )
 }
 
@@ -28,23 +41,24 @@ pub(crate) fn is_filesystem_builtin(name: &str) -> bool {
 /// `mkdir` and `writefile` are not here: their `D`/`R` flags register a
 /// deferred delete against the enclosing function frame, so they are called
 /// from [`crate::builtins::filesystem`] with that context.
-pub(crate) fn call(io: &dyn FileIO, name: &str, args: Vec<Typval>) -> ox_eval::Result<Typval> {
+pub(crate) fn call(io: &dyn FileIO, name: &str, args: &[Typval]) -> ox_eval::Result<Typval> {
     check_arity(name, args.len())?;
     match name {
-        "delete" => delete(io, &args),
-        "rename" => rename(io, &args),
-        "filecopy" => filecopy(io, &args),
-        "readblob" => readblob(io, &args),
-        "glob" => glob(io, &args),
-        "globpath" => globpath(io, &args),
-        "readfile" => readfile(io, &args),
+        "delete" => delete(io, args),
+        "rename" => rename(io, args),
+        "filecopy" => filecopy(io, args),
+        "readblob" => readblob(io, args),
+        "glob" => glob(io, args),
+        "globpath" => globpath(io, args),
+        "readfile" => readfile(io, args),
         "filereadable" => filereadable(io, &args[0]),
         "isdirectory" => isdirectory(io, &args[0]),
         "getftime" => getftime(io, &args[0]),
         "getfsize" => getfsize(io, &args[0]),
         "getfperm" => getfperm(io, &args[0]),
+        "getftype" => getftype(io, &args[0]),
         "filewritable" => filewritable(io, &args[0]),
-        "setfperm" => setfperm(io, &args),
+        "setfperm" => setfperm(io, args),
         _ => unreachable!("filesystem builtin predicate and dispatcher disagree: {name}"),
     }
 }
@@ -56,10 +70,18 @@ pub(crate) fn check_writefile_arity(count: usize) -> ox_eval::Result<()> {
 pub(crate) fn check_arity(name: &str, count: usize) -> ox_eval::Result<()> {
     let spec = builtin_spec(name).ok_or_else(|| EvalError::not_implemented(OxStr::from(name)))?;
     if count < spec.min_args {
-        return Err(EvalError::new("E119", 0, format!("Not enough arguments for function: {name}")));
+        return Err(EvalError::new(
+            "E119",
+            0,
+            format!("Not enough arguments for function: {name}"),
+        ));
     }
     if spec.max_args.is_some_and(|maximum| count > maximum) {
-        return Err(EvalError::new("E118", 0, format!("Too many arguments for function: {name}")));
+        return Err(EvalError::new(
+            "E118",
+            0,
+            format!("Too many arguments for function: {name}"),
+        ));
     }
     Ok(())
 }
@@ -108,8 +130,10 @@ pub(crate) fn mkdir(
             // `can_add_defer`'s own message, emitted before anything is created.
             return Err(EvalError::new("E193", 0, "defer not inside a function"));
         }
+        let mode = u32::try_from(prot)
+            .map_err(|_| EvalError::new("E474", 0, format!("Invalid argument: {prot}")))?;
         if flags.contains('p') {
-            match mkdir_recurse(io, Path::new(&name), prot as u32) {
+            match mkdir_recurse(io, Path::new(&name), mode) {
                 Ok(first) => {
                     created = first;
                     outcome = 1;
@@ -120,7 +144,9 @@ pub(crate) fn mkdir(
     }
     if outcome == 0 {
         // `vim_mkdir_emsg` (ex_docmd.c:7006-7015).
-        if let Err(error) = io.create_dir(Path::new(&name), false, prot as u32) {
+        let mode = u32::try_from(prot)
+            .map_err(|_| EvalError::new("E474", 0, format!("Invalid argument: {prot}")))?;
+        if let Err(error) = io.create_dir(Path::new(&name), false, mode) {
             return Err(e739(Path::new(&name), &error));
         }
         outcome = 1;
@@ -136,7 +162,11 @@ pub(crate) fn mkdir(
             // (1147-1156).
             *deferred = Some((
                 created,
-                if defer_recurse { DeleteMode::Recursive } else { DeleteMode::Dir },
+                if defer_recurse {
+                    DeleteMode::Recursive
+                } else {
+                    DeleteMode::Dir
+                },
             ));
         }
     }
@@ -155,7 +185,10 @@ fn mkdir_recurse(
     let mut missing: Vec<PathBuf> = Vec::new();
     let mut current = dir.to_path_buf();
     loop {
-        if io.metadata(&current, true).is_ok_and(|metadata| metadata.kind == FileKind::Directory) {
+        if io
+            .metadata(&current, true)
+            .is_ok_and(|metadata| metadata.kind == FileKind::Directory)
+        {
             break;
         }
         missing.push(current.clone());
@@ -168,7 +201,8 @@ fn mkdir_recurse(
     }
     let mut created = None;
     for dir in missing.into_iter().rev() {
-        io.create_dir(&dir, false, mode).map_err(|error| (dir.clone(), error))?;
+        io.create_dir(&dir, false, mode)
+            .map_err(|error| (dir.clone(), error))?;
         if created.is_none() {
             created = Some(io.canonicalize(&dir));
         }
@@ -178,7 +212,11 @@ fn mkdir_recurse(
 
 /// `e_mkdir` (`errors.h:55`): "Cannot create directory %s: %s".
 fn e739(path: &Path, error: &std::io::Error) -> EvalError {
-    EvalError::new("E739", 0, format!("Cannot create directory {}: {}", path.display(), error))
+    EvalError::new(
+        "E739",
+        0,
+        format!("Cannot create directory {}: {}", path.display(), error),
+    )
 }
 
 /// The three `delete()` flag strings (`eval/fs.c:459-470`), shared by the
@@ -204,7 +242,11 @@ impl DeleteMode {
             "" => Ok(DeleteMode::File),
             "d" => Ok(DeleteMode::Dir),
             "rf" => Ok(DeleteMode::Recursive),
-            _ => Err(EvalError::new("E15", 0, format!("Invalid expression: {flags}"))),
+            _ => Err(EvalError::new(
+                "E15",
+                0,
+                format!("Invalid expression: {flags}"),
+            )),
         }
     }
     /// The `os_remove`/`os_rmdir`/`delete_recursive` dispatch behind each
@@ -225,7 +267,11 @@ fn delete(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
     }
     let flags = optional_string(args.get(1))?.unwrap_or_default();
     let mode = DeleteMode::parse(&flags)?;
-    Ok(number(if mode.remove(io, &path).is_ok() { 0 } else { -1 }))
+    Ok(number(if mode.remove(io, &path).is_ok() {
+        0
+    } else {
+        -1
+    }))
 }
 /// `f_rename` (`eval/fs.c:1512-1521`) delegates to `vim_rename`
 /// (fileio.c:2710-2766): a normal rename, falling back to copy-then-unlink
@@ -260,9 +306,9 @@ fn rename(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
 fn filecopy(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
     let from = strict_path_arg(&args[0], 1)?;
     let to = strict_path_arg(&args[1], 2)?;
-    let eligible = io.metadata(&from, false).is_ok_and(|metadata| {
-        matches!(metadata.kind, FileKind::File | FileKind::Symlink)
-    });
+    let eligible = io
+        .metadata(&from, false)
+        .is_ok_and(|metadata| matches!(metadata.kind, FileKind::File | FileKind::Symlink));
     if !eligible {
         return Ok(boolean(false));
     }
@@ -301,20 +347,24 @@ fn readblob(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
 
 fn filereadable(io: &dyn FileIO, value: &Typval) -> ox_eval::Result<Typval> {
     let path = path_arg(value)?;
-    let readable = io.metadata(&path, true).is_ok_and(|metadata| {
-        metadata.kind == FileKind::File && metadata.mode & 0o444 != 0
-    });
+    let readable = io
+        .metadata(&path, true)
+        .is_ok_and(|metadata| metadata.kind == FileKind::File && metadata.mode & 0o444 != 0);
     Ok(boolean(readable))
 }
 
 fn isdirectory(io: &dyn FileIO, value: &Typval) -> ox_eval::Result<Typval> {
     let path = path_arg(value)?;
-    Ok(boolean(io.metadata(&path, true).is_ok_and(|metadata| metadata.kind == FileKind::Directory)))
+    Ok(boolean(io.metadata(&path, true).is_ok_and(|metadata| {
+        metadata.kind == FileKind::Directory
+    })))
 }
 
 fn getftime(io: &dyn FileIO, value: &Typval) -> ox_eval::Result<Typval> {
     let path = path_arg(value)?;
-    let seconds = io.metadata(&path, true).ok()
+    let seconds = io
+        .metadata(&path, true)
+        .ok()
         .and_then(|metadata| metadata.modified)
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
@@ -337,7 +387,7 @@ fn getfperm(io: &dyn FileIO, value: &Typval) -> ox_eval::Result<Typval> {
     let Some(mode) = io.metadata(&path, true).ok().map(|metadata| metadata.mode) else {
         return Ok(text(""));
     };
-    let flags = [b'r', b'w', b'x'];
+    let flags = *b"rwx";
     let mut output = [b'-'; 9];
     for (index, slot) in output.iter_mut().enumerate() {
         if mode & (1 << (8 - index)) != 0 {
@@ -347,13 +397,39 @@ fn getfperm(io: &dyn FileIO, value: &Typval) -> ox_eval::Result<Typval> {
     Ok(Typval::String(OxStr(output.to_vec())))
 }
 
+/// `getftype()` (`os_filetype`): the file's kind as upstream's fixed strings.
+/// The [`FileKind`] seam distinguishes file/dir/symlink; every other upstream
+/// kind (bdev, cdev, socket, fifo) shares `Other`, which is upstream's own
+/// fallback name for them here. A missing path answers "".
+fn getftype(io: &dyn FileIO, value: &Typval) -> ox_eval::Result<Typval> {
+    let path = path_arg(value)?;
+    let kind = if let Ok(metadata) = io.metadata(&path, false) {
+        metadata.kind
+    } else {
+        match io.metadata(&path, true) {
+            Ok(metadata) => metadata.kind,
+            Err(_) => return Ok(text("")),
+        }
+    };
+    let name = match kind {
+        FileKind::File => "file",
+        FileKind::Directory => "dir",
+        FileKind::Symlink => "link",
+        FileKind::Other => "other",
+    };
+    Ok(text(name))
+}
+
 fn filewritable(io: &dyn FileIO, value: &Typval) -> ox_eval::Result<Typval> {
     let path = path_arg(value)?;
     let writable = io.metadata(&path, true).map_or(0, |metadata| {
-        if metadata.mode & 0o222 == 0 { 0 }
-        else if metadata.kind == FileKind::Directory { 2 }
-        else if metadata.kind == FileKind::File { 1 }
-        else { 0 }
+        if metadata.mode & 0o222 == 0 {
+            0
+        } else if metadata.kind == FileKind::Directory {
+            2
+        } else {
+            i64::from(metadata.kind == FileKind::File)
+        }
     });
     Ok(number(writable))
 }
@@ -361,12 +437,17 @@ fn filewritable(io: &dyn FileIO, value: &Typval) -> ox_eval::Result<Typval> {
 fn setfperm(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
     let path = path_arg(&args[0])?;
     let permission = string_arg(&args[1])?;
-    if permission.len() != 9 { return Ok(number(0)); }
-    let expected = [b'r', b'w', b'x'];
+    if permission.len() != 9 {
+        return Ok(number(0));
+    }
+    let expected = *b"rwx";
     let mut mode = 0u32;
     for (index, byte) in permission.bytes().enumerate() {
-        if byte == expected[index % 3] { mode |= 1 << (8 - index); }
-        else if byte != b'-' { return Ok(number(0)); }
+        if byte == expected[index % 3] {
+            mode |= 1 << (8 - index);
+        } else if byte != b'-' {
+            return Ok(number(0));
+        }
     }
     Ok(boolean(io.set_permissions(&path, mode).is_ok()))
 }
@@ -381,7 +462,8 @@ fn readfile(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
     let binary = kind == "b";
     let blob = kind == "B";
     let maximum = args.get(2).map(number_arg).transpose()?;
-    let bytes = io.read_bytes(&path)
+    let bytes = io
+        .read_bytes(&path)
         .map_err(|_| EvalError::new("E484", 0, format!("Can't open file {}", path.display())))?;
     if blob {
         return Ok(Typval::Blob(bytes));
@@ -391,33 +473,53 @@ fn readfile(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
     // never splits a line — and, in text mode, drops every EF BB BF triple
     // it finds. A BOM cannot span a line boundary (the '\n' would break the
     // EF BB BF adjacency), so filtering the whole buffer first is equivalent.
-    let content = if binary { bytes } else { remove_byte_order_marks(&bytes) };
+    let content = if binary {
+        bytes
+    } else {
+        remove_byte_order_marks(&bytes)
+    };
     let ended_in_newline = content.last() == Some(&b'\n');
-    let mut lines: Vec<Vec<u8>> = content.split(|byte| *byte == b'\n').map(|line| {
-        let mut line = line.to_vec();
-        if !binary {
-            // Remove CRs before NL (1378-1388) — all of them.
-            while line.last() == Some(&b'\r') { line.pop(); }
-        }
-        for byte in &mut line { if *byte == 0 { *byte = b'\n'; } }
-        line
-    }).collect();
+    let mut lines: Vec<Vec<u8>> = content
+        .split(|byte| *byte == b'\n')
+        .map(|line| {
+            let mut line = line.to_vec();
+            if !binary {
+                // Remove CRs before NL (1378-1388) — all of them.
+                while line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+            }
+            for byte in &mut line {
+                if *byte == 0 {
+                    *byte = b'\n';
+                }
+            }
+            line
+        })
+        .collect();
     if content.is_empty() {
         // Text mode flushes nothing for an empty file; binary mode's final
         // pass still appends one empty line (1371), so [''] survives.
-        if !binary { lines.clear(); }
+        if !binary {
+            lines.clear();
+        }
     } else if !binary && ended_in_newline {
         lines.pop();
     }
     if let Some(maximum) = maximum {
+        let retain = usize::try_from(maximum.unsigned_abs()).unwrap_or(usize::MAX);
         if maximum >= 0 {
-            lines.truncate(maximum as usize);
-        } else {
-            let retain = maximum.unsigned_abs() as usize;
-            if lines.len() > retain { lines.drain(..lines.len() - retain); }
+            lines.truncate(retain);
+        } else if lines.len() > retain {
+            lines.drain(..lines.len() - retain);
         }
     }
-    Ok(Typval::list(lines.into_iter().map(|line| Typval::String(OxStr(line))).collect()))
+    Ok(Typval::list(
+        lines
+            .into_iter()
+            .map(|line| Typval::String(OxStr(line)))
+            .collect(),
+    ))
 }
 
 /// Text mode removes EF BB BF at any position (1426-1459), not only the one
@@ -447,26 +549,39 @@ fn remove_byte_order_marks(bytes: &[u8]) -> Vec<u8> {
 /// change nothing observable — the bytes are already in the file either way.
 /// Rejecting them would be the only observable difference, and it is the wrong
 /// one.
-struct WriteFlags {
-    binary: bool,
-    append: bool,
-    defer: bool,
-    mkdir: bool,
+#[derive(Clone, Copy)]
+struct WriteFlags(u8);
+
+impl WriteFlags {
+    const APPEND: Self = Self(1 << 0);
+    const BINARY: Self = Self(1 << 1);
+    const DEFER: Self = Self(1 << 2);
+    const MKDIR: Self = Self(1 << 3);
+
+    fn contains(self, flag: Self) -> bool {
+        self.0 & flag.0 != 0
+    }
 }
 
 fn write_flags(flags: &str) -> ox_eval::Result<WriteFlags> {
-    let mut parsed = WriteFlags { binary: false, append: false, defer: false, mkdir: false };
+    let mut parsed = WriteFlags(0);
     for (offset, flag) in flags.char_indices() {
         match flag {
-            'b' => parsed.binary = true,
-            'a' => parsed.append = true,
-            'D' => parsed.defer = true,
+            'b' => parsed.0 |= WriteFlags::BINARY.0,
+            'a' => parsed.0 |= WriteFlags::APPEND.0,
+            'D' => parsed.0 |= WriteFlags::DEFER.0,
             's' | 'S' => {}
-            'p' => parsed.mkdir = true,
+            'p' => parsed.0 |= WriteFlags::MKDIR.0,
             // `semsg(_("E5060: Unknown flag: %s"), p)` prints the rest of the
             // string from the offending byte, not just that one character, so
             // a multibyte flag survives the message intact.
-            _ => return Err(EvalError::new("E5060", 0, format!("Unknown flag: {}", &flags[offset..]))),
+            _ => {
+                return Err(EvalError::new(
+                    "E5060",
+                    0,
+                    format!("Unknown flag: {}", &flags[offset..]),
+                ));
+            }
         }
     }
     Ok(parsed)
@@ -487,26 +602,42 @@ pub(crate) fn writefile(
     let flags = write_flags(&optional_string(args.get(2))?.unwrap_or_default())?;
     let path = path_arg(&args[1])?;
     if path.as_os_str().is_empty() {
-        return Err(EvalError::new("E482", 0, "Can't open file with an empty name"));
+        return Err(EvalError::new(
+            "E482",
+            0,
+            "Can't open file with an empty name",
+        ));
     }
     // `can_add_defer` runs before `file_open` (1868-1870), so a `D` outside a
     // function leaves no file behind.
-    if flags.defer && !in_function {
+    if flags.contains(WriteFlags::DEFER) && !in_function {
         return Err(EvalError::new("E193", 0, "defer not inside a function"));
     }
     // `kFileMkDir` creates the parent chain as part of the open, so a `p`
     // failure is reported as the open failure it is.
-    if flags.mkdir {
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-            io.create_dir(parent, true, 0o755).map_err(|error| {
-                EvalError::new("E482", 0, format!("Can't open file {path:?} for writing: {error}"))
-            })?;
-        }
+    if flags.contains(WriteFlags::MKDIR)
+        && let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        io.create_dir(parent, true, 0o755).map_err(|error| {
+            EvalError::new(
+                "E482",
+                0,
+                format!("Can't open file {} for writing: {error}", path.display()),
+            )
+        })?;
     }
-    let bytes = write_data(&args[0], flags.binary)?;
-    io.write_bytes(&path, &bytes, flags.append)
-        .map_err(|error| EvalError::new("E482", 0, format!("Can't open file {path:?} for writing: {error}")))?;
-    if flags.defer {
+    let bytes = write_data(&args[0], flags.contains(WriteFlags::BINARY))?;
+    io.write_bytes(&path, &bytes, flags.contains(WriteFlags::APPEND))
+        .map_err(|error| {
+            EvalError::new(
+                "E482",
+                0,
+                format!("Can't open file {} for writing: {error}", path.display()),
+            )
+        })?;
+    if flags.contains(WriteFlags::DEFER) {
         // `add_defer("delete", 1, &tv)` with `FullName_save(fname, false)`
         // (1882-1889): the path is absolutized now, so a later `:cd` cannot
         // move the deletion target.
@@ -520,17 +651,29 @@ fn write_data(value: &Typval, binary: bool) -> ox_eval::Result<Vec<u8>> {
         Typval::Blob(bytes) => Ok(bytes.clone()),
         Typval::String(value) => Ok(value.as_bytes().to_vec()),
         Typval::List(list) => {
-            let list = list.try_borrow().map_err(|_| EvalError::new("E742", 0, "List is locked"))?;
+            let list = list
+                .try_borrow()
+                .map_err(|_| EvalError::new("E742", 0, "List is locked"))?;
             let mut output = Vec::new();
             for (index, item) in list.items.iter().enumerate() {
                 let mut line = value_bytes(item)?;
-                for byte in &mut line { if *byte == b'\n' { *byte = 0; } }
+                for byte in &mut line {
+                    if *byte == b'\n' {
+                        *byte = 0;
+                    }
+                }
                 output.extend_from_slice(&line);
-                if !binary || index + 1 < list.items.len() { output.push(b'\n'); }
+                if !binary || index + 1 < list.items.len() {
+                    output.push(b'\n');
+                }
             }
             Ok(output)
         }
-        _ => Err(EvalError::new("E474", 0, "writefile() first argument must be a List, String, or Blob")),
+        _ => Err(EvalError::new(
+            "E474",
+            0,
+            "writefile() first argument must be a List, String, or Blob",
+        )),
     }
 }
 
@@ -538,7 +681,7 @@ fn glob(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
     let pattern = string_arg(&args[0])?;
     let list = args.get(2).map(bool_arg).transpose()?.unwrap_or(false);
     let all_links = args.get(3).map(bool_arg).transpose()?.unwrap_or(false);
-    glob_result(expand_glob(io, &pattern, all_links), list)
+    Ok(glob_result(expand_glob(io, &pattern, all_links), list))
 }
 
 fn globpath(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
@@ -548,18 +691,22 @@ fn globpath(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
     let all_links = args.get(4).map(bool_arg).transpose()?.unwrap_or(false);
     let mut matches = Vec::new();
     for directory in split_path_list(&paths) {
-        matches.extend(expand_glob(io, &Path::new(&directory).join(&pattern).to_string_lossy(), all_links));
+        matches.extend(expand_glob(
+            io,
+            &Path::new(&directory).join(&pattern).to_string_lossy(),
+            all_links,
+        ));
     }
     matches.sort();
     matches.dedup();
-    glob_result(matches, list)
+    Ok(glob_result(matches, list))
 }
 
-fn glob_result(matches: Vec<String>, list: bool) -> ox_eval::Result<Typval> {
+fn glob_result(matches: Vec<String>, list: bool) -> Typval {
     if list {
-        Ok(Typval::list(matches.into_iter().map(text).collect()))
+        Typval::list(matches.into_iter().map(text).collect())
     } else {
-        Ok(text(matches.join("\n")))
+        text(matches.join("\n"))
     }
 }
 
@@ -569,7 +716,11 @@ fn glob_result(matches: Vec<String>, list: bool) -> ox_eval::Result<Typval> {
 /// the matches. Each pattern's matches are appended in pattern order with
 /// duplicates kept across patterns — `EW_KEEPALL` only skips 'wildignore' and
 /// 'suffixes' filtering (path.c 2129-2141); there is no cross-pattern dedup.
-pub(crate) fn swapfilelist(io: &dyn FileIO, arg_count: usize, directory: &str) -> ox_eval::Result<Typval> {
+pub(crate) fn swapfilelist(
+    io: &dyn FileIO,
+    arg_count: usize,
+    directory: &str,
+) -> ox_eval::Result<Typval> {
     check_arity("swapfilelist", arg_count)?;
     let mut matches = Vec::new();
     for dir in split_path_list(directory) {
@@ -600,22 +751,31 @@ pub(crate) fn swapfilelist(io: &dyn FileIO, arg_count: usize, directory: &str) -
 
 pub(crate) fn expand_glob(io: &dyn FileIO, pattern: &str, all_links: bool) -> Vec<String> {
     let expanded;
-    let pattern = if (pattern == "~" || pattern.starts_with("~/")) && std::env::var_os("HOME").is_some() {
-        expanded = format!("{}{}", PathBuf::from(std::env::var_os("HOME").expect("checked above")).to_string_lossy(), &pattern[1..]);
+    let pattern = if (pattern == "~" || pattern.starts_with("~/"))
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        expanded = format!("{}{}", PathBuf::from(home).to_string_lossy(), &pattern[1..]);
         expanded.as_str()
     } else {
         pattern
     };
     let path = Path::new(pattern);
     let absolute = path.is_absolute();
-    let components: Vec<String> = path.components().filter_map(|component| match component {
-        Component::RootDir => None,
-        Component::CurDir => Some(".".to_owned()),
-        Component::ParentDir => Some("..".to_owned()),
-        Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
-        Component::Prefix(value) => Some(value.as_os_str().to_string_lossy().into_owned()),
-    }).collect();
-    let base = if absolute { PathBuf::from("/") } else { PathBuf::new() };
+    let components: Vec<String> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::RootDir => None,
+            Component::CurDir => Some(".".to_owned()),
+            Component::ParentDir => Some("..".to_owned()),
+            Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            Component::Prefix(value) => Some(value.as_os_str().to_string_lossy().into_owned()),
+        })
+        .collect();
+    let base = if absolute {
+        PathBuf::from("/")
+    } else {
+        PathBuf::new()
+    };
     let mut output = Vec::new();
     expand_components(io, &base, &components, 0, all_links, &mut output);
     output.sort();
@@ -623,35 +783,67 @@ pub(crate) fn expand_glob(io: &dyn FileIO, pattern: &str, all_links: bool) -> Ve
     output
 }
 
-fn expand_components(io: &dyn FileIO, base: &Path, components: &[String], index: usize, all_links: bool, output: &mut Vec<String>) {
+fn expand_components(
+    io: &dyn FileIO,
+    base: &Path,
+    components: &[String],
+    index: usize,
+    all_links: bool,
+    output: &mut Vec<String>,
+) {
     if index == components.len() {
         if io.metadata(base, !all_links).is_ok() {
-            output.push(if base.as_os_str().is_empty() { ".".to_owned() } else { base.to_string_lossy().into_owned() });
+            output.push(if base.as_os_str().is_empty() {
+                ".".to_owned()
+            } else {
+                base.to_string_lossy().into_owned()
+            });
         }
         return;
     }
     let component = &components[index];
     if component == "**" {
         expand_components(io, base, components, index + 1, all_links, output);
-        let directory = if base.as_os_str().is_empty() { Path::new(".") } else { base };
+        let directory = if base.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            base
+        };
         let mut entries = io.read_dir(directory).unwrap_or_default();
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         for entry in entries {
-            let ordinary_directory = io.metadata(&entry.path, false).is_ok_and(|metadata| metadata.kind == FileKind::Directory);
-            if ordinary_directory { expand_components(io, &entry.path, components, index, all_links, output); }
+            let ordinary_directory = io
+                .metadata(&entry.path, false)
+                .is_ok_and(|metadata| metadata.kind == FileKind::Directory);
+            if ordinary_directory {
+                expand_components(io, &entry.path, components, index, all_links, output);
+            }
         }
         return;
     }
     if !has_wildcard(component) {
-        expand_components(io, &base.join(component), components, index + 1, all_links, output);
+        expand_components(
+            io,
+            &base.join(component),
+            components,
+            index + 1,
+            all_links,
+            output,
+        );
         return;
     }
-    let directory = if base.as_os_str().is_empty() { Path::new(".") } else { base };
+    let directory = if base.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        base
+    };
     let mut entries = io.read_dir(directory).unwrap_or_default();
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     for entry in entries {
         let filename = entry.name.to_string_lossy();
-        if filename.starts_with('.') && !component.starts_with('.') { continue; }
+        if filename.starts_with('.') && !component.starts_with('.') {
+            continue;
+        }
         if wildcard_match(component.as_bytes(), filename.as_bytes()) {
             expand_components(io, &entry.path, components, index + 1, all_links, output);
         }
@@ -659,53 +851,81 @@ fn expand_components(io: &dyn FileIO, base: &Path, components: &[String], index:
 }
 
 fn has_wildcard(component: &str) -> bool {
-    component.bytes().any(|byte| matches!(byte, b'*' | b'?' | b'['))
+    component
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
 }
 
 /// Matches one file-name wildcard pattern (`*`, `?`, `[...]`) against a name.
 pub(crate) fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
     fn matches_at(pattern: &[u8], value: &[u8], pi: usize, vi: usize) -> bool {
-        if pi == pattern.len() { return vi == value.len(); }
+        if pi == pattern.len() {
+            return vi == value.len();
+        }
         match pattern[pi] {
             b'*' => (vi..=value.len()).any(|next| matches_at(pattern, value, pi + 1, next)),
             b'?' => vi < value.len() && matches_at(pattern, value, pi + 1, vi + 1),
             b'[' => {
-                let Some(relative) = pattern.get(pi + 1..).and_then(|tail| tail.iter().position(|byte| *byte == b']')) else {
-                    return vi < value.len() && value[vi] == b'[' && matches_at(pattern, value, pi + 1, vi + 1);
+                let Some(relative) = pattern
+                    .get(pi + 1..)
+                    .and_then(|tail| tail.iter().position(|byte| *byte == b']'))
+                else {
+                    return vi < value.len()
+                        && value[vi] == b'['
+                        && matches_at(pattern, value, pi + 1, vi + 1);
                 };
                 let close = pi + 1 + relative;
                 let class = &pattern[pi + 1..close];
-                let negated = class.first().is_some_and(|byte| matches!(byte, b'!' | b'^'));
+                let negated = class
+                    .first()
+                    .is_some_and(|byte| matches!(byte, b'!' | b'^'));
                 let class = if negated { &class[1..] } else { class };
                 let mut accepted = false;
                 let mut cursor = 0;
                 while cursor < class.len() {
                     if cursor + 2 < class.len() && class[cursor + 1] == b'-' {
-                        accepted |= vi < value.len() && (class[cursor]..=class[cursor + 2]).contains(&value[vi]);
+                        accepted |= vi < value.len()
+                            && (class[cursor]..=class[cursor + 2]).contains(&value[vi]);
                         cursor += 3;
                     } else {
                         accepted |= vi < value.len() && class[cursor] == value[vi];
                         cursor += 1;
                     }
                 }
-                vi < value.len() && accepted != negated && matches_at(pattern, value, close + 1, vi + 1)
+                vi < value.len()
+                    && accepted != negated
+                    && matches_at(pattern, value, close + 1, vi + 1)
             }
-            literal => vi < value.len() && literal == value[vi] && matches_at(pattern, value, pi + 1, vi + 1),
+            literal => {
+                vi < value.len()
+                    && literal == value[vi]
+                    && matches_at(pattern, value, pi + 1, vi + 1)
+            }
         }
     }
     matches_at(pattern, value, 0, 0)
 }
 
-fn split_path_list(paths: &str) -> Vec<String> {
-    let mut output = vec![String::new()];
+pub(crate) fn split_path_list(paths: &str) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut current = String::new();
     let mut escaped = false;
     for character in paths.chars() {
-        if escaped { output.last_mut().expect("one path").push(character); escaped = false; }
-        else if character == '\\' { escaped = true; }
-        else if character == ',' { output.push(String::new()); }
-        else { output.last_mut().expect("one path").push(character); }
+        if escaped {
+            current.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == ',' {
+            output.push(std::mem::take(&mut current));
+        } else {
+            current.push(character);
+        }
     }
-    if escaped { output.last_mut().expect("one path").push('\\'); }
+    if escaped {
+        current.push('\\');
+    }
+    output.push(current);
     output
 }
 
@@ -720,7 +940,11 @@ fn path_arg(value: &Typval) -> ox_eval::Result<PathBuf> {
 fn strict_path_arg(value: &Typval, argument: usize) -> ox_eval::Result<PathBuf> {
     match value {
         Typval::String(value) => Ok(PathBuf::from(value.to_string_lossy().into_owned())),
-        _ => Err(EvalError::new("E1174", 0, format!("String required for argument {argument}"))),
+        _ => Err(EvalError::new(
+            "E1174",
+            0,
+            format!("String required for argument {argument}"),
+        )),
     }
 }
 
@@ -751,9 +975,15 @@ fn bool_arg(value: &Typval) -> ox_eval::Result<bool> {
     number_arg(value).map(|value| value != 0)
 }
 
-fn number(value: i64) -> Typval { Typval::Number(value) }
-fn boolean(value: bool) -> Typval { number(i64::from(value)) }
-fn text(value: impl AsRef<str>) -> Typval { Typval::String(OxStr::from(value.as_ref())) }
+fn number(value: i64) -> Typval {
+    Typval::Number(value)
+}
+fn boolean(value: bool) -> Typval {
+    number(i64::from(value))
+}
+fn text(value: impl AsRef<str>) -> Typval {
+    Typval::String(OxStr::from(value.as_ref()))
+}
 
 #[cfg(test)]
 mod tests {
@@ -761,47 +991,69 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use crate::{Editor, ExExecutor};
-    use ox_eval::ScopeKind;
     use crate::script::RealFileIO;
+    use crate::{Editor, ExExecutor, TestEditorAccess};
+    use ox_eval::ScopeKind;
 
     struct TempRoot(PathBuf);
 
     impl TempRoot {
         fn new(label: &str) -> Self {
-            let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-            let path = std::env::temp_dir().join(format!("ox-editor-{label}-{}-{nonce}", std::process::id()));
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("ox-editor-{label}-{}-{nonce}", std::process::id()));
             fs::create_dir(&path).unwrap();
             Self(path)
         }
     }
 
     impl Drop for TempRoot {
-        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
-    fn path(path: &Path) -> Typval { text(path.to_string_lossy()) }
+    fn path(path: &Path) -> Typval {
+        text(path.to_string_lossy())
+    }
 
     /// `writefile` at top-level script scope: no function frame, so `D` is
     /// `E193` here and the deferred path is discarded.
-    fn write(args: Vec<Typval>) -> ox_eval::Result<Typval> {
+    fn write(args: &[Typval]) -> ox_eval::Result<Typval> {
         check_writefile_arity(args.len())?;
-        writefile(&RealFileIO, &args, false, &mut None)
+        writefile(&RealFileIO, args, false, &mut None)
     }
 
     #[test]
     fn executor_routes_filesystem_builtins_through_fileio() {
         let root = TempRoot::new("executor");
         let directory = root.0.join("made");
-        let mut editor = Editor::new();
+        let editor = TestEditorAccess::new(Editor::new());
         let mut executor = ExExecutor::new();
-        executor.execute_script(
-            &mut editor,
-            "<filesystem-test>",
-            &format!("call mkdir('{}')\nlet g:isdir = isdirectory('{}')", directory.display(), directory.display()),
-        ).unwrap();
+        executor
+            .execute_script(
+                &editor,
+                "<filesystem-test>",
+                &format!(
+                    "call mkdir('{}')\nlet g:isdir = isdirectory('{}')",
+                    directory.display(),
+                    directory.display()
+                ),
+            )
+            .unwrap();
         assert!(directory.is_dir());
-        assert_eq!(executor.scope().global.iter().find(|(name, _)| name.as_bytes() == b"isdir").map(|(_, value)| value.clone()), Some(number(1)));
+        assert_eq!(
+            executor
+                .scope()
+                .global
+                .iter()
+                .find(|(name, _)| name.as_bytes() == b"isdir")
+                .map(|(_, value)| value.clone()),
+            Some(number(1))
+        );
     }
 
     #[test]
@@ -814,16 +1066,47 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
         }
-        assert_eq!(call(&RealFileIO, "filereadable", vec![path(&file)]).unwrap(), number(1));
-        assert_eq!(call(&RealFileIO, "isdirectory", vec![path(&root.0)]).unwrap(), number(1));
-        assert_eq!(call(&RealFileIO, "getfsize", vec![path(&file)]).unwrap(), number(4));
-        assert_eq!(call(&RealFileIO, "getfsize", vec![path(&root.0)]).unwrap(), number(0));
-        assert_eq!(call(&RealFileIO, "getfsize", vec![path(&root.0.join("missing"))]).unwrap(), number(-1));
-        assert!(matches!(call(&RealFileIO, "getftime", vec![path(&file)]).unwrap(), Typval::Number(value) if value > 0));
+        assert_eq!(
+            call(&RealFileIO, "filereadable", &[path(&file)]).unwrap(),
+            number(1)
+        );
+        assert_eq!(
+            call(&RealFileIO, "isdirectory", &[path(&root.0)]).unwrap(),
+            number(1)
+        );
+        assert_eq!(
+            call(&RealFileIO, "getfsize", &[path(&file)]).unwrap(),
+            number(4)
+        );
+        assert_eq!(
+            call(&RealFileIO, "getfsize", &[path(&root.0)]).unwrap(),
+            number(0)
+        );
+        assert_eq!(
+            call(&RealFileIO, "getfsize", &[path(&root.0.join("missing"))]).unwrap(),
+            number(-1)
+        );
+        assert!(
+            matches!(call(&RealFileIO, "getftime", &[path(&file)]).unwrap(), Typval::Number(value) if value > 0)
+        );
         #[cfg(unix)]
-        assert_eq!(call(&RealFileIO, "getfperm", vec![path(&file)]).unwrap(), text("rw-r-----"));
-        assert_eq!(call(&RealFileIO, "filewritable", vec![path(&root.0)]).unwrap(), number(2));
-        assert_eq!(call(&RealFileIO, "filewritable", vec![path(&root.0.join("missing"))]).unwrap(), number(0));
+        assert_eq!(
+            call(&RealFileIO, "getfperm", &[path(&file)]).unwrap(),
+            text("rw-r-----")
+        );
+        assert_eq!(
+            call(&RealFileIO, "filewritable", &[path(&root.0)]).unwrap(),
+            number(2)
+        );
+        assert_eq!(
+            call(
+                &RealFileIO,
+                "filewritable",
+                &[path(&root.0.join("missing"))]
+            )
+            .unwrap(),
+            number(0)
+        );
     }
 
     #[test]
@@ -832,17 +1115,43 @@ mod tests {
         let nested = root.0.join("one/two");
         // `f_mkdir` reports OK as 1, and no longer routes through `call`:
         // its `D`/`R` flags need the function-frame context.
-        assert_eq!(mkdir(&RealFileIO, &[path(&nested), text("p"), number(0o700)], false, &mut None).unwrap(), number(1));
+        assert_eq!(
+            mkdir(
+                &RealFileIO,
+                &[path(&nested), text("p"), number(0o700)],
+                false,
+                &mut None
+            )
+            .unwrap(),
+            number(1)
+        );
         assert!(nested.is_dir());
         let from = nested.join("from");
         let to = nested.join("to");
         fs::write(&from, b"x").unwrap();
-        assert_eq!(call(&RealFileIO, "rename", vec![path(&from), path(&to)]).unwrap(), number(0));
+        assert_eq!(
+            call(&RealFileIO, "rename", &[path(&from), path(&to)]).unwrap(),
+            number(0)
+        );
         assert!(!from.exists() && to.is_file());
-        assert_eq!(call(&RealFileIO, "delete", vec![path(&to)]).unwrap(), number(0));
+        assert_eq!(
+            call(&RealFileIO, "delete", &[path(&to)]).unwrap(),
+            number(0)
+        );
         fs::write(nested.join("child"), b"x").unwrap();
-        assert_eq!(call(&RealFileIO, "delete", vec![path(&nested), text("d")]).unwrap(), number(-1));
-        assert_eq!(call(&RealFileIO, "delete", vec![path(&root.0.join("one")), text("rf")]).unwrap(), number(0));
+        assert_eq!(
+            call(&RealFileIO, "delete", &[path(&nested), text("d")]).unwrap(),
+            number(-1)
+        );
+        assert_eq!(
+            call(
+                &RealFileIO,
+                "delete",
+                &[path(&root.0.join("one")), text("rf")]
+            )
+            .unwrap(),
+            number(0)
+        );
         assert!(!root.0.join("one").exists());
     }
 
@@ -853,32 +1162,85 @@ mod tests {
     fn mkdir_reports_ok_one_fail_zero_and_validates_prot_before_flags() {
         let root = TempRoot::new("mkdir-p");
         let nested = root.0.join("Xmkdir/nested");
-        assert_eq!(mkdir(&RealFileIO, &[path(&nested), text("p")], false, &mut None).unwrap(), number(1));
+        assert_eq!(
+            mkdir(&RealFileIO, &[path(&nested), text("p")], false, &mut None).unwrap(),
+            number(1)
+        );
         assert!(nested.is_dir());
         // Existing directories with 'p' are quiet successes.
-        assert_eq!(mkdir(&RealFileIO, &[path(&root.0.join("Xmkdir")), text("p")], false, &mut None).unwrap(), number(1));
-        assert_eq!(mkdir(&RealFileIO, &[path(&nested), text("p")], false, &mut None).unwrap(), number(1));
+        assert_eq!(
+            mkdir(
+                &RealFileIO,
+                &[path(&root.0.join("Xmkdir")), text("p")],
+                false,
+                &mut None
+            )
+            .unwrap(),
+            number(1)
+        );
+        assert_eq!(
+            mkdir(&RealFileIO, &[path(&nested), text("p")], false, &mut None).unwrap(),
+            number(1)
+        );
         // 'p' does not suppress a real error: an existing file is E739.
         let file = root.0.join("Xfile");
         fs::write(&file, b"").unwrap();
-        assert_eq!(mkdir(&RealFileIO, &[path(&file), text("p")], false, &mut None).unwrap_err().code, "E739");
+        assert_eq!(
+            mkdir(&RealFileIO, &[path(&file), text("p")], false, &mut None)
+                .unwrap_err()
+                .code,
+            "E739"
+        );
         // Without 'p' an existing directory is E739 and a fresh one is 1.
-        assert_eq!(mkdir(&RealFileIO, &[path(&root.0.join("Xmkdir"))], false, &mut None).unwrap_err().code, "E739");
+        assert_eq!(
+            mkdir(
+                &RealFileIO,
+                &[path(&root.0.join("Xmkdir"))],
+                false,
+                &mut None
+            )
+            .unwrap_err()
+            .code,
+            "E739"
+        );
         let fresh = root.0.join("fresh");
-        assert_eq!(mkdir(&RealFileIO, &[path(&fresh)], false, &mut None).unwrap(), number(1));
+        assert_eq!(
+            mkdir(&RealFileIO, &[path(&fresh)], false, &mut None).unwrap(),
+            number(1)
+        );
         assert!(fresh.is_dir());
         // An empty name is FAIL without a message; a List name is E730.
-        assert_eq!(mkdir(&RealFileIO, &[text("")], false, &mut None).unwrap(), number(0));
-        assert_eq!(mkdir(&RealFileIO, &[Typval::list(Vec::new())], false, &mut None).unwrap_err().code, "E730");
+        assert_eq!(
+            mkdir(&RealFileIO, &[text("")], false, &mut None).unwrap(),
+            number(0)
+        );
+        assert_eq!(
+            mkdir(&RealFileIO, &[Typval::list(Vec::new())], false, &mut None)
+                .unwrap_err()
+                .code,
+            "E730"
+        );
         // prot (argument 3) is read as a Number before the flags string is
         // read as a String, so the List prot reports E745 and not E730.
         assert_eq!(
-            mkdir(&RealFileIO, &[text("abc"), Typval::list(Vec::new()), Typval::list(Vec::new())], false, &mut None)
-                .unwrap_err()
-                .code,
+            mkdir(
+                &RealFileIO,
+                &[
+                    text("abc"),
+                    Typval::list(Vec::new()),
+                    Typval::list(Vec::new())
+                ],
+                false,
+                &mut None
+            )
+            .unwrap_err()
+            .code,
             "E745"
         );
-        assert!(!root.0.join("abc").exists(), "E745 must not create the directory");
+        assert!(
+            !root.0.join("abc").exists(),
+            "E745 must not create the directory"
+        );
     }
 
     // Test_mkdir_defer_del (test_eval_stuff.vim 69-103): 'D' defers
@@ -889,36 +1251,77 @@ mod tests {
     fn mkdir_defer_flags_report_first_created_directory_and_mode() {
         let root = TempRoot::new("mkdir-defer");
         let top = root.0.join("Xtopdir");
-        assert_eq!(mkdir(&RealFileIO, &[path(&top), text("p")], false, &mut None).unwrap(), number(1));
+        assert_eq!(
+            mkdir(&RealFileIO, &[path(&top), text("p")], false, &mut None).unwrap(),
+            number(1)
+        );
 
         // Xtopdir exists, so the walk's first creation is tmp-d, not the
         // full name.
         let mut deferred = None;
         let sub = top.join("tmp-d/sub");
-        assert_eq!(mkdir(&RealFileIO, &[path(&sub), text("pD")], true, &mut deferred).unwrap(), number(1));
-        assert_eq!(deferred, Some((fs::canonicalize(&top.join("tmp-d")).unwrap(), DeleteMode::Dir)));
+        assert_eq!(
+            mkdir(&RealFileIO, &[path(&sub), text("pD")], true, &mut deferred).unwrap(),
+            number(1)
+        );
+        assert_eq!(
+            deferred,
+            Some((
+                fs::canonicalize(top.join("tmp-d")).unwrap(),
+                DeleteMode::Dir
+            ))
+        );
 
         // 'R' swaps the mode for the recursive delete; a fresh path keeps
         // this on the first-created branch.
         let mut deferred = None;
         let sub = top.join("tmp-r/sub");
-        assert_eq!(mkdir(&RealFileIO, &[path(&sub), text("pR")], true, &mut deferred).unwrap(), number(1));
-        assert_eq!(deferred, Some((fs::canonicalize(&top.join("tmp-r")).unwrap(), DeleteMode::Recursive)));
+        assert_eq!(
+            mkdir(&RealFileIO, &[path(&sub), text("pR")], true, &mut deferred).unwrap(),
+            number(1)
+        );
+        assert_eq!(
+            deferred,
+            Some((
+                fs::canonicalize(top.join("tmp-r")).unwrap(),
+                DeleteMode::Recursive
+            ))
+        );
 
         // Nothing was created, so the deferred delete targets the directory
         // itself (fs.c 1143-1146).
         let mut deferred = None;
         let existing = top.join("tmp-d");
-        assert_eq!(mkdir(&RealFileIO, &[path(&existing), text("pD")], true, &mut deferred).unwrap(), number(1));
-        assert_eq!(deferred, Some((fs::canonicalize(&existing).unwrap(), DeleteMode::Dir)));
+        assert_eq!(
+            mkdir(
+                &RealFileIO,
+                &[path(&existing), text("pD")],
+                true,
+                &mut deferred
+            )
+            .unwrap(),
+            number(1)
+        );
+        assert_eq!(
+            deferred,
+            Some((fs::canonicalize(&existing).unwrap(), DeleteMode::Dir))
+        );
 
         // Without a function frame the D/R flags are E193 before anything is
         // created, and no defer is reported on the success path without them.
         let target = root.0.join("noframe");
-        assert_eq!(mkdir(&RealFileIO, &[path(&target), text("D")], false, &mut None).unwrap_err().code, "E193");
+        assert_eq!(
+            mkdir(&RealFileIO, &[path(&target), text("D")], false, &mut None)
+                .unwrap_err()
+                .code,
+            "E193"
+        );
         assert!(!target.exists(), "E193 must leave no directory behind");
         let mut deferred = None;
-        assert_eq!(mkdir(&RealFileIO, &[path(&target)], true, &mut deferred).unwrap(), number(1));
+        assert_eq!(
+            mkdir(&RealFileIO, &[path(&target)], true, &mut deferred).unwrap(),
+            number(1)
+        );
         assert_eq!(deferred, None);
     }
 
@@ -932,11 +1335,11 @@ mod tests {
         let root = TempRoot::new("mkdir-defer-frames");
         let base = root.0.display().to_string();
 
-        let mut editor = Editor::new();
+        let editor = TestEditorAccess::new(Editor::new());
         let mut executor = ExExecutor::new();
         executor
             .execute_script(
-                &mut editor,
+                &editor,
                 "mkdir-defer.vim",
                 &format!(
                     "func DoMkdirDel(name)\n\
@@ -976,14 +1379,47 @@ mod tests {
             )
             .unwrap();
 
-        let flag = |name: &[u8]| executor.scope().get_scoped(ScopeKind::Global, name, 0).cloned();
-        assert_eq!(flag(b"plain"), Ok(Typval::Number(1)), "tmp was created, so its own frame's 'D' had to remove it");
-        assert_eq!(flag(b"contains_dir"), Ok(Typval::Number(1)), "'D' on tmp must fail while sub is inside it");
-        assert_eq!(flag(b"contains_file"), Ok(Typval::Number(1)), "'D' on tmp must fail while file is inside it");
-        assert_eq!(flag(b"rec"), Ok(Typval::Number(1)), "'R' had to remove the freshly created tmp");
-        assert_eq!(flag(b"rec_nested"), Ok(Typval::Number(1)), "'R' on tmp/sub had to take tmp with it");
-        assert_eq!(flag(b"rec_file"), Ok(Typval::Number(1)), "'R' had to remove tmp and its file");
-        assert_eq!(flag(b"top_after"), Ok(Typval::Number(0)), "Suite's own 'R' had to remove Xtopdir");
+        let flag = |name: &[u8]| {
+            executor
+                .scope()
+                .get_scoped(ScopeKind::Global, name, 0)
+                .cloned()
+        };
+        assert_eq!(
+            flag(b"plain"),
+            Ok(Typval::Number(1)),
+            "tmp was created, so its own frame's 'D' had to remove it"
+        );
+        assert_eq!(
+            flag(b"contains_dir"),
+            Ok(Typval::Number(1)),
+            "'D' on tmp must fail while sub is inside it"
+        );
+        assert_eq!(
+            flag(b"contains_file"),
+            Ok(Typval::Number(1)),
+            "'D' on tmp must fail while file is inside it"
+        );
+        assert_eq!(
+            flag(b"rec"),
+            Ok(Typval::Number(1)),
+            "'R' had to remove the freshly created tmp"
+        );
+        assert_eq!(
+            flag(b"rec_nested"),
+            Ok(Typval::Number(1)),
+            "'R' on tmp/sub had to take tmp with it"
+        );
+        assert_eq!(
+            flag(b"rec_file"),
+            Ok(Typval::Number(1)),
+            "'R' had to remove tmp and its file"
+        );
+        assert_eq!(
+            flag(b"top_after"),
+            Ok(Typval::Number(0)),
+            "Suite's own 'R' had to remove Xtopdir"
+        );
     }
 
     // Test_readfile_binary (test_eval_stuff.vim 170-186) and
@@ -996,43 +1432,62 @@ mod tests {
         let file = root.0.join("dos");
         fs::write(&file, b"one\r\ntwo\r\nthree\r\n").unwrap();
         assert_eq!(
-            call(&RealFileIO, "readfile", vec![path(&file)]).unwrap(),
+            call(&RealFileIO, "readfile", &[path(&file)]).unwrap(),
             Typval::list(vec![text("one"), text("two"), text("three")])
         );
         assert_eq!(
-            call(&RealFileIO, "readfile", vec![path(&file), text(""), number(2)]).unwrap(),
+            call(&RealFileIO, "readfile", &[path(&file), text(""), number(2)]).unwrap(),
             Typval::list(vec![text("one"), text("two")])
         );
         assert_eq!(
-            call(&RealFileIO, "readfile", vec![path(&file), text("b")]).unwrap(),
-            Typval::list(vec![text("one\r"), text("two\r"), text("three\r"), text("")])
+            call(&RealFileIO, "readfile", &[path(&file), text("b")]).unwrap(),
+            Typval::list(vec![
+                text("one\r"),
+                text("two\r"),
+                text("three\r"),
+                text("")
+            ])
         );
         assert_eq!(
-            call(&RealFileIO, "readfile", vec![path(&file), text("b"), number(2)]).unwrap(),
+            call(
+                &RealFileIO,
+                "readfile",
+                &[path(&file), text("b"), number(2)]
+            )
+            .unwrap(),
             Typval::list(vec![text("one\r"), text("two\r")])
         );
 
         let empty = root.0.join("empty");
         fs::write(&empty, b"").unwrap();
-        assert_eq!(call(&RealFileIO, "readfile", vec![path(&empty), text("b")]).unwrap(), Typval::list(vec![text("")]));
-        assert_eq!(call(&RealFileIO, "readfile", vec![path(&empty)]).unwrap(), Typval::list(Vec::new()));
+        assert_eq!(
+            call(&RealFileIO, "readfile", &[path(&empty), text("b")]).unwrap(),
+            Typval::list(vec![text("")])
+        );
+        assert_eq!(
+            call(&RealFileIO, "readfile", &[path(&empty)]).unwrap(),
+            Typval::list(Vec::new())
+        );
 
         let nulls = root.0.join("nulls");
         fs::write(&nulls, b"a\0b\nc\0\n").unwrap();
         assert_eq!(
-            call(&RealFileIO, "readfile", vec![path(&nulls)]).unwrap(),
+            call(&RealFileIO, "readfile", &[path(&nulls)]).unwrap(),
             Typval::list(vec![text("a\nb"), text("c\n")])
         );
         assert_eq!(
-            call(&RealFileIO, "readfile", vec![path(&nulls), text("b")]).unwrap(),
+            call(&RealFileIO, "readfile", &[path(&nulls), text("b")]).unwrap(),
             Typval::list(vec![text("a\nb"), text("c\n"), text("")])
         );
 
         // 'B' is an exact-match flag returning the whole file as a Blob;
         // "bb" is not 'b', so it reads as text.
-        assert_eq!(call(&RealFileIO, "readfile", vec![path(&file), text("B")]).unwrap(), Typval::Blob(b"one\r\ntwo\r\nthree\r\n".to_vec()));
         assert_eq!(
-            call(&RealFileIO, "readfile", vec![path(&file), text("bb")]).unwrap(),
+            call(&RealFileIO, "readfile", &[path(&file), text("B")]).unwrap(),
+            Typval::Blob(b"one\r\ntwo\r\nthree\r\n".to_vec())
+        );
+        assert_eq!(
+            call(&RealFileIO, "readfile", &[path(&file), text("bb")]).unwrap(),
             Typval::list(vec![text("one"), text("two"), text("three")])
         );
     }
@@ -1045,11 +1500,11 @@ mod tests {
         let file = root.0.join("bom");
         fs::write(&file, b"\xef\xbb\xbfFOO\nFOO\xef\xbb\xbfBAR\n").unwrap();
         assert_eq!(
-            call(&RealFileIO, "readfile", vec![path(&file)]).unwrap(),
+            call(&RealFileIO, "readfile", &[path(&file)]).unwrap(),
             Typval::list(vec![text("FOO"), text("FOOBAR")])
         );
         assert_eq!(
-            call(&RealFileIO, "readfile", vec![path(&file), text("b")]).unwrap(),
+            call(&RealFileIO, "readfile", &[path(&file), text("b")]).unwrap(),
             Typval::list(vec![text("\u{feff}FOO"), text("FOO\u{feff}BAR"), text("")])
         );
     }
@@ -1059,14 +1514,26 @@ mod tests {
         let root = TempRoot::new("content");
         let file = root.0.join("file");
         let lines = Typval::list(vec![text("one"), text("two")]);
-        assert_eq!(write(vec![lines, path(&file)]).unwrap(), number(0));
+        assert_eq!(write(&[lines, path(&file)]).unwrap(), number(0));
         assert_eq!(fs::read(&file).unwrap(), b"one\ntwo\n");
-        assert_eq!(call(&RealFileIO, "readfile", vec![path(&file)]).unwrap(), Typval::list(vec![text("one"), text("two")]));
-        assert_eq!(write(vec![Typval::list(vec![text("three")]), path(&file), text("ab")]).unwrap(), number(0));
+        assert_eq!(
+            call(&RealFileIO, "readfile", &[path(&file)]).unwrap(),
+            Typval::list(vec![text("one"), text("two")])
+        );
+        assert_eq!(
+            write(&[Typval::list(vec![text("three")]), path(&file), text("ab")]).unwrap(),
+            number(0)
+        );
         assert_eq!(fs::read(&file).unwrap(), b"one\ntwo\nthree");
-        assert_eq!(call(&RealFileIO, "readfile", vec![path(&file), text("b")]).unwrap(), Typval::list(vec![text("one"), text("two"), text("three")]));
+        assert_eq!(
+            call(&RealFileIO, "readfile", &[path(&file), text("b")]).unwrap(),
+            Typval::list(vec![text("one"), text("two"), text("three")])
+        );
         let bytes = root.0.join("bytes");
-        assert_eq!(write(vec![Typval::Blob(vec![0, 0xff, b'\n']), path(&bytes)]).unwrap(), number(0));
+        assert_eq!(
+            write(&[Typval::Blob(vec![0, 0xff, b'\n']), path(&bytes)]).unwrap(),
+            number(0)
+        );
         assert_eq!(fs::read(bytes).unwrap(), vec![0, 0xff, b'\n']);
     }
 
@@ -1075,9 +1542,14 @@ mod tests {
         let root = TempRoot::new("write-errors");
         let directory = root.0.join("directory");
         fs::create_dir(&directory).unwrap();
-        let error = write(vec![Typval::list(vec![text("x")]), path(&directory)]).unwrap_err();
+        let error = write(&[Typval::list(vec![text("x")]), path(&directory)]).unwrap_err();
         assert_eq!(error.code, "E482");
-        let error = write(vec![Typval::list(Vec::new()), path(&root.0.join("file")), text("z")]).unwrap_err();
+        let error = write(&[
+            Typval::list(Vec::new()),
+            path(&root.0.join("file")),
+            text("z"),
+        ])
+        .unwrap_err();
         assert_eq!(error.code, "E5060");
     }
 
@@ -1099,42 +1571,88 @@ mod tests {
 
         // `p` creates the parent chain; without it the same write fails.
         let deep = root.0.join("a/b/deep");
-        assert_eq!(write(vec![Typval::list(vec![text("x")]), path(&deep), text("p")]).unwrap(), number(0));
+        assert_eq!(
+            write(&[Typval::list(vec![text("x")]), path(&deep), text("p")]).unwrap(),
+            number(0)
+        );
         assert_eq!(fs::read(&deep).unwrap(), b"x\n");
         let deeper = root.0.join("c/d/deep");
-        assert_eq!(write(vec![Typval::list(vec![text("x")]), path(&deeper)]).unwrap_err().code, "E482");
+        assert_eq!(
+            write(&[Typval::list(vec![text("x")]), path(&deeper)])
+                .unwrap_err()
+                .code,
+            "E482"
+        );
 
         // `a` appends, and only `a`.
         let file = root.0.join("file");
-        assert_eq!(write(vec![Typval::list(vec![text("one")]), path(&file)]).unwrap(), number(0));
-        assert_eq!(write(vec![Typval::list(vec![text("two")]), path(&file), text("a")]).unwrap(), number(0));
+        assert_eq!(
+            write(&[Typval::list(vec![text("one")]), path(&file)]).unwrap(),
+            number(0)
+        );
+        assert_eq!(
+            write(&[Typval::list(vec![text("two")]), path(&file), text("a")]).unwrap(),
+            number(0)
+        );
         assert_eq!(fs::read(&file).unwrap(), b"one\ntwo\n");
-        assert_eq!(write(vec![Typval::list(vec![text("three")]), path(&file)]).unwrap(), number(0));
+        assert_eq!(
+            write(&[Typval::list(vec![text("three")]), path(&file)]).unwrap(),
+            number(0)
+        );
         assert_eq!(fs::read(&file).unwrap(), b"three\n");
 
         // `b` drops the final newline; `s` and `S` are durability controls this
         // port has no seam for and must leave the bytes exactly as `b` alone
         // would.
         let binary = root.0.join("binary");
-        assert_eq!(write(vec![Typval::list(vec![text("x"), text("y")]), path(&binary), text("b")]).unwrap(), number(0));
+        assert_eq!(
+            write(&[
+                Typval::list(vec![text("x"), text("y")]),
+                path(&binary),
+                text("b")
+            ])
+            .unwrap(),
+            number(0)
+        );
         assert_eq!(fs::read(&binary).unwrap(), b"x\ny");
         for flags in ["s", "S", "bs", "bS"] {
-            assert_eq!(write(vec![Typval::list(vec![text("x"), text("y")]), path(&binary), text(flags)]).unwrap(), number(0));
-            let expected: &[u8] = if flags.contains('b') { b"x\ny" } else { b"x\ny\n" };
+            assert_eq!(
+                write(&[
+                    Typval::list(vec![text("x"), text("y")]),
+                    path(&binary),
+                    text(flags)
+                ])
+                .unwrap(),
+                number(0)
+            );
+            let expected: &[u8] = if flags.contains('b') {
+                b"x\ny"
+            } else {
+                b"x\ny\n"
+            };
             assert_eq!(fs::read(&binary).unwrap(), expected, "flags {flags:?}");
         }
 
         // `D` needs a function frame (`can_add_defer`) and reports the path to
         // delete when it has one. The check runs before the file is opened.
         let deferred_path = root.0.join("deferred");
-        let error = write(vec![Typval::list(vec![text("x")]), path(&deferred_path), text("D")]).unwrap_err();
+        let error = write(&[
+            Typval::list(vec![text("x")]),
+            path(&deferred_path),
+            text("D"),
+        ])
+        .unwrap_err();
         assert_eq!(error.code, "E193");
         assert!(!deferred_path.exists(), "E193 must leave no file behind");
         let mut deferred = None;
         assert_eq!(
             writefile(
                 &RealFileIO,
-                &[Typval::list(vec![text("x")]), path(&deferred_path), text("D")],
+                &[
+                    Typval::list(vec![text("x")]),
+                    path(&deferred_path),
+                    text("D")
+                ],
                 true,
                 &mut deferred,
             )
@@ -1142,11 +1660,14 @@ mod tests {
             number(0)
         );
         assert!(deferred_path.exists());
-        assert_eq!(deferred.as_deref(), Some(fs::canonicalize(&deferred_path).unwrap().as_path()));
+        assert_eq!(
+            deferred.as_deref(),
+            Some(fs::canonicalize(&deferred_path).unwrap().as_path())
+        );
 
         // An unknown letter names the remainder of the flag string, not the
         // single character: `semsg("...%s", p)`.
-        let error = write(vec![Typval::list(Vec::new()), path(&file), text("bxa")]).unwrap_err();
+        let error = write(&[Typval::list(Vec::new()), path(&file), text("bxa")]).unwrap_err();
         assert_eq!(error.code, "E5060");
         assert_eq!(error.message, "Unknown flag: xa");
     }
@@ -1160,10 +1681,32 @@ mod tests {
         fs::write(root.0.join("one/deep/b.vim"), b"").unwrap();
         fs::write(root.0.join("two/c.vim"), b"").unwrap();
         let pattern = root.0.join("**/*.vim");
-        let expected = Typval::list(vec![path(&root.0.join("one/a.vim")), path(&root.0.join("one/deep/b.vim")), path(&root.0.join("two/c.vim"))]);
-        assert_eq!(call(&RealFileIO, "glob", vec![path(&pattern), number(0), number(1)]).unwrap(), expected);
-        let paths = format!("{},{}", root.0.join("one").display(), root.0.join("two").display());
-        assert_eq!(call(&RealFileIO, "globpath", vec![text(paths), text("*.vim"), number(0), number(1)]).unwrap(), Typval::list(vec![path(&root.0.join("one/a.vim")), path(&root.0.join("two/c.vim"))]));
+        let expected = Typval::list(vec![
+            path(&root.0.join("one/a.vim")),
+            path(&root.0.join("one/deep/b.vim")),
+            path(&root.0.join("two/c.vim")),
+        ]);
+        assert_eq!(
+            call(&RealFileIO, "glob", &[path(&pattern), number(0), number(1)]).unwrap(),
+            expected
+        );
+        let paths = format!(
+            "{},{}",
+            root.0.join("one").display(),
+            root.0.join("two").display()
+        );
+        assert_eq!(
+            call(
+                &RealFileIO,
+                "globpath",
+                &[text(paths), text("*.vim"), number(0), number(1)]
+            )
+            .unwrap(),
+            Typval::list(vec![
+                path(&root.0.join("one/a.vim")),
+                path(&root.0.join("two/c.vim"))
+            ])
+        );
     }
 
     #[test]
@@ -1187,14 +1730,17 @@ mod tests {
             path(&root.0.join(".runtest.vim.swp")),
             path(&sub.join(".nested.swp")),
         ]);
-        assert_eq!(swapfilelist(&RealFileIO, 0, &directories).unwrap(), expected);
+        assert_eq!(
+            swapfilelist(&RealFileIO, 0, &directories).unwrap(),
+            expected
+        );
     }
 
     #[test]
     fn swapfilelist_current_directory_entry_yields_relative_names() {
         let _guard = crate::PROCESS_STATE_GUARD
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = TempRoot::new("swapfilelist-dot");
         fs::write(root.0.join(".one.swp"), b"").unwrap();
         fs::write(root.0.join("plain"), b"").unwrap();
@@ -1212,13 +1758,16 @@ mod tests {
         assert_eq!(swapfilelist(&RealFileIO, 1, ".").unwrap_err().code, "E118");
         let root = TempRoot::new("swapfilelist-option");
         fs::write(root.0.join(".opt.swp"), b"").unwrap();
-        let mut editor = Editor::new();
+        let editor = TestEditorAccess::new(Editor::new());
         let mut executor = ExExecutor::new();
         executor
             .execute_script(
-                &mut editor,
+                &editor,
                 "<swapfilelist-test>",
-                &format!("let &directory = '{}'\nlet g:swaps = swapfilelist()", root.0.display()),
+                &format!(
+                    "let &directory = '{}'\nlet g:swaps = swapfilelist()",
+                    root.0.display()
+                ),
             )
             .unwrap();
         let swaps = executor
@@ -1238,11 +1787,11 @@ mod tests {
         let root = TempRoot::new("mkdir-plain-p");
         let base = root.0.display().to_string();
 
-        let mut editor = Editor::new();
+        let editor = TestEditorAccess::new(Editor::new());
         let mut executor = ExExecutor::new();
         executor
             .execute_script(
-                &mut editor,
+                &editor,
                 "mkdir-plain-p.vim",
                 &format!(
                     "func MakeDir(name)\n\
@@ -1255,7 +1804,12 @@ mod tests {
             .unwrap();
 
         assert!(root.0.join("Xplain").is_dir());
-        let flag = |name: &[u8]| executor.scope().get_scoped(ScopeKind::Global, name, 0).cloned();
+        let flag = |name: &[u8]| {
+            executor
+                .scope()
+                .get_scoped(ScopeKind::Global, name, 0)
+                .cloned()
+        };
         assert_eq!(flag(b"after"), Ok(Typval::Number(1)));
     }
 
@@ -1267,11 +1821,11 @@ mod tests {
         let root = TempRoot::new("defer-delete");
         let base = root.0.display().to_string();
 
-        let mut editor = Editor::new();
+        let editor = TestEditorAccess::new(Editor::new());
         let mut executor = ExExecutor::new();
         executor
             .execute_script(
-                &mut editor,
+                &editor,
                 "defer-delete.vim",
                 &format!(
                     "func DeferFile(name)\n\
@@ -1300,15 +1854,20 @@ mod tests {
             )
             .unwrap();
 
-        let flag = |name: &[u8]| executor.scope().get_scoped(ScopeKind::Global, name, 0).cloned();
+        let flag = |name: &[u8]| {
+            executor
+                .scope()
+                .get_scoped(ScopeKind::Global, name, 0)
+                .cloned()
+        };
         assert_eq!(flag(b"file_gone"), Ok(Typval::Number(1)));
         assert_eq!(flag(b"dir_gone"), Ok(Typval::Number(1)));
         assert_eq!(flag(b"rec_gone"), Ok(Typval::Number(1)));
 
-        let mut editor = Editor::new();
+        let editor = TestEditorAccess::new(Editor::new());
         let mut executor = ExExecutor::new();
         let result = executor.execute_script(
-            &mut editor,
+            &editor,
             "defer-delete-invalid.vim",
             &format!(
                 "func Bad(name)\n\
@@ -1317,7 +1876,10 @@ mod tests {
                  call Bad('{base}/ignored')"
             ),
         );
-        assert!(result.is_err(), "invalid defer delete flags must raise an error");
+        assert!(
+            result.is_err(),
+            "invalid defer delete flags must raise an error"
+        );
     }
     // `f_filecopy` copies a regular file or a symbolic link.  When a rename
     // across devices fails, `f_rename` falls back to copy-then-unlink.
@@ -1327,7 +1889,10 @@ mod tests {
         let from = root.0.join("from");
         let to = root.0.join("to");
         fs::write(&from, b"data").unwrap();
-        assert_eq!(call(&RealFileIO, "filecopy", vec![path(&from), path(&to)]).unwrap(), number(1));
+        assert_eq!(
+            call(&RealFileIO, "filecopy", &[path(&from), path(&to)]).unwrap(),
+            number(1)
+        );
         assert_eq!(fs::read(&to).unwrap(), b"data");
 
         let link = root.0.join("link");
@@ -1337,21 +1902,30 @@ mod tests {
         {
             std::os::unix::fs::symlink(&link_target, &link).unwrap();
             let link_copy = root.0.join("link-copy");
-            assert_eq!(call(&RealFileIO, "filecopy", vec![path(&link), path(&link_copy)]).unwrap(), number(1));
+            assert_eq!(
+                call(&RealFileIO, "filecopy", &[path(&link), path(&link_copy)]).unwrap(),
+                number(1)
+            );
             assert!(link_copy.is_symlink() || link_copy.is_file());
         }
 
         // Non-string arguments report E1174 with argument position.
         let list_arg = Typval::list(Vec::new());
         let blob_arg = Typval::Blob(vec![0]);
-        let error = call(&RealFileIO, "filecopy", vec![list_arg, path(&to)])
-            .unwrap_err();
+        let error = call(&RealFileIO, "filecopy", &[list_arg, path(&to)]).unwrap_err();
         assert_eq!(error.code, "E1174");
-        assert!(error.message.contains("String required for argument 1"), "got: {}", error.message);
-        let error = call(&RealFileIO, "filecopy", vec![path(&from), blob_arg])
-            .unwrap_err();
+        assert!(
+            error.message.contains("String required for argument 1"),
+            "got: {}",
+            error.message
+        );
+        let error = call(&RealFileIO, "filecopy", &[path(&from), blob_arg]).unwrap_err();
         assert_eq!(error.code, "E1174");
-        assert!(error.message.contains("String required for argument 2"), "got: {}", error.message);
+        assert!(
+            error.message.contains("String required for argument 2"),
+            "got: {}",
+            error.message
+        );
     }
 
     // `f_readblob` only reads the whole file for `size == -1`; any other
@@ -1362,22 +1936,35 @@ mod tests {
         let root = TempRoot::new("readblob");
         let file = root.0.join("file");
         fs::write(&file, b"abcdef").unwrap();
-        let whole = call(&RealFileIO, "readblob", vec![path(&file)]).unwrap();
+        let whole = call(&RealFileIO, "readblob", &[path(&file)]).unwrap();
         assert_eq!(whole, Typval::Blob(b"abcdef".to_vec()));
 
-        let with_offset = call(&RealFileIO, "readblob", vec![path(&file), number(2)]).unwrap();
+        let with_offset = call(&RealFileIO, "readblob", &[path(&file), number(2)]).unwrap();
         assert_eq!(with_offset, Typval::Blob(b"cdef".to_vec()));
 
-
-        let with_size = call(&RealFileIO, "readblob", vec![path(&file), number(1), number(2)]).unwrap();
+        let with_size = call(
+            &RealFileIO,
+            "readblob",
+            &[path(&file), number(1), number(2)],
+        )
+        .unwrap();
         assert_eq!(with_size, Typval::Blob(b"bc".to_vec()));
 
-        let empty = call(&RealFileIO, "readblob", vec![path(&file), number(0), number(-2)]).unwrap();
+        let empty = call(
+            &RealFileIO,
+            "readblob",
+            &[path(&file), number(0), number(-2)],
+        )
+        .unwrap();
         assert_eq!(empty, Typval::Blob(Vec::new()));
 
         let missing = root.0.join("missing");
-        let error = call(&RealFileIO, "readblob", vec![path(&missing)]).unwrap_err();
+        let error = call(&RealFileIO, "readblob", &[path(&missing)]).unwrap_err();
         assert_eq!(error.code, "E484");
-        assert!(error.message.contains("Can't open file"), "got: {}", error.message);
+        assert!(
+            error.message.contains("Can't open file"),
+            "got: {}",
+            error.message
+        );
     }
 }

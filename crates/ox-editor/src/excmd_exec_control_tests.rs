@@ -18,6 +18,7 @@
 use ox_eval::ScopeKind;
 use ox_types::Typval;
 
+use crate::TestEditorAccess;
 use crate::{Editor, ExExecutor, ExecError, VimExceptionKind};
 
 // ---------------------------------------------------------------------------
@@ -26,26 +27,35 @@ use crate::{Editor, ExExecutor, ExecError, VimExceptionKind};
 
 /// Read a `g:` variable as a number, panicking if missing or non-numeric.
 fn gnum(executor: &ExExecutor, name: &str) -> i64 {
-    match executor.scope().get_scoped(ScopeKind::Global, name.as_bytes(), 0) {
-        Ok(Typval::Number(n)) => *n,
-        Ok(other) => panic!("g:{name} is {other:?}, expected Number"),
-        Err(_) => panic!("g:{name} is undefined"),
+    let value = executor
+        .scope()
+        .get_scoped(ScopeKind::Global, name.as_bytes(), 0)
+        .unwrap_or_else(|error| panic!("g:{name} is undefined: {error:?}"));
+    match value {
+        Typval::Number(n) => *n,
+        other => panic!("g:{name} is {other:?}, expected Number"),
     }
 }
 
 /// Read a `g:` variable as a string, panicking if missing or non-string.
 fn gstr(executor: &ExExecutor, name: &str) -> String {
-    match executor.scope().get_scoped(ScopeKind::Global, name.as_bytes(), 0) {
-        Ok(Typval::String(s)) => s.to_string_lossy().into_owned(),
-        Ok(other) => panic!("g:{name} is {other:?}, expected String"),
-        Err(_) => panic!("g:{name} is undefined"),
+    let value = executor
+        .scope()
+        .get_scoped(ScopeKind::Global, name.as_bytes(), 0)
+        .unwrap_or_else(|error| panic!("g:{name} is undefined: {error:?}"));
+    match value {
+        Typval::String(s) => s.to_string_lossy().into_owned(),
+        other => panic!("g:{name} is {other:?}, expected String"),
     }
 }
 
 /// Assert that a `g:` variable is undefined (E121).
 fn gundefined(executor: &ExExecutor, name: &str) {
     assert!(
-        executor.scope().get_scoped(ScopeKind::Global, name.as_bytes(), 0).is_err(),
+        executor
+            .scope()
+            .get_scoped(ScopeKind::Global, name.as_bytes(), 0)
+            .is_err(),
         "g:{name} should be undefined"
     );
 }
@@ -68,9 +78,9 @@ fn vim_error<T>(result: Result<T, ExecError>) -> crate::VimException {
 fn if_true_branch_executes_and_sets_global() {
     // ex_docmd.c: `:if` evaluates condition; truthy branch body runs.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
-        .execute_script(&mut editor, "test.vim", "if 1\nlet g:x = 42\nendif")
+        .execute_script(&editor, "test.vim", "if 1\nlet g:x = 42\nendif")
         .unwrap();
     assert_eq!(gnum(&executor, "x"), 42);
 }
@@ -80,10 +90,10 @@ fn elseif_chain_picks_first_true_branch() {
     // ex_docmd.c: `:elseif` conditions are evaluated in order; the first
     // truthy one wins and later elseif bodies are skipped.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "if 0\nlet g:a = 1\nelseif 1\nlet g:b = 2\nelseif 1\nlet g:c = 3\nendif",
         )
@@ -97,10 +107,10 @@ fn elseif_chain_picks_first_true_branch() {
 fn else_runs_when_all_conditions_false() {
     // ex_docmd.c: `:else` is the fallback when no if/elseif condition matches.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "if 0\nlet g:a = 1\nelseif 0\nlet g:b = 1\nelse\nlet g:z = 99\nendif",
         )
@@ -115,10 +125,10 @@ fn nested_if_inside_if_evaluates_inner_branch() {
     // ex_docmd.c: nested `:if` blocks are independent; the inner condition
     // is only evaluated when the outer branch is active.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "if 1\nif 0\nlet g:inner_bad = 1\nelse\nlet g:inner_good = 1\nendif\nendif",
         )
@@ -137,10 +147,10 @@ fn while_loop_counts_iterations() {
     // ex_docmd.c: `:while` re-evaluates the condition before each iteration;
     // the body runs until the condition is falsy.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "let g:i = 0\nwhile g:i < 3\nlet g:i += 1\nendwhile",
         )
@@ -153,10 +163,10 @@ fn for_loop_sums_list_elements() {
     // ex_docmd.c: `:for` iterates list elements, assigning each to the loop
     // variable before executing the body.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "let g:sum = 0\nfor x in [1, 2, 3, 4]\nlet g:sum += x\nendfor",
         )
@@ -166,11 +176,11 @@ fn for_loop_sums_list_elements() {
 
 #[test]
 fn list_targets_destructure_let_and_for_values() {
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     let mut executor = ExExecutor::new();
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "let g:commented = 'ok' \" inline comment\nlet [x, y] = [3, 4]\nlet g:sum = x + y\nfor [left, right] in [[1, 2], [5, 8]]\nlet g:last = left + right\nendfor",
         )
@@ -185,10 +195,10 @@ fn for_loop_sets_last_element_as_string() {
     // ex_docmd.c: `:for` over a string list assigns each Typval::String to
     // the loop variable; the last value persists after the loop.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "for item in [\"alpha\", \"beta\", \"gamma\"]\nlet g:last = item\nendfor",
         )
@@ -205,10 +215,10 @@ fn for_loop_sets_last_element_as_string() {
 fn break_exits_while_loop_early() {
     // ex_docmd.c: `:break` terminates the innermost `:while`/`:for`.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "let g:i = 0\nwhile 1\nif g:i >= 2\nbreak\nendif\nlet g:i += 1\nendwhile",
         )
@@ -221,10 +231,10 @@ fn continue_skips_rest_of_while_body() {
     // ex_docmd.c: `:continue` jumps to the next loop iteration, skipping the
     // remaining body statements.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "let g:i = 0\nlet g:count = 0\nwhile g:i < 4\nlet g:i += 1\nif g:i == 2\ncontinue\nendif\nlet g:count += 1\nendwhile",
         )
@@ -238,10 +248,10 @@ fn continue_skips_rest_of_while_body() {
 fn break_exits_for_loop_early() {
     // ex_docmd.c: `:break` inside `:for` stops iteration immediately.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "let g:sum = 0\nfor x in [1, 2, 3, 4, 5]\nif x == 3\nbreak\nendif\nlet g:sum += x\nendfor",
         )
@@ -261,9 +271,9 @@ fn inactive_if_branch_body_not_executed() {
     // ex_docmd.c: when `:if` condition is falsy and there is no `:else`,
     // the body is skipped entirely.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
-        .execute_script(&mut editor, "test.vim", "if 0\nlet g:bad = 1\nendif")
+        .execute_script(&editor, "test.vim", "if 0\nlet g:bad = 1\nendif")
         .unwrap();
     gundefined(&executor, "bad");
 }
@@ -271,10 +281,10 @@ fn inactive_if_branch_body_not_executed() {
 #[test]
 fn inactive_function_branch_does_not_resolve_unknown_command() {
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "function Run()\nif 0\nechoconsole 'unreachable'\nendif\nlet g:inside = 3\nendfunction\ncall Run()\nlet g:after = 4",
         )
@@ -287,14 +297,21 @@ fn inactive_function_branch_does_not_resolve_unknown_command() {
 #[test]
 fn selected_function_branch_resolves_unknown_command_to_e492() {
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
-    let exception = vim_error(executor.execute_script(
-        &mut editor,
-        "test.vim",
-        "function Run()\nif 1\nechoconsole 'reached'\nendif\nendfunction\ncall Run()",
-    ));
-
-    assert_eq!(exception.kind, VimExceptionKind::Error("E492".to_owned()));
+    let editor = TestEditorAccess::new(Editor::new());
+    // Upstream `TRY_WRAP` (`helpers.c:159-165`) increments `trylevel` to 1
+    // before API execution, so errors propagate as exceptions.
+    let err = executor
+        .execute_script(
+            &editor,
+            "test.vim",
+            "function Run()\nif 1\nechoconsole 'reached'\nendif\nendfunction\ncall Run()",
+        )
+        .unwrap_err();
+    let message = match err {
+        ExecError::Vim(exception) => exception.message(),
+        other => panic!("expected Vim error, got {other:?}"),
+    };
+    assert!(message.contains("E492"), "expected E492 in {message:?}");
 }
 
 #[test]
@@ -303,10 +320,10 @@ fn inactive_elseif_condition_not_evaluated() {
     // `:elseif` conditions are NOT evaluated — referencing an undefined
     // variable in a skipped elseif must NOT raise E121.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "if 1\nlet g:ran = 1\nelseif g:undefined\nlet g:bad = 1\nendif",
         )
@@ -328,10 +345,10 @@ fn catch_regex_matches_thrown_string() {
     // through the exception message) matches.
     // test_trycatch.vim: `:throw "MyError" | catch /MyError/`
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "try\nthrow \"MyError\"\ncatch /MyError/\nlet g:caught = 1\nendtry",
         )
@@ -344,10 +361,10 @@ fn catch_unanchored_pattern_matches_suffix() {
     // test_trycatch.vim: `:throw "prefix-suffix"` is caught by `/suffix/`.
     // Patterns compile with search semantics; only an authored `^` anchors.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "try\nthrow \"prefix-suffix\"\ncatch /suffix/\nlet g:caught = 1\nendtry",
         )
@@ -360,9 +377,9 @@ fn catch_anchored_pattern_requires_exact_start() {
     // An authored `^` anchors the catch pattern; `/^suffix$/` does not match
     // `prefix-suffix`.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     let result = executor.execute_script(
-        &mut editor,
+        &editor,
         "test.vim",
         "try\nthrow \"prefix-suffix\"\ncatch /^suffix$/\nlet g:wrong = 1\nendtry",
     );
@@ -378,10 +395,10 @@ fn catch_non_match_falls_through_to_next_catch() {
     // matching pattern wins, non-matching ones are skipped.
     // test_trycatch.vim: sequential catch patterns
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "try\nthrow \"foo\"\ncatch /bar/\nlet g:wrong = 1\ncatch /foo/\nlet g:caught = 1\nendtry",
         )
@@ -396,10 +413,10 @@ fn catch_matches_error_code_from_undefined_function_call() {
     // starts with the error code; `:catch /E117/` matches it.
     // test_trycatch.vim: catching error-code exceptions
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "try\ncall NoSuchFunction()\ncatch /E117/\nlet g:caught = 1\nendtry",
         )
@@ -418,10 +435,10 @@ fn bare_catch_catches_any_throw() {
     // ex_docmd.c: `:catch` without a pattern is an unconditional catch.
     // test_trycatch.vim: `:throw "x" | catch | ...`
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "try\nthrow \"anything\"\ncatch\nlet g:caught = 1\nendtry",
         )
@@ -435,10 +452,10 @@ fn bare_catch_after_failed_pattern_catches_remaining() {
     // as the fallback for any exception the earlier patterns missed.
     // test_trycatch.vim: pattern catch followed by bare catch
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "try\nthrow \"zzz\"\ncatch /aaa/\nlet g:wrong = 1\ncatch\nlet g:caught = 1\nendtry",
         )
@@ -459,10 +476,10 @@ fn finally_runs_after_normal_try_completion() {
     // exception.
     // test_trycatch.vim: finally after normal try
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "try\nlet g:x = 1\nfinally\nlet g:final = 1\nendtry",
         )
@@ -477,10 +494,10 @@ fn finally_runs_after_catch_handles_throw() {
     // runs before control leaves the try block.
     // test_trycatch.vim: finally after catch
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "try\nthrow \"err\"\ncatch /err/\nlet g:caught = 1\nfinally\nlet g:final = 1\nendtry",
         )
@@ -495,9 +512,9 @@ fn finally_runs_and_uncaught_exception_propagates() {
     // exception propagates out of the try block as an error.
     // test_trycatch.vim: uncaught exception with finally
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     let result = executor.execute_script(
-        &mut editor,
+        &editor,
         "test.vim",
         "try\nthrow \"boom\"\ncatch /nope/\nlet g:wrong = 1\nfinally\nlet g:final = 1\nendtry",
     );
@@ -514,10 +531,10 @@ fn finally_runs_after_break_exits_loop() {
     // before the break propagates out to terminate the loop.
     // test_trycatch.vim: finally with break
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "test.vim",
             "let g:final = 0\nlet g:ran = 0\nfor x in [1, 2, 3]\ntry\nif x == 2\nbreak\nendif\nlet g:ran = x\nfinally\nlet g:final = x\nendtry\nendfor",
         )
@@ -539,8 +556,8 @@ fn uncaught_throw_returns_vim_error_with_message_and_throwpoint() {
     // it becomes ExecError::Vim.  Throwpoint for `:execute_line` is
     // "command line" (no source stack frame).
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
-    let result = executor.execute_line(&mut editor, "throw \"oops\"");
+    let editor = TestEditorAccess::new(Editor::new());
+    let result = executor.execute_line(&editor, "throw \"oops\"");
     let exception = vim_error(result.map(|_| ()));
     assert_eq!(exception.kind, VimExceptionKind::Throw);
     assert_eq!(exception.message(), "oops");
@@ -552,8 +569,8 @@ fn script_throw_has_script_throwpoint_with_line_number() {
     // ex_docmd.c: throwpoint for a sourced script is "script name[line]".
     // The line number is the physical source line of the `:throw`.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
-    let result = executor.execute_script(&mut editor, "my.vim", "let g:dummy = 0\nthrow \"err\"");
+    let editor = TestEditorAccess::new(Editor::new());
+    let result = executor.execute_script(&editor, "my.vim", "let g:dummy = 0\nthrow \"err\"");
     let exception = vim_error(result.map(|_| ()));
     assert_eq!(exception.kind, VimExceptionKind::Throw);
     assert_eq!(exception.message(), "err");
@@ -572,8 +589,8 @@ fn missing_endif_produces_e171_error() {
     // reports `Vim:E171` and not `Vim(if):`, because `do_cmdline` notices the
     // missing closer after its loop, where no command is current.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
-    let result = executor.execute_script(&mut editor, "test.vim", "if 1\necho \"hi\"");
+    let editor = TestEditorAccess::new(Editor::new());
+    let result = executor.execute_script(&editor, "test.vim", "if 1\necho \"hi\"");
     let exception = vim_error(result.map(|_| ()));
     assert_eq!(exception.kind, VimExceptionKind::Error("E171".to_owned()));
     assert_eq!(exception.message(), "Vim:E171: Missing :endif");
@@ -583,8 +600,8 @@ fn missing_endif_produces_e171_error() {
 fn missing_endtry_produces_e600_error() {
     // ex_docmd.c: `:try` without a matching `:endtry` raises E600.
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
-    let result = executor.execute_script(&mut editor, "test.vim", "try\nthrow \"x\"");
+    let editor = TestEditorAccess::new(Editor::new());
+    let result = executor.execute_script(&editor, "test.vim", "try\nthrow \"x\"");
     let exception = vim_error(result.map(|_| ()));
     assert_eq!(exception.kind, VimExceptionKind::Error("E600".to_owned()));
     assert_eq!(exception.message(), "Vim:E600: Missing :endtry");
@@ -599,29 +616,42 @@ fn missing_endtry_produces_e600_error() {
 
 /// An error escaping a builtin Ex command is prefixed with that command's
 /// *canonical* name, so an abbreviation still reports the full name, and a
-/// command implementation's own error carries no command line after it.
 #[test]
 fn an_error_is_prefixed_with_the_command_it_escaped_from() {
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
 
     // Oracle: `Vim(echo):E121: Undefined variable: g:nope`.
-    let exception = vim_error(executor.execute_line(&mut editor, "echo g:nope").map(|_| ()));
-    assert_eq!(exception.message(), "Vim(echo):E121: Undefined variable: g:nope");
+    // Upstream `TRY_WRAP` (`helpers.c:159-165`) increments `trylevel` to 1
+    // before API execution, so errors propagate as exceptions.
+    let err = executor.execute_line(&editor, "echo g:nope").unwrap_err();
+    assert_eq!(
+        match err {
+            ExecError::Vim(exception) => exception.message(),
+            other => panic!("expected Vim error, got {other:?}"),
+        },
+        "Vim(echo):E121: Undefined variable: g:nope"
+    );
 
     // Oracle: `:unm` resolves to `unmap`, and the prefix names the canonical
     // command, not what was typed — `Vim(unmap):E31: No such mapping`.
-    let exception = vim_error(executor.execute_line(&mut editor, "unm ,zzz").map(|_| ()));
-    assert_eq!(exception.message(), "Vim(unmap):E31: No such mapping");
+    let err = executor.execute_line(&editor, "unm ,zzz").unwrap_err();
+    assert_eq!(
+        match err {
+            ExecError::Vim(exception) => exception.message(),
+            other => panic!("expected Vim error, got {other:?}"),
+        },
+        "Vim(unmap):E31: No such mapping"
+    );
 }
 
 /// `:throw` is a user exception: its value is reported verbatim, with no
-/// prefix at all (`get_exception_string`'s ET_USER branch).
+/// prefix at all (`get_exception_string`'s `ET_USER` branch).
 #[test]
 fn an_explicit_throw_keeps_its_value_unprefixed() {
     let mut executor = ExExecutor::new();
-    let mut editor = Editor::new();
-    let exception = vim_error(executor.execute_line(&mut editor, "throw 'boom'").map(|_| ()));
+    let editor = TestEditorAccess::new(Editor::new());
+    let exception = vim_error(executor.execute_line(&editor, "throw 'boom'").map(|_| ()));
     assert_eq!(exception.message(), "boom");
 }
 
@@ -632,33 +662,41 @@ fn an_explicit_throw_keeps_its_value_unprefixed() {
 fn a_command_line_error_echoes_the_line_it_could_not_read() {
     // Oracle: `Vim(print):E16: Invalid range:   99print` — the two spaces of
     // indent are part of the line and are echoed.
-    let (mut editor, mut executor) = editor_with_buffer();
+    let (editor, mut executor) = editor_with_buffer();
     executor
-        .execute_script(&mut editor, "t.vim", "try\n  99print\ncatch\n  let g:e = v:exception\nendtry")
+        .execute_script(
+            &editor,
+            "t.vim",
+            "try\n  99print\ncatch\n  let g:e = v:exception\nendtry",
+        )
         .unwrap();
     assert_eq!(
         global_string(&executor, "e").as_deref(),
         Some("Vim(print):E16: Invalid range:   99print")
     );
 
-    // Oracle: `Vim:E492: Not an editor command:   definitelynotacommand`. An
-    // unresolvable name has no `cmdidx`, so upstream prefixes `Vim:`.
-    let (mut editor, mut executor) = editor_with_buffer();
+    // E492 reports the raw command line, including indentation, modifiers,
+    // range, arguments, and the unexecuted bar tail.
+    let (editor, mut executor) = editor_with_buffer();
     executor
-        .execute_script(&mut editor, "t.vim", "try\n  definitelynotacommand\ncatch\n  let g:e = v:exception\nendtry")
+        .execute_script(
+            &editor,
+            "t.vim",
+            "try\n  silent  1doesnotexist arg | echo hi\ncatch\n  let g:e = v:exception\nendtry",
+        )
         .unwrap();
     assert_eq!(
         global_string(&executor, "e").as_deref(),
-        Some("Vim:E492: Not an editor command:   definitelynotacommand")
+        Some("Vim:E492: Not an editor command:   silent  1doesnotexist arg | echo hi")
     );
 
     // Oracle: `Vim(print):E16: Invalid range: 99print " q | b"` — a quote and
     // a bar inside the line are echoed as written, neither escaped nor used as
     // a separator.
-    let (mut editor, mut executor) = editor_with_buffer();
+    let (editor, mut executor) = editor_with_buffer();
     executor
         .execute_script(
-            &mut editor,
+            &editor,
             "t.vim",
             "try\nexecute '99print \" q | b\"'\ncatch\nlet g:e = v:exception\nendtry",
         )
@@ -669,27 +707,77 @@ fn a_command_line_error_echoes_the_line_it_could_not_read() {
     );
 }
 
+/// Oracle: `Vim:E464: Ambiguous use of user-defined command:   Do` — two
+/// user commands `Doit` and `Dothat` make the prefix `Do` ambiguous. Unlike
+/// E492, `append_command` still echoes the raw indented command line after
+/// the message.
+#[test]
+fn an_ambiguous_user_command_echoes_the_line() {
+    let (editor, mut executor) = editor_with_buffer();
+    executor
+        .execute_line(&editor, "command! Doit let g:v = 1")
+        .unwrap();
+    executor
+        .execute_line(&editor, "command! Dothat let g:v = 2")
+        .unwrap();
+    executor
+        .execute_script(
+            &editor,
+            "t.vim",
+            "try\n  Do\ncatch\n  let g:e = v:exception\nendtry",
+        )
+        .unwrap();
+    assert_eq!(
+        global_string(&executor, "e").as_deref(),
+        Some("Vim:E464: Ambiguous use of user-defined command:   Do")
+    );
+}
+
+#[test]
+fn vanished_user_command_after_bar_uses_the_executing_line() {
+    let (editor, mut executor) = editor_with_buffer();
+    executor
+        .execute_line(&editor, "command! -bar -nargs=* Foo let g:value = 1")
+        .unwrap();
+
+    let exception = vim_error(
+        executor
+            .execute_line(&editor, "delcommand Foo | Foo arg | echo later")
+            .map(|_| ()),
+    );
+    assert_eq!(
+        exception.message(),
+        "Vim:E492: Not an editor command:  Foo arg | echo later"
+    );
+}
+
 /// An error a command *implementation* emits reaches `emsg` directly, so
 /// `append_command` never runs on it. Oracle: `Vim(foldopen):E490: No fold
 /// found` — the prefix is there and nothing follows the message.
 #[test]
 fn a_command_implementation_error_does_not_echo_the_line() {
-    let (mut editor, mut executor) = editor_with_buffer();
+    let (editor, mut executor) = editor_with_buffer();
     executor
-        .execute_script(&mut editor, "t.vim", "try\n  foldopen\ncatch\n  let g:e = v:exception\nendtry")
+        .execute_script(
+            &editor,
+            "t.vim",
+            "try\n  foldopen\ncatch\n  let g:e = v:exception\nendtry",
+        )
         .unwrap();
-    assert_eq!(global_string(&executor, "e").as_deref(), Some("Vim(foldopen):E490: No fold found"));
+    assert_eq!(
+        global_string(&executor, "e").as_deref(),
+        Some("Vim(foldopen):E490: No fold found")
+    );
 }
 
 /// An editor with one listed buffer shown in one window, which the commands
 /// above need in order to reach their own error rather than E749.
-fn editor_with_buffer() -> (Editor, ExExecutor) {
-    let mut editor = Editor::new();
-    let buffer = editor.create_buffer(true).unwrap();
-    editor
-        .create_tabpage(buffer, crate::Geometry::new(0, 0, 80, 24).unwrap())
+fn editor_with_buffer() -> (TestEditorAccess, ExExecutor) {
+    let mut raw = Editor::new();
+    let buffer = raw.create_buffer(true).unwrap();
+    raw.create_tabpage(buffer, crate::Geometry::new(0, 0, 80, 24).unwrap())
         .unwrap();
-    (editor, ExExecutor::new())
+    (TestEditorAccess::new(raw), ExExecutor::new())
 }
 
 /// Reads a global as a plain string.
@@ -725,11 +813,22 @@ fn global_string(executor: &ExExecutor, name: &str) -> Option<String> {
 
 /// Assert one Ex line raises `code`, and hand back the message.
 fn line_error(line: &str, code: &str) -> String {
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     let mut executor = ExExecutor::new();
-    let exception = vim_error(executor.execute_line(&mut editor, line));
-    assert_eq!(exception.kind, VimExceptionKind::Error(code.to_owned()), "for {line:?}");
-    exception.message()
+    // Upstream `TRY_WRAP` (`helpers.c:159-165`) increments `trylevel` to 1
+    // before executing commands via the API, so errors propagate as
+    // exceptions. `execute_line` mirrors this: errors return as
+    // `Err(ExecError::Vim(...))` with the message in the exception.
+    let err = executor.execute_line(&editor, line).unwrap_err();
+    let message = match err {
+        ExecError::Vim(exception) => exception.message(),
+        other => panic!("for {line:?}: expected Vim error, got {other:?}"),
+    };
+    assert!(
+        message.contains(&format!("{code}:")),
+        "for {line:?}: expected {code} in {message:?}"
+    );
+    message
 }
 
 /// The whole class in one assertion, and the reason it takes both rules: with
@@ -738,7 +837,10 @@ fn line_error(line: &str, code: &str) -> String {
 /// is no error at all. Oracle: `Vim(let):E488: Trailing characters: <CR>`.
 #[test]
 fn trailing_carriage_return_after_a_let_expression_is_e488() {
-    assert_eq!(line_error("let g:v = 4\r", "E488"), "Vim(let):E488: Trailing characters: \r");
+    assert_eq!(
+        line_error("let g:v = 4\r", "E488"),
+        "Vim(let):E488: Trailing characters: \r"
+    );
 }
 
 /// The white-space rule on its own: a form feed is `is_ascii_whitespace` and a
@@ -747,8 +849,14 @@ fn trailing_carriage_return_after_a_let_expression_is_e488() {
 /// `skipwhite`. Oracle: both are `E488: Trailing characters:`.
 #[test]
 fn vertical_tab_and_form_feed_are_not_white_space_to_skipwhite() {
-    assert_eq!(line_error("let g:v = 4\x0b", "E488"), "Vim(let):E488: Trailing characters: \x0b");
-    assert_eq!(line_error("let g:v = 4\x0c", "E488"), "Vim(let):E488: Trailing characters: \x0c");
+    assert_eq!(
+        line_error("let g:v = 4\x0b", "E488"),
+        "Vim(let):E488: Trailing characters: \x0b"
+    );
+    assert_eq!(
+        line_error("let g:v = 4\x0c", "E488"),
+        "Vim(let):E488: Trailing characters: \x0c"
+    );
 }
 
 /// The tolerant-lexer rule on its own: `'ab` is not white space under any
@@ -757,7 +865,10 @@ fn vertical_tab_and_form_feed_are_not_white_space_to_skipwhite() {
 /// Oracle: `Vim(let):E488: Trailing characters: 'ab`.
 #[test]
 fn an_unterminated_string_after_a_complete_expression_is_remainder() {
-    assert_eq!(line_error("let g:v = 4 'ab", "E488"), "Vim(let):E488: Trailing characters: 'ab");
+    assert_eq!(
+        line_error("let g:v = 4 'ab", "E488"),
+        "Vim(let):E488: Trailing characters: 'ab"
+    );
 }
 
 /// And the rule is still `skipwhite`, not "no trimming": space and tab around
@@ -765,11 +876,11 @@ fn an_unterminated_string_after_a_complete_expression_is_remainder() {
 /// compound operator still survives the split intact.
 #[test]
 fn space_and_tab_around_an_assignment_are_still_white_space() {
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     let mut executor = ExExecutor::new();
-    executor.execute_line(&mut editor, "let g:v\t=  4 \t").unwrap();
+    executor.execute_line(&editor, "let g:v\t=  4 \t").unwrap();
     assert_eq!(gnum(&executor, "v"), 4);
-    executor.execute_line(&mut editor, "let g:v  +=\t3").unwrap();
+    executor.execute_line(&editor, "let g:v  +=\t3").unwrap();
     assert_eq!(gnum(&executor, "v"), 7);
 }
 
@@ -778,11 +889,26 @@ fn space_and_tab_around_an_assignment_are_still_white_space() {
 /// `str::trim` back at any single call site fails exactly one of these.
 #[test]
 fn every_expression_command_rejects_a_trailing_carriage_return() {
-    assert_eq!(line_error("const g:c = 4\r", "E488"), "Vim(const):E488: Trailing characters: \r");
-    assert_eq!(line_error("eval 4\r", "E488"), "Vim(eval):E488: Trailing characters: \r");
-    assert_eq!(line_error("throw 'a'\r", "E488"), "Vim(throw):E488: Trailing characters: \r");
-    assert_eq!(line_error("call len('a')\r", "E488"), "Vim(call):E488: Trailing characters: \r");
-    assert_eq!(line_error("unlet g:z\r", "E488"), "Vim(unlet):E488: Trailing characters: \r");
+    assert_eq!(
+        line_error("const g:c = 4\r", "E488"),
+        "Vim(const):E488: Trailing characters: \r"
+    );
+    assert_eq!(
+        line_error("eval 4\r", "E488"),
+        "Vim(eval):E488: Trailing characters: \r"
+    );
+    assert_eq!(
+        line_error("throw 'a'\r", "E488"),
+        "Vim(throw):E488: Trailing characters: \r"
+    );
+    assert_eq!(
+        line_error("call len('a')\r", "E488"),
+        "Vim(call):E488: Trailing characters: \r"
+    );
+    assert_eq!(
+        line_error("unlet g:z\r", "E488"),
+        "Vim(unlet):E488: Trailing characters: \r"
+    );
 }
 
 /// Two sites whose argument is only *tested* for emptiness or cut at a
@@ -794,28 +920,43 @@ fn every_expression_command_rejects_a_trailing_carriage_return() {
 #[test]
 fn the_emptiness_test_and_the_comment_cut_see_the_carriage_return_too() {
     // Oracle: `Vim(return):E15: Invalid expression:` — an argument was given.
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     let mut executor = ExExecutor::new();
-    let exception = vim_error(executor.execute_script(
-        &mut editor,
-        "t.vim",
-        "function! F()\nreturn \r\nendfunction\ncall F()",
-    ));
-    assert_eq!(exception.kind, VimExceptionKind::Error("E15".to_owned()));
+    // Upstream `TRY_WRAP` (`helpers.c:159-165`) increments `trylevel` to 1
+    // before API execution, so errors propagate as exceptions.
+    let err = executor
+        .execute_script(
+            &editor,
+            "t.vim",
+            "function! F()\nreturn \r\nendfunction\ncall F()",
+        )
+        .unwrap_err();
+    let message = match err {
+        ExecError::Vim(exception) => exception.message(),
+        other => panic!("expected Vim error, got {other:?}"),
+    };
+    assert!(message.contains("E15"), "expected E15 in {message:?}");
 
     // A bare `:return` with nothing after it is still a bare `:return`.
     executor
-        .execute_script(&mut editor, "t.vim", "function! G()\nreturn \nendfunction\nlet g:r = G()")
+        .execute_script(
+            &editor,
+            "t.vim",
+            "function! G()\nreturn \nendfunction\nlet g:r = G()",
+        )
         .unwrap();
     assert_eq!(gnum(&executor, "r"), 0);
 
     // Oracle: `Vim(let):E488: Trailing characters: <CR> "c"`. This port names
     // only the CR, because the comment is cut before `eval0` sees it.
-    assert_eq!(line_error("let g:v = 4\r \"c\"", "E488"), "Vim(let):E488: Trailing characters: \r");
+    assert_eq!(
+        line_error("let g:v = 4\r \"c\"", "E488"),
+        "Vim(let):E488: Trailing characters: \r"
+    );
     // ...and an ordinary trailing comment is still a comment.
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     let mut executor = ExExecutor::new();
-    executor.execute_line(&mut editor, "let g:v = 4 \"c\"").unwrap();
+    executor.execute_line(&editor, "let g:v = 4 \"c\"").unwrap();
     assert_eq!(gnum(&executor, "v"), 4);
 }
 
@@ -824,23 +965,45 @@ fn the_emptiness_test_and_the_comment_cut_see_the_carriage_return_too() {
 /// rows. Oracle: `Vim(if)`, `Vim(while)` and `Vim(for)` all raise E488.
 #[test]
 fn block_openers_reject_a_trailing_carriage_return_in_the_condition() {
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     let mut executor = ExExecutor::new();
-    let exception = vim_error(executor.execute_script(&mut editor, "t.vim", "if 1\r\nendif"));
-    assert_eq!(exception.kind, VimExceptionKind::Error("E488".to_owned()));
+    // Upstream `TRY_WRAP` (`helpers.c:159-165`) increments `trylevel` to 1
+    // before API execution, so errors propagate as exceptions.
+    let err = executor
+        .execute_script(&editor, "t.vim", "if 1\r\nendif")
+        .unwrap_err();
+    assert!(match err {
+        ExecError::Vim(e) => e.message().contains("E488"),
+        _ => false,
+    });
 
-    let exception = vim_error(executor.execute_script(&mut editor, "t.vim", "while 0\r\nendwhile"));
-    assert_eq!(exception.kind, VimExceptionKind::Error("E488".to_owned()));
+    let err = executor
+        .execute_script(&editor, "t.vim", "while 0\r\nendwhile")
+        .unwrap_err();
+    assert!(match err {
+        ExecError::Vim(e) => e.message().contains("E488"),
+        _ => false,
+    });
 
-    let exception = vim_error(executor.execute_script(&mut editor, "t.vim", "for i in [1]\r\nendfor"));
-    assert_eq!(exception.kind, VimExceptionKind::Error("E488".to_owned()));
+    let err = executor
+        .execute_script(&editor, "t.vim", "for i in [1]\r\nendfor")
+        .unwrap_err();
+    assert!(match err {
+        ExecError::Vim(e) => e.message().contains("E488"),
+        _ => false,
+    });
 
-    let exception = vim_error(executor.execute_script(
-        &mut editor,
-        "t.vim",
-        "function! F()\nreturn 4\r\nendfunction\ncall F()",
-    ));
-    assert_eq!(exception.kind, VimExceptionKind::Error("E488".to_owned()));
+    let err = executor
+        .execute_script(
+            &editor,
+            "t.vim",
+            "function! F()\nreturn 4\r\nendfunction\ncall F()",
+        )
+        .unwrap_err();
+    assert!(match err {
+        ExecError::Vim(e) => e.message().contains("E488"),
+        _ => false,
+    });
 }
 
 /// `:echo`, `:echomsg` and `:execute` loop `eval1` until the line is spent, so
@@ -861,17 +1024,32 @@ fn echo_family_reports_e15_not_e488_for_a_trailing_carriage_return() {
 /// stays E471.
 #[test]
 fn a_nargs_zero_user_command_rejects_any_argument_with_e488() {
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     let mut executor = ExExecutor::new();
-    executor.execute_line(&mut editor, "command! -nargs=0 T73D let g:v = 4").unwrap();
-    executor.execute_line(&mut editor, "command! -nargs=1 T73N let g:v = 4").unwrap();
+    executor
+        .execute_line(&editor, "command! -nargs=0 T73D let g:v = 4")
+        .unwrap();
+    executor
+        .execute_line(&editor, "command! -nargs=1 T73N let g:v = 4")
+        .unwrap();
 
-    let exception = vim_error(executor.execute_line(&mut editor, "T73D x"));
-    assert_eq!(exception.kind, VimExceptionKind::Error("E488".to_owned()));
-    let exception = vim_error(executor.execute_line(&mut editor, "T73D\r"));
-    assert_eq!(exception.kind, VimExceptionKind::Error("E488".to_owned()));
-    let exception = vim_error(executor.execute_line(&mut editor, "T73N"));
-    assert_eq!(exception.kind, VimExceptionKind::Error("E471".to_owned()));
+    // Upstream `TRY_WRAP` (`helpers.c:159-165`) increments `trylevel` to 1
+    // before API execution, so errors propagate as exceptions.
+    let err = executor.execute_line(&editor, "T73D x").unwrap_err();
+    assert!(match err {
+        ExecError::Vim(e) => e.message().contains("E488"),
+        _ => false,
+    });
+    let err = executor.execute_line(&editor, "T73D\r").unwrap_err();
+    assert!(match err {
+        ExecError::Vim(e) => e.message().contains("E488"),
+        _ => false,
+    });
+    let err = executor.execute_line(&editor, "T73N").unwrap_err();
+    assert!(match err {
+        ExecError::Vim(e) => e.message().contains("E471"),
+        _ => false,
+    });
 }
 
 /// The sourced-line reader stripped a trailing CR from every line, which hid
@@ -881,13 +1059,22 @@ fn a_nargs_zero_user_command_rejects_any_argument_with_e488() {
 /// platform: even a wholly CRLF script is `E488` on the first line.
 #[test]
 fn a_sourced_line_keeps_its_trailing_carriage_return() {
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     let mut executor = ExExecutor::new();
-    let exception = vim_error(executor.execute_script(&mut editor, "t.vim", "let g:v = 4\r\n"));
-    assert_eq!(exception.kind, VimExceptionKind::Error("E488".to_owned()));
+    // Upstream `TRY_WRAP` (`helpers.c:159-165`) increments `trylevel` to 1
+    // before API execution, so errors propagate as exceptions.
+    let err = executor
+        .execute_script(&editor, "t.vim", "let g:v = 4\r\n")
+        .unwrap_err();
+    assert!(match err {
+        ExecError::Vim(e) => e.message().contains("E488"),
+        _ => false,
+    });
 
     // A script with no stray CR is untouched by the change.
-    executor.execute_script(&mut editor, "t.vim", "let g:w = 7\n").unwrap();
+    executor
+        .execute_script(&editor, "t.vim", "let g:w = 7\n")
+        .unwrap();
     assert_eq!(gnum(&executor, "w"), 7);
 }
 
@@ -898,14 +1085,16 @@ fn a_sourced_line_keeps_its_trailing_carriage_return() {
 /// also what stopped `:if`/`:while`/`:for` from being measurable at all.
 #[test]
 fn execute_runs_a_list_argument_line_by_line() {
-    let mut editor = Editor::new();
+    let editor = TestEditorAccess::new(Editor::new());
     let mut executor = ExExecutor::new();
     executor
-        .execute_line(&mut editor, "call execute(['if 1', 'let g:v = 9', 'endif'])")
+        .execute_line(&editor, "call execute(['if 1', 'let g:v = 9', 'endif'])")
         .unwrap();
     assert_eq!(gnum(&executor, "v"), 9);
 
     // The single-string form still runs as one command line.
-    executor.execute_line(&mut editor, "call execute('let g:s = 3')").unwrap();
+    executor
+        .execute_line(&editor, "call execute('let g:s = 3')")
+        .unwrap();
     assert_eq!(gnum(&executor, "s"), 3);
 }

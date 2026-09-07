@@ -33,6 +33,7 @@ impl TimerEntry {
     }
 
     /// Returns the repeat interval, or `None` for a one-shot timer.
+    #[must_use]
     pub fn repeat(&self) -> Option<Duration> {
         self.repeat
     }
@@ -57,6 +58,7 @@ pub struct TimerHeap {
 
 impl TimerHeap {
     /// Creates an empty timer heap.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -90,11 +92,11 @@ impl TimerHeap {
         let mut expired = Vec::with_capacity(due.len());
         for (deadline, sequence) in due {
             if let Some(entry) = self.entries.remove(&(deadline, sequence)) {
-                if let Some(interval) = entry.repeat {
-                    if let Some(next_deadline) = deadline.checked_add(interval) {
-                        self.entries
-                            .insert((next_deadline, sequence), entry.clone());
-                    }
+                if let Some(interval) = entry.repeat
+                    && let Some(next_deadline) = deadline.checked_add(interval)
+                {
+                    self.entries
+                        .insert((next_deadline, sequence), entry.clone());
                 }
                 expired.push(entry);
             }
@@ -103,16 +105,19 @@ impl TimerHeap {
     }
 
     /// Returns the earliest pending deadline.
+    #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
         self.entries.first_key_value().map(|(key, _)| key.0)
     }
 
     /// Reports whether no timers are pending.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// Returns the number of pending timer identities.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }

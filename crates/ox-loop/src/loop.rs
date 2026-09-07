@@ -2,7 +2,7 @@
 //!
 //! Each iteration maps libuv's phases onto mio as follows: expired timers
 //! (timer phase), readiness polling and dispatch (poll phase), then owned
-//! MultiQueue processing (check/deferred phase). Timers that become due while
+//! `MultiQueue` processing (check/deferred phase). Timers that become due while
 //! poll sleeps are fired before readiness dispatch, preserving timers-before-I/O.
 //!
 //! # Readiness contract (edge-triggered, drain-until-WouldBlock)
@@ -22,8 +22,8 @@
 //! was already available on this edge and cannot strand buffered frames.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use mio::Waker as MioWaker;
@@ -37,6 +37,9 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Platform-neutral readiness flags captured from a mio event.
+// Mirrors mio's per-event readiness flags one-to-one; a bitflag set would hide
+// the per-field docs behind accessor ceremony for a Copy value passed by ref.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Readiness {
     /// Registered source token.
     pub token: Token,
@@ -85,7 +88,7 @@ type ReadinessCallback = Box<dyn FnMut(Readiness, &mut MultiQueue) -> Result<Dra
 /// any clone sets a shared flag and wakes the reactor, so a loop blocked in
 /// [`Loop::run`] returns promptly and a loop that has not started yet returns
 /// immediately on entry.
-/// [`stop`]: StopHandle::stop
+/// [`stop`]: `StopHandle::stop`
 #[derive(Clone)]
 pub struct StopHandle {
     stopped: Arc<AtomicBool>,
@@ -115,11 +118,24 @@ pub struct Loop {
 
 impl Loop {
     /// Creates a loop without signal subscriptions.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::with_signals`]'s errors: creating the platform
+    /// reactor or its waker, or registering the signal self-pipe, can fail
+    /// with an I/O error even for an empty signal list.
     pub fn new() -> Result<Self> {
         Self::with_signals(&[])
     }
 
     /// Creates a loop subscribed to `signal_numbers`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidSignal`] if any entry of `signal_numbers` is
+    /// not a registrable signal number (non-positive, `>= 128`, or on the
+    /// forbidden list), and an I/O error if the reactor, its waker, or the
+    /// signal delivery pipe cannot be created or registered.
     pub fn with_signals(signal_numbers: &[i32]) -> Result<Self> {
         let reactor = Reactor::new()?;
         let work = WorkQueues::new(reactor.waker());
@@ -150,6 +166,12 @@ impl Loop {
     /// the chosen token, so a later caller-owned source at `IO_TOKEN_START`
     /// never collides with it. The returned token is dispatched through the
     /// ordinary callbacks map, so pair it with [`Loop::on_readiness`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReservedToken`] when the internal token range
+    /// `2..IO_TOKEN_START` is exhausted, or the underlying registration
+    /// I/O error when the source cannot be registered.
     pub fn register_internal<S: Source + ?Sized>(
         &mut self,
         source: &mut S,
@@ -189,6 +211,12 @@ impl Loop {
     ///
     /// The callback returns [`DrainState`] to signal whether the source was
     /// drained until `WouldBlock`; see the crate-module readiness contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReservedToken`] if `token` is the wake or signal
+    /// token, and [`Error::DuplicateReadiness`] if a callback is already
+    /// registered for `token`.
     pub fn on_readiness(
         &mut self,
         token: Token,
@@ -234,6 +262,11 @@ impl Loop {
     /// A stop requested before `run` is entered is honored: the flag is
     /// observed on entry and never cleared, so `run` returns immediately
     /// without pumping.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first error surfaced by [`Self::run_once`] — a poll,
+    /// work-transfer, or readiness-callback failure — and stops pumping.
     pub fn run(&mut self) -> Result<()> {
         if self.stopped.load(Ordering::Acquire) {
             return Ok(());
@@ -245,6 +278,12 @@ impl Loop {
     }
 
     /// Pumps one root-queue iteration and returns unhandled signal events.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::run_once_for`]'s errors: poll failures, work
+    /// transfer failures, signal drain failures, or readiness-callback
+    /// errors.
     pub fn run_once(&mut self, timeout: Option<Duration>) -> Result<Vec<Event>> {
         self.run_once_for(self.events.root(), timeout)
     }
@@ -252,6 +291,11 @@ impl Loop {
     /// Recursive RPC wait modeled after channel.c:162-166 and
     /// multiqueue.h:25-43. Only the selected channel queue (and descendants)
     /// is drained while sibling events remain represented in the root queue.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::run_once_for`]'s errors — poll, work-transfer,
+    /// signal-drain, or readiness-callback failures — on every iteration.
     pub fn process_events_until(
         &mut self,
         owner: Owner,
@@ -355,9 +399,8 @@ impl Loop {
         readiness: Readiness,
     ) -> Result<()> {
         loop {
-            match callback(readiness, &mut self.events)? {
-                DrainState::Drained => return Ok(()),
-                DrainState::KeepDraining => continue,
+            if callback(readiness, &mut self.events)? == DrainState::Drained {
+                return Ok(());
             }
         }
     }

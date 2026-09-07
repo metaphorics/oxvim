@@ -23,24 +23,62 @@ pub enum InsertError {
 }
 
 fn line(editor: &Editor, buffer: BufHandle, lnum: usize) -> Result<Vec<u8>, EditorError> {
-    editor.buffer(buffer)?.text()?.line(lnum).map_err(BufferStateError::from).map_err(EditorError::from)
+    editor
+        .buffer(buffer)?
+        .text()?
+        .line(lnum)
+        .map_err(BufferStateError::from)
+        .map_err(EditorError::from)
 }
 
 /// Inserts one Unicode scalar at the insertion cursor.
-pub fn insert_char(editor: &mut Editor, buffer: BufHandle, window: WinHandle, cursor: Position, ch: char, timestamp: i64) -> Result<Position, EditorError> {
-    let mut line = line(editor, buffer, cursor.lnum)?;
+///
+/// # Errors
+///
+/// Returns an error when the buffer or its line cannot be read, the line
+/// edit fails, or the window cursor cannot be updated.
+pub fn insert_char(
+    editor: &mut Editor,
+    buffer: BufHandle,
+    window: WinHandle,
+    cursor: Position,
+    ch: char,
+    timestamp: i64,
+) -> Result<Position, EditorError> {
+    let line = line(editor, buffer, cursor.lnum)?;
     let col = cursor.col.min(line.len());
-    let mut encoded = [0; 4]; let bytes = ch.encode_utf8(&mut encoded).as_bytes();
-    line.splice(col..col, bytes.iter().copied());
-    let after = Position { lnum: cursor.lnum, col: col + bytes.len() };
-    editor.replace_buffer_lines(buffer, cursor.lnum, cursor.lnum, &[line], cursor, after, timestamp)?;
+    let mut encoded = [0; 4];
+    let bytes = ch.encode_utf8(&mut encoded).as_bytes();
+    let after = Position {
+        lnum: cursor.lnum,
+        col: col + bytes.len(),
+    };
+    let request = BufferTextEditRequest {
+        start: ExtmarkPosition::new(cursor.lnum - 1, col),
+        end: ExtmarkPosition::new(cursor.lnum - 1, col),
+        replacement: vec![bytes.to_vec()],
+    };
+    editor.replace_buffer_text(buffer, &request, cursor, after, timestamp)?;
     editor.set_window_cursor(window, after)?;
     Ok(after)
 }
 
 /// Splits the current line at the insertion cursor, indenting the new line
 /// when an indent method is active (`edit.c` newline + `fix_indent`).
-pub fn newline(editor: &mut Editor, buffer: BufHandle, window: WinHandle, cursor: Position, timestamp: i64, eval: &mut dyn ExprEval) -> Result<Position, InsertError> {
+///
+/// # Errors
+///
+/// Returns an error when the buffer or its line cannot be read, the split
+/// edit fails, the window cursor cannot be updated, or indent expression
+/// evaluation fails.
+pub fn newline(
+    editor: &mut Editor,
+    buffer: BufHandle,
+    window: WinHandle,
+    cursor: Position,
+    timestamp: i64,
+    eval: &mut dyn ExprEval,
+) -> Result<Position, InsertError> {
     let line = line(editor, buffer, cursor.lnum)?;
     let col = cursor.col.min(line.len());
     let opts = indent::IndentOptions::capture(editor, buffer);
@@ -49,7 +87,10 @@ pub fn newline(editor: &mut Editor, buffer: BufHandle, window: WinHandle, cursor
     let mut indent = indent::smart_newline_indent(source_prefix, smart, &opts);
     // The staged overlay only feeds indentexpr/lisp/cindent; with every
     // method off, skip the whole-buffer materialization on each Enter.
-    if !(opts.indentexpr.is_empty() && !opts.lisp && !opts.cindent) {
+    if !(opts.indentexpr.is_empty()
+        && !opts.flags.contains(indent::IndentFlags::LISP)
+        && !opts.flags.contains(indent::IndentFlags::CINDENT))
+    {
         let mut staged = {
             let text = editor.buffer(buffer)?.text().map_err(EditorError::from)?;
             (1..=text.line_count())
@@ -64,7 +105,13 @@ pub fn newline(editor: &mut Editor, buffer: BufHandle, window: WinHandle, cursor
         staged[cursor.lnum - 1] = line[..col].to_vec();
         staged.insert(cursor.lnum, second);
         let context = indent::IndentEvalContext::new(editor, buffer, &staged);
-        if let Some(whitespace) = indent::fix_line_indent(&context, cursor.lnum + 1, CinTrigger::OpenForward, &opts, eval)? {
+        if let Some(whitespace) = indent::fix_line_indent(
+            &context,
+            cursor.lnum + 1,
+            CinTrigger::OpenForward,
+            &opts,
+            eval,
+        )? {
             indent = whitespace;
         }
     }
@@ -73,7 +120,10 @@ pub fn newline(editor: &mut Editor, buffer: BufHandle, window: WinHandle, cursor
         end: ExtmarkPosition::new(cursor.lnum - 1, col),
         replacement: vec![Vec::new(), indent.clone()],
     };
-    let after = Position { lnum: cursor.lnum + 1, col: indent.len() };
+    let after = Position {
+        lnum: cursor.lnum + 1,
+        col: indent.len(),
+    };
     editor.replace_buffer_text(buffer, &request, cursor, after, timestamp)?;
     editor.set_window_cursor(window, after)?;
     Ok(after)
@@ -91,28 +141,45 @@ fn pad_width(col: usize, width: usize) -> usize {
     width - col % width
 }
 
-fn commit_line_splice(
-    editor: &mut Editor,
-    buffer: BufHandle,
-    window: WinHandle,
+/// One replacement inside the cursor line, staged as a text edit before the
+/// window cursor moves to `after`.
+struct ColumnSplice {
     cursor: Position,
     after: Position,
     timestamp: i64,
     start_col: usize,
     end_col: usize,
     inserted: Vec<u8>,
+}
+
+fn commit_column_splice(
+    editor: &mut Editor,
+    buffer: BufHandle,
+    window: WinHandle,
+    splice: ColumnSplice,
 ) -> Result<Position, EditorError> {
     let request = BufferTextEditRequest {
-        start: ExtmarkPosition::new(cursor.lnum - 1, start_col),
-        end: ExtmarkPosition::new(cursor.lnum - 1, end_col),
-        replacement: vec![inserted],
+        start: ExtmarkPosition::new(splice.cursor.lnum - 1, splice.start_col),
+        end: ExtmarkPosition::new(splice.cursor.lnum - 1, splice.end_col),
+        replacement: vec![splice.inserted],
     };
-    editor.replace_buffer_text(buffer, &request, cursor, after, timestamp)?;
-    editor.set_window_cursor(window, after)?;
-    Ok(after)
+    editor.replace_buffer_text(
+        buffer,
+        &request,
+        splice.cursor,
+        splice.after,
+        splice.timestamp,
+    )?;
+    editor.set_window_cursor(window, splice.after)?;
+    Ok(splice.after)
 }
 
 /// Inserts Tab as spaces or a tab byte using `'expandtab'`/`'softtabstop'`/`'shiftwidth'`.
+///
+/// # Errors
+///
+/// Returns an error when the buffer or its line cannot be read, the line
+/// edit fails, or the window cursor cannot be updated.
 pub fn insert_tab(
     editor: &mut Editor,
     buffer: BufHandle,
@@ -125,7 +192,7 @@ pub fn insert_tab(
     let opts = indent::IndentOptions::capture(editor, buffer);
     let sts = option_number(editor, buffer, "softtabstop", 0);
     let in_indent = col <= indent::leading_len(&line);
-    let inserted = if opts.expandtab {
+    let inserted = if opts.flags.contains(indent::IndentFlags::EXPANDTAB) {
         vec![b' '; pad_width(col, opts.shiftwidth)]
     } else if sts > 0 {
         vec![b' '; pad_width(col, usize::try_from(sts).unwrap_or(1).max(1))]
@@ -138,7 +205,19 @@ pub fn insert_tab(
         lnum: cursor.lnum,
         col: col + inserted.len(),
     };
-    commit_line_splice(editor, buffer, window, cursor, after, timestamp, col, col, inserted)
+    commit_column_splice(
+        editor,
+        buffer,
+        window,
+        ColumnSplice {
+            cursor,
+            after,
+            timestamp,
+            start_col: col,
+            end_col: col,
+            inserted,
+        },
+    )
 }
 
 fn shifted_indent_columns(current: usize, shiftwidth: usize, add: bool) -> usize {
@@ -155,6 +234,11 @@ fn shifted_indent_columns(current: usize, shiftwidth: usize, add: bool) -> usize
 }
 
 /// Adds or removes one `'shiftwidth'` of leading indentation (`ins_shift`).
+///
+/// # Errors
+///
+/// Returns an error when the buffer or its line cannot be read, the
+/// indentation edit fails, or the window cursor cannot be updated.
 pub fn adjust_indent(
     editor: &mut Editor,
     buffer: BufHandle,
@@ -177,20 +261,28 @@ pub fn adjust_indent(
         lnum: cursor.lnum,
         col: cursor.col.saturating_sub(old_lead).saturating_add(new_lead),
     };
-    commit_line_splice(
+    commit_column_splice(
         editor,
         buffer,
         window,
-        cursor,
-        after,
-        timestamp,
-        0,
-        old_lead,
-        whitespace,
+        ColumnSplice {
+            cursor,
+            after,
+            timestamp,
+            start_col: 0,
+            end_col: old_lead,
+            inserted: whitespace,
+        },
     )
 }
 
 /// Reindents the current line through the indent engine (`!^F` / `fixthisline`).
+///
+/// # Errors
+///
+/// Returns an error when the buffer or its line cannot be read, the
+/// reindent edit fails, the window cursor cannot be updated, or indent
+/// expression evaluation fails.
 pub fn force_reindent(
     editor: &mut Editor,
     buffer: BufHandle,
@@ -201,7 +293,10 @@ pub fn force_reindent(
 ) -> Result<Position, InsertError> {
     let line = line(editor, buffer, cursor.lnum)?;
     let opts = indent::IndentOptions::capture(editor, buffer);
-    if opts.indentexpr.is_empty() && !opts.lisp && !opts.cindent {
+    if opts.indentexpr.is_empty()
+        && !opts.flags.contains(indent::IndentFlags::LISP)
+        && !opts.flags.contains(indent::IndentFlags::CINDENT)
+    {
         return Ok(cursor);
     }
     let text = editor.buffer(buffer)?.text().map_err(EditorError::from)?;
@@ -213,7 +308,8 @@ pub fn force_reindent(
     let old_lead = indent::leading_len(&line);
     let method = indent::resolve_options_method(&opts);
     let context = indent::IndentEvalContext::new(editor, buffer, &lines);
-    let indent::IndentAmount::Columns(target) = indent::amount_for(&context, cursor.lnum, method, &opts, eval)?
+    let indent::IndentAmount::Columns(target) =
+        indent::amount_for(&context, cursor.lnum, method, &opts, eval)?
     else {
         return Ok(cursor);
     };
@@ -226,34 +322,99 @@ pub fn force_reindent(
         lnum: cursor.lnum,
         col: cursor.col.saturating_sub(old_lead).saturating_add(new_lead),
     };
-    Ok(commit_line_splice(
+    Ok(commit_column_splice(
         editor,
         buffer,
         window,
-        cursor,
-        after,
-        timestamp,
-        0,
-        old_lead,
-        whitespace,
+        ColumnSplice {
+            cursor,
+            after,
+            timestamp,
+            start_col: 0,
+            end_col: old_lead,
+            inserted: whitespace,
+        },
     )?)
 }
 
 /// Deletes the previous character or joins with the previous line when allowed.
-pub fn backspace(editor: &mut Editor, buffer: BufHandle, window: WinHandle, cursor: Position, allow_join: bool, timestamp: i64) -> Result<Position, EditorError> {
+///
+/// # Errors
+///
+/// Returns an error when the affected line cannot be read, the deletion or
+/// join fails, or the window cursor cannot be updated.
+pub fn backspace(
+    editor: &mut Editor,
+    buffer: BufHandle,
+    window: WinHandle,
+    cursor: Position,
+    allow_join: bool,
+    timestamp: i64,
+) -> Result<Position, EditorError> {
     if cursor.col > 0 {
-        let mut line = line(editor, buffer, cursor.lnum)?; let mut start = cursor.col.min(line.len()).saturating_sub(1);
-        while start > 0 && !std::str::from_utf8(&line).map_or(true, |text| text.is_char_boundary(start)) { start -= 1; }
-        line.drain(start..cursor.col.min(line.len())); let after = Position { lnum: cursor.lnum, col: start };
-        editor.replace_buffer_lines(buffer, cursor.lnum, cursor.lnum, &[line], cursor, after, timestamp)?; editor.set_window_cursor(window, after)?; return Ok(after);
+        let mut line = line(editor, buffer, cursor.lnum)?;
+        let mut start = cursor.col.min(line.len()).saturating_sub(1);
+        while start > 0
+            && !std::str::from_utf8(&line).map_or(true, |text| text.is_char_boundary(start))
+        {
+            start -= 1;
+        }
+        line.drain(start..cursor.col.min(line.len()));
+        let after = Position {
+            lnum: cursor.lnum,
+            col: start,
+        };
+        editor.replace_buffer_lines(crate::LineReplaceRequest {
+            buffer,
+            start: cursor.lnum,
+            end: cursor.lnum,
+            lines: &[line],
+            cursor_before: cursor,
+            cursor_after: after,
+            timestamp,
+        })?;
+        editor.set_window_cursor(window, after)?;
+        return Ok(after);
     }
-    if cursor.lnum <= 1 || !allow_join { return Ok(cursor); }
-    let previous = line(editor, buffer, cursor.lnum - 1)?; let current = line(editor, buffer, cursor.lnum)?;
-    let col = previous.len(); let mut joined = previous; joined.extend(current); let after = Position { lnum: cursor.lnum - 1, col };
-    editor.replace_buffer_lines(buffer, cursor.lnum - 1, cursor.lnum, &[joined], cursor, after, timestamp)?; editor.set_window_cursor(window, after)?; Ok(after)
+    if cursor.lnum <= 1 || !allow_join {
+        return Ok(cursor);
+    }
+    let previous = line(editor, buffer, cursor.lnum - 1)?;
+    let current = line(editor, buffer, cursor.lnum)?;
+    let col = previous.len();
+    let mut joined = previous;
+    joined.extend(current);
+    let after = Position {
+        lnum: cursor.lnum - 1,
+        col,
+    };
+    editor.replace_buffer_lines(crate::LineReplaceRequest {
+        buffer,
+        start: cursor.lnum - 1,
+        end: cursor.lnum,
+        lines: &[joined],
+        cursor_before: cursor,
+        cursor_after: after,
+        timestamp,
+    })?;
+    editor.set_window_cursor(window, after)?;
+    Ok(after)
 }
 
 /// Leaves insertion on the character before the insertion point, as `stop_insert()` does.
-pub fn normal_cursor(editor: &mut Editor, window: WinHandle, cursor: Position) -> Result<Position, EditorError> {
-    let after = Position { lnum: cursor.lnum, col: cursor.col.saturating_sub(1) }; editor.set_window_cursor(window, after)?; Ok(after)
+///
+/// # Errors
+///
+/// Returns an error when the window cursor cannot be updated.
+pub fn normal_cursor(
+    editor: &mut Editor,
+    window: WinHandle,
+    cursor: Position,
+) -> Result<Position, EditorError> {
+    let after = Position {
+        lnum: cursor.lnum,
+        col: cursor.col.saturating_sub(1),
+    };
+    editor.set_window_cursor(window, after)?;
+    Ok(after)
 }

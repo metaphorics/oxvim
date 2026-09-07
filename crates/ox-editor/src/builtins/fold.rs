@@ -17,40 +17,43 @@
 //! `v:` variables nor the `'foldtext'` option, so neither builtin can be
 //! answered without inventing a string, and they stay unimplemented.
 
+use crate::excmd_exec::ExEditorAccess;
 use ox_eval::EvalError;
 use ox_types::{BufHandle, Typval};
 
-use crate::excmd_exec::{buffer_lines, EvalHost};
-use crate::fold::{FoldMethod, Folds};
+use crate::Editor;
+use crate::excmd_exec::{EvalHost, buffer_lines};
+use crate::fold::{FoldComputeResult, FoldMethod, FoldRefresh, Folds};
 use crate::options::OptionValue;
 use crate::script::FileIO;
-use crate::Editor;
 
 /// Routes one fold query builtin.
-pub(crate) fn call<F: FileIO>(
-    host: &mut EvalHost<'_, F>,
+pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
     name: &str,
-    args: Vec<Typval>,
+    args: &[Typval],
 ) -> ox_eval::Result<Typval> {
     check_arity(name, args.len())?;
-    let editor = &mut *host.editor;
-    // `tv_get_lnum` runs before the range check in every one of the three, so
-    // an argument with no numeric value raises its error whatever the folds
-    // hold.
-    let lnum = super::position::current_lnum_arg(editor, &args[0])?;
-    let value = match name {
-        "foldclosed" => closed_line(editor, lnum, false),
-        "foldclosedend" => closed_line(editor, lnum, true),
-        "foldlevel" => level(editor, lnum),
-        _ => unreachable!("fold builtin route and dispatcher disagree"),
-    };
-    Ok(Typval::Number(value))
+    host.access.with_ex_editor(|editor| {
+        // `tv_get_lnum` runs before the range check in every one of the three, so
+        // an argument with no numeric value raises its error whatever the folds
+        // hold.
+        let lnum = super::position::current_lnum_arg(editor, &args[0])?;
+        let value = match name {
+            "foldclosed" => closed_line(editor, lnum, false),
+            "foldclosedend" => closed_line(editor, lnum, true),
+            "foldlevel" => level(editor, lnum),
+            _ => unreachable!("fold builtin route and dispatcher disagree"),
+        };
+        Ok(Typval::Number(value))
+    })
 }
 
 /// Enforces the `eval.lua` argument counts the way upstream's function table
 /// does before a builtin body runs.
 fn check_arity(name: &str, count: usize) -> ox_eval::Result<()> {
-    let spec = ox_eval::builtin_spec(name).expect("fold builtins come from eval.lua");
+    let spec = ox_eval::builtin_spec(name)
+        .ok_or_else(|| EvalError::new("E117", 0, format!("Unknown function: {name}")))?;
     if count < spec.min_args {
         return Err(EvalError::new(
             "E119",
@@ -75,18 +78,22 @@ fn closed_line(editor: &mut Editor, lnum: i64, end: bool) -> i64 {
     let Some((folds, line_count)) = synced_folds(editor) else {
         return -1;
     };
-    if lnum < 1 || lnum > line_count as i64 {
-        return -1;
-    }
-    let Some((first, last)) = folds.closed_rows_at(lnum as usize - 1) else {
+    let Ok(line) = usize::try_from(lnum) else {
         return -1;
     };
-    if end {
-        // `last = MIN(last, ml_line_count)` (`fold.c:250`).
-        (last as i64 + 1).min(line_count as i64)
-    } else {
-        first as i64 + 1
+    if line == 0 || line > line_count {
+        return -1;
     }
+    let Some((first, last)) = folds.closed_rows_at(line - 1) else {
+        return -1;
+    };
+    let result = if end {
+        // `last = MIN(last, ml_line_count)` (`fold.c:250`).
+        last.saturating_add(1).min(line_count)
+    } else {
+        first.saturating_add(1)
+    };
+    i64::try_from(result).unwrap_or(i64::MAX)
 }
 
 /// `f_foldlevel` (`fold.c:3206-3212`): the nesting level at `lnum`, and `0`
@@ -95,10 +102,13 @@ fn level(editor: &mut Editor, lnum: i64) -> i64 {
     let Some((folds, line_count)) = synced_folds(editor) else {
         return 0;
     };
-    if lnum < 1 || lnum > line_count as i64 {
+    let Ok(line) = usize::try_from(lnum) else {
+        return 0;
+    };
+    if line == 0 || line > line_count {
         return 0;
     }
-    folds.level_at_row(lnum as usize - 1) as i64
+    i64::try_from(folds.level_at_row(line - 1)).unwrap_or(i64::MAX)
 }
 
 /// `checkupdate` (`fold.c:1113-1122`): brings the current buffer's folds up to
@@ -106,10 +116,12 @@ fn level(editor: &mut Editor, lnum: i64) -> i64 {
 /// buffer's line count. `None` reproduces `hasAnyFolding` being false: no
 /// window, no buffer, or `'foldenable'` off.
 ///
-/// Named gaps, all of them upstream behaviour this port has no seam for:
-/// `'foldmethod'` of `expr`, `syntax` or `diff` needs a host computation
+/// Named gaps, most of them upstream behaviour this port has no seam for:
+/// `'foldmethod'` of `expr` or `syntax` needs a host computation
 /// [`Folds::refresh`] can only request, so those methods answer from whatever
-/// a host last applied — nothing, by default. `'foldnestmax'` does not cap
+/// a host last applied — nothing, by default. `diff` is computed by the host
+/// module [`crate::diffmode`] from the tabpage's diff blocks.
+/// `'foldnestmax'` does not cap
 /// computed levels and `'foldignore'` does not exclude lines, so an indent
 /// fold deeper than `'foldnestmax'` or starting at an ignored line is reported
 /// where upstream would not report it. `'foldlevel'` does not close computed
@@ -131,13 +143,30 @@ fn synced_folds(editor: &mut Editor) -> Option<(&Folds, usize)> {
     let shift_width = effective_shift_width(editor, buffer);
     let lines = buffer_lines(editor, buffer).ok()?;
     let line_count = lines.len();
+    // `'foldmethod'` = `diff` delegates to the host: `refresh` can only
+    // request the computation, so the ranges come from the tabpage's diff
+    // blocks before the buffer is borrowed mutably (fold.c:2869 delegates to
+    // `diff_infold`).
+    let host_ranges = if method == FoldMethod::Diff {
+        crate::diffmode::diff_fold_ranges(editor, line_count)
+    } else {
+        Vec::new()
+    };
     let state = editor.buffer_mut(buffer).ok()?;
     let changedtick = state.changedtick();
     state.folds.set_method(method);
     let _ = state.folds.set_shift_width(shift_width);
     // A host request or a computation error leaves the cached set answering,
     // which is the closest honest reading of folds this port cannot compute.
-    let _ = state.folds.refresh(changedtick, &lines);
+    match state.folds.refresh(changedtick, &lines) {
+        Ok(FoldRefresh::Host(request)) if request.kind == crate::fold::HostFoldKind::Diff => {
+            let _ = state.folds.apply_host_result(FoldComputeResult {
+                request,
+                ranges: host_ranges,
+            });
+        }
+        _ => {}
+    }
     Some((&state.folds, line_count))
 }
 
@@ -165,6 +194,7 @@ mod tests {
     use ox_eval::ScopeKind;
 
     use super::*;
+    use crate::TestEditorAccess;
     use crate::excmd_exec::ExecError;
     use crate::{ExExecutor, Geometry, VimExceptionKind};
 
@@ -181,10 +211,10 @@ mod tests {
     /// Runs `script` against a six-line buffer and answers the numeric globals
     /// `names` in order.
     fn numbers(script: &str, names: &[&str]) -> Vec<i64> {
-        let mut editor = editor();
+        let editor = TestEditorAccess::new(editor());
         let mut exec = ExExecutor::new();
         exec.execute_script(
-            &mut editor,
+            &editor,
             "fold.vim",
             &format!("call setline(1, ['a','b','c','d','e','f'])\n{script}"),
         )
@@ -206,12 +236,14 @@ mod tests {
 
     /// The Vim error code a script raises.
     fn error_code(script: &str) -> String {
-        let mut editor = editor();
+        let editor = TestEditorAccess::new(editor());
         let mut exec = ExExecutor::new();
-        match exec.execute_script(&mut editor, "fold.vim", script) {
+        match exec.execute_script(&editor, "fold.vim", script) {
             Err(ExecError::Vim(exception)) => match exception.kind {
                 VimExceptionKind::Error(code) => code,
-                other => panic!("expected an error exception, got {other:?}"),
+                other @ VimExceptionKind::Throw => {
+                    panic!("expected an error exception, got {other:?}")
+                }
             },
             other => panic!("expected a Vim error, got {other:?}"),
         }
@@ -370,10 +402,10 @@ mod tests {
     // `a`, `  b`, `  c`, `d`, ...): fl2=1 fc2=2 fce2=3 fl1=0.
     #[test]
     fn indent_foldmethod_is_computed_before_the_query() {
-        let mut editor = editor();
+        let editor = TestEditorAccess::new(editor());
         let mut exec = ExExecutor::new();
         exec.execute_script(
-            &mut editor,
+            &editor,
             "fold.vim",
             "call setline(1, ['a','  b','  c','d','e','f'])\n\
              set foldmethod=indent\n\

@@ -91,7 +91,10 @@ fn preloads_exact_upstream_builtin_set() -> Result<(), Box<dyn Error>> {
     let package: Table = lua.globals().get("package")?;
     let preload: Table = package.get("preload")?;
     for name in UPSTREAM_BUILTIN_MODULES {
-        assert!(matches!(preload.get::<Value>(*name)?, Value::Function(_)), "missing {name}");
+        assert!(
+            matches!(preload.get::<Value>(*name)?, Value::Function(_)),
+            "missing {name}"
+        );
     }
     Ok(())
 }

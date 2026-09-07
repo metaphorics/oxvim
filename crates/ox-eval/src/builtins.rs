@@ -5,15 +5,19 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::rc::Rc;
 
-use ox_types::{Funcref, OxStr, Special, Typval};
+use ox_types::{DictEntry, DictEntryFlags, EntryValueLock, Funcref, OxStr, Special, Typval};
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
 use crate::error::{EvalError, Result};
-use crate::eval::{compare_bytes, BuiltinHost, BufferHost, ClosureRegistry, Evaluator, RegexEngine};
+use crate::eval::{
+    BufferHost, BuiltinHost, ClosureRegistry, Evaluator, RegexEngine, compare_bytes,
+};
 use crate::parser::Parser;
 use crate::path_builtins;
-use crate::scope::Scope;
+use crate::scope::{Scope, env_os_string};
 
 const MAX_CONTAINER_DEPTH: usize = 100;
 
@@ -69,7 +73,9 @@ pub const fn type_constant(value: &Typval) -> i64 {
 /// The value of a `v:t_*` constant, by fully qualified name.
 #[must_use]
 pub fn vim_type_var(name: &[u8]) -> Option<i64> {
-    VIM_TYPE_VARS.iter().find_map(|(key, value)| (*key == name).then_some(*value))
+    VIM_TYPE_VARS
+        .iter()
+        .find_map(|(key, value)| (*key == name).then_some(*value))
 }
 
 /// Declarative metadata recovered from Neovim's `eval.lua`.
@@ -81,10 +87,10 @@ pub struct BuiltinSpec {
     pub min_args: usize,
     /// Maximum accepted argument count, or `None` for varargs.
     pub max_args: Option<usize>,
-    /// Help signature from `eval.lua`.
-    pub signature: &'static str,
     /// Whether `eval.lua` permits method-call syntax for an overload.
     pub method: bool,
+    /// 1-based method-call receiver slot from `eval.lua` `base`, or 0.
+    pub method_base: usize,
 }
 
 include!(concat!(env!("OUT_DIR"), "/builtins_gen.rs"));
@@ -92,7 +98,47 @@ include!(concat!(env!("OUT_DIR"), "/builtins_gen.rs"));
 /// Look up generated builtin metadata by exact name.
 #[must_use]
 pub fn builtin_spec(name: &str) -> Option<&'static BuiltinSpec> {
-    BUILTINS.binary_search_by_key(&name, |spec| spec.name).ok().map(|index| &BUILTINS[index])
+    BUILTINS
+        .binary_search_by_key(&name, |spec| spec.name)
+        .ok()
+        .map(|index| &BUILTINS[index])
+}
+
+/// Whether `name` evaluates a callback for each collection item.
+#[must_use]
+pub fn is_higher_order_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "filter" | "map" | "mapnew" | "foreach" | "reduce" | "indexof"
+    )
+}
+
+/// Calls a collection builtin with callbacks evaluated through `host`.
+///
+/// # Errors
+///
+/// Returns the builtin's arity, callback, conversion, or collection error.
+/// Unknown names return [`EvalError::not_implemented`].
+pub fn call_higher_order_builtin<H: BuiltinHost, R: RegexEngine>(
+    host: &mut H,
+    regex: &R,
+    name: &str,
+    args: Vec<Typval>,
+    scope: &mut Scope,
+) -> Result<Typval> {
+    let spec = builtin_spec(name)
+        .filter(|_| is_higher_order_builtin(name))
+        .ok_or_else(|| EvalError::not_implemented(OxStr::from(name)))?;
+    check_arity(spec, args.len())?;
+    match name {
+        "filter" => Builtins::<'_>::filter_or_map(host, regex, args, scope, CollectionOp::Filter),
+        "map" => Builtins::<'_>::filter_or_map(host, regex, args, scope, CollectionOp::Map),
+        "mapnew" => Builtins::<'_>::filter_or_map(host, regex, args, scope, CollectionOp::MapNew),
+        "foreach" => Builtins::<'_>::filter_or_map(host, regex, args, scope, CollectionOp::ForEach),
+        "reduce" => Builtins::<'_>::reduce(host, regex, &args, scope),
+        "indexof" => Builtins::<'_>::indexof(host, regex, &args, scope),
+        _ => unreachable!("higher-order builtin predicate and dispatcher disagree"),
+    }
 }
 
 /// Typval-only builtin dispatcher. Regex operations use only the supplied seam.
@@ -106,13 +152,21 @@ impl<'a> Builtins<'a> {
     /// Create a dispatcher with regex-backed builtins enabled through `regex`.
     #[must_use]
     pub fn new(regex: &'a dyn RegexEngine) -> Self {
-        Self { regex: Some(regex), closures: ClosureRegistry::new(), ambiguous_wide: false }
+        Self {
+            regex: Some(regex),
+            closures: ClosureRegistry::new(),
+            ambiguous_wide: false,
+        }
     }
 
     /// Create a dispatcher whose regex-backed operations return a typed error.
     #[must_use]
     pub fn without_regex() -> Self {
-        Self { regex: None, closures: ClosureRegistry::new(), ambiguous_wide: false }
+        Self {
+            regex: None,
+            closures: ClosureRegistry::new(),
+            ambiguous_wide: false,
+        }
     }
 
     /// Use double-cell widths for East-Asian ambiguous characters.
@@ -131,10 +185,18 @@ impl<'a> Builtins<'a> {
 
     /// Borrow the shared closure registry.
     #[must_use]
-    pub const fn closure_registry(&self) -> &ClosureRegistry { &self.closures }
-
+    pub const fn closure_registry(&self) -> &ClosureRegistry {
+        &self.closures
+    }
+    // Upstream's builtin dispatch is one giant if/else chain; this match mirrors it.
+    #[allow(clippy::too_many_lines)]
     fn dispatch(&mut self, name: &str, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
-        let spec = builtin_spec(name).ok_or_else(|| EvalError::not_implemented(OxStr::from(name)))?;
+        if is_higher_order_builtin(name) {
+            let regex = RegexRef(self.regex);
+            return call_higher_order_builtin(self, &regex, name, args, scope);
+        }
+        let spec =
+            builtin_spec(name).ok_or_else(|| EvalError::not_implemented(OxStr::from(name)))?;
         if !is_builtin_implemented(name) {
             return Err(EvalError::not_implemented(OxStr::from(name)));
         }
@@ -165,6 +227,7 @@ impl<'a> Builtins<'a> {
             "tan" => float_unary(&args[0], f64::tan),
             "tanh" => float_unary(&args[0], f64::tanh),
             "blob2list" => blob2list(&args[0]),
+            "byteidx" => byteidx(&args),
             "ceil" => float_unary(&args[0], f64::ceil),
             "char2nr" => char2nr(&args),
             "copy" => shallow_copy(&args[0]),
@@ -176,43 +239,47 @@ impl<'a> Builtins<'a> {
             "exepath" => path_builtins::exepath(&args[0]),
             "exists" => exists(&args[0], scope),
             "extend" | "extendnew" => extend(args),
-            "filter" => self.filter_or_map(args, scope, CollectionOp::Filter),
             "flatten" => flatten(&args, true),
             "flattennew" => flatten(&args, false),
-            "findfile" => path_builtins::findfilendir(self.regex, &args, scope, crate::find_file::FindWhat::File),
-            "finddir" => path_builtins::findfilendir(self.regex, &args, scope, crate::find_file::FindWhat::Dir),
+            "findfile" => path_builtins::findfilendir(
+                self.regex,
+                &args,
+                scope,
+                crate::find_file::FindWhat::File,
+            ),
+            "finddir" => path_builtins::findfilendir(
+                self.regex,
+                &args,
+                scope,
+                crate::find_file::FindWhat::Dir,
+            ),
             "float2nr" => float_to_number(&args[0]),
             "floor" => float_unary(&args[0], f64::floor),
             "fnamemodify" => path_builtins::fnamemodify(self.regex, &args[0], &args[1]),
-            "environ" => environ(scope),
+            "environ" => Ok(environ()),
             "fnameescape" => fnameescape(&args),
             "get" => get(&args),
             "gettext" => gettext(&args[0]),
             "getcwd" => path_builtins::getcwd(&args),
             "getpid" => Ok(Typval::Number(i64::from(std::process::id()))),
-            "getenv" => getenv(&args, scope),
+            "getenv" => getenv(&args),
             "has" => has_feature(&args),
             "has_key" => has_key(&args),
             "hostname" => hostname(),
             "index" => index(&args),
-            "indexof" => self.indexof(&args, scope),
             "insert" => insert(args),
             "isabsolutepath" => path_builtins::is_absolute_path(&args[0]),
-            "islocked" => is_locked_value(&args[0]),
-            "items" => dict_projection(&args[0], Projection::Items),
+            "islocked" => is_locked(&args[0], scope),
+            "items" => dict_projection(&args[0], &Projection::Items),
             "join" => join(&args),
             "keytrans" => keytrans(&args[0]),
-            "localtime" => localtime(),
+            "localtime" => Ok(localtime()),
             "json_decode" => json_decode(&args[0]),
             "json_encode" => json_encode(&args[0]),
-            "keys" => dict_projection(&args[0], Projection::Keys),
+            "keys" => dict_projection(&args[0], &Projection::Keys),
             "len" | "strlen" => length(&args[0], name == "strlen"),
             "list2blob" => list2blob(&args[0]),
             "list2str" => list2str(&args),
-            "map" => self.filter_or_map(args, scope, CollectionOp::Map),
-            "mapnew" => self.filter_or_map(args, scope, CollectionOp::MapNew),
-            "foreach" => self.filter_or_map(args, scope, CollectionOp::ForEach),
-            "reduce" => self.reduce(args, scope),
             "match" | "matchend" | "matchstr" => self.regex_match(name, &args),
             "matchlist" | "matchstrpos" => self.regex_result(name, &args),
             "matchstrlist" => self.matchstrlist(&args),
@@ -224,25 +291,29 @@ impl<'a> Builtins<'a> {
             "pow" => float_binary(&args, f64::powf),
             "printf" => printf_builtin(&args),
             "range" => range(&args),
-            "remove" => remove(args),
+            "remove" => remove(&args),
             "repeat" => repeat(&args),
             "resolve" => path_builtins::resolve(&args[0]),
             "pathshorten" => pathshorten(&args),
             "reverse" => reverse(args),
-            "reltime" => reltime(&args),
-            "reltimefloat" => reltimefloat(&args),
-            "reltimestr" => reltimestr(&args),
-            "setenv" => setenv(&args, scope),
+            "reltime" => Ok(reltime(&args)),
+            "reltimefloat" => Ok(reltimefloat(&args)),
+            "reltimestr" => Ok(reltimestr(&args)),
+            "setenv" => setenv(&args),
+            "sha256" => sha256(&args[0]),
             "simplify" => path_builtins::simplify(&args[0]),
             "slice" => slice(&args),
-            "sort" => self.sort(args, scope),
+            "sort" => self.sort(&args, scope),
             "split" => self.regex_split(&args),
             "sqrt" => float_unary(&args[0], f64::sqrt),
             "str2float" => str2float(&args[0]),
             "str2list" => str2list(&args),
             "str2nr" => str2nr(&args),
             "strcharlen" => strcharlen(&args[0]),
+            "strcharpart" => strcharpart(&args),
             "strchars" => strchars(&args),
+            "strdisplaywidth" => strdisplaywidth(&args, self.ambiguous_wide),
+            "strgetchar" => strgetchar(&args),
             "strtrans" => strtrans(&args[0]),
             "strutf16len" => strutf16len(&args),
             "strwidth" => strwidth(&args[0], self.ambiguous_wide),
@@ -264,14 +335,24 @@ impl<'a> Builtins<'a> {
             "charidx" => charidx(&args),
             "type" => Ok(Typval::Number(type_constant(&args[0]))),
             "uniq" => uniq(args),
-            "values" => dict_projection(&args[0], Projection::Values),
+            "values" => dict_projection(&args[0], &Projection::Values),
+            // Release nvim's body is inert outside `-DUNIT_TESTING` builds
+            // (testing.c); this port has no cycle collector to force, so the
+            // callable's whole observable contract is "succeeds, returns 0".
+            "test_garbagecollect_now" => Ok(Typval::Number(0)),
+            // `f_swapname` (eval/funcs.c:7215-7226) for a host with no
+            // editor: `tv_get_buf` finds no buffer, so the answer is the
+            // NULL string — the empty string. Editor-backed hosts route
+            // through `swapname_builtin` in ox-editor's `excmd_exec`.
+            "swapname" => Ok(Typval::String(OxStr::from(""))),
             "xor" => binary_number(&args, |left, right| left ^ right),
             _ => Err(EvalError::not_implemented(OxStr::from(name))),
         }
     }
 
     fn regex(&self) -> Result<&dyn RegexEngine> {
-        self.regex.ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))
+        self.regex
+            .ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))
     }
 
     fn regex_split(&self, args: &[Typval]) -> Result<Typval> {
@@ -287,11 +368,13 @@ impl<'a> Builtins<'a> {
         }
         let pattern = string_arg(&args[1])?;
         let keep_empty = args.get(2).is_some_and(Typval::is_truthy);
-        self.regex()?.split(&text, &pattern, keep_empty).map(|parts| {
-            Typval::list(parts.into_iter().map(Typval::String).collect())
-        })
+        self.regex()?
+            .split(&text, &pattern, keep_empty)
+            .map(|parts| Typval::list(parts.into_iter().map(Typval::String).collect()))
     }
-
+    // i64→usize: Vim list indices are non-negative after .max(0); the cast
+    // mirrors upstream's array indexing after bounds normalization.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     fn regex_match(&self, name: &str, args: &[Typval]) -> Result<Typval> {
         let pattern = string_arg(&args[1])?;
         let start_number = args.get(2).map(number_arg).transpose()?.unwrap_or(0).max(0);
@@ -306,11 +389,19 @@ impl<'a> Builtins<'a> {
                     if self.regex()?.is_match(&text, &pattern, false)? {
                         seen += 1;
                         if seen == occurrence {
-                            return Ok(if name == "matchstr" { Typval::String(text) } else { Typval::Number(saturating_i64(index)) });
+                            return Ok(if name == "matchstr" {
+                                Typval::String(text)
+                            } else {
+                                Typval::Number(saturating_i64(index))
+                            });
                         }
                     }
                 }
-                Ok(if name == "matchstr" { Typval::String(OxStr(Vec::new())) } else { Typval::Number(-1) })
+                Ok(if name == "matchstr" {
+                    Typval::String(OxStr(Vec::new()))
+                } else {
+                    Typval::Number(-1)
+                })
             }
             value => {
                 let text = string_arg(value)?;
@@ -318,15 +409,22 @@ impl<'a> Builtins<'a> {
                 let mut found = None;
                 for _ in 0..occurrence {
                     found = self.regex()?.find(&text, &pattern, search_start)?;
-                    let Some((match_start, match_end)) = found else { break };
-                    search_start = if match_end > match_start { match_end } else { match_start.saturating_add(1) };
+                    let Some((match_start, match_end)) = found else {
+                        break;
+                    };
+                    search_start = if match_end > match_start {
+                        match_end
+                    } else {
+                        match_start.saturating_add(1)
+                    };
                 }
                 Ok(match (name, found) {
-                    ("matchstr", Some((start, end))) => Typval::String(OxStr(text.as_bytes()[start..end].to_vec())),
+                    ("matchstr", Some((start, end))) => {
+                        Typval::String(OxStr(text.as_bytes()[start..end].to_vec()))
+                    }
                     ("matchstr", None) => Typval::String(OxStr(Vec::new())),
                     ("matchend", Some((_, end))) => Typval::Number(saturating_i64(end)),
                     ("match", Some((start, _))) => Typval::Number(saturating_i64(start)),
-                    (_, None) => Typval::Number(-1),
                     _ => Typval::Number(-1),
                 })
             }
@@ -339,31 +437,66 @@ impl<'a> Builtins<'a> {
         match &args[0] {
             Typval::List(values) if name == "matchstrpos" => {
                 let values = list_items(values)?;
-                for (index, value) in values.iter().enumerate().skip(usize::try_from(start_number).unwrap_or(usize::MAX)) {
+                for (index, value) in values
+                    .iter()
+                    .enumerate()
+                    .skip(usize::try_from(start_number).unwrap_or(usize::MAX))
+                {
                     let text = string_arg(value)?;
                     if let Some(found) = self.regex()?.find_captures(&text, &pattern, 0)? {
-                        return Ok(Typval::list(vec![Typval::String(OxStr(text.as_bytes()[found.start..found.end].to_vec())), Typval::Number(saturating_i64(index)), Typval::Number(saturating_i64(found.start)), Typval::Number(saturating_i64(found.end))]));
+                        return Ok(Typval::list(vec![
+                            Typval::String(OxStr(text.as_bytes()[found.start..found.end].to_vec())),
+                            Typval::Number(saturating_i64(index)),
+                            Typval::Number(saturating_i64(found.start)),
+                            Typval::Number(saturating_i64(found.end)),
+                        ]));
                     }
                 }
-                Ok(Typval::list(vec![Typval::String(OxStr(Vec::new())), Typval::Number(-1), Typval::Number(-1), Typval::Number(-1)]))
+                Ok(Typval::list(vec![
+                    Typval::String(OxStr(Vec::new())),
+                    Typval::Number(-1),
+                    Typval::Number(-1),
+                    Typval::Number(-1),
+                ]))
             }
             Typval::List(_) => Err(EvalError::new("E730", 0, "Using a List as a String")),
             value => {
                 let text = string_arg(value)?;
-                let found = self.regex()?.find_captures(&text, &pattern, usize::try_from(start_number).unwrap_or(usize::MAX))?;
+                let found = self.regex()?.find_captures(
+                    &text,
+                    &pattern,
+                    usize::try_from(start_number).unwrap_or(usize::MAX),
+                )?;
                 if name == "matchstrpos" {
                     return Ok(match found {
-                        Some(found) => Typval::list(vec![Typval::String(OxStr(text.as_bytes()[found.start..found.end].to_vec())), Typval::Number(saturating_i64(found.start)), Typval::Number(saturating_i64(found.end))]),
-                        None => Typval::list(vec![Typval::String(OxStr(Vec::new())), Typval::Number(-1), Typval::Number(-1)]),
+                        Some(found) => Typval::list(vec![
+                            Typval::String(OxStr(text.as_bytes()[found.start..found.end].to_vec())),
+                            Typval::Number(saturating_i64(found.start)),
+                            Typval::Number(saturating_i64(found.end)),
+                        ]),
+                        None => Typval::list(vec![
+                            Typval::String(OxStr(Vec::new())),
+                            Typval::Number(-1),
+                            Typval::Number(-1),
+                        ]),
                     });
                 }
-                let Some(found) = found else { return Ok(Typval::list(Vec::new())); };
+                let Some(found) = found else {
+                    return Ok(Typval::list(Vec::new()));
+                };
                 let mut result = Vec::with_capacity(10);
-                result.push(Typval::String(OxStr(text.as_bytes()[found.start..found.end].to_vec())));
+                result.push(Typval::String(OxStr(
+                    text.as_bytes()[found.start..found.end].to_vec(),
+                )));
                 for capture in found.captures.into_iter().take(9) {
-                    result.push(Typval::String(capture.map_or_else(|| OxStr(Vec::new()), |(start, end)| OxStr(text.as_bytes()[start..end].to_vec()))));
+                    result.push(Typval::String(capture.map_or_else(
+                        || OxStr(Vec::new()),
+                        |(start, end)| OxStr(text.as_bytes()[start..end].to_vec()),
+                    )));
                 }
-                while result.len() < 10 { result.push(Typval::String(OxStr(Vec::new()))); }
+                while result.len() < 10 {
+                    result.push(Typval::String(OxStr(Vec::new())));
+                }
                 Ok(Typval::list(result))
             }
         }
@@ -383,18 +516,30 @@ impl<'a> Builtins<'a> {
         let include_submatches = match args.get(2) {
             None | Some(Typval::Special(Special::Null)) => false,
             Some(Typval::Dict(reference)) => {
-                let value = dict_entries(reference)?
+                let value = cloned_entries(reference)?
                     .into_iter()
-                    .find(|(key, _)| key.as_bytes() == b"submatches")
-                    .map(|(_, value)| value);
+                    .find(|entry| entry.key.as_bytes() == b"submatches")
+                    .map(|entry| entry.value);
                 match value {
                     None => false,
                     Some(Typval::Bool(value)) => value,
                     Some(Typval::Number(value)) if matches!(value, 0 | 1) => value != 0,
-                    Some(_) => return Err(EvalError::new("E475", 0, "Invalid value for argument submatches")),
+                    Some(_) => {
+                        return Err(EvalError::new(
+                            "E475",
+                            0,
+                            "Invalid value for argument submatches",
+                        ));
+                    }
                 }
             }
-            Some(_) => return Err(EvalError::new("E1206", 0, "Dictionary required for argument 3")),
+            Some(_) => {
+                return Err(EvalError::new(
+                    "E1206",
+                    0,
+                    "Dictionary required for argument 3",
+                ));
+            }
         };
 
         let mut matches = Vec::new();
@@ -404,19 +549,32 @@ impl<'a> Builtins<'a> {
                 Typval::Special(Special::Null) => OxStr(Vec::new()),
                 _ => string_arg(value)?,
             };
-            let Some(found) = self.regex()?.find_captures(&text, &pattern, 0)? else { continue };
+            let Some(found) = self.regex()?.find_captures(&text, &pattern, 0)? else {
+                continue;
+            };
             let mut entry = vec![
                 (OxStr::from("idx"), Typval::Number(saturating_i64(index))),
-                (OxStr::from("byteidx"), Typval::Number(saturating_i64(found.start))),
-                (OxStr::from("text"), Typval::String(OxStr(text.as_bytes()[found.start..found.end].to_vec()))),
+                (
+                    OxStr::from("byteidx"),
+                    Typval::Number(saturating_i64(found.start)),
+                ),
+                (
+                    OxStr::from("text"),
+                    Typval::String(OxStr(text.as_bytes()[found.start..found.end].to_vec())),
+                ),
             ];
             if include_submatches {
-                let mut captures = found.captures.into_iter().take(9).map(|range| {
-                    Typval::String(range.map_or_else(
-                        || OxStr(Vec::new()),
-                        |(start, end)| OxStr(text.as_bytes()[start..end].to_vec()),
-                    ))
-                }).collect::<Vec<_>>();
+                let mut captures = found
+                    .captures
+                    .into_iter()
+                    .take(9)
+                    .map(|range| {
+                        Typval::String(range.map_or_else(
+                            || OxStr(Vec::new()),
+                            |(start, end)| OxStr(text.as_bytes()[start..end].to_vec()),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
                 captures.resize(9, Typval::String(OxStr(Vec::new())));
                 entry.push((OxStr::from("submatches"), Typval::list(captures)));
             }
@@ -433,13 +591,21 @@ impl<'a> Builtins<'a> {
     fn matchfuzzy(&mut self, name: &str, args: &[Typval], scope: &mut Scope) -> Result<Typval> {
         let retmatchpos = name == "matchfuzzypos";
         let Typval::List(reference) = &args[0] else {
-            return Err(EvalError::new("E686", 0, format!("Argument of {name}() must be a List")));
+            return Err(EvalError::new(
+                "E686",
+                0,
+                format!("Argument of {name}() must be a List"),
+            ));
         };
         let pattern = match &args[1] {
             Typval::String(value) => value.clone(),
             other => {
                 let rendered = string_arg(other)?;
-                return Err(EvalError::new("E475", 0, format!("Invalid argument: {}", rendered.to_string_lossy())));
+                return Err(EvalError::new(
+                    "E475",
+                    0,
+                    format!("Invalid argument: {}", rendered.to_string_lossy()),
+                ));
             }
         };
 
@@ -451,14 +617,24 @@ impl<'a> Builtins<'a> {
             if options.limit > 0 && saturating_i64(found.len()) >= options.limit {
                 break;
             }
-            let Some(text) = self.fuzzy_item_text(&item, options.key.as_ref(), options.text_cb.as_ref(), scope)? else {
+            let Some(text) =
+                self.fuzzy_item_text(&item, options.key.as_ref(), options.text_cb.as_ref(), scope)?
+            else {
                 continue;
             };
             let haystack = crate::fuzzy::composed_chars(text.as_bytes());
-            let Some(matched) = crate::fuzzy::fuzzy_match(&haystack, &pattern_chars, options.matchseq) else {
+            let Some(matched) =
+                crate::fuzzy::fuzzy_match(&haystack, &pattern_chars, options.matchseq)
+            else {
                 continue;
             };
-            found.push(FuzzyItem { index, item, score: matched.score, positions: matched.positions, text });
+            found.push(FuzzyItem {
+                index,
+                item,
+                score: matched.score,
+                positions: matched.positions,
+                text,
+            });
         }
 
         // `fuzzy_match_item_compare` (`fuzzy.c:162-189`): score descending,
@@ -470,9 +646,14 @@ impl<'a> Builtins<'a> {
             right.score.cmp(&left.score).then_with(|| {
                 let exact = |item: &FuzzyItem| {
                     let offset = item.positions.first().copied().unwrap_or(0);
-                    item.text.as_bytes().get(offset..).is_some_and(|tail| tail.starts_with(pattern.as_bytes()))
+                    item.text
+                        .as_bytes()
+                        .get(offset..)
+                        .is_some_and(|tail| tail.starts_with(pattern.as_bytes()))
                 };
-                exact(right).cmp(&exact(left)).then_with(|| left.index.cmp(&right.index))
+                exact(right)
+                    .cmp(&exact(left))
+                    .then_with(|| left.index.cmp(&right.index))
             })
         });
 
@@ -492,15 +673,24 @@ impl<'a> Builtins<'a> {
                         break;
                     }
                     if options.matchseq || !matches!(character, ' ' | '\t') {
-                        values.push(Typval::Number(saturating_i64(entry.positions.get(slot).copied().unwrap_or(0))));
+                        values.push(Typval::Number(saturating_i64(
+                            entry.positions.get(slot).copied().unwrap_or(0),
+                        )));
                         slot += 1;
                     }
                 }
                 Typval::list(values)
             })
             .collect();
-        let scores = found.iter().map(|entry| Typval::Number(i64::from(entry.score))).collect();
-        Ok(Typval::list(vec![Typval::list(items), Typval::list(positions), Typval::list(scores)]))
+        let scores = found
+            .iter()
+            .map(|entry| Typval::Number(i64::from(entry.score)))
+            .collect();
+        Ok(Typval::list(vec![
+            Typval::list(items),
+            Typval::list(positions),
+            Typval::list(scores),
+        ]))
     }
 
     /// The string a `matchfuzzy()` list item contributes: the item itself for
@@ -517,16 +707,21 @@ impl<'a> Builtins<'a> {
             Typval::String(text) => Ok(Some(text.clone())),
             Typval::Dict(entries) => {
                 if let Some(key) = key {
-                    return dict_entries(entries)?
+                    return cloned_entries(entries)?
                         .iter()
-                        .find(|(candidate, _)| candidate == key)
-                        .map(|(_, value)| string_arg(value))
+                        .find(|entry| &entry.key == key)
+                        .map(|entry| string_arg(&entry.value))
                         .transpose();
                 }
-                let Some(callback) = text_cb else { return Ok(None) };
+                let Some(callback) = text_cb else {
+                    return Ok(None);
+                };
                 let regex = RegexRef(self.regex);
-                let result = Evaluator::new(self, &regex)
-                    .invoke(callback.clone(), vec![item.clone()], &mut scope.snapshot())?;
+                let result = Evaluator::new(self, &regex).invoke(
+                    callback.clone(),
+                    vec![item.clone()],
+                    &mut scope.snapshot(),
+                )?;
                 Ok(match result {
                     Typval::String(text) => Some(text),
                     _ => None,
@@ -541,17 +736,36 @@ impl<'a> Builtins<'a> {
         let pattern = string_arg(&args[1])?;
         let replacement = string_arg(&args[2])?;
         let flags = string_arg(&args[3])?;
-        self.regex()?.substitute(&text, &pattern, &replacement, &flags).map(Typval::String)
+        self.regex()?
+            .substitute(&text, &pattern, &replacement, &flags)
+            .map(Typval::String)
     }
 
-    fn filter_or_map(&mut self, mut args: Vec<Typval>, scope: &mut Scope, operation: CollectionOp) -> Result<Typval> {
-        let callback = args.pop().ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
-        let container = args.pop().ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
+    // Two container types (List, Dict) × two operations (filter, map) = four
+    // paths, all inline for upstream fidelity; splitting would obscure the symmetry.
+    #[allow(clippy::too_many_lines)]
+    fn filter_or_map<H: BuiltinHost, R: RegexEngine>(
+        host: &mut H,
+        regex: &R,
+        mut args: Vec<Typval>,
+        scope: &mut Scope,
+        operation: CollectionOp,
+    ) -> Result<Typval> {
+        let callback = args
+            .pop()
+            .ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
+        let container = args
+            .pop()
+            .ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
         match &container {
             Typval::List(reference) => {
                 let (items, previous_lock) = {
                     let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
-                    if data.lock.locked && matches!(operation, CollectionOp::Map | CollectionOp::Filter) { return Err(locked_error()); }
+                    if data.lock.locked
+                        && matches!(operation, CollectionOp::Map | CollectionOp::Filter)
+                    {
+                        return Err(locked_error());
+                    }
                     let items = data.items.clone();
                     let previous = data.lock;
                     data.lock.locked = true;
@@ -561,17 +775,32 @@ impl<'a> Builtins<'a> {
                 let mut current_index = 0usize;
                 let evaluated = (|| {
                     for (callback_index, value) in items.iter().cloned().enumerate() {
-                        let mapped = self.eval_callback(&callback, Typval::Number(saturating_i64(callback_index)), value, scope)?;
+                        let mapped = eval_callback_with_host(
+                            host,
+                            regex,
+                            &callback,
+                            Typval::Number(saturating_i64(callback_index)),
+                            value,
+                            scope,
+                        )?;
                         match operation {
                             CollectionOp::Map => {
-                                let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
-                                let Some(slot) = data.items.get_mut(current_index) else { return Err(borrow_error()); };
+                                let mut data =
+                                    reference.try_borrow_mut().map_err(|_| borrow_error())?;
+                                let Some(slot) = data.items.get_mut(current_index) else {
+                                    return Err(borrow_error());
+                                };
                                 *slot = mapped;
                                 current_index += 1;
                             }
                             CollectionOp::Filter => {
-                                let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
-                                if mapped.is_truthy() { current_index += 1; } else if current_index < data.items.len() { data.items.remove(current_index); }
+                                let mut data =
+                                    reference.try_borrow_mut().map_err(|_| borrow_error())?;
+                                if mapped.is_truthy() {
+                                    current_index += 1;
+                                } else if current_index < data.items.len() {
+                                    data.items.remove(current_index);
+                                }
                             }
                             CollectionOp::MapNew => output.push(mapped),
                             CollectionOp::ForEach => {}
@@ -589,7 +818,11 @@ impl<'a> Builtins<'a> {
             Typval::Dict(reference) => {
                 let (entries, previous_lock) = {
                     let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
-                    if data.lock.locked && matches!(operation, CollectionOp::Map | CollectionOp::Filter) { return Err(locked_error()); }
+                    if data.lock.locked
+                        && matches!(operation, CollectionOp::Map | CollectionOp::Filter)
+                    {
+                        return Err(locked_error());
+                    }
                     let entries = data.entries.clone();
                     let previous = data.lock;
                     data.lock.locked = true;
@@ -597,22 +830,50 @@ impl<'a> Builtins<'a> {
                 };
                 let mut output = Vec::with_capacity(entries.len());
                 let evaluated = (|| {
-                    for (key, value) in entries.iter().cloned() {
-                        let mapped = self.eval_callback(&callback, Typval::String(key.clone()), value, scope)?;
+                    for entry in entries.iter().cloned() {
+                        let mapped = eval_callback_with_host(
+                            host,
+                            regex,
+                            &callback,
+                            Typval::String(entry.key.clone()),
+                            entry.value,
+                            scope,
+                        )?;
                         match operation {
+                            // Upstream re-checks the live item per iteration
+                            // (`list.c` filter_map_dict): the check happens
+                            // inside the mutation borrow window, and the first
+                            // violation aborts the whole loop.
                             CollectionOp::Map => {
-                                let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
-                                let Some((_, slot)) = data.entries.iter_mut().find(|(candidate, _)| candidate == &key) else { return Err(borrow_error()); };
-                                *slot = mapped;
+                                let mut data =
+                                    reference.try_borrow_mut().map_err(|_| borrow_error())?;
+                                let Some(slot) = data
+                                    .entries
+                                    .iter_mut()
+                                    .find(|candidate| candidate.key == entry.key)
+                                else {
+                                    return Err(borrow_error());
+                                };
+                                check_value_lock(slot.value_lock, "map() argument")?;
+                                check_writable(slot.flags, "map() argument")?;
+                                slot.value = mapped;
                             }
                             CollectionOp::Filter => {
                                 if !mapped.is_truthy() {
-                                    let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
-                                    let Some(index) = data.entries.iter().position(|(candidate, _)| candidate == &key) else { return Err(borrow_error()); };
+                                    let mut data =
+                                        reference.try_borrow_mut().map_err(|_| borrow_error())?;
+                                    let Some(index) = data
+                                        .entries
+                                        .iter()
+                                        .position(|candidate| candidate.key == entry.key)
+                                    else {
+                                        return Err(borrow_error());
+                                    };
+                                    check_deletable(&data.entries[index], "filter() argument")?;
                                     data.entries.remove(index);
                                 }
                             }
-                            CollectionOp::MapNew => output.push((key, mapped)),
+                            CollectionOp::MapNew => output.push((entry.key, mapped)),
                             CollectionOp::ForEach => {}
                         }
                     }
@@ -628,16 +889,29 @@ impl<'a> Builtins<'a> {
             Typval::Blob(bytes) => {
                 let mut output = Vec::with_capacity(bytes.len());
                 for (index, byte) in bytes.iter().copied().enumerate() {
-                    let mapped = self.eval_callback(&callback, Typval::Number(saturating_i64(index)), Typval::Number(i64::from(byte)), scope)?;
+                    let mapped = eval_callback_with_host(
+                        host,
+                        regex,
+                        &callback,
+                        Typval::Number(saturating_i64(index)),
+                        Typval::Number(i64::from(byte)),
+                        scope,
+                    )?;
                     match operation {
-                        CollectionOp::Map | CollectionOp::MapNew => output.push(u8::try_from(number_arg(&mapped)?).map_err(|_| EvalError::new("E1230", 0, "Blob value must be in range 0 to 255"))?),
+                        CollectionOp::Map | CollectionOp::MapNew => {
+                            output.push(u8::try_from(number_arg(&mapped)?).map_err(|_| {
+                                EvalError::new("E1230", 0, "Blob value must be in range 0 to 255")
+                            })?);
+                        }
                         CollectionOp::Filter if mapped.is_truthy() => output.push(byte),
                         CollectionOp::Filter | CollectionOp::ForEach => {}
                     }
                 }
                 Ok(match operation {
                     CollectionOp::ForEach => container,
-                    CollectionOp::Map | CollectionOp::MapNew | CollectionOp::Filter => Typval::Blob(output),
+                    CollectionOp::Map | CollectionOp::MapNew | CollectionOp::Filter => {
+                        Typval::Blob(output)
+                    }
                 })
             }
             Typval::String(text) => {
@@ -645,61 +919,90 @@ impl<'a> Builtins<'a> {
                 let mut output = Vec::new();
                 for (index, character) in characters.into_iter().enumerate() {
                     let original = Typval::String(character.clone());
-                    let mapped = self.eval_callback(&callback, Typval::Number(saturating_i64(index)), original, scope)?;
+                    let mapped = eval_callback_with_host(
+                        host,
+                        regex,
+                        &callback,
+                        Typval::Number(saturating_i64(index)),
+                        original,
+                        scope,
+                    )?;
                     match operation {
-                        CollectionOp::Map | CollectionOp::MapNew => output.extend_from_slice(string_arg(&mapped)?.as_bytes()),
-                        CollectionOp::Filter if mapped.is_truthy() => output.extend_from_slice(character.as_bytes()),
+                        CollectionOp::Map | CollectionOp::MapNew => {
+                            output.extend_from_slice(string_arg(&mapped)?.as_bytes());
+                        }
+                        CollectionOp::Filter if mapped.is_truthy() => {
+                            output.extend_from_slice(character.as_bytes());
+                        }
                         CollectionOp::Filter | CollectionOp::ForEach => {}
                     }
                 }
                 Ok(match operation {
                     CollectionOp::ForEach => container,
-                    CollectionOp::Map | CollectionOp::MapNew | CollectionOp::Filter => Typval::String(OxStr(output)),
+                    CollectionOp::Map | CollectionOp::MapNew | CollectionOp::Filter => {
+                        Typval::String(OxStr(output))
+                    }
                 })
             }
-            _ => Err(EvalError::new("E1251", 0, "List, Dictionary, Blob or String required")),
+            _ => Err(EvalError::new(
+                "E1251",
+                0,
+                "List, Dictionary, Blob or String required",
+            )),
         }
     }
 
-    fn eval_callback(&mut self, callback: &Typval, key: Typval, value: Typval, scope: &Scope) -> Result<Typval> {
-        match callback {
-            Typval::String(expression) => {
-                let parsed = Parser::new(expression.as_bytes()).parse()?;
-                let mut callback_scope = scope.snapshot();
-                set_pair(&mut callback_scope.vim, b"key", key);
-                set_pair(&mut callback_scope.vim, b"val", value);
-                let regex = RegexRef(self.regex);
-                Evaluator::new(self, &regex).eval(&parsed, &mut callback_scope)
-            }
-            Typval::Funcref(_) | Typval::Partial(_) => {
-                let regex = RegexRef(self.regex);
-                Evaluator::new(self, &regex).invoke(callback.clone(), vec![key, value], &mut scope.snapshot())
-            }
-            _ => Err(EvalError::new("E921", 0, "Invalid callback argument")),
-        }
+    fn eval_callback(
+        &mut self,
+        callback: &Typval,
+        key: Typval,
+        value: Typval,
+        scope: &Scope,
+    ) -> Result<Typval> {
+        let regex = RegexRef(self.regex);
+        eval_callback_with_host(self, &regex, callback, key, value, scope)
     }
 
     /// `indexof()` — upstream `f_indexof` (eval/funcs.c 2961-3002): evaluate
     /// the callback with `v:key`/`v:val` for each List item or Blob byte
     /// starting at `opts.startidx` (negative counts from the end; out of range
     /// finds nothing) and return the first index whose result converts to a
-    /// nonzero number (tv_get_bool_chk, funcs.c 2872), else -1. An empty or
+    /// nonzero number (`tv_get_bool_chk`, funcs.c 2872), else -1. An empty or
     /// null-string callback never matches, and a callback error aborts the
     /// search like upstream's `did_emsg` check.
-    fn indexof(&mut self, args: &[Typval], scope: &mut Scope) -> Result<Typval> {
+    fn indexof<H: BuiltinHost, R: RegexEngine>(
+        host: &mut H,
+        regex: &R,
+        args: &[Typval],
+        scope: &mut Scope,
+    ) -> Result<Typval> {
         let callback = match &args[1] {
-            Typval::String(expression) if expression.as_bytes().is_empty() => return Ok(Typval::Number(-1)),
+            Typval::String(expression) if expression.as_bytes().is_empty() => {
+                return Ok(Typval::Number(-1));
+            }
             Typval::Special(Special::Null) => return Ok(Typval::Number(-1)),
             Typval::String(_) | Typval::Funcref(_) | Typval::Partial(_) => args[1].clone(),
-            _ => return Err(EvalError::new("E1256", 0, "String or function required for argument 2")),
+            _ => {
+                return Err(EvalError::new(
+                    "E1256",
+                    0,
+                    "String or function required for argument 2",
+                ));
+            }
         };
         let startidx = match args.get(2) {
             None | Some(Typval::Special(Special::Null)) => 0,
-            Some(Typval::Dict(reference)) => dict_entries(reference)?
+            Some(Typval::Dict(reference)) => cloned_entries(reference)?
                 .iter()
-                .find(|(key, _)| key.as_bytes() == b"startidx")
-                .map_or(0, |(_, value)| number_arg(value).unwrap_or(0)),
-            Some(_) => return Err(EvalError::new("E1206", 0, "Dictionary required for argument 3")),
+                .find(|entry| entry.key.as_bytes() == b"startidx")
+                .map_or(0, |entry| number_arg(&entry.value).unwrap_or(0)),
+            Some(_) => {
+                return Err(EvalError::new(
+                    "E1206",
+                    0,
+                    "Dictionary required for argument 3",
+                ));
+            }
         };
         let found = match &args[0] {
             Typval::List(reference) => {
@@ -707,9 +1010,15 @@ impl<'a> Builtins<'a> {
                 let start = normalize_index(items.len(), startidx).unwrap_or(items.len());
                 let mut found = -1;
                 for (index, value) in items.into_iter().enumerate().skip(start) {
-                    let matched = self
-                        .eval_callback(&callback, Typval::Number(saturating_i64(index)), value, scope)
-                        .and_then(|result| number_arg(&result).map(|number| number != 0))?;
+                    let matched = eval_callback_with_host(
+                        host,
+                        regex,
+                        &callback,
+                        Typval::Number(saturating_i64(index)),
+                        value,
+                        scope,
+                    )
+                    .and_then(|result| number_arg(&result).map(|number| number != 0))?;
                     if matched {
                         found = saturating_i64(index);
                         break;
@@ -721,9 +1030,15 @@ impl<'a> Builtins<'a> {
                 let start = normalize_index(bytes.len(), startidx).unwrap_or(bytes.len());
                 let mut found = -1;
                 for (index, byte) in bytes.iter().copied().enumerate().skip(start) {
-                    let matched = self
-                        .eval_callback(&callback, Typval::Number(saturating_i64(index)), Typval::Number(i64::from(byte)), scope)
-                        .and_then(|result| number_arg(&result).map(|number| number != 0))?;
+                    let matched = eval_callback_with_host(
+                        host,
+                        regex,
+                        &callback,
+                        Typval::Number(saturating_i64(index)),
+                        Typval::Number(i64::from(byte)),
+                        scope,
+                    )
+                    .and_then(|result| number_arg(&result).map(|number| number != 0))?;
                     if matched {
                         found = saturating_i64(index);
                         break;
@@ -731,12 +1046,18 @@ impl<'a> Builtins<'a> {
                 }
                 found
             }
-            _ => return Err(EvalError::new("E1226", 0, "List or Blob required for argument 1")),
+            _ => {
+                return Err(EvalError::new(
+                    "E1226",
+                    0,
+                    "List or Blob required for argument 1",
+                ));
+            }
         };
         Ok(Typval::Number(found))
     }
 
-    fn sort(&mut self, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
+    fn sort(&mut self, args: &[Typval], scope: &mut Scope) -> Result<Typval> {
         let Some(Typval::List(reference)) = args.first() else {
             return Err(EvalError::new("E714", 0, "List required"));
         };
@@ -761,7 +1082,9 @@ impl<'a> Builtins<'a> {
         };
         let (mut values, previous_lock) = {
             let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
-            if data.lock.locked { return Err(locked_error()); }
+            if data.lock.locked {
+                return Err(locked_error());
+            }
             let values = data.items.clone();
             let previous = data.lock;
             data.lock.locked = true;
@@ -778,8 +1101,10 @@ impl<'a> Builtins<'a> {
                 SortMode::Numeric => Ok(sort_numeric(left).total_cmp(&sort_numeric(right))),
                 SortMode::Integer => Ok(sort_integer(left).cmp(&sort_integer(right))),
                 SortMode::Float => Ok(sort_float(left).total_cmp(&sort_float(right))),
-                SortMode::Callback(callback) => self.eval_callback(callback, left.clone(), right.clone(), scope)
-                    .and_then(|value| number_arg(&value)).map(|value| value.cmp(&0)),
+                SortMode::Callback(callback) => self
+                    .eval_callback(callback, left.clone(), right.clone(), scope)
+                    .and_then(|value| number_arg(&value))
+                    .map(|value| value.cmp(&0)),
             };
             match result {
                 Ok(ordering) => ordering,
@@ -792,14 +1117,28 @@ impl<'a> Builtins<'a> {
             }
         });
         reference.try_borrow_mut().map_err(|_| borrow_error())?.lock = previous_lock;
-        if let Some(error) = failure { return Err(error); }
-        reference.try_borrow_mut().map_err(|_| borrow_error())?.items = values;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        reference
+            .try_borrow_mut()
+            .map_err(|_| borrow_error())?
+            .items = values;
         Ok(args[0].clone())
     }
 
-    fn reduce(&mut self, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
-        let source = args.first().ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
-        let callback = args.get(1).ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
+    fn reduce<H: BuiltinHost, R: RegexEngine>(
+        host: &mut H,
+        regex: &R,
+        args: &[Typval],
+        scope: &mut Scope,
+    ) -> Result<Typval> {
+        let source = args
+            .first()
+            .ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
+        let callback = args
+            .get(1)
+            .ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
         let mut previous_lock = None;
         let mut items = match source {
             Typval::List(reference) => {
@@ -809,19 +1148,32 @@ impl<'a> Builtins<'a> {
                 data.lock.locked = true;
                 items
             }
-            Typval::Blob(bytes) => bytes.iter().map(|byte| Typval::Number(i64::from(*byte))).collect(),
-            Typval::String(text) => string_elements(text.as_bytes()).into_iter().map(Typval::String).collect(),
+            Typval::Blob(bytes) => bytes
+                .iter()
+                .map(|byte| Typval::Number(i64::from(*byte)))
+                .collect(),
+            Typval::String(text) => string_elements(text.as_bytes())
+                .into_iter()
+                .map(Typval::String)
+                .collect(),
             _ => return Err(EvalError::new("E1252", 0, "String, List or Blob required")),
         };
         let reduced = (|| {
             let mut accumulator = if let Some(initial) = args.get(2) {
                 initial.clone()
             } else if items.is_empty() {
-                return Err(EvalError::new("E998", 0, "Reduce of an empty value with no initial value"));
+                return Err(EvalError::new(
+                    "E998",
+                    0,
+                    "Reduce of an empty value with no initial value",
+                ));
             } else {
                 items.remove(0)
             };
-            for item in items { accumulator = self.eval_callback(callback, accumulator, item, scope)?; }
+            for item in items {
+                accumulator =
+                    eval_callback_with_host(host, regex, callback, accumulator, item, scope)?;
+            }
             Ok(accumulator)
         })();
         if let Some((reference, lock)) = previous_lock {
@@ -829,7 +1181,31 @@ impl<'a> Builtins<'a> {
         }
         reduced
     }
+}
 
+fn eval_callback_with_host<H: BuiltinHost, R: RegexEngine>(
+    host: &mut H,
+    regex: &R,
+    callback: &Typval,
+    key: Typval,
+    value: Typval,
+    scope: &Scope,
+) -> Result<Typval> {
+    match callback {
+        Typval::String(expression) => {
+            let parsed = Parser::new(expression.as_bytes()).parse()?;
+            let mut callback_scope = scope.snapshot();
+            set_pair(&mut callback_scope.vim, b"key", key);
+            set_pair(&mut callback_scope.vim, b"val", value);
+            Evaluator::new(host, regex).eval(&parsed, &mut callback_scope)
+        }
+        Typval::Funcref(_) | Typval::Partial(_) => Evaluator::new(host, regex).invoke(
+            callback.clone(),
+            vec![key, value],
+            &mut scope.snapshot(),
+        ),
+        _ => Err(EvalError::new("E921", 0, "Invalid callback argument")),
+    }
 }
 
 /// `fuzzyItem_T` (`fuzzy.c:56-65`), reduced to the fields the two return
@@ -855,13 +1231,22 @@ struct FuzzyOptions {
 /// `text_cb` is consulted only when `key` is absent, and `matchseq` is keyed
 /// on presence rather than value.
 fn fuzzy_options(value: Option<&Typval>) -> Result<FuzzyOptions> {
-    let Some(value) = value else { return Ok(FuzzyOptions::default()) };
-    let Typval::Dict(value) = value else {
-        return Err(EvalError::new("E1206", 0, "Dictionary required for argument 3"));
+    let Some(value) = value else {
+        return Ok(FuzzyOptions::default());
     };
-    let entries = dict_entries(value)?;
+    let Typval::Dict(value) = value else {
+        return Err(EvalError::new(
+            "E1206",
+            0,
+            "Dictionary required for argument 3",
+        ));
+    };
+    let entries = cloned_entries(value)?;
     let entry = |wanted: &[u8]| {
-        entries.iter().find(|(candidate, _)| candidate.as_bytes() == wanted).map(|(_, value)| value)
+        entries
+            .iter()
+            .find(|entry| entry.key.as_bytes() == wanted)
+            .map(|entry| &entry.value)
     };
     let mut options = FuzzyOptions::default();
     if let Some(value) = entry(b"key") {
@@ -869,7 +1254,14 @@ fn fuzzy_options(value: Option<&Typval>) -> Result<FuzzyOptions> {
             Typval::String(text) if !text.as_bytes().is_empty() => options.key = Some(text.clone()),
             _ => {
                 let rendered = string_arg(value)?;
-                return Err(EvalError::new("E475", 0, format!("Invalid value for argument key: {}", rendered.to_string_lossy())));
+                return Err(EvalError::new(
+                    "E475",
+                    0,
+                    format!(
+                        "Invalid value for argument key: {}",
+                        rendered.to_string_lossy()
+                    ),
+                ));
             }
         }
     } else if let Some(value) = entry(b"text_cb") {
@@ -881,7 +1273,9 @@ fn fuzzy_options(value: Option<&Typval>) -> Result<FuzzyOptions> {
             Typval::Funcref(_) | Typval::Partial(_) => Some(value.clone()),
             Typval::String(function) => match function.as_bytes().first() {
                 None => None,
-                Some(b'0'..=b'9') => return Err(EvalError::new("E921", 0, "Invalid callback argument")),
+                Some(b'0'..=b'9') => {
+                    return Err(EvalError::new("E921", 0, "Invalid callback argument"));
+                }
                 Some(_) => Some(Typval::Funcref(Funcref {
                     name: function.clone(),
                     args: Vec::new(),
@@ -889,12 +1283,22 @@ fn fuzzy_options(value: Option<&Typval>) -> Result<FuzzyOptions> {
                     registry: None,
                 })),
             },
-            _ => return Err(EvalError::new("E6000", 0, "Argument is not a function or function name")),
+            _ => {
+                return Err(EvalError::new(
+                    "E6000",
+                    0,
+                    "Argument is not a function or function name",
+                ));
+            }
         };
     }
     if let Some(value) = entry(b"limit") {
         let Typval::Number(value) = value else {
-            return Err(EvalError::new("E475", 0, "Invalid value for argument limit"));
+            return Err(EvalError::new(
+                "E475",
+                0,
+                "Invalid value for argument limit",
+            ));
         };
         options.limit = *value;
     }
@@ -903,9 +1307,14 @@ fn fuzzy_options(value: Option<&Typval>) -> Result<FuzzyOptions> {
 }
 
 #[derive(Clone, Copy)]
-enum CollectionOp { Map, Filter, MapNew, ForEach }
+enum CollectionOp {
+    Map,
+    Filter,
+    MapNew,
+    ForEach,
+}
 
-/// How the builtin `sort()`/`uniq()` comparison behaves (parse_sort_uniq_args).
+/// How the builtin `sort()`/`uniq()` comparison behaves (`parse_sort_uniq_args`).
 enum SortMode {
     Default,
     IgnoreCase,
@@ -929,8 +1338,17 @@ fn sort_string_key(value: &Typval, peer_is_string: bool, depth: usize) -> Result
 }
 
 fn sort_string_pair(left: &Typval, right: &Typval, ignore_case: bool) -> Ordering {
-    match (sort_string_key(left, matches!(right, Typval::String(_)), 0), sort_string_key(right, matches!(left, Typval::String(_)), 0)) {
-        (Ok(left), Ok(right)) => match compare_bytes(left.as_bytes(), right.as_bytes(), ignore_case) { -1 => Ordering::Less, 1 => Ordering::Greater, _ => Ordering::Equal },
+    match (
+        sort_string_key(left, matches!(right, Typval::String(_)), 0),
+        sort_string_key(right, matches!(left, Typval::String(_)), 0),
+    ) {
+        (Ok(left), Ok(right)) => {
+            match compare_bytes(left.as_bytes(), right.as_bytes(), ignore_case) {
+                -1 => Ordering::Less,
+                1 => Ordering::Greater,
+                _ => Ordering::Equal,
+            }
+        }
         _ => Ordering::Equal,
     }
 }
@@ -941,7 +1359,10 @@ fn sort_string_pair(left: &Typval, right: &Typval, ignore_case: bool) -> Orderin
 fn sort_numeric(value: &Typval) -> f64 {
     match value {
         Typval::String(_) => 0.0,
-        _ => match vim_string(value, 0) { Ok(encoded) => leading_float(encoded.as_bytes()), Err(_) => 0.0 },
+        _ => match vim_string(value, 0) {
+            Ok(encoded) => leading_float(encoded.as_bytes()),
+            Err(_) => 0.0,
+        },
     }
 }
 
@@ -952,12 +1373,12 @@ fn sort_integer(value: &Typval) -> i64 {
         Typval::Number(number) => *number,
         Typval::Bool(boolean) => i64::from(*boolean),
         Typval::String(text) => crate::eval::string_to_number(text.as_bytes()),
-        Typval::Special(Special::Null) => 0,
         _ => 0,
     }
 }
 
-/// Float mode `f`: float comparison (`tv_get_float`).
+// i64→f64 is Vim's number-to-float coercion; upstream uses the same C cast.
+#[allow(clippy::cast_precision_loss)]
 fn sort_float(value: &Typval) -> f64 {
     match value {
         Typval::Number(number) => *number as f64,
@@ -972,7 +1393,9 @@ fn leading_float(bytes: &[u8]) -> f64 {
     String::from_utf8_lossy(bytes)
         .trim_start()
         .chars()
-        .take_while(|character| character.is_ascii_digit() || matches!(character, '+' | '-' | '.' | 'e' | 'E'))
+        .take_while(|character| {
+            character.is_ascii_digit() || matches!(character, '+' | '-' | '.' | 'e' | 'E')
+        })
         .collect::<String>()
         .parse()
         .unwrap_or(0.0)
@@ -983,46 +1406,117 @@ impl BuiltinHost for Builtins<'_> {
         self.dispatch(&name.to_string_lossy(), args, scope)
     }
 
-    fn call_method(&mut self, name: &OxStr, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
+    fn call_method(
+        &mut self,
+        name: &OxStr,
+        args: Vec<Typval>,
+        scope: &mut Scope,
+    ) -> Result<Typval> {
         let name_text = name.to_string_lossy();
-        let spec = builtin_spec(&name_text).ok_or_else(|| EvalError::not_implemented(name.clone()))?;
+        let spec =
+            builtin_spec(&name_text).ok_or_else(|| EvalError::not_implemented(name.clone()))?;
         if !spec.method {
-            return Err(EvalError::new("E276", 0, format!("Cannot use function as a method: {name_text}")));
+            return Err(EvalError::new(
+                "E276",
+                0,
+                format!("Cannot use function as a method: {name_text}"),
+            ));
         }
         self.dispatch(&name_text, args, scope)
     }
 
-    fn closure_registry(&self) -> Option<ClosureRegistry> { Some(self.closures.clone()) }
+    fn closure_registry(&self) -> Option<ClosureRegistry> {
+        Some(self.closures.clone())
+    }
 }
 
 struct RegexRef<'a>(Option<&'a dyn RegexEngine>);
 
 impl RegexEngine for RegexRef<'_> {
     fn is_match(&self, text: &OxStr, pattern: &OxStr, ignore_case: bool) -> Result<bool> {
-        self.0.ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?.is_match(text, pattern, ignore_case)
+        self.0
+            .ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?
+            .is_match(text, pattern, ignore_case)
     }
     fn split(&self, text: &OxStr, pattern: &OxStr, keep_empty: bool) -> Result<Vec<OxStr>> {
-        self.0.ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?.split(text, pattern, keep_empty)
+        self.0
+            .ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?
+            .split(text, pattern, keep_empty)
     }
     fn find(&self, text: &OxStr, pattern: &OxStr, start: usize) -> Result<Option<(usize, usize)>> {
-        self.0.ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?.find(text, pattern, start)
+        self.0
+            .ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?
+            .find(text, pattern, start)
     }
-    fn find_captures(&self, text: &OxStr, pattern: &OxStr, start: usize) -> Result<Option<crate::eval::RegexMatch>> {
-        self.0.ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?.find_captures(text, pattern, start)
+    fn find_captures(
+        &self,
+        text: &OxStr,
+        pattern: &OxStr,
+        start: usize,
+    ) -> Result<Option<crate::eval::RegexMatch>> {
+        self.0
+            .ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?
+            .find_captures(text, pattern, start)
     }
-    fn substitute(&self, text: &OxStr, pattern: &OxStr, replacement: &OxStr, flags: &OxStr) -> Result<OxStr> {
-        self.0.ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?.substitute(text, pattern, replacement, flags)
+    fn substitute(
+        &self,
+        text: &OxStr,
+        pattern: &OxStr,
+        replacement: &OxStr,
+        flags: &OxStr,
+    ) -> Result<OxStr> {
+        self.0
+            .ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?
+            .substitute(text, pattern, replacement, flags)
     }
 }
 
 fn check_arity(spec: &BuiltinSpec, count: usize) -> Result<()> {
     if count < spec.min_args {
-        return Err(EvalError::new("E119", 0, format!("Not enough arguments for function: {}", spec.name)));
+        return Err(EvalError::new(
+            "E119",
+            0,
+            format!("Not enough arguments for function: {}", spec.name),
+        ));
     }
     if spec.max_args.is_some_and(|maximum| count > maximum) {
-        return Err(EvalError::new("E118", 0, format!("Too many arguments for function: {}", spec.name)));
+        return Err(EvalError::new(
+            "E118",
+            0,
+            format!("Too many arguments for function: {}", spec.name),
+        ));
     }
     Ok(())
+}
+
+/// Whether upstream permits `name` in an `api-fast` callback.
+///
+/// This is the exact function set exercised by `api/fast_spec.lua` -- the
+/// 17 `|api-fast|` Vimscript builtins plus `vim.keycode`. Editor hosts
+/// delegate here so the fast-event policy has one owner.
+#[must_use]
+pub fn is_fast_builtin(name: &OxStr) -> bool {
+    matches!(
+        name.as_bytes(),
+        b"byteidx"
+            | b"char2nr"
+            | b"charidx"
+            | b"keycode"
+            | b"keytrans"
+            | b"nr2char"
+            | b"str2list"
+            | b"strcharlen"
+            | b"strcharpart"
+            | b"strchars"
+            | b"strdisplaywidth"
+            | b"strgetchar"
+            | b"strlen"
+            | b"strpart"
+            | b"strtrans"
+            | b"tr"
+            | b"trim"
+            | b"utf16idx"
+    )
 }
 
 /// Whether this port implements `name`, as opposed to merely carrying its
@@ -1036,46 +1530,171 @@ fn check_arity(spec: &BuiltinSpec, count: usize) -> Result<()> {
 /// name that answers 1 and then reports `not implemented` turns an honest skip
 /// into a wall of failures.
 #[must_use]
+// One upstream dispatch table; splitting would obscure the name→coverage mapping.
+#[allow(clippy::too_many_lines)]
 pub fn is_builtin_implemented(name: &str) -> bool {
-    matches!(name,
-        "abs" | "acos" | "add" | "and" | "asin" | "atan" | "atan2" | "blob2list" | "ceil" |
-        "char2nr" | "copy" | "cos" | "cosh" | "count" | "exp" | "fmod" | "isinf" | "isnan" |
-        "log" | "log10" | "round" | "sin" | "sinh" | "tan" | "tanh" |
-        "deepcopy" | "empty" | "escape" | "executable" | "exepath" | "exists" | "extend" | "extendnew" | "filter" | "flatten" |
-        "flattennew" | "foreach" | "float2nr" | "floor" | "fnameescape" | "fnamemodify" | "finddir" | "findfile" | "environ" | "get" | "getenv" | "gettext" | "getcwd" | "getpid" | "has" | "has_key" | "hostname" | "index" | "insert" | "items" |
-        "indexof" | "isabsolutepath" | "islocked" | "join" | "json_decode" | "json_encode" | "keytrans" | "keys" | "len" | "strlen" | "list2blob" | "list2str" | "map" | "mapnew" |
-        "match" | "matchend" | "matchstr" | "matchlist" | "matchstrpos" | "matchstrlist" | "matchfuzzy" | "matchfuzzypos" |
-        "max" | "min" | "nr2char" | "or" | "pathshorten" | "pow" | "printf" | "range" | "reduce" | "resolve" |
-        "localtime" | "reltime" | "reltimefloat" | "reltimestr" |
-        "remove" | "repeat" | "reverse" | "setenv" | "simplify" | "slice" | "sort" | "split" | "sqrt" | "str2float" | "str2list" |
-        "str2nr" | "strcharlen" | "strchars" | "stridx" | "string" | "strpart" | "strridx" | "strtrans" | "strutf16len" | "strwidth" |
-        "substitute" | "tempname" | "tolower" | "toupper" | "tr" | "trim" | "trunc" | "type" | "uniq" | "utf16idx" | "charidx" | "values" | "xor"
+    matches!(
+        name,
+        "abs"
+            | "acos"
+            | "add"
+            | "and"
+            | "asin"
+            | "atan"
+            | "atan2"
+            | "blob2list"
+            | "byteidx"
+            | "ceil"
+            | "char2nr"
+            | "copy"
+            | "cos"
+            | "cosh"
+            | "count"
+            | "exp"
+            | "fmod"
+            | "isinf"
+            | "test_garbagecollect_now"
+            | "swapname"
+            | "isnan"
+            | "log"
+            | "log10"
+            | "round"
+            | "sin"
+            | "sinh"
+            | "tan"
+            | "tanh"
+            | "deepcopy"
+            | "empty"
+            | "escape"
+            | "executable"
+            | "exepath"
+            | "exists"
+            | "extend"
+            | "extendnew"
+            | "filter"
+            | "flatten"
+            | "flattennew"
+            | "foreach"
+            | "float2nr"
+            | "floor"
+            | "fnameescape"
+            | "fnamemodify"
+            | "finddir"
+            | "findfile"
+            | "environ"
+            | "get"
+            | "getenv"
+            | "gettext"
+            | "getcwd"
+            | "getpid"
+            | "has"
+            | "has_key"
+            | "hostname"
+            | "index"
+            | "insert"
+            | "items"
+            | "indexof"
+            | "isabsolutepath"
+            | "islocked"
+            | "join"
+            | "json_decode"
+            | "json_encode"
+            | "keytrans"
+            | "keys"
+            | "len"
+            | "strlen"
+            | "list2blob"
+            | "list2str"
+            | "map"
+            | "mapnew"
+            | "match"
+            | "matchend"
+            | "matchstr"
+            | "matchlist"
+            | "matchstrpos"
+            | "matchstrlist"
+            | "matchfuzzy"
+            | "matchfuzzypos"
+            | "max"
+            | "min"
+            | "nr2char"
+            | "or"
+            | "pathshorten"
+            | "pow"
+            | "printf"
+            | "range"
+            | "reduce"
+            | "resolve"
+            | "localtime"
+            | "reltime"
+            | "reltimefloat"
+            | "reltimestr"
+            | "remove"
+            | "repeat"
+            | "reverse"
+            | "setenv"
+            | "sha256"
+            | "simplify"
+            | "slice"
+            | "sort"
+            | "split"
+            | "sqrt"
+            | "str2float"
+            | "str2list"
+            | "str2nr"
+            | "strcharlen"
+            | "strcharpart"
+            | "strchars"
+            | "strdisplaywidth"
+            | "strgetchar"
+            | "stridx"
+            | "string"
+            | "strpart"
+            | "strridx"
+            | "strtrans"
+            | "strutf16len"
+            | "strwidth"
+            | "substitute"
+            | "tempname"
+            | "tolower"
+            | "toupper"
+            | "tr"
+            | "trim"
+            | "trunc"
+            | "type"
+            | "uniq"
+            | "utf16idx"
+            | "charidx"
+            | "values"
+            | "xor"
     )
 }
 
 /// Implements the evaluator-owned portions of `exists()`: environment,
 /// option, builtin-function, and variable names. Hosts with user functions,
 /// Ex commands, and autocommands layer those namespaces on top.
+///
+/// # Errors
+///
+/// Returns `E731` or similar when the argument cannot be converted to a
+/// string (e.g. a List or Dict passed as the operand).
 pub fn exists(value: &Typval, scope: &Scope) -> Result<Typval> {
     let operand = string_arg(value)?;
     let bytes = operand.as_bytes();
     let found = match bytes.first() {
-        Some(b'$') => {
-            let name = &bytes[1..];
-            scope.contains_env(name)
-                || std::env::var_os(String::from_utf8_lossy(name).as_ref()).is_some()
-        }
+        Some(b'$') => scope.contains_env(&bytes[1..]),
         Some(b'&' | b'+') => option_exists(scope, &bytes[1..]),
         // `f_exists` calls `function_exists`, which asks whether the function
         // can be *called* — so the answer is the implemented subset, not the
         // generated inventory (see [`is_builtin_implemented`]).
-        Some(b'*') => std::str::from_utf8(&bytes[1..])
-            .ok()
-            .is_some_and(is_builtin_implemented),
+        Some(b'*') => std::str::from_utf8(&bytes[1..]).is_ok_and(is_builtin_implemented),
         Some(b':' | b'#') | None => false,
-        _ => matches!(bytes, b"v:true" | b"v:false" | b"v:null" | b"v:none")
-            || vim_type_var(bytes).is_some()
-            || scope.contains_variable(bytes),
+        _ => {
+            matches!(bytes, b"v:true" | b"v:false" | b"v:null" | b"v:none")
+                || vim_type_var(bytes).is_some()
+                || scope.contains_variable(bytes)
+                || (bytes == b"version" && scope.contains_variable(b"v:version"))
+        }
     };
     Ok(Typval::Number(i64::from(found)))
 }
@@ -1104,14 +1723,26 @@ pub fn is_buffer_builtin(name: &str) -> bool {
 /// admitted by [`is_buffer_builtin`].
 ///
 /// # Panics
+///
 /// Panics when `name` is not admitted by [`is_buffer_builtin`].
-pub fn call_buffer_builtin(buffer: &mut dyn BufferHost, name: &str, args: Vec<Typval>) -> Result<Typval> {
+///
+/// # Errors
+///
+/// Returns `E118` when the argument count does not match the builtin's
+/// arity, or the buffer host's error when the line access fails.
+pub fn call_buffer_builtin(
+    buffer: &mut dyn BufferHost,
+    name: &str,
+    args: &[Typval],
+) -> Result<Typval> {
     assert!(is_buffer_builtin(name), "{name} is not a buffer builtin");
-    let spec = builtin_spec(name).expect("getline and setline are in the generated eval.lua table");
+    let Some(spec) = builtin_spec(name) else {
+        return Err(EvalError::not_implemented(OxStr::from(name)));
+    };
     check_arity(spec, args.len())?;
     match name {
-        "getline" => get_buffer_lines(buffer, &args),
-        _ => set_buffer_lines(buffer, &args),
+        "getline" => get_buffer_lines(buffer, args),
+        _ => set_buffer_lines(buffer, args),
     }
 }
 
@@ -1126,15 +1757,15 @@ fn lnum_arg(buffer: &dyn BufferHost, value: &Typval) -> Result<i64> {
     if numeric > 0 {
         return Ok(numeric);
     }
-    if let Typval::String(text) = value {
-        if !text.as_bytes().is_empty() {
-            let address = text.to_string_lossy();
-            if text.as_bytes() == b"$" {
-                return Ok(saturating_i64(buffer.line_count()?));
-            }
-            if let Some(line) = buffer.address_line(&address)? {
-                return Ok(line);
-            }
+    if let Typval::String(text) = value
+        && !text.as_bytes().is_empty()
+    {
+        let address = text.to_string_lossy();
+        if text.as_bytes() == b"$" {
+            return Ok(saturating_i64(buffer.line_count()?));
+        }
+        if let Some(line) = buffer.address_line(&address)? {
+            return Ok(line);
         }
     }
     Ok(numeric)
@@ -1153,6 +1784,8 @@ fn line_text_arg(value: &Typval) -> Result<OxStr> {
 /// a String without `{end}` (empty when out of range) and a List with it,
 /// clamped to the buffer with `end < start` and negative `start` yielding
 /// an empty List.
+// i64→usize: line numbers are bounds-checked (≥1, ≤line_count) before casting.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn get_buffer_lines(buffer: &mut dyn BufferHost, args: &[Typval]) -> Result<Typval> {
     let line_count = buffer.line_count()?;
     let start = lnum_arg(buffer, &args[0])?;
@@ -1172,7 +1805,9 @@ fn get_buffer_lines(buffer: &mut dyn BufferHost, args: &[Typval]) -> Result<Typv
     let last = end.min(saturating_i64(line_count)) as usize;
     let mut lines = Vec::new();
     for lnum in first..=last {
-        lines.push(Typval::String(buffer.get_line(lnum)?.unwrap_or_else(|| OxStr(Vec::new()))));
+        lines.push(Typval::String(
+            buffer.get_line(lnum)?.unwrap_or_else(|| OxStr(Vec::new())),
+        ));
     }
     Ok(Typval::list(lines))
 }
@@ -1217,6 +1852,8 @@ fn set_buffer_lines(buffer: &mut dyn BufferHost, args: &[Typval]) -> Result<Typv
 
 /// One iteration of upstream's write loop: replace an existing line, or
 /// append when `lnum` is the line just past the end.
+// i64→usize: lnum is bounds-checked (≤line_count) before casting.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn set_buffer_line(buffer: &mut dyn BufferHost, lnum: i64, text: &OxStr) -> Result<()> {
     let line_count = buffer.line_count()?;
     if lnum <= saturating_i64(line_count) {
@@ -1239,14 +1876,17 @@ fn number_arg(value: &Typval) -> Result<i64> {
         Typval::Special(Special::Null) => Ok(0),
         Typval::String(value) => Ok(crate::eval::string_to_number(value.as_bytes())),
         Typval::Float(_) => Err(EvalError::new("E805", 0, "Using a Float as a Number")),
-        Typval::Funcref(_) | Typval::Partial(_) => Err(EvalError::new("E703", 0, "Using a Funcref as a Number")),
+        Typval::Funcref(_) | Typval::Partial(_) => {
+            Err(EvalError::new("E703", 0, "Using a Funcref as a Number"))
+        }
         Typval::List(_) => Err(EvalError::new("E745", 0, "Using a List as a Number")),
         Typval::Dict(_) => Err(EvalError::new("E728", 0, "Using a Dictionary as a Number")),
         Typval::Blob(_) => Err(EvalError::new("E974", 0, "Using a Blob as a Number")),
         _ => Err(EvalError::new("E745", 0, "Using invalid value as a Number")),
     }
 }
-
+// i64→f64 is Vim's number-to-float coercion; upstream uses the same C cast.
+#[allow(clippy::cast_precision_loss)]
 fn float_arg(value: &Typval) -> Result<f64> {
     match value {
         Typval::Float(value) => Ok(*value),
@@ -1255,7 +1895,12 @@ fn float_arg(value: &Typval) -> Result<f64> {
     }
 }
 
-fn string_arg(value: &Typval) -> Result<OxStr> {
+/// Converts a Vim value with `tv_get_string_chk` semantics.
+///
+/// # Errors
+///
+/// Returns the matching Vim conversion error for unsupported value types.
+pub fn string_arg(value: &Typval) -> Result<OxStr> {
     match value {
         Typval::String(value) => Ok(value.clone()),
         Typval::Number(value) => Ok(OxStr(value.to_string().into_bytes())),
@@ -1265,71 +1910,56 @@ fn string_arg(value: &Typval) -> Result<OxStr> {
         Typval::List(_) => Err(EvalError::new("E730", 0, "Using a List as a String")),
         Typval::Dict(_) => Err(EvalError::new("E731", 0, "Using a Dictionary as a String")),
         Typval::Blob(_) => Err(EvalError::new("E976", 0, "Using a Blob as a String")),
-        Typval::Funcref(_) | Typval::Partial(_) => Err(EvalError::new("E729", 0, "Using a Funcref as a String")),
+        Typval::Funcref(_) | Typval::Partial(_) => {
+            Err(EvalError::new("E729", 0, "Using a Funcref as a String"))
+        }
         _ => Err(EvalError::new("E729", 0, "Using invalid value as a String")),
     }
 }
 
-/// `f_setenv` (`eval/funcs.c`) is `os_setenv`/`os_unsetenv`, so the assignment
-/// changes the process environment. oxvim additionally keeps a snapshot of the
-/// environment in `Scope::env`, taken once at startup, and `$VAR` reads come
-/// from that snapshot; upstream has no snapshot and reads the live environment
-/// through `os_getenv` every time. Writing only the process environment
-/// therefore left `setenv('X', 'v')` invisible to `echo $X` in the same
-/// session, so both are updated here, exactly as `:let $VAR` does.
-fn setenv(args: &[Typval], scope: &mut Scope) -> Result<Typval> {
-    let name = string_arg(&args[0])?.to_string_lossy().into_owned();
+/// `f_setenv` (`eval/funcs.c`) is `os_setenv`/`os_unsetenv`: the assignment
+/// changes the process environment that `$VAR`, `getenv()`, and child
+/// processes all read. Upstream ignores the `os_setenv` status and always
+/// answers zero, so a refused name is not an error here either.
+fn setenv(args: &[Typval]) -> Result<Typval> {
+    let name = string_arg(&args[0])?;
+    let name = env_os_string(name.as_bytes());
     if args[1] == Typval::Special(Special::Null) {
         ox_sys::unset_env(&name);
-        scope.unset_env(name.as_bytes());
     } else {
-        let value = string_arg(&args[1])?.to_string_lossy().into_owned();
-        ox_sys::set_env(&name, &value);
-        scope.set_env(name.as_bytes(), Typval::String(OxStr::from(value.as_str())));
+        let value = string_arg(&args[1])?;
+        ox_sys::set_env(&name, env_os_string(value.as_bytes()));
     }
     Ok(Typval::Number(0))
 }
 
-/// `f_getenv` (`eval/funcs.c:1104-1115`): `vim_getenv`, answering `v:null`
-/// rather than an empty string when the variable is not set -- which is how
-/// callers tell "unset" from "set to empty". `plenary/log.lua:12` is the
-/// first thing telescope.nvim reaches this through.
-///
-/// The `Scope::env` snapshot is consulted first for the same reason
-/// [`setenv`] writes to it: `$VAR` reads come from the snapshot, so a value
-/// assigned this session lives there and not yet in the process environment.
-fn getenv(args: &[Typval], scope: &Scope) -> Result<Typval> {
+/// `f_getenv` (`eval/funcs.c:1104-1115`): `vim_getenv` against the live
+/// process environment, answering `v:null` rather than an empty string when
+/// the variable is not set -- which is how callers tell "unset" from "set to
+/// empty". `plenary/log.lua:12` is the first thing telescope.nvim reaches
+/// this through.
+fn getenv(args: &[Typval]) -> Result<Typval> {
     let name = string_arg(&args[0])?;
-    if scope.contains_env(name.as_bytes()) {
-        return Ok(scope.get_env(name.as_bytes()));
-    }
-    Ok(std::env::var_os(name.to_string_lossy().as_ref()).map_or(
-        Typval::Special(Special::Null),
-        |value| Typval::String(OxStr::from(value.to_string_lossy().as_ref())),
-    ))
+    Ok(std::env::var_os(env_os_string(name.as_bytes()))
+        .map_or(Typval::Special(Special::Null), |value| {
+            Typval::String(OxStr(value.as_encoded_bytes().to_vec()))
+        }))
 }
 
 /// `environ()`, whose implementation upstream is Lua rather than C:
 /// `runtime/lua/vim/_core/vimfn.lua:16-26` returns `vim.uv.os_environ()`
-/// unchanged off Windows. The `Scope::env` snapshot overlays the process
-/// environment for the same reason [`getenv`] consults it.
-fn environ(scope: &Scope) -> Result<Typval> {
-    let mut entries: Vec<(OxStr, Typval)> = std::env::vars_os()
+/// unchanged off Windows. The live process environment is the single source.
+fn environ() -> Typval {
+    let entries: Vec<(OxStr, Typval)> = std::env::vars_os()
         .filter(|(name, _)| !name.is_empty())
         .map(|(name, value)| {
             (
-                OxStr::from(name.to_string_lossy().as_ref()),
-                Typval::String(OxStr::from(value.to_string_lossy().as_ref())),
+                OxStr(name.as_encoded_bytes().to_vec()),
+                Typval::String(OxStr(value.as_encoded_bytes().to_vec())),
             )
         })
         .collect();
-    for (name, value) in scope.env_entries() {
-        match entries.iter_mut().find(|(key, _)| key == name) {
-            Some(entry) => entry.1 = value.clone(),
-            None => entries.push((name.clone(), value.clone())),
-        }
-    }
-    Ok(Typval::dict(entries))
+    Typval::dict(entries)
 }
 
 /// The characters `fnameescape()` puts a backslash before: `PATH_ESC_CHARS`
@@ -1361,11 +1991,13 @@ fn fnameescape(args: &[Typval]) -> Result<Typval> {
 
 /// `f_localtime` (`eval/funcs.c:3924-3927`): `time(NULL)`, seconds since the
 /// Unix epoch.
-fn localtime() -> Result<Typval> {
+fn localtime() -> Typval {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX));
-    Ok(Typval::Number(seconds))
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        });
+    Typval::Number(seconds)
 }
 
 /// Monotonic nanoseconds from a process-local origin, which is what
@@ -1377,13 +2009,16 @@ fn hrtime_nanos() -> i64 {
         std::sync::LazyLock::new(std::time::Instant::now);
     i64::try_from(ORIGIN.elapsed().as_nanos()).unwrap_or(i64::MAX)
 }
-
-/// `list2proftime` (`eval/funcs.c:5059-5085`): a reltime value is one 64-bit
-/// count split across two 32-bit list items, high half first.
+// i64→u32: low half of a 64-bit reltime, mirroring upstream's list2proftime.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn proftime_from_list(value: &Typval) -> Option<i64> {
-    let Typval::List(reference) = value else { return None };
+    let Typval::List(reference) = value else {
+        return None;
+    };
     let items = list_items(reference).ok()?;
-    let [high, low] = items.as_slice() else { return None };
+    let [high, low] = items.as_slice() else {
+        return None;
+    };
     let number = |value: &Typval| match value {
         Typval::Number(number) => Some(*number),
         _ => None,
@@ -1392,7 +2027,12 @@ fn proftime_from_list(value: &Typval) -> Option<i64> {
     let low = i64::from(number(low)? as u32);
     Some((high << 32) | low)
 }
-
+// i64→u32→i32 splits a 64-bit reltime into two 32-bit list items, mirroring upstream.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 fn proftime_to_list(nanos: i64) -> Typval {
     Typval::list(vec![
         Typval::Number(nanos >> 32),
@@ -1402,56 +2042,235 @@ fn proftime_to_list(nanos: i64) -> Typval {
 
 /// `f_reltime` (`eval/funcs.c:5096-5134`): no argument is "now", one argument
 /// is the time elapsed since it, two arguments are their difference.
-fn reltime(args: &[Typval]) -> Result<Typval> {
+fn reltime(args: &[Typval]) -> Typval {
     let nanos = match args {
         [] => hrtime_nanos(),
         [start] => {
-            let Some(start) = proftime_from_list(start) else { return Ok(Typval::list(Vec::new())) };
+            let Some(start) = proftime_from_list(start) else {
+                return Typval::list(Vec::new());
+            };
             hrtime_nanos() - start
         }
         [start, end] => {
-            let (Some(start), Some(end)) = (proftime_from_list(start), proftime_from_list(end)) else {
-                return Ok(Typval::list(Vec::new()));
+            let (Some(start), Some(end)) = (proftime_from_list(start), proftime_from_list(end))
+            else {
+                return Typval::list(Vec::new());
             };
             end - start
         }
-        _ => return Ok(Typval::list(Vec::new())),
+        _ => return Typval::list(Vec::new()),
     };
-    Ok(proftime_to_list(nanos))
+    proftime_to_list(nanos)
 }
 
 /// `f_reltimefloat` (`eval/funcs.c:6774-6784`): `profile_signed(tm) / 1e9`.
-fn reltimefloat(args: &[Typval]) -> Result<Typval> {
+fn reltimefloat(args: &[Typval]) -> Typval {
     let nanos = proftime_from_list(&args[0]).unwrap_or(0);
-    #[expect(clippy::cast_precision_loss, reason = "upstream casts the same nanosecond count to a C double")]
-    Ok(Typval::Float(nanos as f64 / 1_000_000_000.0))
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "upstream casts the same nanosecond count to a C double"
+    )]
+    Typval::Float(nanos as f64 / 1_000_000_000.0)
 }
 
 /// `f_reltimestr` (`eval/funcs.c:5138-5148`) through `profile_msg`
 /// (`profile.c:72-78`), whose format is `"%10.6lf"` -- so a short elapsed
 /// time is right-aligned in ten columns and a long one simply overflows it.
-fn reltimestr(args: &[Typval]) -> Result<Typval> {
+fn reltimestr(args: &[Typval]) -> Typval {
     let Some(nanos) = proftime_from_list(&args[0]) else {
-        return Ok(Typval::String(OxStr(Vec::new())));
+        return Typval::String(OxStr(Vec::new()));
     };
-    #[expect(clippy::cast_precision_loss, reason = "upstream casts the same nanosecond count to a C double")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "upstream casts the same nanosecond count to a C double"
+    )]
     let seconds = nanos as f64 / 1_000_000_000.0;
-    Ok(Typval::String(OxStr::from(format!("{seconds:10.6}").as_str())))
+    Typval::String(OxStr::from(format!("{seconds:10.6}").as_str()))
 }
 
-fn borrow_error() -> EvalError { EvalError::new("E742", 0, "Cannot change value during recursive container access") }
-fn locked_error() -> EvalError { EvalError::new("E741", 0, "Value is locked") }
+fn borrow_error() -> EvalError {
+    EvalError::new(
+        "E742",
+        0,
+        "Cannot change value during recursive container access",
+    )
+}
+fn locked_error() -> EvalError {
+    EvalError::new("E741", 0, "Value is locked")
+}
 
 fn list_items(reference: &ox_types::ListRef) -> Result<Vec<Typval>> {
-    reference.try_borrow().map(|data| data.items.clone()).map_err(|_| borrow_error())
+    reference
+        .try_borrow()
+        .map(|data| data.items.clone())
+        .map_err(|_| borrow_error())
 }
 
-fn dict_entries(reference: &ox_types::DictRef) -> Result<Vec<(OxStr, Typval)>> {
-    reference.try_borrow().map(|data| data.entries.clone()).map_err(|_| borrow_error())
+/// Clone a dictionary's entries, values and their mutability metadata
+/// included.
+fn cloned_entries(reference: &ox_types::DictRef) -> Result<Vec<ox_types::DictEntry>> {
+    reference
+        .try_borrow()
+        .map(|data| data.entries.clone())
+        .map_err(|_| borrow_error())
+}
+
+/// `value_check_lock` (`eval/typval.c`): a fixed value refuses every change
+/// (E742) and a `:lockvar`-locked value names itself (E741).
+fn check_value_lock(lock: EntryValueLock, name: &str) -> Result<()> {
+    match lock {
+        EntryValueLock::Fixed => Err(EvalError::new(
+            "E742",
+            0,
+            format!("Cannot change value of {name}"),
+        )),
+        EntryValueLock::Locked => Err(EvalError::new(
+            "E741",
+            0,
+            format!("Value is locked: {name}"),
+        )),
+        EntryValueLock::Unlocked => Ok(()),
+    }
+}
+
+/// `var_check_ro` (`eval/vars.c:2963`).
+fn check_writable(flags: DictEntryFlags, name: &str) -> Result<()> {
+    if flags.intersects(DictEntryFlags::READ_ONLY) {
+        Err(EvalError::new(
+            "E46",
+            0,
+            format!("Cannot change read-only variable \"{name}\""),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// `var_check_fixed` (`eval/vars.c:3026`) before `var_check_ro` — the order
+/// every deletion path owes.
+fn check_deletable(entry: &DictEntry, name: &str) -> Result<()> {
+    if entry.flags.intersects(DictEntryFlags::FIXED) {
+        Err(EvalError::new(
+            "E795",
+            0,
+            format!("Cannot delete variable {name}"),
+        ))
+    } else {
+        check_writable(entry.flags, name)
+    }
+}
+
+/// `f_islocked` (funcs.c:3099): resolve a variable name, optionally with
+/// `d.key` / `d["key"]` / `l[0]` subscripts, read-only — resolution checks
+/// neither read-only entries nor locks — and report whether it is locked.
+///
+/// A plain variable is locked when its `:lockvar` mark (`DI_FLAGS_LOCK`) is
+/// set or its value is; a reached dict item reports only its value lock, so
+/// `b:changedtick`'s read-only/fixed metadata stays invisible, exactly as
+/// upstream's `tv_islocked` ignores `VAR_FIXED`.
+fn is_locked(arg: &Typval, scope: &Scope) -> Result<Typval> {
+    let name = string_arg(arg)?;
+    let bytes = name.as_bytes();
+    let name_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'#';
+    let mut end = 0;
+    while end < bytes.len() && (name_byte(bytes[end]) || bytes[end] == b':') {
+        end += 1;
+    }
+    if end == 0 {
+        return Err(EvalError::new("E515", 0, "Invalid argument"));
+    }
+    let Some((base, base_locked)) = scope.resolve_for_lock(&bytes[..end]) else {
+        // `find_var` failing leaves `rettv` at its initial -1.
+        return Ok(Typval::Number(-1));
+    };
+    let mut current = base.clone();
+    let mut rest = &bytes[end..];
+    let mut plain = true;
+    while !rest.is_empty() {
+        plain = false;
+        if let Some(key) = rest.strip_prefix(b".") {
+            let mut length = 0;
+            while length < key.len() && name_byte(key[length]) {
+                length += 1;
+            }
+            rest = &key[length..];
+            current = dict_item_value(&current, &key[..length])?;
+        } else if let Some(inner) = rest.strip_prefix(b"[") {
+            let Some(close) = inner.iter().position(|byte| *byte == b']') else {
+                return Err(EvalError::new(
+                    "E488",
+                    0,
+                    format!("Trailing characters: {}", String::from_utf8_lossy(rest)),
+                ));
+            };
+            let mut key = &inner[..close];
+            rest = &inner[close + 1..];
+            if key.len() >= 2
+                && ((key[0] == b'"' && key.last() == Some(&b'"'))
+                    || (key[0] == b'\'' && key.last() == Some(&b'\'')))
+            {
+                key = &key[1..key.len() - 1];
+            }
+            current = match &current {
+                Typval::Dict(_) => dict_item_value(&current, key)?,
+                Typval::List(reference) => {
+                    let index = std::str::from_utf8(key)
+                        .ok()
+                        .and_then(|text| text.trim().parse::<usize>().ok())
+                        .ok_or_else(|| EvalError::new("E808", 0, "Number required"))?;
+                    list_items(reference)?
+                        .into_iter()
+                        .nth(index)
+                        .ok_or_else(|| EvalError::new("E684", 0, "list index out of range"))?
+                }
+                _ => {
+                    return Err(EvalError::new(
+                        "E909",
+                        0,
+                        "Expected List or Dictionary for subscript",
+                    ));
+                }
+            };
+        } else {
+            return Err(EvalError::new(
+                "E488",
+                0,
+                format!("Trailing characters: {}", String::from_utf8_lossy(rest)),
+            ));
+        }
+    }
+    let locked = if plain {
+        base_locked || !matches!(is_locked_value(&current)?, Typval::Number(0))
+    } else {
+        !matches!(is_locked_value(&current)?, Typval::Number(0))
+    };
+    Ok(Typval::Number(i64::from(locked)))
+}
+
+/// Read one dict item's value by byte key, E716 when absent, as `get_lval`
+/// does for a read-only walk.
+fn dict_item_value(container: &Typval, key: &[u8]) -> Result<Typval> {
+    let Typval::Dict(reference) = container else {
+        return Err(EvalError::new(
+            "E715",
+            0,
+            "Dictionary required for subscript",
+        ));
+    };
+    reference
+        .try_borrow()
+        .map_err(|_| borrow_error())?
+        .get(key)
+        .cloned()
+        .ok_or_else(|| EvalError::new("E716", 0, "Key not present in Dictionary"))
 }
 
 fn ensure_unlocked(lock: ox_types::LockState) -> Result<()> {
-    if lock.locked { Err(locked_error()) } else { Ok(()) }
+    if lock.locked {
+        Err(locked_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// `f_abs` (`funcs.c:424-441`): a Float goes to `fabs`, everything else to
@@ -1460,17 +2279,23 @@ fn ensure_unlocked(lock: ox_types::LockState) -> Result<()> {
 /// `abs('-9223372036854775808')` is -9223372036854775808 on the oracle. A
 /// saturating negation answered `VARNUMBER_MAX` here.
 fn absolute(value: &Typval) -> Result<Typval> {
-    match value {
-        Typval::Float(value) => Ok(Typval::Float(value.abs())),
-        _ => {
-            let number = number_arg(value)?;
-            Ok(Typval::Number(if number > 0 { number } else { number.wrapping_neg() }))
-        }
+    if let Typval::Float(value) = value {
+        Ok(Typval::Float(value.abs()))
+    } else {
+        let number = number_arg(value)?;
+        Ok(Typval::Number(if number > 0 {
+            number
+        } else {
+            number.wrapping_neg()
+        }))
     }
 }
 
 fn binary_number(args: &[Typval], operation: impl FnOnce(i64, i64) -> i64) -> Result<Typval> {
-    Ok(Typval::Number(operation(number_arg(&args[0])?, number_arg(&args[1])?)))
+    Ok(Typval::Number(operation(
+        number_arg(&args[0])?,
+        number_arg(&args[1])?,
+    )))
 }
 
 fn float_unary(value: &Typval, operation: impl FnOnce(f64) -> f64) -> Result<Typval> {
@@ -1478,7 +2303,10 @@ fn float_unary(value: &Typval, operation: impl FnOnce(f64) -> f64) -> Result<Typ
 }
 
 fn float_binary(args: &[Typval], operation: impl FnOnce(f64, f64) -> f64) -> Result<Typval> {
-    Ok(Typval::Float(operation(float_arg(&args[0])?, float_arg(&args[1])?)))
+    Ok(Typval::Float(operation(
+        float_arg(&args[0])?,
+        float_arg(&args[1])?,
+    )))
 }
 
 /// `f_isinf` (`funcs.c:3141`): the sign of an infinite Float, and 0 for
@@ -1486,7 +2314,11 @@ fn float_binary(args: &[Typval], operation: impl FnOnce(f64, f64) -> f64) -> Res
 fn float_infinity_sign(value: &Typval) -> i64 {
     match value {
         Typval::Float(number) if number.is_infinite() => {
-            if *number > 0.0 { 1 } else { -1 }
+            if *number > 0.0 {
+                1
+            } else {
+                -1
+            }
         }
         _ => 0,
     }
@@ -1506,6 +2338,12 @@ fn float_infinity_sign(value: &Typval) -> i64 {
 /// and reaches the cast, which on x86-64 gives `INT64_MIN`. Measured on the
 /// oracle: `float2nr(-1.0/0.0)` is -9223372036854775807 and
 /// `float2nr(0.0/0.0)` is -9223372036854775808.
+// f64→i64 is Vim's float2nr: truncates toward zero after bounds-checking against ±i64::MAX.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn float_to_number(value: &Typval) -> Result<Typval> {
     let value = float_arg(value)?;
     // `i64::MAX as f64` rounds up to 2^63, which is the bound upstream
@@ -1524,10 +2362,14 @@ fn float_to_number(value: &Typval) -> Result<Typval> {
 }
 
 fn add(mut args: Vec<Typval>) -> Result<Typval> {
-    let value = args.pop().ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
+    let value = args
+        .pop()
+        .ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
     match args.pop() {
         Some(container @ Typval::List(_)) => {
-            let Typval::List(reference) = &container else { return Err(EvalError::new("E714", 0, "List required")); };
+            let Typval::List(reference) = &container else {
+                return Err(EvalError::new("E714", 0, "List required"));
+            };
             let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
             ensure_unlocked(data.lock)?;
             data.items.push(value);
@@ -1535,7 +2377,8 @@ fn add(mut args: Vec<Typval>) -> Result<Typval> {
             Ok(container)
         }
         Some(Typval::Blob(mut values)) => {
-            let byte = u8::try_from(number_arg(&value)?).map_err(|_| EvalError::new("E1230", 0, "Blob value must be in range 0 to 255"))?;
+            let byte = u8::try_from(number_arg(&value)?)
+                .map_err(|_| EvalError::new("E1230", 0, "Blob value must be in range 0 to 255"))?;
             values.push(byte);
             Ok(Typval::Blob(values))
         }
@@ -1549,8 +2392,12 @@ fn is_empty(value: &Typval) -> bool {
         Typval::Float(value) => *value == 0.0,
         Typval::String(value) => value.as_bytes().is_empty(),
         Typval::Blob(value) => value.is_empty(),
-        Typval::List(value) => value.try_borrow().map_or(true, |data| data.items.is_empty()),
-        Typval::Dict(value) => value.try_borrow().map_or(true, |data| data.entries.is_empty()),
+        Typval::List(value) => value
+            .try_borrow()
+            .map_or(true, |data| data.items.is_empty()),
+        Typval::Dict(value) => value
+            .try_borrow()
+            .map_or(true, |data| data.entries.is_empty()),
         Typval::Bool(value) => !value,
         Typval::Special(Special::Null) => true,
         Typval::Funcref(value) | Typval::Partial(value) => value.name.as_bytes().is_empty(),
@@ -1571,14 +2418,16 @@ fn is_empty(value: &Typval) -> bool {
 /// String error out of `string_arg`.
 fn length(value: &Typval, string_length: bool) -> Result<Typval> {
     if string_length {
-        return Ok(Typval::Number(saturating_i64(string_arg(value)?.as_bytes().len())));
+        return Ok(Typval::Number(saturating_i64(
+            string_arg(value)?.as_bytes().len(),
+        )));
     }
     let length = match value {
         Typval::String(value) => value.as_bytes().len(),
         Typval::Number(value) => value.to_string().len(),
         Typval::Blob(value) => value.len(),
         Typval::List(value) => list_items(value)?.len(),
-        Typval::Dict(value) => dict_entries(value)?.len(),
+        Typval::Dict(value) => cloned_entries(value)?.len(),
         _ => return Err(EvalError::new("E701", 0, "Invalid type for len()")),
     };
     Ok(Typval::Number(saturating_i64(length)))
@@ -1586,28 +2435,45 @@ fn length(value: &Typval, string_length: bool) -> Result<Typval> {
 
 fn strcharlen(value: &Typval) -> Result<Typval> {
     let value = string_arg(value)?;
-    let count = String::from_utf8_lossy(value.as_bytes()).chars().filter(|character| UnicodeWidthChar::width(*character).unwrap_or(0) != 0).count();
-    Ok(Typval::Number(saturating_i64(count)))
+    Ok(Typval::Number(saturating_i64(count_composed_characters(
+        value.as_bytes(),
+    ))))
 }
 
 fn strchars(args: &[Typval]) -> Result<Typval> {
     let value = string_arg(&args[0])?;
     let skip_composing = args.get(1).is_some_and(Typval::is_truthy);
-    let count = String::from_utf8_lossy(value.as_bytes()).chars().filter(|character| !skip_composing || UnicodeWidthChar::width(*character).unwrap_or(0) != 0).count();
+    let bytes = value.as_bytes();
+    let count = if skip_composing {
+        count_composed_characters(bytes)
+    } else {
+        String::from_utf8_lossy(bytes).chars().count()
+    };
     Ok(Typval::Number(saturating_i64(count)))
+}
+
+fn utf_character_len(bytes: &[u8]) -> usize {
+    let Some(&lead) = bytes.first() else {
+        return 0;
+    };
+    let width = match lead {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 1,
+    }
+    .min(bytes.len());
+    if width > 1 && std::str::from_utf8(&bytes[..width]).is_ok() {
+        width
+    } else {
+        1
+    }
 }
 
 fn string_elements(mut bytes: &[u8]) -> Vec<OxStr> {
     let mut elements = Vec::new();
     while !bytes.is_empty() {
-        let width = match bytes[0] {
-            0x00..=0x7f => 1,
-            0xc2..=0xdf => 2,
-            0xe0..=0xef => 3,
-            0xf0..=0xf4 => 4,
-            _ => 1,
-        }.min(bytes.len());
-        let length = if width > 1 && std::str::from_utf8(&bytes[..width]).is_ok() { width } else { 1 };
+        let length = utf_character_len(bytes);
         elements.push(OxStr(bytes[..length].to_vec()));
         bytes = &bytes[length..];
     }
@@ -1622,11 +2488,21 @@ fn change_case(value: &Typval, upper: bool) -> Result<Typval> {
         let mapped = if upper {
             let mut values = character.to_uppercase();
             let first = values.next().unwrap_or(character);
-            if values.next().is_none() { first } else { character }
+            if values.next().is_none() {
+                first
+            } else {
+                character
+            }
         } else {
             let mut values = character.to_lowercase();
             let first = values.next().unwrap_or(character);
-            if values.next().is_none() { first } else if character == '\u{0130}' { 'i' } else { character }
+            if values.next().is_none() {
+                first
+            } else if character == '\u{0130}' {
+                'i'
+            } else {
+                character
+            }
         };
         changed.push(mapped);
     }
@@ -1635,29 +2511,66 @@ fn change_case(value: &Typval, upper: bool) -> Result<Typval> {
 
 fn trim(args: &[Typval]) -> Result<Typval> {
     let value = string_arg(&args[0])?;
-    let mask = args.get(1).map(|value| strict_string_arg(value, 2)).transpose()?;
+    let mask = args
+        .get(1)
+        .map(|value| strict_string_arg(value, 2))
+        .transpose()?;
     let direction = args.get(2).map(number_arg).transpose()?.unwrap_or(0);
     if !(0..=2).contains(&direction) {
         return Err(EvalError::new("E475", 0, "Invalid argument"));
     }
     let text = String::from_utf8_lossy(value.as_bytes());
-    let mask_text = mask.as_ref().map(|value| String::from_utf8_lossy(value.as_bytes()));
-    let removable = |character: char| mask_text.as_ref().map_or(character <= '\u{20}' || character == '\u{a0}', |mask| mask.contains(character));
-    let start = if direction != 2 { text.char_indices().find(|(_, character)| !removable(*character)).map_or(text.len(), |(index, _)| index) } else { 0 };
-    let end = if direction != 1 { text.char_indices().rev().find(|(_, character)| !removable(*character)).map_or(start, |(index, character)| index + character.len_utf8()) } else { text.len() };
-    Ok(Typval::String(OxStr(text.as_bytes()[start.min(end)..end].to_vec())))
+    let mask_text = mask
+        .as_ref()
+        .map(|value| String::from_utf8_lossy(value.as_bytes()));
+    let removable = |character: char| {
+        mask_text
+            .as_ref()
+            .map_or(character <= '\u{20}' || character == '\u{a0}', |mask| {
+                mask.contains(character)
+            })
+    };
+    let start = if direction == 2 {
+        0
+    } else {
+        text.char_indices()
+            .find(|(_, character)| !removable(*character))
+            .map_or(text.len(), |(index, _)| index)
+    };
+    let end = if direction == 1 {
+        text.len()
+    } else {
+        text.char_indices()
+            .rev()
+            .find(|(_, character)| !removable(*character))
+            .map_or(start, |(index, character)| index + character.len_utf8())
+    };
+    Ok(Typval::String(OxStr(
+        text.as_bytes()[start.min(end)..end].to_vec(),
+    )))
 }
 
 fn translate(args: &[Typval]) -> Result<Typval> {
     let input = string_arg(&args[0])?;
     let from = string_arg(&args[1])?;
     let to = string_arg(&args[2])?;
-    let from_chars = String::from_utf8_lossy(from.as_bytes()).chars().collect::<Vec<_>>();
-    let to_chars = String::from_utf8_lossy(to.as_bytes()).chars().collect::<Vec<_>>();
+    let from_chars = String::from_utf8_lossy(from.as_bytes())
+        .chars()
+        .collect::<Vec<_>>();
+    let to_chars = String::from_utf8_lossy(to.as_bytes())
+        .chars()
+        .collect::<Vec<_>>();
     if from_chars.len() != to_chars.len() {
-        return Err(EvalError::new("E475", 0, "Invalid argument: fromstr and tostr have different number of characters"));
+        return Err(EvalError::new(
+            "E475",
+            0,
+            "Invalid argument: fromstr and tostr have different number of characters",
+        ));
     }
-    let replacements = from_chars.into_iter().zip(to_chars).collect::<HashMap<_, _>>();
+    let replacements = from_chars
+        .into_iter()
+        .zip(to_chars)
+        .collect::<HashMap<_, _>>();
     let mut output = String::new();
     for character in String::from_utf8_lossy(input.as_bytes()).chars() {
         output.push(replacements.get(&character).copied().unwrap_or(character));
@@ -1667,8 +2580,50 @@ fn translate(args: &[Typval]) -> Result<Typval> {
 
 fn strwidth(value: &Typval, ambiguous_wide: bool) -> Result<Typval> {
     let value = string_arg(value)?;
-    let width = String::from_utf8_lossy(value.as_bytes()).chars().map(|character| match character { '\t' => 1, _ if ambiguous_wide => UnicodeWidthChar::width_cjk(character).unwrap_or(0), _ => UnicodeWidthChar::width(character).unwrap_or(0) }).sum::<usize>();
+    let width = String::from_utf8_lossy(value.as_bytes())
+        .chars()
+        .map(|character| match character {
+            '\t' => 1,
+            _ if ambiguous_wide => UnicodeWidthChar::width_cjk(character).unwrap_or(0),
+            _ => UnicodeWidthChar::width(character).unwrap_or(0),
+        })
+        .sum::<usize>();
     Ok(Typval::Number(saturating_i64(width)))
+}
+
+/// `f_strdisplaywidth` (`strings.c:2775-2785`): display cells consumed from
+/// the optional starting column. The typval-only host has no window options,
+/// so it uses upstream's default `'tabstop'` of eight.
+fn strdisplaywidth(args: &[Typval], ambiguous_wide: bool) -> Result<Typval> {
+    let value = string_arg(&args[0])?;
+    let start = args.get(1).map(number_arg).transpose()?.unwrap_or(0).max(0);
+    let mut column = usize::try_from(start).unwrap_or(usize::MAX);
+    let begin = column;
+    let mut bytes = value.as_bytes();
+    while !bytes.is_empty() {
+        let length = utf_character_len(bytes);
+        let width = if bytes[0] == b'\t' {
+            8 - column % 8
+        } else if length == 1 && (bytes[0] < 0x20 || bytes[0] == 0x7f) {
+            2
+        } else if length == 1 && bytes[0] >= 0x80 {
+            4
+        } else {
+            let character = std::str::from_utf8(&bytes[..length])
+                .ok()
+                .and_then(|text| text.chars().next());
+            character.map_or(0, |character| {
+                if ambiguous_wide {
+                    UnicodeWidthChar::width_cjk(character).unwrap_or(0)
+                } else {
+                    UnicodeWidthChar::width(character).unwrap_or(0)
+                }
+            })
+        };
+        column = column.saturating_add(width);
+        bytes = &bytes[length..];
+    }
+    Ok(Typval::Number(saturating_i64(column.saturating_sub(begin))))
 }
 
 fn strtrans(value: &Typval) -> Result<Typval> {
@@ -1678,18 +2633,31 @@ fn strtrans(value: &Typval) -> Result<Typval> {
         let bytes = element.as_bytes();
         if bytes.len() == 1 {
             match bytes[0] {
-                0x00..=0x1f => { output.push('^'); output.push(char::from(bytes[0] + b'@')); }
+                0x00..=0x1f => {
+                    output.push('^');
+                    output.push(char::from(bytes[0] + b'@'));
+                }
                 0x7f => output.push_str("^?"),
-                0x80..=0xff => output.push_str(&format!("<{:02x}>", bytes[0])),
+                0x80..=0xff => {
+                    let _ = write!(output, "<{:02x}>", bytes[0]);
+                }
                 byte => output.push(char::from(byte)),
             }
             continue;
         }
-        let character = std::str::from_utf8(bytes).ok().and_then(|text| text.chars().next());
+        let character = std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| text.chars().next());
         match character {
-            Some(character @ ('\u{80}'..='\u{9f}' | '\u{200b}' | '\u{feff}')) => output.push_str(&format!("<{:x}>", character as u32)),
+            Some(character @ ('\u{80}'..='\u{9f}' | '\u{200b}' | '\u{feff}')) => {
+                let _ = write!(output, "<{:x}>", character as u32);
+            }
             Some(character) => output.push(character),
-            None => for byte in bytes { output.push_str(&format!("<{byte:02x}>")); },
+            None => {
+                for byte in bytes {
+                    let _ = write!(output, "<{byte:02x}>");
+                }
+            }
         }
     }
     Ok(Typval::String(OxStr(output.into_bytes())))
@@ -1700,7 +2668,9 @@ fn strutf16len(args: &[Typval]) -> Result<Typval> {
     let count_composing = bool_number_arg(args.get(1))?;
     let mut units = 0usize;
     for character in String::from_utf8_lossy(value.as_bytes()).chars() {
-        if count_composing || UnicodeWidthChar::width(character).unwrap_or(0) != 0 { units += character.len_utf16(); }
+        if count_composing || UnicodeWidthChar::width(character).unwrap_or(0) != 0 {
+            units += character.len_utf16();
+        }
     }
     Ok(Typval::Number(saturating_i64(units)))
 }
@@ -1710,23 +2680,47 @@ fn charidx(args: &[Typval]) -> Result<Typval> {
     let index = strict_number_arg(&args[1], 2)?;
     let count_composing = bool_number_arg(args.get(2))?;
     let utf16_index = bool_number_arg(args.get(3))?;
-    if index < 0 { return Ok(Typval::Number(-1)); }
+    if index < 0 {
+        return Ok(Typval::Number(-1));
+    }
     let target = usize::try_from(index).unwrap_or(usize::MAX);
     let text = String::from_utf8_lossy(value.as_bytes());
-    let limit = if utf16_index { text.encode_utf16().count() } else { value.as_bytes().len() };
-    if target > limit { return Ok(Typval::Number(-1)); }
+    let limit = if utf16_index {
+        text.encode_utf16().count()
+    } else {
+        value.as_bytes().len()
+    };
+    if target > limit {
+        return Ok(Typval::Number(-1));
+    }
     let mut position = 0usize;
     let mut characters = 0usize;
     for character in text.chars() {
-        let next = position + if utf16_index { character.len_utf16() } else { character.len_utf8() };
+        let next = position
+            + if utf16_index {
+                character.len_utf16()
+            } else {
+                character.len_utf8()
+            };
         if target < next {
-            let index = if !count_composing && UnicodeWidthChar::width(character).unwrap_or(0) == 0 { characters.saturating_sub(1) } else { characters };
+            let index = if !count_composing && UnicodeWidthChar::width(character).unwrap_or(0) == 0
+            {
+                characters.saturating_sub(1)
+            } else {
+                characters
+            };
             return Ok(Typval::Number(saturating_i64(index)));
         }
         position = next;
-        if count_composing || UnicodeWidthChar::width(character).unwrap_or(0) != 0 { characters += 1; }
+        if count_composing || UnicodeWidthChar::width(character).unwrap_or(0) != 0 {
+            characters += 1;
+        }
     }
-    Ok(Typval::Number(if target == position { saturating_i64(characters) } else { -1 }))
+    Ok(Typval::Number(if target == position {
+        saturating_i64(characters)
+    } else {
+        -1
+    }))
 }
 
 fn utf16idx(args: &[Typval]) -> Result<Typval> {
@@ -1734,19 +2728,39 @@ fn utf16idx(args: &[Typval]) -> Result<Typval> {
     let index = strict_number_arg(&args[1], 2)?;
     let count_composing = bool_number_arg(args.get(2))?;
     let char_index = bool_number_arg(args.get(3))?;
-    if index < 0 { return Ok(Typval::Number(-1)); }
+    if index < 0 {
+        return Ok(Typval::Number(-1));
+    }
     let target = usize::try_from(index).unwrap_or(usize::MAX);
     let text = String::from_utf8_lossy(value.as_bytes());
-    let limit = if char_index { text.chars().filter(|character| count_composing || UnicodeWidthChar::width(*character).unwrap_or(0) != 0).count() } else { value.as_bytes().len() };
-    if target > limit { return Ok(Typval::Number(-1)); }
+    let limit = if char_index {
+        text.chars()
+            .filter(|character| {
+                count_composing || UnicodeWidthChar::width(*character).unwrap_or(0) != 0
+            })
+            .count()
+    } else {
+        value.as_bytes().len()
+    };
+    if target > limit {
+        return Ok(Typval::Number(-1));
+    }
     let mut source_position = 0usize;
     let mut units = 0usize;
     let mut cluster_start = 0usize;
     for character in text.chars() {
         let composing = UnicodeWidthChar::width(character).unwrap_or(0) == 0;
-        let source_width = if char_index { usize::from(count_composing || !composing) } else { character.len_utf8() };
+        let source_width = if char_index {
+            usize::from(count_composing || !composing)
+        } else {
+            character.len_utf8()
+        };
         if target < source_position + source_width {
-            let result = if !count_composing && composing { cluster_start } else { units };
+            let result = if !count_composing && composing {
+                cluster_start
+            } else {
+                units
+            };
             return Ok(Typval::Number(saturating_i64(result)));
         }
         source_position += source_width;
@@ -1755,87 +2769,366 @@ fn utf16idx(args: &[Typval]) -> Result<Typval> {
             units += character.len_utf16();
         }
     }
-    Ok(Typval::Number(if target == source_position { saturating_i64(units) } else { -1 }))
+    Ok(Typval::Number(if target == source_position {
+        saturating_i64(units)
+    } else {
+        -1
+    }))
 }
 
 fn bool_number_arg(value: Option<&Typval>) -> Result<bool> {
-    match value { None => Ok(false), Some(Typval::Bool(value)) => Ok(*value), Some(Typval::Number(0)) => Ok(false), Some(Typval::Number(1)) => Ok(true), Some(_) => Err(EvalError::new("E1212", 0, "Bool required")) }
+    match value {
+        None | Some(Typval::Number(0)) => Ok(false),
+        Some(Typval::Bool(value)) => Ok(*value),
+        Some(Typval::Number(1)) => Ok(true),
+        Some(_) => Err(EvalError::new("E1212", 0, "Bool required")),
+    }
+}
+
+/// `f_sha256` (`eval/funcs.c:6642-6656`): a Blob's bytes are hashed whole,
+/// while a String goes through `tv_get_string` and `strlen`, so a string
+/// argument is cut at its first NUL byte. The digest renders lowercase, as
+/// `sha256_bytes` does (`sha256.c`), and an empty argument answers the SHA-256
+/// of zero bytes, which the NUL cut preserves from `sha256("")`.
+fn sha256(value: &Typval) -> Result<Typval> {
+    let converted;
+    let bytes = match value {
+        Typval::Blob(value) => value.as_slice(),
+        value => {
+            converted = string_arg(value)?;
+            let raw = converted.as_bytes();
+            match raw.iter().position(|byte| *byte == 0) {
+                Some(end) => raw.get(..end).ok_or_else(|| {
+                    EvalError::new("E685", 0, "Internal error: invalid SHA-256 string length")
+                })?,
+                None => raw,
+            }
+        }
+    };
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        for nibble in [byte >> 4, byte & 0x0f] {
+            let digit = char::from_digit(u32::from(nibble), 16).ok_or_else(|| {
+                EvalError::new("E685", 0, "Internal error: invalid SHA-256 nibble")
+            })?;
+            hex.push(digit);
+        }
+    }
+    Ok(Typval::String(OxStr(hex.into_bytes())))
 }
 
 fn strict_string_arg(value: &Typval, argument: usize) -> Result<OxStr> {
-    match value { Typval::String(value) => Ok(value.clone()), _ => Err(EvalError::new("E1174", 0, format!("String required for argument {argument}"))) }
+    match value {
+        Typval::String(value) => Ok(value.clone()),
+        _ => Err(EvalError::new(
+            "E1174",
+            0,
+            format!("String required for argument {argument}"),
+        )),
+    }
 }
 
 fn strict_number_arg(value: &Typval, argument: usize) -> Result<i64> {
-    match value { Typval::Number(value) => Ok(*value), _ => Err(EvalError::new("E1210", 0, format!("Number required for argument {argument}"))) }
+    match value {
+        Typval::Number(value) => Ok(*value),
+        _ => Err(EvalError::new(
+            "E1210",
+            0,
+            format!("Number required for argument {argument}"),
+        )),
+    }
 }
-
+// i64→usize: keep count is .max(1) before casting, mirroring upstream's bounds.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn pathshorten(args: &[Typval]) -> Result<Typval> {
     let value = string_arg(&args[0])?;
     let keep = args.get(1).map(number_arg).transpose()?.unwrap_or(1).max(1) as usize;
     let source = String::from_utf8_lossy(value.as_bytes());
     let mut components = source.split('/').collect::<Vec<_>>();
-    let last = if source.ends_with('/') { components.len().saturating_sub(1) } else { components.iter().rposition(|component| !component.is_empty()).unwrap_or(0) };
+    let last = if source.ends_with('/') {
+        components.len().saturating_sub(1)
+    } else {
+        components
+            .iter()
+            .rposition(|component| !component.is_empty())
+            .unwrap_or(0)
+    };
     for (index, component) in components.iter_mut().enumerate() {
-        if index == last || component.is_empty() { continue; }
-        let prefix = component.chars().take_while(|character| matches!(character, '.' | '~')).count();
-        let end = component.char_indices().nth(prefix + keep).map_or(component.len(), |(index, _)| index);
+        if index == last || component.is_empty() {
+            continue;
+        }
+        let prefix = component
+            .chars()
+            .take_while(|character| matches!(character, '.' | '~'))
+            .count();
+        let end = component
+            .char_indices()
+            .nth(prefix + keep)
+            .map_or(component.len(), |(index, _)| index);
         *component = &component[..end];
     }
     Ok(Typval::String(OxStr(components.join("/").into_bytes())))
 }
 
 fn keytrans(value: &Typval) -> Result<Typval> {
-    let Typval::String(value) = value else { return Err(EvalError::new("E1174", 0, "String required for argument 1")); };
+    let Typval::String(value) = value else {
+        return Err(EvalError::new("E1174", 0, "String required for argument 1"));
+    };
     let bytes = value.as_bytes();
     let mut output = String::new();
     let mut index = 0usize;
     let mut modifiers = 0u8;
     while index < bytes.len() {
-        if bytes.get(index..index + 3).is_some_and(|value| value[0] == 0x80 && value[1] == 0xfc) { modifiers = bytes[index + 2]; index += 3; continue; }
-        let (name, consumed) = if bytes.get(index..index + 3).is_some_and(|value| value[0] == 0x80 && value[1] == 0xfd) {
-            (match bytes[index + 2] { b'B' => "BS".to_owned(), b'T' => "Tab".to_owned(), b'N' => "NL".to_owned(), b'R' => "CR".to_owned(), b'E' => "Esc".to_owned(), b'S' => "Space".to_owned(), b'L' => "lt".to_owned(), b'\\' => "Bslash".to_owned(), b'|' => "Bar".to_owned(), b'D' => "Del".to_owned(), b'H' => "Home".to_owned(), other => char::from(other).to_string() }, 3)
-        } else {
-            let width = match bytes[index] { 0x00..=0x7f => 1, 0xc2..=0xdf => 2, 0xe0..=0xef => 3, 0xf0..=0xf4 => 4, _ => 1 }.min(bytes.len() - index);
-            let raw = &bytes[index..index + width];
-            let name = match raw { b" " => "Space".to_owned(), b"<" => "lt".to_owned(), b"|" => "Bar".to_owned(), b"\\" => "Bslash".to_owned(), [0x08] => "BS".to_owned(), [b'\t'] => "C-I".to_owned(), [b'\r'] => "CR".to_owned(), [0x1b] => "Esc".to_owned(), [0x7f] => "Del".to_owned(), [control @ 1..=26] => format!("C-{}", char::from(control + b'@')), _ => String::from_utf8_lossy(raw).into_owned() };
-            (name, width)
+        // `str2special` (`message.c:2084-2166`): every `K_SPECIAL` triple is
+        // one key. `KS_MODIFIER` prefixes the next key with a modifier mask;
+        // any other triple is a termcap or `KS_EXTRA` key resolved through
+        // [`special_key_name`], with unknown pairs taking upstream's
+        // `<t_xx>` termcap form (`keycodes.c:324-327`).
+        let (name, consumed) = match bytes.get(index..index + 3) {
+            Some(&[0x80, 0xfc, modifier]) => {
+                modifiers = modifier;
+                index += 3;
+                continue;
+            }
+            Some(&[0x80, second, third]) => (
+                match special_key_name(second, third) {
+                    Some(name) => name,
+                    None if second == 0xfd => char::from(third).to_string(),
+                    None => format!("<t_{}{}>", char::from(second), char::from(third)),
+                },
+                3,
+            ),
+            _ => {
+                let width = match bytes[index] {
+                    0xc2..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    0xf0..=0xf4 => 4,
+                    _ => 1,
+                }
+                .min(bytes.len() - index);
+                let raw = &bytes[index..index + width];
+                let name = match raw {
+                    b" " => "Space".to_owned(),
+                    b"<" => "lt".to_owned(),
+                    b"|" => "Bar".to_owned(),
+                    b"\\" => "Bslash".to_owned(),
+                    [0x08] => "BS".to_owned(),
+                    [b'\t'] => "C-I".to_owned(),
+                    [b'\r'] => "CR".to_owned(),
+                    [0x1b] => "Esc".to_owned(),
+                    [0x7f] => "Del".to_owned(),
+                    [control @ 1..=26] => format!("C-{}", char::from(control + b'@')),
+                    _ => String::from_utf8_lossy(raw).into_owned(),
+                };
+                (name, width)
+            }
         };
         index += consumed;
-        let requires_brackets = modifiers != 0 || name.chars().count() != 1 || matches!(name.as_str(), "Space" | "lt" | "Bar" | "Bslash");
+        let requires_brackets = modifiers != 0
+            || name.chars().count() != 1
+            || matches!(name.as_str(), "Space" | "lt" | "Bar" | "Bslash");
         if requires_brackets {
             output.push('<');
-            if modifiers & 2 != 0 && !name.starts_with("C-") { output.push_str("C-"); }
-            if modifiers & 1 != 0 { output.push_str("S-"); }
-            if modifiers & 4 != 0 { output.push_str("M-"); }
+            if modifiers & 4 != 0 && !name.starts_with("C-") {
+                output.push_str("C-");
+            }
+            if modifiers & 2 != 0 {
+                output.push_str("S-");
+            }
+            if modifiers & 8 != 0 {
+                output.push_str("M-");
+            }
             output.push_str(&name);
             output.push('>');
-        } else { output.push_str(&name); }
+        } else {
+            output.push_str(&name);
+        }
         modifiers = 0;
     }
     Ok(Typval::String(OxStr(output.into_bytes())))
 }
 
+/// Canonical `keytrans` name for an internal three-byte key
+/// (`K_SPECIAL first second`): the termcap byte pairs upstream builds with
+/// `TERMCAP2KEY` and the `KS_EXTRA` codes of `keycodes.h`'s
+/// `enum key_extra`, named after `keycode_names.generated.h`'s primary
+/// entries. This is the reverse of what the string lexer's `\<X>` letters
+/// and ox-api's `replace_termcodes` emit, so those letter names lead the
+/// table ahead of the numeric codes they collide with.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one flat table preserves the canonical Vim key-code mapping"
+)]
+fn special_key_name(first: u8, second: u8) -> Option<String> {
+    const NAMES: &[(u8, u8, &str)] = &[
+        // String-lexer `\<X>` letters (first match wins).
+        (0xfd, b'B', "BS"),
+        (0xfd, b'T', "Tab"),
+        (0xfd, b'N', "NL"),
+        (0xfd, b'R', "CR"),
+        (0xfd, b'E', "Esc"),
+        (0xfd, b'S', "Space"),
+        (0xfd, b'L', "lt"),
+        (0xfd, b'\\', "Bslash"),
+        (0xfd, b'|', "Bar"),
+        (0xfd, b'D', "Del"),
+        (0xfd, b'H', "Home"),
+        // Termcap pairs (`TERMCAP2KEY`).
+        (b'k', b'u', "Up"),
+        (b'k', b'd', "Down"),
+        (b'k', b'l', "Left"),
+        (b'k', b'r', "Right"),
+        (b'k', b'h', "Home"),
+        (b'@', b'7', "End"),
+        (b'k', b'P', "PageUp"),
+        (b'k', b'N', "PageDown"),
+        (b'k', b'D', "Del"),
+        (b'k', b'b', "BS"),
+        (b'k', b'I', "Insert"),
+        (b'%', b'1', "Help"),
+        (b'&', b'8', "Undo"),
+        (b'@', b'0', "Find"),
+        (b'*', b'6', "Select"),
+        (b'k', b'B', "S-Tab"),
+        (b'#', b'4', "S-Left"),
+        (b'%', b'i', "S-Right"),
+        (b'#', b'2', "S-Home"),
+        (b'*', b'7', "S-End"),
+        (b'*', b'4', "S-Del"),
+        (b'K', b'C', "k0"),
+        (b'K', b'D', "k1"),
+        (b'K', b'E', "k2"),
+        (b'K', b'F', "k3"),
+        (b'K', b'G', "k4"),
+        (b'K', b'H', "k5"),
+        (b'K', b'I', "k6"),
+        (b'K', b'J', "k7"),
+        (b'K', b'K', "k8"),
+        (b'K', b'L', "k9"),
+        (b'K', b'u', "kUp"),
+        (b'K', b'd', "kDown"),
+        (b'K', b'l', "kLeft"),
+        (b'K', b'r', "kRight"),
+        (b'K', b'1', "kHome"),
+        (b'K', b'4', "kEnd"),
+        (b'K', b'3', "kPageUp"),
+        (b'K', b'5', "kPageDown"),
+        (b'K', b'2', "kOrigin"),
+        (b'K', b'6', "kPlus"),
+        (b'K', b'7', "kMinus"),
+        (b'K', b'8', "kDivide"),
+        (b'K', b'9', "kMultiply"),
+        (b'K', b'A', "kEnter"),
+        (b'K', b'B', "kPoint"),
+        (b'K', b'M', "kComma"),
+        (b'K', b'N', "kEqual"),
+        (b'k', b'1', "F1"),
+        (b'k', b'2', "F2"),
+        (b'k', b'3', "F3"),
+        (b'k', b'4', "F4"),
+        (b'k', b'5', "F5"),
+        (b'k', b'6', "F6"),
+        (b'k', b'7', "F7"),
+        (b'k', b'8', "F8"),
+        (b'k', b'9', "F9"),
+        (b'k', b';', "F10"),
+        (b'F', b'1', "F11"),
+        (b'F', b'2', "F12"),
+        // `enum key_extra` codes.
+        (0xfd, 4, "S-Up"),
+        (0xfd, 5, "S-Down"),
+        (0xfd, 6, "S-F1"),
+        (0xfd, 7, "S-F2"),
+        (0xfd, 8, "S-F3"),
+        (0xfd, 9, "S-F4"),
+        (0xfd, 10, "S-F5"),
+        (0xfd, 11, "S-F6"),
+        (0xfd, 12, "S-F7"),
+        (0xfd, 13, "S-F8"),
+        (0xfd, 14, "S-F9"),
+        (0xfd, 15, "S-F10"),
+        (0xfd, 16, "S-F11"),
+        (0xfd, 17, "S-F12"),
+        (0xfd, 54, "Tab"),
+        (0xfd, 57, "xF1"),
+        (0xfd, 58, "xF2"),
+        (0xfd, 59, "xF3"),
+        (0xfd, 60, "xF4"),
+        (0xfd, 61, "xEnd"),
+        (0xfd, 62, "zEnd"),
+        (0xfd, 63, "xHome"),
+        (0xfd, 64, "zHome"),
+        (0xfd, 65, "xUp"),
+        (0xfd, 66, "xDown"),
+        (0xfd, 67, "xLeft"),
+        (0xfd, 68, "xRight"),
+        (0xfd, 71, "S-xF1"),
+        (0xfd, 72, "S-xF2"),
+        (0xfd, 73, "S-xF3"),
+        (0xfd, 74, "S-xF4"),
+        (0xfd, 79, "kInsert"),
+        (0xfd, 80, "kDel"),
+        (0xfd, 85, "C-Left"),
+        (0xfd, 86, "C-Right"),
+        (0xfd, 87, "C-Home"),
+        (0xfd, 88, "C-End"),
+    ];
+    NAMES
+        .iter()
+        .find(|entry| entry.0 == first && entry.1 == second)
+        .map(|entry| (*entry.2).to_owned())
+        .or_else(|| {
+            // F13-F63 are one numeric termcap run (`K_F13`..`K_F63`).
+            if first != b'F' {
+                return None;
+            }
+            let teens = b"3456789ABCDEFGHIJKLMNOPQRSTU";
+            let rest = b"VWXYZabcdefghijklmnopqr";
+            let number = teens
+                .iter()
+                .position(|byte| *byte == second)
+                .map(|index| 13 + index)
+                .or_else(|| {
+                    rest.iter()
+                        .position(|byte| *byte == second)
+                        .map(|index| 41 + index)
+                })?;
+            Some(format!("F{number}"))
+        })
+}
+
 fn join(args: &[Typval]) -> Result<Typval> {
-    let Typval::List(reference) = &args[0] else { return Err(EvalError::new("E714", 0, "List required")); };
+    let Typval::List(reference) = &args[0] else {
+        return Err(EvalError::new("E714", 0, "List required"));
+    };
     let values = list_items(reference)?;
-    let separator = args.get(1).map(string_arg).transpose()?.unwrap_or_else(|| OxStr::from(" "));
+    let separator = args
+        .get(1)
+        .map(string_arg)
+        .transpose()?
+        .unwrap_or_else(|| OxStr::from(" "));
     let mut result = Vec::new();
     for (index, value) in values.iter().enumerate() {
-        if index > 0 { result.extend_from_slice(separator.as_bytes()); }
+        if index > 0 {
+            result.extend_from_slice(separator.as_bytes());
+        }
         result.extend_from_slice(string_arg(value)?.as_bytes());
     }
     Ok(Typval::String(OxStr(result)))
 }
 
 fn repeat(args: &[Typval]) -> Result<Typval> {
-    let count = usize::try_from(number_arg(&args[1])?.max(0)).map_err(|_| EvalError::new("E1240", 0, "Resulting text too long"))?;
+    let count = usize::try_from(number_arg(&args[1])?.max(0))
+        .map_err(|_| EvalError::new("E1240", 0, "Resulting text too long"))?;
     match &args[0] {
         Typval::String(value) => Ok(Typval::String(OxStr(value.as_bytes().repeat(count)))),
         Typval::List(value) => {
             let items = list_items(value)?;
             let mut repeated = Vec::with_capacity(items.len().saturating_mul(count));
-            for _ in 0..count { repeated.extend(items.iter().cloned()); }
+            for _ in 0..count {
+                repeated.extend(items.iter().cloned());
+            }
             Ok(Typval::list(repeated))
         }
         Typval::Blob(value) => Ok(Typval::Blob(value.repeat(count))),
@@ -1850,9 +3143,20 @@ fn reverse(mut args: Vec<Typval>) -> Result<Typval> {
             let mut clusters: Vec<String> = Vec::new();
             for character in text.chars() {
                 if is_combining(character) {
-                    if let Some(cluster) = clusters.last_mut() { cluster.push(character); } else { clusters.push(character.to_string()); }
-                } else if is_regional_indicator(character) && clusters.last().is_some_and(|cluster| cluster.chars().count() == 1 && cluster.chars().next().is_some_and(is_regional_indicator)) {
-                    clusters.last_mut().expect("checked above").push(character);
+                    if let Some(cluster) = clusters.last_mut() {
+                        cluster.push(character);
+                    } else {
+                        clusters.push(character.to_string());
+                    }
+                } else if is_regional_indicator(character)
+                    && clusters.last().is_some_and(|cluster| {
+                        cluster.chars().count() == 1
+                            && cluster.chars().next().is_some_and(is_regional_indicator)
+                    })
+                {
+                    if let Some(cluster) = clusters.last_mut() {
+                        cluster.push(character);
+                    }
                 } else {
                     clusters.push(character.to_string());
                 }
@@ -1861,47 +3165,220 @@ fn reverse(mut args: Vec<Typval>) -> Result<Typval> {
             Ok(Typval::String(OxStr(clusters.concat().into_bytes())))
         }
         Some(container @ Typval::List(_)) => {
-            let Typval::List(reference) = &container else { return Err(EvalError::new("E714", 0, "List required")); };
+            let Typval::List(reference) = &container else {
+                return Err(EvalError::new("E714", 0, "List required"));
+            };
             let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
             ensure_unlocked(data.lock)?;
             data.items.reverse();
             drop(data);
             Ok(container)
         }
-        Some(Typval::Blob(mut value)) => { value.reverse(); Ok(Typval::Blob(value)) }
+        Some(Typval::Blob(mut value)) => {
+            value.reverse();
+            Ok(Typval::Blob(value))
+        }
         _ => Err(EvalError::new("E899", 0, "List, Blob or String required")),
     }
 }
-
+// i64→usize: indices are .max(0) before casting, mirroring upstream's string indexing.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn string_index(args: &[Typval], reverse: bool) -> Result<Typval> {
     let haystack = string_arg(&args[0])?;
     let needle = string_arg(&args[1])?;
     let requested = args.get(2).map(number_arg).transpose()?;
     let bytes = haystack.as_bytes();
     let position = if reverse {
-        let maximum_start = requested.unwrap_or_else(|| saturating_i64(bytes.len())).max(0) as usize;
-        let prefix_end = maximum_start.saturating_add(needle.as_bytes().len()).min(bytes.len());
-        find_subslice_reverse(&bytes[..prefix_end], needle.as_bytes()).filter(|position| *position <= maximum_start)
+        let maximum_start = requested
+            .unwrap_or_else(|| saturating_i64(bytes.len()))
+            .max(0) as usize;
+        let prefix_end = maximum_start
+            .saturating_add(needle.as_bytes().len())
+            .min(bytes.len());
+        find_subslice_reverse(&bytes[..prefix_end], needle.as_bytes())
+            .filter(|position| *position <= maximum_start)
     } else {
         let start = requested.unwrap_or(0).max(0) as usize;
-        if start > bytes.len() { None } else { find_subslice(&bytes[start..], needle.as_bytes()).map(|position| position + start) }
+        if start > bytes.len() {
+            None
+        } else {
+            find_subslice(&bytes[start..], needle.as_bytes()).map(|position| position + start)
+        }
     };
     Ok(Typval::Number(position.map_or(-1, saturating_i64)))
+}
+
+/// Byte length of the composed character at `bytes[0]`: the first UAX 29
+/// extended grapheme cluster, so VS, ZWJ, combining marks, and regional
+/// indicator pairs all travel with their base. A leading ASCII byte is one
+/// byte only when no non-ASCII byte follows that could extend it -- CRLF
+/// stays two characters while `e` plus combining marks stay one cluster. An
+/// invalid leading byte consumes one; empty input returns zero. No lossy
+/// `String` allocation.
+fn composed_character_len(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    // ASCII fast path: one byte only when the next byte is also ASCII or
+    // absent, so CR-LF stays two characters while a following combining
+    // mark still joins an ASCII base.
+    if bytes[0] < 0x80 && (bytes.len() == 1 || bytes[1] < 0x80) {
+        return 1;
+    }
+    // First valid UTF-8 chunk; an invalid leading byte yields an empty str.
+    let Some(chunk) = bytes.utf8_chunks().next() else {
+        return 0;
+    };
+    let valid = chunk.valid();
+    if valid.is_empty() {
+        return 1;
+    }
+    // First extended grapheme cluster within the valid prefix.
+    valid.graphemes(true).next().map_or(1, str::len)
+}
+
+/// Count composed characters by repeatedly advancing one boundary, sharing
+/// the single boundary definition used by `strcharlen`, `strchars(..., 1)`,
+/// `byteidx`, and `strcharpart(..., true)`.
+fn count_composed_characters(bytes: &[u8]) -> usize {
+    let mut count = 0usize;
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        offset += composed_character_len(&bytes[offset..]);
+        count += 1;
+    }
+    count
+}
+
+/// Base codepoint at `bytes[0]`, or the raw byte for an invalid sequence --
+/// the Rust translation of `utf_ptr2char` (`mbyte.c`).
+fn utf_character_value(bytes: &[u8]) -> i64 {
+    let length = utf_character_len(bytes);
+    std::str::from_utf8(&bytes[..length])
+        .ok()
+        .and_then(|text| text.chars().next())
+        .map_or_else(
+            || i64::from(bytes[0]),
+            |character| i64::from(character as u32),
+        )
+}
+
+/// `byteidx_common(..., comp = false)` (`strings.c:2453-2503`): composing
+/// characters travel with their base, and an optional UTF-16 index that lands
+/// on the low surrogate rounds back to the character's first byte.
+fn byteidx(args: &[Typval]) -> Result<Typval> {
+    let value = string_arg(&args[0])?;
+    let index = number_arg(&args[1])?;
+    if index < 0 {
+        return Ok(Typval::Number(-1));
+    }
+    let utf16 = bool_number_arg(args.get(2))?;
+    let bytes = value.as_bytes();
+    let mut remaining = usize::try_from(index).unwrap_or(usize::MAX);
+    let mut offset = 0usize;
+    while remaining > 0 {
+        if offset == bytes.len() {
+            return Ok(Typval::Number(-1));
+        }
+        let length = composed_character_len(&bytes[offset..]);
+        if utf16 && utf_character_value(&bytes[offset..]) > 0xffff {
+            remaining -= 1;
+            if remaining == 0 {
+                break;
+            }
+        }
+        offset += length;
+        remaining -= 1;
+    }
+    Ok(Typval::Number(saturating_i64(offset)))
+}
+
+/// `f_strgetchar` (`strings.c:2631-2657`): codepoint lookup, counting
+/// composing characters separately.
+fn strgetchar(args: &[Typval]) -> Result<Typval> {
+    let value = string_arg(&args[0])?;
+    let index = number_arg(&args[1])?;
+    let Ok(mut remaining) = usize::try_from(index) else {
+        return Ok(Typval::Number(-1));
+    };
+    let bytes = value.as_bytes();
+    let mut offset = 0usize;
+    while remaining > 0 && offset < bytes.len() {
+        offset += utf_character_len(&bytes[offset..]);
+        remaining -= 1;
+    }
+    Ok(Typval::Number(if offset < bytes.len() {
+        utf_character_value(&bytes[offset..])
+    } else {
+        -1
+    }))
+}
+
+/// `f_strcharpart` (`strings.c:2795-2868`): select by character count, or by
+/// composed character when `skipcc` is set. A negative start consumes
+/// requested character slots before byte zero, so only the overlap with the
+/// string is returned; a missing length takes the rest of the string.
+fn strcharpart(args: &[Typval]) -> Result<Typval> {
+    let value = string_arg(&args[0])?;
+    let start = number_arg(&args[1])?;
+    let skip_composing = bool_number_arg(args.get(3))?;
+    let bytes = value.as_bytes();
+
+    let mut start_byte = 0usize;
+    if start > 0 {
+        let mut remaining = usize::try_from(start).unwrap_or(usize::MAX);
+        while remaining > 0 && start_byte < bytes.len() {
+            start_byte += if skip_composing {
+                composed_character_len(&bytes[start_byte..])
+            } else {
+                utf_character_len(&bytes[start_byte..])
+            };
+            remaining -= 1;
+        }
+    }
+
+    let Some(length) = args.get(2).map(number_arg).transpose()? else {
+        return Ok(Typval::String(OxStr(bytes[start_byte..].to_vec())));
+    };
+    let requested = usize::try_from(length).unwrap_or(0);
+    let skipped = if start < 0 {
+        usize::try_from(start.unsigned_abs()).unwrap_or(usize::MAX)
+    } else {
+        0
+    };
+    let mut remaining = requested.saturating_sub(skipped);
+    let mut end = start_byte;
+    while remaining > 0 && end < bytes.len() {
+        end += if skip_composing {
+            composed_character_len(&bytes[end..])
+        } else {
+            utf_character_len(&bytes[end..])
+        };
+        remaining -= 1;
+    }
+    Ok(Typval::String(OxStr(bytes[start_byte..end].to_vec())))
 }
 
 fn strpart(args: &[Typval]) -> Result<Typval> {
     let value = string_arg(&args[0])?;
     let mut start = number_arg(&args[1])?;
     let mut length = args.get(2).map(number_arg).transpose()?.unwrap_or(i64::MAX);
-    if start < 0 { length = length.saturating_add(start); start = 0; }
-    let start = usize::try_from(start).unwrap_or(usize::MAX).min(value.as_bytes().len());
+    if start < 0 {
+        length = length.saturating_add(start);
+        start = 0;
+    }
+    let start = usize::try_from(start)
+        .unwrap_or(usize::MAX)
+        .min(value.as_bytes().len());
     if args.get(3).is_some_and(Typval::is_truthy) {
         let suffix = String::from_utf8_lossy(&value.as_bytes()[start..]);
         let mut base_count = 0i64;
         let mut end = 0usize;
         for (offset, character) in suffix.char_indices() {
             if !is_combining(character) {
-                if base_count >= length.max(0) { break; }
+                if base_count >= length.max(0) {
+                    break;
+                }
                 base_count += 1;
             }
             end = offset + character.len_utf8();
@@ -1917,12 +3394,22 @@ fn is_combining(character: char) -> bool {
     matches!(character as u32, 0x0300..=0x036f | 0x1ab0..=0x1aff | 0x1dc0..=0x1dff | 0x20d0..=0x20ff | 0xfe20..=0xfe2f)
 }
 
-fn is_regional_indicator(character: char) -> bool { matches!(character as u32, 0x1f1e6..=0x1f1ff) }
+fn is_regional_indicator(character: char) -> bool {
+    matches!(character as u32, 0x1f1e6..=0x1f1ff)
+}
 
 /// `f_printf` (`eval/strings.c`): C-style formatting over typvals. Handles
 /// `%s`, `%d`/`%i`/`%u`, `%x`/`%X`/`%o`/`%b`/`%B`, `%c`, `%f`/`%e`/`%g`
-/// families with `-`/`0`/`+` flags, width, and precision; `%%` is literal.
 /// Too few arguments is E766, leftovers are E767.
+// Upstream's printf is one giant switch over conversion characters; splitting
+// would obscure the format-spec → output mapping.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::expect_used
+)]
 fn printf_builtin(args: &[Typval]) -> Result<Typval> {
     let format = match &args[0] {
         Typval::String(text) => text.to_string_lossy().into_owned(),
@@ -1942,23 +3429,23 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
             continue;
         }
         let mut flags = String::new();
-        while matches!(source.peek(), Some('-') | Some('0') | Some('+') | Some(' ') | Some('#')) {
+        while matches!(source.peek(), Some('-' | '0' | '+' | ' ' | '#')) {
             flags.push(source.next().expect("peeked flag"));
         }
         let mut width = String::new();
-        while source.peek().is_some_and(|digit| digit.is_ascii_digit()) {
+        while source.peek().is_some_and(char::is_ascii_digit) {
             width.push(source.next().expect("peeked digit"));
         }
         let mut precision: Option<usize> = None;
         if source.peek() == Some(&'.') {
             source.next();
             let mut digits = String::new();
-            while source.peek().is_some_and(|digit| digit.is_ascii_digit()) {
+            while source.peek().is_some_and(char::is_ascii_digit) {
                 digits.push(source.next().expect("peeked digit"));
             }
             precision = Some(digits.parse().unwrap_or(0));
         }
-        while matches!(source.peek(), Some('l') | Some('h') | Some('z')) {
+        while matches!(source.peek(), Some('l' | 'h' | 'z')) {
             source.next();
         }
         let Some(conversion) = source.next() else {
@@ -1968,7 +3455,7 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
             return Err(EvalError::new(
                 "E766",
                 0,
-                format!("Insufficient arguments for printf() at {}", conversion),
+                format!("Insufficient arguments for printf() at {conversion}"),
             ));
         };
         let left = flags.contains('-');
@@ -2015,10 +3502,10 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
                     };
                     digits = format!("{prefix}{digits}");
                 }
-                if let Some(count) = precision {
-                    if digits.len() < count {
-                        digits = format!("{}{digits}", "0".repeat(count - digits.len()));
-                    }
+                if let Some(count) = precision
+                    && digits.len() < count
+                {
+                    digits = format!("{}{digits}", "0".repeat(count - digits.len()));
                 }
                 digits
             }
@@ -2026,7 +3513,9 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
                 Typval::String(text) if !text.as_bytes().is_empty() => {
                     char::from(text.as_bytes()[0]).to_string()
                 }
-                other => char::from_u32(number_arg(other)? as u32).unwrap_or('\0').to_string(),
+                other => char::from_u32(number_arg(other)? as u32)
+                    .unwrap_or('\0')
+                    .to_string(),
             },
             'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
                 // `tv_float` (`strings.c:716`) has its own error, distinct from
@@ -2034,10 +3523,21 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
                 let number = match value {
                     Typval::Float(number) => *number,
                     Typval::Number(number) => *number as f64,
-                    _ => return Err(EvalError::new("E807", 0, "Expected Float argument for printf()")),
+                    _ => {
+                        return Err(EvalError::new(
+                            "E807",
+                            0,
+                            "Expected Float argument for printf()",
+                        ));
+                    }
                 };
-                let (rendered, numeric) =
-                    format_float(conversion, number, precision, force_sign, space_for_positive);
+                let (rendered, numeric) = format_float(
+                    conversion,
+                    number,
+                    precision,
+                    force_sign,
+                    space_for_positive,
+                );
                 // `infinity_str` and `nan` both clear `zero_padding`
                 // (`strings.c:2109`, `2114`), so `%06f` of infinity pads with
                 // blanks.
@@ -2069,7 +3569,20 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
         } else if zero
             && matches!(
                 conversion,
-                'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'b' | 'B' | 'c' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G'
+                'd' | 'i'
+                    | 'u'
+                    | 'x'
+                    | 'X'
+                    | 'o'
+                    | 'b'
+                    | 'B'
+                    | 'c'
+                    | 'f'
+                    | 'F'
+                    | 'e'
+                    | 'E'
+                    | 'g'
+                    | 'G'
             )
         {
             // `strings.c:2188-2192`: padding zeroes go after the sign, and
@@ -2100,6 +3613,13 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
 /// the superfluous zeroes itself, keeping the one just after the dot. That one
 /// kept zero is why `string(1.0)` is `'1.0'` and not `'1'`, and scripts compare
 /// against it.
+// f64→usize is the integer-digit count for precision limiting; expects are
+// invariant on LowerExp output shape. Upstream printf uses the same C casts.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::expect_used
+)]
 fn format_float(
     conversion: char,
     number: f64,
@@ -2136,7 +3656,10 @@ fn format_float(
         } else {
             "+"
         };
-        return (format!("{sign}{}", if upper { "INF" } else { "inf" }), false);
+        return (
+            format!("{sign}{}", if upper { "INF" } else { "inf" }),
+            false,
+        );
     }
     if number.is_nan() {
         // Not a number has no sign, not even a forced one.
@@ -2167,7 +3690,8 @@ fn format_float(
         rendered.insert(0, if space_for_positive { ' ' } else { '+' });
     }
     if remove_trailing_zeroes {
-        rendered = strip_superfluous_zeroes(&rendered, matches!(spec, 'e' | 'E'), precision.is_some());
+        rendered =
+            strip_superfluous_zeroes(&rendered, matches!(spec, 'e' | 'E'), precision.is_some());
     }
     (rendered, true)
 }
@@ -2178,11 +3702,18 @@ fn format_float(
 /// An exponent loses its `+` and its leading zeroes unconditionally; the
 /// mantissa loses its trailing zeroes only when no precision was given, and
 /// never the one directly after the dot.
-fn strip_superfluous_zeroes(rendered: &str, exponential: bool, precision_specified: bool) -> String {
+fn strip_superfluous_zeroes(
+    rendered: &str,
+    exponential: bool,
+    precision_specified: bool,
+) -> String {
     let mut text: Vec<char> = rendered.chars().collect();
     let mut mantissa_end = text.len();
     if exponential {
-        let Some(marker) = text.iter().position(|character| matches!(character, 'e' | 'E')) else {
+        let Some(marker) = text
+            .iter()
+            .position(|character| matches!(character, 'e' | 'E'))
+        else {
             return rendered.to_owned();
         };
         let mut cursor = marker + 1;
@@ -2218,6 +3749,7 @@ fn strip_superfluous_zeroes(rendered: &str, exponential: bool, precision_specifi
 /// E806 is deliberately absent here. Upstream raises it in exactly one place,
 /// `check_can_index` (`eval.c:3225-3229`), so it is the answer for `1.0[0]`
 /// and `1.0[1:2]` and for nothing else.
+#[must_use]
 pub fn float_as_string(number: f64) -> OxStr {
     OxStr(format_float('g', number, None, false, true).0.into_bytes())
 }
@@ -2237,6 +3769,8 @@ fn vim_float_string(number: f64) -> String {
 }
 
 /// Digits of `value` in `radix`, lowercase, without prefix.
+// u64→usize: radix is ≤16, so the modulo result always fits.
+#[allow(clippy::cast_possible_truncation, clippy::expect_used)]
 fn to_radix(mut value: u64, radix: u64) -> String {
     if value == 0 {
         return "0".to_owned();
@@ -2255,29 +3789,68 @@ fn escape(args: &[Typval]) -> Result<Typval> {
     let chars = string_arg(&args[1])?;
     let mut result = Vec::with_capacity(value.as_bytes().len());
     for byte in value.as_bytes() {
-        if chars.as_bytes().contains(byte) { result.push(b'\\'); }
+        if chars.as_bytes().contains(byte) {
+            result.push(b'\\');
+        }
         result.push(*byte);
     }
     Ok(Typval::String(OxStr(result)))
 }
-
+// i64→usize: start index is .max(0) before casting, mirroring upstream.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn count(args: &[Typval]) -> Result<Typval> {
     let needle = &args[1];
     let ignore_case = args.get(2).is_some_and(Typval::is_truthy);
     let start = args.get(3).map(number_arg).transpose()?.unwrap_or(0).max(0) as usize;
     let total = match &args[0] {
-        Typval::List(values) => list_items(values)?.iter().skip(start).try_fold(0usize, |total, value| Ok::<_, EvalError>(total + usize::from(values_equal(value, needle, ignore_case, 0)?)))?,
-        Typval::Dict(values) => dict_entries(values)?.iter().skip(start).try_fold(0usize, |total, (_, value)| Ok::<_, EvalError>(total + usize::from(values_equal(value, needle, ignore_case, 0)?)))?,
-        Typval::String(value) => non_overlapping_count(value.as_bytes(), string_arg(needle)?.as_bytes()),
-        _ => return Err(EvalError::new("E706", 0, "List, Dictionary or String required")),
+        Typval::List(values) => {
+            list_items(values)?
+                .iter()
+                .skip(start)
+                .try_fold(0usize, |total, value| {
+                    Ok::<_, EvalError>(
+                        total + usize::from(values_equal(value, needle, ignore_case, 0)?),
+                    )
+                })?
+        }
+        Typval::Dict(values) => {
+            cloned_entries(values)?
+                .iter()
+                .skip(start)
+                .try_fold(0usize, |total, entry| {
+                    Ok::<_, EvalError>(
+                        total + usize::from(values_equal(&entry.value, needle, ignore_case, 0)?),
+                    )
+                })?
+        }
+        Typval::String(value) => {
+            non_overlapping_count(value.as_bytes(), string_arg(needle)?.as_bytes())
+        }
+        _ => {
+            return Err(EvalError::new(
+                "E706",
+                0,
+                "List, Dictionary or String required",
+            ));
+        }
     };
     Ok(Typval::Number(saturating_i64(total)))
 }
 
 fn extend(mut args: Vec<Typval>) -> Result<Typval> {
-    let mode = if args.len() > 2 { Some(string_arg(&args[2])?) } else { None };
-    let right = args.get(1).cloned().ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
-    let left = args.first().cloned().ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
+    let mode = if args.len() > 2 {
+        Some(string_arg(&args[2])?)
+    } else {
+        None
+    };
+    let right = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
+    let left = args
+        .first()
+        .cloned()
+        .ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
     match (&left, right) {
         (Typval::List(left_ref), Typval::List(right_ref)) => {
             let right = list_items(&right_ref)?;
@@ -2288,24 +3861,47 @@ fn extend(mut args: Vec<Typval>) -> Result<Typval> {
             Ok(args.remove(0))
         }
         (Typval::Dict(left_ref), Typval::Dict(right_ref)) => {
-            let right = dict_entries(&right_ref)?;
+            let right = cloned_entries(&right_ref)?;
             let mut left = left_ref.try_borrow_mut().map_err(|_| borrow_error())?;
             ensure_unlocked(left.lock)?;
             let mode = mode.as_ref().map_or(b"force".as_slice(), OxStr::as_bytes);
-            for (key, value) in right {
-                if let Some((_, existing)) = left.entries.iter_mut().find(|(candidate, _)| candidate == &key) {
+            for entry in right {
+                if let Some(existing) = left
+                    .entries
+                    .iter_mut()
+                    .find(|candidate| candidate.key == entry.key)
+                {
                     match mode {
                         b"keep" => {}
-                        b"error" => return Err(EvalError::new("E737", 0, format!("Key already exists: {}", key.to_string_lossy()))),
-                        b"force" => *existing = value,
+                        b"error" => {
+                            return Err(EvalError::new(
+                                "E737",
+                                0,
+                                format!("Key already exists: {}", entry.key.to_string_lossy()),
+                            ));
+                        }
+                        // `tv_dict_extend` (`typval.c:2847`): "force" checks
+                        // the existing item's value lock, then its read-only
+                        // flag — never the fixed bit.
+                        b"force" => {
+                            check_value_lock(existing.value_lock, "extend() argument")?;
+                            check_writable(existing.flags, "extend() argument")?;
+                            existing.value = entry.value;
+                        }
                         _ => return Err(EvalError::new("E475", 0, "Invalid argument")),
                     }
-                } else { left.entries.push((key, value)); }
+                } else {
+                    left.entries.push(DictEntry::new(entry.key, entry.value));
+                }
             }
             drop(left);
             Ok(args.remove(0))
         }
-        _ => Err(EvalError::new("E712", 0, "Argument of extend() must be a List or Dictionary")),
+        _ => Err(EvalError::new(
+            "E712",
+            0,
+            "Argument of extend() must be a List or Dictionary",
+        )),
     }
 }
 
@@ -2314,14 +3910,26 @@ fn get(args: &[Typval]) -> Result<Typval> {
     match &args[0] {
         Typval::List(values) => {
             let values = list_items(values)?;
-            Ok(normalize_index(values.len(), number_arg(&args[1])?).and_then(|index| values.get(index)).cloned().unwrap_or(fallback))
+            Ok(normalize_index(values.len(), number_arg(&args[1])?)
+                .and_then(|index| values.get(index))
+                .cloned()
+                .unwrap_or(fallback))
         }
-        Typval::Blob(values) => Ok(normalize_index(values.len(), number_arg(&args[1])?).and_then(|index| values.get(index)).map_or(fallback, |value| Typval::Number(i64::from(*value)))),
+        Typval::Blob(values) => Ok(normalize_index(values.len(), number_arg(&args[1])?)
+            .and_then(|index| values.get(index))
+            .map_or(fallback, |value| Typval::Number(i64::from(*value)))),
         Typval::Dict(values) => {
             let key = string_arg(&args[1])?;
-            Ok(dict_entries(values)?.into_iter().find(|(candidate, _)| candidate == &key).map_or(fallback, |(_, value)| value))
+            Ok(cloned_entries(values)?
+                .into_iter()
+                .find(|entry| entry.key == key)
+                .map_or(fallback, |entry| entry.value))
         }
-        _ => Err(EvalError::new("E896", 0, "List, Dictionary or Blob required")),
+        _ => Err(EvalError::new(
+            "E896",
+            0,
+            "List, Dictionary or Blob required",
+        )),
     }
 }
 
@@ -2341,6 +3949,7 @@ fn get(args: &[Typval]) -> Result<Typval> {
 /// lowercase the query first. The trailing comment on each line names the
 /// module that answers for the feature, or the probe that proved it.
 pub(crate) const FEATURES: &[&str] = &[
+    "diff",                // ox-editor/diffmode.rs: `:diffthis` / `:diffoff`
     "eval",                // ox-eval/eval.rs: `eval("1+2")` == 3
     "file_in_path",        // ox-eval/find_file.rs: `findfile()` honours 'path'
     "float",               // ox-eval Typval::Float: arithmetic, str2float, float2nr, sqrt, floor
@@ -2352,6 +3961,7 @@ pub(crate) const FEATURES: &[&str] = &[
     "num64",               // ox-eval Typval::Number is i64
     "nvim",                // this build targets Neovim 0.13 (ox_rpc API_LEVEL 15)
     "path_extra",          // ox-eval/find_file.rs: `**` downward and `dir;` upward search
+    "quickfix",            // ox-editor/quickfix.rs: setqflist/getqflist and :cnext
     "startuptime",         // oxvim/cli.rs implements `--startuptime`
     "textobjects",         // ox-editor: `daw` deletes a word with its white space
     "user-commands",       // the spelling upstream keeps for 5.4 compatibility
@@ -2371,8 +3981,14 @@ pub(crate) const FEATURES: &[&str] = &[
 fn has_feature(args: &[Typval]) -> Result<Typval> {
     let feature = string_arg(&args[0])?.to_string_lossy().to_ascii_lowercase();
     let supported = if let Some(version) = feature.strip_prefix("nvim-") {
-        let mut parts = version.split('.').map(|part| part.parse::<u64>().unwrap_or(u64::MAX));
-        let requested = (parts.next().unwrap_or(0), parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+        let mut parts = version
+            .split('.')
+            .map(|part| part.parse::<u64>().unwrap_or(u64::MAX));
+        let requested = (
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+        );
         requested <= (0, 13, 0) && parts.next().is_none()
     } else {
         match feature.as_str() {
@@ -2389,9 +4005,13 @@ fn has_feature(args: &[Typval]) -> Result<Typval> {
 }
 
 fn has_key(args: &[Typval]) -> Result<Typval> {
-    let Typval::Dict(values) = &args[0] else { return Err(EvalError::new("E1206", 0, "Dictionary required")); };
+    let Typval::Dict(values) = &args[0] else {
+        return Err(EvalError::new("E1206", 0, "Dictionary required"));
+    };
     let key = string_arg(&args[1])?;
-    Ok(Typval::Number(i64::from(dict_entries(values)?.iter().any(|(candidate, _)| candidate == &key))))
+    Ok(Typval::Number(i64::from(
+        cloned_entries(values)?.iter().any(|entry| entry.key == key),
+    )))
 }
 
 fn gettext(value: &Typval) -> Result<Typval> {
@@ -2399,7 +4019,11 @@ fn gettext(value: &Typval) -> Result<Typval> {
         return Err(EvalError::new("E1174", 0, "String required for argument 1"));
     };
     if text.as_bytes().is_empty() {
-        return Err(EvalError::new("E1175", 0, "Non-empty string required for argument 1"));
+        return Err(EvalError::new(
+            "E1175",
+            0,
+            "Non-empty string required for argument 1",
+        ));
     }
     Ok(Typval::String(text.clone()))
 }
@@ -2408,7 +4032,9 @@ fn hostname() -> Result<Typval> {
     let name = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|value| value.trim_end_matches(['\r', '\n']).to_owned())
         .or_else(|_| std::env::var("HOSTNAME"))
-        .map_err(|error| EvalError::new("E500", 0, format!("Cannot determine hostname: {error}")))?;
+        .map_err(|error| {
+            EvalError::new("E500", 0, format!("Cannot determine hostname: {error}"))
+        })?;
     Ok(Typval::String(OxStr::from(name.as_str())))
 }
 
@@ -2426,14 +4052,26 @@ fn slice(args: &[Typval]) -> Result<Typval> {
             Ok(Typval::Blob(value[start..end].to_vec()))
         }
         Typval::String(value) => {
-            let characters = String::from_utf8_lossy(value.as_bytes()).chars().collect::<Vec<_>>();
+            let characters = String::from_utf8_lossy(value.as_bytes())
+                .chars()
+                .collect::<Vec<_>>();
             let (start, end) = slice_bounds(characters.len(), start, end);
-            Ok(Typval::String(OxStr(characters[start..end].iter().collect::<String>().into_bytes())))
+            Ok(Typval::String(OxStr(
+                characters[start..end]
+                    .iter()
+                    .collect::<String>()
+                    .into_bytes(),
+            )))
         }
-        _ => Err(EvalError::new("E1170", 0, "Cannot use slice() with this type")),
+        _ => Err(EvalError::new(
+            "E1170",
+            0,
+            "Cannot use slice() with this type",
+        )),
     }
 }
-
+// u64→usize: unsigned_abs of an i64 index; saturating_sub bounds the result.
+#[allow(clippy::cast_possible_truncation)]
 fn slice_bounds(length: usize, start: i64, end: Option<i64>) -> (usize, usize) {
     fn bound(length: usize, index: i64) -> usize {
         if index < 0 {
@@ -2448,39 +4086,59 @@ fn slice_bounds(length: usize, start: i64, end: Option<i64>) -> (usize, usize) {
 }
 
 fn index(args: &[Typval]) -> Result<Typval> {
-    let Typval::List(values) = &args[0] else { return Err(EvalError::new("E714", 0, "List required")); };
+    let Typval::List(values) = &args[0] else {
+        return Err(EvalError::new("E714", 0, "List required"));
+    };
     let values = list_items(values)?;
     let ignore_case = args.get(3).is_some_and(Typval::is_truthy);
     let start_number = args.get(2).map(number_arg).transpose()?.unwrap_or(0);
     let start = normalize_index(values.len(), start_number).unwrap_or(values.len());
     for (index, value) in values.iter().enumerate().skip(start) {
-        if values_equal(value, &args[1], ignore_case, 0)? { return Ok(Typval::Number(saturating_i64(index))); }
+        if values_equal(value, &args[1], ignore_case, 0)? {
+            return Ok(Typval::Number(saturating_i64(index)));
+        }
     }
     Ok(Typval::Number(-1))
 }
 
 fn insert(mut args: Vec<Typval>) -> Result<Typval> {
-    let index = if args.len() > 2 { number_arg(&args[2])? } else { 0 };
-    let value = args.get(1).cloned().ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
+    let index = if args.len() > 2 {
+        number_arg(&args[2])?
+    } else {
+        0
+    };
+    let value = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
     match args.first() {
         Some(Typval::List(reference)) => {
             let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
             ensure_unlocked(data.lock)?;
             let index = if index < 0 {
-                return Err(EvalError::new("E686", 0, "Argument of insert() must be non-negative"));
+                return Err(EvalError::new(
+                    "E686",
+                    0,
+                    "Argument of insert() must be non-negative",
+                ));
             } else {
                 usize::try_from(index).unwrap_or(usize::MAX)
             };
-            if index > data.items.len() { return Err(EvalError::new("E686", 0, "List index out of range")); }
+            if index > data.items.len() {
+                return Err(EvalError::new("E686", 0, "List index out of range"));
+            }
             data.items.insert(index, value);
             drop(data);
             Ok(args.remove(0))
         }
         Some(Typval::Blob(values)) => {
             let mut values = values.clone();
-            let byte = u8::try_from(number_arg(&value)?).map_err(|_| EvalError::new("E1230", 0, "Blob value must be in range 0 to 255"))?;
+            let byte = u8::try_from(number_arg(&value)?)
+                .map_err(|_| EvalError::new("E1230", 0, "Blob value must be in range 0 to 255"))?;
             let index = usize::try_from(index.max(0)).unwrap_or(usize::MAX);
-            if index > values.len() { return Err(EvalError::new("E979", 0, "Blob index out of range")); }
+            if index > values.len() {
+                return Err(EvalError::new("E979", 0, "Blob index out of range"));
+            }
             values.insert(index, byte);
             Ok(Typval::Blob(values))
         }
@@ -2488,51 +4146,99 @@ fn insert(mut args: Vec<Typval>) -> Result<Typval> {
     }
 }
 
-enum Projection { Items, Keys, Values }
+enum Projection {
+    Items,
+    Keys,
+    Values,
+}
 
-fn dict_projection(value: &Typval, projection: Projection) -> Result<Typval> {
-    let Typval::Dict(values) = value else { return Err(EvalError::new("E1206", 0, "Dictionary required")); };
-    Ok(Typval::list(dict_entries(values)?.iter().map(|(key, value)| match projection {
-        Projection::Items => Typval::list(vec![Typval::String(key.clone()), value.clone()]),
-        Projection::Keys => Typval::String(key.clone()),
-        Projection::Values => value.clone(),
-    }).collect()))
+fn dict_projection(value: &Typval, projection: &Projection) -> Result<Typval> {
+    let Typval::Dict(values) = value else {
+        return Err(EvalError::new("E1206", 0, "Dictionary required"));
+    };
+    Ok(Typval::list(
+        cloned_entries(values)?
+            .iter()
+            .map(|entry| match projection {
+                Projection::Items => {
+                    Typval::list(vec![Typval::String(entry.key.clone()), entry.value.clone()])
+                }
+                Projection::Keys => Typval::String(entry.key.clone()),
+                Projection::Values => entry.value.clone(),
+            })
+            .collect(),
+    ))
 }
 
 fn extremum(value: &Typval, maximum: bool) -> Result<Typval> {
     let values = match value {
         Typval::List(values) => list_items(values)?,
-        Typval::Dict(values) => dict_entries(values)?.into_iter().map(|(_, value)| value).collect(),
+        Typval::Dict(values) => cloned_entries(values)?
+            .into_iter()
+            .map(|entry| entry.value)
+            .collect(),
         _ => return Err(EvalError::new("E712", 0, "List or Dictionary required")),
     };
-    if values.is_empty() { return Ok(Typval::Number(0)); }
+    if values.is_empty() {
+        return Ok(Typval::Number(0));
+    }
     let mut selected = values[0].clone();
     for value in &values[1..] {
         let ordering = compare_values(&selected, value, 0)?;
-        if (maximum && ordering == Ordering::Less) || (!maximum && ordering == Ordering::Greater) { selected = value.clone(); }
+        if (maximum && ordering == Ordering::Less) || (!maximum && ordering == Ordering::Greater) {
+            selected = value.clone();
+        }
     }
     Ok(selected)
 }
 
+/// `f_range` (`eval/funcs.c:4944-4978`): E726 for a zero stride, E727 when
+/// the start lies past the end in the stride's direction, otherwise one
+/// Number per step. Upstream only hints the length from
+/// `(end - start) / stride`, so there is no item cap: the count is
+/// precomputed and reserved once, and a reservation too large for memory
+/// answers E1240 instead of aborting. `checked_add` still ends the walk
+/// when a step would overflow.
 fn range(args: &[Typval]) -> Result<Typval> {
     let (start, end, stride) = match args.len() {
         1 => (0, number_arg(&args[0])? - 1, 1),
         2 => (number_arg(&args[0])?, number_arg(&args[1])?, 1),
-        _ => (number_arg(&args[0])?, number_arg(&args[1])?, number_arg(&args[2])?),
+        _ => (
+            number_arg(&args[0])?,
+            number_arg(&args[1])?,
+            number_arg(&args[2])?,
+        ),
     };
-    if stride == 0 { return Err(EvalError::new("E726", 0, "Stride is zero")); }
+    if stride == 0 {
+        return Err(EvalError::new("E726", 0, "Stride is zero"));
+    }
+    if (stride > 0 && end.wrapping_add(1) < start) || (stride < 0 && end.wrapping_sub(1) > start) {
+        return Err(EvalError::new("E727", 0, "Start past end"));
+    }
+    let span = i128::from(end) - i128::from(start);
+    let step = i128::from(stride);
+    let steps = if step > 0 {
+        span.div_euclid(step)
+    } else {
+        (-span).div_euclid(-step)
+    };
+    let count = usize::try_from(steps.max(0).saturating_add(1)).unwrap_or(usize::MAX);
     let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| EvalError::new("E1240", 0, "Resulting List too long"))?;
     let mut current = start;
     while (stride > 0 && current <= end) || (stride < 0 && current >= end) {
         values.push(Typval::Number(current));
-        let Some(next) = current.checked_add(stride) else { break };
+        let Some(next) = current.checked_add(stride) else {
+            break;
+        };
         current = next;
-        if values.len() > 1_000_000 { return Err(EvalError::new("E1240", 0, "Resulting List too long")); }
     }
     Ok(Typval::list(values))
 }
 
-fn remove(args: Vec<Typval>) -> Result<Typval> {
+fn remove(args: &[Typval]) -> Result<Typval> {
     let first = number_arg(&args[1])?;
     let last = args.get(2).map(number_arg).transpose()?;
     let dict_key = string_arg(&args[1]).ok();
@@ -2540,40 +4246,69 @@ fn remove(args: Vec<Typval>) -> Result<Typval> {
         Some(Typval::List(reference)) => {
             let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
             ensure_unlocked(data.lock)?;
-            let index = normalize_index(data.items.len(), first).ok_or_else(|| EvalError::new("E684", 0, "List index out of range"))?;
+            let index = normalize_index(data.items.len(), first)
+                .ok_or_else(|| EvalError::new("E684", 0, "List index out of range"))?;
             if let Some(last) = last {
-                let end = normalize_index(data.items.len(), last).ok_or_else(|| EvalError::new("E684", 0, "List index out of range"))?;
-                if end < index { return Ok(Typval::list(vec![])); }
+                let end = normalize_index(data.items.len(), last)
+                    .ok_or_else(|| EvalError::new("E684", 0, "List index out of range"))?;
+                if end < index {
+                    return Ok(Typval::list(vec![]));
+                }
                 Ok(Typval::list(data.items.drain(index..=end).collect()))
-            } else { Ok(data.items.remove(index)) }
+            } else {
+                Ok(data.items.remove(index))
+            }
         }
         Some(Typval::Blob(values)) => {
             let mut values = values.clone();
-            let index = normalize_index(values.len(), first).ok_or_else(|| EvalError::new("E979", 0, "Blob index out of range"))?;
+            let index = normalize_index(values.len(), first)
+                .ok_or_else(|| EvalError::new("E979", 0, "Blob index out of range"))?;
             if let Some(last) = last {
-                let end = normalize_index(values.len(), last).ok_or_else(|| EvalError::new("E979", 0, "Blob index out of range"))?;
+                let end = normalize_index(values.len(), last)
+                    .ok_or_else(|| EvalError::new("E979", 0, "Blob index out of range"))?;
                 Ok(Typval::Blob(values.drain(index..=end).collect()))
-            } else { Ok(Typval::Number(i64::from(values.remove(index)))) }
+            } else {
+                Ok(Typval::Number(i64::from(values.remove(index))))
+            }
         }
         Some(Typval::Dict(reference)) => {
-            let key = dict_key.ok_or_else(|| EvalError::new("E731", 0, "Dictionary key must be a String"))?;
+            let key = dict_key
+                .ok_or_else(|| EvalError::new("E731", 0, "Dictionary key must be a String"))?;
             let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
             ensure_unlocked(data.lock)?;
-            let index = data.entries.iter().position(|(candidate, _)| candidate == &key).ok_or_else(|| EvalError::new("E716", 0, "Key not present in Dictionary"))?;
-            Ok(data.entries.remove(index).1)
+            let index = data
+                .entries
+                .iter()
+                .position(|entry| entry.key == key)
+                .ok_or_else(|| EvalError::new("E716", 0, "Key not present in Dictionary"))?;
+            // `tv_dict_remove` (`typval.c:3439`): fixed, then read-only.
+            check_deletable(&data.entries[index], "remove() argument")?;
+            Ok(data.entries.remove(index).value)
         }
-        _ => Err(EvalError::new("E896", 0, "List, Dictionary or Blob required")),
+        _ => Err(EvalError::new(
+            "E896",
+            0,
+            "List, Dictionary or Blob required",
+        )),
     }
 }
 
 fn uniq(mut args: Vec<Typval>) -> Result<Typval> {
-    let Some(container @ Typval::List(_)) = args.get_mut(0).cloned() else { return Err(EvalError::new("E714", 0, "List required")); };
-    let Typval::List(reference) = &container else { return Err(EvalError::new("E714", 0, "List required")); };
+    let Some(container @ Typval::List(_)) = args.get_mut(0).cloned() else {
+        return Err(EvalError::new("E714", 0, "List required"));
+    };
+    let Typval::List(reference) = &container else {
+        return Err(EvalError::new("E714", 0, "List required"));
+    };
     let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
     ensure_unlocked(data.lock)?;
     let mut index = 1;
     while index < data.items.len() {
-        if values_equal(&data.items[index - 1], &data.items[index], false, 0)? { data.items.remove(index); } else { index += 1; }
+        if values_equal(&data.items[index - 1], &data.items[index], false, 0)? {
+            data.items.remove(index);
+        } else {
+            index += 1;
+        }
     }
     drop(data);
     Ok(container)
@@ -2582,33 +4317,67 @@ fn uniq(mut args: Vec<Typval>) -> Result<Typval> {
 fn shallow_copy(value: &Typval) -> Result<Typval> {
     match value {
         Typval::List(reference) => Ok(Typval::list(list_items(reference)?)),
-        Typval::Dict(reference) => Ok(Typval::dict(dict_entries(reference)?)),
+        // `tv_dict_copy` builds every item through `tv_dict_item_copy`, so a
+        // copy drops the source's entry flags and value lock.
+        Typval::Dict(reference) => Ok(Typval::dict_with_entries(
+            cloned_entries(reference)?
+                .iter()
+                .map(DictEntry::copy_cloned)
+                .collect(),
+        )),
         _ => Ok(value.clone()),
     }
 }
 
 fn flatten(args: &[Typval], mutate: bool) -> Result<Typval> {
-    let Typval::List(reference) = &args[0] else { return Err(EvalError::new("E686", 0, "Argument of flatten() must be a List")); };
-    if mutate { ensure_unlocked(reference.try_borrow().map_err(|_| borrow_error())?.lock)?; }
+    let Typval::List(reference) = &args[0] else {
+        return Err(EvalError::new(
+            "E686",
+            0,
+            "Argument of flatten() must be a List",
+        ));
+    };
+    if mutate {
+        ensure_unlocked(reference.try_borrow().map_err(|_| borrow_error())?.lock)?;
+    }
     let maximum = args.get(1).map(number_arg).transpose()?.unwrap_or(i64::MAX);
     let mut output = Vec::new();
     flatten_into(reference, maximum, 0, &mut HashSet::new(), &mut output)?;
     if mutate {
-        reference.try_borrow_mut().map_err(|_| borrow_error())?.items = output;
+        reference
+            .try_borrow_mut()
+            .map_err(|_| borrow_error())?
+            .items = output;
         Ok(args[0].clone())
     } else {
         Ok(Typval::list(output))
     }
 }
 
-fn flatten_into(reference: &ox_types::ListRef, maximum: i64, depth: usize, active: &mut HashSet<usize>, output: &mut Vec<Typval>) -> Result<()> {
-    if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E724", 0, "too much recursion")); }
+fn flatten_into(
+    reference: &ox_types::ListRef,
+    maximum: i64,
+    depth: usize,
+    active: &mut HashSet<usize>,
+    output: &mut Vec<Typval>,
+) -> Result<()> {
+    if depth >= MAX_CONTAINER_DEPTH {
+        return Err(EvalError::new("E724", 0, "too much recursion"));
+    }
     let pointer = Rc::as_ptr(reference) as usize;
-    if !active.insert(pointer) { return Err(EvalError::new("E724", 0, "too much recursion in flatten()")); }
+    if !active.insert(pointer) {
+        return Err(EvalError::new("E724", 0, "too much recursion in flatten()"));
+    }
     for value in list_items(reference)? {
         if let Typval::List(nested) = &value {
-            if maximum > 0 { flatten_into(nested, maximum - 1, depth + 1, active, output)?; } else { output.push(value); }
-        } else { output.push(value); }
+            if maximum > 0 {
+                flatten_into(nested, maximum - 1, depth + 1, active, output)?;
+            } else {
+                output.push(value);
+            }
+        } else {
+            output.push(value);
+        }
     }
     active.remove(&pointer);
     Ok(())
@@ -2621,27 +4390,49 @@ fn deep_copy(value: &Typval) -> Result<Typval> {
         dicts: &mut HashMap<usize, ox_types::DictRef>,
         depth: usize,
     ) -> Result<Typval> {
-        if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E698", 0, "variable nested too deep for making a copy")); }
+        if depth >= MAX_CONTAINER_DEPTH {
+            return Err(EvalError::new(
+                "E698",
+                0,
+                "variable nested too deep for making a copy",
+            ));
+        }
         match value {
             Typval::List(source) => {
                 let key = Rc::as_ptr(source) as usize;
-                if let Some(existing) = lists.get(&key) { return Ok(Typval::List(existing.clone())); }
-                let Typval::List(target) = Typval::list(vec![]) else { return Err(EvalError::new("E698", 0, "copy failed")); };
+                if let Some(existing) = lists.get(&key) {
+                    return Ok(Typval::List(existing.clone()));
+                }
+                let Typval::List(target) = Typval::list(vec![]) else {
+                    return Err(EvalError::new("E698", 0, "copy failed"));
+                };
                 lists.insert(key, target.clone());
                 let source_items = list_items(source)?;
                 let mut items = Vec::with_capacity(source_items.len());
-                for item in &source_items { items.push(copy(item, lists, dicts, depth + 1)?); }
+                for item in &source_items {
+                    items.push(copy(item, lists, dicts, depth + 1)?);
+                }
                 target.try_borrow_mut().map_err(|_| borrow_error())?.items = items;
                 Ok(Typval::List(target))
             }
             Typval::Dict(source) => {
                 let key = Rc::as_ptr(source) as usize;
-                if let Some(existing) = dicts.get(&key) { return Ok(Typval::Dict(existing.clone())); }
-                let Typval::Dict(target) = Typval::dict(vec![]) else { return Err(EvalError::new("E698", 0, "copy failed")); };
+                if let Some(existing) = dicts.get(&key) {
+                    return Ok(Typval::Dict(existing.clone()));
+                }
+                let Typval::Dict(target) = Typval::dict(vec![]) else {
+                    return Err(EvalError::new("E698", 0, "copy failed"));
+                };
                 dicts.insert(key, target.clone());
-                let source_entries = dict_entries(source)?;
+                let source_entries = cloned_entries(source)?;
                 let mut entries = Vec::with_capacity(source_entries.len());
-                for (name, item) in &source_entries { entries.push((name.clone(), copy(item, lists, dicts, depth + 1)?)); }
+                for source_entry in &source_entries {
+                    // Fresh entries carry no flags or value lock.
+                    entries.push(DictEntry::new(
+                        source_entry.key.clone(),
+                        copy(&source_entry.value, lists, dicts, depth + 1)?,
+                    ));
+                }
                 target.try_borrow_mut().map_err(|_| borrow_error())?.entries = entries;
                 Ok(Typval::Dict(target))
             }
@@ -2661,35 +4452,56 @@ fn deep_copy(value: &Typval) -> Result<Typval> {
 /// # Errors
 /// `E742` when a container in the traversal is already borrowed.
 pub fn lock_value(value: &Typval, depth: i32, lock: bool) -> Result<()> {
-    fn apply(value: &Typval, depth: i32, lock: bool, seen: &mut HashSet<(usize, u8)>) -> Result<()> {
+    fn apply(
+        value: &Typval,
+        depth: i32,
+        lock: bool,
+        seen: &mut HashSet<(usize, u8)>,
+    ) -> Result<()> {
         if depth == 0 {
             return Ok(());
         }
-        let recurse = depth < 0 || depth > 1;
+        let recurse = !(0..=1).contains(&depth);
         let state = ox_types::LockState {
-            scope: if recurse { ox_types::LockScope::Deep } else { ox_types::LockScope::Shallow },
+            scope: if recurse {
+                ox_types::LockScope::Deep
+            } else {
+                ox_types::LockScope::Shallow
+            },
             locked: lock,
         };
         match value {
             Typval::List(reference) => {
                 let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_LIST);
-                if !seen.insert(key) { return Ok(()); }
+                if !seen.insert(key) {
+                    return Ok(());
+                }
                 let items = {
                     let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
                     data.lock = state;
                     data.items.clone()
                 };
-                if recurse { for item in &items { apply(item, depth - 1, lock, seen)?; } }
+                if recurse {
+                    for item in &items {
+                        apply(item, depth - 1, lock, seen)?;
+                    }
+                }
             }
             Typval::Dict(reference) => {
                 let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_DICT);
-                if !seen.insert(key) { return Ok(()); }
+                if !seen.insert(key) {
+                    return Ok(());
+                }
                 let entries = {
                     let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
                     data.lock = state;
                     data.entries.clone()
                 };
-                if recurse { for (_, item) in &entries { apply(item, depth - 1, lock, seen)?; } }
+                if recurse {
+                    for entry in &entries {
+                        apply(&entry.value, depth - 1, lock, seen)?;
+                    }
+                }
             }
             _ => {}
         }
@@ -2699,6 +4511,11 @@ pub fn lock_value(value: &Typval, depth: i32, lock: bool) -> Result<()> {
 }
 
 /// Return the encoded lock state: 0 unlocked, 1 direct, 2 shallow, 3 deep.
+///
+/// # Errors
+///
+/// Returns `EvalError` if the list or dictionary is already borrowed and
+/// cannot be accessed.
 pub fn is_locked_value(value: &Typval) -> Result<Typval> {
     let lock = match value {
         Typval::List(reference) => reference.try_borrow().map_err(|_| borrow_error())?.lock,
@@ -2715,26 +4532,51 @@ pub fn is_locked_value(value: &Typval) -> Result<Typval> {
 }
 
 fn blob2list(value: &Typval) -> Result<Typval> {
-    let Typval::Blob(values) = value else { return Err(EvalError::new("E972", 0, "Blob required")); };
-    Ok(Typval::list(values.iter().map(|value| Typval::Number(i64::from(*value))).collect()))
+    let Typval::Blob(values) = value else {
+        return Err(EvalError::new("E972", 0, "Blob required"));
+    };
+    Ok(Typval::list(
+        values
+            .iter()
+            .map(|value| Typval::Number(i64::from(*value)))
+            .collect(),
+    ))
 }
 
 fn list2blob(value: &Typval) -> Result<Typval> {
-    let Typval::List(values) = value else { return Err(EvalError::new("E714", 0, "List required")); };
-    list_items(values)?.iter().map(|value| u8::try_from(number_arg(value)?).map_err(|_| EvalError::new("E1230", 0, "Blob value must be in range 0 to 255"))).collect::<Result<Vec<_>>>().map(Typval::Blob)
+    let Typval::List(values) = value else {
+        return Err(EvalError::new("E714", 0, "List required"));
+    };
+    list_items(values)?
+        .iter()
+        .map(|value| {
+            u8::try_from(number_arg(value)?)
+                .map_err(|_| EvalError::new("E1230", 0, "Blob value must be in range 0 to 255"))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Typval::Blob)
 }
 
+// i64→u8: upstream's non-utf8 list2str truncates each number to a byte.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn list2str(args: &[Typval]) -> Result<Typval> {
-    let Typval::List(values) = &args[0] else { return Err(EvalError::new("E714", 0, "List required")); };
+    let Typval::List(values) = &args[0] else {
+        return Err(EvalError::new("E714", 0, "List required"));
+    };
     let utf8 = args.get(1).is_some_and(Typval::is_truthy);
     let mut output = Vec::new();
     for value in list_items(values)? {
         let number = number_arg(&value)?;
         if utf8 {
-            let character = u32::try_from(number).ok().and_then(char::from_u32).ok_or_else(|| EvalError::new("E1280", 0, "Illegal character code"))?;
+            let character = u32::try_from(number)
+                .ok()
+                .and_then(char::from_u32)
+                .ok_or_else(|| EvalError::new("E1280", 0, "Illegal character code"))?;
             let mut encoded = [0; 4];
             output.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
-        } else { output.push(number as u8); }
+        } else {
+            output.push(number as u8);
+        }
     }
     Ok(Typval::String(OxStr(output)))
 }
@@ -2743,26 +4585,101 @@ fn str2list(args: &[Typval]) -> Result<Typval> {
     let value = string_arg(&args[0])?;
     let utf8 = args.get(1).is_some_and(Typval::is_truthy);
     let values = if utf8 {
-        String::from_utf8_lossy(value.as_bytes()).chars().map(|character| Typval::Number(i64::from(u32::from(character)))).collect()
-    } else { value.as_bytes().iter().map(|byte| Typval::Number(i64::from(*byte))).collect() };
+        String::from_utf8_lossy(value.as_bytes())
+            .chars()
+            .map(|character| Typval::Number(i64::from(u32::from(character))))
+            .collect()
+    } else {
+        value
+            .as_bytes()
+            .iter()
+            .map(|byte| Typval::Number(i64::from(*byte)))
+            .collect()
+    };
     Ok(Typval::list(values))
 }
 
 fn char2nr(args: &[Typval]) -> Result<Typval> {
     let value = string_arg(&args[0])?;
-    if value.as_bytes().is_empty() { return Ok(Typval::Number(0)); }
-    let utf8 = !args.get(1).is_some_and(|value| !value.is_truthy());
-    let number = if utf8 { String::from_utf8_lossy(value.as_bytes()).chars().next().map_or(0, |character| i64::from(u32::from(character))) } else { i64::from(value.as_bytes()[0]) };
+    if value.as_bytes().is_empty() {
+        return Ok(Typval::Number(0));
+    }
+    let utf8 = args.get(1).is_none_or(ox_types::Typval::is_truthy);
+    let number = if utf8 {
+        String::from_utf8_lossy(value.as_bytes())
+            .chars()
+            .next()
+            .map_or(0, |character| i64::from(u32::from(character)))
+    } else {
+        i64::from(value.as_bytes()[0])
+    };
     Ok(Typval::Number(number))
 }
 
+// Neovim accepts the historical 1-6 byte UTF-8 range here, not only Unicode
+// scalar values, because keycode translation still consumes that byte form.
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "the non-UTF-8 form intentionally truncates to one byte"
+)]
 fn nr2char(args: &[Typval]) -> Result<Typval> {
     let number = number_arg(&args[0])?;
-    let utf8 = !args.get(1).is_some_and(|value| !value.is_truthy());
-    if !utf8 { return Ok(Typval::String(OxStr(vec![number as u8]))); }
-    let scalar = u32::try_from(number).ok().and_then(char::from_u32).ok_or_else(|| EvalError::new("E1280", 0, "Illegal character code"))?;
-    let mut buffer = [0; 4];
-    Ok(Typval::String(OxStr(scalar.encode_utf8(&mut buffer).as_bytes().to_vec())))
+    if number < 0 {
+        return Err(EvalError::new(
+            "E5070",
+            0,
+            "Character number must not be less than zero",
+        ));
+    }
+    if number > i64::from(i32::MAX) {
+        return Err(EvalError::new(
+            "E5071",
+            0,
+            format!(
+                "Character number must not be greater than INT_MAX ({})",
+                i32::MAX
+            ),
+        ));
+    }
+    let utf8 = args.get(1).is_none_or(ox_types::Typval::is_truthy);
+    if !utf8 {
+        return Ok(Typval::String(OxStr(vec![number as u8])));
+    }
+    let number =
+        u32::try_from(number).map_err(|_| EvalError::new("E1280", 0, "Illegal character code"))?;
+    let byte = |value: u32| value.to_le_bytes()[0];
+    let bytes = match number {
+        0..0x80 => vec![byte(number)],
+        0x80..0x800 => vec![byte(0xc0 + (number >> 6)), byte(0x80 + (number & 0x3f))],
+        0x800..0x1_0000 => vec![
+            byte(0xe0 + (number >> 12)),
+            byte(0x80 + ((number >> 6) & 0x3f)),
+            byte(0x80 + (number & 0x3f)),
+        ],
+        0x1_0000..0x20_0000 => vec![
+            byte(0xf0 + (number >> 18)),
+            byte(0x80 + ((number >> 12) & 0x3f)),
+            byte(0x80 + ((number >> 6) & 0x3f)),
+            byte(0x80 + (number & 0x3f)),
+        ],
+        0x20_0000..0x400_0000 => vec![
+            byte(0xf8 + (number >> 24)),
+            byte(0x80 + ((number >> 18) & 0x3f)),
+            byte(0x80 + ((number >> 12) & 0x3f)),
+            byte(0x80 + ((number >> 6) & 0x3f)),
+            byte(0x80 + (number & 0x3f)),
+        ],
+        _ => vec![
+            byte(0xfc + (number >> 30)),
+            byte(0x80 + ((number >> 24) & 0x3f)),
+            byte(0x80 + ((number >> 18) & 0x3f)),
+            byte(0x80 + ((number >> 12) & 0x3f)),
+            byte(0x80 + ((number >> 6) & 0x3f)),
+            byte(0x80 + (number & 0x3f)),
+        ],
+    };
+    Ok(Typval::String(OxStr(bytes)))
 }
 
 fn str2nr(args: &[Typval]) -> Result<Typval> {
@@ -2775,7 +4692,7 @@ fn str2nr(args: &[Typval]) -> Result<Typval> {
         return Err(EvalError::new("E474", 0, "Invalid argument"));
     }
     let quoted = args.get(2).is_some_and(Typval::is_truthy);
-    let number = parse_vim_number(value.as_bytes(), base, quoted)?;
+    let number = parse_vim_number(value.as_bytes(), base, quoted);
     Ok(Typval::Number(number))
 }
 
@@ -2793,13 +4710,16 @@ fn str2float(value: &Typval) -> Result<Typval> {
     let number = string2float(bytes);
     // Upstream multiplies by -1, which flips the sign of a zero and leaves a
     // NaN a NaN: `str2float('-')` is `-0.0` and `str2float('-nan')` is `nan`.
-    Ok(Typval::Float(if negative { number * -1.0 } else { number }))
+    Ok(Typval::Float(if negative { -number } else { number }))
 }
 
 /// `skipwhite` (`charset.c`), where `ascii_iswhite` is a space or a tab and
 /// nothing else — a newline or a form feed stops it.
 fn skip_white(bytes: &[u8]) -> &[u8] {
-    let end = bytes.iter().position(|byte| !matches!(byte, b' ' | b'\t')).unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t'))
+        .unwrap_or(bytes.len());
     &bytes[end..]
 }
 
@@ -2834,9 +4754,13 @@ fn strtod(bytes: &[u8]) -> f64 {
         _ => (false, bytes),
     };
     let hexadecimal = rest.len() > 2 && rest[0] == b'0' && matches!(rest[1], b'x' | b'X');
-    let magnitude = if hexadecimal { hex_float_prefix(&rest[2..]) } else { None }
-        .or_else(|| decimal_float_prefix(rest))
-        .unwrap_or(0.0);
+    let magnitude = if hexadecimal {
+        hex_float_prefix(&rest[2..])
+    } else {
+        None
+    }
+    .or_else(|| decimal_float_prefix(rest))
+    .unwrap_or(0.0);
     if negative { -magnitude } else { magnitude }
 }
 
@@ -2846,19 +4770,33 @@ fn strtod(bytes: &[u8]) -> f64 {
 fn decimal_float_prefix(bytes: &[u8]) -> Option<f64> {
     let mut end = 0;
     let mut digits = 0;
-    while bytes.get(end).is_some_and(u8::is_ascii_digit) { end += 1; digits += 1; }
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+        digits += 1;
+    }
     if bytes.get(end) == Some(&b'.') {
         end += 1;
-        while bytes.get(end).is_some_and(u8::is_ascii_digit) { end += 1; digits += 1; }
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+            digits += 1;
+        }
     }
-    if digits == 0 { return None; }
+    if digits == 0 {
+        return None;
+    }
     if matches!(bytes.get(end), Some(b'e' | b'E')) {
         let mut cursor = end + 1;
-        if matches!(bytes.get(cursor), Some(b'+' | b'-')) { cursor += 1; }
+        if matches!(bytes.get(cursor), Some(b'+' | b'-')) {
+            cursor += 1;
+        }
         let exponent = cursor;
-        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) { cursor += 1; }
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
         // An `e` with no digits after it is not part of the number.
-        if cursor > exponent { end = cursor; }
+        if cursor > exponent {
+            end = cursor;
+        }
     }
     std::str::from_utf8(&bytes[..end]).ok()?.parse().ok()
 }
@@ -2866,11 +4804,16 @@ fn decimal_float_prefix(bytes: &[u8]) -> Option<f64> {
 /// `0x` already consumed: `[0-9a-f]*(\.[0-9a-f]*)?([pP][+-]?[0-9]+)?` with at
 /// least one significand digit. The value is assembled by scaling rather than
 /// parsed, since Rust has no hexadecimal float literal.
+// u32→i32: digit is 0-9 from to_digit(10), always fits in i32.
+#[allow(clippy::cast_possible_wrap)]
 fn hex_float_prefix(bytes: &[u8]) -> Option<f64> {
     let mut cursor = 0;
     let mut value = 0.0_f64;
     let mut digits = 0;
-    while let Some(digit) = bytes.get(cursor).and_then(|byte| (*byte as char).to_digit(16)) {
+    while let Some(digit) = bytes
+        .get(cursor)
+        .and_then(|byte| (*byte as char).to_digit(16))
+    {
         value = value * 16.0 + f64::from(digit);
         cursor += 1;
         digits += 1;
@@ -2878,31 +4821,43 @@ fn hex_float_prefix(bytes: &[u8]) -> Option<f64> {
     let mut exponent = 0i32;
     if bytes.get(cursor) == Some(&b'.') {
         cursor += 1;
-        while let Some(digit) = bytes.get(cursor).and_then(|byte| (*byte as char).to_digit(16)) {
+        while let Some(digit) = bytes
+            .get(cursor)
+            .and_then(|byte| (*byte as char).to_digit(16))
+        {
             value = value * 16.0 + f64::from(digit);
             cursor += 1;
             digits += 1;
             exponent -= 4;
         }
     }
-    if digits == 0 { return None; }
+    if digits == 0 {
+        return None;
+    }
     if matches!(bytes.get(cursor), Some(b'p' | b'P')) {
         let mut scan = cursor + 1;
         let negative = bytes.get(scan) == Some(&b'-');
-        if matches!(bytes.get(scan), Some(b'+' | b'-')) { scan += 1; }
+        if matches!(bytes.get(scan), Some(b'+' | b'-')) {
+            scan += 1;
+        }
         let start = scan;
         let mut binary = 0i32;
-        while let Some(digit) = bytes.get(scan).and_then(|byte| (*byte as char).to_digit(10)) {
+        while let Some(digit) = bytes
+            .get(scan)
+            .and_then(|byte| (*byte as char).to_digit(10))
+        {
             binary = binary.saturating_mul(10).saturating_add(digit as i32);
             scan += 1;
         }
-        if scan > start { exponent += if negative { -binary } else { binary }; }
+        if scan > start {
+            exponent += if negative { -binary } else { binary };
+        }
     }
     Some(value * 2.0_f64.powi(exponent))
 }
 
-/// "str2nr()" digit conversion following upstream `vim_str2nr`
-/// (charset.c:1219-1300) with the STR2NR_FORCE flag set by `f_str2nr`
+/// "`str2nr()`" digit conversion following upstream `vim_str2nr`
+/// (charset.c:1219-1300) with the `STR2NR_FORCE` flag set by `f_str2nr`
 /// (strings.c:2589-2633).
 ///
 /// Whitespace is skipped before the optional sign and again after it, so
@@ -2910,19 +4865,42 @@ fn hex_float_prefix(bytes: &[u8]) -> Option<f64> {
 /// for 2, "0o"/"0O" for 8) is consumed as a prefix only when a digit valid in
 /// that base follows it. Base 10 has no prefixes and is parsed as plain
 /// decimal, so `str2nr("0xff")` is `0`. Text after the number is ignored.
-fn parse_vim_number(bytes: &[u8], base: i64, quoted: bool) -> Result<i64> {
-    let mut digits: Vec<u8> = bytes.iter().copied().skip_while(u8::is_ascii_whitespace).collect();
+// i64→u32: base is validated as 2/8/10/16 by the caller before reaching here.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn parse_vim_number(bytes: &[u8], base: i64, quoted: bool) -> i64 {
+    let mut digits: Vec<u8> = bytes
+        .iter()
+        .copied()
+        .skip_while(u8::is_ascii_whitespace)
+        .collect();
     let negative = digits.first() == Some(&b'-');
     if matches!(digits.first(), Some(b'-' | b'+')) {
         digits.drain(..1);
-        while digits.first().is_some_and(u8::is_ascii_whitespace) { digits.remove(0); }
+        while digits.first().is_some_and(u8::is_ascii_whitespace) {
+            digits.remove(0);
+        }
     }
     let digits: &[u8] = &digits;
     // STR2NR_FORCE: skip the base marker only when a valid digit follows it.
     let digits = match base {
-        16 if digits.len() > 2 && (digits.starts_with(b"0x") || digits.starts_with(b"0X")) && digits[2].is_ascii_hexdigit() => &digits[2..],
-        2 if digits.len() > 2 && (digits.starts_with(b"0b") || digits.starts_with(b"0B")) && matches!(digits[2], b'0' | b'1') => &digits[2..],
-        8 if digits.len() > 2 && (digits.starts_with(b"0o") || digits.starts_with(b"0O")) && matches!(digits[2], b'0'..=b'7') => &digits[2..],
+        16 if digits.len() > 2
+            && (digits.starts_with(b"0x") || digits.starts_with(b"0X"))
+            && digits[2].is_ascii_hexdigit() =>
+        {
+            &digits[2..]
+        }
+        2 if digits.len() > 2
+            && (digits.starts_with(b"0b") || digits.starts_with(b"0B"))
+            && matches!(digits[2], b'0' | b'1') =>
+        {
+            &digits[2..]
+        }
+        8 if digits.len() > 2
+            && (digits.starts_with(b"0o") || digits.starts_with(b"0O"))
+            && matches!(digits[2], b'0'..=b'7') =>
+        {
+            &digits[2..]
+        }
         _ => digits,
     };
     let normalized;
@@ -2931,60 +4909,129 @@ fn parse_vim_number(bytes: &[u8], base: i64, quoted: bool) -> Result<i64> {
             let mut output = Vec::with_capacity(digits.len());
             let mut index = 0;
             while index < digits.len() {
-                if digits[index] == b'\'' && !output.is_empty() && digits.get(index + 1).is_some_and(|byte| (*byte as char).to_digit(base as u32).is_some()) { index += 1; continue; }
+                if digits[index] == b'\''
+                    && !output.is_empty()
+                    && digits
+                        .get(index + 1)
+                        .is_some_and(|byte| (*byte as char).is_digit(base as u32))
+                {
+                    index += 1;
+                    continue;
+                }
                 output.push(digits[index]);
                 index += 1;
             }
             output
         };
         normalized.as_slice()
-    } else { digits };
+    } else {
+        digits
+    };
     let magnitude = parse_integer_prefix(digits, base as u32).unwrap_or(0);
-    Ok(if negative { magnitude.saturating_neg() } else { magnitude })
+    if negative {
+        magnitude.saturating_neg()
+    } else {
+        magnitude
+    }
 }
 
 fn parse_integer_prefix(bytes: &[u8], base: u32) -> Option<i64> {
     let mut value = 0i64;
     let mut seen = false;
     for byte in bytes {
-        let Some(digit) = (*byte as char).to_digit(base) else { break };
+        let Some(digit) = (*byte as char).to_digit(base) else {
+            break;
+        };
         seen = true;
-        value = value.saturating_mul(i64::from(base)).saturating_add(i64::from(digit));
+        value = value
+            .saturating_mul(i64::from(base))
+            .saturating_add(i64::from(digit));
     }
     seen.then_some(value)
 }
 
 fn json_encode(value: &Typval) -> Result<Typval> {
-    fn encode(value: &Typval, depth: usize, active: &mut HashSet<(usize, u8)>, output: &mut String) -> Result<()> {
-        if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E724", 0, "too much recursion in json_encode()")); }
+    fn encode(
+        value: &Typval,
+        depth: usize,
+        active: &mut HashSet<(usize, u8)>,
+        output: &mut String,
+    ) -> Result<()> {
+        if depth >= MAX_CONTAINER_DEPTH {
+            return Err(EvalError::new(
+                "E724",
+                0,
+                "too much recursion in json_encode()",
+            ));
+        }
         match value {
             Typval::Special(Special::Null) => output.push_str("null"),
             Typval::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
-            Typval::Number(value) => { let _ = write!(output, "{value}"); }
+            Typval::Number(value) => {
+                let _ = write!(output, "{value}");
+            }
             Typval::Float(value) => {
-                let number = serde_json::Number::from_f64(*value).ok_or_else(|| EvalError::new("E474", 0, "NaN or Infinity cannot be JSON encoded"))?;
+                let number = serde_json::Number::from_f64(*value).ok_or_else(|| {
+                    EvalError::new("E474", 0, "NaN or Infinity cannot be JSON encoded")
+                })?;
                 output.push_str(&number.to_string());
             }
-            Typval::String(value) => output.push_str(&serde_json::to_string(&String::from_utf8_lossy(value.as_bytes())).map_err(|error| EvalError::new("E474", 0, error.to_string()))?),
+            Typval::String(value) => output.push_str(
+                &serde_json::to_string(&String::from_utf8_lossy(value.as_bytes()))
+                    .map_err(|error| EvalError::new("E474", 0, error.to_string()))?,
+            ),
             Typval::Blob(values) => {
-                output.push('['); for (index, value) in values.iter().enumerate() { if index > 0 { output.push(','); } let _ = write!(output, "{value}"); } output.push(']');
+                output.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        output.push(',');
+                    }
+                    let _ = write!(output, "{value}");
+                }
+                output.push(']');
             }
             Typval::List(reference) => {
                 let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_LIST);
-                if !active.insert(key) { return Err(EvalError::new("E724", 0, "recursive List cannot be JSON encoded")); }
-                output.push('['); for (index, value) in list_items(reference)?.iter().enumerate() { if index > 0 { output.push(','); } encode(value, depth + 1, active, output)?; } output.push(']');
+                if !active.insert(key) {
+                    return Err(EvalError::new(
+                        "E724",
+                        0,
+                        "recursive List cannot be JSON encoded",
+                    ));
+                }
+                output.push('[');
+                for (index, value) in list_items(reference)?.iter().enumerate() {
+                    if index > 0 {
+                        output.push(',');
+                    }
+                    encode(value, depth + 1, active, output)?;
+                }
+                output.push(']');
                 active.remove(&key);
             }
             Typval::Dict(reference) => {
                 let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_DICT);
-                if !active.insert(key) { return Err(EvalError::new("E724", 0, "recursive Dictionary cannot be JSON encoded")); }
-                output.push('{');
-                for (index, (name, value)) in dict_entries(reference)?.iter().enumerate() {
-                    if index > 0 { output.push(','); }
-                    output.push_str(&serde_json::to_string(&String::from_utf8_lossy(name.as_bytes())).map_err(|error| EvalError::new("E474", 0, error.to_string()))?);
-                    output.push(':'); encode(value, depth + 1, active, output)?;
+                if !active.insert(key) {
+                    return Err(EvalError::new(
+                        "E724",
+                        0,
+                        "recursive Dictionary cannot be JSON encoded",
+                    ));
                 }
-                output.push('}'); active.remove(&key);
+                output.push('{');
+                for (index, entry) in cloned_entries(reference)?.iter().enumerate() {
+                    if index > 0 {
+                        output.push(',');
+                    }
+                    output.push_str(
+                        &serde_json::to_string(&String::from_utf8_lossy(entry.key.as_bytes()))
+                            .map_err(|error| EvalError::new("E474", 0, error.to_string()))?,
+                    );
+                    output.push(':');
+                    encode(&entry.value, depth + 1, active, output)?;
+                }
+                output.push('}');
+                active.remove(&key);
             }
             _ => return Err(EvalError::new("E474", 0, "value cannot be JSON encoded")),
         }
@@ -2996,50 +5043,115 @@ fn json_encode(value: &Typval) -> Result<Typval> {
 }
 fn json_decode(value: &Typval) -> Result<Typval> {
     let value = string_arg(value)?;
-    let decoded: JsonValue = serde_json::from_slice(value.as_bytes()).map_err(|error| EvalError::new("E474", error.column(), format!("Invalid JSON: {error}")))?;
+    let decoded: JsonValue = serde_json::from_slice(value.as_bytes()).map_err(|error| {
+        EvalError::new("E474", error.column(), format!("Invalid JSON: {error}"))
+    })?;
     json_to_typval(decoded, 0)
 }
 
 fn json_to_typval(value: JsonValue, depth: usize) -> Result<Typval> {
-    if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E724", 0, "too much recursion in json_decode()")); }
+    if depth >= MAX_CONTAINER_DEPTH {
+        return Err(EvalError::new(
+            "E724",
+            0,
+            "too much recursion in json_decode()",
+        ));
+    }
     match value {
         JsonValue::Null => Ok(Typval::Special(Special::Null)),
         JsonValue::Bool(value) => Ok(Typval::Bool(value)),
-        JsonValue::Number(value) => value.as_i64().map(Typval::Number).or_else(|| value.as_f64().map(Typval::Float)).ok_or_else(|| EvalError::new("E474", 0, "JSON number is out of range")),
+        JsonValue::Number(value) => value
+            .as_i64()
+            .map(Typval::Number)
+            .or_else(|| value.as_f64().map(Typval::Float))
+            .ok_or_else(|| EvalError::new("E474", 0, "JSON number is out of range")),
         JsonValue::String(value) => Ok(Typval::String(OxStr(value.into_bytes()))),
-        JsonValue::Array(values) => values.into_iter().map(|value| json_to_typval(value, depth + 1)).collect::<Result<Vec<_>>>().map(Typval::list),
-        JsonValue::Object(values) => values.into_iter().map(|(key, value)| json_to_typval(value, depth + 1).map(|value| (OxStr(key.into_bytes()), value))).collect::<Result<Vec<_>>>().map(Typval::dict),
+        JsonValue::Array(values) => values
+            .into_iter()
+            .map(|value| json_to_typval(value, depth + 1))
+            .collect::<Result<Vec<_>>>()
+            .map(Typval::list),
+        JsonValue::Object(values) => values
+            .into_iter()
+            .map(|(key, value)| {
+                json_to_typval(value, depth + 1).map(|value| (OxStr(key.into_bytes()), value))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Typval::dict),
     }
 }
 
 fn vim_string(value: &Typval, _depth: usize) -> Result<OxStr> {
-    fn render(value: &Typval, active: &mut HashSet<(usize, u8)>, output: &mut Vec<u8>) -> Result<()> {
+    fn render(
+        value: &Typval,
+        active: &mut HashSet<(usize, u8)>,
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
         match value {
-            Typval::String(value) => { output.push(b'\''); for byte in value.as_bytes() { output.push(*byte); if *byte == b'\'' { output.push(b'\''); } } output.push(b'\''); }
+            Typval::String(value) => {
+                output.push(b'\'');
+                for byte in value.as_bytes() {
+                    output.push(*byte);
+                    if *byte == b'\'' {
+                        output.push(b'\'');
+                    }
+                }
+                output.push(b'\'');
+            }
             Typval::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
             Typval::Float(value) => output.extend_from_slice(vim_float_string(*value).as_bytes()),
-            Typval::Bool(value) => output.extend_from_slice(if *value { b"v:true" } else { b"v:false" }),
+            Typval::Bool(value) => {
+                output.extend_from_slice(if *value { b"v:true" } else { b"v:false" });
+            }
             Typval::Special(Special::Null) => output.extend_from_slice(b"v:null"),
-            Typval::Blob(value) => { output.extend_from_slice(b"0z"); for byte in value { let _ = write!(StringWriter(output), "{byte:02X}"); } }
+            Typval::Blob(value) => {
+                output.extend_from_slice(b"0z");
+                for byte in value {
+                    let _ = write!(StringWriter(output), "{byte:02X}");
+                }
+            }
             Typval::List(reference) => {
                 let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_LIST);
-                if !active.insert(key) { output.extend_from_slice(b"[...]"); return Ok(()); }
+                if !active.insert(key) {
+                    output.extend_from_slice(b"[...]");
+                    return Ok(());
+                }
                 output.push(b'[');
-                for (index, item) in list_items(reference)?.iter().enumerate() { if index > 0 { output.extend_from_slice(b", "); } render(item, active, output)?; }
-                output.push(b']'); active.remove(&key);
+                for (index, item) in list_items(reference)?.iter().enumerate() {
+                    if index > 0 {
+                        output.extend_from_slice(b", ");
+                    }
+                    render(item, active, output)?;
+                }
+                output.push(b']');
+                active.remove(&key);
             }
             Typval::Dict(reference) => {
                 let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_DICT);
-                if !active.insert(key) { output.extend_from_slice(b"{...}"); return Ok(()); }
-                output.push(b'{');
-                for (index, (name, item)) in dict_entries(reference)?.iter().enumerate() {
-                    if index > 0 { output.extend_from_slice(b", "); }
-                    render(&Typval::String(name.clone()), active, output)?; output.extend_from_slice(b": "); render(item, active, output)?;
+                if !active.insert(key) {
+                    output.extend_from_slice(b"{...}");
+                    return Ok(());
                 }
-                output.push(b'}'); active.remove(&key);
+                output.push(b'{');
+                for (index, entry) in cloned_entries(reference)?.iter().enumerate() {
+                    if index > 0 {
+                        output.extend_from_slice(b", ");
+                    }
+                    render(&Typval::String(entry.key.clone()), active, output)?;
+                    output.extend_from_slice(b": ");
+                    render(&entry.value, active, output)?;
+                }
+                output.push(b'}');
+                active.remove(&key);
             }
-            Typval::Funcref(Funcref { name, .. }) | Typval::Partial(Funcref { name, .. }) => { output.extend_from_slice(b"function('"); output.extend_from_slice(name.as_bytes()); output.extend_from_slice(b"')"); }
-            Typval::Channel(value) | Typval::Job(value) => output.extend_from_slice(value.to_string().as_bytes()),
+            Typval::Funcref(Funcref { name, .. }) | Typval::Partial(Funcref { name, .. }) => {
+                output.extend_from_slice(b"function('");
+                output.extend_from_slice(name.as_bytes());
+                output.extend_from_slice(b"')");
+            }
+            Typval::Channel(value) | Typval::Job(value) => {
+                output.extend_from_slice(value.to_string().as_bytes());
+            }
         }
         Ok(())
     }
@@ -3048,30 +5160,95 @@ fn vim_string(value: &Typval, _depth: usize) -> Result<OxStr> {
     Ok(OxStr(output))
 }
 struct StringWriter<'a>(&'a mut Vec<u8>);
-impl std::fmt::Write for StringWriter<'_> { fn write_str(&mut self, value: &str) -> std::fmt::Result { self.0.extend_from_slice(value.as_bytes()); Ok(()) } }
+impl std::fmt::Write for StringWriter<'_> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.0.extend_from_slice(value.as_bytes());
+        Ok(())
+    }
+}
 
 fn values_equal(left: &Typval, right: &Typval, ignore_case: bool, depth: usize) -> Result<bool> {
-    fn equal(left: &Typval, right: &Typval, ignore_case: bool, depth: usize, seen: &mut HashSet<(usize, usize, u8)>) -> Result<bool> {
-        if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E724", 0, "too much recursion comparing values")); }
+    fn equal(
+        left: &Typval,
+        right: &Typval,
+        ignore_case: bool,
+        depth: usize,
+        seen: &mut HashSet<(usize, usize, u8)>,
+    ) -> Result<bool> {
+        if depth >= MAX_CONTAINER_DEPTH {
+            return Err(EvalError::new(
+                "E724",
+                0,
+                "too much recursion comparing values",
+            ));
+        }
         match (left, right) {
-            (Typval::String(left), Typval::String(right)) => Ok(if ignore_case { left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase() } else { left == right }),
+            (Typval::String(left), Typval::String(right)) => Ok(if ignore_case {
+                left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+            } else {
+                left == right
+            }),
             (Typval::List(left), Typval::List(right)) => {
-                let pair=(Rc::as_ptr(left) as usize,Rc::as_ptr(right) as usize,ox_types::VAR_LIST); if !seen.insert(pair) { return Ok(true); }
-                let left=list_items(left)?; let right=list_items(right)?; if left.len()!=right.len(){return Ok(false)}
-                for (left,right) in left.iter().zip(&right){if !equal(left,right,ignore_case,depth+1,seen)?{return Ok(false)}} Ok(true)
+                let pair = (
+                    Rc::as_ptr(left) as usize,
+                    Rc::as_ptr(right) as usize,
+                    ox_types::VAR_LIST,
+                );
+                if !seen.insert(pair) {
+                    return Ok(true);
+                }
+                let left = list_items(left)?;
+                let right = list_items(right)?;
+                if left.len() != right.len() {
+                    return Ok(false);
+                }
+                for (left, right) in left.iter().zip(&right) {
+                    if !equal(left, right, ignore_case, depth + 1, seen)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
             (Typval::Dict(left), Typval::Dict(right)) => {
-                let pair=(Rc::as_ptr(left) as usize,Rc::as_ptr(right) as usize,ox_types::VAR_DICT); if !seen.insert(pair) { return Ok(true); }
-                let left=dict_entries(left)?; let right=dict_entries(right)?; if left.len()!=right.len(){return Ok(false)}
-                for (key,value) in &left { let Some((_,other))=right.iter().find(|(candidate,_)|candidate==key) else{return Ok(false)}; if !equal(value,other,ignore_case,depth+1,seen)?{return Ok(false)} } Ok(true)
+                let pair = (
+                    Rc::as_ptr(left) as usize,
+                    Rc::as_ptr(right) as usize,
+                    ox_types::VAR_DICT,
+                );
+                if !seen.insert(pair) {
+                    return Ok(true);
+                }
+                let left = cloned_entries(left)?;
+                let right = cloned_entries(right)?;
+                if left.len() != right.len() {
+                    return Ok(false);
+                }
+                for entry in &left {
+                    let Some(other) = right.iter().find(|candidate| candidate.key == entry.key)
+                    else {
+                        return Ok(false);
+                    };
+                    if !equal(&entry.value, &other.value, ignore_case, depth + 1, seen)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
             _ => Ok(left == right),
         }
     }
     equal(left, right, ignore_case, depth, &mut HashSet::new())
 }
+// i64→f64: Vim's number-to-float comparison coercion; upstream uses the same C cast.
+#[allow(clippy::cast_precision_loss)]
 fn compare_values(left: &Typval, right: &Typval, depth: usize) -> Result<Ordering> {
-    if depth >= MAX_CONTAINER_DEPTH { return Err(EvalError::new("E724", 0, "too much recursion comparing values")); }
+    if depth >= MAX_CONTAINER_DEPTH {
+        return Err(EvalError::new(
+            "E724",
+            0,
+            "too much recursion comparing values",
+        ));
+    }
     match (left, right) {
         (Typval::Number(left), Typval::Number(right)) => Ok(left.cmp(right)),
         (Typval::Float(left), Typval::Float(right)) => Ok(left.total_cmp(right)),
@@ -3082,15 +5259,67 @@ fn compare_values(left: &Typval, right: &Typval, depth: usize) -> Result<Orderin
 }
 
 fn compare_strings(left: &Typval, right: &Typval, ignore_case: bool) -> Result<Ordering> {
-    let left = string_arg(left)?; let right = string_arg(right)?;
-    if ignore_case { Ok(left.to_string_lossy().to_lowercase().cmp(&right.to_string_lossy().to_lowercase())) } else { Ok(left.as_bytes().cmp(right.as_bytes())) }
+    let left = string_arg(left)?;
+    let right = string_arg(right)?;
+    if ignore_case {
+        Ok(left
+            .to_string_lossy()
+            .to_lowercase()
+            .cmp(&right.to_string_lossy().to_lowercase()))
+    } else {
+        Ok(left.as_bytes().cmp(right.as_bytes()))
+    }
 }
 
 fn normalize_index(length: usize, index: i64) -> Option<usize> {
-    if index >= 0 { usize::try_from(index).ok().filter(|index| *index < length) } else { usize::try_from(index.unsigned_abs()).ok().and_then(|distance| length.checked_sub(distance)) }
+    if index >= 0 {
+        usize::try_from(index).ok().filter(|index| *index < length)
+    } else {
+        usize::try_from(index.unsigned_abs())
+            .ok()
+            .and_then(|distance| length.checked_sub(distance))
+    }
 }
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> { if needle.is_empty() { Some(0) } else { haystack.windows(needle.len()).position(|window| window == needle) } }
-fn find_subslice_reverse(haystack: &[u8], needle: &[u8]) -> Option<usize> { if needle.is_empty() { Some(haystack.len()) } else { haystack.windows(needle.len()).rposition(|window| window == needle) } }
-fn non_overlapping_count(haystack: &[u8], needle: &[u8]) -> usize { if needle.is_empty() { return 0; } let mut count = 0; let mut offset = 0; while let Some(position) = find_subslice(&haystack[offset..], needle) { count += 1; offset += position + needle.len(); } count }
-fn saturating_i64(value: usize) -> i64 { i64::try_from(value).unwrap_or(i64::MAX) }
-fn set_pair(values: &mut Vec<(OxStr, Typval)>, key: &[u8], value: Typval) { if let Some((_, existing)) = values.iter_mut().find(|(candidate, _)| candidate.as_bytes() == key) { *existing = value; } else { values.push((OxStr(key.to_vec()), value)); } }
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        Some(0)
+    } else {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+}
+fn find_subslice_reverse(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        Some(haystack.len())
+    } else {
+        haystack
+            .windows(needle.len())
+            .rposition(|window| window == needle)
+    }
+}
+fn non_overlapping_count(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut offset = 0;
+    while let Some(position) = find_subslice(&haystack[offset..], needle) {
+        count += 1;
+        offset += position + needle.len();
+    }
+    count
+}
+fn saturating_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+fn set_pair(values: &mut Vec<(OxStr, Typval)>, key: &[u8], value: Typval) {
+    if let Some((_, existing)) = values
+        .iter_mut()
+        .find(|(candidate, _)| candidate.as_bytes() == key)
+    {
+        *existing = value;
+    } else {
+        values.push((OxStr(key.to_vec()), value));
+    }
+}

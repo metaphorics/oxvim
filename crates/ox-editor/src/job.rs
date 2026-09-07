@@ -1,15 +1,15 @@
 //! Reactor-driven child process channels used by Vimscript job control.
 
 use std::collections::{HashMap, VecDeque};
-use std::ffi::{OsString};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ox_types::{DictRef, OxStr, Typval};
-use ox_uv::process::{self, Process, ProcessPipe, SpawnOptions, StdioConfig};
 #[cfg(unix)]
-use ox_uv::process::{PtyHandle, PtySize};
+use ox_uv::process::PtyHandle;
+use ox_uv::process::{self, Process, ProcessPipe, PtySize, SpawnOptions, StdioConfig};
 use ox_uv::{NetEvent, UvLoop};
 
 /// Callback values and their dictionary receiver from `jobstart()` options.
@@ -25,7 +25,18 @@ pub struct JobCallbacks {
     pub exit: Option<Typval>,
 }
 
+/// `pty_proc_init` geometry (os/pty_proc_unix.c:460-461): the size each pty
+/// dimension keeps when `jobstart` supplies none (channel.c:394-398).
+pub const DEFAULT_PTY_SIZE: PtySize = PtySize {
+    columns: 80,
+    rows: 24,
+};
+
 /// Normalized options for one child process.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "these independent Vim job options do not form one state machine"
+)]
 pub struct JobStartOptions {
     /// Executable path.
     pub program: PathBuf,
@@ -39,6 +50,11 @@ pub struct JobStartOptions {
     pub detached: bool,
     /// Whether stdio uses a pseudoterminal.
     pub pty: bool,
+    /// Whether the pseudoterminal backs a `:terminal` buffer.
+    pub term: bool,
+    /// Geometry a `pty` spawn opens with: the current window's text area
+    /// when the caller supplied one, else [`DEFAULT_PTY_SIZE`].
+    pub pty_size: PtySize,
     /// Whether the channel carries msgpack-rpc.
     pub rpc: bool,
     /// Whether stdin is connected to a writable pipe.
@@ -114,6 +130,8 @@ struct Job {
     terminal_buffer: Option<ox_types::BufHandle>,
     /// Raw PTY output accumulated for the terminal buffer.
     pty_output: Vec<u8>,
+    /// Whether the default `nvim.terminal` `TermClose` handler is active.
+    terminal_exit_message: bool,
     /// `jobstart({'detach': v:true})`: upstream leaves a detached child running
     /// past editor exit and terminates every other one (`channel_close_on_exit`).
     detached: bool,
@@ -128,7 +146,11 @@ struct Job {
 fn pty_slave_path(pid: u32) -> Option<String> {
     let link = std::fs::read_link(format!("/proc/{pid}/fd/0")).ok()?;
     let text = link.to_string_lossy().into_owned();
-    if text.starts_with("/dev/pts/") { Some(text) } else { None }
+    if text.starts_with("/dev/pts/") {
+        Some(text)
+    } else {
+        None
+    }
 }
 
 /// Owns job channels and the `ox-uv` loop which drives their process handles.
@@ -140,10 +162,19 @@ pub struct JobManager {
     /// them (`channel.c` defers callbacks onto the main loop instead of
     /// dropping them, which is what `let _ = poll()` did).
     deferred: Vec<JobEvent>,
+    /// Set when the `jobwait` flush re-defers Lua-registered callbacks:
+    /// upstream runs them before `jobwait` returns (`multiqueue_process_
+    /// events`, funcs.c:3668/3721), so the first borrow-free boundary after
+    /// the builtin returns must deliver them, not the next tick.
+    lua_flush_pending: bool,
 }
 
 impl JobManager {
     /// Create an isolated reactor-backed job table.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reactor initialization error.
     pub fn new() -> Result<Self, String> {
         let loop_ = UvLoop::new().map_err(|error| error.to_string())?;
         Ok(Self {
@@ -151,10 +182,30 @@ impl JobManager {
             jobs: HashMap::new(),
             raw: Arc::new(Mutex::new(VecDeque::new())),
             deferred: Vec::new(),
+            lua_flush_pending: false,
         })
     }
 
+    /// Marks a `jobwait` Lua flush as awaiting synchronous delivery.
+    pub(crate) fn set_lua_flush_pending(&mut self) {
+        self.lua_flush_pending = true;
+    }
+
+    /// Takes the `jobwait` Lua-flush marker; the caller that delivers the
+    /// flushed callbacks consumes it.
+    pub(crate) fn take_lua_flush_pending(&mut self) -> bool {
+        std::mem::take(&mut self.lua_flush_pending)
+    }
+
     /// Spawn a process and register it under the already-allocated channel id.
+    ///
+    /// # Errors
+    ///
+    /// Returns the process or stream setup error.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the Unix and non-Unix spawn paths share one resource-ownership boundary"
+    )]
     pub fn start(&mut self, id: u64, options: JobStartOptions) -> Result<u32, String> {
         let mut spawn_options = SpawnOptions::new(options.program);
         spawn_options.args = options.args;
@@ -162,7 +213,11 @@ impl JobManager {
         spawn_options.cwd = options.cwd;
         spawn_options.detached = options.detached;
         spawn_options.stdio = [
-            if options.stdin_pipe { StdioConfig::CreatePipe } else { StdioConfig::Ignore },
+            if options.stdin_pipe {
+                StdioConfig::CreatePipe
+            } else {
+                StdioConfig::Ignore
+            },
             StdioConfig::CreatePipe,
             StdioConfig::CreatePipe,
         ];
@@ -175,19 +230,22 @@ impl JobManager {
 
         #[cfg(unix)]
         let (process, input, stdout_pipe, stderr_pipe) = if options.pty {
-            let mut spawned = process::spawn_pty(
-                &mut self.loop_,
-                spawn_options,
-                PtySize { columns: 80, rows: 24 },
-                on_exit,
-            )
-            .map_err(|error| error.to_string())?;
+            let mut spawned =
+                process::spawn_pty(&mut self.loop_, spawn_options, options.pty_size, on_exit)
+                    .map_err(|error| error.to_string())?;
             let output_queue = Arc::clone(&self.raw);
-            spawned.master.read_start(&mut self.loop_, move |_loop_, _handle, event| {
-                queue_stream_event(&output_queue, id, StreamKind::Stdout, event);
-            })
-            .map_err(|error| error.to_string())?;
-            (spawned.process, Some(JobInput::Pty(spawned.master)), None, None)
+            spawned
+                .master
+                .read_start(&mut self.loop_, move |_loop_, _handle, event| {
+                    queue_stream_event(&output_queue, id, StreamKind::Stdout, event);
+                })
+                .map_err(|error| error.to_string())?;
+            (
+                spawned.process,
+                Some(JobInput::Pty(spawned.master)),
+                None,
+                None,
+            )
         } else {
             let mut spawned = process::spawn(&mut self.loop_, spawn_options, on_exit)
                 .map_err(|error| error.to_string())?;
@@ -224,29 +282,47 @@ impl JobManager {
 
         let pid = process.pid();
         #[cfg(unix)]
-        let pty_slave = if options.pty { pty_slave_path(pid) } else { None };
+        let pty_slave = if options.pty {
+            pty_slave_path(pid)
+        } else {
+            None
+        };
         #[cfg(not(unix))]
         let pty_slave = None;
-        self.jobs.insert(id, Job {
-            process,
-            input,
-            _stdout_pipe: stdout_pipe,
-            _stderr_pipe: stderr_pipe,
-            callbacks: options.callbacks,
-            stdout: StreamState { buffered: options.stdout_buffered, ..StreamState::default() },
-            stderr: StreamState { buffered: options.stderr_buffered, ..StreamState::default() },
-            status: -1,
-            rpc: options.rpc,
-            pty_slave,
-            terminal_buffer: options.terminal_buffer,
-            pty_output: Vec::new(),
-            detached: options.detached,
-        });
+        self.jobs.insert(
+            id,
+            Job {
+                process,
+                input,
+                _stdout_pipe: stdout_pipe,
+                _stderr_pipe: stderr_pipe,
+                callbacks: options.callbacks,
+                stdout: StreamState {
+                    buffered: options.stdout_buffered,
+                    ..StreamState::default()
+                },
+                stderr: StreamState {
+                    buffered: options.stderr_buffered,
+                    ..StreamState::default()
+                },
+                status: -1,
+                rpc: options.rpc,
+                pty_slave,
+                terminal_buffer: options.terminal_buffer,
+                pty_output: Vec::new(),
+                terminal_exit_message: true,
+                detached: options.detached,
+            },
+        );
         Ok(pid)
     }
 
     /// Run one non-blocking reactor turn and return callback work queued by
     /// it, ahead of any events deferred by a poll that could not deliver them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reactor polling error.
     pub fn poll(&mut self) -> Result<Vec<JobEvent>, String> {
         self.loop_.run_nowait().map_err(|error| error.to_string())?;
         let mut events = std::mem::take(&mut self.deferred);
@@ -259,21 +335,83 @@ impl JobManager {
     pub fn defer_events(&mut self, events: Vec<JobEvent>) {
         self.deferred.extend(events);
     }
+    /// Takes the whole deferred queue, keeping relative order (the server's
+    /// borrow-free `deliver_deferred_job_events` drains before invoking so
+    /// no borrow spans user code while the manager stays installed; requeue
+    /// goes through [`Self::defer_events`], preserving
+    /// `take_deferred_and_invoke`'s handler-deferred-ahead-of-tail order).
+    pub fn drain_deferred(&mut self) -> Vec<JobEvent> {
+        std::mem::take(&mut self.deferred)
+    }
+    /// Drain and invoke pending deferred events now.
+    ///
+    /// The whole queue is drained first (`channel_process_callbacks`,
+    /// channel.c:1089-1148): a callback that sends, polls, or stops a job
+    /// mutates the job table or enqueues new events, and iterating live state
+    /// would see it.
+    ///
+    /// `invoke` receives the drained batch by `&mut` and removes the events
+    /// it invoked from the front (`Vec::drain(..n)`), the same call
+    /// chansend/jobwait make on their collected events. Whatever remains in
+    /// the vector after `invoke` returns — an uninvoked tail on a handler
+    /// failure, exactly what upstream keeps queued (`channel.c` requeues
+    /// unprocessed callbacks) — is put back on the queue and surfaces on the
+    /// next poll.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's invocation error after requeuing the tail.
+    pub fn take_deferred_and_invoke(
+        &mut self,
+        invoke: impl FnOnce(&mut Vec<JobEvent>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut events = std::mem::take(&mut self.deferred);
+        let result = invoke(&mut events);
+        // `invoke` drained what it delivered from the front; anything left is
+        // an unconsumed tail (handler failed mid-batch) and stays deliverable.
+        self.deferred.extend(events);
+        result
+    }
 
     /// Wait for the selected jobs, sharing one deadline across the list.
-    pub fn wait(&mut self, ids: &[u64], timeout_ms: i64) -> Result<(Vec<i64>, Vec<JobEvent>), String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the reactor polling error.
+    pub fn wait(
+        &mut self,
+        ids: &[u64],
+        timeout_ms: i64,
+    ) -> Result<(Vec<i64>, Vec<JobEvent>), String> {
         let deadline = if timeout_ms < 0 {
             None
         } else {
-            Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
+            Some(Instant::now() + Duration::from_millis(timeout_ms.cast_unsigned()))
         };
         let mut events = Vec::new();
         loop {
-            events.extend(self.poll()?);
-            if ids.iter().all(|id| self.jobs.get(id).is_none_or(|job| job.status >= 0)) {
+            match self.poll() {
+                Ok(mut polled) => events.append(&mut polled),
+                Err(error) => {
+                    // Keep the events gathered so far deliverable instead of
+                    // dropping them with the error.
+                    self.defer_events(events);
+                    return Err(error);
+                }
+            }
+            if ids
+                .iter()
+                .all(|id| self.jobs.get(id).is_none_or(|job| job.status >= 0))
+            {
                 // EOF readiness can trail the waiter notification by one turn.
                 for _ in 0..4 {
-                    events.extend(self.poll()?);
+                    match self.poll() {
+                        Ok(mut polled) => events.append(&mut polled),
+                        Err(error) => {
+                            self.defer_events(events);
+                            return Err(error);
+                        }
+                    }
                 }
                 break;
             }
@@ -282,18 +420,35 @@ impl JobManager {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        let statuses = ids.iter().map(|id| self.jobs.get(id).map_or(-3, |job| job.status)).collect();
+        let statuses = ids
+            .iter()
+            .map(|id| self.jobs.get(id).map_or(-3, |job| job.status))
+            .collect();
         Ok((statuses, events))
     }
 
     /// Write raw bytes to the process stdin or PTY master.
+    ///
+    /// # Errors
+    ///
+    /// Returns the process input write error.
     pub fn send(&mut self, id: u64, data: Vec<u8>) -> Result<bool, String> {
-        let Some(job) = self.jobs.get_mut(&id) else { return Ok(false); };
-        let Some(input) = job.input.as_mut() else { return Ok(false); };
+        let Some(job) = self.jobs.get_mut(&id) else {
+            return Ok(false);
+        };
+        let Some(input) = job.input.as_mut() else {
+            return Ok(false);
+        };
         match input {
-            JobInput::Pipe(pipe) => { pipe.write(&mut self.loop_, data).map_err(|error| error.to_string())?; }
+            JobInput::Pipe(pipe) => {
+                pipe.write(&mut self.loop_, data)
+                    .map_err(|error| error.to_string())?;
+            }
             #[cfg(unix)]
-            JobInput::Pty(pty) => { pty.write(&mut self.loop_, data).map_err(|error| error.to_string())?; }
+            JobInput::Pty(pty) => {
+                pty.write(&mut self.loop_, data)
+                    .map_err(|error| error.to_string())?;
+            }
         }
         Ok(true)
     }
@@ -312,8 +467,12 @@ impl JobManager {
     /// loop is pumped until the queue drains first — the reactor clears it on
     /// either a completed write or a closed peer, so the pump terminates.
     pub fn close_input(&mut self, id: u64) -> bool {
-        let Some(job) = self.jobs.get_mut(&id) else { return false };
-        let Some(input) = job.input.take() else { return false };
+        let Some(job) = self.jobs.get_mut(&id) else {
+            return false;
+        };
+        let Some(input) = job.input.take() else {
+            return false;
+        };
         match input {
             JobInput::Pipe(pipe) => {
                 let deadline = Instant::now() + Duration::from_secs(30);
@@ -339,12 +498,21 @@ impl JobManager {
     /// Take output accumulated by buffered streams after the job completes.
     pub fn take_buffered_output(&mut self, id: u64) -> Option<(Vec<u8>, Vec<u8>)> {
         let job = self.jobs.get_mut(&id)?;
-        Some((std::mem::take(&mut job.stdout.bytes), std::mem::take(&mut job.stderr.bytes)))
+        Some((
+            std::mem::take(&mut job.stdout.bytes),
+            std::mem::take(&mut job.stderr.bytes),
+        ))
     }
 
     /// Send SIGTERM to a live job. An already-reaped job is a successful no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns the process termination error.
     pub fn stop(&mut self, id: u64) -> Result<bool, String> {
-        let Some(job) = self.jobs.get(&id) else { return Ok(false); };
+        let Some(job) = self.jobs.get(&id) else {
+            return Ok(false);
+        };
         if job.status < 0 {
             job.process.kill(None).map_err(|error| error.to_string())?;
         }
@@ -353,11 +521,15 @@ impl JobManager {
 
     #[must_use]
     /// Return the child PID for a registered job.
-    pub fn pid(&self, id: u64) -> Option<u32> { self.jobs.get(&id).map(|job| job.process.pid()) }
+    pub fn pid(&self, id: u64) -> Option<u32> {
+        self.jobs.get(&id).map(|job| job.process.pid())
+    }
 
     #[must_use]
     /// Report whether a registered job channel carries msgpack-rpc.
-    pub fn is_rpc(&self, id: u64) -> bool { self.jobs.get(&id).is_some_and(|job| job.rpc) }
+    pub fn is_rpc(&self, id: u64) -> bool {
+        self.jobs.get(&id).is_some_and(|job| job.rpc)
+    }
 
     /// PTY slave path behind a job channel that was spawned through one.
     #[must_use]
@@ -372,21 +544,72 @@ impl JobManager {
         }
     }
 
+    /// Enable or disable the default terminal process-exit message.
+    pub fn set_terminal_exit_message(&mut self, id: u64, enabled: bool) {
+        if let Some(job) = self.jobs.get_mut(&id) {
+            job.terminal_exit_message = enabled;
+        }
+    }
+
     /// Take accumulated PTY output for the terminal buffer.
     pub fn take_pty_output(&mut self, id: u64) -> Option<Vec<u8>> {
         let job = self.jobs.get_mut(&id)?;
-        if job.pty_output.is_empty() { return None; }
+        if job.pty_output.is_empty() {
+            return None;
+        }
         Some(std::mem::take(&mut job.pty_output))
     }
 
     /// Poll once and write any PTY output to the editor-owned terminal buffer.
-    pub fn flush_pty_to_editor(&mut self, id: u64, editor: &mut crate::Editor) -> Result<(), String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the reactor polling or terminal-buffer update error.
+    pub fn flush_pty_to_editor(
+        &mut self,
+        id: u64,
+        editor: &mut crate::Editor,
+    ) -> Result<(), String> {
         let events = self.poll()?;
         self.defer_events(events);
         if let Some(bytes) = self.take_pty_output(id) {
-            editor.append_terminal_buffer(id, &bytes).map_err(|error| error.to_string())?;
+            editor
+                .append_terminal_buffer(id, &bytes)
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
+    }
+
+    /// Poll once and take pending output for every terminal-backed job.
+    ///
+    /// Callback events remain deferred for the normal callback host.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reactor polling error.
+    pub fn take_all_pty_output(&mut self) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        let events = self.poll()?;
+        self.defer_events(events);
+        let output = self
+            .jobs
+            .iter_mut()
+            .filter_map(|(&id, job)| {
+                (!job.pty_output.is_empty()).then(|| (id, std::mem::take(&mut job.pty_output)))
+            })
+            .collect::<Vec<_>>();
+        let cursor_queries = output
+            .iter()
+            .filter_map(|(id, bytes)| {
+                bytes
+                    .windows(4)
+                    .any(|bytes| bytes == b"\x1b[6n")
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in cursor_queries {
+            self.send(id, b"\x1b[1;1R".to_vec())?;
+        }
+        Ok(output)
     }
 
     fn drain_raw(&mut self) -> Vec<JobEvent> {
@@ -398,7 +621,9 @@ impl JobManager {
         for event in raw {
             match event {
                 RawEvent::Data(id, stream, bytes) => {
-                    let Some(job) = self.jobs.get_mut(&id) else { continue; };
+                    let Some(job) = self.jobs.get_mut(&id) else {
+                        continue;
+                    };
                     // PTY output accumulates for the terminal buffer.
                     if job.terminal_buffer.is_some() && matches!(stream, StreamKind::Stdout) {
                         job.pty_output.extend_from_slice(&bytes);
@@ -407,33 +632,60 @@ impl JobManager {
                     if state.buffered {
                         state.bytes.extend_from_slice(&bytes);
                     } else if let Some(callback) = callback {
-                        callbacks.push(data_event(id, callback, &job.callbacks.options, name, bytes));
+                        callbacks.push(data_event(
+                            id,
+                            callback,
+                            &job.callbacks.options,
+                            name,
+                            &bytes,
+                        ));
                     }
                 }
                 RawEvent::Eof(id, stream) => {
-                    let Some(job) = self.jobs.get_mut(&id) else { continue; };
+                    let Some(job) = self.jobs.get_mut(&id) else {
+                        continue;
+                    };
                     let (state, callback, name) = stream_parts(job, stream);
-                    if state.eof { continue; }
+                    if state.eof {
+                        continue;
+                    }
                     state.eof = true;
                     if let Some(callback) = callback {
-                        let bytes = if state.buffered { std::mem::take(&mut state.bytes) } else { Vec::new() };
-                        callbacks.push(data_event(id, callback, &job.callbacks.options, name, bytes));
+                        let bytes = if state.buffered {
+                            std::mem::take(&mut state.bytes)
+                        } else {
+                            Vec::new()
+                        };
+                        callbacks.push(data_event(
+                            id,
+                            callback,
+                            &job.callbacks.options,
+                            name,
+                            &bytes,
+                        ));
                     }
                 }
                 RawEvent::Exit(id, result) => {
-                    let Some(job) = self.jobs.get_mut(&id) else { continue; };
+                    let Some(job) = self.jobs.get_mut(&id) else {
+                        continue;
+                    };
                     let status = match result {
                         Ok(exit) if exit.signal != 0 => i64::from(128 + exit.signal),
                         Ok(exit) => exit.code,
                         Err(_) => -2,
                     };
                     job.status = status;
+                    if job.terminal_buffer.is_some() && job.terminal_exit_message {
+                        job.pty_output.extend_from_slice(
+                            format!("\r\n[Process exited {status}]\r\n").as_bytes(),
+                        );
+                    }
                     if let Some(callback) = job.callbacks.exit.clone() {
                         callbacks.push(JobEvent {
                             callback,
                             receiver: job.callbacks.options.clone(),
                             args: vec![
-                                Typval::Number(id as i64),
+                                Typval::Number(id.cast_signed()),
                                 Typval::Number(status),
                                 Typval::String(OxStr::from("exit")),
                             ],
@@ -463,18 +715,28 @@ impl Drop for JobManager {
     }
 }
 
-fn stream_parts(job: &mut Job, stream: StreamKind) -> (&mut StreamState, Option<Typval>, &'static str) {
+fn stream_parts(
+    job: &mut Job,
+    stream: StreamKind,
+) -> (&mut StreamState, Option<Typval>, &'static str) {
     match stream {
         StreamKind::Stdout => (&mut job.stdout, job.callbacks.stdout.clone(), "stdout"),
         StreamKind::Stderr => (&mut job.stderr, job.callbacks.stderr.clone(), "stderr"),
     }
 }
 
-fn data_event(id: u64, callback: Typval, receiver: &DictRef, name: &'static str, bytes: Vec<u8>) -> JobEvent {
+fn data_event(
+    id: u64,
+    callback: Typval,
+    receiver: &DictRef,
+    name: &'static str,
+    bytes: &[u8],
+) -> JobEvent {
     let lines = if bytes.is_empty() {
         vec![Typval::String(OxStr(Vec::new()))]
     } else {
-        bytes.split(|byte| *byte == b'\n')
+        bytes
+            .split(|byte| *byte == b'\n')
             .map(|line| Typval::String(OxStr(line.strip_suffix(b"\r").unwrap_or(line).to_vec())))
             .collect()
     };
@@ -482,18 +744,22 @@ fn data_event(id: u64, callback: Typval, receiver: &DictRef, name: &'static str,
         callback,
         receiver: receiver.clone(),
         args: vec![
-            Typval::Number(id as i64),
+            Typval::Number(id.cast_signed()),
             Typval::list(lines),
             Typval::String(OxStr::from(name)),
         ],
     }
 }
 
-fn queue_stream_event(queue: &Arc<Mutex<VecDeque<RawEvent>>>, id: u64, stream: StreamKind, event: NetEvent) {
+fn queue_stream_event(
+    queue: &Arc<Mutex<VecDeque<RawEvent>>>,
+    id: u64,
+    stream: StreamKind,
+    event: NetEvent,
+) {
     let event = match event {
         NetEvent::Read(bytes) => Some(RawEvent::Data(id, stream, bytes)),
-        NetEvent::Eof => Some(RawEvent::Eof(id, stream)),
-        NetEvent::Error(_) => Some(RawEvent::Eof(id, stream)),
+        NetEvent::Eof | NetEvent::Error(_) => Some(RawEvent::Eof(id, stream)),
         _ => None,
     };
     if let Some(event) = event {
@@ -501,8 +767,12 @@ fn queue_stream_event(queue: &Arc<Mutex<VecDeque<RawEvent>>>, id: u64, stream: S
     }
 }
 
-fn lock_queue(queue: &Arc<Mutex<VecDeque<RawEvent>>>) -> std::sync::MutexGuard<'_, VecDeque<RawEvent>> {
-    queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+fn lock_queue(
+    queue: &Arc<Mutex<VecDeque<RawEvent>>>,
+) -> std::sync::MutexGuard<'_, VecDeque<RawEvent>> {
+    queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(all(test, unix))]
@@ -511,7 +781,9 @@ mod tests {
 
     fn options(command: &str, buffered: bool) -> JobStartOptions {
         let options = Typval::dict(Vec::new());
-        let Typval::Dict(reference) = options else { unreachable!() };
+        let Typval::Dict(reference) = options else {
+            unreachable!()
+        };
         let callback = Typval::String(OxStr::from("Callback"));
         JobStartOptions {
             program: PathBuf::from("sh"),
@@ -520,6 +792,8 @@ mod tests {
             cwd: None,
             detached: false,
             pty: false,
+            term: false,
+            pty_size: DEFAULT_PTY_SIZE,
             rpc: false,
             stdin_pipe: true,
             stdout_buffered: buffered,
@@ -539,9 +813,16 @@ mod tests {
     /// callback when there is one, so only this shape leaves them for
     /// `take_buffered_output`.
     fn collected(command: &str) -> JobStartOptions {
-        let Typval::Dict(reference) = Typval::dict(Vec::new()) else { unreachable!() };
+        let Typval::Dict(reference) = Typval::dict(Vec::new()) else {
+            unreachable!()
+        };
         JobStartOptions {
-            callbacks: JobCallbacks { options: reference, stdout: None, stderr: None, exit: None },
+            callbacks: JobCallbacks {
+                options: reference,
+                stdout: None,
+                stderr: None,
+                exit: None,
+            },
             ..options(command, true)
         }
     }
@@ -561,12 +842,39 @@ mod tests {
     #[test]
     fn buffered_output_and_exit_are_deferred_through_the_loop() {
         let mut jobs = JobManager::new().unwrap();
-        jobs.start(3, options("printf 'alpha\nbeta'; printf 'err' >&2", true)).unwrap();
+        jobs.start(3, options("printf 'alpha\nbeta'; printf 'err' >&2", true))
+            .unwrap();
         let (status, events) = jobs.wait(&[3], 2_000).unwrap();
         assert_eq!(status, vec![0]);
         assert!(events.iter().any(|event| event_name(event) == "stdout"));
         assert!(events.iter().any(|event| event_name(event) == "stderr"));
         assert!(events.iter().any(|event| event_name(event) == "exit"));
+    }
+
+    // system()'s contract: events drained while waiting for one job must
+    // stay deliverable for the others. run_shell_command re-defers what
+    // wait() collected; this pins that the deferred queue survives the
+    // round-trip and surfaces on a later poll.
+    #[test]
+    fn redeferred_events_survive_a_wait_for_another_job() {
+        let mut jobs = JobManager::new().unwrap();
+        jobs.start(3, options("printf 'out'", true)).unwrap();
+        jobs.start(4, collected("printf 'other'")).unwrap();
+        let (_, events) = jobs.wait(&[3], 2_000).unwrap();
+        jobs.defer_events(events);
+        let mut surfaced = false;
+        for _ in 0..100 {
+            let polled = jobs.poll().unwrap();
+            // exit can lead stdout in the re-deferred queue; any position
+            // counts — the pin is that the event surfaces, not its order.
+            if polled.iter().any(|event| event_name(event) == "stdout") {
+                surfaced = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        jobs.wait(&[4], 2_000).unwrap();
+        assert!(surfaced, "re-deferred events must surface on a later poll");
     }
 
     // `close_input` must close the descriptor, not just drop the handle: the
@@ -604,7 +912,11 @@ mod tests {
         let (status, _) = jobs.wait(&[8], 20_000).unwrap();
         assert_eq!(status, vec![0]);
         let (stdout, _) = jobs.take_buffered_output(8).unwrap();
-        assert_eq!(stdout.len(), payload.len(), "the queued remainder was dropped");
+        assert_eq!(
+            stdout.len(),
+            payload.len(),
+            "the queued remainder was dropped"
+        );
     }
 
     // Dropping the manager terminates a child that is still running, so no
@@ -623,8 +935,14 @@ mod tests {
             // One turn so both children are really running before the drop.
             jobs.wait(&[9, 10], 200).unwrap();
         }
-        assert!(!process_is_alive(live_pid), "a live child outlived its manager");
-        assert!(process_is_alive(detached_pid), "a detached child was terminated");
+        assert!(
+            !process_is_alive(live_pid),
+            "a live child outlived its manager"
+        );
+        assert!(
+            process_is_alive(detached_pid),
+            "a detached child was terminated"
+        );
         let _ignored = ox_uv::process::kill(detached_pid, Some(9));
     }
 
@@ -650,6 +968,35 @@ mod tests {
         assert_eq!(status, vec![0]);
     }
 
+    // `spawn_pty` must open the pty at the caller's geometry, not a fixed
+    // 80x24: `f_jobstart` sizes a `term` job's pty from `curwin`
+    // (eval/funcs.c:3505-3506) and `channel_job_start` keeps the
+    // `pty_proc_init` default only for a dimension left at zero
+    // (channel.c:394-398). `get_size` reads the kernel winsize back, so
+    // this asserts the size the child was actually born with.
+    #[test]
+    fn pty_spawn_uses_the_requested_size() {
+        let mut jobs = JobManager::new().unwrap();
+        let mut pty = options("cat", true);
+        pty.pty = true;
+        pty.pty_size = PtySize {
+            columns: 100,
+            rows: 40,
+        };
+        jobs.start(3, pty).unwrap();
+        let size = match jobs.jobs.get(&3).and_then(|job| job.input.as_ref()) {
+            Some(JobInput::Pty(master)) => master.get_size().unwrap(),
+            _ => panic!("pty job has no pty input"),
+        };
+        assert_eq!(
+            size,
+            PtySize {
+                columns: 100,
+                rows: 40
+            }
+        );
+    }
+
     #[test]
     fn timeout_invalid_ids_and_sigterm_status_match_jobwait_contract() {
         let mut jobs = JobManager::new().unwrap();
@@ -665,7 +1012,10 @@ mod tests {
 
     #[test]
     fn cwd_and_environment_are_applied_to_the_spawn() {
-        let mut job_options = options("printenv OX_JOB_VALUE | grep -qx set && pwd | grep -qx /tmp", false);
+        let mut job_options = options(
+            "printenv OX_JOB_VALUE | grep -qx set && pwd | grep -qx /tmp",
+            false,
+        );
         let mut environment = std::env::vars_os().collect::<Vec<_>>();
         environment.push((OsString::from("OX_JOB_VALUE"), OsString::from("set")));
         job_options.environment = Some(environment);
@@ -683,15 +1033,120 @@ mod tests {
     fn deferred_events_are_redelivered_by_the_next_poll() {
         let mut jobs = JobManager::new().unwrap();
         let options = Typval::dict(Vec::new());
-        let Typval::Dict(reference) = options else { unreachable!() };
+        let Typval::Dict(reference) = options else {
+            unreachable!()
+        };
         let event = JobEvent {
             callback: Typval::String(OxStr::from("Callback")),
             receiver: reference,
-            args: vec![Typval::Number(1), Typval::list(vec![Typval::String(OxStr::from("data"))]), Typval::String(OxStr::from("stdout"))],
+            args: vec![
+                Typval::Number(1),
+                Typval::list(vec![Typval::String(OxStr::from("data"))]),
+                Typval::String(OxStr::from("stdout")),
+            ],
         };
         jobs.defer_events(vec![event.clone(), event.clone()]);
         let first = jobs.poll().unwrap();
-        assert_eq!(first.len(), 2, "deferred events must be returned on the next poll");
-        assert!(jobs.poll().unwrap().is_empty(), "deferred events must be drained after one poll");
+        assert_eq!(
+            first.len(),
+            2,
+            "deferred events must be returned on the next poll"
+        );
+        assert!(
+            jobs.poll().unwrap().is_empty(),
+            "deferred events must be drained after one poll"
+        );
+    }
+
+    // A fire-and-forget job's exit callback must survive a poll path with no
+    // host: the tick re-defers what it drains, and the drained batch reaches
+    // `take_deferred_and_invoke` exactly once, in arrival order — upstream
+    // delivers job callbacks on the main loop (`process_events` →
+    // `channel_write` → `invoke_callback`).
+    #[test]
+    fn deferred_exit_event_is_delivered_exactly_once_through_the_invoke_host() {
+        let mut jobs = JobManager::new().unwrap();
+        jobs.start(3, options("true", true)).unwrap();
+        // The tick shape: poll without a host, re-defer, repeat until the
+        // exit event surfaces. A blocking wait() would consume the event
+        // itself, which is the path this must not take.
+        let mut events = Vec::new();
+        for _ in 0..500 {
+            let polled = jobs.poll().unwrap();
+            let exited = polled.iter().any(|event| event_name(event) == "exit");
+            events.extend(polled);
+            if exited {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            events.iter().any(|event| event_name(event) == "exit"),
+            "a finished job must queue its exit event"
+        );
+        jobs.defer_events(events);
+        // The invoke host consumes the drained batch and records it.
+        let mut invoked = Vec::new();
+        jobs.take_deferred_and_invoke(|events| {
+            let count = events.len();
+            invoked.extend(events.drain(..count));
+            Ok(())
+        })
+        .unwrap();
+        let exits = invoked
+            .iter()
+            .filter(|event| event_name(event) == "exit")
+            .count();
+        assert_eq!(exits, 1, "on_exit must run exactly once");
+        let status = invoked
+            .iter()
+            .find(|event| event_name(event) == "exit")
+            .and_then(|event| match &event.args[1] {
+                Typval::Number(status) => Some(*status),
+                _ => None,
+            });
+        assert_eq!(status, Some(0), "on_exit must carry the exit code");
+        // The queue is empty afterwards; a second poll is a no-op.
+        let second = jobs.poll().unwrap();
+        assert!(
+            !second.iter().any(|event| event_name(event) == "exit"),
+            "the exit event must not survive its invocation"
+        );
+    }
+
+    // A handler that fails mid-batch must not destroy the uninvoked tail:
+    // `invoke_job_events` drains from the front as it delivers, and
+    // `take_deferred_and_invoke` requeues whatever remains (upstream keeps
+    // unprocessed callbacks queued, `channel.c`).
+    #[test]
+    fn failed_handler_keeps_the_uninvoked_tail_deliverable() {
+        let mut jobs = JobManager::new().unwrap();
+        let options = Typval::dict(Vec::new());
+        let Typval::Dict(reference) = options else {
+            unreachable!()
+        };
+        let event = |name: &str| JobEvent {
+            callback: Typval::String(OxStr::from("Callback")),
+            receiver: reference.clone(),
+            args: vec![
+                Typval::Number(1),
+                Typval::list(Vec::new()),
+                Typval::String(OxStr::from(name)),
+            ],
+        };
+        jobs.defer_events(vec![event("stdout"), event("exit")]);
+        let result = jobs.take_deferred_and_invoke(|events| {
+            // Deliver the first event, then fail: the exit event stays.
+            let _ = events.remove(0);
+            Err("handler failed".to_owned())
+        });
+        assert_eq!(result.unwrap_err(), "handler failed");
+        let requeued = jobs.poll().unwrap();
+        assert_eq!(
+            requeued.len(),
+            1,
+            "the uninvoked tail must survive the failure"
+        );
+        assert_eq!(event_name(&requeued[0]), "exit");
     }
 }

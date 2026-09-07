@@ -1,3 +1,6 @@
+// Pure unit-test module: expect/panic on UV I/O results IS the assertion;
+// a failed expect here is a test failure, not a recoverable error.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::cell::{Cell, RefCell};
 use std::fs as std_fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -13,9 +16,9 @@ use crate::dns::{self, AddrInfoHints};
 use crate::fs::{self, OpenFlags};
 use crate::net::{NetEvent, Tcp, Udp};
 use crate::pool::{LoopPoster, Pool};
-use crate::process::{self, SpawnOptions};
 #[cfg(unix)]
 use crate::process::StdioConfig;
+use crate::process::{self, SpawnOptions};
 use crate::work;
 use crate::{Handle, HandleId};
 
@@ -27,10 +30,8 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "ox-uv-io-tests-{}-{sequence}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ox-uv-io-tests-{}-{sequence}", std::process::id()));
         std_fs::create_dir(&path).expect("create isolated test directory");
         Self(path)
     }
@@ -50,8 +51,11 @@ fn run_default_bounded(uv_loop: &mut UvLoop) {
     let poster = uv_loop.completion_poster();
     let (cancel_tx, cancel_rx) = mpsc::channel();
     let watchdog = thread::spawn(move || {
-        if matches!(cancel_rx.recv_timeout(TIMEOUT), Err(mpsc::RecvTimeoutError::Timeout)) {
-            let _ = poster.post(Box::new(|uv_loop| uv_loop.stop()));
+        if matches!(
+            cancel_rx.recv_timeout(TIMEOUT),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            let _ = poster.post(Box::new(super::uv_loop::UvLoop::stop));
         }
     });
     let alive = uv_loop.run_default().expect("pump loop");
@@ -70,12 +74,24 @@ fn sync_filesystem_round_trip_and_enoent_name() {
 
     std_fs::write(&original, []).expect("seed file");
     let file = fs::open(&original, OpenFlags::READ_WRITE, 0o600).expect("open file");
-    assert_eq!(fs::write(&file, payload, Some(0)).expect("write file"), payload.len());
-    assert_eq!(fs::read(&file, payload.len(), Some(0)).expect("read file"), payload);
-    assert_eq!(fs::fstat(&file).expect("stat open file").size, payload.len() as u64);
+    assert_eq!(
+        fs::write(&file, payload, Some(0)).expect("write file"),
+        payload.len()
+    );
+    assert_eq!(
+        fs::read(&file, payload.len(), Some(0)).expect("read file"),
+        payload
+    );
+    assert_eq!(
+        fs::fstat(&file).expect("stat open file").size,
+        payload.len() as u64
+    );
     fs::close(&file).expect("close file");
 
-    assert_eq!(fs::copyfile(&original, &copy, false).expect("copy file"), payload.len() as u64);
+    assert_eq!(
+        fs::copyfile(&original, &copy, false).expect("copy file"),
+        payload.len() as u64
+    );
     let names: Vec<_> = fs::scandir(temp.path())
         .expect("scan directory")
         .map(|entry| entry.name)
@@ -83,7 +99,10 @@ fn sync_filesystem_round_trip_and_enoent_name() {
     assert_eq!(names, ["a-copy", "b-original"]);
 
     fs::rename(&copy, &renamed).expect("rename file");
-    assert_eq!(fs::stat(&renamed).expect("stat renamed file").size, payload.len() as u64);
+    assert_eq!(
+        fs::stat(&renamed).expect("stat renamed file").size,
+        payload.len() as u64
+    );
     fs::unlink(&original).expect("unlink original");
     fs::unlink(&renamed).expect("unlink renamed file");
 
@@ -120,9 +139,15 @@ fn async_filesystem_callback_waits_for_loop_and_runs_on_loop_thread() {
     .expect("submit async stat");
 
     work_rx.recv_timeout(TIMEOUT).expect("worker finishes");
-    assert!(callback_rx.try_recv().is_err(), "callback ran before loop pumping");
+    assert!(
+        callback_rx.try_recv().is_err(),
+        "callback ran before loop pumping"
+    );
     run_default_bounded(&mut uv_loop);
-    assert_eq!(callback_rx.recv_timeout(TIMEOUT).expect("callback result"), (loop_thread, 5));
+    assert_eq!(
+        callback_rx.recv_timeout(TIMEOUT).expect("callback result"),
+        (loop_thread, 5)
+    );
 }
 
 #[test]
@@ -135,9 +160,14 @@ fn fixed_pool_drains_thirty_two_jobs_without_deadlock() {
 
     for value in 0_u32..32 {
         let tx = tx.clone();
-        pool.submit(poster.clone(), move || value * value, move |_, result| {
-            tx.send(result.expect("pool work succeeds")).expect("send pool result");
-        })
+        pool.submit(
+            poster.clone(),
+            move || value * value,
+            move |_, result| {
+                tx.send(result.expect("pool work succeeds"))
+                    .expect("send pool result");
+            },
+        )
         .expect("submit pool job");
     }
     drop(tx);
@@ -166,14 +196,21 @@ fn queue_work_returns_value_on_loop_thread() {
             Box::new(value + 1)
         },
         move |_, result| {
-            let value = *result.expect("work succeeds").downcast::<u32>().expect("u32 work output");
-            tx.send((thread::current().id(), value)).expect("send work result");
+            let value = *result
+                .expect("work succeeds")
+                .downcast::<u32>()
+                .expect("u32 work output");
+            tx.send((thread::current().id(), value))
+                .expect("send work result");
         },
     );
 
     work::queue_work(&queued, Box::new(41_u32)).expect("queue work");
     run_default_bounded(&mut uv_loop);
-    assert_eq!(rx.recv_timeout(TIMEOUT).expect("receive work result"), (loop_thread, 42));
+    assert_eq!(
+        rx.recv_timeout(TIMEOUT).expect("receive work result"),
+        (loop_thread, 42)
+    );
 }
 
 #[test]
@@ -190,9 +227,14 @@ fn process_cat_echoes_through_pipes_and_exits_cleanly() {
     let mut uv_loop = UvLoop::new().expect("create loop");
     let (tx, rx) = mpsc::channel();
     let mut options = SpawnOptions::new("/bin/cat");
-    options.stdio = [StdioConfig::CreatePipe, StdioConfig::CreatePipe, StdioConfig::Ignore];
+    options.stdio = [
+        StdioConfig::CreatePipe,
+        StdioConfig::CreatePipe,
+        StdioConfig::Ignore,
+    ];
     let mut spawned = process::spawn(&mut uv_loop, options, move |_, result| {
-        tx.send(result.expect("cat exits cleanly")).expect("send cat exit");
+        tx.send(result.expect("cat exits cleanly"))
+            .expect("send cat exit");
     })
     .expect("spawn cat");
 
@@ -201,7 +243,9 @@ fn process_cat_echoes_through_pipes_and_exits_cleanly() {
     let eof_reached: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     {
         let mut stdin = spawned.pipes.stdin.take().expect("cat stdin pipe");
-        stdin.write(&mut uv_loop, payload.to_vec()).expect("write cat stdin");
+        stdin
+            .write(&mut uv_loop, payload.to_vec())
+            .expect("write cat stdin");
         // The small write flushes synchronously; closing stdin signals EOF.
         stdin.close(&mut uv_loop).expect("close cat stdin");
     }
@@ -243,7 +287,8 @@ fn sigterm_is_reported_as_terminating_signal() {
     options.args = vec!["-c".into(), "exec sleep 30".into()];
     options.stdio = [StdioConfig::Ignore; 3];
     let spawned = process::spawn(&mut uv_loop, options, move |_, result| {
-        tx.send(result.expect("sleeper exits by signal")).expect("send terminated exit");
+        tx.send(result.expect("sleeper exits by signal"))
+            .expect("send terminated exit");
     })
     .expect("spawn sleeper");
 
@@ -262,18 +307,28 @@ fn pty_reports_terminal_and_supports_resize() {
     let mut uv_loop = UvLoop::new().expect("create loop");
     let (tx, rx) = mpsc::channel();
     let mut options = SpawnOptions::new("/bin/sh");
-    options.args = vec!["-c".into(), "tty".into()];
+    options.args = vec!["-c".into(), "printf '%s\\n' \"$PWD\"; tty".into()];
     let mut spawned = process::spawn_pty(
         &mut uv_loop,
         options,
-        PtySize { rows: 24, columns: 80 },
+        PtySize {
+            rows: 24,
+            columns: 80,
+        },
         move |_, result| {
-            tx.send(result.expect("PTY exits cleanly")).expect("send PTY exit");
+            tx.send(result.expect("PTY exits cleanly"))
+                .expect("send PTY exit");
         },
     )
     .expect("spawn PTY");
 
-    spawned.master.resize(PtySize { rows: 40, columns: 100 }).expect("resize PTY");
+    spawned
+        .master
+        .resize(PtySize {
+            rows: 40,
+            columns: 100,
+        })
+        .expect("resize PTY");
     let size = spawned.master.get_size().expect("read PTY size");
     assert_eq!((size.rows, size.columns), (40, 100));
 
@@ -299,12 +354,26 @@ fn pty_reports_terminal_and_supports_resize() {
     }
     assert!(eof_reached.get(), "PTY did not reach EOF");
     let output = String::from_utf8(output.borrow().clone()).expect("tty output is UTF-8");
+    let mut lines = output.lines().map(|line| line.trim_end_matches('\r'));
+    assert_eq!(
+        lines.next(),
+        Some(
+            std::env::current_dir()
+                .expect("read parent cwd")
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+    let tty = lines.next().expect("tty path");
     #[cfg(target_os = "linux")]
-    assert!(output.trim().starts_with("/dev/pts/"), "unexpected tty path: {output:?}");
+    assert!(tty.starts_with("/dev/pts/"), "unexpected tty path: {tty:?}");
     #[cfg(not(target_os = "linux"))]
-    assert!(output.trim().starts_with("/dev/"), "unexpected tty path: {output:?}");
+    assert!(tty.starts_with("/dev/"), "unexpected tty path: {tty:?}");
 
-    spawned.master.close(&mut uv_loop).expect("close PTY master");
+    spawned
+        .master
+        .close(&mut uv_loop)
+        .expect("close PTY master");
     run_default_bounded(&mut uv_loop);
     let exit = rx.recv_timeout(TIMEOUT).expect("PTY exit callback");
     assert_eq!((exit.code, exit.signal), (0, 0));
@@ -322,16 +391,22 @@ fn pty_sigterm_reports_terminating_signal() {
     let spawned = process::spawn_pty(
         &mut uv_loop,
         options,
-        PtySize { rows: 24, columns: 80 },
+        PtySize {
+            rows: 24,
+            columns: 80,
+        },
         move |_, result| {
-            tx.send(result.expect("PTY sleeper exits by signal")).expect("send terminated PTY exit");
+            tx.send(result.expect("PTY sleeper exits by signal"))
+                .expect("send terminated PTY exit");
         },
     )
     .expect("spawn PTY sleeper");
 
     process::process_kill(&spawned.process, Some(15)).expect("send SIGTERM to PTY child");
     run_default_bounded(&mut uv_loop);
-    let exit = rx.recv_timeout(TIMEOUT).expect("PTY terminated exit callback");
+    let exit = rx
+        .recv_timeout(TIMEOUT)
+        .expect("PTY terminated exit callback");
     assert_eq!((exit.code, exit.signal), (0, 15));
 }
 
@@ -344,7 +419,7 @@ fn tcp_loopback_drains_large_echo_across_read_events() {
     let server_read_events = Rc::new(Cell::new(0usize));
     let echoed = Rc::new(RefCell::new(Vec::<u8>::new()));
     let done = Rc::new(Cell::new(false));
-    let payload: Vec<u8> = (0..(192 * 1024)).map(|index| (index % 251) as u8).collect();
+    let payload: Vec<u8> = (0u8..=250).cycle().take(192 * 1024).collect();
     let payload_len = payload.len();
 
     let listener = {
@@ -382,27 +457,25 @@ fn tcp_loopback_drains_large_echo_across_read_events() {
     let client = {
         let echoed = echoed.clone();
         let done = done.clone();
-        let mut client = Tcp::connect(
-            &mut uv_loop,
-            address,
-            move |_, _, event| match event {
-                NetEvent::Connected(result) => result.expect("TCP connection succeeds"),
-                NetEvent::Read(data) => {
-                    let mut echoed = echoed.borrow_mut();
-                    echoed.extend(data);
-                    if echoed.len() == payload_len {
-                        done.set(true);
-                    }
+        let mut client = Tcp::connect(&mut uv_loop, address, move |_, _, event| match event {
+            NetEvent::Connected(result) => result.expect("TCP connection succeeds"),
+            NetEvent::Read(data) => {
+                let mut echoed = echoed.borrow_mut();
+                echoed.extend(data);
+                if echoed.len() == payload_len {
+                    done.set(true);
                 }
-                NetEvent::Eof => done.set(true),
-                NetEvent::WriteComplete { result, .. } => result.expect("client write succeeds"),
-                NetEvent::Error(error) => panic!("TCP client error: {error}"),
-                _ => {}
-            },
-        )
+            }
+            NetEvent::Eof => done.set(true),
+            NetEvent::WriteComplete { result, .. } => result.expect("client write succeeds"),
+            NetEvent::Error(error) => panic!("TCP client error: {error}"),
+            _ => {}
+        })
         .expect("connect TCP");
         client.read_start(&mut uv_loop).expect("start client reads");
-        client.write(&mut uv_loop, payload.clone()).expect("queue TCP payload");
+        client
+            .write(&mut uv_loop, payload.clone())
+            .expect("queue TCP payload");
         Rc::new(RefCell::new(client))
     };
 
@@ -460,7 +533,9 @@ fn unix_pipe_loopback_echoes_payload() {
             &socket,
             move |uv_loop, id, event| match event {
                 NetEvent::AcceptedPipe(mut accepted) => {
-                    accepted.read_start(uv_loop).expect("start server pipe reads");
+                    accepted
+                        .read_start(uv_loop)
+                        .expect("start server pipe reads");
                     server_id.set(Some(accepted.id()));
                     *server.borrow_mut() = Some(accepted);
                 }
@@ -485,27 +560,27 @@ fn unix_pipe_loopback_echoes_payload() {
         let echoed = echoed.clone();
         let done = done.clone();
         let payload_len = payload.len();
-        let mut client = Pipe::connect(
-            &mut uv_loop,
-            &socket,
-            move |_, _, event| match event {
-                NetEvent::Connected(result) => result.expect("pipe connection succeeds"),
-                NetEvent::Read(data) => {
-                    let mut echoed = echoed.borrow_mut();
-                    echoed.extend(data);
-                    if echoed.len() == payload_len {
-                        done.set(true);
-                    }
+        let mut client = Pipe::connect(&mut uv_loop, &socket, move |_, _, event| match event {
+            NetEvent::Connected(result) => result.expect("pipe connection succeeds"),
+            NetEvent::Read(data) => {
+                let mut echoed = echoed.borrow_mut();
+                echoed.extend(data);
+                if echoed.len() == payload_len {
+                    done.set(true);
                 }
-                NetEvent::Eof => done.set(true),
-                NetEvent::WriteComplete { result, .. } => result.expect("client write succeeds"),
-                NetEvent::Error(error) => panic!("pipe client error: {error}"),
-                _ => {}
-            },
-        )
+            }
+            NetEvent::Eof => done.set(true),
+            NetEvent::WriteComplete { result, .. } => result.expect("client write succeeds"),
+            NetEvent::Error(error) => panic!("pipe client error: {error}"),
+            _ => {}
+        })
         .expect("connect pipe");
-        client.read_start(&mut uv_loop).expect("start pipe client reads");
-        client.write(&mut uv_loop, payload.clone()).expect("queue pipe payload");
+        client
+            .read_start(&mut uv_loop)
+            .expect("start pipe client reads");
+        client
+            .write(&mut uv_loop, payload.clone())
+            .expect("queue pipe payload");
         Rc::new(RefCell::new(client))
     };
 
@@ -546,11 +621,17 @@ fn unix_pipe_replaces_stale_path_and_removes_owned_path_on_close() {
     let socket = temp.path().join("stale.sock");
     std_fs::write(&socket, b"stale").expect("create stale path");
 
-    let listener = Pipe::bind(&mut uv_loop, &socket, |_, _, _| {})
-        .expect("replace stale pipe path");
-    assert_eq!(listener.local_name().expect("pipe local name"), Some(socket.clone()));
+    let listener =
+        Pipe::bind(&mut uv_loop, &socket, |_, _, _| {}).expect("replace stale pipe path");
+    assert_eq!(
+        listener.local_name().expect("pipe local name"),
+        Some(socket.clone())
+    );
     listener.close(&mut uv_loop).expect("close pipe listener");
-    assert!(!socket.exists(), "closing the listener must remove its socket path");
+    assert!(
+        !socket.exists(),
+        "closing the listener must remove its socket path"
+    );
 }
 
 #[cfg(unix)]
@@ -562,13 +643,19 @@ fn unix_pipe_does_not_replace_an_active_listener() {
     let mut second_loop = UvLoop::new().expect("create second loop");
     let temp = TempDir::new();
     let socket = temp.path().join("active.sock");
-    let mut first = Pipe::bind(&mut first_loop, &socket, |_, _, _| {}).expect("bind first listener");
-    first.listen(&mut first_loop, 8).expect("listen on first listener");
+    let mut first =
+        Pipe::bind(&mut first_loop, &socket, |_, _, _| {}).expect("bind first listener");
+    first
+        .listen(&mut first_loop, 8)
+        .expect("listen on first listener");
 
     let error = Pipe::bind(&mut second_loop, &socket, |_, _, _| {})
         .err()
         .expect("active listener must keep its address");
-    assert!(error.to_string().contains("Address already in use"), "unexpected bind error: {error}");
+    assert!(
+        error.to_string().contains("Address already in use"),
+        "unexpected bind error: {error}"
+    );
 
     first.close(&mut first_loop).expect("close first listener");
 }
@@ -591,7 +678,9 @@ fn udp_loopback_echoes_datagram() {
             move |uv_loop, _id, event| match event {
                 NetEvent::Datagram { data, from } => {
                     if let Some(server) = server_for_cb.borrow_mut().as_mut() {
-                        server.send(uv_loop, data, Some(from)).expect("queue UDP echo");
+                        server
+                            .send(uv_loop, data, Some(from))
+                            .expect("queue UDP echo");
                     }
                 }
                 NetEvent::WriteComplete { result, .. } => result.expect("server send succeeds"),
@@ -601,7 +690,9 @@ fn udp_loopback_echoes_datagram() {
         )
         .expect("bind UDP server");
         let address = server.local_addr().expect("UDP server address");
-        server.recv_start(&mut uv_loop).expect("start UDP server receive");
+        server
+            .recv_start(&mut uv_loop)
+            .expect("start UDP server receive");
         *server_holder.borrow_mut() = Some(server);
         address
     };
@@ -625,7 +716,9 @@ fn udp_loopback_echoes_datagram() {
         )
         .expect("bind UDP client");
         let _client_address = client.local_addr().expect("UDP client address");
-        client.recv_start(&mut uv_loop).expect("start UDP client receive");
+        client
+            .recv_start(&mut uv_loop)
+            .expect("start UDP client receive");
         client
             .send(&mut uv_loop, payload.clone(), Some(server_address))
             .expect("queue UDP datagram");
@@ -639,7 +732,11 @@ fn udp_loopback_echoes_datagram() {
     assert!(done.get(), "UDP echo timed out");
 
     assert_eq!(
-        echoed.borrow().as_ref().expect("echoed UDP datagram").as_slice(),
+        echoed
+            .borrow()
+            .as_ref()
+            .expect("echoed UDP datagram")
+            .as_slice(),
         payload.as_slice()
     );
 
@@ -653,6 +750,114 @@ fn udp_loopback_echoes_datagram() {
         .borrow()
         .close(&mut uv_loop)
         .expect("close UDP client");
+    for _ in 0..8 {
+        let _ = uv_loop.run_nowait();
+    }
+}
+
+#[test]
+fn net_callback_panic_does_not_strand_slot() {
+    let mut uv_loop = UvLoop::new().expect("create loop");
+
+    let server: Rc<RefCell<Option<Box<Tcp>>>> = Rc::new(RefCell::new(None));
+    let server_id: Rc<Cell<Option<HandleId>>> = Rc::new(Cell::new(None));
+
+    let listener = {
+        let server = server.clone();
+        let server_id = server_id.clone();
+        let mut listener = Tcp::bind(
+            &mut uv_loop,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            move |uv_loop, id, event| match event {
+                NetEvent::AcceptedTcp(mut accepted) => {
+                    accepted.read_start(uv_loop).expect("start server reads");
+                    server_id.set(Some(accepted.id()));
+                    *server.borrow_mut() = Some(accepted);
+                }
+                NetEvent::Read(data) if server_id.get() == Some(id) => {
+                    if let Some(stream) = server.borrow_mut().as_mut() {
+                        stream.write(uv_loop, data).expect("echo TCP data");
+                    }
+                }
+                NetEvent::WriteComplete { result, .. } if server_id.get() == Some(id) => {
+                    result.expect("server write succeeds");
+                }
+                NetEvent::Error(error) => panic!("TCP server error: {error}"),
+                _ => {}
+            },
+        )
+        .expect("bind TCP");
+        listener.listen(&mut uv_loop, 16).expect("listen TCP");
+        Rc::new(RefCell::new(listener))
+    };
+    let address = listener.borrow().local_addr().expect("listener address");
+
+    let first_read = Rc::new(Cell::new(true));
+    let second_data = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let done = Rc::new(Cell::new(false));
+
+    let client = {
+        let first_read = first_read.clone();
+        let second_data = second_data.clone();
+        let done = done.clone();
+        let mut client = Tcp::connect(&mut uv_loop, address, move |_, _, event| match event {
+            NetEvent::Connected(result) => result.expect("TCP connection succeeds"),
+            NetEvent::Read(data) => {
+                if first_read.get() {
+                    first_read.set(false);
+                    panic!("intentional panic in first read callback");
+                }
+                second_data.borrow_mut().extend(&data);
+                done.set(true);
+            }
+            NetEvent::Eof => done.set(true),
+            NetEvent::WriteComplete { result, .. } => result.expect("client write succeeds"),
+            NetEvent::Error(error) => panic!("TCP client error: {error}"),
+            _ => {}
+        })
+        .expect("connect TCP");
+        client.read_start(&mut uv_loop).expect("start client reads");
+        client
+            .write(&mut uv_loop, b"first".to_vec())
+            .expect("queue first payload");
+        Rc::new(RefCell::new(client))
+    };
+
+    // Pump until the first read panics and the error is captured.
+    let deadline = Instant::now() + TIMEOUT;
+    while first_read.get() && Instant::now() < deadline {
+        uv_loop.run_nowait().expect("pump until first read");
+    }
+    assert!(!first_read.get(), "first read did not fire");
+
+    // The panic should have been captured, not unwound through the loop.
+    let panic_error = uv_loop.pop_callback_error();
+    assert!(
+        panic_error.is_some(),
+        "expected a callback error from the panic"
+    );
+
+    // Queue a second payload; the callback slot must still be installed.
+    client
+        .borrow_mut()
+        .write(&mut uv_loop, b"second".to_vec())
+        .expect("queue second payload");
+
+    // Pump until the second read fires.
+    let deadline = Instant::now() + TIMEOUT;
+    while !done.get() && Instant::now() < deadline {
+        uv_loop.run_nowait().expect("pump until second read");
+    }
+    assert!(done.get(), "second read did not fire after panic");
+    assert_eq!(second_data.borrow().as_slice(), b"second");
+
+    server
+        .borrow()
+        .as_ref()
+        .expect("server")
+        .close(&mut uv_loop)
+        .expect("close server");
+    client.borrow().close(&mut uv_loop).expect("close client");
     for _ in 0..8 {
         let _ = uv_loop.run_nowait();
     }

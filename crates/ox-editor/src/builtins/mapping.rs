@@ -38,32 +38,35 @@
 //! `nvim_set_keymap`'s option table, so upstream reports 0 for every mapping a
 //! `:map` command can create, which is every mapping here.
 
+use crate::excmd_exec::ExEditorAccess;
 use ox_eval::EvalError;
 use ox_eval::Scope;
 use ox_types::{OxStr, Typval};
 
-use crate::excmd_exec::{map_leader, EvalHost};
+use crate::excmd_exec::{EvalHost, map_leader};
 use crate::mapping::{MapModes, Mapping, MappingAction};
 use crate::script::FileIO;
-use crate::typeahead::{special_notation, Keys};
+use crate::typeahead::{Keys, special_notation};
 
 /// Routes one mapping query builtin.
-pub(crate) fn call<F: FileIO>(
-    host: &mut EvalHost<'_, F>,
+pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
     name: &str,
-    args: Vec<Typval>,
+    args: &[Typval],
     scope: &Scope,
 ) -> ox_eval::Result<Typval> {
     match name {
         "maparg" => maparg(host, args, scope),
+        "mapcheck" => mapcheck(host, args, scope),
+        "hasmapto" => hasmapto(host, args, scope),
         _ => unreachable!("mapping builtin route and dispatcher disagree"),
     }
 }
 
 /// `get_maparg` (`mapping.c:2148-2227`).
-fn maparg<F: FileIO>(
-    host: &mut EvalHost<'_, F>,
-    args: Vec<Typval>,
+fn maparg<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
     scope: &Scope,
 ) -> ox_eval::Result<Typval> {
     check_arity("maparg", args.len())?;
@@ -75,7 +78,9 @@ fn maparg<F: FileIO>(
         return Ok(Typval::String(OxStr::from("")));
     }
     let which = match args.get(1) {
-        Some(value) => super::input_string_arg(value)?.to_string_lossy().into_owned(),
+        Some(value) => super::input_string_arg(value)?
+            .to_string_lossy()
+            .into_owned(),
         None => String::new(),
     };
     let abbr = args.get(2).is_some_and(Typval::is_truthy);
@@ -83,7 +88,11 @@ fn maparg<F: FileIO>(
     let modes = MapModes::from_mode_string(&which);
 
     let empty = || {
-        if want_dict { Typval::dict(Vec::new()) } else { Typval::String(OxStr::from("")) }
+        if want_dict {
+            Typval::dict(Vec::new())
+        } else {
+            Typval::String(OxStr::from(""))
+        }
     };
     // See this module's header: the abbreviation table cannot answer.
     if abbr {
@@ -97,18 +106,21 @@ fn maparg<F: FileIO>(
         &map_leader(scope, "mapleader"),
         &map_leader(scope, "maplocalleader"),
     );
-    let buffer = host.editor.current_buffer();
-    let Some((mapping, local)) = host.editor.mappings().find_exact(lhs.as_bytes(), modes, buffer)
-    else {
+    let found = host.access.with_ex_editor(|editor| {
+        editor
+            .mappings()
+            .find_exact(lhs.as_bytes(), modes, editor.current_buffer())
+            .map(|(mapping, local)| (mapping.clone(), local))
+    });
+    let Some((mapping, local)) = found else {
         return Ok(empty());
     };
     // A callback mapping has no key string, and this port cannot hand back the
-    // Funcref that would replace it.
     let Some(replaced) = mapping.action.replaced_keys() else {
         return Ok(empty());
     };
     if want_dict {
-        return Ok(fill_dict(mapping, local));
+        return Ok(fill_dict(&mapping, local));
     }
     // `get_maparg`'s string form (`mapping.c:2200-2210`): an empty right-hand
     // side prints as the literal `<Nop>`, everything else through
@@ -120,6 +132,98 @@ fn maparg<F: FileIO>(
     }))
 }
 
+/// `f_mapcheck` — `get_maparg` with `exact = 0` (`mapping.c:2148-2227`):
+/// answers the right-hand side of the first mapping whose left-hand side
+/// begins with the queried keys, '' when none does. Abbreviations answer
+/// nothing for the same reason `maparg`'s does (module header).
+fn mapcheck<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+    scope: &Scope,
+) -> ox_eval::Result<Typval> {
+    check_arity("mapcheck", args.len())?;
+    let keys = super::input_string_arg(&args[0])?;
+    if keys.0.is_empty() {
+        return Ok(Typval::String(OxStr::from("")));
+    }
+    let which = match args.get(1) {
+        Some(value) => super::input_string_arg(value)?
+            .to_string_lossy()
+            .into_owned(),
+        None => String::new(),
+    };
+    if args.get(2).is_some_and(Typval::is_truthy) {
+        return Ok(Typval::String(OxStr::from("")));
+    }
+    let modes = MapModes::from_mode_string(&which);
+    let lhs = Keys::parse_notation(
+        &keys.to_string_lossy(),
+        &map_leader(scope, "mapleader"),
+        &map_leader(scope, "maplocalleader"),
+    );
+    let found = host.access.with_ex_editor(|editor| {
+        editor
+            .mappings()
+            .matching(lhs.as_bytes(), modes, editor.current_buffer())
+            .into_iter()
+            .filter(|(mapping, _)| mapping.lhs.as_bytes().starts_with(lhs.as_bytes()))
+            // `map_check` prefers the exact lhs over any longer one.
+            .min_by_key(|(mapping, _)| mapping.lhs.as_bytes().len())
+            .and_then(|(mapping, _)| mapping.action.replaced_keys().map(<[u8]>::to_vec))
+    });
+    let Some(replaced) = found else {
+        return Ok(Typval::String(OxStr::from("")));
+    };
+    Ok(Typval::String(OxStr::from(
+        special_notation(&replaced, false, false).as_str(),
+    )))
+}
+
+/// `f_hasmapto` (`mapping.c:1980-2022`): 1 when any mapping's right-hand
+/// side contains `what` (after `replace_termcodes`), 0 otherwise.
+fn hasmapto<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+    scope: &Scope,
+) -> ox_eval::Result<Typval> {
+    check_arity("hasmapto", args.len())?;
+    let what = super::input_string_arg(&args[0])?;
+    let which = match args.get(1) {
+        Some(value) => super::input_string_arg(value)?
+            .to_string_lossy()
+            .into_owned(),
+        None => String::new(),
+    };
+    if args.get(2).is_some_and(Typval::is_truthy) {
+        return Ok(Typval::Number(0));
+    }
+    let modes = MapModes::from_mode_string(&which);
+    let needle = Keys::parse_notation(
+        &what.to_string_lossy(),
+        &map_leader(scope, "mapleader"),
+        &map_leader(scope, "maplocalleader"),
+    );
+    let found = host.access.with_ex_editor(|editor| {
+        editor
+            .mappings()
+            .matching(b"", modes, editor.current_buffer())
+            .into_iter()
+            .any(|(mapping, _)| {
+                mapping
+                    .action
+                    .replaced_keys()
+                    .is_some_and(|rhs| windows_contains(rhs, needle.as_bytes()))
+            })
+    });
+    Ok(Typval::Number(i64::from(found)))
+}
+
+/// `windows()`-style substring test that answers false for an empty needle,
+/// matching `vim_strchr`-based containment upstream.
+fn windows_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// `mapblock_fill_dict` with `compatible` true (`mapping.c:2090-2146`).
 fn fill_dict(mapping: &Mapping, local: bool) -> Typval {
     let options = &mapping.options;
@@ -127,31 +231,72 @@ fn fill_dict(mapping: &Mapping, local: bool) -> Typval {
     let mut entries = vec![
         // `compatible` reports `m_orig_str`, the right-hand side as written,
         // rather than `str2special` of the replaced form.
-        (OxStr::from("rhs"), Typval::String(OxStr::from(options.orig_rhs.as_str()))),
-        (OxStr::from("lhs"), Typval::String(OxStr::from(special_notation(mapping.lhs.as_bytes(), true, false).as_str()))),
-        (OxStr::from("lhsraw"), Typval::String(OxStr(mapping.lhs.as_bytes().to_vec()))),
+        (
+            OxStr::from("rhs"),
+            Typval::String(OxStr::from(options.orig_rhs.as_str())),
+        ),
+        (
+            OxStr::from("lhs"),
+            Typval::String(OxStr::from(
+                special_notation(mapping.lhs.as_bytes(), true, false).as_str(),
+            )),
+        ),
+        (
+            OxStr::from("lhsraw"),
+            Typval::String(OxStr(mapping.lhs.as_bytes().to_vec())),
+        ),
         // The compatible form cannot distinguish `<script>`, so `noremap` is
         // just "does not remap" (`mapping.c:2101-2104`).
-        (OxStr::from("noremap"), Typval::Number(i64::from(!options.remap))),
-        (OxStr::from("script"), Typval::Number(i64::from(options.script))),
-        (OxStr::from("expr"), Typval::Number(i64::from(matches!(mapping.action, MappingAction::Expr(_))))),
-        (OxStr::from("silent"), Typval::Number(i64::from(options.silent))),
-        (OxStr::from("sid"), Typval::Number(i64::try_from(context.sid).unwrap_or(0))),
+        (
+            OxStr::from("noremap"),
+            Typval::Number(i64::from(!options.flags.contains(crate::MapFlags::REMAP))),
+        ),
+        (
+            OxStr::from("script"),
+            Typval::Number(i64::from(options.flags.contains(crate::MapFlags::SCRIPT))),
+        ),
+        (
+            OxStr::from("silent"),
+            Typval::Number(i64::from(options.flags.contains(crate::MapFlags::SILENT))),
+        ),
+        (
+            OxStr::from("expr"),
+            Typval::Number(i64::from(matches!(mapping.action, MappingAction::Expr(_)))),
+        ),
         // Hard-coded upstream too (`mapping.c:2133`).
         (OxStr::from("scriptversion"), Typval::Number(1)),
-        (OxStr::from("lnum"), Typval::Number(i64::try_from(context.lnum).unwrap_or(0))),
+        (
+            OxStr::from("sid"),
+            Typval::Number(i64::try_from(context.sid).unwrap_or(0)),
+        ),
+        (
+            OxStr::from("lnum"),
+            Typval::Number(i64::try_from(context.lnum).unwrap_or(0)),
+        ),
         (OxStr::from("buffer"), Typval::Number(i64::from(local))),
-        (OxStr::from("nowait"), Typval::Number(i64::from(options.nowait))),
+        (
+            OxStr::from("nowait"),
+            Typval::Number(i64::from(options.flags.contains(crate::MapFlags::NOWAIT))),
+        ),
         // Only `nvim_set_keymap`'s option table sets `m_replace_keycodes`, and
         // this port has no such surface, so every mapping reports upstream's
         // value for a `:map`-created one.
         (OxStr::from("replace_keycodes"), Typval::Number(0)),
-        (OxStr::from("mode"), Typval::String(OxStr::from(options.modes.to_chars().as_str()))),
+        (
+            OxStr::from("mode"),
+            Typval::String(OxStr::from(options.modes.to_chars().as_str())),
+        ),
         (OxStr::from("abbr"), Typval::Number(0)),
-        (OxStr::from("mode_bits"), Typval::Number(i64::from(options.modes.bits()))),
+        (
+            OxStr::from("mode_bits"),
+            Typval::Number(i64::from(options.modes.bits())),
+        ),
     ];
     if let Some(description) = &options.description {
-        entries.push((OxStr::from("desc"), Typval::String(OxStr::from(description.as_str()))));
+        entries.push((
+            OxStr::from("desc"),
+            Typval::String(OxStr::from(description.as_str())),
+        ));
     }
     Typval::dict(entries)
 }
@@ -159,12 +304,21 @@ fn fill_dict(mapping: &Mapping, local: bool) -> Typval {
 /// Enforces the `eval.lua` argument counts the way upstream's function table
 /// does before a builtin body runs.
 fn check_arity(name: &str, count: usize) -> ox_eval::Result<()> {
-    let spec = ox_eval::builtin_spec(name).expect("mapping builtins come from eval.lua");
+    let spec = ox_eval::builtin_spec(name)
+        .ok_or_else(|| EvalError::new("E117", 0, format!("Unknown function: {name}")))?;
     if count < spec.min_args {
-        return Err(EvalError::new("E119", 0, format!("Not enough arguments for function: {name}")));
+        return Err(EvalError::new(
+            "E119",
+            0,
+            format!("Not enough arguments for function: {name}"),
+        ));
     }
     if spec.max_args.is_some_and(|maximum| count > maximum) {
-        return Err(EvalError::new("E118", 0, format!("Too many arguments for function: {name}")));
+        return Err(EvalError::new(
+            "E118",
+            0,
+            format!("Too many arguments for function: {name}"),
+        ));
     }
     Ok(())
 }

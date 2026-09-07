@@ -39,7 +39,10 @@ impl BuiltinHost for NoBuiltins {
         if name.as_bytes() == b"has" {
             return Ok(Typval::Number(0));
         }
-        Err(format!("unexpected Vimscript builtin call: {}", name.to_string_lossy()))
+        Err(format!(
+            "unexpected Vimscript builtin call: {}",
+            name.to_string_lossy()
+        ))
     }
 }
 
@@ -47,11 +50,18 @@ fn parser_from_environment() -> Option<(PathBuf, String)> {
     if let Some(path) = std::env::var_os("OXVIM_TREE_SITTER_PARSER").map(PathBuf::from) {
         let language = std::env::var("OXVIM_TREE_SITTER_LANGUAGE")
             .ok()
-            .or_else(|| path.file_stem().and_then(|stem| stem.to_str()).map(str::to_owned))?;
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(str::to_owned)
+            })?;
         return path.is_file().then_some((path, language));
     }
 
-    let root = std::env::var_os("OXVIM_REF_ROOT").map(PathBuf::from)?;
+    let root = std::env::var_os("OXVIM_REF_ROOT").map_or_else(
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.references/neovim"),
+        PathBuf::from,
+    );
     [
         root.join("build/lib/nvim/parser/lua.so"),
         root.join(".deps/usr/lib/nvim/parser/lua.so"),
@@ -75,21 +85,29 @@ fn runtime_root() -> RuntimeRoot {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one stateful Tree-sitter scenario exercises parse, node, edit, query, and lifetime boundaries through a single Lua chunk"
+)]
 fn real_parser_exercises_parse_nodes_edit_queries_and_lifetimes() {
     let Some((parser, language)) = parser_from_environment() else {
-        println!("SKIP treesitter real-parser test: set OXVIM_TREE_SITTER_PARSER and OXVIM_TREE_SITTER_LANGUAGE, or provide OXVIM_REF_ROOT with a built Neovim parser");
+        println!(
+            "SKIP treesitter real-parser test: set OXVIM_TREE_SITTER_PARSER and OXVIM_TREE_SITTER_LANGUAGE, or provide OXVIM_REF_ROOT with a built Neovim parser"
+        );
         return;
     };
 
     let scheduler = Rc::new(TestScheduler::default());
     let host = LuaHost::new(runtime_root(), Rc::new(NoBuiltins), scheduler.clone()).unwrap();
     let lua = host.lua();
-    lua.globals().set("parser_path", parser.to_string_lossy().as_ref()).unwrap();
+    lua.globals()
+        .set("parser_path", parser.to_string_lossy().as_ref())
+        .unwrap();
     lua.globals().set("parser_language", language).unwrap();
 
     let result: mlua::Table = lua
         .load(
-            r#"
+            r"
             assert(vim._ts_add_language_from_object(parser_path, parser_language))
             assert(vim._ts_has_language(parser_language))
             assert(vim._ts_get_minimum_language_version() <= vim._ts_get_language_version())
@@ -176,12 +194,79 @@ fn real_parser_exercises_parse_nodes_edit_queries_and_lifetimes() {
             assert(query:inspect().captures[1] == 'node')
 
             return { logs = function() return logs end }
-            "#,
+            ",
         )
         .eval()
         .unwrap();
 
     scheduler.drain().unwrap();
     let logs: mlua::Function = result.get("logs").unwrap();
-    assert!(logs.call::<u32>(()).unwrap() > 0, "real parser should emit scheduled logger records");
+    assert!(
+        logs.call::<u32>(()).unwrap() > 0,
+        "real parser should emit scheduled logger records"
+    );
+}
+
+#[test]
+fn failing_treesitter_calls_reach_pcall_as_strings() {
+    let Some((parser, language)) = parser_from_environment() else {
+        println!(
+            "SKIP treesitter string-error test: no parser .so found (OXVIM_TREE_SITTER_PARSER, OXVIM_REF_ROOT, or .references/neovim)"
+        );
+        return;
+    };
+
+    let scheduler = Rc::new(TestScheduler::default());
+    let host = LuaHost::new(runtime_root(), Rc::new(NoBuiltins), scheduler.clone()).unwrap();
+    let lua = host.lua();
+    lua.globals()
+        .set("parser_path", parser.to_string_lossy().as_ref())
+        .unwrap();
+    lua.globals().set("parser_language", language).unwrap();
+
+    lua.load(
+        r"
+        assert(vim._ts_add_language_from_object(parser_path, parser_language))
+        local parser = vim._create_ts_parser(parser_language)
+
+        -- Factory failures: bad query compile and unknown language.
+        local ok, err = pcall(vim._ts_parse_query, parser_language, '(')
+        assert(ok == false, 'bad query parse must fail')
+        assert(type(err) == 'string', 'bad query parse error must be a string, got ' .. type(err))
+        assert(#err > 0)
+
+        local ok, err = pcall(vim._create_ts_parser, '__missing_language__')
+        assert(ok == false and type(err) == 'string' and #err > 0)
+
+        -- Userdata method failures: invalid node operations.
+        local tree, ranges = parser:parse(nil, 'local value = 1')
+        assert(type(tree) == 'userdata', 'parser:parse first return is ' .. type(tree))
+        local root = tree:root()
+        assert(type(root) == 'userdata', 'tree:root() returned ' .. type(root))
+
+        local ok, err = pcall(root.child, root, -1)
+        assert(ok == false and type(err) == 'string' and #err > 0)
+
+        local ok, err = pcall(function() return root:child('not-a-number') end)
+        assert(ok == false and type(err) == 'string' and #err > 0)
+
+        local ok, err = pcall(function() return root:descendant_for_range(0, 0, -5, -5) end)
+        assert(ok == false and type(err) == 'string' and #err > 0)
+
+        local ok, err = pcall(parser.parse, parser, 123)
+        assert(ok == false and type(err) == 'string' and #err > 0)
+
+        local query = vim._ts_parse_query(parser_language, '(_) @node')
+        local ok, err = pcall(query.disable_pattern, query, 99)
+        assert(ok == false and type(err) == 'string' and #err > 0)
+
+        -- Success paths are unchanged by the wrappers.
+        assert(type(parser:parse(nil, 'local other = 2')) == 'userdata')
+        assert(root:child_count() > 0)
+        local child = root:child(0)
+        assert(child ~= nil and child:parent():equal(root))
+        ",
+    )
+    .eval::<()>()
+    .unwrap();
 }

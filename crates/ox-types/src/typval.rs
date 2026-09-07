@@ -6,6 +6,7 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt;
+use std::ops::{BitOr, BitOrAssign};
 use std::rc::Rc;
 
 use crate::byte_str::OxStr;
@@ -60,6 +61,117 @@ pub struct LockState {
     /// Whether this container rejects mutation.
     pub locked: bool,
 }
+/// Mutability flags stored on a single Dictionary entry.
+///
+/// These mirror upstream's `dictitem_T.di_flags`. The allocation bit has no
+/// Rust equivalent because ownership is represented by the type system.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash)]
+pub struct DictEntryFlags(u8);
+
+impl DictEntryFlags {
+    /// An ordinary mutable entry.
+    pub const NONE: Self = Self(0);
+    /// The entry's value may not be replaced.
+    pub const READ_ONLY: Self = Self(1);
+    /// Read-only only while evaluating in a sandbox.
+    pub const READ_ONLY_SANDBOX: Self = Self(2);
+    /// The entry may not be removed.
+    pub const FIXED: Self = Self(4);
+    /// The entry was locked with `:lockvar`.
+    pub const LOCKED: Self = Self(8);
+
+    /// Whether all bits in `other` are set.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Whether any bit in `other` is set.
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    /// Whether no flags are set.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl BitOr for DictEntryFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for DictEntryFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+/// Lock status stored on an individual Dictionary entry's value.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash)]
+pub enum EntryValueLock {
+    /// The value may be changed.
+    #[default]
+    Unlocked,
+    /// The value was locked with `:lockvar`.
+    Locked,
+    /// The value is owned by Vim and cannot be locked or replaced.
+    Fixed,
+}
+
+/// One ordered Dictionary entry.
+#[derive(Clone, Debug)]
+pub struct DictEntry {
+    /// Entry key.
+    pub key: OxStr,
+    /// Entry value.
+    pub value: Typval,
+    /// Entry mutability flags.
+    pub flags: DictEntryFlags,
+    /// Lock status of the entry's value.
+    pub value_lock: EntryValueLock,
+}
+
+impl DictEntry {
+    /// Construct an ordinary mutable entry.
+    #[must_use]
+    pub fn new(key: OxStr, value: Typval) -> Self {
+        Self {
+            key,
+            value,
+            flags: DictEntryFlags::NONE,
+            value_lock: EntryValueLock::Unlocked,
+        }
+    }
+
+    /// Construct an entry with explicit mutability metadata.
+    #[must_use]
+    pub fn marked(
+        key: OxStr,
+        value: Typval,
+        flags: DictEntryFlags,
+        value_lock: EntryValueLock,
+    ) -> Self {
+        Self {
+            key,
+            value,
+            flags,
+            value_lock,
+        }
+    }
+
+    /// Clone the key and value into a new ordinary mutable entry.
+    #[must_use]
+    pub fn copy_cloned(&self) -> Self {
+        Self::new(self.key.clone(), self.value.clone())
+    }
+}
 
 /// Mutable payload of a shared List reference.
 #[derive(Clone)]
@@ -74,9 +186,27 @@ pub struct ListData {
 #[derive(Clone)]
 pub struct DictData {
     /// Ordered Dictionary entries.
-    pub entries: Vec<(OxStr, Typval)>,
+    pub entries: Vec<DictEntry>,
     /// Container lock metadata.
     pub lock: LockState,
+    /// Whether this is the null dictionary sentinel.
+    is_null: bool,
+}
+
+impl DictData {
+    /// Look up an entry's value by byte key.
+    #[must_use]
+    pub fn get(&self, key: &[u8]) -> Option<&Typval> {
+        self.get_entry(key).map(|entry| &entry.value)
+    }
+
+    /// Look up an entry and its metadata by byte key.
+    #[must_use]
+    pub fn get_entry(&self, key: &[u8]) -> Option<&DictEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.key.as_bytes() == key)
+    }
 }
 
 /// Shared List identity.
@@ -132,13 +262,47 @@ impl Typval {
     /// Construct a new unlocked List identity.
     #[must_use]
     pub fn list(items: Vec<Self>) -> Self {
-        Self::List(Rc::new(RefCell::new(ListData { items, lock: LockState::default() })))
+        Self::List(Rc::new(RefCell::new(ListData {
+            items,
+            lock: LockState::default(),
+        })))
     }
 
     /// Construct a new unlocked ordered Dictionary identity.
     #[must_use]
     pub fn dict(entries: Vec<(OxStr, Self)>) -> Self {
-        Self::Dict(Rc::new(RefCell::new(DictData { entries, lock: LockState::default() })))
+        Self::dict_with_entries(
+            entries
+                .into_iter()
+                .map(|(key, value)| DictEntry::new(key, value))
+                .collect(),
+        )
+    }
+
+    /// Construct a Dictionary from entries carrying explicit metadata.
+    #[must_use]
+    pub fn dict_with_entries(entries: Vec<DictEntry>) -> Self {
+        Self::Dict(Rc::new(RefCell::new(DictData {
+            entries,
+            lock: LockState::default(),
+            is_null: false,
+        })))
+    }
+
+    /// Construct the null dictionary sentinel.
+    #[must_use]
+    pub fn null_dict() -> Self {
+        Self::Dict(Rc::new(RefCell::new(DictData {
+            entries: Vec::new(),
+            lock: LockState::default(),
+            is_null: true,
+        })))
+    }
+
+    /// Return whether this value is the null dictionary sentinel.
+    #[must_use]
+    pub fn is_null_dict(&self) -> bool {
+        matches!(self, Self::Dict(dict) if dict.try_borrow().is_ok_and(|data| data.is_null))
     }
 
     /// Return the upstream numeric `VAR_*` tag.
@@ -184,13 +348,19 @@ impl PartialEq for Typval {
         fn equal(left: &Typval, right: &Typval, seen: &mut HashSet<(usize, usize, u8)>) -> bool {
             match (left, right) {
                 (Typval::Number(a), Typval::Number(b)) => a == b,
+                // Upstream tv_equal (typval.c:4090) compares v_float with
+                // `==` exactly; an epsilon would change Vimscript semantics.
+                #[allow(clippy::float_cmp)]
                 (Typval::Float(a), Typval::Float(b)) => a == b,
                 (Typval::String(a), Typval::String(b)) => a == b,
                 (Typval::Blob(a), Typval::Blob(b)) => a == b,
                 (Typval::Bool(a), Typval::Bool(b)) => a == b,
                 (Typval::Special(a), Typval::Special(b)) => a == b,
-                (Typval::Channel(a), Typval::Channel(b)) | (Typval::Job(a), Typval::Job(b)) => a == b,
-                (Typval::Funcref(a), Typval::Funcref(b)) | (Typval::Partial(a), Typval::Partial(b)) => a == b,
+                (Typval::Channel(a), Typval::Channel(b)) | (Typval::Job(a), Typval::Job(b)) => {
+                    a == b
+                }
+                (Typval::Funcref(a), Typval::Funcref(b))
+                | (Typval::Partial(a), Typval::Partial(b)) => a == b,
                 (Typval::List(a), Typval::List(b)) => {
                     let pair = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize, VAR_LIST);
                     if !seen.insert(pair) {
@@ -219,9 +389,11 @@ impl PartialEq for Typval {
                     drop(a);
                     drop(b);
                     left.len() == right.len()
-                        && left.iter().all(|(key, value)| {
-                            right.iter().find(|(candidate, _)| candidate == key)
-                                .is_some_and(|(_, other)| equal(value, other, seen))
+                        && left.iter().all(|entry| {
+                            right
+                                .iter()
+                                .find(|candidate| candidate.key == entry.key)
+                                .is_some_and(|other| equal(&entry.value, &other.value, seen))
                         })
                 }
                 _ => false,
@@ -234,7 +406,8 @@ impl PartialEq for Typval {
 
 impl fmt::Debug for Funcref {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("Funcref")
+        formatter
+            .debug_struct("Funcref")
             .field("name", &self.name)
             .field("args", &self.args)
             .field("dict", &self.dict)
@@ -245,7 +418,11 @@ impl fmt::Debug for Funcref {
 
 impl fmt::Debug for Typval {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fn write_value(value: &Typval, f: &mut fmt::Formatter<'_>, active: &mut HashSet<(usize, u8)>) -> fmt::Result {
+        fn write_value(
+            value: &Typval,
+            f: &mut fmt::Formatter<'_>,
+            active: &mut HashSet<(usize, u8)>,
+        ) -> fmt::Result {
             match value {
                 Typval::List(list) => {
                     let key = (Rc::as_ptr(list) as usize, VAR_LIST);
@@ -255,7 +432,9 @@ impl fmt::Debug for Typval {
                     f.write_str("List([")?;
                     let items = list.try_borrow().map_err(|_| fmt::Error)?.items.clone();
                     for (index, item) in items.iter().enumerate() {
-                        if index != 0 { f.write_str(", ")?; }
+                        if index != 0 {
+                            f.write_str(", ")?;
+                        }
                         write_value(item, f, active)?;
                     }
                     active.remove(&key);
@@ -268,10 +447,12 @@ impl fmt::Debug for Typval {
                     }
                     f.write_str("Dict({")?;
                     let entries = dict.try_borrow().map_err(|_| fmt::Error)?.entries.clone();
-                    for (index, (name, item)) in entries.iter().enumerate() {
-                        if index != 0 { f.write_str(", ")?; }
-                        write!(f, "{name:?}: ")?;
-                        write_value(item, f, active)?;
+                    for (index, entry) in entries.iter().enumerate() {
+                        if index != 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{:?}: ", entry.key)?;
+                        write_value(&entry.value, f, active)?;
                     }
                     active.remove(&key);
                     f.write_str("})")
@@ -313,7 +494,9 @@ mod tests {
     #[test]
     fn clone_shares_container_and_equality_handles_cycles() {
         let list = Typval::list(vec![]);
-        let Typval::List(reference) = &list else { return };
+        let Typval::List(reference) = &list else {
+            return;
+        };
         reference.borrow_mut().items.push(list.clone());
         let alias = list.clone();
         assert_eq!(list, alias);
@@ -322,7 +505,9 @@ mod tests {
 
     #[test]
     fn lock_state_defaults_unlocked() {
-        let Typval::List(list) = Typval::list(vec![]) else { return };
+        let Typval::List(list) = Typval::list(vec![]) else {
+            return;
+        };
         let data = list.borrow();
         assert!(!data.lock.locked);
         assert_eq!(data.lock.scope, LockScope::None);
@@ -330,7 +515,12 @@ mod tests {
 
     #[test]
     fn funcref_types_remain_distinct() {
-        let function = Funcref { name: OxStr::from("g:fn"), args: vec![], dict: None, registry: None };
+        let function = Funcref {
+            name: OxStr::from("g:fn"),
+            args: vec![],
+            dict: None,
+            registry: None,
+        };
         assert_eq!(Typval::Funcref(function.clone()).vartype(), super::VAR_FUNC);
         assert_eq!(Typval::Partial(function).vartype(), super::VAR_PARTIAL);
         assert_eq!(Typval::Special(Special::Null).vartype(), super::VAR_SPECIAL);

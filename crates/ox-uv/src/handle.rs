@@ -20,6 +20,11 @@ pub trait Handle {
     }
 
     /// Requests deferred destruction without a close callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHandle`] if the handle is no longer live, or
+    /// [`Error::AlreadyClosing`] if close was already requested.
     fn close(&self, uv_loop: &mut UvLoop) -> Result<()> {
         uv_loop.close(
             self.id(),
@@ -28,6 +33,11 @@ pub trait Handle {
     }
 
     /// Requests deferred destruction with a next-turn callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHandle`] if the handle is no longer live, or
+    /// [`Error::AlreadyClosing`] if close was already requested.
     fn close_with<F>(&self, uv_loop: &mut UvLoop, callback: F) -> Result<()>
     where
         F: FnOnce(&mut UvLoop, HandleId) -> std::result::Result<(), CallbackError> + 'static,
@@ -36,11 +46,19 @@ pub trait Handle {
     }
 
     /// Makes an active handle contribute to loop liveness.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHandle`] if the handle is no longer live.
     fn ref_(&self, uv_loop: &mut UvLoop) -> Result<()> {
         uv_loop.set_referenced(self.id(), true)
     }
 
     /// Prevents this handle alone from keeping the loop alive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHandle`] if the handle is no longer live.
     fn unref(&self, uv_loop: &mut UvLoop) -> Result<()> {
         uv_loop.set_referenced(self.id(), false)
     }
@@ -51,12 +69,10 @@ pub trait Handle {
     }
 }
 
-pub(crate) type Callback = Box<
-    dyn FnMut(&mut UvLoop, HandleId) -> std::result::Result<(), CallbackError> + 'static,
->;
-pub(crate) type CloseCallback = Box<
-    dyn FnOnce(&mut UvLoop, HandleId) -> std::result::Result<(), CallbackError> + 'static,
->;
+pub(crate) type Callback =
+    Box<dyn FnMut(&mut UvLoop, HandleId) -> std::result::Result<(), CallbackError> + 'static>;
+pub(crate) type CloseCallback =
+    Box<dyn FnOnce(&mut UvLoop, HandleId) -> std::result::Result<(), CallbackError> + 'static>;
 
 pub(crate) struct HandleState {
     pub(crate) referenced: bool,

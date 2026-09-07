@@ -1,11 +1,13 @@
 //! Generates byte-embedded Neovim Lua builtin modules.
+// Build script: panicking fails the build with the generation error, which
+// is the correct outcome; there is no caller to recover on cargo's behalf.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::env;
 use std::error::Error;
 use std::fmt::Write as _;
-use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::{env, fs};
 
 // Neovim's src/nvim/CMakeLists.txt:647-673 defines the inputs and requires
 // vim._init_packages and vim.inspect to be first and second. The generated
@@ -50,49 +52,43 @@ const BUILTIN_MODULES: &[(&str, &str)] = &[
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-env-changed=OXVIM_REF_ROOT");
 
-    let runtime_root = match env::var_os("OXVIM_REF_ROOT") {
-        Some(reference_root) => {
-            let reference_root = PathBuf::from(reference_root);
-            if !reference_root.is_dir() {
-                return Err(io::Error::new(
-                    ErrorKind::NotFound,
-                    format!(
-                        "OXVIM_REF_ROOT does not name a directory: {}",
-                        reference_root.display()
-                    ),
-                )
-                .into());
-            }
-            reference_root.join("runtime")
+    let runtime_root = if let Some(reference_root) = env::var_os("OXVIM_REF_ROOT") {
+        let reference_root = PathBuf::from(reference_root);
+        if !reference_root.is_dir() {
+            return Err(io::Error::new(
+                ErrorKind::NotFound,
+                format!(
+                    "OXVIM_REF_ROOT does not name a directory: {}",
+                    reference_root.display()
+                ),
+            )
+            .into());
         }
-        None => {
-            let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").ok_or_else(|| {
-                io::Error::new(
-                    ErrorKind::NotFound,
-                    "OXVIM_REF_ROOT is unset and Cargo did not provide CARGO_MANIFEST_DIR",
-                )
-            })?;
-            let fallback = PathBuf::from(manifest_dir).join("../../runtime");
-            if !fallback.is_dir() {
-                return Err(io::Error::new(
-                    ErrorKind::NotFound,
-                    format!(
-                        "OXVIM_REF_ROOT is unset and the checked-out runtime is missing: {}",
-                        fallback.display()
-                    ),
-                )
-                .into());
-            }
-            fallback
+        reference_root.join("runtime")
+    } else {
+        let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::NotFound,
+                "OXVIM_REF_ROOT is unset and Cargo did not provide CARGO_MANIFEST_DIR",
+            )
+        })?;
+        let fallback = PathBuf::from(manifest_dir).join("../../runtime");
+        if !fallback.is_dir() {
+            return Err(io::Error::new(
+                ErrorKind::NotFound,
+                format!(
+                    "OXVIM_REF_ROOT is unset and the checked-out runtime is missing: {}",
+                    fallback.display()
+                ),
+            )
+            .into());
         }
+        fallback
     };
     if !runtime_root.is_dir() {
         return Err(io::Error::new(
             ErrorKind::NotFound,
-            format!(
-                "Neovim runtime root is missing: {}",
-                runtime_root.display()
-            ),
+            format!("Neovim runtime root is missing: {}", runtime_root.display()),
         )
         .into());
     }
@@ -133,6 +129,87 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     generated.push_str("];\n");
     write_if_changed(&out_dir.join("ox_lua_embedded.rs"), generated.as_bytes())?;
+    build_lpeg()?;
+    Ok(())
+}
+/// Compiles the vendored `LPeg` 1.1.0 C sources into the binary, mirroring
+/// Neovim's `cmake.deps` `BuildLpeg.cmake`, which statically links the upstream
+/// module and registers it as vim.lpeg (src/nvim/lua/stdlib.c:821-832).
+fn build_lpeg() -> Result<(), Box<dyn Error>> {
+    // Same translation units as LPeg's own makefile; lpprint.c is included for
+    // parity with upstream's LpegCMakeLists.txt which globs *.c.
+    const LPEG_SOURCES: &[&str] = &[
+        "lpcap.c",
+        "lpcode.c",
+        "lpcset.c",
+        "lpprint.c",
+        "lptree.c",
+        "lpvm.c",
+    ];
+    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::NotFound,
+            "Cargo did not provide CARGO_MANIFEST_DIR",
+        )
+    })?);
+    let lpeg_root = manifest_dir.join("../../third_party/lpeg");
+    if !lpeg_root.join("lptree.c").is_file() {
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            format!("vendored LPeg sources are missing: {}", lpeg_root.display()),
+        )
+        .into());
+    }
+
+    // mlua's vendored LuaJIT (mlua-sys, links = "lua") installs its headers in
+    // <target>/<profile>/build/mlua-sys-<hash>/out/include but emits no
+    // DEP_LUA_INCLUDE metadata, so locate the sibling build directory from our
+    // own OUT_DIR layout: <target>/<profile>/build/ox-lua-<hash>/out.
+    let out_dir = PathBuf::from(
+        env::var_os("OUT_DIR")
+            .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "Cargo did not provide OUT_DIR"))?,
+    );
+    let build_dir = out_dir.ancestors().nth(2).ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("unexpected OUT_DIR layout: {}", out_dir.display()),
+        )
+    })?;
+    let mut include_dirs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(build_dir)? {
+        let entry = entry?;
+        let include = entry.path().join("out").join("include");
+        if include.join("lua.h").is_file() && include.join("luajit.h").is_file() {
+            include_dirs.push((entry.metadata()?.modified()?, include));
+        }
+    }
+    include_dirs.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    let Some((_, include_dir)) = include_dirs.first() else {
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            format!(
+                "no mlua-sys vendored LuaJIT headers found under {}; build mlua first",
+                build_dir.display()
+            ),
+        )
+        .into());
+    };
+    println!(
+        "cargo:rerun-if-changed={}",
+        include_dir.join("lua.h").display()
+    );
+
+    let mut build = cc::Build::new();
+    build.include(include_dir);
+    // Upstream LpegCMakeLists.txt compiles the vendored sources with -w; the
+    // Lua 5.1 shims in lptypes.h legitimately redefine luaL_newlib.
+    build.warnings(false);
+    for source in LPEG_SOURCES {
+        let path = lpeg_root.join(source);
+        println!("cargo:rerun-if-changed={}", path.display());
+        build.file(path);
+    }
+    build.compile("lpeg");
     Ok(())
 }
 

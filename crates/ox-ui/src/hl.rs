@@ -5,7 +5,16 @@ use std::collections::BTreeMap;
 use ox_types::{Dict, Object, OxStr};
 use thiserror::Error;
 
+/// Maximum highlight group name length (`MAX_SYN_NAME`).
+const MAX_GROUP_NAME_LEN: usize = 200;
+/// Maximum highlight group id (`MAX_HL_ID`).
+const MAX_GROUP_ID: u64 = 20_000;
+
 /// RGB or terminal highlight attributes.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Neovim's highlight protocol defines these independent style flags as separate booleans"
+)]
 #[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct HlAttrs {
     /// Foreground color (`0xRRGGBB`) or terminal color index.
@@ -32,6 +41,8 @@ pub struct HlAttrs {
     pub strikethrough: bool,
     /// Reverse foreground and background.
     pub reverse: bool,
+    /// Standout text (distinct from `reverse` in the API surface).
+    pub standout: bool,
     /// Alternative font.
     pub altfont: bool,
     /// Faint text.
@@ -42,12 +53,16 @@ pub struct HlAttrs {
     pub conceal: bool,
     /// Overlined text.
     pub overline: bool,
+    /// Attribute combination is suppressed.
+    pub nocombine: bool,
     /// Blend percentage from zero through one hundred.
     pub blend: Option<u8>,
     /// Clickable hyperlink URL.
     pub url: Option<OxStr>,
     /// Foreground is a terminal color index, not an RGB value.
     pub fg_indexed: bool,
+    /// Background is a terminal color index, not an RGB value.
+    pub bg_indexed: bool,
 }
 
 impl HlAttrs {
@@ -59,6 +74,7 @@ impl HlAttrs {
         push_color(&mut entries, "background", self.background);
         push_color(&mut entries, "special", self.special);
         push_flag(&mut entries, "bold", self.bold);
+        push_flag(&mut entries, "standout", self.standout);
         push_flag(&mut entries, "italic", self.italic);
         push_flag(&mut entries, "underline", self.underline);
         push_flag(&mut entries, "undercurl", self.undercurl);
@@ -72,8 +88,14 @@ impl HlAttrs {
         push_flag(&mut entries, "blink", self.blink);
         push_flag(&mut entries, "conceal", self.conceal);
         push_flag(&mut entries, "overline", self.overline);
+        push_flag(&mut entries, "nocombine", self.nocombine);
+        push_flag(&mut entries, "fg_indexed", self.fg_indexed);
+        push_flag(&mut entries, "bg_indexed", self.bg_indexed);
         if let Some(blend) = self.blend {
-            entries.push((OxStr::from("blend"), Object::Integer(i64::from(blend.min(100)))));
+            entries.push((
+                OxStr::from("blend"),
+                Object::Integer(i64::from(blend.min(100))),
+            ));
         }
         if let Some(url) = &self.url {
             entries.push((OxStr::from("url"), Object::String(url.clone())));
@@ -128,6 +150,30 @@ pub struct Highlight {
     pub info: Vec<HlInfo>,
 }
 
+/// Canonical API-level definition of a highlight group, mirroring upstream
+/// `HlGroup` state: rgb and cterm attribute sets, cterm color indices, link
+/// target, font, and the `default` flag.
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct HlDef {
+    /// Gui (RGB) attributes.
+    pub rgb: HlAttrs,
+    /// Cterm attribute flags (colors are carried by [`HlDef::cterm_fg`]
+    /// and [`HlDef::cterm_bg`]).
+    pub cterm: HlAttrs,
+    /// Cterm foreground color index.
+    pub cterm_fg: Option<u32>,
+    /// Cterm background color index.
+    pub cterm_bg: Option<u32>,
+    /// Linked target group id.
+    pub link: Option<u64>,
+    /// The link resolves in the global (`ns 0`) namespace.
+    pub link_global: bool,
+    /// Gui font name.
+    pub font: Option<OxStr>,
+    /// Whether `default=true` was set (don't override existing definition).
+    pub default_flag: bool,
+}
+
 /// Highlight protocol event.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HlEvent {
@@ -146,6 +192,18 @@ pub enum HlError {
     /// A requested identifier does not exist.
     #[error("unknown highlight id {0}")]
     UnknownId(u64),
+    /// A group name contains an invalid character (`E5248`).
+    #[error("Vim:E5248: Invalid character in group name")]
+    InvalidGroupName,
+    /// A group name contains an unprintable character (`E669`).
+    #[error("Vim:E669: Unprintable character in group name")]
+    UnprintableGroupName,
+    /// A group name exceeds the length limit (`E1249`).
+    #[error("Vim:E1249: Highlight group name too long")]
+    GroupNameTooLong,
+    /// The group table has exhausted its identifier space (`E849`).
+    #[error("Vim:E849: Too many highlight and syntax groups")]
+    TooManyGroups,
 }
 
 /// Stable highlight table. Identifier zero is always the default group.
@@ -154,10 +212,18 @@ pub struct HlState {
     definitions: Vec<Highlight>,
     ids: BTreeMap<Highlight, u64>,
     groups: BTreeMap<OxStr, u64>,
+    /// Group name to stable group id (`syn_check_group` registry).
+    group_ids: BTreeMap<OxStr, u64>,
+    /// Group id to the last explicitly-set canonical definition.
+    group_defs: BTreeMap<u64, HlDef>,
+    /// Next group id; group ids are one-based and stable per name.
+    next_group_id: u64,
 }
 
 impl Default for HlState {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HlState {
@@ -167,7 +233,14 @@ impl HlState {
         let default = Highlight::default();
         let mut ids = BTreeMap::new();
         ids.insert(default.clone(), 0);
-        Self { definitions: vec![default], ids, groups: BTreeMap::new() }
+        Self {
+            definitions: vec![default],
+            ids,
+            groups: BTreeMap::new(),
+            group_ids: BTreeMap::new(),
+            group_defs: BTreeMap::new(),
+            next_group_id: 1,
+        }
     }
 
     /// Creates the render table with the standard syntax groups the editor
@@ -176,11 +249,18 @@ impl HlState {
     pub fn with_default_syntax_groups() -> Self {
         let mut state = Self::new();
         let comment = Highlight {
-            rgb: HlAttrs { foreground: Some(0x0000ff), ..HlAttrs::default() },
+            rgb: HlAttrs {
+                foreground: Some(0x0000_00ff),
+                ..HlAttrs::default()
+            },
             ..Highlight::default()
         };
         let string = Highlight {
-            rgb: HlAttrs { foreground: Some(0x0000ff), bold: true, ..HlAttrs::default() },
+            rgb: HlAttrs {
+                foreground: Some(0x0000_00ff),
+                bold: true,
+                ..HlAttrs::default()
+            },
             ..Highlight::default()
         };
         let _ = state.define_group("Comment", comment);
@@ -189,48 +269,85 @@ impl HlState {
     }
 
     /// Interns an attribute set, returning its stable id and an event only once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HlError::IdExhausted`] when no identifier remains in the
+    /// signed range supported by the protocol.
     pub fn intern(&mut self, highlight: Highlight) -> Result<(u64, Option<HlEvent>), HlError> {
         if let Some(id) = self.ids.get(&highlight) {
             return Ok((*id, None));
         }
         let id = u64::try_from(self.definitions.len()).map_err(|_| HlError::IdExhausted)?;
         i64::try_from(id).map_err(|_| HlError::IdExhausted)?;
+        let event = define_event(id, &highlight);
         self.definitions.push(highlight.clone());
-        self.ids.insert(highlight.clone(), id);
-        Ok((id, Some(define_event(id, &highlight))))
+        self.ids.insert(highlight, id);
+        Ok((id, Some(event)))
     }
 
     /// Replaces a definition while retaining its identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HlError::UnknownId`] when `id` does not identify an existing
+    /// highlight.
     pub fn redefine(&mut self, id: u64, highlight: Highlight) -> Result<Option<HlEvent>, HlError> {
         let index = usize::try_from(id).map_err(|_| HlError::UnknownId(id))?;
-        let existing = self.definitions.get_mut(index).ok_or(HlError::UnknownId(id))?;
-        if *existing == highlight { return Ok(None); }
+        let existing = self
+            .definitions
+            .get_mut(index)
+            .ok_or(HlError::UnknownId(id))?;
+        if *existing == highlight {
+            return Ok(None);
+        }
         if self.ids.get(existing) == Some(&id) {
             self.ids.remove(existing);
         }
-        *existing = highlight.clone();
+        let event = define_event(id, &highlight);
         self.ids.entry(highlight.clone()).or_insert(id);
-        Ok(Some(define_event(id, &highlight)))
+        *existing = highlight;
+        Ok(Some(event))
     }
 
     /// Associates a named highlight group with an id, emitting only on change.
-    pub fn set_group(&mut self, name: impl Into<OxStr>, id: u64) -> Result<Option<HlEvent>, HlError> {
-        if usize::try_from(id).ok().is_none_or(|index| index >= self.definitions.len()) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HlError::UnknownId`] when `id` does not identify an existing
+    /// highlight, or [`HlError::IdExhausted`] when it cannot be represented in
+    /// the signed protocol range.
+    pub fn set_group(
+        &mut self,
+        name: impl Into<OxStr>,
+        id: u64,
+    ) -> Result<Option<HlEvent>, HlError> {
+        if usize::try_from(id)
+            .ok()
+            .is_none_or(|index| index >= self.definitions.len())
+        {
             return Err(HlError::UnknownId(id));
         }
         let name = name.into();
-        if self.groups.get(&name) == Some(&id) { return Ok(None); }
+        if self.groups.get(&name) == Some(&id) {
+            return Ok(None);
+        }
         self.groups.insert(name.clone(), id);
         Ok(Some(HlEvent {
             name: "hl_group_set",
-            args: vec![Object::String(name), Object::Integer(i64::try_from(id).map_err(|_| HlError::IdExhausted)?)],
+            args: vec![
+                Object::String(name),
+                Object::Integer(i64::try_from(id).map_err(|_| HlError::IdExhausted)?),
+            ],
         }))
     }
 
     /// Returns a definition by id.
     #[must_use]
     pub fn get(&self, id: u64) -> Option<&Highlight> {
-        usize::try_from(id).ok().and_then(|index| self.definitions.get(index))
+        usize::try_from(id)
+            .ok()
+            .and_then(|index| self.definitions.get(index))
     }
 
     /// Iterates definitions in identifier order.
@@ -257,7 +374,16 @@ impl HlState {
     }
 
     /// Defines a named group, interning the highlight and binding the name.
-    pub fn define_group(&mut self, name: impl Into<OxStr>, highlight: Highlight) -> Result<u64, HlError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HlError::IdExhausted`] when no identifier remains in the
+    /// signed range supported by the protocol.
+    pub fn define_group(
+        &mut self,
+        name: impl Into<OxStr>,
+        highlight: Highlight,
+    ) -> Result<u64, HlError> {
         let (id, _) = self.intern(highlight)?;
         self.set_group(name, id)?;
         Ok(id)
@@ -269,17 +395,105 @@ impl HlState {
         self.groups.get(name).copied()
     }
 
+    /// Validates a highlight group name per upstream `syn_add_group` and
+    /// returns its stable id, allocating one when the name is new.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HlError::GroupNameTooLong`], [`HlError::UnprintableGroupName`]
+    /// or [`HlError::InvalidGroupName`] for invalid names, and
+    /// [`HlError::TooManyGroups`] when the group table is exhausted.
+    pub fn check_group(&mut self, name: &OxStr) -> Result<u64, HlError> {
+        let bytes = name.as_bytes();
+        if bytes.len() > MAX_GROUP_NAME_LEN {
+            return Err(HlError::GroupNameTooLong);
+        }
+        if bytes.is_empty() {
+            return Err(HlError::InvalidGroupName);
+        }
+        for &byte in bytes {
+            if byte < 0x21 || byte == 0x7f {
+                return Err(HlError::UnprintableGroupName);
+            }
+            if !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'.' | b'@' | b'-') {
+                return Err(HlError::InvalidGroupName);
+            }
+        }
+        if let Some(id) = self.group_ids.get(name) {
+            return Ok(*id);
+        }
+        if self.next_group_id > MAX_GROUP_ID {
+            return Err(HlError::TooManyGroups);
+        }
+        let id = self.next_group_id;
+        self.next_group_id += 1;
+        self.group_ids.insert(name.clone(), id);
+        Ok(id)
+    }
+
+    /// Looks up a group id by name in the registry without allocating.
+    #[must_use]
+    pub fn group_by_name(&self, name: &OxStr) -> Option<u64> {
+        self.group_ids.get(name).copied()
+    }
+
+    /// Looks up a group name by id in the registry.
+    #[must_use]
+    pub fn group_name(&self, id: u64) -> Option<&OxStr> {
+        self.group_ids
+            .iter()
+            .find_map(|(name, candidate)| (*candidate == id).then_some(name))
+    }
+
+    /// Returns the number of allocated group ids.
+    #[must_use]
+    pub fn group_count(&self) -> u64 {
+        self.next_group_id - 1
+    }
+
+    /// Returns the canonical definition explicitly set for a group id.
+    #[must_use]
+    pub fn group_def(&self, id: u64) -> Option<&HlDef> {
+        self.group_defs.get(&id)
+    }
+
+    /// Stores the canonical definition for a group id.
+    pub fn set_group_def(&mut self, id: u64, definition: HlDef) {
+        self.group_defs.insert(id, definition);
+    }
+
+    /// Iterates explicitly-set group definitions in name order.
+    pub fn iter_group_defs(&self) -> impl Iterator<Item = (&OxStr, u64, &HlDef)> {
+        self.group_ids.iter().filter_map(|(name, id)| {
+            self.group_defs
+                .get(id)
+                .map(|definition| (name, *id, definition))
+        })
+    }
+
     /// Interns the result of stacking the overlay over the base highlight.
     ///
     /// Colors explicitly supplied by the later layer replace earlier colors;
     /// style flags accumulate, matching Neovim's range-highlight composition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HlError::UnknownId`] when either identifier does not identify
+    /// an existing highlight, or [`HlError::IdExhausted`] when the composite
+    /// cannot be assigned a protocol identifier.
     pub fn combine(
         &mut self,
         base_id: u64,
         overlay_id: u64,
     ) -> Result<(u64, Option<HlEvent>), HlError> {
-        let base = self.get(base_id).ok_or(HlError::UnknownId(base_id))?.clone();
-        let overlay = self.get(overlay_id).ok_or(HlError::UnknownId(overlay_id))?.clone();
+        let base = self
+            .get(base_id)
+            .ok_or(HlError::UnknownId(base_id))?
+            .clone();
+        let overlay = self
+            .get(overlay_id)
+            .ok_or(HlError::UnknownId(overlay_id))?
+            .clone();
         let mut combined = base;
         combine_attrs(&mut combined.rgb, &overlay.rgb);
         combine_attrs(&mut combined.cterm, &overlay.cterm);
@@ -291,27 +505,39 @@ impl HlState {
     }
 
     /// Interns the blend-mode composite of `overlay_id` layered over `base_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HlError::UnknownId`] when either identifier does not identify
+    /// an existing highlight, or [`HlError::IdExhausted`] when the composite
+    /// cannot be assigned a protocol identifier.
     pub fn blend(
         &mut self,
         base_id: u64,
         overlay_id: u64,
     ) -> Result<(u64, Option<HlEvent>), HlError> {
-        let base = self.get(base_id).ok_or(HlError::UnknownId(base_id))?.clone();
-        let overlay = self.get(overlay_id).ok_or(HlError::UnknownId(overlay_id))?.clone();
+        let base = self
+            .get(base_id)
+            .ok_or(HlError::UnknownId(base_id))?
+            .clone();
+        let overlay = self
+            .get(overlay_id)
+            .ok_or(HlError::UnknownId(overlay_id))?
+            .clone();
         let amount = overlay.rgb.blend.unwrap_or(0).min(100);
-        let (overlay_fg, base_fg) = (overlay.rgb.foreground, base.rgb.foreground);
-        let (overlay_bg, base_bg) = (overlay.rgb.background, base.rgb.background);
-        let (overlay_sp, base_sp) = (overlay.rgb.special, base.rgb.special);
+        let (overlay_foreground, base_foreground) = (overlay.rgb.foreground, base.rgb.foreground);
+        let (overlay_background, base_background) = (overlay.rgb.background, base.rgb.background);
+        let (overlay_special, base_special) = (overlay.rgb.special, base.rgb.special);
         let mut mixed = base;
         combine_attrs(&mut mixed.rgb, &overlay.rgb);
         combine_attrs(&mut mixed.cterm, &overlay.cterm);
-        if let (Some(over), Some(under)) = (overlay_fg, base_fg) {
+        if let (Some(over), Some(under)) = (overlay_foreground, base_foreground) {
             mixed.rgb.foreground = Some(premix_color(over, under, amount));
         }
-        if let (Some(over), Some(under)) = (overlay_bg, base_bg) {
+        if let (Some(over), Some(under)) = (overlay_background, base_background) {
             mixed.rgb.background = Some(premix_color(over, under, amount));
         }
-        if let (Some(over), Some(under)) = (overlay_sp, base_sp) {
+        if let (Some(over), Some(under)) = (overlay_special, base_special) {
             mixed.rgb.special = Some(premix_color(over, under, amount));
         }
         mixed.rgb.blend = None;
@@ -323,18 +549,32 @@ impl HlState {
     }
 
     /// Interns a winblend-premixed variant of `foreground_id` over `background_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HlError::UnknownId`] when either identifier does not identify
+    /// an existing highlight, or [`HlError::IdExhausted`] when the premixed
+    /// highlight cannot be assigned a protocol identifier.
     pub fn premix(
         &mut self,
         foreground_id: u64,
         background_id: u64,
         blend: u8,
     ) -> Result<(u64, Option<HlEvent>), HlError> {
-        let foreground = self.get(foreground_id).ok_or(HlError::UnknownId(foreground_id))?.clone();
-        let background = self.get(background_id).ok_or(HlError::UnknownId(background_id))?.clone();
+        let foreground = self
+            .get(foreground_id)
+            .ok_or(HlError::UnknownId(foreground_id))?
+            .clone();
+        let background = self
+            .get(background_id)
+            .ok_or(HlError::UnknownId(background_id))?
+            .clone();
         let mut mixed = foreground;
         let amount = blend.min(100);
-        mixed.rgb.foreground = mix_optional(mixed.rgb.foreground, background.rgb.foreground, amount);
-        mixed.rgb.background = mix_optional(mixed.rgb.background, background.rgb.background, amount);
+        mixed.rgb.foreground =
+            mix_optional(mixed.rgb.foreground, background.rgb.foreground, amount);
+        mixed.rgb.background =
+            mix_optional(mixed.rgb.background, background.rgb.background, amount);
         mixed.rgb.special = mix_optional(mixed.rgb.special, background.rgb.special, amount);
         mixed.rgb.blend = None;
         self.intern(mixed)
@@ -342,9 +582,15 @@ impl HlState {
 }
 
 fn combine_attrs(base: &mut HlAttrs, overlay: &HlAttrs) {
-    if overlay.foreground.is_some() { base.foreground = overlay.foreground; }
-    if overlay.background.is_some() { base.background = overlay.background; }
-    if overlay.special.is_some() { base.special = overlay.special; }
+    if overlay.foreground.is_some() {
+        base.foreground = overlay.foreground;
+    }
+    if overlay.background.is_some() {
+        base.background = overlay.background;
+    }
+    if overlay.special.is_some() {
+        base.special = overlay.special;
+    }
     base.bold |= overlay.bold;
     base.italic |= overlay.italic;
     base.underline |= overlay.underline;
@@ -354,13 +600,21 @@ fn combine_attrs(base: &mut HlAttrs, overlay: &HlAttrs) {
     base.underdashed |= overlay.underdashed;
     base.strikethrough |= overlay.strikethrough;
     base.reverse |= overlay.reverse;
+    base.standout |= overlay.standout;
     base.altfont |= overlay.altfont;
     base.dim |= overlay.dim;
     base.blink |= overlay.blink;
     base.conceal |= overlay.conceal;
     base.overline |= overlay.overline;
-    if overlay.blend.is_some() { base.blend = overlay.blend; }
-    if overlay.url.is_some() { base.url.clone_from(&overlay.url); }
+    base.nocombine |= overlay.nocombine;
+    base.fg_indexed |= overlay.fg_indexed;
+    base.bg_indexed |= overlay.bg_indexed;
+    if overlay.blend.is_some() {
+        base.blend = overlay.blend;
+    }
+    if overlay.url.is_some() {
+        base.url.clone_from(&overlay.url);
+    }
 }
 
 /// Premixes a foreground RGB color over a background with Neovim-style percentage rounding.
@@ -402,5 +656,41 @@ fn push_color(entries: &mut Vec<(OxStr, Object)>, name: &'static str, color: Opt
 }
 
 fn push_flag(entries: &mut Vec<(OxStr, Object)>, name: &'static str, enabled: bool) {
-    if enabled { entries.push((OxStr::from(name), Object::Boolean(true))); }
+    if enabled {
+        entries.push((OxStr::from(name), Object::Boolean(true)));
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_boundary_rejects_past_max_hl_id() {
+        let mut state = HlState::new();
+        // Seed the counter so the next allocation would exceed MAX_HL_ID.
+        state.next_group_id = MAX_GROUP_ID;
+        assert_eq!(
+            state.check_group(&OxStr::from("LastGroup")),
+            Ok(MAX_GROUP_ID)
+        );
+        assert_eq!(
+            state.check_group(&OxStr::from("Over")),
+            Err(HlError::TooManyGroups)
+        );
+    }
+
+    #[test]
+    fn group_boundary_allows_exactly_max_hl_id() {
+        let mut state = HlState::new();
+        state.next_group_id = MAX_GROUP_ID - 1;
+        assert_eq!(
+            state.check_group(&OxStr::from("Penultimate")),
+            Ok(MAX_GROUP_ID - 1)
+        );
+        assert_eq!(state.check_group(&OxStr::from("Last")), Ok(MAX_GROUP_ID));
+        assert_eq!(
+            state.check_group(&OxStr::from("Over")),
+            Err(HlError::TooManyGroups)
+        );
+    }
 }

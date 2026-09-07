@@ -76,7 +76,9 @@ impl ChannelIdAllocator {
     /// An allocator whose next id is `3` (`CHAN_STDERR + 1`).
     #[must_use]
     pub fn new() -> Self {
-        Self { next: CHAN_STDERR.get() + 1 }
+        Self {
+            next: CHAN_STDERR.get() + 1,
+        }
     }
 
     /// Allocate the next id, increasing monotonically.
@@ -107,7 +109,11 @@ impl ChannelState {
     /// Freshly created, non-RPC channel state.
     #[must_use]
     pub fn new() -> Self {
-        Self { is_rpc: false, closed: false, pending: HashMap::new() }
+        Self {
+            is_rpc: false,
+            closed: false,
+            pending: HashMap::new(),
+        }
     }
 
     /// Start RPC on this channel (`rpc_start`: `is_rpc = true`, `closed = false`).
@@ -161,6 +167,7 @@ impl ChannelState {
 /// [errtype, msg]]`, exactly as `channel.c serialize_response()` emits for a
 /// failed notification (`serialize_request(..., 0, "nvim_error_event", args)`
 /// where `args` is the `[type, message]` pair).
+#[must_use]
 pub fn nvim_error_event(error: &ApiError) -> Vec<u8> {
     let params = vec![
         Object::Integer(error.error_type()),
@@ -206,7 +213,10 @@ mod tests {
         st.register_request(8, OxStr::from("nvim_get_mode"));
         assert_eq!(st.pending_count(), 2);
         assert_eq!(st.method_for(7), Some(&OxStr::from("nvim_buf_line_count")));
-        assert_eq!(st.resolve_request(7), Some(OxStr::from("nvim_buf_line_count")));
+        assert_eq!(
+            st.resolve_request(7),
+            Some(OxStr::from("nvim_buf_line_count"))
+        );
         assert_eq!(st.pending_count(), 1);
         assert_eq!(st.resolve_request(99), None);
         st.close();
@@ -214,28 +224,29 @@ mod tests {
     }
 
     #[test]
-    fn nvim_error_event_wire_shape() {
+    fn nvim_error_event_wire_shape() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = nvim_error_event(&ApiError::exception("boom"));
         // [2, "nvim_error_event", [0, "boom"]]
         let expected: &[u8] = &[
-            0x93,       // array(3)
-            0x02,       // notification kind
+            0x93, // array(3)
+            0x02, // notification kind
             0xb0, b'n', b'v', b'i', b'm', b'_', b'e', b'r', b'r', b'o', b'r', b'_', b'e', b'v',
             b'e', b'n', b't', // fixstr(16) "nvim_error_event"
-            0x92,       // array(2): params = [errtype, msg]
-            0x00,       // type 0 = exception
+            0x92, // array(2): params = [errtype, msg]
+            0x00, // type 0 = exception
             0xa4, b'b', b'o', b'o', b'm', // "boom"
         ];
         assert_eq!(bytes, expected);
         let mut dec = IncrementalDecoder::new();
-        let msgs = dec.feed(&bytes).unwrap();
+        let msgs = dec.feed(&bytes)?;
         let crate::message::Message::Notification { method, params } = &msgs[0] else {
-            panic!("expected notification")
+            return Err("expected notification".into());
         };
         assert_eq!(*method, OxStr::from("nvim_error_event"));
         assert_eq!(
             *params,
             vec![Object::Integer(0), Object::String(OxStr::from("boom"))]
         );
+        Ok(())
     }
 }

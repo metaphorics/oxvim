@@ -1,5 +1,5 @@
 // unsafe-permitted crate: FFI surface; safe API exposed to dependents.
-//! mlua-hosted LuaJIT executor, converters, and the C-side `vim` Lua table core.
+//! mlua-hosted `LuaJIT` executor, converters, and the C-side `vim` Lua table core.
 
 pub mod converter;
 mod embedded;
@@ -7,16 +7,24 @@ pub mod host;
 mod stdlib;
 mod treesitter;
 pub mod typval_bridge;
+pub mod ui_events;
 mod uv_core;
 mod uv_handles;
 pub mod vim;
 
 pub use converter::{
-    free_lua_ref, lua_to_object, object_to_lua, ConversionError, CONVERSION_RECURSION_LIMIT,
+    CONVERSION_RECURSION_LIMIT, ConversionError, free_lua_ref, lua_to_object, lua_to_object_ref,
+    object_to_lua,
 };
 pub use host::{ExecError, HostError, LuaHost, RuntimeRoot};
-pub use typval_bridge::{lua_to_typval, typval_to_lua};
+pub use typval_bridge::{collect_typval_refs, free_typval_refs, lua_to_typval, typval_to_lua};
+pub use ui_events::{
+    bind_ui_events, deliver_pending_ui_events, enqueue_ui_event, has_attached_callbacks,
+    reset as reset_ui_events,
+};
+pub use uv_core::EventLoopPump;
 pub use vim::{
-    bind_api, bind_variables, call_with_traceback, install_vim_core, ApiDispatchContext, BuiltinHost,
-    FastCallbackGuard, FastCallbackState, Scheduler, TextlockGuard, VariableHost, VariableScope, Work,
+    ApiDispatchContext, BuiltinHost, FastCallbackGuard, FastCallbackState, Scheduler,
+    TextlockGuard, VariableHost, VariableScope, Work, bind_api, bind_variables, bind_with,
+    call_with_traceback, error_shim, install_vim_core, userdata_error_shim,
 };

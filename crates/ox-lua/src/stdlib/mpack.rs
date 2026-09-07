@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, ErrorKind};
 
-use mlua::{AnyUserData, Function, Lua, LuaString, MetaMethod, Table, UserData, UserDataMethods, Value};
+use mlua::{
+    AnyUserData, Function, Lua, LuaString, MetaMethod, Table, UserData, UserDataMethods, Value,
+};
 use rmpv::Value as MpackValue;
 
 use crate::converter::{has_empty_dict_metatable, is_vim_nil};
@@ -17,7 +19,11 @@ struct MpackExt {
 impl UserData for MpackExt {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(MetaMethod::ToString, |_, this, ()| {
-            Ok(format!("vim.mpack.ext({}, {} bytes)", this.kind, this.data.len()))
+            Ok(format!(
+                "vim.mpack.ext({}, {} bytes)",
+                this.kind,
+                this.data.len()
+            ))
         });
     }
 }
@@ -171,7 +177,13 @@ impl UserData for Session {
                         let id = rpc_u32(&fields[1])?;
                         let method = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
                         let args = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
-                        Ok((Value::String(lua.create_string("request")?), Value::Integer(i64::from(id)), method, args, next))
+                        Ok((
+                            Value::String(lua.create_string("request")?),
+                            Value::Integer(i64::from(id)),
+                            method,
+                            args,
+                            next,
+                        ))
                     }
                     1 => {
                         let id = rpc_u32(&fields[1])?;
@@ -180,12 +192,24 @@ impl UserData for Session {
                         })?;
                         let error = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
                         let result = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
-                        Ok((Value::String(lua.create_string("response")?), callback, error, result, next))
+                        Ok((
+                            Value::String(lua.create_string("response")?),
+                            callback,
+                            error,
+                            result,
+                            next,
+                        ))
                     }
                     2 => {
                         let method = mpack_to_lua_with_ext(lua, fields.remove(1), 0, ext)?;
                         let args = mpack_to_lua_with_ext(lua, fields.remove(1), 0, ext)?;
-                        Ok((Value::String(lua.create_string("notification")?), Value::Nil, method, args, next))
+                        Ok((
+                            Value::String(lua.create_string("notification")?),
+                            Value::Nil,
+                            method,
+                            args,
+                            next,
+                        ))
                     }
                     _ => Err(mlua::Error::runtime("invalid msgpack-rpc string")),
                 }
@@ -200,7 +224,11 @@ pub(super) fn install(lua: &Lua, vim: &Table) -> mlua::Result<()> {
         "Packer",
         lua.create_function(|lua, options: Option<Table>| {
             let ext = option_table(lua, options.as_ref(), "ext")?;
-            let is_bin = match options.as_ref().map(|options| options.get::<Value>("is_bin")).transpose()? {
+            let is_bin = match options
+                .as_ref()
+                .map(|options| options.get::<Value>("is_bin"))
+                .transpose()?
+            {
                 None | Some(Value::Nil) => None,
                 Some(Value::Boolean(value)) => Some(IsBin::Boolean(value)),
                 Some(Value::Function(value)) => Some(IsBin::Function(value)),
@@ -216,9 +244,11 @@ pub(super) fn install(lua: &Lua, vim: &Table) -> mlua::Result<()> {
     module.set(
         "Unpacker",
         lua.create_function(|lua, options: Option<Table>| {
-            let ext = option_table(lua, options.as_ref(), "ext")?
-                .unwrap_or(lua.create_table()?);
-            lua.create_userdata(Unpacker { pending: Vec::new(), ext })
+            let ext = option_table(lua, options.as_ref(), "ext")?.unwrap_or(lua.create_table()?);
+            lua.create_userdata(Unpacker {
+                pending: Vec::new(),
+                ext,
+            })
         })?,
     )?;
     module.set(
@@ -253,9 +283,14 @@ pub(super) fn install(lua: &Lua, vim: &Table) -> mlua::Result<()> {
             unpacker.borrow::<Unpacker>().map_err(|_| {
                 mlua::Error::runtime("\"unpack\" option must be a mpack.Unpacker instance")
             })?;
-            lua.create_userdata(Session { unpacker, pending: HashMap::new(), next_id: 0 })
+            lua.create_userdata(Session {
+                unpacker,
+                pending: HashMap::new(),
+                next_id: 0,
+            })
         })?,
     )?;
+    module.set("NIL", vim.get::<Value>("NIL")?)?;
     vim.set("mpack", module.clone())?;
     let package: Table = lua.globals().get("package")?;
     let loaded: Table = package.get("loaded")?;
@@ -279,9 +314,10 @@ fn next_request_id(id: u32) -> u32 {
 }
 
 fn rpc_u32(value: &MpackValue) -> mlua::Result<u32> {
-    value.as_u64().and_then(|value| u32::try_from(value).ok()).ok_or_else(|| {
-        mlua::Error::runtime("invalid msgpack-rpc string")
-    })
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| mlua::Error::runtime("invalid msgpack-rpc string"))
 }
 
 fn lua_to_mpack(
@@ -294,17 +330,16 @@ fn lua_to_mpack(
     if depth > RECURSION_LIMIT {
         return Err(mlua::Error::runtime("msgpack object is too deeply nested"));
     }
-    if let (Some(packer), Value::Table(table)) = (packer, value) {
-        if let (Some(ext), Some(metatable)) = (&packer.ext, table.metatable()) {
-            if let Value::Function(handler) = ext.raw_get::<Value>(metatable)? {
-                let (kind, payload): (i64, LuaString) = handler.call(value.clone())?;
-                let kind = i8::try_from(kind)
-                    .ok()
-                    .filter(|kind| *kind >= 0)
-                    .ok_or_else(|| mlua::Error::runtime("extension type must be between 0 and 127"))?;
-                return Ok(MpackValue::Ext(kind, payload.as_bytes().to_vec()));
-            }
-        }
+    if let (Some(packer), Value::Table(table)) = (packer, value)
+        && let (Some(ext), Some(metatable)) = (&packer.ext, table.metatable())
+        && let Value::Function(handler) = ext.raw_get::<Value>(metatable)?
+    {
+        let (kind, payload): (i64, LuaString) = handler.call(value.clone())?;
+        let kind = i8::try_from(kind)
+            .ok()
+            .filter(|kind| *kind >= 0)
+            .ok_or_else(|| mlua::Error::runtime("extension type must be between 0 and 127"))?;
+        return Ok(MpackValue::Ext(kind, payload.as_bytes().to_vec()));
     }
     Ok(match value {
         Value::Nil => MpackValue::Nil,
@@ -334,7 +369,9 @@ fn lua_to_mpack(
         }
         Value::UserData(userdata) => {
             let extension = userdata.borrow::<MpackExt>().map_err(|_| {
-                mlua::Error::runtime("cannot encode userdata other than vim.NIL or msgpack extension")
+                mlua::Error::runtime(
+                    "cannot encode userdata other than vim.NIL or msgpack extension",
+                )
             })?;
             MpackValue::Ext(extension.kind, extension.data.clone())
         }
@@ -342,7 +379,7 @@ fn lua_to_mpack(
             return Err(mlua::Error::runtime(format!(
                 "cannot encode {} as msgpack",
                 other.type_name()
-            )))
+            )));
         }
     })
 }
@@ -363,14 +400,13 @@ fn table_to_mpack(
     let mut array_only = !has_empty_dict_metatable(lua, table).map_err(mlua::Error::external)?;
     for pair in table.clone().pairs::<Value, Value>() {
         let (key, value) = pair?;
-        if let Value::Integer(index) = key {
-            if let Ok(index) = usize::try_from(index) {
-                if index > 0 {
-                    max_index = max_index.max(index);
-                    entries.push((Value::Integer(index as i64), value));
-                    continue;
-                }
-            }
+        if let Value::Integer(index) = key
+            && let Ok(array_index) = usize::try_from(index)
+            && array_index > 0
+        {
+            max_index = max_index.max(array_index);
+            entries.push((key, value));
+            continue;
         }
         array_only = false;
         entries.push((key, value));
@@ -382,7 +418,9 @@ fn table_to_mpack(
             let Value::Integer(index) = key else {
                 continue;
             };
-            values[*index as usize - 1] = lua_to_mpack(lua, value, depth + 1, active, packer)?;
+            let index = usize::try_from(*index)
+                .map_err(|_| mlua::Error::runtime("msgpack array index exceeds platform limits"))?;
+            values[index - 1] = lua_to_mpack(lua, value, depth + 1, active, packer)?;
         }
         MpackValue::Array(values)
     } else {
@@ -419,10 +457,17 @@ fn mpack_to_lua_with_ext(
             if let Some(value) = value.as_i64() {
                 Ok(Value::Integer(value))
             } else if let Some(value) = value.as_u64() {
-                if value <= i64::MAX as u64 {
-                    Ok(Value::Integer(value as i64))
+                if let Ok(value) = i64::try_from(value) {
+                    Ok(Value::Integer(value))
                 } else {
-                    Ok(Value::Number(value as f64))
+                    // msgpack u64 above i64::MAX cannot be a LuaJIT integer; it
+                    // degrades to a double like Neovim's msgpack decode.
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "LuaJIT represents msgpack u64 values above i64::MAX as doubles"
+                    )]
+                    let number = value as f64;
+                    Ok(Value::Number(number))
                 }
             } else {
                 Err(mlua::Error::runtime("invalid msgpack integer"))
@@ -435,7 +480,10 @@ fn mpack_to_lua_with_ext(
         MpackValue::Array(values) => {
             let table = lua.create_table_with_capacity(values.len(), 0)?;
             for (index, value) in values.into_iter().enumerate() {
-                table.raw_set(index + 1, mpack_to_lua_with_ext(lua, value, depth + 1, ext)?)?;
+                table.raw_set(
+                    index + 1,
+                    mpack_to_lua_with_ext(lua, value, depth + 1, ext)?,
+                )?;
             }
             Ok(Value::Table(table))
         }
@@ -446,7 +494,9 @@ fn mpack_to_lua_with_ext(
             }
             for (key, value) in values {
                 let key = mpack_to_lua_with_ext(lua, key, depth + 1, ext)?;
-                if matches!(key, Value::Nil) || is_vim_nil(lua, &key).map_err(mlua::Error::external)? {
+                if matches!(key, Value::Nil)
+                    || is_vim_nil(lua, &key).map_err(mlua::Error::external)?
+                {
                     return Err(mlua::Error::runtime("msgpack map contains nil key"));
                 }
                 table.raw_set(key, mpack_to_lua_with_ext(lua, value, depth + 1, ext)?)?;
@@ -465,7 +515,9 @@ fn mpack_to_lua_with_ext(
             } else if ext.is_some() {
                 Ok(Value::String(lua.create_string(data)?))
             } else {
-                Ok(Value::UserData(lua.create_userdata(MpackExt { kind, data })?))
+                Ok(Value::UserData(
+                    lua.create_userdata(MpackExt { kind, data })?,
+                ))
             }
         }
     }
@@ -485,7 +537,9 @@ fn option_table(lua: &Lua, options: Option<&Table>, name: &str) -> mlua::Result<
             }
             Ok(Some(copy))
         }
-        _ => Err(mlua::Error::runtime(format!("\"{name}\" option must be a table"))),
+        _ => Err(mlua::Error::runtime(format!(
+            "\"{name}\" option must be a table"
+        ))),
     }
 }
 

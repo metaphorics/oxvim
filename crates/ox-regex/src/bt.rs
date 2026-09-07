@@ -34,7 +34,9 @@ impl State {
     }
 
     pub(crate) fn close_capture(&mut self, index: usize) {
-        if let (Some(Some(start)), Some(slot)) = (self.opens.get(index - 1), self.captures.get_mut(index - 1)) {
+        if let (Some(Some(start)), Some(slot)) =
+            (self.opens.get(index - 1), self.captures.get_mut(index - 1))
+        {
             *slot = Some((*start, self.pos));
         }
     }
@@ -48,11 +50,24 @@ impl State {
     }
 
     pub(crate) fn into_match(self, text: &Text, capture_count: usize) -> Match {
-        let start_byte = match self.start_override { Some(byte) => byte, None => 0 };
-        let end_byte = match self.end_override { Some(byte) => byte, None => self.pos };
-        let fallback = Position { lnum: 1, col: 0, byte: 0 };
-        let start = match text.position(start_byte) { Some(position) => position, None => fallback };
-        let end = match text.position(end_byte) { Some(position) => position, None => start };
+        let start_byte = self.start_override.unwrap_or_default();
+        let end_byte = match self.end_override {
+            Some(byte) => byte,
+            None => self.pos,
+        };
+        let fallback = Position {
+            lnum: 1,
+            col: 0,
+            byte: 0,
+        };
+        let start = match text.position(start_byte) {
+            Some(position) => position,
+            None => fallback,
+        };
+        let end = match text.position(end_byte) {
+            Some(position) => position,
+            None => start,
+        };
         let captures = self
             .captures
             .into_iter()
@@ -66,7 +81,11 @@ impl State {
                 })
             })
             .collect();
-        Match { start, end, captures }
+        Match {
+            start,
+            end,
+            captures,
+        }
     }
 }
 
@@ -78,11 +97,23 @@ struct Context<'a> {
 }
 
 pub(crate) fn search(prog: &Prog, text: &Text, from: usize) -> Result<Option<State>, ExecError> {
-    let mut context = Context { prog, text, steps: 0, search_start: from };
+    let mut context = Context {
+        prog,
+        text,
+        steps: 0,
+        search_start: from,
+    };
+    let anchored = leading_anchor(&prog.expr);
     for candidate in candidate_offsets(text.as_str(), from) {
+        if !anchor_allows(anchored, text, candidate) {
+            continue;
+        }
         context.search_start = candidate;
         let initial = State::new(candidate, prog.capture_count);
-        if let Some(mut state) = match_expr(&prog.expr, initial, &mut context, 0)?.into_iter().next() {
+        if let Some(mut state) = match_expr(&prog.expr, initial, &mut context, 0)?
+            .into_iter()
+            .next()
+        {
             if state.start_override.is_none() {
                 state.start_override = Some(candidate);
             }
@@ -92,6 +123,28 @@ pub(crate) fn search(prog: &Prog, text: &Text, from: usize) -> Result<Option<Sta
     Ok(None)
 }
 
+/// The line/file-start anchor a program begins with, if any: a search whose
+/// pattern starts with `^` (or `\%^`) can only match where that anchor holds,
+/// so every other candidate offset is skipped up front.
+pub(crate) fn leading_anchor(expr: &Expr) -> Option<Anchor> {
+    match expr {
+        Expr::Anchor(anchor @ (Anchor::LineStart | Anchor::FileStart)) => Some(*anchor),
+        Expr::Concat(parts) => parts.first().and_then(leading_anchor),
+        Expr::Group { expr, .. } => leading_anchor(expr),
+        _ => None,
+    }
+}
+
+pub(crate) fn anchor_allows(anchor: Option<Anchor>, text: &Text, offset: usize) -> bool {
+    match anchor {
+        Some(Anchor::FileStart) => offset == 0,
+        Some(Anchor::LineStart) => {
+            offset == 0 || text.as_str().as_bytes().get(offset.wrapping_sub(1)) == Some(&b'\n')
+        }
+        _ => true,
+    }
+}
+
 pub(crate) fn match_at(
     prog: &Prog,
     text: &Text,
@@ -99,10 +152,18 @@ pub(crate) fn match_at(
     state: State,
     search_start: usize,
 ) -> Result<Vec<State>, ExecError> {
-    let mut context = Context { prog, text, steps: 0, search_start };
+    let mut context = Context {
+        prog,
+        text,
+        steps: 0,
+        search_start,
+    };
     match_expr(expr, state, &mut context, 0)
 }
 
+// Per-Expr dispatch mirroring upstream's regmatch switch; the arm order is
+// upstream's, so splitting it would fragment the mirror.
+#[allow(clippy::too_many_lines)]
 fn match_expr(
     expr: &Expr,
     state: State,
@@ -125,7 +186,9 @@ fn match_expr(
             _ => Ok(Vec::new()),
         },
         Expr::Any { newline } => match next_char(context.text.as_str(), state.pos) {
-            Some((actual, next)) if *newline || actual != '\n' => Ok(vec![State { pos: next, ..state }]),
+            Some((actual, next)) if *newline || actual != '\n' => {
+                Ok(vec![State { pos: next, ..state }])
+            }
             _ => Ok(Vec::new()),
         },
         Expr::Class(class) => match next_char(context.text.as_str(), state.pos) {
@@ -166,9 +229,23 @@ fn match_expr(
             }
             match_expr(last, state, context, depth + 1)
         }
-        Expr::Repeat { expr, min, max, greedy } => {
+        Expr::Repeat {
+            expr,
+            min,
+            max,
+            greedy,
+        } => {
             let mut states = Vec::new();
-            repeat(expr, *min, *max, *greedy, state, 0, context, depth + 1, &mut states)?;
+            repeat(
+                expr,
+                *min,
+                *max,
+                *greedy,
+                state,
+                context,
+                depth + 1,
+                &mut states,
+            )?;
             Ok(states)
         }
         Expr::Group { index, expr } => {
@@ -186,47 +263,93 @@ fn match_expr(
         Expr::OptionalSeq(parts) => optional_sequence(parts, state, context, depth + 1),
         Expr::Anchor(anchor) if anchor_matches(anchor, state.pos, context.text) => Ok(vec![state]),
         Expr::Anchor(_) => Ok(Vec::new()),
-        Expr::Look { expr, kind, limit } => match_look(expr, *kind, *limit, state, context, depth + 1),
-        Expr::Backref(index) => match_backref(*index, state, context),
-        Expr::SetStart => Ok(vec![State { start_override: Some(state.pos), ..state }]),
-        Expr::SetEnd => Ok(vec![State { end_override: Some(state.pos), ..state }]),
+        Expr::Look { expr, kind, limit } => {
+            match_look(expr, *kind, *limit, state, context, depth + 1)
+        }
+        Expr::Backref(index) => Ok(match_backref(*index, state, context)),
+        Expr::SetStart => Ok(vec![State {
+            start_override: Some(state.pos),
+            ..state
+        }]),
+        Expr::SetEnd => Ok(vec![State {
+            end_override: Some(state.pos),
+            ..state
+        }]),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // mirrors the recursive shape it replaced
 fn repeat(
     expr: &Expr,
     min: usize,
     max: Option<usize>,
     greedy: bool,
     state: State,
-    count: usize,
     context: &mut Context<'_>,
     depth: usize,
     results: &mut Vec<State>,
 ) -> Result<(), ExecError> {
+    enum Frame {
+        /// Explore one repetition level: record a lazy result, then descend.
+        Visit(State, usize),
+        /// All continuations of this level are done: record a greedy result.
+        Emit(State, usize),
+        /// Zero-width iterations collected in child order; record them where
+        /// the recursion would have.
+        Zero(Vec<State>),
+    }
+    // Explicit-stack DFS over repetition levels: the recursion this replaces
+    // grew one stack frame per matched iteration, so a run longer than the
+    // depth limit (a several-kilobyte line under `[^"]\+`) aborted with
+    // RecursionLimit after paying the full depth cost. Iteration count is
+    // bounded by the shared step limit instead.
     if depth > context.prog.depth_limit {
         return Err(ExecError::RecursionLimit);
     }
-    let can_continue = max.is_none_or(|maximum| count < maximum);
-    if !greedy && count >= min {
-        results.push(state.clone());
-    }
-    if can_continue {
-        for next in match_expr(expr, state.clone(), context, depth + 1)? {
-            if next.pos == state.pos {
-                if count + 1 >= min && greedy {
-                    results.push(next);
-                } else if count + 1 >= min && !greedy {
-                    results.push(next);
+    let mut stack = vec![Frame::Visit(state, 0)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Visit(state, count) => {
+                if !greedy && count >= min {
+                    results.push(state.clone());
                 }
-                continue;
+                let here = state.pos;
+                if max.is_none_or(|maximum| count < maximum) {
+                    let nexts = match_expr(expr, state.clone(), context, depth + 1)?;
+                    let mut children = Vec::new();
+                    for next in nexts {
+                        if next.pos == here {
+                            // Empty-width iteration cannot advance; record it
+                            // at this level instead of looping forever.
+                            if count + 1 >= min {
+                                children.push(Frame::Zero(vec![next]));
+                            }
+                        } else {
+                            children.push(Frame::Visit(next, count + 1));
+                        }
+                    }
+                    if greedy {
+                        // Unwinds after every child's subtree: pushed first,
+                        // so it pops last.
+                        stack.push(Frame::Emit(state, count));
+                        stack.extend(children.into_iter().rev());
+                    } else {
+                        // Recorded before any child: children go below, the
+                        // marker on top.
+                        stack.extend(children.into_iter().rev());
+                        stack.push(Frame::Emit(state, count));
+                    }
+                } else if greedy && count >= min {
+                    results.push(state);
+                }
             }
-            repeat(expr, min, max, greedy, next, count + 1, context, depth + 1, results)?;
+            Frame::Emit(state, count) => {
+                if greedy && count >= min {
+                    results.push(state);
+                }
+            }
+            Frame::Zero(states) => results.extend(states),
         }
-    }
-    if greedy && count >= min {
-        results.push(state);
     }
     Ok(())
 }
@@ -282,9 +405,10 @@ fn match_look(
                 Ok(Vec::new())
             }
         }
-        LookKind::Atomic => {
-            Ok(match_expr(expr, state, context, depth + 1)?.into_iter().take(1).collect())
-        }
+        LookKind::Atomic => Ok(match_expr(expr, state, context, depth + 1)?
+            .into_iter()
+            .take(1)
+            .collect()),
         LookKind::Behind | LookKind::NotBehind => {
             let earliest = lookbehind_earliest(context.text.as_str(), state.pos, limit);
             let mut found = false;
@@ -302,27 +426,36 @@ fn match_look(
                 }
             }
             let positive = kind == LookKind::Behind;
-            if found == positive { Ok(vec![state]) } else { Ok(Vec::new()) }
+            if found == positive {
+                Ok(vec![state])
+            } else {
+                Ok(Vec::new())
+            }
         }
     }
 }
 
-fn match_backref(index: usize, state: State, context: &Context<'_>) -> Result<Vec<State>, ExecError> {
+fn match_backref(index: usize, state: State, context: &Context<'_>) -> Vec<State> {
     let Some(Some((start, end))) = state.captures.get(index - 1) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let Some(captured) = context.text.as_str().get(*start..*end) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let Some(candidate) = context.text.as_str().get(state.pos..) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let consumed = if context.prog.ignore_case {
         prefix_case_folded(candidate, captured)
     } else {
         candidate.starts_with(captured).then_some(captured.len())
     };
-    Ok(consumed.map_or_else(Vec::new, |length| vec![State { pos: state.pos + length, ..state }]))
+    consumed.map_or_else(Vec::new, |length| {
+        vec![State {
+            pos: state.pos + length,
+            ..state
+        }]
+    })
 }
 
 fn prefix_case_folded(candidate: &str, captured: &str) -> Option<usize> {
@@ -353,10 +486,12 @@ fn anchor_matches(anchor: &Anchor, offset: usize, text: &Text) -> bool {
             previous_char(text.as_str(), offset).is_some_and(is_word)
                 && next_char(text.as_str(), offset).is_none_or(|(ch, _)| !is_word(ch))
         }
-        Anchor::Line(compare, expected) => text.position(offset).is_some_and(|pos| compare_number(*compare, pos.lnum, *expected)),
-        Anchor::Column(compare, expected) => {
-            text.position(offset).is_some_and(|pos| compare_number(*compare, pos.col + 1, *expected))
-        }
+        Anchor::Line(compare, expected) => text
+            .position(offset)
+            .is_some_and(|pos| compare_number(*compare, pos.lnum, *expected)),
+        Anchor::Column(compare, expected) => text
+            .position(offset)
+            .is_some_and(|pos| compare_number(*compare, pos.col + 1, *expected)),
         Anchor::VirtualColumn(compare, expected) => {
             compare_number(*compare, virtual_column(text.as_str(), offset), *expected)
         }
@@ -376,7 +511,10 @@ fn compare_number(compare: Compare, actual: usize, expected: usize) -> bool {
 
 fn previous_line_start(text: &str, offset: usize) -> usize {
     let before = &text.as_bytes()[..offset];
-    let current_start = before.iter().rposition(|byte| *byte == b'\n').map_or(0, |index| index + 1);
+    let current_start = before
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
     if current_start == 0 {
         return 0;
     }
@@ -448,7 +586,7 @@ fn kind_matches(kind: ClassKind, ch: char) -> bool {
         ClassKind::Blank => matches!(ch, ' ' | '\t'),
         ClassKind::Cntrl => ch.is_control(),
         ClassKind::Digit => ch.is_ascii_digit(),
-        ClassKind::Graph => !ch.is_control() && !ch.is_whitespace(),
+        ClassKind::Graph | ClassKind::File => !ch.is_control() && !ch.is_whitespace(),
         ClassKind::Lower => ch.is_lowercase(),
         ClassKind::Print => !ch.is_control(),
         ClassKind::Punct => ch.is_ascii_punctuation(),
@@ -461,8 +599,9 @@ fn kind_matches(kind: ClassKind, ch: char) -> bool {
         ClassKind::Ident => ch == '_' || ch.is_alphanumeric(),
         ClassKind::Keyword => ch == '_' || ch.is_alphanumeric() || !ch.is_ascii(),
         ClassKind::IdentNoDigit => ch == '_' || (ch.is_alphabetic() && !ch.is_numeric()),
-        ClassKind::KeywordNoDigit => ch == '_' || !ch.is_ascii() || (ch.is_alphabetic() && !ch.is_numeric()),
-        ClassKind::File => !ch.is_control() && !ch.is_whitespace(),
+        ClassKind::KeywordNoDigit => {
+            ch == '_' || !ch.is_ascii() || (ch.is_alphabetic() && !ch.is_numeric())
+        }
         ClassKind::FileNoDigit => !ch.is_control() && !ch.is_whitespace() && !ch.is_numeric(),
         ClassKind::PrintNoDigit => !ch.is_control() && !ch.is_numeric(),
     }

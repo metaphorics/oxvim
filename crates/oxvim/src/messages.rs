@@ -44,11 +44,11 @@ impl PrintfSink {
             MessageDestination::Ui | MessageDestination::Suppressed => return Ok(()),
         };
         if let Some(previous) = self.last {
-            self.put(previous, b"\n")?;
+            Self::put(previous, b"\n")?;
         }
         match &message.content {
-            Object::String(text) => self.put(stream, text.as_bytes())?,
-            value => self.put(stream, format!("{value:?}").as_bytes())?,
+            Object::String(text) => Self::put(stream, text.as_bytes())?,
+            value => Self::put(stream, format!("{value:?}").as_bytes())?,
         }
         self.last = Some(stream);
         Ok(())
@@ -59,15 +59,15 @@ impl PrintfSink {
     /// `silent_mode` output always ends in a newline (`ex_cmds.c` line 1721),
     /// while `--headless` output does not.
     pub fn finish(&mut self, routing: MessageRouting) -> io::Result<()> {
-        if let Some(stream) = self.last.take() {
-            if routing.silent {
-                self.put(stream, b"\n")?;
-            }
+        if let Some(stream) = self.last.take()
+            && routing.silent
+        {
+            Self::put(stream, b"\n")?;
         }
         Ok(())
     }
 
-    fn put(&self, stream: Stream, bytes: &[u8]) -> io::Result<()> {
+    fn put(stream: Stream, bytes: &[u8]) -> io::Result<()> {
         match stream {
             Stream::Out => {
                 let stdout = io::stdout();

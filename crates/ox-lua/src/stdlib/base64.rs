@@ -22,9 +22,14 @@ fn encode(input: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         output.push(ALPHABET[usize::from(chunk[0] >> 2)]);
-        output.push(ALPHABET[usize::from((chunk[0] & 0x03) << 4 | chunk.get(1).copied().unwrap_or(0) >> 4)]);
+        output.push(
+            ALPHABET[usize::from((chunk[0] & 0x03) << 4 | chunk.get(1).copied().unwrap_or(0) >> 4)],
+        );
         if let Some(second) = chunk.get(1) {
-            output.push(ALPHABET[usize::from((second & 0x0f) << 2 | chunk.get(2).copied().unwrap_or(0) >> 6)]);
+            output.push(
+                ALPHABET
+                    [usize::from((second & 0x0f) << 2 | chunk.get(2).copied().unwrap_or(0) >> 6)],
+            );
         } else {
             output.push(b'=');
         }
@@ -47,35 +52,36 @@ fn decode(input: &[u8]) -> mlua::Result<Vec<u8>> {
         return Err(mlua::Error::runtime("invalid base64 data"));
     }
     let mut output = Vec::with_capacity(input.len() / 4 * 3 - padding);
-    for (index, chunk) in input.chunks_exact(4).enumerate() {
-        let last = index + 1 == input.len() / 4;
-        let a = sextet(chunk[0])?;
-        let b = sextet(chunk[1])?;
-        let c = if chunk[2] == b'=' {
-            if !last || chunk[3] != b'=' {
+    let (chunks, _) = input.as_chunks::<4>();
+    for (index, &[first, second, third, fourth]) in chunks.iter().enumerate() {
+        let last = index + 1 == chunks.len();
+        let a = sextet(first)?;
+        let b = sextet(second)?;
+        let c = if third == b'=' {
+            if !last || fourth != b'=' {
                 return Err(mlua::Error::runtime("invalid base64 data"));
             }
             0
         } else {
-            sextet(chunk[2])?
+            sextet(third)?
         };
-        let d = if chunk[3] == b'=' {
+        let d = if fourth == b'=' {
             if !last {
                 return Err(mlua::Error::runtime("invalid base64 data"));
             }
             0
         } else {
-            sextet(chunk[3])?
+            sextet(fourth)?
         };
 
-        if chunk[2] == b'=' && b & 0x0f != 0 || chunk[3] == b'=' && chunk[2] != b'=' && c & 0x03 != 0 {
+        if third == b'=' && b & 0x0f != 0 || fourth == b'=' && third != b'=' && c & 0x03 != 0 {
             return Err(mlua::Error::runtime("invalid base64 data"));
         }
         output.push(a << 2 | b >> 4);
-        if chunk[2] != b'=' {
+        if third != b'=' {
             output.push(b << 4 | c >> 2);
         }
-        if chunk[3] != b'=' {
+        if fourth != b'=' {
             output.push(c << 6 | d);
         }
     }

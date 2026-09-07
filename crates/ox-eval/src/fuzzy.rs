@@ -88,7 +88,11 @@ fn to_upper(character: char) -> char {
     }
     let mut mapped = character.to_uppercase();
     let first = mapped.next().unwrap_or(character);
-    if mapped.next().is_none() { first } else { character }
+    if mapped.next().is_none() {
+        first
+    } else {
+        character
+    }
 }
 
 /// `mb_islower`: `mb_toupper(c) != c`.
@@ -106,19 +110,56 @@ fn is_upper(character: char) -> bool {
 /// character. Adjacent upstream intervals are merged because only the
 /// `>= 2` test matters here.
 const NON_WORD_INTERVALS: [(u32, u32); 50] = [
-    (0x037e, 0x037e), (0x0387, 0x0387), (0x055a, 0x055f), (0x0589, 0x0589),
-    (0x05be, 0x05be), (0x05c0, 0x05c0), (0x05c3, 0x05c3), (0x05f3, 0x05f4),
-    (0x060c, 0x060c), (0x061b, 0x061b), (0x061f, 0x061f), (0x066a, 0x066d),
-    (0x06d4, 0x06d4), (0x0700, 0x070d), (0x0964, 0x0965), (0x0970, 0x0970),
-    (0x0df4, 0x0df4), (0x0e4f, 0x0e4f), (0x0e5a, 0x0e5b), (0x0f04, 0x0f12),
-    (0x0f3a, 0x0f3d), (0x0f85, 0x0f85), (0x104a, 0x104f), (0x10fb, 0x10fb),
-    (0x1361, 0x1368), (0x166d, 0x166e), (0x1680, 0x1680), (0x169b, 0x169c),
-    (0x16eb, 0x16ed), (0x1735, 0x1736), (0x17d4, 0x17dc), (0x1800, 0x180a),
-    (0x2000, 0x206f), (0x20a0, 0x27ff), (0x2900, 0x2998), (0x29d8, 0x29db),
-    (0x29fc, 0x29fd), (0x2e00, 0x2e7f), (0x3000, 0x3020), (0x3030, 0x3030),
-    (0x303d, 0x303d), (0xfd3e, 0xfd3f), (0xfe30, 0xfe6b), (0xff00, 0xff0f),
-    (0xff1a, 0xff20), (0xff3b, 0xff40), (0xff5b, 0xff65), (0x1d000, 0x1d24f),
-    (0x1d400, 0x1d7ff), (0x1f000, 0x1f9ff),
+    (0x037e, 0x037e),
+    (0x0387, 0x0387),
+    (0x055a, 0x055f),
+    (0x0589, 0x0589),
+    (0x05be, 0x05be),
+    (0x05c0, 0x05c0),
+    (0x05c3, 0x05c3),
+    (0x05f3, 0x05f4),
+    (0x060c, 0x060c),
+    (0x061b, 0x061b),
+    (0x061f, 0x061f),
+    (0x066a, 0x066d),
+    (0x06d4, 0x06d4),
+    (0x0700, 0x070d),
+    (0x0964, 0x0965),
+    (0x0970, 0x0970),
+    (0x0df4, 0x0df4),
+    (0x0e4f, 0x0e4f),
+    (0x0e5a, 0x0e5b),
+    (0x0f04, 0x0f12),
+    (0x0f3a, 0x0f3d),
+    (0x0f85, 0x0f85),
+    (0x104a, 0x104f),
+    (0x10fb, 0x10fb),
+    (0x1361, 0x1368),
+    (0x166d, 0x166e),
+    (0x1680, 0x1680),
+    (0x169b, 0x169c),
+    (0x16eb, 0x16ed),
+    (0x1735, 0x1736),
+    (0x17d4, 0x17dc),
+    (0x1800, 0x180a),
+    (0x2000, 0x206f),
+    (0x20a0, 0x27ff),
+    (0x2900, 0x2998),
+    (0x29d8, 0x29db),
+    (0x29fc, 0x29fd),
+    (0x2e00, 0x2e7f),
+    (0x3000, 0x3020),
+    (0x3030, 0x3030),
+    (0x303d, 0x303d),
+    (0xfd3e, 0xfd3f),
+    (0xfe30, 0xfe6b),
+    (0xff00, 0xff0f),
+    (0xff1a, 0xff20),
+    (0xff3b, 0xff40),
+    (0xff5b, 0xff65),
+    (0x1d000, 0x1d24f),
+    (0x1d400, 0x1d7ff),
+    (0x1f000, 0x1f9ff),
 ];
 
 /// `vim_iswordc` under the default `'iskeyword'` (`@,48-57,_,192-255`):
@@ -135,9 +176,13 @@ const NON_WORD_INTERVALS: [(u32, u32); 50] = [
 fn is_word_char(character: char) -> bool {
     let code = u32::from(character);
     if code < 0x100 {
-        return character.is_ascii_alphanumeric() || character == '_' || (0xc0..=0xff).contains(&code);
+        return character.is_ascii_alphanumeric()
+            || character == '_'
+            || (0xc0..=0xff).contains(&code);
     }
-    !NON_WORD_INTERVALS.iter().any(|(first, last)| (*first..=*last).contains(&code))
+    !NON_WORD_INTERVALS
+        .iter()
+        .any(|(first, last)| (*first..=*last).contains(&code))
 }
 
 /// `compute_bonus_codepoint` (`fuzzy.c:794-811`).
@@ -193,7 +238,11 @@ struct MatchStruct {
 
 /// `setup_match_struct` (`fuzzy.c:813-837`).
 fn setup_match_struct(needle: &[char], haystack: &[char]) -> MatchStruct {
-    let lower_needle = needle.iter().take(MATCH_MAX_LEN).map(|character| to_lower(*character)).collect();
+    let lower_needle = needle
+        .iter()
+        .take(MATCH_MAX_LEN)
+        .map(|character| to_lower(*character))
+        .collect();
     let mut lower_haystack = Vec::new();
     let mut match_bonus = Vec::new();
     let mut previous = '/';
@@ -202,7 +251,11 @@ fn setup_match_struct(needle: &[char], haystack: &[char]) -> MatchStruct {
         match_bonus.push(compute_bonus(previous, *character));
         previous = *character;
     }
-    MatchStruct { lower_needle, lower_haystack, match_bonus }
+    MatchStruct {
+        lower_needle,
+        lower_haystack,
+        match_bonus,
+    }
 }
 
 /// `j * SCORE_GAP_LEADING` (`fuzzy.c:860`). A column index is bounded by
@@ -223,7 +276,11 @@ fn match_row(
     let needle_len = match_data.lower_needle.len();
     let haystack_len = match_data.lower_haystack.len();
     let mut previous_score = f64::NEG_INFINITY;
-    let gap_score = if row == needle_len - 1 { SCORE_GAP_TRAILING } else { SCORE_GAP_INNER };
+    let gap_score = if row == needle_len - 1 {
+        SCORE_GAP_TRAILING
+    } else {
+        SCORE_GAP_INNER
+    };
     let mut previous_m = f64::NEG_INFINITY;
     let mut previous_d = f64::NEG_INFINITY;
 
@@ -253,6 +310,9 @@ fn match_row(
 
 /// `match_positions` (`fuzzy.c:879-966`): the fzy score, plus the character
 /// positions of the optimal match written into `positions`.
+// Upstream fuzzy.c compares fzy scores with exact ==; the scores are
+// deterministic grid values, not computed approximations.
+#[allow(clippy::float_cmp)]
 fn match_positions(needle: &[char], haystack: &[char], positions: &mut [usize]) -> f64 {
     if needle.is_empty() {
         return f64::NEG_INFINITY;
@@ -285,7 +345,14 @@ fn match_positions(needle: &[char], haystack: &[char], positions: &mut [usize]) 
         let (previous_m, current_m) = best_match.split_at_mut(row * columns);
         let last_d = &previous_d[(row - 1) * columns..][..columns];
         let last_m = &previous_m[(row - 1) * columns..][..columns];
-        match_row(&match_data, row, &mut current_d[..columns], &mut current_m[..columns], last_d, last_m);
+        match_row(
+            &match_data,
+            row,
+            &mut current_d[..columns],
+            &mut current_m[..columns],
+            last_d,
+            last_m,
+        );
     }
 
     // Backtrace, `fuzzy.c:937-960`. `remaining` is the exclusive upper bound
@@ -303,7 +370,8 @@ fn match_positions(needle: &[char], haystack: &[char], positions: &mut [usize]) 
             {
                 match_required = row > 0
                     && column > 0
-                    && best_match[index] == best_end[(row - 1) * columns + column - 1] + SCORE_MATCH_CONSECUTIVE;
+                    && best_match[index]
+                        == best_end[(row - 1) * columns + column - 1] + SCORE_MATCH_CONSECUTIVE;
                 if let Some(slot) = positions.get_mut(row) {
                     *slot = column;
                 }
@@ -316,6 +384,8 @@ fn match_positions(needle: &[char], haystack: &[char], positions: &mut [usize]) 
 }
 
 /// Convert an fzy score to upstream's integer score (`fuzzy.c:122-129`).
+// The cast is guarded by the i32::MAX/MIN bounds check immediately above.
+#[allow(clippy::cast_possible_truncation)]
 fn scale_score(fzy: f64) -> i32 {
     if fzy == f64::NEG_INFINITY {
         return SCORE_NONE;
@@ -323,7 +393,11 @@ fn scale_score(fzy: f64) -> i32 {
     if fzy == f64::INFINITY {
         return i32::MAX;
     }
-    let scaled = if fzy < 0.0 { (fzy * SCORE_SCALE - 0.5).ceil() } else { (fzy * SCORE_SCALE + 0.5).floor() };
+    let scaled = if fzy < 0.0 {
+        (fzy * SCORE_SCALE - 0.5).ceil()
+    } else {
+        (fzy * SCORE_SCALE + 0.5).floor()
+    };
     if scaled >= f64::from(i32::MAX) {
         i32::MAX
     } else if scaled <= f64::from(i32::MIN) {
@@ -339,7 +413,11 @@ fn scale_score(fzy: f64) -> i32 {
 ///
 /// Returns `None` when nothing matched, which is upstream's
 /// `numMatches == 0`.
-pub(crate) fn fuzzy_match(haystack: &[char], pattern: &[char], matchseq: bool) -> Option<FuzzyMatch> {
+pub(crate) fn fuzzy_match(
+    haystack: &[char],
+    pattern: &[char],
+    matchseq: bool,
+) -> Option<FuzzyMatch> {
     let mut positions = vec![0usize; MATCH_MAX_LEN];
     let mut matched = 0usize;
     let mut total: i32 = 0;
@@ -398,5 +476,8 @@ pub(crate) fn fuzzy_match(haystack: &[char], pattern: &[char], matchseq: bool) -
         return None;
     }
     positions.truncate(matched);
-    Some(FuzzyMatch { score: total, positions })
+    Some(FuzzyMatch {
+        score: total,
+        positions,
+    })
 }

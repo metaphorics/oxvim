@@ -5,6 +5,44 @@ local cmp_lt = Range.cmp_pos.lt
 
 local ns = api.nvim_create_namespace('nvim.treesitter.highlighter')
 
+--- Emits every treesitter capture over the whole buffer as a real,
+--- persistent highlight extmark (`crates/ox-lua/src/treesitter.rs`
+--- `emit_highlight_extmarks`). This port's compositor
+--- (`crates/ox-ui/src/compositor.rs` `apply_extmark_highlights`) paints
+--- exclusively from the buffer's real extmark store and never dispatches
+--- the `on_win`/`on_range` decoration-provider phases `on_range_impl`
+--- (below) depends on — confirmed by an exhaustive search of the redraw
+--- path (`crates/ox-editor/src/excmd_exec.rs` `command_redraw`), which
+--- only ever dispatches the `on_start`/`on_end` phases, never `on_win` or
+--- `on_range`, so `on_range_impl` never runs in this port today. This
+--- function is the substitute producer; a per-tree failure is isolated so
+--- one broken language does not block edits or `:redraw` for the rest of
+--- the buffer.
+---@param self vim.treesitter.highlighter
+local function apply_highlights(self)
+  if not api.nvim_buf_is_loaded(self.bufnr) then
+    return
+  end
+  -- Callers ensure the tree is already parsed before calling this: a
+  -- `parse()` call here would be able to re-enter through `on_changedtree`
+  -- (`_parse` reports changes and fires registered `on_changedtree`
+  -- callbacks synchronously; `on_changedtree` calls this function), so the
+  -- initial-parse call site (`TSHighlighter.new`, below) parses first
+  -- instead of this function doing it.
+  api.nvim_buf_clear_namespace(self.bufnr, ns, 0, -1)
+  self.tree:for_each_tree(function(tstree, tree)
+    if not tstree then
+      return
+    end
+    local hl_query = self:get_query(tree:lang())
+    local q = hl_query:query()
+    if not q then
+      return
+    end
+    pcall(vim._ts_emit_highlights, tstree:root(), q.query, self.bufnr, ns)
+  end)
+end
+
 ---@alias vim.treesitter.highlighter.Iter fun(end_line: integer|nil, end_col: integer|nil): integer, TSNode, vim.treesitter.query.TSMetadata, TSQueryMatch, TSTree
 
 ---@class (private) vim.treesitter.highlighter.Query
@@ -188,6 +226,15 @@ function TSHighlighter.new(tree, opts)
     vim.opt_local.spelloptions:append('noplainbuffer')
   end)
 
+  -- Force a synchronous initial parse (languagetree.lua:637-642: safe and
+  -- synchronous without an `on_parse` callback) so the first
+  -- `apply_highlights` pass below has trees to walk; `vim.treesitter.start`
+  -- does not parse before constructing the highlighter.
+  pcall(function()
+    self.tree:parse()
+  end)
+  apply_highlights(self)
+
   return self
 end
 
@@ -273,6 +320,8 @@ function TSHighlighter:on_changedtree(changes)
       self._conceal_checked[i] = false
     end
   end
+
+  apply_highlights(self)
 end
 
 --- Gets the query used for @param lang

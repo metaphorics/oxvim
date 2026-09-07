@@ -4,8 +4,7 @@
 
 pub mod locale;
 
-pub use locale::{current_locale, set_locale, LocaleCategory};
-
+pub use locale::{LocaleCategory, current_locale, set_locale};
 
 use std::ffi::OsStr;
 
@@ -81,6 +80,17 @@ pub fn unset_env(name: impl AsRef<OsStr>) -> bool {
     true
 }
 
+/// Current effective uid, for ownership checks on paths shared with other
+/// users (temporary listen directories).
+///
+/// `libc::geteuid` is a pure query: it takes no arguments and cannot fail.
+#[must_use]
+#[cfg(unix)]
+pub fn current_euid() -> u32 {
+    // SAFETY: `geteuid` reads only process state; no pointers cross the boundary.
+    unsafe { libc::geteuid() }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
@@ -101,11 +111,20 @@ mod tests {
         assert!(!super::set_env("", "value"), "empty name accepted");
         assert!(!super::unset_env(""), "empty name accepted");
 
-        assert!(!super::set_env("OX_SYS_EQ=BAD", "value"), "`=` in name accepted");
+        assert!(
+            !super::set_env("OX_SYS_EQ=BAD", "value"),
+            "`=` in name accepted"
+        );
         assert!(!super::unset_env("OX_SYS_EQ=BAD"), "`=` in name accepted");
 
-        assert!(!super::set_env(with_nul(b"OX_SYS\0NUL"), "value"), "NUL in name accepted");
-        assert!(!super::unset_env(with_nul(b"OX_SYS\0NUL")), "NUL in name accepted");
+        assert!(
+            !super::set_env(with_nul(b"OX_SYS\0NUL"), "value"),
+            "NUL in name accepted"
+        );
+        assert!(
+            !super::unset_env(with_nul(b"OX_SYS\0NUL")),
+            "NUL in name accepted"
+        );
 
         assert!(
             !super::set_env("OX_SYS_NUL_VALUE", with_nul(b"a\0b")),

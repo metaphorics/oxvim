@@ -5,8 +5,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ox_types::{OxStr, Typval};
@@ -20,14 +20,16 @@ pub(crate) fn getcwd(args: &[Typval]) -> Result<Typval> {
     for argument in args {
         number_arg(argument)?;
     }
-    let directory = std::env::current_dir()
-        .map_err(|error| EvalError::new("E472", 0, error.to_string()))?;
+    let directory =
+        std::env::current_dir().map_err(|error| EvalError::new("E472", 0, error.to_string()))?;
     Ok(text(directory.to_string_lossy()))
 }
 
 pub(crate) fn is_absolute_path(value: &Typval) -> Result<Typval> {
     let value = string_arg(value)?;
-    Ok(boolean(Path::new(&value.to_string_lossy().as_ref()).is_absolute()))
+    Ok(boolean(
+        Path::new(&value.to_string_lossy().as_ref()).is_absolute(),
+    ))
 }
 
 pub(crate) fn executable(value: &Typval) -> Result<Typval> {
@@ -47,13 +49,36 @@ pub(crate) fn executable(value: &Typval) -> Result<Typval> {
 
 pub(crate) fn exepath(value: &Typval) -> Result<Typval> {
     let program = string_arg(value)?.to_string_lossy().into_owned();
-    if program.is_empty() { return Ok(text("")); }
+    if program.is_empty() {
+        return Ok(text(""));
+    }
     let path = Path::new(&program);
     if path.components().count() > 1 {
-        return Ok(if is_executable(path) { text(fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy()) } else { text("") });
+        return Ok(if is_executable(path) {
+            text(
+                fs::canonicalize(path)
+                    .unwrap_or_else(|_| path.to_path_buf())
+                    .to_string_lossy(),
+            )
+        } else {
+            text("")
+        });
     }
-    let found = std::env::var_os("PATH").and_then(|search| std::env::split_paths(&search).map(|directory| directory.join(&program)).find(|candidate| is_executable(candidate)));
-    Ok(found.map_or_else(|| text(""), |candidate| text(fs::canonicalize(&candidate).unwrap_or(candidate).to_string_lossy())))
+    let found = std::env::var_os("PATH").and_then(|search| {
+        std::env::split_paths(&search)
+            .map(|directory| directory.join(&program))
+            .find(|candidate| is_executable(candidate))
+    });
+    Ok(found.map_or_else(
+        || text(""),
+        |candidate| {
+            text(
+                fs::canonicalize(&candidate)
+                    .unwrap_or(candidate)
+                    .to_string_lossy(),
+            )
+        },
+    ))
 }
 
 pub(crate) fn simplify(value: &Typval) -> Result<Typval> {
@@ -97,7 +122,11 @@ pub(crate) fn fnamemodify(
 ) -> Result<Typval> {
     let name = string_arg(filename)?.to_string_lossy().into_owned();
     let modifiers = string_arg(modifiers)?;
-    Ok(text(apply_filename_modifiers(regex, &name, modifiers.as_bytes())?))
+    Ok(text(apply_filename_modifiers(
+        regex,
+        &name,
+        modifiers.as_bytes(),
+    )?))
 }
 
 /// `modify_fname` (`eval/fs.c:69`): apply a chain of filename modifiers
@@ -110,6 +139,12 @@ pub(crate) fn fnamemodify(
 /// builtin error as it is for `fnamemodify` today. Modifiers are raw
 /// bytes — `fnamemodify` forwards its argument without a lossy string
 /// conversion, exactly as before this parser was shared.
+///
+/// # Errors
+///
+/// Returns `E54` when a `:s`/`:gs` substitution modifier is requested
+/// but no regex engine is available, or the regex engine's own error
+/// when the substitution fails.
 pub fn apply_filename_modifiers(
     regex: Option<&dyn RegexEngine>,
     name: &str,
@@ -164,7 +199,11 @@ pub fn apply_filename_modifiers(
                 let engine = regex.ok_or_else(|| {
                     EvalError::new("E54", 0, "regular-expression engine is not installed")
                 })?;
-                let flags = if global { OxStr::from("g") } else { OxStr::from("") };
+                let flags = if global {
+                    OxStr::from("g")
+                } else {
+                    OxStr::from("")
+                };
                 name = engine
                     .substitute(
                         &OxStr(name.into_bytes()),
@@ -195,7 +234,11 @@ pub(crate) fn tempname() -> Result<Typval> {
     static COUNT: AtomicU64 = AtomicU64::new(0);
 
     let Some(directory) = TEMPDIR.as_ref() else {
-        return Err(EvalError::new("E5431", 0, "cannot create a temporary directory"));
+        return Err(EvalError::new(
+            "E5431",
+            0,
+            "cannot create a temporary directory",
+        ));
     };
     let count = COUNT.fetch_add(1, Ordering::Relaxed);
     // `vim_settempdir` stores the directory with a trailing separator and
@@ -216,8 +259,14 @@ fn make_tempdir() -> Option<PathBuf> {
         let owned_root = root.join(format!("nvim.{user}"));
         // Always create, to avoid a race, then verify it is ours.
         create_private_dir(&owned_root);
-        let parent = if is_private_dir(&owned_root) { owned_root } else { root };
-        let Some(created) = mkdtemp(&parent) else { continue };
+        let parent = if is_private_dir(&owned_root) {
+            owned_root
+        } else {
+            root
+        };
+        let Some(created) = mkdtemp(&parent) else {
+            continue;
+        };
         // `vim_FullName` so a later `:cd` cannot change the meaning.
         return Some(fs::canonicalize(&created).unwrap_or(created));
     }
@@ -243,7 +292,9 @@ fn temp_dir_names() -> Vec<PathBuf> {
 /// replaces path separators, because a user name may contain them.
 fn tempdir_user() -> String {
     let uid = current_uid();
-    let name = uid.and_then(passwd_name).unwrap_or_else(|| uid.map_or_else(|| "0".to_owned(), |uid| uid.to_string()));
+    let name = uid
+        .and_then(passwd_name)
+        .unwrap_or_else(|| uid.map_or_else(|| "0".to_owned(), |uid| uid.to_string()));
     name.replace(['/', '\\'], "_")
 }
 
@@ -262,7 +313,9 @@ fn passwd_name(uid: u32) -> Option<String> {
         let mut fields = line.split(':');
         let name = fields.next()?;
         let _password = fields.next();
-        if fields.next().and_then(|value| value.parse::<u32>().ok()) == Some(uid) && !name.is_empty() {
+        if fields.next().and_then(|value| value.parse::<u32>().ok()) == Some(uid)
+            && !name.is_empty()
+        {
             return Some(name.to_owned());
         }
     }
@@ -288,7 +341,9 @@ fn create_private_dir(path: &Path) -> bool {
 fn is_private_dir(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::fs::PermissionsExt as _;
-    let Ok(metadata) = fs::metadata(path) else { return false };
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
     metadata.is_dir()
         && current_uid() == Some(metadata.uid())
         && metadata.permissions().mode() & 0o777 == 0o700
@@ -306,8 +361,14 @@ fn mkdtemp(parent: &Path) -> Option<PathBuf> {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     for _ in 0..1024 {
         let sequence = u128::from(SEQUENCE.fetch_add(1, Ordering::Relaxed));
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_nanos();
-        let name = format!("{:06x}", (stamp ^ sequence ^ u128::from(std::process::id())) & 0xff_ffff);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos();
+        let name = format!(
+            "{:06x}",
+            (stamp ^ sequence ^ u128::from(std::process::id())) & 0xff_ffff
+        );
         let candidate = parent.join(name);
         if create_private_dir(&candidate) {
             return Some(candidate);
@@ -343,14 +404,19 @@ pub(crate) fn findfilendir(
     }
     let as_list = count < 0;
     if name.is_empty() {
-        return Ok(if as_list { Typval::list(Vec::new()) } else { text("") });
+        return Ok(if as_list {
+            Typval::list(Vec::new())
+        } else {
+            text("")
+        });
     }
 
     let suffixes = match find_what {
         FindWhat::Dir => String::new(),
         FindWhat::File => option_list(scope, b"suffixesadd", ""),
     };
-    let regex = regex.ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?;
+    let regex = regex
+        .ok_or_else(|| EvalError::new("E54", 0, "regular-expression engine is not installed"))?;
     let mut search = FindSearch::new(regex, &name, &path, &suffixes, find_what);
 
     if as_list {
@@ -382,10 +448,10 @@ fn option_list(scope: &Scope, name: &[u8], default: &str) -> String {
         if !scope.contains_option(option_scope, name) {
             continue;
         }
-        if let Typval::String(value) = scope.get_option(option_scope, name) {
-            if !value.as_bytes().is_empty() {
-                return value.to_string_lossy().into_owned();
-            }
+        if let Typval::String(value) = scope.get_option(option_scope, name)
+            && !value.as_bytes().is_empty()
+        {
+            return value.to_string_lossy().into_owned();
         }
     }
     default.to_owned()
@@ -398,7 +464,8 @@ fn boolean(value: bool) -> Typval {
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
-    fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]
@@ -456,7 +523,7 @@ fn absolute_name(name: &str) -> String {
 
 fn expand_home(name: &str) -> String {
     if (name == "~" || name.starts_with("~/")) && std::env::var_os("HOME").is_some() {
-        let home = PathBuf::from(std::env::var_os("HOME").expect("checked above"));
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
         return format!("{}{}", home.to_string_lossy(), &name[1..]);
     }
     name.to_owned()
@@ -556,38 +623,45 @@ pub(crate) fn simplify_name(name: &str) -> String {
     }
     let absolute = name.starts_with('/');
     let double_root = name.starts_with("//") && !name.starts_with("///");
-    let leading_dot = name.starts_with("./");
     let trailing_separator = name.ends_with('/');
-    let mut collapsed_to_current = false;
+    let mut current_prefix = false;
     let mut parts: Vec<&str> = Vec::new();
     for component in name.split('/') {
         match component {
-            "" | "." => {}
+            "" => {}
+            "." => {
+                current_prefix |= !absolute && parts.is_empty();
+            }
             ".." if parts.last().is_some_and(|part| *part != "..") => {
                 parts.pop();
-                collapsed_to_current |= parts.is_empty();
             }
-            ".." if !absolute => parts.push(component),
-            ".." => {}
+            ".." if absolute => {}
+            ".." => {
+                current_prefix = false;
+                parts.push(component);
+            }
             _ => parts.push(component),
         }
     }
-    let mut output = parts.join("/");
-    if absolute {
-        output.insert_str(0, if double_root { "//" } else { "/" });
-    } else if (leading_dot || collapsed_to_current) && !output.is_empty() && !output.starts_with("../") && output != ".." {
-        output.insert_str(0, "./");
-    }
-    if output.is_empty() {
-        output = if absolute {
+    let mut output = if parts.is_empty() {
+        String::from(if double_root {
+            "//"
+        } else if absolute {
             "/"
-        } else if leading_dot {
-            "./"
         } else {
             "."
+        })
+    } else {
+        let mut output = parts.join("/");
+        if double_root {
+            output.insert_str(0, "//");
+        } else if absolute {
+            output.insert(0, '/');
+        } else if current_prefix {
+            output.insert_str(0, "./");
         }
-        .to_owned();
-    }
+        output
+    };
     if trailing_separator && !output.ends_with('/') {
         output.push('/');
     }

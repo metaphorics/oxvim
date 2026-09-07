@@ -101,7 +101,10 @@ impl<'a> FindSearch<'a> {
         } else {
             None
         };
-        let entries = if direct.is_some() || is_absolute(&file_to_find) || is_relative_to_curdir(&file_to_find) {
+        let entries = if direct.is_some()
+            || is_absolute(&file_to_find)
+            || is_relative_to_curdir(&file_to_find)
+        {
             Vec::new()
         } else {
             option_parts(path, b" ,")
@@ -134,7 +137,9 @@ impl<'a> FindSearch<'a> {
         }
         loop {
             if self.context.is_none() {
-                let Some(entry) = self.entries.next() else { return Ok(None) };
+                let Some(entry) = self.entries.next() else {
+                    return Ok(None);
+                };
                 let (path, stopdirs) = split_stopdir(&entry);
                 self.context = init_context(&path, stopdirs.as_deref())?;
                 continue;
@@ -152,7 +157,11 @@ impl<'a> FindSearch<'a> {
     /// previous match.
     fn step(&mut self) -> Option<String> {
         loop {
-            while let Some(mut entry) = self.context.as_mut().and_then(|context| context.stack.pop()) {
+            while let Some(mut entry) = self
+                .context
+                .as_mut()
+                .and_then(|context| context.stack.pop())
+            {
                 if entry.filearray.is_none() && !self.mark_dir_visited(&entry) {
                     continue;
                 }
@@ -175,7 +184,9 @@ impl<'a> FindSearch<'a> {
     /// directory already searched with an equivalent wildcard remainder, and
     /// reject one whose identity cannot be read at all.
     fn mark_dir_visited(&mut self, entry: &StackEntry) -> bool {
-        let Some(id) = file_id(&entry.fix_path) else { return false };
+        let Some(id) = file_id(&entry.fix_path) else {
+            return false;
+        };
         if self
             .dir_visited
             .iter()
@@ -194,7 +205,10 @@ impl<'a> FindSearch<'a> {
         if entry.filearray.is_some() {
             return Vec::new();
         }
-        let start_dir = self.context.as_ref().map_or("", |context| context.start_dir.as_str());
+        let start_dir = self
+            .context
+            .as_ref()
+            .map_or("", |context| context.start_dir.as_str());
         let mut pattern = String::new();
         if !is_absolute(&entry.fix_path) && !start_dir.is_empty() {
             pattern.push_str(start_dir);
@@ -307,10 +321,13 @@ impl<'a> FindSearch<'a> {
         if path_with_url(candidate) {
             return true;
         }
-        if !Path::new(candidate).exists() || (self.find_what == FindWhat::Dir) != is_dir(candidate) {
+        if !Path::new(candidate).exists() || (self.find_what == FindWhat::Dir) != is_dir(candidate)
+        {
             return false;
         }
-        let Some(id) = file_id(candidate) else { return false };
+        let Some(id) = file_id(candidate) else {
+            return false;
+        };
         if self.visited.contains(&id) {
             return false;
         }
@@ -350,8 +367,12 @@ impl<'a> FindSearch<'a> {
     /// component off the starting directory and search again, unless that
     /// directory is in the stop list or nothing is left.
     fn ascend(&mut self) -> bool {
-        let Some(context) = self.context.as_mut() else { return false };
-        let Some(stopdirs) = context.stopdirs.as_ref() else { return false };
+        let Some(context) = self.context.as_mut() else {
+            return false;
+        };
+        let Some(stopdirs) = context.stopdirs.as_ref() else {
+            return false;
+        };
         if context.start_dir.is_empty() {
             return false;
         }
@@ -395,10 +416,14 @@ impl<'a> FindSearch<'a> {
 /// the starting directory, split the entry into its fixed prefix and its
 /// wildcard remainder, encode each `**` count as a binary descent counter,
 /// and seed the stack.
+// Direct port of vim_findfile_init; splitting would obscure the path→context mapping.
+#[allow(clippy::too_many_lines)]
 fn init_context(path: &str, stopdirs: Option<&str>) -> Result<Option<Context>> {
     let mut start_dir = String::new();
     if path.is_empty() || !is_absolute(path) {
-        let Ok(current) = std::env::current_dir() else { return Ok(None) };
+        let Ok(current) = std::env::current_dir() else {
+            return Ok(None);
+        };
         start_dir = current.to_string_lossy().into_owned();
     }
 
@@ -406,7 +431,7 @@ fn init_context(path: &str, stopdirs: Option<&str>) -> Result<Option<Context>> {
     let mut wc_path = Vec::new();
     if let Some(offset) = path.find('*') {
         fix_path = path[..offset].to_owned();
-        let tail = path[offset..].as_bytes();
+        let tail = &path.as_bytes()[offset..];
         let mut cursor = 0;
         while cursor < tail.len() {
             if !tail[cursor..].starts_with(b"**") {
@@ -426,10 +451,17 @@ fn init_context(path: &str, stopdirs: Option<&str>) -> Result<Option<Context>> {
             let count = if digits.is_empty() {
                 None
             } else {
-                Some(std::str::from_utf8(digits).ok().and_then(|text| text.parse::<i64>().ok()).unwrap_or(255))
+                Some(
+                    std::str::from_utf8(digits)
+                        .ok()
+                        .and_then(|text| text.parse::<i64>().ok())
+                        .unwrap_or(255),
+                )
             };
             match count {
-                Some(count) if count > 0 && count < 255 => wc_path.push(count as u8),
+                Some(count) if count > 0 && count < 255 => {
+                    wc_path.push(u8::try_from(count).unwrap_or(MAX_STAR_STAR_EXPAND));
+                }
                 Some(0) => {
                     wc_path.truncate(wc_path.len() - 2);
                 }
@@ -448,7 +480,7 @@ fn init_context(path: &str, stopdirs: Option<&str>) -> Result<Option<Context>> {
     }
 
     if start_dir.is_empty() {
-        start_dir = fix_path.clone();
+        start_dir.clone_from(&fix_path);
         fix_path.clear();
     }
 
@@ -470,7 +502,9 @@ fn init_context(path: &str, stopdirs: Option<&str>) -> Result<Option<Context>> {
         if tail > 0 {
             kept = tail - 1;
             // Never walk into "..", which would restart the search upwards.
-            if fix_path.starts_with("..") && (kept == 2 || fix_path.as_bytes().get(2) == Some(&b'/')) {
+            if fix_path.starts_with("..")
+                && (kept == 2 || fix_path.as_bytes().get(2) == Some(&b'/'))
+            {
                 return Ok(None);
             }
             expanded.push_str(&fix_path[..kept]);
@@ -556,7 +590,10 @@ fn in_stoplist(path: &str, stopdirs: &[String]) -> bool {
         let stop = stop.as_bytes();
         // `strncmp(stop, path, path_len) == 0`, where a short stop entry
         // compares its terminator against a path byte and cannot match.
-        let matched = path.iter().enumerate().all(|(index, byte)| stop.get(index) == Some(byte));
+        let matched = path
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| stop.get(index) == Some(byte));
         matched && (stop.len() <= length || stop[length] == b'/')
     })
 }
@@ -646,11 +683,15 @@ fn path_expand(regex: &dyn RegexEngine, found: &mut Vec<String>, pattern: &str) 
     let directory = &pattern[..component_start];
     let component = remove_backslashes(&pattern[component_start..cursor]);
     let remainder = &pattern[cursor..];
-    let Some(matcher) = glob_to_regex(&component) else { return };
+    let Some(glob_re) = glob_to_regex(&component) else {
+        return;
+    };
     let starts_with_dot = component.starts_with('.');
 
     let scan_root = if directory.is_empty() { "." } else { directory };
-    let Ok(entries) = fs::read_dir(scan_root) else { return };
+    let Ok(entries) = fs::read_dir(scan_root) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') && !starts_with_dot {
@@ -660,7 +701,13 @@ fn path_expand(regex: &dyn RegexEngine, found: &mut Vec<String>, pattern: &str) 
         // not compile as a regular expression.
         let literal = name == component;
         let matched = literal
-            || regex.is_match(&OxStr::from(name.as_str()), &OxStr::from(matcher.as_str()), false).unwrap_or(false);
+            || regex
+                .is_match(
+                    &OxStr::from(name.as_str()),
+                    &OxStr::from(glob_re.as_str()),
+                    false,
+                )
+                .unwrap_or(false);
         if !matched {
             continue;
         }
@@ -689,7 +736,8 @@ fn add_directory(path: &str) -> Option<String> {
 /// `file_pat_to_reg_pat(pat, end, NULL, false)` (`fileio.c`) on a platform
 /// without `BACKSLASH_IN_FILENAME`. `None` mirrors upstream's E219/E220
 /// failure, which `do_path_expand` treats as "expand nothing".
-fn glob_to_regex(pattern: &str) -> Option<String> {
+#[must_use]
+pub fn glob_to_regex(pattern: &str) -> Option<String> {
     let bytes = pattern.as_bytes();
     if bytes.is_empty() {
         return Some("^$".to_owned());
@@ -729,12 +777,19 @@ fn glob_to_regex(pattern: &str) -> Option<String> {
             }
             b'?' => converted.push('.'),
             b'\\' => {
-                let Some(next) = bytes.get(cursor + 1).copied() else { break };
+                let Some(next) = bytes.get(cursor + 1).copied() else {
+                    break;
+                };
                 cursor += 1;
                 match next {
                     b'?' => converted.push('?'),
-                    b',' | b'%' | b'#' | b' ' | b'\t' | b'{' | b'}' => converted.push(char::from(next)),
-                    b'\\' if bytes.get(cursor + 1) == Some(&b'\\') && bytes.get(cursor + 2) == Some(&b'{') => {
+                    b',' | b'%' | b'#' | b' ' | b'\t' | b'{' | b'}' => {
+                        converted.push(char::from(next));
+                    }
+                    b'\\'
+                        if bytes.get(cursor + 1) == Some(&b'\\')
+                            && bytes.get(cursor + 2) == Some(&b'{') =>
+                    {
                         converted.push_str("\\{");
                         cursor += 2;
                     }
@@ -817,7 +872,11 @@ fn option_parts(value: &str, separators: &[u8]) -> Vec<String> {
             cursor += 1;
         }
         while cursor < bytes.len() && !separators.contains(&bytes[cursor]) {
-            if bytes[cursor] == b'\\' && bytes.get(cursor + 1).is_some_and(|byte| separators.contains(byte)) {
+            if bytes[cursor] == b'\\'
+                && bytes
+                    .get(cursor + 1)
+                    .is_some_and(|byte| separators.contains(byte))
+            {
                 cursor += 1;
             }
             part.push(bytes[cursor]);
@@ -843,11 +902,12 @@ fn expand_env(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0;
-    if bytes.first() == Some(&b'~') && (bytes.len() == 1 || bytes[1] == b'/') {
-        if let Some(home) = std::env::var_os("HOME") {
-            output.push_str(&home.to_string_lossy());
-            cursor = 1;
-        }
+    if bytes.first() == Some(&b'~')
+        && (bytes.len() == 1 || bytes[1] == b'/')
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        output.push_str(&home.to_string_lossy());
+        cursor = 1;
     }
     while cursor < bytes.len() {
         if bytes[cursor] != b'$' {
@@ -865,7 +925,10 @@ fn expand_env(text: &str) -> String {
         let braced = bytes.get(cursor + 1) == Some(&b'{');
         let name_start = cursor + 1 + usize::from(braced);
         let mut name_end = name_start;
-        while bytes.get(name_end).is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_') {
+        while bytes
+            .get(name_end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
             name_end += 1;
         }
         let closed = !braced || bytes.get(name_end) == Some(&b'}');
@@ -892,9 +955,13 @@ fn report(candidate: &str) -> String {
         return candidate.to_owned();
     }
     let simplified = crate::path_builtins::simplify_name(candidate);
-    let Ok(current) = std::env::current_dir() else { return simplified };
+    let Ok(current) = std::env::current_dir() else {
+        return simplified;
+    };
     let current = current.to_string_lossy();
-    let Some(tail) = simplified.strip_prefix(current.as_ref()) else { return simplified };
+    let Some(tail) = simplified.strip_prefix(current.as_ref()) else {
+        return simplified;
+    };
     if current.ends_with('/') {
         return tail.to_owned();
     }
@@ -909,7 +976,9 @@ fn full_name(name: &str) -> String {
     if is_absolute(name) {
         return name.to_owned();
     }
-    let Ok(current) = std::env::current_dir() else { return name.to_owned() };
+    let Ok(current) = std::env::current_dir() else {
+        return name.to_owned();
+    };
     crate::path_builtins::simplify_name(&format!("{}/{name}", current.to_string_lossy()))
 }
 
@@ -945,7 +1014,9 @@ fn path_with_url(path: &str) -> bool {
     scheme.len() < path.len()
         && !scheme.is_empty()
         && scheme.starts_with(|character: char| character.is_ascii_alphabetic())
-        && scheme.chars().all(|character| character.is_ascii_alphanumeric() || matches!(character, '+' | '.' | '-'))
+        && scheme.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '.' | '-')
+        })
 }
 
 /// `path_equal(a, b, kPathCmpLiteral)`: byte equality after trimming a
@@ -969,5 +1040,7 @@ fn file_id(path: &str) -> Option<FileId> {
 
 #[cfg(not(unix))]
 fn file_id(path: &str) -> Option<FileId> {
-    fs::canonicalize(path).ok().map(|path| path.to_string_lossy().into_owned())
+    fs::canonicalize(path)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
 }

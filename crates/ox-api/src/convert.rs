@@ -4,7 +4,7 @@ use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, WinHandle};
 
 use crate::metadata::{ApiType, TypeRef};
 
-/// A typed MessagePack nil value.
+/// A typed `MessagePack` nil value.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Nil;
 
@@ -17,11 +17,11 @@ pub struct LuaRef(pub i32);
 /// `argument` is one-based, matching Neovim's generated dispatch diagnostics.
 pub trait FromObject: ApiType + Sized {
     /// Convert `object`, or return an upstream-compatible argument error.
-    fn from_object(
-        object: &Object,
-        argument: usize,
-        function: &str,
-    ) -> Result<Self, ApiError>;
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ApiError`] when `object` does not match [`Self::TYPE`].
+    fn from_object(object: &Object, argument: usize, function: &str) -> Result<Self, ApiError>;
 }
 
 /// Converts a Rust API return value into an [`Object`].
@@ -108,6 +108,17 @@ impl IntoObject for bool {
     }
 }
 
+/// Converts an `i64` to `f64` exactly: both 32-bit halves convert losslessly
+/// and `mul_add` rounds only once, matching a direct hardware conversion.
+fn exact_f64(value: i64) -> f64 {
+    const RADIX: i64 = 1_i64 << 32;
+    // The quotient of any `i64` divided by 2^32 fits `i32` and the remainder
+    // fits `u32`, so both conversions below are infallible.
+    let high = i32::try_from(value.div_euclid(RADIX)).unwrap_or(i32::MAX);
+    let low = u32::try_from(value.rem_euclid(RADIX)).unwrap_or(u32::MAX);
+    f64::from(high).mul_add(4_294_967_296.0, f64::from(low))
+}
+
 impl ApiType for f64 {
     const TYPE: TypeRef = TypeRef::Float;
 }
@@ -116,7 +127,7 @@ impl FromObject for f64 {
     fn from_object(object: &Object, argument: usize, function: &str) -> Result<Self, ApiError> {
         match object {
             Object::Float(value) => Ok(*value),
-            Object::Integer(value) => Ok(*value as Self),
+            Object::Integer(value) => Ok(exact_f64(*value)),
             _ => Err(wrong_type::<Self>(argument, function)),
         }
     }
@@ -314,7 +325,10 @@ mod tests {
             ().into_object(),
         ];
         assert_eq!(cases[0], Object::Boolean(true));
-        assert_eq!(cases[4], Object::Array(vec![Object::Integer(1), Object::Integer(2)]));
+        assert_eq!(
+            cases[4],
+            Object::Array(vec![Object::Integer(1), Object::Integer(2)])
+        );
         assert_eq!(cases[6], Object::LuaRef(8));
         assert_eq!(cases[8], Object::Nil);
         assert_eq!(cases[9], Object::Nil);

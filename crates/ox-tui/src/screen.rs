@@ -90,7 +90,8 @@ impl Grid {
     /// A cell at `(row, column)`, if it lies inside the grid.
     #[must_use]
     pub fn cell(&self, row: usize, column: usize) -> Option<&Cell> {
-        self.index(row, column).and_then(|index| self.cells.get(index))
+        self.index(row, column)
+            .and_then(|index| self.cells.get(index))
     }
 
     /// Whether a row was marked as wrapping into the following row.
@@ -118,9 +119,10 @@ impl Grid {
                 let Some(destination) = replacement.index(row, column) else {
                     continue;
                 };
-                if let (Some(source_cell), Some(destination_cell)) =
-                    (self.cells.get(source), replacement.cells.get_mut(destination))
-                {
+                if let (Some(source_cell), Some(destination_cell)) = (
+                    self.cells.get(source),
+                    replacement.cells.get_mut(destination),
+                ) {
                     destination_cell.clone_from(source_cell);
                 }
             }
@@ -488,6 +490,13 @@ impl Screen {
     }
 
     /// Apply one already-decoded RPC redraw event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScreenError`] when a known event carries a malformed
+    /// argument set (wrong arity, wrong type, out-of-range value, or an
+    /// inconsistent grid reference). Unrecognized events yield
+    /// [`ApplyOutcome::Unknown`] rather than an error.
     pub fn apply_event(&mut self, event: &RedrawEvent) -> Result<ApplyOutcome, ScreenError> {
         let known = is_screen_event(&event.name);
         if !known {
@@ -500,6 +509,14 @@ impl Screen {
     }
 
     /// Parse and apply one wire event entry: `[name, argset, argset, ...]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScreenError::EventEntryNotArray`] if `entry` is not an
+    /// array, [`ScreenError::EventNameNotString`] if the first element is
+    /// not a byte string, [`ScreenError::EventArgumentsNotArray`] if a
+    /// subsequent element is not an array, or any error propagated from
+    /// [`apply_event`](Self::apply_event) while applying the parsed event.
     pub fn apply_redraw_object(&mut self, entry: &Object) -> Result<ApplyOutcome, ScreenError> {
         let Object::Array(parts) = entry else {
             return Err(ScreenError::EventEntryNotArray);
@@ -524,10 +541,14 @@ impl Screen {
     }
 
     /// Parse and apply every event entry in a redraw batch array.
-    pub fn apply_redraw_batch(
-        &mut self,
-        batch: &Object,
-    ) -> Result<Vec<ApplyOutcome>, ScreenError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScreenError::EventEntryNotArray`] if `batch` is not an
+    /// array, or any error propagated from
+    /// [`apply_redraw_object`](Self::apply_redraw_object) while parsing or
+    /// applying an individual entry.
+    pub fn apply_redraw_batch(&mut self, batch: &Object) -> Result<Vec<ApplyOutcome>, ScreenError> {
         let Object::Array(entries) = batch else {
             return Err(ScreenError::EventEntryNotArray);
         };
@@ -538,6 +559,11 @@ impl Screen {
     }
 
     /// Compose all visible internal windows over the terminal grid.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScreenError::UnknownGrid`] when the terminal grid has not
+    /// been created yet.
     pub fn composed_grid(&self) -> Result<ComposedGrid, ScreenError> {
         let root = self
             .grids
@@ -585,7 +611,9 @@ impl Screen {
         let cursor = self.cursor?;
         if cursor.grid == self.terminal_grid {
             let root = self.grids.get(&self.terminal_grid)?;
-            return root.cell(cursor.row, cursor.column).map(|_| (cursor.row, cursor.column));
+            return root
+                .cell(cursor.row, cursor.column)
+                .map(|_| (cursor.row, cursor.column));
         }
         let window = self.windows.get(&cursor.grid)?;
         if window.hidden
@@ -602,6 +630,11 @@ impl Screen {
     }
 
     /// Headless string rendering of the composed terminal grid.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error propagated from
+    /// [`composed_grid`](Self::composed_grid).
     pub fn render_to_string(&self) -> Result<String, ScreenError> {
         self.composed_grid().map(|grid| grid.render_to_string())
     }
@@ -635,9 +668,10 @@ impl Screen {
                 else {
                     continue;
                 };
-                if let (Some(source_cell), Some(target_cell)) =
-                    (source.cells.get(source_index), target.cells.get_mut(target_index))
-                {
+                if let (Some(source_cell), Some(target_cell)) = (
+                    source.cells.get(source_index),
+                    target.cells.get_mut(target_index),
+                ) {
                     let underlay = target_cell.highlight_id;
                     target_cell.clone_from(source_cell);
                     if window.kind == WindowKind::Floating {
@@ -744,10 +778,13 @@ impl Screen {
             return Err(wrong_type("grid_line", 3, "cells", "an array"));
         };
         let wrap = boolean(args, 4, "grid_line", "wrap")?;
-        let grid = self.grids.get_mut(&grid_id).ok_or(ScreenError::UnknownGrid {
-            event: "grid_line",
-            grid: grid_id,
-        })?;
+        let grid = self
+            .grids
+            .get_mut(&grid_id)
+            .ok_or(ScreenError::UnknownGrid {
+                event: "grid_line",
+                grid: grid_id,
+            })?;
         if row >= grid.height || column > grid.width {
             return Err(ScreenError::GridPositionOutOfBounds {
                 event: "grid_line",
@@ -760,12 +797,7 @@ impl Screen {
         let mut current_highlight = 0;
         for (tuple_index, tuple) in tuples.iter().enumerate() {
             let Object::Array(parts) = tuple else {
-                return Err(wrong_type(
-                    "grid_line",
-                    3,
-                    "cells tuple",
-                    "an array",
-                ));
+                return Err(wrong_type("grid_line", 3, "cells tuple", "an array"));
             };
             if !(1..=3).contains(&parts.len()) {
                 return Err(ScreenError::InvalidCellTupleArity { tuple: tuple_index });
@@ -775,22 +807,14 @@ impl Screen {
                 _ => return Err(wrong_type("grid_line", 3, "cell text", "a byte string")),
             };
             if let Some(value) = parts.get(1) {
-                current_highlight = object_integer(value).ok_or_else(|| {
-                    wrong_type("grid_line", 3, "cell highlight", "an integer")
-                })?;
+                current_highlight = object_integer(value)
+                    .ok_or_else(|| wrong_type("grid_line", 3, "cell highlight", "an integer"))?;
             }
             let repeat = match parts.get(2) {
-                Some(value) => object_integer(value).ok_or_else(|| {
-                    wrong_type("grid_line", 3, "cell repeat", "an integer")
-                })?,
+                Some(value) => object_integer(value)
+                    .ok_or_else(|| wrong_type("grid_line", 3, "cell repeat", "an integer"))?,
                 None => 1,
             };
-            if repeat <= 0 {
-                return Err(ScreenError::InvalidCellRepeat {
-                    tuple: tuple_index,
-                    repeat,
-                });
-            }
             let repeat = usize::try_from(repeat).map_err(|_| ScreenError::InvalidCellRepeat {
                 tuple: tuple_index,
                 repeat,
@@ -828,15 +852,14 @@ impl Screen {
         let right = unsigned(args, 4, "grid_scroll", "right")?;
         let rows = integer(args, 5, "grid_scroll", "rows")?;
         let columns = integer(args, 6, "grid_scroll", "columns")?;
-        let grid = self.grids.get_mut(&grid_id).ok_or(ScreenError::UnknownGrid {
-            event: "grid_scroll",
-            grid: grid_id,
-        })?;
-        if top > bottom
-            || left > right
-            || bottom > grid.height
-            || right > grid.width
-        {
+        let grid = self
+            .grids
+            .get_mut(&grid_id)
+            .ok_or(ScreenError::UnknownGrid {
+                event: "grid_scroll",
+                grid: grid_id,
+            })?;
+        if top > bottom || left > right || bottom > grid.height || right > grid.width {
             return Err(ScreenError::InvalidScrollRegion {
                 grid: grid_id,
                 top,
@@ -863,10 +886,10 @@ impl Screen {
                     }
                     _ => Cell::default(),
                 };
-                if let Some(index) = grid.index(destination_row, destination_column) {
-                    if let Some(cell) = grid.cells.get_mut(index) {
-                        *cell = replacement;
-                    }
+                if let Some(index) = grid.index(destination_row, destination_column)
+                    && let Some(cell) = grid.cells.get_mut(index)
+                {
+                    *cell = replacement;
                 }
             }
         }
@@ -918,8 +941,8 @@ impl Screen {
         let column = integer(args, 3, "win_pos", "start_column")?;
         let width = unsigned(args, 4, "win_pos", "width")?;
         let height = unsigned(args, 5, "win_pos", "height")?;
-        if !self.grids.contains_key(&grid) {
-            self.grids.insert(grid, Grid::new(width, height)?);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.grids.entry(grid) {
+            e.insert(Grid::new(width, height)?);
         }
         let sequence = self.sequence();
         self.windows.insert(
@@ -1055,7 +1078,6 @@ impl Screen {
     fn win_viewport_margins(&mut self, args: &[Object]) -> Result<(), ScreenError> {
         expect_arity("win_viewport_margins", args, 6)?;
         let grid = integer(args, 0, "win_viewport_margins", "grid")?;
-        self.require_grid("win_viewport_margins", grid)?;
         let window = window_id(args, 1, "win_viewport_margins")?;
         self.margins.insert(
             grid,
@@ -1076,7 +1098,8 @@ impl Screen {
         let Object::Dict(rgb) = argument(args, 1, "hl_attr_define", "rgb", "a dictionary")? else {
             return Err(wrong_type("hl_attr_define", 1, "rgb", "a dictionary"));
         };
-        let Object::Dict(cterm) = argument(args, 2, "hl_attr_define", "cterm", "a dictionary")? else {
+        let Object::Dict(cterm) = argument(args, 2, "hl_attr_define", "cterm", "a dictionary")?
+        else {
             return Err(wrong_type("hl_attr_define", 2, "cterm", "a dictionary"));
         };
         let Object::Array(info) = argument(args, 3, "hl_attr_define", "info", "an array")? else {
@@ -1165,11 +1188,7 @@ fn is_screen_event(name: &OxStr) -> bool {
     NAMES.iter().any(|candidate| name.as_bytes() == *candidate)
 }
 
-fn expect_arity(
-    event: &'static str,
-    args: &[Object],
-    expected: usize,
-) -> Result<(), ScreenError> {
+fn expect_arity(event: &'static str, args: &[Object], expected: usize) -> Result<(), ScreenError> {
     if args.len() == expected {
         Ok(())
     } else {
@@ -1188,13 +1207,12 @@ fn argument<'a>(
     field: &'static str,
     expected: &'static str,
 ) -> Result<&'a Object, ScreenError> {
-    args.get(index)
-        .ok_or(ScreenError::WrongType {
-            event,
-            index,
-            field,
-            expected,
-        })
+    args.get(index).ok_or(ScreenError::WrongType {
+        event,
+        index,
+        field,
+        expected,
+    })
 }
 
 fn wrong_type(
@@ -1275,16 +1293,24 @@ fn number(
 ) -> Result<f64, ScreenError> {
     match argument(args, index, event, field, "a number")? {
         Object::Float(value) => Ok(*value),
-        Object::Integer(value) => Ok(*value as f64),
+        Object::Integer(value) => {
+            // Screen coordinates are always small integers.  Route through
+            // i32 so the i32→f64 widening is provably lossless (f64's
+            // 53-bit mantissa holds every i32), rejecting anything outside
+            // that domain instead of silently losing precision.
+            let precise = i32::try_from(*value).map_err(|_| ScreenError::OutOfRange {
+                event,
+                index,
+                field,
+                value: *value,
+            })?;
+            Ok(f64::from(precise))
+        }
         _ => Err(wrong_type(event, index, field, "a number")),
     }
 }
 
-fn window_id(
-    args: &[Object],
-    index: usize,
-    event: &'static str,
-) -> Result<WindowId, ScreenError> {
+fn window_id(args: &[Object], index: usize, event: &'static str) -> Result<WindowId, ScreenError> {
     match argument(args, index, event, "window", "a window handle")? {
         Object::Window(handle) => Ok(i64::from(*handle)),
         Object::Integer(handle) if *handle >= 0 => Ok(*handle),
@@ -1494,6 +1520,55 @@ mod tests {
     }
 
     #[test]
+    fn grid_line_accepts_zero_repeat_as_no_op() {
+        let mut screen = Screen::new();
+        resize(&mut screen, 1, 4, 1);
+        line(&mut screen, 1, 0, vec![tuple("x", Some(9), Some(4))]);
+
+        line(
+            &mut screen,
+            1,
+            0,
+            vec![
+                tuple("a", Some(7), None),
+                tuple(" ", Some(0), Some(0)),
+                tuple("b", None, None),
+            ],
+        );
+
+        assert_eq!(rendered_grid(&screen, 1), "abxx");
+        let grid = screen.grid(1).unwrap();
+        assert_eq!(grid.cell(0, 0).unwrap().highlight_id, 7);
+        assert_eq!(grid.cell(0, 1).unwrap().highlight_id, 0);
+        assert_eq!(grid.cell(0, 2).unwrap().highlight_id, 9);
+    }
+
+    #[test]
+    fn grid_line_rejects_negative_repeat_with_tuple_context() {
+        let mut screen = Screen::new();
+        resize(&mut screen, 1, 2, 1);
+
+        let result = screen.apply_event(&event(
+            "grid_line",
+            vec![
+                Object::Integer(1),
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Array(vec![tuple("a", None, None), tuple("b", Some(0), Some(-1))]),
+                Object::Boolean(false),
+            ],
+        ));
+
+        assert_eq!(
+            result,
+            Err(ScreenError::InvalidCellRepeat {
+                tuple: 1,
+                repeat: -1,
+            })
+        );
+    }
+
+    #[test]
     fn grid_scroll_moves_both_axes_and_blanks_vacated_cells() {
         let mut screen = Screen::new();
         resize(&mut screen, 1, 4, 3);
@@ -1526,22 +1601,38 @@ mod tests {
             vec![Object::Integer(1), Object::Integer(1), Object::Integer(3)],
         );
         let fields = Dict(vec![
-            (OxStr::from("cursor_shape"), Object::String(OxStr::from("vertical"))),
+            (
+                OxStr::from("cursor_shape"),
+                Object::String(OxStr::from("vertical")),
+            ),
             (OxStr::from("cell_percentage"), Object::Integer(25)),
             (OxStr::from("name"), Object::String(OxStr::from("insert"))),
         ]);
         apply(
             &mut screen,
             "mode_info_set",
-            vec![Object::Boolean(true), Object::Array(vec![Object::Dict(fields)])],
+            vec![
+                Object::Boolean(true),
+                Object::Array(vec![Object::Dict(fields)]),
+            ],
         );
         apply(
             &mut screen,
             "mode_change",
             vec![Object::String(OxStr::from("insert")), Object::Integer(0)],
         );
-        assert_eq!(screen.cursor(), Some(Cursor { grid: 1, row: 1, column: 3 }));
-        assert_eq!(screen.active_mode().unwrap().info.cursor_shape, Some(CursorShape::Vertical));
+        assert_eq!(
+            screen.cursor(),
+            Some(Cursor {
+                grid: 1,
+                row: 1,
+                column: 3
+            })
+        );
+        assert_eq!(
+            screen.active_mode().unwrap().info.cursor_shape,
+            Some(CursorShape::Vertical)
+        );
     }
 
     #[test]
@@ -1563,18 +1654,34 @@ mod tests {
             &mut screen,
             "win_float_pos",
             vec![
-                Object::Integer(2), Object::Window(window_two), Object::String(OxStr::from("NW")),
-                Object::Integer(1), Object::Float(0.0), Object::Float(0.0), Object::Boolean(false),
-                Object::Integer(50), Object::Integer(10), Object::Integer(1), Object::Integer(2),
+                Object::Integer(2),
+                Object::Window(window_two),
+                Object::String(OxStr::from("NW")),
+                Object::Integer(1),
+                Object::Float(0.0),
+                Object::Float(0.0),
+                Object::Boolean(false),
+                Object::Integer(50),
+                Object::Integer(10),
+                Object::Integer(1),
+                Object::Integer(2),
             ],
         );
         apply(
             &mut screen,
             "win_float_pos",
             vec![
-                Object::Integer(3), Object::Window(window_three), Object::String(OxStr::from("NW")),
-                Object::Integer(1), Object::Float(0.0), Object::Float(0.0), Object::Boolean(false),
-                Object::Integer(40), Object::Integer(11), Object::Integer(0), Object::Integer(3),
+                Object::Integer(3),
+                Object::Window(window_three),
+                Object::String(OxStr::from("NW")),
+                Object::Integer(1),
+                Object::Float(0.0),
+                Object::Float(0.0),
+                Object::Boolean(false),
+                Object::Integer(40),
+                Object::Integer(11),
+                Object::Integer(0),
+                Object::Integer(3),
             ],
         );
         assert_eq!(screen.render_to_string().unwrap(), "...bb\n..aBB\n..AAA");
@@ -1584,16 +1691,160 @@ mod tests {
     fn headless_render_preserves_utf8_and_row_boundaries() {
         let mut screen = Screen::new();
         resize(&mut screen, 1, 2, 2);
-        line(&mut screen, 1, 0, vec![tuple("λ", Some(4), None), tuple("x", None, None)]);
-        line(&mut screen, 1, 1, vec![tuple("界", Some(5), None), tuple("", None, None)]);
+        line(
+            &mut screen,
+            1,
+            0,
+            vec![tuple("λ", Some(4), None), tuple("x", None, None)],
+        );
+        line(
+            &mut screen,
+            1,
+            1,
+            vec![tuple("界", Some(5), None), tuple("", None, None)],
+        );
         assert_eq!(screen.render_to_string().unwrap(), "λx\n界");
-        assert_eq!(screen.composed_grid().unwrap().render_to_bytes(), "λx\n界".as_bytes());
+        assert_eq!(
+            screen.composed_grid().unwrap().render_to_bytes(),
+            "λx\n界".as_bytes()
+        );
+    }
+
+    #[test]
+    fn viewport_margins_can_arrive_before_grid_creation() {
+        let mut screen = Screen::new();
+        let expected = ViewportMargins {
+            window: 23,
+            top: 1,
+            bottom: 2,
+            left: 3,
+            right: 4,
+        };
+        apply(
+            &mut screen,
+            "win_viewport_margins",
+            vec![
+                Object::Integer(17),
+                Object::Window(WinHandle::try_from(23).unwrap()),
+                Object::Integer(1),
+                Object::Integer(2),
+                Object::Integer(3),
+                Object::Integer(4),
+            ],
+        );
+
+        assert!(screen.grid(17).is_none());
+        assert_eq!(screen.viewport_margins(17), Some(expected));
+
+        resize(&mut screen, 17, 20, 10);
+        apply(
+            &mut screen,
+            "win_pos",
+            vec![
+                Object::Integer(17),
+                Object::Integer(23),
+                Object::Integer(5),
+                Object::Integer(6),
+                Object::Integer(20),
+                Object::Integer(10),
+            ],
+        );
+
+        assert_eq!(screen.window(17).map(|window| window.window), Some(23));
+        assert_eq!(screen.viewport_margins(17), Some(expected));
+    }
+
+    #[test]
+    fn viewport_margins_reject_malformed_arguments() {
+        let mut screen = Screen::new();
+        let malformed = [
+            (
+                vec![
+                    Object::Integer(17),
+                    Object::Integer(23),
+                    Object::Integer(1),
+                    Object::Integer(2),
+                    Object::Integer(3),
+                ],
+                ScreenError::WrongArity {
+                    event: "win_viewport_margins",
+                    expected: 6,
+                    actual: 5,
+                },
+            ),
+            (
+                vec![
+                    Object::Integer(17),
+                    Object::Integer(23),
+                    Object::Boolean(false),
+                    Object::Integer(2),
+                    Object::Integer(3),
+                    Object::Integer(4),
+                ],
+                ScreenError::WrongType {
+                    event: "win_viewport_margins",
+                    index: 2,
+                    field: "top",
+                    expected: "an integer",
+                },
+            ),
+            (
+                vec![
+                    Object::Integer(17),
+                    Object::Integer(23),
+                    Object::Integer(1),
+                    Object::Integer(2),
+                    Object::Integer(3),
+                    Object::Integer(-1),
+                ],
+                ScreenError::OutOfRange {
+                    event: "win_viewport_margins",
+                    index: 5,
+                    field: "right",
+                    value: -1,
+                },
+            ),
+        ];
+
+        for (args, expected) in malformed {
+            assert_eq!(
+                screen.apply_event(&event("win_viewport_margins", args)),
+                Err(expected)
+            );
+            assert_eq!(screen.viewport_margins(17), None);
+        }
+    }
+
+    #[test]
+    fn grid_line_still_rejects_an_unknown_grid() {
+        let mut screen = Screen::new();
+        let result = screen.apply_event(&event(
+            "grid_line",
+            vec![
+                Object::Integer(17),
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Array(vec![tuple("x", None, None)]),
+                Object::Boolean(false),
+            ],
+        ));
+
+        assert_eq!(
+            result,
+            Err(ScreenError::UnknownGrid {
+                event: "grid_line",
+                grid: 17,
+            })
+        );
     }
 
     #[test]
     fn unknown_event_is_returned_unchanged_for_upper_layer() {
         let mut screen = Screen::new();
         let unknown = event("popupmenu_show", vec![Object::Integer(1)]);
-        assert_eq!(screen.apply_event(&unknown).unwrap(), ApplyOutcome::Unknown(unknown));
+        assert_eq!(
+            screen.apply_event(&unknown).unwrap(),
+            ApplyOutcome::Unknown(unknown)
+        );
     }
 }

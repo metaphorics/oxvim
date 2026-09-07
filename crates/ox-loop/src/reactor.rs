@@ -27,6 +27,11 @@ pub struct Reactor {
 
 impl Reactor {
     /// Creates a poll registry and reserves the cross-thread wake token.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error if the poll registry cannot be
+    /// created or the waker cannot be registered on the wake token.
     pub fn new() -> Result<Self> {
         let poll = Poll::new()?;
         let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
@@ -45,6 +50,12 @@ impl Reactor {
     /// Callers MUST drain readable sources until `WouldBlock` before
     /// returning; [`crate::Loop`] enforces this by re-invoking callbacks that
     /// report [`crate::DrainState::KeepDraining`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReservedToken`] if `token` is below
+    /// [`IO_TOKEN_START`] (reserved for internal sources), or the
+    /// underlying I/O error if registration fails.
     pub fn register<S: Source + ?Sized>(
         &self,
         source: &mut S,
@@ -62,6 +73,12 @@ impl Reactor {
     ///
     /// The same edge-triggered (`EPOLLET`) and drain-until-WouldBlock contract
     /// applies as for [`Reactor::register`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReservedToken`] if `token` is below
+    /// [`IO_TOKEN_START`], or the underlying I/O error if the source is
+    /// not currently registered or re-registration fails.
     pub fn reregister<S: Source + ?Sized>(
         &self,
         source: &mut S,
@@ -76,6 +93,11 @@ impl Reactor {
     }
 
     /// Removes a source from this reactor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error if the source is not registered
+    /// with this reactor or cannot be deregistered.
     pub fn deregister<S: Source + ?Sized>(&self, source: &mut S) -> Result<()> {
         self.poll.registry().deregister(source)?;
         Ok(())
@@ -108,6 +130,10 @@ impl Reactor {
     }
 
     /// Waits for readiness, bounded by `timeout` when supplied.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error if polling the registry fails.
     pub fn poll(&mut self, events: &mut Events, timeout: Option<Duration>) -> Result<()> {
         self.poll.poll(events, timeout)?;
         Ok(())

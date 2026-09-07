@@ -13,6 +13,8 @@ const MAX_OFFSETS: usize = 64;
 /// An upstream-compatible error identifier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorCode {
+    /// E464: Ambiguous use of user-defined command.
+    E464,
     /// E492: Not an editor command.
     E492,
     /// E481: No range allowed.
@@ -32,6 +34,7 @@ impl ErrorCode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::E464 => "E464",
             Self::E492 => "E492",
             Self::E481 => "E481",
             Self::E488 => "E488",
@@ -53,6 +56,8 @@ pub struct ParseError {
     /// Human-readable detail, which may name the offending text the way
     /// upstream's `%s` messages do.
     pub message: String,
+    /// Canonical built-in name when the failure happened after resolution.
+    pub command: Option<&'static str>,
 }
 
 /// Base of one Ex address.
@@ -115,6 +120,46 @@ pub struct Range {
     pub end: Option<Address>,
     /// Range shape.
     pub kind: RangeKind,
+}
+
+/// Forced `'magic'` override recognized while extracting an Ex command's
+/// `'incsearch'` preview pattern (`parse_pattern_and_range`,
+/// `ex_getln.c:319-323`): only `smagic`/`snomagic` set one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreviewMagic {
+    /// No override: the command's own default magic setting applies.
+    Default,
+    /// `smagic`: force `'magic'` on for this command's pattern.
+    ForceMagic,
+    /// `snomagic`: force `'magic'` off for this command's pattern.
+    ForceNomagic,
+}
+
+/// Syntax-only extraction of the search pattern and address range a
+/// preview-eligible Ex command line would use for `'incsearch'`, produced by
+/// [`parse_preview_pattern`]. Mirrors `parse_pattern_and_range`
+/// (`ex_getln.c:276-398`) without resolving addresses to line numbers or
+/// executing anything — evaluation and search stay with the host, which
+/// alone has the buffer and cursor this needs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreviewPattern {
+    /// Forced magic override; [`PreviewMagic::Default`] otherwise.
+    pub magic: PreviewMagic,
+    /// Parsed address range, unresolved to line numbers.
+    pub range: Option<Range>,
+    /// Whether an absent range defaults to the current line (`:s`-family,
+    /// `ex_getln.c:391-394`) rather than leaving the whole buffer
+    /// unrestricted.
+    pub default_current_line: bool,
+    /// Search delimiter character that closed (or would close) the pattern.
+    pub delimiter: char,
+    /// Pattern text between the delimiters, raw and un-escaped.
+    pub pattern: String,
+    /// Whether `pattern` is empty specifically because of a closed,
+    /// back-to-back delimiter pair (`//`), which reuses the last search
+    /// pattern (`ex_getln.c:360` `use_last_pat`) rather than meaning no
+    /// pattern has been typed yet.
+    pub use_last_pattern: bool,
 }
 
 /// A recognized command modifier.
@@ -209,6 +254,15 @@ pub struct ExCommand {
     pub span: std::ops::Range<usize>,
 }
 
+struct ParsedCommandTail {
+    end: usize,
+    bang: bool,
+    usefilter: bool,
+    count: Option<u64>,
+    register: Option<char>,
+    args: String,
+}
+
 /// Stateless Ex command-line parser.
 pub struct Parser<'a, P: UserCommandProvider + ?Sized = NoUserCommands> {
     users: &'a P,
@@ -238,6 +292,12 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
     }
 
     /// Parses all bar-separated commands from one command line.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any command cannot be parsed, violates the
+    /// resolved command's accepted syntax, or exceeds the per-line command
+    /// limit.
     pub fn parse(&self, input: &str) -> Result<Vec<ExCommand>, ParseError> {
         let mut commands = Vec::new();
         let mut cursor = 0;
@@ -258,6 +318,25 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
         }
         Ok(commands)
     }
+    /// Parses only the first bar-separated command from one line, returning
+    /// it and the cursor just past it.
+    ///
+    /// This is `do_one_cmd`'s single-command step: a host that executes a
+    /// line one command at a time (`do_cmdline`'s loop) can re-resolve every
+    /// later command against whatever the earlier ones changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the first command cannot be parsed or violates
+    /// the resolved command's accepted syntax.
+    pub fn parse_first(&self, input: &str) -> Result<Option<(ExCommand, usize)>, ParseError> {
+        let cursor = skip_space_and_colons(input, 0);
+        if cursor >= input.len() || input.as_bytes()[cursor] == b'"' {
+            return Ok(None);
+        }
+        let (command, next) = self.parse_one(input, cursor)?;
+        Ok(Some((command, next)))
+    }
 
     fn parse_one(&self, input: &str, start: usize) -> Result<(ExCommand, usize), ParseError> {
         let mut cursor = start;
@@ -268,29 +347,101 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
         cursor = skip_ascii_space(input, cursor);
 
         let command_offset = cursor;
+        let unknown_command = || {
+            error(
+                ErrorCode::E492,
+                command_offset,
+                format!("Not an editor command: {}", &input[range_offset..]),
+            )
+        };
         let (typed, after_name) = parse_command_name(input, cursor);
         if typed.is_empty() {
-            return Err(error(ErrorCode::E492, command_offset, "Not an editor command"));
-        }
-        let command = resolve_command(typed, self.users).map_err(|resolve_error| {
-            let message = match resolve_error {
-                ResolveError::NotFound => "Not an editor command",
-                ResolveError::AmbiguousUserCommand => "ambiguous user command",
+            // ex_docmd.c:2074-2085: "If we got a line, but no command,
+            // then go to the line"; a following `|` prints the range
+            // instead (ex_range_without_command, ex_docmd.c:2422-2432).
+            let command = match (range.is_some(), input.as_bytes().get(cursor)) {
+                (_, Some(b'|')) => {
+                    resolve_command("print", self.users).map_err(|_| unknown_command())?
+                }
+                (true, _) => ResolvedCommand::RangeOnly,
+                (false, _) => return Err(unknown_command()),
             };
-            error(ErrorCode::E492, command_offset, message)
-        })?;
+            return Ok((
+                ExCommand {
+                    command,
+                    modifiers,
+                    range,
+                    bang: false,
+                    usefilter: false,
+                    count: None,
+                    register: None,
+                    args: String::new(),
+                    span: start..cursor,
+                },
+                cursor,
+            ));
+        }
+        let command =
+            resolve_command(typed, self.users).map_err(|resolve_error| match resolve_error {
+                ResolveError::NotFound => unknown_command(),
+                ResolveError::AmbiguousUserCommand => error(
+                    ErrorCode::E464,
+                    command_offset,
+                    "Ambiguous use of user-defined command",
+                ),
+            })?;
         let flags = effective_flags(&command);
         if range.is_some() && !flags.contains(CommandFlags::RANGE) {
-            return Err(error(ErrorCode::E481, range_offset, "No range allowed"));
+            return Err(command_error(
+                &command,
+                ErrorCode::E481,
+                range_offset,
+                "No range allowed",
+            ));
         }
 
-        cursor = after_name;
-        let bang_offset = cursor;
+        let ParsedCommandTail {
+            end,
+            bang,
+            usefilter,
+            count,
+            register,
+            args,
+        } = Self::parse_command_tail(input, after_name, &command, flags)?;
+
+        Ok((
+            ExCommand {
+                command,
+                modifiers,
+                range,
+                bang,
+                usefilter,
+                count,
+                register,
+                args,
+                span: start..end,
+            },
+            end,
+        ))
+    }
+    /// Parses one resolved command's bang, filter selection, and argument
+    /// tail: everything after the command name.
+    fn parse_command_tail(
+        input: &str,
+        mut cursor: usize,
+        command: &ResolvedCommand,
+        flags: CommandFlags,
+    ) -> Result<ParsedCommandTail, ParseError> {
         let mut bang = input.as_bytes().get(cursor) == Some(&b'!');
+        if bang && !flags.contains(CommandFlags::BANG) {
+            return Err(command_error(
+                command,
+                ErrorCode::E477,
+                cursor,
+                "No ! allowed",
+            ));
+        }
         if bang {
-            if !flags.contains(CommandFlags::BANG) {
-                return Err(error(ErrorCode::E477, bang_offset, "No ! allowed"));
-            }
             cursor += 1;
         }
         cursor = skip_ascii_space(input, cursor);
@@ -339,7 +490,12 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
             // (ex_docmd.c:1420-1425), so `:sleep 0m` is E939 while `:0read`
             // is fine.
             if count == Some(0) && !flags.contains(CommandFlags::ZEROR) {
-                return Err(error(ErrorCode::E939, args_start, "Positive count required"));
+                return Err(command_error(
+                    command,
+                    ErrorCode::E939,
+                    args_start,
+                    "Positive count required",
+                ));
             }
             count
         } else {
@@ -347,63 +503,48 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
         };
 
         if flags.contains(CommandFlags::NEEDARG) && args.trim().is_empty() {
-            return Err(error(ErrorCode::E471, args_start, "Argument required"));
+            return Err(command_error(
+                command,
+                ErrorCode::E471,
+                args_start,
+                "Argument required",
+            ));
         }
         if !flags.contains(CommandFlags::EXTRA)
             && !matches!(command.name(), "append" | "change" | "insert")
             && !args.trim().is_empty()
         {
             // e_trailing_arg (errors.h:123) names the offending text.
-            return Err(error(
+            return Err(command_error(
+                command,
                 ErrorCode::E488,
                 args_start,
                 format!("Trailing characters: {}", args.trim()),
             ));
         }
 
-        Ok((
-            ExCommand {
-                command,
-                modifiers,
-                range,
-                bang,
-                usefilter,
-                count,
-                register,
-                args,
-                span: start..end,
-            },
+        Ok(ParsedCommandTail {
             end,
-        ))
+            bang,
+            usefilter,
+            count,
+            register,
+            args,
+        })
     }
 }
 
 /// The argument flags that govern one resolved command: a built-in's table
-/// entry, or the fixed set upstream gives user commands.
+/// entry, or the flags the host recorded for its user command.
 #[must_use]
-pub fn effective_flags(command: &ResolvedCommand) -> CommandFlags {
-    match command {
-        ResolvedCommand::Builtin(spec) => spec.flags,
-        ResolvedCommand::User(_) => CommandFlags(
-            CommandFlags::RANGE.bits()
-                | CommandFlags::BANG.bits()
-                | CommandFlags::EXTRA.bits()
-                | CommandFlags::TRLBAR.bits(),
-        ),
-    }
+pub const fn effective_flags(command: &ResolvedCommand) -> CommandFlags {
+    command.flags()
 }
 
 /// The address domain that governs one resolved command.
-///
-/// User commands answer [`AddrType::Lines`], upstream's `-range` default
-/// (`usercmd.c:815-818`), matching the `RANGE` that [`effective_flags`]
-/// grants them.
 #[must_use]
-pub fn effective_addr_type(command: &ResolvedCommand) -> AddrType {
-    match command {
-        ResolvedCommand::Builtin(spec) => spec.addr_type,
-        ResolvedCommand::User(_) => AddrType::Lines,
-    }
+pub const fn effective_addr_type(command: &ResolvedCommand) -> AddrType {
+    command.addr_type()
 }
 
 fn parse_command_name(input: &str, start: usize) -> (&str, usize) {
@@ -412,7 +553,7 @@ fn parse_command_name(input: &str, start: usize) -> (&str, usize) {
         return ("", start);
     };
     if is_one_letter_command(bytes, start) {
-        return (&input[start..start + 1], start + 1);
+        return (&input[start..=start], start + 1);
     }
     if first.is_ascii_alphabetic() {
         let mut end = start + 1;
@@ -427,7 +568,7 @@ fn parse_command_name(input: &str, start: usize) -> (&str, usize) {
         return (&input[start..end], end);
     }
     if b"@!=><&~#*".contains(&first) {
-        return (&input[start..start + 1], start + 1);
+        return (&input[start..=start], start + 1);
     }
     ("", start)
 }
@@ -471,7 +612,11 @@ fn parse_modifiers(input: &str, cursor: &mut usize) -> Result<Vec<CommandModifie
         };
 
         let name_start = probe;
-        while input.as_bytes().get(probe).is_some_and(u8::is_ascii_alphabetic) {
+        while input
+            .as_bytes()
+            .get(probe)
+            .is_some_and(u8::is_ascii_alphabetic)
+        {
             probe += 1;
         }
         let typed = &input[name_start..probe];
@@ -501,14 +646,13 @@ fn parse_modifiers(input: &str, cursor: &mut usize) -> Result<Vec<CommandModifie
             let pattern_start = skip_ascii_space(input, probe);
             let at_command_end = matches!(
                 input.as_bytes().get(pattern_start).copied(),
-                None | Some(b'|') | Some(b'"')
+                None | Some(b'|' | b'"')
             );
             if at_command_end {
                 *cursor = saved;
                 break;
             }
-            let Ok((parsed_pattern, after_pattern)) =
-                parse_vimgrep_pattern(input, pattern_start)
+            let Ok((parsed_pattern, after_pattern)) = parse_vimgrep_pattern(input, pattern_start)
             else {
                 *cursor = saved;
                 break;
@@ -519,7 +663,7 @@ fn parse_modifiers(input: &str, cursor: &mut usize) -> Result<Vec<CommandModifie
             let after_pattern_space = skip_ascii_space(input, probe);
             if matches!(
                 input.as_bytes().get(after_pattern_space).copied(),
-                None | Some(b'|') | Some(b'"')
+                None | Some(b'|' | b'"')
             ) {
                 *cursor = saved;
                 break;
@@ -529,8 +673,10 @@ fn parse_modifiers(input: &str, cursor: &mut usize) -> Result<Vec<CommandModifie
             // a modifier only when another command follows (the 'h' case in
             // parse_command_modifiers: ex_docmd.c:2594-2603).
             let after_word = skip_ascii_space(input, probe);
-            if matches!(input.as_bytes().get(after_word).copied(), None | Some(b'|') | Some(b'"'))
-            {
+            if matches!(
+                input.as_bytes().get(after_word).copied(),
+                None | Some(b'|' | b'"')
+            ) {
                 *cursor = saved;
                 break;
             }
@@ -539,11 +685,21 @@ fn parse_modifiers(input: &str, cursor: &mut usize) -> Result<Vec<CommandModifie
         // is exempt because probe has advanced past its pattern, where a
         // following identifier is the nested command, not a word extension
         // (":filter /pat/delete" has no separating space).
-        if !is_filter && input.as_bytes().get(probe).is_some_and(u8::is_ascii_alphabetic) {
+        if !is_filter
+            && input
+                .as_bytes()
+                .get(probe)
+                .is_some_and(u8::is_ascii_alphabetic)
+        {
             *cursor = saved;
             break;
         }
-        modifiers.push(CommandModifier { kind, count, bang, pattern });
+        modifiers.push(CommandModifier {
+            kind,
+            count,
+            bang,
+            pattern,
+        });
         if modifiers.len() == MAX_MODIFIERS {
             return Err(error(ErrorCode::E488, probe, "too many modifiers"));
         }
@@ -561,19 +717,22 @@ fn parse_vimgrep_pattern(input: &str, start: usize) -> Result<(String, usize), P
     let Some(&first) = bytes.get(start) else {
         return Err(error(ErrorCode::E488, start, "search pattern required"));
     };
-    if first.is_ascii_alphanumeric() || first == b'_' {
+    if !first.is_ascii() || first.is_ascii_alphanumeric() || first == b'_' {
         // ":filter foo cmd" / ":vimgrep foo fname": bare pattern up to space.
         let pattern_start = start;
         let mut cursor = start;
-        while bytes.get(cursor).is_some_and(|byte| !byte.is_ascii_whitespace()) {
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
             cursor += 1;
         }
         return Ok((input[pattern_start..cursor].to_owned(), cursor));
     }
     // Delimited pattern ":filter /foo/ cmd", optionally followed by flags.
-    let (pattern, after) = parse_pattern(input, start, first)?;
+    let (pattern, after) = parse_pattern(input, start, first, true)?;
     let mut cursor = after;
-    while matches!(bytes.get(cursor), Some(b'g') | Some(b'j') | Some(b'f')) {
+    while matches!(bytes.get(cursor), Some(b'g' | b'j' | b'f')) {
         cursor += 1;
     }
     Ok((pattern, cursor))
@@ -586,8 +745,8 @@ fn is_grep_command(name: &str) -> bool {
 }
 
 /// Returns the cursor just past a vimgrep-family leading pattern, or
-/// `args_start` when no pattern can be skipped (`skip_grep_pat`: ex_docmd.c
-/// 3840-3854; used by `separate_nextcmd` at ex_docmd.c:4114).
+/// `args_start` when no pattern can be skipped (`skip_grep_pat`: `ex_docmd.c`
+/// 3840-3854; used by `separate_nextcmd` at `ex_docmd.c:4114`).
 fn skip_grep_pattern(input: &str, args_start: usize) -> usize {
     match parse_vimgrep_pattern(input, args_start) {
         Ok((_, after)) => after,
@@ -627,13 +786,175 @@ fn modifier(typed: &str) -> Option<(ModifierKind, bool)> {
     })
 }
 
+/// Whether `typed` is a valid abbreviation of `full`, replicating
+/// `strncmp(cmd, full, MAX(p - cmd, min_len)) == 0` (`ex_getln.c:315-350`):
+/// `typed` must be at least `min_len` bytes and a genuine prefix of `full`.
+fn is_abbrev(typed: &str, full: &str, min_len: usize) -> bool {
+    typed.len() >= min_len && full.as_bytes().get(..typed.len()) == Some(typed.as_bytes())
+}
+
+/// Scans a possibly unterminated delimited pattern for `'incsearch'`
+/// preview purposes, mirroring `skip_regexp_ex` as `parse_pattern_and_range`
+/// uses it (`ex_getln.c:359-364`): an unescaped closing delimiter ends the
+/// pattern; running off the end of `input` takes the rest of the line
+/// instead of erroring — this only recognizes a command line, it never
+/// requires one to be complete. Returns the pattern text and whether it is
+/// empty specifically because of a closed, back-to-back delimiter pair
+/// (`//`), which reuses the last search pattern.
+fn scan_preview_pattern(input: &str, delim_pos: usize, delimiter: char) -> (String, bool) {
+    let mut cursor = delim_pos + delimiter.len_utf8();
+    let pattern_start = cursor;
+    let mut escaped = false;
+    while let Some(ch) = input[cursor..].chars().next() {
+        if !escaped && ch == delimiter {
+            let pattern = input[pattern_start..cursor].to_owned();
+            let use_last_pattern = pattern.is_empty();
+            return (pattern, use_last_pattern);
+        }
+        escaped = !escaped && ch == '\\';
+        cursor += ch.len_utf8();
+    }
+    (input[pattern_start..cursor].to_owned(), false)
+}
+
+/// Syntax-only extraction of the search pattern and address range a
+/// preview-eligible Ex command line would use, mirroring
+/// `parse_pattern_and_range` (`ex_getln.c:276-398`). This NEVER resolves or
+/// executes the command — only recognizes whether `'incsearch'` may preview
+/// it, and if so, what to search for. Returns `None` for every other
+/// command, and for a previewable command with no pattern typed yet
+/// (`ex_getln.c:311-313,333-335,344-346,362-364`).
+///
+/// The previewable command families and their minimum typed abbreviation
+/// are exactly upstream's (`ex_getln.c:315-350`): `substitute`/`smagic`/
+/// `vglobal` (any prefix), `snomagic` (3), `sort`/`uniq` (3), `vimgrep` (3),
+/// `vimgrepadd` (8), `lvimgrep` (2), `lvimgrepadd` (9), `global` (any
+/// prefix). A destructive command among these is only ever recognized here,
+/// never dispatched: the caller runs a read-only search with the returned
+/// pattern and stops.
+#[must_use]
+pub fn parse_preview_pattern(input: &str) -> Option<PreviewPattern> {
+    let mut cursor = 0usize;
+    // Skip command modifiers silently (`parse_command_modifiers`,
+    // `ex_getln.c:301`).
+    parse_modifiers(input, &mut cursor).ok()?;
+    cursor = skip_ascii_space(input, cursor);
+    // Skip over the range to find the command (`skip_range`,
+    // `ex_docmd.c:3313-3361`); `parse_range`/`parse_address` already
+    // tolerate an unterminated `/pattern` address the same permissive way.
+    let range = parse_range(input, &mut cursor).ok()?;
+    cursor = skip_ascii_space(input, cursor);
+    let bytes = input.as_bytes();
+    let cmd_start = cursor;
+    if !matches!(
+        bytes.get(cmd_start).copied(),
+        Some(b's' | b'g' | b'v' | b'l' | b'u')
+    ) {
+        return None;
+    }
+    let mut name_end = cmd_start;
+    while bytes.get(name_end).is_some_and(u8::is_ascii_alphabetic) {
+        name_end += 1;
+    }
+    let name = &input[cmd_start..name_end];
+    // `if (*skipwhite(p) == NUL) return false;` (`ex_getln.c:311-313`): the
+    // command name alone, with nothing after it yet, previews nothing.
+    if skip_ascii_space(input, name_end) >= input.len() {
+        return None;
+    }
+    let first = bytes[cmd_start];
+    let (magic, default_current_line, delim_optional, mut p) = if is_abbrev(name, "substitute", 1)
+        || is_abbrev(name, "smagic", 1)
+        || is_abbrev(name, "snomagic", 3)
+        || is_abbrev(name, "vglobal", 1)
+    {
+        let magic = if name.starts_with("sm") {
+            PreviewMagic::ForceMagic
+        } else if name.starts_with("sn") {
+            PreviewMagic::ForceNomagic
+        } else {
+            PreviewMagic::Default
+        };
+        // `:s` defaults its range to the current line; `cmd[1] != 'o'`
+        // (`ex_getln.c:391`) excludes `:sort`, which shares the `s` prefix.
+        let default_current_line = first == b's' && name.as_bytes().get(1) != Some(&b'o');
+        (magic, default_current_line, false, name_end)
+    } else if is_abbrev(name, "sort", 3) || is_abbrev(name, "uniq", 3) {
+        // Skip over `!` and whitespace-separated alpha flags
+        // (`ex_getln.c:326-335`).
+        let mut p = name_end;
+        if bytes.get(p) == Some(&b'!') {
+            p = skip_ascii_space(input, p + 1);
+        }
+        loop {
+            p = skip_ascii_space(input, p);
+            if bytes.get(p).is_some_and(u8::is_ascii_alphabetic) {
+                p += 1;
+            } else {
+                break;
+            }
+        }
+        if p >= input.len() {
+            return None;
+        }
+        (PreviewMagic::Default, false, false, p)
+    } else if is_abbrev(name, "vimgrep", 3)
+        || is_abbrev(name, "vimgrepadd", 8)
+        || is_abbrev(name, "lvimgrep", 2)
+        || is_abbrev(name, "lvimgrepadd", 9)
+        || is_abbrev(name, "global", 1)
+    {
+        let mut p = name_end;
+        if bytes.get(p) == Some(&b'!') {
+            p += 1;
+            if skip_ascii_space(input, p) >= input.len() {
+                return None;
+            }
+        }
+        // Only the `g`/`v` global commands require a punctuation delimiter;
+        // the `vimgrep` family also accepts a bare space-delimited word
+        // (`ex_getln.c:340-350` `delim_optional`).
+        (PreviewMagic::Default, false, first != b'g', p)
+    } else {
+        return None;
+    };
+    p = skip_ascii_space(input, p);
+    let delimiter = input[p..].chars().next()?;
+    let (pattern, use_last_pattern) =
+        if delim_optional && (delimiter.is_alphanumeric() || delimiter == '_') {
+            let end = input[p..]
+                .find(char::is_whitespace)
+                .map_or(input.len(), |offset| p + offset);
+            (input[p..end].to_owned(), false)
+        } else {
+            scan_preview_pattern(input, p, delimiter)
+        };
+    if pattern.is_empty() && !use_last_pattern {
+        return None;
+    }
+    Some(PreviewPattern {
+        magic,
+        range,
+        default_current_line,
+        delimiter,
+        pattern,
+        use_last_pattern,
+    })
+}
+
 fn parse_range(input: &str, cursor: &mut usize) -> Result<Option<Range>, ParseError> {
     let start = *cursor;
     if input.as_bytes().get(start) == Some(&b'%') {
         *cursor += 1;
         return Ok(Some(Range {
-            start: Some(Address { base: AddressBase::Line(1), offsets: Vec::new() }),
-            end: Some(Address { base: AddressBase::Last, offsets: Vec::new() }),
+            start: Some(Address {
+                base: AddressBase::Line(1),
+                offsets: Vec::new(),
+            }),
+            end: Some(Address {
+                base: AddressBase::Last,
+                offsets: Vec::new(),
+            }),
             kind: RangeKind::WholeBuffer,
         }));
     }
@@ -659,7 +980,10 @@ fn parse_range(input: &str, cursor: &mut usize) -> Result<Option<Range>, ParseEr
         if end.is_some() {
             first = end.take();
         } else if first.is_none() {
-            first = Some(Address { base: AddressBase::Current, offsets: Vec::new() });
+            first = Some(Address {
+                base: AddressBase::Current,
+                offsets: Vec::new(),
+            });
         }
         end = Some(next);
     }
@@ -671,10 +995,17 @@ fn parse_range(input: &str, cursor: &mut usize) -> Result<Option<Range>, ParseEr
         return Ok(Some(Range {
             start: first,
             end,
-            kind: RangeKind::Pair { separator, cursor_advance },
+            kind: RangeKind::Pair {
+                separator,
+                cursor_advance,
+            },
         }));
     }
-    Ok(Some(Range { start: first, end: None, kind: RangeKind::Single }))
+    Ok(Some(Range {
+        start: first,
+        end: None,
+        kind: RangeKind::Single,
+    }))
 }
 
 fn parse_address(input: &str, cursor: &mut usize) -> Result<Option<Address>, ParseError> {
@@ -697,9 +1028,9 @@ fn parse_address(input: &str, cursor: &mut usize) -> Result<Option<Address>, Par
             *cursor = mark_offset + mark.len_utf8();
             Some(AddressBase::Mark(mark))
         }
-        Some(b'/') | Some(b'?') => {
+        Some(b'/' | b'?') => {
             let delimiter = bytes[*cursor];
-            let (pattern, end) = parse_pattern(input, *cursor, delimiter)?;
+            let (pattern, end) = parse_pattern(input, *cursor, delimiter, false)?;
             *cursor = end;
             if delimiter == b'/' {
                 Some(AddressBase::ForwardSearch(pattern))
@@ -717,18 +1048,22 @@ fn parse_address(input: &str, cursor: &mut usize) -> Result<Option<Address>, Par
                 .map_err(|_| error(ErrorCode::E488, number_start, "line number is too large"))?;
             Some(AddressBase::Line(number))
         }
-        Some(b'+') | Some(b'-') => Some(AddressBase::Current),
+        Some(b'+' | b'-') => Some(AddressBase::Current),
         _ => None,
     };
     let Some(base) = base else {
         return Ok(None);
     };
     let mut offsets = Vec::new();
-    while matches!(bytes.get(*cursor), Some(b'+') | Some(b'-')) {
+    while matches!(bytes.get(*cursor), Some(b'+' | b'-')) {
         if offsets.len() == MAX_OFFSETS {
             return Err(error(ErrorCode::E488, *cursor, "too many address offsets"));
         }
-        let sign = if bytes[*cursor] == b'+' { 1_i64 } else { -1_i64 };
+        let sign = if bytes[*cursor] == b'+' {
+            1_i64
+        } else {
+            -1_i64
+        };
         *cursor += 1;
         let magnitude_start = *cursor;
         while bytes.get(*cursor).is_some_and(u8::is_ascii_digit) {
@@ -749,7 +1084,12 @@ fn parse_address(input: &str, cursor: &mut usize) -> Result<Option<Address>, Par
     Ok(Some(Address { base, offsets }))
 }
 
-fn parse_pattern(input: &str, start: usize, delimiter: u8) -> Result<(String, usize), ParseError> {
+fn parse_pattern(
+    input: &str,
+    start: usize,
+    delimiter: u8,
+    require_close: bool,
+) -> Result<(String, usize), ParseError> {
     let bytes = input.as_bytes();
     let mut cursor = start + 1;
     let pattern_start = cursor;
@@ -764,7 +1104,12 @@ fn parse_pattern(input: &str, start: usize, delimiter: u8) -> Result<(String, us
         }
         cursor += 1;
     }
-    Err(error(ErrorCode::E488, start, "unterminated search pattern"))
+    if require_close {
+        return Err(error(ErrorCode::E488, start, "unterminated search pattern"));
+    }
+    // Address form: `skip_regexp` takes the rest of the line when the
+    // closing delimiter is missing, so `:/#if FOO` is a search.
+    Ok((input[pattern_start..cursor].to_owned(), cursor))
 }
 
 fn command_end(
@@ -783,8 +1128,31 @@ fn command_end(
     if usefilter {
         return input.len();
     }
-    if matches!(name, "execute" | "echo" | "echon" | "echomsg" | "echoerr") {
+    if matches!(
+        name,
+        "execute"
+            | "let"
+            | "call"
+            | "echo"
+            | "echon"
+            | "echomsg"
+            | "echoerr"
+            | "for"
+            | "if"
+            | "elseif"
+            | "while"
+            | "return"
+            | "throw"
+    ) {
         return expression_command_end(input, args_start);
+    }
+    // Every other non-`TRLBAR` command owns the whole remainder. The one
+    // handler-owned exception is `wincmd`: `ex_wincmd` (ex_docmd.c:6523-6549)
+    // consumes the window-command key itself and then splits the tail with
+    // `check_nextcmd` (ex_docmd.c:4630-4637), so the command ends after its
+    // key form instead of after the whole line.
+    if name == "wincmd" {
+        return wincmd_command_end(input, args_start);
     }
     let is_substitute = name == "substitute";
     if !flags.contains(CommandFlags::TRLBAR) && !is_substitute {
@@ -821,6 +1189,37 @@ fn command_end(
             return cursor;
         }
         cursor += 1;
+    }
+    input.len()
+}
+
+/// The `wincmd` command boundary (`ex_wincmd`, ex_docmd.c:6522-6551).
+///
+/// The generated `wincmd` metadata deliberately has no `EX_TRLBAR`, so
+/// `separate_nextcmd` never scans its argument and the handler computes
+/// `eap->nextcmd = check_nextcmd(p)` itself from just past the
+/// window-command key. The command therefore ends after one key — two for
+/// the `g`/Ctrl-G forms (`ex_docmd.c:6527-6534`) — followed only by a bar
+/// after optional spaces or tabs (`check_nextcmd`, `ex_docmd.c:4630-4637`).
+/// Anything else stays in the argument so the handler can reject it, and a
+/// literal `|` is consumed as the key itself, which is exactly why
+/// `EX_TRLBAR` can never be added to `wincmd`.
+fn wincmd_command_end(input: &str, args_start: usize) -> usize {
+    let bytes = input.as_bytes();
+    let Some(&key) = bytes.get(args_start) else {
+        // NEEDARG rejects an empty argument before the handler ever runs.
+        return input.len();
+    };
+    let mut cursor = args_start + 1;
+    if key == b'g' || key == 0x07 {
+        // The `g`/Ctrl-G forms consume a second command character; a
+        // missing one stays missing so the handler reports E474 instead of
+        // the parser splitting the line here (ex_docmd.c:6529-6532).
+        cursor += usize::from(bytes.get(cursor).is_some());
+    }
+    cursor = skip_ascii_space(input, cursor);
+    if bytes.get(cursor) == Some(&b'|') {
+        return cursor;
     }
     input.len()
 }
@@ -982,5 +1381,23 @@ fn del_trailing_spaces(input: &str, start: usize, mut end: usize) -> usize {
 }
 
 fn error(code: ErrorCode, offset: usize, message: impl Into<String>) -> ParseError {
-    ParseError { code, offset, message: message.into() }
+    ParseError {
+        code,
+        offset,
+        message: message.into(),
+        command: None,
+    }
+}
+
+fn command_error(
+    command: &ResolvedCommand,
+    code: ErrorCode,
+    offset: usize,
+    message: impl Into<String>,
+) -> ParseError {
+    let mut error = error(code, offset, message);
+    if let ResolvedCommand::Builtin(spec) = command {
+        error.command = Some(spec.name);
+    }
+    error
 }

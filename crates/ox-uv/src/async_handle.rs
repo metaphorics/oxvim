@@ -15,6 +15,10 @@ pub struct AsyncSender {
 
 impl AsyncSender {
     /// Marks the callback pending and wakes the loop; repeated pending sends coalesce.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the reactor waker cannot be signaled.
     pub fn send(&self) -> Result<()> {
         self.pending.store(true, Ordering::Release);
         self.waker.wake()?;
@@ -30,6 +34,10 @@ pub struct Async {
 
 impl Async {
     /// Allocates an immediately-active async handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::HandleLimit`] when the 32-bit handle identity space is exhausted.
     pub fn new<F>(uv_loop: &mut UvLoop, callback: F) -> Result<Self>
     where
         F: FnMut(&mut UvLoop, HandleId) -> std::result::Result<(), CallbackError> + 'static,
@@ -45,8 +53,15 @@ impl Async {
     }
 
     /// Returns a cloneable cross-thread sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHandle`] if the handle is no longer live, or
+    /// [`Error::WrongHandleKind`] if it is not an async handle.
     pub fn sender(&self, uv_loop: &UvLoop) -> Result<AsyncSender> {
-        let state = uv_loop.state(self.id).ok_or(crate::Error::InvalidHandle(self.id))?;
+        let state = uv_loop
+            .state(self.id)
+            .ok_or(crate::Error::InvalidHandle(self.id))?;
         let HandleKind::Async(inner) = &state.kind else {
             return Err(crate::handle::wrong_kind(self.id, "async"));
         };
@@ -57,6 +72,12 @@ impl Async {
     }
 
     /// Sends through this handle from the loop thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidHandle`] if the handle is no longer live,
+    /// [`Error::WrongHandleKind`] if it is not an async handle, or
+    /// [`Error::Io`] if the reactor waker cannot be signaled.
     pub fn send(&self, uv_loop: &UvLoop) -> Result<()> {
         self.sender(uv_loop)?.send()
     }

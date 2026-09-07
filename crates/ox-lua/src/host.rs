@@ -7,8 +7,11 @@ use mlua::{Function, Lua, LuaOptions, MultiValue, StdLib, Table, Value};
 use ox_types::Object;
 use thiserror::Error;
 
-use crate::converter::{lua_to_object, object_to_lua, ConversionError};
-use crate::vim::{call_with_traceback, install_vim_core, BuiltinHost, FastCallbackState, Scheduler};
+use crate::converter::{ConversionError, lua_to_object, object_to_lua};
+use crate::uv_core::EventLoopPump;
+use crate::vim::{
+    BuiltinHost, FastCallbackState, Scheduler, call_with_traceback, install_vim_core,
+};
 use crate::{embedded, stdlib, treesitter, uv_core};
 
 /// Caller-provided root of the checked-out Neovim-compatible runtime tree.
@@ -39,7 +42,11 @@ impl RuntimeRoot {
     #[must_use]
     pub fn runtime_entries(&self, relative: impl AsRef<Path>) -> Vec<PathBuf> {
         let entry = self.resolve(relative);
-        if entry.exists() { vec![entry] } else { Vec::new() }
+        if entry.exists() {
+            vec![entry]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -67,7 +74,7 @@ pub enum ExecError {
 
 impl From<mlua::Error> for ExecError {
     fn from(err: mlua::Error) -> Self {
-        Self::Runtime(err.to_string())
+        Self::Runtime(crate::vim::mlua_error_text(&err))
     }
 }
 
@@ -76,6 +83,7 @@ pub struct LuaHost {
     lua: Lua,
     runtime_root: RuntimeRoot,
     fast_callbacks: FastCallbackState,
+    event_loop: EventLoopPump,
 }
 
 impl LuaHost {
@@ -111,7 +119,7 @@ impl LuaHost {
         stdlib::install(&lua)?;
         embedded::install(&lua)?;
         treesitter::install(&lua, scheduler.clone())?;
-        uv_core::install(
+        let event_loop = uv_core::install(
             &lua,
             scheduler,
             fast_callbacks.clone(),
@@ -126,7 +134,12 @@ impl LuaHost {
         // state, matching upstream's load order.
         let require: Function = lua.globals().get("require")?;
         require.call::<()>("vim._init_packages")?;
-        Ok(Self { lua, runtime_root, fast_callbacks })
+        Ok(Self {
+            lua,
+            runtime_root,
+            fast_callbacks,
+            event_loop,
+        })
     }
 
     /// Borrow the initialized Lua state.
@@ -145,6 +158,12 @@ impl LuaHost {
     #[must_use]
     pub fn fast_callbacks(&self) -> FastCallbackState {
         self.fast_callbacks.clone()
+    }
+
+    /// Clone the non-blocking UV event-loop pump.
+    #[must_use]
+    pub fn event_loop_pump(&self) -> EventLoopPump {
+        self.event_loop.clone()
     }
 
     /// Execute a Lua chunk with `...` bound to `args`, returning the first
@@ -203,9 +222,7 @@ impl LuaHost {
             }
             Some(Value::Nil) => {
                 let message = match error_value {
-                    Some(Value::String(s)) => {
-                        String::from_utf8_lossy(&s.as_bytes()).into_owned()
-                    }
+                    Some(Value::String(s)) => String::from_utf8_lossy(&s.as_bytes()).into_owned(),
                     Some(other) => format!("{other:?}"),
                     None => "loadfile returned nil without an error message".to_string(),
                 };
@@ -219,6 +236,28 @@ impl LuaHost {
 
 fn configure_package_path(lua: &Lua, runtime_root: &RuntimeRoot) -> mlua::Result<()> {
     let package: Table = lua.globals().get("package")?;
+    // An unresolved root is a runtime-less host (tests, tools): it must
+    // resolve nothing, so both fields clear - an empty root would otherwise
+    // contribute the CWD-relative `lua`, and the LuaJIT defaults
+    // (./?.lua source, ./?.so native, vendored luaconf.h LUA_PATH_DEFAULT /
+    // LUA_CPATH_DEFAULT) keep a planted-tree vector open.
+    //
+    // A resolved root mirrors upstream instead of hardening past it:
+    // runtime entries are prepended to `package.path` and win by
+    // precedence - `vim._load_package` sits at `package.loaders` position 2
+    // (runtime/lua/vim/_init_packages.lua:48-49), ahead of the standard
+    // searchers - while the LuaJIT defaults, CWD entries included, survive
+    // after them exactly as in the reference interpreter. `package.cpath`
+    // stays untouched: `_init_packages.lua:3-13` harvests its `/?.so`-style
+    // suffix trails and `_load_package` resolves native modules over
+    // 'runtimepath' (:25-31) - the system library entries in the default
+    // also serve the standard searcher like upstream. Emptying cpath here
+    // would kill the trail harvest and drop the system entries; both would
+    // be behavior drift, not hardening.
+    if runtime_root.resolve("").as_os_str().is_empty() {
+        package.set("path", "")?;
+        return package.set("cpath", "");
+    }
     let existing: String = package.get("path")?;
     let lua_root = runtime_root.resolve("lua");
     let module = lua_root.join("?.lua");
@@ -231,4 +270,42 @@ fn configure_package_path(lua: &Lua, runtime_root: &RuntimeRoot) -> mlua::Result
             package_init.to_string_lossy()
         ),
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configures_package_paths_from_the_runtime_root() {
+        let lua = Lua::new();
+        let package_field = |lua: &Lua, field: &str| {
+            lua.globals()
+                .get::<Table>("package")
+                .unwrap()
+                .get::<String>(field)
+                .unwrap()
+        };
+        let path = |lua: &Lua| package_field(lua, "path");
+        let cpath = |lua: &Lua| package_field(lua, "cpath");
+        // A runtime-less host resolves nothing: planted CWD trees stay
+        // unreachable for both source and native modules.
+        configure_package_path(&lua, &RuntimeRoot::new(PathBuf::new())).unwrap();
+        assert_eq!(path(&lua), "");
+        assert_eq!(cpath(&lua), "");
+        // A resolved host prepends its runtime entries, which win by
+        // precedence over the surviving defaults, and leaves cpath alone:
+        // emptying it would starve `vim._so_trails`
+        // (_init_packages.lua:3-13) and drop the system library entries
+        // the standard searcher uses upstream.
+        let fresh = Lua::new();
+        let default_cpath = cpath(&fresh);
+        configure_package_path(&fresh, &RuntimeRoot::new(PathBuf::from("/rt"))).unwrap();
+        let seeded = path(&fresh);
+        assert!(seeded.contains("/rt/lua/?.lua"), "{seeded}");
+        let seeded_cpath = cpath(&fresh);
+        assert_eq!(seeded_cpath, default_cpath);
+        assert!(!seeded_cpath.is_empty(), "trails must stay harvestable");
+    }
 }

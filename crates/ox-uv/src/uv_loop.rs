@@ -53,6 +53,10 @@ pub struct UvLoop {
 
 impl UvLoop {
     /// Creates an empty loop and installs the dynamically extensible signal pipe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform loop or signal driver cannot initialize.
     pub fn new() -> Result<Self> {
         let mut inner = ox_loop::Loop::new()?;
         let signals = SignalDriver::new(&mut inner)?;
@@ -79,6 +83,11 @@ impl UvLoop {
     }
 
     /// Runs with the selected libuv mode and reports whether live work remains.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::LoopAlreadyRunning`] for reentry through this method, or
+    /// propagates an error from the selected loop iteration.
     pub fn run(&mut self, mode: RunMode) -> Result<bool> {
         if self.running_mode.is_some() {
             return Err(Error::LoopAlreadyRunning);
@@ -98,6 +107,10 @@ impl UvLoop {
     /// The caller must already hold callback-scoped access to this exact loop.
     /// An outer run mode, when present, remains installed while the nested run
     /// executes; synchronous callbacks without an outer run use normal setup.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an error from the selected loop iteration.
     pub fn run_nested(&mut self, mode: RunMode) -> Result<bool> {
         if self.running_mode.is_none() {
             return self.run(mode);
@@ -115,6 +128,10 @@ impl UvLoop {
     }
 
     /// Runs in default mode and reports whether live work remains after stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a loop iteration fails.
     pub fn run_default(&mut self) -> Result<bool> {
         self.run(RunMode::Default)
     }
@@ -134,6 +151,10 @@ impl UvLoop {
     }
 
     /// Runs one possibly-blocking iteration and reports whether work remains.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the loop iteration fails.
     pub fn run_once(&mut self) -> Result<bool> {
         self.run(RunMode::Once)
     }
@@ -153,6 +174,10 @@ impl UvLoop {
     }
 
     /// Runs one non-blocking iteration and reports whether work remains.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the loop iteration fails.
     pub fn run_nowait(&mut self) -> Result<bool> {
         self.run(RunMode::NoWait)
     }
@@ -173,18 +198,15 @@ impl UvLoop {
     /// Reports referenced active handles and all closing handles.
     pub fn loop_alive(&self) -> bool {
         self.completions.has_outstanding()
-            || self.handles.iter().any(|(_, state)| {
-                state.closing || (state.referenced && state.is_active())
-            })
+            || self
+                .handles
+                .iter()
+                .any(|(_, state)| state.closing || (state.referenced && state.is_active()))
     }
 
     /// Visits a stable snapshot of every allocated handle identity.
     pub fn walk(&mut self, mut callback: impl FnMut(&mut Self, HandleId)) {
-        let ids: Vec<_> = self
-            .handles
-            .iter()
-            .map(|(id, _)| *id)
-            .collect();
+        let ids: Vec<_> = self.handles.iter().map(|(id, _)| *id).collect();
         for id in ids {
             if self.state(id).is_some() {
                 callback(self, id);
@@ -205,6 +227,11 @@ impl UvLoop {
     /// Removes and returns the oldest callback failure or caught panic.
     pub fn pop_callback_error(&mut self) -> Option<CallbackErrorEvent> {
         self.callback_errors.pop_front()
+    }
+
+    /// Records a callback failure or caught panic from a net I/O callback.
+    pub(crate) fn push_callback_error(&mut self, event: CallbackErrorEvent) {
+        self.callback_errors.push_back(event);
     }
 
     /// Removes the oldest panic captured from a posted completion.
@@ -259,7 +286,10 @@ impl UvLoop {
 
     pub(crate) fn allocate_io_token(&mut self) -> Result<mio::Token> {
         let token = self.next_io_token;
-        self.next_io_token = self.next_io_token.checked_add(1).ok_or(Error::HandleLimit)?;
+        self.next_io_token = self
+            .next_io_token
+            .checked_add(1)
+            .ok_or(Error::HandleLimit)?;
         Ok(mio::Token(token))
     }
 
@@ -346,7 +376,9 @@ impl UvLoop {
             match &state.kind {
                 HandleKind::Timer(timer) if timer.active => {
                     if let Some(candidate) = timer.deadline {
-                        deadline = Some(deadline.map_or(candidate, |current: Instant| current.min(candidate)));
+                        deadline = Some(
+                            deadline.map_or(candidate, |current: Instant| current.min(candidate)),
+                        );
                     }
                 }
                 HandleKind::Idle(phase) if phase.active => {
@@ -384,25 +416,25 @@ impl UvLoop {
             if !still_due {
                 continue;
             }
-            let callback = match self.take_callback(id, CallbackPhase::Timer, false) {
-                Some(callback) => callback,
-                None => continue,
+            let Some(callback) = self.take_callback(id, CallbackPhase::Timer, false) else {
+                continue;
             };
             self.invoke_callback(id, CallbackPhase::Timer, callback);
             let mut overflow = false;
-            if let Some(state) = self.state_mut_if_present(id) {
-                if let HandleKind::Timer(timer) = &mut state.kind {
-                    if !state.closing && timer.active && timer.generation == generation {
-                        if timer.repeat.is_zero() {
-                            timer.active = false;
-                            timer.deadline = None;
-                        } else {
-                            timer.deadline = now.checked_add(timer.repeat);
-                            if timer.deadline.is_none() {
-                                timer.active = false;
-                                overflow = true;
-                            }
-                        }
+            if let Some(state) = self.state_mut_if_present(id)
+                && let HandleKind::Timer(timer) = &mut state.kind
+                && !state.closing
+                && timer.active
+                && timer.generation == generation
+            {
+                if timer.repeat.is_zero() {
+                    timer.active = false;
+                    timer.deadline = None;
+                } else {
+                    timer.deadline = now.checked_add(timer.repeat);
+                    if timer.deadline.is_none() {
+                        timer.active = false;
+                        overflow = true;
                     }
                 }
             }
@@ -425,7 +457,10 @@ impl UvLoop {
                     (HandleKind::Idle(inner), CallbackPhase::Idle)
                     | (HandleKind::Prepare(inner), CallbackPhase::Prepare)
                     | (HandleKind::Check(inner), CallbackPhase::Check)
-                        if inner.active => Some(inner.generation),
+                        if inner.active =>
+                    {
+                        Some(inner.generation)
+                    }
                     _ => None,
                 };
                 generation.map(|generation| (*id, generation))
@@ -436,13 +471,16 @@ impl UvLoop {
                 (HandleKind::Idle(inner), CallbackPhase::Idle)
                 | (HandleKind::Prepare(inner), CallbackPhase::Prepare)
                 | (HandleKind::Check(inner), CallbackPhase::Check)
-                    if inner.active => Some(inner.generation),
+                    if inner.active =>
+                {
+                    Some(inner.generation)
+                }
                 _ => None,
             });
-            if current == Some(generation) {
-                if let Some(callback) = self.take_callback(id, phase, false) {
-                    self.invoke_callback(id, phase, callback);
-                }
+            if current == Some(generation)
+                && let Some(callback) = self.take_callback(id, phase, false)
+            {
+                self.invoke_callback(id, phase, callback);
             }
         }
     }
@@ -450,7 +488,8 @@ impl UvLoop {
     fn dispatch_pending_sources(&mut self) {
         while let Some(completion) = self.completions.pop() {
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| completion(self))) {
-                self.completion_errors.push_back(CallbackError::panic(payload));
+                self.completion_errors
+                    .push_back(CallbackError::panic(payload.as_ref()));
             }
         }
 
@@ -497,30 +536,26 @@ impl UvLoop {
         while let Some((id, phase, generation)) = self.pending_callbacks.pop_front() {
             let mut allow_inactive = false;
             let deliver = match phase {
-                CallbackPhase::Async => self.state(id).is_some_and(|state| {
-                    matches!(&state.kind, HandleKind::Async(inner) if inner.active)
+                CallbackPhase::Async => self.state(id).is_some_and(
+                    |state| matches!(&state.kind, HandleKind::Async(inner) if inner.active),
+                ),
+                CallbackPhase::Signal(_) => self.state_mut_if_present(id).is_some_and(|state| {
+                    let HandleKind::Signal(inner) = &mut state.kind else {
+                        return false;
+                    };
+                    if !inner.active || Some(inner.generation) != generation {
+                        return false;
+                    }
+                    if inner.oneshot {
+                        inner.active = false;
+                        allow_inactive = true;
+                    }
+                    true
                 }),
-                CallbackPhase::Signal(_) => {
-                    self.state_mut_if_present(id).is_some_and(|state| {
-                        let HandleKind::Signal(inner) = &mut state.kind else {
-                            return false;
-                        };
-                        if !inner.active || Some(inner.generation) != generation {
-                            return false;
-                        }
-                        if inner.oneshot {
-                            inner.active = false;
-                            allow_inactive = true;
-                        }
-                        true
-                    })
-                }
                 _ => false,
             };
-            if deliver {
-                if let Some(callback) = self.take_callback(id, phase, allow_inactive) {
-                    self.invoke_callback(id, phase, callback);
-                }
+            if deliver && let Some(callback) = self.take_callback(id, phase, allow_inactive) {
+                self.invoke_callback(id, phase, callback);
             }
         }
     }
@@ -532,7 +567,8 @@ impl UvLoop {
                 break;
             };
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| dispatch(self))) {
-                self.completion_errors.push_back(CallbackError::panic(payload));
+                self.completion_errors
+                    .push_back(CallbackError::panic(payload.as_ref()));
             }
         }
     }
@@ -583,11 +619,14 @@ impl UvLoop {
         let result = catch_unwind(AssertUnwindSafe(|| callback(self, id)));
         match result {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => self.callback_errors.push_back(CallbackErrorEvent { id, phase, error }),
+            Ok(Err(error)) => {
+                self.callback_errors
+                    .push_back(CallbackErrorEvent { id, phase, error });
+            }
             Err(payload) => self.callback_errors.push_back(CallbackErrorEvent {
                 id,
                 phase,
-                error: CallbackError::panic(payload),
+                error: CallbackError::panic(payload.as_ref()),
             }),
         }
         self.restore_callback(id, phase, callback);
@@ -614,7 +653,7 @@ impl UvLoop {
                     Err(payload) => self.callback_errors.push_back(CallbackErrorEvent {
                         id,
                         phase: CallbackPhase::Close,
-                        error: CallbackError::panic(payload),
+                        error: CallbackError::panic(payload.as_ref()),
                     }),
                 }
             }

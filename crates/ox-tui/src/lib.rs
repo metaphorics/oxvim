@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrome::{
-    Chrome, ChromeError, ChunkLine, HistoryEntry, MessageSeverity, MessageUpdate, PopupItem, Rect,
-    TextChunk, TimeMs,
+    Chrome, ChromeError, ChunkLine, HistoryEntry, MessageFlag, MessageFlags, MessageSeverity,
+    MessageUpdate, PopupItem, Rect, TextChunk, TimeMs,
 };
 use client::{Client, ClientError};
 use crossterm::Command as _;
@@ -30,11 +30,12 @@ use ox_rpc::RedrawEvent;
 use ox_types::{Dict, Object, OxStr};
 use screen::{ApplyOutcome, ComposedGrid, Screen, ScreenError};
 use terminal::{
-    Cell as TerminalCell, CellAttributes, ColorSupport, DamageWriter, Frame, FrameError,
-    ProcessFailure, ProcessFailureKind, ProbePolicy, ShutdownSignals, TerminalCapabilities,
-    TerminalColor, TerminalEnvironment, TerminalError, TerminalSession, UnderlineStyle,
+    Cell as TerminalCell, CellAttributes, CellEmphasis, ColorSupport, DamageWriter, Frame,
+    FrameError, ProbePolicy, ProcessFailure, ProcessFailureKind, ShutdownSignals,
+    TerminalCapabilities, TerminalColor, TerminalEnvironment, TerminalError, TerminalSession,
+    UnderlineStyle,
 };
-use theme::{HighlightGroup, HighlightStyle, MonoTheme, Rgb, Theme};
+use theme::{HighlightAttributes, HighlightGroup, HighlightStyle, MonoTheme, Rgb, Theme};
 use thiserror::Error;
 
 const LOOP_SLICE: Duration = Duration::from_millis(16);
@@ -66,7 +67,9 @@ impl MotionPolicy {
         if self == Self::Reduced || elapsed_ms >= NOTIFICATION_FADE_MS {
             return 1.0;
         }
-        let progress = elapsed_ms as f64 / NOTIFICATION_FADE_MS as f64;
+        let elapsed = u32::try_from(elapsed_ms).unwrap_or(u32::MAX);
+        let fade_ms = u32::try_from(NOTIFICATION_FADE_MS).unwrap_or(u32::MAX);
+        let progress = f64::from(elapsed) / f64::from(fade_ms);
         1.0 - (1.0 - progress).powi(3)
     }
 }
@@ -85,6 +88,7 @@ pub struct TuiState {
     /// Whether the editor has asked for mouse input (`mouse_on`). Drives
     /// crossterm's terminal mouse-capture enable/disable at the run boundary.
     pub mouse_capture: bool,
+    client_working_directory: Option<OxStr>,
     highlight_groups: BTreeMap<HighlightGroup, HighlightStyle>,
     current_time: TimeMs,
     notification_started: Option<TimeMs>,
@@ -106,6 +110,7 @@ impl TuiState {
             theme: Theme::new(colorfgbg),
             motion,
             mouse_capture: false,
+            client_working_directory: None,
             highlight_groups: BTreeMap::new(),
             current_time: TimeMs(0),
             notification_started: None,
@@ -113,11 +118,12 @@ impl TuiState {
     }
 
     /// Apply a complete redraw batch and start stable-batch message timers.
-    pub fn apply_redraw(
-        &mut self,
-        events: &[RedrawEvent],
-        now: TimeMs,
-    ) -> Result<(), TuiError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a server-grid or client-chrome event is malformed
+    /// or is not implemented by this client.
+    pub fn apply_redraw(&mut self, events: &[RedrawEvent], now: TimeMs) -> Result<(), TuiError> {
         self.current_time = now;
         for redraw in events {
             match self.screen.apply_event(redraw)? {
@@ -139,13 +145,19 @@ impl TuiState {
     }
 
     fn notification_opacity(&self) -> f64 {
-        let elapsed = self.notification_started.map_or(NOTIFICATION_FADE_MS, |started| {
-            self.current_time.0.saturating_sub(started.0)
-        });
+        let elapsed = self
+            .notification_started
+            .map_or(NOTIFICATION_FADE_MS, |started| {
+                self.current_time.0.saturating_sub(started.0)
+            });
         self.motion.notification_opacity(elapsed)
     }
 
     /// Render the server grid without terminal escape sequences.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the server grids cannot be composed into one frame.
     pub fn render_to_string(&self) -> Result<String, TuiError> {
         Ok(self.screen.composed_grid()?.render_to_string())
     }
@@ -177,7 +189,11 @@ impl TuiState {
                 }
             }
         }
-        self.theme.reswap(self.highlight_groups.iter().map(|(group, style)| (*group, *style)));
+        self.theme.reswap(
+            self.highlight_groups
+                .iter()
+                .map(|(group, style)| (*group, *style)),
+        );
     }
 
     fn apply_client_event(&mut self, event: &RedrawEvent) -> Result<(), TuiError> {
@@ -185,10 +201,23 @@ impl TuiState {
             match event.name.as_bytes() {
                 b"mouse_on" => self.mouse_capture = true,
                 b"mouse_off" => self.mouse_capture = false,
-                b"flush" | b"option_set" | b"default_colors_set" | b"hl_group_set"
-                | b"busy_start" | b"busy_stop"
-                | b"bell" | b"visual_bell" | b"update_menu" | b"menu_show"
-                | b"menu_hide" | b"set_title" | b"set_icon" => {
+                b"chdir" => {
+                    require_arity(args, 1, "chdir")?;
+                    self.client_working_directory = Some(as_string(args, 0, "chdir")?.clone());
+                }
+                b"flush"
+                | b"option_set"
+                | b"default_colors_set"
+                | b"hl_group_set"
+                | b"busy_start"
+                | b"busy_stop"
+                | b"bell"
+                | b"visual_bell"
+                | b"update_menu"
+                | b"menu_show"
+                | b"menu_hide"
+                | b"set_title"
+                | b"set_icon" => {
                     // These carry no client-rendered content, so they are
                     // consumed intentionally: the client must survive its
                     // first redraw regardless of which core negotiation/status
@@ -196,7 +225,10 @@ impl TuiState {
                 }
                 b"cmdline_show" => self.apply_cmdline_show(args)?,
                 b"cmdline_pos" => {
-                    self.chrome.cmdline_pos(as_u32(args, 1, "cmdline_pos")?, as_usize(args, 0, "cmdline_pos")?);
+                    self.chrome.cmdline_pos(
+                        as_u32(args, 1, "cmdline_pos")?,
+                        as_usize(args, 0, "cmdline_pos")?,
+                    );
                 }
                 b"cmdline_special_char" => {
                     self.chrome.cmdline_special_char(
@@ -212,7 +244,8 @@ impl TuiState {
                     );
                 }
                 b"cmdline_block_show" => {
-                    self.chrome.cmdline_block_show(as_chunk_lines(args, 0, "cmdline_block_show")?);
+                    self.chrome
+                        .cmdline_block_show(as_chunk_lines(args, 0, "cmdline_block_show")?);
                 }
                 b"cmdline_block_append" => {
                     for line in as_chunk_lines(args, 0, "cmdline_block_append")? {
@@ -224,9 +257,10 @@ impl TuiState {
                 }
                 b"popupmenu_show" => self.apply_popupmenu_show(args)?,
                 b"popupmenu_select" => {
-                    self.chrome.popupmenu_select(optional_selection(args, 0, "popupmenu_select")?);
+                    self.chrome
+                        .popupmenu_select(optional_selection(args, 0, "popupmenu_select")?);
                 }
-                b"popupmenu_hide" => self.chrome.popupmenu_hide(),
+                b"popupmenu_hide" | b"wildmenu_hide" => self.chrome.popupmenu_hide(),
                 b"wildmenu_show" => {
                     let items = as_string_array(args, 0, "wildmenu_show")?
                         .into_iter()
@@ -235,23 +269,19 @@ impl TuiState {
                     self.chrome.popupmenu_show(items, None, 0, 0, -1);
                 }
                 b"wildmenu_select" => {
-                    self.chrome.popupmenu_select(optional_selection(args, 0, "wildmenu_select")?);
+                    self.chrome
+                        .popupmenu_select(optional_selection(args, 0, "wildmenu_select")?);
                 }
-                b"wildmenu_hide" => self.chrome.popupmenu_hide(),
                 b"msg_show" => self.apply_message_show(args)?,
                 b"msg_clear" => self.chrome.message_clear(),
                 b"msg_history_show" => self.apply_history_show(args)?,
                 b"msg_showcmd" | b"msg_showmode" | b"msg_ruler" => {
-                    require_arity(args, 1, &event.name.to_string_lossy())?;
                     let kind = event.name.clone();
                     self.chrome.message_show(MessageUpdate {
                         kind: kind.clone(),
                         content: as_chunks(args, 0, &kind.to_string_lossy())?,
-                        replace_last: false,
-                        history: false,
-                        append: false,
+                        flags: MessageFlags::default(),
                         id: Object::String(kind),
-                        prompt: false,
                     })?;
                 }
                 _ => return Err(TuiError::NotImplemented(event.name.clone())),
@@ -293,14 +323,18 @@ impl TuiState {
     fn apply_message_show(&mut self, args: &[Object]) -> Result<(), TuiError> {
         require_arity(args, 7, "msg_show")?;
         let trigger = as_string(args, 6, "msg_show")?;
+        let kind = as_string(args, 0, "msg_show")?.clone();
+        let content = as_chunks(args, 1, "msg_show")?;
+        let mut flags = MessageFlags::default();
+        flags.set(MessageFlag::ReplaceLast, as_bool(args, 2, "msg_show")?);
+        flags.set(MessageFlag::History, as_bool(args, 3, "msg_show")?);
+        flags.set(MessageFlag::Append, as_bool(args, 4, "msg_show")?);
+        flags.set(MessageFlag::Prompt, !trigger.as_bytes().is_empty());
         self.chrome.message_show(MessageUpdate {
-            kind: as_string(args, 0, "msg_show")?.clone(),
-            content: as_chunks(args, 1, "msg_show")?,
-            replace_last: as_bool(args, 2, "msg_show")?,
-            history: as_bool(args, 3, "msg_show")?,
-            append: as_bool(args, 4, "msg_show")?,
+            kind,
+            content,
+            flags,
             id: args[5].clone(),
-            prompt: !trigger.as_bytes().is_empty(),
         })?;
         self.notification_started = Some(self.current_time);
         Ok(())
@@ -309,12 +343,16 @@ impl TuiState {
     fn apply_history_show(&mut self, args: &[Object]) -> Result<(), TuiError> {
         require_arity(args, 2, "msg_history_show")?;
         let Object::Array(entries) = &args[0] else {
-            return Err(TuiError::Protocol("msg_history_show entries must be an array".into()));
+            return Err(TuiError::Protocol(
+                "msg_history_show entries must be an array".into(),
+            ));
         };
         let mut history = Vec::with_capacity(entries.len());
         for entry in entries {
             let Object::Array(fields) = entry else {
-                return Err(TuiError::Protocol("message history entry must be an array".into()));
+                return Err(TuiError::Protocol(
+                    "message history entry must be an array".into(),
+                ));
             };
             require_arity(fields, 2, "msg_history_show entry")?;
             history.push(HistoryEntry {
@@ -323,7 +361,8 @@ impl TuiState {
                 append: false,
             });
         }
-        self.chrome.history_show(history, as_bool(args, 1, "msg_history_show")?);
+        self.chrome
+            .history_show(history, as_bool(args, 1, "msg_history_show")?);
         Ok(())
     }
 }
@@ -358,11 +397,23 @@ pub enum TuiError {
 }
 
 /// Run an already-spawned client until its RPC stream closes.
+///
+/// # Errors
+///
+/// Returns an error when attachment, terminal setup or restoration, RPC or input
+/// handling, redraw decoding, frame construction, or terminal output fails.
 pub fn run(mut client: Client) -> Result<(), TuiError> {
     // This full-screen client owns its palette; NO_COLOR must not strip its SGR output.
     crossterm::style::force_color_output(true);
     let (width, height) = crossterm::terminal::size().map_err(TuiError::Input)?;
-    client.attach(width, height)?;
+    // A child whose startup commands already quit (`-c qall`) can close its
+    // stream before serving attach; that is a clean exit, not a failure.
+    if let Err(error) = client.attach(width, height) {
+        if clean_eof(&error) {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
 
     let environment = terminal_environment();
     let mut probe_reader = io::stdin();
@@ -375,12 +426,15 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
     )?;
     let mut shared = SharedWriter::stdout();
     let mut session = TerminalSession::start(shared.clone(), capabilities)?;
-    let mut damage = DamageWriter::new(shared.clone(), capabilities.undercurl);
+    let mut damage = DamageWriter::new(shared.clone(), capabilities.features.undercurl());
     // Registered before the palette is programmed: a terminating signal that
     // arrives between programming and the first loop turn must still reach the
     // restore path instead of killing the process with OSC 4 still in effect.
     let signals = ShutdownSignals::install()?;
-    let mut state = TuiState::new(env::var("COLORFGBG").ok().as_deref(), MotionPolicy::from_environment());
+    let mut state = TuiState::new(
+        env::var("COLORFGBG").ok().as_deref(),
+        MotionPolicy::from_environment(),
+    );
     let tokens = state.theme.tokens();
     session.program_palette(&[
         (0, tokens.bg),
@@ -412,26 +466,18 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
                     apply_mouse_capture(&mut shared, state.mouse_capture)?;
                 }
                 if let Ok(grid) = state.screen.composed_grid() {
-                    let frame = render_frame(&grid, &state, capabilities)?;
-                    session.begin_synchronized_output()?;
-                    let rendered = damage.render(&frame);
-                    let close_result = session.end_synchronized_output();
-                    rendered?;
-                    close_result?;
+                    render_current_frame(&mut session, &mut damage, &grid, &state, capabilities)?;
                 }
             }
             Ok(None) => {
                 let now = TimeMs(duration_millis(started.elapsed()));
                 let expired = state.advance_time(now);
-                let fading = state.motion == MotionPolicy::Full
-                    && state.notification_opacity() < 1.0;
-                if (expired || fading) && let Ok(grid) = state.screen.composed_grid() {
-                    let frame = render_frame(&grid, &state, capabilities)?;
-                    session.begin_synchronized_output()?;
-                    let rendered = damage.render(&frame);
-                    let close_result = session.end_synchronized_output();
-                    rendered?;
-                    close_result?;
+                let fading =
+                    state.motion == MotionPolicy::Full && state.notification_opacity() < 1.0;
+                if (expired || fading)
+                    && let Ok(grid) = state.screen.composed_grid()
+                {
+                    render_current_frame(&mut session, &mut damage, &grid, &state, capabilities)?;
                 }
             }
             Err(error) => {
@@ -439,48 +485,75 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
                     let _ = apply_mouse_capture(&mut shared, false);
                 }
                 session.restore()?;
-                if clean_eof(&error) { return Ok(()); }
+                if clean_eof(&error) {
+                    return Ok(());
+                }
                 let failure = process_failure(&error);
                 failure.write_diagnostic(&mut io::stderr())?;
                 return Err(TuiError::Client(error));
             }
         }
 
-        while event::poll(Duration::ZERO).map_err(TuiError::Input)? {
-            match event::read().map_err(TuiError::Input)? {
-                Event::Key(key) => {
-                    state.chrome.keypress();
-                    if let Some(input) = encode_key(key) {
-                        client.input(OxStr::from(input.as_str()))?;
-                    }
-                }
-                Event::Resize(columns, rows) => client.try_resize(columns, rows)?,
-                Event::Mouse(mouse) => {
-                    let dimensions = state
-                        .screen
-                        .composed_grid()
-                        .ok()
-                        .map(|grid| (grid.width(), grid.height()));
-                    let hit_chrome = dimensions
-                        .is_some_and(|(columns, rows)| {
-                            let cursor_row = state.screen.cursor().map(|cursor| cursor.row);
-                            state.chrome.layout(columns, rows, cursor_row).contains(
-                                usize::from(mouse.column),
-                                usize::from(mouse.row),
-                            )
-                        });
-                    if !hit_chrome {
-                        let (button, action, modifier) = encode_mouse(mouse);
-                        client.input_mouse(&button, &action, &modifier, mouse.row, mouse.column)?;
-                    }
-                }
-                _ => {}
-            }
-        }
+        forward_terminal_events(&mut client, &mut state)?;
     }
 }
 
+fn render_current_frame(
+    session: &mut TerminalSession<SharedWriter>,
+    damage: &mut DamageWriter<SharedWriter>,
+    grid: &ComposedGrid,
+    state: &TuiState,
+    capabilities: TerminalCapabilities,
+) -> Result<(), TuiError> {
+    let frame = render_frame(grid, state, capabilities)?;
+    session.begin_synchronized_output()?;
+    let rendered = damage.render(&frame);
+    let close_result = session.end_synchronized_output();
+    rendered?;
+    close_result?;
+    Ok(())
+}
+
+fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<(), TuiError> {
+    while event::poll(Duration::ZERO).map_err(TuiError::Input)? {
+        match event::read().map_err(TuiError::Input)? {
+            Event::Key(key) => {
+                state.chrome.keypress();
+                if let Some(input) = encode_key(key) {
+                    client.input(OxStr::from(input.as_str()))?;
+                }
+            }
+            Event::Resize(columns, rows) => client.try_resize(columns, rows)?,
+            Event::Mouse(mouse) => {
+                let dimensions = state
+                    .screen
+                    .composed_grid()
+                    .ok()
+                    .map(|grid| (grid.width(), grid.height()));
+                let hit_chrome = dimensions.is_some_and(|(columns, rows)| {
+                    let cursor_row = state.screen.cursor().map(|cursor| cursor.row);
+                    state
+                        .chrome
+                        .layout(columns, rows, cursor_row)
+                        .contains(usize::from(mouse.column), usize::from(mouse.row))
+                });
+                if !hit_chrome {
+                    let (button, action, modifier) = encode_mouse(mouse);
+                    client.input_mouse(&button, &action, &modifier, mouse.row, mouse.column)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Spawn an embed command, restoring and diagnosing process-edge failures in `run`.
+///
+/// # Errors
+///
+/// Returns an error when the child cannot be spawned, its failure diagnostic
+/// cannot be written, or [`run`] fails.
 pub fn run_command(command: Command) -> Result<(), TuiError> {
     match Client::spawn(command) {
         Ok(client) => run(client),
@@ -506,7 +579,9 @@ fn apply_mouse_capture(shared: &mut SharedWriter, enabled: bool) -> Result<(), T
         crossterm::event::DisableMouseCapture.write_ansi(&mut command)
     };
     result.map_err(|error| TuiError::Input(io::Error::other(error)))?;
-    shared.write_all(command.as_bytes()).map_err(TuiError::Input)?;
+    shared
+        .write_all(command.as_bytes())
+        .map_err(TuiError::Input)?;
     shared.flush().map_err(TuiError::Input)
 }
 
@@ -515,10 +590,31 @@ fn render_frame(
     state: &TuiState,
     capabilities: TerminalCapabilities,
 ) -> Result<Frame, TuiError> {
-    let width = u16::try_from(grid.width()).map_err(|_| TuiError::Protocol("terminal width exceeds u16".into()))?;
-    let height = u16::try_from(grid.height()).map_err(|_| TuiError::Protocol("terminal height exceeds u16".into()))?;
-    let mut cells = grid
-        .cells()
+    let width = u16::try_from(grid.width())
+        .map_err(|_| TuiError::Protocol("terminal width exceeds u16".into()))?;
+    let height = u16::try_from(grid.height())
+        .map_err(|_| TuiError::Protocol("terminal height exceeds u16".into()))?;
+    let mut cells = render_grid_cells(grid, state, capabilities);
+    let cursor_row = state.screen.cursor().map(|cursor| cursor.row);
+    let layout = state.chrome.layout(grid.width(), grid.height(), cursor_row);
+    let mut canvas = FrameCanvas {
+        cells: &mut cells,
+        width: grid.width(),
+        height: grid.height(),
+        theme: &state.theme,
+        color_support: capabilities.colors,
+    };
+    paint_completion_surfaces(&mut canvas, &layout, state);
+    paint_message_surfaces(&mut canvas, &layout, state);
+    Ok(Frame::new(width, height, cells)?)
+}
+
+fn render_grid_cells(
+    grid: &ComposedGrid,
+    state: &TuiState,
+    capabilities: TerminalCapabilities,
+) -> Vec<TerminalCell> {
+    grid.cells()
         .iter()
         .map(|cell| {
             if cell.text.as_bytes().is_empty() {
@@ -534,13 +630,17 @@ fn render_frame(
                 } else {
                     &highlight.cterm
                 };
-                rendered.foreground = terminal_highlight_color(attributes, "foreground", capabilities.colors);
-                rendered.background = terminal_highlight_color(attributes, "background", capabilities.colors);
+                rendered.foreground =
+                    terminal_highlight_color(attributes, "foreground", capabilities.colors);
+                rendered.background =
+                    terminal_highlight_color(attributes, "background", capabilities.colors);
+                let mut emphasis = CellEmphasis::default();
+                emphasis.set_bold(dict_bool(attributes, "bold"));
+                emphasis.set_italic(dict_bool(attributes, "italic"));
+                emphasis.set_dim(dict_bool(attributes, "standout"));
+                emphasis.set_reverse(dict_bool(attributes, "reverse"));
                 rendered.attributes = CellAttributes {
-                    bold: dict_bool(attributes, "bold"),
-                    italic: dict_bool(attributes, "italic"),
-                    dim: dict_bool(attributes, "standout"),
-                    reverse: dict_bool(attributes, "reverse"),
+                    emphasis,
                     underline: if dict_bool(attributes, "undercurl") {
                         UnderlineStyle::Curl
                     } else if dict_bool(attributes, "underline") {
@@ -549,50 +649,55 @@ fn render_frame(
                         UnderlineStyle::None
                     },
                 };
-                if let Some(underlay_id) = cell.blend_underlay {
-                    if let Some(underlay) = state.screen.highlight(underlay_id) {
-                        if let (Some(top), Some(bottom)) = (
-                            dict_color(&highlight.rgb, "foreground"),
-                            dict_color(&underlay.rgb, "foreground"),
-                        ) {
-                            rendered.foreground = fallback_color(
-                                premix(top, bottom, cell.blend_percentage),
-                                capabilities.colors,
-                            );
-                        }
-                        if let (Some(top), Some(bottom)) = (
-                            dict_color(&highlight.rgb, "background"),
-                            dict_color(&underlay.rgb, "background"),
-                        ) {
-                            rendered.background = fallback_color(
-                                premix(top, bottom, cell.blend_percentage),
-                                capabilities.colors,
-                            );
-                        }
+                if let Some(underlay_id) = cell.blend_underlay
+                    && let Some(underlay) = state.screen.highlight(underlay_id)
+                {
+                    if let (Some(top), Some(bottom)) = (
+                        dict_color(&highlight.rgb, "foreground"),
+                        dict_color(&underlay.rgb, "foreground"),
+                    ) {
+                        rendered.foreground = fallback_color(
+                            premix(top, bottom, cell.blend_percentage),
+                            capabilities.colors,
+                        );
+                    }
+                    if let (Some(top), Some(bottom)) = (
+                        dict_color(&highlight.rgb, "background"),
+                        dict_color(&underlay.rgb, "background"),
+                    ) {
+                        rendered.background = fallback_color(
+                            premix(top, bottom, cell.blend_percentage),
+                            capabilities.colors,
+                        );
                     }
                 }
             }
             rendered
         })
-        .collect::<Vec<_>>();
-    let cursor_row = state.screen.cursor().map(|cursor| cursor.row);
-    let layout = state.chrome.layout(grid.width(), grid.height(), cursor_row);
+        .collect()
+}
+
+fn paint_completion_surfaces(
+    canvas: &mut FrameCanvas<'_>,
+    layout: &chrome::ChromeLayout,
+    state: &TuiState,
+) {
     if let (Some(rect), Some(popup)) = (layout.insert_popup, &state.chrome.insert_popup) {
         paint_completion_menu(
-            &mut cells,
-            grid.width(),
-            grid.height(),
+            canvas.cells,
+            canvas.width,
+            canvas.height,
             rect,
             &popup.items,
             popup.selected,
-            &state.theme,
-            capabilities.colors,
+            canvas.theme,
+            canvas.color_support,
         );
     }
-    if let (Some(rect), Some(popup)) = (layout.documentation, &state.chrome.insert_popup) {
-        if let Some(info) = popup.documentation() {
-            paint_surface(&mut cells, grid.width(), grid.height(), rect, info, &state.theme, HighlightGroup::NormalFloat, capabilities.colors, 1.0);
-        }
+    if let (Some(rect), Some(popup)) = (layout.documentation, &state.chrome.insert_popup)
+        && let Some(info) = popup.documentation()
+    {
+        canvas.paint_surface(rect, info, HighlightGroup::NormalFloat, 1.0);
     }
     if let (Some(rect), Some(cmdline)) = (layout.cmdline, state.chrome.cmdline.active()) {
         let mut text = Vec::new();
@@ -603,30 +708,50 @@ fn render_frame(
         for chunk in &cmdline.content {
             text.extend_from_slice(chunk.text.as_bytes());
         }
-        paint_surface(&mut cells, grid.width(), grid.height(), rect, &text, &state.theme, HighlightGroup::NormalFloat, capabilities.colors, 1.0);
+        canvas.paint_surface(rect, &text, HighlightGroup::NormalFloat, 1.0);
     }
     if let (Some(rect), Some(wildlist)) = (layout.wildlist, &state.chrome.sticky_wildlist) {
-        let text = wildlist.iter().flat_map(|chunk| chunk.text.as_bytes().iter().copied()).collect::<Vec<_>>();
-        paint_surface(&mut cells, grid.width(), grid.height(), rect, &text, &state.theme, HighlightGroup::WildMenu, capabilities.colors, 1.0);
+        let text = wildlist
+            .iter()
+            .flat_map(|chunk| chunk.text.as_bytes().iter().copied())
+            .collect::<Vec<_>>();
+        canvas.paint_surface(rect, &text, HighlightGroup::WildMenu, 1.0);
     }
     if let (Some(rect), Some(wildmenu)) = (layout.wildmenu, &state.chrome.wildmenu) {
         paint_wildmenu_strip(
-            &mut cells,
-            grid.width(),
-            grid.height(),
+            canvas.cells,
+            canvas.width,
+            canvas.height,
             rect,
             &wildmenu.items,
             wildmenu.selected,
-            &state.theme,
-            capabilities.colors,
+            canvas.theme,
+            canvas.color_support,
         );
     }
+}
+
+fn paint_message_surfaces(
+    canvas: &mut FrameCanvas<'_>,
+    layout: &chrome::ChromeLayout,
+    state: &TuiState,
+) {
     if let Some(rect) = layout.messages {
-        paint_message_stack(&mut cells, grid.width(), grid.height(), rect, state, capabilities.colors);
+        paint_message_stack(
+            canvas.cells,
+            canvas.width,
+            canvas.height,
+            rect,
+            state,
+            canvas.color_support,
+        );
     }
     if let (Some(rect), Some(search_count)) = (layout.search_count, &state.chrome.search_count) {
-        let text = search_count.iter().flat_map(|chunk| chunk.text.as_bytes().iter().copied()).collect::<Vec<_>>();
-        paint_surface(&mut cells, grid.width(), grid.height(), rect, &text, &state.theme, HighlightGroup::MsgArea, capabilities.colors, 1.0);
+        let text = search_count
+            .iter()
+            .flat_map(|chunk| chunk.text.as_bytes().iter().copied())
+            .collect::<Vec<_>>();
+        canvas.paint_surface(rect, &text, HighlightGroup::MsgArea, 1.0);
     }
     if let (Some(rect), Some(history)) = (layout.history, &state.chrome.history_float) {
         let mut text = Vec::new();
@@ -636,9 +761,8 @@ fn render_frame(
             }
             text.push(b'\n');
         }
-        paint_surface(&mut cells, grid.width(), grid.height(), rect, &text, &state.theme, HighlightGroup::NormalFloat, capabilities.colors, 1.0);
+        canvas.paint_surface(rect, &text, HighlightGroup::NormalFloat, 1.0);
     }
-    Ok(Frame::new(width, height, cells)?)
 }
 
 /// The three resolved colors a client-owned float paints with.
@@ -660,19 +784,34 @@ fn surface_style(
     let tokens = theme.tokens();
     let surface = theme.style(group);
     let border_style = theme.style(HighlightGroup::FloatBorder);
-    let fade = ((1.0 - opacity.clamp(0.0, 1.0)) * 100.0).round() as u8;
-    let background = premix(surface.background.unwrap_or(tokens.float_bg), tokens.bg, fade);
+    let fade_level = (1.0 - opacity.clamp(0.0, 1.0)) * 100.0;
+    let fade = (0_u8..=100)
+        .find(|level| fade_level < f64::from(*level) + 0.5)
+        .unwrap_or(100);
+    let background = premix(
+        surface.background.unwrap_or(tokens.float_bg),
+        tokens.bg,
+        fade,
+    );
     let (foreground, background_color) = resolve_client_pair(
         premix(surface.foreground.unwrap_or(tokens.fg), tokens.bg, fade),
         background,
         color_support,
     );
     let (border, _) = resolve_client_pair(
-        premix(border_style.foreground.unwrap_or(tokens.accent), tokens.bg, fade),
+        premix(
+            border_style.foreground.unwrap_or(tokens.accent),
+            tokens.bg,
+            fade,
+        ),
         background,
         color_support,
     );
-    SurfaceStyle { foreground, background: background_color, border }
+    SurfaceStyle {
+        foreground,
+        background: background_color,
+        border,
+    }
 }
 
 /// Repaint `count` cells of one row in `style`, as a selection band.
@@ -703,8 +842,8 @@ fn fill_row(
         cell.continuation = false;
         cell.foreground = style.foreground;
         cell.background = style.background;
-        cell.attributes.reverse = reverse;
-        cell.attributes.bold = bold;
+        cell.attributes.emphasis.set_reverse(reverse);
+        cell.attributes.emphasis.set_bold(bold);
     }
 }
 
@@ -753,7 +892,15 @@ fn paint_completion_menu(
         let row = inner_y.saturating_add(index);
         let chosen = selected == Some(index);
         if chosen {
-            fill_row(cells, width, inner_x, row, inner_width, selection, monochrome);
+            fill_row(
+                cells,
+                width,
+                inner_x,
+                row,
+                inner_width,
+                selection,
+                monochrome,
+            );
         }
         let mut column = 0usize;
         for (text, group) in [
@@ -825,7 +972,15 @@ fn paint_wildmenu_strip(
         let chosen = selected == Some(index);
         let style = if chosen { selection } else { base };
         if chosen {
-            fill_row(cells, width, inner_x.saturating_add(column), inner_y, span, selection, monochrome);
+            fill_row(
+                cells,
+                width,
+                inner_x.saturating_add(column),
+                inner_y,
+                span,
+                selection,
+                monochrome,
+            );
         }
         flow_text(
             cells,
@@ -862,7 +1017,11 @@ fn fill_surface(
             cell.continuation = false;
             cell.foreground = style.foreground;
             cell.background = style.background;
-            if y == rect.y || y + 1 == rect.y.saturating_add(rect.height) || x == rect.x || x + 1 == rect.x.saturating_add(rect.width) {
+            if y == rect.y
+                || y + 1 == rect.y.saturating_add(rect.height)
+                || x == rect.x
+                || x + 1 == rect.x.saturating_add(rect.width)
+            {
                 cell.foreground = style.border;
             }
         }
@@ -904,7 +1063,9 @@ fn flow_text(
             x = 0;
             y = y.saturating_add(1);
             last_glyph_x = None;
-            advance = chrome::decoded_cell_width(text, offset, 0).1.min(wrap_width);
+            advance = chrome::decoded_cell_width(text, offset, 0)
+                .1
+                .min(wrap_width);
         }
         if y >= max_rows {
             break;
@@ -912,7 +1073,11 @@ fn flow_text(
         let column = origin_x.saturating_add(x);
         let row = origin_y.saturating_add(y);
         rows = y.saturating_add(1);
-        if let Some(cell) = row.checked_mul(width).and_then(|base| base.checked_add(column)).and_then(|index| cells.get_mut(index)) {
+        if let Some(cell) = row
+            .checked_mul(width)
+            .and_then(|base| base.checked_add(column))
+            .and_then(|index| cells.get_mut(index))
+        {
             if advance > 0 {
                 cell.text = text[offset..offset.saturating_add(consumed)].to_vec();
                 cell.foreground = foreground;
@@ -928,7 +1093,11 @@ fn flow_text(
                 // right half.
                 if advance == 2 {
                     let trailing_column = column.saturating_add(1);
-                    if let Some(trailing) = row.checked_mul(width).and_then(|base| base.checked_add(trailing_column)).and_then(|index| cells.get_mut(index)) {
+                    if let Some(trailing) = row
+                        .checked_mul(width)
+                        .and_then(|base| base.checked_add(trailing_column))
+                        .and_then(|index| cells.get_mut(index))
+                    {
                         trailing.text = Vec::new();
                         trailing.continuation = true;
                         trailing.foreground = foreground;
@@ -939,8 +1108,14 @@ fn flow_text(
                 // Zero-width combining/decorative marks overlay the preceding
                 // glyph, preserving the original byte sequence.
                 let base_column = origin_x.saturating_add(base_x);
-                if let Some(base_cell) = row.checked_mul(width).and_then(|base| base.checked_add(base_column)).and_then(|index| cells.get_mut(index)) {
-                    base_cell.text.extend_from_slice(&text[offset..offset.saturating_add(consumed)]);
+                if let Some(base_cell) = row
+                    .checked_mul(width)
+                    .and_then(|base| base.checked_add(base_column))
+                    .and_then(|index| cells.get_mut(index))
+                {
+                    base_cell
+                        .text
+                        .extend_from_slice(&text[offset..offset.saturating_add(consumed)]);
                     base_cell.continuation = false;
                 }
             }
@@ -951,33 +1126,35 @@ fn flow_text(
     rows
 }
 
-fn paint_surface(
-    cells: &mut [TerminalCell],
+/// Mutable frame cells with the grid dimensions and theme context the
+/// client-surface painters share.
+struct FrameCanvas<'a> {
+    cells: &'a mut [TerminalCell],
     width: usize,
     height: usize,
-    rect: Rect,
-    text: &[u8],
-    theme: &Theme,
-    group: HighlightGroup,
+    theme: &'a Theme,
     color_support: ColorSupport,
-    opacity: f64,
-) {
-    if rect.width == 0 || rect.height == 0 {
-        return;
+}
+
+impl FrameCanvas<'_> {
+    fn paint_surface(&mut self, rect: Rect, text: &[u8], group: HighlightGroup, opacity: f64) {
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        let style = surface_style(self.theme, group, self.color_support, opacity);
+        fill_surface(self.cells, self.width, self.height, rect, style);
+        flow_text(
+            self.cells,
+            self.width,
+            rect.x.saturating_add(1),
+            rect.y.saturating_add(1),
+            rect.width.saturating_sub(2),
+            rect.height.saturating_sub(2),
+            text,
+            style.foreground,
+            style.background,
+        );
     }
-    let style = surface_style(theme, group, color_support, opacity);
-    fill_surface(cells, width, height, rect, style);
-    flow_text(
-        cells,
-        width,
-        rect.x.saturating_add(1),
-        rect.y.saturating_add(1),
-        rect.width.saturating_sub(2),
-        rect.height.saturating_sub(2),
-        text,
-        style.foreground,
-        style.background,
-    );
 }
 
 /// The theme group a diagnostic weight paints its letter with.
@@ -1004,11 +1181,15 @@ fn paint_message_stack(
     state: &TuiState,
     color_support: ColorSupport,
 ) {
-    if rect.width == 0 || rect.height == 0 {
-        return;
-    }
+    const BADGE_WIDTH: usize = 2;
+
     let opacity = state.notification_opacity();
-    let base = surface_style(&state.theme, HighlightGroup::MsgArea, color_support, opacity);
+    let base = surface_style(
+        &state.theme,
+        HighlightGroup::MsgArea,
+        color_support,
+        opacity,
+    );
     fill_surface(cells, width, height, rect, base);
 
     let inner_x = rect.x.saturating_add(1);
@@ -1018,8 +1199,6 @@ fn paint_message_stack(
     // A one-column letter plus one column of separation. Narrow terminals keep
     // the badge and give up message columns instead: the diagnostic weight is
     // the part a clipped message must not lose.
-    const BADGE_WIDTH: usize = 2;
-
     let visible = state.chrome.visible_messages();
     let mut row = 0usize;
     for entry in &visible.entries {
@@ -1098,11 +1277,17 @@ impl SharedWriter {
 
 impl Write for SharedWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().map_err(|_| io::Error::other("terminal writer lock poisoned"))?.write(bytes)
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("terminal writer lock poisoned"))?
+            .write(bytes)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.0.lock().map_err(|_| io::Error::other("terminal writer lock poisoned"))?.flush()
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("terminal writer lock poisoned"))?
+            .flush()
     }
 }
 
@@ -1111,7 +1296,9 @@ fn terminal_environment() -> TerminalEnvironment {
     TerminalEnvironment {
         colorterm: env::var("COLORTERM").ok(),
         terminfo: term.clone(),
-        terminfo_colors: term.as_deref().and_then(|value| value.contains("256color").then_some(256)),
+        terminfo_colors: term
+            .as_deref()
+            .and_then(|value| value.contains("256color").then_some(256)),
         inside_tmux: env::var_os("TMUX").is_some(),
         tmux_passthrough: env::var("TMUX_PASSTHROUGH").is_ok_and(|value| value == "1"),
         term,
@@ -1120,18 +1307,34 @@ fn terminal_environment() -> TerminalEnvironment {
 
 fn process_failure(error: &ClientError) -> ProcessFailure {
     match error {
-        ClientError::Spawn { .. } => ProcessFailure { kind: ProcessFailureKind::Spawn, child_stderr: Vec::new(), exit_code: None },
-        ClientError::Eof { exit_code, stderr } | ClientError::NonZeroExit { exit_code, stderr } => ProcessFailure {
-            kind: ProcessFailureKind::RpcEof,
-            child_stderr: stderr.clone(),
-            exit_code: *exit_code,
+        ClientError::Spawn { .. } => ProcessFailure {
+            kind: ProcessFailureKind::Spawn,
+            child_stderr: Vec::new(),
+            exit_code: None,
         },
-        _ => ProcessFailure { kind: ProcessFailureKind::RpcEof, child_stderr: Vec::new(), exit_code: None },
+        ClientError::Eof { exit_code, stderr } | ClientError::NonZeroExit { exit_code, stderr } => {
+            ProcessFailure {
+                kind: ProcessFailureKind::RpcEof,
+                child_stderr: stderr.clone(),
+                exit_code: *exit_code,
+            }
+        }
+        _ => ProcessFailure {
+            kind: ProcessFailureKind::RpcEof,
+            child_stderr: Vec::new(),
+            exit_code: None,
+        },
     }
 }
 
 fn clean_eof(error: &ClientError) -> bool {
-    matches!(error, ClientError::Eof { exit_code: Some(0), .. })
+    matches!(
+        error,
+        ClientError::Eof {
+            exit_code: Some(0),
+            ..
+        }
+    )
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -1140,7 +1343,11 @@ fn duration_millis(duration: Duration) -> u64 {
 
 fn encode_key(key: KeyEvent) -> Option<String> {
     let key_name = match key.code {
-        KeyCode::Char(character) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => return Some(character.to_string()),
+        KeyCode::Char(character)
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            return Some(character.to_string());
+        }
         KeyCode::Char(character) => character.to_string(),
         KeyCode::Enter => "CR".into(),
         KeyCode::Esc => "Esc".into(),
@@ -1158,12 +1365,27 @@ fn encode_key(key: KeyEvent) -> Option<String> {
         KeyCode::Delete => "Del".into(),
         KeyCode::Insert => "Insert".into(),
         KeyCode::F(number) => format!("F{number}"),
-        KeyCode::Null | KeyCode::CapsLock | KeyCode::ScrollLock | KeyCode::NumLock | KeyCode::PrintScreen | KeyCode::Pause | KeyCode::Menu | KeyCode::KeypadBegin | KeyCode::Media(_) | KeyCode::Modifier(_) => return None,
+        KeyCode::Null
+        | KeyCode::CapsLock
+        | KeyCode::ScrollLock
+        | KeyCode::NumLock
+        | KeyCode::PrintScreen
+        | KeyCode::Pause
+        | KeyCode::Menu
+        | KeyCode::KeypadBegin
+        | KeyCode::Media(_)
+        | KeyCode::Modifier(_) => return None,
     };
     let mut prefix = String::new();
-    if key.modifiers.contains(KeyModifiers::CONTROL) { prefix.push_str("C-"); }
-    if key.modifiers.contains(KeyModifiers::ALT) { prefix.push_str("A-"); }
-    if key.modifiers.contains(KeyModifiers::SHIFT) && !key_name.starts_with("S-") { prefix.push_str("S-"); }
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        prefix.push_str("C-");
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        prefix.push_str("A-");
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT) && !key_name.starts_with("S-") {
+        prefix.push_str("S-");
+    }
     Some(format!("<{prefix}{key_name}>"))
 }
 
@@ -1181,7 +1403,11 @@ fn encode_mouse(event: MouseEvent) -> (String, String, String) {
         MouseEventKind::ScrollLeft => ("wheel", "left"),
         MouseEventKind::ScrollRight => ("wheel", "right"),
     };
-    (button.to_owned(), action.to_owned(), encode_mouse_modifiers(event.modifiers))
+    (
+        button.to_owned(),
+        action.to_owned(),
+        encode_mouse_modifiers(event.modifiers),
+    )
 }
 
 fn mouse_button_name(button: MouseButton) -> &'static str {
@@ -1224,38 +1450,61 @@ fn terminal_highlight_color(dict: &Dict, key: &str, support: ColorSupport) -> Te
                 (value & 0xff) as u8,
             ))
         }
-        ColorSupport::Xterm256 | ColorSupport::Ansi16 => u8::try_from(*value)
-            .ok()
-            .map(|index| TerminalColor::Xterm256(theme::QuantizedColor {
-                index,
-                rgb: theme::xterm_rgb(index),
-            }))
-            .unwrap_or(TerminalColor::Default),
+        ColorSupport::Xterm256 | ColorSupport::Ansi16 => {
+            u8::try_from(*value)
+                .ok()
+                .map_or(TerminalColor::Default, |index| {
+                    TerminalColor::Xterm256(theme::QuantizedColor {
+                        index,
+                        rgb: theme::xterm_rgb(index),
+                    })
+                })
+        }
         ColorSupport::Mono => TerminalColor::Default,
     }
 }
 
 fn highlight_style(dict: &Dict) -> HighlightStyle {
+    let mut attributes = HighlightAttributes::default();
+    if dict_bool(dict, "bold") {
+        attributes.insert(HighlightAttributes::BOLD);
+    }
+    if dict_bool(dict, "italic") {
+        attributes.insert(HighlightAttributes::ITALIC);
+    }
+    if dict_bool(dict, "underline") {
+        attributes.insert(HighlightAttributes::UNDERLINE);
+    }
+    if dict_bool(dict, "undercurl") {
+        attributes.insert(HighlightAttributes::UNDERCURL);
+    }
+    if dict_bool(dict, "reverse") {
+        attributes.insert(HighlightAttributes::REVERSE);
+    }
     HighlightStyle {
         foreground: dict_color(dict, "foreground"),
         background: dict_color(dict, "background"),
         special: dict_color(dict, "special"),
-        bold: dict_bool(dict, "bold"),
-        italic: dict_bool(dict, "italic"),
-        underline: dict_bool(dict, "underline"),
-        undercurl: dict_bool(dict, "undercurl"),
-        reverse: dict_bool(dict, "reverse"),
+        attributes,
     }
 }
 
 fn dict_get<'a>(dict: &'a Dict, key: &str) -> Option<&'a Object> {
-    dict.iter().find(|(candidate, _)| candidate.as_bytes() == key.as_bytes()).map(|(_, value)| value)
+    dict.iter()
+        .find(|(candidate, _)| candidate.as_bytes() == key.as_bytes())
+        .map(|(_, value)| value)
 }
 
 fn dict_color(dict: &Dict, key: &str) -> Option<Rgb> {
-    let Object::Integer(value) = dict_get(dict, key)? else { return None; };
+    let Object::Integer(value) = dict_get(dict, key)? else {
+        return None;
+    };
     let value = u32::try_from(*value).ok()?;
-    Some(Rgb::new(((value >> 16) & 0xff) as u8, ((value >> 8) & 0xff) as u8, (value & 0xff) as u8))
+    Some(Rgb::new(
+        ((value >> 16) & 0xff) as u8,
+        ((value >> 8) & 0xff) as u8,
+        (value & 0xff) as u8,
+    ))
 }
 
 fn dict_bool(dict: &Dict, key: &str) -> bool {
@@ -1263,83 +1512,169 @@ fn dict_bool(dict: &Dict, key: &str) -> bool {
 }
 
 fn require_arity(args: &[Object], expected: usize, event: &str) -> Result<(), TuiError> {
-    if args.len() == expected { Ok(()) } else { Err(TuiError::Protocol(format!("{event} expected {expected} arguments, got {}", args.len()))) }
+    if args.len() == expected {
+        Ok(())
+    } else {
+        Err(TuiError::Protocol(format!(
+            "{event} expected {expected} arguments, got {}",
+            args.len()
+        )))
+    }
 }
 
 fn as_i64(args: &[Object], index: usize, event: &str) -> Result<i64, TuiError> {
-    match args.get(index) { Some(Object::Integer(value)) => Ok(*value), _ => Err(TuiError::Protocol(format!("{event} argument {index} must be an integer"))) }
+    match args.get(index) {
+        Some(Object::Integer(value)) => Ok(*value),
+        _ => Err(TuiError::Protocol(format!(
+            "{event} argument {index} must be an integer"
+        ))),
+    }
 }
 
 fn as_usize(args: &[Object], index: usize, event: &str) -> Result<usize, TuiError> {
-    usize::try_from(as_i64(args, index, event)?).map_err(|_| TuiError::Protocol(format!("{event} argument {index} must be non-negative")))
+    usize::try_from(as_i64(args, index, event)?)
+        .map_err(|_| TuiError::Protocol(format!("{event} argument {index} must be non-negative")))
 }
 
 fn as_u32(args: &[Object], index: usize, event: &str) -> Result<u32, TuiError> {
-    u32::try_from(as_i64(args, index, event)?).map_err(|_| TuiError::Protocol(format!("{event} argument {index} must fit u32")))
+    u32::try_from(as_i64(args, index, event)?)
+        .map_err(|_| TuiError::Protocol(format!("{event} argument {index} must fit u32")))
 }
 
 fn as_bool(args: &[Object], index: usize, event: &str) -> Result<bool, TuiError> {
-    match args.get(index) { Some(Object::Boolean(value)) => Ok(*value), _ => Err(TuiError::Protocol(format!("{event} argument {index} must be a boolean"))) }
+    match args.get(index) {
+        Some(Object::Boolean(value)) => Ok(*value),
+        _ => Err(TuiError::Protocol(format!(
+            "{event} argument {index} must be a boolean"
+        ))),
+    }
 }
 
 fn as_string<'a>(args: &'a [Object], index: usize, event: &str) -> Result<&'a OxStr, TuiError> {
-    args.get(index).ok_or_else(|| TuiError::Protocol(format!("{event} missing argument {index}"))).and_then(|value| object_string(value, event))
+    args.get(index)
+        .ok_or_else(|| TuiError::Protocol(format!("{event} missing argument {index}")))
+        .and_then(|value| object_string(value, event))
 }
 
 fn object_string<'a>(value: &'a Object, event: &str) -> Result<&'a OxStr, TuiError> {
-    match value { Object::String(value) => Ok(value), _ => Err(TuiError::Protocol(format!("{event} must be a string"))) }
+    match value {
+        Object::String(value) => Ok(value),
+        _ => Err(TuiError::Protocol(format!("{event} must be a string"))),
+    }
 }
 
 fn as_chunks(args: &[Object], index: usize, event: &str) -> Result<ChunkLine, TuiError> {
-    let value = args.get(index).ok_or_else(|| TuiError::Protocol(format!("{event} missing argument {index}")))?;
+    let value = args
+        .get(index)
+        .ok_or_else(|| TuiError::Protocol(format!("{event} missing argument {index}")))?;
     chunks_from_object(value, event)
 }
 
 fn chunks_from_object(value: &Object, event: &str) -> Result<ChunkLine, TuiError> {
-    let Object::Array(chunks) = value else { return Err(TuiError::Protocol(format!("{event} chunks must be an array"))); };
-    chunks.iter().map(|chunk| {
-        let Object::Array(fields) = chunk else { return Err(TuiError::Protocol(format!("{event} chunk must be an array"))); };
-        if fields.len() < 2 { return Err(TuiError::Protocol(format!("{event} chunk needs attr and text"))); }
-        let attr = match &fields[0] { Object::Integer(value) => *value, _ => return Err(TuiError::Protocol(format!("{event} chunk attr must be an integer"))) };
-        let text = object_string(&fields[1], event)?;
-        Ok(TextChunk::new(attr, text.as_bytes(), attr))
-    }).collect()
+    let Object::Array(chunks) = value else {
+        return Err(TuiError::Protocol(format!(
+            "{event} chunks must be an array"
+        )));
+    };
+    chunks
+        .iter()
+        .map(|chunk| {
+            let Object::Array(fields) = chunk else {
+                return Err(TuiError::Protocol(format!(
+                    "{event} chunk must be an array"
+                )));
+            };
+            if fields.len() < 2 {
+                return Err(TuiError::Protocol(format!(
+                    "{event} chunk needs attr and text"
+                )));
+            }
+            let attr = match &fields[0] {
+                Object::Integer(value) => *value,
+                _ => {
+                    return Err(TuiError::Protocol(format!(
+                        "{event} chunk attr must be an integer"
+                    )));
+                }
+            };
+            let text = object_string(&fields[1], event)?;
+            Ok(TextChunk::new(attr, text.as_bytes(), attr))
+        })
+        .collect()
 }
 
 fn as_chunk_lines(args: &[Object], index: usize, event: &str) -> Result<Vec<ChunkLine>, TuiError> {
-    let Some(Object::Array(lines)) = args.get(index) else { return Err(TuiError::Protocol(format!("{event} lines must be an array"))); };
-    lines.iter().map(|line| chunks_from_object(line, event)).collect()
+    let Some(Object::Array(lines)) = args.get(index) else {
+        return Err(TuiError::Protocol(format!(
+            "{event} lines must be an array"
+        )));
+    };
+    lines
+        .iter()
+        .map(|line| chunks_from_object(line, event))
+        .collect()
 }
 
 fn as_string_array(args: &[Object], index: usize, event: &str) -> Result<Vec<OxStr>, TuiError> {
-    let Some(Object::Array(items)) = args.get(index) else { return Err(TuiError::Protocol(format!("{event} items must be an array"))); };
-    items.iter().map(|item| object_string(item, event).cloned()).collect()
+    let Some(Object::Array(items)) = args.get(index) else {
+        return Err(TuiError::Protocol(format!(
+            "{event} items must be an array"
+        )));
+    };
+    items
+        .iter()
+        .map(|item| object_string(item, event).cloned())
+        .collect()
 }
 
-fn optional_selection(args: &[Object], index: usize, event: &str) -> Result<Option<usize>, TuiError> {
+fn optional_selection(
+    args: &[Object],
+    index: usize,
+    event: &str,
+) -> Result<Option<usize>, TuiError> {
     let value = as_i64(args, index, event)?;
-    if value < 0 { Ok(None) } else { usize::try_from(value).map(Some).map_err(|_| TuiError::Protocol(format!("{event} selection is too large"))) }
+    if value < 0 {
+        Ok(None)
+    } else {
+        usize::try_from(value)
+            .map(Some)
+            .map_err(|_| TuiError::Protocol(format!("{event} selection is too large")))
+    }
 }
 
 fn as_popup_items(args: &[Object], index: usize, event: &str) -> Result<Vec<PopupItem>, TuiError> {
-    let Some(Object::Array(items)) = args.get(index) else { return Err(TuiError::Protocol(format!("{event} items must be an array"))); };
-    items.iter().map(|item| {
-        let Object::Array(fields) = item else { return Err(TuiError::Protocol(format!("{event} item must be an array"))); };
-        if fields.len() < 4 { return Err(TuiError::Protocol(format!("{event} item needs word, kind, menu, and info"))); }
-        Ok(PopupItem::new(
-            object_string(&fields[0], event)?.as_bytes(),
-            object_string(&fields[1], event)?.as_bytes(),
-            object_string(&fields[2], event)?.as_bytes(),
-            object_string(&fields[3], event)?.as_bytes(),
-        ))
-    }).collect()
+    let Some(Object::Array(items)) = args.get(index) else {
+        return Err(TuiError::Protocol(format!(
+            "{event} items must be an array"
+        )));
+    };
+    items
+        .iter()
+        .map(|item| {
+            let Object::Array(fields) = item else {
+                return Err(TuiError::Protocol(format!("{event} item must be an array")));
+            };
+            if fields.len() < 4 {
+                return Err(TuiError::Protocol(format!(
+                    "{event} item needs word, kind, menu, and info"
+                )));
+            }
+            Ok(PopupItem::new(
+                object_string(&fields[0], event)?.as_bytes(),
+                object_string(&fields[1], event)?.as_bytes(),
+                object_string(&fields[2], event)?.as_bytes(),
+                object_string(&fields[3], event)?.as_bytes(),
+            ))
+        })
+        .collect()
 }
 
 fn premix(top: Rgb, bottom: Rgb, blend_percentage: u8) -> Rgb {
     let underlay = u16::from(blend_percentage.min(100));
-    let foreground = 100u16.saturating_sub(underlay);
+    let foreground = 100_u16.saturating_sub(underlay);
     let channel = |top: u8, bottom: u8| {
-        ((u16::from(top) * foreground + u16::from(bottom) * underlay + 50) / 100) as u8
+        let mixed = (u16::from(top) * foreground + u16::from(bottom) * underlay + 50) / 100;
+        u8::try_from(mixed).unwrap_or(u8::MAX)
     };
     Rgb::new(
         channel(top.r, bottom.r),
@@ -1358,7 +1693,13 @@ fn fallback_color(rgb: Rgb, support: ColorSupport) -> TerminalColor {
         ColorSupport::TrueColor => TerminalColor::Rgb(rgb),
         ColorSupport::Xterm256 => {
             let cube_component = |component: u8| -> u8 {
-                if component < 48 { 0 } else if component < 115 { 1 } else { ((component - 35) / 40).min(5) }
+                if component < 48 {
+                    0
+                } else if component < 115 {
+                    1
+                } else {
+                    ((component - 35) / 40).min(5)
+                }
             };
             let red = cube_component(rgb.r);
             let green = cube_component(rgb.g);
@@ -1373,8 +1714,17 @@ fn fallback_color(rgb: Rgb, support: ColorSupport) -> TerminalColor {
                 let db = i32::from(candidate.b) - i32::from(rgb.b);
                 dr * dr + dg * dg + db * db
             };
-            let index = if distance(theme::xterm_rgb(gray_index)) < distance(theme::xterm_rgb(cube_index)) { gray_index } else { cube_index };
-            TerminalColor::Xterm256(theme::QuantizedColor { index, rgb: theme::xterm_rgb(index) })
+            let index = if distance(theme::xterm_rgb(gray_index))
+                < distance(theme::xterm_rgb(cube_index))
+            {
+                gray_index
+            } else {
+                cube_index
+            };
+            TerminalColor::Xterm256(theme::QuantizedColor {
+                index,
+                rgb: theme::xterm_rgb(index),
+            })
         }
         // A sixteen-color terminal must be sent one of its sixteen colors:
         // an xterm-256 index there is either out of range or wrong.
@@ -1397,16 +1747,21 @@ fn resolve_client_pair(
     support: ColorSupport,
 ) -> (TerminalColor, TerminalColor) {
     match support {
-        ColorSupport::TrueColor => (TerminalColor::Rgb(foreground), TerminalColor::Rgb(background)),
+        ColorSupport::TrueColor => (
+            TerminalColor::Rgb(foreground),
+            TerminalColor::Rgb(background),
+        ),
         ColorSupport::Xterm256 => {
             let surface = background.quantize_xterm();
             let text = theme::quantize_text(foreground, &[surface.rgb], theme::TEXT_CONTRAST_FLOOR);
-            (TerminalColor::Xterm256(text), TerminalColor::Xterm256(surface))
+            (
+                TerminalColor::Xterm256(text),
+                TerminalColor::Xterm256(surface),
+            )
         }
         ColorSupport::Ansi16 => {
             let surface = theme::nearest_ansi16(background);
-            let text =
-                theme::quantize_ansi16_text(foreground, surface, theme::TEXT_CONTRAST_FLOOR);
+            let text = theme::quantize_ansi16_text(foreground, surface, theme::TEXT_CONTRAST_FLOOR);
             (TerminalColor::Ansi16(text), TerminalColor::Ansi16(surface))
         }
         ColorSupport::Mono => (TerminalColor::Default, TerminalColor::Default),
@@ -1418,13 +1773,19 @@ mod tests {
     #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
     use super::*;
+    use crate::terminal::TerminalFeatures;
     use crate::theme::ThemeTokens;
 
     #[test]
     fn reduced_motion_is_instant_and_full_is_bounded() {
-        assert_eq!(MotionPolicy::Reduced.notification_opacity(0), 1.0);
-        assert_eq!(MotionPolicy::Full.notification_opacity(150), 1.0);
-        assert!(MotionPolicy::Full.notification_opacity(0) < MotionPolicy::Full.notification_opacity(75));
+        const TOLERANCE: f64 = f64::EPSILON;
+
+        assert!((MotionPolicy::Reduced.notification_opacity(0) - 1.0).abs() <= TOLERANCE);
+        assert!((MotionPolicy::Full.notification_opacity(150) - 1.0).abs() <= TOLERANCE);
+        assert!(
+            MotionPolicy::Full.notification_opacity(0)
+                < MotionPolicy::Full.notification_opacity(75)
+        );
     }
 
     #[test]
@@ -1438,7 +1799,11 @@ mod tests {
         let events = vec![
             RedrawEvent {
                 name: OxStr::from("grid_resize"),
-                argsets: vec![vec![Object::Integer(1), Object::Integer(2), Object::Integer(1)]],
+                argsets: vec![vec![
+                    Object::Integer(1),
+                    Object::Integer(2),
+                    Object::Integer(1),
+                ]],
             },
             RedrawEvent {
                 name: OxStr::from("hl_attr_define"),
@@ -1467,25 +1832,81 @@ mod tests {
         let grid = state.screen.composed_grid().unwrap();
         let capabilities = TerminalCapabilities {
             colors: ColorSupport::TrueColor,
-            kitty_keyboard: false,
-            synchronized_output: false,
-            undercurl: false,
-            colored_underline: false,
-            osc52_clipboard: false,
+            features: TerminalFeatures::default(),
             palette: terminal::PaletteDecision::Direct,
         };
         let frame = render_frame(&grid, &state, capabilities).unwrap();
         assert_eq!(frame.cells()[0].text, vec![0xff]);
-        assert_eq!(frame.cells()[0].foreground, TerminalColor::Rgb(Rgb::new(0x11, 0x22, 0x33)));
-        assert!(frame.cells()[0].attributes.bold);
+        assert_eq!(
+            frame.cells()[0].foreground,
+            TerminalColor::Rgb(Rgb::new(0x11, 0x22, 0x33))
+        );
+        assert!(frame.cells()[0].attributes.emphasis.bold());
         assert!(frame.cells()[1].continuation);
     }
 
     #[test]
     fn typed_not_implemented_rejects_unknown_events() {
         let mut state = TuiState::default();
-        let result = state.apply_redraw(&[RedrawEvent { name: OxStr::from("future_event"), argsets: vec![vec![]] }], TimeMs(0));
+        let result = state.apply_redraw(
+            &[RedrawEvent {
+                name: OxStr::from("future_event"),
+                argsets: vec![vec![]],
+            }],
+            TimeMs(0),
+        );
         assert!(matches!(result, Err(TuiError::NotImplemented(_))));
+    }
+
+    #[test]
+    fn chdir_tracks_client_directory_without_changing_process_cwd() {
+        let mut state = TuiState::default();
+        blank_grid(&mut state, 2, 1);
+        let screen_before = state.render_to_string().unwrap();
+        let message_count_before = state.chrome.messages.len();
+        let process_cwd_before = std::env::current_dir().unwrap();
+
+        state
+            .apply_redraw(
+                &[RedrawEvent {
+                    name: OxStr::from("chdir"),
+                    argsets: vec![
+                        vec![Object::String(OxStr::from("/first"))],
+                        vec![Object::String(OxStr::from("/second"))],
+                    ],
+                }],
+                TimeMs(1),
+            )
+            .unwrap();
+
+        assert_eq!(state.client_working_directory, Some(OxStr::from("/second")));
+        assert_eq!(state.render_to_string().unwrap(), screen_before);
+        assert_eq!(state.chrome.messages.len(), message_count_before);
+        assert_eq!(std::env::current_dir().unwrap(), process_cwd_before);
+    }
+
+    #[test]
+    fn malformed_chdir_is_a_protocol_error() {
+        let mut state = TuiState::default();
+        let apply = |state: &mut TuiState, args| {
+            state.apply_redraw(
+                &[RedrawEvent {
+                    name: OxStr::from("chdir"),
+                    argsets: vec![args],
+                }],
+                TimeMs(0),
+            )
+        };
+
+        assert!(matches!(
+            apply(&mut state, Vec::new()),
+            Err(TuiError::Protocol(message))
+                if message == "chdir expected 1 arguments, got 0"
+        ));
+        assert!(matches!(
+            apply(&mut state, vec![Object::Integer(1)]),
+            Err(TuiError::Protocol(message)) if message == "chdir must be a string"
+        ));
     }
 
     #[test]
@@ -1496,7 +1917,10 @@ mod tests {
             argsets: vec![args],
         };
         let batch = vec![
-            event("option_set", vec![Object::String(OxStr::from("title")), Object::Boolean(false)]),
+            event(
+                "option_set",
+                vec![Object::String(OxStr::from("title")), Object::Boolean(false)],
+            ),
             event(
                 "default_colors_set",
                 vec![
@@ -1527,35 +1951,50 @@ mod tests {
             row: 4,
             modifiers: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         };
-        assert_eq!(encode_mouse(down), ("left".into(), "press".into(), "CS".into()));
+        assert_eq!(
+            encode_mouse(down),
+            ("left".into(), "press".into(), "CS".into())
+        );
         let up = MouseEvent {
             kind: MouseEventKind::Up(MouseButton::Right),
             column: 0,
             row: 0,
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(encode_mouse(up), ("right".into(), "release".into(), String::new()));
+        assert_eq!(
+            encode_mouse(up),
+            ("right".into(), "release".into(), String::new())
+        );
         let scrolled = MouseEvent {
             kind: MouseEventKind::ScrollDown,
             column: 0,
             row: 0,
             modifiers: KeyModifiers::ALT,
         };
-        assert_eq!(encode_mouse(scrolled), ("wheel".into(), "down".into(), "A".into()));
+        assert_eq!(
+            encode_mouse(scrolled),
+            ("wheel".into(), "down".into(), "A".into())
+        );
         let drag = MouseEvent {
             kind: MouseEventKind::Drag(MouseButton::Middle),
             column: 0,
             row: 0,
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(encode_mouse(drag), ("middle".into(), "drag".into(), String::new()));
+        assert_eq!(
+            encode_mouse(drag),
+            ("middle".into(), "drag".into(), String::new())
+        );
         let moved = MouseEvent {
             kind: MouseEventKind::Moved,
             column: 0,
             row: 0,
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(encode_mouse(moved), ("move".into(), "move".into(), String::new()));
+        assert_eq!(
+            encode_mouse(moved),
+            ("move".into(), "move".into(), String::new())
+        );
     }
 
     #[test]
@@ -1564,23 +2003,25 @@ mod tests {
         let height = 3usize;
         let mut cells = vec![TerminalCell::default(); width * height];
         let theme = Theme::new(None);
-        let rect = Rect { x: 0, y: 0, width, height };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
         let mut text: Vec<u8> = Vec::new();
         text.push(b'a');
         text.extend_from_slice("界".as_bytes());
         text.extend_from_slice("\u{301}".as_bytes());
         text.push(0xff);
-        paint_surface(
-            &mut cells,
+        let mut canvas = FrameCanvas {
+            cells: &mut cells,
             width,
             height,
-            rect,
-            &text,
-            &theme,
-            HighlightGroup::NormalFloat,
-            ColorSupport::TrueColor,
-            1.0,
-        );
+            theme: &theme,
+            color_support: ColorSupport::TrueColor,
+        };
+        canvas.paint_surface(rect, &text, HighlightGroup::NormalFloat, 1.0);
         let cell_text = |row: usize, column: usize| cells[row * width + column].text.clone();
         assert_eq!(cell_text(1, 1), b"a");
         assert_eq!(cell_text(1, 2), b"\xe7\x95\x8c\xcc\x81");
@@ -1600,23 +2041,25 @@ mod tests {
         let height = 3usize;
         let mut cells = vec![TerminalCell::default(); width * height];
         let theme = Theme::new(None);
-        let rect = Rect { x: 0, y: 0, width, height };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
         let mut text: Vec<u8> = Vec::new();
         text.extend_from_slice("界".as_bytes());
         text.push(b'x');
         text.extend_from_slice("\u{301}".as_bytes());
         text.push(b'y');
-        paint_surface(
-            &mut cells,
+        let mut canvas = FrameCanvas {
+            cells: &mut cells,
             width,
             height,
-            rect,
-            &text,
-            &theme,
-            HighlightGroup::NormalFloat,
-            ColorSupport::TrueColor,
-            1.0,
-        );
+            theme: &theme,
+            color_support: ColorSupport::TrueColor,
+        };
+        canvas.paint_surface(rect, &text, HighlightGroup::NormalFloat, 1.0);
         let cell_text = |row: usize, column: usize| cells[row * width + column].text.clone();
         // 界 at inner col 0 (2 wide), x lands on inner col 2, y lands on col 3.
         assert_eq!(cell_text(1, 1), "界".as_bytes());
@@ -1626,62 +2069,64 @@ mod tests {
 
     #[test]
     fn surface_overwrite_clears_stale_continuations() {
-        // render_frame turns empty grid cells into continuation cells before
-        // paint_surface draws chrome over them. Painting over such a cell must
-        // clear the continuation marker, or the damage writer would skip the
-        // repaint and leave stale background behind.
-        let width = 6usize;
-        let height = 3usize;
+        // render_frame turns empty input grid cells into continuation markers;
+        // damage_writer would skip them. A client-surface repaint must replace
+        // them and leave no stale background behind.
+        let width = 6_usize;
+        let height = 3_usize;
         let mut cells = vec![TerminalCell::default(); width * height];
         cells[width + 2] = TerminalCell::continuation();
         cells[width + 4] = TerminalCell::continuation();
         let theme = Theme::new(None);
-        let rect = Rect { x: 0, y: 0, width, height };
-        paint_surface(
-            &mut cells,
+        let rect = Rect {
+            x: 0,
+            y: 0,
             width,
             height,
-            rect,
-            b"ab",
-            &theme,
-            HighlightGroup::NormalFloat,
-            ColorSupport::TrueColor,
-            1.0,
-        );
-        // "ab" paints inner columns 0..2 -> absolute columns 1..2; the former
+        };
+        let mut canvas = FrameCanvas {
+            cells: &mut cells,
+            width,
+            height,
+            theme: &theme,
+            color_support: ColorSupport::TrueColor,
+        };
+        canvas.paint_surface(rect, b"ab", HighlightGroup::NormalFloat, 1.0);
+        // "ab" paints inner columns 0..2 -> absolute columns 1..3; the former
         // continuation at absolute column 2 is now a real glyph.
-        let cell2 = &cells[width + 2];
-        assert_eq!(cell2.text, b"b");
-        assert!(!cell2.continuation);
+        let third_column = &cells[width + 2];
+        assert_eq!(third_column.text, b"b");
+        assert!(!third_column.continuation);
         // Absolute column 4 is cleared by the rect wipe (no glyph there): its
-        // continuation marker is dropped so it repaints as background space.
-        let cell4 = &cells[width + 4];
-        assert_eq!(cell4.text, b" ");
-        assert!(!cell4.continuation);
+        // continuation marker is dropped so it repaints as a background space.
+        let fifth_column = &cells[width + 4];
+        assert_eq!(fifth_column.text, b" ");
+        assert!(!fifth_column.continuation);
     }
 
     #[test]
     fn mouse_on_off_drives_capture_state() {
         let mut state = TuiState::default();
-        let event = |name: &str| RedrawEvent { name: OxStr::from(name), argsets: vec![vec![]] };
+        let event = |name: &str| RedrawEvent {
+            name: OxStr::from(name),
+            argsets: vec![vec![]],
+        };
         assert!(!state.mouse_capture);
         state.apply_redraw(&[event("mouse_on")], TimeMs(0)).unwrap();
         assert!(state.mouse_capture);
         // A repeated mouse_on keeps capture enabled.
         state.apply_redraw(&[event("mouse_on")], TimeMs(0)).unwrap();
         assert!(state.mouse_capture);
-        state.apply_redraw(&[event("mouse_off")], TimeMs(0)).unwrap();
+        state
+            .apply_redraw(&[event("mouse_off")], TimeMs(0))
+            .unwrap();
         assert!(!state.mouse_capture);
     }
 
     fn truecolor_capabilities() -> TerminalCapabilities {
         TerminalCapabilities {
             colors: ColorSupport::TrueColor,
-            kitty_keyboard: false,
-            synchronized_output: false,
-            undercurl: false,
-            colored_underline: false,
-            osc52_clipboard: false,
+            features: TerminalFeatures::default(),
             palette: terminal::PaletteDecision::Direct,
         }
     }
@@ -1710,11 +2155,8 @@ mod tests {
             .message_show(MessageUpdate {
                 kind: OxStr::from(kind),
                 content: vec![TextChunk::new(0, text, -1)],
-                replace_last: false,
-                history: false,
-                append: false,
+                flags: MessageFlags::default(),
                 id: Object::Nil,
-                prompt: false,
             })
             .unwrap();
     }
@@ -1748,7 +2190,14 @@ mod tests {
             MessageSeverity::from_kind(&OxStr::from("wmsg")),
             MessageSeverity::Warning
         );
-        for kind in ["echo", "echomsg", "shell_out", "confirm", "", "kind_from_the_future"] {
+        for kind in [
+            "echo",
+            "echomsg",
+            "shell_out",
+            "confirm",
+            "",
+            "kind_from_the_future",
+        ] {
             assert_eq!(
                 MessageSeverity::from_kind(&OxStr::from(kind)),
                 MessageSeverity::Plain,
@@ -1778,10 +2227,29 @@ mod tests {
 
         let grid = state.screen.composed_grid().unwrap();
         let frame = render_frame(&grid, &state, truecolor_capabilities()).unwrap();
-        let rect = state.chrome.layout(40, 10, None).messages.expect("message stack");
-        let plain = surface_style(&state.theme, HighlightGroup::MsgArea, ColorSupport::TrueColor, 1.0);
-        let error = surface_style(&state.theme, HighlightGroup::ErrorMsg, ColorSupport::TrueColor, 1.0);
-        let warning = surface_style(&state.theme, HighlightGroup::WarningMsg, ColorSupport::TrueColor, 1.0);
+        let rect = state
+            .chrome
+            .layout(40, 10, None)
+            .messages
+            .expect("message stack");
+        let plain = surface_style(
+            &state.theme,
+            HighlightGroup::MsgArea,
+            ColorSupport::TrueColor,
+            1.0,
+        );
+        let error = surface_style(
+            &state.theme,
+            HighlightGroup::ErrorMsg,
+            ColorSupport::TrueColor,
+            1.0,
+        );
+        let warning = surface_style(
+            &state.theme,
+            HighlightGroup::WarningMsg,
+            ColorSupport::TrueColor,
+            1.0,
+        );
 
         let badge_column = rect.x + 1;
         let text_column = badge_column + 2;
@@ -1808,7 +2276,10 @@ mod tests {
 
         // A message with no diagnostic weight spends no columns on a badge.
         let (glyphs, colors) = row_of(&frame, rect.y + 3);
-        assert!(glyphs[badge_column..].starts_with("written"), "got {glyphs:?}");
+        assert!(
+            glyphs[badge_column..].starts_with("written"),
+            "got {glyphs:?}"
+        );
         assert_eq!(colors[badge_column], plain.foreground);
     }
 
@@ -1824,8 +2295,7 @@ mod tests {
             TerminalColor::Xterm256(quantized) => quantized.rgb,
             other => panic!("expected an xterm-256 color, got {other:?}"),
         };
-        let unguarded =
-            independent(tokens.fg_muted).contrast(independent(tokens.float_bg));
+        let unguarded = independent(tokens.fg_muted).contrast(independent(tokens.float_bg));
         assert!(
             unguarded < theme::TEXT_CONTRAST_FLOOR,
             "independent quantization is {unguarded:.2}, so the floor guards nothing"
@@ -1839,7 +2309,10 @@ mod tests {
             panic!("client chrome must resolve to xterm-256 colors");
         };
         let guarded = text.rgb.contrast(surface.rgb);
-        assert!(guarded >= theme::TEXT_CONTRAST_FLOOR, "floored pair is {guarded:.2}");
+        assert!(
+            guarded >= theme::TEXT_CONTRAST_FLOOR,
+            "floored pair is {guarded:.2}"
+        );
     }
 
     /// A sixteen-color terminal must receive one of its sixteen colors: an

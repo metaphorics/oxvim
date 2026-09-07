@@ -4,15 +4,21 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::rc::Rc;
 
-use mlua::{Lua, Table, Value};
-use ox_types::{Funcref, OxStr, Special, Typval};
+use mlua::{FromLua, Lua, Table, Value};
+use ox_types::{DictEntry, Funcref, OxStr, Special, Typval};
 
 use crate::converter::{
-    has_empty_dict_metatable, is_vim_nil, lua_to_object, object_to_lua, ConversionError,
-    CONVERSION_RECURSION_LIMIT,
+    CONVERSION_RECURSION_LIMIT, ConversionError, has_empty_dict_metatable, i64_to_f64, is_vim_nil,
+    lua_to_object, object_to_lua, object_to_lua_not_special, u64_to_f64,
 };
 
 /// Convert a Vimscript value to the representation used by the Lua executor.
+///
+/// # Errors
+///
+/// Returns an error when the nesting limit is exceeded, a container is
+/// mutably borrowed elsewhere, a Lua registry reference is out of range, or
+/// Lua rejects a required operation.
 pub fn typval_to_lua(lua: &Lua, value: &Typval) -> Result<Value, ConversionError> {
     typval_to_lua_inner(lua, value, 0, &mut HashMap::new())
 }
@@ -24,17 +30,19 @@ fn typval_to_lua_inner(
     containers: &mut HashMap<(*const c_void, u8), Table>,
 ) -> Result<Value, ConversionError> {
     if depth > CONVERSION_RECURSION_LIMIT {
-        return Err(ConversionError::RecursionLimit { limit: CONVERSION_RECURSION_LIMIT });
+        return Err(ConversionError::RecursionLimit {
+            limit: CONVERSION_RECURSION_LIMIT,
+        });
     }
 
     Ok(match value {
-        Typval::Number(value) => Value::Number(*value as f64),
+        Typval::Number(value) => Value::Number(i64_to_f64(*value)),
         Typval::Float(value) => Value::Number(*value),
         Typval::String(value) => Value::String(lua.create_string(value.as_bytes())?),
         Typval::Blob(value) => Value::String(lua.create_string(value)?),
         Typval::Bool(value) => Value::Boolean(*value),
-        Typval::Special(Special::Null) => object_to_lua(lua, &ox_types::Object::Nil)?,
-        Typval::Channel(value) | Typval::Job(value) => Value::Number(*value as f64),
+        Typval::Special(Special::Null) => object_to_lua_not_special(lua, &ox_types::Object::Nil)?,
+        Typval::Channel(value) | Typval::Job(value) => Value::Number(u64_to_f64(*value)),
         Typval::List(list) => {
             let key = (Rc::as_ptr(list).cast::<c_void>(), ox_types::VAR_LIST);
             if let Some(table) = containers.get(&key) {
@@ -69,17 +77,19 @@ fn typval_to_lua_inner(
                 let Value::Table(table) =
                     object_to_lua(lua, &ox_types::Object::Dict(ox_types::Dict(Vec::new())))?
                 else {
-                    return Err(ConversionError::UnsupportedType("empty Vimscript Dictionary"));
+                    return Err(ConversionError::UnsupportedType(
+                        "empty Vimscript Dictionary",
+                    ));
                 };
                 table
             } else {
                 lua.create_table_with_capacity(0, entries.len())?
             };
             containers.insert(key, table.clone());
-            for (name, item) in &entries {
+            for entry in &entries {
                 table.raw_set(
-                    lua.create_string(name.as_bytes())?,
-                    typval_to_lua_inner(lua, item, depth + 1, containers)?,
+                    lua.create_string(entry.key.as_bytes())?,
+                    typval_to_lua_inner(lua, &entry.value, depth + 1, containers)?,
                 )?;
             }
             Value::Table(table)
@@ -96,6 +106,12 @@ fn typval_to_lua_inner(
     })
 }
 /// Convert a Lua executor value to a Vimscript [`Typval`].
+///
+/// # Errors
+///
+/// Returns an error when a table mixes integer and string keys or cannot
+/// represent a List or Dictionary, the nesting limit is exceeded, a container
+/// is mutably borrowed elsewhere, or Lua rejects a required operation.
 pub fn lua_to_typval(lua: &Lua, value: &Value) -> Result<Typval, ConversionError> {
     lua_to_typval_inner(lua, value, 0, &mut HashMap::new())
 }
@@ -114,13 +130,14 @@ pub fn collect_typval_refs(value: &Typval, out: &mut Vec<i32>) {
             .borrow()
             .entries
             .iter()
-            .for_each(|(_, item)| collect_typval_refs(item, out)),
+            .for_each(|entry| collect_typval_refs(&entry.value, out)),
         Typval::Funcref(funcref) | Typval::Partial(funcref) => {
-            funcref.args.iter().for_each(|arg| collect_typval_refs(arg, out));
-            if let Some(reference) = funcref.registry {
-                if let Ok(reference) = i32::try_from(reference) {
-                    out.push(reference);
-                }
+            funcref
+                .args
+                .iter()
+                .for_each(|arg| collect_typval_refs(arg, out));
+            if let Some(Ok(reference)) = funcref.registry.map(i32::try_from) {
+                out.push(reference);
             }
         }
         _ => {}
@@ -134,7 +151,6 @@ pub fn free_typval_refs(lua: &Lua, refs: &[i32]) {
     }
 }
 
-
 fn lua_to_typval_inner(
     lua: &Lua,
     value: &Value,
@@ -142,7 +158,9 @@ fn lua_to_typval_inner(
     containers: &mut HashMap<*const c_void, Typval>,
 ) -> Result<Typval, ConversionError> {
     if depth > CONVERSION_RECURSION_LIMIT {
-        return Err(ConversionError::RecursionLimit { limit: CONVERSION_RECURSION_LIMIT });
+        return Err(ConversionError::RecursionLimit {
+            limit: CONVERSION_RECURSION_LIMIT,
+        });
     }
 
     match value {
@@ -150,11 +168,13 @@ fn lua_to_typval_inner(
         Value::Boolean(value) => Ok(Typval::Bool(*value)),
         Value::Integer(value) => Ok(Typval::Number(*value)),
         Value::Number(value) => {
-            if *value >= i64::MAX as f64 || *value < i64::MIN as f64 {
+            let Ok(integer) = i64::from_lua(Value::Number(*value), lua) else {
                 return Ok(Typval::Float(*value));
-            }
-            let integer = *value as i64;
-            if (integer as f64) == *value {
+            };
+            let integer_as_number = i64_to_f64(integer);
+            if integer_as_number.to_bits() == value.to_bits()
+                || (integer == 0 && value.to_bits() == (-0.0_f64).to_bits())
+            {
                 Ok(Typval::Number(integer))
             } else {
                 Ok(Typval::Float(*value))
@@ -166,16 +186,17 @@ fn lua_to_typval_inner(
             let ox_types::Object::LuaRef(reference) = lua_to_object(lua, value)? else {
                 return Err(ConversionError::UnsupportedType("function"));
             };
+            let Ok(registry) = usize::try_from(reference) else {
+                return Err(ConversionError::MissingLuaRef(i32::MAX));
+            };
             Ok(Typval::Funcref(Funcref {
                 name: OxStr::from(""),
                 args: Vec::new(),
                 dict: None,
-                registry: Some(reference as usize),
+                registry: Some(registry),
             }))
         }
-        Value::UserData(_) if is_vim_nil(lua, value)? => {
-            Ok(Typval::Special(Special::Null))
-        }
+        Value::UserData(_) if is_vim_nil(lua, value)? => Ok(Typval::Special(Special::Null)),
         other => Err(ConversionError::UnsupportedType(other.type_name())),
     }
 }
@@ -196,11 +217,23 @@ fn table_to_typval(
     for pair in table.clone().pairs::<Value, Value>() {
         let (key, value) = pair?;
         match key {
-            Value::Integer(index) if index > 0 => numeric.push((index as usize, value)),
-            Value::Number(index)
-                if index > 0.0 && index <= usize::MAX as f64 && index.trunc() == index =>
-            {
-                numeric.push((index as usize, value));
+            Value::Integer(index) if index > 0 => {
+                let Ok(index) = usize::try_from(index) else {
+                    return Err(ConversionError::InvalidTable);
+                };
+                numeric.push((index, value));
+            }
+            Value::Number(index) => {
+                let Ok(integer) = usize::from_lua(Value::Number(index), lua) else {
+                    return Err(ConversionError::InvalidTable);
+                };
+                let Ok(integer_u64) = u64::try_from(integer) else {
+                    return Err(ConversionError::InvalidTable);
+                };
+                if integer == 0 || u64_to_f64(integer_u64).to_bits() != index.to_bits() {
+                    return Err(ConversionError::InvalidTable);
+                }
+                numeric.push((integer, value));
             }
             Value::String(name) => strings.push((OxStr(name.as_bytes().to_vec()), value)),
             _ => return Err(ConversionError::InvalidTable),
@@ -210,9 +243,7 @@ fn table_to_typval(
         return Err(ConversionError::InvalidTable);
     }
 
-    if strings.is_empty()
-        && (!numeric.is_empty() || !has_empty_dict_metatable(lua, table)?)
-    {
+    if strings.is_empty() && (!numeric.is_empty() || !has_empty_dict_metatable(lua, table)?) {
         numeric.sort_unstable_by_key(|(index, _)| *index);
         let length = numeric.last().map_or(0, |(index, _)| *index);
         let result = Typval::list(Vec::new());
@@ -234,7 +265,10 @@ fn table_to_typval(
     containers.insert(pointer, result.clone());
     let mut entries = Vec::with_capacity(strings.len());
     for (name, value) in strings {
-        entries.push((name, lua_to_typval_inner(lua, &value, depth + 1, containers)?));
+        entries.push(DictEntry::new(
+            name,
+            lua_to_typval_inner(lua, &value, depth + 1, containers)?,
+        ));
     }
     let Typval::Dict(dict) = &result else {
         return Err(ConversionError::UnsupportedType("Vimscript Dictionary"));

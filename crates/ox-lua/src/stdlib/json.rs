@@ -34,7 +34,9 @@ pub(super) fn install(lua: &Lua, vim: &Table) -> mlua::Result<()> {
                 let formatter = serde_json::ser::PrettyFormatter::with_indent(&options.indent);
                 let mut output = Vec::new();
                 let mut serializer = serde_json::Serializer::with_formatter(&mut output, formatter);
-                value.serialize(&mut serializer).map_err(mlua::Error::external)?;
+                value
+                    .serialize(&mut serializer)
+                    .map_err(mlua::Error::external)?;
                 output
             };
             if options.escape_slash {
@@ -62,16 +64,24 @@ pub(super) fn install(lua: &Lua, vim: &Table) -> mlua::Result<()> {
 
 fn parse_encode_options(options: Option<Table>) -> mlua::Result<EncodeOptions> {
     let Some(options) = options else {
-        return Ok(EncodeOptions { escape_slash: false, indent: Vec::new(), sort_keys: false });
+        return Ok(EncodeOptions {
+            escape_slash: false,
+            indent: Vec::new(),
+            sort_keys: false,
+        });
     };
     let indent = options
         .get::<Option<LuaString>>("indent")?
         .map_or_else(Vec::new, |value| value.as_bytes().to_vec());
     if indent.iter().any(|byte| !matches!(byte, b' ' | b'\t')) {
-        return Err(mlua::Error::runtime("JSON indent must contain only spaces or tabs"));
+        return Err(mlua::Error::runtime(
+            "JSON indent must contain only spaces or tabs",
+        ));
     }
     Ok(EncodeOptions {
-        escape_slash: options.get::<Option<bool>>("escape_slash")?.unwrap_or(false),
+        escape_slash: options
+            .get::<Option<bool>>("escape_slash")?
+            .unwrap_or(false),
         indent,
         sort_keys: options.get::<Option<bool>>("sort_keys")?.unwrap_or(false),
     })
@@ -89,7 +99,12 @@ fn parse_decode_options(options: Option<Table>) -> mlua::Result<(LuaNilOptions, 
         },
         _ => return Err(mlua::Error::runtime("luanil must be a table")),
     };
-    Ok((luanil, options.get::<Option<bool>>("skip_comments")?.unwrap_or(false)))
+    Ok((
+        luanil,
+        options
+            .get::<Option<bool>>("skip_comments")?
+            .unwrap_or(false),
+    ))
 }
 
 fn lua_to_json(
@@ -124,7 +139,7 @@ fn lua_to_json(
             return Err(mlua::Error::runtime(format!(
                 "cannot encode {} as JSON",
                 other.type_name()
-            )))
+            )));
         }
     })
 }
@@ -138,7 +153,9 @@ fn table_to_json(
 ) -> mlua::Result<JsonValue> {
     let pointer = table.to_pointer() as usize;
     if !active.insert(pointer) {
-        return Err(mlua::Error::runtime("cannot encode recursive table as JSON"));
+        return Err(mlua::Error::runtime(
+            "cannot encode recursive table as JSON",
+        ));
     }
     let mut entries = Vec::new();
     let mut max_index = 0usize;
@@ -147,7 +164,10 @@ fn table_to_json(
         let (key, value) = pair?;
         match key {
             Value::Integer(index) if index > 0 => {
-                max_index = max_index.max(index as usize);
+                let array_index = usize::try_from(index).map_err(|_| {
+                    mlua::Error::runtime("JSON array index exceeds platform limits")
+                })?;
+                max_index = max_index.max(array_index);
                 entries.push((Value::Integer(index), value));
             }
             key => {
@@ -166,7 +186,9 @@ fn table_to_json(
             let Value::Integer(index) = key else {
                 continue;
             };
-            values[*index as usize - 1] = lua_to_json(lua, value, depth + 1, active, sort_keys)?;
+            let index = usize::try_from(*index)
+                .map_err(|_| mlua::Error::runtime("JSON array index exceeds platform limits"))?;
+            values[index - 1] = lua_to_json(lua, value, depth + 1, active, sort_keys)?;
         }
         JsonValue::Array(values)
     } else {
@@ -227,8 +249,8 @@ fn json_to_lua(
         JsonValue::Number(value) => {
             if let Some(value) = value.as_i64() {
                 Ok(Value::Integer(value))
-            } else if let Some(value) = value.as_u64().filter(|value| *value <= i64::MAX as u64) {
-                Ok(Value::Integer(value as i64))
+            } else if let Some(value) = value.as_u64().and_then(|value| i64::try_from(value).ok()) {
+                Ok(Value::Integer(value))
             } else {
                 value
                     .as_f64()

@@ -11,10 +11,21 @@ ox-sys = { path = "../ox-sys" }
 ox-text = { path = "../ox-text" }
 ox-excmd = { path = "../ox-excmd" }
 ox-eval = { path = "../ox-eval" }
+similar = { workspace = true }
 ox-regex = { path = "../ox-regex" }
+ox-rpc = { path = "../ox-rpc" }
+rmpv.workspace = true
 ox-uv = { path = "../ox-uv" }
 thiserror.workspace = true
 unicode-width = "0.2.2"
 
+[features]
+testutils = []
+
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Self dev-dependency: turns on `testutils` for integration tests so they can
+# construct TestEditorAccess without shipping the accessor in production.
+ox-editor = { path = ".", features = ["testutils"] }

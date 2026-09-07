@@ -45,13 +45,47 @@ impl Keys {
         Self(encoded)
     }
 
+    /// Quotes a trailing literal [`K_SPECIAL`] while preserving complete
+    /// three-byte internal key codes.
+    #[must_use]
+    pub fn escape_ks(bytes: &[u8]) -> Self {
+        let mut escaped = Vec::with_capacity(bytes.len().saturating_add(2));
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if bytes[offset] != K_SPECIAL {
+                escaped.push(bytes[offset]);
+                offset += 1;
+                continue;
+            }
+            if bytes.len() - offset >= 3 {
+                escaped.extend_from_slice(&bytes[offset..offset + 3]);
+                offset += 3;
+                continue;
+            }
+            escaped.extend_from_slice(&[K_SPECIAL, KS_SPECIAL, KE_FILLER]);
+            offset += 1;
+        }
+        Self(escaped)
+    }
+
     /// Creates a key string from bytes already in internal form.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyDecodeError`] if the bytes contain a truncated
+    /// three-byte special key, an invalid special-key third byte, or a
+    /// quoted literal with the wrong filler.
     pub fn from_encoded(bytes: Vec<u8>) -> Result<Self, KeyDecodeError> {
         validate_encoded(&bytes)?;
         Ok(Self(bytes))
     }
 
     /// Creates one named special key from its termcap bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyDecodeError::InvalidThirdByte`] when `third` is outside
+    /// the reserved `0x02..=0x7f` range.
     pub fn special(second: u8, third: u8) -> Result<Self, KeyDecodeError> {
         if !(0x02..=0x7f).contains(&third) {
             return Err(KeyDecodeError::InvalidThirdByte(third));
@@ -78,6 +112,12 @@ impl Keys {
     }
 
     /// Decodes all logical keys without losing named special-key identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyDecodeError`] if any three-byte special key in the
+    /// sequence is truncated, has an invalid third byte, or uses the wrong
+    /// filler for a quoted literal.
     pub fn decode(&self) -> Result<Vec<Key>, KeyDecodeError> {
         let mut result = Vec::with_capacity(self.0.len());
         let mut offset = 0;
@@ -89,22 +129,12 @@ impl Keys {
         Ok(result)
     }
 
-    /// Decodes `<...>` key notation into key bytes (`replace_termcodes`,
-    /// `keycodes.c:830-1000`), the translation every `:map` left- and
-    /// right-hand side goes through before it is stored.
+    /// Decodes `<...>` key notation into the internal bytes used by mappings
+    /// and typeahead (`replace_termcodes`, `keycodes.c`).
     ///
-    /// Without it a mapping is only usable when both sides are literal text:
-    /// `nnoremap ,q ix<Esc>` inserted the seven characters `x<Esc>` instead of
-    /// leaving Insert mode, and `<Leader>` never resolved.
-    ///
-    /// Only notation that names a **byte** is decoded — the ASCII control and
-    /// named keys, `<C-x>`, and `<Leader>`/`<LocalLeader>`. Notation naming an
-    /// internal three-byte key (`<F2>`, `<Up>`, …) is left literal on purpose:
-    /// that encoding is also produced by `ox-eval`'s `\<Key>` string escape
-    /// and by the RPC input decoder, the three do not agree yet, and decoding
-    /// it here alone would make such a mapping match a sequence nothing
-    /// produces. Unrecognized notation is likewise left exactly as written,
-    /// which is what upstream does with an unknown `<...>` name.
+    /// Literal bytes must be quoted, but complete modifier and special-key
+    /// triples must not be quoted again. Building the result in its final form
+    /// keeps those two byte domains separate.
     #[must_use]
     pub fn parse_notation(text: &str, leader: &str, local_leader: &str) -> Self {
         let bytes = text.as_bytes();
@@ -112,80 +142,146 @@ impl Keys {
         let mut index = 0;
         while index < bytes.len() {
             if bytes[index] != b'<' {
-                out.push(bytes[index]);
+                append_raw(&mut out, &bytes[index..=index]);
                 index += 1;
                 continue;
             }
             let Some(close) = bytes[index + 1..].iter().position(|byte| *byte == b'>') else {
-                out.push(bytes[index]);
+                append_raw(&mut out, &bytes[index..=index]);
                 index += 1;
                 continue;
             };
             let name = &text[index + 1..index + 1 + close];
-            match named_key_bytes(name, leader, local_leader) {
-                Some(decoded) => out.extend_from_slice(&decoded),
-                None => {
-                    out.push(bytes[index]);
-                    index += 1;
-                    continue;
-                }
-            }
+            let Some(decoded) = named_key_bytes(name, leader, local_leader) else {
+                append_raw(&mut out, &bytes[index..=index]);
+                index += 1;
+                continue;
+            };
+            out.extend_from_slice(&decoded);
             index += close + 2;
         }
-        Self::encode(&out)
+        Self(out)
     }
 }
 
-/// One `<...>` key name's byte expansion, or `None` when the name is not one
-/// this port can represent as bytes.
-///
-/// Names are matched case-insensitively, as `find_special_key` does.
+/// Prefix for a modifier byte applied to a following key (keycodes.h:44).
+pub const KS_MODIFIER: u8 = 0xfc;
+/// Shift modifier mask (keycodes.h:467).
+pub const MOD_MASK_SHIFT: u8 = 0x02;
+/// Ctrl modifier mask (keycodes.h:468).
+pub const MOD_MASK_CTRL: u8 = 0x04;
+/// Alt/Meta modifier mask (keycodes.h:469).
+pub const MOD_MASK_ALT: u8 = 0x08;
+/// META when distinct from ALT (keycodes.h:470; the notation parser folds
+/// `m` into ALT the way terminals deliver it).
+pub const MOD_MASK_META: u8 = 0x10;
+/// Double-click mask (keycodes.h:471).
+pub const MOD_MASK_2CLICK: u8 = 0x20;
+/// Triple-click mask (keycodes.h:472).
+pub const MOD_MASK_3CLICK: u8 = 0x40;
+/// Quadruple-click mask (keycodes.h:473).
+pub const MOD_MASK_4CLICK: u8 = 0x60;
+/// Command ("super") key mask (keycodes.h:474).
+pub const MOD_MASK_CMD: u8 = 0x80;
+
+fn append_raw(output: &mut Vec<u8>, bytes: &[u8]) {
+    for byte in bytes {
+        match *byte {
+            0 => output.extend_from_slice(&[K_SPECIAL, KS_ZERO, KE_FILLER]),
+            K_SPECIAL => output.extend_from_slice(&[K_SPECIAL, KS_SPECIAL, KE_FILLER]),
+            byte => output.push(byte),
+        }
+    }
+}
+
+/// One `<...>` key name in final internal form.
 fn named_key_bytes(name: &str, leader: &str, local_leader: &str) -> Option<Vec<u8>> {
-    // `<Leader>`/`<LocalLeader>` expand to text, not to one byte
-    // (`replace_termcodes`'s `REPTERM_SPECIAL` pass over "mapleader").
     if name.eq_ignore_ascii_case("leader") {
-        return Some(leader.as_bytes().to_vec());
+        let mut output = Vec::with_capacity(leader.len());
+        append_raw(&mut output, leader.as_bytes());
+        return Some(output);
     }
     if name.eq_ignore_ascii_case("localleader") {
-        return Some(local_leader.as_bytes().to_vec());
+        let mut output = Vec::with_capacity(local_leader.len());
+        append_raw(&mut output, local_leader.as_bytes());
+        return Some(output);
     }
-    let single = match name.to_ascii_lowercase().as_str() {
-        "lt" => b'<',
-        "bslash" => b'\\',
-        "bar" => b'|',
-        "space" => b' ',
-        "tab" => 0x09,
-        "cr" | "return" | "enter" => 0x0d,
-        "nl" | "newline" | "linefeed" | "lf" => 0x0a,
-        "esc" | "escape" => 0x1b,
-        "bs" | "backspace" => 0x08,
-        "del" | "delete" => 0x7f,
-        "nul" => 0x00,
-        rest => return control_key_byte(rest),
-    };
-    Some(vec![single])
-}
 
-/// `<C-x>` and its `<Char->`-free aliases (`Ctrl_chr`, `keycodes.h`).
-///
-/// `<S-x>` and `<M-x>`/`<A-x>` are deliberately absent: a shifted letter is
-/// already writable literally, and this port has no meta-key input path to
-/// produce the byte `<M-x>` would name.
-fn control_key_byte(name: &str) -> Option<Vec<u8>> {
-    let rest = name.strip_prefix("c-").or_else(|| name.strip_prefix("ctrl-"))?;
-    let mut chars = rest.chars();
-    let key = chars.next()?;
-    if chars.next().is_some() || !key.is_ascii() {
+    let (mut rest, simplify) = name
+        .strip_prefix('*')
+        .map_or((name, true), |rest| (rest, false));
+    let mut modifiers = 0;
+    while let Some((prefix, tail)) = rest.split_once('-') {
+        let modifier = if prefix.eq_ignore_ascii_case("s") {
+            MOD_MASK_SHIFT
+        } else if prefix.eq_ignore_ascii_case("c") || prefix.eq_ignore_ascii_case("ctrl") {
+            MOD_MASK_CTRL
+        } else if prefix.eq_ignore_ascii_case("m") || prefix.eq_ignore_ascii_case("a") {
+            MOD_MASK_ALT
+        } else {
+            break;
+        };
+        modifiers |= modifier;
+        rest = tail;
+    }
+    if rest.is_empty() {
         return None;
     }
-    let upper = key.to_ascii_uppercase() as u8;
-    // `Ctrl_chr` is defined over '@'..'_' plus '?'; anything else is not a
-    // control byte and stays literal.
-    match upper {
-        b'?' => Some(vec![0x7f]),
-        b'@'..=b'_' => Some(vec![upper & 0x1f]),
-        _ => None,
+
+    let mut raw = None;
+    if rest.len() == 1 {
+        let byte = rest.as_bytes()[0];
+        if simplify && modifiers & MOD_MASK_SHIFT != 0 && byte.is_ascii_alphabetic() {
+            modifiers &= !MOD_MASK_SHIFT;
+            raw = Some(byte.to_ascii_uppercase());
+        } else if simplify && modifiers & MOD_MASK_CTRL != 0 {
+            let upper = byte.to_ascii_uppercase();
+            raw = match upper {
+                b'?' => Some(0x7f),
+                b'@'..=b'_' => Some(upper & 0x1f),
+                _ => None,
+            };
+            if raw.is_some() {
+                modifiers &= !MOD_MASK_CTRL;
+            }
+        }
     }
+
+    let lower = rest.to_ascii_lowercase();
+    if raw.is_none() {
+        raw = match lower.as_str() {
+            "lt" => Some(b'<'),
+            "bslash" => Some(b'\\'),
+            "bar" => Some(b'|'),
+            "space" => Some(b' '),
+            "tab" => Some(0x09),
+            "cr" | "return" | "enter" => Some(0x0d),
+            "nl" | "newline" | "linefeed" | "lf" => Some(0x0a),
+            "esc" | "escape" => Some(0x1b),
+            "bs" | "backspace" => Some(0x08),
+            "del" | "delete" => Some(0x7f),
+            "nul" => Some(0x00),
+            _ => None,
+        };
+    }
+
+    let mut output = Vec::new();
+    if modifiers != 0 {
+        output.extend_from_slice(&[K_SPECIAL, KS_MODIFIER, modifiers]);
+    }
+    if let Some(raw) = raw {
+        append_raw(&mut output, &[raw]);
+        return Some(output);
+    }
+    if let [b'f', digit @ b'1'..=b'9'] = lower.as_bytes() {
+        output.extend_from_slice(&[K_SPECIAL, b'k', *digit]);
+        return Some(output);
+    }
+    if modifiers != 0 && rest.chars().count() == 1 {
+        append_raw(&mut output, rest.as_bytes());
+        return Some(output);
+    }
+    None
 }
 
 impl From<&str> for Keys {
@@ -358,6 +454,11 @@ impl Typeahead {
     }
 
     /// Inserts keys at `offset`; zero pushes onto the front like `ins_typebuf`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TypeaheadError::OffsetOutOfRange`] when `offset` exceeds the
+    /// current encoded byte length.
     pub fn push(
         &mut self,
         keys: &Keys,
@@ -372,27 +473,34 @@ impl Typeahead {
         }
         self.bytes
             .splice(offset..offset, keys.as_bytes().iter().copied());
-        self.flags.splice(
-            offset..offset,
-            std::iter::repeat_n(flags, keys.len()),
-        );
+        self.flags
+            .splice(offset..offset, std::iter::repeat_n(flags, keys.len()));
         Ok(())
     }
 
     /// Appends direct typed input after all queued bytes.
     pub fn append(&mut self, keys: &Keys, flags: TypeaheadFlags) {
         self.bytes.extend_from_slice(keys.as_bytes());
-        self.flags
-            .extend(std::iter::repeat_n(flags, keys.len()));
+        self.flags.extend(std::iter::repeat_n(flags, keys.len()));
     }
 
     /// Queues input with `feedkeys()` mode semantics and reports whether the
     /// caller must execute the queue immediately (`x`). All input remains in
     /// this one buffer; `L` precedes raw input with `K_EVENT` so the normal
     /// state loop takes its event-processing path before consuming it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TypeaheadError`] if the `L` mode's synthetic event key is
+    /// malformed or the resulting low-level sequence fails encoding
+    /// validation, or if the underlying [`push`][Typeahead::push] fails.
     pub fn feedkeys(&mut self, keys: &Keys, mode: &str) -> Result<bool, TypeaheadError> {
         let flags = TypeaheadFlags {
-            remap: if mode.contains('n') { Remap::No } else { Remap::Yes },
+            remap: if mode.contains('n') {
+                Remap::No
+            } else {
+                Remap::Yes
+            },
             ..TypeaheadFlags::default()
         };
         if mode.contains('L') {
@@ -400,7 +508,11 @@ impl Typeahead {
             let mut low_level = event.as_bytes().to_vec();
             low_level.extend_from_slice(keys.as_bytes());
             let low_level = Keys::from_encoded(low_level)?;
-            if mode.contains('i') { self.push(&low_level, 0, flags)?; } else { self.append(&low_level, flags); }
+            if mode.contains('i') {
+                self.push(&low_level, 0, flags)?;
+            } else {
+                self.append(&low_level, flags);
+            }
         } else if mode.contains('i') {
             self.push(keys, 0, flags)?;
         } else {
@@ -439,6 +551,12 @@ impl Typeahead {
     }
 
     /// Decodes the next logical key without consuming it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyDecodeError`] if the front of the buffer is a malformed
+    /// three-byte special key (`None` is returned only when the buffer is
+    /// empty, not on decode failure).
     pub fn peek(&self) -> Result<Option<Key>, KeyDecodeError> {
         if self.bytes.is_empty() {
             return Ok(None);
@@ -447,6 +565,12 @@ impl Typeahead {
     }
 
     /// Removes and decodes the next logical key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyDecodeError`] if the front of the buffer is a malformed
+    /// three-byte special key (`None` is returned only when the buffer is
+    /// empty, not on decode failure).
     pub fn pop(&mut self) -> Result<Option<Key>, KeyDecodeError> {
         if self.bytes.is_empty() {
             return Ok(None);
@@ -479,11 +603,7 @@ impl Typeahead {
     /// true)`, which counts the whole argument into `tb_maplen`
     /// (`input.c:964-966`), so the remainder of a `:normal` goes here too.
     pub fn flush_mapped(&mut self) {
-        let mapped = self
-            .flags
-            .iter()
-            .take_while(|flags| flags.mapped)
-            .count();
+        let mapped = self.flags.iter().take_while(|flags| flags.mapped).count();
         self.bytes.drain(..mapped);
         self.flags.drain(..mapped);
     }

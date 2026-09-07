@@ -1,4 +1,4 @@
-//! ShaDa MessagePack stream reading, writing, and timestamp merge.
+//! `ShaDa` `MessagePack` stream reading, writing, and timestamp merge.
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
@@ -6,7 +6,7 @@ use std::io::{Cursor, Read, Write};
 use rmpv::Value;
 use thiserror::Error;
 
-/// Known ShaDa entry types from `shada.c`.
+/// Known `ShaDa` entry types from `shada.c`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u64)]
 pub enum EntryType {
@@ -53,14 +53,14 @@ impl EntryType {
     }
 }
 
-/// One ShaDa stream entry.
+/// One `ShaDa` stream entry.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
     /// Numeric entry type; unknown values are retained.
     pub type_id: u64,
     /// Unix timestamp in seconds.
     pub timestamp: u64,
-    /// Type-specific MessagePack value.
+    /// Type-specific `MessagePack` value.
     pub data: Value,
 }
 
@@ -82,20 +82,20 @@ impl Entry {
     }
 }
 
-/// A sequence of ShaDa entries.
+/// A sequence of `ShaDa` entries.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ShaDa {
     /// Entries in stream order.
     pub entries: Vec<Entry>,
 }
 
-/// ShaDa stream error.
+/// `ShaDa` stream error.
 #[derive(Debug, Error)]
 pub enum ShaDaError {
     /// Stream I/O failed.
     #[error("ShaDa I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    /// A MessagePack value was malformed.
+    /// A `MessagePack` value was malformed.
     #[error("malformed ShaDa MessagePack: {0}")]
     Decode(String),
     /// An entry prefix was not an unsigned integer.
@@ -108,6 +108,13 @@ pub enum ShaDaError {
 
 impl ShaDa {
     /// Reads the concatenated type/timestamp/length/payload stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reader's I/O error, [`ShaDaError::Prefix`] for a
+    /// non-integer entry prefix, [`ShaDaError::Length`] for a declared
+    /// length that exceeds the remaining bytes or address space, and
+    /// [`ShaDaError::Decode`] for a malformed `MessagePack` payload.
     pub fn read(mut reader: impl Read, max_kbyte: usize) -> Result<Self, ShaDaError> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes)?;
@@ -116,7 +123,8 @@ impl ShaDa {
         while usize::try_from(cursor.position()).map_err(|_| ShaDaError::Length)? < bytes.len() {
             let type_id = read_uint(&mut cursor)?;
             let timestamp = read_uint(&mut cursor)?;
-            let length = usize::try_from(read_uint(&mut cursor)?).map_err(|_| ShaDaError::Length)?;
+            let length =
+                usize::try_from(read_uint(&mut cursor)?).map_err(|_| ShaDaError::Length)?;
             let start = usize::try_from(cursor.position()).map_err(|_| ShaDaError::Length)?;
             let end = start.checked_add(length).ok_or(ShaDaError::Length)?;
             let payload = bytes.get(start..end).ok_or(ShaDaError::Length)?;
@@ -137,6 +145,12 @@ impl ShaDa {
     }
 
     /// Writes entries, omitting payloads above `max_kbyte` as Neovim does.
+    ///
+    /// # Errors
+    ///
+    /// Returns the writer's I/O error, [`ShaDaError::Decode`] if a payload
+    /// cannot be re-encoded, and [`ShaDaError::Length`] if a payload
+    /// length is not representable.
     pub fn write(&self, mut writer: impl Write, max_kbyte: usize) -> Result<(), ShaDaError> {
         for entry in &self.entries {
             let mut payload = Vec::new();
@@ -225,7 +239,9 @@ fn array_value(value: &Value, index: usize) -> Option<&Value> {
 
 fn map_value<'a>(value: &'a Value, key: &[u8]) -> Option<&'a Value> {
     value.as_map()?.iter().find_map(|(candidate, value)| {
-        let matches = candidate.as_str().is_some_and(|text| text.as_bytes() == key)
+        let matches = candidate
+            .as_str()
+            .is_some_and(|text| text.as_bytes() == key)
             || candidate.as_slice() == Some(key);
         matches.then_some(value)
     })

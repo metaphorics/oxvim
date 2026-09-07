@@ -60,6 +60,14 @@ impl UndoFile {
     /// entry framing and length-prefixed payloads, both end markers, and the
     /// end of input. Truncated, mis-framed, or trailing-garbage tails are
     /// rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reader's I/O error, [`UndoFileError::Magic`] for a
+    /// missing magic string, [`UndoFileError::Version`] for an unsupported
+    /// version, [`UndoFileError::Malformed`] for a truncated fixed header,
+    /// and the structural-validation error for mis-framed header records,
+    /// entries, end markers, or trailing garbage.
     pub fn read(mut reader: impl Read) -> Result<Self, UndoFileError> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes)?;
@@ -144,6 +152,11 @@ impl UndoFile {
     }
 
     /// Writes the complete validated byte stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns the writer's I/O error if the byte stream cannot be fully
+    /// written.
     pub fn write(&self, mut writer: impl Write) -> Result<(), UndoFileError> {
         writer.write_all(&self.bytes)?;
         Ok(())
@@ -162,6 +175,11 @@ impl UndoFile {
     }
 
     /// Confirms that the undo stream belongs to `buffer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UndoFileError::ContentMismatch`] when the stored content
+    /// hash or line count disagrees with `buffer`'s current content.
     pub fn verify_buffer(&self, buffer: &Buffer) -> Result<(), UndoFileError> {
         if self.content_hash != content_hash(buffer)
             || usize::try_from(self.line_count).ok() != Some(buffer.line_count())
@@ -297,7 +315,10 @@ fn validate_entry(bytes: &[u8], mut offset: usize) -> Result<usize, UndoFileErro
     for _ in 0..size {
         let line_len = read_u32(bytes, offset)?;
         offset = add(offset, 4)?;
-        offset = add(offset, usize::try_from(line_len).map_err(|_| UndoFileError::Malformed)?)?;
+        offset = add(
+            offset,
+            usize::try_from(line_len).map_err(|_| UndoFileError::Malformed)?,
+        )?;
         if offset > bytes.len() {
             return Err(UndoFileError::Malformed);
         }

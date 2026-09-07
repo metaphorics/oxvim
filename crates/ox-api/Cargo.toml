@@ -17,5 +17,7 @@ ox-ui = { path = "../ox-ui" }
 thiserror.workspace = true
 unicode-width = "0.2.2"
 
+[dev-dependencies]
+
 [lints]
 workspace = true

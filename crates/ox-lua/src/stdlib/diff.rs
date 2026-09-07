@@ -29,10 +29,10 @@ pub(super) fn install(lua: &Lua, vim: &Table) -> mlua::Result<()> {
             if let Some(callback) = options.on_hunk {
                 for (old_start, old_count, new_start, new_count) in hunks {
                     let result: Option<i64> = callback.call((
-                        old_start as i64,
-                        old_count as i64,
-                        new_start as i64,
-                        new_count as i64,
+                        i64::try_from(old_start).map_err(mlua::Error::external)?,
+                        i64::try_from(old_count).map_err(mlua::Error::external)?,
+                        i64::try_from(new_start).map_err(mlua::Error::external)?,
+                        i64::try_from(new_count).map_err(mlua::Error::external)?,
                     ))?;
                     if result.is_some_and(|value| value < 0) {
                         break;
@@ -53,10 +53,10 @@ pub(super) fn install(lua: &Lua, vim: &Table) -> mlua::Result<()> {
                         hunks.into_iter().enumerate()
                     {
                         let hunk = lua.create_sequence_from([
-                            old_start as i64,
-                            old_count as i64,
-                            new_start as i64,
-                            new_count as i64,
+                            i64::try_from(old_start).map_err(mlua::Error::external)?,
+                            i64::try_from(old_count).map_err(mlua::Error::external)?,
+                            i64::try_from(new_start).map_err(mlua::Error::external)?,
+                            i64::try_from(new_count).map_err(mlua::Error::external)?,
                         ])?;
                         result.raw_set(index + 1, hunk)?;
                     }
@@ -65,17 +65,7 @@ pub(super) fn install(lua: &Lua, vim: &Table) -> mlua::Result<()> {
             }
         },
     )?;
-    vim.set("diff", function.clone())?;
-    let text = match vim.get::<Value>("text")? {
-        Value::Table(table) => table,
-        Value::Nil => {
-            let table = lua.create_table()?;
-            vim.set("text", table.clone())?;
-            table
-        }
-        _ => return Err(mlua::Error::runtime("vim.text must be a table")),
-    };
-    text.set("diff", function)
+    vim.set("diff", function)
 }
 
 fn checked_text(value: &LuaString, which: &str) -> mlua::Result<String> {
@@ -99,7 +89,7 @@ fn parse_options(options: Option<Table>) -> mlua::Result<Options> {
         Some(value) => {
             return Err(mlua::Error::runtime(format!(
                 "invalid diff algorithm: {value}"
-            )))
+            )));
         }
     };
     let context = options.get::<Option<i64>>("ctxlen")?.unwrap_or(0);
@@ -111,7 +101,7 @@ fn parse_options(options: Option<Table>) -> mlua::Result<Options> {
         Some(value) => {
             return Err(mlua::Error::runtime(format!(
                 "invalid diff result_type: {value}"
-            )))
+            )));
         }
     };
     Ok(Options {
@@ -136,9 +126,17 @@ fn hunk_from_op(operation: &DiffOp) -> (usize, usize, usize, usize) {
     let old_count = old.len();
     let new_count = new.len();
     (
-        if old_count == 0 { old.start } else { old.start + 1 },
+        if old_count == 0 {
+            old.start
+        } else {
+            old.start + 1
+        },
         old_count,
-        if new_count == 0 { new.start } else { new.start + 1 },
+        if new_count == 0 {
+            new.start
+        } else {
+            new.start + 1
+        },
         new_count,
     )
 }

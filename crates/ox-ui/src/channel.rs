@@ -8,6 +8,10 @@ use thiserror::Error;
 
 /// Negotiated UI extensions.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field is an independent nvim `ui-ext-options` capability negotiated over RPC"
+)]
 pub struct UiOptions {
     /// Line-grid protocol support.
     pub ext_linegrid: bool,
@@ -70,7 +74,10 @@ impl UiEvent {
     /// Creates an event.
     #[must_use]
     pub fn new(name: impl Into<OxStr>, args: Vec<Object>) -> Self {
-        Self { name: name.into(), args }
+        Self {
+            name: name.into(),
+            args,
+        }
     }
 }
 
@@ -111,48 +118,93 @@ pub struct UiChannel {
 
 impl UiChannel {
     /// Creates an attached channel.
-    pub fn new(id: u64, width: usize, height: usize, options: UiOptions) -> Result<Self, UiChannelError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiChannelError::InvalidSize`] if `width` or `height` is zero, or
+    /// [`UiChannelError::LegacyGridUnsupported`] if the negotiated options lack `ext_linegrid`.
+    pub fn new(
+        id: u64,
+        width: usize,
+        height: usize,
+        options: UiOptions,
+    ) -> Result<Self, UiChannelError> {
         validate_size(width, height)?;
         let options = options.normalized();
-        if !options.ext_linegrid { return Err(UiChannelError::LegacyGridUnsupported); }
-        Ok(Self { id, width, height, options, batch: None })
+        if !options.ext_linegrid {
+            return Err(UiChannelError::LegacyGridUnsupported);
+        }
+        Ok(Self {
+            id,
+            width,
+            height,
+            options,
+            batch: None,
+        })
     }
 
     /// RPC channel identity.
     #[must_use]
-    pub const fn id(&self) -> u64 { self.id }
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
 
     /// Current UI dimensions.
     #[must_use]
-    pub const fn size(&self) -> (usize, usize) { (self.width, self.height) }
+    pub const fn size(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
 
     /// Negotiated capabilities.
     #[must_use]
-    pub const fn options(&self) -> UiOptions { self.options }
+    pub const fn options(&self) -> UiOptions {
+        self.options
+    }
 
     /// Starts a new redraw transaction, discarding no previously completed data.
-    pub fn begin(&mut self) { self.batch = Some(RedrawBatch::new()); }
+    pub fn begin(&mut self) {
+        self.batch = Some(RedrawBatch::new());
+    }
 
     /// Adds an event to the current transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiChannelError::BatchNotStarted`] if no redraw transaction is active
+    /// ([`begin`](Self::begin) was not called or [`flush`](Self::flush) already ended it).
     pub fn emit(&mut self, event: UiEvent) -> Result<(), UiChannelError> {
-        let batch = self.batch.as_mut().ok_or(UiChannelError::BatchNotStarted(self.id))?;
+        let batch = self
+            .batch
+            .as_mut()
+            .ok_or(UiChannelError::BatchNotStarted(self.id))?;
         if event.name == OxStr::from("flush") {
             return Ok(());
         }
-        if event.name == OxStr::from("grid_line") {
-            if let Some((grid, row, col, cells, wrap)) = grid_line_parts(&event.args) {
-                batch.grid_line(grid, row, col, cells, wrap);
-                return Ok(());
-            }
+        if event.name == OxStr::from("grid_line")
+            && let Some((grid, row, col, cells, wrap)) = grid_line_parts(&event.args)
+        {
+            batch.grid_line(grid, row, col, cells, wrap);
+            return Ok(());
         }
         batch.push(event.name, event.args);
         Ok(())
     }
 
     /// Ends the transaction with exactly one `flush` and returns packed bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiChannelError::BatchNotStarted`] if no redraw transaction is active.
     pub fn flush(&mut self) -> Result<Vec<u8>, UiChannelError> {
-        let mut batch = self.batch.take().ok_or(UiChannelError::BatchNotStarted(self.id))?;
-        if batch.events().last().is_none_or(|event| event.name != OxStr::from("flush")) {
+        let mut batch = self
+            .batch
+            .take()
+            .ok_or(UiChannelError::BatchNotStarted(self.id))?;
+        if batch
+            .events()
+            .last()
+            .is_none_or(|event| event.name != OxStr::from("flush"))
+        {
             batch.push("flush", vec![]);
         }
         Ok(batch.pack())
@@ -181,9 +233,18 @@ pub struct UiChannels {
 impl UiChannels {
     /// Creates an empty registry.
     #[must_use]
-    pub const fn new() -> Self { Self { channels: BTreeMap::new() } }
+    pub const fn new() -> Self {
+        Self {
+            channels: BTreeMap::new(),
+        }
+    }
 
     /// Attaches a UI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiChannelError::AlreadyAttached`] if `id` is already registered, or
+    /// propagates errors from [`UiChannel::new`] (invalid size or missing `ext_linegrid`).
     pub fn attach(
         &mut self,
         id: u64,
@@ -191,27 +252,53 @@ impl UiChannels {
         height: usize,
         options: UiOptions,
     ) -> Result<(), UiChannelError> {
-        if self.channels.contains_key(&id) { return Err(UiChannelError::AlreadyAttached(id)); }
-        self.channels.insert(id, UiChannel::new(id, width, height, options)?);
+        if self.channels.contains_key(&id) {
+            return Err(UiChannelError::AlreadyAttached(id));
+        }
+        self.channels
+            .insert(id, UiChannel::new(id, width, height, options)?);
         Ok(())
     }
 
     /// Detaches and returns a UI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiChannelError::NotAttached`] if no channel is registered under `id`.
     pub fn detach(&mut self, id: u64) -> Result<UiChannel, UiChannelError> {
-        self.channels.remove(&id).ok_or(UiChannelError::NotAttached(id))
+        self.channels
+            .remove(&id)
+            .ok_or(UiChannelError::NotAttached(id))
     }
 
     /// Changes an attached UI's dimensions.
-    pub fn try_resize(&mut self, id: u64, width: usize, height: usize) -> Result<(), UiChannelError> {
-        self.channels.get_mut(&id).ok_or(UiChannelError::NotAttached(id))?.resize(width, height)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UiChannelError::NotAttached`] if no channel is registered under `id`, or
+    /// [`UiChannelError::InvalidSize`] if `width` or `height` is zero.
+    pub fn try_resize(
+        &mut self,
+        id: u64,
+        width: usize,
+        height: usize,
+    ) -> Result<(), UiChannelError> {
+        self.channels
+            .get_mut(&id)
+            .ok_or(UiChannelError::NotAttached(id))?
+            .resize(width, height)
     }
 
     /// Reads an attached channel.
     #[must_use]
-    pub fn get(&self, id: u64) -> Option<&UiChannel> { self.channels.get(&id) }
+    pub fn get(&self, id: u64) -> Option<&UiChannel> {
+        self.channels.get(&id)
+    }
 
     /// Mutably reads an attached channel.
-    pub fn get_mut(&mut self, id: u64) -> Option<&mut UiChannel> { self.channels.get_mut(&id) }
+    pub fn get_mut(&mut self, id: u64) -> Option<&mut UiChannel> {
+        self.channels.get_mut(&id)
+    }
 
     /// Iterates attached channels in stable id order.
     pub fn iter(&self) -> impl Iterator<Item = (&u64, &UiChannel)> {
@@ -225,20 +312,33 @@ impl UiChannels {
 
     /// Number of attached UIs.
     #[must_use]
-    pub fn len(&self) -> usize { self.channels.len() }
+    pub fn len(&self) -> usize {
+        self.channels.len()
+    }
 
     /// Whether no UI is attached.
     #[must_use]
-    pub fn is_empty(&self) -> bool { self.channels.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.channels.is_empty()
+    }
 }
 
 fn validate_size(width: usize, height: usize) -> Result<(), UiChannelError> {
-    if width == 0 || height == 0 { return Err(UiChannelError::InvalidSize { width, height }); }
+    if width == 0 || height == 0 {
+        return Err(UiChannelError::InvalidSize { width, height });
+    }
     Ok(())
 }
 
 fn grid_line_parts(args: &[Object]) -> Option<(i64, i64, i64, Vec<Object>, bool)> {
-    let [Object::Integer(grid), Object::Integer(row), Object::Integer(col), Object::Array(cells), Object::Boolean(wrap)] = args else {
+    let [
+        Object::Integer(grid),
+        Object::Integer(row),
+        Object::Integer(col),
+        Object::Array(cells),
+        Object::Boolean(wrap),
+    ] = args
+    else {
         return None;
     };
     Some((*grid, *row, *col, cells.clone(), *wrap))

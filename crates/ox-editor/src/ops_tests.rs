@@ -2,8 +2,8 @@
 
 use ox_text::{Buffer, Position};
 
-use crate::extmark::{ExtmarkAttributes, ExtmarkGravity, ExtmarkPlacement, ExtmarkPosition};
-use crate::ops::{self, EditRange, Operator};
+use crate::extmark::{ExtmarkGravity, ExtmarkPlacement, ExtmarkPosition};
+use crate::ops::{self, EditRange, Operator, OperatorRequest};
 use crate::{Editor, Geometry, MotionKind, NullExprEval, RegisterKind};
 
 fn position(lnum: usize, col: usize) -> Position {
@@ -97,13 +97,15 @@ fn apply_op(
     let mut eval = NullExprEval;
     ops::apply(
         editor,
-        buffer,
-        window,
-        operator,
-        range,
-        register,
-        10,
-        &mut eval,
+        OperatorRequest {
+            buffer,
+            window,
+            operator,
+            range,
+            register,
+            timestamp: 10,
+            eval: &mut eval,
+        },
     )
     .unwrap();
 }
@@ -160,7 +162,13 @@ fn characterwise_same_row_delete_moves_marks_and_undo_redo() {
         editor.buffer(buffer).unwrap().changedtick(),
         tick_before + 1
     );
-    assert!(editor.buffer(buffer).unwrap().modified);
+    assert!(
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::MODIFIED)
+    );
     assert_eq!(editor.buffer(buffer).unwrap().undo.current_block_len(), 1);
     let unnamed = editor.registers().get('"').unwrap().unwrap();
     assert_eq!(unnamed.kind(), RegisterKind::CharacterWise);
@@ -499,10 +507,10 @@ fn linewise_delete_replaces_only_deleted_rows() {
     );
     let mut inside =
         ExtmarkPlacement::new(ExtmarkPosition::new(1, 0)).with_end(ExtmarkPosition::new(2, 0));
-    inside.attributes = ExtmarkAttributes {
-        invalidate: true,
-        ..ExtmarkAttributes::default()
-    };
+    inside
+        .attributes
+        .flags
+        .set(crate::ExtmarkFlags::INVALIDATE, true);
     let inside = place(&mut editor, buffer, namespace, inside);
     let after = place(
         &mut editor,
@@ -603,7 +611,11 @@ fn delete_text_edit_error_is_atomic() {
     let (namespace, mark) = mark_at(&mut editor, buffer, 0, 0);
     let before_text = text_bytes(&editor, buffer);
     let before_tick = editor.buffer(buffer).unwrap().changedtick();
-    let before_modified = editor.buffer(buffer).unwrap().modified;
+    let before_modified = editor
+        .buffer(buffer)
+        .unwrap()
+        .flags
+        .contains(crate::BufferFlags::MODIFIED);
     let before_changelist = editor.changelists().len(buffer);
     let before_seq = editor.buffer(buffer).unwrap().undo.current_seq();
     let before_register = editor.registers().get('"').unwrap().cloned();
@@ -611,24 +623,33 @@ fn delete_text_edit_error_is_atomic() {
     let mut eval = NullExprEval;
     let err = ops::apply(
         &mut editor,
-        buffer,
-        window,
-        Operator::Delete,
-        EditRange {
-            start: position(1, 2),
-            end: position(2, 2),
-            kind: MotionKind::BlockWise,
-            inclusive: true,
+        OperatorRequest {
+            buffer,
+            window,
+            operator: Operator::Delete,
+            range: EditRange {
+                start: position(1, 2),
+                end: position(2, 2),
+                kind: MotionKind::BlockWise,
+                inclusive: true,
+            },
+            register: Some('z'),
+            timestamp: 10,
+            eval: &mut eval,
         },
-        Some('z'),
-        10,
-        &mut eval,
     )
     .unwrap_err();
     assert!(matches!(err, ops::OperatorError::Buffer(_)), "{err:?}");
     assert_eq!(text_bytes(&editor, buffer), before_text);
     assert_eq!(editor.buffer(buffer).unwrap().changedtick(), before_tick);
-    assert_eq!(editor.buffer(buffer).unwrap().modified, before_modified);
+    assert_eq!(
+        editor
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::MODIFIED),
+        before_modified
+    );
     assert_eq!(
         editor.buffer(buffer).unwrap().undo.current_seq(),
         before_seq

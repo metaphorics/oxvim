@@ -12,26 +12,71 @@ const DEFAULT_CINWORDS: &str = "if,else,while,do,for,switch";
 const DEFAULT_COMMENTS: &str = "s1:/*,mb:*,ex:*/,://,b:#,:%,:XCOMM,n:>,fb:-,fb:•";
 const DEFAULT_LISPWORDS: &str = "defun,define,defmacro,set!,lambda,if,case,let,flet,let*,letrec,do,do*,define-syntax,let-syntax,letrec-syntax,destructuring-bind,defpackage,defparameter,defstruct,deftype,defvar,do-all-symbols,do-external-symbols,do-symbols,dolist,dotimes,ecase,etypecase,eval-when,labels,macrolet,multiple-value-bind,multiple-value-call,multiple-value-prog1,multiple-value-setq,prog1,progv,typecase,unless,unwind-protect,when,with-input-from-string,with-open-file,with-open-stream,with-output-to-string,with-package-iterator,define-condition,handler-bind,handler-case,restart-bind,restart-case,with-simple-restart,store-value,use-value,muffle-warning,abort,continue,with-slots,with-slots*,with-accessors,with-accessors*,defclass,defmethod,print-unreadable-object";
 
+/// Independently combinable indentation option flags.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct IndentFlags(u8);
+
+impl IndentFlags {
+    /// Insert spaces instead of tabs (`'expandtab'`).
+    pub(crate) const EXPANDTAB: Self = Self(1 << 0);
+    /// Reuse existing leading whitespace when indenting (`'preserveindent'`).
+    pub(crate) const PRESERVEINDENT: Self = Self(1 << 1);
+    /// Copy leading whitespace from the previous line (`'copyindent'`).
+    pub(crate) const COPYINDENT: Self = Self(1 << 2);
+    /// Take indent from the previous line on new lines (`'autoindent'`).
+    pub(crate) const AUTOINDENT: Self = Self(1 << 3);
+    /// Apply smart-indent heuristics after `{`-class openers (`'smartindent'`).
+    pub(crate) const SMARTINDENT: Self = Self(1 << 4);
+    /// Program using the C indent method (`'cindent'`).
+    pub(crate) const CINDENT: Self = Self(1 << 5);
+    /// Insert-mode paste policy suppresses auto indent (`'paste'`).
+    pub(crate) const PASTE: Self = Self(1 << 6);
+    /// Program using the Lisp indent method (`'lisp'`).
+    pub(crate) const LISP: Self = Self(1 << 7);
+
+    /// Whether every flag in `other` is enabled.
+    #[must_use]
+    pub(crate) const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Enables or disables `flag` without touching the other bits.
+    pub(crate) const fn set(&mut self, flag: Self, enabled: bool) {
+        if enabled {
+            self.0 |= flag.0;
+        } else {
+            self.0 &= !flag.0;
+        }
+    }
+}
+
+impl std::ops::BitOr for IndentFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for IndentFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
 /// All options that can affect one indentation decision.
 #[derive(Clone, Debug)]
 pub(crate) struct IndentOptions {
     pub(crate) shiftwidth: usize,
     pub(crate) tabstop: usize,
-    pub(crate) expandtab: bool,
-    pub(crate) preserveindent: bool,
-    pub(crate) copyindent: bool,
-    pub(crate) autoindent: bool,
-    pub(crate) smartindent: bool,
-    pub(crate) cindent: bool,
-    pub(crate) paste: bool,
+    /// Indentation behavior flags (`IndentFlags`).
+    pub(crate) flags: IndentFlags,
     pub(crate) cinoptions: Cino,
     pub(crate) cinkeys: String,
     pub(crate) cinwords: String,
     pub(crate) comments: String,
     pub(crate) indentexpr: String,
     pub(crate) indentkeys: String,
-    pub(crate) lisp: bool,
-    pub(crate) lispoptions_expr: bool,
     pub(crate) lispwords: String,
 }
 
@@ -41,21 +86,13 @@ impl Default for IndentOptions {
         Self {
             shiftwidth,
             tabstop: 8,
-            expandtab: false,
-            preserveindent: false,
-            copyindent: false,
-            autoindent: false,
-            smartindent: false,
-            cindent: false,
-            paste: false,
+            flags: IndentFlags::default(),
             cinoptions: Cino::parse("", shiftwidth),
             cinkeys: DEFAULT_CINKEYS.to_owned(),
             cinwords: DEFAULT_CINWORDS.to_owned(),
             comments: DEFAULT_COMMENTS.to_owned(),
             indentexpr: String::new(),
             indentkeys: DEFAULT_CINKEYS.to_owned(),
-            lisp: false,
-            lispoptions_expr: false,
             lispwords: DEFAULT_LISPWORDS.to_owned(),
         }
     }
@@ -74,37 +111,57 @@ impl IndentOptions {
             configured_shiftwidth.max(1)
         };
         let cinoptions = buffer_string(editor, buffer, "cinoptions", "");
+        let mut flags = IndentFlags::default();
+        flags.set(
+            IndentFlags::EXPANDTAB,
+            buffer_bool(editor, buffer, "expandtab"),
+        );
+        flags.set(
+            IndentFlags::PRESERVEINDENT,
+            buffer_bool(editor, buffer, "preserveindent"),
+        );
+        flags.set(
+            IndentFlags::COPYINDENT,
+            buffer_bool(editor, buffer, "copyindent"),
+        );
+        flags.set(
+            IndentFlags::AUTOINDENT,
+            buffer_bool(editor, buffer, "autoindent"),
+        );
+        flags.set(
+            IndentFlags::SMARTINDENT,
+            buffer_bool(editor, buffer, "smartindent"),
+        );
+        flags.set(IndentFlags::CINDENT, buffer_bool(editor, buffer, "cindent"));
+        flags.set(IndentFlags::PASTE, global_bool(editor, "paste"));
+        flags.set(IndentFlags::LISP, buffer_bool(editor, buffer, "lisp"));
         Self {
             shiftwidth,
             tabstop,
-            expandtab: buffer_bool(editor, buffer, "expandtab"),
-            preserveindent: buffer_bool(editor, buffer, "preserveindent"),
-            copyindent: buffer_bool(editor, buffer, "copyindent"),
-            autoindent: buffer_bool(editor, buffer, "autoindent"),
-            smartindent: buffer_bool(editor, buffer, "smartindent"),
-            cindent: buffer_bool(editor, buffer, "cindent"),
-            paste: global_bool(editor, "paste"),
+            flags,
             cinoptions: Cino::parse(&cinoptions, shiftwidth),
             cinkeys: buffer_string(editor, buffer, "cinkeys", DEFAULT_CINKEYS),
             cinwords: buffer_string(editor, buffer, "cinwords", DEFAULT_CINWORDS),
             comments: buffer_string(editor, buffer, "comments", DEFAULT_COMMENTS),
             indentexpr: buffer_string(editor, buffer, "indentexpr", ""),
             indentkeys: buffer_string(editor, buffer, "indentkeys", DEFAULT_CINKEYS),
-            lisp: buffer_bool(editor, buffer, "lisp"),
-            lispoptions_expr: buffer_string(editor, buffer, "lispoptions", "")
-                .split(',')
-                .any(|flag| flag == "expr:1"),
             lispwords: buffer_string(editor, buffer, "lispwords", DEFAULT_LISPWORDS),
         }
     }
 }
 
 fn buffer_bool(editor: &Editor, buffer: BufHandle, name: &str) -> bool {
-    matches!(editor.options().get_buffer(buffer, name), Ok(OptionValue::Boolean(true)))
+    matches!(
+        editor.options().get_buffer(buffer, name),
+        Ok(OptionValue::Boolean(true))
+    )
 }
 
 fn global_bool(editor: &Editor, name: &str) -> bool {
-    matches!(editor.options().get_global(name), Ok(OptionValue::Boolean(true)))
+    matches!(
+        editor.options().get_global(name),
+        Ok(OptionValue::Boolean(true))
+    )
 }
 
 fn buffer_number(editor: &Editor, buffer: BufHandle, name: &str, fallback: usize) -> usize {
@@ -124,7 +181,9 @@ fn buffer_string(editor: &Editor, buffer: BufHandle, name: &str, fallback: &str)
 /// Number of leading space and tab bytes.
 #[must_use]
 pub(crate) fn leading_len(line: &[u8]) -> usize {
-    line.iter().take_while(|byte| matches!(byte, b' ' | b'\t')).count()
+    line.iter()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count()
 }
 
 /// Counts an indent in display columns using fixed `tabstop` stops.
@@ -150,15 +209,28 @@ fn tab_padding(col: usize, tabstop: usize) -> usize {
 /// `set_indent()` without `SIN_INSERT`.
 #[must_use]
 pub(crate) fn whitespace_for(target_cols: usize, current: &[u8], opts: &IndentOptions) -> Vec<u8> {
-    whitespace_with_policy(target_cols, current, opts, opts.preserveindent)
+    whitespace_with_policy(
+        target_cols,
+        current,
+        opts,
+        opts.flags.contains(IndentFlags::PRESERVEINDENT),
+    )
 }
 
-fn whitespace_with_policy(target_cols: usize, current: &[u8], opts: &IndentOptions, preserve: bool) -> Vec<u8> {
+fn whitespace_with_policy(
+    target_cols: usize,
+    current: &[u8],
+    opts: &IndentOptions,
+    preserve: bool,
+) -> Vec<u8> {
     let mut todo = target_cols;
     let mut ind_done = 0usize;
     let mut out = Vec::with_capacity(target_cols.saturating_add(opts.tabstop));
     if preserve {
-        for &byte in current.iter().take_while(|byte| matches!(**byte, b' ' | b'\t')) {
+        for &byte in current
+            .iter()
+            .take_while(|byte| matches!(**byte, b' ' | b'\t'))
+        {
             if todo == 0 {
                 break;
             }
@@ -176,18 +248,22 @@ fn whitespace_with_policy(target_cols: usize, current: &[u8], opts: &IndentOptio
                 ind_done += 1;
             }
         }
-        if !opts.expandtab {
+        if !opts.flags.contains(IndentFlags::EXPANDTAB) {
             let pad = tab_padding(ind_done, opts.tabstop);
             if todo >= pad {
                 out.push(b'\t');
                 todo -= pad;
                 ind_done += pad;
-            } else if opts.preserveindent && todo == 0 && ind_done == target_cols && out.last() == Some(&b' ') {
+            } else if opts.flags.contains(IndentFlags::PRESERVEINDENT)
+                && todo == 0
+                && ind_done == target_cols
+                && out.last() == Some(&b' ')
+            {
                 out.push(b'\t');
             }
         }
     }
-    if !opts.expandtab {
+    if !opts.flags.contains(IndentFlags::EXPANDTAB) {
         loop {
             let pad = tab_padding(ind_done, opts.tabstop);
             if pad > todo {
@@ -202,7 +278,6 @@ fn whitespace_with_policy(target_cols: usize, current: &[u8], opts: &IndentOptio
     out
 }
 
-
 fn copied_whitespace_for(target_cols: usize, source: &[u8], opts: &IndentOptions) -> Vec<u8> {
     whitespace_with_policy(target_cols, source, opts, true)
 }
@@ -212,7 +287,7 @@ fn inserted_whitespace_for(target_cols: usize, opts: &IndentOptions) -> Vec<u8> 
 }
 
 fn newline_whitespace_for(target_cols: usize, source: &[u8], opts: &IndentOptions) -> Vec<u8> {
-    if opts.copyindent {
+    if opts.flags.contains(IndentFlags::COPYINDENT) {
         copied_whitespace_for(target_cols, source, opts)
     } else {
         inserted_whitespace_for(target_cols, opts)
@@ -288,7 +363,9 @@ fn parse_cino_amount(text: &str, shiftwidth: i64) -> i64 {
     let digits_start = index;
     let mut whole = 0i64;
     while let Some(byte) = bytes.get(index).copied().filter(u8::is_ascii_digit) {
-        whole = whole.saturating_mul(10).saturating_add(i64::from(byte - b'0'));
+        whole = whole
+            .saturating_mul(10)
+            .saturating_add(i64::from(byte - b'0'));
         index += 1;
     }
     let had_whole = index > digits_start;
@@ -298,7 +375,9 @@ fn parse_cino_amount(text: &str, shiftwidth: i64) -> i64 {
     if bytes.get(index) == Some(&b'.') {
         index += 1;
         while let Some(byte) = bytes.get(index).copied().filter(u8::is_ascii_digit) {
-            fraction = fraction.saturating_mul(10).saturating_add(i64::from(byte - b'0'));
+            fraction = fraction
+                .saturating_mul(10)
+                .saturating_add(i64::from(byte - b'0'));
             divider = divider.saturating_mul(10);
             had_fraction = true;
             index += 1;
@@ -310,13 +389,20 @@ fn parse_cino_amount(text: &str, shiftwidth: i64) -> i64 {
             shiftwidth
         } else {
             whole.saturating_mul(shiftwidth).saturating_add(
-                shiftwidth.saturating_mul(fraction).saturating_add(divider / 2) / divider,
+                shiftwidth
+                    .saturating_mul(fraction)
+                    .saturating_add(divider / 2)
+                    / divider,
             )
         }
     } else {
         whole
     };
-    if negative { value.saturating_neg() } else { value }
+    if negative {
+        value.saturating_neg()
+    } else {
+        value
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -327,7 +413,6 @@ struct Pos {
 
 #[derive(Clone, Debug)]
 struct RawState {
-    start: Pos,
     close: Vec<u8>,
 }
 
@@ -335,7 +420,6 @@ struct RawState {
 struct CLine {
     code: Vec<u8>,
     comment_at_start: Option<Pos>,
-    raw_at_start: Option<Pos>,
     brace_at_start: Option<Pos>,
     brace_at_end: Option<Pos>,
     paren_at_start: Option<Pos>,
@@ -362,7 +446,6 @@ fn scan_c(lines: &[Vec<u8>], through: usize) -> CScan {
     let mut raw = None::<RawState>;
     for (row, line) in lines.iter().enumerate().take(through.saturating_add(1)) {
         let comment_at_start = comment;
-        let raw_at_start = raw.as_ref().map(|state| state.start);
         let brace_at_start = braces.last().copied();
         let paren_at_start = parens.last().copied();
         let bracket_at_start = brackets.last().copied();
@@ -380,7 +463,9 @@ fn scan_c(lines: &[Vec<u8>], through: usize) -> CScan {
                 continue;
             }
             if let Some(state) = raw.as_ref() {
-                if line.get(index..index.saturating_add(state.close.len())) == Some(state.close.as_slice()) {
+                if line.get(index..index.saturating_add(state.close.len()))
+                    == Some(state.close.as_slice())
+                {
                     index += state.close.len();
                     raw = None;
                 } else {
@@ -389,7 +474,10 @@ fn scan_c(lines: &[Vec<u8>], through: usize) -> CScan {
                 continue;
             }
             if line.get(index..index.saturating_add(2)) == Some(b"/*") {
-                comment = Some(Pos { line: row, byte: index });
+                comment = Some(Pos {
+                    line: row,
+                    byte: index,
+                });
                 index += 2;
                 continue;
             }
@@ -399,14 +487,17 @@ fn scan_c(lines: &[Vec<u8>], through: usize) -> CScan {
             }
             if line.get(index..index.saturating_add(2)) == Some(b"R\"") {
                 let search_end = line.len().min(index.saturating_add(20));
-                if let Some(relative) = line[index + 2..search_end].iter().position(|byte| *byte == b'(') {
+                if let Some(relative) = line[index + 2..search_end]
+                    .iter()
+                    .position(|byte| *byte == b'(')
+                {
                     let paren = index + 2 + relative;
                     let delimiter = &line[index + 2..paren];
                     let mut close = Vec::with_capacity(delimiter.len().saturating_add(2));
                     close.push(b')');
                     close.extend_from_slice(delimiter);
                     close.push(b'"');
-                    raw = Some(RawState { start: Pos { line: row, byte: index }, close });
+                    raw = Some(RawState { close });
                     index = paren + 1;
                     continue;
                 }
@@ -428,7 +519,10 @@ fn scan_c(lines: &[Vec<u8>], through: usize) -> CScan {
             }
             let byte = line[index];
             code[index] = byte;
-            let pos = Pos { line: row, byte: index };
+            let pos = Pos {
+                line: row,
+                byte: index,
+            };
             match byte {
                 b'{' => braces.push(pos),
                 b'}' => {
@@ -455,7 +549,6 @@ fn scan_c(lines: &[Vec<u8>], through: usize) -> CScan {
         scan.lines.push(CLine {
             code,
             comment_at_start,
-            raw_at_start: raw_at_start.or_else(|| raw.as_ref().map(|state| state.start)),
             brace_at_start,
             brace_at_end: braces.last().copied(),
             paren_at_start,
@@ -482,10 +575,10 @@ fn find_start_brace(scan: &CScan, line: usize) -> Option<Pos> {
 
 fn find_match_paren(scan: &CScan, line: usize, max_lines: usize) -> Option<Pos> {
     for previous in (0..=line).rev() {
-        if let Some(pos) = scan.lines.get(previous).and_then(|info| info.paren_at_end) {
-            if line.saturating_sub(pos.line) <= max_lines {
-                return Some(pos);
-            }
+        if let Some(pos) = scan.lines.get(previous).and_then(|info| info.paren_at_end)
+            && line.saturating_sub(pos.line) <= max_lines
+        {
+            return Some(pos);
         }
     }
     None
@@ -496,18 +589,22 @@ fn find_start_comment(scan: &CScan, line: usize, max_lines: usize) -> Option<Pos
     (line.saturating_sub(pos.line) <= max_lines).then_some(pos)
 }
 
-fn find_start_rawstring(scan: &CScan, line: usize, max_lines: usize) -> Option<Pos> {
-    let pos = scan.lines.get(line)?.raw_at_start?;
-    (line.saturating_sub(pos.line) <= max_lines).then_some(pos)
-}
-
 fn first_nonblank(bytes: &[u8]) -> usize {
-    bytes.iter().position(|byte| !matches!(byte, b' ' | b'\t')).unwrap_or(bytes.len())
+    bytes
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t'))
+        .unwrap_or(bytes.len())
 }
 
 fn trim_code(code: &[u8]) -> &[u8] {
-    let start = code.iter().position(|byte| *byte != b' ').unwrap_or(code.len());
-    let end = code.iter().rposition(|byte| *byte != b' ').map_or(start, |index| index + 1);
+    let start = code
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t'))
+        .unwrap_or(code.len());
+    let end = code
+        .iter()
+        .rposition(|byte| !matches!(byte, b' ' | b'\t'))
+        .map_or(start, |index| index + 1);
     &code[start..end]
 }
 
@@ -540,7 +637,10 @@ fn is_identifier(byte: u8) -> bool {
 }
 
 fn starts_word(line: &[u8], word: &[u8]) -> bool {
-    line.starts_with(word) && line.get(word.len()).is_none_or(|byte| !is_identifier(*byte))
+    line.starts_with(word)
+        && line
+            .get(word.len())
+            .is_none_or(|byte| !is_identifier(*byte))
 }
 
 fn starts_if(line: &[u8]) -> bool {
@@ -567,7 +667,10 @@ fn is_control_head(code: &[u8]) -> bool {
 
 fn is_cinword(source: &[u8], opts: &IndentOptions) -> bool {
     let line = trim_code(&source[first_nonblank(source)..]);
-    opts.cinwords.split(',').filter(|word| !word.is_empty()).any(|word| starts_word(line, word.as_bytes()))
+    opts.cinwords
+        .split(',')
+        .filter(|word| !word.is_empty())
+        .any(|word| starts_word(line, word.as_bytes()))
 }
 
 fn line_terminator(code: &[u8], is_else: bool, include_comma: bool) -> Option<u8> {
@@ -580,7 +683,10 @@ fn line_terminator(code: &[u8], is_else: bool, include_comma: bool) -> Option<u8
         if *byte == b' ' {
             continue;
         }
-        if !is_else && (*byte == b';' || *byte == b'}' || (include_comma && *byte == b',')) && rest_empty {
+        if !is_else
+            && (*byte == b';' || *byte == b'}' || (include_comma && *byte == b','))
+            && rest_empty
+        {
             return Some(*byte);
         }
         rest_empty = false;
@@ -663,7 +769,7 @@ fn find_matching_do(scan: &CScan, line: usize, scope: Option<Pos>) -> Option<usi
 fn matching_open_for_last_close(scan: &CScan, line: usize) -> Option<Pos> {
     let current = trim_code(&scan.lines[line].code);
     let close = *current.last()?;
-    let open = match close {
+    let _open = match close {
         b'}' => b'{',
         b')' => b'(',
         b']' => b'[',
@@ -712,10 +818,12 @@ fn logical_statement_start(scan: &CScan, line: usize, scope: Option<Pos>) -> usi
 }
 
 fn unwind_unbraced_controls(scan: &CScan, mut line: usize, scope: Option<Pos>) -> usize {
-    loop {
-        let Some(previous) = previous_scope_line(scan, line, scope) else { break };
+    while let Some(previous) = previous_scope_line(scan, line, scope) {
         let code = &scan.lines[previous].code;
-        if !is_control_head(code) || code.contains(&b'{') || line_terminator(code, false, true).is_some() {
+        if !is_control_head(code)
+            || code.contains(&b'{')
+            || line_terminator(code, false, true).is_some()
+        {
             break;
         }
         line = statement_start(scan, previous, scope);
@@ -746,7 +854,9 @@ struct CommentLeaders {
 fn comment_leaders(value: &str) -> CommentLeaders {
     let mut result = CommentLeaders::default();
     for part in value.split(',') {
-        let Some((flags, text)) = part.split_once(':') else { continue };
+        let Some((flags, text)) = part.split_once(':') else {
+            continue;
+        };
         let offset = flags
             .trim_start_matches(|ch: char| ch.is_ascii_alphabetic())
             .parse::<i64>()
@@ -764,11 +874,20 @@ fn comment_leaders(value: &str) -> CommentLeaders {
     result
 }
 
-fn comment_indent(lines: &[Vec<u8>], scan: &CScan, line: usize, start: Pos, opts: &IndentOptions) -> usize {
+fn comment_indent(
+    lines: &[Vec<u8>],
+    scan: &CScan,
+    line: usize,
+    start: Pos,
+    opts: &IndentOptions,
+) -> usize {
     let opener_col = visual_col(&lines[start.line], start.byte, opts.tabstop);
     let current = &lines[line][first_nonblank(&lines[line])..];
     let leaders = comment_leaders(&opts.comments);
-    if !leaders.middle.is_empty() && current.starts_with(&leaders.middle) && !current.starts_with(&leaders.end) {
+    if !leaders.middle.is_empty()
+        && current.starts_with(&leaders.middle)
+        && !current.starts_with(&leaders.end)
+    {
         let mut amount = opener_col;
         if line > 0 {
             let previous = &lines[line - 1][first_nonblank(&lines[line - 1])..];
@@ -778,7 +897,10 @@ fn comment_indent(lines: &[Vec<u8>], scan: &CScan, line: usize, start: Pos, opts
         }
         return add_signed(amount, leaders.start_offset);
     }
-    if !leaders.end.is_empty() && current.starts_with(&leaders.end) && !current.starts_with(&leaders.middle) {
+    if !leaders.end.is_empty()
+        && current.starts_with(&leaders.end)
+        && !current.starts_with(&leaders.middle)
+    {
         return add_signed(indent_columns(&lines[line - 1], opts), leaders.end_offset);
     }
     if current.first() == Some(&b'*') {
@@ -788,14 +910,18 @@ fn comment_indent(lines: &[Vec<u8>], scan: &CScan, line: usize, start: Pos, opts
         return add_signed(opener_col, 1);
     }
     for previous in (start.line + 1..line).rev() {
-        if !trim_code(&scan.lines[previous].code).is_empty() || leading_len(&lines[previous]) < lines[previous].len() {
+        if !trim_code(&scan.lines[previous].code).is_empty()
+            || leading_len(&lines[previous]) < lines[previous].len()
+        {
             return indent_columns(&lines[previous], opts);
         }
     }
     let after = start.byte.saturating_add(2);
     let opener = &lines[start.line];
     if let Some(first_text) = opener.get(after..).and_then(|tail| {
-        tail.iter().position(|byte| !matches!(byte, b' ' | b'\t')).map(|offset| after + offset)
+        tail.iter()
+            .position(|byte| !matches!(byte, b' ' | b'\t'))
+            .map(|offset| after + offset)
     }) {
         visual_col(opener, first_text, opts.tabstop)
     } else {
@@ -803,7 +929,12 @@ fn comment_indent(lines: &[Vec<u8>], scan: &CScan, line: usize, start: Pos, opts
     }
 }
 
-fn line_comment_indent(lines: &[Vec<u8>], scan: &CScan, line: usize, opts: &IndentOptions) -> Option<usize> {
+fn line_comment_indent(
+    lines: &[Vec<u8>],
+    scan: &CScan,
+    line: usize,
+    opts: &IndentOptions,
+) -> Option<usize> {
     let current = &lines[line][first_nonblank(&lines[line])..];
     if !current.starts_with(b"//") {
         return None;
@@ -819,7 +950,13 @@ fn line_comment_indent(lines: &[Vec<u8>], scan: &CScan, line: usize, opts: &Inde
     None
 }
 
-fn paren_indent(lines: &[Vec<u8>], scan: &CScan, line: usize, open: Pos, opts: &IndentOptions) -> usize {
+fn paren_indent(
+    lines: &[Vec<u8>],
+    scan: &CScan,
+    line: usize,
+    open: Pos,
+    opts: &IndentOptions,
+) -> usize {
     let current = trim_code(&scan.lines[line].code);
     if current.contains(&b')') {
         return visual_col(&lines[open.line], open.byte, opts.tabstop);
@@ -851,21 +988,27 @@ fn cindent_cols(lines: &[Vec<u8>], lnum: usize, opts: &IndentOptions) -> usize {
     }
 }
 
-fn brace_indent(lines: &[Vec<u8>], scan: &CScan, line: usize, open: Pos, opts: &IndentOptions) -> usize {
+fn brace_indent(
+    lines: &[Vec<u8>],
+    scan: &CScan,
+    line: usize,
+    open: Pos,
+    opts: &IndentOptions,
+) -> usize {
     let current = trim_code(&scan.lines[line].code);
     let base = brace_base(lines, scan, open, opts);
     if current.first() == Some(&b'}') {
         return base;
     }
-    if starts_else(current) {
-        if let Some(matched) = find_matching_if(scan, line, Some(open)) {
-            return indent_columns(&lines[matched], opts);
-        }
+    if starts_else(current)
+        && let Some(matched) = find_matching_if(scan, line, Some(open))
+    {
+        return indent_columns(&lines[matched], opts);
     }
-    if while_do_tail(current) {
-        if let Some(matched) = find_matching_do(scan, line, Some(open)) {
-            return indent_columns(&lines[matched], opts);
-        }
+    if while_do_tail(current)
+        && let Some(matched) = find_matching_do(scan, line, Some(open))
+    {
+        return indent_columns(&lines[matched], opts);
     }
     if is_case(current) {
         if let Some(previous) = nearest_case(scan, line, open) {
@@ -881,11 +1024,16 @@ fn brace_indent(lines: &[Vec<u8>], scan: &CScan, line: usize, open: Pos, opts: &
     };
     let previous_code = &scan.lines[previous].code;
     if is_case(previous_code) {
-        return add_signed(cindent_cols(lines, previous + 1, opts), opts.cinoptions.case_code);
+        return add_signed(
+            cindent_cols(lines, previous + 1, opts),
+            opts.cinoptions.case_code,
+        );
     }
     if current.first() == Some(&b'{') {
         let start = statement_start(scan, previous, Some(open));
-        if is_control_head(&scan.lines[start].code) || line_terminator(previous_code, false, true).is_none() {
+        if is_control_head(&scan.lines[start].code)
+            || line_terminator(previous_code, false, true).is_none()
+        {
             return indent_columns(&lines[start], opts);
         }
         return scope_amount;
@@ -895,7 +1043,10 @@ fn brace_indent(lines: &[Vec<u8>], scan: &CScan, line: usize, open: Pos, opts: &
         if is_control_head(&scan.lines[start].code) {
             return add_signed(cindent_cols(lines, start + 1, opts), level);
         }
-        return add_signed(cindent_cols(lines, start + 1, opts), opts.cinoptions.continuation);
+        return add_signed(
+            cindent_cols(lines, start + 1, opts),
+            opts.cinoptions.continuation,
+        );
     }
     if line_terminator(previous_code, false, true) == Some(b';') {
         let anchor = logical_statement_start(scan, previous, Some(open));
@@ -905,9 +1056,13 @@ fn brace_indent(lines: &[Vec<u8>], scan: &CScan, line: usize, open: Pos, opts: &
     }
     let logical = logical_statement_start(scan, previous, Some(open));
     let anchor = unwind_unbraced_controls(scan, logical, Some(open));
-    if previous_case.is_some_and(|case| anchor <= case) {
-        let case = previous_case.expect("checked");
-        return add_signed(indent_columns(&lines[case], opts), opts.cinoptions.case_code);
+    if let Some(case) = previous_case
+        && anchor <= case
+    {
+        return add_signed(
+            indent_columns(&lines[case], opts),
+            opts.cinoptions.case_code,
+        );
     }
     cindent_cols(lines, anchor + 1, opts)
 }
@@ -917,17 +1072,26 @@ fn top_level_indent(lines: &[Vec<u8>], scan: &CScan, line: usize, opts: &IndentO
     if current.first() == Some(&b'{') {
         return 0;
     }
-    let Some(previous) = previous_scope_line(scan, line, None) else { return 0 };
+    let Some(previous) = previous_scope_line(scan, line, None) else {
+        return 0;
+    };
     let previous_code = &scan.lines[previous].code;
     if line_terminator(previous_code, false, true).is_none() {
         let start = statement_start(scan, previous, None);
         if is_control_head(&scan.lines[start].code) {
             return add_signed(cindent_cols(lines, start + 1, opts), opts.cinoptions.level);
         }
-        return add_signed(cindent_cols(lines, start + 1, opts), opts.cinoptions.continuation);
+        return add_signed(
+            cindent_cols(lines, start + 1, opts),
+            opts.cinoptions.continuation,
+        );
     }
     let logical = logical_statement_start(scan, previous, None);
-    cindent_cols(lines, unwind_unbraced_controls(scan, logical, None) + 1, opts)
+    cindent_cols(
+        lines,
+        unwind_unbraced_controls(scan, logical, None) + 1,
+        opts,
+    )
 }
 
 #[must_use]
@@ -957,18 +1121,17 @@ pub(crate) fn cindent(lines: &[Vec<u8>], lnum: usize, opts: &IndentOptions) -> I
     if let Some(amount) = line_comment_indent(lines, &scan, line, opts) {
         return IndentAmount::Columns(amount);
     }
-    if trim_code(&scan.lines[line].code).first() == Some(&b']') {
-        if let Some(open) = scan.lines[line].bracket_at_start {
-            return IndentAmount::Columns(indent_columns(&lines[open.line], opts));
-        }
+    if trim_code(&scan.lines[line].code).first() == Some(&b']')
+        && let Some(open) = scan.lines[line].bracket_at_start
+    {
+        return IndentAmount::Columns(indent_columns(&lines[open.line], opts));
     }
     let paren = find_match_paren(&scan, line, opts.cinoptions.maxparen);
     let brace = find_start_brace(&scan, line);
     let amount = match (paren, brace) {
         (Some(paren), Some(brace)) => match paren.cmp(&brace) {
             Ordering::Less => paren_indent(lines, &scan, line, paren, opts),
-            Ordering::Greater => brace_indent(lines, &scan, line, brace, opts),
-            Ordering::Equal => brace_indent(lines, &scan, line, brace, opts),
+            Ordering::Greater | Ordering::Equal => brace_indent(lines, &scan, line, brace, opts),
         },
         (Some(paren), None) => paren_indent(lines, &scan, line, paren, opts),
         (None, Some(brace)) => brace_indent(lines, &scan, line, brace, opts),
@@ -1016,7 +1179,13 @@ fn scan_lisp(lines: &[Vec<u8>], through: usize) -> Vec<LispLine> {
                 }
                 b'(' | b'[' => {
                     code[index] = line[index];
-                    stack.push(LispOpen { pos: Pos { line: row, byte: index }, kind: line[index] });
+                    stack.push(LispOpen {
+                        pos: Pos {
+                            line: row,
+                            byte: index,
+                        },
+                        kind: line[index],
+                    });
                     index += 1;
                 }
                 b')' | b']' => {
@@ -1033,17 +1202,26 @@ fn scan_lisp(lines: &[Vec<u8>], through: usize) -> Vec<LispLine> {
                 }
             }
         }
-        result.push(LispLine { code, open_at_start, open_at_end: stack.last().copied() });
+        result.push(LispLine {
+            code,
+            open_at_start,
+            open_at_end: stack.last().copied(),
+        });
     }
     result
 }
 
 fn lispword_matches(line: &[u8], start: usize, opts: &IndentOptions) -> bool {
-    opts.lispwords.split(',').filter(|word| !word.is_empty()).any(|word| {
-        let bytes = word.as_bytes();
-        line.get(start..start.saturating_add(bytes.len())) == Some(bytes)
-            && line.get(start.saturating_add(bytes.len())).is_none_or(|byte| matches!(byte, b' ' | b'\t'))
-    })
+    opts.lispwords
+        .split(',')
+        .filter(|word| !word.is_empty())
+        .any(|word| {
+            let bytes = word.as_bytes();
+            line.get(start..start.saturating_add(bytes.len())) == Some(bytes)
+                && line
+                    .get(start.saturating_add(bytes.len()))
+                    .is_none_or(|byte| matches!(byte, b' ' | b'\t'))
+        })
 }
 
 #[must_use]
@@ -1060,10 +1238,14 @@ pub(crate) fn lisp_indent(lines: &[Vec<u8>], lnum: usize, opts: &IndentOptions) 
         if trim_code(&scan[previous].code).is_empty() {
             continue;
         }
-        if scan[previous].open_at_end == scan[line].open_at_start && scan[line].open_at_start.is_some() {
+        if scan[previous].open_at_end == scan[line].open_at_start
+            && scan[line].open_at_start.is_some()
+        {
             let current_trim = trim_code(&scan[line].code);
             if !matches!(current_trim.first(), Some(b'(' | b'[')) {
-                return IndentAmount::Columns(indent_columns(&lines[previous], opts).saturating_add(1));
+                return IndentAmount::Columns(
+                    indent_columns(&lines[previous], opts).saturating_add(1),
+                );
             }
             break;
         }
@@ -1077,7 +1259,11 @@ pub(crate) fn lisp_indent(lines: &[Vec<u8>], lnum: usize, opts: &IndentOptions) 
     amount = amount.saturating_add(1);
     let mut firsttry = amount;
     while cursor < source.len() && matches!(source[cursor], b' ' | b'\t') {
-        amount = amount.saturating_add(if source[cursor] == b'\t' { tab_padding(amount, opts.tabstop) } else { 1 });
+        amount = amount.saturating_add(if source[cursor] == b'\t' {
+            tab_padding(amount, opts.tabstop)
+        } else {
+            1
+        });
         cursor += 1;
     }
     if cursor < source.len() && source[cursor] != b';' {
@@ -1087,7 +1273,9 @@ pub(crate) fn lisp_indent(lines: &[Vec<u8>], lnum: usize, opts: &IndentOptions) 
         if !matches!(source[cursor], b'"' | b'\'' | b'#' | b'0'..=b'9') {
             let mut quotes = false;
             let mut parens = 0i64;
-            while cursor < source.len() && (!matches!(source[cursor], b' ' | b'\t') || quotes || parens != 0) {
+            while cursor < source.len()
+                && (!matches!(source[cursor], b' ' | b'\t') || quotes || parens != 0)
+            {
                 match source[cursor] {
                     b'"' => quotes = !quotes,
                     b'(' | b'[' if !quotes => parens += 1,
@@ -1103,7 +1291,11 @@ pub(crate) fn lisp_indent(lines: &[Vec<u8>], lnum: usize, opts: &IndentOptions) 
             }
         }
         while cursor < source.len() && matches!(source[cursor], b' ' | b'\t') {
-            amount = amount.saturating_add(if source[cursor] == b'\t' { tab_padding(amount, opts.tabstop) } else { 1 });
+            amount = amount.saturating_add(if source[cursor] == b'\t' {
+                tab_padding(amount, opts.tabstop)
+            } else {
+                1
+            });
             cursor += 1;
         }
         if cursor == source.len() || source[cursor] == b';' {
@@ -1114,12 +1306,21 @@ pub(crate) fn lisp_indent(lines: &[Vec<u8>], lnum: usize, opts: &IndentOptions) 
 }
 
 #[must_use]
-pub(crate) fn smart_newline_indent(source_prefix: &[u8], smart_trigger: bool, opts: &IndentOptions) -> Vec<u8> {
-    if opts.paste {
+pub(crate) fn smart_newline_indent(
+    source_prefix: &[u8],
+    smart_trigger: bool,
+    opts: &IndentOptions,
+) -> Vec<u8> {
+    if opts.flags.contains(IndentFlags::PASTE) {
         return Vec::new();
     }
-    let do_smart = opts.smartindent && !opts.cindent && opts.indentexpr.is_empty();
-    if !opts.autoindent && !opts.copyindent && !do_smart {
+    let do_smart = opts.flags.contains(IndentFlags::SMARTINDENT)
+        && !opts.flags.contains(IndentFlags::CINDENT)
+        && opts.indentexpr.is_empty();
+    if !opts.flags.contains(IndentFlags::AUTOINDENT)
+        && !opts.flags.contains(IndentFlags::COPYINDENT)
+        && !do_smart
+    {
         return Vec::new();
     }
     let mut target = indent_columns(source_prefix, opts);
@@ -1146,34 +1347,34 @@ pub(crate) fn smart_source_trigger(source: &[u8], backward: bool, opts: &IndentO
 pub(crate) enum CinTrigger {
     OpenForward,
     OpenBackward,
-    Else,
+    #[cfg(test)]
     OpenBrace,
-    CloseBrace,
-    Hash,
-    CloseBracket,
-    CloseParen,
+    #[cfg(test)]
     Colon,
 }
 
 #[must_use]
 pub(crate) fn cinkeys_trigger(opts: &IndentOptions, trigger: CinTrigger) -> bool {
-    let keys = if opts.indentexpr.is_empty() { &opts.cinkeys } else { &opts.indentkeys };
+    let keys = if opts.indentexpr.is_empty() {
+        &opts.cinkeys
+    } else {
+        &opts.indentkeys
+    };
     let wanted = match trigger {
         CinTrigger::OpenForward => "o",
         CinTrigger::OpenBackward => "O",
-        CinTrigger::Else => "e",
+        #[cfg(test)]
         CinTrigger::OpenBrace => "0{",
-        CinTrigger::CloseBrace => "0}",
-        CinTrigger::Hash => "0#",
-        CinTrigger::CloseBracket => "0]",
-        CinTrigger::CloseParen => "0)",
+        #[cfg(test)]
         CinTrigger::Colon => ":",
     };
     keys.split(',').any(|entry| entry.trim() == wanted)
 }
 
+/// Failure from evaluating an `indentexpr` expression.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum IndentExprError {
+    /// The expression evaluated to an error or non-number result.
     #[error("indent expression failed: {0}")]
     Failed(String),
     /// No expression evaluator is wired (e.g. the typeahead drain is using
@@ -1198,7 +1399,11 @@ impl<'a> IndentEvalContext<'a> {
     /// Borrows the editor, target buffer handle, and staged lines for one evaluation.
     #[must_use]
     pub const fn new(editor: &'a Editor, buffer: BufHandle, lines: &'a [Vec<u8>]) -> Self {
-        Self { editor, buffer, lines }
+        Self {
+            editor,
+            buffer,
+            lines,
+        }
     }
 
     /// Editor providing options and buffer metadata (not buffer text mutation).
@@ -1220,7 +1425,14 @@ impl<'a> IndentEvalContext<'a> {
     }
 }
 
+/// Evaluates an `indentexpr` expression for one line, returning the desired indent width.
 pub trait ExprEval {
+    /// Evaluates `expression` at `lnum` within `context`, returning the indent width in columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndentExprError`] when `expression` cannot produce a usable
+    /// indentation width or when no expression evaluator is available.
     fn eval_indentexpr(
         &mut self,
         context: &IndentEvalContext<'_>,
@@ -1229,6 +1441,7 @@ pub trait ExprEval {
     ) -> Result<i64, IndentExprError>;
 }
 
+/// No-op `ExprEval` that always reports evaluation unavailable.
 pub struct NullExprEval;
 
 impl ExprEval for NullExprEval {
@@ -1259,7 +1472,7 @@ impl<'a> IgnoreExprEval<'a> {
     }
 }
 
-impl<'a> ExprEval for IgnoreExprEval<'a> {
+impl ExprEval for IgnoreExprEval<'_> {
     fn eval_indentexpr(
         &mut self,
         context: &IndentEvalContext<'_>,
@@ -1272,7 +1485,6 @@ impl<'a> ExprEval for IgnoreExprEval<'a> {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Method {
     Cindent,
@@ -1282,31 +1494,16 @@ pub(crate) enum Method {
 
 #[must_use]
 pub(crate) fn resolve_options_method(opts: &IndentOptions) -> Method {
-    if !opts.indentexpr.is_empty() {
-        Method::Expr
-    } else if opts.lisp {
+    // Upstream `fix_indent` (`indent.c:1896-1901`): `lisp` wins over
+    // `indentexpr` unless `lispoptions` carries `expr:1`
+    // (`use_indentexpr_for_lisp`, `indent.c:1883-1888`). `lispoptions` is not
+    // modeled yet, so lisp unconditionally wins here; revisit when it is.
+    if opts.flags.contains(IndentFlags::LISP) {
         Method::Lisp
-    } else if opts.cindent {
-        Method::Cindent
+    } else if !opts.indentexpr.is_empty() {
+        Method::Expr
     } else {
         Method::Cindent
-    }
-}
-
-#[must_use]
-pub(crate) fn equalprg(editor: &Editor, buffer: BufHandle) -> Option<String> {
-    match editor.options().get_buffer(buffer, "equalprg") {
-        Ok(OptionValue::String(value)) if !value.is_empty() => Some(value.clone()),
-        _ => None,
-    }
-}
-
-#[must_use]
-pub(crate) fn resolve_method(editor: &Editor, buffer: BufHandle) -> Option<Method> {
-    if equalprg(editor, buffer).is_some() {
-        None
-    } else {
-        Some(resolve_options_method(&IndentOptions::capture(editor, buffer)))
     }
 }
 
@@ -1324,10 +1521,12 @@ pub(crate) fn amount_for(
             Ok(value) if value >= 0 => {
                 IndentAmount::Columns(usize::try_from(value).unwrap_or(usize::MAX))
             }
-            Ok(_) => context.lines().get(lnum.saturating_sub(1)).map_or(
-                IndentAmount::LeaveAlone,
-                |line| IndentAmount::Columns(indent_columns(line, opts)),
-            ),
+            Ok(_) => context
+                .lines()
+                .get(lnum.saturating_sub(1))
+                .map_or(IndentAmount::LeaveAlone, |line| {
+                    IndentAmount::Columns(indent_columns(line, opts))
+                }),
             // No real evaluator is wired; ignore the expression and keep the
             // existing indent instead of aborting o/O/Enter/==.
             Err(IndentExprError::Unavailable) => IndentAmount::LeaveAlone,
@@ -1346,7 +1545,10 @@ pub(crate) fn fix_line_indent(
 ) -> Result<Option<Vec<u8>>, IndentExprError> {
     // cinkeys only fire when an indent method is actually enabled; default
     // cinkeys include `o`/`O` and must not invent cindent for plain buffers.
-    if opts.indentexpr.is_empty() && !opts.lisp && !opts.cindent {
+    if opts.indentexpr.is_empty()
+        && !opts.flags.contains(IndentFlags::LISP)
+        && !opts.flags.contains(IndentFlags::CINDENT)
+    {
         return Ok(None);
     }
     if !cinkeys_trigger(opts, trigger) {
@@ -1357,7 +1559,12 @@ pub(crate) fn fix_line_indent(
         IndentAmount::Columns(value) => value,
         IndentAmount::LeaveAlone => return Ok(None),
     };
-    Ok(Some(whitespace_for(amount, context.lines().get(lnum.saturating_sub(1)).map_or(&[], Vec::as_slice), opts)))
+    Ok(Some(whitespace_for(
+        amount,
+        context
+            .lines()
+            .get(lnum.saturating_sub(1))
+            .map_or(&[], Vec::as_slice),
+        opts,
+    )))
 }
-
-

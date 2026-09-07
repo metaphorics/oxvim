@@ -18,6 +18,11 @@ static FALLBACK_EOF: Token = Token {
 
 /// Vim's default maximum expression nesting (see `E1169`).
 pub const DEFAULT_MAX_NESTING: usize = 1_000;
+// A parenthesis re-enters the entire nine-level precedence chain. Grow before
+// the native stack can abort so Vim's semantic recursion guard remains the
+// authority, including on the smaller stacks used by test and host threads.
+const PARSER_STACK_RED_ZONE: usize = 64 * 1024;
+const PARSER_STACK_SEGMENT: usize = 32 * 1024 * 1024;
 
 /// A parsed expression and its exact source range.
 #[derive(Clone, Debug, PartialEq)]
@@ -94,6 +99,10 @@ pub enum ExprKind {
     Interpolated(Vec<InterpolatedPart>),
     /// A scoped or unscoped internal variable name.
     Variable(OxStr),
+    /// A curly-braces name `{expr}`: evaluate `expr` and read the result as
+    /// a variable name (upstream `eval7`'s NOTDONE path,
+    /// `eval.c:2769-2789`).
+    CurlyName(Box<Expr>),
     /// `$NAME`.
     Environment(OxStr),
     /// `&name`, `&g:name`, or `&l:name`.
@@ -107,7 +116,11 @@ pub enum ExprKind {
     /// A prefix operation.
     Unary { op: UnaryOp, expr: Box<Expr> },
     /// A left-associative binary operation.
-    Binary { op: BinaryOp, left: Box<Expr>, right: Box<Expr> },
+    Binary {
+        op: BinaryOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     /// A comparison and its optional `#`/`?` case suffix.
     Compare {
         op: CompareOp,
@@ -136,10 +149,18 @@ pub enum ExprKind {
         end: Option<Box<Expr>>,
     },
     /// `receiver->method(args)`; `method` may be a name or lambda.
-    MethodCall { receiver: Box<Expr>, method: Box<Expr>, args: Vec<Expr> },
+    MethodCall {
+        receiver: Box<Expr>,
+        method: Box<Expr>,
+        args: Vec<Expr>,
+    },
     /// `{arg, ... -> expr}`. `varargs` is true when the parameter list ends
     /// with `...`, matching `get_lambda_tv`'s acceptance of the variadic form.
-    Lambda { params: Vec<OxStr>, varargs: bool, body: Box<Expr> },
+    Lambda {
+        params: Vec<OxStr>,
+        varargs: bool,
+        body: Box<Expr>,
+    },
 }
 
 /// One literal or parsed-expression segment in an interpolated string.
@@ -169,7 +190,7 @@ pub struct Parser<'a> {
 /// failure before `stop` is unrelated and stands. The refusal's own offset is
 /// not the comparison point: it can sit inside the token that failed to lex,
 /// past the offset the parser reports.
-fn resolve_refusal(error: EvalError, refused: &Option<EvalError>, stop: usize) -> EvalError {
+fn resolve_refusal(error: EvalError, refused: Option<&EvalError>, stop: usize) -> EvalError {
     match refused {
         Some(refusal) if error.offset >= stop => refusal.clone(),
         _ => error,
@@ -197,11 +218,20 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse one complete expression and reject trailing tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns `E15: Invalid expression` when the source cannot be parsed,
+    /// `E488: Trailing characters` when the expression is followed by
+    /// unconsumed bytes, or the lexer's own error when a byte cannot start
+    /// any token and the expression needed it.
     pub fn parse(mut self) -> Result<Expr, EvalError> {
         let (tokens, refused) = Lexer::new(self.source).tokenize_tolerant();
         let stop = tokens.last().map_or(0, |token| token.span.start);
         self.tokens = tokens;
-        let expression = self.parse_expr1().map_err(|error| resolve_refusal(error, &refused, stop))?;
+        let expression = self
+            .parse_expr1()
+            .map_err(|error| resolve_refusal(error, refused.as_ref(), stop))?;
         if !matches!(self.current().kind, TokenKind::Eof) || refused.is_some() {
             // Upstream reports the unconsumed remainder verbatim:
             // `e_trailing_arg` is "E488: Trailing characters: %s" (errors.h:123),
@@ -211,12 +241,22 @@ impl<'a> Parser<'a> {
             // already complete.
             let start = self.current().span.start;
             let rest = String::from_utf8_lossy(&self.source[start..]);
-            return Err(EvalError::new("E488", start, format!("Trailing characters: {rest}")));
+            return Err(EvalError::new(
+                "E488",
+                start,
+                format!("Trailing characters: {rest}"),
+            ));
         }
         Ok(expression)
     }
 
     /// Parse whitespace-separated expressions, as consumed by `:execute`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `E15: Invalid expression` when any expression cannot be
+    /// parsed, or the lexer's error when a byte cannot start any token
+    /// and an expression needed it.
     pub fn parse_many(mut self) -> Result<Vec<Expr>, EvalError> {
         let (tokens, refused) = Lexer::new(self.source).tokenize_tolerant();
         let stop = tokens.last().map_or(0, |token| token.span.start);
@@ -233,7 +273,10 @@ impl<'a> Parser<'a> {
                     ));
                 }
             }
-            expressions.push(self.parse_expr1().map_err(|error| resolve_refusal(error, &refused, stop))?);
+            expressions.push(
+                self.parse_expr1()
+                    .map_err(|error| resolve_refusal(error, refused.as_ref(), stop))?,
+            );
         }
         // `:echo`, `:echomsg` and `:execute` loop `eval1` until the line is
         // spent (`eval.c:1846` and `ex_docmd`'s echo handlers), so they do
@@ -247,19 +290,38 @@ impl<'a> Parser<'a> {
     fn parse_expr1(&mut self) -> Result<Expr, EvalError> {
         let offset = self.current().span.start;
         if self.nesting >= self.max_nesting {
-            return Err(EvalError::new("E1169", offset, "expression nesting is too deep"));
+            // `eval7` (eval.c:2662-2671): `e_expression_too_recursive_str`
+            // echoes the not-yet-parsed remainder — "E1169: Expression too
+            // recursive: %s".
+            return Err(EvalError::new(
+                "E1169",
+                offset,
+                format!(
+                    "Expression too recursive: {}",
+                    String::from_utf8_lossy(&self.source[offset..])
+                ),
+            ));
         }
         self.nesting += 1;
-        let result = self.parse_expr1_inner();
+        let result = stacker::maybe_grow(PARSER_STACK_RED_ZONE, PARSER_STACK_SEGMENT, || {
+            self.parse_expr1_inner()
+        });
         self.nesting -= 1;
         result
     }
 
     fn parse_expr1_inner(&mut self) -> Result<Expr, EvalError> {
         let left = self.parse_expr2()?;
-        if self.take(|kind| matches!(kind, TokenKind::Question)).is_some() {
+        if self
+            .take(|kind| matches!(kind, TokenKind::Question))
+            .is_some()
+        {
             let then_expr = self.parse_expr1()?;
-            self.require(|kind| matches!(kind, TokenKind::Colon), "E109", "missing ':' after '?' branch")?;
+            self.require(
+                |kind| matches!(kind, TokenKind::Colon),
+                "E109",
+                "missing ':' after '?' branch",
+            )?;
             let else_expr = self.parse_expr1()?;
             let span = left.span.through(else_expr.span);
             return Ok(Expr::new(
@@ -271,11 +333,17 @@ impl<'a> Parser<'a> {
                 span,
             ));
         }
-        if self.take(|kind| matches!(kind, TokenKind::Coalesce)).is_some() {
+        if self
+            .take(|kind| matches!(kind, TokenKind::Coalesce))
+            .is_some()
+        {
             let right = self.parse_expr1()?;
             let span = left.span.through(right.span);
             return Ok(Expr::new(
-                ExprKind::Coalesce { left: Box::new(left), right: Box::new(right) },
+                ExprKind::Coalesce {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
                 span,
             ));
         }
@@ -293,7 +361,10 @@ impl<'a> Parser<'a> {
 
     fn parse_expr3(&mut self) -> Result<Expr, EvalError> {
         let mut left = self.parse_expr4()?;
-        while self.take(|kind| matches!(kind, TokenKind::AndAnd)).is_some() {
+        while self
+            .take(|kind| matches!(kind, TokenKind::AndAnd))
+            .is_some()
+        {
             let right = self.parse_expr4()?;
             left = binary(BinaryOp::And, left, right);
         }
@@ -308,7 +379,12 @@ impl<'a> Parser<'a> {
         let right = self.parse_expr5()?;
         let span = left.span.through(right.span);
         Ok(Expr::new(
-            ExprKind::Compare { op, case, left: Box::new(left), right: Box::new(right) },
+            ExprKind::Compare {
+                op,
+                case,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
             span,
         ))
     }
@@ -320,13 +396,23 @@ impl<'a> Parser<'a> {
                 Some(BinaryOp::Add)
             } else if self.take(|kind| matches!(kind, TokenKind::Minus)).is_some() {
                 Some(BinaryOp::Subtract)
-            } else if self.take(|kind| matches!(kind, TokenKind::Dot | TokenKind::DotDot)).is_some() {
+            } else if self
+                .take(|kind| matches!(kind, TokenKind::Dot | TokenKind::DotDot))
+                .is_some()
+            {
                 Some(BinaryOp::Concat)
             } else {
                 None
             };
             let Some(op) = op else { break };
-            let right = self.parse_expr6()?;
+            // `eval5` (eval.c:2580) parses the right operand of `.` with
+            // `want_string`, which is why `1.2.3` concatenates "1", "2", "3"
+            // instead of reading `2.3` as a Float.
+            let right = if matches!(op, BinaryOp::Concat) {
+                self.parse_want_string_operand()?
+            } else {
+                self.parse_expr6()?
+            };
             left = binary(op, left, right);
         }
         Ok(left)
@@ -339,7 +425,10 @@ impl<'a> Parser<'a> {
                 Some(BinaryOp::Multiply)
             } else if self.take(|kind| matches!(kind, TokenKind::Slash)).is_some() {
                 Some(BinaryOp::Divide)
-            } else if self.take(|kind| matches!(kind, TokenKind::Percent)).is_some() {
+            } else if self
+                .take(|kind| matches!(kind, TokenKind::Percent))
+                .is_some()
+            {
                 Some(BinaryOp::Modulo)
             } else {
                 None
@@ -369,7 +458,13 @@ impl<'a> Parser<'a> {
         let mut expression = self.parse_expr8()?;
         while let Some((op, start)) = operators.pop() {
             let span = Span::new(start, expression.span.end);
-            expression = Expr::new(ExprKind::Unary { op, expr: Box::new(expression) }, span);
+            expression = Expr::new(
+                ExprKind::Unary {
+                    op,
+                    expr: Box::new(expression),
+                },
+                span,
+            );
         }
         while self.take(|kind| matches!(kind, TokenKind::Arrow)).is_some() {
             expression = self.parse_method_call(expression)?;
@@ -392,17 +487,33 @@ impl<'a> Parser<'a> {
                 expression = self.parse_subscript(expression)?;
                 continue;
             }
+            if matches!(
+                expression.kind,
+                ExprKind::Literal(_) | ExprKind::Interpolated(_)
+            ) && self.is_adjacent_member(expression.span.end)
+            {
+                break;
+            }
             if self.is_adjacent_member(expression.span.end) {
                 self.advance();
                 let token = self.advance().clone();
                 let name = match token.kind {
                     TokenKind::Identifier(bytes) => bytes,
                     TokenKind::Integer(number) => number.to_string().into_bytes(),
-                    _ => return Err(EvalError::new("E15", token.span.start, "member name expected")),
+                    _ => {
+                        return Err(EvalError::new(
+                            "E15",
+                            token.span.start,
+                            "member name expected",
+                        ));
+                    }
                 };
                 let span = expression.span.through(token.span);
                 expression = Expr::new(
-                    ExprKind::Member { target: Box::new(expression), name: OxStr(name) },
+                    ExprKind::Member {
+                        target: Box::new(expression),
+                        name: OxStr(name),
+                    },
                     span,
                 );
                 continue;
@@ -413,7 +524,13 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let (args, end) = self.parse_arguments()?;
                 let span = Span::new(expression.span.start, end);
-                expression = Expr::new(ExprKind::Call { callee: Box::new(expression), args }, span);
+                expression = Expr::new(
+                    ExprKind::Call {
+                        callee: Box::new(expression),
+                        args,
+                    },
+                    span,
+                );
                 continue;
             }
             break;
@@ -421,12 +538,81 @@ impl<'a> Parser<'a> {
         Ok(expression)
     }
 
+    /// The right operand of `.`, parsed with upstream's `want_string` flag:
+    /// an eager lexer cannot know the flag, so a `Float` token here is split
+    /// back into its integer part plus re-lexed remainder tokens
+    /// (`eval_number`, eval.c:3460-3487). The leftover `.…` then feeds the
+    /// next round of the concat loop.
+    fn parse_want_string_operand(&mut self) -> Result<Expr, EvalError> {
+        if matches!(self.current().kind, TokenKind::Float(_)) {
+            let token = self.current().clone();
+            let start = token.span.start;
+            let text = &self.source[token.span.start..token.span.end];
+            let int_len = text
+                .iter()
+                .position(|byte| !byte.is_ascii_digit())
+                .unwrap_or(text.len());
+            let digits =
+                std::str::from_utf8(&text[..int_len]).map_err(|_| self.invalid_expression())?;
+            // A float token is always digit-led and cannot overflow i64 in
+            // practice; saturate like `vim_str2nr` does if it does.
+            let value = digits.parse::<i64>().unwrap_or(i64::MAX);
+            let mut replacement = vec![Token {
+                kind: TokenKind::Integer(value),
+                span: Span::new(start, start + int_len),
+            }];
+            if int_len < text.len() {
+                let (rest, _) = Lexer::new(&text[int_len..]).tokenize_tolerant();
+                let offset = start + int_len;
+                replacement.extend(rest.into_iter().filter_map(|mut token| {
+                    if matches!(token.kind, TokenKind::Eof) {
+                        return None;
+                    }
+                    token.span = Span::new(token.span.start + offset, token.span.end + offset);
+                    Some(token)
+                }));
+            }
+            self.tokens.splice(self.cursor..=self.cursor, replacement);
+        }
+        self.parse_expr6()
+    }
+
+    /// `eval_dict`'s pre-check (eval.c:4488-4499): a `{` holding one
+    /// complete expression and a closing `}` is a curly-braces name, not a
+    /// dictionary. The decision parses without evaluating; only a
+    /// successful expression that is not followed by `}` falls back to the
+    /// dictionary grammar. A committed expression error propagates: the
+    /// dict reparse would fail the same way and only double the
+    /// [`Parser::parse_expr1`] recursion work that the stacker wrapper
+    /// counts at this seam.
+    fn try_parse_curly_name(&mut self) -> Result<Option<Expr>, EvalError> {
+        if matches!(self.current().kind, TokenKind::RBrace | TokenKind::Eof) {
+            return Ok(None);
+        }
+        let saved = self.cursor;
+        let inner = self.parse_expr1()?;
+        if !matches!(self.current().kind, TokenKind::RBrace) {
+            self.cursor = saved;
+            return Ok(None);
+        }
+        Ok(Some(inner))
+    }
+
     fn parse_expr9(&mut self) -> Result<Expr, EvalError> {
         let token = self.advance().clone();
         match token.kind {
-            TokenKind::Integer(value) => Ok(Expr::new(ExprKind::Literal(Typval::Number(value)), token.span)),
-            TokenKind::Float(value) => Ok(Expr::new(ExprKind::Literal(Typval::Float(value)), token.span)),
-            TokenKind::String(value) => Ok(Expr::new(ExprKind::Literal(Typval::String(OxStr(value))), token.span)),
+            TokenKind::Integer(value) => Ok(Expr::new(
+                ExprKind::Literal(Typval::Number(value)),
+                token.span,
+            )),
+            TokenKind::Float(value) => Ok(Expr::new(
+                ExprKind::Literal(Typval::Float(value)),
+                token.span,
+            )),
+            TokenKind::String(value) => Ok(Expr::new(
+                ExprKind::Literal(Typval::String(OxStr(value))),
+                token.span,
+            )),
             TokenKind::Interpolated(parts) => {
                 let parts = parts
                     .into_iter()
@@ -434,37 +620,68 @@ impl<'a> Parser<'a> {
                         LexInterpolationPart::Literal(bytes) => {
                             Ok(InterpolatedPart::Literal(OxStr(bytes)))
                         }
-                        LexInterpolationPart::Expression(source) => {
-                            Parser::new(&source).parse().map(InterpolatedPart::Expression)
-                        }
+                        LexInterpolationPart::Expression(source) => Parser::new(&source)
+                            .parse()
+                            .map(InterpolatedPart::Expression),
                     })
                     .collect::<Result<Vec<_>, EvalError>>()?;
                 Ok(Expr::new(ExprKind::Interpolated(parts), token.span))
             }
-            TokenKind::Blob(value) => Ok(Expr::new(ExprKind::Literal(Typval::Blob(value)), token.span)),
+            TokenKind::Blob(value) => Ok(Expr::new(
+                ExprKind::Literal(Typval::Blob(value)),
+                token.span,
+            )),
             TokenKind::Identifier(value) => {
-                let variable = self.parse_variable(value, token.span)?;
+                let variable = self.parse_variable(value, token.span);
                 self.parse_detached_call(variable)
             }
-            TokenKind::Environment(value) => Ok(Expr::new(ExprKind::Environment(OxStr(value)), token.span)),
+            TokenKind::Environment(value) => {
+                Ok(Expr::new(ExprKind::Environment(OxStr(value)), token.span))
+            }
             TokenKind::Option { scope, name } => {
                 let scope = match scope {
                     Some(b'g') => OptionScope::Global,
                     Some(b'l') => OptionScope::Local,
                     _ => OptionScope::Effective,
                 };
-                Ok(Expr::new(ExprKind::Option { scope, name: OxStr(name) }, token.span))
+                Ok(Expr::new(
+                    ExprKind::Option {
+                        scope,
+                        name: OxStr(name),
+                    },
+                    token.span,
+                ))
             }
             TokenKind::Register(name) => Ok(Expr::new(ExprKind::Register(name), token.span)),
             TokenKind::LParen => {
                 let expression = self.parse_expr1()?;
-                let close = self.require(|kind| matches!(kind, TokenKind::RParen), "E110", "missing ')'" )?;
-                Ok(Expr::new(expression.kind, Span::new(token.span.start, close.span.end)))
+                let close = self.require(
+                    |kind| matches!(kind, TokenKind::RParen),
+                    "E110",
+                    "missing ')'",
+                )?;
+                Ok(Expr::new(
+                    expression.kind,
+                    Span::new(token.span.start, close.span.end),
+                ))
             }
             TokenKind::LBracket => self.parse_list(token.span.start),
             TokenKind::HashLBrace => self.parse_literal_dict(token.span.start),
             TokenKind::LBrace if self.brace_is_lambda() => self.parse_lambda(token.span.start),
-            TokenKind::LBrace => self.parse_dict(token.span.start),
+            // Lambda, then curly-braces name, then dictionary — the same
+            // NOTDONE chain `eval9`/`eval7` walks (eval.c:2717-2721,
+            // 2769-2789).
+            TokenKind::LBrace => match self.try_parse_curly_name() {
+                Ok(Some(inner)) => {
+                    let close = self.advance().clone();
+                    Ok(Expr::new(
+                        ExprKind::CurlyName(Box::new(inner)),
+                        Span::new(token.span.start, close.span.end),
+                    ))
+                }
+                Ok(None) => self.parse_dict(token.span.start),
+                Err(error) => Err(error),
+            },
             // Nothing here can begin an expression. Upstream does not describe
             // the offending token; `e_invexpr2` (errors.h:38) quotes the whole
             // expression back: `E15: Invalid expression: "%s"`.
@@ -472,14 +689,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `e_invexpr2` (errors.h:38): `E15: Invalid expression: "%s"`, quoting the
-    /// whole expression rather than the token that could not be parsed.
+    /// `e_invexpr2` (errors.h:38): quote the whole expression, not only the
+    /// token that could not be parsed.
     fn invalid_expression(&self) -> EvalError {
         let source = String::from_utf8_lossy(self.source);
         EvalError::new("E15", 0, format!("Invalid expression: \"{source}\""))
     }
 
-    fn parse_variable(&mut self, mut name: Vec<u8>, mut span: Span) -> Result<Expr, EvalError> {
+    fn parse_variable(&mut self, mut name: Vec<u8>, mut span: Span) -> Expr {
         if name.len() == 1
             && is_scope_prefix(name[0])
             && matches!(self.current().kind, TokenKind::Colon)
@@ -499,7 +716,8 @@ impl<'a> Parser<'a> {
                     // distinct from `a:0` (the count), which both lex as the
                     // integer token `0`.
                     TokenKind::Integer(_) if name.as_slice() == b"a:" => {
-                        let suffix = &self.source[self.current().span.start..self.current().span.end];
+                        let suffix =
+                            &self.source[self.current().span.start..self.current().span.end];
                         name.extend_from_slice(suffix);
                         span.end = self.advance().span.end;
                     }
@@ -507,7 +725,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        Ok(Expr::new(ExprKind::Variable(OxStr(name)), span))
+        Expr::new(ExprKind::Variable(OxStr(name)), span)
     }
 
     /// A bare name may be separated from its argument list by white space, so
@@ -524,13 +742,22 @@ impl<'a> Parser<'a> {
         self.advance();
         let (args, end) = self.parse_arguments()?;
         let span = Span::new(callee.span.start, end);
-        Ok(Expr::new(ExprKind::Call { callee: Box::new(callee), args }, span))
+        Ok(Expr::new(
+            ExprKind::Call {
+                callee: Box::new(callee),
+                args,
+            },
+            span,
+        ))
     }
 
     fn parse_list(&mut self, start: usize) -> Result<Expr, EvalError> {
         let mut items = Vec::new();
         if let Some(close) = self.take(|kind| matches!(kind, TokenKind::RBracket)) {
-            return Ok(Expr::new(ExprKind::List(items), Span::new(start, close.span.end)));
+            return Ok(Expr::new(
+                ExprKind::List(items),
+                Span::new(start, close.span.end),
+            ));
         }
         loop {
             items.push(self.parse_expr1()?);
@@ -541,18 +768,32 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let close = self.require(|kind| matches!(kind, TokenKind::RBracket), "E696", "missing ']'" )?;
-        Ok(Expr::new(ExprKind::List(items), Span::new(start, close.span.end)))
+        let close = self.require(
+            |kind| matches!(kind, TokenKind::RBracket),
+            "E696",
+            "missing ']'",
+        )?;
+        Ok(Expr::new(
+            ExprKind::List(items),
+            Span::new(start, close.span.end),
+        ))
     }
 
     fn parse_dict(&mut self, start: usize) -> Result<Expr, EvalError> {
         let mut entries = Vec::new();
         if let Some(close) = self.take(|kind| matches!(kind, TokenKind::RBrace)) {
-            return Ok(Expr::new(ExprKind::Dict(entries), Span::new(start, close.span.end)));
+            return Ok(Expr::new(
+                ExprKind::Dict(entries),
+                Span::new(start, close.span.end),
+            ));
         }
         loop {
             let key = self.parse_expr1()?;
-            self.require(|kind| matches!(kind, TokenKind::Colon), "E720", "missing ':' in dictionary")?;
+            self.require(
+                |kind| matches!(kind, TokenKind::Colon),
+                "E720",
+                "missing ':' in dictionary",
+            )?;
             let value = self.parse_expr1()?;
             entries.push((key, value));
             if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
@@ -562,14 +803,24 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let close = self.require(|kind| matches!(kind, TokenKind::RBrace), "E723", "missing '}'" )?;
-        Ok(Expr::new(ExprKind::Dict(entries), Span::new(start, close.span.end)))
+        let close = self.require(
+            |kind| matches!(kind, TokenKind::RBrace),
+            "E723",
+            "missing '}'",
+        )?;
+        Ok(Expr::new(
+            ExprKind::Dict(entries),
+            Span::new(start, close.span.end),
+        ))
     }
 
     fn parse_literal_dict(&mut self, start: usize) -> Result<Expr, EvalError> {
         let mut entries = Vec::new();
         if let Some(close) = self.take(|kind| matches!(kind, TokenKind::RBrace)) {
-            return Ok(Expr::new(ExprKind::Dict(entries), Span::new(start, close.span.end)));
+            return Ok(Expr::new(
+                ExprKind::Dict(entries),
+                Span::new(start, close.span.end),
+            ));
         }
         loop {
             // `get_literal_key` (eval.c:4458-4472) scans raw bytes, not tokens:
@@ -589,10 +840,16 @@ impl<'a> Parser<'a> {
                 // dictionary entirely and reports the whole expression as
                 // invalid (`eval_dict` FAIL -> `e_invexpr2`, eval.c:4512-4514).
                 let rest = String::from_utf8_lossy(&self.source[start..]);
-                return Err(EvalError::new("E15", start, format!("Invalid expression: \"{rest}\"")));
+                return Err(EvalError::new(
+                    "E15",
+                    start,
+                    format!("Invalid expression: \"{rest}\""),
+                ));
             }
             let key = Expr::new(
-                ExprKind::Literal(Typval::String(OxStr(self.source[key_start..key_end].to_vec()))),
+                ExprKind::Literal(Typval::String(OxStr(
+                    self.source[key_start..key_end].to_vec(),
+                ))),
                 Span::new(key_start, key_end),
             );
             let mut colon = key_end;
@@ -601,12 +858,22 @@ impl<'a> Parser<'a> {
             }
             if self.source.get(colon) != Some(&b':') {
                 let rest = String::from_utf8_lossy(&self.source[colon..]);
-                return Err(EvalError::new("E720", colon, format!("Missing colon in Dictionary: {rest}")));
+                return Err(EvalError::new(
+                    "E720",
+                    colon,
+                    format!("Missing colon in Dictionary: {rest}"),
+                ));
             }
-            while self.current().span.start < colon && !matches!(self.current().kind, TokenKind::Eof) {
+            while self.current().span.start < colon
+                && !matches!(self.current().kind, TokenKind::Eof)
+            {
                 self.advance();
             }
-            self.require(|kind| matches!(kind, TokenKind::Colon), "E720", "missing ':' in dictionary")?;
+            self.require(
+                |kind| matches!(kind, TokenKind::Colon),
+                "E720",
+                "missing ':' in dictionary",
+            )?;
             let value = self.parse_expr1()?;
             entries.push((key, value));
             if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
@@ -616,8 +883,15 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let close = self.require(|kind| matches!(kind, TokenKind::RBrace), "E723", "missing '}'" )?;
-        Ok(Expr::new(ExprKind::Dict(entries), Span::new(start, close.span.end)))
+        let close = self.require(
+            |kind| matches!(kind, TokenKind::RBrace),
+            "E723",
+            "missing '}'",
+        )?;
+        Ok(Expr::new(
+            ExprKind::Dict(entries),
+            Span::new(start, close.span.end),
+        ))
     }
 
     fn parse_lambda(&mut self, start: usize) -> Result<Expr, EvalError> {
@@ -627,18 +901,32 @@ impl<'a> Parser<'a> {
             loop {
                 // The variadic form `...` ends the parameter list; it accepts
                 // any number of extra arguments (a:0 / a:000 / a:1 ...).
-                if self.take(|kind| matches!(kind, TokenKind::DotDotDot)).is_some() {
+                if self
+                    .take(|kind| matches!(kind, TokenKind::DotDotDot))
+                    .is_some()
+                {
                     varargs = true;
                     break;
                 }
                 let token = self.advance().clone();
                 let TokenKind::Identifier(name) = token.kind else {
-                    return Err(EvalError::new("E451", token.span.start, "lambda argument name expected"));
+                    return Err(EvalError::new(
+                        "E451",
+                        token.span.start,
+                        "lambda argument name expected",
+                    ));
                 };
                 if name.contains(&b':') {
-                    return Err(EvalError::new("E451", token.span.start, "lambda arguments must be unscoped"));
+                    return Err(EvalError::new(
+                        "E451",
+                        token.span.start,
+                        "lambda arguments must be unscoped",
+                    ));
                 }
-                if params.iter().any(|existing: &OxStr| existing.as_bytes() == name.as_slice()) {
+                if params
+                    .iter()
+                    .any(|existing: &OxStr| existing.as_bytes() == name.as_slice())
+                {
                     return Err(EvalError::new(
                         "E853",
                         token.span.start,
@@ -654,11 +942,23 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        self.require(|kind| matches!(kind, TokenKind::Arrow), "E451", "missing '->' in lambda")?;
+        self.require(
+            |kind| matches!(kind, TokenKind::Arrow),
+            "E451",
+            "missing '->' in lambda",
+        )?;
         let body = self.parse_expr1()?;
-        let close = self.require(|kind| matches!(kind, TokenKind::RBrace), "E451", "missing '}' after lambda")?;
+        let close = self.require(
+            |kind| matches!(kind, TokenKind::RBrace),
+            "E451",
+            "missing '}' after lambda",
+        )?;
         Ok(Expr::new(
-            ExprKind::Lambda { params, varargs, body: Box::new(body) },
+            ExprKind::Lambda {
+                params,
+                varargs,
+                body: Box::new(body),
+            },
             Span::new(start, close.span.end),
         ))
     }
@@ -667,7 +967,11 @@ impl<'a> Parser<'a> {
         let start_span = target.span;
         if let Some(close) = self.take(|kind| matches!(kind, TokenKind::RBracket)) {
             return Ok(Expr::new(
-                ExprKind::Slice { target: Box::new(target), start: None, end: None },
+                ExprKind::Slice {
+                    target: Box::new(target),
+                    start: None,
+                    end: None,
+                },
                 Span::new(start_span.start, close.span.end),
             ));
         }
@@ -682,18 +986,37 @@ impl<'a> Parser<'a> {
             } else {
                 Some(Box::new(self.parse_expr1()?))
             };
-            let close = self.require(|kind| matches!(kind, TokenKind::RBracket), "E111", "missing ']' after slice")?;
+            let close = self.require(
+                |kind| matches!(kind, TokenKind::RBracket),
+                "E111",
+                "missing ']' after slice",
+            )?;
             return Ok(Expr::new(
-                ExprKind::Slice { target: Box::new(target), start: first, end },
+                ExprKind::Slice {
+                    target: Box::new(target),
+                    start: first,
+                    end,
+                },
                 Span::new(start_span.start, close.span.end),
             ));
         }
         let Some(index) = first else {
-            return Err(EvalError::new("E111", self.current().span.start, "subscript expression expected"));
+            return Err(EvalError::new(
+                "E111",
+                self.current().span.start,
+                "subscript expression expected",
+            ));
         };
-        let close = self.require(|kind| matches!(kind, TokenKind::RBracket), "E111", "missing ']' after subscript")?;
+        let close = self.require(
+            |kind| matches!(kind, TokenKind::RBracket),
+            "E111",
+            "missing ']' after subscript",
+        )?;
         Ok(Expr::new(
-            ExprKind::Index { target: Box::new(target), index },
+            ExprKind::Index {
+                target: Box::new(target),
+                index,
+            },
             Span::new(start_span.start, close.span.end),
         ))
     }
@@ -708,19 +1031,31 @@ impl<'a> Parser<'a> {
         // `-> ` at the end of the source is caught too.
         if matches!(self.source.get(arrow_end), Some(b' ' | b'\t')) {
             let rest = String::from_utf8_lossy(&self.source[arrow_end..]);
-            return Err(EvalError::new("E15", arrow_end, format!("Invalid expression: \"{rest}\"")));
+            return Err(EvalError::new(
+                "E15",
+                arrow_end,
+                format!("Invalid expression: \"{rest}\""),
+            ));
         }
         let is_lambda = matches!(self.current().kind, TokenKind::LBrace);
         let method = if is_lambda {
             let open = self.advance().clone();
             if !self.brace_is_lambda() {
-                return Err(EvalError::new("E260", open.span.start, "Missing name after ->"));
+                return Err(EvalError::new(
+                    "E260",
+                    open.span.start,
+                    "Missing name after ->",
+                ));
             }
             self.parse_lambda(open.span.start)?
         } else {
             let token = self.advance().clone();
             let TokenKind::Identifier(name) = token.kind else {
-                return Err(EvalError::new("E260", token.span.start, "Missing name after ->"));
+                return Err(EvalError::new(
+                    "E260",
+                    token.span.start,
+                    "Missing name after ->",
+                ));
             };
             Expr::new(ExprKind::Variable(OxStr(name)), token.span)
         };
@@ -730,18 +1065,31 @@ impl<'a> Parser<'a> {
             let name = if is_lambda {
                 "lambda".to_owned()
             } else {
-                String::from_utf8_lossy(&self.source[method.span.start..method.span.end]).into_owned()
+                String::from_utf8_lossy(&self.source[method.span.start..method.span.end])
+                    .into_owned()
             };
-            return Err(EvalError::new("E107", method.span.start, format!("Missing parentheses: {name}")));
+            return Err(EvalError::new(
+                "E107",
+                method.span.start,
+                format!("Missing parentheses: {name}"),
+            ));
         }
         let open = self.advance().clone();
         if method.span.end != open.span.start {
-            return Err(EvalError::new("E274", open.span.start, "No white space allowed before parenthesis"));
+            return Err(EvalError::new(
+                "E274",
+                open.span.start,
+                "No white space allowed before parenthesis",
+            ));
         }
         let (args, end) = self.parse_arguments()?;
         let span = Span::new(receiver.span.start, end);
         Ok(Expr::new(
-            ExprKind::MethodCall { receiver: Box::new(receiver), method: Box::new(method), args },
+            ExprKind::MethodCall {
+                receiver: Box::new(receiver),
+                method: Box::new(method),
+                args,
+            },
             span,
         ))
     }
@@ -760,7 +1108,11 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let close = self.require(|kind| matches!(kind, TokenKind::RParen), "E116", "missing ')' after arguments")?;
+        let close = self.require(
+            |kind| matches!(kind, TokenKind::RParen),
+            "E116",
+            "missing ')' after arguments",
+        )?;
         Ok((args, close.span.end))
     }
 
@@ -768,13 +1120,21 @@ impl<'a> Parser<'a> {
         let mut index = self.cursor;
         let mut nested = 0_usize;
         loop {
-            let Some(token) = self.tokens.get(index) else { return false };
+            let Some(token) = self.tokens.get(index) else {
+                return false;
+            };
             match token.kind {
                 TokenKind::Arrow if nested == 0 => return true,
-                TokenKind::Colon if nested == 0 => return false,
-                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace | TokenKind::HashLBrace => nested += 1,
-                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace if nested > 0 => nested -= 1,
-                TokenKind::RBrace | TokenKind::Eof if nested == 0 => return false,
+                TokenKind::Colon | TokenKind::RBrace | TokenKind::Eof if nested == 0 => {
+                    return false;
+                }
+                TokenKind::LParen
+                | TokenKind::LBracket
+                | TokenKind::LBrace
+                | TokenKind::HashLBrace => nested += 1,
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace if nested > 0 => {
+                    nested -= 1;
+                }
                 _ => {}
             }
             index += 1;
@@ -837,7 +1197,9 @@ impl<'a> Parser<'a> {
     }
 
     fn previous_span(&self) -> Span {
-        self.tokens.get(self.cursor.saturating_sub(1)).map_or(Span::default(), |token| token.span)
+        self.tokens
+            .get(self.cursor.saturating_sub(1))
+            .map_or(Span::default(), |token| token.span)
     }
 
     fn take(&mut self, predicate: impl FnOnce(&TokenKind) -> bool) -> Option<Token> {
@@ -867,5 +1229,12 @@ fn is_scope_prefix(byte: u8) -> bool {
 
 fn binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
     let span = left.span.through(right.span);
-    Expr::new(ExprKind::Binary { op, left: Box::new(left), right: Box::new(right) }, span)
+    Expr::new(
+        ExprKind::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        },
+        span,
+    )
 }

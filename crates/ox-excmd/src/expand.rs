@@ -136,13 +136,6 @@ enum ExpansionToken {
 }
 
 fn expansion_at(input: &str, start: usize) -> Option<(usize, ExpansionToken)> {
-    let tail = input.get(start..)?;
-    if tail.starts_with('%') {
-        return Some((1, ExpansionToken::Special(CmdlineSpecial::CurrentFile)));
-    }
-    if tail.starts_with('#') {
-        return Some((1, ExpansionToken::Special(CmdlineSpecial::AlternateFile)));
-    }
     const ANGLE: &[(&str, CmdlineSpecial)] = &[
         ("<cword>", CmdlineSpecial::CurrentWord),
         ("<cWORD>", CmdlineSpecial::CurrentBigWord),
@@ -158,6 +151,13 @@ fn expansion_at(input: &str, start: usize) -> Option<(usize, ExpansionToken)> {
         ("<sflnum>", CmdlineSpecial::ScriptFileLine),
         ("<SID>", CmdlineSpecial::ScriptId),
     ];
+    let tail = input.get(start..)?;
+    if tail.starts_with('%') {
+        return Some((1, ExpansionToken::Special(CmdlineSpecial::CurrentFile)));
+    }
+    if tail.starts_with('#') {
+        return Some((1, ExpansionToken::Special(CmdlineSpecial::AlternateFile)));
+    }
     if tail.starts_with("<lt>") {
         return Some((4, ExpansionToken::LessThan));
     }
@@ -167,12 +167,7 @@ fn expansion_at(input: &str, start: usize) -> Option<(usize, ExpansionToken)> {
     })
 }
 
-fn push_literal(
-    parts: &mut Vec<ExpansionPart>,
-    literal: &mut String,
-    start: usize,
-    end: usize,
-) {
+fn push_literal(parts: &mut Vec<ExpansionPart>, literal: &mut String, start: usize, end: usize) {
     if literal.is_empty() {
         return;
     }

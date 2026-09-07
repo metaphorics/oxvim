@@ -14,15 +14,17 @@
 
 mod channel;
 mod codec;
+mod convert;
 mod message;
 mod metadata;
 mod redraw;
 
 pub use channel::{
-    nvim_error_event, ChannelId, ChannelIdAllocator, ChannelKind, ChannelState, CHAN_STDERR,
-    CHAN_STDIO,
+    CHAN_STDERR, CHAN_STDIO, ChannelId, ChannelIdAllocator, ChannelKind, ChannelState,
+    nvim_error_event,
 };
-pub use codec::{decode, encode, DecodeError, IncrementalDecoder};
+pub use codec::{DecodeError, IncrementalDecoder, decode, encode};
+pub use convert::typval_to_object;
 pub use message::{Message, MsgidCounter};
 pub use metadata::{ApiMetadata, canonical_metadata};
 pub use redraw::{RedrawBatch, RedrawEvent};

@@ -43,7 +43,11 @@ struct Cell {
 
 impl Default for Cell {
     fn default() -> Self {
-        Self { glyph: " ".into(), foreground: Color::Default, background: Color::Default }
+        Self {
+            glyph: " ".into(),
+            foreground: Color::Default,
+            background: Color::Default,
+        }
     }
 }
 
@@ -118,7 +122,7 @@ impl Terminal {
                 end + 1
             }
             // OSC and DCS strings run to ST or BEL and paint nothing.
-            Some(b']') | Some(b'P') => {
+            Some(b']' | b'P') => {
                 let mut end = 2;
                 while end < bytes.len() {
                     if bytes[end] == 0x07 {
@@ -139,16 +143,24 @@ impl Terminal {
     fn move_to(&mut self, parameters: &[u8]) {
         let text = String::from_utf8_lossy(parameters);
         let mut parts = text.split(';');
-        let row = parts.next().and_then(|value| value.parse::<usize>().ok()).unwrap_or(1);
-        let column = parts.next().and_then(|value| value.parse::<usize>().ok()).unwrap_or(1);
+        let row = parts
+            .next()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        let column = parts
+            .next()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
         self.row = row.saturating_sub(1);
         self.column = column.saturating_sub(1);
     }
 
     fn select_graphic(&mut self, parameters: &[u8]) {
         let text = String::from_utf8_lossy(parameters);
-        let values: Vec<u32> =
-            text.split(';').map(|value| value.parse::<u32>().unwrap_or(0)).collect();
+        let values: Vec<u32> = text
+            .split(';')
+            .map(|value| value.parse::<u32>().unwrap_or(0))
+            .collect();
         let mut index = 0;
         while index < values.len() {
             match values[index] {
@@ -182,19 +194,28 @@ impl Terminal {
     fn put(&mut self, glyph: String) {
         if self.row < self.height && self.column < self.width {
             let index = self.row * self.width + self.column;
-            self.cells[index] =
-                Cell { glyph, foreground: self.foreground, background: self.background };
+            self.cells[index] = Cell {
+                glyph,
+                foreground: self.foreground,
+                background: self.background,
+            };
         }
         self.column = self.column.saturating_add(1);
     }
 
     fn row_text(&self, row: usize) -> String {
         let start = row * self.width;
-        self.cells[start..start + self.width].iter().map(|cell| cell.glyph.as_str()).collect()
+        self.cells[start..start + self.width]
+            .iter()
+            .map(|cell| cell.glyph.as_str())
+            .collect()
     }
 
     fn screen_text(&self) -> String {
-        (0..self.height).map(|row| self.row_text(row)).collect::<Vec<_>>().join("\n")
+        (0..self.height)
+            .map(|row| self.row_text(row))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn cell(&self, row: usize, column: usize) -> &Cell {
@@ -205,9 +226,8 @@ impl Terminal {
 fn parse_extended(values: &[u32]) -> (Color, usize) {
     match values.get(1) {
         Some(2) => {
-            let component = |offset: usize| {
-                u8::try_from(values.get(offset).copied().unwrap_or(0)).unwrap_or(0)
-            };
+            let component =
+                |offset: usize| u8::try_from(values.get(offset).copied().unwrap_or(0)).unwrap_or(0);
             (Color::Rgb(component(2), component(3), component(4)), 5)
         }
         Some(5) => (
@@ -220,7 +240,6 @@ fn parse_extended(values: &[u32]) -> (Color, usize) {
 
 fn utf8_length(first: u8) -> usize {
     match first {
-        0x00..=0x7f => 1,
         0xc0..=0xdf => 2,
         0xe0..=0xef => 3,
         0xf0..=0xf7 => 4,
@@ -243,7 +262,12 @@ impl Session {
     fn start(script: &str, columns: u16, rows: u16) -> Self {
         let pty = native_pty_system();
         let pair = pty
-            .openpty(PtySize { rows, cols: columns, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows,
+                cols: columns,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .expect("open PTY");
         let mut command = CommandBuilder::new(HARNESS);
         command.arg("client");
@@ -254,7 +278,10 @@ impl Session {
         // The variant is chosen from $COLORFGBG before any highlight arrives,
         // so the dark palette under test is selected explicitly.
         command.env("COLORFGBG", "15;0");
-        let child = pair.slave.spawn_command(command).expect("spawn harness client");
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .expect("spawn harness client");
         drop(pair.slave);
         let pid = child.process_id();
 
@@ -294,12 +321,11 @@ impl Session {
             if ready(&self.output) {
                 return;
             }
-            if Instant::now() >= deadline {
-                panic!(
-                    "timed out waiting for {description}; output so far:\n{}",
-                    String::from_utf8_lossy(&self.output)
-                );
-            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {description}; output so far:\n{}",
+                String::from_utf8_lossy(&self.output)
+            );
             match self.receiver.recv_timeout(Duration::from_millis(50)) {
                 Ok(chunk) => self.output.extend(chunk),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -375,7 +401,11 @@ fn the_command_line_renders_as_a_top_third_overlay() {
     let mut session = Session::start("cmdline", 80, 24);
     session.wait_for_screen("=1+1");
     let (output, success) = session.finish();
-    assert!(success, "client exited badly:\n{}", String::from_utf8_lossy(&output));
+    assert!(
+        success,
+        "client exited badly:\n{}",
+        String::from_utf8_lossy(&output)
+    );
 
     let terminal = render(&output, 80, 24);
     let screen = terminal.screen_text();
@@ -384,8 +414,14 @@ fn the_command_line_renders_as_a_top_third_overlay() {
     let row = (0..24)
         .find(|row| terminal.row_text(*row).contains("=1+1"))
         .unwrap_or_else(|| panic!("no rendered command line in:\n{screen}"));
-    assert!(row < 24 / 2, "the overlay sits in the top third, not row {row}");
-    assert!(!screen.contains("edit alpha"), "two levels painted at once:\n{screen}");
+    assert!(
+        row < 24 / 2,
+        "the overlay sits in the top third, not row {row}"
+    );
+    assert!(
+        !screen.contains("edit alpha"),
+        "two levels painted at once:\n{screen}"
+    );
 
     // The overlay is a float: its text sits on the float background, while the
     // grid around it keeps the terminal's own colors.
@@ -399,12 +435,22 @@ fn cancelling_a_nested_command_line_restores_the_level_below_it() {
     let mut session = Session::start("cmdline-restore", 80, 24);
     session.wait_for_screen(":edit alpha");
     let (output, success) = session.finish();
-    assert!(success, "client exited badly:\n{}", String::from_utf8_lossy(&output));
+    assert!(
+        success,
+        "client exited badly:\n{}",
+        String::from_utf8_lossy(&output)
+    );
 
     let terminal = render(&output, 80, 24);
     let screen = terminal.screen_text();
-    assert!(screen.contains(":edit alpha"), "level one was not restored:\n{screen}");
-    assert!(!screen.contains("1+1"), "the cancelled level is still painted:\n{screen}");
+    assert!(
+        screen.contains(":edit alpha"),
+        "level one was not restored:\n{screen}"
+    );
+    assert!(
+        !screen.contains("1+1"),
+        "the cancelled level is still painted:\n{screen}"
+    );
 }
 
 #[test]
@@ -412,13 +458,20 @@ fn the_message_stack_replaces_by_id_and_appends_to_a_stream() {
     let mut session = Session::start("messages", 80, 24);
     session.wait_for_screen("stream head and tail");
     let (output, success) = session.finish();
-    assert!(success, "client exited badly:\n{}", String::from_utf8_lossy(&output));
+    assert!(
+        success,
+        "client exited badly:\n{}",
+        String::from_utf8_lossy(&output)
+    );
 
     let terminal = render(&output, 80, 24);
     let screen = terminal.screen_text();
 
     // Same id, so the second message replaces the first rather than stacking.
-    assert!(screen.contains("second failure"), "replacement missing:\n{screen}");
+    assert!(
+        screen.contains("second failure"),
+        "replacement missing:\n{screen}"
+    );
     assert!(
         !screen.contains("first failure"),
         "the replaced message is still on screen:\n{screen}"
@@ -444,7 +497,15 @@ fn the_message_stack_replaces_by_id_and_appends_to_a_stream() {
     assert_eq!(terminal.cell(error, letter).foreground, ERROR);
     let body = terminal.row_text(error).find("second").expect("error body");
     assert_eq!(terminal.cell(error, body).foreground, FG);
-    assert_eq!(terminal.cell(stream, terminal.row_text(stream).find('s').expect("stream body")).foreground, FG);
+    assert_eq!(
+        terminal
+            .cell(
+                stream,
+                terminal.row_text(stream).find('s').expect("stream body")
+            )
+            .foreground,
+        FG
+    );
 }
 
 #[test]
@@ -452,7 +513,11 @@ fn the_completion_menu_marks_its_selection_and_shows_the_documentation_preview()
     let mut session = Session::start("popupmenu", 80, 24);
     session.wait_for_screen("beta documentation");
     let (output, success) = session.finish();
-    assert!(success, "client exited badly:\n{}", String::from_utf8_lossy(&output));
+    assert!(
+        success,
+        "client exited badly:\n{}",
+        String::from_utf8_lossy(&output)
+    );
 
     let terminal = render(&output, 80, 24);
     let screen = terminal.screen_text();
@@ -460,17 +525,26 @@ fn the_completion_menu_marks_its_selection_and_shows_the_documentation_preview()
         .find(|row| terminal.row_text(*row).contains("alpha"))
         .unwrap_or_else(|| panic!("no menu in:\n{screen}"));
     let selected = unselected + 1;
-    assert!(terminal.row_text(selected).contains("beta"), "menu rows out of order:\n{screen}");
+    assert!(
+        terminal.row_text(selected).contains("beta"),
+        "menu rows out of order:\n{screen}"
+    );
 
     // The selected row is the one sanctioned use of the accent surface:
     // background-colored text on accent, 6.21:1. Ordinary foreground on accent
     // is 1.78:1 and forbidden, so the foreground is asserted too.
-    let column = terminal.row_text(selected).find("beta").expect("selected word");
+    let column = terminal
+        .row_text(selected)
+        .find("beta")
+        .expect("selected word");
     assert_eq!(terminal.cell(selected, column).background, ACCENT);
     assert_eq!(terminal.cell(selected, column).foreground, BG);
 
     // The unselected row stays on the float background.
-    let other = terminal.row_text(unselected).find("alpha").expect("unselected word");
+    let other = terminal
+        .row_text(unselected)
+        .find("alpha")
+        .expect("unselected word");
     assert_eq!(terminal.cell(unselected, other).background, FLOAT_BG);
     assert_ne!(terminal.cell(unselected, other).foreground, BG);
 
@@ -478,8 +552,10 @@ fn the_completion_menu_marks_its_selection_and_shows_the_documentation_preview()
     let preview = (0..24)
         .find(|row| terminal.row_text(*row).contains("beta documentation"))
         .expect("preview row");
-    let preview_column =
-        terminal.row_text(preview).find("beta documentation").expect("preview column");
+    let preview_column = terminal
+        .row_text(preview)
+        .find("beta documentation")
+        .expect("preview column");
     assert!(
         preview_column > column,
         "the preview must sit beside the menu, not over it:\n{screen}"
@@ -495,7 +571,11 @@ fn twenty_columns_drops_the_preview_and_keeps_the_menu() {
     let mut session = Session::start("narrow", 20, 24);
     session.wait_for_screen("alphabetagamma");
     let (output, success) = session.finish();
-    assert!(success, "client exited badly:\n{}", String::from_utf8_lossy(&output));
+    assert!(
+        success,
+        "client exited badly:\n{}",
+        String::from_utf8_lossy(&output)
+    );
 
     let terminal = render(&output, 20, 24);
     let screen = terminal.screen_text();
@@ -509,11 +589,22 @@ fn twenty_columns_drops_the_preview_and_keeps_the_menu() {
         !screen.contains("documentation"),
         "a 20-column terminal must not paint the preview:\n{screen}"
     );
-    let column = terminal.row_text(row).find("alphabetagamma").expect("menu column");
-    assert_eq!(terminal.cell(row, column).background, ACCENT, "selection still marked");
+    let column = terminal
+        .row_text(row)
+        .find("alphabetagamma")
+        .expect("menu column");
+    assert_eq!(
+        terminal.cell(row, column).background,
+        ACCENT,
+        "selection still marked"
+    );
     // Nothing was written past the last column.
     for line in screen.lines() {
-        assert_eq!(line.chars().count(), 20, "row wider than the terminal:\n{screen}");
+        assert_eq!(
+            line.chars().count(),
+            20,
+            "row wider than the terminal:\n{screen}"
+        );
     }
 }
 
@@ -525,14 +616,21 @@ fn a_preview_too_narrow_for_text_paints_nothing_at_all() {
     let mut session = Session::start("strip", 25, 24);
     session.wait_for_screen("alphabetagamma");
     let (output, success) = session.finish();
-    assert!(success, "client exited badly:\n{}", String::from_utf8_lossy(&output));
+    assert!(
+        success,
+        "client exited badly:\n{}",
+        String::from_utf8_lossy(&output)
+    );
 
     let terminal = render(&output, 25, 24);
     let screen = terminal.screen_text();
     let row = (0..24)
         .find(|row| terminal.row_text(*row).contains("alphabetagamma"))
         .unwrap_or_else(|| panic!("no menu in:\n{screen}"));
-    assert!(!screen.contains("documentation"), "the preview was painted:\n{screen}");
+    assert!(
+        !screen.contains("documentation"),
+        "the preview was painted:\n{screen}"
+    );
 
     // The menu ends at column 21; nothing claimed the columns after it.
     for column in 22..25 {
@@ -551,7 +649,11 @@ fn the_palette_is_programmed_and_restored_on_a_clean_exit() {
         contains(bytes, b"\x1b]4;0;rgb:16/18/1d\x1b\\")
     });
     let (output, success) = session.finish();
-    assert!(success, "client exited badly:\n{}", String::from_utf8_lossy(&output));
+    assert!(
+        success,
+        "client exited badly:\n{}",
+        String::from_utf8_lossy(&output)
+    );
 
     // Every slot the client claims, with the design system's own values.
     for expected in [
@@ -569,8 +671,14 @@ fn the_palette_is_programmed_and_restored_on_a_clean_exit() {
             String::from_utf8_lossy(expected)
         );
     }
-    assert!(contains(&output, b"\x1b]104"), "OSC 104 palette restore missing on a clean exit");
-    assert!(contains(&output, b"\x1b[?25h"), "the cursor was left hidden");
+    assert!(
+        contains(&output, b"\x1b]104"),
+        "OSC 104 palette restore missing on a clean exit"
+    );
+    assert!(
+        contains(&output, b"\x1b[?25h"),
+        "the cursor was left hidden"
+    );
 }
 
 #[test]
@@ -591,9 +699,18 @@ fn the_palette_is_restored_when_the_client_is_signalled() {
     session.wait_for("the palette restore", |bytes| contains(bytes, b"\x1b]104"));
     let (output, success) = session.finish();
 
-    assert!(contains(&output, b"\x1b]104"), "OSC 104 palette restore missing after SIGTERM");
-    assert!(contains(&output, b"\x1b[?25h"), "the cursor was left hidden after SIGTERM");
+    assert!(
+        contains(&output, b"\x1b]104"),
+        "OSC 104 palette restore missing after SIGTERM"
+    );
+    assert!(
+        contains(&output, b"\x1b[?25h"),
+        "the cursor was left hidden after SIGTERM"
+    );
     // SIGTERM's default action still ends the process, so it does not report a
     // successful exit: the client restores and then dies from the signal.
-    assert!(!success, "the client must terminate from the signal, not exit cleanly");
+    assert!(
+        !success,
+        "the client must terminate from the signal, not exit cleanly"
+    );
 }

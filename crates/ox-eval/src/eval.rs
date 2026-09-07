@@ -3,13 +3,15 @@
 use ox_types::{Funcref, OxStr, Special, Typval};
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error::{EvalError, Result};
 use crate::lexer::CaseSensitivity;
-use crate::parser::{BinaryOp, CompareOp, Expr, ExprKind, InterpolatedPart, OptionScope as AstOptionScope, UnaryOp};
+use crate::parser::{
+    BinaryOp, CompareOp, Expr, ExprKind, InterpolatedPart, OptionScope as AstOptionScope, UnaryOp,
+};
 use crate::scope::{OptionScope, Scope, ScopeKind};
 
 /// Default maximum recursive evaluator depth.
@@ -18,15 +20,31 @@ pub const DEFAULT_MAX_EVAL_DEPTH: usize = 1_000;
 /// Function-call integration point for Task 8b's builtin implementation.
 pub trait BuiltinHost {
     /// Invoke a named Vimscript function.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's call error (e.g. `E117: Unknown function`) when
+    /// the function is not found or the call fails.
     fn call(&mut self, name: &OxStr, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval>;
 
     /// Invoke a named function through `receiver->name(...)`.
-    fn call_method(&mut self, name: &OxStr, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
+    ///
+    /// # Errors
+    ///
+    /// Delegates to [`call`](Self::call); see its error semantics.
+    fn call_method(
+        &mut self,
+        name: &OxStr,
+        args: Vec<Typval>,
+        scope: &mut Scope,
+    ) -> Result<Typval> {
         self.call(name, args, scope)
     }
 
     /// Registry shared with callback-capable builtins, when this host owns one.
-    fn closure_registry(&self) -> Option<ClosureRegistry> { None }
+    fn closure_registry(&self) -> Option<ClosureRegistry> {
+        None
+    }
 }
 
 /// A regex match range plus capture groups one through nine.
@@ -43,26 +61,81 @@ pub struct RegexMatch {
 /// Regular-expression integration point for operators and pure regex builtins.
 pub trait RegexEngine {
     /// Match `text` against a Vim regular expression.
+    ///
+    /// # Errors
+    ///
+    /// Returns `E54` when the engine cannot process the pattern, or the
+    /// engine's own error for an invalid regex.
     fn is_match(&self, text: &OxStr, pattern: &OxStr, ignore_case: bool) -> Result<bool>;
 
     /// Split `text` at Vim regular-expression matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns `E54` when the engine does not support splitting.
     fn split(&self, _text: &OxStr, _pattern: &OxStr, _keep_empty: bool) -> Result<Vec<OxStr>> {
-        Err(EvalError::new("E54", 0, "regular-expression split is not supported by this engine"))
+        Err(EvalError::new(
+            "E54",
+            0,
+            "regular-expression split is not supported by this engine",
+        ))
     }
 
     /// Return the byte range of the first match at or after `start`.
-    fn find(&self, _text: &OxStr, _pattern: &OxStr, _start: usize) -> Result<Option<(usize, usize)>> {
-        Err(EvalError::new("E54", 0, "regular-expression search is not supported by this engine"))
+    ///
+    /// # Errors
+    ///
+    /// Returns `E54` when the engine does not support searching.
+    fn find(
+        &self,
+        _text: &OxStr,
+        _pattern: &OxStr,
+        _start: usize,
+    ) -> Result<Option<(usize, usize)>> {
+        Err(EvalError::new(
+            "E54",
+            0,
+            "regular-expression search is not supported by this engine",
+        ))
     }
 
     /// Return the first match and its capture groups at or after `start`.
-    fn find_captures(&self, text: &OxStr, pattern: &OxStr, start: usize) -> Result<Option<RegexMatch>> {
-        self.find(text, pattern, start).map(|matched| matched.map(|(start, end)| RegexMatch { start, end, captures: Vec::new() }))
+    ///
+    /// # Errors
+    ///
+    /// Delegates to [`find`](Self::find); see its error semantics.
+    fn find_captures(
+        &self,
+        text: &OxStr,
+        pattern: &OxStr,
+        start: usize,
+    ) -> Result<Option<RegexMatch>> {
+        self.find(text, pattern, start).map(|matched| {
+            matched.map(|(start, end)| RegexMatch {
+                start,
+                end,
+                captures: Vec::new(),
+            })
+        })
     }
 
     /// Replace matches according to Vim's substitute flags.
-    fn substitute(&self, _text: &OxStr, _pattern: &OxStr, _replacement: &OxStr, _flags: &OxStr) -> Result<OxStr> {
-        Err(EvalError::new("E54", 0, "regular-expression substitution is not supported by this engine"))
+    ///
+    /// # Errors
+    ///
+    /// Returns `E54` when the engine does not support substitution.
+    fn substitute(
+        &self,
+        _text: &OxStr,
+        _pattern: &OxStr,
+        _replacement: &OxStr,
+        _flags: &OxStr,
+    ) -> Result<OxStr> {
+        Err(EvalError::new(
+            "E54",
+            0,
+            "regular-expression substitution is not supported by this engine",
+        ))
     }
 }
 
@@ -76,15 +149,32 @@ pub trait RegexEngine {
 /// unimplemented. Line numbers are 1-based.
 pub trait BufferHost {
     /// Number of lines in the current buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's error when the buffer is not accessible.
     fn line_count(&self) -> Result<usize>;
 
     /// Read the 1-based line `lnum`; `None` when it falls outside the buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's error when the buffer is not accessible.
     fn get_line(&self, lnum: usize) -> Result<Option<OxStr>>;
 
     /// Replace the existing 1-based line `lnum` with `text`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's error when the line number is out of range
+    /// or the buffer is not accessible.
     fn replace_line(&mut self, lnum: usize, text: &OxStr) -> Result<()>;
 
     /// Append `text` as the new last line.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's error when the buffer is not accessible.
     fn append_line(&mut self, text: &OxStr) -> Result<()>;
 
     /// Resolve a string line address (`.`, `'x`) to its 1-based line,
@@ -92,6 +182,11 @@ pub trait BufferHost {
     /// arguments. `None` when the address names no position (an unset
     /// mark), which degrades to 0 exactly like upstream returning `NULL`.
     /// The `"$"` last-line address stays with [`BufferHost::line_count`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's error when the buffer or mark table is not
+    /// accessible; `Ok(None)` when the address names no valid position.
     fn address_line(&self, _address: &str) -> Result<Option<i64>> {
         Ok(None)
     }
@@ -117,7 +212,11 @@ pub struct NoRegex;
 
 impl RegexEngine for NoRegex {
     fn is_match(&self, _text: &OxStr, _pattern: &OxStr, _ignore_case: bool) -> Result<bool> {
-        Err(EvalError::new("E54", 0, "regular-expression engine is not installed"))
+        Err(EvalError::new(
+            "E54",
+            0,
+            "regular-expression engine is not installed",
+        ))
     }
 }
 
@@ -128,7 +227,7 @@ struct Closure {
     captured: Scope,
 }
 
-/// A shared, externally-oblivious registry of lambda closures.
+/// A shared registry of lambda closures.
 ///
 /// Closure bodies and captured scopes live here under a stable index so that a
 /// stored `Partial` (`<lambda>N`) resolves to the original closure even when
@@ -140,16 +239,35 @@ struct Closure {
 #[derive(Clone)]
 pub struct ClosureRegistry {
     id: usize,
-    closures: Rc<RefCell<Vec<Closure>>>,
+    closures: ClosureStore,
+}
+
+/// Closure storage shared between a [`ClosureRegistry`] and the live table.
+type ClosureStore = Rc<RefCell<Vec<Closure>>>;
+
+thread_local! {
+    /// Every closure registry created on this thread, by registry nonce.
+    ///
+    /// A lambda is a value: one evaluator may create it and a later,
+    /// unrelated one may call it — a `map()` callback runs through the
+    /// builtin dispatcher's own evaluator, whose registry differs from the
+    /// expression that built the lambda. Keeping storages reachable here lets
+    /// any [`Evaluator`] on the thread resolve any live registry's closures.
+    /// Upstream keeps lambda funcs refcounted; without refcounts a created
+    /// closure stays callable for the session.
+    static LIVE_REGISTRIES: RefCell<HashMap<usize, ClosureStore>> =
+        RefCell::new(HashMap::new());
 }
 
 impl Default for ClosureRegistry {
     fn default() -> Self {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-        Self {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            closures: Rc::new(RefCell::new(Vec::new())),
-        }
+        let closures = Rc::new(RefCell::new(Vec::new()));
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        LIVE_REGISTRIES.with(|registries| {
+            registries.borrow_mut().insert(id, Rc::clone(&closures));
+        });
+        Self { id, closures }
     }
 }
 
@@ -185,6 +303,40 @@ impl ClosureRegistry {
         }
         self.closures.borrow().get(closure_id).cloned()
     }
+
+    /// Resolve through this registry, falling back to any live registry.
+    fn resolve_any(&self, registry_id: usize, closure_id: usize) -> Option<Closure> {
+        self.resolve(registry_id, closure_id)
+            .or_else(|| resolve_live(registry_id, closure_id))
+    }
+
+    /// The registry nonce a `Funcref` must carry to resolve closures here.
+    ///
+    /// `function('<lambda>N')` reattaches this id so the reconstructed
+    /// reference calls the original closure instead of the name dispatcher
+    /// (upstream `get_lambda_name` lookups through `func_ref`).
+    #[must_use]
+    pub const fn registry_id(&self) -> usize {
+        self.id
+    }
+
+    /// True when a closure with this local index exists in this registry.
+    #[must_use]
+    pub fn contains_closure(&self, closure_id: usize) -> bool {
+        self.closures.borrow().get(closure_id).is_some()
+    }
+}
+
+/// Looks up a closure in any registry created on this thread.
+///
+/// The caller's registry is only a cache; the nonce on the `Funcref` decides
+/// which storage owns the closure. A nonce that no registry ever created
+/// resolves to nothing, so an unknown lambda still reports an honest `E117`.
+fn resolve_live(registry_id: usize, closure_id: usize) -> Option<Closure> {
+    LIVE_REGISTRIES.with(|registries| {
+        let store = registries.borrow().get(&registry_id).cloned()?;
+        store.borrow().get(closure_id).cloned()
+    })
 }
 
 struct Evaluated {
@@ -194,7 +346,10 @@ struct Evaluated {
 
 impl Evaluated {
     fn plain(value: Typval) -> Self {
-        Self { value, identity: None }
+        Self {
+            value,
+            identity: None,
+        }
     }
 }
 
@@ -211,7 +366,13 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
     /// Construct an evaluator. Default string comparisons are case-sensitive.
     pub fn new(host: &'a mut H, regex: &'a R) -> Self {
         let closures = host.closure_registry().unwrap_or_default();
-        Self { host, regex, ignore_case: false, max_depth: DEFAULT_MAX_EVAL_DEPTH, closures }
+        Self {
+            host,
+            regex,
+            ignore_case: false,
+            max_depth: DEFAULT_MAX_EVAL_DEPTH,
+            closures,
+        }
     }
 
     /// Borrow the shared closure registry.
@@ -246,15 +407,29 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
     }
 
     /// Evaluate one parsed expression in `scope`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `E1169` when nesting exceeds the evaluation budget, or any
+    /// error raised by the expression's operators, builtins, or host.
     pub fn eval(&mut self, expression: &Expr, scope: &mut Scope) -> Result<Typval> {
-        self.eval_at(expression, scope, 0).map(|evaluated| evaluated.value)
+        self.eval_at(expression, scope, 0)
+            .map(|evaluated| evaluated.value)
     }
 
     /// Apply numeric coercion used by legacy `:if`, distinct from `tv2bool()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `E729`–`E976` when the value cannot be coerced to a number
+    /// (e.g. a Funcref or List used where a number is expected).
     pub fn condition_number(value: &Typval) -> Result<bool> {
         Ok(to_number(value, 0)? != 0)
     }
 
+    // Upstream eval.c eval7→eval5→eval3→eval1 chain is one giant switch;
+    // this mirrors that structure in a single match for fidelity.
+    #[allow(clippy::too_many_lines)]
     fn eval_at(&mut self, expression: &Expr, scope: &mut Scope, depth: usize) -> Result<Evaluated> {
         if depth >= self.max_depth {
             return Err(EvalError::new(
@@ -266,31 +441,51 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         let next = depth + 1;
         match &expression.kind {
             ExprKind::Literal(value) => {
-                let identity = identity_type(value).then_some(expression as *const Expr as usize);
-                Ok(Evaluated { value: value.clone(), identity })
+                let identity =
+                    identity_type(value).then_some(std::ptr::from_ref::<Expr>(expression) as usize);
+                Ok(Evaluated {
+                    value: value.clone(),
+                    identity,
+                })
             }
             ExprKind::Interpolated(parts) => {
                 let mut bytes = Vec::new();
                 for part in parts {
                     match part {
-                        InterpolatedPart::Literal(literal) => bytes.extend_from_slice(literal.as_bytes()),
+                        InterpolatedPart::Literal(literal) => {
+                            bytes.extend_from_slice(literal.as_bytes());
+                        }
                         InterpolatedPart::Expression(part) => {
                             let value = self.eval_at(part, scope, next)?.value;
-                            bytes.extend_from_slice(to_string(&value, expression.span.start)?.as_bytes());
+                            bytes.extend_from_slice(
+                                to_string(&value, expression.span.start)?.as_bytes(),
+                            );
                         }
                     }
                 }
                 Ok(Evaluated::plain(Typval::String(OxStr(bytes))))
             }
-            ExprKind::Variable(name) => self.eval_variable(name, expression.span.start, scope),
+            ExprKind::Variable(name) => Self::eval_variable(name, expression.span.start, scope),
+            ExprKind::CurlyName(inner) => {
+                // `eval7`'s default arm (eval.c:2769-2789): the expanded
+                // name is evaluated and then read like any variable name.
+                let value = self.eval_at(inner, scope, next)?.value;
+                let name = to_string(&value, expression.span.start)?;
+                Self::eval_variable(&name, expression.span.start, scope)
+            }
             ExprKind::Environment(name) => Ok(Evaluated::plain(scope.get_env(name.as_bytes()))),
-            ExprKind::Option { scope: option_scope, name } => {
+            ExprKind::Option {
+                scope: option_scope,
+                name,
+            } => {
                 let option_scope = match option_scope {
                     AstOptionScope::Effective => OptionScope::Effective,
                     AstOptionScope::Global => OptionScope::Global,
                     AstOptionScope::Local => OptionScope::Local,
                 };
-                Ok(Evaluated::plain(scope.get_option(option_scope, name.as_bytes())))
+                Ok(Evaluated::plain(
+                    scope.get_option(option_scope, name.as_bytes()),
+                ))
             }
             ExprKind::Register(name) => Ok(Evaluated::plain(scope.get_register(&[*name]))),
             ExprKind::List(items) => {
@@ -300,7 +495,7 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                 }
                 Ok(Evaluated {
                     value: Typval::list(values),
-                    identity: Some(expression as *const Expr as usize),
+                    identity: Some(std::ptr::from_ref::<Expr>(expression) as usize),
                 })
             }
             ExprKind::Dict(entries) => {
@@ -309,42 +504,66 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                     let key_offset = key.span.start;
                     let key_value = self.eval_at(key, scope, next)?.value;
                     let key = to_string(&key_value, key_offset)?;
-                    if values.iter().any(|(existing, _): &(OxStr, Typval)| existing == &key) {
-                        return Err(EvalError::new("E721", key_offset, "duplicate dictionary key"));
+                    if values
+                        .iter()
+                        .any(|(existing, _): &(OxStr, Typval)| existing == &key)
+                    {
+                        return Err(EvalError::new(
+                            "E721",
+                            key_offset,
+                            "duplicate dictionary key",
+                        ));
                     }
                     values.push((key, self.eval_at(value, scope, next)?.value));
                 }
                 Ok(Evaluated {
                     value: Typval::dict(values),
-                    identity: Some(expression as *const Expr as usize),
+                    identity: Some(std::ptr::from_ref::<Expr>(expression) as usize),
                 })
             }
             ExprKind::Unary { op, expr } => {
                 let value = self.eval_at(expr, scope, next)?.value;
-                self.eval_unary(*op, value, expression.span.start)
+                Self::eval_unary(*op, value, expression.span.start)
             }
-            ExprKind::Binary { op: BinaryOp::And, left, right } => {
+            ExprKind::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+            } => {
                 let lhs = self.eval_at(left, scope, next)?.value;
                 if to_number(&lhs, left.span.start)? == 0 {
                     return Ok(Evaluated::plain(Typval::Number(0)));
                 }
                 let rhs = self.eval_at(right, scope, next)?.value;
-                Ok(Evaluated::plain(Typval::Number(i64::from(to_number(&rhs, right.span.start)? != 0))))
+                Ok(Evaluated::plain(Typval::Number(i64::from(
+                    to_number(&rhs, right.span.start)? != 0,
+                ))))
             }
-            ExprKind::Binary { op: BinaryOp::Or, left, right } => {
+            ExprKind::Binary {
+                op: BinaryOp::Or,
+                left,
+                right,
+            } => {
                 let lhs = self.eval_at(left, scope, next)?.value;
                 if to_number(&lhs, left.span.start)? != 0 {
                     return Ok(Evaluated::plain(Typval::Number(1)));
                 }
                 let rhs = self.eval_at(right, scope, next)?.value;
-                Ok(Evaluated::plain(Typval::Number(i64::from(to_number(&rhs, right.span.start)? != 0))))
+                Ok(Evaluated::plain(Typval::Number(i64::from(
+                    to_number(&rhs, right.span.start)? != 0,
+                ))))
             }
             ExprKind::Binary { op, left, right } => {
                 let lhs = self.eval_at(left, scope, next)?.value;
                 let rhs = self.eval_at(right, scope, next)?.value;
-                self.eval_binary(*op, lhs, rhs, expression.span.start)
+                Self::eval_binary(*op, lhs, rhs, expression.span.start)
             }
-            ExprKind::Compare { op, case, left, right } => {
+            ExprKind::Compare {
+                op,
+                case,
+                left,
+                right,
+            } => {
                 let lhs = self.eval_at(left, scope, next)?;
                 let rhs = self.eval_at(right, scope, next)?;
                 let ignore_case = match case {
@@ -352,10 +571,15 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                     CaseSensitivity::MatchCase => false,
                     CaseSensitivity::IgnoreCase => true,
                 };
-                let result = self.compare(*op, &lhs, &rhs, ignore_case, expression.span.start, next)?;
+                let result =
+                    self.compare(*op, &lhs, &rhs, ignore_case, expression.span.start, next)?;
                 Ok(Evaluated::plain(Typval::Number(i64::from(result))))
             }
-            ExprKind::Ternary { condition, then_expr, else_expr } => {
+            ExprKind::Ternary {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
                 let condition = self.eval_at(condition, scope, next)?.value;
                 if to_number(&condition, expression.span.start)? != 0 {
                     self.eval_at(then_expr, scope, next)
@@ -365,37 +589,62 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
             }
             ExprKind::Coalesce { left, right } => {
                 let lhs = self.eval_at(left, scope, next)?;
-                if lhs.value.is_truthy() { Ok(lhs) } else { self.eval_at(right, scope, next) }
+                if lhs.value.is_truthy() {
+                    Ok(lhs)
+                } else {
+                    self.eval_at(right, scope, next)
+                }
             }
             ExprKind::Call { callee, args } => self.eval_call(callee, args, scope, next),
             ExprKind::Member { target, name } => {
                 let target = self.eval_at(target, scope, next)?;
-                dict_lookup(&target.value, name.as_bytes(), expression.span.start, target.identity)
+                dict_lookup(
+                    &target.value,
+                    name.as_bytes(),
+                    expression.span.start,
+                    target.identity,
+                )
             }
             ExprKind::Index { target, index } => {
                 let target = self.eval_at(target, scope, next)?;
                 let index_value = self.eval_at(index, scope, next)?.value;
-                self.index(target, index_value, expression.span.start)
+                Self::index(target, &index_value, expression.span.start)
             }
             ExprKind::Slice { target, start, end } => {
                 let target = self.eval_at(target, scope, next)?.value;
                 let start = match start {
-                    Some(bound) => Some(to_number(&self.eval_at(bound, scope, next)?.value, bound.span.start)?),
+                    Some(bound) => Some(to_number(
+                        &self.eval_at(bound, scope, next)?.value,
+                        bound.span.start,
+                    )?),
                     None => None,
                 };
                 let end = match end {
-                    Some(bound) => Some(to_number(&self.eval_at(bound, scope, next)?.value, bound.span.start)?),
+                    Some(bound) => Some(to_number(
+                        &self.eval_at(bound, scope, next)?.value,
+                        bound.span.start,
+                    )?),
                     None => None,
                 };
-                self.slice(target, start, end, expression.span.start)
+                Self::slice(target, start, end, expression.span.start)
             }
-            ExprKind::MethodCall { receiver, method, args } => {
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => {
                 let receiver = self.eval_at(receiver, scope, next)?;
                 let mut values = Vec::with_capacity(args.len() + 1);
-                values.push(receiver.value);
                 for arg in args {
                     values.push(self.eval_at(arg, scope, next)?.value);
                 }
+                let slot = match &method.kind {
+                    ExprKind::Variable(name) => crate::builtin_spec(&name.to_string_lossy())
+                        .map_or(1, |spec| spec.method_base),
+                    _ => 1,
+                };
+                let index = slot.saturating_sub(1).min(values.len());
+                values.insert(index, receiver.value);
                 self.call_method(method, values, scope, next)
             }
             ExprKind::Lambda { params, body, .. } => {
@@ -407,14 +656,19 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                 let name = OxStr(format!("<lambda>{id}").into_bytes());
                 let identity = Some(registry_id.wrapping_mul(0x9e37_79b9).wrapping_add(id));
                 Ok(Evaluated {
-                    value: Typval::Partial(Funcref { name, args: Vec::new(), dict: None, registry: Some(registry_id) }),
+                    value: Typval::Partial(Funcref {
+                        name,
+                        args: Vec::new(),
+                        dict: None,
+                        registry: Some(registry_id),
+                    }),
                     identity,
                 })
             }
         }
     }
 
-    fn eval_variable(&self, name: &OxStr, offset: usize, scope: &Scope) -> Result<Evaluated> {
+    fn eval_variable(name: &OxStr, offset: usize, scope: &Scope) -> Result<Evaluated> {
         match name.as_bytes() {
             b"v:true" => return Ok(Evaluated::plain(Typval::Bool(true))),
             b"v:false" => return Ok(Evaluated::plain(Typval::Bool(false))),
@@ -431,7 +685,11 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         let bytes = name.as_bytes();
         if bytes.len() == 2 && bytes[1] == b':' {
             let kind = ScopeKind::from_byte(bytes[0]).ok_or_else(|| {
-                EvalError::new("E121", offset, format!("Undefined variable: {}", name.to_string_lossy()))
+                EvalError::new(
+                    "E121",
+                    offset,
+                    format!("Undefined variable: {}", name.to_string_lossy()),
+                )
             })?;
             let map = match kind {
                 ScopeKind::Global => &scope.global,
@@ -445,25 +703,42 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
             };
             return Ok(Evaluated {
                 value: scope.scope_dict(kind),
-                identity: Some(map as *const _ as usize),
+                identity: Some(std::ptr::from_ref(map) as usize),
             });
         }
         let value = if bytes.len() >= 2 && bytes[1] == b':' {
-            scope.get_scoped(ScopeKind::from_byte(bytes[0]).ok_or_else(|| {
-                EvalError::new("E121", offset, format!("Undefined variable: {}", name.to_string_lossy()))
-            })?, &bytes[2..], offset)?
+            scope.get_scoped(
+                ScopeKind::from_byte(bytes[0]).ok_or_else(|| {
+                    EvalError::new(
+                        "E121",
+                        offset,
+                        format!("Undefined variable: {}", name.to_string_lossy()),
+                    )
+                })?,
+                &bytes[2..],
+                offset,
+            )?
+        } else if bytes == b"version" {
+            scope.get_scoped(ScopeKind::Vim, b"version", offset)?
         } else {
             scope.get(bytes, offset)?
         };
-        let identity = identity_type(value).then_some(value as *const Typval as usize);
-        Ok(Evaluated { value: value.clone(), identity })
+        let identity = identity_type(value).then_some(std::ptr::from_ref::<Typval>(value) as usize);
+        Ok(Evaluated {
+            value: value.clone(),
+            identity,
+        })
     }
 
-    fn eval_unary(&self, op: UnaryOp, value: Typval, offset: usize) -> Result<Evaluated> {
+    fn eval_unary(op: UnaryOp, value: Typval, offset: usize) -> Result<Evaluated> {
         match op {
             UnaryOp::Not => match value {
-                Typval::Float(value) => Ok(Evaluated::plain(Typval::Number(i64::from(value == 0.0)))),
-                other => Ok(Evaluated::plain(Typval::Number(i64::from(to_number(&other, offset)? == 0)))),
+                Typval::Float(value) => {
+                    Ok(Evaluated::plain(Typval::Number(i64::from(value == 0.0))))
+                }
+                other => Ok(Evaluated::plain(Typval::Number(i64::from(
+                    to_number(&other, offset)? == 0,
+                )))),
             },
             UnaryOp::Plus => match value {
                 Typval::Float(value) => Ok(Evaluated::plain(Typval::Float(value))),
@@ -471,12 +746,14 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
             },
             UnaryOp::Negate => match value {
                 Typval::Float(value) => Ok(Evaluated::plain(Typval::Float(-value))),
-                other => Ok(Evaluated::plain(Typval::Number(to_number(&other, offset)?.wrapping_neg()))),
+                other => Ok(Evaluated::plain(Typval::Number(
+                    to_number(&other, offset)?.wrapping_neg(),
+                ))),
             },
         }
     }
 
-    fn eval_binary(&self, op: BinaryOp, lhs: Typval, rhs: Typval, offset: usize) -> Result<Evaluated> {
+    fn eval_binary(op: BinaryOp, lhs: Typval, rhs: Typval, offset: usize) -> Result<Evaluated> {
         if op == BinaryOp::Concat {
             let mut bytes = to_string(&lhs, offset)?.0;
             bytes.extend_from_slice(to_string(&rhs, offset)?.as_bytes());
@@ -485,8 +762,16 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         if op == BinaryOp::Add {
             match (lhs, rhs) {
                 (Typval::List(left), Typval::List(right)) => {
-                    let mut items = left.try_borrow().map_err(|_| borrow_error(offset))?.items.clone();
-                    let right_items = right.try_borrow().map_err(|_| borrow_error(offset))?.items.clone();
+                    let mut items = left
+                        .try_borrow()
+                        .map_err(|_| borrow_error(offset))?
+                        .items
+                        .clone();
+                    let right_items = right
+                        .try_borrow()
+                        .map_err(|_| borrow_error(offset))?
+                        .items
+                        .clone();
                     items.extend(right_items);
                     return Ok(Evaluated::plain(Typval::list(items)));
                 }
@@ -494,10 +779,10 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                     left.extend(right);
                     return Ok(Evaluated::plain(Typval::Blob(left)));
                 }
-                (left, right) => return numeric_binary(op, left, right, offset),
+                (left, right) => return numeric_binary(op, &left, &right, offset),
             }
         }
-        numeric_binary(op, lhs, rhs, offset)
+        numeric_binary(op, &lhs, &rhs, offset)
     }
 
     fn compare(
@@ -513,11 +798,16 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
             let text = to_string(&lhs.value, offset)?;
             let pattern = to_string(&rhs.value, offset)?;
             let matched = self.regex.is_match(&text, &pattern, ignore_case)?;
-            return Ok(if op == CompareOp::NoMatch { !matched } else { matched });
+            return Ok(if op == CompareOp::NoMatch {
+                !matched
+            } else {
+                matched
+            });
         }
         if matches!(op, CompareOp::Is | CompareOp::IsNot) {
-            let same = identical_values(&lhs.value, &rhs.value, ignore_case, depth, self.max_depth)?
-                || (lhs.identity.is_some() && lhs.identity == rhs.identity);
+            let same =
+                identical_values(&lhs.value, &rhs.value, ignore_case, depth, self.max_depth)?
+                    || (lhs.identity.is_some() && lhs.identity == rhs.identity);
             return Ok(if op == CompareOp::IsNot { !same } else { same });
         }
         if matches!((&lhs.value, &rhs.value), (Typval::List(_), Typval::List(_)))
@@ -528,9 +818,20 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         if matches!((&lhs.value, &rhs.value), (Typval::Dict(_), Typval::Dict(_)))
             && !matches!(op, CompareOp::Equal | CompareOp::NotEqual)
         {
-            return Err(EvalError::new("E736", offset, "Invalid operation for Dictionary"));
+            return Err(EvalError::new(
+                "E736",
+                offset,
+                "Invalid operation for Dictionary",
+            ));
         }
-        let ordering = compare_values(&lhs.value, &rhs.value, ignore_case, offset, depth, self.max_depth)?;
+        let ordering = compare_values(
+            &lhs.value,
+            &rhs.value,
+            ignore_case,
+            offset,
+            depth,
+            self.max_depth,
+        )?;
         Ok(match op {
             CompareOp::Equal => ordering == 0,
             CompareOp::NotEqual => ordering != 0,
@@ -542,45 +843,79 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         })
     }
 
-    fn index(&self, target: Evaluated, index: Typval, offset: usize) -> Result<Evaluated> {
+    fn index(target: Evaluated, index: &Typval, offset: usize) -> Result<Evaluated> {
         match target.value {
             Typval::List(values) => {
-                let requested = to_number(&index, offset)?;
-                let items = values.try_borrow().map_err(|_| borrow_error(offset))?.items.clone();
-                let normalized = normalize_list_index(items.len(), requested)
-                    .ok_or_else(|| EvalError::new("E684", offset, format!("list index out of range: {requested}")))?;
+                let requested = to_number(index, offset)?;
+                let items = values
+                    .try_borrow()
+                    .map_err(|_| borrow_error(offset))?
+                    .items
+                    .clone();
+                let normalized = normalize_list_index(items.len(), requested).ok_or_else(|| {
+                    EvalError::new(
+                        "E684",
+                        offset,
+                        format!("list index out of range: {requested}"),
+                    )
+                })?;
                 Ok(Evaluated::plain(items[normalized].clone()))
             }
             Typval::Blob(values) => {
-                let requested = to_number(&index, offset)?;
-                let normalized = normalize_list_index(values.len(), requested)
-                    .ok_or_else(|| EvalError::new("E979", offset, format!("blob index out of range: {requested}")))?;
-                Ok(Evaluated::plain(Typval::Number(i64::from(values[normalized]))))
+                let requested = to_number(index, offset)?;
+                let normalized =
+                    normalize_list_index(values.len(), requested).ok_or_else(|| {
+                        EvalError::new(
+                            "E979",
+                            offset,
+                            format!("blob index out of range: {requested}"),
+                        )
+                    })?;
+                Ok(Evaluated::plain(Typval::Number(i64::from(
+                    values[normalized],
+                ))))
             }
             value @ Typval::Dict(_) => {
-                let key = to_string(&index, offset)?;
+                let key = to_string(index, offset)?;
                 dict_lookup(&value, key.as_bytes(), offset, target.identity)
             }
             value @ (Typval::Number(_) | Typval::String(_)) => {
                 let bytes = to_string(&value, offset)?;
-                let index = to_number(&index, offset)?;
-                if index < 0 || usize::try_from(index).map_or(true, |index| index >= bytes.0.len()) {
+                let index = to_number(index, offset)?;
+                if index < 0 || usize::try_from(index).map_or(true, |index| index >= bytes.0.len())
+                {
                     return Ok(Evaluated::plain(Typval::String(OxStr(Vec::new()))));
                 }
-                let index = usize::try_from(index).map_err(|_| EvalError::new("E111", offset, "invalid string index"))?;
-                Ok(Evaluated::plain(Typval::String(OxStr(vec![bytes.0[index]]))))
+                let index = usize::try_from(index)
+                    .map_err(|_| EvalError::new("E111", offset, "invalid string index"))?;
+                Ok(Evaluated::plain(Typval::String(OxStr(vec![
+                    bytes.0[index],
+                ]))))
             }
             // `check_can_index` (`eval.c:3225-3229`) is upstream's only E806:
             // indexing is the one String context a Float is refused in.
             Typval::Float(_) => Err(EvalError::new("E806", offset, "Using a Float as a String")),
-            _ => Err(EvalError::new("E909", offset, "invalid value for subscript")),
+            _ => Err(EvalError::new(
+                "E909",
+                offset,
+                "invalid value for subscript",
+            )),
         }
     }
 
-    fn slice(&self, target: Typval, start: Option<i64>, end: Option<i64>, offset: usize) -> Result<Evaluated> {
+    fn slice(
+        target: Typval,
+        start: Option<i64>,
+        end: Option<i64>,
+        offset: usize,
+    ) -> Result<Evaluated> {
         match target {
             Typval::List(values) => {
-                let items = values.try_borrow().map_err(|_| borrow_error(offset))?.items.clone();
+                let items = values
+                    .try_borrow()
+                    .map_err(|_| borrow_error(offset))?
+                    .items
+                    .clone();
                 let (start, end) = list_slice_bounds(items.len(), start, end);
                 Ok(Evaluated::plain(Typval::list(items[start..end].to_vec())))
             }
@@ -591,7 +926,9 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
             value @ (Typval::Number(_) | Typval::String(_)) => {
                 let value = to_string(&value, offset)?;
                 let (start, end) = string_slice_bounds(value.0.len(), start, end);
-                Ok(Evaluated::plain(Typval::String(OxStr(value.0[start..end].to_vec()))))
+                Ok(Evaluated::plain(Typval::String(OxStr(
+                    value.0[start..end].to_vec(),
+                ))))
             }
             Typval::Dict(_) => Err(EvalError::new("E719", offset, "Cannot slice a Dictionary")),
             Typval::Float(_) => Err(EvalError::new("E806", offset, "Using a Float as a String")),
@@ -599,16 +936,27 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         }
     }
 
-    fn eval_call(&mut self, callee: &Expr, args: &[Expr], scope: &mut Scope, depth: usize) -> Result<Evaluated> {
+    fn eval_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        scope: &mut Scope,
+        depth: usize,
+    ) -> Result<Evaluated> {
         let mut values = Vec::with_capacity(args.len());
         for arg in args {
             values.push(self.eval_at(arg, scope, depth)?.value);
         }
         if let ExprKind::Variable(name) = &callee.kind {
-            match self.eval_variable(name, callee.span.start, scope) {
-                Ok(value) => return self.call_value(value.value, values, scope, depth),
-                Err(error) if error.code == "E121" => {}
-                Err(error) => return Err(error),
+            // A Funcref/Partial variable is callable (`g:Xsetlist()`). A
+            // Number argument named `line` must not steal `line('.')`
+            // (test_goto.vim `XTest_goto_decl`).
+            match Self::eval_variable(name, callee.span.start, scope) {
+                Ok(value) if matches!(value.value, Typval::Funcref(_) | Typval::Partial(_)) => {
+                    return self.call_value(value.value, values, scope, depth);
+                }
+                Err(error) if error.code != "E121" => return Err(error),
+                Ok(_) | Err(_) => {}
             }
             return self.call_named(name, values, scope, callee.span.start, depth);
         }
@@ -616,12 +964,23 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         self.call_value(callee.value, values, scope, depth)
     }
 
-    fn call_method(&mut self, method: &Expr, args: Vec<Typval>, scope: &mut Scope, depth: usize) -> Result<Evaluated> {
+    fn call_method(
+        &mut self,
+        method: &Expr,
+        args: Vec<Typval>,
+        scope: &mut Scope,
+        depth: usize,
+    ) -> Result<Evaluated> {
         if let ExprKind::Variable(name) = &method.kind {
-            self.host.call_method(name, args, scope).map(Evaluated::plain).map_err(|mut error| {
-                if error.code == "E117" { error.offset = method.span.start; }
-                error
-            })
+            self.host
+                .call_method(name, args, scope)
+                .map(Evaluated::plain)
+                .map_err(|mut error| {
+                    if error.code == "E117" {
+                        error.offset = method.span.start;
+                    }
+                    error
+                })
         } else {
             let method = self.eval_at(method, scope, depth)?;
             self.call_value(method.value, args, scope, depth)
@@ -636,18 +995,43 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         offset: usize,
         _depth: usize,
     ) -> Result<Evaluated> {
-        self.host.call(name, args, scope).map(Evaluated::plain).map_err(|mut error| {
-            if error.code == "E117" { error.offset = offset; }
-            error
-        })
+        self.host
+            .call(name, args, scope)
+            .map(Evaluated::plain)
+            .map_err(|mut error| {
+                if error.code == "E117" {
+                    error.offset = offset;
+                }
+                error
+            })
     }
 
     /// Invoke an already-evaluated callable through this evaluator's registry.
-    pub(crate) fn invoke(&mut self, callee: Typval, args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
-        self.call_value(callee, args, scope, 0).map(|evaluated| evaluated.value)
+    ///
+    /// This preserves closure registry identity and bound Partial arguments,
+    /// so callback-capable hosts do not need a parallel invocation path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the callable's evaluation error, or `E1085` when `callee` is
+    /// not a Funcref or Partial.
+    pub fn invoke(
+        &mut self,
+        callee: Typval,
+        args: Vec<Typval>,
+        scope: &mut Scope,
+    ) -> Result<Typval> {
+        self.call_value(callee, args, scope, 0)
+            .map(|evaluated| evaluated.value)
     }
 
-    fn call_value(&mut self, callee: Typval, mut args: Vec<Typval>, scope: &mut Scope, depth: usize) -> Result<Evaluated> {
+    fn call_value(
+        &mut self,
+        callee: Typval,
+        mut args: Vec<Typval>,
+        scope: &mut Scope,
+        depth: usize,
+    ) -> Result<Evaluated> {
         match callee {
             Typval::Funcref(funcref) | Typval::Partial(funcref) => {
                 if !funcref.args.is_empty() {
@@ -658,7 +1042,11 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                 match funcref.registry {
                     Some(registry_id) => {
                         let id = closure_index(funcref.name.as_bytes()).ok_or_else(|| {
-                            EvalError::new("E117", 0, format!("Unknown function: {}", funcref.name.to_string_lossy()))
+                            EvalError::new(
+                                "E117",
+                                0,
+                                format!("Unknown function: {}", funcref.name.to_string_lossy()),
+                            )
                         })?;
                         self.call_closure(&funcref.name, registry_id, id, &args, depth, 0)
                     }
@@ -678,11 +1066,19 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         depth: usize,
         offset: usize,
     ) -> Result<Evaluated> {
-        let closure = self.closures.resolve(registry_id, id).ok_or_else(|| {
-            EvalError::new("E117", offset, format!("Unknown function: {}", name.to_string_lossy()))
+        let closure = self.closures.resolve_any(registry_id, id).ok_or_else(|| {
+            EvalError::new(
+                "E117",
+                offset,
+                format!("Unknown function: {}", name.to_string_lossy()),
+            )
         })?;
         if args.len() < closure.params.len() {
-            return Err(EvalError::new("E119", offset, "not enough or too many arguments for function"));
+            return Err(EvalError::new(
+                "E119",
+                offset,
+                "not enough or too many arguments for function",
+            ));
         }
         let mut scope = closure.captured;
         for (param, value) in closure.params.iter().zip(args) {
@@ -696,7 +1092,11 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         let extras = &args[closure.params.len()..];
         let extra_count = i64::try_from(extras.len()).unwrap_or(i64::MAX);
         bind_argument(&mut scope, &OxStr::from("0"), Typval::Number(extra_count));
-        bind_argument(&mut scope, &OxStr::from("000"), Typval::list(extras.to_vec()));
+        bind_argument(
+            &mut scope,
+            &OxStr::from("000"),
+            Typval::list(extras.to_vec()),
+        );
         for (index, value) in extras.iter().enumerate() {
             let name = OxStr(format!("{}", index + 1).into_bytes());
             bind_argument(&mut scope, &name, value.clone());
@@ -711,51 +1111,90 @@ fn bind_argument(scope: &mut Scope, name: &OxStr, value: Typval) {
 }
 
 fn identity_type(value: &Typval) -> bool {
-    matches!(value, Typval::List(_) | Typval::Dict(_) | Typval::Blob(_) | Typval::Funcref(_) | Typval::Partial(_))
+    matches!(
+        value,
+        Typval::List(_)
+            | Typval::Dict(_)
+            | Typval::Blob(_)
+            | Typval::Funcref(_)
+            | Typval::Partial(_)
+    )
 }
 
-fn closure_index(name: &[u8]) -> Option<usize> {
+/// Parses the local index out of a `<lambda>N` closure name.
+#[must_use]
+pub fn closure_index(name: &[u8]) -> Option<usize> {
     let digits = name.strip_prefix(b"<lambda>")?;
     let text = std::str::from_utf8(digits).ok()?;
     text.parse().ok()
 }
 
-fn dict_lookup(value: &Typval, key: &[u8], offset: usize, _parent_identity: Option<usize>) -> Result<Evaluated> {
+fn dict_lookup(
+    value: &Typval,
+    key: &[u8],
+    offset: usize,
+    _parent_identity: Option<usize>,
+) -> Result<Evaluated> {
     let Typval::Dict(entries) = value else {
         return Err(EvalError::new("E715", offset, "Dictionary required"));
     };
-    let entries = entries.try_borrow().map_err(|_| borrow_error(offset))?.entries.clone();
+    let entries = entries
+        .try_borrow()
+        .map_err(|_| borrow_error(offset))?
+        .entries
+        .clone();
     entries
         .into_iter()
-        .find(|(candidate, _)| candidate.as_bytes() == key)
-        .map(|(_, value)| Evaluated::plain(value))
-        .ok_or_else(|| EvalError::new("E716", offset, format!("Key not present in Dictionary: {}", String::from_utf8_lossy(key))))
+        .find(|entry| entry.key.as_bytes() == key)
+        .map(|entry| Evaluated::plain(entry.value))
+        .ok_or_else(|| {
+            EvalError::new(
+                "E716",
+                offset,
+                format!(
+                    "Key not present in Dictionary: {}",
+                    String::from_utf8_lossy(key)
+                ),
+            )
+        })
 }
 
-fn numeric_binary(op: BinaryOp, lhs: Typval, rhs: Typval, offset: usize) -> Result<Evaluated> {
+fn numeric_binary(op: BinaryOp, lhs: &Typval, rhs: &Typval, offset: usize) -> Result<Evaluated> {
     if matches!(lhs, Typval::Float(_)) || matches!(rhs, Typval::Float(_)) {
         if op == BinaryOp::Modulo {
             return Err(EvalError::new("E804", offset, "Cannot use '%' with Float"));
         }
-        let left = to_float_arithmetic(&lhs, offset)?;
-        let right = to_float_arithmetic(&rhs, offset)?;
+        let left = to_float_arithmetic(lhs, offset)?;
+        let right = to_float_arithmetic(rhs, offset)?;
         let value = match op {
             BinaryOp::Add => left + right,
             BinaryOp::Subtract => left - right,
             BinaryOp::Multiply => left * right,
             BinaryOp::Divide => left / right,
-            _ => return Err(EvalError::new("E15", offset, "invalid floating-point operator")),
+            _ => {
+                return Err(EvalError::new(
+                    "E15",
+                    offset,
+                    "invalid floating-point operator",
+                ));
+            }
         };
         return Ok(Evaluated::plain(Typval::Float(value)));
     }
-    let left = to_number(&lhs, offset)?;
-    let right = to_number(&rhs, offset)?;
+    let left = to_number(lhs, offset)?;
+    let right = to_number(rhs, offset)?;
     let value = match op {
         BinaryOp::Add => left.wrapping_add(right),
         BinaryOp::Subtract => left.wrapping_sub(right),
         BinaryOp::Multiply => left.wrapping_mul(right),
         BinaryOp::Divide => vim_divide(left, right),
-        BinaryOp::Modulo => if right == 0 { 0 } else { left.wrapping_rem(right) },
+        BinaryOp::Modulo => {
+            if right == 0 {
+                0
+            } else {
+                left.wrapping_rem(right)
+            }
+        }
         _ => return Err(EvalError::new("E15", offset, "invalid numeric operator")),
     };
     Ok(Evaluated::plain(Typval::Number(value)))
@@ -763,7 +1202,10 @@ fn numeric_binary(op: BinaryOp, lhs: Typval, rhs: Typval, offset: usize) -> Resu
 
 fn vim_divide(left: i64, right: i64) -> i64 {
     if right == 0 {
-        if left == 0 { i64::MIN } else if left > 0 { i64::MAX } else { i64::MIN }
+        match left.cmp(&0) {
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Less => i64::MIN,
+            std::cmp::Ordering::Greater => i64::MAX,
+        }
     } else if left == i64::MIN && right == -1 {
         i64::MIN
     } else {
@@ -771,6 +1213,8 @@ fn vim_divide(left: i64, right: i64) -> i64 {
     }
 }
 
+// i64→f64 is Vim's number-to-float coercion; upstream uses the same C cast.
+#[allow(clippy::cast_precision_loss)]
 fn to_float_arithmetic(value: &Typval, offset: usize) -> Result<f64> {
     match value {
         Typval::Float(value) => Ok(*value),
@@ -781,13 +1225,23 @@ fn to_float_arithmetic(value: &Typval, offset: usize) -> Result<f64> {
 fn to_number(value: &Typval, offset: usize) -> Result<i64> {
     match value {
         Typval::Number(value) => Ok(*value),
-        Typval::Channel(value) | Typval::Job(value) => Ok(i64::try_from(*value).unwrap_or(i64::MAX)),
+        Typval::Channel(value) | Typval::Job(value) => {
+            Ok(i64::try_from(*value).unwrap_or(i64::MAX))
+        }
         Typval::String(value) => Ok(string_to_number(value.as_bytes())),
         Typval::Bool(value) => Ok(i64::from(*value)),
         Typval::Special(Special::Null) => Ok(0),
-        Typval::Funcref(_) | Typval::Partial(_) => Err(EvalError::new("E703", offset, "Using a Funcref as a Number")),
+        Typval::Funcref(_) | Typval::Partial(_) => Err(EvalError::new(
+            "E703",
+            offset,
+            "Using a Funcref as a Number",
+        )),
         Typval::List(_) => Err(EvalError::new("E745", offset, "Using a List as a Number")),
-        Typval::Dict(_) => Err(EvalError::new("E728", offset, "Using a Dictionary as a Number")),
+        Typval::Dict(_) => Err(EvalError::new(
+            "E728",
+            offset,
+            "Using a Dictionary as a Number",
+        )),
         Typval::Float(_) => Err(EvalError::new("E805", offset, "Using a Float as a Number")),
         Typval::Blob(_) => Err(EvalError::new("E974", offset, "Using a Blob as a Number")),
     }
@@ -802,7 +1256,8 @@ fn to_number(value: &Typval, offset: usize) -> Result<i64> {
 /// `'+12' + 0` is 0. And a leading zero selects octal only when *every*
 /// following digit is octal — `'010' + 0` is 8 while `'08' + 0` is 8 as
 /// decimal, because `ptr[1]` being `8` or `9` skips the base detection
-/// outright (`charset.c:1276-1277`).
+// i64↔u64 casts mirror upstream's unsigned-accumulate-then-negate in vim_str2nr.
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 pub(crate) fn string_to_number(bytes: &[u8]) -> i64 {
     let byte = |index: usize| bytes.get(index).copied().unwrap_or(0);
     let negative = byte(0) == b'-';
@@ -813,11 +1268,17 @@ pub(crate) fn string_to_number(bytes: &[u8]) -> i64 {
     let mut magnitude = 0_u64;
     let mut index = digits_at;
     while let Some(digit) = char::from(byte(index)).to_digit(base) {
-        magnitude = magnitude.saturating_mul(u64::from(base)).saturating_add(u64::from(digit));
+        magnitude = magnitude
+            .saturating_mul(u64::from(base))
+            .saturating_add(u64::from(digit));
         index += 1;
     }
     if negative {
-        if magnitude > i64::MAX as u64 { i64::MIN } else { -(magnitude as i64) }
+        if magnitude > i64::MAX as u64 {
+            i64::MIN
+        } else {
+            -(magnitude as i64)
+        }
     } else {
         i64::try_from(magnitude).unwrap_or(i64::MAX)
     }
@@ -839,7 +1300,9 @@ fn detect_base(bytes: &[u8], start: usize) -> (u32, usize) {
         digit if digit.is_ascii_digit() && digit < b'8' => {
             let mut index = start + 2;
             while byte(index).is_ascii_digit() {
-                if byte(index) > b'7' { return (10, start); }
+                if byte(index) > b'7' {
+                    return (10, start);
+                }
                 index += 1;
             }
             (8, start + 1)
@@ -857,13 +1320,22 @@ fn to_string(value: &Typval, offset: usize) -> Result<OxStr> {
         Typval::Bool(true) => Ok(OxStr::from("v:true")),
         Typval::Bool(false) => Ok(OxStr::from("v:false")),
         Typval::Special(Special::Null) => Ok(OxStr::from("v:null")),
-        Typval::Funcref(_) | Typval::Partial(_) => Err(EvalError::new("E729", offset, "Using a Funcref as a String")),
+        Typval::Funcref(_) | Typval::Partial(_) => Err(EvalError::new(
+            "E729",
+            offset,
+            "Using a Funcref as a String",
+        )),
         Typval::List(_) => Err(EvalError::new("E730", offset, "Using a List as a String")),
-        Typval::Dict(_) => Err(EvalError::new("E731", offset, "Using a Dictionary as a String")),
+        Typval::Dict(_) => Err(EvalError::new(
+            "E731",
+            offset,
+            "Using a Dictionary as a String",
+        )),
         Typval::Blob(_) => Err(EvalError::new("E976", offset, "Using a Blob as a String")),
     }
 }
-
+// i64→f64 is Vim's number-to-float coercion; i64→i8 is the cmp result cast.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn compare_values(
     lhs: &Typval,
     rhs: &Typval,
@@ -874,42 +1346,101 @@ fn compare_values(
 ) -> Result<i8> {
     if matches!(lhs, Typval::List(_)) || matches!(rhs, Typval::List(_)) {
         if !matches!((lhs, rhs), (Typval::List(_), Typval::List(_))) {
-            return Err(EvalError::new("E691", offset, "Can only compare List with List"));
+            return Err(EvalError::new(
+                "E691",
+                offset,
+                "Can only compare List with List",
+            ));
         }
-        return Ok(if equal_values(lhs, rhs, ignore_case, depth, maximum)? { 0 } else { 1 });
+        return Ok(i8::from(!equal_values(
+            lhs,
+            rhs,
+            ignore_case,
+            depth,
+            maximum,
+        )?));
     }
     if matches!(lhs, Typval::Dict(_)) || matches!(rhs, Typval::Dict(_)) {
         if !matches!((lhs, rhs), (Typval::Dict(_), Typval::Dict(_))) {
-            return Err(EvalError::new("E735", offset, "Can only compare Dictionary with Dictionary"));
+            return Err(EvalError::new(
+                "E735",
+                offset,
+                "Can only compare Dictionary with Dictionary",
+            ));
         }
-        return Ok(if equal_values(lhs, rhs, ignore_case, depth, maximum)? { 0 } else { 1 });
+        return Ok(i8::from(!equal_values(
+            lhs,
+            rhs,
+            ignore_case,
+            depth,
+            maximum,
+        )?));
     }
     if matches!(lhs, Typval::Float(_)) || matches!(rhs, Typval::Float(_)) {
-        let left = match lhs { Typval::Float(v) => *v, _ => to_number(lhs, offset)? as f64 };
-        let right = match rhs { Typval::Float(v) => *v, _ => to_number(rhs, offset)? as f64 };
-        return Ok(if left < right { -1 } else if left > right { 1 } else { 0 });
+        let left = match lhs {
+            Typval::Float(v) => *v,
+            _ => to_number(lhs, offset)? as f64,
+        };
+        let right = match rhs {
+            Typval::Float(v) => *v,
+            _ => to_number(rhs, offset)? as f64,
+        };
+        return Ok(if left < right {
+            -1
+        } else {
+            i8::from(left > right)
+        });
     }
-    if matches!(lhs, Typval::Number(_) | Typval::Bool(_) | Typval::Special(_) | Typval::Channel(_) | Typval::Job(_))
-        || matches!(rhs, Typval::Number(_) | Typval::Bool(_) | Typval::Special(_) | Typval::Channel(_) | Typval::Job(_))
-    {
+    if matches!(
+        lhs,
+        Typval::Number(_)
+            | Typval::Bool(_)
+            | Typval::Special(_)
+            | Typval::Channel(_)
+            | Typval::Job(_)
+    ) || matches!(
+        rhs,
+        Typval::Number(_)
+            | Typval::Bool(_)
+            | Typval::Special(_)
+            | Typval::Channel(_)
+            | Typval::Job(_)
+    ) {
         return Ok(to_number(lhs, offset)?.cmp(&to_number(rhs, offset)?) as i8);
     }
     let left = to_string(lhs, offset)?;
     let right = to_string(rhs, offset)?;
-    Ok(compare_bytes(left.as_bytes(), right.as_bytes(), ignore_case))
+    Ok(compare_bytes(
+        left.as_bytes(),
+        right.as_bytes(),
+        ignore_case,
+    ))
 }
 
-fn identical_values(lhs: &Typval, rhs: &Typval, ignore_case: bool, depth: usize, maximum: usize) -> Result<bool> {
+fn identical_values(
+    lhs: &Typval,
+    rhs: &Typval,
+    ignore_case: bool,
+    depth: usize,
+    maximum: usize,
+) -> Result<bool> {
     match (lhs, rhs) {
         (Typval::List(left), Typval::List(right)) => Ok(Rc::ptr_eq(left, right)),
         (Typval::Dict(left), Typval::Dict(right)) => Ok(Rc::ptr_eq(left, right)),
         (Typval::Partial(left), Typval::Partial(right)) => Ok(left.registry.is_some()
-            && left.registry == right.registry && left.name == right.name),
+            && left.registry == right.registry
+            && left.name == right.name),
         _ => equal_values(lhs, rhs, ignore_case, depth, maximum),
     }
 }
 
-fn equal_values(lhs: &Typval, rhs: &Typval, ignore_case: bool, depth: usize, maximum: usize) -> Result<bool> {
+fn equal_values(
+    lhs: &Typval,
+    rhs: &Typval,
+    ignore_case: bool,
+    depth: usize,
+    maximum: usize,
+) -> Result<bool> {
     fn recurse(
         lhs: &Typval,
         rhs: &Typval,
@@ -919,30 +1450,82 @@ fn equal_values(lhs: &Typval, rhs: &Typval, ignore_case: bool, depth: usize, max
         seen: &mut HashSet<(usize, usize, u8)>,
     ) -> Result<bool> {
         if depth >= maximum {
-            return Err(EvalError::new("E1169", 0, "value comparison nesting is too deep"));
+            return Err(EvalError::new(
+                "E1169",
+                0,
+                "value comparison nesting is too deep",
+            ));
         }
         match (lhs, rhs) {
-            (Typval::String(left), Typval::String(right)) => Ok(compare_bytes(left.as_bytes(), right.as_bytes(), ignore_case) == 0),
+            (Typval::String(left), Typval::String(right)) => {
+                Ok(compare_bytes(left.as_bytes(), right.as_bytes(), ignore_case) == 0)
+            }
             (Typval::List(left), Typval::List(right)) => {
-                let pair = (Rc::as_ptr(left) as usize, Rc::as_ptr(right) as usize, ox_types::VAR_LIST);
-                if !seen.insert(pair) { return Ok(true); }
-                let left = left.try_borrow().map_err(|_| borrow_error(0))?.items.clone();
-                let right = right.try_borrow().map_err(|_| borrow_error(0))?.items.clone();
-                if left.len() != right.len() { return Ok(false); }
+                let pair = (
+                    Rc::as_ptr(left) as usize,
+                    Rc::as_ptr(right) as usize,
+                    ox_types::VAR_LIST,
+                );
+                if !seen.insert(pair) {
+                    return Ok(true);
+                }
+                let left = left
+                    .try_borrow()
+                    .map_err(|_| borrow_error(0))?
+                    .items
+                    .clone();
+                let right = right
+                    .try_borrow()
+                    .map_err(|_| borrow_error(0))?
+                    .items
+                    .clone();
+                if left.len() != right.len() {
+                    return Ok(false);
+                }
                 for (left, right) in left.iter().zip(&right) {
-                    if !recurse(left, right, ignore_case, depth + 1, maximum, seen)? { return Ok(false); }
+                    if !recurse(left, right, ignore_case, depth + 1, maximum, seen)? {
+                        return Ok(false);
+                    }
                 }
                 Ok(true)
             }
             (Typval::Dict(left), Typval::Dict(right)) => {
-                let pair = (Rc::as_ptr(left) as usize, Rc::as_ptr(right) as usize, ox_types::VAR_DICT);
-                if !seen.insert(pair) { return Ok(true); }
-                let left = left.try_borrow().map_err(|_| borrow_error(0))?.entries.clone();
-                let right = right.try_borrow().map_err(|_| borrow_error(0))?.entries.clone();
-                if left.len() != right.len() { return Ok(false); }
-                for (key, value) in &left {
-                    let Some((_, other)) = right.iter().find(|(candidate, _)| candidate == key) else { return Ok(false); };
-                    if !recurse(value, other, ignore_case, depth + 1, maximum, seen)? { return Ok(false); }
+                let pair = (
+                    Rc::as_ptr(left) as usize,
+                    Rc::as_ptr(right) as usize,
+                    ox_types::VAR_DICT,
+                );
+                if !seen.insert(pair) {
+                    return Ok(true);
+                }
+                let left = left
+                    .try_borrow()
+                    .map_err(|_| borrow_error(0))?
+                    .entries
+                    .clone();
+                let right = right
+                    .try_borrow()
+                    .map_err(|_| borrow_error(0))?
+                    .entries
+                    .clone();
+                if left.len() != right.len() {
+                    return Ok(false);
+                }
+                for entry in &left {
+                    let Some(other) = right.iter().find(|candidate| candidate.key == entry.key)
+                    else {
+                        return Ok(false);
+                    };
+                    if !recurse(
+                        &entry.value,
+                        &other.value,
+                        ignore_case,
+                        depth + 1,
+                        maximum,
+                        seen,
+                    )? {
+                        return Ok(false);
+                    }
                 }
                 Ok(true)
             }
@@ -954,7 +1537,11 @@ fn equal_values(lhs: &Typval, rhs: &Typval, ignore_case: bool, depth: usize, max
 }
 
 fn borrow_error(offset: usize) -> EvalError {
-    EvalError::new("E742", offset, "Cannot change value during recursive container access")
+    EvalError::new(
+        "E742",
+        offset,
+        "Cannot change value during recursive container access",
+    )
 }
 
 /// Length in bytes of the UTF-8 sequence starting with `lead`, using only the
@@ -1008,8 +1595,12 @@ fn fold_bytes(bytes: &[u8]) -> Vec<u8> {
 pub(crate) fn compare_bytes(lhs: &[u8], rhs: &[u8], ignore_case: bool) -> i8 {
     if !ignore_case {
         for (&left, &right) in lhs.iter().zip(rhs) {
-            if left < right { return -1; }
-            if left > right { return 1; }
+            if left < right {
+                return -1;
+            }
+            if left > right {
+                return 1;
+            }
         }
         return lhs.len().cmp(&rhs.len()) as i8;
     }
@@ -1025,35 +1616,69 @@ pub(crate) fn compare_bytes(lhs: &[u8], rhs: &[u8], ignore_case: bool) -> i8 {
     }
 }
 
-fn normalize_list_index(length: usize, requested: i64) -> Option<usize> {
+/// Resolves a possibly negative list index to an in-range offset.
+#[must_use]
+pub fn normalize_list_index(length: usize, requested: i64) -> Option<usize> {
     let length_i64 = i64::try_from(length).ok()?;
-    let normalized = if requested < 0 { length_i64.checked_add(requested)? } else { requested };
-    if normalized < 0 || normalized >= length_i64 { None } else { usize::try_from(normalized).ok() }
+    let normalized = if requested < 0 {
+        length_i64.checked_add(requested)?
+    } else {
+        requested
+    };
+    if normalized < 0 || normalized >= length_i64 {
+        None
+    } else {
+        usize::try_from(normalized).ok()
+    }
 }
 
-fn list_slice_bounds(length: usize, start: Option<i64>, end: Option<i64>) -> (usize, usize) {
+/// Returns the clamped half-open bounds for an inclusive Vim list slice.
+#[must_use]
+pub fn list_slice_bounds(length: usize, start: Option<i64>, end: Option<i64>) -> (usize, usize) {
     let len = i64::try_from(length).unwrap_or(i64::MAX);
     let mut first = start.unwrap_or(0);
-    if first < 0 { first = first.saturating_add(len); }
-    if first < 0 || first >= len { first = len; }
+    if first < 0 {
+        first = first.saturating_add(len);
+    }
+    if first < 0 || first >= len {
+        first = len;
+    }
     let mut last = end.unwrap_or(len.saturating_sub(1));
-    if last < 0 { last = last.saturating_add(len); }
-    if last >= len { last = len.saturating_sub(1); }
-    if last < first || last < 0 { return (length, length); }
+    if last < 0 {
+        last = last.saturating_add(len);
+    }
+    if last >= len {
+        last = len.saturating_sub(1);
+    }
+    if last < first || last < 0 {
+        return (length, length);
+    }
     let start = usize::try_from(first).unwrap_or(length).min(length);
-    let exclusive = usize::try_from(last.saturating_add(1)).unwrap_or(length).min(length);
+    let exclusive = usize::try_from(last.saturating_add(1))
+        .unwrap_or(length)
+        .min(length);
     (start, exclusive.max(start))
 }
 
 fn string_slice_bounds(length: usize, start: Option<i64>, end: Option<i64>) -> (usize, usize) {
     let len = i64::try_from(length).unwrap_or(i64::MAX);
     let mut first = start.unwrap_or(0);
-    if first < 0 { first = first.saturating_add(len).max(0); }
+    if first < 0 {
+        first = first.saturating_add(len).max(0);
+    }
     let mut last = end.unwrap_or(len.saturating_sub(1));
-    if last < 0 { last = last.saturating_add(len); }
-    if last >= len { last = len.saturating_sub(1); }
-    if first >= len || last < 0 || first > last { return (length, length); }
+    if last < 0 {
+        last = last.saturating_add(len);
+    }
+    if last >= len {
+        last = len.saturating_sub(1);
+    }
+    if first >= len || last < 0 || first > last {
+        return (length, length);
+    }
     let start = usize::try_from(first).unwrap_or(length).min(length);
-    let exclusive = usize::try_from(last.saturating_add(1)).unwrap_or(length).min(length);
+    let exclusive = usize::try_from(last.saturating_add(1))
+        .unwrap_or(length)
+        .min(length);
     (start, exclusive.max(start))
 }

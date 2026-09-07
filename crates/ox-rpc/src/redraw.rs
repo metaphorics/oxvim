@@ -56,13 +56,16 @@ impl RedrawBatch {
     /// different `name` a new event entry is started.
     pub fn push(&mut self, name: impl Into<OxStr>, args: Vec<Object>) {
         let name = name.into();
-        if let Some(last) = self.events.last_mut() {
-            if last.name == name {
-                last.argsets.push(args);
-                return;
-            }
+        if let Some(last) = self.events.last_mut()
+            && last.name == name
+        {
+            last.argsets.push(args);
+            return;
         }
-        self.events.push(RedrawEvent { name, argsets: vec![args] });
+        self.events.push(RedrawEvent {
+            name,
+            argsets: vec![args],
+        });
     }
 
     /// Append a `grid_line` call, coalescing it into the previous call when it
@@ -79,19 +82,17 @@ impl RedrawBatch {
         wrap: bool,
     ) {
         // Try to fuse with the previous grid_line (contiguous same grid+row).
-        if let Some(last) = self.events.last_mut() {
-            if last.name == OxStr::from("grid_line") {
-                if let Some(prev) = last.argsets.last_mut() {
-                    if can_fuse(prev, grid, row, startcol) {
-                        // Append the new cell tuples and adopt the final wrap.
-                        if let Object::Array(prev_cells) = &mut prev[ARG_CELLS] {
-                            prev_cells.extend(cells);
-                        }
-                        prev[ARG_WRAP] = Object::Boolean(wrap);
-                        return;
-                    }
-                }
+        if let Some(last) = self.events.last_mut()
+            && last.name == OxStr::from("grid_line")
+            && let Some(prev) = last.argsets.last_mut()
+            && can_fuse(prev, grid, row, startcol)
+        {
+            // Append the new cell tuples and adopt the final wrap.
+            if let Object::Array(prev_cells) = &mut prev[ARG_CELLS] {
+                prev_cells.extend(cells);
             }
+            prev[ARG_WRAP] = Object::Boolean(wrap);
+            return;
         }
         self.push(
             "grid_line",
@@ -122,6 +123,7 @@ impl RedrawBatch {
     /// A batch of calls is emitted as one event entry per name —
     /// `[name, args1, args2, …]` — matching `flush_event`'s `1 + ncalls`
     /// accounting.
+    #[must_use]
     pub fn pack(&self) -> Vec<u8> {
         let events: Vec<Object> = self
             .events
@@ -144,10 +146,10 @@ impl RedrawBatch {
 /// Number of cells a cell tuple `[char, attrid?, repeat?]` represents
 /// (`remote_ui_raw_line`: `repeat` defaults to 1).
 fn cell_count(tuple: &Object) -> i64 {
-    if let Object::Array(cells) = tuple {
-        if let Some(Object::Integer(repeat)) = cells.get(2) {
-            return *repeat;
-        }
+    if let Object::Array(cells) = tuple
+        && let Some(Object::Integer(repeat)) = cells.get(2)
+    {
+        return *repeat;
     }
     1
 }
@@ -184,8 +186,8 @@ fn can_fuse(prev: &[Object], grid: i64, row: i64, startcol: i64) -> bool {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use std::io::Cursor;
     use rmpv::Value;
+    use std::io::Cursor;
 
     fn parse(bytes: &[u8]) -> Value {
         let mut cur = Cursor::new(bytes);
@@ -201,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn same_grid_row_coalesces() {
+    fn same_grid_row_coalesces() -> Result<(), Box<dyn std::error::Error>> {
         let mut b = RedrawBatch::new();
         b.grid_line(1, 3, 0, vec![cell("a", 0, 1), cell("b", 1, 1)], false);
         b.grid_line(1, 3, 2, vec![cell("c", 2, 5)], true);
@@ -215,10 +217,11 @@ mod tests {
         assert_eq!(args[ARG_ROW], Object::Integer(3));
         assert_eq!(args[ARG_STARTCOL], Object::Integer(0));
         assert_eq!(args[ARG_WRAP], Object::Boolean(true)); // final wrap wins
-        match &args[ARG_CELLS] {
-            Object::Array(cells) => assert_eq!(cells.len(), 3),
-            _ => panic!("cells must be an array"),
-        }
+        let Object::Array(cells) = &args[ARG_CELLS] else {
+            return Err("cells must be an array".into());
+        };
+        assert_eq!(cells.len(), 3);
+        Ok(())
     }
 
     #[test]
@@ -249,28 +252,37 @@ mod tests {
     }
 
     #[test]
-    fn pack_emits_redraw_notification_shape() {
+    fn pack_emits_redraw_notification_shape() -> Result<(), Box<dyn std::error::Error>> {
         let mut b = RedrawBatch::new();
         b.grid_line(1, 0, 0, vec![cell("x", 0, 1)], false);
         b.push("flush", vec![]);
         let bytes = b.pack();
         // Decode the frame and check the shape.
         let v = parse(&bytes);
-        let Value::Array(frame) = v else { panic!("top must be array") };
+        let Value::Array(frame) = v else {
+            return Err("top must be array".into());
+        };
         assert_eq!(frame.len(), 3);
         assert_eq!(frame[0].as_i64(), Some(2));
         assert_eq!(frame[1].as_str(), Some("redraw"));
-        let Value::Array(events) = &frame[2] else { panic!("events must be array") };
+        let Value::Array(events) = &frame[2] else {
+            return Err("events must be array".into());
+        };
         assert_eq!(events.len(), 2); // one grid_line, one flush
         // grid_line entry: ["grid_line", [args...]]
-        let Value::Array(ge) = &events[0] else { panic!() };
+        let Value::Array(ge) = &events[0] else {
+            return Err("grid_line entry must be an array".into());
+        };
         assert_eq!(ge[0].as_str(), Some("grid_line"));
         assert_eq!(ge.len(), 2);
         // flush entry: ["flush", []]
-        let Value::Array(fe) = &events[1] else { panic!() };
+        let Value::Array(fe) = &events[1] else {
+            return Err("flush entry must be an array".into());
+        };
         assert_eq!(fe[0].as_str(), Some("flush"));
         assert_eq!(fe.len(), 2);
-        assert_eq!(fe[1].as_array().map(|s| s.len()), Some(0));
+        assert_eq!(fe[1].as_array().map(std::vec::Vec::len), Some(0));
+        Ok(())
     }
 
     #[test]
