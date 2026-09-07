@@ -264,6 +264,10 @@ pub struct AppState {
     lua: Rc<RefCell<LuaHost>>,
     registry: Rc<Registry>,
     ex: Rc<RefCell<ExExecutor>>,
+    /// Re-entry executor an autocommand or mapping runs on while `ex` is
+    /// busy: `finish_quit` records a quit on whichever ran, so both are
+    /// drained at every exit boundary.
+    nested_ex: Rc<RefCell<ExExecutor>>,
     mode: Rc<RefCell<ModeMachine>>,
     exiting: bool,
     /// Process exit code requested by `:cquit` (0 for plain quits).
@@ -527,6 +531,7 @@ impl AppState {
             lua,
             registry,
             ex,
+            nested_ex,
             mode,
             exiting: false,
             exit_code: 0,
@@ -770,7 +775,35 @@ impl AppState {
             self.exiting = true;
             self.exit_code = code;
         }
+        // The command itself may have fired an autocommand that quit
+        // without that reaching `outcome`.
+        self.absorb_pending_quit();
         Ok(())
+    }
+
+    /// Absorbs a quit that user code recorded while it ran.
+    ///
+    /// Upstream reaches `getout` from wherever `:qall` runs — an
+    /// autocommand, a mapping, a Lua callback — because the quit sets
+    /// global state rather than a return value (`ex_quit_all` ->
+    /// `getout`, `ex_docmd.c`). `finish_quit` (`excmd_exec.rs`) records it on
+    /// whichever executor ran the command — `ex` when it is free, else
+    /// `nested_ex` (see `ServerAutocmdHost::execute_vimscript`) — so both
+    /// are polled at every boundary where user code could have run.
+    /// Polling one executor in `dispatch` alone left
+    /// `-c 'autocmd VimEnter * qall'` running forever: the autocommand
+    /// body executed and recorded its quit, nothing drained it, and the
+    /// stdio loop then blocked reading a pipe the peer never closes.
+    fn absorb_pending_quit(&mut self) {
+        let quit = self
+            .ex
+            .borrow_mut()
+            .take_quit()
+            .or_else(|| self.nested_ex.borrow_mut().take_quit());
+        if let Some(code) = quit {
+            self.exiting = true;
+            self.exit_code = code;
+        }
     }
 
     fn fire_vim_enter(&mut self) -> Result<(), AppError> {
@@ -779,8 +812,10 @@ impl AppState {
                 .autocmds_mut()
                 .plan(Event::VimEnter, AutocmdContext::default())
         });
-        ox_api::execute_firing_plan(&self.session, plan)
-            .map_err(|error| AppError::Api(error.to_string()))
+        let fired = ox_api::execute_firing_plan(&self.session, plan)
+            .map_err(|error| AppError::Api(error.to_string()));
+        self.absorb_pending_quit();
+        fired
     }
 
     fn dispatch(
@@ -812,10 +847,7 @@ impl AppState {
         };
         drop(caller);
         let result = result?;
-        if let Some(code) = self.ex.borrow_mut().take_quit() {
-            self.exiting = true;
-            self.exit_code = code;
-        }
+        self.absorb_pending_quit();
         let redraws = if name == "nvim_ui_attach"
             || name == "nvim_ui_try_resize"
             || method_is_mutating(&name)
@@ -1407,6 +1439,9 @@ impl AppState {
                 self.exiting = true;
                 self.exit_code = code;
             }
+            // Keys can run a mapping or autocommand that quits without
+            // that reaching `outcome`.
+            self.absorb_pending_quit();
             if repeats.is_empty() {
                 return Ok(());
             }
@@ -1560,6 +1595,14 @@ impl AppState {
         self.exiting
     }
 
+    fn stdio_closed(&mut self) {
+        // Stdin EOF — plain or the embedded server's primary channel —
+        // ends the main loop through `getout(0)` (main.c:935). The exit
+        // code keeps whatever a startup command already requested; the
+        // embed path separately records `preserve_exit` for its swapfiles.
+        self.exiting = true;
+    }
+
     /// Process exit code requested so far (`:cquit`, else 0).
     fn exit_code(&self) -> i64 {
         self.exit_code
@@ -1662,6 +1705,10 @@ fn method_is_mutating(method: &str) -> bool {
         )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the stdio loop is one process-mode lifecycle"
+)]
 /// Serve channel 1 over stdin/stdout until the peer closes its write side.
 /// Returns the process exit code requested by `:cquit` (0 otherwise).
 pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
@@ -1679,6 +1726,7 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
         loop {
             let count = input.read(&mut bytes).map_err(AppError::Io)?;
             if count == 0 {
+                state.borrow_mut().stdio_closed();
                 break;
             }
             let messages = decoder
@@ -1690,6 +1738,9 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
                         output.write_all(&bytes).map_err(AppError::Io)?;
                     }
                 }
+            }
+            if state.borrow().should_exit() {
+                break;
             }
             output.flush().map_err(AppError::Io)?;
             if state.borrow().should_exit() {
@@ -1960,6 +2011,7 @@ fn bind_stdio(
                 let mut bytes = vec![0; 64 * 1024].into_boxed_slice();
                 match input.read(&mut bytes) {
                     Ok(0) => {
+                        callback_runtime.borrow().state.borrow_mut().stdio_closed();
                         uv_loop.stop();
                         break;
                     }
@@ -1978,6 +2030,7 @@ fn bind_stdio(
                             }
                             if state.borrow().should_exit() {
                                 uv_loop.stop();
+                                return output.flush().map_err(AppError::Io);
                             }
                         }
                     }
@@ -2582,6 +2635,10 @@ impl NetworkRuntime {
     ///
     /// Returns the drain, redraw, or stream write failure.
     fn poll_background(&mut self, uv_loop: &mut UvLoop) -> Result<(), ox_uv::CallbackError> {
+        if self.shutdown || self.state.borrow().should_exit() {
+            uv_loop.stop();
+            return Ok(());
+        }
         let session = self.state.borrow().session.clone();
         let ex = self.state.borrow().ex.clone();
         let changed = ex
@@ -2600,6 +2657,10 @@ impl NetworkRuntime {
         // marker is taken.
         let _ = ex.borrow_mut().take_lua_flush_pending();
         let worked = self.state.borrow_mut().drain_lua_work();
+        if self.shutdown || self.state.borrow().should_exit() {
+            uv_loop.stop();
+            return Ok(());
+        }
         if !delivered && !changed && !worked {
             return Ok(());
         }
@@ -2633,7 +2694,7 @@ impl NetworkRuntime {
                     .map_err(|error| ox_uv::CallbackError::new(error.clone()))?;
             }
         }
-        if self.shutdown {
+        if self.shutdown || self.state.borrow().should_exit() {
             uv_loop.stop();
         }
         Ok(())
@@ -2706,6 +2767,8 @@ impl NetworkRuntime {
             }
             if self.state.borrow().should_exit() {
                 uv_loop.stop();
+                self.shutdown = true;
+                break;
             }
         }
         Ok(())
