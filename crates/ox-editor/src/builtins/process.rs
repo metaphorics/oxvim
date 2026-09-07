@@ -195,6 +195,53 @@ fn pty_dimension(extent: usize, fallback: u16) -> u16 {
     }
 }
 
+/// `jobstart(..., {term: true})` guards (`f_jobstart`,
+/// eval/funcs.c:3486-3498) run before the spawn: a modified current
+/// buffer is rejected instead of destroyed, a running terminal rejects
+/// a second attach, and a completed terminal is closed so its buffer is
+/// reused. (`:terminal` always arrives here through its own `enew`, so
+/// these only bite direct `jobstart({term: true})` callers.) Returns
+/// whether the spawn must not proceed (the message is already shown).
+fn term_attach_rejected<E: ExEditorAccess>(access: &E, manager: &mut JobManager) -> bool {
+    let current = access.with_ex_editor(|editor| editor.current_buffer());
+    let Some(buffer) = current else {
+        return false;
+    };
+    let modified = access.with_ex_editor(|editor| {
+        editor
+            .buffer(buffer)
+            .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+    });
+    if modified {
+        access.with_ex_editor(|editor| {
+            crate::excmd_exec::push_text_message(
+                editor,
+                "jobstart(...,{term=true}) requires unmodified buffer".to_owned(),
+                true,
+                true,
+            );
+        });
+        return true;
+    }
+    let Some((previous, running)) = manager.terminal_job_for_buffer(buffer) else {
+        return false;
+    };
+    if running {
+        access.with_ex_editor(|editor| {
+            crate::excmd_exec::push_text_message(
+                editor,
+                format!("Terminal already connected to buffer {}", i64::from(buffer)),
+                true,
+                true,
+            );
+        });
+        return true;
+    }
+    manager.clear_terminal_buffer(previous);
+    access.with_ex_editor(|editor| editor.close_terminal_channel(previous));
+    false
+}
+
 fn call_job_start<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -230,50 +277,9 @@ fn call_job_start<F: FileIO, E: ExEditorAccess>(
         },
     };
     let term = options.term;
-    if term {
-        // `jobstart(..., {term: true})` guards (`f_jobstart`,
-        // eval/funcs.c:3486-3498) run before the spawn: a modified
-        // current buffer is rejected instead of destroyed, a running
-        // terminal rejects a second attach, and a completed terminal is
-        // closed so its buffer is reused. (`:terminal` always arrives
-        // here through its own `enew`, so these only bite direct
-        // `jobstart({term: true})` callers.)
-        let current = access.with_ex_editor(|editor| editor.current_buffer());
-        if let Some(buffer) = current {
-            let modified = access.with_ex_editor(|editor| {
-                editor
-                    .buffer(buffer)
-                    .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
-            });
-            if modified {
-                access.with_ex_editor(|editor| {
-                    crate::excmd_exec::push_text_message(
-                        editor,
-                        "jobstart(...,{term=true}) requires unmodified buffer".to_owned(),
-                        true,
-                        true,
-                    );
-                });
-                runtime.jobs = Some(manager);
-                return Ok(Typval::Number(-1));
-            }
-            if let Some((previous, running)) = manager.terminal_job_for_buffer(buffer) {
-                if running {
-                    access.with_ex_editor(|editor| {
-                        crate::excmd_exec::push_text_message(
-                            editor,
-                            format!("Terminal already connected to buffer {}", i64::from(buffer)),
-                            true,
-                            true,
-                        );
-                    });
-                    runtime.jobs = Some(manager);
-                    return Ok(Typval::Number(-1));
-                }
-                manager.clear_terminal_buffer(previous);
-                access.with_ex_editor(|editor| editor.close_terminal_channel(previous));
-            }
-        }
+    if term && term_attach_rejected(access, &mut manager) {
+        runtime.jobs = Some(manager);
+        return Ok(Typval::Number(-1));
     }
     let started = manager.start(id, options);
     if let Ok(_pid) = started

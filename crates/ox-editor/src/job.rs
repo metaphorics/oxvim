@@ -551,7 +551,7 @@ impl JobManager {
     #[must_use]
     pub fn terminal_job_for_buffer(&self, buffer: ox_types::BufHandle) -> Option<(u64, bool)> {
         self.jobs.iter().find_map(|(id, job)| {
-            (job.terminal_buffer == Some(buffer)).then(|| (*id, job.status < 0))
+            (job.terminal_buffer == Some(buffer)).then_some((*id, job.status < 0))
         })
     }
 

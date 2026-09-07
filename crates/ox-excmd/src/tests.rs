@@ -1257,13 +1257,23 @@ fn unknown_command_error_offset_is_byte_accurate() -> Result<(), String> {
     Ok(())
 }
 
+/// Unwraps a preview parse for the table test: `unwrap_used` is
+/// denied workspace-wide, so the failure carries its input instead.
+#[allow(clippy::panic, reason = "test helper fails with the input attached")]
+fn must_preview(input: &str) -> crate::PreviewPattern {
+    match parse_preview_pattern(input) {
+        Some(parsed) => parsed,
+        None => panic!("{input:?} should preview"),
+    }
+}
+
 /// `parse_preview_pattern` classification contract
 /// (`parse_pattern_and_range`, `ex_getln.c:276-398`): every whitelisted
 /// family resolves its magic, range default, and pattern, and anything
 /// else previews nothing.
 #[test]
 fn preview_pattern_classifies_families() {
-    let parsed = parse_preview_pattern("s/foo/").expect("substitute previews");
+    let parsed = must_preview("s/foo/");
     assert_eq!(parsed.magic, PreviewMagic::Default);
     assert!(parsed.range.is_none());
     assert!(parsed.default_current_line);
@@ -1271,34 +1281,34 @@ fn preview_pattern_classifies_families() {
     assert_eq!(parsed.pattern, "foo");
     assert!(!parsed.use_last_pattern);
 
-    let parsed = parse_preview_pattern("s//").expect("empty pair reuses");
+    let parsed = must_preview("s//");
     assert!(parsed.use_last_pattern);
     assert!(parsed.pattern.is_empty());
 
-    let parsed = parse_preview_pattern("sm/foo/").expect("smagic previews");
+    let parsed = must_preview("sm/foo/");
     assert_eq!(parsed.magic, PreviewMagic::ForceMagic);
-    let parsed = parse_preview_pattern("snom/foo/").expect("snomagic previews");
+    let parsed = must_preview("snom/foo/");
     assert_eq!(parsed.magic, PreviewMagic::ForceNomagic);
 
-    let parsed = parse_preview_pattern("%s/foo/").expect("explicit range");
+    let parsed = must_preview("%s/foo/");
     assert!(parsed.range.is_some());
-    let parsed = parse_preview_pattern("1,3g/x/").expect("ranged global");
+    let parsed = must_preview("1,3g/x/");
     assert!(parsed.range.is_some());
 
-    let parsed = parse_preview_pattern("sort n /foo/").expect("sort previews");
+    let parsed = must_preview("sort n /foo/");
     assert_eq!(parsed.magic, PreviewMagic::Default);
     assert!(!parsed.default_current_line);
     assert_eq!(parsed.pattern, "foo");
-    let parsed = parse_preview_pattern("uniq /x/").expect("uniq previews");
+    let parsed = must_preview("uniq /x/");
     assert_eq!(parsed.pattern, "x");
 
-    let parsed = parse_preview_pattern("g/foo/").expect("global previews");
+    let parsed = must_preview("g/foo/");
     assert_eq!(parsed.pattern, "foo");
-    let parsed = parse_preview_pattern("v/bar/").expect("vglobal previews");
+    let parsed = must_preview("v/bar/");
     assert_eq!(parsed.pattern, "bar");
-    let parsed = parse_preview_pattern("g//").expect("global reuse");
+    let parsed = must_preview("g//");
     assert!(parsed.use_last_pattern);
-    let parsed = parse_preview_pattern("vimgrep foo").expect("bare vimgrep word");
+    let parsed = must_preview("vimgrep foo");
     assert_eq!(parsed.pattern, "foo");
 
     for bare in ["s", "sort", "g", "echo foo", "w", "edit foo"] {

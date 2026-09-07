@@ -87,6 +87,10 @@ fn runtime_root() -> RuntimeRoot {
 /// These tests pin the real parser boundary: a missing parser shared
 /// object fails loudly instead of reporting a green suite that ran
 /// nothing.
+#[allow(
+    clippy::panic,
+    reason = "integration tests fail loudly without parsers by design"
+)]
 fn require_parser() -> (PathBuf, String) {
     parser_from_environment().unwrap_or_else(|| {
         panic!(
@@ -96,10 +100,6 @@ fn require_parser() -> (PathBuf, String) {
 }
 
 #[test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one stateful Tree-sitter scenario exercises parse, node, edit, query, and lifetime boundaries through a single Lua chunk"
-)]
 fn real_parser_exercises_parse_nodes_edit_queries_and_lifetimes() {
     let (parser, language) = require_parser();
 
@@ -284,64 +284,64 @@ fn incremental_parse_reports_exact_changed_ranges() {
     lua.globals().set("parser_language", language).unwrap();
 
     lua.load(
-        r#"
+        r"
         assert(vim._ts_add_language_from_object(parser_path, parser_language))
         PARSER = vim._create_ts_parser(parser_language)
         SOURCE = 'local value = 1\n'
         FIRST, INITIAL = PARSER:parse(nil, SOURCE, true)
-        "#,
+        ",
     )
     .eval::<()>()
     .unwrap();
-    let initial: i64 = lua.load(r#"return #INITIAL"#).eval().unwrap();
+    let initial: i64 = lua.load(r"return #INITIAL").eval().unwrap();
     assert!(initial > 0, "initial parse has ranges");
     lua.load(
-        r#"
+        r"
         SAME_TREE, SAME = PARSER:parse(FIRST, SOURCE, true)
-        "#,
+        ",
     )
     .eval::<()>()
     .unwrap();
-    let same: i64 = lua.load(r#"return #SAME"#).eval().unwrap();
+    let same: i64 = lua.load(r"return #SAME").eval().unwrap();
     assert_eq!(same, 0, "identical reparse reports no changes");
     lua.load(
-        r#"
+        r"
         -- The old tree records the edit first (`tree:edit`), then the
         -- reparse reports exactly the changed span in new coordinates.
         EDITED_SOURCE = 'local value = true\n'
         EDITED_OLD = FIRST:edit(14, 15, 18, 0, 14, 0, 15, 0, 18)
         SECOND, CHANGED = PARSER:parse(EDITED_OLD, EDITED_SOURCE, true)
-        "#,
+        ",
     )
     .eval::<()>()
     .unwrap();
-    let changed: i64 = lua.load(r#"return #CHANGED"#).eval().unwrap();
+    let changed: i64 = lua.load(r"return #CHANGED").eval().unwrap();
     assert_eq!(changed, 1, "one changed span");
-    let span: mlua::Table = lua.load(r#"return CHANGED[1]"#).eval().unwrap();
+    let span: mlua::Table = lua.load(r"return CHANGED[1]").eval().unwrap();
     let get = |index: i64| -> i64 { span.raw_get(index).unwrap() };
     assert_eq!((get(1), get(2), get(3)), (0, 14, 14));
     assert_eq!((get(4), get(5), get(6)), (0, 18, 18));
     lua.load(
-        r#"
+        r"
         THIRD, QUADS = PARSER:parse(EDITED_OLD, EDITED_SOURCE)
-        "#,
+        ",
     )
     .eval::<()>()
     .unwrap();
-    let quad_len: i64 = lua.load(r#"return #QUADS[1]"#).eval().unwrap();
+    let quad_len: i64 = lua.load(r"return #QUADS[1]").eval().unwrap();
     assert_eq!(quad_len, 4, "byte-free entries are row/col quads");
-    let quads: i64 = lua.load(r#"return #QUADS"#).eval().unwrap();
+    let quads: i64 = lua.load(r"return #QUADS").eval().unwrap();
     assert!(quads > 0, "quad reparse reports changes");
     lua.load(
-        r#"
+        r"
         RANGE_REJECTED = not pcall(function()
           PARSER:set_included_ranges({ { 'x' } })
         end)
-        "#,
+        ",
     )
     .eval::<()>()
     .unwrap();
-    let rejected: bool = lua.load(r#"return RANGE_REJECTED"#).eval().unwrap();
+    let rejected: bool = lua.load(r"RANGE_REJECTED").eval().unwrap();
     assert!(rejected, "malformed included ranges fail");
     scheduler.drain().unwrap();
 }

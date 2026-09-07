@@ -361,6 +361,7 @@ pub fn open_startup_buffers(
 /// sets binary I/O): `open_buffer` (buffer.c:258) applies them while it
 /// loads each named file, so the second and later files of `-R -o a b`
 /// (or `-M`/`-b` equivalents) match the first.
+#[derive(Clone, Copy)]
 struct StartupFlags {
     readonly: bool,
     no_modifiable: bool,

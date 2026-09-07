@@ -1844,7 +1844,7 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
         // main.c:359 `server_init`: every startup shape binds a primary
         // server, with NVIM_LISTEN_ADDRESS adoption (server.c:40-58);
         // failure is non-fatal (server.c:59-64).
-        bind_primary_server(&listen_server, &state, adopted_listen);
+        bind_primary_server(&listen_server, &state, adopted_listen.as_deref());
         let mut uv_loop = UvLoop::new().map_err(|error| AppError::Server(error.to_string()))?;
         let stdio_poll = bind_stdio(&mut uv_loop, &runtime)?;
         let timer =
@@ -1935,15 +1935,12 @@ fn take_listen_env() -> Option<String> {
 fn bind_primary_server(
     server: &ListenServer,
     state: &Rc<RefCell<AppState>>,
-    adopted: Option<String>,
+    adopted: Option<&str>,
 ) {
-    let address = adopted
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .map_or_else(
-            || ox_editor::server_address_new(None),
-            ox_editor::prepare_server_address,
-        );
+    let address = adopted.filter(|value| !value.is_empty()).map_or_else(
+        || ox_editor::server_address_new(None),
+        ox_editor::prepare_server_address,
+    );
     let mut bound = server.clone();
     if let Err(error) = bound.start(&address) {
         let session = state.borrow().session.clone();
