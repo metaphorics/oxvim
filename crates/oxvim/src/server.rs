@@ -377,6 +377,7 @@ pub(crate) fn build_embedded_core(
         Rc::new(EditorBuiltins {
             session: session.clone(),
             ex: ex.clone(),
+            nested_ex: nested_ex.clone(),
         }),
         Rc::new(LuaScheduler {
             queue: lua_work.clone(),
@@ -3041,6 +3042,7 @@ fn live_mode_builtin(
 struct EditorBuiltins {
     session: Rc<ApiSession>,
     ex: Rc<RefCell<ExExecutor>>,
+    nested_ex: Rc<RefCell<ExExecutor>>,
 }
 
 impl EditorBuiltins {
@@ -3059,12 +3061,18 @@ impl EditorBuiltins {
         if let Some(value) = value.map_err(|error| ExecError::Editor(error.to_string()))? {
             return Ok(value);
         }
-        let Ok(mut ex) = self.ex.try_borrow_mut() else {
+        // A builtin called from an autocommand action runs while the outer
+        // command still holds the primary executor, so fall through to the
+        // nested one instead of failing the action.
+        if let Ok(mut ex) = self.ex.try_borrow_mut() {
+            return ex.call_builtin(&*self.session, name, args);
+        }
+        let Ok(mut nested) = self.nested_ex.try_borrow_mut() else {
             return Err(ExecError::Editor(
                 "no free Ex executor for a Vimscript builtin call".into(),
             ));
         };
-        ex.call_builtin(&*self.session, name, args)
+        nested.call_builtin(&*self.session, name, args)
     }
 }
 
@@ -3618,10 +3626,28 @@ impl ServerAutocmdHost {
                 .map(|_| AutocmdExecution::Keep)
                 .map_err(|error| format_autocmd_exec_error(action, &error));
         }
-        let Ok(mut nested) = self.nested_ex.try_borrow_mut() else {
+        // The primary executor is busy: fork from the free nested one
+        // instead of holding it. User code that calls back into
+        // `vim.fn`/`vim.cmd` then finds `nested_ex` still free, so a
+        // `:write` with a BufWritePre action running Lua no longer fails
+        // with "no free Ex executor". The fork inherits the session's
+        // shared definitions, quit bus, and swap ledger, and carries a
+        // fresh scope like every other deep-reentry fork. Past depth 3
+        // (both executors borrowed) the error below still applies.
+        let Some((forked, _)) = fresh_executors(
+            &self.lua,
+            &self.registry,
+            &self.session,
+            &self.nested_ex,
+            &self.channel_ids,
+            &self.event_loop,
+        ) else {
             return Err("no free Ex executor for an autocmd action".into());
         };
-        execute(&mut nested)
+        let Ok(mut guard) = forked.try_borrow_mut() else {
+            return Err("no free Ex executor for an autocmd action".into());
+        };
+        execute(&mut guard)
             .map(|_| AutocmdExecution::Keep)
             .map_err(|error| format_autocmd_exec_error(action, &error))
     }

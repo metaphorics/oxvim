@@ -9008,25 +9008,36 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
     {
         return error_flow(runtime, "E13", "File exists (add ! to override)");
     }
-    let mut bytes = match access.with_ex_editor(|editor| {
-        editor
-            .buffer(buffer)
-            .and_then(|state| state.text().map_err(Into::into))
-            .map(ox_text::Buffer::to_bytes)
-    }) {
-        Ok(bytes) => bytes,
-        Err(error) => return error_flow(runtime, "E749", error.to_string()),
-    };
-    if bytes.last().is_some_and(|byte| *byte != b'\n') {
-        bytes.push(b'\n');
-    }
-    let contents = String::from_utf8_lossy(&bytes);
-    if let Err(error) = runtime.scripts.io().write_string(&path, &contents) {
-        return error_flow(
-            runtime,
-            "E212",
-            format!("Can't open file for writing: {error}"),
-        );
+    // `buf_write` (`bufwrite.c`): `BufWriteCmd` handlers replace the file
+    // write entirely; otherwise `BufWritePre` runs first and anything but a
+    // normal flow aborts. Both match the write target, not the buffer name.
+    let target = path.to_string_lossy();
+    let perform_write =
+        match buf_write_prelude(runtime, access, scope, lua, buffer, target.as_ref()) {
+            Ok(perform) => perform,
+            Err(flow) => return flow,
+        };
+    if perform_write {
+        let mut bytes = match access.with_ex_editor(|editor| {
+            editor
+                .buffer(buffer)
+                .and_then(|state| state.text().map_err(Into::into))
+                .map(ox_text::Buffer::to_bytes)
+        }) {
+            Ok(bytes) => bytes,
+            Err(error) => return error_flow(runtime, "E749", error.to_string()),
+        };
+        if bytes.last().is_some_and(|byte| *byte != b'\n') {
+            bytes.push(b'\n');
+        }
+        let contents = String::from_utf8_lossy(&bytes);
+        if let Err(error) = runtime.scripts.io().write_string(&path, &contents) {
+            return error_flow(
+                runtime,
+                "E212",
+                format!("Can't open file for writing: {error}"),
+            );
+        }
     }
     access.with_ex_editor(|editor| {
         if let Ok(state) = editor.buffer_mut(buffer) {
@@ -9035,7 +9046,77 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
             state.flags.set(crate::BufferFlags::NOTEDITED, false);
         }
     });
+    buf_write_postlude(runtime, access, scope, lua, buffer, target.as_ref());
     Flow::Normal
+}
+
+/// `buf_write` event prelude (`bufwrite.c`): `BufWriteCmd` handlers replace
+/// the file write, so `Ok(false)` skips it; otherwise `BufWritePre` runs and
+/// anything but a normal flow aborts in `Err`. Both events match the write
+/// target, not the buffer name.
+fn buf_write_prelude<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    buffer: BufHandle,
+    target: &str,
+) -> Result<bool, Flow> {
+    let write_cmd_plan = access.with_ex_editor(|editor| {
+        editor.autocmds_mut().plan(
+            Event::BufWriteCmd,
+            AutocmdContext {
+                buffer: Some(buffer),
+                file_name: Some(target),
+                ..AutocmdContext::default()
+            },
+        )
+    });
+    if !write_cmd_plan.ready.is_empty()
+        && (runtime.autocmd_busy == 0 || runtime.active_autocmd.nested)
+    {
+        let flow = run_autocmd_plan(runtime, access, scope, lua, write_cmd_plan);
+        return if matches!(flow, Flow::Normal) {
+            Ok(false)
+        } else {
+            Err(flow)
+        };
+    }
+    let flow = fire_buffer_lifecycle_with(
+        runtime,
+        access,
+        scope,
+        lua,
+        &[Event::BufWritePre],
+        buffer,
+        Some(target),
+    );
+    if matches!(flow, Flow::Normal) {
+        Ok(true)
+    } else {
+        Err(flow)
+    }
+}
+
+/// `buf_write` epilogue: `BufWritePost` after the save is recorded. Its flow
+/// never aborts the write, so there is nothing to return.
+fn buf_write_postlude<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    buffer: BufHandle,
+    target: &str,
+) {
+    fire_buffer_lifecycle_with(
+        runtime,
+        access,
+        scope,
+        lua,
+        &[Event::BufWritePost],
+        buffer,
+        Some(target),
+    );
 }
 
 /// `:[range]write !cmd` (`ex_cmds.c` `ex_write` → `do_bang(1, eap, false,
@@ -13301,25 +13382,46 @@ fn fire_buffer_lifecycle<F: FileIO, E: ExEditorAccess>(
     events: &[Event],
     buffer: BufHandle,
 ) -> Flow {
+    fire_buffer_lifecycle_with(runtime, access, scope, lua, events, buffer, None)
+}
+
+/// [`fire_buffer_lifecycle`] with an explicit `<afile>` match name for callers
+/// whose target differs from the buffer name (`:write {file}` matches the
+/// argument upstream, not the buffer).
+fn fire_buffer_lifecycle_with<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    events: &[Event],
+    buffer: BufHandle,
+    file_name: Option<&str>,
+) -> Flow {
     // `apply_autocmds` (`autocmd.c:1465-1468`): while autocommands are busy,
     // an event raised without `force` fires only through a `++nested` handler.
     if runtime.autocmd_busy > 0 && !runtime.active_autocmd.nested {
         return Flow::Normal;
     }
-    let name = access.with_ex_editor(|editor| {
-        editor
-            .buffer(buffer)
-            .ok()
-            .map(|state| state.name().to_string_lossy().into_owned())
-            .unwrap_or_default()
-    });
+    let owned;
+    let name = if let Some(name) = file_name {
+        name
+    } else {
+        owned = access.with_ex_editor(|editor| {
+            editor
+                .buffer(buffer)
+                .ok()
+                .map(|state| state.name().to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+        &owned
+    };
     for &event in events {
         let plan = access.with_ex_editor(|editor| {
             editor.autocmds_mut().plan(
                 event,
                 AutocmdContext {
                     buffer: Some(buffer),
-                    file_name: Some(&name),
+                    file_name: Some(name),
                     ..AutocmdContext::default()
                 },
             )
