@@ -173,6 +173,24 @@ pub fn export_vim_environment() {
 /// buffer that exists at this point (upstream's `curbuf`).
 pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppError> {
     let editor_error = |error: OptionError| AppError::Editor(error.to_string());
+    // main.c `command_line_scan` routes every ShaDa-file request through the
+    // option itself: `-i {file}` at 1430-1432, and `--clean` at 1194-1196,
+    // both via `set_option_value_give_err(kOptShadafile, ...)`, before any
+    // `--cmd` runs. `-l` defaults a still-empty 'shadafile' to `NONE`
+    // (main.c:1438-1442); cli.rs collapses that to `None` while scanning.
+    // `shada_filename` (`shada.c:1289-1316`) then resolves reads and writes
+    // through 'shadafile' alone, and `NONE` disables ShaDa for the session.
+    match &cli.shada {
+        ShadaConfig::None => editor
+            .options_mut()
+            .set_global("shadafile", OptionValue::String("NONE".into()))
+            .map_err(editor_error)?,
+        ShadaConfig::File(path) => editor
+            .options_mut()
+            .set_global("shadafile", OptionValue::String(path.clone()))
+            .map_err(editor_error)?,
+        ShadaConfig::Default => {}
+    }
     // option.c set_init_default_shell (182-199): the static 'shell' default is
     // the bare name "sh", and startup replaces it with $SHELL when that is set
     // and non-empty, quoting it if it holds a space. The absolute path is the
