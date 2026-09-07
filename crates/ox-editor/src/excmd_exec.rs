@@ -751,6 +751,13 @@ pub(crate) struct ExRuntime<F: FileIO> {
     pub(crate) pending_edit_mode: Option<PendingEditMode>,
     /// Whether an uncaught error was displayed during this execution.
     pub(crate) did_emsg: bool,
+    /// A `BufWriteCmd`-owned write left the buffer modified while
+    /// overwriting its own file: upstream's bare `FAIL`
+    /// (`bufwrite.c:469-473`) shows no message and the `|` chain
+    /// continues, but the write did not persist, so `:wq`/`:xit` and
+    /// `:wnext`/`:wprevious` must not advance. Set by `command_write`,
+    /// read by its gating callers; reset on every `:write` entry.
+    pub(crate) write_silent_fail: bool,
     /// The host's live mode machine, installed so `:normal` feeds keys into the
     /// real mode state instead of a throwaway copy. `None` in unit tests that
     /// do not install one; those fall back to a temporary machine.
@@ -795,13 +802,14 @@ impl<F: FileIO> ExRuntime<F> {
             executing: ExecutingCommand::default(),
             active_autocmd: ActiveAutocmdContext::default(),
             autocmd_busy: 0,
+            did_emsg: false,
+            write_silent_fail: false,
             filetype_autocmd_depth: 0,
             deferred_ops: Vec::new(),
             prev_bang_command: None,
             preview_tag: None,
             closures: ClosureRegistry::new(),
             pending_edit_mode: None,
-            did_emsg: false,
             try_depth: 0,
             mode_machine: None,
             swap_names: Rc::new(RefCell::new(HashMap::new())),
@@ -1534,9 +1542,13 @@ impl<F: FileIO> ExExecutor<F> {
         &self.scope
     }
 
-    /// Call any builtin through this executor's persistent runtime, using the
-    /// same dispatch a Vimscript expression gets.
-    ///
+    /// Mutable runtime-plus-scope pair for tests that drive executor
+    /// internals ([`run_autocmd_plan`]) directly: one borrow for both
+    /// disjoint fields (no `execute_*` call leaves dirt behind: they sync).
+    #[cfg(test)]
+    pub(crate) fn runtime_scope_mut(&mut self) -> (&mut ExRuntime<F>, &mut Scope) {
+        (&mut self.runtime, &mut self.scope)
+    }
     /// This is the entry point the Lua `vim.fn`/`vim.call` bridge comes in
     /// through, so it has to answer exactly what Vimscript answers: the
     /// editor-stateful families, user functions, and the regex-backed
@@ -3129,7 +3141,13 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         }
         "write" | "wq" | "xit" => {
             let flow = command_write(runtime, access, scope, lua, command);
-            if matches!(flow, Flow::Normal) && matches!(name, "wq" | "xit") {
+            // A handler-owned write that left the buffer modified failed
+            // silently (`write_silent_fail`): stay put like upstream's
+            // `do_write != FAIL` gate instead of closing into E37.
+            if matches!(flow, Flow::Normal)
+                && matches!(name, "wq" | "xit")
+                && !runtime.write_silent_fail
+            {
                 access.with_ex_editor(|editor| command_close(runtime, editor, command, true))
             } else {
                 flow
@@ -3204,7 +3222,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         }
         "wnext" => {
             let flow = command_write(runtime, access, scope, lua, command);
-            if matches!(flow, Flow::Normal) {
+            if matches!(flow, Flow::Normal) && !runtime.write_silent_fail {
                 access.with_ex_editor(|editor| command_next(runtime, editor, command))
             } else {
                 flow
@@ -3212,7 +3230,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         }
         "wprevious" => {
             let flow = command_write(runtime, access, scope, lua, command);
-            if matches!(flow, Flow::Normal) {
+            if matches!(flow, Flow::Normal) && !runtime.write_silent_fail {
                 access.with_ex_editor(|editor| command_previous(runtime, editor, command))
             } else {
                 flow
@@ -8962,6 +8980,10 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
 ) -> Flow {
+    // Reset first: filter writes (`:w !cmd`) return before the main path
+    // and neither set nor clear the flag, so a stale `true` must not leak
+    // into their gate checks.
+    runtime.write_silent_fail = false;
     if command.usefilter {
         return command_write_filter(runtime, access, scope, lua, command);
     }
@@ -9017,28 +9039,9 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
             Ok(perform) => perform,
             Err(flow) => return flow,
         };
+    runtime.write_silent_fail = false;
     if !perform_write {
-        // `buf_write_do_autocmds` (`bufwrite.c:454-475`): a matching
-        // `BufWriteCmd` returns before the file write, so there is no save
-        // bookkeeping, no `BufWritePost`, and no written message. The
-        // buffer keeps whatever modified state the handler left: when it
-        // is still modified the write fails with no message and no error,
-        // matching upstream's bare `FAIL`. Only the never-edited flags
-        // clear, and only when overwriting the buffer's own file, mirroring
-        // the `BF_WRITE_MASK` reset.
-        let overwriting = access.with_ex_editor(|editor| {
-            editor
-                .buffer(buffer)
-                .is_ok_and(|state| state.name().to_string_lossy().as_ref() == target.as_ref())
-        });
-        if overwriting {
-            access.with_ex_editor(|editor| {
-                if let Ok(state) = editor.buffer_mut(buffer) {
-                    state.flags.set(crate::BufferFlags::NOTEDITED, false);
-                }
-            });
-        }
-        return Flow::Normal;
+        return command_write_did_cmd(runtime, access, buffer, target.as_ref());
     }
     let mut bytes = match access.with_ex_editor(|editor| {
         editor
@@ -9071,6 +9074,44 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
     // after the write, and an aborting handler fails the command even
     // though the file is written — so the postlude's flow is the return.
     buf_write_postlude(runtime, access, scope, lua, buffer, target.as_ref())
+}
+
+/// The `BufWriteCmd`-owned write (`buf_write_do_autocmds`, `bufwrite.c:454-475`):
+/// a matching handler returns before the file write, so there is no save
+/// bookkeeping, no `BufWritePost`, and no written message. The buffer keeps
+/// whatever modified state the handler left. When it is still modified while
+/// overwriting its own file, upstream returns a bare `FAIL`: no message, the
+/// `|` chain continues, and RPC reports success (verified against the
+/// reference binary, and `TRY_WRAP` only errors on throw/emsg). The internal
+/// failure lands in `write_silent_fail` so the advance gates stay put exactly
+/// like upstream's `do_write != FAIL` checks. Only the never-edited flags
+/// clear, and only when overwriting the buffer's own file, mirroring the
+/// `BF_WRITE_MASK` reset.
+fn command_write_did_cmd<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    buffer: BufHandle,
+    target: &str,
+) -> Flow {
+    let overwriting = access.with_ex_editor(|editor| {
+        editor
+            .buffer(buffer)
+            .is_ok_and(|state| state.name().to_string_lossy().as_ref() == target)
+    });
+    if overwriting {
+        access.with_ex_editor(|editor| {
+            if let Ok(state) = editor.buffer_mut(buffer) {
+                state.flags.set(crate::BufferFlags::NOTEDITED, false);
+            }
+        });
+    }
+    runtime.write_silent_fail = overwriting
+        && access.with_ex_editor(|editor| {
+            editor
+                .buffer(buffer)
+                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        });
+    Flow::Normal
 }
 
 /// `buf_write` event prelude (`bufwrite.c`): `BufWriteCmd` handlers replace
@@ -13224,24 +13265,23 @@ fn run_lua_autocmd_callback<F: FileIO, E: ExEditorAccess>(
 /// `do_cmdline`: at trylevel 0 a displayed error continues to the next
 /// action — only an interrupt stops matching (`autocmd.c:1871`) — while
 /// an undisplayed exception aborts the group.
-fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
+pub(crate) fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     plan: FiringPlan,
 ) -> Flow {
-    // No user code runs with unflushed scope dirt: an action may reenter
-    // through another executor (a `:lua` payload reaching a pooled host,
-    // a nested API firing), whose read sync mirrors the live map. Flushing
-    // first makes outer writes visible to nested readers and refreshes the
-    // mirror, so the outer write-back after reentry only carries writes
-    // made after it — the later nested write wins (`bufwrite.c` has one
-    // scope, so last-writer-wins is the only order). Same flush discipline
-    // as the Lua entries below.
-    if let Err(error) = access.with_ex_editor(|editor| sync_scope_into_editor(editor, scope)) {
-        return exec_error_flow(runtime, error);
-    }
+    // No user code runs with unflushed scope dirt: any action may reenter
+    // through another executor (a `:lua` payload reaching a pooled host, a
+    // nested API firing), whose read sync mirrors the live map. The flush
+    // runs per action, not once per plan: action N-1 is itself user code
+    // that may have dirtied the maps action N's reentry would otherwise
+    // read stale. Flushing makes outer writes visible to nested readers
+    // and refreshes the mirror, so the later nested write wins
+    // (`bufwrite.c` has one scope, so last-writer-wins is the only order).
+    // Same flush discipline as the Lua entries below. Clean maps early-out
+    // inside the callee, so the steady-state cost is flag checks.
     // `autocmd_busy` (`autocmd.c:1657`): one plan counts as one busy span,
     // matching `apply_autocmds` which sets and restores it around the group.
     runtime.autocmd_busy += 1;
@@ -13249,6 +13289,12 @@ fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
     for action in plan.ready {
         if !access.with_ex_editor(|editor| editor.autocmds().is_entry_live(action.entry_id)) {
             continue;
+        }
+        // A sync failure is internal state corruption, not user-code error:
+        // abort the group rather than display-and-continue.
+        if let Err(error) = access.with_ex_editor(|editor| sync_scope_into_editor(editor, scope)) {
+            flow = exec_error_flow(runtime, error);
+            break;
         }
         let mut removed = Vec::new();
         if action.once
@@ -15505,6 +15551,14 @@ fn sync_buffer_scope(editor: &Editor, scope: &mut Scope) -> Result<(), ExecError
     Ok(())
 }
 
+/// Refreshes the global write-back mirror entry-wise and by value (see
+/// [`ox_eval::scope::refresh_mirror`]): an in-place container mutation
+/// through an aliased read must differ from the mirror at write-back time.
+fn refresh_global_mirror(scope: &Scope) -> Result<(), ExecError> {
+    ox_eval::scope::refresh_mirror(&mut scope.global_mirror.borrow_mut(), &scope.global)
+        .map_err(ExecError::Eval)
+}
+
 pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Result<(), ExecError> {
     // Differential sync: a map whose stamp still matches the editor's
     // version is kept as-is, so shared Typval values — and the mutability
@@ -15516,9 +15570,7 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
     let global_version = editor.gvars_version();
     if scope.synced.get(ScopeKind::Global) != global_version {
         scope.global = dict_to_scope(editor.gvars());
-        // By value, not shared: an in-place container mutation through an
-        // aliased read must differ from the mirror at write-back time.
-        *scope.global_mirror.borrow_mut() = ox_eval::scope::snapshot_map(&scope.global);
+        refresh_global_mirror(scope)?;
         scope.synced.set(ScopeKind::Global, global_version);
         scope.synced.clear_dirty(ScopeKind::Global);
     }
@@ -15753,20 +15805,35 @@ pub(crate) fn sync_scope_into_editor(editor: &mut Editor, scope: &Scope) -> Resu
         // outer value is the later one. The outer-wins tiebreak below only
         // covers genuinely simultaneous dirt, where either order converges
         // on the next sync.
-        let current = scope_to_dict(&scope.global);
-        let baseline = scope_to_dict(&scope.global_mirror.borrow());
+        // Typval-space diff: the mirror is already a `ScopeMap`, so the
+        // two `Object` round-trips are gone; borrowed lookup maps cost one
+        // pass with no value clones, and only changed keys convert.
         let live = editor.gvars_mut();
-        for (key, value) in &current.0 {
-            if baseline.get(key) != Some(value) {
-                live.insert(key.clone(), value.clone());
+        {
+            let mirror = scope.global_mirror.borrow();
+            let baseline: HashMap<&OxStr, &Typval> =
+                mirror.iter().map(|(key, value)| (key, value)).collect();
+            let current: HashMap<&OxStr, &Typval> = scope
+                .global
+                .iter()
+                .map(|(key, value)| (key, value))
+                .collect();
+            for (key, value) in &scope.global {
+                let changed = match baseline.get(key) {
+                    Some(previous) => **previous != *value,
+                    None => true,
+                };
+                if changed {
+                    live.insert(key.clone(), typval_to_object(value));
+                }
+            }
+            for key in mirror.iter().map(|(key, _)| key) {
+                if !current.contains_key(key) {
+                    live.0.retain(|live_key| live_key.0 != *key);
+                }
             }
         }
-        for (key, _) in &baseline.0 {
-            if current.get(key).is_none() {
-                live.0.retain(|live_key| live_key.0 != *key);
-            }
-        }
-        *scope.global_mirror.borrow_mut() = ox_eval::scope::snapshot_map(&scope.global);
+        refresh_global_mirror(scope)?;
         scope.synced.set(ScopeKind::Global, editor.gvars_version());
         scope.synced.clear_dirty(ScopeKind::Global);
     }
