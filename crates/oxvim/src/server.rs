@@ -700,7 +700,7 @@ impl AppState {
     /// This is the step whose absence meant nothing a user wrote ever ran:
     /// before it, only an explicit `-u` was read.
     fn discover_user_config(&mut self) -> Result<(), AppError> {
-        if self.execute_env("VIMINIT")? {
+        if self.execute_env("VIMINIT") {
             return Ok(());
         }
         let mut bases = ox_editor::stdpath(ox_editor::StdPath::Config);
@@ -733,21 +733,22 @@ impl AppState {
                 return self.source_config_file(&vim);
             }
         }
-        self.execute_env("EXINIT").map(|_| ())
+        self.execute_env("EXINIT");
+        Ok(())
     }
 
     /// `execute_env` (main.c:2257-...): a non-empty environment variable is run
     /// as Ex command lines. Reports whether it ran.
-    fn execute_env(&mut self, name: &str) -> Result<bool, AppError> {
+    fn execute_env(&mut self, name: &str) -> bool {
         let Some(value) = std::env::var_os(name) else {
-            return Ok(false);
+            return false;
         };
         let value = value.to_string_lossy().into_owned();
         if value.is_empty() {
-            return Ok(false);
+            return false;
         }
-        self.execute_ex(&value)?;
-        Ok(true)
+        self.run_startup_command(&value);
+        true
     }
 
     /// `load_plugins` (runtime.c:1397-1424): `plugin/**/*` under every
