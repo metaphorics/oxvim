@@ -304,6 +304,27 @@ fn add_logging_methods<M: UserDataMethods<ParserHandle>>(methods: &mut M) {
     );
 }
 
+/// Reads live buffer text for tree-sitter's buffer-handle `parse` input:
+/// upstream parses the buffer (unsaved changes included), so the lines
+/// come through `vim.api` on this same loop thread and are joined with
+/// single newlines exactly like the buffer store would. Sound under the
+/// `add_method_mut` borrow only because `nvim_buf_get_lines` is a pure
+/// read: it fires no autocmd, so the same parser cannot be reentered
+/// mid-call. Never extend this helper with event-firing calls.
+fn buffer_bytes(lua: &Lua, bufnr: i64) -> mlua::Result<Vec<u8>> {
+    let api: Table = lua.globals().get::<Table>("vim")?.get("api")?;
+    let get_lines: Function = api.get("nvim_buf_get_lines")?;
+    let lines: Table = get_lines.call((bufnr, 0, -1, false))?;
+    let mut bytes = Vec::new();
+    for line in lines.sequence_values::<Vec<u8>>() {
+        if !bytes.is_empty() {
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(&line?);
+    }
+    Ok(bytes)
+}
+
 impl UserData for ParserHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(MetaMethod::ToString, |_, _, ()| Ok("<parser>"));
@@ -336,49 +357,80 @@ impl UserData for ParserHandle {
                 )
             }),
         );
-        methods.add_method_mut("parse", string_errors_mut(|lua, this: &mut ParserHandle, (old, input, include_bytes, timeout): (Option<AnyUserData>, Value, Option<bool>, Option<u64>)| {
-            let bytes = match input {
-                Value::String(string) => string.as_bytes().to_vec(),
-                Value::Integer(_) | Value::Number(_) => {
-                    return Err(runtime_error("expected either string or buffer handle; buffer parsing is unavailable"));
-                }
-                _ => return Err(runtime_error("expected either string or buffer handle")),
-            };
-            let old_tree = old
-                .as_ref()
-                .map(AnyUserData::borrow::<TreeHandle>)
-                .transpose()?;
-            let old_tree_ref = old_tree.as_ref().map(|tree| &tree.0.tree);
-            let timeout = timeout.unwrap_or(0);
-            let parsed = if timeout == 0 {
-                this.parser.parse(&bytes, old_tree_ref)
-            } else {
-                let started = Instant::now();
-                let deadline = Duration::from_nanos(timeout);
-                let length = bytes.len();
-                let mut input = |offset: usize, _: Point| {
-                    if offset < length { &bytes[offset..] } else { &[] }
-                };
-                let mut progress = parse_deadline_callback(started, deadline);
-                let options = ParseOptions::new().progress_callback(&mut progress);
-                this.parser.parse_with_options(&mut input, old_tree_ref, Some(options))
-            }
-            .ok_or_else(|| runtime_error("Language was unset, has an incompatible ABI, or parsing timed out."))?;
-            if let Some(message) = this.logger_error.borrow_mut().take() {
-                return Err(runtime_error(message));
-            }
-            let changed = if let Some(old_tree) = old_tree.as_ref() {
-                old_tree.0.tree.changed_ranges(&parsed).collect::<Vec<_>>()
-            } else {
-                parsed.included_ranges()
-            };
-            let tree = TreeHandle(Arc::new(TreeData {
-                tree: parsed,
-                source: Arc::from(bytes),
-                language: this.language.clone(),
-            }));
-            Ok((tree, ranges_table(lua, changed, include_bytes.unwrap_or(false))?))
-        }));
+        methods.add_method_mut(
+            "parse",
+            string_errors_mut(
+                |lua,
+                 this: &mut ParserHandle,
+                 (old, input, include_bytes, timeout): (
+                    Option<AnyUserData>,
+                    Value,
+                    Option<bool>,
+                    Option<u64>,
+                )| {
+                    let bytes = match input {
+                        Value::String(string) => string.as_bytes().to_vec(),
+                        // Upstream parses live buffer text when the input is a
+                        // buffer handle: fetch the lines through `vim.api` on
+                        // this same loop thread (unsaved changes included) and
+                        // join them exactly like the buffer store would.
+                        Value::Integer(bufnr) => buffer_bytes(lua, bufnr)?,
+                        Value::Number(number) =>
+                        {
+                            #[allow(clippy::cast_possible_truncation)]
+                            buffer_bytes(lua, number as i64)?
+                        }
+                        _ => return Err(runtime_error("expected either string or buffer handle")),
+                    };
+                    let old_tree = old
+                        .as_ref()
+                        .map(AnyUserData::borrow::<TreeHandle>)
+                        .transpose()?;
+                    let old_tree_ref = old_tree.as_ref().map(|tree| &tree.0.tree);
+                    let timeout = timeout.unwrap_or(0);
+                    let parsed = if timeout == 0 {
+                        this.parser.parse(&bytes, old_tree_ref)
+                    } else {
+                        let started = Instant::now();
+                        let deadline = Duration::from_nanos(timeout);
+                        let length = bytes.len();
+                        let mut input = |offset: usize, _: Point| {
+                            if offset < length {
+                                &bytes[offset..]
+                            } else {
+                                &[]
+                            }
+                        };
+                        let mut progress = parse_deadline_callback(started, deadline);
+                        let options = ParseOptions::new().progress_callback(&mut progress);
+                        this.parser
+                            .parse_with_options(&mut input, old_tree_ref, Some(options))
+                    }
+                    .ok_or_else(|| {
+                        runtime_error(
+                            "Language was unset, has an incompatible ABI, or parsing timed out.",
+                        )
+                    })?;
+                    if let Some(message) = this.logger_error.borrow_mut().take() {
+                        return Err(runtime_error(message));
+                    }
+                    let changed = if let Some(old_tree) = old_tree.as_ref() {
+                        old_tree.0.tree.changed_ranges(&parsed).collect::<Vec<_>>()
+                    } else {
+                        parsed.included_ranges()
+                    };
+                    let tree = TreeHandle(Arc::new(TreeData {
+                        tree: parsed,
+                        source: Arc::from(bytes),
+                        language: this.language.clone(),
+                    }));
+                    Ok((
+                        tree,
+                        ranges_table(lua, changed, include_bytes.unwrap_or(false))?,
+                    ))
+                },
+            ),
+        );
         add_logging_methods(methods);
     }
 }
