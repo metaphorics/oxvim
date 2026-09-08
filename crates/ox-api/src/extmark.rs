@@ -177,16 +177,18 @@ fn parse_virtual_lines_overflow(opts: &Dict) -> Result<(), ApiError> {
     }
 }
 
-fn parse_highlight_groups(opts: &Dict) -> Result<Option<String>, ApiError> {
+fn parse_highlight_groups(opts: &Dict) -> Result<(Option<String>, Vec<String>), ApiError> {
     let Some(value) = opts.get(&OxStr::from("hl_group")) else {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     };
     match value {
-        Object::String(value) => {
-            Ok(Some(String::from_utf8(value.0.clone()).map_err(|_| {
-                ApiError::validation("'hl_group' must be UTF-8")
-            })?))
-        }
+        Object::String(value) => Ok((
+            Some(
+                String::from_utf8(value.0.clone())
+                    .map_err(|_| ApiError::validation("'hl_group' must be UTF-8"))?,
+            ),
+            Vec::new(),
+        )),
         Object::Array(values) => {
             let mut groups = values
                 .iter()
@@ -196,7 +198,15 @@ fn parse_highlight_groups(opts: &Dict) -> Result<Option<String>, ApiError> {
                     _ => Err(ApiError::validation("'hl_group' must contain strings")),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok((!groups.is_empty()).then(|| groups.remove(0)))
+            // Extra groups stack after the first (highest-priority last),
+            // mirroring the `has_hl_multiple` decor entries upstream
+            // (api/extmark.c:876-889).
+            let first = if groups.is_empty() {
+                None
+            } else {
+                Some(groups.remove(0))
+            };
+            Ok((first, groups))
         }
         _ => Err(ApiError::validation("'hl_group' must be a string or array")),
     }
@@ -293,8 +303,10 @@ fn placement(
 }
 
 fn parse_extmark_attributes(opts: &Dict) -> Result<ExtmarkAttributes, ApiError> {
+    let (highlight_group, additional_highlight_groups) = parse_highlight_groups(opts)?;
     let mut attributes = ExtmarkAttributes {
-        highlight_group: parse_highlight_groups(opts)?,
+        highlight_group,
+        additional_highlight_groups,
         sign_text: string(opts, "sign_text")?,
         sign_highlight_group: string(opts, "sign_hl_group")?,
         number_highlight_group: string(opts, "number_hl_group")?,
