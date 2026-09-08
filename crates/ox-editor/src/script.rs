@@ -1102,14 +1102,30 @@ impl<F: FileIO> ScriptCtx<F> {
         self.current_sid().map(|sid| format!("<SNR>{sid}_"))
     }
 
+    /// Whether one component of a `#`-named autoload path is a plain
+    /// identifier: ASCII letters, digits, and underscores, not starting
+    /// with a digit. This rejects `..`, `/`, and other characters that
+    /// could escape `autoload/` and source an arbitrary file.
+    fn is_autoload_component(component: &str) -> bool {
+        let mut chars = component.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
     /// Resolves a `#`-named autoload function to its script path: components
     /// before the last become directories under `autoload/`, e.g.
     /// `a#b#c` → `autoload/a/b.vim` (`src/nvim/runtime.c:144-167`).
+    ///
+    /// Components must be plain identifiers (`[A-Za-z_][A-Za-z0-9_]*`); any
+    /// name containing `..`, `/`, an empty segment, or other invalid
+    /// characters returns `None`, preventing escape from `autoload/`.
     #[must_use]
     pub fn resolve_autoload(&self, function: &str) -> Option<PathBuf> {
         let mut components: Vec<&str> = function.split('#').collect();
         let last = components.pop()?;
-        if last.is_empty() || components.iter().any(|part| part.is_empty()) {
+        if !Self::is_autoload_component(last)
+            || components.iter().any(|part| !Self::is_autoload_component(part))
+        {
             return None;
         }
         let mut relative = PathBuf::from("autoload");
