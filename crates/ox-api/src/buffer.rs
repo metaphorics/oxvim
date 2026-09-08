@@ -1,8 +1,8 @@
 //! Buffer-scoped API functions.
 
 use ox_editor::{
-    BufferAttachSubscription, BufferEditMode, BufferRelease, BufferTextEditRequest, Editor,
-    ExtmarkPosition, MarkLocation, Mode, NormalState, OptionValue, VisualKind, VisualState,
+    BufferAttachSubscription, BufferEditMode, BufferFlags, BufferRelease, BufferTextEditRequest,
+    Editor, ExtmarkPosition, MarkLocation, Mode, NormalState, OptionValue, VisualKind, VisualState,
 };
 use ox_text::{Buffer, Position};
 
@@ -668,17 +668,20 @@ pub fn nvim_buf_delete(
     let unload = dict_bool(&options, "unload", false)?;
     let buffer = resolve_buffer(session, buffer)?;
     session.with_editor_mut(|editor| {
-        // Windows showing the target buffer must be rehomed onto a replacement
-        // REGARDLESS of `force`; `force` only overrides unsaved-change protection
-        // (src/nvim/api/buffer.c:1039-1059, src/nvim/buffer.c:1039-1059). Since
-        // buffer modified-state is not modeled yet, `force` has no further
-        // observable effect.
-        if editor
+        // `force` only overrides unsaved-change protection: without it a
+        // modified buffer fails with the E89 `do_buffer` raises
+        // (`command_buffer_remove`). Once deletion proceeds, windows showing
+        // the target buffer are rehomed onto a replacement REGARDLESS of
+        // `force` (src/nvim/api/buffer.c:1039-1059, src/nvim/buffer.c:1039-1059).
+        let state = editor
             .buffer(buffer)
-            .map_err(|error| ApiError::exception(error.to_string()))?
-            .attachments
-            != 0
-        {
+            .map_err(|error| ApiError::exception(error.to_string()))?;
+        if !force && state.flags.contains(BufferFlags::MODIFIED) {
+            return Err(ApiError::exception(
+                "E89: No write since last change (add ! to override)",
+            ));
+        }
+        if state.attachments != 0 {
             let replacement = match editor
                 .buffers()
                 .into_iter()
@@ -706,7 +709,6 @@ pub fn nvim_buf_delete(
         }
         Ok(())
     })?;
-    let _ = force;
     if unload {
         session.with_editor_mut(|editor| {
             editor

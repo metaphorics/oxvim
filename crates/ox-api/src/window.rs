@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use ox_editor::{
-    Anchor, Border, BorderText, BufferRelease, BufferState, Editor, Extmark, ExtmarkPosition,
-    ExtmarkVirtualLinesOverflow, ExtmarkVirtualTextPosition, Margins, OptionStore, OptionValue,
-    RelativeTo, TextAlignment, VirtualTextChunk, WinConfig,
+    Anchor, Border, BorderText, BufferFlags, BufferRelease, BufferState, Editor, Extmark,
+    ExtmarkPosition, ExtmarkVirtualLinesOverflow, ExtmarkVirtualTextPosition, Margins, OptionStore,
+    OptionValue, RelativeTo, TextAlignment, VirtualTextChunk, WinConfig,
 };
 use ox_text::{Buffer, Position};
 use unicode_width::UnicodeWidthChar;
@@ -985,10 +985,19 @@ pub fn nvim_win_hide(session: &ApiSession, win: WinHandle) -> Result<(), ApiErro
 pub fn nvim_win_close(session: &ApiSession, win: WinHandle, force: bool) -> Result<(), ApiError> {
     let win = resolve_window(session, win)?;
     let tab = window_tabpage(session, win)?;
-    // Buffer modified-state is not modeled yet. Closing still follows normal
-    // hidden-buffer retention; `force` has no observable distinction until it is.
-    let _ = force;
     session.with_editor_mut(|editor| {
+        // `force` only overrides unsaved-change protection: without it,
+        // closing the last window displaying a modified buffer fails with
+        // the E37 the `:close` excmd path raises (`command_close`).
+        let buffer = editor.window(win).map_err(exception)?.buffer;
+        let abandons_modified = editor.buffer(buffer).is_ok_and(|state| {
+            state.flags.contains(BufferFlags::MODIFIED) && state.attachments == 1
+        });
+        if !force && abandons_modified {
+            return Err(exception(
+                "E37: No write since last change (add ! to override)",
+            ));
+        }
         editor.close_window(tab, win, true).map_err(exception)?;
         Ok(())
     })
