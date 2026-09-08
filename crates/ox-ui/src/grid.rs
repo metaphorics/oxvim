@@ -376,21 +376,36 @@ impl Grid {
                 height: self.height,
             });
         }
-        let old = self.cells.clone();
-        for row in top..bottom {
-            for col in left..right {
+        // In-place copy: visit destinations so every source cell is read
+        // before it is written — rows ascending for non-negative vertical
+        // shifts and descending otherwise, likewise for columns — moving each
+        // source into place and planting a blank behind it.
+        for row_index in 0..bottom - top {
+            let row = if rows >= 0 {
+                top + row_index
+            } else {
+                bottom - 1 - row_index
+            };
+            for col_index in 0..right - left {
+                let col = if cols >= 0 {
+                    left + col_index
+                } else {
+                    right - 1 - col_index
+                };
                 let source_row = row.checked_add_signed(rows);
                 let source_col = col.checked_add_signed(cols);
-                let cell = match (source_row, source_col) {
+                self.cells[row * self.width + col] = match (source_row, source_col) {
                     (Some(source_row), Some(source_col))
                         if (top..bottom).contains(&source_row)
                             && (left..right).contains(&source_col) =>
                     {
-                        old[source_row * self.width + source_col].clone()
+                        std::mem::replace(
+                            &mut self.cells[source_row * self.width + source_col],
+                            Cell::blank(),
+                        )
                     }
                     _ => Cell::blank(),
                 };
-                self.cells[row * self.width + col] = cell;
             }
         }
         Ok(())
