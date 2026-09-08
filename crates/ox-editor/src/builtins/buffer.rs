@@ -356,8 +356,9 @@ fn add_unloaded_buffer(editor: &mut Editor, name: &OxStr) -> ox_eval::Result<Buf
 /// buffer and window are never changed.
 ///
 /// A file-backed load fires `BufReadPre` before the read and `BufReadPost`
-/// after it, the way `open_buffer`'s `readfile` does. Resolution and the
-/// text install each hold one short borrow; the events fire between borrows
+/// after it, the way `open_buffer`'s `readfile` does; a name whose file
+/// does not exist fires `BufNewFile` instead. Resolution and the text
+/// install each hold one short borrow; the events fire between borrows
 /// because listeners reenter the editor.
 fn call_bufload_with_events<F: FileIO, E: ExEditorAccess>(
     host: &mut EvalHost<'_, F, E>,
@@ -392,10 +393,26 @@ fn call_bufload_with_events<F: FileIO, E: ExEditorAccess>(
     if loaded {
         return Ok(Typval::Number(0));
     }
-    // Only a real file read carries the read events; scratch, special-type,
-    // and missing-file buffers load silently.
-    let from_file = !name.as_bytes().is_empty() && !is_nofileread(&buftype);
-    if from_file {
+    // Upstream `readfile` probes the file with a real open before choosing
+    // the event family (`fileio.c:428-516`): a file that opens reads
+    // between `BufReadPre` and `BufReadPost`; a missing one fires
+    // `BufNewFile` instead; a present but unreadable or non-regular name —
+    // like every `buftype` that never reads — loads without an event. The
+    // probe is a read because the seam has no bare open.
+    let path = if name.as_bytes().is_empty() || is_nofileread(&buftype) {
+        None
+    } else {
+        Some(std::path::PathBuf::from(name.to_string_lossy().as_ref()))
+    };
+    let probe = path
+        .as_deref()
+        .map(|path| host.runtime.scripts.io().read_to_string(path));
+    let (existing, new_file) = match &probe {
+        Some(Ok(_)) => (true, false),
+        Some(Err(error)) => (false, error.kind() == std::io::ErrorKind::NotFound),
+        _ => (false, false),
+    };
+    if existing {
         let flow = fire_buffer_lifecycle(
             host.runtime,
             host.access,
@@ -408,17 +425,19 @@ fn call_bufload_with_events<F: FileIO, E: ExEditorAccess>(
             return Err(flow_to_eval_error(flow, "bufload"));
         }
     }
-    let io = host.runtime.scripts.io();
+    // The content read still happens after `BufReadPre` — upstream closes
+    // and reopens around the pre autocmds so a handler can change the file
+    // first; a read that fails after the probe leaves the buffer empty and
+    // fires no post event (upstream's E200 exit).
+    let content = match (existing, path.as_deref()) {
+        (true, Some(path)) => host.runtime.scripts.io().read_to_string(path).ok(),
+        _ => None,
+    };
     host.access.with_ex_editor(|editor| {
-        let text = if name.as_bytes().is_empty() || is_nofileread(&buftype) {
-            Buffer::new()
-        } else {
-            let path = std::path::PathBuf::from(name.to_string_lossy().as_ref());
-            match io.read_to_string(&path) {
-                Ok(content) => Buffer::from_bytes(content.as_bytes())
-                    .map_err(|error| EvalError::new("E474", 0, error.to_string()))?,
-                Err(_) => Buffer::new(),
-            }
+        let text = match &content {
+            Some(content) => Buffer::from_bytes(content.as_bytes())
+                .map_err(|error| EvalError::new("E474", 0, error.to_string()))?,
+            None => Buffer::new(),
         };
         let state = editor
             .buffer_mut(buffer)
@@ -426,17 +445,15 @@ fn call_bufload_with_events<F: FileIO, E: ExEditorAccess>(
         state.load(text);
         state.mark_saved();
         state.flags.set(crate::BufferFlags::NOTEDITED, false);
-        Ok(Typval::Number(0))
+        Ok(())
     })?;
-    if from_file {
-        let flow = fire_buffer_lifecycle(
-            host.runtime,
-            host.access,
-            scope,
-            host.lua,
-            &[Event::BufReadPost],
-            buffer,
-        );
+    let post = content
+        .is_some()
+        .then_some(Event::BufReadPost)
+        .or(new_file.then_some(Event::BufNewFile));
+    if let Some(event) = post {
+        let flow =
+            fire_buffer_lifecycle(host.runtime, host.access, scope, host.lua, &[event], buffer);
         if !matches!(flow, Flow::Normal) {
             return Err(flow_to_eval_error(flow, "bufload"));
         }
