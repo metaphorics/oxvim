@@ -318,25 +318,51 @@ fn add_logging_methods<M: UserDataMethods<ParserHandle>>(methods: &mut M) {
 /// Reads live buffer text for tree-sitter's buffer-handle `parse` input:
 /// upstream parses the buffer (unsaved changes included), so the lines
 /// come through `vim.api` on this same loop thread. Every line is
-/// newline-terminated, including the last: upstream buffer text always
-/// carries the final EOL, and tree-sitter extends the root end past it
-/// (`'int x = 1;\n'` roots at `{0,0,1,0}` on both binaries, while the
-/// unterminated form roots at `{0,0,0,10}`). Joining without the final
-/// newline shortens every root end by one row (`{0,0,2,1}` instead of
-/// `{0,0,3,0}`). Sound under the `add_method_mut` borrow only because
-/// `nvim_buf_get_lines` is a pure read: it fires no autocmd, so the
-/// same parser cannot be reentered mid-call. Never extend this helper
-/// with event-firing calls.
+/// newline-terminated, including the last, unless the buffer genuinely
+/// lacks a final EOL (binary, or both 'fixeol' and 'eol' off); see
+/// `buffer_lacks_eol`. Sound under the `add_method_mut` borrow only
+/// because `nvim_buf_get_lines` is a pure read: it fires no autocmd,
+/// so the same parser cannot be reentered mid-call. Never extend this
+/// helper with event-firing calls.
 fn buffer_bytes(lua: &Lua, bufnr: i64) -> mlua::Result<Vec<u8>> {
     let api: Table = lua.globals().get::<Table>("vim")?.get("api")?;
     let get_lines: Function = api.get("nvim_buf_get_lines")?;
     let lines: Table = get_lines.call((bufnr, 0, -1, false))?;
     let mut bytes = Vec::new();
-    for line in lines.sequence_values::<String>() {
-        bytes.extend_from_slice(line?.as_bytes());
+    for line in lines.sequence_values::<mlua::LuaString>() {
+        bytes.extend_from_slice(&line?.as_bytes());
         bytes.push(b'\n');
     }
+    // Upstream appends the line terminator even for the last line, and
+    // drops it only when the buffer genuinely lacks one: binary, or
+    // both 'fixeol' and 'eol' off (`input_cb`, treesitter.c:479-487).
+    // Without the terminator tree-sitter ends every buffer root one
+    // row early (`{0,0,2,1}` instead of `{0,0,3,0}` on both binaries).
+    if !bytes.is_empty() && !buffer_lacks_eol(&api, bufnr)? {
+        return Ok(bytes);
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
     Ok(bytes)
+}
+
+/// Reports whether a buffer genuinely lacks a final EOL: binary, or
+/// both 'fixeol' and 'eol' off. Mirrors the last-line arm of upstream
+/// `input_cb` (treesitter.c:482-483); option reads go through the same
+/// `vim.api` bridge as the lines above, so no new borrow surface.
+fn buffer_lacks_eol(api: &Table, bufnr: i64) -> mlua::Result<bool> {
+    let get_option: Function = api.get("nvim_buf_get_option")?;
+    let binary: bool = get_option.call((bufnr, "binary"))?;
+    if binary {
+        return Ok(true);
+    }
+    let fixeol: bool = get_option.call((bufnr, "fixeol"))?;
+    if fixeol {
+        return Ok(false);
+    }
+    let eol: bool = get_option.call((bufnr, "eol"))?;
+    Ok(!eol)
 }
 
 impl UserData for ParserHandle {
