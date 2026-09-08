@@ -28,4 +28,6 @@ pub use scope::{Scope, ScopeKind};
 #[cfg(test)]
 mod builtins_tests;
 #[cfg(test)]
+mod parser_prefix_tests;
+#[cfg(test)]
 mod tests;
