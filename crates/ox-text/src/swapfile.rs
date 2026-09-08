@@ -10,7 +10,7 @@
 //! writer's byte order (`memline.c:170-177`).
 
 use std::collections::BTreeSet;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use thiserror::Error;
@@ -225,10 +225,10 @@ impl SwapFile {
     ///
     /// New files are reserved atomically (`O_EXCL`, `memfile.c:157-160`)
     /// without following symlinks (`O_NOFOLLOW`, `:765-776`) and with
-    /// owner-only permissions (`fileio.c:435-444`): a pre-existing link
-    /// or file the writer did not create fails instead of redirecting
-    /// the snapshot. Rewrites of a file this writer already reserved
-    /// re-open it, still refusing to follow links.
+    /// owner-only permissions (`fileio.c:435-444`). Rewrites verify the
+    /// creator process and host recorded in block zero before truncating;
+    /// a live foreign swapfile is never reused, while a stale one keeps the
+    /// existing recovery behavior.
     ///
     /// # Errors
     ///
@@ -241,16 +241,28 @@ impl SwapFile {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = Self::reserve_swapfile(path, &self.file_name)?;
+        let host = self.owner_host();
+        let mut file = Self::reserve_swapfile(
+            path,
+            &self.file_name,
+            self.owner_pid(),
+            &host,
+        )?;
         self.write(&mut file)?;
         file.sync_all()?;
         Ok(())
     }
 
-    /// Atomically reserves a new swapfile or re-opens one already reserved:
-    /// the create half refuses symlinks and pre-existing files, the re-open
-    /// half still refuses symlinks, and both enforce owner-only permissions.
-    fn reserve_swapfile(path: &Path, expected_fname: &str) -> Result<std::fs::File, SwapError> {
+    /// Atomically reserves a new swapfile or re-opens one already reserved.
+    /// The create half refuses symlinks and pre-existing files. The re-open
+    /// half verifies the identity on the same descriptor it will truncate,
+    /// so a path replacement after the check cannot redirect the write.
+    fn reserve_swapfile(
+        path: &Path,
+        expected_fname: &str,
+        expected_pid: u32,
+        expected_host: &str,
+    ) -> Result<std::fs::File, SwapError> {
         #[cfg(unix)]
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -269,48 +281,57 @@ impl SwapFile {
         match created {
             Ok(file) => Ok(file),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                // A file this writer reserved on an earlier preserve: verify
-                // it is still that swapfile (block-zero id, byte-order magic,
-                // and target name), so a foreign file, hardlink, or link
-                // target planted at the path is never truncated. Then re-open
-                // for truncation without following links, and re-assert the
-                // owner-only mode in case it predates this reservation.
-                if !Self::is_own_swapfile(path, expected_fname) {
-                    return Err(SwapError::Malformed("swapfile identity"));
-                }
+                // Open for read and write once, then validate this exact
+                // descriptor. A separate read followed by an open-by-path
+                // would reintroduce a replacement race.
                 #[cfg(unix)]
-                let file = std::fs::OpenOptions::new()
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
                     .write(true)
                     .custom_flags(Self::libc_nofollow())
                     .open(path)?;
                 #[cfg(not(unix))]
-                let file = std::fs::OpenOptions::new().write(true).open(path)?;
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)?;
+                if !Self::is_own_swapfile(
+                    &mut file,
+                    expected_fname,
+                    expected_pid,
+                    expected_host,
+                ) {
+                    return Err(SwapError::Malformed("swapfile identity"));
+                }
                 #[cfg(unix)]
                 file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
                 file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
                 Ok(file)
             }
             Err(error) => Err(SwapError::Io(error)),
         }
     }
 
-    /// Whether `path` still holds this writer's swapfile: block-zero id,
-    /// byte-order magic, and the target file name all match. The magic and
-    /// name gate rejects foreign files and link targets alike; on
-    /// Linux/macOS the reserve path already refused symlinks outright via
-    /// `O_NOFOLLOW`.
-    fn is_own_swapfile(path: &Path, expected_fname: &str) -> bool {
-        use std::io::Read;
-
+    /// Whether an already-open descriptor still holds this writer's swapfile:
+    /// block-zero id, byte-order magic, target name, and creator identity all
+    /// match. A different creator is accepted only after its process is no
+    /// longer running, preserving the existing stale-swapfile replacement.
+    fn is_own_swapfile(
+        file: &mut std::fs::File,
+        expected_fname: &str,
+        expected_pid: u32,
+        expected_host: &str,
+    ) -> bool {
         // Block zero through the byte-order magic words.
-        let mut head = vec![0; 1024];
-        let Ok(mut file) = std::fs::File::open(path) else {
+        let mut head = vec![0; ZERO_BLOCK_SIZE];
+        if file.seek(SeekFrom::Start(0)).is_err() {
             return false;
-        };
+        }
         let Ok(read) = file.read(&mut head) else {
             return false;
         };
-        if read < 1020 {
+        if read < ZERO_BLOCK_SIZE {
             return false;
         }
         if head.get(0..2) != Some(b"b0") {
@@ -318,6 +339,8 @@ impl SwapFile {
         }
         if le_i64(&head, 1008).ok() != Some(B0_MAGIC_LONG)
             || le_u32(&head, 1016).ok() != Some(B0_MAGIC_INT)
+            || le_u16(&head, 1020).ok() != Some(B0_MAGIC_SHORT)
+            || head.get(1022) != Some(&B0_MAGIC_CHAR)
         {
             return false;
         }
@@ -326,13 +349,75 @@ impl SwapFile {
             .take_while(|&&byte| byte != 0)
             .copied()
             .collect::<Vec<u8>>();
-        stored == expected_fname.as_bytes()
+        if stored != expected_fname.as_bytes() {
+            return false;
+        }
+
+        let stored_host = &head[B0_HNAME..B0_HNAME + B0_HNAME_SIZE];
+        let Some(stored_host_len) = stored_host.iter().position(|&byte| byte == 0) else {
+            return false;
+        };
+        let expected_host = expected_host.as_bytes();
+        let expected_host_len = expected_host.len().min(B0_HNAME_SIZE - 1);
+        if stored_host_len != expected_host_len
+            || stored_host[..stored_host_len] != expected_host[..expected_host_len]
+        {
+            return false;
+        }
+
+        let Some(stored_pid) = le_u32(&head, 24).ok() else {
+            return false;
+        };
+        stored_pid == expected_pid
+            || stored_pid == 0
+            || !Self::process_is_running(stored_pid)
+    }
+
+    /// Metadata omitted by a caller means this process and host. That keeps
+    /// the ordinary `SwapFile::new(...).write_to(...)` API ownership-safe
+    /// without requiring every caller to thread a reservation object.
+    fn owner_pid(&self) -> u32 {
+        (self.meta.pid != 0)
+            .then_some(self.meta.pid)
+            .unwrap_or_else(std::process::id)
+    }
+
+    fn owner_host(&self) -> String {
+        if self.meta.host.is_empty() {
+            Self::current_hostname()
+        } else {
+            self.meta.host.clone()
+        }
+    }
+
+    fn current_hostname() -> String {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .map_or_else(|_| String::new(), |name| name.trim().to_owned())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::env::var("HOSTNAME").unwrap_or_default()
+        }
+    }
+
+    /// Linux exposes process liveness without an unsafe platform binding.
+    /// Other targets conservatively retain a foreign file rather than risk
+    /// truncating a process whose liveness cannot be checked safely.
+    fn process_is_running(pid: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            pid != 0 && std::fs::metadata(Path::new("/proc").join(pid.to_string())).is_ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            pid != 0
+        }
     }
 
     /// `O_NOFOLLOW` without taking a `libc` dependency: the flag value is a
-    /// stable kernel ABI constant on Linux and macOS. Other Unix targets
-    /// keep `create_new` atomicity but not link refusal (the magic and name
-    /// gate in `is_own_swapfile` still rejects foreign targets there).
+    /// stable kernel ABI constant on Linux and macOS.
     #[cfg(unix)]
     fn libc_nofollow() -> i32 {
         #[cfg(target_os = "linux")]
@@ -405,11 +490,12 @@ impl SwapFile {
         );
         block[16..20].copy_from_slice(&self.meta.mtime.to_le_bytes());
         block[20..24].copy_from_slice(&self.meta.inode.to_le_bytes());
-        block[24..28].copy_from_slice(&self.meta.pid.to_le_bytes());
+        block[24..28].copy_from_slice(&self.owner_pid().to_le_bytes());
         block[B0_UNAME..B0_UNAME + B0_UNAME_SIZE]
             .copy_from_slice(&capped_nul(self.meta.user.as_bytes(), B0_UNAME_SIZE));
+        let host = self.owner_host();
         block[B0_HNAME..B0_HNAME + B0_HNAME_SIZE]
-            .copy_from_slice(&capped_nul(self.meta.host.as_bytes(), B0_HNAME_SIZE));
+            .copy_from_slice(&capped_nul(host.as_bytes(), B0_HNAME_SIZE));
         let name = self.file_name.as_bytes();
         let copy_len = name.len().min(B0_FNAME_SIZE_CRYPT - 1);
         block[B0_FNAME..B0_FNAME + copy_len].copy_from_slice(&name[..copy_len]);
@@ -554,4 +640,124 @@ fn array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], SwapErr
         .get(offset..offset + N)
         .and_then(|word| word.try_into().ok())
         .ok_or(SwapError::Malformed("truncated block"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    const FILE_NAME: &str = "/tmp/oxvim-ownership-example.txt";
+
+    fn test_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "oxvim-swap-ownership-{label}-{}",
+            std::process::id()
+        ))
+    }
+
+    fn identity(pid: u32) -> SwapMeta {
+        SwapMeta {
+            pid,
+            host: SwapFile::current_hostname(),
+            ..SwapMeta::default()
+        }
+    }
+
+    fn read_snapshot(path: &std::path::Path) -> SwapFile {
+        SwapFile::read(fs::File::open(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn own_swapfile_is_reused_across_preserves() {
+        let dir = test_dir("own");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("buffer.swp");
+        let owner = identity(std::process::id());
+
+        SwapFile::new(FILE_NAME, Buffer::from_bytes(b"first\n").unwrap())
+            .with_meta(owner.clone())
+            .write_to(&path)
+            .unwrap();
+        SwapFile::new(FILE_NAME, Buffer::from_bytes(b"second\n").unwrap())
+            .with_meta(owner)
+            .write_to(&path)
+            .unwrap();
+
+        assert_eq!(read_snapshot(&path).buffer.to_bytes(), b"second\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_foreign_reservation_is_not_truncated() {
+        let dir = test_dir("race");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("buffer.swp");
+        let host = SwapFile::current_hostname();
+        // The test runner's parent is a separate live process. Its PID gives
+        // the competing reservation a real process identity without making
+        // the test depend on a second test binary.
+        let winner_pid = fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:\t"))
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .filter(|&pid| pid != 0 && pid != std::process::id())
+            .unwrap_or(1);
+        let mut winner_file =
+            SwapFile::reserve_swapfile(&path, FILE_NAME, winner_pid, &host).unwrap();
+        assert!(fs::read(&path).unwrap().is_empty());
+
+        let loser = SwapFile::new(FILE_NAME, Buffer::from_bytes(b"loser\n").unwrap())
+            .with_meta(identity(std::process::id()));
+        let error = loser.write_to(&path).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "malformed or unsupported swapfile: swapfile identity"
+        );
+        assert!(fs::read(&path).unwrap().is_empty());
+
+        let winner = SwapFile::new(FILE_NAME, Buffer::from_bytes(b"winner\n").unwrap())
+            .with_meta(identity(winner_pid));
+        winner.write(&mut winner_file).unwrap();
+        winner_file.sync_all().unwrap();
+        let winner_bytes = fs::read(&path).unwrap();
+
+        let error = loser.write_to(&path).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "malformed or unsupported swapfile: swapfile identity"
+        );
+        assert_eq!(fs::read(&path).unwrap(), winner_bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_swapfile_from_dead_process_is_replaced() {
+        let dir = test_dir("stale");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("buffer.swp");
+        let stale = SwapFile::new(FILE_NAME, Buffer::from_bytes(b"stale\n").unwrap())
+            .with_meta(identity(u32::MAX));
+        stale.write_to(&path).unwrap();
+
+        SwapFile::new(
+            FILE_NAME,
+            Buffer::from_bytes(b"recovered after stale\n").unwrap(),
+        )
+        .with_meta(identity(std::process::id()))
+        .write_to(&path)
+        .unwrap();
+
+        assert_eq!(
+            read_snapshot(&path).buffer.to_bytes(),
+            b"recovered after stale\n"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
