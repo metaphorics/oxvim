@@ -36,6 +36,16 @@ struct ParserHandle {
     scheduler: Rc<dyn Scheduler>,
     logger: Option<Function>,
     logger_error: Rc<RefCell<Option<String>>>,
+    /// Set by `__gc`; every method refuses work afterwards, mirroring
+    /// upstream `parser_check` (`treesitter.c:423`).
+    deleted: bool,
+}
+
+fn check_parser_live(handle: &ParserHandle) -> mlua::Result<()> {
+    if handle.deleted {
+        return Err(runtime_error("Parser has been deleted"));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -268,6 +278,7 @@ fn add_logging_methods<M: UserDataMethods<ParserHandle>>(methods: &mut M) {
         "_set_logger",
         string_errors_mut(
             |_, this: &mut ParserHandle, (lex, parse, callback): (bool, bool, Function)| {
+                check_parser_live(this)?;
                 let scheduler = this.scheduler.clone();
                 let callback_for_log = callback.clone();
                 let error = this.logger_error.clone();
@@ -332,9 +343,18 @@ impl UserData for ParserHandle {
     )]
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(MetaMethod::ToString, |_, _, ()| Ok("<parser>"));
+        // Upstream exposes `__gc` through `__index`, so the finalizer is
+        // callable explicitly (`parser:__gc()`); mlua reserves the real
+        // `__gc` metamethod, so a regular method of the same name carries
+        // it. Marking deleted is idempotent, like the real finalizer.
+        methods.add_method_mut("__gc", |_, this: &mut ParserHandle, ()| {
+            this.deleted = true;
+            Ok(())
+        });
         methods.add_method_mut(
             "reset",
             string_errors_mut(|_, this: &mut ParserHandle, ()| {
+                check_parser_live(this)?;
                 this.parser.reset();
                 Ok(())
             }),
@@ -342,6 +362,7 @@ impl UserData for ParserHandle {
         methods.add_method_mut(
             "set_included_ranges",
             string_errors_mut(|_, this: &mut ParserHandle, values: Table| {
+                check_parser_live(this)?;
                 let ranges = values
                     .sequence_values::<Value>()
                     .map(|value| value.and_then(range_from_value))
@@ -354,6 +375,7 @@ impl UserData for ParserHandle {
         methods.add_method(
             "included_ranges",
             string_errors(|lua, this: &ParserHandle, include_bytes: Option<bool>| {
+                check_parser_live(this)?;
                 ranges_table(
                     lua,
                     this.parser.included_ranges(),
@@ -372,6 +394,7 @@ impl UserData for ParserHandle {
                     Option<bool>,
                     Option<u64>,
                 )| {
+                    check_parser_live(this)?;
                     let bytes = match input {
                         Value::String(string) => string.as_bytes().to_vec(),
                         // Upstream parses live buffer text when the input is a
@@ -1257,6 +1280,7 @@ pub(crate) fn install(lua: &Lua, scheduler: Rc<dyn Scheduler>) -> mlua::Result<(
                 scheduler: scheduler.clone(),
                 logger: None,
                 logger_error: Rc::new(RefCell::new(None)),
+                deleted: false,
             })
         })?,
     )?;
