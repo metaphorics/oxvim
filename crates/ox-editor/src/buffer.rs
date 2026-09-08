@@ -251,6 +251,9 @@ pub struct BufferState {
     variables_version: u64,
     /// RPC subscriptions use channel keys; Lua keys occupy the wider namespace.
     subscriptions: BTreeMap<u128, BufferAttachSubscription>,
+    /// Subscriptions removed while the buffer is still owned by the editor.
+    /// The Lua host drains this queue after the editor borrow ends.
+    pending_subscription_releases: Vec<BufferAttachSubscription>,
     next_lua_subscription: u128,
     /// Committed mutations and their original recipients, in commit order.
     pending_bytes: Vec<BufferBytesEvent>,
@@ -333,6 +336,7 @@ impl BufferState {
             locked_vars: Vec::new(),
             variables_version: 1,
             subscriptions: BTreeMap::new(),
+            pending_subscription_releases: Vec::new(),
             next_lua_subscription: u128::from(u64::MAX) + 1,
             pending_bytes: Vec::new(),
             undo: UndoTree::new(),
@@ -451,17 +455,29 @@ impl BufferState {
         std::mem::take(&mut self.pending_bytes)
     }
 
+    /// Adds a subscription, queuing the previous value when its identity is reused.
+    pub fn insert_subscription(
+        &mut self,
+        id: u128,
+        subscription: BufferAttachSubscription,
+    ) {
+        if let Some(previous) = self.subscriptions.insert(id, subscription) {
+            self.pending_subscription_releases.push(previous);
+        }
+    }
     /// Adds a distinct Lua attachment without sharing RPC channel identities.
     /// Returns the unique subscription id assigned to this attachment.
     pub fn attach_lua(&mut self, subscription: BufferAttachSubscription) -> u128 {
         let id = self.next_lua_subscription;
         self.next_lua_subscription += 1;
-        self.subscriptions.insert(id, subscription);
+        self.insert_subscription(id, subscription);
         id
     }
     /// Removes one attachment and its pending deliveries.
     pub fn remove_subscription(&mut self, id: u128) {
-        self.subscriptions.remove(&id);
+        if let Some(subscription) = self.subscriptions.remove(&id) {
+            self.pending_subscription_releases.push(subscription);
+        }
         for event in &mut self.pending_bytes {
             event.subscribers.retain(|recipient| *recipient != id);
         }
@@ -482,13 +498,31 @@ impl BufferState {
             return;
         }
         for id in &removed {
-            self.subscriptions.remove(id);
+            if let Some(subscription) = self.subscriptions.remove(id) {
+                self.pending_subscription_releases.push(subscription);
+            }
         }
         for event in &mut self.pending_bytes {
             event.subscribers.retain(|id| !removed.contains(id));
         }
         self.pending_bytes
             .retain(|event| !event.subscribers.is_empty());
+    }
+
+    /// Takes subscriptions removed while the buffer remains owned by the editor.
+    pub fn take_pending_subscription_releases(&mut self) -> Vec<BufferAttachSubscription> {
+        std::mem::take(&mut self.pending_subscription_releases)
+    }
+
+    /// Consumes a buffer and returns every subscription that still owns refs.
+    ///
+    /// Callers that remove a buffer must pass the returned subscriptions to the
+    /// Lua host before dropping them; no editor-owned code knows how to free
+    /// the registry values.
+    pub fn into_released_subscriptions(mut self) -> Vec<BufferAttachSubscription> {
+        let mut released = std::mem::take(&mut self.pending_subscription_releases);
+        released.extend(std::mem::take(&mut self.subscriptions).into_values());
+        released
     }
 
     /// Returns mutable requested buffer event subscriptions.
@@ -1099,7 +1133,8 @@ impl BufferState {
     ///
     /// # Errors
     ///
-    /// Returns [`BufferStateError::Unloaded`] when the buffer text is not resident.
+    /// Returns [`BufferStateError::Unloaded`] when the buffer text is not
+    /// resident.
     pub fn set_eol(&mut self, has_eol: bool) -> Result<(), BufferStateError> {
         self.require_loaded()?;
         let changed = self.text.has_eol() != has_eol;
@@ -1132,7 +1167,8 @@ impl BufferState {
         self.saved_changedtick = self.changedtick();
         self.saved_has_eol = self.text.has_eol();
         self.saved_undo_state = (0, 0);
-        self.subscriptions.clear();
+        self.pending_subscription_releases
+            .extend(std::mem::take(&mut self.subscriptions).into_values());
         self.pending_bytes.clear();
     }
 

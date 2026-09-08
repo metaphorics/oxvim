@@ -1297,7 +1297,7 @@ pub fn nvim_buf_attach(
                     send_buffer,
                     options,
                 };
-                state.subscriptions_mut().insert(subscription_id, subscription);
+                state.insert_subscription(subscription_id, subscription);
             }
             None => {
                 // In-process Lua calls get a distinct id per attach so
@@ -1420,4 +1420,43 @@ pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(nvim_buf_attach__API_META(), nvim_buf_attach__API_DISPATCH)?;
     registry.register(nvim_buf_detach__API_META(), nvim_buf_detach__API_DISPATCH)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+
+    use super::*;
+
+    #[test]
+    fn buf_attach_detach_queues_callback_refs_for_release() {
+        let editor = Rc::new(RefCell::new(Editor::new()));
+        let buffer = editor.borrow_mut().create_buffer(true).unwrap();
+        let session = ApiSession::new(editor);
+
+        assert!(nvim_buf_attach(
+            &session,
+            buffer,
+            false,
+            Dict(vec![(
+                OxStr::from("on_bytes"),
+                Object::LuaRef(41),
+            )]),
+        )
+        .unwrap());
+        assert!(nvim_buf_detach(&session, buffer).unwrap());
+
+        session.with_editor_mut(|editor| {
+            let state = editor.buffer_mut(buffer).unwrap();
+            assert!(state.subscriptions().is_empty());
+            let released = state.take_pending_subscription_releases();
+            assert_eq!(released.len(), 1);
+            assert_eq!(
+                released[0].options.get(&OxStr::from("on_bytes")),
+                Some(&Object::LuaRef(41))
+            );
+        });
+    }
 }

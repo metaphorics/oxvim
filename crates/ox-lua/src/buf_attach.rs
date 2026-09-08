@@ -14,10 +14,10 @@ use std::collections::HashSet;
 
 use mlua::{Lua, Value, Variadic};
 use ox_api::ApiSession;
-use ox_editor::{BufferBytesEvent, BufferState};
+use ox_editor::{BufferAttachSubscription, BufferBytesEvent, BufferState};
 use ox_types::{BufHandle, Object, OxStr};
 
-use crate::converter::object_to_lua;
+use crate::converter::{free_lua_ref, object_to_lua};
 
 /// One subscription's Lua registry reference plus the identity that owns it.
 ///
@@ -29,11 +29,17 @@ struct CallbackRef {
     reference: i32,
 }
 
-/// One buffer's drained callbacks plus its events. Built under the editor
-/// borrow; invoked after it is released.
+/// One buffer's drained callbacks and events. Built under the editor borrow;
+/// invoked after it is released.
 struct PendingDelivery {
     buffer: BufHandle,
     events: Vec<EventDelivery>,
+}
+
+/// All callback deliveries and registry references released by one editor pull.
+struct PendingBatch {
+    deliveries: Vec<PendingDelivery>,
+    released: Vec<BufferAttachSubscription>,
 }
 
 /// One queued event and the callback references that were live for it.
@@ -54,17 +60,90 @@ fn callback_ref(state: &BufferState, id: u128, key: &OxStr) -> Option<CallbackRe
     }
 }
 
-/// Collects every pending event plus the callback references registered
-/// for it, emptying all queues.
-fn collect_pending(session: &ApiSession) -> Vec<PendingDelivery> {
+/// Releases every Lua registry reference nested in one object.
+fn release_object_refs(lua: &Lua, object: &Object) -> Result<(), String> {
+    let mut first_error = None;
+    match object {
+        Object::LuaRef(reference) => {
+            if let Err(error) = free_lua_ref(lua, *reference).map_err(|error| error.to_string()) {
+                first_error = Some(error);
+            }
+        }
+        Object::Array(values) => {
+            for value in values {
+                if let Err(error) = release_object_refs(lua, value)
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+        }
+        Object::Dict(dict) => {
+            for (_, value) in dict.iter() {
+                if let Err(error) = release_object_refs(lua, value)
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+        }
+        _ => {}
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Releases every callback reference owned by one removed subscription.
+fn release_subscription_refs(
+    lua: &Lua,
+    subscription: &BufferAttachSubscription,
+) -> Result<(), String> {
+    let mut first_error = None;
+    for (_, value) in subscription.options.iter() {
+        if let Err(error) = release_object_refs(lua, value)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Releases callback references from subscriptions removed while the editor
+/// was borrowed by a caller.
+///
+/// The caller must invoke this only after the editor borrow has ended; Lua
+/// registry access is user-facing runtime work and must never overlap it.
+pub fn release_removed_subscriptions(
+    lua: &Lua,
+    subscriptions: &[BufferAttachSubscription],
+) -> Result<(), String> {
+    let mut first_error = None;
+    for subscription in subscriptions {
+        if let Err(error) = release_subscription_refs(lua, subscription)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Collects every pending event, callback reference, and removed subscription,
+/// emptying all queues while the editor borrow is held.
+fn collect_pending(session: &ApiSession) -> PendingBatch {
     let key = OxStr::from("on_bytes");
     session.with_editor_mut(|editor| {
-        let mut pending = Vec::new();
+        let mut pending = PendingBatch {
+            deliveries: Vec::new(),
+            released: editor.take_pending_subscription_releases(),
+        };
         for handle in editor.buffers() {
             let Ok(state) = editor.buffer_mut(handle) else {
                 continue;
             };
             let events = state.take_bytes_events();
+            let released = state.take_pending_subscription_releases();
+            pending.released.extend(released);
             if events.is_empty() {
                 continue;
             }
@@ -81,7 +160,7 @@ fn collect_pending(session: &ApiSession) -> Vec<PendingDelivery> {
                 }
             }
             if !deliveries.is_empty() {
-                pending.push(PendingDelivery {
+                pending.deliveries.push(PendingDelivery {
                     buffer: handle,
                     events: deliveries,
                 });
@@ -176,10 +255,13 @@ pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), Str
     let mut detached: HashSet<u128> = HashSet::new();
     loop {
         let batch = collect_pending(session);
-        if batch.is_empty() {
+        if batch.deliveries.is_empty() && batch.released.is_empty() {
             break;
         }
-        for delivery in &batch {
+        if let Err(error) = release_removed_subscriptions(lua, &batch.released) {
+            first_error.get_or_insert(error);
+        }
+        for delivery in &batch.deliveries {
             for event_delivery in &delivery.events {
                 let args = match bytes_args(lua, delivery, &event_delivery.event) {
                     Ok(args) => args,
@@ -229,12 +311,27 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use mlua::Table;
     use ox_editor::{BufferAttachSubscription, Editor, Geometry};
     use ox_types::Dict;
 
     use super::*;
     use crate::converter::lua_to_object_ref;
 
+    fn live_lua_ref_count(lua: &Lua) -> usize {
+        let Ok(Some(refs)) = lua.named_registry_value::<Option<Table>>("ox-lua.refs") else {
+            return 0;
+        };
+        let next: i32 = refs.raw_get("__next").unwrap();
+        (1..next)
+            .filter(|reference| {
+                !matches!(
+                    refs.raw_get::<Value>(*reference).unwrap(),
+                    Value::Nil
+                )
+            })
+            .count()
+    }
     fn setup_with_callback<F>(lua: &Lua, callback: F) -> (Editor, BufHandle, i32)
     where
         F: Fn(&Lua, Variadic<Value>) -> Result<Value, mlua::Error> + 'static,
@@ -498,6 +595,7 @@ mod tests {
     #[test]
     fn truthy_return_detaches_only_owning_subscription() {
         let lua = Lua::new();
+        let baseline = live_lua_ref_count(&lua);
         lua.globals()
             .set("vim", lua.create_table().unwrap())
             .unwrap();
@@ -561,5 +659,137 @@ mod tests {
 
         assert_eq!(*calls_a.borrow(), 1);
         assert_eq!(*calls_b.borrow(), 2);
+        assert_eq!(live_lua_ref_count(&lua), baseline + 1);
+        session.with_editor_mut(|editor| {
+            editor
+                .buffer_mut(buffer)
+                .unwrap()
+                .remove_subscriptions_by_channel(0);
+        });
+        drain_buffer_callbacks(&lua, &session).unwrap();
+        assert_eq!(live_lua_ref_count(&lua), baseline);
+    }
+
+    #[test]
+    fn detached_subscriptions_release_registry_refs() {
+        let lua = Lua::new();
+        let baseline = live_lua_ref_count(&lua);
+        lua.globals()
+            .set("vim", lua.create_table().unwrap())
+            .unwrap();
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        let session = ApiSession::new(Rc::new(RefCell::new(editor)));
+
+        for _ in 0..8 {
+            let callback = lua.create_function(|_, _args: Variadic<Value>| Ok(Value::Nil)).unwrap();
+            let Object::LuaRef(reference) =
+                lua_to_object_ref(&lua, &Value::Function(callback)).unwrap()
+            else {
+                unreachable!()
+            };
+            session.with_editor_mut(|editor| {
+                editor
+                    .buffer_mut(buffer)
+                    .unwrap()
+                    .attach_lua(BufferAttachSubscription {
+                        channel_id: 0,
+                        send_buffer: false,
+                        options: Dict(vec![(
+                            OxStr::from("on_bytes"),
+                            Object::LuaRef(reference),
+                        )]),
+                    });
+                editor
+                    .buffer_mut(buffer)
+                    .unwrap()
+                    .remove_subscriptions_by_channel(0);
+            });
+            drain_buffer_callbacks(&lua, &session).unwrap();
+            assert_eq!(live_lua_ref_count(&lua), baseline);
+        }
+    }
+
+    #[test]
+    fn unloading_buffer_releases_registry_refs() {
+        let lua = Lua::new();
+        let baseline = live_lua_ref_count(&lua);
+        lua.globals()
+            .set("vim", lua.create_table().unwrap())
+            .unwrap();
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        let callback = lua.create_function(|_, _args: Variadic<Value>| Ok(Value::Nil)).unwrap();
+        let Object::LuaRef(reference) =
+            lua_to_object_ref(&lua, &Value::Function(callback)).unwrap()
+        else {
+            unreachable!()
+        };
+        let session = ApiSession::new(Rc::new(RefCell::new(editor)));
+        session.with_editor_mut(|editor| {
+            editor
+                .buffer_mut(buffer)
+                .unwrap()
+                .attach_lua(BufferAttachSubscription {
+                    channel_id: 0,
+                    send_buffer: false,
+                    options: Dict(vec![(
+                        OxStr::from("on_bytes"),
+                        Object::LuaRef(reference),
+                    )]),
+                });
+            editor.unload_buffer(buffer).unwrap();
+        });
+
+        assert_eq!(live_lua_ref_count(&lua), baseline + 1);
+        drain_buffer_callbacks(&lua, &session).unwrap();
+        assert_eq!(live_lua_ref_count(&lua), baseline);
+    }
+
+    #[test]
+    fn consuming_wiped_state_returns_active_and_pending_subscriptions() {
+        let lua = Lua::new();
+        let baseline = live_lua_ref_count(&lua);
+        lua.globals()
+            .set("vim", lua.create_table().unwrap())
+            .unwrap();
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        let callback_a =
+            lua.create_function(|_, _args: Variadic<Value>| Ok(Value::Nil)).unwrap();
+        let callback_b =
+            lua.create_function(|_, _args: Variadic<Value>| Ok(Value::Nil)).unwrap();
+        let Object::LuaRef(ref_a) =
+            lua_to_object_ref(&lua, &Value::Function(callback_a)).unwrap()
+        else {
+            unreachable!()
+        };
+        let Object::LuaRef(ref_b) =
+            lua_to_object_ref(&lua, &Value::Function(callback_b)).unwrap()
+        else {
+            unreachable!()
+        };
+        let session = ApiSession::new(Rc::new(RefCell::new(editor)));
+        session.with_editor_mut(|editor| {
+            {
+                let state = editor.buffer_mut(buffer).unwrap();
+                state.attach_lua(BufferAttachSubscription {
+                    channel_id: 0,
+                    send_buffer: false,
+                    options: Dict(vec![(OxStr::from("on_bytes"), Object::LuaRef(ref_a))]),
+                });
+                state.remove_subscription(u128::from(u64::MAX) + 1);
+                state.attach_lua(BufferAttachSubscription {
+                    channel_id: 0,
+                    send_buffer: false,
+                    options: Dict(vec![(OxStr::from("on_bytes"), Object::LuaRef(ref_b))]),
+                });
+            }
+            editor.wipe_buffer(buffer).unwrap();
+        });
+
+        assert_eq!(live_lua_ref_count(&lua), baseline + 2);
+        drain_buffer_callbacks(&lua, &session).unwrap();
+        assert_eq!(live_lua_ref_count(&lua), baseline);
     }
 }
