@@ -10,23 +10,25 @@ use std::rc::Rc;
 
 use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
 use ox_api::{
-    ApiSession, AutocmdExecution, AutocmdExecutor, ChannelInfo, CommandExecutor, LuaExecutor,
-    Registry, close_channel, register_channel,
+    ApiSession, AutocmdExecution, AutocmdExecutor, ChannelInfo, CommandExecutor, DispatchFn,
+    LuaExecutor, Registry, close_channel, register_channel,
 };
 use ox_editor::job::JobEvent;
 use ox_editor::{
+    mode::InsertTransition,
     AutocmdAction, AutocmdContext, AutocmdKind, ChannelIds, CmdlineKind, Editor, Event, ExExecutor,
     ExecError, ExecOutcome, Geometry, Keys, LuaExec, LuaExecError, MessageDestination, MessageKind,
     Mode, ModeMachine, OptionValue, PendingEditMode, ServerHost, TypeaheadFlags, UserCommand,
     VisualKind, vim_variable_is_writable,
 };
+use ox_editor::editor::MessageIdentity;
 use ox_lua::{
     ApiDispatchContext, BuiltinHost, EventLoopPump, LuaHost, RuntimeRoot as LuaRuntimeRoot,
     Scheduler, VariableHost, VariableScope, Work, bind_api, bind_variables, bind_with,
     call_with_traceback, collect_typval_refs, error_shim, free_lua_ref, free_typval_refs,
     lua_to_object, lua_to_object_ref, lua_to_typval, object_to_lua, typval_to_lua,
 };
-use ox_rpc::{CHAN_STDIO, ChannelId, IncrementalDecoder, Message};
+use ox_rpc::{CHAN_STDIO, ChannelId, IncrementalDecoder, Message, RedrawBatch};
 use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, Typval, WinHandle};
 use ox_ui::{
     CmdlineState as UiCmdlineState, Compositor, ContentChunk, Emitter, Highlight, HlAttrs,
@@ -303,6 +305,9 @@ pub struct AppState {
     /// Long-lived render state: the layer stack and its grid buffers, rebuilt
     /// in place on each redraw rather than reconstructed.
     compositor: Compositor,
+    /// Attached channels whose `nvim_ui_attach` options set `stdout_tty` —
+    /// the only UIs `nvim_ui_send` delivers to (`api/ui.c:981`).
+    stdout_tty_channels: HashSet<u64>,
 }
 
 /// The editor/Lua/Ex triangle every process mode shares: one editor, one
@@ -399,6 +404,7 @@ pub(crate) fn build_embedded_core(
         }),
         Rc::new(LuaScheduler {
             queue: lua_work.clone(),
+            session: session.clone(),
         }),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -409,6 +415,57 @@ pub(crate) fn build_embedded_core(
         lua.fast_callbacks(),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
+    // Deferred and non-scoped Lua resolves `vim.api.nvim_echo` from the
+    // top-level table at call time — outside any `with_scoped_editor_api`
+    // rebind — so the identity-stamping binding is installed there too.
+    {
+        let to_app_error = |error: mlua::Error| AppError::Lua(error.to_string());
+        let api: Table = lua
+            .lua()
+            .globals()
+            .get::<Table>("vim")
+            .map_err(to_app_error)?
+            .get::<Table>("api")
+            .map_err(to_app_error)?;
+        let Some((_, echo)) = registry.get("nvim_echo") else {
+            return Err(AppError::Api("nvim_echo is not registered".to_owned()));
+        };
+        let echo_session = session.clone();
+        let echo_bind = lua
+            .lua()
+            .create_function(move |lua, args: Variadic<Value>| {
+                let mut converted = Vec::with_capacity(args.len());
+                for value in args.iter() {
+                    let value = lua_to_object(lua, value)
+                        .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+                    converted.push(value);
+                }
+                let result = dispatch_echo(&echo_session, echo, &converted)
+                    .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+                object_to_lua(lua, &result)
+                    .map_err(|error| mlua::Error::RuntimeError(error.to_string()))
+            })
+            .map_err(to_app_error)?;
+        api.set("nvim_echo", echo_bind).map_err(to_app_error)?;
+        // The built-in OSC52 provider, the tty helper, and the Progress
+        // handler call `vim.api.nvim_ui_send` from Lua; the binding queues
+        // through the editor sink exactly like the RPC path.
+        let ui_send_session = session.clone();
+        let ui_send_bind = lua
+            .lua()
+            .create_function(move |lua, args: Variadic<Value>| {
+                let mut converted = Vec::with_capacity(args.len());
+                for value in args.iter() {
+                    let value = lua_to_object(lua, value)
+                        .map_err(|error| mlua::Error::RuntimeError(error.to_string()))?;
+                    converted.push(value);
+                }
+                queue_lua_ui_send(&ui_send_session, &converted)?;
+                Ok(Value::Nil)
+            })
+            .map_err(to_app_error)?;
+        api.set("nvim_ui_send", ui_send_bind).map_err(to_app_error)?;
+    }
     bind_with(
         lua.lua(),
         ApiDispatchContext::new(session.clone()),
@@ -573,11 +630,15 @@ impl AppState {
             lua_work,
             emitter: Emitter::new(),
             compositor: Compositor::new(1, 1),
+            stdout_tty_channels: HashSet::new(),
         };
         state.run_startup(cli, timer)?;
         // main.c writes startup message output before the process waits on
         // its input, and --headless/-es exit without ever attaching a UI.
         state.publish_messages()?;
+        // Startup-recorded insert transitions (`+startinsert`) fire before
+        // the first RPC turn, with no AppState borrow to reenter.
+        state.fire_pending_transitions();
         Ok(state)
     }
 
@@ -959,6 +1020,11 @@ impl AppState {
             "nvim_ui_attach" => self.ui_attach(channel, params),
             "nvim_ui_detach" => self.ui_detach(channel, params),
             "nvim_ui_try_resize" => self.ui_resize(channel, params),
+            "nvim_ui_send" => queue_ui_send(&self.session, params),
+            "nvim_echo" => match self.registry.get("nvim_echo") {
+                Some((_, echo)) => dispatch_echo(&self.session, echo, params),
+                None => Err(ApiError::exception("nvim_echo is not registered")),
+            },
             _ => {
                 let Some((_, dispatch)) = self.registry.get(&name) else {
                     return Err(ApiError::exception(Registry::invalid_method_message(
@@ -971,11 +1037,12 @@ impl AppState {
         drop(caller);
         // Absorb before propagating: user code may have recorded a quit
         // before failing, and that quit must still end the process.
-        self.absorb_pending_quit();
         let result = result?;
         let redraws = if name == "nvim_ui_attach"
             || name == "nvim_ui_try_resize"
             || method_is_mutating(&name)
+            || self.has_pending_ui_sends()
+            || self.has_pending_redraws()
         {
             self.redraw()?
         } else {
@@ -1023,6 +1090,7 @@ impl AppState {
             let result = match name.as_ref() {
                 "nvim_get_api_info" => self.dispatch_api_info(channel, args),
                 "nvim_call_atomic" => self.dispatch_call_atomic(channel, args),
+                "nvim_ui_send" => queue_ui_send(&self.session, args),
                 _ => match self.registry.get(&name) {
                     Some((_, dispatch)) => {
                         let caller = self.session.enter_rpc_call(channel);
@@ -1132,17 +1200,24 @@ impl AppState {
 
     fn dispatch_nvim_cmd(&mut self, params: &[Object]) -> Result<Object, ApiError> {
         let (cmd, opts) = nvim_cmd_args(params)?;
-        let mut ex = self.ex.borrow_mut();
-        let mut executor = ExApiExecutor {
-            executor: &mut ex,
-            outcome: ExecOutcome::Completed,
+        let (result, outcome, pending) = {
+            let mut ex = self.ex.borrow_mut();
+            let mut executor = ExApiExecutor {
+                executor: &mut ex,
+                outcome: ExecOutcome::Completed,
+            };
+            let result = ox_api::execute_nvim_cmd(&self.session, cmd, opts, &mut executor);
+            let outcome = executor.outcome;
+            let pending = executor.executor.take_pending_edit_mode();
+            drop(executor);
+            drop(ex);
+            (result, outcome, pending)
         };
-        let result = ox_api::execute_nvim_cmd(&self.session, cmd, opts, &mut executor);
-        if let Some(pending) = executor.executor.take_pending_edit_mode() {
+        if let Some(pending) = pending {
             Self::apply_pending_edit_mode(&self.session, &self.mode, pending)?;
         }
         let result = result?;
-        if let ExecOutcome::Quit(code) = executor.outcome {
+        if let ExecOutcome::Quit(code) = outcome {
             self.exiting = true;
             self.exit_code = code;
         }
@@ -1227,6 +1302,12 @@ impl AppState {
                 ))),
             };
         }
+        if matches!(
+            options.get(&OxStr::from("stdout_tty")),
+            Some(Object::Boolean(true))
+        ) {
+            self.stdout_tty_channels.insert(channel.get());
+        }
         self.sync_ui_active();
         Ok(Object::Nil)
     }
@@ -1241,6 +1322,7 @@ impl AppState {
                 .map_err(|error| ApiError::exception(error.to_string()))
         })?;
         self.emitter.detach(channel.get());
+        self.stdout_tty_channels.remove(&channel.get());
         self.sync_ui_active();
         Ok(Object::Nil)
     }
@@ -1273,7 +1355,89 @@ impl AppState {
         Ok(Object::Nil)
     }
 
+
+    /// Whether any `nvim_ui_send` payload awaits the next redraw pass.
+    fn has_pending_ui_sends(&self) -> bool {
+        self.session.with_editor(|editor| editor.ui_sends_pending())
+    }
+
+    /// Whether any `nvim__redraw` request awaits the next redraw pass.
+    fn has_pending_redraws(&self) -> bool {
+        self.session.with_editor(|editor| editor.redraws_pending())
+    }
+
+    /// Applies queued `nvim__redraw` requests before this pass repaints
+    /// (`nvim__redraw`, `api/vim.c:2469`).
+    ///
+    /// One pass already recomputes every window, the status widgets, the
+    /// tabline, and the cursor from live editor state and flushes each
+    /// attached channel, so `flush`, `cursor`, and the widget flags are
+    /// honored by the pass itself. What the pass cannot express is
+    /// `valid = false`: the emitter sends only lines that differ from the
+    /// image it retained, while upstream's `redraw_all_later(UPD_NOT_VALID)`
+    /// repaints regardless of what changed. Dropping the retained images
+    /// forces that full retransmit on the emit right after. Channel images
+    /// — not windows — are what the emitter retains, so that is also the
+    /// finest invalidation scope this layer owns.
+    fn drain_redraws(&mut self) {
+        let requests = self.session.with_editor_mut(|editor| editor.take_redraws());
+        if requests.is_empty() {
+            return;
+        }
+        if requests.iter().any(|request| request.valid == Some(false)) {
+            let targets: Vec<u64> = self
+                .session
+                .with_render_state(|ui_channels, _, _| {
+                    ui_channels.iter().map(|(id, _)| *id).collect()
+                });
+            for id in targets {
+                self.emitter.detach(id);
+            }
+        }
+    }
+
+    /// Delivers queued `nvim_ui_send` payloads into each attached
+    /// `stdout_tty` channel's frame (`remote_ui_ui_send`, `api/ui.c:979-988`).
+    ///
+    /// The events ride outside the `UiChannel` begin/emit/flush transaction
+    /// as their own redraw batch: `UiChannel::begin` discards the whole open
+    /// batch, so an event queued for the next pass through `emit` would be
+    /// dropped before its flush. Appending one self-contained batch per
+    /// channel — a `ui_send` entry per payload, closed by `flush` — keeps
+    /// every payload in this turn's frame regardless of grid state.
+    fn drain_ui_sends(&mut self, frames: &mut BTreeMap<u64, Vec<u8>>) -> Result<(), ApiError> {
+        let pending = self.session.with_editor_mut(|editor| editor.take_ui_sends());
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut batch = RedrawBatch::new();
+        for content in &pending {
+            batch.push("ui_send", vec![Object::String(content.clone())]);
+        }
+        batch.push("flush", vec![]);
+        let bytes = batch
+            .pack()
+            .map_err(|error| ApiError::exception(error.to_string()))?;
+        let targets: Vec<u64> = self
+            .session
+            .with_render_state(|ui_channels, _, _| {
+                ui_channels
+                    .iter()
+                    .filter(|(id, _)| self.stdout_tty_channels.contains(id))
+                    .map(|(id, _)| *id)
+                    .collect()
+            });
+        for id in targets {
+            frames.entry(id).or_default().extend_from_slice(&bytes);
+        }
+        Ok(())
+    }
+
     fn redraw(&mut self) -> Result<BTreeMap<u64, Vec<u8>>, ApiError> {
+        // Queued `nvim__redraw` requests shape this pass: invalidation must
+        // land before the emit, and the pass itself flushes everything else
+        // they ask for.
+        self.drain_redraws();
         self.sync_chrome()?;
         self.publish_messages()
             .map_err(|error| ApiError::exception(error.to_string()))?;
@@ -1300,7 +1464,8 @@ impl AppState {
                     .redraw(ui_channels, &self.compositor, highlights, chrome)
                     .map_err(|error| ApiError::exception(error.to_string()))
             })?;
-        let RedrawOutput(frames, semantic) = output;
+        let RedrawOutput(mut frames, semantic) = output;
+        self.drain_ui_sends(&mut frames)?;
         // vim.ui_attach callbacks (upstream ui_add_cb via the event loop):
         // queued at emission, invoked here with no editor or render-state
         // borrow held.
@@ -1546,19 +1711,21 @@ impl AppState {
     /// Sends every newly retained message where the editor sink decided it
     /// goes: an attached UI, stdout, stderr, or nowhere.
     fn publish_messages(&mut self) -> Result<(), AppError> {
-        let pending: Vec<(ox_editor::Message, MessageDestination)> =
+        let pending: Vec<(ox_editor::Message, MessageDestination, MessageIdentity)> =
             self.session.with_editor(|editor| {
                 let from = self.rendered_messages;
                 editor.messages()[from..]
                     .iter()
                     .cloned()
                     .zip(editor.message_destinations()[from..].iter().copied())
+                    .zip(editor.message_identities()[from..].iter().cloned())
+                    .map(|((message, destination), identity)| (message, destination, identity))
                     .collect()
             });
         self.rendered_messages += pending.len();
-        for (message, destination) in &pending {
+        for (message, destination, identity) in &pending {
             if *destination == MessageDestination::Ui {
-                self.show_in_chrome(message);
+                self.show_in_chrome(message, identity);
             } else {
                 self.printf
                     .write(*destination, message)
@@ -1625,26 +1792,12 @@ impl AppState {
         }
     }
 
-    fn show_in_chrome(&mut self, message: &ox_editor::Message) {
-        let text = match &message.content {
-            Object::String(text) => text.clone(),
-            value => OxStr::from(format!("{value:?}").as_bytes()),
-        };
-        self.session.with_render_state(|_, _, chrome| {
-            chrome.show_message(MessageState {
-                kind: OxStr::from(if message.kind == MessageKind::Error {
-                    "emsg"
-                } else {
-                    "echo"
-                }),
-                content: vec![ContentChunk::new(0, text)],
-                replace_last: false,
-                history: message.history,
-                append: false,
-                id: Object::Nil,
-                trigger: OxStr::from(""),
-            });
-        });
+    fn show_in_chrome(
+        &mut self,
+        message: &ox_editor::Message,
+        identity: &MessageIdentity,
+    ) {
+        show_message_in_chrome(&self.session, message, identity);
     }
 
     /// One turn of `state_enter`'s input handling (`state.c:34-106`).
@@ -1655,96 +1808,36 @@ impl AppState {
     /// `feedkeys()` use, so a mapping cannot behave differently depending on
     /// how its left-hand side arrived.
     fn drive_input(&mut self) -> Result<(), ApiError> {
-        // Upstream fires `InsertEnter` on insert entry and
-        // `InsertLeavePre`+`InsertLeave` on exit (`ins_redraw`/`edit`); the
-        // mode machine itself cannot run listeners, so snapshot insert-ness
-        // around the drain and fire post-hoc. Only pure-`Insert`
-        // transitions are covered: `Replace` entry/exit and mid-drain
-        // round-trips stay silent until their semantics are pinned.
-        let was_insert = self.mode.borrow().mode().is_insert();
-        loop {
-            self.mode.borrow_mut().set_no_more_input(false);
-            // The host can still receive keys: a pending mapping parks
-            // instead of timing out (`vgetorpeek`'s interactive wait).
-            let result = self
-                .ex
-                .borrow_mut()
-                .run_typeahead(&*self.session, &self.mode);
-            self.mode.borrow_mut().set_no_more_input(true);
-            let outcome = match result {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    self.absorb_pending_quit();
-                    self.fire_insert_transition(was_insert);
-                    return Err(ApiError::exception(error.to_string()));
-                }
-            };
-            let repeats = self.mode.borrow_mut().take_paste_repeats();
-            let (outcome, repeats) = (outcome, repeats);
-            if let ExecOutcome::Quit(code) = outcome {
-                self.exiting = true;
-                self.exit_code = code;
-            }
-            // Keys can run a mapping or autocommand that quits without
-            // that reaching `outcome`.
-            self.absorb_pending_quit();
-            if repeats.is_empty() {
-                self.fire_insert_transition(was_insert);
-                return Ok(());
-            }
-            for data in repeats {
-                ox_api::nvim_paste(&self.session, OxStr(data), false, -1)?;
-            }
-        }
+        let session = self.session.clone();
+        let ex = self.ex.clone();
+        let nested_ex = self.nested_ex.clone();
+        let mode = self.mode.clone();
+        drive_input_parts(
+            &session,
+            &ex,
+            &nested_ex,
+            &mode,
+            &mut self.exiting,
+            &mut self.exit_code,
+        )
     }
 
-    /// Fire insert-transition events when drained input changed pure-`Insert`
-    /// insert-ness. A failing listener is reported, never fatal to the input
-    /// that already ran (upstream shows the error and keeps the new mode).
-    fn fire_insert_transition(&mut self, was_insert: bool) {
-        let now_insert = self.mode.borrow().mode().is_insert();
-        if now_insert == was_insert {
-            return;
-        }
-        let Some(buffer) = self.session.with_editor(Editor::current_buffer) else {
-            return;
-        };
-        // Entry fires `InsertEnter`; exit fires `InsertLeavePre` first, the
-        // way `edit` orders the exit pair.
-        let events = if now_insert {
-            &[Event::InsertEnter][..]
-        } else {
-            &[Event::InsertLeavePre, Event::InsertLeave][..]
-        };
-        for event in events {
-            if self
-                .session
-                .with_editor(|editor| editor.autocmds().is_ignored(*event))
-            {
-                continue;
-            }
-            let plan = self.session.with_editor_mut(|editor| {
-                editor.autocmds_mut().plan(
-                    *event,
-                    AutocmdContext {
-                        buffer: Some(buffer),
-                        ..AutocmdContext::default()
-                    },
-                )
-            });
-            if let Err(error) = ox_api::execute_firing_plan(&self.session, plan) {
-                self.session.with_editor_mut(|editor| {
-                    editor.push_message(ox_editor::Message {
-                        kind: ox_editor::MessageKind::Error,
-                        content: Object::String(OxStr::from(error.to_string().as_str())),
-                        history: true,
-                        leading_newline: true,
-                    });
-                });
-            }
-        }
-        self.absorb_pending_quit();
+    /// Fires queued insert-lifecycle transitions without a shared borrow:
+    /// construction and direct-call tests drain here; dispatch boundaries
+    /// drain through `fire_pending_transitions_for_state` after the
+    /// caller's `RefMut` drops.
+    fn fire_pending_transitions(&mut self) {
+        fire_recorded_insert_transitions(
+            &self.session,
+            &self.ex,
+            &self.nested_ex,
+            &self.mode,
+            &mut self.exiting,
+            &mut self.exit_code,
+        );
     }
+
+
 
     /// Whether unprocessed keys sit in typeahead after this message.
     ///
@@ -1888,7 +1981,9 @@ impl AppState {
                     }
                 }
                 let response = Message::Response { msgid, result };
-                let encoded = response.encode_bytes();
+                let encoded = response
+                    .encode_bytes()
+                    .map_err(|error| AppError::Server(error.to_string()))?;
                 if owns_result_refs
                     && let Message::Response {
                         result: Ok(value), ..
@@ -1913,7 +2008,8 @@ impl AppState {
                     b"nvim_input" | b"nvim_feedkeys" | b"nvim_paste"
                 );
                 let owns_result_refs = allocates_result_refs(method.as_bytes());
-                match self.dispatch(channel, &method, &params) {
+                let dispatched = self.dispatch(channel, &method, &params);
+                match dispatched {
                     Ok((value, mut redraws)) => {
                         // No reply is encoded for a fire-and-forget call, so
                         // the ephemeral references in its result are released
@@ -1927,12 +2023,11 @@ impl AppState {
                                     let (frames, failure) = self.redraw_reporting();
                                     redraws = frames;
                                     if let Some(message) = failure {
-                                        writes.push((
-                                            channel.get(),
-                                            ox_rpc::nvim_error_event(&ApiError::exception(
-                                                message,
-                                            )),
-                                        ));
+                                        let event = ox_rpc::nvim_error_event(
+                                            &ApiError::exception(message),
+                                        )
+                                        .map_err(|error| AppError::Server(error.to_string()))?;
+                                        writes.push((channel.get(), event));
                                     }
                                 }
                                 Err(error) => {
@@ -1946,15 +2041,16 @@ impl AppState {
                                         });
                                     });
                                     let (frames, failure) = self.redraw_reporting();
-                                    writes.push((channel.get(), ox_rpc::nvim_error_event(&error)));
+                                    let event = ox_rpc::nvim_error_event(&error)
+                                        .map_err(|error| AppError::Server(error.to_string()))?;
+                                    writes.push((channel.get(), event));
                                     writes.extend(frames);
                                     if let Some(message) = failure {
-                                        writes.push((
-                                            channel.get(),
-                                            ox_rpc::nvim_error_event(&ApiError::exception(
-                                                message,
-                                            )),
-                                        ));
+                                        let event = ox_rpc::nvim_error_event(
+                                            &ApiError::exception(message),
+                                        )
+                                        .map_err(|error| AppError::Server(error.to_string()))?;
+                                        writes.push((channel.get(), event));
                                     }
                                     let _ = self.drain_lua_work();
                                     self.absorb_pending_quit();
@@ -1964,7 +2060,11 @@ impl AppState {
                         }
                         writes.extend(redraws);
                     }
-                    Err(error) => writes.push((channel.get(), ox_rpc::nvim_error_event(&error))),
+                    Err(error) => {
+                        let event = ox_rpc::nvim_error_event(&error)
+                            .map_err(|error| AppError::Server(error.to_string()))?;
+                        writes.push((channel.get(), event));
+                    }
                 }
             }
             Message::Response { .. } => {}
@@ -2007,6 +2107,173 @@ impl AppState {
         self.exit_code
     }
 }
+fn drain_buffer_callbacks_for_state(state: &Rc<RefCell<AppState>>) -> Result<(), String> {
+    let (lua, session) = {
+        let state = state.borrow();
+        let lua = state.lua.borrow().lua().clone();
+        (lua, state.session.clone())
+    };
+    ox_lua::buf_attach::drain_buffer_callbacks(&lua, &session)
+}
+/// Drains insert-lifecycle transitions and staged mode switches recorded
+/// during a dispatch without holding an `AppState` borrow: transition
+/// autocmds run user code that can reenter this state, so every dispatch
+/// boundary drains after the caller's `RefMut` is gone.
+fn fire_pending_transitions_for_state(state: &Rc<RefCell<AppState>>) {
+    let (session, ex, nested_ex, mode, mut exiting, mut exit_code) = {
+        let state = state.borrow();
+        (
+            state.session.clone(),
+            state.ex.clone(),
+            state.nested_ex.clone(),
+            state.mode.clone(),
+            state.exiting,
+            state.exit_code,
+        )
+    };
+    fire_recorded_insert_transitions(
+        &session,
+        &ex,
+        &nested_ex,
+        &mode,
+        &mut exiting,
+        &mut exit_code,
+    );
+    if exiting {
+        let mut state = state.borrow_mut();
+        state.exiting = true;
+        state.exit_code = exit_code;
+    }
+}
+
+
+fn drive_input_parts(
+    session: &Rc<ApiSession>,
+    ex: &Rc<RefCell<ExExecutor>>,
+    nested_ex: &Rc<RefCell<ExExecutor>>,
+    mode: &Rc<RefCell<ModeMachine>>,
+    exiting: &mut bool,
+    exit_code: &mut i64,
+) -> Result<(), ApiError> {
+    loop {
+        mode.borrow_mut().set_no_more_input(false);
+        let result = ex.borrow_mut().run_typeahead(session.as_ref(), mode);
+        mode.borrow_mut().set_no_more_input(true);
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                absorb_pending_quit_parts(ex, nested_ex, exiting, exit_code);
+                // Transitions stay queued: they fire at the dispatch
+                // boundary, where no AppState borrow is held.
+                return Err(ApiError::exception(error.to_string()));
+            }
+        };
+        let repeats = mode.borrow_mut().take_paste_repeats();
+        if let ExecOutcome::Quit(code) = outcome {
+            *exiting = true;
+            *exit_code = code;
+        }
+        // Keys can run a mapping or autocommand that quits without that
+        // reaching the returned outcome.
+        absorb_pending_quit_parts(ex, nested_ex, exiting, exit_code);
+        // Transitions stay queued: they fire at the dispatch boundary
+        // (`fire_pending_transitions_for_state`), never under a caller's
+        // AppState `RefMut`.
+        if repeats.is_empty() {
+            return Ok(());
+        }
+        for data in repeats {
+            ox_api::nvim_paste(session, OxStr(data), false, -1)?;
+        }
+    }
+}
+
+fn absorb_pending_quit_parts(
+    ex: &Rc<RefCell<ExExecutor>>,
+    nested_ex: &Rc<RefCell<ExExecutor>>,
+    exiting: &mut bool,
+    exit_code: &mut i64,
+) {
+    // One borrow per statement: the temporaries must drop before the next
+    // borrow of the same executor.
+    let quit = ex.borrow_mut().take_quit();
+    let quit = quit.or_else(|| nested_ex.borrow_mut().take_quit());
+    let quit = quit.or_else(|| ex.borrow_mut().take_shared_quit());
+    if let Some(code) = quit {
+        *exiting = true;
+        *exit_code = code;
+    }
+}
+
+fn take_pending_edit_mode_parts(
+    ex: &Rc<RefCell<ExExecutor>>,
+    nested_ex: &Rc<RefCell<ExExecutor>>,
+) -> Option<PendingEditMode> {
+    let pending = ex.borrow_mut().take_pending_edit_mode();
+    pending.or_else(|| nested_ex.borrow_mut().take_pending_edit_mode())
+}
+/// Reports a failed mode switch or autocmd plan through the message system.
+fn push_error_message(session: &Rc<ApiSession>, error: impl std::fmt::Display) {
+    session.with_editor_mut(|editor| {
+        editor.push_message(ox_editor::Message {
+            kind: MessageKind::Error,
+            content: Object::String(OxStr::from(error.to_string().as_str())),
+            history: true,
+            leading_newline: true,
+        });
+    });
+}
+
+
+fn fire_recorded_insert_transitions(
+    session: &Rc<ApiSession>,
+    ex: &Rc<RefCell<ExExecutor>>,
+    nested_ex: &Rc<RefCell<ExExecutor>>,
+    mode: &Rc<RefCell<ModeMachine>>,
+    exiting: &mut bool,
+    exit_code: &mut i64,
+) {
+    loop {
+        if let Some(pending) = take_pending_edit_mode_parts(ex, nested_ex) {
+            if let Err(error) = AppState::apply_pending_edit_mode(session, mode, pending) {
+                push_error_message(session, error);
+            }
+            continue;
+        }
+        let transitions = mode.borrow_mut().take_insert_transitions();
+        if transitions.is_empty() {
+            return;
+        }
+        for transition in transitions {
+            let events = match transition {
+                InsertTransition::Enter => &[Event::InsertEnter][..],
+                InsertTransition::Leave => &[Event::InsertLeavePre, Event::InsertLeave][..],
+            };
+            for event in events {
+                let Some(buffer) = session.with_editor(Editor::current_buffer) else {
+                    continue;
+                };
+                if session.with_editor(|editor| editor.autocmds().is_ignored(*event)) {
+                    continue;
+                }
+                let plan = session.with_editor_mut(|editor| {
+                    editor.autocmds_mut().plan(
+                        *event,
+                        AutocmdContext {
+                            buffer: Some(buffer),
+                            ..AutocmdContext::default()
+                        },
+                    )
+                });
+                if let Err(error) = ox_api::execute_firing_plan(session, plan) {
+                    push_error_message(session, error);
+                }
+            }
+        }
+        absorb_pending_quit_parts(ex, nested_ex, exiting, exit_code);
+    }
+}
+
 
 /// Drains queued Lua work (`vim.schedule` callbacks, deferred channel
 /// sends) until the queue empties. Runs on the RPC turn and on the
@@ -2082,6 +2349,107 @@ fn free_object_refs(lua: &Lua, object: &Object) {
     }
 }
 
+/// The `ui-messages` kind an `nvim_echo` call emits: `opts.kind` verbatim,
+/// else `echoerr`/`echomsg`/`echo` by `err` and `history`
+/// (`nvim_echo`, `api/vim.c:841-846`).
+fn echo_ui_kind(params: &[Object]) -> OxStr {
+    let Some(Object::Dict(opts)) = params.get(2) else {
+        return OxStr::from("echo");
+    };
+    if let Some(Object::String(kind)) = opts.get(&OxStr::from("kind")) {
+        return kind.clone();
+    }
+    let err = matches!(opts.get(&OxStr::from("err")), Some(Object::Boolean(true)));
+    let history = matches!(params.get(1), Some(Object::Boolean(true)));
+    OxStr::from(if err {
+        "echoerr"
+    } else if history {
+        "echomsg"
+    } else {
+        "echo"
+    })
+}
+
+/// Renders one editor message into the chrome message state so an
+/// `ext_messages` UI receives the matching `msg_show`.
+fn show_message_in_chrome(
+    session: &ApiSession,
+    message: &ox_editor::Message,
+    identity: &MessageIdentity,
+) {
+    let text = match &message.content {
+        Object::String(text) => text.clone(),
+        value => OxStr::from(format!("{value:?}").as_bytes()),
+    };
+    session.with_render_state(|_, _, chrome| {
+        chrome.show_message(MessageState {
+            kind: identity.kind.clone(),
+            content: vec![ContentChunk::new(0, text)],
+            replace_last: false,
+            history: message.history,
+            append: false,
+            id: identity.id.clone(),
+            trigger: OxStr::from(""),
+        });
+    });
+}
+
+/// Stamps `nvim_echo` identity onto the message the frozen handler pushed:
+/// the handler keeps validation, verbose gating, id allocation, and the
+/// `Progress` autocmd; this records the returned id and `ui-messages` kind
+/// on the sink entry so a later call with the same id replaces it
+/// (`runtime/doc/api.txt:707-710`). A UI-destined replacement is re-shown
+/// here because the publisher's watermark only forwards appended messages.
+fn settle_echo(session: &ApiSession, pushed_at: usize, kind: OxStr, id: Object) {
+    let re_show =
+        session.with_editor_mut(|editor| editor.settle_echo_identity(pushed_at, kind, id));
+    if let Some((message, identity)) = re_show {
+        show_message_in_chrome(session, &message, &identity);
+    }
+}
+
+/// One `nvim_echo` dispatch with identity settled around the registry
+/// handler. Every entry path routes through here, so the editor sink sees
+/// the same identity regardless of transport.
+fn dispatch_echo(
+    session: &ApiSession,
+    dispatch: DispatchFn,
+    params: &[Object],
+) -> Result<Object, ApiError> {
+    let pushed_at = session.with_editor(|editor| editor.messages().len());
+    let result = dispatch(session, params)?;
+    settle_echo(session, pushed_at, echo_ui_kind(params), result.clone());
+    Ok(result)
+}
+
+/// Queues raw `nvim_ui_send` content for the next redraw pass
+/// (`nvim_ui_send`, `api/ui.c:1102-1106`). Upstream forwards the payload to
+/// every UI that negotiated `stdout_tty`, and the call cannot fail, so an
+/// unmatched shape stays the same silent no-op the frozen registry handler
+/// is. The documented signature is `nvim_ui_send({content})`
+/// (`api.txt:3824-3837`); the leading `channel_id` argument is legacy and
+/// ignored, so both shapes deliver. The queue rides the editor sink, so
+/// every entry path — RPC, nested `nvim_call_atomic`, and the Lua `vim.api`
+/// bindings — shares one queue and `AppState::drain_ui_sends` stays the one
+/// owner of frame assembly.
+fn queue_ui_send(session: &ApiSession, params: &[Object]) -> Result<Object, ApiError> {
+    let content = match params {
+        [Object::String(content)] => content,
+        [Object::Integer(_), Object::String(content)] => content,
+        _ => return Ok(Object::Nil),
+    };
+    session.with_editor_mut(|editor| editor.queue_ui_send(content.clone()));
+    Ok(Object::Nil)
+}
+
+/// Queues raw `nvim_ui_send` content from a Lua binding, keeping the
+/// level-15 no-failure contract.
+fn queue_lua_ui_send(session: &ApiSession, converted: &[Object]) -> mlua::Result<()> {
+    queue_ui_send(session, converted)
+        .map(|_| ())
+        .map_err(|error| mlua::Error::RuntimeError(error.to_string()))
+}
+
 fn method_is_mutating(method: &str) -> bool {
     method.starts_with("nvim_set_")
         || method.starts_with("nvim_buf_set_")
@@ -2119,6 +2487,7 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
         state.borrow_mut().run_exit()?;
         return Ok(state.borrow().exit_code());
     }
+    fire_pending_transitions_for_state(&state);
 
     if !cli.embed {
         let mut decoder = IncrementalDecoder::new();
@@ -2131,15 +2500,28 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
                 state.borrow_mut().stdio_closed();
                 break;
             }
-            let messages = decoder
-                .feed(&bytes[..count])
-                .map_err(|error| AppError::Server(error.to_string()))?;
+            let (messages, decode_error) = match decoder.feed(&bytes[..count]) {
+                Ok(messages) => (messages, None),
+                Err(failure) => (failure.messages, Some(failure.error)),
+            };
             for message in messages {
-                for (channel, bytes) in state.borrow_mut().process_message(CHAN_STDIO, message)? {
+                if state.borrow().should_exit() {
+                    break;
+                }
+                let processed = state.borrow_mut().process_message(CHAN_STDIO, message);
+                let drained = drain_buffer_callbacks_for_state(&state);
+                fire_pending_transitions_for_state(&state);
+
+                for (channel, bytes) in processed? {
                     if channel == CHAN_STDIO.get() {
                         output.write_all(&bytes).map_err(AppError::Io)?;
                     }
                 }
+                drained.map_err(AppError::Server)?;
+            }
+            if let Some(error) = decode_error {
+                output.flush().map_err(AppError::Io)?;
+                return Err(AppError::Server(error.to_string()));
             }
             if state.borrow().should_exit() {
                 break;
@@ -2442,22 +2824,35 @@ fn bind_stdio(
                         break;
                     }
                     Ok(count) => {
-                        let messages = decoder
-                            .feed(&bytes[..count])
-                            .map_err(|error| AppError::Server(error.to_string()))?;
+                        let (messages, decode_error) = match decoder.feed(&bytes[..count]) {
+                            Ok(messages) => (messages, None),
+                            Err(failure) => (failure.messages, Some(failure.error)),
+                        };
                         for message in messages {
                             let state = callback_runtime.borrow().state.clone();
-                            for (channel, bytes) in
-                                state.borrow_mut().process_message(CHAN_STDIO, message)?
-                            {
-                                if channel == CHAN_STDIO.get() {
-                                    output.write_all(&bytes).map_err(AppError::Io)?;
-                                }
-                            }
                             if state.borrow().should_exit() {
                                 uv_loop.stop();
                                 return output.flush().map_err(AppError::Io);
                             }
+                            let processed =
+                                state.borrow_mut().process_message(CHAN_STDIO, message);
+                            let drained = drain_buffer_callbacks_for_state(&state);
+                            fire_pending_transitions_for_state(&state);
+
+                            for (channel, bytes) in processed? {
+                                if channel == CHAN_STDIO.get() {
+                                    output.write_all(&bytes).map_err(AppError::Io)?;
+                                }
+                            }
+                            drained.map_err(AppError::Server)?;
+                            if state.borrow().should_exit() {
+                                uv_loop.stop();
+                                return output.flush().map_err(AppError::Io);
+                            }
+                        }
+                        if let Some(error) = decode_error {
+                            output.flush().map_err(AppError::Io)?;
+                            return Err(AppError::Server(error.to_string()));
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -2634,12 +3029,13 @@ struct ListenServer {
 
 impl ListenServer {
     fn new(runtime: &Rc<RefCell<NetworkRuntime>>) -> Result<Self, AppError> {
+        let listeners = runtime.borrow().listener_registry.clone();
         Ok(Self {
             runtime: Rc::clone(runtime),
             uv: Rc::new(RefCell::new(
                 UvLoop::new().map_err(|error| AppError::Server(error.to_string()))?,
             )),
-            listeners: Rc::new(RefCell::new(Vec::new())),
+            listeners,
             pending: Rc::new(RefCell::new(Vec::new())),
         })
     }
@@ -2668,19 +3064,19 @@ impl ListenServer {
     /// Removes `address` from the registry and closes its handle on the
     /// accept loop (`socket_watcher_close` + swap-remove, `server.c:241-248`).
     fn close_entry(&self, address: &str) {
-        let entry = {
-            let mut listeners = self.listeners.borrow_mut();
-            listeners
-                .iter()
-                .position(|entry| entry.address == address)
-                .map(|index| listeners.remove(index))
+        let listener_id = self
+            .listeners
+            .borrow()
+            .iter()
+            .find(|entry| entry.address == address)
+            .map(|entry| entry.listener.id());
+        let Some(listener_id) = listener_id else {
+            return;
         };
-        if let Some(entry) = entry {
-            let listener_id = entry.listener.id();
-            self.runtime.borrow_mut().listeners.remove(&listener_id);
-            if let Ok(mut uv) = self.uv.try_borrow_mut() {
-                let _ = entry.listener.close(&mut uv);
-            }
+        if let Ok(mut uv) = self.uv.try_borrow_mut() {
+            self.runtime
+                .borrow_mut()
+                .remove_listener(&mut uv, listener_id);
         }
     }
 
@@ -2695,19 +3091,23 @@ impl ListenServer {
 
     /// Closes every listener on the accept loop; process shutdown.
     fn close_all(&self) {
-        let entries = std::mem::take(&mut *self.listeners.borrow_mut());
-        for entry in &entries {
-            self.runtime
-                .borrow_mut()
-                .listeners
-                .remove(&entry.listener.id());
-        }
+        let ids: Vec<_> = self
+            .listeners
+            .borrow()
+            .iter()
+            .map(|entry| entry.listener.id())
+            .collect();
         if let Ok(mut uv) = self.uv.try_borrow_mut() {
-            for entry in entries {
-                let _ = entry.listener.close(&mut uv);
+            for id in ids {
+                self.runtime
+                    .borrow_mut()
+                    .remove_listener(&mut uv, id);
             }
             // Flush deferred closes so bound pipe paths unlink before exit.
             let _ = uv.run(RunMode::NoWait);
+        } else {
+            self.listeners.borrow_mut().clear();
+            self.runtime.borrow_mut().listeners.clear();
         }
     }
 }
@@ -3036,7 +3436,6 @@ struct Peer {
     channel: ChannelId,
     decoder: IncrementalDecoder,
 }
-
 struct NetworkRuntime {
     state: Rc<RefCell<AppState>>,
     /// The accept loop every listening socket and peer stream lives on; the
@@ -3048,6 +3447,9 @@ struct NetworkRuntime {
     /// process the way an unknown transport failure does (see
     /// `handle_network_event`).
     listeners: HashSet<HandleId>,
+    /// Public listener entries share this registry so transport and API
+    /// removal cannot drift apart.
+    listener_registry: Rc<RefCell<Vec<ListenEntry>>>,
     /// Consecutive `poll_background` passes that re-deferred hostless Lua
     /// job events; see [`MAX_HOSTLESS_JOB_EVENT_PASSES`].
     hostless_job_event_passes: usize,
@@ -3065,6 +3467,7 @@ impl NetworkRuntime {
             peers: HashMap::new(),
             streams: HashMap::new(),
             listeners: HashSet::new(),
+            listener_registry: Rc::new(RefCell::new(Vec::new())),
             hostless_job_event_passes: 0,
             error: None,
             shutdown: false,
@@ -3093,8 +3496,19 @@ impl NetworkRuntime {
             uv_loop.stop();
             return Ok(());
         }
-        let session = self.state.borrow().session.clone();
-        let ex = self.state.borrow().ex.clone();
+        let (session, ex, nested_ex, mode, lua_work, typeahead_pending, mut exiting, mut exit_code) = {
+            let state = self.state.borrow();
+            (
+                state.session.clone(),
+                state.ex.clone(),
+                state.nested_ex.clone(),
+                state.mode.clone(),
+                state.lua_work.clone(),
+                state.typeahead_pending(),
+                state.exiting,
+                state.exit_code,
+            )
+        };
         let changed = ex
             .borrow_mut()
             .flush_pty_output(&*session)
@@ -3114,12 +3528,21 @@ impl NetworkRuntime {
         // is served here; the events are already delivered, so only the
         // marker is taken.
         let _ = ex.borrow_mut().take_lua_flush_pending();
-        let worked = self.state.borrow_mut().drain_lua_work();
+        // Run scheduled callbacks without keeping an AppState borrow alive:
+        // callbacks can pump the accept loop and re-enter this state.
+        let worked = drain_lua_work_queue(&lua_work, &session);
         // Timers and job callbacks feed keys outside any RPC turn; upstream
         // services pending typeahead on the same main-loop turn
         // (state.c:100-113), so the tick drives it the same way.
-        let drove = if self.state.borrow().typeahead_pending() {
-            match self.state.borrow_mut().drive_input() {
+        let drove = if typeahead_pending {
+            match drive_input_parts(
+                &session,
+                &ex,
+                &nested_ex,
+                &mode,
+                &mut exiting,
+                &mut exit_code,
+            ) {
                 Ok(()) => true,
                 Err(error) => {
                     report_server_error(&session, error.message());
@@ -3131,7 +3554,16 @@ impl NetworkRuntime {
         };
         // Job `on_exit` and scheduled callbacks above run user code that
         // can record quits; promote them before the exit check stops us.
-        self.state.borrow_mut().absorb_pending_quit();
+        absorb_pending_quit_parts(&ex, &nested_ex, &mut exiting, &mut exit_code);
+        // Setter- or startup-recorded transitions drain on the background
+        // tick the same way key-driven ones do, still with no AppState
+        // borrow held.
+        fire_pending_transitions_for_state(&self.state);
+        if exiting {
+            let mut state = self.state.borrow_mut();
+            state.exiting = true;
+            state.exit_code = exit_code;
+        }
         if self.shutdown || self.state.borrow().should_exit() {
             uv_loop.stop();
             return Ok(());
@@ -3225,24 +3657,53 @@ impl NetworkRuntime {
         Ok(())
     }
 
+    fn remove_listener(&mut self, uv_loop: &mut UvLoop, id: HandleId) {
+        self.listeners.remove(&id);
+        let entry = {
+            let mut listeners = self.listener_registry.borrow_mut();
+            listeners
+                .iter()
+                .position(|entry| entry.listener.id() == id)
+                .map(|index| listeners.remove(index))
+        };
+        if let Some(entry) = entry {
+            let _ = entry.listener.close(uv_loop);
+        }
+    }
+
     fn read(&mut self, uv_loop: &mut UvLoop, id: HandleId, bytes: &[u8]) -> Result<(), String> {
-        let (channel, messages) = {
+        let (channel, messages, decode_error) = {
             let peer = self
                 .peers
                 .get_mut(&id)
                 .ok_or_else(|| "read from unknown RPC peer".to_owned())?;
-            let messages = peer
-                .decoder
-                .feed(bytes)
-                .map_err(|error| error.to_string())?;
-            (peer.channel, messages)
+            let (messages, decode_error) = match peer.decoder.feed(bytes) {
+                Ok(messages) => (messages, None),
+                Err(failure) => (failure.messages, Some(failure.error)),
+            };
+            (peer.channel, messages, decode_error)
         };
         for message in messages {
-            let writes = self
+            if self.state.borrow().should_exit() {
+                uv_loop.stop();
+                self.shutdown = true;
+                break;
+            }
+            let process_result = self
                 .state
                 .borrow_mut()
                 .process_message(channel, message)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string());
+            // Buffer listeners run before the reply is written, so an RPC
+            // mutation cannot appear complete while its on_bytes callbacks
+            // are still queued. A listener failure is parked until after the
+            // writes flush: one buggy on_bytes handler must not starve the
+            // msgid of its answer (compare the decode_error tail below).
+            let drained = drain_buffer_callbacks_for_state(&self.state);
+            // Transition autocmds run user code; this runs with no AppState
+            // borrow held.
+            fire_pending_transitions_for_state(&self.state);
+            let writes = process_result?;
             for (target, bytes) in writes {
                 if target == CHAN_STDIO.get() {
                     // Mirror `poll_background`: a turn that started on a
@@ -3281,9 +3742,19 @@ impl NetworkRuntime {
                     }
                 }
             }
+            // A failing on_bytes listener is reported, not fatal: the peer
+            // must not be dropped for a server-side script error (upstream
+            // reports Lua errors via nvim_error_event and continues).
+            if let Err(error) = drained {
+                let session = self.state.borrow().session.clone();
+                report_server_error(&session, &error);
+            }
         }
-        // Every pulled message finished above; the exit flags land only now
-        // so they never cut the loop while drained messages wait.
+        if let Some(error) = decode_error {
+            return Err(error.to_string());
+        }
+        // A decode failure is reported only after the valid prefix above has
+        // drained; a quit still stops before any later message is dispatched.
         if self.state.borrow().should_exit() {
             uv_loop.stop();
             self.shutdown = true;
@@ -3333,10 +3804,12 @@ fn handle_network_event(
         let mut runtime = runtime.borrow_mut();
         if runtime.peers.contains_key(&id) {
             runtime.remove_peer(uv_loop, id);
-        } else if runtime.listeners.remove(&id) {
+        } else if runtime.listeners.contains(&id) {
             // A listener failure keeps the process alive — upstream never
             // tears the loop down for one watcher (`server.c`); the user
-            // sees why through the message system.
+            // sees why through the message system. Remove the transport and
+            // public registry entry through one path before reporting it.
+            runtime.remove_listener(uv_loop, id);
             let session = runtime.state.borrow().session.clone();
             report_server_error(&session, &format!("listen socket error: {error}"));
         } else {
@@ -4921,6 +5394,29 @@ fn with_scoped_editor_api<T>(
                     )?)?,
                 )?;
                 continue;
+            } else if metadata.name == "nvim_ui_send" {
+                // The frozen handler drops the payload; this binding queues
+                // it for the server's redraw pass and keeps the level-15
+                // result.
+                api.set(
+                    metadata.name,
+                    shim.call::<Function>(scope.create_function_mut(
+                        move |lua, args: Variadic<Value>| {
+                            let mut converted = Vec::with_capacity(args.len());
+                            for value in args.iter() {
+                                match lua_to_object(lua, value) {
+                                    Ok(value) => converted.push(value),
+                                    Err(error) => return scoped_failure_multi(lua, error),
+                                }
+                            }
+                            match queue_ui_send(session, &converted) {
+                                Ok(_) => Ok(MultiValue::new()),
+                                Err(error) => scoped_failure_multi(lua, error),
+                            }
+                        },
+                    )?)?,
+                )?;
+                continue;
             }
             let params = metadata.params;
             api.set(
@@ -4941,7 +5437,14 @@ fn with_scoped_editor_api<T>(
                             }
                             converted.push(Object::Dict(Dict(Vec::new())));
                         }
-                        let result = match dispatch(session, &converted) {
+                        let result = if metadata.name == "nvim_echo" {
+                            // `nvim_echo` brackets the frozen handler so the
+                            // returned message-id reaches the editor sink.
+                            dispatch_echo(session, dispatch, &converted)
+                        } else {
+                            dispatch(session, &converted)
+                        };
+                        let result = match result {
                             Ok(result) => result,
                             Err(error) => return scoped_failure_multi(lua, error),
                         };
@@ -5035,12 +5538,21 @@ fn nvim_cmd_args(params: &[Object]) -> Result<(&Dict, &Dict), ApiError> {
 
 struct LuaScheduler {
     queue: Rc<RefCell<VecDeque<Work>>>,
+    session: Rc<ApiSession>,
 }
 
 impl Scheduler for LuaScheduler {
     fn schedule_deferred(&self, work: Work) -> Result<(), String> {
         self.queue.borrow_mut().push_back(work);
         Ok(())
+    }
+
+    fn defers_to_main_loop(&self) -> bool {
+        true
+    }
+
+    fn pump_scheduled(&self) -> bool {
+        drain_lua_work_queue(&self.queue, &self.session)
     }
 }
 
@@ -6290,6 +6802,48 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the startup fixture and first RPC must succeed"
+    )]
+    fn startup_insert_transition_is_drained_before_first_rpc() {
+        let mut cli = Cli {
+            user_config: UserConfig::None,
+            shada: crate::cli::ShadaConfig::None,
+            loadplugins: false,
+            ..Cli::default()
+        };
+        cli.pre_commands = vec![
+            "let g:insert_events = 0".to_owned(),
+            "autocmd InsertEnter * let g:insert_events += 1".to_owned(),
+            "startinsert".to_owned(),
+        ];
+        let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
+        let before = state
+            .ex
+            .borrow_mut()
+            .evaluate_expression(&*state.session, "g:insert_events")
+            .unwrap();
+        assert_eq!(before, Typval::Number(1));
+        state
+            .process_message(
+                CHAN_STDIO,
+                Message::Request {
+                    msgid: 11,
+                    method: OxStr::from("nvim_get_mode"),
+                    params: Vec::new(),
+                },
+            )
+            .unwrap();
+        let after = state
+            .ex
+            .borrow_mut()
+            .evaluate_expression(&*state.session, "g:insert_events")
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
     #[expect(clippy::unwrap_used, reason = "the fixture must build")]
     fn input_notification_produces_a_redraw_batch() {
         let mut state = message_state();
@@ -6308,6 +6862,537 @@ mod tests {
                 .any(|(channel, bytes)| *channel == 0x4242 && !bytes.is_empty()),
             "the driven input must produce redraw bytes for the attached UI"
         );
+    }
+
+    /// Whether the encoded frame contains `needle` verbatim: msgpack embeds
+    /// string payloads as raw bytes, so containment identifies a delivered
+    /// event without a full decoder in the test.
+    fn frame_contains(frame: &[u8], needle: &str) -> bool {
+        frame
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    }
+
+    /// Fixture with one UI on `0x4242` and a `stdout_tty` UI on `0x4243`:
+    /// delivery must target by option, not by attachment.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the startup fixture and both attaches must succeed"
+    )]
+    fn ui_send_state() -> AppState {
+        let cli = Cli::default();
+        let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
+        let options = |stdout_tty: bool| {
+            Object::Dict(Dict(vec![
+                (OxStr::from("ext_linegrid"), Object::Boolean(true)),
+                (OxStr::from("stdout_tty"), Object::Boolean(stdout_tty)),
+            ]))
+        };
+        for (channel, stdout_tty) in [
+            (ChannelId::new(0x4242), false),
+            (ChannelId::new(0x4243), true),
+        ] {
+            state
+                .dispatch(
+                    channel,
+                    &OxStr::from("nvim_ui_attach"),
+                    &[
+                        Object::Integer(80),
+                        Object::Integer(24),
+                        options(stdout_tty),
+                    ],
+                )
+                .unwrap();
+        }
+        state
+    }
+
+    fn echo_chunks(text: &str) -> Object {
+        Object::Array(vec![Object::Array(vec![Object::String(OxStr::from(text))])])
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture and both dispatches must succeed"
+    )]
+    fn ui_send_payload_reaches_stdout_tty_frames_only() {
+        let mut state = ui_send_state();
+        let tty = ChannelId::new(0x4243);
+        let plain = ChannelId::new(0x4242);
+        let payload = "\x1b]52;c;AAAA";
+        let (result, frames) = state
+            .dispatch(
+                tty,
+                &OxStr::from("nvim_ui_send"),
+                &[
+                    Object::Integer(0),
+                    Object::String(OxStr::from(payload)),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            Object::Nil,
+            "the level-15 contract keeps the call successful"
+        );
+        assert!(
+            frame_contains(&frames[&tty.get()], payload),
+            "the payload must ride the stdout_tty channel's redraw frame"
+        );
+        assert!(
+            !frame_contains(&frames[&plain.get()], payload),
+            "a UI without stdout_tty never receives ui_send"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture and the atomic dispatch must succeed"
+    )]
+    fn ui_send_survives_channel_batch_boundaries_and_call_atomic() {
+        let mut state = ui_send_state();
+        let tty = ChannelId::new(0x4243);
+        let call = |content: &str| {
+            Object::Array(vec![
+                Object::String(OxStr::from("nvim_ui_send")),
+                Object::Array(vec![
+                    Object::Integer(0),
+                    Object::String(OxStr::from(content)),
+                ]),
+            ])
+        };
+        // Two payloads queued in one turn must share one redraw batch, and a
+        // later send must not be lost to the channel's next `begin()`
+        // discarding the open batch.
+        let (_, frames) = state
+            .dispatch(
+                tty,
+                &OxStr::from("nvim_call_atomic"),
+                &[Object::Array(vec![call("first"), call("second")])],
+            )
+            .unwrap();
+        let frame = &frames[&tty.get()];
+        assert!(
+            frame_contains(frame, "first") && frame_contains(frame, "second"),
+            "both queued payloads ride one batch"
+        );
+        let (_, frames) = state
+            .dispatch(
+                tty,
+                &OxStr::from("nvim_ui_send"),
+                &[
+                    Object::Integer(0),
+                    Object::String(OxStr::from("third")),
+                ],
+            )
+            .unwrap();
+        assert!(
+            frame_contains(&frames[&tty.get()], "third"),
+            "a later send survives the next channel transaction"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture and the exec_lua dispatch must succeed"
+    )]
+    fn ui_send_from_lua_reaches_stdout_tty_frames() {
+        // The built-in OSC52 provider calls `vim.api.nvim_ui_send` from Lua;
+        // the binding must queue through the editor sink like the RPC path.
+        let mut state = ui_send_state();
+        let tty = ChannelId::new(0x4243);
+        let (_, frames) = state
+            .dispatch(
+                tty,
+                &OxStr::from("nvim_exec_lua"),
+                &[
+                    Object::String(OxStr::from(
+                        r#"vim.api.nvim_ui_send("\27]52;c;QUJD")"#,
+                    )),
+                    Object::Array(Vec::new()),
+                ],
+            )
+            .unwrap();
+        assert!(
+            frame_contains(&frames[&tty.get()], "QUJD"),
+            "the Lua-origin payload must ride the stdout_tty channel's redraw frame"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the startup fixture must succeed"
+    )]
+    fn ui_send_without_eligible_ui_still_succeeds() {
+        let cli = Cli::default();
+        let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
+        let (result, frames) = state
+            .dispatch(
+                ChannelId::new(0x4244),
+                &OxStr::from("nvim_ui_send"),
+                &[
+                    Object::Integer(0),
+                    Object::String(OxStr::from("\x1b]52;c;AAAA")),
+                ],
+            )
+            .unwrap();
+        assert_eq!(result, Object::Nil);
+        assert!(
+            frames.is_empty(),
+            "no attached UI means nothing is written"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture and the exec_lua dispatch must succeed"
+    )]
+    fn redraw_request_flushes_a_pass_in_the_same_turn() {
+        let mut state = ui_send_state();
+        let tty = ChannelId::new(0x4243);
+        let plain = ChannelId::new(0x4242);
+        // A non-mutating call with nothing pending repaints nothing: the
+        // pass must come from the queued request, not from every dispatch.
+        let (_, idle) = state
+            .dispatch(tty, &OxStr::from("nvim_get_current_buf"), &[])
+            .unwrap();
+        assert!(idle.is_empty(), "an idle dispatch must not redraw");
+        let (_, frames) = state
+            .dispatch(
+                tty,
+                &OxStr::from("nvim_exec_lua"),
+                &[
+                    Object::String(OxStr::from("vim.api.nvim__redraw{flush = true}")),
+                    Object::Array(Vec::new()),
+                ],
+            )
+            .unwrap();
+        assert!(
+            frames.contains_key(&tty.get()) && frames.contains_key(&plain.get()),
+            "the queued request must drive a pass for every attached UI"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture and the exec_lua dispatch must succeed"
+    )]
+    fn redraw_range_request_drives_a_scoped_pass() {
+        let mut state = ui_send_state();
+        let tty = ChannelId::new(0x4243);
+        // A `range` is a redraw-later action: it queues, forces the implicit
+        // flush (vim.c:2544-2546), and the pass delivers the buffered lines
+        // it names in the same turn.
+        let (_, frames) = state
+            .dispatch(
+                tty,
+                &OxStr::from("nvim_exec_lua"),
+                &[
+                    Object::String(OxStr::from(
+                        "vim.api.nvim__redraw{buf = 0, range = {0, -1}}",
+                    )),
+                    Object::Array(Vec::new()),
+                ],
+            )
+            .unwrap();
+        assert!(
+            frames.contains_key(&tty.get()),
+            "the range request must drive a flushed pass for the buffer's UIs"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture and the exec_lua dispatch must succeed"
+    )]
+    fn redraw_valid_false_forces_a_full_retransmit() {
+        let mut state = ui_send_state();
+        let tty = ChannelId::new(0x4243);
+        let exec = |state: &mut AppState, code: &str| {
+            let (_, frames) = state
+                .dispatch(
+                    tty,
+                    &OxStr::from("nvim_exec_lua"),
+                    &[
+                        Object::String(OxStr::from(code)),
+                        Object::Array(Vec::new()),
+                    ],
+                )
+                .unwrap();
+            frames
+        };
+        // The fixture's attach already delivered the initial image, so a
+        // plain flush pass rides the diff and re-sends no grid geometry.
+        let frames = exec(&mut state, "vim.api.nvim__redraw{flush = true}");
+        assert!(
+            !frame_contains(&frames[&tty.get()], "grid_resize"),
+            "an unchanged image must stay on the diff path"
+        );
+        // `valid = false` invalidates: the retained image drops and the
+        // pass retransmits full grids (upstream `UPD_NOT_VALID`).
+        let frames = exec(&mut state, "vim.api.nvim__redraw{valid = false}");
+        assert!(
+            frame_contains(&frames[&tty.get()], "grid_resize"),
+            "invalidation must force a full retransmit"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture and the exec_lua dispatch must succeed"
+    )]
+    fn redraw_cursor_and_widget_requests_reach_the_pass() {
+        let mut state = ui_send_state();
+        let tty = ChannelId::new(0x4243);
+        let exec = |state: &mut AppState, code: &str| {
+            let (_, frames) = state
+                .dispatch(
+                    tty,
+                    &OxStr::from("nvim_exec_lua"),
+                    &[
+                        Object::String(OxStr::from(code)),
+                        Object::Array(Vec::new()),
+                    ],
+                )
+                .unwrap();
+            frames
+        };
+        // `cursor` must push the cursor event in the same turn.
+        let frames = exec(&mut state, "vim.api.nvim__redraw{cursor = true}");
+        assert!(
+            frame_contains(&frames[&tty.get()], "grid_cursor_goto"),
+            "the cursor request must update the on-screen cursor"
+        );
+        // The widget flags count as actions and drive the same-turn pass;
+        // `win = 0` resolves to the current window instead of failing.
+        let frames = exec(
+            &mut state,
+            "vim.api.nvim__redraw{win = 0, tabline = true, statusline = true, statuscolumn = true, winbar = true}",
+        );
+        assert!(
+            frames.contains_key(&tty.get()) && frame_contains(&frames[&tty.get()], "flush"),
+            "widget requests must drive a flushed pass"
+        );
+    }
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture and both dispatches must succeed"
+    )]
+    fn nvim_echo_update_by_id_replaces_instead_of_appending() {
+        let cli = Cli::default();
+        let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
+        let id_opts = || {
+            Object::Dict(Dict(vec![(
+                OxStr::from("id"),
+                Object::String(OxStr::from("my.msg")),
+            )]))
+        };
+        for text in ["first", "second"] {
+            state
+                .dispatch(
+                    CHAN_STDIO,
+                    &OxStr::from("nvim_echo"),
+                    &[
+                        echo_chunks(text),
+                        Object::Boolean(true),
+                        id_opts(),
+                    ],
+                )
+                .unwrap();
+        }
+        state.session.with_editor(|editor| {
+            assert_eq!(
+                editor.messages().len(),
+                1,
+                "a repeated id replaces in place"
+            );
+            assert_eq!(editor.messages()[0].content, echo_chunks("second"));
+            assert_eq!(
+                editor.message_identities()[0].id,
+                Object::String(OxStr::from("my.msg"))
+            );
+        });
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture and the dispatches must succeed"
+    )]
+    fn nvim_echo_progress_reports_stay_one_message() {
+        // The `vim.health` shape: a kind/source/title base, the returned id
+        // fed back on every later call, and changing status per call.
+        let cli = Cli::default();
+        let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
+        let base = || {
+            vec![
+                (OxStr::from("kind"), Object::String(OxStr::from("progress"))),
+                (
+                    OxStr::from("source"),
+                    Object::String(OxStr::from("vim.health")),
+                ),
+                (
+                    OxStr::from("title"),
+                    Object::String(OxStr::from("checkhealth")),
+                ),
+            ]
+        };
+        let (first, _) = state
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_echo"),
+                &[
+                    echo_chunks("checking a"),
+                    Object::Boolean(false),
+                    Object::Dict(Dict(base())),
+                ],
+            )
+            .unwrap();
+        let Object::Integer(id) = first else {
+            panic!("nvim_echo returns an integer message-id");
+        };
+        for text in ["checking b", "checking c", "checks done"] {
+            let mut opts = base();
+            opts.push((OxStr::from("id"), Object::Integer(id)));
+            opts.push((
+                OxStr::from("status"),
+                Object::String(OxStr::from("running")),
+            ));
+            state
+                .dispatch(
+                    CHAN_STDIO,
+                    &OxStr::from("nvim_echo"),
+                    &[
+                        echo_chunks(text),
+                        Object::Boolean(false),
+                        Object::Dict(Dict(opts)),
+                    ],
+                )
+                .unwrap();
+        }
+        state.session.with_editor(|editor| {
+            assert_eq!(
+                editor.messages().len(),
+                1,
+                "progress updates must not stack"
+            );
+            assert_eq!(
+                editor.message_identities()[0].kind.as_bytes(),
+                b"progress"
+            );
+            assert_eq!(editor.message_identities()[0].id, Object::Integer(id));
+        });
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture and the dispatches must succeed"
+    )]
+    fn nvim_echo_progress_reaches_chrome_with_replace_key() {
+        let mut state = message_state();
+        let base = || {
+            vec![
+                (OxStr::from("kind"), Object::String(OxStr::from("progress"))),
+                (
+                    OxStr::from("source"),
+                    Object::String(OxStr::from("vim.health")),
+                ),
+                (
+                    OxStr::from("title"),
+                    Object::String(OxStr::from("checkhealth")),
+                ),
+            ]
+        };
+        let (first, _) = state
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_echo"),
+                &[
+                    echo_chunks("checking a"),
+                    Object::Boolean(false),
+                    Object::Dict(Dict(base())),
+                ],
+            )
+            .unwrap();
+        let Object::Integer(id) = first else {
+            panic!("nvim_echo returns an integer message-id");
+        };
+        let mut opts = base();
+        opts.push((OxStr::from("id"), Object::Integer(id)));
+        opts.push((
+            OxStr::from("status"),
+            Object::String(OxStr::from("success")),
+        ));
+        state
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_echo"),
+                &[
+                    echo_chunks("checks done"),
+                    Object::Boolean(false),
+                    Object::Dict(Dict(opts)),
+                ],
+            )
+            .unwrap();
+        state.session.with_render_state(|_, _, chrome| {
+            let message = chrome.message.as_ref().expect("progress reaches the chrome");
+            assert_eq!(message.kind.as_bytes(), b"progress");
+            assert_eq!(message.id, Object::Integer(id));
+        });
+    }
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture, autocmd setup, and input turn must succeed"
+    )]
+    fn input_notification_fires_each_insert_lifecycle_transition() {
+        let mut state = message_state();
+        state
+            .ex
+            .borrow_mut()
+            .execute_script(
+                &*state.session,
+                "<test>",
+                r#"
+                let g:insert_events = ''
+                augroup oxvim_insert_lifecycle
+                  autocmd!
+                  autocmd InsertEnter * let g:insert_events .= 'enter,'
+                  autocmd InsertLeavePre * let g:insert_events .= 'pre,'
+                  autocmd InsertLeave * let g:insert_events .= 'leave,'
+                augroup END
+                "#,
+            )
+            .unwrap();
+        state
+            .process_message(
+                CHAN_STDIO,
+                Message::Notification {
+                    method: OxStr::from("nvim_input"),
+                    params: vec![Object::String(OxStr::from("i\u{1b}"))],
+                },
+            )
+            .unwrap();
+        // The dispatch boundary drain does not run for a direct
+        // `process_message` call; fire the queued transitions like every
+        // production caller does after the borrow drops.
+        state.fire_pending_transitions();
+        let events = state
+            .ex
+            .borrow_mut()
+            .evaluate_expression(&*state.session, "g:insert_events")
+            .unwrap();
+        assert_eq!(events, Typval::String(OxStr::from("enter,pre,leave,")));
     }
 
     // An errored `nvim_command` that already queued `feedkeys` must still

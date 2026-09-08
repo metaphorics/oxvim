@@ -9,7 +9,10 @@ pub fn metadata() -> Result<Object, RegistryError> {
 
 /// Encode API metadata as exactly one `MessagePack` value.
 pub fn encoded() -> Result<Vec<u8>, RegistryError> {
-    metadata().map(|object| ox_rpc::encode(&object))
+    let object = metadata()?;
+    let mut encoded = Vec::new();
+    ox_rpc::encode(&mut encoded, &object).map_err(|_| RegistryError::MetadataEncode)?;
+    Ok(encoded)
 }
 
 #[cfg(test)]
