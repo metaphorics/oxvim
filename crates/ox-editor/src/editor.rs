@@ -1534,6 +1534,13 @@ impl Editor {
         // (`window.c:5275-5279`, `buffer.c:1743-1750`).
         self.sync_buffer_undo(old_buffer);
         if let Some(state) = self.buffers.get_mut(&buffer) {
+            // Entering loads an unloaded buffer (`buf_ensure_loaded` on every
+            // `win_enter` path). Without file IO the port materializes empty
+            // text, the same policy `nvim_buf_set_lines` already applies;
+            // loading from disk stays queued behind IO plumbing.
+            if !state.residency.is_loaded() {
+                state.load(Buffer::new());
+            }
             state.attach()?;
         }
         let tab = self
