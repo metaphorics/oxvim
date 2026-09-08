@@ -180,6 +180,24 @@ impl LoopAccess {
         }
     }
 
+    /// Reads loop state through the callback-scoped pointer when one exists.
+    /// Outside callbacks, a failed borrow is reported instead of being
+    /// converted into a fabricated status value.
+    pub(crate) fn with_loop_ref<R>(
+        &self,
+        operation: impl FnOnce(&UvLoop) -> R,
+    ) -> mlua::Result<R> {
+        if let Some(active_loop) = self.active_loop.get() {
+            // SAFETY: `active_loop` is installed only for the synchronous
+            // lifetime of the `&mut UvLoop` supplied to `callback`.
+            return Ok(operation(unsafe { active_loop.as_ref() }));
+        }
+        let uv_loop = self.uv_loop.try_borrow().map_err(|_| {
+            mlua::Error::runtime("vim.uv handle status is unavailable during callback")
+        })?;
+        Ok(operation(&uv_loop))
+    }
+
     pub(crate) fn callback<R>(&self, uv_loop: &mut UvLoop, callback: impl FnOnce() -> R) -> R {
         let prior_callback = self.in_callback.replace(true);
         let prior_loop = self.active_loop.replace(Some(NonNull::from(&mut *uv_loop)));
@@ -552,17 +570,12 @@ impl UserData for LuaTcp {
             Ok(true)
         });
         methods.add_method("is_closing", |_, this, ()| {
-            Ok(this
-                .context
-                .access
-                .uv_loop
-                .try_borrow()
-                .map_or(this.closing.get(), |uv_loop| {
-                    this.inner
-                        .borrow()
-                        .as_ref()
-                        .is_none_or(|tcp| tcp.is_closing(&uv_loop))
-                }))
+            this.context.access.with_loop_ref(|uv_loop| {
+                this.inner
+                    .borrow()
+                    .as_ref()
+                    .is_none_or(|tcp| tcp.is_closing(uv_loop))
+            })
         });
         methods.add_method("close", |_, this, callback: Option<Function>| {
             if this.closing.replace(true) {
@@ -1104,8 +1117,9 @@ impl UserData for LuaPhase {
             let fast = this.fast.clone();
             access.apply(Box::new(move |uv_loop| {
                 let _ = handle.start(uv_loop, move |loop_| {
-                    event_access
-                        .callback(loop_, || invoke(&lua, &fast, &callback, MultiValue::new()));
+                    event_access.callback(loop_, || {
+                        invoke(&lua, &fast, &callback, MultiValue::new());
+                    });
                     Ok(())
                 });
             }));
@@ -1119,18 +1133,12 @@ impl UserData for LuaPhase {
             Ok(true)
         });
         methods.add_method("is_active", |_, this, ()| {
-            Ok(this
-                .access
-                .uv_loop
-                .try_borrow()
-                .map_or(false, |uv_loop| this.handle.active(&uv_loop)))
+            this.access
+                .with_loop_ref(|uv_loop| this.handle.active(uv_loop))
         });
         methods.add_method("is_closing", |_, this, ()| {
-            Ok(this
-                .access
-                .uv_loop
-                .try_borrow()
-                .map_or(false, |uv_loop| this.handle.closing(&uv_loop)))
+            this.access
+                .with_loop_ref(|uv_loop| this.handle.closing(uv_loop))
         });
         methods.add_method("close", |_, this, ()| {
             let handle = this.handle;
@@ -1234,11 +1242,8 @@ impl UserData for LuaSignal {
         );
         methods.add_method("stop", |_, this, ()| Ok(this.stop()));
         methods.add_method("is_closing", |_, this, ()| {
-            Ok(this
-                .access
-                .uv_loop
-                .try_borrow()
-                .map_or(false, |uv_loop| this.handle.is_closing(&uv_loop)))
+            this.access
+                .with_loop_ref(|uv_loop| this.handle.is_closing(uv_loop))
         });
         methods.add_method("close", |_, this, ()| {
             let handle = this.handle;
@@ -1445,12 +1450,6 @@ impl UserData for LuaFsEvent {
         methods.add_method("stop", |_, this, ()| Ok(this.stop_watching()));
         methods.add_method("is_closing", |_, this, ()| {
             Ok(this.phase.get() == FsEventPhase::Closed)
-        });
-        methods.add_method("is_ready", |_, this, ()| {
-            let ready = this.state.try_borrow().ok().is_some_and(|state| {
-                state.as_ref().is_some_and(FsEvent::is_ready)
-            });
-            Ok(ready)
         });
         methods.add_method("close", |_, this, ()| {
             this.close_handle();
@@ -2564,13 +2563,6 @@ mod fs_event_lifecycle_tests {
                   delivered = true
                   handle:close()
                 end) == 0)
-                -- Handshake on the baseline snapshot: without it the creation
-                -- can land inside the initial scan and go unreported.
-                local deadline = vim.uv.now() + 5000
-                while not handle:is_ready() and vim.uv.now() < deadline do
-                  vim.uv.run('nowait')
-                end
-                assert(handle:is_ready(), 'watcher never became ready')
                 ",
             )
             .exec()

@@ -203,6 +203,45 @@ fn signal_binding_supports_luv_module_and_method_forms() {
 
 #[cfg(unix)]
 #[test]
+fn signal_status_reads_live_loop_inside_callback() {
+    let (host, _) = host();
+    host.lua()
+        .load(
+            r"
+            local signal = assert(vim.uv.new_signal())
+            signal_callback_ran = false
+            signal_closing = true
+            assert(signal:start_oneshot('sigusr1', function(signame)
+              assert(signame == 'sigusr1')
+              signal_callback_ran = true
+              signal_closing = signal:is_closing()
+              signal:close()
+            end) == 0)
+            ",
+        )
+        .exec()
+        .unwrap();
+    let raiser = std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        signal_hook::low_level::raise(signal_hook::consts::SIGUSR1)
+            .expect("raise SIGUSR1 for the callback");
+    });
+    host.lua().load("vim.uv.run('default')").exec().unwrap();
+    raiser.join().expect("signal raiser must finish");
+    assert!(
+        host.lua()
+            .globals()
+            .get::<bool>("signal_callback_ran")
+            .unwrap()
+    );
+    assert!(
+        !host.lua().globals().get::<bool>("signal_closing").unwrap(),
+        "signal callback must see its open handle"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn fs_event_binding_lifecycle_reports_enoent_and_closes() {
     let (host, _) = host();
     let dir = std::env::temp_dir()
@@ -267,6 +306,30 @@ fn phase_handles_support_between_case_cleanup() {
               assert(handle:is_closing())
             end
             vim.wait(0)
+            ",
+        )
+        .exec()
+        .unwrap();
+}
+
+#[test]
+fn phase_status_reads_live_loop_inside_callback() {
+    let (host, _) = host();
+    host.lua()
+        .load(
+            r"
+            local phase = assert(vim.uv.new_idle())
+            phase_active = false
+            phase_closing = true
+            assert(phase:start(function()
+              phase_active = phase:is_active()
+              phase_closing = phase:is_closing()
+              phase:stop()
+              phase:close()
+            end))
+            vim.uv.run('nowait')
+            assert(phase_active, 'phase callback must see its active handle')
+            assert(not phase_closing, 'phase callback must see its open handle')
             ",
         )
         .exec()
@@ -466,11 +529,13 @@ fn tcp_loopback_accepts_reads_and_writes() {
             local address = assert(server:getsockname())
             assert(server:listen(16, function(err)
               assert(err == nil)
+              assert(not server:is_closing(), 'listen callback must see its open handle')
               local peer = vim.uv.new_tcp()
               assert(server:accept(peer))
               peer:read_start(function(read_err, chunk)
                 assert(read_err == nil)
                 if chunk then
+                  assert(not peer:is_closing(), 'read callback must see its open handle')
                   peer:write(chunk)
                 else
                   peer:close()
@@ -481,6 +546,7 @@ fn tcp_loopback_accepts_reads_and_writes() {
             local client = vim.uv.new_tcp()
             client:connect('127.0.0.1', address.port, function(err)
               assert(err == nil)
+              assert(not client:is_closing(), 'connect callback must see its open handle')
               client:read_start(function(read_err, chunk)
                 assert(read_err == nil)
                 if chunk then
