@@ -395,6 +395,15 @@ pub(crate) fn build_embedded_core(
     // exit events exactly once.
     nested_ex.borrow_mut().share_quit_bus_from(&ex.borrow());
     nested_ex.borrow_mut().share_session_from(&ex.borrow());
+    // This executor is never checked out by a frame. Autocmd actions can
+    // therefore fork from it while an outer `:lua` holds `ex` and its
+    // `vim.cmd` dispatch holds `nested_ex`; using either pool member as the
+    // source would fail precisely at that reentry depth.
+    let fork_seed = Rc::new(RefCell::new({
+        let mut seed = ExExecutor::new();
+        seed_executor_from(&mut seed, &ex.borrow(), &channel_ids);
+        seed
+    }));
     let mut lua = LuaHost::new(
         LuaRuntimeRoot::new(runtime_root().unwrap_or_default()),
         Rc::new(EditorBuiltins {
@@ -542,6 +551,7 @@ pub(crate) fn build_embedded_core(
             session: session.clone(),
             ex: ex.clone(),
             nested_ex: nested_ex.clone(),
+            fork_seed: fork_seed.clone(),
             lua: lua.lua().clone(),
             registry: registry.clone(),
             channel_ids: channel_ids.clone(),
@@ -551,6 +561,7 @@ pub(crate) fn build_embedded_core(
             session: session.clone(),
             ex: ex.clone(),
             nested_ex: nested_ex.clone(),
+            fork_seed: fork_seed.clone(),
             lua: lua.lua().clone(),
             registry: registry.clone(),
             channel_ids: channel_ids.clone(),
@@ -4246,6 +4257,19 @@ fn lua_exec_error_text(error: LuaExecError) -> String {
 
 type ExExecutorPair = (Rc<RefCell<ExExecutor>>, Rc<RefCell<ExExecutor>>);
 
+/// Wires one executor to the session-shared state of `source`: durable user
+/// definitions, the quit bus, and the swap ledger are shared live, runtime
+/// search roots are copied. Every fork of a session executor must seed
+/// exactly this way or it silently diverges from the session.
+fn seed_executor_from(executor: &mut ExExecutor, source: &ExExecutor, channel_ids: &ChannelIds) {
+    executor.share_user_commands_from(source);
+    executor.share_user_functions_from(source);
+    executor.share_runtime_roots_from(source);
+    executor.share_quit_bus_from(source);
+    executor.share_session_from(source);
+    executor.set_channel_ids(channel_ids.clone());
+}
+
 fn fresh_executors(
     lua: &Lua,
     registry: &Rc<Registry>,
@@ -4258,19 +4282,9 @@ fn fresh_executors(
     let mut nested = ExExecutor::new();
     {
         let source = source.try_borrow().ok()?;
-        primary.share_user_commands_from(&source);
-        nested.share_user_commands_from(&source);
-        primary.share_user_functions_from(&source);
-        nested.share_user_functions_from(&source);
-        primary.share_runtime_roots_from(&source);
-        primary.share_quit_bus_from(&source);
-        nested.share_quit_bus_from(&source);
-        primary.share_session_from(&source);
-        nested.share_session_from(&source);
-        nested.share_runtime_roots_from(&source);
+        seed_executor_from(&mut primary, &source, channel_ids);
+        seed_executor_from(&mut nested, &source, channel_ids);
     }
-    primary.set_channel_ids(channel_ids.clone());
-    nested.set_channel_ids(channel_ids.clone());
     let primary = Rc::new(RefCell::new(primary));
     let nested = Rc::new(RefCell::new(nested));
     let callback_host = || {
@@ -4448,6 +4462,11 @@ struct ServerAutocmdHost {
     session: Rc<ApiSession>,
     ex: Rc<RefCell<ExExecutor>>,
     nested_ex: Rc<RefCell<ExExecutor>>,
+    /// An executor no frame ever executes on, so a fresh pair can be minted
+    /// while both pool members are mid-dispatch — an outer `:lua` holds `ex`
+    /// while the `vim.cmd` dispatching this action holds `nested_ex`, which
+    /// is exactly when the action needs the fork.
+    fork_seed: Rc<RefCell<ExExecutor>>,
     lua: Lua,
     registry: Rc<Registry>,
     channel_ids: ChannelIds,
@@ -4465,22 +4484,17 @@ impl ServerAutocmdHost {
                 .map(|_| AutocmdExecution::Keep)
                 .map_err(|error| format_autocmd_exec_error(action, &error));
         }
-        // The primary executor is busy: fork from the free nested one
-        // instead of holding it. User code that calls back into
-        // `vim.fn`/`vim.cmd` then finds `nested_ex` still free, so a
-        // `:write` with a BufWritePre action running Lua no longer fails
-        // with "no free Ex executor". The fork inherits the session's
-        // shared definitions, quit bus, and swap ledger, and carries a
-        // fresh scope like every other deep-reentry fork. Past depth 3
-        // (both executors borrowed) the error below still applies.
-        let Some((forked, _)) = fresh_executors(
-            &self.lua,
-            &self.registry,
-            &self.session,
-            &self.nested_ex,
-            &self.channel_ids,
-            &self.event_loop,
-        ) else {
+        // The primary executor is busy: fork instead of holding
+        // `nested_ex`, so user code in the action that calls back into
+        // `vim.fn`/`vim.cmd` still finds an executor free (a `:write` with
+        // a BufWritePre action running Lua no longer fails with "no free
+        // Ex executor"). The fork seeds from the never-executed seed, not
+        // a pool member: the dispatching `vim.cmd` holds `nested_ex` at
+        // exactly the depth where the fork is needed, so a pool-member
+        // source failed there. The fork inherits the session's shared
+        // definitions, quit bus, and swap ledger, and carries a fresh
+        // scope like every other deep-reentry fork.
+        let Some((forked, _)) = self.fresh_pair() else {
             return Err("no free Ex executor for an autocmd action".into());
         };
         let Ok(mut guard) = forked.try_borrow_mut() else {
@@ -4489,6 +4503,32 @@ impl ServerAutocmdHost {
         execute(&mut guard)
             .map(|_| AutocmdExecution::Keep)
             .map_err(|error| format_autocmd_exec_error(action, &error))
+    }
+    /// Mints a fresh executor pair from the never-executed seed, refreshing
+    /// its runtime search roots from the live 'runtimepath' the way
+    /// `sync_runtime_roots` keeps searches glued to `p_rtp`; an unset or
+    /// empty value keeps the seed's startup roots so embedders that inject
+    /// roots without seeding the option keep working. The seed is never
+    /// borrowed by a running frame, so this succeeds at any reentry depth.
+    fn fresh_pair(&self) -> Option<ExExecutorPair> {
+        if let Ok(OptionValue::String(rtp)) = self
+            .session
+            .with_editor(|editor| editor.options().get_global("runtimepath").cloned())
+            && !rtp.is_empty()
+        {
+            self.fork_seed
+                .borrow_mut()
+                .scripts_mut()
+                .set_runtime_roots_from_rtp(&rtp);
+        }
+        fresh_executors(
+            &self.lua,
+            &self.registry,
+            &self.session,
+            &self.fork_seed,
+            &self.channel_ids,
+            &self.event_loop,
+        )
     }
 }
 
@@ -4551,18 +4591,12 @@ impl AutocmdExecutor for ServerAutocmdHost {
     }
 
     fn fork(&self) -> Option<Box<dyn AutocmdExecutor>> {
-        let (ex, nested_ex) = fresh_executors(
-            &self.lua,
-            &self.registry,
-            &self.session,
-            &self.ex,
-            &self.channel_ids,
-            &self.event_loop,
-        )?;
+        let (ex, nested_ex) = self.fresh_pair()?;
         Some(Box::new(Self {
             session: self.session.clone(),
             ex,
             nested_ex,
+            fork_seed: self.fork_seed.clone(),
             lua: self.lua.clone(),
             registry: self.registry.clone(),
             channel_ids: self.channel_ids.clone(),
@@ -5953,6 +5987,54 @@ mod tests {
                 .unwrap();
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the test requires editor and Lua dispatch setup to succeed"
+    )]
+    fn nested_autocmd_fires_with_both_pool_executors_busy() {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let core = build_embedded_core(editor, true).unwrap();
+        let (_, dispatch) = core.registry.get("nvim_exec_lua").unwrap();
+        dispatch(
+            &core.session,
+            &[
+                Object::String(OxStr::from(
+                    r#"
+                    vim.cmd "autocmd User OxDeepA lua vim.api.nvim_exec_autocmds('User', {pattern = 'OxDeepB'})"
+                    vim.cmd "autocmd User OxDeepB let g:ox_deep_depth = 3"
+                    "#,
+                )),
+                Object::Array(Vec::new()),
+            ],
+        )
+        .unwrap();
+        // The dispatch loop runs Ex on the primary executor with its borrow
+        // held for the whole command (execute_ex), so this `:lua` keeps `ex`
+        // busy while `vim.cmd` holds `nested_ex` for its inner `:lua`.
+        // That inner Lua calls nvim_exec_autocmds for A, entering
+        // ServerAutocmdHost with both pool members busy. A's ExString runs
+        // on the fresh fork; its nested B action grows the host pool and
+        // records the result at three levels end to end.
+        core.ex
+            .borrow_mut()
+            .execute_line(
+                &*core.session,
+                "lua vim.cmd([[lua vim.api.nvim_exec_autocmds('User', {pattern = 'OxDeepA'})]])",
+            )
+            .unwrap();
+        let (_, get_var) = core.registry.get("nvim_get_var").unwrap();
+        let depth = get_var(
+            &core.session,
+            &[Object::String(OxStr::from("ox_deep_depth"))],
+        )
+        .unwrap();
+        assert_eq!(depth, Object::Integer(3));
     }
     #[cfg(unix)]
     #[test]
