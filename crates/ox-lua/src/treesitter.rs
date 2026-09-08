@@ -826,6 +826,30 @@ impl UserData for NodeHandle {
     }
 }
 
+/// Appends one property raw predicate (`{op, [capture,] key, [value]}`) to
+/// an `inspect()` predicate list, mirroring the C predicate steps.
+fn push_property_predicate(
+    lua: &Lua,
+    predicates: &Table,
+    slot: usize,
+    operator: &str,
+    property: &tree_sitter::QueryProperty,
+) -> mlua::Result<()> {
+    let values = lua.create_table()?;
+    values.raw_set(1, operator)?;
+    let mut next = 2;
+    if let Some(capture) = property.capture_id {
+        values.raw_set(next, capture + 1)?;
+        next += 1;
+    }
+    values.raw_set(next, property.key.as_ref())?;
+    if let Some(value) = property.value.as_deref() {
+        values.raw_set(next + 1, value)?;
+    }
+    predicates.raw_set(slot, values)?;
+    Ok(())
+}
+
 impl UserData for QueryHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(MetaMethod::ToString, |_, _, ()| Ok("<query>"));
@@ -860,9 +884,8 @@ impl UserData for QueryHandle {
                 let patterns = lua.create_table()?;
                 for index in 0..this.query.pattern_count() {
                     let predicates = lua.create_table()?;
-                    for (pred_index, predicate) in
-                        this.query.general_predicates(index).iter().enumerate()
-                    {
+                    let mut slot = 1;
+                    for predicate in this.query.general_predicates(index) {
                         let values = lua.create_table()?;
                         values.raw_set(1, predicate.operator.as_ref())?;
                         for (arg_index, arg) in predicate.args.iter().enumerate() {
@@ -878,7 +901,22 @@ impl UserData for QueryHandle {
                                 }
                             }
                         }
-                        predicates.raw_set(pred_index + 1, values)?;
+                        predicates.raw_set(slot, values)?;
+                        slot += 1;
+                    }
+                    // The binding classifies `set!`/`is?` away from general
+                    // predicates, but Lua pattern processing needs their raw
+                    // operator form (upstream `query_inspect` reports raw
+                    // steps, treesitter.c:1722-1750). Without these the
+                    // injection directives never materialize.
+                    for property in this.query.property_settings(index) {
+                        push_property_predicate(lua, &predicates, slot, "set!", property)?;
+                        slot += 1;
+                    }
+                    for (property, positive) in this.query.property_predicates(index) {
+                        let operator = if *positive { "is?" } else { "is-not?" };
+                        push_property_predicate(lua, &predicates, slot, operator, property)?;
+                        slot += 1;
                     }
                     patterns.raw_set(index + 1, predicates)?;
                 }
