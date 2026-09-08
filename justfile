@@ -23,22 +23,32 @@ _parser_fixtures:
     #!/usr/bin/env bash
     set -euo pipefail
     root="{{justfile_directory()}}"
-    src="${root}/.references/neovim/build/lib/nvim/parser"
     out="${root}/runtime/parser"
     mkdir -p "${out}"
     shopt -s nullglob
-    have=0
+    # The reference checkout may install parsers under the build tree or the
+    # .deps prefix; the tree-sitter tests accept both, so use the first
+    # directory that actually contains parser libraries.
+    src=""
+    for candidate in \
+      "${root}/.references/neovim/build/lib/nvim/parser" \
+      "${root}/.references/neovim/.deps/usr/lib/nvim/parser"; do
+      libs=("${candidate}"/*.so)
+      if ((${#libs[@]} > 0)); then
+        src="${candidate}"
+        break
+      fi
+    done
+    if [[ -z "${src}" ]]; then
+      echo "no parser .so files under ${root}/.references/neovim (build the reference checkout first)" >&2
+      exit 1
+    fi
     for lib in "${src}"/*.so; do
-      have=1
       base="$(basename "${lib}")"
       if [[ ! -f "${out}/${base}" || "${lib}" -nt "${out}/${base}" ]]; then
         cp "${lib}" "${out}/${base}"
       fi
     done
-    if [[ "${have}" -eq 0 ]]; then
-      echo "no parser .so files in ${src} (build the reference checkout first)" >&2
-      exit 1
-    fi
 
 # Build the upstream helper programs beside oxvim. testprg() resolves helpers
 # relative to NVIM_PRG, not the Neovim reference build directory.
