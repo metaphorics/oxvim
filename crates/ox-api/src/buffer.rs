@@ -1287,14 +1287,30 @@ pub fn nvim_buf_attach(
         if !state.residency.is_loaded() {
             return Ok(false);
         }
-        state.subscriptions_mut().insert(
-            API_CHANNEL_ID,
-            BufferAttachSubscription {
-                channel_id: API_CHANNEL_ID,
-                send_buffer,
-                options,
-            },
-        );
+        match session.requesting_channel() {
+            Some(channel) => {
+                // RPC subscriptions are keyed by their channel id, so a
+                // channel can attach at most once per buffer.
+                let subscription_id = u128::from(channel.get());
+                let subscription = BufferAttachSubscription {
+                    channel_id: channel.get(),
+                    send_buffer,
+                    options,
+                };
+                state.subscriptions_mut().insert(subscription_id, subscription);
+            }
+            None => {
+                // In-process Lua calls get a distinct id per attach so
+                // multiple plugins on the same buffer do not overwrite each
+                // other. Detachment is by a truthy callback return.
+                let subscription = BufferAttachSubscription {
+                    channel_id: API_CHANNEL_ID,
+                    send_buffer,
+                    options,
+                };
+                state.attach_lua(subscription);
+            }
+        }
         Ok(true)
     })
 }
@@ -1309,7 +1325,16 @@ pub fn nvim_buf_detach(session: &ApiSession, buffer: BufHandle) -> Result<bool, 
         if !state.residency.is_loaded() {
             return Ok(false);
         }
-        state.subscriptions_mut().remove(&API_CHANNEL_ID);
+        match session.requesting_channel() {
+            Some(channel) => {
+                state.remove_subscriptions_by_channel(channel.get());
+            }
+            None => {
+                // In-process Lua calls are not tied to an RPC channel;
+                // detach every Lua callback for this buffer.
+                state.remove_subscriptions_by_channel(API_CHANNEL_ID);
+            }
+        }
         Ok(true)
     })
 }

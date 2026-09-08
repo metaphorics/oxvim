@@ -41,8 +41,10 @@ pub struct BufferAttachSubscription {
 /// buffer-text coordinates: the old span addresses the pre-edit text,
 /// the new span the post-edit text, and both share the same start. The
 /// tick is the script-visible changedtick the callback observes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BufferBytesEvent {
+    /// Subscription identities present when this mutation committed.
+    pub subscribers: Vec<u128>,
     /// Script-visible changedtick after the mutation.
     pub tick: u64,
     /// Zero-based start row.
@@ -247,11 +249,10 @@ pub struct BufferState {
     /// Bumped by every variable writer; the differential Ex-variable sync
     /// skips re-reading an unchanged map.
     variables_version: u64,
-    /// Attached RPC channels keyed by channel identity.
-    subscriptions: BTreeMap<u64, BufferAttachSubscription>,
-    /// Committed mutations awaiting `on_bytes` delivery, in commit order.
-    /// The drain lives outside this crate (Lua owns the callbacks), so the
-    /// queue only grows here and is taken whole by `take_bytes_events`.
+    /// RPC subscriptions use channel keys; Lua keys occupy the wider namespace.
+    subscriptions: BTreeMap<u128, BufferAttachSubscription>,
+    next_lua_subscription: u128,
+    /// Committed mutations and their original recipients, in commit order.
     pending_bytes: Vec<BufferBytesEvent>,
     /// Branch-preserving undo history.
     pub undo: UndoTree,
@@ -332,6 +333,7 @@ impl BufferState {
             locked_vars: Vec::new(),
             variables_version: 1,
             subscriptions: BTreeMap::new(),
+            next_lua_subscription: u128::from(u64::MAX) + 1,
             pending_bytes: Vec::new(),
             undo: UndoTree::new(),
             marks: LocalMarks::new(),
@@ -438,7 +440,7 @@ impl BufferState {
 
     /// Returns requested buffer event subscriptions.
     #[must_use]
-    pub const fn subscriptions(&self) -> &BTreeMap<u64, BufferAttachSubscription> {
+    pub const fn subscriptions(&self) -> &BTreeMap<u128, BufferAttachSubscription> {
         &self.subscriptions
     }
 
@@ -449,8 +451,48 @@ impl BufferState {
         std::mem::take(&mut self.pending_bytes)
     }
 
+    /// Adds a distinct Lua attachment without sharing RPC channel identities.
+    /// Returns the unique subscription id assigned to this attachment.
+    pub fn attach_lua(&mut self, subscription: BufferAttachSubscription) -> u128 {
+        let id = self.next_lua_subscription;
+        self.next_lua_subscription += 1;
+        self.subscriptions.insert(id, subscription);
+        id
+    }
+    /// Removes one attachment and its pending deliveries.
+    pub fn remove_subscription(&mut self, id: u128) {
+        self.subscriptions.remove(&id);
+        for event in &mut self.pending_bytes {
+            event.subscribers.retain(|recipient| *recipient != id);
+        }
+        self.pending_bytes
+            .retain(|event| !event.subscribers.is_empty());
+    }
+
+    /// Removes every attachment owned by `channel_id` and its pending
+    /// deliveries. Used by `nvim_buf_detach` for both RPC channels and
+    /// in-process Lua calls.
+    pub fn remove_subscriptions_by_channel(&mut self, channel_id: u64) {
+        let removed: Vec<u128> = self
+            .subscriptions
+            .iter()
+            .filter_map(|(id, sub)| (sub.channel_id == channel_id).then_some(*id))
+            .collect();
+        if removed.is_empty() {
+            return;
+        }
+        for id in &removed {
+            self.subscriptions.remove(id);
+        }
+        for event in &mut self.pending_bytes {
+            event.subscribers.retain(|id| !removed.contains(id));
+        }
+        self.pending_bytes
+            .retain(|event| !event.subscribers.is_empty());
+    }
+
     /// Returns mutable requested buffer event subscriptions.
-    pub const fn subscriptions_mut(&mut self) -> &mut BTreeMap<u64, BufferAttachSubscription> {
+    pub const fn subscriptions_mut(&mut self) -> &mut BTreeMap<u128, BufferAttachSubscription> {
         &mut self.subscriptions
     }
 
@@ -970,7 +1012,22 @@ impl BufferState {
             } else {
                 (&edit.before, &edit.after)
             };
+            let start_row = edit.start.saturating_sub(1);
+            let event = BufferBytesEvent {
+                subscribers: self.subscriptions.keys().copied().collect(),
+                tick: self.script_changedtick(),
+                start_row,
+                start_col: 0,
+                start_byte: self.text.byte_of_line(edit.start)?,
+                old_row: remove.len(),
+                old_col: 0,
+                old_byte: remove.iter().map(|line| line.len() + 1).sum(),
+                new_row: apply.len(),
+                new_col: 0,
+                new_byte: apply.iter().map(|line| line.len() + 1).sum(),
+            };
             self.replay_text(edit.start, remove, apply)?;
+            self.pending_bytes.push(event);
             self.marks.splice(edit.start, remove.len(), apply.len());
             let recorded = self
                 .extmark_undo
@@ -1076,6 +1133,7 @@ impl BufferState {
         self.saved_has_eol = self.text.has_eol();
         self.saved_undo_state = (0, 0);
         self.subscriptions.clear();
+        self.pending_bytes.clear();
     }
 
     /// Writes a prepared splice's lines into the resident text.
@@ -1134,10 +1192,11 @@ impl BufferState {
         let new_end = extent_end(start, edit.splice.new_extent);
         // One-based line of the change start in either text generation:
         // lines before it are untouched by this edit.
-        let start_byte = self.text.byte_of_line(start.row + 1)?;
+        let start_byte = self.text.byte_of_line(start.row + 1)? + start.column;
         let old_byte = span_bytes(&edit.before, start, old_end);
         let new_byte = span_bytes(&edit.after, start, new_end);
         Ok(BufferBytesEvent {
+            subscribers: self.subscriptions.keys().copied().collect(),
             tick: self.script_changedtick(),
             start_row: start.row,
             start_col: start.column,
@@ -1193,6 +1252,10 @@ impl BufferState {
         if prepared.is_empty() {
             return Ok(0);
         }
+        let events = prepared
+            .iter()
+            .map(|edit| self.bytes_event(edit))
+            .collect::<Result<Vec<_>, _>>()?;
         let splices: Vec<LineSplice<'_>> = prepared
             .iter()
             // The end line cannot overflow: both operands are bounded by the
@@ -1207,10 +1270,8 @@ impl BufferState {
             .replace_lines_disjoint(&splices)
             .map_err(BufferStateError::from)?;
         self.bump_changedtick();
-        // Same byte-event contract as the single-splice path: project
-        // every edit before the record loop moves them.
-        for edit in &prepared {
-            let event = self.bytes_event(edit)?;
+        for mut event in events {
+            event.tick = self.script_changedtick();
             self.pending_bytes.push(event);
         }
         let mut seq = 0;
@@ -1576,7 +1637,7 @@ mod tests {
             .unwrap();
         let events = state.take_bytes_events();
         assert_eq!(events.len(), 1);
-        let event = events[0];
+        let event = &events[0];
         assert_eq!(
             (event.start_row, event.start_col, event.start_byte),
             (1, 0, 2)
@@ -1599,7 +1660,7 @@ mod tests {
             .unwrap();
         let events = state.take_bytes_events();
         assert_eq!(events.len(), 1);
-        let event = events[0];
+        let event = &events[0];
         assert_eq!(
             (event.start_row, event.start_col, event.start_byte),
             (0, 0, 0)
@@ -1607,5 +1668,86 @@ mod tests {
         assert_eq!((event.old_row, event.old_col, event.old_byte), (0, 0, 0));
         // Inserting one line reports the added line plus its newline.
         assert_eq!((event.new_row, event.new_col, event.new_byte), (1, 0, 2));
+    }
+
+    #[test]
+    fn undo_and_redo_emit_bytes_events() {
+        let (mut editor, buffer, _) = editor_with(b"a\nb\nc\n");
+        let state = editor.buffer_mut(buffer).unwrap();
+        state
+            .replace_lines(2, 2, &[b"XY".to_vec()], position(1, 0), position(2, 2), 0)
+            .unwrap();
+
+        let forward = state.take_bytes_events();
+        assert_eq!(forward.len(), 1);
+        assert_eq!(
+            (
+                forward[0].start_row,
+                forward[0].start_col,
+                forward[0].start_byte
+            ),
+            (1, 0, 2)
+        );
+
+        state.undo().unwrap();
+        let undo = state.take_bytes_events();
+        assert_eq!(undo.len(), 1);
+        let event = &undo[0];
+        assert_eq!(
+            (event.start_row, event.start_col, event.start_byte),
+            (1, 0, 2)
+        );
+        // Undo removes "XY" (2 bytes + newline = 3) and inserts "b" (1 byte + newline = 2).
+        assert_eq!((event.old_row, event.old_col, event.old_byte), (1, 0, 3));
+        assert_eq!((event.new_row, event.new_col, event.new_byte), (1, 0, 2));
+
+        state.redo().unwrap();
+        let redo = state.take_bytes_events();
+        assert_eq!(redo.len(), 1);
+        let event = &redo[0];
+        assert_eq!(
+            (event.start_row, event.start_col, event.start_byte),
+            (1, 0, 2)
+        );
+        // Redo does the inverse: removes "b" and inserts "XY".
+        assert_eq!((event.old_row, event.old_col, event.old_byte), (1, 0, 2));
+        assert_eq!((event.new_row, event.new_col, event.new_byte), (1, 0, 3));
+    }
+
+    #[test]
+    fn line_preserving_batch_reports_pre_edit_offsets() {
+        let (mut editor, buffer, window) = editor_with(b"a\nb\nc\n");
+        let requests = &[
+            BufferTextEditRequest {
+                start: ExtmarkPosition::new(0, 0),
+                end: ExtmarkPosition::new(0, 1),
+                replacement: vec![b"longer".to_vec()],
+            },
+            BufferTextEditRequest {
+                start: ExtmarkPosition::new(1, 0),
+                end: ExtmarkPosition::new(1, 1),
+                replacement: vec![b"also longer".to_vec()],
+            },
+            BufferTextEditRequest {
+                start: ExtmarkPosition::new(2, 0),
+                end: ExtmarkPosition::new(2, 1),
+                replacement: vec![b"c2".to_vec()],
+            },
+        ];
+        editor
+            .replace_buffer_texts(buffer, window, requests, position(1, 0), position(1, 0), 0)
+            .unwrap();
+
+        let state = editor.buffer_mut(buffer).unwrap();
+        let events = state.take_bytes_events();
+        assert_eq!(events.len(), 3);
+        // Offsets must be pre-edit: 0 for line 1, 2 for line 2, 4 for line 3.
+        assert_eq!((events[0].start_row, events[0].start_byte), (0, 0));
+        assert_eq!((events[1].start_row, events[1].start_byte), (1, 2));
+        assert_eq!((events[2].start_row, events[2].start_byte), (2, 4));
+
+        // Sanity check the batch really changed all three lines.
+        let text = state.text().unwrap().to_bytes();
+        assert_eq!(text, b"longer\nalso longer\nc2\n");
     }
 }
