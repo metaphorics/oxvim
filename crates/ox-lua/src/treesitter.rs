@@ -316,11 +316,11 @@ fn buffer_bytes(lua: &Lua, bufnr: i64) -> mlua::Result<Vec<u8>> {
     let get_lines: Function = api.get("nvim_buf_get_lines")?;
     let lines: Table = get_lines.call((bufnr, 0, -1, false))?;
     let mut bytes = Vec::new();
-    for line in lines.sequence_values::<Vec<u8>>() {
+    for line in lines.sequence_values::<String>() {
         if !bytes.is_empty() {
             bytes.push(b'\n');
         }
-        bytes.extend_from_slice(&line?);
+        bytes.extend_from_slice(line?.as_bytes());
     }
     Ok(bytes)
 }
