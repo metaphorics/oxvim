@@ -3209,11 +3209,9 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "ls" | "buffers" | "files" => {
             access.with_ex_editor(|editor| command_buffer_list(runtime, editor, command))
         }
-        "bwipeout" | "bwipe" => {
-            access.with_ex_editor(|editor| command_buffer_remove(runtime, editor, command, true))
-        }
+        "bwipeout" | "bwipe" => command_buffer_remove(runtime, access, scope, lua, command, true),
         "bdelete" | "bdel" | "bunload" | "bun" => {
-            access.with_ex_editor(|editor| command_buffer_remove(runtime, editor, command, false))
+            command_buffer_remove(runtime, access, scope, lua, command, false)
         }
         "args" => access.with_ex_editor(|editor| command_args(runtime, editor, command)),
         "next" => access.with_ex_editor(|editor| command_next(runtime, editor, command)),
@@ -8365,167 +8363,235 @@ fn command_enew<F: FileIO, E: ExEditorAccess>(
     clippy::too_many_lines,
     reason = "buffer removal keeps window migration and modified-buffer checks atomic"
 )]
-fn command_buffer_remove<F: FileIO>(
+fn command_buffer_remove<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
     wipe: bool,
 ) -> Flow {
-    let arg = command.args.trim();
-    let requested = command
-        .count
-        .and_then(|value| i64::try_from(value).ok())
-        .or_else(|| arg.parse::<i64>().ok());
-    let mut targets = if command.range.is_some() {
-        let (start, end) = match resolve_range(editor, command) {
-            Ok(range) => range,
-            Err(message) => return error_flow(runtime, "E16", message),
-        };
-        editor
-            .buffers()
-            .into_iter()
-            .filter(|handle| {
-                usize::try_from(i64::from(*handle))
-                    .is_ok_and(|number| (start..=end).contains(&number))
-            })
-            .collect::<Vec<_>>()
-    } else {
-        let target =
-            if let Some(handle) = requested.and_then(|value| BufHandle::try_from(value).ok()) {
-                handle
-            } else if arg.is_empty() {
-                match editor.current_buffer() {
-                    Some(handle) => handle,
-                    None => return error_flow(runtime, "E85", "There is no listed buffer"),
-                }
-            } else {
-                let matches: Vec<_> = editor
+    // Phase 1 borrows the editor only to resolve targets and run the
+    // removal guards. Firing lifecycle events runs user code, which must
+    // never execute while an editor borrow is held, so every later phase
+    // re-borrows.
+    let resolved = access.with_ex_editor(
+        |editor| -> Result<(Vec<BufHandle>, std::collections::HashSet<BufHandle>), Flow> {
+            let arg = command.args.trim();
+            let requested = command
+                .count
+                .and_then(|value| i64::try_from(value).ok())
+                .or_else(|| arg.parse::<i64>().ok());
+            let mut targets = if command.range.is_some() {
+                let (start, end) = match resolve_range(editor, command) {
+                    Ok(range) => range,
+                    Err(message) => return Err(error_flow(runtime, "E16", message)),
+                };
+                editor
                     .buffers()
                     .into_iter()
                     .filter(|handle| {
-                        editor
-                            .buffer(*handle)
-                            .is_ok_and(|buffer| buffer_name_matches(buffer.name(), arg))
+                        usize::try_from(i64::from(*handle))
+                            .is_ok_and(|number| (start..=end).contains(&number))
                     })
-                    .collect();
-                match matches.as_slice() {
-                    [handle] => *handle,
-                    [] => {
-                        return error_flow(runtime, "E94", format!("No matching buffer for {arg}"));
-                    }
-                    _ => match editor
-                        .current_buffer()
-                        .filter(|current| matches.contains(current))
-                    {
-                        Some(current) => current,
-                        None => {
-                            return error_flow(
-                                runtime,
-                                "E93",
-                                format!("More than one match for {arg}"),
-                            );
-                        }
-                    },
-                }
-            };
-        vec![target]
-    };
-    if targets.is_empty() {
-        let (code, message) = if wipe {
-            ("E517", "No buffers were wiped out")
-        } else {
-            ("E516", "No buffers were deleted")
-        };
-        return error_flow(runtime, code, message);
-    }
-    // Deleting the current buffer last prevents each replacement from
-    // becoming current and loading just before it is deleted.
-    if let Some(current) = editor.current_buffer()
-        && let Some(index) = targets.iter().position(|target| *target == current)
-    {
-        targets.remove(index);
-        targets.push(current);
-    }
-    for target in &targets {
-        if editor.buffer(*target).is_err() {
-            return error_flow(
-                runtime,
-                "E86",
-                format!("Buffer {} does not exist", i64::from(*target)),
-            );
-        }
-        if !command.bang
-            && editor
-                .buffer(*target)
-                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
-        {
-            return error_flow(
-                runtime,
-                "E89",
-                "No write since last change (add ! to override)",
-            );
-        }
-    }
-
-    let selected: std::collections::HashSet<_> = targets.iter().copied().collect();
-    for target in targets {
-        let attached = editor
-            .windows()
-            .into_iter()
-            .filter(|window| {
-                editor
-                    .window(*window)
-                    .is_ok_and(|state| state.buffer == target)
-            })
-            .collect::<Vec<_>>();
-        if !attached.is_empty() {
-            let replacement = match editor.buffers().into_iter().find(|buffer| {
-                !selected.contains(buffer)
-                    && editor.buffer(*buffer).is_ok_and(|state| {
-                        state.flags.contains(crate::BufferFlags::LISTED)
-                            && state.residency.is_loaded()
-                    })
-            }) {
-                Some(buffer) => buffer,
-                None => match editor.create_buffer(true) {
-                    Ok(handle) => handle,
-                    Err(error) => return error_flow(runtime, "E948", error.to_string()),
-                },
-            };
-            for window in attached {
-                if let Err(error) =
-                    editor.set_window_buffer(window, replacement, BufferRelease::KeepLoaded)
+                    .collect::<Vec<_>>()
+            } else {
+                let target = if let Some(handle) =
+                    requested.and_then(|value| BufHandle::try_from(value).ok())
                 {
-                    return error_flow(runtime, "E948", error.to_string());
+                    handle
+                } else if arg.is_empty() {
+                    match editor.current_buffer() {
+                        Some(handle) => handle,
+                        None => {
+                            return Err(error_flow(runtime, "E85", "There is no listed buffer"));
+                        }
+                    }
+                } else {
+                    let matches: Vec<_> = editor
+                        .buffers()
+                        .into_iter()
+                        .filter(|handle| {
+                            editor
+                                .buffer(*handle)
+                                .is_ok_and(|buffer| buffer_name_matches(buffer.name(), arg))
+                        })
+                        .collect();
+                    match matches.as_slice() {
+                        [handle] => *handle,
+                        [] => {
+                            return Err(error_flow(
+                                runtime,
+                                "E94",
+                                format!("No matching buffer for {arg}"),
+                            ));
+                        }
+                        _ => match editor
+                            .current_buffer()
+                            .filter(|current| matches.contains(current))
+                        {
+                            Some(current) => current,
+                            None => {
+                                return Err(error_flow(
+                                    runtime,
+                                    "E93",
+                                    format!("More than one match for {arg}"),
+                                ));
+                            }
+                        },
+                    }
+                };
+                vec![target]
+            };
+            if targets.is_empty() {
+                let (code, message) = if wipe {
+                    ("E517", "No buffers were wiped out")
+                } else {
+                    ("E516", "No buffers were deleted")
+                };
+                return Err(error_flow(runtime, code, message));
+            }
+            // Deleting the current buffer last prevents each replacement from
+            // becoming current and loading just before it is deleted.
+            if let Some(current) = editor.current_buffer()
+                && let Some(index) = targets.iter().position(|target| *target == current)
+            {
+                targets.remove(index);
+                targets.push(current);
+            }
+            for target in &targets {
+                if editor.buffer(*target).is_err() {
+                    return Err(error_flow(
+                        runtime,
+                        "E86",
+                        format!("Buffer {} does not exist", i64::from(*target)),
+                    ));
+                }
+                if !command.bang
+                    && editor
+                        .buffer(*target)
+                        .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+                {
+                    return Err(error_flow(
+                        runtime,
+                        "E89",
+                        "No write since last change (add ! to override)",
+                    ));
                 }
             }
-        }
-        if !wipe {
-            if let Ok(state) = editor.buffer_mut(target) {
-                state.flags.set(crate::BufferFlags::LISTED, false);
+
+            let selected: std::collections::HashSet<_> = targets.iter().copied().collect();
+            Ok((targets, selected))
+        },
+    );
+    let (targets, selected) = match resolved {
+        Ok(pair) => pair,
+        Err(flow) => return flow,
+    };
+    for target in targets {
+        // Phase 2 migrates displaying windows; the borrow ends before any
+        // listener runs.
+        let flow = access.with_ex_editor(|editor| {
+            let attached = editor
+                .windows()
+                .into_iter()
+                .filter(|window| {
+                    editor
+                        .window(*window)
+                        .is_ok_and(|state| state.buffer == target)
+                })
+                .collect::<Vec<_>>();
+            if !attached.is_empty() {
+                let replacement = match editor.buffers().into_iter().find(|buffer| {
+                    !selected.contains(buffer)
+                        && editor.buffer(*buffer).is_ok_and(|state| {
+                            state.flags.contains(crate::BufferFlags::LISTED)
+                                && state.residency.is_loaded()
+                        })
+                }) {
+                    Some(buffer) => buffer,
+                    None => match editor.create_buffer(true) {
+                        Ok(handle) => handle,
+                        Err(error) => return error_flow(runtime, "E948", error.to_string()),
+                    },
+                };
+                for window in attached {
+                    if let Err(error) =
+                        editor.set_window_buffer(window, replacement, BufferRelease::KeepLoaded)
+                    {
+                        return error_flow(runtime, "E948", error.to_string());
+                    }
+                }
             }
-            if let Err(error) = editor.unload_buffer(target) {
-                return error_flow(runtime, "E90", error.to_string());
+            Flow::Normal
+        });
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
+        // `do_buffer` (`buffer.c`): unloading fires `BufUnload`; deleting
+        // additionally fires `BufDelete`. Listeners run while the buffer
+        // is still resident.
+        let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufUnload], target);
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
+        if !wipe && command.command.name() == "bdelete" {
+            let flow =
+                fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufDelete], target);
+            if !matches!(flow, Flow::Normal) {
+                return flow;
             }
-            continue;
         }
-        if let Err(error) = editor.wipe_buffer(target) {
-            return error_flow(runtime, "E90", error.to_string());
-        }
-        // A wipe drops the buffer's local user commands; unload/delete do
-        // not (`do_buffer`'s DOBUF_WIPE branch).
-        runtime.user_commands.borrow_mut().remove_buffer(target);
-        for window in editor.windows() {
-            if let Ok(stack) = editor.window_tag_stack_mut(window) {
-                stack.forget_buffer(target);
+        // Phase 3 unlists and unloads; the borrow ends before wipe events fire.
+        let flow = access.with_ex_editor(|editor| {
+            if !wipe {
+                if let Ok(state) = editor.buffer_mut(target) {
+                    state.flags.set(crate::BufferFlags::LISTED, false);
+                }
+                if let Err(error) = editor.unload_buffer(target) {
+                    return error_flow(runtime, "E90", error.to_string());
+                }
             }
+            Flow::Normal
+        });
+        if !matches!(flow, Flow::Normal) {
+            return flow;
         }
-        if runtime
-            .preview_tag
-            .as_ref()
-            .is_some_and(|item| item.from_bufnr == target)
-        {
-            runtime.preview_tag = None;
+        if wipe {
+            // Wiping fires `BufDelete` then `BufWipeout` before the buffer is
+            // freed (`do_buffer`'s DOBUF_WIPE branch); `BufUnload` already ran
+            // above.
+            for event in [Event::BufDelete, Event::BufWipeout] {
+                let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[event], target);
+                if !matches!(flow, Flow::Normal) {
+                    return flow;
+                }
+            }
+            // Phase 4 frees the buffer and drops its tag state.
+            let flow = access.with_ex_editor(|editor| {
+                if let Err(error) = editor.wipe_buffer(target) {
+                    return error_flow(runtime, "E90", error.to_string());
+                }
+                // A wipe drops the buffer's local user commands; unload/delete do
+                // not (`do_buffer`'s DOBUF_WIPE branch).
+                runtime.user_commands.borrow_mut().remove_buffer(target);
+                for window in editor.windows() {
+                    if let Ok(stack) = editor.window_tag_stack_mut(window) {
+                        stack.forget_buffer(target);
+                    }
+                }
+                if runtime
+                    .preview_tag
+                    .as_ref()
+                    .is_some_and(|item| item.from_bufnr == target)
+                {
+                    runtime.preview_tag = None;
+                }
+                Flow::Normal
+            });
+            if !matches!(flow, Flow::Normal) {
+                return flow;
+            }
         }
     }
     Flow::Normal
