@@ -3186,6 +3186,79 @@ fn bwipeout_replaces_window_buffer_and_wipes() {
     assert_eq!(buffer_text(&editor), vec!["first"]);
 }
 
+/// `:bdelete` fires `BufUnload` only for resident text, then `BufDelete`;
+/// an already-unloaded target receives only `BufDelete`.
+#[test]
+fn bdelete_skips_bufunload_for_already_unloaded_target() {
+    let (editor, mut executor) = setup_with_content(&[b"loaded".to_vec()]);
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufUnload", "BufDelete"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} * call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+
+    executor.execute_line(&editor, "bdelete").unwrap();
+    assert_eq!(order_events(&executor), ["BufUnload", "BufDelete"]);
+
+    let unloaded = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(unloaded)
+        .unwrap()
+        .unload()
+        .unwrap();
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            &format!("bdelete {}", i64::from(unloaded)),
+        )
+        .unwrap();
+    assert_eq!(order_events(&executor), ["BufDelete"]);
+}
+
+/// `:bwipeout` preserves upstream's `BufUnload`, `BufDelete`, `BufWipeout`
+/// order for resident text and omits `BufUnload` when text was already freed.
+#[test]
+fn bwipeout_skips_bufunload_for_already_unloaded_target() {
+    let (editor, mut executor) = setup_with_content(&[b"loaded".to_vec()]);
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufUnload", "BufDelete", "BufWipeout"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} * call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+
+    executor.execute_line(&editor, "bwipeout").unwrap();
+    assert_eq!(
+        order_events(&executor),
+        ["BufUnload", "BufDelete", "BufWipeout"]
+    );
+
+    let unloaded = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(unloaded)
+        .unwrap()
+        .unload()
+        .unwrap();
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            &format!("bwipeout {}", i64::from(unloaded)),
+        )
+        .unwrap();
+    assert_eq!(order_events(&executor), ["BufDelete", "BufWipeout"]);
+}
+
 #[test]
 fn bwipeout_does_not_select_an_unloaded_unlisted_replacement() {
     let (editor, mut executor) = setup_with_content(&[b"current".to_vec()]);

@@ -8579,13 +8579,18 @@ fn command_buffer_remove<F: FileIO, E: ExEditorAccess>(
         // Re-validate each target: earlier lifecycle handlers may have removed
         // or changed it. Upstream `do_buffer` rechecks `buf_valid` and the
         // changed flag per buffer (`do_bufdel`/`do_buffer`, buffer.c).
-        let modified = access.with_ex_editor(|editor| {
-            editor
-                .buffer(target)
-                .ok()
-                .map(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
-        });
-        let Some(modified) = modified else {
+        // Residency is captured in the same snapshot, before any lifecycle
+        // handler for this target can run and unload it: upstream
+        // `buf_freeall` (`buffer.c:851`) fires `BufUnload` only when
+        // `b_ml.ml_mfp != NULL` — the buffer is loaded at that moment.
+        let Some((modified, was_loaded)) = access.with_ex_editor(|editor| {
+            editor.buffer(target).ok().map(|state| {
+                (
+                    state.flags.contains(crate::BufferFlags::MODIFIED),
+                    state.residency.is_loaded(),
+                )
+            })
+        }) else {
             continue;
         };
         if modified && !command.bang {
@@ -8639,10 +8644,14 @@ fn command_buffer_remove<F: FileIO, E: ExEditorAccess>(
         }
         // `do_buffer` (`buffer.c`): unloading fires `BufUnload`; deleting
         // additionally fires `BufDelete`. Listeners run while the buffer
-        // is still resident.
-        let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufUnload], target);
-        if !matches!(flow, Flow::Normal) {
-            return flow;
+        // is still resident, so skip `BufUnload` for a target whose text
+        // was already released before removal began.
+        if was_loaded {
+            let flow =
+                fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufUnload], target);
+            if !matches!(flow, Flow::Normal) {
+                return flow;
+            }
         }
         if kind == BufferRemoveKind::Delete {
             let flow =
@@ -8671,8 +8680,8 @@ fn command_buffer_remove<F: FileIO, E: ExEditorAccess>(
         }
         if kind == BufferRemoveKind::Wipe {
             // Wiping fires `BufDelete` then `BufWipeout` before the buffer is
-            // freed (`do_buffer`'s DOBUF_WIPE branch); `BufUnload` already ran
-            // above.
+            // freed (`do_buffer`'s DOBUF_WIPE branch); `BufUnload` ran above
+            // only when the target was loaded.
             for event in [Event::BufDelete, Event::BufWipeout] {
                 let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[event], target);
                 if !matches!(flow, Flow::Normal) {
