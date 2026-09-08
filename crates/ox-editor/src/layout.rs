@@ -75,6 +75,11 @@ pub struct WindowState {
     /// Previous directory for this window's `lcd -` (`w_prevdir`); `None`
     /// when no `:lcd` has recorded one yet.
     pub previous_directory: Option<PathBuf>,
+    /// Source window whose location list this window displays, if this is a
+    /// location-list display window (upstream `w_llist_ref`,
+    /// `GET_LOC_LIST`). Reads like `getloclist(0)` from inside the display
+    /// window resolve through it.
+    pub loclist_ref: Option<WinHandle>,
 }
 
 impl WindowState {
@@ -91,6 +96,7 @@ impl WindowState {
             coladd: 0,
             local_directory: None,
             previous_directory: None,
+            loclist_ref: None,
         }
     }
 }

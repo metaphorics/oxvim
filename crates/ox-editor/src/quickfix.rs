@@ -389,10 +389,25 @@ pub enum QfScope {
 }
 
 impl QfScope {
+    /// Follows a location-list display window to its source window
+    /// (upstream `GET_LOC_LIST`, quickfix.c:286).
+    fn resolve(self, editor: &Editor) -> Self {
+        match self {
+            Self::Loclist(window) => Self::Loclist(
+                editor
+                    .window(window)
+                    .ok()
+                    .and_then(|state| state.loclist_ref)
+                    .unwrap_or(window),
+            ),
+            Self::Quickfix => self,
+        }
+    }
+
     /// The stack for reads; `None` when a location list was never created
     /// (`GET_LOC_LIST` returning NULL, quickfix.c:286).
     pub(crate) fn stack(self, editor: &Editor) -> Option<&QuickfixStack> {
-        match self {
+        match self.resolve(editor) {
             Self::Quickfix => Some(editor.quickfix()),
             Self::Loclist(window) => editor.loclist(window),
         }
@@ -401,7 +416,7 @@ impl QfScope {
     /// The stack for writes, allocating a location list on first use
     /// (`ll_get_or_alloc_list`, quickfix.c:2127-2145).
     pub(crate) fn stack_mut(self, editor: &mut Editor) -> &mut QuickfixStack {
-        match self {
+        match self.resolve(editor) {
             Self::Quickfix => editor.quickfix_mut(),
             Self::Loclist(window) => editor.loclist_or_alloc_mut(window),
         }
@@ -1358,6 +1373,7 @@ pub fn open(editor: &mut Editor, scope: QfScope) -> std::result::Result<WinHandl
         editor
             .set_current_window(window)
             .map_err(|error| QuickfixError::editor(&error))?;
+        tag_loclist_window(editor, scope, window);
         return Ok(window);
     }
     let window =
@@ -1380,7 +1396,23 @@ pub fn open(editor: &mut Editor, scope: QfScope) -> std::result::Result<WinHandl
     editor
         .set_current_window(window)
         .map_err(|error| QuickfixError::editor(&error))?;
+    tag_loclist_window(editor, scope, window);
     Ok(window)
+}
+
+/// Records the source window on a location-list display window (upstream
+/// `w_llist_ref`). A reused or fresh window showing another window's list
+/// reads through it.
+fn tag_loclist_window(editor: &mut Editor, scope: QfScope, window: WinHandle) {
+    let QfScope::Loclist(source) = scope else {
+        return;
+    };
+    if source == window {
+        return;
+    }
+    if let Ok(state) = editor.window_mut(window) {
+        state.loclist_ref = Some(source);
+    }
 }
 
 /// Closes the list window if one is open in the current tabpage.
