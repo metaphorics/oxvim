@@ -1595,6 +1595,13 @@ impl AppState {
     /// `feedkeys()` use, so a mapping cannot behave differently depending on
     /// how its left-hand side arrived.
     fn drive_input(&mut self) -> Result<(), ApiError> {
+        // Upstream fires `InsertEnter` on insert entry and
+        // `InsertLeavePre`+`InsertLeave` on exit (`ins_redraw`/`edit`); the
+        // mode machine itself cannot run listeners, so snapshot insert-ness
+        // around the drain and fire post-hoc. Only pure-`Insert`
+        // transitions are covered: `Replace` entry/exit and mid-drain
+        // round-trips stay silent until their semantics are pinned.
+        let was_insert = self.mode.borrow().mode().is_insert();
         loop {
             self.mode.borrow_mut().set_no_more_input(false);
             // The host can still receive keys: a pending mapping parks
@@ -1608,6 +1615,7 @@ impl AppState {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     self.absorb_pending_quit();
+                    self.fire_insert_transition(was_insert);
                     return Err(ApiError::exception(error.to_string()));
                 }
             };
@@ -1621,12 +1629,61 @@ impl AppState {
             // that reaching `outcome`.
             self.absorb_pending_quit();
             if repeats.is_empty() {
+                self.fire_insert_transition(was_insert);
                 return Ok(());
             }
             for data in repeats {
                 ox_api::nvim_paste(&self.session, OxStr(data), false, -1)?;
             }
         }
+    }
+
+    /// Fire insert-transition events when drained input changed pure-`Insert`
+    /// insert-ness. A failing listener is reported, never fatal to the input
+    /// that already ran (upstream shows the error and keeps the new mode).
+    fn fire_insert_transition(&mut self, was_insert: bool) {
+        let now_insert = self.mode.borrow().mode().is_insert();
+        if now_insert == was_insert {
+            return;
+        }
+        let Some(buffer) = self.session.with_editor(Editor::current_buffer) else {
+            return;
+        };
+        // Entry fires `InsertEnter`; exit fires `InsertLeavePre` first, the
+        // way `edit` orders the exit pair.
+        let events = if now_insert {
+            &[Event::InsertEnter][..]
+        } else {
+            &[Event::InsertLeavePre, Event::InsertLeave][..]
+        };
+        for event in events {
+            if self
+                .session
+                .with_editor(|editor| editor.autocmds().is_ignored(*event))
+            {
+                continue;
+            }
+            let plan = self.session.with_editor_mut(|editor| {
+                editor.autocmds_mut().plan(
+                    *event,
+                    AutocmdContext {
+                        buffer: Some(buffer),
+                        ..AutocmdContext::default()
+                    },
+                )
+            });
+            if let Err(error) = ox_api::execute_firing_plan(&self.session, plan) {
+                self.session.with_editor_mut(|editor| {
+                    editor.push_message(ox_editor::Message {
+                        kind: ox_editor::MessageKind::Error,
+                        content: Object::String(OxStr::from(error.to_string().as_str())),
+                        history: true,
+                        leading_newline: true,
+                    });
+                });
+            }
+        }
+        self.absorb_pending_quit();
     }
 
     /// Drains queued Lua work for this state; see [`drain_lua_work_queue`].

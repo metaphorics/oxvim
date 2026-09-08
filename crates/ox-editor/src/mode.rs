@@ -129,6 +129,15 @@ impl Default for Mode {
         Self::Normal(NormalState::default())
     }
 }
+impl Mode {
+    /// Whether the mode counts as inside insertion for `InsertEnter` /
+    /// `InsertLeave`. Only pure `Insert`; `Replace` entry/exit stays silent
+    /// until its event semantics are pinned.
+    #[must_use]
+    pub fn is_insert(&self) -> bool {
+        matches!(self, Self::Insert(_))
+    }
+}
 
 /// One state-loop action produced by input checking.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
