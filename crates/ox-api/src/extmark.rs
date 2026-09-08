@@ -6,9 +6,9 @@ use ox_editor::decoration::{
     WinCallbackId,
 };
 use ox_editor::{
-    Extmark, ExtmarkAttributes, ExtmarkEnd, ExtmarkGravity, ExtmarkHighlightMode, ExtmarkId,
-    ExtmarkPlacement, ExtmarkPosition, ExtmarkVirtualLinesOverflow, ExtmarkVirtualTextPosition,
-    Extmarks, NamespaceId, VirtualLine, VirtualTextChunk,
+    Extmark, ExtmarkAttributes, ExtmarkEnd, ExtmarkError, ExtmarkGravity, ExtmarkHighlightMode,
+    ExtmarkId, ExtmarkPlacement, ExtmarkPosition, ExtmarkVirtualLinesOverflow,
+    ExtmarkVirtualTextPosition, Extmarks, NamespaceId, VirtualLine, VirtualTextChunk,
 };
 use ox_text::Buffer;
 
@@ -1085,10 +1085,18 @@ pub fn nvim_buf_get_extmarks(
             None => state
                 .extmarks
                 .query_all(query_first, query_last, query_limit),
-            Some(namespace) => state
-                .extmarks
-                .query(namespace, query_first, query_last, query_limit)
-                .map_err(|error| ApiError::validation(error.to_string()))?,
+            // A globally allocated namespace never used on this buffer reads
+            // as empty upstream; only truly unallocated ids fail above.
+            Some(namespace) => {
+                match state
+                    .extmarks
+                    .query(namespace, query_first, query_last, query_limit)
+                {
+                    Ok(marks) => marks,
+                    Err(ExtmarkError::UnknownNamespace(_)) => Vec::new(),
+                    Err(error) => return Err(ApiError::validation(error.to_string())),
+                }
+            }
         };
         if overlap {
             marks.retain(|mark| mark_overlaps(mark, lower, upper));
