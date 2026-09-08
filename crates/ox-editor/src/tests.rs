@@ -382,6 +382,39 @@ fn floats_are_stably_sorted_by_zindex() {
 }
 
 #[test]
+fn cursor_float_freezes_anchor_so_entering_keeps_geometry_resolvable() {
+    // T107: a cursor-anchored float became current, and every later
+    // geometry resolution (e.g. the post-request redraw) self-recursed
+    // into a reference cycle. The anchor now freezes at insertion.
+    let buffer = buffer_handle(1);
+    let tiled = window_handle(1);
+    let layout = Layout::new(
+        tiled,
+        WindowState::new(buffer, position(1, 0)),
+        Geometry::new(0, 0, 20, 10).unwrap(),
+    )
+    .unwrap();
+    let mut tab = TabpageState::new(layout);
+    let float = window_handle(2);
+    let config = WinConfig::new(RelativeTo::Cursor, Anchor::NorthWest, 1.0, 1.0, 4, 2).unwrap();
+    tab.add_float(float, WindowState::new(buffer, position(1, 0)), config)
+        .unwrap();
+    // The stored config carries the frozen anchor: cursor (1, 0) against
+    // topline 1 contributes no offset, so the given row/col survive.
+    let stored = tab
+        .floating_windows()
+        .find(|candidate| candidate.window == float)
+        .unwrap();
+    assert_eq!(stored.config.relative, RelativeTo::Window(tiled));
+    assert_eq!(stored.config.row, 1.0);
+    assert_eq!(stored.config.col, 1.0);
+    // Entering the float then resolving (the redraw path) stays total.
+    tab.set_current(float).unwrap();
+    let geometry = tab.window_geometry(float).unwrap();
+    assert_eq!((geometry.row, geometry.col), (1, 1));
+}
+
+#[test]
 fn generated_option_table_matches_authoritative_source_count() {
     let source_path = std::env::var("OXVIM_REF_ROOT").map_or_else(
         |_| {

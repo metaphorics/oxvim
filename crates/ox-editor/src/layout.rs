@@ -1147,10 +1147,11 @@ impl TabpageState {
     pub fn set_window_config(
         &mut self,
         window: WinHandle,
-        config: WinConfig,
+        mut config: WinConfig,
     ) -> Result<(), LayoutError> {
-        config.validate()?;
         let resolved = self.resolve(window);
+        self.freeze_cursor_anchor(resolved, &mut config);
+        config.validate()?;
         let floating = self
             .floats
             .iter_mut()
@@ -1303,6 +1304,50 @@ impl TabpageState {
         Ok(())
     }
 
+    /// Folds a cursor-relative anchor into `row`/`col`, freezing the float
+    /// against its anchor window.
+    ///
+    /// Upstream converts `kFloatRelativeCursor` to `kFloatRelativeWindow`
+    /// at config time (`win_config_float`, winfloat.c:204-209): the cursor
+    /// display offset joins `row`/`col` and the current window becomes the
+    /// anchor, so later geometry queries never recurse through whatever
+    /// window happens to be current. Resolving at query time self-recurses
+    /// the moment the float itself becomes current and trips the reference
+    /// cycle guard on every redraw.
+    fn freeze_cursor_anchor(&self, window: WinHandle, config: &mut WinConfig) {
+        if !matches!(config.relative, RelativeTo::Cursor) {
+            return;
+        }
+        let anchor = if self.current != window {
+            self.current
+        } else if let Some(previous) = self
+            .previous
+            .filter(|previous| *previous != window && self.contains(*previous))
+        {
+            // Reconfiguring the current window: anchor to the window entered
+            // from while it is still live.
+            previous
+        } else {
+            // Degenerate anchor: cursor offsets become editor offsets rather
+            // than a self-loop that can never resolve.
+            config.relative = RelativeTo::Editor;
+            return;
+        };
+        let (row_offset, col_offset) = self.window(anchor).ok().map_or((0.0, 0.0), |state| {
+            // Display offsets always fit `u32`; anything larger saturates
+            // instead of losing precision into `f64`.
+            let row = u32::try_from(state.cursor.lnum.saturating_sub(state.topline));
+            let col = u32::try_from(state.cursor.col);
+            (
+                row.map_or(f64::from(u32::MAX), f64::from),
+                col.map_or(f64::from(u32::MAX), f64::from),
+            )
+        });
+        config.row += row_offset;
+        config.col += col_offset;
+        config.relative = RelativeTo::Window(anchor);
+    }
+
     /// Adds a floating window while preserving stable z-index ordering.
     ///
     /// # Errors
@@ -1316,9 +1361,10 @@ impl TabpageState {
         &mut self,
         window: WinHandle,
         state: WindowState,
-        config: WinConfig,
+        mut config: WinConfig,
     ) -> Result<(), LayoutError> {
         validate_identity(window)?;
+        self.freeze_cursor_anchor(window, &mut config);
         config.validate()?;
         if self.contains(window) {
             return Err(LayoutError::DuplicateWindow(window));
@@ -1614,26 +1660,11 @@ impl TabpageState {
                 (origin_row, origin_col)
             }
             RelativeTo::Cursor => {
-                let relative = self.current;
-                let geometry = self.resolve_window_geometry(relative, next_depth)?;
-                let state = self.window(relative)?;
-                let cursor_row = state.cursor.lnum.saturating_sub(state.topline);
-                let origin_row = i128::try_from(geometry.row)
-                    .and_then(|row| i128::try_from(cursor_row).map(|cursor| (row, cursor)))
-                    .map_err(|_| LayoutError::GeometryOverflow)?;
-                let origin_col = i128::try_from(geometry.col)
-                    .and_then(|col| i128::try_from(state.cursor.col).map(|cursor| (col, cursor)))
-                    .map_err(|_| LayoutError::GeometryOverflow)?;
-                (
-                    origin_row
-                        .0
-                        .checked_add(origin_row.1)
-                        .ok_or(LayoutError::GeometryOverflow)?,
-                    origin_col
-                        .0
-                        .checked_add(origin_col.1)
-                        .ok_or(LayoutError::GeometryOverflow)?,
-                )
+                // Cursor-relative configs are frozen against their anchor
+                // window at insertion (`freeze_cursor_anchor`); reaching
+                // resolution unfrozen means a writer bypassed both entry
+                // points and must be fixed, not worked around.
+                unreachable!("cursor-relative float config reached geometry resolution unfrozen");
             }
         };
         floating_content_geometry(&floating.config, origin_row, origin_col)
