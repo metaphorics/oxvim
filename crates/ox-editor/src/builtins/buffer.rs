@@ -1212,3 +1212,7 @@ fn current_line_address(editor: &mut Editor, value: &Typval) -> ox_eval::Result<
     };
     Ok(usize::try_from(line.max(0)).unwrap_or(usize::MAX))
 }
+
+#[cfg(test)]
+#[cfg_attr(test, path = "buffer_lifecycle_tests.rs")]
+mod buffer_lifecycle_tests;
