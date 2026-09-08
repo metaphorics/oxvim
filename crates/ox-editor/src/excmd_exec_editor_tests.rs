@@ -8319,6 +8319,137 @@ fn sort_invalid_flag_e475() {
     assert_vim_error(executor.execute_line(&editor, "sort z"), "E475");
 }
 
+fn editor_with_scoped_variables() -> Editor {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    editor
+}
+
+fn local_editor_value(
+    editor: &Editor,
+    kind: ox_eval::scope::ScopeKind,
+    name: &str,
+) -> Option<ox_types::Object> {
+    let key = ox_types::OxStr::from(name);
+    match kind {
+        ox_eval::scope::ScopeKind::Buffer => editor
+            .current_buffer()
+            .and_then(|buffer| editor.buffer(buffer).ok())
+            .and_then(|state| state.variables().get(&key).cloned()),
+        ox_eval::scope::ScopeKind::Window => editor
+            .current_window()
+            .and_then(|window| editor.window_variables(window).ok())
+            .and_then(|variables| variables.get(&key).cloned()),
+        ox_eval::scope::ScopeKind::Tab => editor
+            .current_tabpage()
+            .and_then(|tab| editor.tabpage_variables(tab).ok())
+            .and_then(|variables| variables.get(&key).cloned()),
+        _ => None,
+    }
+}
+
+fn assert_nested_local_write_survives_outer_sync(kind: ox_eval::scope::ScopeKind) {
+    let mut editor = editor_with_scoped_variables();
+    let mut outer = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut outer).unwrap();
+    outer
+        .set_scoped(kind, b"outer", 0, ox_types::Typval::Number(1))
+        .unwrap();
+
+    let mut nested = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut nested).unwrap();
+    nested
+        .set_scoped(kind, b"nested", 0, ox_types::Typval::Number(2))
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &mut nested).unwrap();
+
+    outer
+        .set_scoped(kind, b"outer", 0, ox_types::Typval::Number(3))
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
+
+    assert_eq!(
+        local_editor_value(&editor, kind, "outer"),
+        Some(ox_types::Object::Integer(3)),
+    );
+    assert_eq!(
+        local_editor_value(&editor, kind, "nested"),
+        Some(ox_types::Object::Integer(2)),
+    );
+}
+
+fn assert_outer_local_deletion_survives_nested_sync(kind: ox_eval::scope::ScopeKind) {
+    let mut editor = editor_with_scoped_variables();
+    let key = ox_types::OxStr::from("gone");
+    match kind {
+        ox_eval::scope::ScopeKind::Buffer => editor
+            .buffer_mut(editor.current_buffer().unwrap())
+            .unwrap()
+            .variables_mut()
+            .insert(key.clone(), ox_types::Object::Integer(1)),
+        ox_eval::scope::ScopeKind::Window => editor
+            .window_variables_mut(editor.current_window().unwrap())
+            .unwrap()
+            .insert(key.clone(), ox_types::Object::Integer(1)),
+        ox_eval::scope::ScopeKind::Tab => editor
+            .tabpage_variables_mut(editor.current_tabpage().unwrap())
+            .unwrap()
+            .insert(key.clone(), ox_types::Object::Integer(1)),
+        _ => unreachable!("local deletion test only covers editor-local scopes"),
+    }
+
+    let mut outer = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut outer).unwrap();
+    assert!(outer.remove_pair(kind, b"gone"));
+
+    let mut nested = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut nested).unwrap();
+    nested
+        .set_scoped(kind, b"nested", 0, ox_types::Typval::Number(2))
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &mut nested).unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
+
+    assert_eq!(local_editor_value(&editor, kind, "gone"), None);
+    assert_eq!(
+        local_editor_value(&editor, kind, "nested"),
+        Some(ox_types::Object::Integer(2)),
+    );
+}
+
+#[test]
+fn nested_buffer_write_survives_outer_sync() {
+    assert_nested_local_write_survives_outer_sync(ox_eval::scope::ScopeKind::Buffer);
+}
+
+#[test]
+fn nested_window_write_survives_outer_sync() {
+    assert_nested_local_write_survives_outer_sync(ox_eval::scope::ScopeKind::Window);
+}
+
+#[test]
+fn nested_tab_write_survives_outer_sync() {
+    assert_nested_local_write_survives_outer_sync(ox_eval::scope::ScopeKind::Tab);
+}
+
+#[test]
+fn outer_buffer_deletion_survives_nested_sync() {
+    assert_outer_local_deletion_survives_nested_sync(ox_eval::scope::ScopeKind::Buffer);
+}
+
+#[test]
+fn outer_window_deletion_survives_nested_sync() {
+    assert_outer_local_deletion_survives_nested_sync(ox_eval::scope::ScopeKind::Window);
+}
+
+#[test]
+fn outer_tab_deletion_survives_nested_sync() {
+    assert_outer_local_deletion_survives_nested_sync(ox_eval::scope::ScopeKind::Tab);
+}
+
 #[test]
 fn nested_global_write_survives_outer_sync() {
     // A reentrant executor's `g:` write must survive the outer

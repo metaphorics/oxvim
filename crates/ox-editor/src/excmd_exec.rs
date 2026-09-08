@@ -15780,6 +15780,7 @@ fn sync_buffer_scope(editor: &Editor, scope: &mut Scope) -> Result<(), ExecError
             Typval::Number(i64::try_from(state.script_changedtick()).unwrap_or(i64::MAX)),
         ));
         scope.buffer = pairs;
+        refresh_scope_mirror(scope, ScopeKind::Buffer)?;
         scope.synced.set_buffer_identity(Some(buffer));
         scope.synced.set_buffer_version(vars_version);
         scope.synced.clear_dirty(ScopeKind::Buffer);
@@ -15806,12 +15807,209 @@ fn sync_buffer_scope(editor: &Editor, scope: &mut Scope) -> Result<(), ExecError
     Ok(())
 }
 
-/// Refreshes the global write-back mirror entry-wise and by value (see
-/// [`ox_eval::scope::refresh_mirror`]): an in-place container mutation
-/// through an aliased read must differ from the mirror at write-back time.
-fn refresh_global_mirror(scope: &Scope) -> Result<(), ExecError> {
-    ox_eval::scope::refresh_mirror(&mut scope.global_mirror.borrow_mut(), &scope.global)
-        .map_err(ExecError::Eval)
+/// The scope type exposes one per-scope write-back mirror. Keep the mirrors
+/// for all editor-backed namespaces in that existing carrier, tagging keys by
+/// namespace so a reentrant write can be merged without process-global state.
+/// These tagged keys never reach an editor dictionary.
+const SCOPE_MIRROR_PREFIX: u8 = 0;
+
+fn scope_mirror_tag(kind: ScopeKind) -> Option<u8> {
+    match kind {
+        ScopeKind::Global => Some(b'g'),
+        ScopeKind::Buffer => Some(b'b'),
+        ScopeKind::Window => Some(b'w'),
+        ScopeKind::Tab => Some(b't'),
+        ScopeKind::Script | ScopeKind::Local | ScopeKind::Argument | ScopeKind::Vim => None,
+    }
+}
+
+fn scope_map(scope: &Scope, kind: ScopeKind) -> Option<&ScopeMap> {
+    match kind {
+        ScopeKind::Global => Some(&scope.global),
+        ScopeKind::Buffer => Some(&scope.buffer),
+        ScopeKind::Window => Some(&scope.window),
+        ScopeKind::Tab => Some(&scope.tab),
+        ScopeKind::Script | ScopeKind::Local | ScopeKind::Argument | ScopeKind::Vim => None,
+    }
+}
+
+fn mirror_name(key: &OxStr, tag: u8) -> Option<&[u8]> {
+    let bytes = key.as_bytes();
+    (bytes.len() >= 2 && bytes[0] == SCOPE_MIRROR_PREFIX && bytes[1] == tag)
+        .then(|| &bytes[2..])
+}
+
+fn mirror_key(tag: u8, key: &[u8]) -> OxStr {
+    let mut bytes = Vec::with_capacity(2 + key.len());
+    bytes.push(SCOPE_MIRROR_PREFIX);
+    bytes.push(tag);
+    bytes.extend_from_slice(key);
+    OxStr(bytes)
+}
+
+fn mirrored_key(kind: ScopeKind, key: &[u8]) -> bool {
+    !matches!(kind, ScopeKind::Buffer) || key != b"changedtick"
+}
+
+/// Refresh one tagged mirror entry-wise and by value. Equal values retain
+/// their deep snapshot; only changed values pay for `snapshot_value`, and the
+/// one owned key index keeps the pass linear.
+fn refresh_scope_mirror_map(
+    current: &ScopeMap,
+    mirror: &mut ScopeMap,
+    kind: ScopeKind,
+) -> Result<(), ExecError> {
+    let Some(tag) = scope_mirror_tag(kind) else {
+        return Ok(());
+    };
+    let current_keys: HashSet<&[u8]> = current
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+        .map(|(key, _)| key.as_bytes())
+        .collect();
+    mirror.retain(|(key, _)| {
+        mirror_name(key, tag).is_none_or(|name| current_keys.contains(name))
+    });
+    let mut slots: HashMap<Vec<u8>, usize> = mirror
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (key, _))| {
+            mirror_name(key, tag).map(|name| (name.to_vec(), index))
+        })
+        .collect();
+    for (key, value) in current
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+    {
+        match slots.get(key.as_bytes()).copied() {
+            Some(index) if mirror[index].1 == *value => {}
+            Some(index) => {
+                mirror[index].1 =
+                    ox_eval::scope::snapshot_value(value).map_err(ExecError::Eval)?;
+            }
+            None => {
+                let index = mirror.len();
+                mirror.push((
+                    mirror_key(tag, key.as_bytes()),
+                    ox_eval::scope::snapshot_value(value).map_err(ExecError::Eval)?,
+                ));
+                slots.insert(key.as_bytes().to_vec(), index);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn refresh_scope_mirror(scope: &Scope, kind: ScopeKind) -> Result<(), ExecError> {
+    let Some(current) = scope_map(scope, kind) else {
+        return Ok(());
+    };
+    refresh_scope_mirror_map(
+        current,
+        &mut scope.global_mirror.borrow_mut(),
+        kind,
+    )
+}
+
+/// Merge one dirty scope into its live dictionary and refresh its mirror.
+/// Baseline keys are the only keys eligible for deletion: a live key absent
+/// from both the baseline and the current scope was created reentrantly.
+fn merge_scope_map_into_editor(
+    live: &mut Dict,
+    current: &ScopeMap,
+    mirror: &mut ScopeMap,
+    kind: ScopeKind,
+) -> Result<(), ExecError> {
+    let Some(tag) = scope_mirror_tag(kind) else {
+        return Ok(());
+    };
+    let baseline: HashMap<&[u8], &Typval> = mirror
+        .iter()
+        .filter_map(|(key, value)| mirror_name(key, tag).map(|name| (name, value)))
+        .collect();
+    let current_keys: HashSet<&[u8]> = current
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+        .map(|(key, _)| key.as_bytes())
+        .collect();
+    for (key, value) in current
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+    {
+        let changed = match baseline.get(key.as_bytes()) {
+            Some(previous) => **previous != *value,
+            None => true,
+        };
+        if changed {
+            live.insert(key.clone(), typval_to_object(value));
+        }
+    }
+    for key in baseline.keys() {
+        if !current_keys.contains(key) {
+            live.0.retain(|(live_key, _)| live_key.as_bytes() != *key);
+        }
+    }
+    drop(current_keys);
+    drop(baseline);
+    refresh_scope_mirror_map(current, mirror, kind)
+}
+
+/// Pull live-only or changed values back into a scope after a reentrant write.
+/// The owned slot index avoids a per-pull linear search.
+fn pull_scope_map_from_editor(
+    live: &Dict,
+    current: &mut ScopeMap,
+    mirror: &mut ScopeMap,
+    kind: ScopeKind,
+) -> Result<(), ExecError> {
+    if scope_mirror_tag(kind).is_none() {
+        return Ok(());
+    }
+    let live_keys: HashSet<&[u8]> = live
+        .0
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+        .map(|(key, _)| key.as_bytes())
+        .collect();
+    current.retain(|(key, _)| {
+        !mirrored_key(kind, key.as_bytes()) || live_keys.contains(key.as_bytes())
+    });
+    let current_values: HashMap<&[u8], &Typval> = current
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+        .map(|(key, value)| (key.as_bytes(), value))
+        .collect();
+    let mut pulls = Vec::new();
+    for (key, value) in live
+        .0
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+    {
+        let stale = match current_values.get(key.as_bytes()) {
+            Some(current) => !typval_matches_object(current, value),
+            None => true,
+        };
+        if stale {
+            pulls.push((key.clone(), object_to_typval(value)));
+        }
+    }
+    drop(current_values);
+    let mut slots: HashMap<Vec<u8>, usize> = current
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+        .enumerate()
+        .map(|(index, (key, _))| (key.as_bytes().to_vec(), index))
+        .collect();
+    for (key, value) in pulls {
+        match slots.get(key.as_bytes()).copied() {
+            Some(index) => current[index].1 = value,
+            None => {
+                slots.insert(key.as_bytes().to_vec(), current.len());
+                current.push((key, value));
+            }
+        }
+    }
+    refresh_scope_mirror_map(current, mirror, kind)
 }
 
 pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Result<(), ExecError> {
@@ -15825,7 +16023,7 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
     let global_version = editor.gvars_version();
     if scope.synced.get(ScopeKind::Global) != global_version {
         scope.global = dict_to_scope(editor.gvars());
-        refresh_global_mirror(scope)?;
+        refresh_scope_mirror(scope, ScopeKind::Global)?;
         scope.synced.set(ScopeKind::Global, global_version);
         scope.synced.clear_dirty(ScopeKind::Global);
     }
@@ -15840,6 +16038,7 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
                     .window_variables(window)
                     .map_err(|error| ExecError::Editor(error.to_string()))?,
             );
+            refresh_scope_mirror(scope, ScopeKind::Window)?;
             scope.synced.set(ScopeKind::Window, window_version);
             scope.synced.clear_dirty(ScopeKind::Window);
         }
@@ -15854,6 +16053,7 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
                     .tabpage_variables(tab)
                     .map_err(|error| ExecError::Editor(error.to_string()))?,
             );
+            refresh_scope_mirror(scope, ScopeKind::Tab)?;
             scope.synced.set(ScopeKind::Tab, tab_version);
             scope.synced.clear_dirty(ScopeKind::Tab);
         }
@@ -16056,118 +16256,75 @@ pub(crate) fn sync_scope_into_editor(
     editor: &mut Editor,
     scope: &mut Scope,
 ) -> Result<(), ExecError> {
-    let dirty = scope.synced.is_dirty(ScopeKind::Global);
-    if dirty {
-        // Merge, never replace: a reentrant executor may have written the
-        // live map after this scope mirrored it (`let g:outer = 1` outside
-        // an autocmd that sets `g:nested = 2` must keep both). Only keys
-        // added, changed, or removed since the mirror sync back.
-        // Write-write conflicts cannot carry stale outer values here:
-        // every user-code entry flushes first (see `run_autocmd_plan`),
-        // so dirt present at this sync postdates any nested write and the
-        // outer value is the later one. The outer-wins tiebreak below only
-        // covers genuinely simultaneous dirt, where either order converges
-        // on the next sync.
-        // Typval-space diff: the mirror is already a `ScopeMap`, so the
-        // two `Object` round-trips are gone; borrowed lookup maps cost one
-        // pass with no value clones, and only changed keys convert.
+    let global_dirty = scope.synced.is_dirty(ScopeKind::Global);
+    if global_dirty {
         let live = editor.gvars_mut();
-        {
-            let mirror = scope.global_mirror.borrow();
-            let baseline: HashMap<&OxStr, &Typval> =
-                mirror.iter().map(|(key, value)| (key, value)).collect();
-            let current: HashMap<&OxStr, &Typval> = scope
-                .global
-                .iter()
-                .map(|(key, value)| (key, value))
-                .collect();
-            for (key, value) in &scope.global {
-                let changed = match baseline.get(key) {
-                    Some(previous) => **previous != *value,
-                    None => true,
-                };
-                if changed {
-                    live.insert(key.clone(), typval_to_object(value));
-                }
-            }
-            for key in mirror.iter().map(|(key, _)| key) {
-                if !current.contains_key(key) {
-                    live.0.retain(|live_key| live_key.0 != *key);
-                }
-            }
-        }
+        let mut mirror = scope.global_mirror.borrow_mut();
+        merge_scope_map_into_editor(live, &scope.global, &mut mirror, ScopeKind::Global)?;
     }
-    // Pull reentrant writes back into the scope whenever this scope wrote
-    // or the live map moved underneath it: the merge preserves live-only
-    // keys in the editor, but without this the scope map would keep
-    // missing them past the version stamp below, and later commands would
-    // skip their read sync and read stale state. Matching entries keep
-    // their Typvals (and metadata); only missing-or-differing keys convert
-    // from live. A clean scope over an unmoved map skips everything.
-    if dirty || scope.synced.get(ScopeKind::Global) != editor.gvars_version() {
-        {
-            let live = editor.gvars();
-            let live_keys: HashSet<&OxStr> = live.0.iter().map(|(key, _)| key).collect();
-            scope.global.retain(|(key, _)| live_keys.contains(key));
-            let current: HashMap<&OxStr, &Typval> = scope
-                .global
-                .iter()
-                .map(|(key, value)| (key, value))
-                .collect();
-            let mut pulls = Vec::new();
-            for (key, value) in &live.0 {
-                let stale = match current.get(key) {
-                    Some(current) => !typval_matches_object(current, value),
-                    None => true,
-                };
-                if stale {
-                    pulls.push((key.clone(), object_to_typval(value)));
-                }
-            }
-            drop(current);
-            for (key, value) in pulls {
-                match scope.global.iter_mut().find(|(slot, _)| slot == &key) {
-                    Some((_, slot)) => *slot = value,
-                    None => scope.global.push((key, value)),
-                }
-            }
-        }
-        refresh_global_mirror(scope)?;
-        scope.synced.set(ScopeKind::Global, editor.gvars_version());
+    if global_dirty || scope.synced.get(ScopeKind::Global) != editor.gvars_version() {
+        let live = editor.gvars();
+        let mut mirror = scope.global_mirror.borrow_mut();
+        pull_scope_map_from_editor(
+            live,
+            &mut scope.global,
+            &mut mirror,
+            ScopeKind::Global,
+        )?;
+        scope
+            .synced
+            .set(ScopeKind::Global, editor.gvars_version());
     }
-    if dirty {
+    if global_dirty {
         scope.synced.clear_dirty(ScopeKind::Global);
     }
+
     // The cached `b:` map belongs to the buffer the read sync mirrored. When
-    // the current buffer has since moved (a Lua callback switched buffers
-    // mid-command) writing it would land in the wrong buffer, so the write is
-    // skipped and the flag stays set: the next read sync sees the identity
-    // change, rebuilds `b:` from the live buffer, and clears it.
-    if scope.synced.is_dirty(ScopeKind::Buffer)
-        && let Some(buffer) = editor
-            .current_buffer()
-            .filter(|buffer| scope.synced.buffer_identity() == Some(*buffer))
+    // the current buffer has since moved, keep the dirt pending: the next
+    // read sync rebuilds `b:` from that buffer instead of writing stale data
+    // into the wrong one.
+    let buffer_dirty = scope.synced.is_dirty(ScopeKind::Buffer);
+    let buffer = editor
+        .current_buffer()
+        .filter(|buffer| scope.synced.buffer_identity() == Some(*buffer));
+    if buffer_dirty
+        && let Some(buffer) = buffer
     {
-        let mut variables = scope_to_dict(&scope.buffer);
-        // The materialized `b:changedtick` never lands in ordinary
-        // variables: the buffer owns the live counter and a stored copy
-        // would go stale.
-        variables
-            .0
-            .retain(|(key, _)| key.as_bytes() != b"changedtick");
         let state = editor
             .buffer_mut(buffer)
             .map_err(|error| ExecError::Editor(error.to_string()))?;
-        *state.variables_mut() = variables;
-        scope.synced.set_buffer_version(state.variables_version());
-        scope.synced.clear_dirty(ScopeKind::Buffer);
+        let live = state.variables_mut();
+        let mut mirror = scope.global_mirror.borrow_mut();
+        merge_scope_map_into_editor(live, &scope.buffer, &mut mirror, ScopeKind::Buffer)?;
     }
+    if let Some(buffer) = buffer {
+        let buffer_version = editor
+            .buffer_variables_version(buffer)
+            .map_err(|error| ExecError::Editor(error.to_string()))?;
+        if buffer_dirty || scope.synced.buffer_version() != buffer_version {
+            let live = editor
+                .buffer(buffer)
+                .map_err(|error| ExecError::Editor(error.to_string()))?
+                .variables();
+            let mut mirror = scope.global_mirror.borrow_mut();
+            pull_scope_map_from_editor(
+                live,
+                &mut scope.buffer,
+                &mut mirror,
+                ScopeKind::Buffer,
+            )?;
+            scope.synced.set_buffer_version(buffer_version);
+        }
+        if buffer_dirty {
+            scope.synced.clear_dirty(ScopeKind::Buffer);
+        }
+    }
+
     // Persist `:lockvar` marks for buffer-scoped variables into editor-owned
     // storage so the API (`nvim_buf_set_var` / `nvim_buf_del_var`) can reject
-    // mutations with "Key is locked".  This is hoisted out of the dirty
+    // mutations with "Key is locked". This is hoisted out of the dirty
     // branch because `:lockvar` modifies `Scope::locked` without marking the
-    // buffer variable map dirty — the lock state must propagate even when
-    // the variable dict itself is unchanged.
+    // buffer variable map dirty.
     if let Some(buffer) = editor
         .current_buffer()
         .filter(|buffer| scope.synced.buffer_identity() == Some(*buffer))
@@ -16182,34 +16339,66 @@ pub(crate) fn sync_scope_into_editor(
             state.set_locked_vars(locked_names);
         }
     }
-    if scope.synced.is_dirty(ScopeKind::Window)
+
+    let window_dirty = scope.synced.is_dirty(ScopeKind::Window);
+    if window_dirty
         && let Some(window) = editor.current_window()
     {
-        *editor
+        let live = editor
             .window_variables_mut(window)
-            .map_err(|error| ExecError::Editor(error.to_string()))? = scope_to_dict(&scope.window);
-        scope.synced.set(
-            ScopeKind::Window,
-            editor
-                .window_variables_version(window)
-                .map_err(|error| ExecError::Editor(error.to_string()))?,
-        );
-        scope.synced.clear_dirty(ScopeKind::Window);
+            .map_err(|error| ExecError::Editor(error.to_string()))?;
+        let mut mirror = scope.global_mirror.borrow_mut();
+        merge_scope_map_into_editor(live, &scope.window, &mut mirror, ScopeKind::Window)?;
     }
-    if scope.synced.is_dirty(ScopeKind::Tab)
+    if let Some(window) = editor.current_window() {
+        let window_version = editor
+            .window_variables_version(window)
+            .map_err(|error| ExecError::Editor(error.to_string()))?;
+        if window_dirty || scope.synced.get(ScopeKind::Window) != window_version {
+            let live = editor
+                .window_variables(window)
+                .map_err(|error| ExecError::Editor(error.to_string()))?;
+            let mut mirror = scope.global_mirror.borrow_mut();
+            pull_scope_map_from_editor(
+                live,
+                &mut scope.window,
+                &mut mirror,
+                ScopeKind::Window,
+            )?;
+            scope.synced.set(ScopeKind::Window, window_version);
+        }
+        if window_dirty {
+            scope.synced.clear_dirty(ScopeKind::Window);
+        }
+    }
+
+    let tab_dirty = scope.synced.is_dirty(ScopeKind::Tab);
+    if tab_dirty
         && let Some(tab) = editor.current_tabpage()
     {
-        *editor
+        let live = editor
             .tabpage_variables_mut(tab)
-            .map_err(|error| ExecError::Editor(error.to_string()))? = scope_to_dict(&scope.tab);
-        scope.synced.set(
-            ScopeKind::Tab,
-            editor
-                .tabpage_variables_version(tab)
-                .map_err(|error| ExecError::Editor(error.to_string()))?,
-        );
-        scope.synced.clear_dirty(ScopeKind::Tab);
+            .map_err(|error| ExecError::Editor(error.to_string()))?;
+        let mut mirror = scope.global_mirror.borrow_mut();
+        merge_scope_map_into_editor(live, &scope.tab, &mut mirror, ScopeKind::Tab)?;
     }
+    if let Some(tab) = editor.current_tabpage() {
+        let tab_version = editor
+            .tabpage_variables_version(tab)
+            .map_err(|error| ExecError::Editor(error.to_string()))?;
+        if tab_dirty || scope.synced.get(ScopeKind::Tab) != tab_version {
+            let live = editor
+                .tabpage_variables(tab)
+                .map_err(|error| ExecError::Editor(error.to_string()))?;
+            let mut mirror = scope.global_mirror.borrow_mut();
+            pull_scope_map_from_editor(live, &mut scope.tab, &mut mirror, ScopeKind::Tab)?;
+            scope.synced.set(ScopeKind::Tab, tab_version);
+        }
+        if tab_dirty {
+            scope.synced.clear_dirty(ScopeKind::Tab);
+        }
+    }
+
     if scope.synced.is_dirty(ScopeKind::Vim) {
         *editor.vvars_mut() = scope_to_dict(&scope.vim);
         scope.synced.set(ScopeKind::Vim, editor.vvars_version());
