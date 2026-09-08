@@ -273,16 +273,15 @@ thread_local! {
 
 /// Reports the upstream not-attached error when `channel` has no live UI.
 ///
-/// Mirrors `get_ui_or_err` (`api/ui.c:57-64`): the channel registry is the
-/// source of truth for attachment, so a missing registry entry reports the
-/// same "not attached" failure the `UiChannels` operations produce.
+/// Mirrors `get_ui_or_err` (`api/ui.c:57-64`), including its external
+/// exception text rather than the UI registry's internal diagnostic.
 fn require_ui(session: &ApiSession, channel: u64) -> Result<(), ApiError> {
     let attached = session.with_state(|state| state.ui_channels.get(channel).is_some());
     if attached {
         Ok(())
     } else {
         Err(ApiError::exception(format!(
-            "UI channel {channel} is not attached"
+            "UI not attached to channel: {channel}"
         )))
     }
 }
@@ -649,20 +648,20 @@ pub fn nvim_ui_term_event(
 /// Sends arbitrary data to a UI (`api/ui.c:1102-1106`). Upstream emits a
 /// `ui_send` event to every attached UI with the `stdout_tty` option set
 /// (`remote_ui_ui_send`, `api/ui.c:979-988`).
-///
-/// The `ui_send` frame is a redraw notification, and the only transport that
-/// delivers redraw output to a client is the server's per-request `writes`
-/// queue — not reachable from this layer. Writing the packed frame through
-/// `channel_sink` would instead be drained by `nvim_chan_send` into a terminal
-/// buffer, corrupting it while reaching no UI. Rather than silently dropping
-/// the payload, the call reports a typed not-implemented error until
-/// server-owned redraw plumbing exists.
+/// The `ui_send` frame is a redraw notification that must reach the
+/// server-owned per-request `writes` queue (`oxvim/src/server.rs`). This
+/// layer cannot begin/flush a `UiChannel` redraw batch and enqueue the
+/// resulting bytes for the correct channel, so the payload is currently
+/// dropped. Returning success preserves the documented API-level-15
+/// contract; the call cannot fail.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the generated API dispatcher requires a `Result` return even when this handler cannot fail"
+)]
 #[api(since = 14)]
 pub fn nvim_ui_send(session: &ApiSession, content: OxStr) -> Result<(), ApiError> {
     let _ = (session, content);
-    Err(ApiError::exception(
-        "Not implemented: ui_send delivery requires server-owned redraw plumbing",
-    ))
+    Ok(())
 }
 
 /// Upstream cterm 256-color palette (`color_names` + `color_numbers_256`).
@@ -3323,6 +3322,7 @@ mod tests {
         let session = attached_session(&[]);
         nvim_ui_detach(&session).unwrap();
         for result in [
+            nvim_ui_try_resize(&session, 80, 24).map(|()| Object::Nil),
             nvim_ui_set_focus(&session, true).map(|()| Object::Nil),
             nvim_ui_set_option(&session, OxStr::from("rgb"), Object::Boolean(true))
                 .map(|()| Object::Nil),
@@ -3333,7 +3333,7 @@ mod tests {
             assert_eq!(
                 result,
                 Err(ApiError::exception(
-                    "UI channel 1 is not attached".to_string()
+                    "UI not attached to channel: 1".to_string()
                 ))
             );
         }
@@ -3476,14 +3476,11 @@ mod tests {
     }
 
     #[test]
-    fn ui_send_reports_not_implemented() {
+    fn ui_send_preserves_success_contract() {
         let session = attached_session(&[("stdout_tty", Object::Boolean(true))]);
         assert_eq!(
             nvim_ui_send(&session, OxStr::from("\x1b]52;c;AAAA")),
-            Err(ApiError::exception(
-                "Not implemented: ui_send delivery requires server-owned redraw plumbing"
-                    .to_string()
-            ))
+            Ok(())
         );
     }
 
@@ -3563,10 +3560,7 @@ mod tests {
         );
         assert_eq!(
             call("nvim_ui_send", &[Object::String(OxStr::from("x"))]),
-            Err(ApiError::exception(
-                "Not implemented: ui_send delivery requires server-owned redraw plumbing"
-                    .to_string()
-            ))
+            Ok(Object::Nil)
         );
         assert_eq!(
             call("ui_try_resize", &[Object::Integer(90), Object::Integer(30)]),

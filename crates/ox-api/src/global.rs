@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::rc::Rc;
-
+use std::sync::atomic::{AtomicI64, Ordering};
 use ox_editor::{
     AutocmdContext, BufferRelease, Editor, EditorError, Event, FocusContainer, K_SPECIAL,
     KE_FILLER, KS_EXTRA, KS_MODIFIER, KS_SPECIAL, KS_ZERO, Keys, MOD_MASK_ALT, MOD_MASK_CTRL,
@@ -1380,10 +1380,14 @@ pub fn nvim_echo(
     opts: Dict,
 ) -> Result<Object, ApiError> {
     validate_echo_chunks(&chunks)?;
-    // Upstream `Dict(echo_opts)` members (`api/keysets_defs.h`): `err`
-    // selects the error kind, `verbose` gates on 'verbose', and `kind`,
-    // `id`, `title`, `status`, `percent`, `_truncate` ride along for the
-    // progress and truncation display layers. Truly unknown keys fail.
+    // Upstream `Dict(echo_opts)` members (`api/keysets_defs.h` and
+    // `runtime/doc/api.txt`): `err` selects the error kind, `verbose`
+    // gates on 'verbose', and `kind`, `id`, `title`, `status`, `percent`,
+    // `source`, `data`, `_truncate` ride along for the progress and
+    // truncation display layers. The editor message sink currently has no
+    // message-identity store and cannot update an existing message by `id`,
+    // so it still emits a plain `echo`/`emsg` for all accepted `kind`s.
+    // Unknown keys are rejected.
     if let Some((key, _)) = opts.iter().find(|(key, _)| {
         !matches!(
             key.as_bytes(),
@@ -1395,6 +1399,8 @@ pub fn nvim_echo(
                 | b"title"
                 | b"status"
                 | b"percent"
+                | b"source"
+                | b"data"
         )
     }) {
         return Err(ApiError::validation(format!(
@@ -1413,6 +1419,9 @@ pub fn nvim_echo(
             return Ok(Object::Integer(-1));
         }
     }
+    let id = message_id(&opts);
+    let progress_data = is_progress_message(&opts)
+        .then(|| progress_event_data(&opts, &id, &chunks));
     let kind = if dict_bool(&opts, "err")? == Some(true) {
         MessageKind::Error
     } else {
@@ -1426,9 +1435,73 @@ pub fn nvim_echo(
             leading_newline: true,
         });
     });
-    Ok(Object::Integer(-1))
+    if let Some(data) = progress_data {
+        let ctx = AutocmdContext {
+            data: Some(&data),
+            ..AutocmdContext::default()
+        };
+        let plan = session
+            .with_editor_mut(|editor| editor.autocmds_mut().plan(Event::Progress, ctx));
+        crate::autocmd::execute_firing_plan(session, plan)?;
+    }
+    Ok(id)
 }
 
+/// Allocates a message-id for `nvim_echo`.
+///
+/// Uses the caller's explicit `id` when it is an integer or string; otherwise
+/// a monotonically increasing integer identity. The editor message sink has
+/// no identity store, so `id` reuse is honored at the API return and
+/// `Progress` event level only.
+fn message_id(opts: &Dict) -> Object {
+    if let Some(id @ (Object::Integer(_) | Object::String(_))) = opts.get(&OxStr::from("id")) {
+        return id.clone();
+    }
+    static NEXT_MESSAGE_ID: AtomicI64 = AtomicI64::new(1);
+    Object::Integer(NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Whether `opts.kind` is the documented `progress` kind.
+fn is_progress_message(opts: &Dict) -> bool {
+    matches!(
+        opts.get(&OxStr::from("kind")),
+        Some(Object::String(kind)) if kind.as_bytes() == b"progress"
+    )
+}
+
+/// Builds the `{data: ...}` argument for a `Progress` autocmd occurrence.
+///
+/// Mirrors the `vim.event.progress.data` fields the bundled Lua handlers read.
+fn progress_event_data(opts: &Dict, id: &Object, chunks: &[Object]) -> Object {
+    let text = chunks
+        .iter()
+        .filter_map(|chunk| match chunk {
+            Object::Array(parts) => parts.first().cloned(),
+            _ => None,
+        })
+        .collect();
+    let mut entries = vec![
+        (OxStr::from("id"), id.clone()),
+        (OxStr::from("kind"), Object::String(OxStr::from("progress"))),
+        (OxStr::from("text"), Object::Array(text)),
+    ];
+    if let Some(value) = opts.get(&OxStr::from("data")) {
+        entries.push((OxStr::from("data"), value.clone()));
+    }
+    if let Some(Object::Integer(percent)) = opts.get(&OxStr::from("percent")) {
+        entries.push((OxStr::from("percent"), Object::Integer(*percent)));
+    }
+    if let Some(Object::String(source)) = opts.get(&OxStr::from("source")) {
+        entries.push((OxStr::from("source"), Object::String(source.clone())));
+    }
+    if let Some(Object::String(status)) = opts.get(&OxStr::from("status")) {
+        entries.push((OxStr::from("status"), Object::String(status.clone())));
+    }
+    if let Some(Object::String(title)) = opts.get(&OxStr::from("title")) {
+        entries.push((OxStr::from("title"), Object::String(title.clone())));
+    }
+    Object::Dict(Dict(entries))
+}
 #[derive(Clone, Copy)]
 enum OptionTarget {
     Global,

@@ -29,6 +29,9 @@ pub enum RegistryError {
     /// The checked-in canonical API metadata could not be decoded.
     #[error("canonical API metadata is invalid")]
     InvalidCanonicalMetadata,
+    /// Canonical API metadata was valid but could not be serialized.
+    #[error("canonical API metadata could not be encoded")]
+    MetadataEncode,
 }
 
 /// An explicit, insertion-ordered registry of API functions.

@@ -548,8 +548,20 @@ fn details(mark: &Extmark) -> Dict {
 }
 
 fn push_string_attributes(values: &mut Vec<(OxStr, Object)>, attributes: &ExtmarkAttributes) {
+    if let Some(primary) = &attributes.highlight_group {
+        let group = if attributes.additional_highlight_groups.is_empty() {
+            Object::String(OxStr::from(primary.as_str()))
+        } else {
+            Object::Array(
+                std::iter::once(primary)
+                    .chain(&attributes.additional_highlight_groups)
+                    .map(|name| Object::String(OxStr::from(name.as_str())))
+                    .collect(),
+            )
+        };
+        values.push((OxStr::from("hl_group"), group));
+    }
     for (key, value) in [
-        ("hl_group", &attributes.highlight_group),
         ("sign_text", &attributes.sign_text),
         ("sign_name", &attributes.sign_name),
         ("sign_hl_group", &attributes.sign_highlight_group),

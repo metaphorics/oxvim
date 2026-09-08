@@ -91,12 +91,13 @@ fn release_removed(
 /// switch and the restore each hold the editor only for their statement, so
 /// `run` re-enters APIs through `session` while no editor borrow is live.
 ///
-/// The first existing window already showing `buffer` and not ignoring
 /// `event` through its window-local `eventignorewin` becomes current; if
 /// every such window ignores the event, or global `eventignore` gates the
 /// event, nothing runs and `None` is returned. A hidden buffer is
-/// temporarily displayed in the caller window. Every window change is undone
-/// on the way out without masking `run`'s result.
+/// temporarily displayed in the caller window; an unloaded one is
+/// materialized through the same empty-text load `set_window_buffer`
+/// performs, so the callback always observes the target as current. Every
+/// window change is undone on the way out without masking `run`'s result.
 ///
 /// # Errors
 ///
@@ -112,24 +113,20 @@ fn run_in_buffer_context(
     if session.with_editor(|editor| editor.autocmds().is_ignored(event)) {
         return Ok(None);
     }
-    // Upstream `aucmd_prepbuf` loads the target from disk before entering;
-    // the API layer has no file IO, so when the target exists but its text
-    // is not resident, fire without entering rather than forcing an
-    // unloadable buffer current. Callbacks still observe the target through
-    // the event context (`<abuf>`); only the current-buffer switch is lost.
-    let enterable = session.with_editor(|editor| {
+    // Upstream `ctx_switch` (legacy `aucmd_prepbuf`) enters the target even
+    // when its text is not resident; `set_current_buffer` materializes an
+    // unloaded buffer through the same empty-text policy `set_window_buffer`
+    // already applies. Only a target wiped between planning and firing still
+    // runs in place — there is no window state left to enter.
+    let target_live = session.with_editor(|editor| {
         let target = if buffer.is_current() {
             editor.current_buffer()
         } else {
             Some(buffer)
         };
-        target.map(|handle| {
-            editor
-                .buffer(handle)
-                .is_ok_and(|state| state.residency.is_loaded())
-        })
+        target.map(|handle| editor.buffer(handle).is_ok())
     });
-    if enterable == Some(false) {
+    if target_live == Some(false) {
         return Ok(Some(run()));
     }
     // Decide the entering window without host code in between, so the state
