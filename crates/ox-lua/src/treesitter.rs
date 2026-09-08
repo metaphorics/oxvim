@@ -317,21 +317,24 @@ fn add_logging_methods<M: UserDataMethods<ParserHandle>>(methods: &mut M) {
 
 /// Reads live buffer text for tree-sitter's buffer-handle `parse` input:
 /// upstream parses the buffer (unsaved changes included), so the lines
-/// come through `vim.api` on this same loop thread and are joined with
-/// single newlines exactly like the buffer store would. Sound under the
-/// `add_method_mut` borrow only because `nvim_buf_get_lines` is a pure
-/// read: it fires no autocmd, so the same parser cannot be reentered
-/// mid-call. Never extend this helper with event-firing calls.
+/// come through `vim.api` on this same loop thread. Every line is
+/// newline-terminated, including the last: upstream buffer text always
+/// carries the final EOL, and tree-sitter extends the root end past it
+/// (`'int x = 1;\n'` roots at `{0,0,1,0}` on both binaries, while the
+/// unterminated form roots at `{0,0,0,10}`). Joining without the final
+/// newline shortens every root end by one row (`{0,0,2,1}` instead of
+/// `{0,0,3,0}`). Sound under the `add_method_mut` borrow only because
+/// `nvim_buf_get_lines` is a pure read: it fires no autocmd, so the
+/// same parser cannot be reentered mid-call. Never extend this helper
+/// with event-firing calls.
 fn buffer_bytes(lua: &Lua, bufnr: i64) -> mlua::Result<Vec<u8>> {
     let api: Table = lua.globals().get::<Table>("vim")?.get("api")?;
     let get_lines: Function = api.get("nvim_buf_get_lines")?;
     let lines: Table = get_lines.call((bufnr, 0, -1, false))?;
     let mut bytes = Vec::new();
     for line in lines.sequence_values::<String>() {
-        if !bytes.is_empty() {
-            bytes.push(b'\n');
-        }
         bytes.extend_from_slice(line?.as_bytes());
+        bytes.push(b'\n');
     }
     Ok(bytes)
 }
