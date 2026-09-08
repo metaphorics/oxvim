@@ -647,6 +647,9 @@ impl ModeMachine {
                 }
                 continue;
             }
+            // A delivered key ends one `vgetorpeek` episode; reset the
+            // mapping-recursion counter so it does not leak across commands.
+            self.map_depth = 0;
             return match key {
                 Key::Byte(byte) => Ok(Step::Key(char::from(byte))),
                 Key::Special(KS_EXTRA, b'R' | b'N') => Ok(Step::Key('\r')),
@@ -743,6 +746,7 @@ impl ModeMachine {
         self.map_depth = self.map_depth.saturating_add(1);
         if u64::from(self.map_depth) >= max_map_depth(editor) {
             editor.typeahead_mut().flush();
+            self.map_depth = 0;
             return Err(ModeError::RecursiveMapping);
         }
         editor.typeahead_mut().consume(width);
