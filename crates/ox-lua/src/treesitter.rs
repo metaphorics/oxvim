@@ -1024,18 +1024,24 @@ fn inspect_language(lua: &Lua, language: &Language) -> mlua::Result<Table> {
     Ok(result)
 }
 
+/// Reads a query-cursor row/column bound, tolerating the conventional `-1`
+/// ("unbounded", e.g. `iter_matches(root, 0, 0, -1)`). Upstream casts the
+/// Lua integer to `uint32_t`, so `-1` wraps to the maximum; saturating here
+/// reaches the same bound without a wrapping cast.
+fn cursor_bound(value: Option<i64>, default: usize) -> usize {
+    value.map_or(default, |bound| {
+        usize::try_from(bound).unwrap_or(usize::MAX)
+    })
+}
+
 fn configure_cursor(cursor: &mut QueryCursor, options: &Table) -> mlua::Result<()> {
     let start = Point::new(
-        options.get::<Option<usize>>("start_row")?.unwrap_or(0),
-        options.get::<Option<usize>>("start_col")?.unwrap_or(0),
+        cursor_bound(options.get("start_row")?, 0),
+        cursor_bound(options.get("start_col")?, 0),
     );
     let end = Point::new(
-        options
-            .get::<Option<usize>>("end_row")?
-            .unwrap_or(usize::MAX),
-        options
-            .get::<Option<usize>>("end_col")?
-            .unwrap_or(usize::MAX),
+        cursor_bound(options.get("end_row")?, usize::MAX),
+        cursor_bound(options.get("end_col")?, usize::MAX),
     );
     cursor.set_point_range(start..end);
     if let Some(limit) = options.get::<Option<u32>>("match_limit")? {
