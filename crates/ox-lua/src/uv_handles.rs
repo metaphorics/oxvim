@@ -16,7 +16,7 @@ use mlua::{
     Variadic,
 };
 use ox_uv::dns::{self, AddrInfoHints};
-use ox_uv::fs::FsResult;
+use ox_uv::fs::{FsError, FsResult};
 use ox_uv::fs_watch::{FsEvent, FsEventOptions, FsEventRecord};
 use ox_uv::net::{NetEvent, Tcp, Udp};
 #[cfg(unix)]
@@ -1277,20 +1277,6 @@ struct LuaFsEvent {
     phase: Rc<Cell<FsEventPhase>>,
     wake: ox_uv::AsyncSender,
 }
-/// errno name for an `io::Error`, mirroring the `errno_name` helper in
-/// `uv_core.rs` (which is private to that module). Used so a metadata
-/// failure in `LuaFsEvent::start` is not hardcoded as `ENOENT`.
-fn errno_name(error: &io::Error) -> &'static str {
-    match error.kind() {
-        io::ErrorKind::NotFound => "ENOENT",
-        io::ErrorKind::PermissionDenied => "EACCES",
-        io::ErrorKind::AlreadyExists => "EEXIST",
-        io::ErrorKind::InvalidInput => "EINVAL",
-        io::ErrorKind::WouldBlock => "EAGAIN",
-        _ => "EIO",
-    }
-}
-
 
 impl LuaFsEvent {
     fn options(flags: &Table) -> FsEventOptions {
@@ -1311,13 +1297,19 @@ impl LuaFsEvent {
         self.check_idle()?;
         // luv surfaces an unstartable path as `nil, err, name` so
         // `vim._watch` can notify on ENOENT; the backend itself only
-        // fails asynchronously after this point.
+        // fails asynchronously after this point. The errno name comes
+        // from the same `FsError` mapping every `uvfs` binding reports
+        // through, so only a genuinely missing path reports `ENOENT` —
+        // `EACCES`, `ELOOP`, and friends keep their own names for
+        // plugins that branch on them.
         if let Err(error) = std::fs::metadata(&path) {
-            let name = errno_name(&error);
-            let message = if error.kind() == io::ErrorKind::NotFound {
+            let missing = error.kind() == io::ErrorKind::NotFound;
+            let fs_error = FsError::from(error);
+            let name = fs_error.name;
+            let message = if missing {
                 format!("{name}: no such file or directory: {path}")
             } else {
-                format!("{name}: {error}: {path}")
+                format!("{name}: {msg}: {path}", msg = fs_error.message)
             };
             return Ok(MultiValue::from_vec(vec![
                 Value::Nil,
@@ -2627,5 +2619,71 @@ mod fs_event_lifecycle_tests {
             vim.uv.run('nowait')
             ",
         );
+    }
+    /// A failed startup probe keeps luv's exact ENOENT text: `vim._watch`
+    /// notifies on that name and existing tests pin the message.
+    #[test]
+    fn fs_event_start_reports_missing_path_enoent() {
+        with_watch_dir(
+            "errno-missing",
+            r"
+            local handle = assert(vim.uv.new_fs_event())
+            local ok, err, name = handle:start(TEST_DIR .. '/absent', {}, function() end)
+            assert(ok == nil and name == 'ENOENT', tostring(err))
+            assert(
+                err == 'ENOENT: no such file or directory: ' .. TEST_DIR .. '/absent',
+                err
+            )
+            handle:close()
+            ",
+        );
+    }
+
+    /// A path behind a mode-000 directory reports EACCES — the errno plugins
+    /// branch on — instead of a collapsed ENOENT. Root bypasses mode bits, so
+    /// the case is skipped where the probe stat succeeds; asserting there
+    /// would prove nothing.
+    #[cfg(unix)]
+    #[test]
+    fn fs_event_start_reports_sealed_path_eacces() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempWatchDir::new("errno-sealed");
+        let host = host();
+        let sealed = dir.path.join("sealed");
+        std::fs::create_dir(&sealed).expect("create sealed dir");
+        std::fs::write(sealed.join("probe"), b"probe").expect("create probe");
+        // The probe targets a path *under* the sealed directory: stat needs
+        // no permission on the final component, so statting the sealed
+        // directory itself would succeed even where mode bits bind.
+        host.lua()
+            .globals()
+            .set(
+                "TEST_SEALED",
+                sealed.join("probe").to_string_lossy().as_ref(),
+            )
+            .unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0))
+            .expect("seal directory");
+        if std::fs::metadata(sealed.join("probe")).is_ok() {
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755))
+                .expect("unseal directory");
+            return;
+        }
+        let result = host.lua()
+            .load(
+                r"
+                local handle = assert(vim.uv.new_fs_event())
+                local ok, err, name = handle:start(TEST_SEALED, {}, function() end)
+                assert(ok == nil and name == 'EACCES', tostring(err))
+                assert(err:sub(1, 8) == 'EACCES: ', err)
+                handle:close()
+                ",
+            )
+            .exec();
+        // Unseal before any unwinding: the recursive cleanup cannot open a
+        // sealed directory.
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755))
+            .expect("unseal directory");
+        result.unwrap();
     }
 }
