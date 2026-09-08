@@ -338,7 +338,7 @@ fn buffer_bytes(lua: &Lua, bufnr: i64) -> mlua::Result<Vec<u8>> {
     // both 'fixeol' and 'eol' off (`input_cb`, treesitter.c:479-487).
     // Without the terminator tree-sitter ends every buffer root one
     // row early (`{0,0,2,1}` instead of `{0,0,3,0}` on both binaries).
-    if !bytes.is_empty() && !buffer_lacks_eol(&api, bufnr)? {
+    if !bytes.is_empty() && !buffer_lacks_eol(lua, &api, bufnr)? {
         return Ok(bytes);
     }
     if bytes.last() == Some(&b'\n') {
@@ -351,18 +351,22 @@ fn buffer_bytes(lua: &Lua, bufnr: i64) -> mlua::Result<Vec<u8>> {
 /// both 'fixeol' and 'eol' off. Mirrors the last-line arm of upstream
 /// `input_cb` (treesitter.c:482-483); option reads go through the same
 /// `vim.api` bridge as the lines above, so no new borrow surface.
-fn buffer_lacks_eol(api: &Table, bufnr: i64) -> mlua::Result<bool> {
-    let get_option: Function = api.get("nvim_buf_get_option")?;
-    let binary: bool = get_option.call((bufnr, "binary"))?;
-    if binary {
+fn buffer_lacks_eol(lua: &Lua, api: &Table, bufnr: i64) -> mlua::Result<bool> {
+    // `nvim_buf_get_option` is deprecated since API level 11; the
+    // supported read is `nvim_get_option_value` with a `buf` scope.
+    let get_option: Function = api.get("nvim_get_option_value")?;
+    let scoped = |name: &str| -> mlua::Result<bool> {
+        let opts = lua.create_table()?;
+        opts.set("buf", bufnr)?;
+        get_option.call((name, opts))
+    };
+    if scoped("binary")? {
         return Ok(true);
     }
-    let fixeol: bool = get_option.call((bufnr, "fixeol"))?;
-    if fixeol {
+    if scoped("fixeol")? {
         return Ok(false);
     }
-    let eol: bool = get_option.call((bufnr, "eol"))?;
-    Ok(!eol)
+    Ok(!scoped("eol")?)
 }
 
 impl UserData for ParserHandle {
