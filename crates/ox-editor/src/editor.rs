@@ -3557,6 +3557,21 @@ impl Editor {
         let buffer = self.resolve_buffer_handle(buffer)?;
         self.require_buffer(buffer)?;
         self.require_tabpage(tab)?;
+        // Splitting a floating window splits the last non-floating window
+        // instead (window.c:1151-1154: "can't split float, use last
+        // nonfloating window instead").
+        let target = {
+            let tabpage = self
+                .tabpages
+                .get(&tab)
+                .ok_or(EditorError::UnknownTabpage(tab))?;
+            let floating = tabpage.window_config(target)?.is_some();
+            if floating {
+                tabpage.layout().windows().into_iter().last().unwrap_or(target)
+            } else {
+                target
+            }
+        };
         let previous = self.current_window();
         let (old_topline, old_cursor, old_height, old_buffer, local_directory, previous_directory) = {
             let tabpage = self
