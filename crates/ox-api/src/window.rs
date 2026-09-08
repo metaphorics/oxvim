@@ -561,6 +561,16 @@ fn text_alignment(value: TextAlignment) -> &'static str {
     }
 }
 
+/// Packs eight border characters into an API array.
+fn border_chars(chars: [&str; 8]) -> Object {
+    Object::Array(
+        chars
+            .iter()
+            .map(|char| Object::String(OxStr::from(*char)))
+            .collect(),
+    )
+}
+
 fn config_to_dict(config: Option<&WinConfig>) -> Result<Dict, ApiError> {
     let Some(config) = config else {
         return Ok(Dict(vec![(
@@ -579,13 +589,17 @@ fn config_to_dict(config: Option<&WinConfig>) -> Result<Dict, ApiError> {
         Anchor::SouthWest => "SW",
         Anchor::SouthEast => "SE",
     };
+    // `nvim_win_get_config` reports the eight border characters, not the
+    // style name (api/win_config.c:892-908). Tables mirror the `defaults`
+    // in `parse_border_style`, ordered top-left, top, top-right, right,
+    // bottom-right, bottom, bottom-left, left.
     let border = match &config.border {
         Border::None => Object::String(OxStr::from("none")),
-        Border::Single => Object::String(OxStr::from("single")),
-        Border::Double => Object::String(OxStr::from("double")),
-        Border::Rounded => Object::String(OxStr::from("rounded")),
-        Border::Solid => Object::String(OxStr::from("solid")),
-        Border::Shadow => Object::String(OxStr::from("shadow")),
+        Border::Single => border_chars(["┌", "─", "┐", "│", "┘", "─", "└", "│"]),
+        Border::Double => border_chars(["╔", "═", "╗", "║", "╝", "═", "╚", "║"]),
+        Border::Rounded => border_chars(["╭", "─", "╮", "│", "╯", "─", "╰", "│"]),
+        Border::Solid => border_chars([" ", " ", " ", " ", " ", " ", " ", " "]),
+        Border::Shadow => border_chars(["", "", " ", " ", " ", " ", " ", ""]),
         Border::Custom(parts) => Object::Array(
             parts
                 .iter()
