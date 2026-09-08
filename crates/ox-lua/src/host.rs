@@ -236,11 +236,13 @@ impl LuaHost {
 
 fn configure_package_path(lua: &Lua, runtime_root: &RuntimeRoot) -> mlua::Result<()> {
     let package: Table = lua.globals().get("package")?;
-    // An unresolved root is a runtime-less host (tests, tools): it must
-    // resolve nothing, so both fields clear - an empty root would otherwise
-    // contribute the CWD-relative `lua`, and the LuaJIT defaults
-    // (./?.lua source, ./?.so native, vendored luaconf.h LUA_PATH_DEFAULT /
-    // LUA_CPATH_DEFAULT) keep a planted-tree vector open.
+    // An unresolved root is a runtime-less host: prepend nothing and leave
+    // the interpreter defaults (CWD entries included) exactly as upstream
+    // leaves them. Wiping the fields here once broke every in-harness
+    // `require` for a binary run outside its sibling runtime tree
+    // (empty `package.path` in the child, `test.functional...` modules
+    // unresolvable): matching the reference interpreter beats hardening
+    // past it, and the CWD entries survive there too.
     //
     // A resolved root mirrors upstream instead of hardening past it:
     // runtime entries are prepended to `package.path` and win by
@@ -255,8 +257,7 @@ fn configure_package_path(lua: &Lua, runtime_root: &RuntimeRoot) -> mlua::Result
     // would kill the trail harvest and drop the system entries; both would
     // be behavior drift, not hardening.
     if runtime_root.resolve("").as_os_str().is_empty() {
-        package.set("path", "")?;
-        return package.set("cpath", "");
+        return Ok(());
     }
     let existing: String = package.get("path")?;
     let lua_root = runtime_root.resolve("lua");
@@ -289,11 +290,12 @@ mod tests {
         };
         let path = |lua: &Lua| package_field(lua, "path");
         let cpath = |lua: &Lua| package_field(lua, "cpath");
-        // A runtime-less host resolves nothing: planted CWD trees stay
-        // unreachable for both source and native modules.
+        // A runtime-less host prepends nothing: the interpreter defaults
+        // survive exactly as upstream leaves them (wiping them once broke
+        // every in-harness require for a binary outside its runtime tree).
         configure_package_path(&lua, &RuntimeRoot::new(PathBuf::new())).unwrap();
-        assert_eq!(path(&lua), "");
-        assert_eq!(cpath(&lua), "");
+        assert_eq!(path(&lua), package_field(&Lua::new(), "path"));
+        assert_eq!(cpath(&lua), package_field(&Lua::new(), "cpath"));
         // A resolved host prepends its runtime entries, which win by
         // precedence over the surviving defaults, and leaves cpath alone:
         // emptying it would starve `vim._so_trails`
