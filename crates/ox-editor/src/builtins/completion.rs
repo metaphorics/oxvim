@@ -1872,6 +1872,11 @@ impl CompletionSession {
                 return Ok(CompletionOutcome::Handled);
             }
             if is_ctrl_x_submode_key(key) {
+                // This selector is recognized by upstream `set_ctrl_x_mode`
+                // but unported here. It consumes the attempt without
+                // continuing the interrupted completion, so the marker must
+                // die here — same rule as the ordinary-key path below.
+                self.interrupted = false;
                 return Ok(CompletionOutcome::Handled);
             }
             // An ordinary key ends the `CTRL-X` attempt (`set_ctrl_x_mode`
@@ -2464,7 +2469,9 @@ fn line_bytes(editor: &Editor, buffer: BufHandle, lnum: usize) -> Result<Vec<u8>
 
 #[cfg(test)]
 mod completion_engine_tests {
-    use super::{CTRL_E, CTRL_N, CTRL_P, CTRL_X, CompletionOutcome, CompletionSession};
+    use super::{
+        CTRL_D, CTRL_E, CTRL_N, CTRL_P, CTRL_X, CompletionOutcome, CompletionSession,
+    };
     use crate::layout::Geometry;
     use ox_text::{Buffer, Position};
 
@@ -2728,6 +2735,39 @@ mod completion_engine_tests {
             .handle_insert_key(&mut editor, buffer, window, cursor, 'x', 2)
             .unwrap();
         assert_eq!(outcome, CompletionOutcome::Release);
+        assert!(!session.interrupted);
+        session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_X, 3)
+            .unwrap();
+        session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_N, 4)
+            .unwrap();
+        assert_eq!(
+            session.showmode_override().as_deref(),
+            Some("-- Keyword Local completion (^N^P) match 1 of 2")
+        );
+    }
+
+    #[test]
+    fn unported_selector_after_interrupt_restarts_local() {
+        // CTRL-N, CTRL-X (interrupts the live session), an unported
+        // selector such as CTRL-D (consumes the attempt upstream but is
+        // not implemented here): it must kill the interruption marker, or
+        // the next unrelated CTRL-X CTRL-N continues non-local.
+        let (mut editor, buffer, window) = editor_with(b"alpha\nalpaca\nal");
+        let mut session = CompletionSession::new();
+        let cursor = Position { lnum: 3, col: 2 };
+        session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_N, 0)
+            .unwrap();
+        session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_X, 1)
+            .unwrap();
+        assert!(session.interrupted);
+        let outcome = session
+            .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_D, 2)
+            .unwrap();
+        assert_eq!(outcome, CompletionOutcome::Handled);
         assert!(!session.interrupted);
         session
             .handle_insert_key(&mut editor, buffer, window, cursor, CTRL_X, 3)
