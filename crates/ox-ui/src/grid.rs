@@ -376,6 +376,14 @@ impl Grid {
                 height: self.height,
             });
         }
+        // Zero displacement is a no-op. It is the only source/destination
+        // alias: for any nonzero shift, the directional traversal reads a
+        // source before its destination is visited. Returning here also
+        // avoids constructing a blank cell for every unchanged cell.
+        if rows == 0 && cols == 0 {
+            return Ok(());
+        }
+
         // In-place copy: visit destinations so every source cell is read
         // before it is written — rows ascending for non-negative vertical
         // shifts and descending otherwise, likewise for columns — moving each
@@ -641,4 +649,155 @@ fn encode_cells(cells: &[Cell]) -> Vec<Object> {
         index += repeat;
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Grid;
+
+    fn filled_grid(width: usize, height: usize) -> Grid {
+        let mut grid = Grid::new(1, width, height).unwrap();
+        for row in 0..height {
+            for col in 0..width {
+                let text = format!("{row}:{col}");
+                let hl_id = u64::try_from(row * width + col).unwrap();
+                grid.write_cell(row, col, text.as_bytes(), hl_id, 1)
+                    .unwrap();
+            }
+        }
+        grid
+    }
+
+    fn assert_source_cell(
+        grid: &Grid,
+        row: usize,
+        col: usize,
+        source_row: usize,
+        source_col: usize,
+        width: usize,
+    ) {
+        let cell = grid.cell(row, col).unwrap();
+        let expected_text = format!("{source_row}:{source_col}");
+        let expected_hl = u64::try_from(source_row * width + source_col).unwrap();
+        assert_eq!(
+            cell.text.as_bytes(),
+            expected_text.as_bytes(),
+            "text at ({row}, {col})"
+        );
+        assert_eq!(cell.hl_id, expected_hl, "highlight at ({row}, {col})");
+    }
+
+    fn assert_blank_cell(grid: &Grid, row: usize, col: usize) {
+        assert!(
+            grid.cell(row, col).unwrap().is_blank(),
+            "expected blank cell at ({row}, {col})"
+        );
+    }
+
+    fn assert_outside_unchanged(
+        before: &Grid,
+        after: &Grid,
+        top: usize,
+        bottom: usize,
+        left: usize,
+        right: usize,
+    ) {
+        for row in 0..before.height() {
+            for col in 0..before.width() {
+                if !(top..bottom).contains(&row) || !(left..right).contains(&col) {
+                    assert_eq!(
+                        after.cell(row, col).unwrap(),
+                        before.cell(row, col).unwrap(),
+                        "cell changed outside region at ({row}, {col})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_offset_scroll_preserves_every_cell() {
+        let mut grid = filled_grid(8, 6);
+        let before = grid.clone();
+
+        grid.scroll(0, 6, 0, 8, 0, 0).unwrap();
+
+        assert_eq!(grid, before);
+    }
+
+    #[test]
+    fn zero_offset_scroll_preserves_partial_region() {
+        let mut grid = filled_grid(8, 6);
+        let before = grid.clone();
+
+        grid.scroll(1, 5, 2, 7, 0, 0).unwrap();
+
+        assert_eq!(grid, before);
+    }
+
+    #[test]
+    fn scroll_up_moves_cells_and_blanks_bottom() {
+        let mut grid = filled_grid(8, 6);
+        let before = grid.clone();
+
+        grid.scroll(1, 5, 2, 7, 1, 0).unwrap();
+
+        for col in 2..7 {
+            assert_source_cell(&grid, 1, col, 2, col, 8);
+            assert_source_cell(&grid, 2, col, 3, col, 8);
+            assert_source_cell(&grid, 3, col, 4, col, 8);
+            assert_blank_cell(&grid, 4, col);
+        }
+        assert_outside_unchanged(&before, &grid, 1, 5, 2, 7);
+    }
+
+    #[test]
+    fn scroll_down_moves_cells_and_blanks_top() {
+        let mut grid = filled_grid(8, 6);
+        let before = grid.clone();
+
+        grid.scroll(1, 5, 2, 7, -1, 0).unwrap();
+
+        for col in 2..7 {
+            assert_blank_cell(&grid, 1, col);
+            assert_source_cell(&grid, 2, col, 1, col, 8);
+            assert_source_cell(&grid, 3, col, 2, col, 8);
+            assert_source_cell(&grid, 4, col, 3, col, 8);
+        }
+        assert_outside_unchanged(&before, &grid, 1, 5, 2, 7);
+    }
+
+    #[test]
+    fn scroll_left_moves_cells_and_blanks_right() {
+        let mut grid = filled_grid(8, 6);
+        let before = grid.clone();
+
+        grid.scroll(1, 5, 2, 7, 0, 1).unwrap();
+
+        for row in 1..5 {
+            assert_source_cell(&grid, row, 2, row, 3, 8);
+            assert_source_cell(&grid, row, 3, row, 4, 8);
+            assert_source_cell(&grid, row, 4, row, 5, 8);
+            assert_source_cell(&grid, row, 5, row, 6, 8);
+            assert_blank_cell(&grid, row, 6);
+        }
+        assert_outside_unchanged(&before, &grid, 1, 5, 2, 7);
+    }
+
+    #[test]
+    fn scroll_right_moves_cells_and_blanks_left() {
+        let mut grid = filled_grid(8, 6);
+        let before = grid.clone();
+
+        grid.scroll(1, 5, 2, 7, 0, -1).unwrap();
+
+        for row in 1..5 {
+            assert_blank_cell(&grid, row, 2);
+            assert_source_cell(&grid, row, 3, row, 2, 8);
+            assert_source_cell(&grid, row, 4, row, 3, 8);
+            assert_source_cell(&grid, row, 5, row, 4, 8);
+            assert_source_cell(&grid, row, 6, row, 5, 8);
+        }
+        assert_outside_unchanged(&before, &grid, 1, 5, 2, 7);
+    }
 }
