@@ -13633,7 +13633,7 @@ pub fn focus_transition(
 /// buffer's name as `<afile>`/`<amatch>`, through the shared planner and
 /// [`run_autocmd_plan`]. The first non-normal handler flow wins, so a caller
 /// can abort the entry it is performing.
-fn fire_buffer_lifecycle<F: FileIO, E: ExEditorAccess>(
+pub(crate) fn fire_buffer_lifecycle<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
