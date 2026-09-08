@@ -2,7 +2,6 @@
 
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicI64, Ordering};
 use ox_editor::{
     AutocmdContext, BufferRelease, Editor, EditorError, Event, FocusContainer, K_SPECIAL,
     KE_FILLER, KS_EXTRA, KS_MODIFIER, KS_SPECIAL, KS_ZERO, Keys, MOD_MASK_ALT, MOD_MASK_CTRL,
@@ -1408,6 +1407,7 @@ pub fn nvim_echo(
             key.to_string_lossy()
         )));
     }
+    validate_message_id(session, &opts)?;
     // `verbose` messages show only when 'verbose' is nonzero (upstream
     // `verbose_enter` around the echo).
     if dict_bool(&opts, "verbose")? == Some(true) {
@@ -1419,7 +1419,7 @@ pub fn nvim_echo(
             return Ok(Object::Integer(-1));
         }
     }
-    let id = message_id(&opts);
+    let id = message_id(session, &opts);
     let progress_data = is_progress_message(&opts)
         .then(|| progress_event_data(&opts, &id, &chunks));
     let kind = if dict_bool(&opts, "err")? == Some(true) {
@@ -1447,18 +1447,34 @@ pub fn nvim_echo(
     Ok(id)
 }
 
+/// Validates an explicit integer message-id against this editor session.
+///
+/// Validation is separate from allocation so a suppressed `verbose` call
+/// still rejects an invalid integer without consuming an automatic id.
+fn validate_message_id(session: &ApiSession, opts: &Dict) -> Result<(), ApiError> {
+    let Some(Object::Integer(id)) = opts.get(&OxStr::from("id")) else {
+        return Ok(());
+    };
+    if session.with_state(|state| *id > 0 && *id < state.next_message_id) {
+        Ok(())
+    } else {
+        Err(ApiError::validation(format!("Invalid 'id': {id}")))
+    }
+}
+
 /// Allocates a message-id for `nvim_echo`.
 ///
-/// Uses the caller's explicit `id` when it is an integer or string; otherwise
-/// a monotonically increasing integer identity. The editor message sink has
-/// no identity store, so `id` reuse is honored at the API return and
-/// `Progress` event level only.
-fn message_id(opts: &Dict) -> Object {
-    if let Some(id @ (Object::Integer(_) | Object::String(_))) = opts.get(&OxStr::from("id")) {
-        return id.clone();
+/// Missing or nil ids consume the next integer in this editor session;
+/// explicit values remain caller-defined after [`validate_message_id`].
+fn message_id(session: &ApiSession, opts: &Dict) -> Object {
+    match opts.get(&OxStr::from("id")) {
+        None | Some(Object::Nil) => Object::Integer(session.with_state_mut(|state| {
+            let id = state.next_message_id;
+            state.next_message_id = state.next_message_id.wrapping_add(1);
+            id
+        })),
+        Some(id) => id.clone(),
     }
-    static NEXT_MESSAGE_ID: AtomicI64 = AtomicI64::new(1);
-    Object::Integer(NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Whether `opts.kind` is the documented `progress` kind.

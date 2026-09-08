@@ -8243,6 +8243,96 @@ fn nvim_echo_accepts_documented_progress_options_and_rejects_unknown_keys() {
 }
 
 #[test]
+fn nvim_echo_validates_integer_message_ids() {
+    let session = session();
+    let chunks = vec![Object::Array(vec![Object::String(OxStr::from("hello"))])];
+
+    // The first automatic id is established before an explicit integer can
+    // refer to it.
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[])),
+        Ok(Object::Integer(1))
+    );
+    assert_eq!(
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[("id", Object::Integer(1))]),
+        ),
+        Ok(Object::Integer(1))
+    );
+    assert_eq!(
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[("id", Object::Integer(2))]),
+        ),
+        Err(ApiError::validation("Invalid 'id': 2"))
+    );
+    assert_eq!(
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[
+                ("id", Object::Integer(0)),
+                ("verbose", Object::Boolean(true)),
+            ]),
+        ),
+        Err(ApiError::validation("Invalid 'id': 0"))
+    );
+    assert_eq!(
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[("id", Object::String(OxStr::from("custom")))]),
+        ),
+        Ok(Object::String(OxStr::from("custom")))
+    );
+    // `Union(Integer, String)` is represented as an Object by both upstream
+    // keyset decoders, so other object types remain caller-defined as well.
+    assert_eq!(
+        crate::global::nvim_echo(
+            &session,
+            chunks,
+            false,
+            dict(&[("id", Object::Boolean(true))]),
+        ),
+        Ok(Object::Boolean(true))
+    );
+}
+
+#[test]
+fn nvim_echo_auto_ids_are_scoped_to_each_api_session() {
+    let first = session();
+    let second = session();
+    let chunks = vec![Object::Array(vec![Object::String(OxStr::from("hello"))])];
+
+    assert_eq!(
+        crate::global::nvim_echo(&first, chunks.clone(), false, dict(&[])),
+        Ok(Object::Integer(1))
+    );
+    assert_eq!(
+        crate::global::nvim_echo(&first, chunks.clone(), false, dict(&[])),
+        Ok(Object::Integer(2))
+    );
+    assert_eq!(
+        crate::global::nvim_echo(&second, chunks.clone(), false, dict(&[])),
+        Ok(Object::Integer(1))
+    );
+
+    drop(first);
+    let fresh = session();
+    assert_eq!(
+        crate::global::nvim_echo(&fresh, chunks, false, dict(&[])),
+        Ok(Object::Integer(1))
+    );
+}
+
+#[test]
 fn nvim_echo_plain_echo_still_pushes_message() {
     let session = session();
     let before = session.with_editor(|editor| editor.messages().len());
