@@ -5,9 +5,11 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-
-use ox_lua::{BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work};
-use ox_types::{OxStr, Typval};
+use ox_api::ApiSession;
+use ox_editor::Editor;
+use ox_editor::editor::RedrawRequest;
+use ox_lua::{ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work, bind_api};
+use ox_types::{BufHandle, OxStr, Typval, WinHandle};
 
 #[derive(Default)]
 struct TestScheduler {
@@ -82,6 +84,21 @@ fn parser_from_environment() -> Option<(PathBuf, String)> {
 
 fn runtime_root() -> RuntimeRoot {
     RuntimeRoot::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime"))
+}
+
+/// Builds a `LuaHost` whose `vim.api` is wired to a real editor session.
+fn with_api_host() -> (LuaHost, Rc<ApiSession>) {
+    let builtins = Rc::new(NoBuiltins);
+    let scheduler = Rc::new(TestScheduler::default());
+    let host = LuaHost::new(runtime_root(), builtins, scheduler).unwrap();
+
+    let editor = Editor::new();
+    let session = Rc::new(ApiSession::new(Rc::new(RefCell::new(editor))));
+    let registry = ox_api::core().unwrap();
+    let context = ApiDispatchContext::new(Rc::clone(&session));
+    bind_api(host.lua(), &registry, context, host.fast_callbacks()).unwrap();
+
+    (host, session)
 }
 
 /// These tests pin the real parser boundary: a missing parser shared
@@ -402,4 +419,282 @@ fn emit_highlights_filters_groups_coords_and_priority() {
     .eval::<()>()
     .unwrap();
     scheduler.drain().unwrap();
+}
+
+#[test]
+fn nvim__redraw_boolean_options_decode_like_nlua_pop_boolean_strict() {
+    let (host, _session) = with_api_host();
+    let lua = host.lua();
+
+    lua.load(
+        r#"
+        -- Keyset booleans decode through nlua_pop_Boolean_strict
+        -- (converter.c:848-871): every number decodes (nonzero is true,
+        -- zero is false), a nil-valued key is absent, and only other
+        -- types fail. api_spec.lua:293 pins `{output = 0}` decoding fine.
+        local ok, err = pcall(vim.api.nvim__redraw, {valid = 123})
+        assert(ok == true, 'valid = 123 must decode: ' .. tostring(err))
+
+        ok, err = pcall(vim.api.nvim__redraw, {valid = 0})
+        assert(ok == true, 'valid = 0 must decode: ' .. tostring(err))
+
+        ok, err = pcall(vim.api.nvim__redraw, {valid = 1.5})
+        assert(ok == true, 'valid = 1.5 must decode: ' .. tostring(err))
+
+        -- Failures name the field: the keyset dispatch prepends it to the
+        -- inner `not a boolean` (api_spec.lua:301 pins the composite).
+        ok, err = pcall(vim.api.nvim__redraw, {cursor = 'invalid'})
+        assert(ok == false and type(err) == 'string', tostring(err))
+        assert(err == "Invalid 'cursor': not a boolean", 'got: ' .. tostring(err))
+
+        ok, err = pcall(vim.api.nvim__redraw, {valid = true})
+        assert(ok == true, 'valid = true should succeed: ' .. tostring(err))
+        "#,
+    )
+    .eval::<()>()
+    .unwrap();
+}
+
+/// Builds an API host whose editor has one live buffer, tabpage, and
+/// window, so the `win = 0` / `buf = 0` sentinels resolve; returns the
+/// handles the expectations compare against.
+fn with_api_host_and_window() -> (LuaHost, Rc<ApiSession>, BufHandle, WinHandle) {
+    let builtins = Rc::new(NoBuiltins);
+    let scheduler = Rc::new(TestScheduler::default());
+    let host = LuaHost::new(runtime_root(), builtins, scheduler).unwrap();
+
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, ox_editor::Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.current_window().unwrap();
+    let session = Rc::new(ApiSession::new(Rc::new(RefCell::new(editor))));
+    let registry = ox_api::core().unwrap();
+    let context = ApiDispatchContext::new(Rc::clone(&session));
+    bind_api(host.lua(), &registry, context, host.fast_callbacks()).unwrap();
+
+    (host, session, buffer, window)
+}
+
+#[test]
+fn nvim__redraw_queues_resolved_requests_for_the_redraw_pass() {
+    let (host, session, buffer, window) = with_api_host_and_window();
+    let lua = host.lua();
+
+    lua.load(
+        r"
+        vim.api.nvim__redraw{flush = true}
+        vim.api.nvim__redraw{valid = 0}
+        vim.api.nvim__redraw{valid = false, flush = false}
+        vim.api.nvim__redraw{win = 0, cursor = true}
+        vim.api.nvim__redraw{buf = 0, winbar = true}
+        vim.api.nvim__redraw{range = {1, 3}}
+        vim.api.nvim__redraw{tabline = true, statusline = true, statuscolumn = true}
+        ",
+    )
+    .eval::<()>()
+    .unwrap();
+
+    let requests = session.with_editor_mut(Editor::take_redraws);
+    assert_eq!(requests.len(), 7, "every action call stages one request");
+    assert_eq!(
+        requests[0],
+        RedrawRequest {
+            window: None,
+            buffer: None,
+            valid: None,
+            range: None,
+            flush: true,
+            cursor: false,
+            tabline: false,
+            statusline: false,
+            statuscolumn: false,
+            winbar: false,
+        }
+    );
+    // `valid = 0` decodes to `Some(false)` (`nlua_pop_Boolean_strict`
+    // compares numbers by `!= 0`), and a redraw-later action forces the
+    // implicit flush (vim.c:2544-2546).
+    assert_eq!(requests[1].valid, Some(false));
+    assert!(requests[1].flush);
+    // An explicit `flush = false` declines the implicit default.
+    assert_eq!(requests[2].valid, Some(false));
+    assert!(!requests[2].flush);
+    // The `0` sentinels resolve to the current window and its buffer.
+    assert_eq!(requests[3].window, Some(window));
+    assert!(requests[3].cursor);
+    assert_eq!(requests[4].buffer, Some(buffer));
+    assert!(requests[4].winbar);
+    // A `range` is a redraw-later action too, so it flushes implicitly.
+    assert_eq!(requests[5].range, Some((1, 3)));
+    assert!(requests[5].flush);
+    // The widget flags decode as their own actions with no implicit flush.
+    assert!(requests[6].tabline);
+    assert!(requests[6].statusline);
+    assert!(requests[6].statuscolumn);
+    assert!(!requests[6].flush);
+}
+
+#[test]
+fn nvim__redraw_failure_stages_no_request() {
+    let (host, session, _buffer, _window) = with_api_host_and_window();
+    let lua = host.lua();
+
+    lua.load(
+        r#"
+        local function expect_failure(opts, message)
+            local ok, err = pcall(vim.api.nvim__redraw, opts)
+            assert(ok == false, 'expected failure, got success')
+            assert(err == message, 'got: ' .. tostring(err))
+        end
+
+        expect_failure({}, 'at least one action required')
+        expect_failure({win = 424242}, 'Invalid window id: 424242')
+        expect_failure({buf = 424242}, 'Invalid buffer id: 424242')
+        expect_failure({buf = 0, win = 0}, "cannot use both 'buf' and 'win'")
+        expect_failure(
+            {range = 'nope'},
+            "Invalid 'range': Expected 2-tuple of Integers"
+        )
+        "#,
+    )
+    .eval::<()>()
+    .unwrap();
+
+    assert!(
+        session.with_editor(|editor| !editor.redraws_pending()),
+        "a rejected call must stage nothing"
+    );
+}
+
+#[test]
+fn parser_parse_truncates_buffer_numbers_and_reports_invalid_handles() {
+    let (parser, language) = require_parser();
+    let (host, session) = with_api_host();
+    let lua = host.lua();
+
+    let buffer = session.with_editor_mut(|editor| editor.create_buffer(true)).unwrap();
+    let bufnr = i64::from(buffer);
+
+    lua.globals()
+        .set("parser_path", parser.to_string_lossy().as_ref())
+        .unwrap();
+    lua.globals().set("parser_language", language).unwrap();
+    lua.globals().set("test_buf", bufnr).unwrap();
+
+    lua.load(
+        r#"
+        assert(vim._ts_add_language_from_object(parser_path, parser_language))
+        local parser = vim._create_ts_parser(parser_language)
+
+        vim.api.nvim_buf_set_lines(test_buf, 0, -1, false, {'local value = 1'})
+
+        -- Upstream casts the numeric argument with (handle_T)lua_tointeger
+        -- (treesitter.c:575), so truncation is the specified behavior: a
+        -- fractional value targets the truncated handle, parsing the same
+        -- text the integral handle would.
+        local tree = parser:parse(nil, test_buf + 0.9)
+        assert(type(tree) == 'userdata', 'truncated handle must parse')
+        local whole = parser:parse(nil, test_buf)
+        -- Node identity spans trees (`ts_node_eq` compares ids), so pin the
+        -- same-text property through the root's byte range instead.
+        local function span(tree)
+            return table.concat({ tree:root():range(true) }, ',')
+        end
+        assert(span(tree) == span(whole), 'truncated handle must target the same buffer')
+
+        -- Values that resolve to no live buffer fail through
+        -- handle_get_buffer (treesitter.c:576-582) with its text.
+        local function assert_invalid_handle(value)
+            local ok, err = pcall(parser.parse, parser, nil, value)
+            assert(ok == false, 'expected error for buffer ' .. tostring(value))
+            assert(
+                type(err) == 'string' and err:match('invalid buffer handle'),
+                'expected invalid buffer handle, got: ' .. tostring(err)
+            )
+        end
+
+        assert_invalid_handle(0)               -- handle 0 is not a buffer
+        assert_invalid_handle(-1)
+        assert_invalid_handle(math.huge)
+        assert_invalid_handle(-math.huge)
+        assert_invalid_handle(0 / 0)
+        assert_invalid_handle(2147483648.0)    -- beyond handle_T (int)
+        assert_invalid_handle(999999)          -- in range, but never created
+        "#,
+    )
+    .eval::<()>()
+    .unwrap();
+}
+
+#[test]
+fn binary_buffer_preserves_final_eol_when_eol_is_set() {
+    let (parser, language) = require_parser();
+    let (host, session) = with_api_host();
+    let lua = host.lua();
+
+    let buffer = session.with_editor_mut(|editor| editor.create_buffer(true)).unwrap();
+    let bufnr = i64::from(buffer);
+
+    lua.globals()
+        .set("parser_path", parser.to_string_lossy().as_ref())
+        .unwrap();
+    lua.globals().set("parser_language", language).unwrap();
+    lua.globals().set("test_buf", bufnr).unwrap();
+
+    lua.load(
+        r#"
+        assert(vim._ts_add_language_from_object(parser_path, parser_language))
+        local parser = vim._create_ts_parser(parser_language)
+
+        vim.api.nvim_buf_set_lines(test_buf, 0, -1, false, {'local value = 1'})
+
+        vim.api.nvim_set_option_value('binary', true, {buf = test_buf})
+        vim.api.nvim_set_option_value('eol', true, {buf = test_buf})
+        local tree = parser:parse(nil, test_buf)
+        local _, _, _, _, _, eb = tree:root():range(true)
+        assert(eb == 16, 'expected final EOL (16 bytes), got ' .. tostring(eb))
+
+        vim.api.nvim_set_option_value('eol', false, {buf = test_buf})
+        tree = parser:parse(nil, test_buf)
+        _, _, _, _, _, eb = tree:root():range(true)
+        assert(eb == 15, 'expected stripped EOL (15 bytes), got ' .. tostring(eb))
+        "#,
+    )
+    .eval::<()>()
+    .unwrap();
+}
+
+#[test]
+fn query_inspect_preserves_interleaved_predicate_order() {
+    let (parser, language) = require_parser();
+    let (host, _session) = with_api_host();
+    let lua = host.lua();
+
+    lua.globals()
+        .set("parser_path", parser.to_string_lossy().as_ref())
+        .unwrap();
+    lua.globals().set("parser_language", language).unwrap();
+
+    lua.load(
+        r#"
+        assert(vim._ts_add_language_from_object(parser_path, parser_language))
+        local query = vim._ts_parse_query(parser_language, '((comment) @c (#set! "key" "value") (#eq? @c "foo") (#is? @c "bar"))')
+        local info = query:inspect()
+        assert(info.patterns[1], 'expected one pattern')
+        local predicates = info.patterns[1]
+        assert(#predicates == 3, 'expected 3 predicates, got ' .. tostring(#predicates))
+        assert(predicates[1][1] == 'set!', 'expected set! first, got ' .. tostring(predicates[1][1]))
+        assert(predicates[2][1] == 'eq?', 'expected eq? second, got ' .. tostring(predicates[2][1]))
+        assert(predicates[3][1] == 'is?', 'expected is? third, got ' .. tostring(predicates[3][1]))
+        assert(predicates[2][2] == 1, 'expected eq? capture index 1')
+        assert(predicates[2][3] == 'foo', 'expected eq? literal foo')
+        assert(predicates[3][2] == 1, 'expected is? capture index 1')
+        assert(predicates[3][3] == 'bar', 'expected is? key bar')
+        assert(info.captures[1] == 'c', 'expected capture c')
+        "#,
+    )
+    .eval::<()>()
+    .unwrap();
 }

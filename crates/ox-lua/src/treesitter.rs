@@ -66,6 +66,22 @@ struct NodeHandle {
 struct QueryHandle {
     query: Query,
     _language: Arc<LoadedLanguage>,
+    /// Predicates for each pattern, in the order they appear in the query
+    /// source. Captured here because `tree_sitter::Query` sorts them into
+    /// separate `general`/`property` vectors and loses cross-kind order.
+    predicates: Vec<Vec<InspectPredicate>>,
+}
+
+#[derive(Clone, Default)]
+struct InspectPredicate {
+    operator: String,
+    args: Vec<InspectArg>,
+}
+
+#[derive(Clone)]
+enum InspectArg {
+    Capture(u32),
+    String(String),
 }
 
 #[derive(Clone)]
@@ -89,6 +105,25 @@ fn runtime_error(message: impl Into<String>) -> mlua::Error {
 
 fn checked_u32(value: i64, what: &str) -> mlua::Result<u32> {
     u32::try_from(value).map_err(|_| runtime_error(format!("{what} out of bounds")))
+}
+
+fn as_buffer_handle(value: &Value) -> mlua::Result<i64> {
+    match value {
+        Value::Integer(bufnr) => Ok(*bufnr),
+        Value::Number(number) => {
+            // `as` is upstream's conversion: a finite float truncates toward
+            // zero (`(handle_T)lua_tointeger`, treesitter.c:575) and the cast
+            // cannot trap — NaN maps to 0, magnitudes beyond `i64` saturate.
+            // Whatever names no live buffer fails handle resolution with
+            // `invalid buffer handle: %d`, exactly like a stale handle.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "truncation is the specified `(handle_T)lua_tointeger` behavior"
+            )]
+            Ok(*number as i64)
+        }
+        _ => Err(runtime_error("expected either string or buffer handle")),
+    }
 }
 
 /// The message a Rust-side failure must carry into Lua: the plain runtime
@@ -347,9 +382,9 @@ fn buffer_bytes(lua: &Lua, bufnr: i64) -> mlua::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Reports whether a buffer genuinely lacks a final EOL: binary, or
-/// both 'fixeol' and 'eol' off. Mirrors the last-line arm of upstream
-/// `input_cb` (treesitter.c:482-483); option reads go through the same
+/// Reports whether a buffer genuinely lacks a final EOL: `eol` is off and
+/// either `binary` is on or `fixeol` is off. Mirrors the last-line arm of
+/// upstream `input_cb` (treesitter.c:482-483); option reads go through the same
 /// `vim.api` bridge as the lines above, so no new borrow surface.
 fn buffer_lacks_eol(lua: &Lua, api: &Table, bufnr: i64) -> mlua::Result<bool> {
     // `nvim_buf_get_option` is deprecated since API level 11; the
@@ -360,13 +395,28 @@ fn buffer_lacks_eol(lua: &Lua, api: &Table, bufnr: i64) -> mlua::Result<bool> {
         opts.set("buf", bufnr)?;
         get_option.call((name, opts))
     };
-    if scoped("binary")? {
-        return Ok(true);
+    let binary = scoped("binary")?;
+    let fixeol = scoped("fixeol")?;
+    let eol = scoped("eol")?;
+    Ok(!eol && (binary || !fixeol))
+}
+
+/// Reports whether `bufnr` names a live buffer: upstream resolves the
+/// parse argument through the raw handle map (`handle_get_buffer`,
+/// helpers.h:140 — no curbuf special case, unlike
+/// `find_buffer_by_handle`), so `0` and negatives fail exactly like a
+/// stale handle. Read through `vim.api.nvim_list_bufs` on this same
+/// loop thread; a pure read like the line fetch below, so the
+/// `add_method_mut` borrow stays sound.
+fn buffer_handle_resolves(lua: &Lua, bufnr: i64) -> mlua::Result<bool> {
+    let api: Table = lua.globals().get::<Table>("vim")?.get("api")?;
+    let handles: Table = api.get::<Function>("nvim_list_bufs")?.call(())?;
+    for handle in handles.sequence_values::<i64>() {
+        if handle? == bufnr {
+            return Ok(true);
+        }
     }
-    if scoped("fixeol")? {
-        return Ok(false);
-    }
-    Ok(!scoped("eol")?)
+    Ok(false)
 }
 
 impl UserData for ParserHandle {
@@ -434,11 +484,17 @@ impl UserData for ParserHandle {
                         // buffer handle: fetch the lines through `vim.api` on
                         // this same loop thread (unsaved changes included) and
                         // join them exactly like the buffer store would.
-                        Value::Integer(bufnr) => buffer_bytes(lua, bufnr)?,
-                        Value::Number(number) =>
-                        {
-                            #[allow(clippy::cast_possible_truncation)]
-                            buffer_bytes(lua, number as i64)?
+                        Value::Integer(_) | Value::Number(_) => {
+                            // Upstream resolves the cast value through
+                            // `handle_get_buffer` before parsing
+                            // (treesitter.c:575-582); a miss raises the bare
+                            // `luaL_argerror` text, like the default arm.
+                            let bufnr = as_buffer_handle(&input)?;
+                            if !buffer_handle_resolves(lua, bufnr)? {
+                                let message = format!("invalid buffer handle: {bufnr}");
+                                return Err(runtime_error(message));
+                            }
+                            buffer_bytes(lua, bufnr)?
                         }
                         _ => return Err(runtime_error("expected either string or buffer handle")),
                     };
@@ -859,29 +915,6 @@ impl UserData for NodeHandle {
     }
 }
 
-/// Appends one property raw predicate (`{op, [capture,] key, [value]}`) to
-/// an `inspect()` predicate list, mirroring the C predicate steps.
-fn push_property_predicate(
-    lua: &Lua,
-    predicates: &Table,
-    slot: usize,
-    operator: &str,
-    property: &tree_sitter::QueryProperty,
-) -> mlua::Result<()> {
-    let values = lua.create_table()?;
-    values.raw_set(1, operator)?;
-    let mut next = 2;
-    if let Some(capture) = property.capture_id {
-        values.raw_set(next, capture + 1)?;
-        next += 1;
-    }
-    values.raw_set(next, property.key.as_ref())?;
-    if let Some(value) = property.value.as_deref() {
-        values.raw_set(next + 1, value)?;
-    }
-    predicates.raw_set(slot, values)?;
-    Ok(())
-}
 
 impl UserData for QueryHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
@@ -915,43 +948,24 @@ impl UserData for QueryHandle {
                 }
                 result.set("captures", captures)?;
                 let patterns = lua.create_table()?;
-                for index in 0..this.query.pattern_count() {
-                    let predicates = lua.create_table()?;
-                    let mut slot = 1;
-                    for predicate in this.query.general_predicates(index) {
+                for (index, predicates) in this.predicates.iter().enumerate() {
+                    let predicates_table = lua.create_table()?;
+                    for (slot, predicate) in predicates.iter().enumerate() {
                         let values = lua.create_table()?;
-                        values.raw_set(1, predicate.operator.as_ref())?;
+                        values.raw_set(1, predicate.operator.as_str())?;
                         for (arg_index, arg) in predicate.args.iter().enumerate() {
                             match arg {
-                                tree_sitter::QueryPredicateArg::Capture(id) => values.raw_set(
-                                    arg_index + 2,
-                                    usize::try_from(*id)
-                                        .map_err(|_| runtime_error("capture id out of bounds"))?
-                                        + 1,
-                                )?,
-                                tree_sitter::QueryPredicateArg::String(value) => {
-                                    values.raw_set(arg_index + 2, value.as_ref())?;
+                                InspectArg::Capture(id) => {
+                                    values.raw_set(arg_index + 2, *id + 1)?;
+                                }
+                                InspectArg::String(s) => {
+                                    values.raw_set(arg_index + 2, s.as_str())?;
                                 }
                             }
                         }
-                        predicates.raw_set(slot, values)?;
-                        slot += 1;
+                        predicates_table.raw_set(slot + 1, values)?;
                     }
-                    // The binding classifies `set!`/`is?` away from general
-                    // predicates, but Lua pattern processing needs their raw
-                    // operator form (upstream `query_inspect` reports raw
-                    // steps, treesitter.c:1722-1750). Without these the
-                    // injection directives never materialize.
-                    for property in this.query.property_settings(index) {
-                        push_property_predicate(lua, &predicates, slot, "set!", property)?;
-                        slot += 1;
-                    }
-                    for (property, positive) in this.query.property_predicates(index) {
-                        let operator = if *positive { "is?" } else { "is-not?" };
-                        push_property_predicate(lua, &predicates, slot, operator, property)?;
-                        slot += 1;
-                    }
-                    patterns.raw_set(index + 1, predicates)?;
+                    patterns.raw_set(index + 1, predicates_table)?;
                 }
                 result.set("patterns", patterns)?;
                 Ok(result)
@@ -1356,6 +1370,91 @@ pub(crate) fn install(lua: &Lua, scheduler: Rc<dyn Scheduler>) -> mlua::Result<(
         })?,
     )?;
 
+/// Walks the raw predicate steps for a compiled tree-sitter query and returns
+/// them in source order. The safe `Query` API splits predicates into separate
+/// `general`/`property`/`text` vectors, so this is the only way to recover the
+/// interleaved order used by upstream `query_inspect`.
+///
+/// # Safety
+///
+/// `query` must be a valid, non-null `TSQuery` pointer returned by
+/// `ts_query_new` (or `Query::new_raw`). It must outlive this function call.
+unsafe fn parse_query_predicates(
+    query: *const tree_sitter::ffi::TSQuery,
+    pattern_count: usize,
+) -> mlua::Result<Vec<Vec<InspectPredicate>>> {
+    let mut predicates = Vec::with_capacity(pattern_count);
+    for pattern_index in 0..pattern_count {
+        predicates.push(unsafe { parse_pattern_predicates(query, pattern_index)? });
+    }
+    Ok(predicates)
+}
+
+/// # Safety
+///
+/// `query` must be a valid, non-null `TSQuery` pointer that outlives this call.
+unsafe fn parse_pattern_predicates(
+    query: *const tree_sitter::ffi::TSQuery,
+    pattern_index: usize,
+) -> mlua::Result<Vec<InspectPredicate>> {
+    let mut length = 0u32;
+    // SAFETY: `query` is a valid TSQuery pointer by the caller's contract.
+    let steps = unsafe { tree_sitter::ffi::ts_query_predicates_for_pattern(
+        query,
+        pattern_index as u32,
+        &mut length,
+    ) };
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    // SAFETY: `ts_query_predicates_for_pattern` returned `length` valid steps.
+    let steps = unsafe { std::slice::from_raw_parts(steps, length as usize) };
+    let mut pattern_predicates = Vec::new();
+    let mut current = InspectPredicate {
+        operator: String::new(),
+        args: Vec::new(),
+    };
+    let mut has_operator = false;
+    for step in steps {
+        if step.type_ == tree_sitter::ffi::TSQueryPredicateStepTypeDone {
+            if has_operator {
+                pattern_predicates.push(std::mem::take(&mut current));
+                has_operator = false;
+            }
+        } else if step.type_ == tree_sitter::ffi::TSQueryPredicateStepTypeString {
+            // SAFETY: `query` is valid and `value_id` is a string from it.
+            let s = unsafe { query_string_value(query, step.value_id)? };
+            if !has_operator {
+                current.operator = s;
+                has_operator = true;
+            } else {
+                current.args.push(InspectArg::String(s));
+            }
+        } else if step.type_ == tree_sitter::ffi::TSQueryPredicateStepTypeCapture && has_operator {
+            current.args.push(InspectArg::Capture(step.value_id));
+        }
+    }
+    Ok(pattern_predicates)
+}
+
+/// # Safety
+///
+/// `query` must be a valid, non-null `TSQuery` pointer that outlives this call,
+/// and `id` must be a valid string value id in that query.
+unsafe fn query_string_value(
+    query: *const tree_sitter::ffi::TSQuery,
+    id: u32,
+) -> mlua::Result<String> {
+    let mut length = 0u32;
+    // SAFETY: `query` is valid and `id` is a string value id by the caller.
+    let ptr = unsafe { tree_sitter::ffi::ts_query_string_value_for_id(query, id, &mut length) };
+    // SAFETY: `ts_query_string_value_for_id` returned `length` bytes from the query.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), length as usize) };
+    std::str::from_utf8(bytes)
+        .map(|s| s.to_string())
+        .map_err(|_| runtime_error("query string value is not valid UTF-8"))
+}
+
     let registry = languages.clone();
     vim.set(
         "_ts_parse_query",
@@ -1363,13 +1462,18 @@ pub(crate) fn install(lua: &Lua, scheduler: Rc<dyn Scheduler>) -> mlua::Result<(
             let language = registry_language(&registry, &name)?;
             let query = Query::new(&language.language, &source)
                 .map_err(|error| runtime_error(error.to_string()))?;
+            let raw = Query::new_raw(&language.language, &source)
+                .map_err(|error| runtime_error(error.to_string()))?;
+            let predicates = unsafe { parse_query_predicates(raw, query.pattern_count()) };
+            unsafe { tree_sitter::ffi::ts_query_delete(raw) };
+            let predicates = predicates.map_err(|error| runtime_error(error.to_string()))?;
             Ok(QueryHandle {
                 query,
                 _language: language,
+                predicates,
             })
         })?,
     )?;
-
     let registry = languages.clone();
     vim.set(
         "_ts_inspect_language",
