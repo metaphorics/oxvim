@@ -611,4 +611,37 @@ mod tests {
         assert!(matches!(msgs[0], Message::Notification { .. }));
         assert!(dec.is_empty());
     }
+
+    #[test]
+    fn feed_partial_ok_on_later_frame_error() {
+        let good = Message::Notification {
+            method: OxStr::from("ok"),
+            params: vec![],
+        };
+        // Valid frame followed by garbage in one feed: the valid message is
+        // returned via Ok (partial), the bad tail is discarded, and the
+        // decoder is left empty and reusable.
+        let mut dec = IncrementalDecoder::new();
+        let blob = [good.encode_bytes(), [0xc1, 0x01].as_slice().to_vec()].concat();
+        let got = dec.feed(&blob).unwrap();
+        assert_eq!(got, vec![good.clone()]);
+        assert!(dec.is_empty(), "buffer cleared after partial return");
+        // Reusable: a fresh, different message decodes normally.
+        let fresh = Message::Notification {
+            method: OxStr::from("fresh"),
+            params: vec![],
+        };
+        assert_eq!(dec.feed(&fresh.encode_bytes()).unwrap(), vec![fresh]);
+
+        // Same contract for an oversized tail: under a small staging limit an
+        // incomplete tail larger than the limit still yields the earlier
+        // frame via Ok and leaves the decoder reusable.
+        let mut dec = IncrementalDecoder::with_limit(8);
+        let mut tail = vec![0xdb, 0x00, 0x00, 0x01, 0x2c]; // str32 len 300
+        tail.extend(std::iter::repeat_n(b'a', 4)); // 9 buffered tail bytes > 8
+        let blob = [good.encode_bytes(), tail.as_slice().to_vec()].concat();
+        let got = dec.feed(&blob).unwrap();
+        assert_eq!(got, vec![good]);
+        assert!(dec.is_empty(), "buffer cleared after oversized tail");
+    }
 }
