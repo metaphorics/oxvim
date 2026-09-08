@@ -3633,7 +3633,11 @@ fn command_resize<F: FileIO>(
             Ok((_, end)) => end.max(1),
             Err(message) => return error_flow(runtime, "E16", message),
         };
-        editor.windows().into_iter().nth(target - 1)
+        let windows = editor
+            .current_tabpage()
+            .and_then(|tab| editor.tabpage_windows(tab).ok())
+            .unwrap_or_default();
+        window_by_number(&windows, target)
     } else {
         editor.current_window()
     };
@@ -6882,8 +6886,8 @@ fn jump_to_tag<F: FileIO, E: ExEditorAccess>(
         index += 1;
     };
 
-    if swap_choice_aborts(runtime, access, scope, lua, &chosen.filename) {
-        return Flow::Normal;
+    if let Some(flow) = swap_choice_aborts(runtime, access, scope, lua, &chosen.filename) {
+        return flow;
     }
 
     let origin_window = access.with_ex_editor(|editor| editor.current_window());
@@ -7268,9 +7272,9 @@ fn swap_choice_aborts<F: FileIO, E: ExEditorAccess>(
     scope: &mut Scope,
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     path: &std::path::Path,
-) -> bool {
+) -> Option<Flow> {
     if !runtime.scripts.io().exists(&swap_path_for(path)) {
-        return false;
+        return None;
     }
     scope.replace_pair(
         ScopeKind::Vim,
@@ -7295,11 +7299,15 @@ fn swap_choice_aborts<F: FileIO, E: ExEditorAccess>(
         )
     });
 
-    let _ = run_autocmd_plan(runtime, access, scope, lua, plan);
+    let flow = run_autocmd_plan(runtime, access, scope, lua, plan);
+    if !matches!(&flow, &Flow::Normal) {
+        return Some(flow);
+    }
     matches!(
         scope.get_scoped(ScopeKind::Vim, b"swapchoice", 0),
         Ok(Typval::String(value)) if value.as_bytes().first().is_some_and(|byte| byte.eq_ignore_ascii_case(&b'q'))
     )
+    .then_some(Flow::Normal)
 }
 
 // ---------- swapfile names and lifecycle ----------
@@ -9016,7 +9024,7 @@ fn command_file<F: FileIO, E: ExEditorAccess>(
         return rename_current_buffer(runtime, access, scope, lua, OxStr::from(""));
     }
     if argument.is_empty() {
-        access.with_ex_editor(|editor| show_current_file(runtime, editor));
+        return access.with_ex_editor(|editor| show_current_file(runtime, editor));
     }
     rename_current_buffer(runtime, access, scope, lua, OxStr::from(argument))
 }
@@ -9800,21 +9808,23 @@ fn command_tabnew<F: FileIO>(
         },
     };
     let name = command.args.trim();
-    let buffer = if name.is_empty() {
+    let (buffer, created) = if name.is_empty() {
         match editor.create_buffer(true) {
-            Ok(handle) => handle,
+            Ok(handle) => (handle, true),
             Err(error) => return error_flow(runtime, "E948", error.to_string()),
         }
     } else {
         match buffer_from_file(runtime, editor, &argument_path(editor, name)) {
-            Ok((handle, _)) => handle,
+            Ok((handle, created)) => (handle, created),
             Err(flow) => return flow,
         }
     };
     match editor.create_tabpage_at(buffer, DEFAULT_TABPAGE_GEOMETRY, after) {
         Ok(_) => Flow::Normal,
         Err(error) => {
-            let _ = editor.wipe_buffer(buffer);
+            if created {
+                let _ = editor.wipe_buffer(buffer);
+            }
             error_flow(runtime, "E948", error.to_string())
         }
     }
@@ -11221,7 +11231,8 @@ fn command_only<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> F
     let Some(current) = editor.current_window() else {
         return error_flow(runtime, "E749", "No current window");
     };
-    for window in editor.windows() {
+    let windows = editor.tabpage_windows(tab).unwrap_or_default();
+    for window in windows {
         if window != current
             && let Err(error) = editor.close_window(tab, window, true)
         {
@@ -11517,7 +11528,10 @@ fn command_argument<F: FileIO>(
         .count
         .and_then(|count| i64::try_from(count).ok())
         .or_else(|| command.args.trim().parse::<i64>().ok())
-        .unwrap_or_else(|| i64::try_from(editor.arglist().index()).unwrap_or(0));
+        .unwrap_or_else(|| {
+            i64::try_from(editor.arglist().index())
+                .map_or(1, |index| index.saturating_add(1))
+        });
     do_argfile(runtime, editor, command.bang, count.saturating_sub(1))
 }
 
