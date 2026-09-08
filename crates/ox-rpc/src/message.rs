@@ -197,7 +197,7 @@ impl Message {
 /// Upstream seeds `rpc->next_request_id = 1` in `rpc_start()` (`channel.c`) and
 /// post-increments per call, so ids start at 1. After the `u32` counter wraps it
 /// skips 0 (the brief's requirement; `msgid 0` is reserved for broadcast/`rpc_send_event`).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MsgidCounter {
     next: u32,
 }
@@ -205,6 +205,10 @@ pub struct MsgidCounter {
 impl MsgidCounter {
     /// A counter whose first issued id is `1` (upstream `next_request_id = 1`).
     #[must_use]
+    #[expect(
+        clippy::new_without_default,
+        reason = "msgid 0 is reserved for broadcast; a derived Default would issue it"
+    )]
     pub fn new() -> Self {
         Self { next: 1 }
     }

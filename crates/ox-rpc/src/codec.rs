@@ -242,12 +242,16 @@ fn ext_payload_uint(payload: &[u8]) -> Option<i64> {
 
 /// Encode a single [`Object`] to its msgpack byte representation.
 ///
-/// Encoding into an in-memory `Vec<u8>` cannot fail; any `Result` from the
-/// generic writer is discarded and the buffer is returned regardless.
+/// Encoding into an in-memory `Vec<u8>` is infallible for well-formed objects.
+/// A malformed write (e.g. an oversized collection) can only happen through an
+/// `Object` that violates the wire limits; if that occurs the output buffer is
+/// discarded so the function never returns a partial frame.
 #[must_use]
 pub fn encode(obj: &Object) -> Vec<u8> {
     let mut out = Vec::new();
-    let _res = write_object(&mut out, obj);
+    if write_object(&mut out, obj).is_err() {
+        out.clear();
+    }
     out
 }
 
@@ -299,6 +303,10 @@ fn decode_one(bytes: &[u8]) -> Result<Value, DecodeError> {
 /// and one `feed` may produce many messages.
 pub struct IncrementalDecoder {
     buf: Vec<u8>,
+    /// Byte offset into `buf` where the next message begins; everything before
+    /// this cursor has already been decoded/consumed but is retained so later
+    /// `feed`s do not O(n) shift the staging buffer.
+    cursor: usize,
     limit: usize,
 }
 
@@ -308,6 +316,7 @@ impl IncrementalDecoder {
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),
+            cursor: 0,
             limit: DEFAULT_DECODE_LIMIT,
         }
     }
@@ -317,13 +326,18 @@ impl IncrementalDecoder {
     pub fn with_limit(limit: usize) -> Self {
         Self {
             buf: Vec::new(),
+            cursor: 0,
             limit,
         }
     }
 
     /// Feed a byte slice, decoding any complete messages it completes.
     ///
-    /// On error the internal buffer is cleared so the decoder can be reused.
+    /// If a frame decodes as valid msgpack but is not a valid message shape,
+    /// the decoder stops at that frame. Any messages already decoded in the
+    /// same feed are returned as `Ok(partial)` and the remaining undecoded
+    /// buffer is discarded so the decoder can be reused. When no message could
+    /// be decoded before the error, the error is propagated directly.
     ///
     /// # Errors
     ///
@@ -335,56 +349,86 @@ impl IncrementalDecoder {
         if !bytes.is_empty() {
             self.buf.extend_from_slice(bytes);
         }
+        // Amount of data from the front of the buffer that has already been
+        // decoded in previous feeds. Updated after each successfully decoded
+        // message in this feed.
+        let mut consumed = self.cursor;
         let mut out = Vec::new();
-        let result = (|| {
-            loop {
-                if self.buf.is_empty() {
-                    break;
-                }
-                let mut cursor = Cursor::new(&self.buf[..]);
-                match rmpv::decode::read_value_with_max_depth(&mut cursor, MAX_MESSAGE_DEPTH) {
-                    Ok(value) => {
-                        let consumed = usize::try_from(cursor.position()).map_err(|_| {
-                            DecodeError::Malformed("cursor position overflow".into())
-                        })?;
-                        self.buf.drain(..consumed);
-                        out.push(Message::from_value(value)?);
-                    }
-                    Err(e) => match e.kind() {
-                        // End of input while reading: valid prefix, wait for more.
-                        ErrorKind::UnexpectedEof => {
-                            if self.buf.len() > self.limit {
-                                return Err(DecodeError::Oversized { limit: self.limit });
-                            }
-                            break;
+        let mut error: Option<DecodeError> = None;
+
+        while consumed < self.buf.len() && error.is_none() {
+            let mut cursor = Cursor::new(&self.buf[consumed..]);
+            match rmpv::decode::read_value_with_max_depth(&mut cursor, MAX_MESSAGE_DEPTH) {
+                Ok(value) => {
+                    let bytes_used = usize::try_from(cursor.position()).map_err(|_| {
+                        DecodeError::Malformed("cursor position overflow".into())
+                    })?;
+                    // Validate message shape before consuming the frame.
+                    match Message::from_value(value) {
+                        Ok(message) => {
+                            consumed += bytes_used;
+                            out.push(message);
                         }
-                        _ => return Err(DecodeError::Malformed(e.to_string())),
-                    },
+                        Err(e) => {
+                            error = Some(e);
+                        }
+                    }
                 }
+                Err(e) => match e.kind() {
+                    // End of input while reading: valid prefix, wait for more.
+                    ErrorKind::UnexpectedEof => {
+                        if self.buf.len() - consumed > self.limit {
+                            error = Some(DecodeError::Oversized { limit: self.limit });
+                        }
+                        break;
+                    }
+                    _ => {
+                        error = Some(DecodeError::Malformed(e.to_string()));
+                    }
+                },
             }
-            let mut done = Vec::new();
-            std::mem::swap(&mut done, &mut out);
-            Ok(done)
-        })();
-        if result.is_err() {
-            self.buf.clear();
         }
-        result
+        self.cursor = consumed;
+        if let Some(e) = error {
+            // Any messages already decoded in this feed are kept; the rest of
+            // the buffer (including the bad frame) is discarded so the decoder
+            // is reusable. If no messages were decoded, the error is propagated.
+            self.buf.clear();
+            self.cursor = 0;
+            if out.is_empty() {
+                return Err(e);
+            }
+            return Ok(out);
+        }
+
+        if self.cursor >= self.buf.len() {
+            // Entire buffer consumed: compact by resetting.
+            self.buf.clear();
+            self.cursor = 0;
+        } else if self.cursor >= 1024 * 1024 {
+            // Lazy compaction: once at least 1 MiB of prefix has been consumed,
+            // discard it so the staging buffer does not grow indefinitely for
+            // streaming protocols. Shifting down is O(n) but is amortized over
+            // the bytes that would otherwise keep accumulating.
+            let remaining = self.buf.split_off(self.cursor);
+            self.buf = remaining;
+            self.cursor = 0;
+        }
+        Ok(out)
     }
 
     /// Whether no undecoded bytes are buffered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+        self.cursor >= self.buf.len()
     }
 
     /// Number of undecoded bytes currently buffered.
     #[must_use]
     pub fn buffered(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.cursor
     }
 }
-
 impl Default for IncrementalDecoder {
     fn default() -> Self {
         Self::new()
