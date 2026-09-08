@@ -1,7 +1,7 @@
 //! Embedded stdio and listening RPC servers.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
@@ -129,6 +129,10 @@ fn lua_job_reference(event: &JobEvent) -> Option<usize> {
     }
 }
 
+/// Consecutive hostless Lua callback passes are bounded so an executor
+/// without a Lua host cannot grow the deferred queue forever.
+const MAX_HOSTLESS_JOB_EVENT_PASSES: usize = 3;
+
 /// Delivers one batch of deferred job events without holding the executor
 /// [`RefCell`] across callbacks (upstream `process_events` → `channel_write` →
 /// `invoke_callback`, event/loop.c, runs all callbacks on the main stack).
@@ -140,10 +144,12 @@ fn lua_job_reference(event: &JobEvent) -> Option<usize> {
 fn deliver_deferred_job_events(
     session: &ApiSession,
     ex: &Rc<RefCell<ExExecutor>>,
+    hostless_passes: &mut usize,
 ) -> Result<bool, String> {
     let lua = ex.borrow().lua_host();
     let mut batch: VecDeque<JobEvent> = ex.borrow_mut().take_deferred_job_events().into();
     if batch.is_empty() {
+        *hostless_passes = 0;
         return Ok(false);
     }
     let batch_len = batch.len();
@@ -153,16 +159,18 @@ fn deliver_deferred_job_events(
     // report fires once per pass, the rest of the batch still delivers,
     // and the event re-defers for a later host (the old head-requeue
     // starved the tail forever; pushing it back into this batch would
-    // re-pop it forever). Script errors keep the flush contract: the
-    // failing event is consumed, the tail re-defers in order, the error
-    // returns.
+    // re-pop it forever). After `MAX_HOSTLESS_JOB_EVENT_PASSES`
+    // consecutive hostless passes, the events are dropped and the
+    // final returned error reports the condition once more. Script
+    // errors keep the flush contract: the failing event is consumed,
+    // the tail re-defers in order, and the error returns.
     let mut parked: Vec<JobEvent> = Vec::new();
+    let mut hostless: Vec<JobEvent> = Vec::new();
     while let Some(event) = batch.pop_front() {
         if let Some(reference) = lua_job_reference(&event) {
             let Some(lua) = lua.as_ref() else {
-                report_job_callback_error(session, "E5108: Lua callback host is not installed");
                 error = Some("E5108: Lua callback host is not installed".to_owned());
-                parked.push(event);
+                hostless.push(event);
                 continue;
             };
             let args = event.args.iter().map(ox_rpc::typval_to_object).collect();
@@ -184,6 +192,16 @@ fn deliver_deferred_job_events(
             }
         }
     }
+    if !hostless.is_empty() {
+        *hostless_passes += 1;
+        if *hostless_passes >= MAX_HOSTLESS_JOB_EVENT_PASSES {
+            hostless.clear();
+            *hostless_passes = 0;
+        }
+    } else {
+        *hostless_passes = 0;
+    }
+    parked.extend(hostless);
     parked.extend(batch);
     if !parked.is_empty() {
         ex.borrow_mut().defer_job_events(parked);
@@ -1196,10 +1214,18 @@ impl AppState {
             })
             .map_err(|error| ApiError::exception(error.to_string()))?;
         if let Err(error) = self.resize_current_tabpage(width, height) {
-            let _ = self
+            // Roll the attach back; when the rollback itself fails the
+            // channel stays half-attached, so the report says both instead
+            // of returning as if the channel was removed.
+            return match self
                 .session
-                .with_render_state(|ui_channels, _, _| ui_channels.detach(channel.get()));
-            return Err(error);
+                .with_render_state(|ui_channels, _, _| ui_channels.detach(channel.get()))
+            {
+                Ok(_) => Err(error),
+                Err(detach_error) => Err(ApiError::exception(format!(
+                    "{error}; detaching after the failed nvim_ui_attach also failed: {detach_error}"
+                ))),
+            };
         }
         self.sync_ui_active();
         Ok(Object::Nil)
@@ -1750,6 +1776,29 @@ impl AppState {
         let lua = self.lua.borrow();
         free_object_refs(lua.lua(), object);
     }
+    /// Renders pending frames without failing the RPC turn: a redraw error
+    /// is reported through the message log and handed back to the caller,
+    /// which still owes the client a reply or error event. A `?` here used
+    /// to return before the response was encoded, so the request's msgid
+    /// never got an answer.
+    fn redraw_reporting(&mut self) -> (BTreeMap<u64, Vec<u8>>, Option<String>) {
+        match self.redraw() {
+            Ok(frames) => (frames, None),
+            Err(error) => {
+                let message = error.to_string();
+                self.session.with_editor_mut(|editor| {
+                    editor.push_message(ox_editor::Message {
+                        kind: MessageKind::Error,
+                        content: Object::String(OxStr::from(message.as_str())),
+                        history: true,
+                        leading_newline: true,
+                    });
+                });
+                (BTreeMap::new(), Some(message))
+            }
+        }
+    }
+
 
     #[expect(
         clippy::too_many_lines,
@@ -1785,9 +1834,20 @@ impl AppState {
                 if is_input || self.typeahead_pending() {
                     match self.drive_input() {
                         Ok(()) => {
-                            redraws = self
-                                .redraw()
-                                .map_err(|error| AppError::Api(error.to_string()))?;
+                            let (frames, failure) = self.redraw_reporting();
+                            redraws = frames;
+                            // A redraw failure still owes the client its
+                            // reply, and the dropped success may own freshly
+                            // allocated reply refs: release them before the
+                            // error takes the reply slot.
+                            if let Some(message) = failure
+                                && result.is_ok()
+                            {
+                                if owns_result_refs && let Ok(value) = &result {
+                                    self.free_reply_refs(value);
+                                }
+                                result = Err(ApiError::exception(message));
+                            }
                         }
                         Err(error) => {
                             let message = error.message().to_owned();
@@ -1799,18 +1859,31 @@ impl AppState {
                                     leading_newline: true,
                                 });
                             });
-                            redraws = self
-                                .redraw()
-                                .map_err(|error| AppError::Api(error.to_string()))?;
+                            let (frames, failure) = self.redraw_reporting();
+                            redraws = frames;
+                            if let Some(message) = failure
+                                && result.is_ok()
+                            {
+                                if owns_result_refs && let Ok(value) = &result {
+                                    self.free_reply_refs(value);
+                                }
+                                result = Err(ApiError::exception(message));
+                            }
+                            // Only the input methods replace the dispatch
+                            // result with the drive failure; every other
+                            // request keeps the result it was given and sees
+                            // the drive error through the message log above.
                             // The dropped Ok value may own freshly allocated
                             // reply refs (exec_lua returning a function after
                             // feeding input): release them before the drive
                             // error takes the reply slot, or the registry
                             // entry leaks.
-                            if owns_result_refs && let Ok(value) = &result {
-                                self.free_reply_refs(value);
+                            if is_input {
+                                if owns_result_refs && let Ok(value) = &result {
+                                    self.free_reply_refs(value);
+                                }
+                                result = Err(error);
                             }
-                            result = Err(error);
                         }
                     }
                 }
@@ -1825,11 +1898,13 @@ impl AppState {
                 }
                 let response = (channel.get(), encoded);
                 if is_ui_attach {
-                    writes.extend(redraws);
+                    // A client only starts interpreting redraw events after
+                    // the attach ack, so the response goes out first.
                     writes.push(response);
+                    writes.extend(redraws);
                 } else {
-                    writes.push(response);
                     writes.extend(redraws);
+                    writes.push(response);
                 }
             }
             Message::Notification { method, params } => {
@@ -1849,9 +1924,16 @@ impl AppState {
                         if is_input || self.typeahead_pending() {
                             match self.drive_input() {
                                 Ok(()) => {
-                                    redraws = self
-                                        .redraw()
-                                        .map_err(|error| AppError::Api(error.to_string()))?;
+                                    let (frames, failure) = self.redraw_reporting();
+                                    redraws = frames;
+                                    if let Some(message) = failure {
+                                        writes.push((
+                                            channel.get(),
+                                            ox_rpc::nvim_error_event(&ApiError::exception(
+                                                message,
+                                            )),
+                                        ));
+                                    }
                                 }
                                 Err(error) => {
                                     let message = error.message().to_owned();
@@ -1863,11 +1945,17 @@ impl AppState {
                                             leading_newline: true,
                                         });
                                     });
-                                    redraws = self
-                                        .redraw()
-                                        .map_err(|error| AppError::Api(error.to_string()))?;
+                                    let (frames, failure) = self.redraw_reporting();
                                     writes.push((channel.get(), ox_rpc::nvim_error_event(&error)));
-                                    writes.extend(redraws);
+                                    writes.extend(frames);
+                                    if let Some(message) = failure {
+                                        writes.push((
+                                            channel.get(),
+                                            ox_rpc::nvim_error_event(&ApiError::exception(
+                                                message,
+                                            )),
+                                        ));
+                                    }
                                     let _ = self.drain_lua_work();
                                     self.absorb_pending_quit();
                                     return Ok(writes);
@@ -2587,10 +2675,12 @@ impl ListenServer {
                 .position(|entry| entry.address == address)
                 .map(|index| listeners.remove(index))
         };
-        if let Some(entry) = entry
-            && let Ok(mut uv) = self.uv.try_borrow_mut()
-        {
-            let _ = entry.listener.close(&mut uv);
+        if let Some(entry) = entry {
+            let listener_id = entry.listener.id();
+            self.runtime.borrow_mut().listeners.remove(&listener_id);
+            if let Ok(mut uv) = self.uv.try_borrow_mut() {
+                let _ = entry.listener.close(&mut uv);
+            }
         }
     }
 
@@ -2606,6 +2696,12 @@ impl ListenServer {
     /// Closes every listener on the accept loop; process shutdown.
     fn close_all(&self) {
         let entries = std::mem::take(&mut *self.listeners.borrow_mut());
+        for entry in &entries {
+            self.runtime
+                .borrow_mut()
+                .listeners
+                .remove(&entry.listener.id());
+        }
         if let Ok(mut uv) = self.uv.try_borrow_mut() {
             for entry in entries {
                 let _ = entry.listener.close(&mut uv);
@@ -2657,10 +2753,12 @@ impl ServerHost for ListenServer {
             Some((host, port)) => start_tcp(&mut uv, host, port, &callback)?,
             None => start_pipe(&mut uv, address, &callback)?,
         };
+        let listener_id = listener.id();
         self.listeners.borrow_mut().push(ListenEntry {
             address: bound.clone(),
             listener,
         });
+        self.runtime.borrow_mut().listeners.insert(listener_id);
         Ok(bound)
     }
 
@@ -2881,6 +2979,14 @@ enum Listener {
 }
 
 impl Listener {
+    fn id(&self) -> HandleId {
+        match self {
+            Self::Tcp(listener) => listener.id(),
+            #[cfg(unix)]
+            Self::Pipe(listener) => listener.id(),
+        }
+    }
+
     fn close(&self, uv_loop: &mut UvLoop) -> Result<(), ox_uv::Error> {
         match self {
             Self::Tcp(listener) => listener.close(uv_loop),
@@ -2938,6 +3044,13 @@ struct NetworkRuntime {
     accept_uv: Rc<RefCell<UvLoop>>,
     peers: HashMap<HandleId, Peer>,
     streams: HashMap<HandleId, Stream>,
+    /// Handle ids of bound listening sockets: their errors must not end the
+    /// process the way an unknown transport failure does (see
+    /// `handle_network_event`).
+    listeners: HashSet<HandleId>,
+    /// Consecutive `poll_background` passes that re-deferred hostless Lua
+    /// job events; see [`MAX_HOSTLESS_JOB_EVENT_PASSES`].
+    hostless_job_event_passes: usize,
     error: Option<String>,
     /// Set when an accept-loop error must end the process; the next
     /// `poll_background` stops the main loop.
@@ -2951,6 +3064,8 @@ impl NetworkRuntime {
             accept_uv,
             peers: HashMap::new(),
             streams: HashMap::new(),
+            listeners: HashSet::new(),
+            hostless_job_event_passes: 0,
             error: None,
             shutdown: false,
         }
@@ -2971,7 +3086,8 @@ impl NetworkRuntime {
     ///
     /// # Errors
     ///
-    /// Returns the drain, redraw, or stream write failure.
+    /// Returns the drain, redraw, or stdio write failure. Peer write failures
+    /// remove the dead peer and continue the batch.
     fn poll_background(&mut self, uv_loop: &mut UvLoop) -> Result<(), ox_uv::CallbackError> {
         if self.shutdown || self.state.borrow().should_exit() {
             uv_loop.stop();
@@ -2983,7 +3099,11 @@ impl NetworkRuntime {
             .borrow_mut()
             .flush_pty_output(&*session)
             .map_err(ox_uv::CallbackError::new)?;
-        let delivered = match deliver_deferred_job_events(&session, &ex) {
+        let delivered = match deliver_deferred_job_events(
+            &session,
+            &ex,
+            &mut self.hostless_job_event_passes,
+        ) {
             Ok(delivered) => delivered,
             Err(error) => {
                 report_job_callback_error(&session, &error);
@@ -2995,6 +3115,20 @@ impl NetworkRuntime {
         // marker is taken.
         let _ = ex.borrow_mut().take_lua_flush_pending();
         let worked = self.state.borrow_mut().drain_lua_work();
+        // Timers and job callbacks feed keys outside any RPC turn; upstream
+        // services pending typeahead on the same main-loop turn
+        // (state.c:100-113), so the tick drives it the same way.
+        let drove = if self.state.borrow().typeahead_pending() {
+            match self.state.borrow_mut().drive_input() {
+                Ok(()) => true,
+                Err(error) => {
+                    report_server_error(&session, error.message());
+                    true
+                }
+            }
+        } else {
+            false
+        };
         // Job `on_exit` and scheduled callbacks above run user code that
         // can record quits; promote them before the exit check stops us.
         self.state.borrow_mut().absorb_pending_quit();
@@ -3002,7 +3136,7 @@ impl NetworkRuntime {
             uv_loop.stop();
             return Ok(());
         }
-        if !delivered && !changed && !worked {
+        if !delivered && !changed && !worked && !drove {
             return Ok(());
         }
         let writes = self
@@ -3013,7 +3147,11 @@ impl NetworkRuntime {
         // Peers live on the accept loop, so their writes go through it, not
         // the main-loop `uv_loop` this tick received. The pump timer and
         // this tick are both main-loop callbacks, so the borrow is free.
-        let mut accept_uv = self.accept_uv.borrow_mut();
+        // Clone the loop handle first: borrowing the RefMut out of
+        // `self.accept_uv` pins a shared borrow of `self`, which
+        // would forbid the `&mut self` that `remove_peer` takes below.
+        let accept_uv = Rc::clone(&self.accept_uv);
+        let mut accept_uv = accept_uv.borrow_mut();
         for (channel, bytes) in writes {
             if channel == CHAN_STDIO.get() {
                 let mut output = io::stdout().lock();
@@ -3027,12 +3165,23 @@ impl NetworkRuntime {
                 .peers
                 .iter()
                 .find_map(|(id, peer)| (peer.channel.get() == channel).then_some(*id));
-            if let Some(target) = target
-                && let Some(stream) = self.streams.get_mut(&target)
-            {
-                stream
-                    .write(&mut accept_uv, bytes)
-                    .map_err(|error| ox_uv::CallbackError::new(error.clone()))?;
+            if let Some(target) = target {
+                // A failing peer drops out of the runtime and the remaining
+                // writes still deliver: one dead socket must not abort the
+                // batch and fail the whole tick.
+                let failed = self
+                    .streams
+                    .get_mut(&target)
+                    .is_some_and(|stream| stream.write(&mut accept_uv, bytes).is_err());
+                if failed {
+                    self.remove_peer(&mut accept_uv, target);
+                }
+            } else {
+                let session = self.state.borrow().session.clone();
+                report_server_error(
+                    &session,
+                    &format!("channel {channel} is gone; redraw dropped"),
+                );
             }
         }
         if self.shutdown || self.state.borrow().should_exit() {
@@ -3095,22 +3244,49 @@ impl NetworkRuntime {
                 .process_message(channel, message)
                 .map_err(|error| error.to_string())?;
             for (target, bytes) in writes {
+                if target == CHAN_STDIO.get() {
+                    // Mirror `poll_background`: a turn that started on a
+                    // peer can still owe stdout its message output.
+                    let mut output = io::stdout().lock();
+                    if let Err(error) = output.write_all(&bytes).and_then(|()| output.flush()) {
+                        let session = self.state.borrow().session.clone();
+                        report_server_error(&session, &format!("stdio write failed: {error}"));
+                    }
+                    continue;
+                }
                 let target_id = self
                     .peers
                     .iter()
                     .find_map(|(id, peer)| (peer.channel.get() == target).then_some(*id));
-                if let Some(target_id) = target_id
-                    && let Some(stream) = self.streams.get_mut(&target_id)
-                    && stream.write(uv_loop, bytes).is_err()
-                {
-                    self.remove_peer(uv_loop, target_id);
+                match target_id {
+                    Some(target_id) => {
+                        if let Some(stream) = self.streams.get_mut(&target_id) {
+                            if stream.write(uv_loop, bytes).is_err() {
+                                self.remove_peer(uv_loop, target_id);
+                            }
+                        } else {
+                            let session = self.state.borrow().session.clone();
+                            report_server_error(
+                                &session,
+                                &format!("channel {target} is gone; response dropped"),
+                            );
+                        }
+                    }
+                    None => {
+                        let session = self.state.borrow().session.clone();
+                        report_server_error(
+                            &session,
+                            &format!("channel {target} is gone; response dropped"),
+                        );
+                    }
                 }
             }
-            if self.state.borrow().should_exit() {
-                uv_loop.stop();
-                self.shutdown = true;
-                break;
-            }
+        }
+        // Every pulled message finished above; the exit flags land only now
+        // so they never cut the loop while drained messages wait.
+        if self.state.borrow().should_exit() {
+            uv_loop.stop();
+            self.shutdown = true;
         }
         Ok(())
     }
@@ -3157,6 +3333,12 @@ fn handle_network_event(
         let mut runtime = runtime.borrow_mut();
         if runtime.peers.contains_key(&id) {
             runtime.remove_peer(uv_loop, id);
+        } else if runtime.listeners.remove(&id) {
+            // A listener failure keeps the process alive — upstream never
+            // tears the loop down for one watcher (`server.c`); the user
+            // sees why through the message system.
+            let session = runtime.state.borrow().session.clone();
+            report_server_error(&session, &format!("listen socket error: {error}"));
         } else {
             runtime.error = Some(error);
             // `uv_loop` here is the accept loop; stopping it would only
@@ -4501,8 +4683,9 @@ fn deliver_pending_lua_flush(session: &ApiSession, owner: &Rc<RefCell<ExExecutor
     {
         return;
     }
+    let mut hostless_passes = 0usize;
     while owner.borrow_mut().take_lua_flush_pending() {
-        if let Err(error) = deliver_deferred_job_events(session, owner) {
+        if let Err(error) = deliver_deferred_job_events(session, owner, &mut hostless_passes) {
             report_job_callback_error(session, &error);
             break;
         }
@@ -5358,7 +5541,7 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            if deliver_deferred_job_events(&core.session, &core.ex).unwrap() {
+            if deliver_deferred_job_events(&core.session, &core.ex, &mut 0).unwrap() {
                 delivered = true;
                 break;
             }
@@ -5383,7 +5566,7 @@ mod tests {
             .borrow_mut()
             .flush_pty_output(&*core.session)
             .unwrap();
-        let again = deliver_deferred_job_events(&core.session, &core.ex).unwrap();
+        let again = deliver_deferred_job_events(&core.session, &core.ex, &mut 0).unwrap();
         assert!(!again, "a delivered on_exit must not re-fire");
     }
 
@@ -5432,7 +5615,7 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            let _delivered = deliver_deferred_job_events(&core.session, &core.ex).unwrap();
+            let _delivered = deliver_deferred_job_events(&core.session, &core.ex, &mut 0).unwrap();
             let exits = core
                 .ex
                 .borrow_mut()
@@ -5490,7 +5673,7 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            let _ = deliver_deferred_job_events(&core.session, &core.ex).unwrap();
+            let _ = deliver_deferred_job_events(&core.session, &core.ex, &mut 0).unwrap();
             exit_count = core
                 .ex
                 .borrow_mut()
@@ -5550,7 +5733,7 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            let _ = deliver_deferred_job_events(&core.session, &core.ex).unwrap();
+            let _ = deliver_deferred_job_events(&core.session, &core.ex, &mut 0).unwrap();
             send_ok = core
                 .ex
                 .borrow_mut()
@@ -5613,7 +5796,7 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            let _ = deliver_deferred_job_events(&core.session, &core.ex).unwrap();
+            let _ = deliver_deferred_job_events(&core.session, &core.ex, &mut 0).unwrap();
             nested_exited = core
                 .ex
                 .borrow_mut()
@@ -5684,7 +5867,7 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            let _ = deliver_deferred_job_events(&core.session, &core.ex).unwrap();
+            let _ = deliver_deferred_job_events(&core.session, &core.ex, &mut 0).unwrap();
             stdout_seen = core
                 .ex
                 .borrow_mut()
@@ -5711,6 +5894,7 @@ mod tests {
     fn hostless_lua_event_requeues_through_the_tick_driver() {
         let session = Rc::new(ApiSession::new(Rc::new(RefCell::new(Editor::new()))));
         let ex = Rc::new(RefCell::new(ExExecutor::new()));
+        let mut hostless_passes = 0usize;
         // A job manager must exist for the deferred queue; jobstart
         // installs one. The executor still has no Lua host.
         ex.borrow_mut()
@@ -5734,7 +5918,7 @@ mod tests {
             args: Vec::new(),
         };
         ex.borrow_mut().defer_job_events(vec![event]);
-        let error = deliver_deferred_job_events(&session, &ex).unwrap_err();
+        let error = deliver_deferred_job_events(&session, &ex, &mut hostless_passes).unwrap_err();
         assert!(error.contains("E5108"), "{error}");
         let requeued = ex.borrow_mut().take_deferred_job_events();
         assert_eq!(
@@ -5749,7 +5933,7 @@ mod tests {
         // Redelivery of the requeued batch is stable: same report, same
         // requeue, no duplication.
         ex.borrow_mut().defer_job_events(requeued);
-        assert!(deliver_deferred_job_events(&session, &ex).is_err());
+        assert!(deliver_deferred_job_events(&session, &ex, &mut hostless_passes).is_err());
         assert_eq!(ex.borrow_mut().take_deferred_job_events().len(), 1);
     }
 
@@ -6079,5 +6263,127 @@ mod tests {
         assert!(port > 0, "ephemeral port must resolve to a real bind");
         assert_eq!(server.list(), vec![bound]);
         server.close_all();
+    }
+
+    // Direct `process_message` turns over CHAN_STDIO with a UI attached:
+    // a redraw failure must never swallow a request's reply (the old `?`
+    // dropped the msgid), an errored dispatch still drives the typeahead it
+    // fed, and redraw bytes precede the response in the write batch.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the test requires editor, UI attach, and dispatch setup to succeed"
+    )]
+    fn message_state() -> AppState {
+        let cli = Cli::default();
+        let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
+        state
+            .ui_attach(
+                ChannelId::new(0x4242),
+                &[
+                    Object::Integer(80),
+                    Object::Integer(24),
+                    Object::Dict(Dict(vec![(OxStr::from("ext_linegrid"), Object::Boolean(true))])),
+                ],
+            )
+            .unwrap();
+        state
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "the fixture must build")]
+    fn input_notification_produces_a_redraw_batch() {
+        let mut state = message_state();
+        let writes = state
+            .process_message(
+                CHAN_STDIO,
+                Message::Notification {
+                    method: OxStr::from("nvim_input"),
+                    params: vec![Object::String(OxStr::from("ihello"))],
+                },
+            )
+            .unwrap();
+        assert!(
+            writes
+                .iter()
+                .any(|(channel, bytes)| *channel == 0x4242 && !bytes.is_empty()),
+            "the driven input must produce redraw bytes for the attached UI"
+        );
+    }
+
+    // An errored `nvim_command` that already queued `feedkeys` must still
+    // drive the pending typeahead and still answer its msgid with the
+    // dispatch error: the drive/redraw failure path must not eat the reply.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "the fixture must build")]
+    fn errored_request_still_drives_fed_input_and_replies() {
+        let mut state = message_state();
+        let writes = state
+            .process_message(
+                CHAN_STDIO,
+                Message::Request {
+                    msgid: 7,
+                    method: OxStr::from("nvim_command"),
+                    params: vec![Object::String(OxStr::from(
+                        "call feedkeys('ihello') | call this_function_does_not_exist()",
+                    ))],
+                },
+            )
+            .unwrap();
+        let response = writes.iter().rev().find_map(|(_, bytes)| {
+            let mut decoder = IncrementalDecoder::new();
+            decoder
+                .feed(bytes)
+                .ok()
+                .and_then(|messages| messages.into_iter().next())
+        });
+        match &response {
+            Some(Message::Response {
+                msgid: 7,
+                result: Err(_),
+            }) => {}
+            other => panic!(
+                "the errored request must be answered with an error response, got {other:?}"
+            ),
+        }
+        assert!(
+            state
+                .session
+                .with_editor(|editor| editor.typeahead().is_empty()),
+            "the errored dispatch's fed input must still drain the typeahead"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "the fixture must build")]
+    fn request_redraw_bytes_precede_the_response() {
+        let mut state = message_state();
+        let writes = state
+            .process_message(
+                CHAN_STDIO,
+                Message::Request {
+                    msgid: 9,
+                    method: OxStr::from("nvim_input"),
+                    params: vec![Object::String(OxStr::from("ihello"))],
+                },
+            )
+            .unwrap();
+        let frame = writes
+            .iter()
+            .position(|(channel, _)| *channel == 0x4242)
+            .expect("driven input must produce redraw bytes for the attached UI");
+        let response = writes
+            .iter()
+            .rposition(|(channel, _)| *channel == CHAN_STDIO.get())
+            .expect("the request must be answered");
+        assert!(frame < response, "redraw bytes must precede the response");
+        let (_, bytes) = &writes[response];
+        let mut decoder = IncrementalDecoder::new();
+        let messages = decoder.feed(bytes).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(
+            matches!(&messages[0], Message::Response { msgid: 9, result: Ok(_) }),
+            "the input request must be answered successfully, got {:?}",
+            messages[0]
+        );
     }
 }
