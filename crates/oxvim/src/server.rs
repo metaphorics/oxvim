@@ -3442,6 +3442,12 @@ fn exec_api_chunk(
 }
 
 fn nvim_exec_lua_error_text(message: String) -> String {
+    // Traceback-carrying errors keep the upstream `nlua_error` shape
+    // (message plus frames): stripping the `[string "<nvim>"]:` frame prefix
+    // would drop the message and return bare frames.
+    if message.contains('\n') {
+        return message;
+    }
     message
         .split_once("[string \"<nvim>\"]:")
         .and_then(|(_, rest)| rest.split_once(": ").map(|(_, detail)| detail.to_owned()))
