@@ -9,6 +9,7 @@ use mlua::{
 };
 use ox_api::Registry;
 use ox_editor::BufferRelease;
+use ox_editor::editor::RedrawRequest;
 use ox_types::{BufHandle, Object, OxStr, Typval, WinHandle};
 use std::cell::Cell;
 use std::io::Write;
@@ -734,19 +735,16 @@ pub fn bind_api(
     // api/vim.c `nvim__redraw` is an internal like `nvim__get_runtime`
     // above: absent from the canonical metadata, bound here by hand. The
     // validation matrix mirrors upstream exactly (its strings are
-    // test-visible, e.g. api/vim_spec.lua's `nvim__redraw` block); paint
-    // effects coalesce into the next regular sync, which repaints
-    // unconditionally, so a separate redraw mark would have no consumer.
+    // test-visible, e.g. api/vim_spec.lua's `nvim__redraw` block), and the
+    // resolved request is queued on the editor for the server's redraw
+    // pass — the same sink-and-drain shape `nvim_ui_send` uses.
     let native_redraw = lua.create_function(move |lua, opts: Table| {
         let session = redraw_context.session();
         let fail = |message: String| -> mlua::Result<(bool, Value)> {
             Ok((false, Value::String(lua.create_string(message)?)))
         };
-        let window = match opts
-            .get::<Option<i64>>("win")
-            .map_err(|error| mlua::Error::runtime(error.to_string()))?
-        {
-            Some(number) => {
+        let window = match opts.get::<Option<i64>>("win") {
+            Ok(Some(number)) => {
                 let handle = WinHandle::try_from(number)
                     .map(|handle| validate_win(session, handle))
                     .ok()
@@ -756,13 +754,11 @@ pub fn bind_api(
                 }
                 handle
             }
-            None => None,
+            Ok(None) => None,
+            Err(error) => return fail(error.to_string()),
         };
-        let buffer = match opts
-            .get::<Option<i64>>("buf")
-            .map_err(|error| mlua::Error::runtime(error.to_string()))?
-        {
-            Some(number) => {
+        let buffer = match opts.get::<Option<i64>>("buf") {
+            Ok(Some(number)) => {
                 let handle = BufHandle::try_from(number)
                     .map(|handle| validate_buf(session, handle))
                     .ok()
@@ -772,14 +768,33 @@ pub fn bind_api(
                 }
                 handle
             }
-            None => None,
+            Ok(None) => None,
+            Err(error) => return fail(error.to_string()),
         };
         if window.is_some() && buffer.is_some() {
             return fail("cannot use both 'buf' and 'win'".to_owned());
         }
-        let action = ["cursor", "flush", "range", "valid", "tabline", "statusline"]
+        // The action flags are all declared as booleans in the keyset and
+        // decode through `nlua_pop_Boolean_strict` (converter.c:848-871):
+        // booleans pass through, every number decodes (nonzero is true, zero
+        // false), and a nil-valued key is simply absent. Only other types
+        // fail, and the keyset dispatch names the failing field, so the
+        // observable string is `Invalid '<key>': not a boolean`
+        // (api_spec.lua:301 pins the composite for nvim_exec2's `output`).
+        // Presence stays the action signal, so `{valid = 0}` still counts.
+        let boolean_keys = ["cursor", "flush", "tabline", "statusline", "statuscolumn", "winbar", "valid"];
+        for key in boolean_keys {
+            if !opts.contains_key(key).unwrap_or(false) {
+                continue;
+            }
+            match opts.raw_get::<Value>(key)? {
+                Value::Boolean(_) | Value::Integer(_) | Value::Number(_) => {}
+                _ => return fail(format!("Invalid '{key}': not a boolean")),
+            }
+        }
+        let action = boolean_keys
             .into_iter()
-            .chain(["statuscolumn", "winbar"])
+            .chain(["range"])
             .any(|key| opts.contains_key(key).unwrap_or(false));
         if !action {
             return fail("at least one action required".to_owned());
@@ -799,6 +814,41 @@ pub fn bind_api(
                 return fail("Invalid 'range': Expected 2-tuple of Integers".to_owned());
             }
         }
+        // Decode the validated flags with `nlua_pop_Boolean_strict`
+        // semantics — booleans pass, numbers compare `!= 0` — and apply
+        // upstream's implicit flush: a present `valid` or `range` flushes
+        // unless `flush` explicitly declines (vim.c:2544-2546). The
+        // resolved request rides the editor sink, so the server's redraw
+        // pass stays the single owner of delivery, exactly like
+        // `nvim_ui_send`'s payload queue.
+        let strict_flag = |key: &str| -> mlua::Result<Option<bool>> {
+            if opts.contains_key(key).unwrap_or(false) {
+                Ok(Some(boolean_strict(opts.raw_get::<Value>(key)?)))
+            } else {
+                Ok(None)
+            }
+        };
+        let validity = strict_flag("valid")?;
+        let range = if opts.contains_key("range").unwrap_or(false) {
+            let range = opts.get::<Table>("range")?;
+            Some((range.get::<i64>(1)?, range.get::<i64>(2)?))
+        } else {
+            None
+        };
+        let request = RedrawRequest {
+            window,
+            buffer,
+            valid: validity,
+            range,
+            flush: strict_flag("flush")?
+                .unwrap_or_else(|| validity.is_some() || range.is_some()),
+            cursor: strict_flag("cursor")?.unwrap_or(false),
+            tabline: strict_flag("tabline")?.unwrap_or(false),
+            statusline: strict_flag("statusline")?.unwrap_or(false),
+            statuscolumn: strict_flag("statuscolumn")?.unwrap_or(false),
+            winbar: strict_flag("winbar")?.unwrap_or(false),
+        };
+        session.with_editor_mut(|editor| editor.queue_redraw(request));
         Ok((true, Value::Nil))
     })?;
     let redraw_binding: Function = wrap_api.call(native_redraw)?;
@@ -879,6 +929,19 @@ pub fn bind_with(
 
 fn truthy(value: &Value) -> bool {
     !matches!(value, Value::Nil | Value::Boolean(false))
+}
+
+/// Decodes a validated `nvim__redraw` action flag the way
+/// `nlua_pop_Boolean_strict` does (converter.c:848-871): booleans pass
+/// through and every number decodes by `!= 0`, so `{valid = 0}` is false.
+/// Only validation-admitted types reach the fallback arm.
+fn boolean_strict(value: Value) -> bool {
+    match value {
+        Value::Boolean(flag) => flag,
+        Value::Integer(number) => number != 0,
+        Value::Number(number) => number != 0.0,
+        other => truthy(&other),
+    }
 }
 
 #[expect(
