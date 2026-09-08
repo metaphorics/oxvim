@@ -1380,11 +1380,38 @@ pub fn nvim_echo(
     opts: Dict,
 ) -> Result<Object, ApiError> {
     validate_echo_chunks(&chunks)?;
-    if let Some((key, _)) = opts.iter().find(|(key, _)| key.as_bytes() != b"err") {
+    // Upstream `Dict(echo_opts)` members (`api/keysets_defs.h`): `err`
+    // selects the error kind, `verbose` gates on 'verbose', and `kind`,
+    // `id`, `title`, `status`, `percent`, `_truncate` ride along for the
+    // progress and truncation display layers. Truly unknown keys fail.
+    if let Some((key, _)) = opts.iter().find(|(key, _)| {
+        !matches!(
+            key.as_bytes(),
+            b"err"
+                | b"verbose"
+                | b"_truncate"
+                | b"kind"
+                | b"id"
+                | b"title"
+                | b"status"
+                | b"percent"
+        )
+    }) {
         return Err(ApiError::validation(format!(
             "Echo option '{}' is unavailable",
             key.to_string_lossy()
         )));
+    }
+    // `verbose` messages show only when 'verbose' is nonzero (upstream
+    // `verbose_enter` around the echo).
+    if dict_bool(&opts, "verbose")? == Some(true) {
+        let level = session.with_editor(|editor| match editor.options().get_global("verbose") {
+            Ok(OptionValue::Number(level)) => *level,
+            _ => 0,
+        });
+        if level == 0 {
+            return Ok(Object::Integer(-1));
+        }
     }
     let kind = if dict_bool(&opts, "err")? == Some(true) {
         MessageKind::Error
