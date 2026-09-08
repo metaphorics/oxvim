@@ -851,6 +851,11 @@ impl BuiltinHost for ScriptBuiltins {
 struct ImmediateScheduler;
 
 impl Scheduler for ImmediateScheduler {
+    // Executes work inline; there is no draining main loop to defer to.
+    fn defers_to_main_loop(&self) -> bool {
+        false
+    }
+
     fn schedule_deferred(&self, work: Work) -> Result<(), String> {
         work().map_err(|error| error.to_string())
     }
