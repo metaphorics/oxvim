@@ -219,6 +219,16 @@ impl QuickfixStack {
     pub fn is_empty(&self) -> bool {
         self.lists.is_empty()
     }
+    /// Titles in history order with the current list flagged, for
+    /// `:chistory` (`ex_chistory`, quickfix.c).
+    #[must_use]
+    pub fn history(&self) -> Vec<(OxStr, bool)> {
+        self.lists
+            .iter()
+            .enumerate()
+            .map(|(index, list)| (list.title().clone(), index == self.current))
+            .collect()
+    }
 
     /// One-based position of the current list, or 0 when empty.
     #[must_use]
@@ -238,6 +248,33 @@ impl QuickfixStack {
     pub fn clear(&mut self) {
         self.lists.clear();
         self.current = 0;
+    }
+
+    /// `:chistory`/`:lhistory` with a count: go to the one-based list.
+    /// Bounds mirror the walk errors (`ex_chistory`).
+    ///
+    /// # Errors
+    ///
+    /// Returns E42 when the history is empty, E380 below the first list, or
+    /// E381 past the last list.
+    pub fn goto_history(&mut self, number: usize) -> std::result::Result<(), QuickfixError> {
+        if self.lists.is_empty() {
+            return Err(QuickfixError::no_errors());
+        }
+        if number < 1 {
+            return Err(QuickfixError {
+                code: "E380",
+                message: "At bottom of quickfix stack".to_owned(),
+            });
+        }
+        if number > self.lists.len() {
+            return Err(QuickfixError {
+                code: "E381",
+                message: "At top of quickfix stack".to_owned(),
+            });
+        }
+        self.current = number - 1;
+        Ok(())
     }
 
     /// `:colder`/`:cnewer`: walk the list history. E380 before the first

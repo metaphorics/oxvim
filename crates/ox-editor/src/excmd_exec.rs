@@ -3323,6 +3323,9 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "clist" | "llist" => {
             access.with_ex_editor(|editor| command_quickfix_list(runtime, editor, command))
         }
+        "chistory" | "lhistory" => {
+            access.with_ex_editor(|editor| command_quickfix_history(runtime, editor, command))
+        }
         "copen" | "lopen" => {
             access.with_ex_editor(|editor| command_quickfix_open(runtime, editor, command))
         }
@@ -18626,6 +18629,37 @@ fn command_quickfix_age<F: FileIO>(
         Ok(()) => Flow::Normal,
         Err(error) => error_flow(runtime, error.code, error.message),
     }
+}
+/// `:chistory` / `:lhistory`: with a count go to that list in the history,
+/// without one print the history (`ex_chistory`, quickfix.c).
+fn command_quickfix_history<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    command: &ExCommand,
+) -> Flow {
+    let scope = quickfix_scope(editor, command.command.name());
+    let Some(stack) = scope.stack(editor) else {
+        return error_flow(runtime, "E776", "No location list");
+    };
+    if let Some(count) = command.count {
+        let number = usize::try_from(count).unwrap_or(usize::MAX);
+        return match scope.stack_mut(editor).goto_history(number) {
+            Ok(()) => Flow::Normal,
+            Err(error) => error_flow(runtime, error.code, error.message),
+        };
+    }
+    for (index, (title, current)) in stack.history().iter().enumerate() {
+        push_info_text_message(
+            editor,
+            format!(
+                "{} {:>2}: {}",
+                if *current { '>' } else { ' ' },
+                index + 1,
+                title.to_string_lossy()
+            ),
+        );
+    }
+    Flow::Normal
 }
 
 /// `:cwin[dow]` / `:lwin[dow]`: open the list window only when the list has
