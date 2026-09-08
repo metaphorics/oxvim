@@ -112,6 +112,26 @@ fn run_in_buffer_context(
     if session.with_editor(|editor| editor.autocmds().is_ignored(event)) {
         return Ok(None);
     }
+    // Upstream `aucmd_prepbuf` loads the target from disk before entering;
+    // the API layer has no file IO, so when the target exists but its text
+    // is not resident, fire without entering rather than forcing an
+    // unloadable buffer current. Callbacks still observe the target through
+    // the event context (`<abuf>`); only the current-buffer switch is lost.
+    let enterable = session.with_editor(|editor| {
+        let target = if buffer.is_current() {
+            editor.current_buffer()
+        } else {
+            Some(buffer)
+        };
+        target.map(|handle| {
+            editor
+                .buffer(handle)
+                .is_ok_and(|state| state.residency.is_loaded())
+        })
+    });
+    if enterable == Some(false) {
+        return Ok(Some(run()));
+    }
     // Decide the entering window without host code in between, so the state
     // cannot move between this read and the switch that follows.
     let (target, caller, caller_buffer, selected, skipped) = session.with_editor(|editor| {
