@@ -600,8 +600,23 @@ pub fn bind_api(
                     }
                     args.push(Object::Dict(ox_types::Dict(Vec::new())));
                 }
-                let result = dispatch(context.session(), &args)
-                    .map_err(|error| error.message().to_owned())?;
+                // A read-only call must never run user code: `parse` reads
+                // lines while its parser handle is borrowed, so draining
+                // there would reenter Lua under the borrow. Drain only when
+                // this call queued new events, which is exactly when
+                // upstream fires `on_bytes` synchronously. Same-chunk
+                // observers (a `parse` after `set_lines`) still see edited
+                // trees. The dispatch error wins when both fail.
+                let queued_before = crate::buf_attach::pending_buffer_bytes(context.session());
+                let dispatch_result = dispatch(context.session(), &args);
+                let drain_result =
+                    if crate::buf_attach::pending_buffer_bytes(context.session()) > queued_before {
+                        crate::buf_attach::drain_buffer_callbacks(lua, context.session())
+                    } else {
+                        Ok(())
+                    };
+                let result = dispatch_result.map_err(|error| error.message().to_owned())?;
+                drain_result?;
                 let values = match &result {
                     Object::Array(values) if matches!(name, "nvim_buf_call" | "nvim_win_call") => {
                         values

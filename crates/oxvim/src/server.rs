@@ -594,11 +594,11 @@ impl AppState {
         // overwrites it and is honoured. Gating this on `!cli.clean` made
         // `--clean -u file` ignore the file, which the oracle sources.
         match &cli.user_config {
-            UserConfig::File(path) => self.source_config_file(Path::new(path))?,
+            UserConfig::File(path) => self.source_config_file(Path::new(path)),
             UserConfig::None | UserConfig::NoRc => {}
             UserConfig::Default => {
                 if !cli.batch.is_some_and(|batch| batch.silent) {
-                    self.discover_user_config()?;
+                    self.discover_user_config();
                 }
             }
         }
@@ -646,7 +646,10 @@ impl AppState {
 
     /// Sources one config file, choosing the host by extension the way
     /// `do_source` picks between `nlua_exec_file` and the Ex parser.
-    fn source_config_file(&mut self, path: &Path) -> Result<(), AppError> {
+    /// An unreadable file is `E282` and startup continues: the reference
+    /// prints `E282: Cannot read from "..."` for `-u /nonexistent` and
+    /// carries on with exit 0, so an explicit `-u` never aborts here.
+    fn source_config_file(&mut self, path: &Path) {
         if path.extension().is_some_and(|extension| extension == "lua") {
             let result = self
                 .lua
@@ -655,14 +658,17 @@ impl AppState {
                 .map_err(|error| AppError::Lua(error.to_string()));
             if let Err(error) = result {
                 self.absorb_pending_quit();
-                self.display_startup_error(error);
+                self.display_startup_error(Self::config_load_error(path, error));
             }
             // A quit inside init.lua must stop startup before buffers and
             // VimEnter, not whenever the next absorb happens to run.
             self.absorb_pending_quit();
-            return Ok(());
+            return;
         }
-        let source = fs::read_to_string(path).map_err(AppError::Io)?;
+        let Ok(source) = fs::read_to_string(path) else {
+            self.display_startup_error(Self::config_missing_error(path));
+            return;
+        };
         let name = path.to_string_lossy().into_owned();
         // An uncaught error aborts the file, never the startup: upstream
         // shows `file[line]` context and keeps going (verified against
@@ -671,13 +677,13 @@ impl AppState {
             .ex
             .borrow_mut()
             .execute_script_core(&*self.session, &name, &source)
-            .map_err(|error| AppError::Ex(error.to_string()));
+            .map_err(Self::startup_ex_error);
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.absorb_pending_quit();
                 self.display_startup_error(error);
-                return Ok(());
+                return;
             }
         };
         if let ExecOutcome::Quit(code) = outcome {
@@ -685,7 +691,37 @@ impl AppState {
             self.exit_code = code;
         }
         self.absorb_pending_quit();
-        Ok(())
+    }
+    /// `E282` for an unreadable config path: the reference prints
+    /// `E282: Cannot read from "..."` for `-u /nonexistent` and continues
+    /// startup with exit 0.
+    fn config_missing_error(path: &Path) -> AppError {
+        AppError::Ex(format!("E282: Cannot read from \"{}\"", path.display()))
+    }
+
+    /// Maps a config execution failure to its display error. A failure on a
+    /// file that cannot even be read is the missing-file case above, not the
+    /// execution error (a missing `-u` Lua file answers `E282`, never the
+    /// loader's own text); anything else surfaces verbatim.
+    fn config_load_error(path: &Path, error: AppError) -> AppError {
+        if fs::read(path).is_ok() {
+            error
+        } else {
+            Self::config_missing_error(path)
+        }
+    }
+    /// Maps an escaping Ex error to its startup display text. The
+    /// uncaught-exception code is composed here, not in the inner layers:
+    /// the reference prints `E605: Exception not caught: boom` for
+    /// `+throw 'boom'`, `--cmd throw`, and `-u` files alike, while inner
+    /// layers carry the bare value for `:catch` matching.
+    fn startup_ex_error(error: ExecError) -> AppError {
+        AppError::Ex(match error {
+            ExecError::Vim(exception) => {
+                format!("E605: Exception not caught: {}", exception.message())
+            }
+            error => error.to_string(),
+        })
     }
 
     /// `do_user_initialization` (main.c:2108-2210), in its order:
@@ -699,9 +735,9 @@ impl AppState {
     ///
     /// This is the step whose absence meant nothing a user wrote ever ran:
     /// before it, only an explicit `-u` was read.
-    fn discover_user_config(&mut self) -> Result<(), AppError> {
+    fn discover_user_config(&mut self) {
         if self.execute_env("VIMINIT") {
-            return Ok(());
+            return;
         }
         let mut bases = ox_editor::stdpath(ox_editor::StdPath::Config);
         bases.extend(ox_editor::stdpath(ox_editor::StdPath::ConfigDirs));
@@ -709,7 +745,7 @@ impl AppState {
             let lua = Path::new(&base).join("init.lua");
             let vim = Path::new(&base).join("init.vim");
             if lua.is_file() {
-                self.source_config_file(&lua)?;
+                self.source_config_file(&lua);
                 if vim.is_file() {
                     self.session.with_editor_mut(|editor| {
                         editor.push_message(ox_editor::Message {
@@ -727,14 +763,14 @@ impl AppState {
                         });
                     });
                 }
-                return Ok(());
+                return;
             }
             if vim.is_file() {
-                return self.source_config_file(&vim);
+                self.source_config_file(&vim);
+                return;
             }
         }
         self.execute_env("EXINIT");
-        Ok(())
     }
 
     /// `execute_env` (main.c:2257-...): a non-empty environment variable is run
@@ -785,19 +821,9 @@ impl AppState {
                 // inside one plugin ends that plugin and nothing else. One
                 // broken plugin must not be able to stop startup -- with the
                 // error propagated instead, `runtime/plugin/gzip.vim` took the
-                // whole editor down on every plain startup.
-                if let Err(error) = self.source_config_file(&script) {
-                    self.session.with_editor_mut(|editor| {
-                        editor.push_message(ox_editor::Message {
-                            kind: MessageKind::Error,
-                            content: Object::String(OxStr::from(
-                                format!("{}: {error}", script.display()).as_str(),
-                            )),
-                            history: true,
-                            leading_newline: true,
-                        });
-                    });
-                }
+                // whole editor down on every plain startup. Config errors
+                // display inside `source_config_file`, never as `Err` here.
+                self.source_config_file(&script);
                 if self.exiting {
                     return;
                 }
@@ -810,7 +836,10 @@ impl AppState {
         // `restart_edit` the moment `:startinsert` runs and no error
         // cancels it (`ex_docmd.c` only saves/zeroes it around `:normal`),
         // so a failing tail command must not drop the staged switch.
-        let outcome = self.ex.borrow_mut().execute_line_core(&*self.session, command);
+        let outcome = self
+            .ex
+            .borrow_mut()
+            .execute_line_core(&*self.session, command);
         // The temporary borrow ends with this statement, so the absorb
         // below may borrow the host mutably.
         let pending = self.ex.borrow_mut().take_pending_edit_mode();
@@ -821,7 +850,7 @@ impl AppState {
             Self::apply_pending_edit_mode(&self.session, &self.mode, pending)
                 .map_err(|error| AppError::Api(error.to_string()))?;
         }
-        let outcome = outcome.map_err(|error| AppError::Ex(error.to_string()))?;
+        let outcome = outcome.map_err(Self::startup_ex_error)?;
         if let ExecOutcome::Quit(code) = outcome {
             self.exiting = true;
             self.exit_code = code;
@@ -1050,6 +1079,11 @@ impl AppState {
         };
         let code = std::str::from_utf8(code.as_bytes())
             .map_err(|_| ApiError::validation("Lua source must be valid UTF-8"))?;
+        // Same entry contract as the executor path: edits committed since
+        // the last Lua entry (key input drained before this request) reach
+        // listeners before the chunk observes buffer state.
+        ox_lua::buf_attach::drain_buffer_callbacks(self.lua.borrow().lua(), &self.session)
+            .map_err(ApiError::exception)?;
         self.lua
             .borrow_mut()
             .exec(code, args.clone())
@@ -3303,6 +3337,10 @@ struct ServerLuaExec {
 
 impl LuaExec for ServerLuaExec {
     fn execute_chunk(&mut self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError> {
+        // Entry contract (see `dispatch_lua`): pending byte events reach
+        // listeners before user code observes buffer state.
+        ox_lua::buf_attach::drain_buffer_callbacks(&self.lua, &self.session)
+            .map_err(LuaExecError::Runtime)?;
         exec_api_chunk(
             &self.lua,
             &self.registry,
@@ -3592,6 +3630,10 @@ impl LuaExecutor for ApiLuaExecutor {
         code: &str,
         args: Vec<Object>,
     ) -> Result<Object, String> {
+        // Edits committed since the last Lua entry (key input, RPC
+        // mutations) queue byte events; deliver them before user code
+        // runs so attached trees observe edited state first.
+        ox_lua::buf_attach::drain_buffer_callbacks(&self.lua, session)?;
         exec_api_chunk(
             &self.lua,
             &self.registry,
@@ -3610,6 +3652,10 @@ impl LuaExecutor for ApiLuaExecutor {
         reference: usize,
         args: Vec<Object>,
     ) -> Result<Object, String> {
+        // Same entry contract as `exec`: pending byte events reach
+        // listeners before this callback observes buffer state. The
+        // nested drain finds an empty queue and returns immediately.
+        ox_lua::buf_attach::drain_buffer_callbacks(&self.lua, session)?;
         let reference = i32::try_from(reference)
             .map_err(|_| "Lua callback reference is out of range".to_owned())?;
         let (lua, registry, ex, nested_ex) = (&self.lua, &self.registry, &self.ex, &self.nested_ex);
@@ -3645,6 +3691,8 @@ impl LuaExecutor for ApiLuaExecutor {
         reference: usize,
         args: Vec<Object>,
     ) -> Result<Vec<Object>, String> {
+        // Same entry contract as `exec` (see above).
+        ox_lua::buf_attach::drain_buffer_callbacks(&self.lua, session)?;
         let reference = i32::try_from(reference)
             .map_err(|_| "Lua callback reference is out of range".to_owned())?;
         let (lua, registry, ex, nested_ex) = (&self.lua, &self.registry, &self.ex, &self.nested_ex);

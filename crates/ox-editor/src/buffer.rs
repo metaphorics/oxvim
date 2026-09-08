@@ -10,6 +10,7 @@ use thiserror::Error;
 use crate::NamespaceId;
 use crate::extmark::{
     ExtmarkError, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, ExtmarkSpliceUndo, TextSplice,
+    extent_end,
 };
 use crate::fold::FoldError;
 use crate::marks::LocalMarks;
@@ -31,6 +32,70 @@ pub struct BufferAttachSubscription {
     pub send_buffer: bool,
     /// Event and callback options supplied by the caller.
     pub options: Dict,
+}
+
+/// One committed text mutation projected onto the upstream
+/// `nvim_buf_attach` `on_bytes` argument shape: the change start as a
+/// zero-based row, byte column, and byte offset, plus the replaced and
+/// inserted spans as row/column extents and byte lengths. Positions are
+/// buffer-text coordinates: the old span addresses the pre-edit text,
+/// the new span the post-edit text, and both share the same start. The
+/// tick is the script-visible changedtick the callback observes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BufferBytesEvent {
+    /// Script-visible changedtick after the mutation.
+    pub tick: u64,
+    /// Zero-based start row.
+    pub start_row: usize,
+    /// Start byte column.
+    pub start_col: usize,
+    /// Start byte offset into the buffer text.
+    pub start_byte: usize,
+    /// Rows spanned by the replaced text.
+    pub old_row: usize,
+    /// Replaced byte columns on the end row.
+    pub old_col: usize,
+    /// Replaced byte length.
+    pub old_byte: usize,
+    /// Rows spanned by the inserted text.
+    pub new_row: usize,
+    /// Inserted byte columns on the end row.
+    pub new_col: usize,
+    /// Inserted byte length.
+    pub new_byte: usize,
+}
+
+/// Byte length of the span from `start` (inclusive) to `end` (exclusive)
+/// across full line bodies: `lines[0]` is the start row's whole line
+/// without its terminator. Rows past the vector (an insertion end landing
+/// on the following line) contribute nothing; their newline was already
+/// counted by the previous row.
+fn span_bytes(lines: &[Vec<u8>], start: ExtmarkPosition, end: ExtmarkPosition) -> usize {
+    let mut bytes = 0;
+    for row in start.row..=end.row {
+        let line_len = lines.get(row - start.row).map_or(0, Vec::len);
+        if row == start.row && row == end.row {
+            bytes += end.column.saturating_sub(start.column);
+        } else if row == start.row {
+            bytes += line_len.saturating_sub(start.column) + 1;
+        } else if row == end.row {
+            bytes += end.column;
+        } else {
+            bytes += line_len + 1;
+        }
+    }
+    bytes
+}
+
+/// End column relative to the change start: absolute when the span covers
+/// several rows, start-relative within a single row, matching upstream
+/// `on_bytes` (`buf_updates_send_tick` reports the same two shapes).
+fn end_column(end: ExtmarkPosition, start: ExtmarkPosition) -> usize {
+    if end.row == start.row {
+        end.column.saturating_sub(start.column)
+    } else {
+        end.column
+    }
 }
 
 /// Failures while changing a buffer or its lifecycle.
@@ -184,6 +249,10 @@ pub struct BufferState {
     variables_version: u64,
     /// Attached RPC channels keyed by channel identity.
     subscriptions: BTreeMap<u64, BufferAttachSubscription>,
+    /// Committed mutations awaiting `on_bytes` delivery, in commit order.
+    /// The drain lives outside this crate (Lua owns the callbacks), so the
+    /// queue only grows here and is taken whole by `take_bytes_events`.
+    pending_bytes: Vec<BufferBytesEvent>,
     /// Branch-preserving undo history.
     pub undo: UndoTree,
     /// Named and special buffer-local marks.
@@ -263,6 +332,7 @@ impl BufferState {
             locked_vars: Vec::new(),
             variables_version: 1,
             subscriptions: BTreeMap::new(),
+            pending_bytes: Vec::new(),
             undo: UndoTree::new(),
             marks: LocalMarks::new(),
             extmarks: Extmarks::new(),
@@ -339,6 +409,13 @@ impl BufferState {
         &mut self.variables
     }
 
+    /// Counts queued mutation events without taking them, for the dispatch
+    /// gate that drains only when a call queued new events.
+    #[must_use]
+    pub fn pending_bytes_len(&self) -> usize {
+        self.pending_bytes.len()
+    }
+
     /// Returns whether a buffer-local variable is locked by `:lockvar`.
     #[must_use]
     pub fn is_var_locked(&self, name: &OxStr) -> bool {
@@ -363,6 +440,13 @@ impl BufferState {
     #[must_use]
     pub const fn subscriptions(&self) -> &BTreeMap<u64, BufferAttachSubscription> {
         &self.subscriptions
+    }
+
+    /// Takes the queued mutation events in commit order, leaving the queue
+    /// empty. The Lua-side drain calls this before invoking callbacks, so
+    /// no editor borrow is held while user code runs.
+    pub fn take_bytes_events(&mut self) -> Vec<BufferBytesEvent> {
+        std::mem::take(&mut self.pending_bytes)
     }
 
     /// Returns mutable requested buffer event subscriptions.
@@ -499,8 +583,20 @@ impl BufferState {
         splice: TextSplice,
     ) -> Result<(), BufferStateError> {
         self.require_loaded()?;
+        let before = self.text.line(lnum)?;
         self.text.replace_lines(lnum, lnum, &[line])?;
         self.bump_changedtick();
+        // Prompt edits bypass undo but not attach callbacks: project the
+        // same byte event from a synthetic single-line splice.
+        let after = self.text.line(lnum)?;
+        let edit = PreparedBufferTextEdit {
+            start_line: lnum,
+            before: vec![before],
+            after: vec![after],
+            splice,
+        };
+        let event = self.bytes_event(&edit)?;
+        self.pending_bytes.push(event);
         self.marks.splice(lnum, 1, 1);
         let _ = self.extmarks.splice_recording(splice);
         self.splice_folds(lnum, 1, 1)?;
@@ -1013,10 +1109,46 @@ impl BufferState {
     ) -> Result<u64, BufferStateError> {
         self.write_prepared_lines(&edit)?;
         self.bump_changedtick();
+        // The byte offsets below address the pre-write text, whose line
+        // prefix is unchanged by this edit; the tick is post-bump, which is
+        // what the callback observes through `b:changedtick`.
+        let event = self.bytes_event(&edit)?;
+        self.pending_bytes.push(event);
         let seq = self.record_committed_splice(edit, cursor_before, cursor_after, timestamp)?;
         self.refresh_modified();
         self.bump_derived_ticks();
         Ok(seq)
+    }
+
+    /// Projects one committed splice onto the `on_bytes` argument shape.
+    /// Must run after a successful write: the changedtick is already
+    /// bumped, and the pre-write line prefix still addresses the change
+    /// start. Fails only when the start line has no byte offset, which
+    /// cannot happen for a splice the text layer just accepted.
+    fn bytes_event(
+        &self,
+        edit: &PreparedBufferTextEdit,
+    ) -> Result<BufferBytesEvent, BufferStateError> {
+        let start = edit.splice.start;
+        let old_end = edit.splice.old_end();
+        let new_end = extent_end(start, edit.splice.new_extent);
+        // One-based line of the change start in either text generation:
+        // lines before it are untouched by this edit.
+        let start_byte = self.text.byte_of_line(start.row + 1)?;
+        let old_byte = span_bytes(&edit.before, start, old_end);
+        let new_byte = span_bytes(&edit.after, start, new_end);
+        Ok(BufferBytesEvent {
+            tick: self.script_changedtick(),
+            start_row: start.row,
+            start_col: start.column,
+            start_byte,
+            old_row: old_end.row.saturating_sub(start.row),
+            old_col: end_column(old_end, start),
+            old_byte,
+            new_row: new_end.row.saturating_sub(start.row),
+            new_col: end_column(new_end, start),
+            new_byte,
+        })
     }
 
     fn record_committed_splice(
@@ -1075,6 +1207,12 @@ impl BufferState {
             .replace_lines_disjoint(&splices)
             .map_err(BufferStateError::from)?;
         self.bump_changedtick();
+        // Same byte-event contract as the single-splice path: project
+        // every edit before the record loop moves them.
+        for edit in &prepared {
+            let event = self.bytes_event(edit)?;
+            self.pending_bytes.push(event);
+        }
         let mut seq = 0;
         for edit in prepared {
             debug_assert!(edit.preserves_line_count());
@@ -1427,5 +1565,47 @@ mod tests {
         assert_eq!(range_tuple(&state, namespace, id), (0, 4, None, false));
         state.redo().unwrap();
         assert_eq!(range_tuple(&state, namespace, id), (0, 1, None, false));
+    }
+
+    #[test]
+    fn commit_records_bytes_event_for_line_replace() {
+        let (mut editor, buffer, _) = editor_with(b"a\nb\nc\n");
+        let state = editor.buffer_mut(buffer).unwrap();
+        state
+            .replace_lines(2, 2, &[b"XY".to_vec()], position(1, 0), position(2, 2), 0)
+            .unwrap();
+        let events = state.take_bytes_events();
+        assert_eq!(events.len(), 1);
+        let event = events[0];
+        assert_eq!(
+            (event.start_row, event.start_col, event.start_byte),
+            (1, 0, 2)
+        );
+        // Full-line spans use the extent shape (terminator included):
+        // replacing "b" with "XY" reports old=(1,0,2), new=(1,0,3),
+        // matching the reference `on_bytes` for the same edit.
+        assert_eq!((event.old_row, event.old_col, event.old_byte), (1, 0, 2));
+        assert_eq!((event.new_row, event.new_col, event.new_byte), (1, 0, 3));
+        assert_eq!(event.tick, state.script_changedtick());
+        assert!(state.take_bytes_events().is_empty());
+    }
+
+    #[test]
+    fn commit_records_bytes_event_for_line_insert() {
+        let (mut editor, buffer, _) = editor_with(b"a\nb\n");
+        let state = editor.buffer_mut(buffer).unwrap();
+        state
+            .insert_lines(0, &[b"Z".to_vec()], position(1, 0), position(2, 0), 0)
+            .unwrap();
+        let events = state.take_bytes_events();
+        assert_eq!(events.len(), 1);
+        let event = events[0];
+        assert_eq!(
+            (event.start_row, event.start_col, event.start_byte),
+            (0, 0, 0)
+        );
+        assert_eq!((event.old_row, event.old_col, event.old_byte), (0, 0, 0));
+        // Inserting one line reports the added line plus its newline.
+        assert_eq!((event.new_row, event.new_col, event.new_byte), (1, 0, 2));
     }
 }

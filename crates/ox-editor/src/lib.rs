@@ -52,8 +52,8 @@ pub use autocmd::{
     PatternKind,
 };
 pub use buffer::{
-    BufferAttachSubscription, BufferFlags, BufferState, BufferStateError, BufferTextEditError,
-    BufferTextEditRequest,
+    BufferAttachSubscription, BufferBytesEvent, BufferFlags, BufferState, BufferStateError,
+    BufferTextEditError, BufferTextEditRequest,
 };
 pub use decoration::Decorations;
 pub use editor::{

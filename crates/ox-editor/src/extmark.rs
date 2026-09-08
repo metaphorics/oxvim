@@ -1297,7 +1297,7 @@ fn ordered_bounds(
     }
 }
 
-fn extent_end(start: ExtmarkPosition, extent: TextExtent) -> ExtmarkPosition {
+pub(crate) fn extent_end(start: ExtmarkPosition, extent: TextExtent) -> ExtmarkPosition {
     if extent.rows == 0 {
         ExtmarkPosition::new(start.row, start.column.saturating_add(extent.columns))
     } else {
