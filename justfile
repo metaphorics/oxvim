@@ -15,6 +15,31 @@ _guard_binary:
     @test -x target/release/oxvim || { echo "oxvim binary not built yet (later task)" >&2; exit 1; }
 
 
+# Provision tree-sitter parser libraries beside the runtime, where the
+# `parser/<lang>.*` runtime-file lookup finds them. The reference build
+# artifacts are ABI-compatible with our tree-sitter crate; missing sources
+# fail loudly by design (same policy as the ox-lua parser tests).
+_parser_fixtures:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="{{justfile_directory()}}"
+    src="${root}/.references/neovim/build/lib/nvim/parser"
+    out="${root}/runtime/parser"
+    mkdir -p "${out}"
+    shopt -s nullglob
+    have=0
+    for lib in "${src}"/*.so; do
+      have=1
+      base="$(basename "${lib}")"
+      if [[ ! -f "${out}/${base}" || "${lib}" -nt "${out}/${base}" ]]; then
+        cp "${lib}" "${out}/${base}"
+      fi
+    done
+    if [[ "${have}" -eq 0 ]]; then
+      echo "no parser .so files in ${src} (build the reference checkout first)" >&2
+      exit 1
+    fi
+
 # Build the upstream helper programs beside oxvim. testprg() resolves helpers
 # relative to NVIM_PRG, not the Neovim reference build directory.
 _functional_fixtures:
@@ -37,7 +62,7 @@ _functional_fixtures:
 # Run upstream Neovim functional tests against oxvim. Focused runs retain the
 # single-file interface; full runs isolate top-level groups so one slow group
 # cannot consume the whole suite's timeout or delete another group's XDG tree.
-functional: _guard_binary _functional_fixtures
+functional: _guard_binary _parser_fixtures _functional_fixtures
     #!/usr/bin/env bash
     set -euo pipefail
     root="{{justfile_directory()}}"

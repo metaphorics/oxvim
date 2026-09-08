@@ -134,3 +134,7 @@ tmtags
 
 # === EMPIRICAL ===
 # (.references/ is covered by the user's global gitignore; not repeated here.)
+# Provisioned tree-sitter parser libraries (`just _parser_fixtures`
+# copies the ABI-compatible reference build artifacts here so the
+# `parser/<lang>.*` runtime lookup resolves them).
+runtime/parser/
