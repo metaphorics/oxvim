@@ -1720,6 +1720,18 @@ impl AppState {
         self.absorb_pending_quit();
     }
 
+    /// Whether unprocessed keys sit in typeahead after this message.
+    ///
+    /// WHY: upstream processes pending typeahead on every main-loop turn,
+    /// so keys fed by any path (including `exec_lua`-wrapped `nvim_input`)
+    /// run before the next RPC observes state. Gating the drive on the
+    /// bare input-method names leaves wrapped input stranded until an
+    /// unrelated input RPC arrives.
+    fn typeahead_pending(&self) -> bool {
+        self.session
+            .with_editor(|editor| !editor.typeahead().is_empty())
+    }
+
     /// Drains queued Lua work for this state; see [`drain_lua_work_queue`].
     fn drain_lua_work(&mut self) -> bool {
         drain_lua_work_queue(&self.lua_work, &self.session)
@@ -1766,7 +1778,11 @@ impl AppState {
                     Ok((result, redraws)) => (Ok(result), redraws),
                     Err(error) => (Err(error), BTreeMap::new()),
                 };
-                if result.is_ok() && is_input {
+                // Upstream processes pending typeahead every main-loop turn
+                // regardless of the previous RPC outcome (input.c:537-541;
+                // state.c:100-113), so an errored dispatch that fed input
+                // still drives.
+                if is_input || self.typeahead_pending() {
                     match self.drive_input() {
                         Ok(()) => {
                             redraws = self
@@ -1786,6 +1802,14 @@ impl AppState {
                             redraws = self
                                 .redraw()
                                 .map_err(|error| AppError::Api(error.to_string()))?;
+                            // The dropped Ok value may own freshly allocated
+                            // reply refs (exec_lua returning a function after
+                            // feeding input): release them before the drive
+                            // error takes the reply slot, or the registry
+                            // entry leaks.
+                            if owns_result_refs && let Ok(value) = &result {
+                                self.free_reply_refs(value);
+                            }
                             result = Err(error);
                         }
                     }
@@ -1822,7 +1846,7 @@ impl AppState {
                         if owns_result_refs {
                             self.free_reply_refs(&value);
                         }
-                        if is_input {
+                        if is_input || self.typeahead_pending() {
                             match self.drive_input() {
                                 Ok(()) => {
                                     redraws = self
