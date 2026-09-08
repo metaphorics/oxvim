@@ -1124,7 +1124,9 @@ impl<F: FileIO> ScriptCtx<F> {
         let mut components: Vec<&str> = function.split('#').collect();
         let last = components.pop()?;
         if !Self::is_autoload_component(last)
-            || components.iter().any(|part| !Self::is_autoload_component(part))
+            || components
+                .iter()
+                .any(|part| !Self::is_autoload_component(part))
         {
             return None;
         }

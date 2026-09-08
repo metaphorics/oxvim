@@ -516,11 +516,9 @@ fn validate_value(
     let (Some(kind), OptionValue::String(value)) = (metadata.list, value) else {
         return Ok(());
     };
-    validate_list(kind, value).map_err(|reason| {
-        OptionError::InvalidList {
-            name: metadata.name,
-            reason,
-        }
+    validate_list(kind, value).map_err(|reason| OptionError::InvalidList {
+        name: metadata.name,
+        reason,
     })
 }
 

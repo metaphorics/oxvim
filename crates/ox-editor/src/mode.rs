@@ -131,12 +131,20 @@ impl Default for Mode {
 }
 impl Mode {
     /// Whether the mode counts as inside insertion for `InsertEnter` /
-    /// `InsertLeave`. Only pure `Insert`; `Replace` entry/exit stays silent
-    /// until its event semantics are pinned.
+    /// `InsertLeave`. Replace mode shares the insert lifecycle.
     #[must_use]
     pub fn is_insert(&self) -> bool {
-        matches!(self, Self::Insert(_))
+        matches!(self, Self::Insert(_) | Self::Replace(_))
     }
+}
+
+/// A transition across the insert lifecycle boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InsertTransition {
+    /// Entered Insert or Replace mode.
+    Enter,
+    /// Left Insert or Replace mode.
+    Leave,
 }
 
 /// One state-loop action produced by input checking.
@@ -224,7 +232,8 @@ pub struct ModeMachine {
     pub completion: CompletionSession,
     /// `CTRL-V` in command-line mode: insert the next character literally.
     pending_cmdline_literal: bool,
-    /// Insert mode temporarily yielded to one Normal-mode command with `CTRL-O`.
+    /// Insert mode temporarily yielded to one Normal-mode command with
+    /// `CTRL-O`.
     one_normal_command: bool,
     /// Register currently recording macros, if any (`reg_recording`).
     recording: Option<char>,
@@ -236,6 +245,8 @@ pub struct ModeMachine {
     paste_capture: Option<Vec<u8>>,
     /// Complete captured paste streams waiting for `nvim_paste` replay.
     pending_paste_repeats: Vec<Vec<u8>>,
+    /// Insert-lifecycle transitions observed while consuming typeahead.
+    insert_transitions: Vec<InsertTransition>,
 }
 
 impl Default for ModeMachine {
@@ -261,6 +272,7 @@ impl Default for ModeMachine {
             redo_buf: Vec::new(),
             paste_capture: None,
             pending_paste_repeats: Vec::new(),
+            insert_transitions: Vec::new(),
         }
     }
 }
@@ -436,7 +448,9 @@ impl ModeMachine {
 
     /// Enters Insert mode at the current cursor.
     pub fn enter_insert(&mut self) {
+        let was_insert = self.mode.is_insert();
         self.mode = Mode::Insert(InsertState);
+        self.record_insert_transition(was_insert);
         self.pending_ctrl_bslash = false;
         self.pending_cmdline_literal = false;
     }
@@ -456,15 +470,19 @@ impl ModeMachine {
     /// Clears two-key parser residue (`CTRL-\` half-sequence, cmdline
     /// literal) so a pending sequence from the prior mode cannot leak in.
     pub fn enter_replace(&mut self) {
+        let was_insert = self.mode.is_insert();
         self.mode = Mode::Replace(ReplaceState);
+        self.record_insert_transition(was_insert);
         self.pending_ctrl_bslash = false;
         self.pending_cmdline_literal = false;
     }
 
     /// Leaves Insert, Replace, or terminal-input mode without applying a cursor motion.
     pub fn stop_insert(&mut self) {
+        let was_insert = self.mode.is_insert();
         if matches!(self.mode, Mode::Insert(_) | Mode::Replace(_)) {
             self.mode = Mode::Normal(NormalState::default());
+            self.record_insert_transition(was_insert);
         }
         self.pending_ctrl_bslash = false;
         self.pending_cmdline_literal = false;
@@ -507,6 +525,23 @@ impl ModeMachine {
     /// typeahead read) for replay by the embedding host.
     pub fn take_paste_repeats(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.pending_paste_repeats)
+    }
+
+    /// Takes insert-lifecycle transitions recorded while consuming keys.
+    #[must_use]
+    pub fn take_insert_transitions(&mut self) -> Vec<InsertTransition> {
+        std::mem::take(&mut self.insert_transitions)
+    }
+
+    fn record_insert_transition(&mut self, was_insert: bool) {
+        let now_insert = self.mode.is_insert();
+        if was_insert != now_insert {
+            self.insert_transitions.push(if now_insert {
+                InsertTransition::Enter
+            } else {
+                InsertTransition::Leave
+            });
+        }
     }
 
     /// Whether a completed stored paste must run before more typeahead.
@@ -867,7 +902,7 @@ impl ModeMachine {
         // refills the slot, so a handler error restores the exact pre-key
         // variant state instead of stranding the machine on a default Normal.
         let mut mode = std::mem::take(&mut self.mode);
-        let was_insert = matches!(mode, Mode::Insert(_));
+        let was_insert = mode.is_insert();
         let transition = match &mut mode {
             Mode::Normal(state) => self.normal(editor, state, key, eval),
             Mode::Insert(state) => self.insert(editor, state, key, eval),
@@ -888,6 +923,7 @@ impl ModeMachine {
                     next = Mode::Insert(InsertState);
                 }
                 self.mode = next;
+                self.record_insert_transition(was_insert);
             }
             Ok(None) => self.mode = mode,
             Err(error) => {
