@@ -167,8 +167,12 @@ impl ChannelState {
 /// [errtype, msg]]`, exactly as `channel.c serialize_response()` emits for a
 /// failed notification (`serialize_request(..., 0, "nvim_error_event", args)`
 /// where `args` is the `[type, message]` pair).
-#[must_use]
-pub fn nvim_error_event(error: &ApiError) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`crate::codec::EncodeError`] when the error payload violates the
+/// msgpack wire limits.
+pub fn nvim_error_event(error: &ApiError) -> Result<Vec<u8>, crate::codec::EncodeError> {
     let params = vec![
         Object::Integer(error.error_type()),
         Object::String(OxStr::from(error.message())),
@@ -225,7 +229,7 @@ mod tests {
 
     #[test]
     fn nvim_error_event_wire_shape() -> Result<(), Box<dyn std::error::Error>> {
-        let bytes = nvim_error_event(&ApiError::exception("boom"));
+        let bytes = nvim_error_event(&ApiError::exception("boom"))?;
         // [2, "nvim_error_event", [0, "boom"]]
         let expected: &[u8] = &[
             0x93, // array(3)

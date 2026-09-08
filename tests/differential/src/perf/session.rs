@@ -1531,7 +1531,12 @@ fn enqueue_quit(msgid: &mut CheckedMsgidCounter, writer: Option<&Sender<(u32, Ve
         method: "nvim_command".into(),
         params: vec![Object::String(OxStr::from("qa!"))],
     };
-    jobs.send((id, request.encode_bytes())).is_ok()
+    // An encode failure means no request reached the writer, so the quit did
+    // not enqueue; report it as such rather than as a sent message.
+    let Ok(bytes) = request.encode_bytes() else {
+        return false;
+    };
+    jobs.send((id, bytes)).is_ok()
 }
 
 /// The outcome of waiting for a specific response: the receipt stamp, the
@@ -1576,7 +1581,11 @@ impl SessionCore {
         message: &Message,
         deadline: Instant,
     ) -> Result<VecDeque<TimedMessage>, PerfError> {
-        let bytes = message.encode_bytes();
+        // A request that cannot be encoded never reaches stdin, so it is a
+        // write failure with the encoder's cause rather than a sent request.
+        let bytes = message.encode_bytes().map_err(|error| PerfError::Write {
+            source: io::Error::new(io::ErrorKind::InvalidData, error.to_string()),
+        })?;
         let jobs = self.writer.as_ref().ok_or_else(writer_closed_error)?;
         jobs.send((id, bytes)).map_err(|_| writer_closed_error())?;
 
