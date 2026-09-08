@@ -462,6 +462,9 @@ impl Editor {
                 ("numbersize".into(), Object::Integer(64)),
                 ("numbermax".into(), Object::Integer(i64::MAX)),
                 ("numbermin".into(), Object::Integer(i64::MIN)),
+                // Largest valid cursor column (`MAXCOL`, `pos_defs.h:17-19`),
+                // also exposed to Lua as `vim.v.maxcol`.
+                ("maxcol".into(), Object::Integer(0x7FFF_FFFF)),
                 ("version".into(), Object::Integer(801)),
                 ("versionlong".into(), Object::Integer(8_012_424)),
                 ("errors".into(), Object::Array(Vec::new())),
