@@ -2,6 +2,7 @@
 
 use crate::converter::{free_lua_ref, lua_to_object, object_to_lua, object_to_lua_legacy};
 use crate::typval_bridge::{collect_typval_refs, free_typval_refs, lua_to_typval, typval_to_lua};
+use crate::uv_core::CallbackContext;
 use mlua::{
     FromLuaMulti, Function, Lua, LuaString, MetaMethod, MultiValue, Table, UserData,
     UserDataMethods, Value, Variadic,
@@ -10,6 +11,7 @@ use ox_api::Registry;
 use ox_editor::BufferRelease;
 use ox_types::{BufHandle, Object, OxStr, Typval, WinHandle};
 use std::cell::Cell;
+use std::io::Write;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -24,6 +26,30 @@ pub trait Scheduler {
     ///
     /// Returns an error when the main-loop adapter cannot enqueue `work`.
     fn schedule_deferred(&self, work: Work) -> Result<(), String>;
+    /// Whether `schedule_deferred` genuinely postpones work to a later
+    /// drained main-loop turn; `false` means it executes work inline and
+    /// the host has no draining main loop.
+    ///
+    /// Inline is the safe default: a host with a real draining main loop
+    /// overrides this with `true`, while inline hosts — including the
+    /// test-only schedulers in `ox-lua/tests/` — inherit the correct
+    /// branch instead of silently queueing work no turn drains.
+    fn defers_to_main_loop(&self) -> bool {
+        false
+    }
+    /// Run queued deferred work now; the wait-pump path.
+    ///
+    /// WHY: upstream's `loop_poll` serves the same `main_loop.events`
+    /// queue `vim.schedule` feeds (`LOOP_PROCESS_EVENTS`, executor.c), so
+    /// a blocking `vim.wait` still advances scheduled continuations. A
+    /// pump that only runs its own timers starves them: the wait never
+    /// observes completion. Hosts with inline scheduling keep the
+    /// no-op default; queued hosts drain their queue.
+    ///
+    /// Returns whether at least one work item ran.
+    fn pump_scheduled(&self) -> bool {
+        false
+    }
 }
 
 /// Vimscript builtin dispatch seam used by `vim.call` and `vim.fn`.
@@ -791,11 +817,43 @@ pub fn bind_api(
                 let rendered: LuaString = to_string.call(value)?;
                 bytes.extend_from_slice(&rendered.as_bytes());
             }
-            let vim: Table = lua.globals().get("vim")?;
-            let api: Table = vim.get("api")?;
-            let out_write: Function = api.get("nvim_out_write")?;
-            out_write.call::<()>(lua.create_string(&bytes)?)?;
-            Ok(())
+            // executor.c:nlua_print queues the emit for fast callbacks
+            // (executor.c:1159-1161) instead of raising E5560; single-threaded
+            // host, so there is no worker-thread branch (executor.c:1154-1158)
+            // to mirror.
+            let context = lua
+                .app_data_ref::<CallbackContext>()
+                .map(|context| (context.scheduler.clone(), context.fast.clone()));
+            if let Some((scheduler, _)) = context.filter(|(_, fast)| fast.in_fast_callback()) {
+                if !scheduler.defers_to_main_loop() {
+                    // Upstream defers to a main loop that always drains
+                    // (executor.c:1159-1161); an inline host executes the
+                    // deferred print immediately, still under the live
+                    // fast-callback guard (E5560). Emit directly to preserve
+                    // the bytes — message-system capture does not apply
+                    // inside fast callbacks by definition. Like the queued
+                    // branch and upstream `nlua_print`, the payload carries
+                    // separators between values, never a trailing newline
+                    // (executor.c:1099-1106).
+                    let mut stdout = std::io::stdout().lock();
+                    return stdout.write_all(&bytes).map_err(mlua::Error::external);
+                }
+                let lua = lua.clone();
+                scheduler
+                    .schedule_deferred(Box::new(move || {
+                        let vim: Table = lua.globals().get("vim")?;
+                        let api: Table = vim.get("api")?;
+                        let out_write: Function = api.get("nvim_out_write")?;
+                        out_write.call::<()>(lua.create_string(&bytes)?)
+                    }))
+                    .map_err(mlua::Error::runtime)
+            } else {
+                let vim: Table = lua.globals().get("vim")?;
+                let api: Table = vim.get("api")?;
+                let out_write: Function = api.get("nvim_out_write")?;
+                out_write.call::<()>(lua.create_string(&bytes)?)?;
+                Ok(())
+            }
         })?,
     )?;
     Ok(())

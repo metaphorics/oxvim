@@ -223,9 +223,9 @@ struct LuaScandir {
 impl UserData for LuaScandir {}
 
 #[derive(Clone)]
-struct CallbackContext {
-    scheduler: Rc<dyn Scheduler>,
-    fast: FastCallbackState,
+pub(crate) struct CallbackContext {
+    pub(crate) scheduler: Rc<dyn Scheduler>,
+    pub(crate) fast: FastCallbackState,
 }
 
 pub(crate) fn install(
@@ -249,10 +249,24 @@ pub(crate) fn install(
     core.set("check_interrupt", lua.create_function(|_, ()| Ok(false))?)?;
 
     let poll_access = loop_access.clone();
+    let pump_scheduler = scheduler.clone();
     core.set(
         "loop_poll",
         lua.create_function(move |_, (timeout, _fast_only): (i64, bool)| {
-            poll_access.poll(timeout)
+            // Serve the `vim.schedule` queue on every wait turn: without
+            // this a blocking `vim.wait` never advances the continuations
+            // it waits on (upstream `LOOP_PROCESS_EVENTS`, executor.c).
+            // Drain before blocking: upstream serves a non-empty
+            // multiqueue first and only blocks on an empty one
+            // (multiqueue.h:45-52; `nlua_loop_poll`, executor.c:574-584).
+            // `vim.wait(t, cond, 0)` runs without a dummy wake timer
+            // (editor.lua:146-148), so blocking first would strand
+            // pre-queued work until the timeout fires.
+            if !pump_scheduler.pump_scheduled() {
+                poll_access.poll(timeout)?;
+                let _ = pump_scheduler.pump_scheduled();
+            }
+            Ok(())
         })?,
     )?;
 
