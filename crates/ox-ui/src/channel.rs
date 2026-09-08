@@ -101,6 +101,9 @@ pub enum UiChannelError {
     /// The legacy cell-at-a-time grid protocol is outside this crate's linegrid contract.
     #[error("UI channel requires ext_linegrid")]
     LegacyGridUnsupported,
+    /// Redraw events could not be encoded for transmission.
+    #[error("UI channel {0} redraw batch could not be encoded")]
+    BatchEncode(u64),
     /// A caller tried to emit outside a redraw transaction.
     #[error("UI channel {0} has no active redraw batch")]
     BatchNotStarted(u64),
@@ -207,7 +210,9 @@ impl UiChannel {
         {
             batch.push("flush", vec![]);
         }
-        Ok(batch.pack())
+        batch
+            .pack()
+            .map_err(|_| UiChannelError::BatchEncode(self.id))
     }
 
     /// Returns current batched events for inspection.
