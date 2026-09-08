@@ -11,7 +11,9 @@ use thiserror::Error;
 
 use crate::arglist::ArgList;
 use crate::autocmd::Autocmds;
-use crate::buffer::{BufferState, BufferStateError, BufferTextEditRequest};
+use crate::buffer::{
+    BufferAttachSubscription, BufferState, BufferStateError, BufferTextEditRequest,
+};
 use crate::decoration::Decorations;
 use crate::extmark::{ExtmarkPosition, NamespaceId, SignGroup, TextExtent, TextSplice};
 use crate::fold::{FoldError, Position as FoldPosition};
@@ -363,6 +365,9 @@ pub struct TerminalChannelInfo {
 pub struct Editor {
     /// Live buffers in monotonically allocated handle order.
     buffers: BTreeMap<BufHandle, BufferState>,
+    /// Subscriptions removed by wiping a buffer; the Lua host drains this
+    /// queue after the editor borrow ends.
+    pending_subscription_releases: Vec<BufferAttachSubscription>,
     /// Tabpage owning each live window handle.
     windows: BTreeMap<WinHandle, TabHandle>,
     /// Live tabpages and their tiled/floating layouts, keyed for lookup.
@@ -441,6 +446,11 @@ pub struct Editor {
     /// index for index. Non-echo producers record their severity kind with no
     /// id; only `nvim_echo` attaches replace-by-id identity.
     message_identities: Vec<MessageIdentity>,
+    /// Identity armed by the server before an `nvim_echo` handler pushes its
+    /// message. The push consumes this marker before Progress callbacks run.
+    pending_echo_identity: Option<MessageIdentity>,
+    /// In-place echo replacements waiting for the server's render pass.
+    echo_replacements: Vec<(Message, MessageIdentity)>,
     /// Raw `nvim_ui_send` payloads staged for the server's redraw pass.
     ///
     /// `nvim_ui_send` reaches every UI that negotiated `stdout_tty`
@@ -526,6 +536,7 @@ impl Editor {
     pub fn new() -> Self {
         let mut editor = Self {
             buffers: BTreeMap::new(),
+            pending_subscription_releases: Vec::new(),
             windows: BTreeMap::new(),
             tabpages: BTreeMap::new(),
             tab_order: Vec::new(),
@@ -579,6 +590,8 @@ impl Editor {
             echo_highlight: OxStr::from(""),
             message_destinations: Vec::new(),
             message_identities: Vec::new(),
+            pending_echo_identity: None,
+            echo_replacements: Vec::new(),
             ui_sends: Vec::new(),
             message_routing: MessageRouting::default(),
             current_tab: None,
@@ -850,6 +863,10 @@ impl Editor {
     #[must_use]
     pub fn buffers(&self) -> Vec<BufHandle> {
         self.buffers.keys().copied().collect()
+    }
+    /// Takes subscriptions removed by wiping a buffer, leaving the queue empty.
+    pub fn take_pending_subscription_releases(&mut self) -> Vec<BufferAttachSubscription> {
+        std::mem::take(&mut self.pending_subscription_releases)
     }
 
     /// Returns the highest buffer number ever allocated.
@@ -2285,9 +2302,28 @@ impl Editor {
         }
         let kind = message.kind;
         let destination = self.message_destination();
+        let identity = self
+            .pending_echo_identity
+            .take()
+            .unwrap_or_else(|| MessageIdentity::of(kind));
+        if identity.id != Object::Nil
+            && let Some(slot) = self
+                .message_identities
+                .iter()
+                .rposition(|existing| existing.id == identity.id)
+        {
+            self.messages[slot] = message;
+            self.message_destinations[slot] = destination;
+            self.message_identities[slot] = identity.clone();
+            if destination == MessageDestination::Ui {
+                self.echo_replacements
+                    .push((self.messages[slot].clone(), identity));
+            }
+            return;
+        }
         self.messages.push(message);
         self.message_destinations.push(destination);
-        self.message_identities.push(MessageIdentity::of(kind));
+        self.message_identities.push(identity);
     }
 
     /// Stores output produced by an informative listing command.
@@ -2360,54 +2396,35 @@ impl Editor {
         std::mem::take(&mut self.redraws)
     }
 
-    /// Applies `nvim_echo` identity to the message the API handler just
-    /// pushed at `appended_at` (`runtime/doc/api.txt:707-710`): a call whose
-    /// returned id matches an earlier message replaces that message in place
-    /// and the duplicate push is dropped, so repeated progress reports stay
-    /// one message.
+    /// Arms the identity that the next `nvim_echo` message push consumes.
     ///
-    /// Returns the replaced message with its new identity when the replaced
-    /// slot was destined for a UI. The publisher's index watermark only ever
-    /// forwards appended messages, so an in-place UI replacement must be
-    /// re-shown by the caller; other destinations were already written to
-    /// their stream once and re-writing would duplicate that output.
-    pub fn settle_echo_identity(
-        &mut self,
-        appended_at: usize,
-        kind: OxStr,
-        id: Object,
-    ) -> Option<(Message, MessageIdentity)> {
-        if self.messages.len() <= appended_at {
-            // A suppressed call (`verbose` gating) pushes nothing: the
-            // handler returned `-1` without appending, so there is nothing
-            // to stamp.
-            return None;
+    /// The API handler emits its message before firing `Progress`, so this
+    /// state must be attached by [`Editor::push_message`] before any callback
+    /// can reenter the editor.
+    pub fn arm_echo_identity(&mut self, kind: OxStr, id: Object) {
+        self.pending_echo_identity = Some(MessageIdentity { kind, id });
+    }
+
+    /// Drops an armed identity when validation or verbose gating prevents a
+    /// handler from pushing a message.
+    pub fn cancel_echo_identity(&mut self) {
+        self.pending_echo_identity = None;
+    }
+
+    /// Takes in-place UI replacements recorded while an echo dispatch was
+    /// reentrant. Appended messages remain on the normal watermark path.
+    pub fn take_echo_replacements(&mut self) -> Vec<(Message, MessageIdentity)> {
+        std::mem::take(&mut self.echo_replacements)
+    }
+
+    /// Stamps the generated id returned by `nvim_echo` onto its appended
+    /// message. Explicit ids are attached by [`Editor::push_message`] before
+    /// `Progress` can reenter the API, so this path never searches for a
+    /// matching earlier entry.
+    pub fn stamp_echo_identity(&mut self, appended_at: usize, kind: OxStr, id: Object) {
+        if let Some(identity) = self.message_identities.get_mut(appended_at) {
+            *identity = MessageIdentity { kind, id };
         }
-        let identity = MessageIdentity { kind, id };
-        if identity.id == Object::Nil {
-            self.message_identities[appended_at] = identity;
-            return None;
-        }
-        let Some(slot) = self.message_identities[..appended_at]
-            .iter()
-            .rposition(|existing| existing.id == identity.id)
-        else {
-            self.message_identities[appended_at] = identity;
-            return None;
-        };
-        // The swap moves the fresh push into the matched slot; the displaced
-        // earlier message lands in the tail slot and the removals below drop
-        // it, so no message text is ever copied just to be thrown away.
-        self.messages.swap(slot, appended_at);
-        self.message_destinations.swap(slot, appended_at);
-        let re_show = (self.message_destinations[slot] == MessageDestination::Ui).then(|| {
-            (self.messages[slot].clone(), identity.clone())
-        });
-        self.message_identities[slot] = identity;
-        self.messages.remove(appended_at);
-        self.message_destinations.remove(appended_at);
-        self.message_identities.remove(appended_at);
-        re_show
     }
 
     /// Returns tabpage-local variables.
@@ -2917,7 +2934,7 @@ impl Editor {
     /// has no live tabpage, [`EditorError::UnknownBuffer`] when the buffer is
     /// not live, or [`EditorError::BufferInUse`] when windows still display
     /// it.
-    pub fn wipe_buffer(&mut self, buffer: BufHandle) -> Result<BufferState, EditorError> {
+    pub fn wipe_buffer(&mut self, buffer: BufHandle) -> Result<(), EditorError> {
         let buffer = self.resolve_buffer_handle(buffer)?;
         let state = self
             .buffers
@@ -2933,9 +2950,13 @@ impl Editor {
         self.options.remove_buffer(buffer);
         self.autocmds.remove_buffer(buffer);
         self.mappings.remove_buffer(buffer);
-        self.buffers
+        let state = self
+            .buffers
             .remove(&buffer)
-            .ok_or(EditorError::UnknownBuffer(buffer))
+            .ok_or(EditorError::UnknownBuffer(buffer))?;
+        self.pending_subscription_releases
+            .extend(state.into_released_subscriptions());
+        Ok(())
     }
 
     /// Releases resident text and undo state for an unattached buffer.
@@ -4500,19 +4521,12 @@ mod tests {
     }
 
     #[test]
-    fn settle_echo_identity_replaces_matching_id_in_place() {
+    fn armed_echo_identity_replaces_matching_id_before_reentry() {
         let mut editor = Editor::new();
+        editor.arm_echo_identity(OxStr::from("echo"), Object::Integer(9));
         editor.push_message(echo("earlier"));
-        // The first echo call stamps its returned id on the pushed message;
-        // the second call with the same id replaces it in place.
-        editor.settle_echo_identity(0, OxStr::from("echo"), Object::Integer(9));
+        editor.arm_echo_identity(OxStr::from("progress"), Object::Integer(9));
         editor.push_message(echo("fresh"));
-        let re_show = editor.settle_echo_identity(
-            1,
-            OxStr::from("progress"),
-            Object::Integer(9),
-        );
-        assert!(re_show.is_none());
         assert_eq!(editor.messages().len(), 1, "the duplicate push is dropped");
         assert_eq!(
             editor.messages()[0].content,
@@ -4528,16 +4542,23 @@ mod tests {
     }
 
     #[test]
-    fn settle_echo_identity_appends_distinct_ids_and_truncates_in_step() {
+    fn nested_echo_identity_stays_separate_from_outer_id() {
+        let mut editor = Editor::new();
+        editor.arm_echo_identity(OxStr::from("progress"), Object::Integer(9));
+        editor.push_message(echo("outer"));
+        editor.arm_echo_identity(OxStr::from("progress"), Object::Integer(10));
+        editor.push_message(echo("nested"));
+        assert_eq!(editor.messages().len(), 2);
+        assert_eq!(editor.message_identities()[0].id, Object::Integer(9));
+        assert_eq!(editor.message_identities()[1].id, Object::Integer(10));
+    }
+
+    #[test]
+    fn stamp_echo_identity_only_updates_the_appended_slot() {
         let mut editor = Editor::new();
         editor.push_message(echo("first"));
         editor.push_message(echo("second"));
-        assert!(
-            editor
-                .settle_echo_identity(1, OxStr::from("echo"), Object::Integer(7))
-                .is_none(),
-            "a distinct id appends without replacement"
-        );
+        editor.stamp_echo_identity(1, OxStr::from("echo"), Object::Integer(7));
         assert_eq!(editor.messages().len(), 2);
         assert_eq!(editor.message_identities().len(), 2);
         assert_eq!(

@@ -2405,31 +2405,68 @@ fn show_message_in_chrome(
     });
 }
 
-/// Stamps `nvim_echo` identity onto the message the frozen handler pushed:
-/// the handler keeps validation, verbose gating, id allocation, and the
-/// `Progress` autocmd; this records the returned id and `ui-messages` kind
-/// on the sink entry so a later call with the same id replaces it
-/// (`runtime/doc/api.txt:707-710`). A UI-destined replacement is re-shown
-/// here because the publisher's watermark only forwards appended messages.
-fn settle_echo(session: &ApiSession, pushed_at: usize, kind: OxStr, id: Object) {
-    let re_show =
-        session.with_editor_mut(|editor| editor.settle_echo_identity(pushed_at, kind, id));
-    if let Some((message, identity)) = re_show {
+/// Returns a caller-supplied `nvim_echo` id. Automatic ids are deliberately
+/// left to the handler: their value is unavailable until the handler returns.
+fn echo_explicit_id(params: &[Object]) -> Option<Object> {
+    let Object::Dict(opts) = params.get(2)? else {
+        return None;
+    };
+    match opts.get(&OxStr::from("id")) {
+        Some(Object::Nil) | None => None,
+        Some(id) => Some(id.clone()),
+    }
+}
+
+/// Settles the identity that was armed before the frozen handler ran.
+///
+/// Explicit ids were attached by `Editor::push_message` before `Progress`
+/// callbacks could reenter. Only an automatically allocated id needs a
+/// post-handler stamp, and that stamp addresses the original append directly;
+/// searching earlier entries would reintroduce the reentrancy bug.
+fn settle_echo(
+    session: &ApiSession,
+    pushed_at: usize,
+    kind: OxStr,
+    generated_id: Option<Object>,
+) {
+    let replacements = session.with_editor_mut(|editor| {
+        editor.cancel_echo_identity();
+        if let Some(id) = generated_id {
+            editor.stamp_echo_identity(pushed_at, kind, id);
+        }
+        editor.take_echo_replacements()
+    });
+    for (message, identity) in replacements {
         show_message_in_chrome(session, &message, &identity);
     }
 }
 
-/// One `nvim_echo` dispatch with identity settled around the registry
-/// handler. Every entry path routes through here, so the editor sink sees
-/// the same identity regardless of transport.
+/// One `nvim_echo` dispatch with identity armed before the registry handler.
+/// Every entry path routes through here, so a `Progress` callback observes the
+/// same identity that later calls use for replacement.
 fn dispatch_echo(
     session: &ApiSession,
     dispatch: DispatchFn,
     params: &[Object],
 ) -> Result<Object, ApiError> {
     let pushed_at = session.with_editor(|editor| editor.messages().len());
-    let result = dispatch(session, params)?;
-    settle_echo(session, pushed_at, echo_ui_kind(params), result.clone());
+    let kind = echo_ui_kind(params);
+    let explicit_id = echo_explicit_id(params);
+    session.with_editor_mut(|editor| {
+        editor.arm_echo_identity(
+            kind.clone(),
+            explicit_id.clone().unwrap_or(Object::Nil),
+        );
+    });
+    let result = match dispatch(session, params) {
+        Ok(result) => result,
+        Err(error) => {
+            settle_echo(session, pushed_at, kind, None);
+            return Err(error);
+        }
+    };
+    let generated_id = explicit_id.is_none().then(|| result.clone());
+    settle_echo(session, pushed_at, kind, generated_id);
     Ok(result)
 }
 
@@ -7372,6 +7409,157 @@ mod tests {
                 b"progress"
             );
             assert_eq!(editor.message_identities()[0].id, Object::Integer(id));
+        });
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture, autocmd setup, and reentrant dispatches must succeed"
+    )]
+    fn nvim_echo_progress_reentry_updates_existing_explicit_id() {
+        let cli = Cli::default();
+        let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
+        state
+            .ex
+            .borrow_mut()
+            .execute_script(
+                &*state.session,
+                "<test>",
+                r#"
+                let g:progress_reentered = 0
+                function! ReenterProgress() abort
+                  if g:progress_reentered == 0
+                    let g:progress_reentered = 1
+                    call nvim_echo([['nested']], v:false, {'kind': 'progress', 'id': 'outer'})
+                  endif
+                endfunction
+                augroup oxvim_echo_reentry
+                  autocmd!
+                  autocmd Progress * call ReenterProgress()
+                augroup END
+                "#,
+            )
+            .unwrap();
+        let opts = Object::Dict(Dict(vec![
+            (OxStr::from("kind"), Object::String(OxStr::from("progress"))),
+            (OxStr::from("id"), Object::String(OxStr::from("outer"))),
+        ]));
+        state
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_echo"),
+                &[
+                    echo_chunks("outer"),
+                    Object::Boolean(false),
+                    opts.clone(),
+                ],
+            )
+            .unwrap();
+        state.session.with_editor(|editor| {
+            assert_eq!(editor.messages().len(), 1);
+            assert_eq!(editor.messages()[0].content, echo_chunks("nested"));
+            assert_eq!(
+                editor.message_identities()[0].id,
+                Object::String(OxStr::from("outer"))
+            );
+        });
+        state
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_echo"),
+                &[echo_chunks("later"), Object::Boolean(false), opts],
+            )
+            .unwrap();
+        state.session.with_editor(|editor| {
+            assert_eq!(editor.messages().len(), 1);
+            assert_eq!(editor.messages()[0].content, echo_chunks("later"));
+            assert_eq!(
+                editor.message_identities()[0].id,
+                Object::String(OxStr::from("outer"))
+            );
+        });
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture, autocmd setup, and reentrant dispatches must succeed"
+    )]
+    fn nvim_echo_progress_reentry_keeps_nested_generated_id() {
+        let cli = Cli::default();
+        let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
+        state
+            .ex
+            .borrow_mut()
+            .execute_script(
+                &*state.session,
+                "<test>",
+                r#"
+                let g:progress_reentered = 0
+                function! ReenterProgress() abort
+                  if g:progress_reentered == 0
+                    let g:progress_reentered = 1
+                    call nvim_echo([['nested']], v:false, {'kind': 'progress'})
+                  endif
+                endfunction
+                augroup oxvim_echo_generated_reentry
+                  autocmd!
+                  autocmd Progress * call ReenterProgress()
+                augroup END
+                "#,
+            )
+            .unwrap();
+        let outer_opts = Object::Dict(Dict(vec![
+            (OxStr::from("kind"), Object::String(OxStr::from("progress"))),
+            (OxStr::from("id"), Object::String(OxStr::from("outer"))),
+        ]));
+        state
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_echo"),
+                &[
+                    echo_chunks("outer"),
+                    Object::Boolean(false),
+                    outer_opts,
+                ],
+            )
+            .unwrap();
+        let nested_id = state.session.with_editor(|editor| {
+            assert_eq!(editor.messages().len(), 2);
+            assert_eq!(
+                editor.message_identities()[0].id,
+                Object::String(OxStr::from("outer"))
+            );
+            let Object::Integer(id) = editor.message_identities()[1].id else {
+                panic!("nested echo must receive an automatic integer id");
+            };
+            id
+        });
+        state
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_echo"),
+                &[
+                    echo_chunks("nested later"),
+                    Object::Boolean(false),
+                    Object::Dict(Dict(vec![
+                        (OxStr::from("kind"), Object::String(OxStr::from("progress"))),
+                        (OxStr::from("id"), Object::Integer(nested_id)),
+                    ])),
+                ],
+            )
+            .unwrap();
+        state.session.with_editor(|editor| {
+            assert_eq!(editor.messages().len(), 2);
+            assert_eq!(
+                editor.messages()[1].content,
+                echo_chunks("nested later")
+            );
+            assert_eq!(
+                editor.message_identities()[1].id,
+                Object::Integer(nested_id)
+            );
         });
     }
 
