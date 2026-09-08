@@ -3223,7 +3223,7 @@ fn scope_write_propagates_to_editor_through_dirty_gate() {
 
     // Establish a clean baseline: read, then write back with nothing changed.
     crate::excmd_exec::sync_editor_into_scope(&editor, &mut scope).unwrap();
-    crate::excmd_exec::sync_scope_into_editor(&mut editor, &scope).unwrap();
+    crate::excmd_exec::sync_scope_into_editor(&mut editor, &mut scope).unwrap();
     assert!(!scope.synced.is_dirty(ScopeKind::Global));
 
     scope
@@ -3234,7 +3234,7 @@ fn scope_write_propagates_to_editor_through_dirty_gate() {
         "set_scoped must mark g: dirty"
     );
 
-    crate::excmd_exec::sync_scope_into_editor(&mut editor, &scope).unwrap();
+    crate::excmd_exec::sync_scope_into_editor(&mut editor, &mut scope).unwrap();
 
     let value = editor
         .gvars()
@@ -3470,7 +3470,7 @@ fn scope_sync_property_interleaved_mutations_mirror_editor() {
             }
         }
         crate::excmd_exec::sync_editor_into_scope(&editor, &mut scope).unwrap();
-        crate::excmd_exec::sync_scope_into_editor(&mut editor, &scope).unwrap();
+        crate::excmd_exec::sync_scope_into_editor(&mut editor, &mut scope).unwrap();
         crate::excmd_exec::sync_editor_into_scope(&editor, &mut scope).unwrap();
 
         // Mirror invariant: a freshly synced scope materializes the same

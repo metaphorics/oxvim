@@ -3256,10 +3256,25 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "ls" | "buffers" | "files" => {
             access.with_ex_editor(|editor| command_buffer_list(runtime, editor, command))
         }
-        "bwipeout" | "bwipe" => command_buffer_remove(runtime, access, scope, lua, command, true),
-        "bdelete" | "bdel" | "bunload" | "bun" => {
-            command_buffer_remove(runtime, access, scope, lua, command, false)
+        "bwipeout" => {
+            command_buffer_remove(runtime, access, scope, lua, command, BufferRemoveKind::Wipe)
         }
+        "bdelete" => command_buffer_remove(
+            runtime,
+            access,
+            scope,
+            lua,
+            command,
+            BufferRemoveKind::Delete,
+        ),
+        "bunload" => command_buffer_remove(
+            runtime,
+            access,
+            scope,
+            lua,
+            command,
+            BufferRemoveKind::Unload,
+        ),
         "args" => access.with_ex_editor(|editor| command_args(runtime, editor, command)),
         "next" => access.with_ex_editor(|editor| command_next(runtime, editor, command)),
         "first" | "rewind" => {
@@ -8413,10 +8428,23 @@ fn command_enew<F: FileIO, E: ExEditorAccess>(
     fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufEnter], handle)
 }
 
-/// `:bwipeout`/`:bdelete` (`ex_cmds.c` `ex_bwipe/ex_bdelete)`: resolve the
-/// buffer from the count or argument (defaulting to the current buffer),
-/// move displaying windows onto another buffer, then wipe or unload it.
-/// The modified-buffer guard matches `do_buffer`'s E89.
+/// Lifecycle classification for the `:bdelete`/`:bunload`/`:bwipeout` family.
+/// The parser resolves typed prefixes to canonical names, so dispatch matches
+/// exactly one of these three identities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BufferRemoveKind {
+    /// `:bdelete` — unload the resident text and unlist the buffer.
+    Delete,
+    /// `:bunload` — unload the resident text; the current implementation also
+    /// unlists, matching the previous behavior (upstream keeps it listed).
+    Unload,
+    /// `:bwipeout` — remove the buffer entirely.
+    Wipe,
+}
+/// `:bwipeout`/`:bdelete`/`:bunload` (`ex_cmds.c` `ex_bwipe`/`ex_bdelete`/`ex_bunload`):
+/// resolve the buffer from the count or argument (defaulting to the current
+/// buffer), move displaying windows onto another buffer, then delete, unload,
+/// or wipe it. The modified-buffer guard matches `do_buffer`'s E89.
 #[expect(
     clippy::too_many_lines,
     reason = "buffer removal keeps window migration and modified-buffer checks atomic"
@@ -8427,7 +8455,7 @@ fn command_buffer_remove<F: FileIO, E: ExEditorAccess>(
     scope: &mut Scope,
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
-    wipe: bool,
+    kind: BufferRemoveKind,
 ) -> Flow {
     // Phase 1 borrows the editor only to resolve targets and run the
     // removal guards. Firing lifecycle events runs user code, which must
@@ -8502,7 +8530,7 @@ fn command_buffer_remove<F: FileIO, E: ExEditorAccess>(
                 vec![target]
             };
             if targets.is_empty() {
-                let (code, message) = if wipe {
+                let (code, message) = if kind == BufferRemoveKind::Wipe {
                     ("E517", "No buffers were wiped out")
                 } else {
                     ("E516", "No buffers were deleted")
@@ -8546,7 +8574,30 @@ fn command_buffer_remove<F: FileIO, E: ExEditorAccess>(
         Ok(pair) => pair,
         Err(flow) => return flow,
     };
+    let mut final_flow = Flow::Normal;
     for target in targets {
+        // Re-validate each target: earlier lifecycle handlers may have removed
+        // or changed it. Upstream `do_buffer` rechecks `buf_valid` and the
+        // changed flag per buffer (`do_bufdel`/`do_buffer`, buffer.c).
+        let modified = access.with_ex_editor(|editor| {
+            editor
+                .buffer(target)
+                .ok()
+                .map(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        });
+        let Some(modified) = modified else {
+            continue;
+        };
+        if modified && !command.bang {
+            if matches!(&final_flow, &Flow::Normal) {
+                final_flow = error_flow(
+                    runtime,
+                    "E89",
+                    "No write since last change (add ! to override)",
+                );
+            }
+            continue;
+        }
         // Phase 2 migrates displaying windows; the borrow ends before any
         // listener runs.
         let flow = access.with_ex_editor(|editor| {
@@ -8593,29 +8644,32 @@ fn command_buffer_remove<F: FileIO, E: ExEditorAccess>(
         if !matches!(flow, Flow::Normal) {
             return flow;
         }
-        if !wipe && command.command.name() == "bdelete" {
+        if kind == BufferRemoveKind::Delete {
             let flow =
                 fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufDelete], target);
             if !matches!(flow, Flow::Normal) {
                 return flow;
             }
         }
-        // Phase 3 unlists and unloads; the borrow ends before wipe events fire.
+        // Phase 3 unlists and/or unloads; the borrow ends before wipe events fire.
         let flow = access.with_ex_editor(|editor| {
-            if !wipe {
-                if let Ok(state) = editor.buffer_mut(target) {
-                    state.flags.set(crate::BufferFlags::LISTED, false);
+            match kind {
+                BufferRemoveKind::Delete | BufferRemoveKind::Unload => {
+                    if let Ok(state) = editor.buffer_mut(target) {
+                        state.flags.set(crate::BufferFlags::LISTED, false);
+                    }
+                    if let Err(error) = editor.unload_buffer(target) {
+                        return error_flow(runtime, "E90", error.to_string());
+                    }
                 }
-                if let Err(error) = editor.unload_buffer(target) {
-                    return error_flow(runtime, "E90", error.to_string());
-                }
+                BufferRemoveKind::Wipe => {}
             }
             Flow::Normal
         });
         if !matches!(flow, Flow::Normal) {
             return flow;
         }
-        if wipe {
+        if kind == BufferRemoveKind::Wipe {
             // Wiping fires `BufDelete` then `BufWipeout` before the buffer is
             // freed (`do_buffer`'s DOBUF_WIPE branch); `BufUnload` already ran
             // above.
@@ -8652,7 +8706,7 @@ fn command_buffer_remove<F: FileIO, E: ExEditorAccess>(
             }
         }
     }
-    Flow::Normal
+    final_flow
 }
 
 /// `:read` and `:read !cmd` (`ex_docmd.c` `ex_read`:6163-6195).
@@ -11529,8 +11583,7 @@ fn command_argument<F: FileIO>(
         .and_then(|count| i64::try_from(count).ok())
         .or_else(|| command.args.trim().parse::<i64>().ok())
         .unwrap_or_else(|| {
-            i64::try_from(editor.arglist().index())
-                .map_or(1, |index| index.saturating_add(1))
+            i64::try_from(editor.arglist().index()).map_or(1, |index| index.saturating_add(1))
         });
     do_argfile(runtime, editor, command.bang, count.saturating_sub(1))
 }
@@ -16047,16 +16100,22 @@ pub(crate) fn sync_scope_into_editor(
             let live = editor.gvars();
             let live_keys: HashSet<&OxStr> = live.0.iter().map(|(key, _)| key).collect();
             scope.global.retain(|(key, _)| live_keys.contains(key));
+            let current: HashMap<&OxStr, &Typval> = scope
+                .global
+                .iter()
+                .map(|(key, value)| (key, value))
+                .collect();
             let mut pulls = Vec::new();
             for (key, value) in &live.0 {
-                let stale = match scope.global.iter().find(|(slot, _)| slot == key) {
-                    Some((_, current)) => typval_to_object(current) != *value,
+                let stale = match current.get(key) {
+                    Some(current) => !typval_matches_object(current, value),
                     None => true,
                 };
                 if stale {
                     pulls.push((key.clone(), object_to_typval(value)));
                 }
             }
+            drop(current);
             for (key, value) in pulls {
                 match scope.global.iter_mut().find(|(slot, _)| slot == &key) {
                     Some((_, slot)) => *slot = value,
@@ -18116,6 +18175,81 @@ pub(crate) fn object_to_typval(value: &Object) -> Typval {
         Object::Tabpage(value) => Typval::Number(i64::from(*value)),
     }
 }
+// Compare in Object space without allocating the converted container tree.
+// Blob/List and Funcref/Dict are intentionally not Typval-space equivalents.
+fn typval_matches_object(value: &Typval, object: &Object) -> bool {
+    match (value, object) {
+        (Typval::List(list), object) => {
+            list.try_borrow()
+                .map_or(matches!(object, Object::Nil), |data| match object {
+                    Object::Array(items) => {
+                        data.items.len() == items.len()
+                            && data
+                                .items
+                                .iter()
+                                .zip(items)
+                                .all(|(a, b)| typval_matches_object(a, b))
+                    }
+                    _ => false,
+                })
+        }
+        (Typval::Dict(dict), object) => {
+            dict.try_borrow()
+                .map_or(matches!(object, Object::Nil), |data| match object {
+                    Object::Dict(items) => {
+                        data.entries.len() == items.0.len()
+                            && data.entries.iter().zip(&items.0).all(|(a, (key, b))| {
+                                a.key == *key && typval_matches_object(&a.value, b)
+                            })
+                    }
+                    _ => false,
+                })
+        }
+        (Typval::Blob(bytes), Object::Array(items)) => {
+            bytes.len() == items.len()
+                && bytes
+                    .iter()
+                    .zip(items)
+                    .all(|(a, b)| *b == Object::Integer(i64::from(*a)))
+        }
+        (Typval::String(a), Object::String(b)) => a == b,
+        (Typval::Funcref(function) | Typval::Partial(function), Object::Dict(dict)) => {
+            let expected_partial = matches!(value, Typval::Partial(_));
+            let expected_registry = function
+                .registry
+                .and_then(|id| i64::try_from(id).ok())
+                .unwrap_or(-1);
+            let get = |key: &[u8]| {
+                dict.0
+                    .iter()
+                    .find(|(k, _)| k.as_bytes() == key)
+                    .map(|(_, v)| v)
+            };
+            dict.0.len() == 4
+                && get(FUNCREF_MARK)
+                    .is_some_and(|v| matches!(v, Object::String(name) if name == &function.name))
+                && get(b"partial")
+                    .is_some_and(|v| matches!(v, Object::Boolean(p) if *p == expected_partial))
+                && get(b"registry")
+                    .is_some_and(|v| matches!(v, Object::Integer(r) if *r == expected_registry))
+                && get(b"args").is_some_and(|v| {
+                    matches!(
+                        v,
+                        Object::Array(items)
+                            if function.args.len() == items.len()
+                                && function
+                                    .args
+                                    .iter()
+                                    .zip(items)
+                                    .all(|(a, b)| typval_matches_object(a, b))
+                    )
+                })
+        }
+        (Typval::Funcref(_) | Typval::Partial(_), _) => false,
+        _ => typval_to_object(value) == *object,
+    }
+}
+
 /// Converts one Vimscript [`Typval`] to an API [`Object`].
 #[must_use]
 pub fn typval_to_object(value: &Typval) -> Object {

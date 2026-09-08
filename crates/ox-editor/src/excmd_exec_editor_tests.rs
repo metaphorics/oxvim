@@ -2858,6 +2858,50 @@ fn bufload_errors_on_invalid_name_and_wrong_arity() {
     assert_vim_error(executor.execute_line(&editor, "call bufload(999)"), "E158");
 }
 
+/// `bufload()` on a named buffer whose file does not exist fires
+/// `BufNewFile`, not the `BufReadPre`/`BufReadPost` pair upstream
+/// `readfile` reserves for a file it actually opened (`fileio.c:472-516`;
+/// `autocmd.txt` *BufReadPre*: "Not used if the file doesn't exist").
+/// An existing file keeps the read family.
+#[test]
+fn bufload_missing_file_fires_bufnewfile_not_read_events() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufReadPre", "BufReadPost", "BufNewFile"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} * call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+
+    executor
+        .execute_line(
+            &editor,
+            "let g:missing = bufadd('XmissingFile') | call bufload(g:missing) | let g:loaded = getbufinfo(g:missing)[0].loaded",
+        )
+        .unwrap();
+
+    assert_eq!(order_events(&executor), ["BufNewFile"]);
+    assert_eq!(
+        global_value(&executor, "loaded"),
+        Some(ox_types::Typval::Number(1)),
+        "a missing file still loads the buffer empty"
+    );
+
+    executor.scripts().io().insert("XexistsFile", "data\n");
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "let g:present = bufadd('XexistsFile') | call bufload(g:present)",
+        )
+        .unwrap();
+
+    assert_eq!(order_events(&executor), ["BufReadPre", "BufReadPost"]);
+}
+
 #[test]
 fn bufnr_create_flag_uses_vim_boolean_conversion_after_lookup() {
     let (editor, mut executor) = setup();
@@ -8228,8 +8272,8 @@ fn nested_global_write_survives_outer_sync() {
             ox_types::Typval::Number(2),
         )
         .unwrap();
-    sync_scope_into_editor(&mut editor, &nested).unwrap();
-    sync_scope_into_editor(&mut editor, &outer).unwrap();
+    sync_scope_into_editor(&mut editor, &mut nested).unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
     let gvars = editor.gvars();
     assert_eq!(
         gvars.get(&ox_types::OxStr::from("outer")),
@@ -8259,7 +8303,7 @@ fn nested_same_key_write_wins_after_flush() {
             ox_types::Typval::Number(1),
         )
         .unwrap();
-    sync_scope_into_editor(&mut editor, &outer).unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
     let mut nested = ox_eval::scope::Scope::new();
     sync_editor_into_scope(&editor, &mut nested).unwrap();
     assert_eq!(
@@ -8277,8 +8321,8 @@ fn nested_same_key_write_wins_after_flush() {
             ox_types::Typval::Number(2),
         )
         .unwrap();
-    sync_scope_into_editor(&mut editor, &nested).unwrap();
-    sync_scope_into_editor(&mut editor, &outer).unwrap();
+    sync_scope_into_editor(&mut editor, &mut nested).unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
     assert_eq!(
         editor.gvars().get(&ox_types::OxStr::from("shared")),
         Some(&ox_types::Object::Integer(2)),
@@ -8302,9 +8346,9 @@ fn outer_delete_then_nested_add_keeps_nested_value() {
             ox_types::Typval::Number(1),
         )
         .unwrap();
-    sync_scope_into_editor(&mut editor, &outer).unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
     assert!(outer.remove_pair(ox_eval::scope::ScopeKind::Global, b"gone"));
-    sync_scope_into_editor(&mut editor, &outer).unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
     let mut nested = ox_eval::scope::Scope::new();
     sync_editor_into_scope(&editor, &mut nested).unwrap();
     nested
@@ -8315,8 +8359,8 @@ fn outer_delete_then_nested_add_keeps_nested_value() {
             ox_types::Typval::Number(2),
         )
         .unwrap();
-    sync_scope_into_editor(&mut editor, &nested).unwrap();
-    sync_scope_into_editor(&mut editor, &outer).unwrap();
+    sync_scope_into_editor(&mut editor, &mut nested).unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
     assert_eq!(
         editor.gvars().get(&ox_types::OxStr::from("gone")),
         Some(&ox_types::Object::Integer(2)),
@@ -8341,7 +8385,7 @@ fn mirror_update_arm_replaces_stale_snapshot() {
                 ox_types::Typval::Number(value),
             )
             .unwrap();
-        sync_scope_into_editor(&mut editor, &scope).unwrap();
+        sync_scope_into_editor(&mut editor, &mut scope).unwrap();
         assert_eq!(
             editor.gvars().get(&ox_types::OxStr::from("k")),
             Some(&ox_types::Object::Integer(value)),
@@ -8518,7 +8562,7 @@ fn nested_list_replace_tracks_through_revert() {
             ox_types::Typval::list(vec![ox_types::Typval::Number(1)]),
         )
         .unwrap();
-    sync_scope_into_editor(&mut editor, &outer).unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
     let mut nested = ox_eval::scope::Scope::new();
     sync_editor_into_scope(&editor, &mut nested).unwrap();
     for values in [vec![1, 2], vec![1]] {
@@ -8534,8 +8578,8 @@ fn nested_list_replace_tracks_through_revert() {
                 ox_types::Typval::list(items),
             )
             .unwrap();
-        sync_scope_into_editor(&mut editor, &nested).unwrap();
-        sync_scope_into_editor(&mut editor, &outer).unwrap();
+        sync_scope_into_editor(&mut editor, &mut nested).unwrap();
+        sync_scope_into_editor(&mut editor, &mut outer).unwrap();
         let expected = ox_types::Object::Array(
             values
                 .iter()
