@@ -150,50 +150,54 @@ pub fn nvim_ui_attach(
             .0
             .push((OxStr::from("ext_linegrid"), Object::Boolean(true)));
     }
+    let channel = request_channel(session);
     session.with_state_mut(|state| {
         state
             .ui_channels
-            .attach(CHANNEL_ID, width, height, UiOptions::from_dict(&options))
+            .attach(channel, width, height, UiOptions::from_dict(&options))
             .map_err(|error| ApiError::exception(error.to_string()))
     })?;
     if let Err(error) = resize_current_tabpage(session, width, height) {
         session.with_state_mut(|state| {
-            let _ = state.ui_channels.detach(CHANNEL_ID);
+            let _ = state.ui_channels.detach(channel);
         });
         return Err(error);
     }
     UI_EXTRA.with(|extra| {
         extra
             .borrow_mut()
-            .insert(CHANNEL_ID, UiExtra::from_options(&options));
+            .insert(channel, UiExtra::from_options(&options));
     });
     Ok(())
 }
 
 #[api(since = 1)]
 pub fn nvim_ui_detach(session: &ApiSession) -> Result<(), ApiError> {
+    let channel = request_channel(session);
     session.with_state_mut(|state| {
         state
             .ui_channels
-            .detach(CHANNEL_ID)
+            .detach(channel)
             .map(|_| ())
             .map_err(|error| ApiError::exception(error.to_string()))
     })?;
     UI_EXTRA.with(|extra| {
-        extra.borrow_mut().remove(&CHANNEL_ID);
+        extra.borrow_mut().remove(&channel);
     });
     Ok(())
 }
 
 #[api(since = 1)]
 pub fn nvim_ui_try_resize(session: &ApiSession, width: i64, height: i64) -> Result<(), ApiError> {
+    let channel = request_channel(session);
+    require_ui(session, channel)?;
     let width = dimension(width, "width")?;
     let height = dimension(height, "height")?;
     resize_current_tabpage(session, width, height)?;
     session.with_state_mut(|state| {
         state
             .ui_channels
-            .try_resize(CHANNEL_ID, width, height)
+            .try_resize(channel, width, height)
             .map_err(|error| ApiError::exception(error.to_string()))
     })
 }
@@ -650,39 +654,15 @@ pub fn nvim_ui_term_event(
 /// delivers redraw output to a client is the server's per-request `writes`
 /// queue — not reachable from this layer. Writing the packed frame through
 /// `channel_sink` would instead be drained by `nvim_chan_send` into a terminal
-/// buffer, corrupting it while reaching no UI. So the target set is computed
-/// faithfully (every attached UI that opted into `stdout_tty`) and the call
-/// succeeds; actual `ui_send` delivery is deferred to server-owned redraw
-/// plumbing.
-#[expect(
-    clippy::needless_pass_by_value,
-    clippy::unnecessary_wraps,
-    reason = "the RPC ABI deserializes the payload as an owned String and requires a `Result` return"
-)]
+/// buffer, corrupting it while reaching no UI. Rather than silently dropping
+/// the payload, the call reports a typed not-implemented error until
+/// server-owned redraw plumbing exists.
 #[api(since = 14)]
 pub fn nvim_ui_send(session: &ApiSession, content: OxStr) -> Result<(), ApiError> {
-    let _ = content;
-    // Compute the `stdout_tty` target set exactly as `remote_ui_ui_send`
-    // selects it; delivery is deferred (see the doc comment).
-    let _targets: Vec<u64> = session
-        .with_state(|state| {
-            state
-                .ui_channels
-                .iter()
-                .map(|(channel, _)| *channel)
-                .collect::<Vec<_>>()
-        })
-        .into_iter()
-        .filter(|channel| {
-            UI_EXTRA.with(|extra| {
-                extra
-                    .borrow()
-                    .get(channel)
-                    .is_some_and(|state| state.stdout_tty)
-            })
-        })
-        .collect();
-    Ok(())
+    let _ = (session, content);
+    Err(ApiError::exception(
+        "Not implemented: ui_send delivery requires server-owned redraw plumbing",
+    ))
 }
 
 /// Upstream cterm 256-color palette (`color_names` + `color_numbers_256`).
@@ -3495,17 +3475,16 @@ mod tests {
         nvim_ui_term_event(&session, OxStr::from("other"), Object::Nil).unwrap();
     }
 
-    #[expect(
-        clippy::unwrap_used,
-        reason = "asserts ui_send succeeds for attached stdout_tty UIs"
-    )]
     #[test]
-    fn ui_send_targets_stdout_tty_uis() {
+    fn ui_send_reports_not_implemented() {
         let session = attached_session(&[("stdout_tty", Object::Boolean(true))]);
-        nvim_ui_send(&session, OxStr::from("\x1b]52;c;AAAA")).unwrap();
-        // Without stdout_tty the call still succeeds (no targets).
-        let session = attached_session(&[]);
-        nvim_ui_send(&session, OxStr::from("x")).unwrap();
+        assert_eq!(
+            nvim_ui_send(&session, OxStr::from("\x1b]52;c;AAAA")),
+            Err(ApiError::exception(
+                "Not implemented: ui_send delivery requires server-owned redraw plumbing"
+                    .to_string()
+            ))
+        );
     }
 
     /// Every task-W2 name resolves in the registry and dispatches through the
@@ -3584,7 +3563,10 @@ mod tests {
         );
         assert_eq!(
             call("nvim_ui_send", &[Object::String(OxStr::from("x"))]),
-            Ok(Object::Nil)
+            Err(ApiError::exception(
+                "Not implemented: ui_send delivery requires server-owned redraw plumbing"
+                    .to_string()
+            ))
         );
         assert_eq!(
             call("ui_try_resize", &[Object::Integer(90), Object::Integer(30)]),
