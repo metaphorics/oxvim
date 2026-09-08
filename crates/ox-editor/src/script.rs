@@ -4,7 +4,7 @@
 //! Semantics mirror `do_source`, `getline_equal`, and the continuation
 //! handling inside `do_cmdline` (`src/nvim/ex_docmd.c:717-1050,
 //! 1330-1500`), plus the autoload name-to-path rule in
-//! `src/nvim/runtime.c:144-167`.
+//! `src/nvim/runtime.c:3012-3031`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1102,31 +1102,55 @@ impl<F: FileIO> ScriptCtx<F> {
         self.current_sid().map(|sid| format!("<SNR>{sid}_"))
     }
 
-    /// Whether one component of a `#`-named autoload path is a plain
-    /// identifier: ASCII letters, digits, and underscores, not starting
-    /// with a digit. This rejects `..`, `/`, and other characters that
-    /// could escape `autoload/` and source an arbitrary file.
-    fn is_autoload_component(component: &str) -> bool {
-        let mut chars = component.chars();
-        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    /// Whether the component may become one segment of the resolved
+    /// autoload path: a nonempty run of alphanumerics and `_`. That is
+    /// exactly the set that cannot escape `autoload/`: no `.`, so no
+    /// `..`; no `/` or `\`; no `:`, so no drive prefix can replace the
+    /// joined base. Digits are safe in every position, matching the
+    /// reference, which turns every `#` before the last into a separator
+    /// (`foo#1bar#baz` → `autoload/foo/1bar.vim`).
+    fn is_autoload_path_segment(component: &str) -> bool {
+        !component.is_empty()
+            && component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     }
 
-    /// Resolves a `#`-named autoload function to its script path: components
-    /// before the last become directories under `autoload/`, e.g.
-    /// `a#b#c` → `autoload/a/b.vim` (`src/nvim/runtime.c:144-167`).
+    /// Whether the trailing component — the function name proper — is
+    /// `eval_isnamec`-shaped (`src/nvim/eval.c:5815-5818`: alphanumerics,
+    /// `_`, and `:`; the `#` separator cannot occur inside a component
+    /// split off the name). It never reaches the filesystem:
+    /// `autoload_name` (`src/nvim/runtime.c:3012-3031`) writes `.vim`
+    /// over the last `#`, so digits and colons cost nothing and
+    /// `foo#1bar` resolves to `autoload/foo.vim`. The first character of
+    /// the whole name stays `eval_isnamec1`'s (`src/nvim/eval.c:5822`)
+    /// business, enforced where the name is lexed.
+    fn is_autoload_function_name(component: &str) -> bool {
+        !component.is_empty()
+            && component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
+    }
+
+    /// Resolves a `#`-named autoload function to its script path:
+    /// components before the last become directories under `autoload/`,
+    /// e.g. `a#b#c` → `autoload/a/b.vim` (`autoload_name`,
+    /// `src/nvim/runtime.c:3012-3031` — the `.vim` suffix is written over
+    /// the last `#`, so the trailing component stays off the path).
     ///
-    /// Components must be plain identifiers (`[A-Za-z_][A-Za-z0-9_]*`); any
-    /// name containing `..`, `/`, an empty segment, or other invalid
-    /// characters returns `None`, preventing escape from `autoload/`.
+    /// Path segments must pass [`Self::is_autoload_path_segment`] and the
+    /// trailing function name [`Self::is_autoload_function_name`]; any
+    /// name containing `..`, `/`, an empty segment, or another invalid
+    /// character returns `None`, preventing escape from `autoload/`,
+    /// while digit-leading subcomponents resolve.
     #[must_use]
     pub fn resolve_autoload(&self, function: &str) -> Option<PathBuf> {
         let mut components: Vec<&str> = function.split('#').collect();
         let last = components.pop()?;
-        if !Self::is_autoload_component(last)
+        if !Self::is_autoload_function_name(last)
             || components
                 .iter()
-                .any(|part| !Self::is_autoload_component(part))
+                .any(|part| !Self::is_autoload_path_segment(part))
         {
             return None;
         }
@@ -1350,5 +1374,184 @@ impl<F: FileIO> ScriptCtx<F> {
 impl Default for ScriptCtx<RealFileIO> {
     fn default() -> Self {
         Self::new(RealFileIO)
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "tests drive executors and assert the failing paths"
+)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    use ox_types::Typval;
+
+    use super::{FileIO, RuntimeRoot, ScriptCtx};
+    use crate::{Editor, ExExecutor, ExecError, TestEditorAccess, VimExceptionKind};
+
+    /// A [`FileIO`] serving a fixed path-to-contents map: everything
+    /// `resolve_autoload` and a one-file source need.
+    struct LookupFileIO {
+        files: BTreeMap<PathBuf, String>,
+    }
+
+    impl LookupFileIO {
+        fn with(files: &[(&str, &str)]) -> Self {
+            Self {
+                files: files
+                    .iter()
+                    .map(|(path, body)| (PathBuf::from(path), (*body).to_owned()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl FileIO for LookupFileIO {
+        fn read_to_string(&self, path: &Path) -> io::Result<String> {
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not in fixture map"))
+        }
+
+        fn write_string(&self, _path: &Path, _contents: &str) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "fixture map is read-only",
+            ))
+        }
+
+        fn exists(&self, path: &Path) -> bool {
+            self.files.contains_key(path)
+        }
+
+        fn canonicalize(&self, path: &Path) -> PathBuf {
+            path.to_path_buf()
+        }
+    }
+
+    fn error_code(error: &ExecError) -> String {
+        match error {
+            ExecError::Vim(exception) => match &exception.kind {
+                VimExceptionKind::Error(code) => code.clone(),
+                VimExceptionKind::Throw => "Throw".to_owned(),
+            },
+            other => panic!("expected Vim error, got {other:?}"),
+        }
+    }
+
+    fn global_number(executor: &ExExecutor<LookupFileIO>, name: &str) -> Option<i64> {
+        executor
+            .scope()
+            .global
+            .iter()
+            .find(|(key, _)| key.as_bytes() == name.as_bytes())
+            .and_then(|(_, value)| match value {
+                Typval::Number(number) => Some(*number),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn autoload_resolves_digit_leading_trailing_name() {
+        // autoload_name (runtime.c:3012-3031) writes ".vim" over the last
+        // '#', so the trailing component never reaches the path: foo#1bar
+        // is the file autoload/foo.vim, not autoload/foo/1bar.vim.
+        let mut ctx = ScriptCtx::new(LookupFileIO::with(&[("/rt/autoload/foo.vim", "")]));
+        ctx.add_runtime_root(RuntimeRoot::new(PathBuf::from("/rt")));
+        assert_eq!(
+            ctx.resolve_autoload("foo#1bar"),
+            Some(PathBuf::from("/rt/autoload/foo.vim"))
+        );
+    }
+
+    #[test]
+    fn autoload_resolves_digit_leading_path_segments() {
+        // Every '#' before the last becomes a directory separator, so a
+        // digit-leading segment is a plain path segment wherever it sits.
+        let mut ctx = ScriptCtx::new(LookupFileIO::with(&[
+            ("/rt/autoload/foo/1bar.vim", ""),
+            ("/rt/autoload/1foo.vim", ""),
+        ]));
+        ctx.add_runtime_root(RuntimeRoot::new(PathBuf::from("/rt")));
+        assert_eq!(
+            ctx.resolve_autoload("foo#1bar#baz"),
+            Some(PathBuf::from("/rt/autoload/foo/1bar.vim"))
+        );
+        // autoload_name rewrites blindly: a digit as the first character
+        // of the whole name is not the resolver's business (the parser
+        // owns eval_isnamec1), so the segment resolves like the reference.
+        assert_eq!(
+            ctx.resolve_autoload("1foo#bar"),
+            Some(PathBuf::from("/rt/autoload/1foo.vim"))
+        );
+    }
+
+    #[test]
+    fn autoload_still_rejects_path_escape_attempts() {
+        // The traversal defense from the name-to-path rewrite: no spelling
+        // of `..`, a separator, a drive prefix, or an empty segment may
+        // become a path segment, whatever exists on disk.
+        let mut ctx = ScriptCtx::new(LookupFileIO::with(&[
+            ("/rt/autoload/foo.vim", ""),
+            ("/rt/autoload/evil.vim", ""),
+            ("/etc/passwd", ""),
+        ]));
+        ctx.add_runtime_root(RuntimeRoot::new(PathBuf::from("/rt")));
+        for name in [
+            "..#foo",
+            "foo#..#bar",
+            "foo#..",
+            "../autoload/foo",
+            "foo#/etc#bar",
+            r"foo#\..#bar",
+            "foo#C:#bar",
+            "foo##bar",
+            "#foo",
+        ] {
+            assert_eq!(ctx.resolve_autoload(name), None, "name: {name}");
+        }
+    }
+
+    #[test]
+    fn autoload_call_sources_digit_named_script() {
+        // A digit-leading trailing name reaches the loader from user code:
+        // the call sources autoload/foo.vim. The E117 afterwards is the
+        // upstream lookup miss (the fixture defines no function), not the
+        // resolution rejection this change removes.
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::with_io(LookupFileIO::with(&[(
+            "/rt/autoload/foo.vim",
+            "let g:foo_loaded = 1",
+        )]));
+        exec.scripts_mut()
+            .add_runtime_root(RuntimeRoot::new(PathBuf::from("/rt")));
+
+        let error = exec.execute_line(&editor, "call foo#1bar()").unwrap_err();
+        assert_eq!(global_number(&exec, "foo_loaded"), Some(1));
+        assert_eq!(error_code(&error), "E117");
+    }
+
+    #[test]
+    fn autoload_whole_name_first_character_stays_with_the_lexer() {
+        // eval_isnamec1 (eval.c:5822) rules the first character of the
+        // whole name where the name is lexed: in expression position a
+        // digit-leading name never parses, so the resolver is never
+        // reached and the file its blind rewrite would pick stays
+        // unsourced.
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::with_io(LookupFileIO::with(&[(
+            "/rt/autoload/1foo.vim",
+            "let g:onefoo_loaded = 1",
+        )]));
+        exec.scripts_mut()
+            .add_runtime_root(RuntimeRoot::new(PathBuf::from("/rt")));
+
+        exec.execute_line(&editor, "echo 1foo#bar()")
+            .unwrap_err();
+        assert_eq!(global_number(&exec, "onefoo_loaded"), None);
     }
 }
