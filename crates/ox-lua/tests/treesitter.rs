@@ -422,7 +422,7 @@ fn emit_highlights_filters_groups_coords_and_priority() {
 }
 
 #[test]
-fn nvim__redraw_boolean_options_decode_like_nlua_pop_boolean_strict() {
+fn nvim_redraw_boolean_options_decode_like_nlua_pop_boolean_strict() {
     let (host, _session) = with_api_host();
     let lua = host.lua();
 
@@ -478,7 +478,7 @@ fn with_api_host_and_window() -> (LuaHost, Rc<ApiSession>, BufHandle, WinHandle)
 }
 
 #[test]
-fn nvim__redraw_queues_resolved_requests_for_the_redraw_pass() {
+fn nvim_redraw_queues_resolved_requests_for_the_redraw_pass() {
     let (host, session, buffer, window) = with_api_host_and_window();
     let lua = host.lua();
 
@@ -537,7 +537,7 @@ fn nvim__redraw_queues_resolved_requests_for_the_redraw_pass() {
 }
 
 #[test]
-fn nvim__redraw_failure_stages_no_request() {
+fn nvim_redraw_failure_stages_no_request() {
     let (host, session, _buffer, _window) = with_api_host_and_window();
     let lua = host.lua();
 
