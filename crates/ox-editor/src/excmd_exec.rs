@@ -2950,6 +2950,45 @@ fn run_deferred_line<F: FileIO, E: ExEditorAccess>(
     run_program(runtime, access, scope, lua, &program, 0, end)
 }
 
+/// Holds `:noautocmd` suppression for one command: every event is ignored on
+/// creation (upstream sets `eventignore` to all around the command,
+/// `ex_docmd.c:2461`), and the prior ignore set is restored on drop so no
+/// exit path — including early command errors — can leak the suppression.
+struct IgnoreAllGuard<'a, E: ExEditorAccess> {
+    access: &'a E,
+    saved: Vec<Event>,
+}
+
+impl<'a, E: ExEditorAccess> IgnoreAllGuard<'a, E> {
+    fn take(access: &'a E) -> Self {
+        let saved = access.with_ex_editor(|editor| {
+            Event::ALL
+                .iter()
+                .copied()
+                .filter(|event| editor.autocmds().is_ignored(*event))
+                .collect()
+        });
+        access.with_ex_editor(|editor| {
+            for event in Event::ALL {
+                editor.autocmds_mut().ignore(*event);
+            }
+        });
+        Self { access, saved }
+    }
+}
+
+impl<E: ExEditorAccess> Drop for IgnoreAllGuard<'_, E> {
+    fn drop(&mut self) {
+        self.access.with_ex_editor(|editor| {
+            for event in Event::ALL {
+                editor.autocmds_mut().unignore(*event);
+            }
+            for event in &self.saved {
+                editor.autocmds_mut().ignore(*event);
+            }
+        });
+    }
+}
 #[expect(
     clippy::too_many_lines,
     reason = "the Ex dispatcher keeps command routing and address validation in one ordered match"
@@ -2961,6 +3000,14 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
 ) -> Flow {
+    // `:noautocmd` suppresses every event for the command (upstream sets
+    // `eventignore` to all). The guard restores on drop, covering early
+    // exits below.
+    let _noautocmd = command
+        .modifiers
+        .iter()
+        .any(|modifier| modifier.kind == ModifierKind::NoAutocmd)
+        .then(|| IgnoreAllGuard::take(access));
     let name = command.command.name();
     if name == "windo"
         && command.range.is_some()
@@ -13628,6 +13675,12 @@ fn fire_buffer_lifecycle_with<F: FileIO, E: ExEditorAccess>(
         &owned
     };
     for &event in events {
+        // `apply_autocmds` honors ignored events (`:noautocmd` sets
+        // `eventignore` to all); the API firing path already checks this,
+        // the Ex path must too.
+        if access.with_ex_editor(|editor| editor.autocmds().is_ignored(event)) {
+            continue;
+        }
         let plan = access.with_ex_editor(|editor| {
             editor.autocmds_mut().plan(
                 event,
