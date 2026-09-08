@@ -900,9 +900,17 @@ fn fs_event_fires_on_file_creation() {
         },
     )
     .expect("start watcher");
-    // Let the worker take its baseline snapshot before mutating, so the
-    // creation cannot land inside the initial scan and go unreported.
-    thread::sleep(Duration::from_millis(1200));
+    // Wait for the worker's baseline snapshot instead of a fixed sleep: a
+    // duration guess absorbs the creation into the baseline under load and
+    // no event is ever posted.
+    let ready_deadline = Instant::now() + Duration::from_secs(8);
+    while !event.is_ready() {
+        assert!(
+            Instant::now() < ready_deadline,
+            "watcher never completed its baseline snapshot"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
     std_fs::write(temp.path().join("created.txt"), b"hello").expect("create file");
     let deadline = Instant::now() + Duration::from_secs(8);
     while !fired.load(Ordering::Relaxed) {

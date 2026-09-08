@@ -142,6 +142,10 @@ pub struct FsEvent {
     path: PathBuf,
     options: FsEventOptions,
     watch: WatchThread,
+    /// Cleared until the worker has taken its initial baseline snapshot;
+    /// consumers must wait for this before mutating the watched tree, or a
+    /// fast change lands inside the baseline and goes unreported.
+    ready: Arc<AtomicBool>,
 }
 
 impl FsEvent {
@@ -187,12 +191,18 @@ impl FsEvent {
         let callback = Arc::new(Mutex::new(callback));
         let thread_active = Arc::clone(&active);
         let thread_callback = Arc::clone(&callback);
+        let ready = Arc::new(AtomicBool::new(false));
+        let thread_ready = Arc::clone(&ready);
         let mut thread_path = PathBuf::new();
         path.clone_into(&mut thread_path);
         let thread = match thread::Builder::new()
             .name("ox-uv-fs-event".into())
             .spawn(move || {
                 let mut previous = event_snapshot(&thread_path, options).ok();
+                // Release-publish the baseline: readers acquire this flag
+                // before touching the watched tree, so every mutation they
+                // make is visible to the first comparison snapshot.
+                thread_ready.store(true, Ordering::Release);
                 while sleep_while_active(&thread_active, FS_EVENT_INTERVAL) {
                     match event_snapshot(&thread_path, options) {
                         Ok(current) => {
@@ -253,7 +263,16 @@ impl FsEvent {
                 accounted: AtomicBool::new(true),
                 deactivated: AtomicBool::new(false),
             },
+            ready,
         })
+    }
+
+    /// Reports whether the worker has taken its initial baseline snapshot.
+    /// Mutating the watched tree before this flag is set can silently absorb
+    /// the change into the baseline and go unreported.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
     }
 
     /// Stops delivery, joins the polling thread, and removes its liveness.

@@ -7,6 +7,7 @@ use std::fs::OpenOptions;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::ptr::NonNull;
+use std::io;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -166,6 +167,18 @@ impl LoopAccess {
         }
         operation(&mut self.uv_loop.borrow_mut());
     }
+    /// Runs `operation` against the event loop. Inside a uv callback the
+    /// callback-scoped `active_loop` pointer is used; outside, the shared
+    /// `RefCell` is borrowed. This keeps mutating calls from panicking when
+    /// the loop is already mutably borrowed by `run` or `run_once`.
+    pub(crate) fn with_loop<R>(&self, operation: impl FnOnce(&mut UvLoop) -> R) -> R {
+        if let Some(mut active_loop) = self.active_loop.get() {
+            // Sound for the same callback-scoped reason documented in `run`.
+            operation(unsafe { active_loop.as_mut() })
+        } else {
+            operation(&mut self.uv_loop.borrow_mut())
+        }
+    }
 
     pub(crate) fn callback<R>(&self, uv_loop: &mut UvLoop, callback: impl FnOnce() -> R) -> R {
         let prior_callback = self.in_callback.replace(true);
@@ -235,7 +248,7 @@ impl LoopAccess {
         self.finish_run()
     }
 
-    fn finish_run(&self) -> mlua::Result<()> {
+    pub(crate) fn finish_run(&self) -> mlua::Result<()> {
         let after_run = self.after_run.borrow().clone();
         match after_run {
             Some(after_run) => after_run(),
@@ -540,10 +553,16 @@ impl UserData for LuaTcp {
         });
         methods.add_method("is_closing", |_, this, ()| {
             Ok(this
-                .inner
-                .borrow()
-                .as_ref()
-                .is_none_or(|tcp| tcp.is_closing(&this.context.access.uv_loop.borrow())))
+                .context
+                .access
+                .uv_loop
+                .try_borrow()
+                .map_or(this.closing.get(), |uv_loop| {
+                    this.inner
+                        .borrow()
+                        .as_ref()
+                        .is_none_or(|tcp| tcp.is_closing(&uv_loop))
+                }))
         });
         methods.add_method("close", |_, this, callback: Option<Function>| {
             if this.closing.replace(true) {
@@ -1100,10 +1119,18 @@ impl UserData for LuaPhase {
             Ok(true)
         });
         methods.add_method("is_active", |_, this, ()| {
-            Ok(this.handle.active(&this.access.uv_loop.borrow()))
+            Ok(this
+                .access
+                .uv_loop
+                .try_borrow()
+                .map_or(false, |uv_loop| this.handle.active(&uv_loop)))
         });
         methods.add_method("is_closing", |_, this, ()| {
-            Ok(this.handle.closing(&this.access.uv_loop.borrow()))
+            Ok(this
+                .access
+                .uv_loop
+                .try_borrow()
+                .map_or(false, |uv_loop| this.handle.closing(&uv_loop)))
         });
         methods.add_method("close", |_, this, ()| {
             let handle = this.handle;
@@ -1122,9 +1149,21 @@ struct LuaAsync {
 impl UserData for LuaAsync {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("send", |_, this, ()| {
-            this.handle
-                .send(&this.access.uv_loop.borrow())
-                .map_err(mlua::Error::external)?;
+            // `callback()` restores `active_loop` before `drain_deferred`,
+            // so a Lua invocation from a deferred operation sees
+            // `in_callback=true` with no active pointer. `with_loop` would
+            // re-borrow the RefCell already held by `run()`; `apply` uses
+            // the deferred-operation pointer instead.
+            if this.access.in_callback.get() && this.access.active_loop.get().is_none() {
+                let handle = this.handle;
+                this.access.apply(Box::new(move |uv_loop| {
+                    let _ = handle.send(uv_loop);
+                }));
+            } else {
+                this.access.with_loop(|uv_loop| {
+                    this.handle.send(uv_loop).map_err(mlua::Error::external)
+                })?;
+            }
             Ok(true)
         });
         methods.add_method("close", |_, this, ()| {
@@ -1195,7 +1234,11 @@ impl UserData for LuaSignal {
         );
         methods.add_method("stop", |_, this, ()| Ok(this.stop()));
         methods.add_method("is_closing", |_, this, ()| {
-            Ok(this.handle.is_closing(&this.access.uv_loop.borrow()))
+            Ok(this
+                .access
+                .uv_loop
+                .try_borrow()
+                .map_or(false, |uv_loop| this.handle.is_closing(&uv_loop)))
         });
         methods.add_method("close", |_, this, ()| {
             let handle = this.handle;
@@ -1218,14 +1261,36 @@ struct FsEventRoute {
     callback: Function,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FsEventPhase {
+    Idle,
+    Pending(u64),
+    Active(u64),
+    Closed,
+}
+
 struct LuaFsEvent {
     state: Rc<RefCell<Option<FsEvent>>>,
     access: LoopAccess,
     routes: Rc<RefCell<HashMap<u64, FsEventRoute>>>,
     next_id: Rc<Cell<u64>>,
-    id: Rc<Cell<Option<u64>>>,
-    closing: Rc<Cell<bool>>,
+    phase: Rc<Cell<FsEventPhase>>,
+    wake: ox_uv::AsyncSender,
 }
+/// errno name for an `io::Error`, mirroring the `errno_name` helper in
+/// `uv_core.rs` (which is private to that module). Used so a metadata
+/// failure in `LuaFsEvent::start` is not hardcoded as `ENOENT`.
+fn errno_name(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::NotFound => "ENOENT",
+        io::ErrorKind::PermissionDenied => "EACCES",
+        io::ErrorKind::AlreadyExists => "EEXIST",
+        io::ErrorKind::InvalidInput => "EINVAL",
+        io::ErrorKind::WouldBlock => "EAGAIN",
+        _ => "EIO",
+    }
+}
+
 
 impl LuaFsEvent {
     fn options(flags: &Table) -> FsEventOptions {
@@ -1243,19 +1308,21 @@ impl LuaFsEvent {
         flags: &Table,
         callback: Function,
     ) -> mlua::Result<MultiValue> {
-        if self.state.borrow().is_some() {
-            return Err(mlua::Error::runtime("fs event already started"));
-        }
+        self.check_idle()?;
         // luv surfaces an unstartable path as `nil, err, name` so
         // `vim._watch` can notify on ENOENT; the backend itself only
         // fails asynchronously after this point.
-        if std::fs::metadata(&path).is_err() {
+        if let Err(error) = std::fs::metadata(&path) {
+            let name = errno_name(&error);
+            let message = if error.kind() == io::ErrorKind::NotFound {
+                format!("{name}: no such file or directory: {path}")
+            } else {
+                format!("{name}: {error}: {path}")
+            };
             return Ok(MultiValue::from_vec(vec![
                 Value::Nil,
-                Value::String(
-                    lua.create_string(format!("ENOENT: no such file or directory: {path}"))?,
-                ),
-                Value::String(lua.create_string("ENOENT")?),
+                Value::String(lua.create_string(message)?),
+                Value::String(lua.create_string(name)?),
             ]));
         }
         let options = Self::options(flags);
@@ -1270,6 +1337,8 @@ impl LuaFsEvent {
                 Value::String(lua.create_string("ENOTSUP")?),
             ]));
         }
+        // Flag lookups can invoke __index and reenter start or close.
+        self.check_idle()?;
         let id = self.next_id.get();
         self.next_id.set(id.wrapping_add(1));
         let queue = Arc::new(Mutex::new(VecDeque::new()));
@@ -1280,12 +1349,16 @@ impl LuaFsEvent {
                 callback,
             },
         );
-        self.id.set(Some(id));
+        self.phase.set(FsEventPhase::Pending(id));
         let state = self.state.clone();
         let access = self.access.clone();
         let fail_routes = self.routes.clone();
-        let fail_id = self.id.clone();
+        let phase = self.phase.clone();
+        let wake = self.wake.clone();
         access.apply(Box::new(move |uv_loop| {
+            if phase.get() != FsEventPhase::Pending(id) {
+                return;
+            }
             let event_callback = move |_: &mut UvLoop, result: FsResult<FsEventRecord>| {
                 let item = match result {
                     Ok(record) => Ok((
@@ -1298,33 +1371,77 @@ impl LuaFsEvent {
                 if let Ok(mut pending) = queue.lock() {
                     pending.push_back(item);
                 }
+                let _ = wake.send();
             };
             if let Ok(event) = FsEvent::start(uv_loop, path, options, event_callback) {
                 *state.borrow_mut() = Some(event);
+                phase.set(FsEventPhase::Active(id));
             } else {
                 // Backend failures (spawn/post/loop) are near-impossible
                 // here, but never leave a registered route that fires
                 // nothing: `stop`/`close` stay coherent.
                 fail_routes.borrow_mut().remove(&id);
-                fail_id.set(None);
+                phase.set(FsEventPhase::Idle);
             }
         }));
         Ok(MultiValue::from_vec(vec![Value::Integer(0)]))
     }
 
-    fn stop(&self) -> i32 {
-        let state = self.state.clone();
-        self.access.apply(Box::new(move |uv_loop| {
-            if let Some(event) = state.borrow().as_ref() {
-                let _ = event.stop(uv_loop);
+    fn check_idle(&self) -> mlua::Result<()> {
+        match self.phase.get() {
+            FsEventPhase::Idle => Ok(()),
+            FsEventPhase::Closed => Err(mlua::Error::runtime("fs event is closed")),
+            FsEventPhase::Pending(_) | FsEventPhase::Active(_) => {
+                Err(mlua::Error::runtime("fs event already started"))
             }
-        }));
-        if let Some(id) = self.id.take() {
-            self.routes.borrow_mut().remove(&id);
         }
+    }
+
+    /// Tears the reservation down to `target`: `Closed` after `close` (never
+    /// resurrectable), `Idle` after `stop` (restartable on the same userdata).
+    /// Also the `Drop` path, so every runtime-state borrow is `try_*`: no
+    /// borrow of `routes`/`state` is ever held across a Lua call here, so a
+    /// failure means reentrancy we cannot service — skipping beats poisoning
+    /// the allocator during GC. The `Cell` transition always lands, which is
+    /// what blocks resurrection.
+    fn teardown(&self, target: FsEventPhase) {
+        let previous = self.phase.replace(target);
+        let (FsEventPhase::Pending(id) | FsEventPhase::Active(id)) = previous else {
+            // A closed handle is never restartable, not even via `stop`.
+            if previous == FsEventPhase::Closed {
+                self.phase.set(FsEventPhase::Closed);
+            }
+            return;
+        };
+        if let Ok(mut routes) = self.routes.try_borrow_mut() {
+            routes.remove(&id);
+        }
+        // Move ownership now: a subsequent start must never be closed by this
+        // deferred teardown, even when both operations originate in a callback.
+        let event = self.state.try_borrow_mut().ok().and_then(|mut state| state.take());
+        if let Some(event) = event {
+            self.access.apply(Box::new(move |uv_loop| {
+                let _ = event.close(uv_loop);
+            }));
+        }
+    }
+
+    fn close_handle(&self) {
+        self.teardown(FsEventPhase::Closed);
+    }
+
+    fn stop_watching(&self) -> i32 {
+        self.teardown(FsEventPhase::Idle);
         0
     }
+
 }
+impl Drop for LuaFsEvent {
+    fn drop(&mut self) {
+        self.close_handle();
+    }
+}
+
 impl UserData for LuaFsEvent {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method(
@@ -1333,19 +1450,18 @@ impl UserData for LuaFsEvent {
                 this.start(lua, path, &flags, callback)
             },
         );
-        methods.add_method("stop", |_, this, ()| Ok(this.stop()));
-        methods.add_method("is_closing", |_, this, ()| Ok(this.closing.get()));
+        methods.add_method("stop", |_, this, ()| Ok(this.stop_watching()));
+        methods.add_method("is_closing", |_, this, ()| {
+            Ok(this.phase.get() == FsEventPhase::Closed)
+        });
+        methods.add_method("is_ready", |_, this, ()| {
+            let ready = this.state.try_borrow().ok().is_some_and(|state| {
+                state.as_ref().is_some_and(FsEvent::is_ready)
+            });
+            Ok(ready)
+        });
         methods.add_method("close", |_, this, ()| {
-            let state = this.state.clone();
-            if let Some(id) = this.id.take() {
-                this.routes.borrow_mut().remove(&id);
-            }
-            this.closing.set(true);
-            this.access.apply(Box::new(move |uv_loop| {
-                if let Some(event) = state.borrow_mut().take() {
-                    let _ = event.close(uv_loop);
-                }
-            }));
+            this.close_handle();
             Ok(())
         });
     }
@@ -1357,10 +1473,12 @@ fn install_fs_event(
     access: &LoopAccess,
     routes: &Rc<RefCell<HashMap<u64, FsEventRoute>>>,
     next_id: &Rc<Cell<u64>>,
+    wake: &ox_uv::AsyncSender,
 ) -> mlua::Result<()> {
     let event_access = access.clone();
     let event_routes = routes.clone();
     let event_next = next_id.clone();
+    let event_wake = wake.clone();
     uv.set(
         "new_fs_event",
         lua.create_function(move |lua, ()| {
@@ -1369,8 +1487,8 @@ fn install_fs_event(
                 access: event_access.clone(),
                 routes: event_routes.clone(),
                 next_id: event_next.clone(),
-                id: Rc::new(Cell::new(None)),
-                closing: Rc::new(Cell::new(false)),
+                phase: Rc::new(Cell::new(FsEventPhase::Idle)),
+                wake: event_wake.clone(),
             })
         })?,
     )?;
@@ -1824,7 +1942,40 @@ pub(crate) fn install(
     )?;
 
     install_aux(lua, uv, &access, &fast)?;
-    install_fs_event(lua, uv, &access, &fs_event_routes, &fs_event_next)?;
+
+    // Allocate an always-live async handle to wake the loop when a watcher
+    // thread posts an event. The handle is unreferenced so it never keeps
+    // a default run alive by itself; its callback drains the fs-event routes
+    // through the same after_run closure used at run-return time.
+    let fs_event_wake = Async::new(&mut access.uv_loop.borrow_mut(), {
+        let wake_access = access.clone();
+        move |loop_, _| {
+            // Drain inside the callback frame so queued fs events reach their
+            // Lua callbacks during an active default run instead of waiting
+            // for run-return; drain errors surface through the callback-error
+            // channel like every other handle callback failure.
+            wake_access.callback(loop_, || {
+                wake_access
+                    .finish_run()
+                    .map_err(|error| CallbackError::new(error.to_string()))
+            })
+        }
+    })
+    .map_err(mlua::Error::external)?;
+    fs_event_wake
+        .unref(&mut access.uv_loop.borrow_mut())
+        .map_err(mlua::Error::external)?;
+    let fs_event_sender = fs_event_wake
+        .sender(&access.uv_loop.borrow())
+        .map_err(mlua::Error::external)?;
+    install_fs_event(
+        lua,
+        uv,
+        &access,
+        &fs_event_routes,
+        &fs_event_next,
+        &fs_event_sender,
+    )?;
     install_udp_tty(lua, uv, access, fast)?;
     Ok(())
 }
@@ -2263,5 +2414,218 @@ mod loop_access_tests {
             "active_loop must unwind to None"
         );
         assert!(!access.draining.get(), "draining must unwind to false");
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "the lifecycle tests construct a host, drive Lua, and panic on assertion failure"
+)]
+mod fs_event_lifecycle_tests {
+    use crate::{BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work};
+    use ox_types::{OxStr, Typval};
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+
+
+    struct TestScheduler {
+        queue: RefCell<VecDeque<Work>>,
+    }
+
+    impl Scheduler for TestScheduler {
+        fn schedule_deferred(&self, work: Work) -> Result<(), String> {
+            self.queue.borrow_mut().push_back(work);
+            Ok(())
+        }
+    }
+
+    struct TestBuiltins;
+
+    impl BuiltinHost for TestBuiltins {
+        fn call(&self, name: &OxStr, _args: Vec<Typval>) -> Result<Typval, String> {
+            // The runtime prelude probes has('win32') during host init.
+            if name.as_bytes() == b"has" {
+                return Ok(Typval::Number(0));
+            }
+            Err(format!("unexpected Vimscript call: {name:?}"))
+        }
+    }
+
+    /// Removes the watched tree on drop, even after an assertion failure.
+    struct TempWatchDir {
+        path: PathBuf,
+    }
+
+    impl TempWatchDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "oxvim-uv-handles-{label}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create watch dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempWatchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn host() -> LuaHost {
+        let scheduler = Rc::new(TestScheduler {
+            queue: RefCell::new(VecDeque::new()),
+        });
+        let runtime = RuntimeRoot::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime"),
+        );
+        LuaHost::new(runtime, Rc::new(TestBuiltins), scheduler).expect("create host")
+    }
+
+    fn with_watch_dir(label: &str, script: &str) {
+        let dir = TempWatchDir::new(label);
+        let host = host();
+        host.lua()
+            .globals()
+            .set("TEST_DIR", dir.path.to_string_lossy().as_ref())
+            .unwrap();
+        host.lua().load(script).exec().unwrap();
+    }
+
+    /// F11 + F12 + F50: `close` then `start` refuses and never resurrects;
+    /// `stop` returns to a restartable state on the same userdata.
+    #[test]
+    fn fs_event_handle_lifecycle_refuses_closed_and_allows_restart() {
+        with_watch_dir(
+            "lifecycle",
+            r"
+            local closed_handle = assert(vim.uv.new_fs_event())
+            closed_handle:close()
+            assert(closed_handle:is_closing())
+            local ok, err = pcall(closed_handle.start, closed_handle, TEST_DIR, {}, function() end)
+            assert(not ok, 'start after close must refuse')
+            assert(tostring(err):find('fs event is closed', 1, true), err)
+            assert(not pcall(closed_handle.start, closed_handle, TEST_DIR, {}, function() end),
+              'a closed handle must never resurrect')
+
+            local handle = assert(vim.uv.new_fs_event())
+            assert(handle:start(TEST_DIR, {}, function() end) == 0)
+            assert(handle:stop() == 0)
+            assert(not handle:is_closing())
+            assert(handle:start(TEST_DIR, {}, function() end) == 0,
+              'stop must allow restarting the same handle')
+            assert(handle:stop() == 0)
+            handle:close()
+            assert(handle:is_closing())
+            ",
+        );
+    }
+
+    /// F20: two racing `start` calls reserve `Pending` synchronously even when
+    /// `apply` defers, so exactly one watcher starts and `stop` still controls it.
+    #[test]
+    fn fs_event_racing_starts_reserve_state_before_deferred_apply() {
+        with_watch_dir(
+            "racing",
+            r"
+            local handle = assert(vim.uv.new_fs_event())
+            local raced = false
+            local async = assert(vim.uv.new_async(function()
+              assert(handle:start(TEST_DIR, {}, function() end) == 0)
+              local ok, err = pcall(handle.start, handle, TEST_DIR, {}, function() end)
+              assert(not ok, 'second racing start must refuse')
+              assert(tostring(err):find('already started', 1, true), err)
+              raced = true
+            end))
+            async:send()
+            vim.uv.run('nowait')
+            assert(raced, 'async callback must have run')
+            assert(handle:stop() == 0, 'the queued start must yield a watcher stop controls')
+            handle:close()
+            ",
+        );
+    }
+
+    /// F22: a queued event reaches its Lua callback during an active default
+    /// run, and the callback's own close is what ends the run.
+    #[test]
+    fn fs_event_delivers_queued_events_during_default_run() {
+        let dir = TempWatchDir::new("delivery");
+        let host = host();
+        host.lua()
+            .globals()
+            .set("TEST_DIR", dir.path.to_string_lossy().as_ref())
+            .unwrap();
+        host.lua()
+            .load(
+                r"
+                handle = assert(vim.uv.new_fs_event())
+                delivered = false
+                assert(handle:start(TEST_DIR, {}, function()
+                  delivered = true
+                  handle:close()
+                end) == 0)
+                -- Handshake on the baseline snapshot: without it the creation
+                -- can land inside the initial scan and go unreported.
+                local deadline = vim.uv.now() + 5000
+                while not handle:is_ready() and vim.uv.now() < deadline do
+                  vim.uv.run('nowait')
+                end
+                assert(handle:is_ready(), 'watcher never became ready')
+                ",
+            )
+            .exec()
+            .unwrap();
+        std::fs::write(dir.path.join("created.txt"), b"hello").expect("create file");
+        host.lua()
+            .load(
+                r"
+                vim.uv.run('default')
+                assert(delivered, 'event must reach its callback during the default run')
+                assert(handle:is_closing(), 'the delivery callback must have closed the watcher')
+                ",
+            )
+            .exec()
+            .unwrap();
+    }
+
+    /// F21: Lua-collected userdata must release the loop, not leak. GC runs
+    /// `Drop`, whose teardown is the same one `stop`/`close` use (route
+    /// removal + `FsEvent::close`); those paths are delivery-observable, so
+    /// this test pins the remaining question: that `Drop` actually fires and
+    /// the dropped watcher's handle-registry entry stops keeping
+    /// `run("default")` alive. A leaked watcher would spin the default run
+    /// until the unreferenced guard timer kills it at 3s.
+    #[test]
+    fn fs_event_collected_userdata_releases_route_and_handle() {
+        with_watch_dir(
+            "collected",
+            r"
+            local leaked = assert(vim.uv.new_fs_event())
+            assert(leaked:start(TEST_DIR, {}, function() end) == 0)
+            leaked = nil
+            collectgarbage()
+            collectgarbage()
+            local guard_fired = false
+            local guard = assert(vim.uv.new_timer())
+            guard:start(3000, 0, function()
+              guard_fired = true
+              vim.uv.stop()
+            end)
+            guard:unref()
+            vim.uv.run('default')
+            assert(not guard_fired,
+              'collected watcher kept the loop alive: route/handle leak')
+            guard:close()
+            vim.uv.run('nowait')
+            ",
+        );
     }
 }
