@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::io;
 use std::rc::Rc;
@@ -1259,7 +1259,7 @@ impl UserData for LuaSignal {
 /// records through the loop poster, but the Lua callback is `!Send`, so
 /// delivery splits into a cross-thread queue plus a loop-thread drain in
 /// the shared `after_run` hook (same shape as the process-exit drain).
-type FsQueueItem = Result<(String, bool, bool), String>;
+type FsQueueItem = Result<(Vec<u8>, bool, bool), String>;
 
 struct FsEventRoute {
     queue: Arc<Mutex<VecDeque<FsQueueItem>>>,
@@ -1274,7 +1274,6 @@ struct FsEventRoute {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FsEventPhase {
     Idle,
-    Pending(u64),
     Active(u64),
     Closed,
 }
@@ -1290,14 +1289,31 @@ struct LuaFsEvent {
     /// it, so `getpath` answers on a restartable handle too.
     path: RefCell<Option<String>>,
 }
+/// Lua strings are byte strings, so the native path encoding must bypass
+/// UTF-8 conversion before crossing the filesystem-event callback boundary.
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_encoded_bytes().to_vec()
+}
 
 impl LuaFsEvent {
-    fn options(flags: &Table) -> FsEventOptions {
-        FsEventOptions {
-            watch_entry: flags.get::<bool>("watch_entry").unwrap_or(false),
-            stat: flags.get::<bool>("stat").unwrap_or(false),
-            recursive: flags.get::<bool>("recursive").unwrap_or(false),
+    fn option_flag(flags: &Table, key: &str) -> mlua::Result<bool> {
+        match flags.get::<Value>(key)? {
+            Value::Nil => Ok(false),
+            Value::Boolean(value) => Ok(value),
+            Value::Integer(value) => Ok(value != 0),
+            Value::Number(value) => Ok(value != 0.0),
+            _ => Err(mlua::Error::runtime(format!(
+                "Invalid '{key}': not a boolean"
+            ))),
         }
+    }
+
+    fn options(flags: &Table) -> mlua::Result<FsEventOptions> {
+        Ok(FsEventOptions {
+            watch_entry: Self::option_flag(flags, "watch_entry")?,
+            stat: Self::option_flag(flags, "stat")?,
+            recursive: Self::option_flag(flags, "recursive")?,
+        })
     }
 
     fn start(
@@ -1309,12 +1325,9 @@ impl LuaFsEvent {
     ) -> mlua::Result<MultiValue> {
         self.check_idle()?;
         // luv surfaces an unstartable path as `nil, err, name` so
-        // `vim._watch` can notify on ENOENT; the backend itself only
-        // fails asynchronously after this point. The errno name comes
-        // from the same `FsError` mapping every `uvfs` binding reports
-        // through, so only a genuinely missing path reports `ENOENT` —
-        // `EACCES`, `ELOOP`, and friends keep their own names for
-        // plugins that branch on them.
+        // `vim._watch` can notify on ENOENT. The synchronous backend start
+        // below still uses this preflight to preserve luv's exact errno
+        // tuple for an absent or inaccessible path.
         if let Err(error) = std::fs::metadata(&path) {
             let missing = error.kind() == io::ErrorKind::NotFound;
             let fs_error = FsError::from(error);
@@ -1330,7 +1343,7 @@ impl LuaFsEvent {
                 Value::String(lua.create_string(name)?),
             ]));
         }
-        let options = Self::options(flags);
+        let options = Self::options(flags)?;
         // The backend rejects this combination (`WatchError::Unsupported`);
         // fail synchronously like luv instead of registering a dead route.
         if options.watch_entry && options.recursive {
@@ -1358,20 +1371,15 @@ impl LuaFsEvent {
         // The path is committed with the route: every failure return sits
         // above this point, so `getpath` never reports a start that refused.
         *self.path.borrow_mut() = Some(path.clone());
-        self.phase.set(FsEventPhase::Pending(id));
         let state = self.state.clone();
-        let access = self.access.clone();
         let fail_routes = self.routes.clone();
         let phase = self.phase.clone();
         let wake = self.wake.clone();
-        access.apply(Box::new(move |uv_loop| {
-            if phase.get() != FsEventPhase::Pending(id) {
-                return;
-            }
+        self.access.with_loop(move |uv_loop| {
             let event_callback = move |_: &mut UvLoop, result: FsResult<FsEventRecord>| {
                 let item = match result {
                     Ok(record) => Ok((
-                        record.filename.to_string_lossy().into_owned(),
+                        path_bytes(&record.filename),
                         record.change,
                         record.rename,
                     )),
@@ -1392,7 +1400,7 @@ impl LuaFsEvent {
                 fail_routes.borrow_mut().remove(&id);
                 phase.set(FsEventPhase::Idle);
             }
-        }));
+        });
         Ok(MultiValue::from_vec(vec![Value::Integer(0)]))
     }
 
@@ -1400,14 +1408,9 @@ impl LuaFsEvent {
         match self.phase.get() {
             FsEventPhase::Idle => Ok(()),
             FsEventPhase::Closed => Err(mlua::Error::runtime("fs event is closed")),
-            FsEventPhase::Pending(_) | FsEventPhase::Active(_) => {
-                Err(mlua::Error::runtime("fs event already started"))
-            }
+            FsEventPhase::Active(_) => Err(mlua::Error::runtime("fs event already started")),
         }
     }
-
-    /// Tears the reservation down to `target`: `Closed` after `close` (never
-    /// resurrectable), `Idle` after `stop` (restartable on the same userdata).
     /// Also the `Drop` path, so every runtime-state borrow is `try_*`: no
     /// borrow of `routes`/`state` is ever held across a Lua call here, so a
     /// failure means reentrancy we cannot service — skipping beats poisoning
@@ -1415,7 +1418,7 @@ impl LuaFsEvent {
     /// what blocks resurrection.
     fn teardown(&self, target: FsEventPhase) {
         let previous = self.phase.replace(target);
-        let (FsEventPhase::Pending(id) | FsEventPhase::Active(id)) = previous else {
+        let FsEventPhase::Active(id) = previous else {
             // A closed handle is never restartable, not even via `stop`.
             if previous == FsEventPhase::Closed {
                 self.phase.set(FsEventPhase::Closed);
@@ -1741,7 +1744,7 @@ pub(crate) fn install(
                 match event {
                     Ok((filename, change, rename)) => {
                         args.push_back(Value::Nil);
-                        args.push_back(Value::String(fs_drain_lua.create_string(filename)?));
+                        args.push_back(Value::String(fs_drain_lua.create_string(&filename)?));
                         let events = fs_drain_lua.create_table()?;
                         events.set("change", change)?;
                         events.set("rename", rename)?;
@@ -2596,10 +2599,10 @@ mod fs_event_lifecycle_tests {
         );
     }
 
-    /// F20: two racing `start` calls reserve `Pending` synchronously even when
-    /// `apply` defers, so exactly one watcher starts and `stop` still controls it.
+    /// F20: two racing `start` calls reserve the handle state synchronously,
+    /// so exactly one watcher starts and `stop` still controls it.
     #[test]
-    fn fs_event_racing_starts_reserve_state_before_deferred_apply() {
+    fn fs_event_racing_starts_refuse_reentry() {
         with_watch_dir(
             "racing",
             r"

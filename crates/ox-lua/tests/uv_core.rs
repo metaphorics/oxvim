@@ -267,6 +267,131 @@ fn fs_event_binding_lifecycle_reports_enoent_and_closes() {
 }
 
 #[test]
+fn fs_event_start_inside_callback_snapshots_before_mutation() {
+    let dir = fresh_dir("start-callback");
+    let (host, scheduler) = host();
+    host.lua()
+        .globals()
+        .set("test_dir", dir.to_string_lossy().as_ref())
+        .unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        local handle = assert(vim.uv.new_fs_event())
+        local trigger = assert(vim.uv.new_timer())
+        local guard = assert(vim.uv.new_timer())
+        local timed_out = false
+        local event_name
+
+        guard:start(3000, 0, function()
+          timed_out = true
+          if not handle:is_closing() then handle:close() end
+          guard:close()
+          vim.uv.stop()
+        end)
+        trigger:start(0, 0, function()
+          assert(handle:start(test_dir, {}, function(err, filename)
+            assert(err == nil)
+            event_name = filename
+            if not handle:is_closing() then handle:close() end
+            if not guard:is_closing() then guard:close() end
+          end) == 0)
+          assert(handle:getpath() == test_dir)
+
+          local fd = assert(vim.uv.fs_open(test_dir .. '/created.txt', 'w', tonumber('644', 8)))
+          assert(vim.uv.fs_write(fd, 'event') == 5)
+          assert(vim.uv.fs_close(fd))
+          trigger:close()
+        end)
+        vim.uv.run('default')
+        assert(not timed_out, 'fs event did not observe the post-start mutation')
+        assert(event_name == 'created.txt', tostring(event_name))
+        "#,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn fs_event_rejects_mistyped_options_and_coerces_numbers() {
+    let dir = fresh_dir("options");
+    let (host, scheduler) = host();
+    host.lua()
+        .globals()
+        .set("test_dir", dir.to_string_lossy().as_ref())
+        .unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        for _, key in ipairs({'recursive', 'stat', 'watch_entry'}) do
+          local handle = assert(vim.uv.new_fs_event())
+          local ok, err = pcall(handle.start, handle, test_dir, {[key] = 'invalid'}, function() end)
+          assert(not ok, key .. ' must reject a string option')
+          -- mlua appends a traceback to the error object, so pin the exact
+          -- message as a plain-text match rather than by whole-string equality.
+          local want = "Invalid '" .. key .. "': not a boolean"
+          assert(tostring(err):find(want, 1, true) ~= nil, tostring(err))
+
+          assert(handle:start(test_dir, {[key] = 1}, function() end) == 0)
+          assert(handle:stop() == 0)
+          handle:close()
+        end
+        "#,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_event_callback_preserves_non_utf8_filename_bytes() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = fresh_dir("non-utf8");
+    let filename = OsString::from_vec(vec![b'n', b'o', b'n', 0xff, b'8']);
+    let (host, scheduler) = host();
+    host.lua()
+        .globals()
+        .set("test_dir", dir.to_string_lossy().as_ref())
+        .unwrap();
+    host.lua()
+        .load(
+            r#"
+            local handle = assert(vim.uv.new_fs_event())
+            local guard = assert(vim.uv.new_timer())
+            timed_out = false
+            event_name = nil
+            guard:start(3000, 0, function()
+              timed_out = true
+              if not handle:is_closing() then handle:close() end
+              guard:close()
+              vim.uv.stop()
+            end)
+            assert(handle:start(test_dir, {}, function(err, filename)
+              assert(err == nil)
+              event_name = filename
+              if not handle:is_closing() then handle:close() end
+              if not guard:is_closing() then guard:close() end
+            end) == 0)
+            "#,
+        )
+        .exec()
+        .unwrap();
+    std::fs::write(dir.join(&filename), b"payload").unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        vim.uv.run('default')
+        assert(not timed_out, 'fs event did not report the non-UTF-8 filename')
+        assert(event_name == string.char(110, 111, 110, 255, 56), 'filename bytes changed')
+        "#,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn wait_primitives_poll_the_owned_uv_loop() {
     let (host, scheduler) = host();
     host.lua()
