@@ -3688,6 +3688,91 @@ fn bwipeout_skips_bufunload_for_already_unloaded_target() {
     assert_eq!(order_events(&executor), ["BufDelete", "BufWipeout"]);
 }
 
+/// A lifecycle handler that removes the target itself must not turn the
+/// outer `:bdelete` into `E90`, and the later targets must still be
+/// processed. Upstream `buf_freeall` (`buffer.c`) rechecks its `bufref`
+/// after the events rather than reporting a failure for work the nested
+/// removal already completed.
+#[test]
+fn buffer_delete_continues_when_a_handler_removes_the_target() {
+    let (editor, mut executor) = setup_with_content(&[b"current".to_vec()]);
+    let target = editor.editor_mut().create_buffer(true).unwrap();
+    let last = editor.editor_mut().create_buffer(true).unwrap();
+    executor.execute_line(&editor, "let g:fired = 0").unwrap();
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    // `BufDelete` fires for every target whatever its residency, so it is
+    // the event that can witness the loop reaching the later target; the
+    // recheck after `BufUnload` is covered by the `:bunload` test below.
+    // The handler is not `nested`, so the nested `:bwipeout!` fires no
+    // further events and `g:order` records exactly the targets the outer
+    // command reached.
+    executor
+        .execute_line(
+            &editor,
+            &format!(
+                "autocmd BufDelete * call add(g:order, expand('<abuf>')) | \
+                 if g:fired == 0 | let g:fired = 1 | \
+                 execute 'bwipeout! {}' | endif",
+                i64::from(target)
+            ),
+        )
+        .unwrap();
+
+    executor
+        .execute_line(
+            &editor,
+            &format!("{},{}bdelete", i64::from(target), i64::from(last)),
+        )
+        .unwrap();
+
+    let messages = echo_messages(&editor);
+    assert!(
+        !messages.iter().any(|row| row.contains("E90")),
+        "a nested removal must not surface E90, got {messages:?}"
+    );
+    assert!(
+        editor.editor().buffer(target).is_err(),
+        "the nested handler removed the target"
+    );
+    assert_eq!(
+        order_events(&executor),
+        [target, last].map(|handle| i64::from(handle).to_string()),
+        "the later target must still be reached"
+    );
+}
+
+/// `:bunload` has no `BufDelete` phase, so its recheck after `BufUnload` is
+/// the only thing between a handler that removes the target and a spurious
+/// `E90` for a handle the nested removal already freed.
+#[test]
+fn buffer_unload_reports_no_error_when_a_handler_removes_the_target() {
+    let (editor, mut executor) = setup_with_content(&[b"current".to_vec()]);
+    let target = editor.editor_mut().create_buffer(true).unwrap();
+    executor
+        .execute_line(
+            &editor,
+            &format!(
+                "autocmd BufUnload * execute 'bwipeout! {}'",
+                i64::from(target)
+            ),
+        )
+        .unwrap();
+
+    executor
+        .execute_line(&editor, &format!("bunload {}", i64::from(target)))
+        .unwrap();
+
+    let messages = echo_messages(&editor);
+    assert!(
+        !messages.iter().any(|row| row.contains("E90")),
+        "a nested removal must not surface E90, got {messages:?}"
+    );
+    assert!(
+        editor.editor().buffer(target).is_err(),
+        "the nested handler removed the target"
+    );
+}
+
 /// `:bunload` releases text but keeps the buffer in the ordinary `:ls`
 /// listing; `:bdelete` unlists it and `:bwipeout` removes it entirely.
 /// Upstream: `buffer.c` `close_buffer` — `DOBUF_UNLOAD`/`DOBUF_DEL`/
