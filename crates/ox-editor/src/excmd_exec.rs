@@ -7763,9 +7763,16 @@ fn preserve_one_swapfile<F: FileIO>(
     let Some(text) = text else {
         return;
     };
+    // A swapfile at this path belongs to us only if this session recorded
+    // writing it. Two sessions in one process share a pid and a host, so
+    // those alone cannot tell one session's swapfile from another's.
+    let session_owns_swapfile = runtime.swap_written.borrow().contains(&name);
     match SwapFile::new(candidate.file_name.clone(), text)
         .with_meta(meta)
-        .write_to(&name)
+        .write_to(
+            &name,
+            ox_text::swapfile::SwapOwnership::for_session(session_owns_swapfile),
+        )
     {
         Ok(()) => {
             runtime.swap_written.borrow_mut().insert(name);
@@ -11558,6 +11565,26 @@ fn rollback_buffer_switch<E: ExEditorAccess, R: FnOnce()>(
     }
 }
 
+/// Builds a filesystem path from Vimscript bytes without a lossy UTF-8 step.
+///
+/// Unix path names are byte sequences, so reconstructing the `OsStr` directly
+/// preserves every byte. Other platforms do not expose arbitrary byte paths;
+/// their native path representation is Unicode, so the display-compatible
+/// lossy conversion is the only meaningful fallback there.
+#[must_use]
+pub fn path_from_ox_str(name: &OxStr) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        PathBuf::from(std::ffi::OsStr::from_bytes(name.as_bytes()))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(name.to_string_lossy().as_ref())
+    }
+}
+
 /// Loads an unloaded file-backed buffer before a focus switch.
 ///
 /// This is the executor-side counterpart of `call_bufload_with_events`:
@@ -11593,7 +11620,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
 
     let mut restore = Some(restore);
     let Some(path) = (!name.as_bytes().is_empty() && !nofileread)
-        .then(|| PathBuf::from(name.to_string_lossy().as_ref()))
+        .then(|| path_from_ox_str(&name))
     else {
         access
             .with_ex_editor(|editor| -> Result<(), EditorError> {
@@ -13913,6 +13940,11 @@ fn run_lua_autocmd_callback<F: FileIO, E: ExEditorAccess>(
         Ok(args) => args,
         Err(error) => return (error_flow(runtime, "E5108", error.to_string()), false),
     };
+    // This guard spans the callback, so a callback reentering through the same
+    // Lua host would panic. It is safe because the primary and nested
+    // executors hold distinct hosts: `build_embedded_core` gives each its own
+    // `Rc<RefCell<ServerLuaExec>>`, and nested reentry lands on the other one.
+    // Sharing one host between those executors would reintroduce that panic.
     let result = lua.borrow_mut().invoke_callback(reference, args);
     let sync = access.with_ex_editor(|editor| sync_editor_into_scope(editor, scope));
     match (result, sync) {

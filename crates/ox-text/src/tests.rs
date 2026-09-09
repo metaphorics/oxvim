@@ -500,7 +500,7 @@ fn swap_write_reserves_owner_only_rewrites_and_refuses_links() {
     let path = dir.join("test.swp");
     let buffer = Buffer::from_bytes(b"one\n").unwrap();
     SwapFile::new("/tmp/example.txt", buffer.clone())
-        .write_to(&path)
+        .write_to(&path, crate::swapfile::SwapOwnership::for_session(true))
         .unwrap();
     #[cfg(unix)]
     assert_eq!(
@@ -510,7 +510,7 @@ fn swap_write_reserves_owner_only_rewrites_and_refuses_links() {
     );
     // The update path re-opens the reserved file.
     SwapFile::new("/tmp/example.txt", buffer)
-        .write_to(&path)
+        .write_to(&path, crate::swapfile::SwapOwnership::for_session(true))
         .unwrap();
     // A foreign regular file at the candidate path is never
     // truncated, even though it is not a link.
@@ -519,7 +519,7 @@ fn swap_write_reserves_owner_only_rewrites_and_refuses_links() {
     let buffer = Buffer::from_bytes(b"evil\n").unwrap();
     assert!(
         SwapFile::new("/tmp/example.txt", buffer)
-            .write_to(&path)
+            .write_to(&path, crate::swapfile::SwapOwnership::for_session(true))
             .is_err()
     );
     assert_eq!(std::fs::read(&path).unwrap(), b"foreign");
@@ -534,7 +534,7 @@ fn swap_write_reserves_owner_only_rewrites_and_refuses_links() {
         let buffer = Buffer::from_bytes(b"evil\n").unwrap();
         assert!(
             SwapFile::new("/tmp/example.txt", buffer)
-                .write_to(&path)
+                .write_to(&path, crate::swapfile::SwapOwnership::for_session(true))
                 .is_err()
         );
         assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
