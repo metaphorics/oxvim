@@ -267,6 +267,39 @@ fn fs_event_binding_lifecycle_reports_enoent_and_closes() {
 }
 
 #[test]
+fn fs_event_backend_start_failure_preserves_idle_handle() {
+    let dir = fresh_dir("backend-start-failure");
+    let (host, scheduler) = host();
+    host.lua()
+        .globals()
+        .set("test_dir", dir.to_string_lossy().as_ref())
+        .unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        local handle = assert(vim.uv.new_fs_event())
+        local ok, err, name = handle:start(
+          test_dir,
+          {watch_entry = true, recursive = true},
+          function() end
+        )
+        assert(ok == nil and name == 'ENOTSUP', tostring(err))
+        assert(
+          err == 'ENOTSUP: watch_entry cannot be combined with recursive',
+          tostring(err)
+        )
+        local path, path_err, path_name = handle:getpath()
+        assert(path == nil and path_name == 'EINVAL', tostring(path_err))
+        assert(handle:start(test_dir, {}, function() end) == 0)
+        assert(handle:getpath() == test_dir)
+        handle:close()
+        "#,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn fs_event_start_inside_callback_snapshots_before_mutation() {
     let dir = fresh_dir("start-callback");
     let (host, scheduler) = host();
@@ -386,6 +419,58 @@ fn fs_event_callback_preserves_non_utf8_filename_bytes() {
         vim.uv.run('default')
         assert(not timed_out, 'fs event did not report the non-UTF-8 filename')
         assert(event_name == string.char(110, 111, 110, 255, 56), 'filename bytes changed')
+        "#,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_event_start_preserves_non_utf8_watch_path_bytes() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = fresh_dir("non-utf8-watch-path");
+    let watched_name = OsString::from_vec(vec![b'w', b'a', b't', 0xff, b'h']);
+    let watched = dir.join(&watched_name);
+    std::fs::create_dir(&watched).unwrap();
+    let filename = OsString::from_vec(vec![b'e', b'v', 0xfe, b'8']);
+    let watched_bytes = watched.as_os_str().as_encoded_bytes().to_vec();
+    let (host, scheduler) = host();
+    let lua_path = host.lua().create_string(&watched_bytes).unwrap();
+    host.lua().globals().set("test_dir", lua_path).unwrap();
+    host.lua()
+        .load(
+            r#"
+            local handle = assert(vim.uv.new_fs_event())
+            local guard = assert(vim.uv.new_timer())
+            timed_out = false
+            event_name = nil
+            guard:start(3000, 0, function()
+              timed_out = true
+              if not handle:is_closing() then handle:close() end
+              guard:close()
+              vim.uv.stop()
+            end)
+            assert(handle:start(test_dir, {}, function(err, filename)
+              assert(err == nil)
+              event_name = filename
+              if not handle:is_closing() then handle:close() end
+              if not guard:is_closing() then guard:close() end
+            end) == 0)
+            assert(handle:getpath() == test_dir, 'watch path bytes changed')
+            "#,
+        )
+        .exec()
+        .unwrap();
+    std::fs::write(watched.join(&filename), b"payload").unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        vim.uv.run('default')
+        assert(not timed_out, 'fs event did not report the non-UTF-8 watch path')
+        assert(event_name == string.char(101, 118, 254, 56), 'filename bytes changed')
         "#,
     );
     std::fs::remove_dir_all(&dir).unwrap();

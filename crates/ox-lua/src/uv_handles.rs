@@ -8,6 +8,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -17,7 +19,7 @@ use mlua::{
 };
 use ox_uv::dns::{self, AddrInfoHints};
 use ox_uv::fs::{FsError, FsResult};
-use ox_uv::fs_watch::{FsEvent, FsEventOptions, FsEventRecord};
+use ox_uv::fs_watch::{FsEvent, FsEventOptions, FsEventRecord, WatchError};
 use ox_uv::net::{NetEvent, Tcp, Udp};
 #[cfg(unix)]
 use ox_uv::net::{Pipe, Tty, TtyMode};
@@ -1287,12 +1289,68 @@ struct LuaFsEvent {
     wake: ox_uv::AsyncSender,
     /// Last successfully started path, kept across `stop` like luv keeps
     /// it, so `getpath` answers on a restartable handle too.
-    path: RefCell<Option<String>>,
+    path: RefCell<Option<Vec<u8>>>,
 }
+
 /// Lua strings are byte strings, so the native path encoding must bypass
 /// UTF-8 conversion before crossing the filesystem-event callback boundary.
 fn path_bytes(path: &Path) -> Vec<u8> {
     path.as_os_str().as_encoded_bytes().to_vec()
+}
+
+fn path_from_bytes(bytes: &[u8]) -> mlua::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        Ok(PathBuf::from(OsString::from_vec(bytes.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        let path = std::str::from_utf8(bytes)
+            .map_err(|_| mlua::Error::runtime("path must be valid UTF-8"))?;
+        Ok(PathBuf::from(path))
+    }
+}
+
+fn watch_error_parts(error: WatchError) -> (&'static str, String) {
+    match error {
+        WatchError::Io(error) => (error.name, error.to_string()),
+        WatchError::Post(error) => ("ECANCELED", format!("ECANCELED: {error}")),
+        WatchError::Spawn(error) => (
+            "EAGAIN",
+            format!("EAGAIN: watcher thread could not be started: {error}"),
+        ),
+        WatchError::Stopped => ("EINVAL", "EINVAL: watcher has already stopped".to_owned()),
+        WatchError::Unsupported(reason)
+            if reason == "watch_entry cannot be combined with recursive traversal" =>
+        {
+            (
+                "ENOTSUP",
+                "ENOTSUP: watch_entry cannot be combined with recursive".to_owned(),
+            )
+        }
+        WatchError::Unsupported(reason) => ("ENOTSUP", format!("ENOTSUP: {reason}")),
+        WatchError::Loop(error) => match error {
+            ox_uv::Error::Io(inner) => {
+                let fs_error = FsError::from(inner);
+                (fs_error.name, fs_error.to_string())
+            }
+            ox_uv::Error::MissingEnvironment(name) => (
+                "ENOENT",
+                format!("ENOENT: environment variable {name} is not set"),
+            ),
+            ox_uv::Error::Unsupported { .. } => ("ENOTSUP", format!("ENOTSUP: {error}")),
+            _ => ("EINVAL", format!("EINVAL: {error}")),
+        },
+    }
+}
+
+fn watch_failure(lua: &Lua, error: WatchError) -> mlua::Result<MultiValue> {
+    let (name, message) = watch_error_parts(error);
+    Ok(MultiValue::from_vec(vec![
+        Value::Nil,
+        Value::String(lua.create_string(message)?),
+        Value::String(lua.create_string(name)?),
+    ]))
 }
 
 impl LuaFsEvent {
@@ -1319,11 +1377,13 @@ impl LuaFsEvent {
     fn start(
         &self,
         lua: &Lua,
-        path: String,
+        path: LuaString,
         flags: &Table,
         callback: Function,
     ) -> mlua::Result<MultiValue> {
         self.check_idle()?;
+        let raw_path = path.as_bytes().to_vec();
+        let path = path_from_bytes(&raw_path)?;
         // luv surfaces an unstartable path as `nil, err, name` so
         // `vim._watch` can notify on ENOENT. The synchronous backend start
         // below still uses this preflight to preserve luv's exact errno
@@ -1332,11 +1392,12 @@ impl LuaFsEvent {
             let missing = error.kind() == io::ErrorKind::NotFound;
             let fs_error = FsError::from(error);
             let name = fs_error.name;
-            let message = if missing {
-                format!("{name}: no such file or directory: {path}")
+            let mut message = if missing {
+                format!("{name}: no such file or directory: ").into_bytes()
             } else {
-                format!("{name}: {msg}: {path}", msg = fs_error.message)
+                format!("{name}: {msg}: ", msg = fs_error.message).into_bytes()
             };
+            message.extend_from_slice(&raw_path);
             return Ok(MultiValue::from_vec(vec![
                 Value::Nil,
                 Value::String(lua.create_string(message)?),
@@ -1344,17 +1405,6 @@ impl LuaFsEvent {
             ]));
         }
         let options = Self::options(flags)?;
-        // The backend rejects this combination (`WatchError::Unsupported`);
-        // fail synchronously like luv instead of registering a dead route.
-        if options.watch_entry && options.recursive {
-            return Ok(MultiValue::from_vec(vec![
-                Value::Nil,
-                Value::String(
-                    lua.create_string("ENOTSUP: watch_entry cannot be combined with recursive")?,
-                ),
-                Value::String(lua.create_string("ENOTSUP")?),
-            ]));
-        }
         // Flag lookups can invoke __index and reenter start or close.
         self.check_idle()?;
         let id = self.next_id.get();
@@ -1368,14 +1418,11 @@ impl LuaFsEvent {
                 phase: self.phase.clone(),
             },
         );
-        // The path is committed with the route: every failure return sits
-        // above this point, so `getpath` never reports a start that refused.
-        *self.path.borrow_mut() = Some(path.clone());
         let state = self.state.clone();
         let fail_routes = self.routes.clone();
         let phase = self.phase.clone();
         let wake = self.wake.clone();
-        self.access.with_loop(move |uv_loop| {
+        let result = self.access.with_loop(move |uv_loop| {
             let event_callback = move |_: &mut UvLoop, result: FsResult<FsEventRecord>| {
                 let item = match result {
                     Ok(record) => Ok((
@@ -1390,18 +1437,26 @@ impl LuaFsEvent {
                 }
                 let _ = wake.send();
             };
-            if let Ok(event) = FsEvent::start(uv_loop, path, options, event_callback) {
-                *state.borrow_mut() = Some(event);
-                phase.set(FsEventPhase::Active(id));
-            } else {
-                // Backend failures (spawn/post/loop) are near-impossible
-                // here, but never leave a registered route that fires
-                // nothing: `stop`/`close` stay coherent.
-                fail_routes.borrow_mut().remove(&id);
-                phase.set(FsEventPhase::Idle);
+            match FsEvent::start(uv_loop, path, options, event_callback) {
+                Ok(event) => {
+                    *state.borrow_mut() = Some(event);
+                    phase.set(FsEventPhase::Active(id));
+                    Ok(())
+                }
+                Err(error) => {
+                    fail_routes.borrow_mut().remove(&id);
+                    phase.set(FsEventPhase::Idle);
+                    Err(error)
+                }
             }
         });
-        Ok(MultiValue::from_vec(vec![Value::Integer(0)]))
+        match result {
+            Ok(()) => {
+                *self.path.borrow_mut() = Some(raw_path);
+                Ok(MultiValue::from_vec(vec![Value::Integer(0)]))
+            }
+            Err(error) => watch_failure(lua, error),
+        }
     }
 
     fn check_idle(&self) -> mlua::Result<()> {
@@ -1478,7 +1533,7 @@ impl UserData for LuaFsEvent {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method(
             "start",
-            |lua, this, (path, flags, callback): (String, Table, Function)| {
+            |lua, this, (path, flags, callback): (LuaString, Table, Function)| {
                 this.start(lua, path, &flags, callback)
             },
         );
@@ -1526,7 +1581,7 @@ fn install_fs_event(
     uv.set(
         "fs_event_start",
         lua.create_function(
-            |lua, (handle, path, flags, callback): (AnyUserData, String, Table, Function)| {
+            |lua, (handle, path, flags, callback): (AnyUserData, LuaString, Table, Function)| {
                 handle
                     .borrow::<LuaFsEvent>()?
                     .start(lua, path, &flags, callback)
