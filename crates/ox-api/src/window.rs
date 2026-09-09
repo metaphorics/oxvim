@@ -729,16 +729,46 @@ fn fire_buffer_read_event(
     crate::autocmd::execute_firing_plan(session, plan)
 }
 
+/// Finishes a callback-capable buffer switch after its read lifecycle. The
+/// restore callback performs only low-level editor transitions, so no user
+/// code runs while the target is being returned to its prior state.
+fn finish_buffer_switch<R: FnOnce(&ApiSession, bool)>(
+    session: &ApiSession,
+    buffer: BufHandle,
+    restore: &mut Option<R>,
+    succeeded: bool,
+    unload: bool,
+) {
+    if let Some(restore) = restore.take() {
+        restore(session, succeeded);
+    }
+    if unload {
+        session.with_editor_mut(|editor| {
+            if let Ok(state) = editor.buffer_mut(buffer) {
+                let _ = state.unload();
+            }
+        });
+    }
+}
+
 /// Loads an unloaded named buffer before an API buffer switch.
 ///
 /// `nvim_win_set_buf` and `nvim_set_current_buf` share the same
-/// `BufReadPre`/`BufReadPost`/`BufNewFile` ordering. The read is deliberately
-/// split around `BufReadPre`: a callback may replace the file before the
-/// second read, and the editor borrow must end before that callback runs.
-pub(crate) fn load_buffer_for_switch(
+/// `BufReadPre`/`BufReadPost`/`BufNewFile` ordering. The target is made current
+/// with a real empty resident state before `BufReadPre`; the read then happens
+/// after that callback because it may re-enter any API. A missing file takes
+/// the `BufNewFile` path. A non-`NotFound` read failure restores the old
+/// window/buffer pairing and leaves the target unloaded.
+pub(crate) fn load_buffer_for_switch<S, R>(
     session: &ApiSession,
     buffer: BufHandle,
-) -> Result<(), ApiError> {
+    switch: S,
+    restore: R,
+) -> Result<bool, ApiError>
+where
+    S: FnOnce(&ApiSession) -> Result<(), ApiError>,
+    R: FnOnce(&ApiSession, bool),
+{
     let (loaded, name, nofileread) = session.with_editor(|editor| {
         let state = editor.buffer(buffer).map_err(exception)?;
         let buftype = match editor.options().get_buffer(buffer, "buftype") {
@@ -752,62 +782,101 @@ pub(crate) fn load_buffer_for_switch(
         ))
     })?;
     if loaded {
-        return Ok(());
+        return Ok(false);
     }
-    if name.as_bytes().is_empty() || nofileread {
-        return session.with_editor_mut(|editor| {
+
+    let mut restore = Some(restore);
+    let Some(path) = (!name.as_bytes().is_empty() && !nofileread)
+        .then(|| PathBuf::from(name.to_string_lossy().as_ref()))
+    else {
+        session.with_editor_mut(|editor| {
             let state = editor.buffer_mut(buffer).map_err(exception)?;
             state.load(Buffer::new());
             state.mark_saved();
             state.flags.set(BufferFlags::NOTEDITED, false);
             Ok(())
-        });
-    }
+        })?;
+        if let Err(error) = switch(session) {
+            finish_buffer_switch(session, buffer, &mut restore, false, true);
+            return Err(error);
+        }
+        return Ok(true);
+    };
 
-    let path = PathBuf::from(name.to_string_lossy().as_ref());
-    let existing = match RealFileIO.read_to_string(&path) {
-        Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+    let new_file = match RealFileIO.read_to_string(&path) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(_) => {
             return Err(exception(
                 ox_editor::buffer::BufferStateError::Unloaded,
             ));
         }
     };
-    if existing {
-        fire_buffer_read_event(session, Event::BufReadPre, buffer)?;
+
+    // `enter_buffer` creates the target's memfile before `BufReadPre`.
+    // Materialize that real empty state explicitly; the low-level setter only
+    // attaches resident buffers and must not perform file I/O.
+    session.with_editor_mut(|editor| {
+        let state = editor.buffer_mut(buffer).map_err(exception)?;
+        state.load(Buffer::new());
+        state.mark_saved();
+        state.flags.set(BufferFlags::NOTEDITED, false);
+        Ok(())
+    })?;
+    if let Err(error) = switch(session) {
+        finish_buffer_switch(session, buffer, &mut restore, false, true);
+        return Err(error);
     }
 
-    let content = if existing {
-        Some(
-            RealFileIO
-                .read_to_string(&path)
-                .map_err(|_| exception(ox_editor::buffer::BufferStateError::Unloaded))?,
-        )
-    } else {
-        None
+    if !new_file {
+        if let Err(error) = fire_buffer_read_event(session, Event::BufReadPre, buffer) {
+            finish_buffer_switch(session, buffer, &mut restore, false, true);
+            return Err(error);
+        }
+    }
+
+    if new_file {
+        if let Err(error) = fire_buffer_read_event(session, Event::BufNewFile, buffer) {
+            finish_buffer_switch(session, buffer, &mut restore, false, false);
+            return Err(error);
+        }
+        finish_buffer_switch(session, buffer, &mut restore, true, false);
+        return Ok(true);
+    }
+
+    let content = match RealFileIO.read_to_string(&path) {
+        Ok(content) => content,
+        Err(_) => {
+            finish_buffer_switch(session, buffer, &mut restore, false, true);
+            return Err(exception(
+                ox_editor::buffer::BufferStateError::Unloaded,
+            ));
+        }
     };
-    session.with_editor_mut(|editor| {
-        let text = match content {
-            Some(content) => Buffer::from_bytes(content.as_bytes()).map_err(exception)?,
-            None => Buffer::new(),
-        };
+    let text = match Buffer::from_bytes(content.as_bytes()) {
+        Ok(text) => text,
+        Err(error) => {
+            finish_buffer_switch(session, buffer, &mut restore, false, true);
+            return Err(exception(error));
+        }
+    };
+    if let Err(error) = session.with_editor_mut(|editor| {
         let state = editor.buffer_mut(buffer).map_err(exception)?;
         state.load(text);
         state.mark_saved();
         state.flags.set(BufferFlags::NOTEDITED, false);
         Ok(())
-    })?;
+    }) {
+        finish_buffer_switch(session, buffer, &mut restore, false, true);
+        return Err(error);
+    }
 
-    fire_buffer_read_event(
-        session,
-        if existing {
-            Event::BufReadPost
-        } else {
-            Event::BufNewFile
-        },
-        buffer,
-    )
+    if let Err(error) = fire_buffer_read_event(session, Event::BufReadPost, buffer) {
+        finish_buffer_switch(session, buffer, &mut restore, false, false);
+        return Err(error);
+    }
+    finish_buffer_switch(session, buffer, &mut restore, true, false);
+    Ok(true)
 }
 
 #[api(since = 1, method)]
@@ -824,12 +893,56 @@ pub fn nvim_win_set_buf(
 ) -> Result<(), ApiError> {
     let win = resolve_window(session, win)?;
     let buf = resolve_buffer(session, buf)?;
-    load_buffer_for_switch(session, buf)?;
-    session.with_editor_mut(|editor| {
+    let caller = session
+        .with_editor(Editor::current_window)
+        .ok_or_else(|| ApiError::exception("No current window"))?;
+    let original = session.with_editor(|editor| {
         editor
-            .set_window_buffer(win, buf, BufferRelease::KeepLoaded)
+            .window(win)
+            .map(|window| window.buffer)
             .map_err(exception)
-    })
+    })?;
+    let switched = load_buffer_for_switch(
+        session,
+        buf,
+        move |session| {
+            session.with_editor_mut(|editor| {
+                if editor.current_window() != Some(win) {
+                    editor.set_current_window(win).map_err(exception)?;
+                }
+                editor
+                    .set_window_buffer(win, buf, BufferRelease::KeepLoaded)
+                    .map_err(exception)
+            })
+        },
+        move |session, succeeded| {
+            session.with_editor_mut(|editor| {
+                if !succeeded
+                    && editor
+                        .window(win)
+                        .is_ok_and(|window| window.buffer == buf)
+                    && editor.buffer(original).is_ok()
+                {
+                    let _ = editor.set_window_buffer(
+                        win,
+                        original,
+                        BufferRelease::KeepLoaded,
+                    );
+                }
+                if caller != win && editor.window(caller).is_ok() {
+                    let _ = editor.set_current_window(caller);
+                }
+            });
+        },
+    )?;
+    if !switched {
+        session.with_editor_mut(|editor| {
+            editor
+                .set_window_buffer(win, buf, BufferRelease::KeepLoaded)
+                .map_err(exception)
+        })?;
+    }
+    Ok(())
 }
 
 #[api(since = 1, method)]

@@ -736,8 +736,8 @@ pub fn bind_api(
     // above: absent from the canonical metadata, bound here by hand. The
     // validation matrix mirrors upstream exactly (its strings are
     // test-visible, e.g. api/vim_spec.lua's `nvim__redraw` block), and the
-    // resolved request is queued on the editor for the server's redraw
-    // pass — the same sink-and-drain shape `nvim_ui_send` uses.
+    // request — including whether `flush` was supplied — is queued on the
+    // editor for the server's redraw pass.
     let native_redraw = lua.create_function(move |lua, opts: Table| {
         let session = redraw_context.session();
         let fail = |message: String| -> mlua::Result<(bool, Value)> {
@@ -815,12 +815,9 @@ pub fn bind_api(
             }
         }
         // Decode the validated flags with `nlua_pop_Boolean_strict`
-        // semantics — booleans pass, numbers compare `!= 0` — and apply
-        // upstream's implicit flush: a present `valid` or `range` flushes
-        // unless `flush` explicitly declines (vim.c:2544-2546). The
-        // resolved request rides the editor sink, so the server's redraw
-        // pass stays the single owner of delivery, exactly like
-        // `nvim_ui_send`'s payload queue.
+        // semantics — booleans pass, numbers compare `!= 0`. Keep `flush`
+        // optional: the redraw pass must distinguish an omitted field from an
+        // explicit false before applying `vim.c:2541-2543`.
         let strict_flag = |key: &str| -> mlua::Result<Option<bool>> {
             if opts.contains_key(key).unwrap_or(false) {
                 Ok(Some(boolean_strict(opts.raw_get::<Value>(key)?)))
@@ -840,8 +837,7 @@ pub fn bind_api(
             buffer,
             valid: validity,
             range,
-            flush: strict_flag("flush")?
-                .unwrap_or_else(|| validity.is_some() || range.is_some()),
+            flush: strict_flag("flush")?,
             cursor: strict_flag("cursor")?.unwrap_or(false),
             tabline: strict_flag("tabline")?.unwrap_or(false),
             statusline: strict_flag("statusline")?.unwrap_or(false),
@@ -1182,10 +1178,28 @@ fn with_c(
         if let (Some((window, _)), Some(buffer)) = (entered, buf_handle)
             && Some(window) == caller
         {
-            // Hidden buffer target: take over the caller window.
-            session.with_editor_mut(|editor| {
-                let _ = editor.set_current_buffer(buffer, BufferRelease::KeepLoaded);
-            });
+            // Hidden buffer target: take over the caller window without
+            // opening its file, matching upstream `ctx_switch`.
+            if let Err(error) = session
+                .with_editor_mut(|editor| editor.enter_buffer_context(buffer))
+            {
+                restore_with_c_context(
+                    session,
+                    entered,
+                    caller,
+                    previous_before,
+                    keepcwd,
+                    target_window,
+                    target_local.flatten(),
+                );
+                if keepcwd && let Some(cwd) = &process_cwd {
+                    let _ = std::env::set_current_dir(cwd);
+                }
+                if let Some(routing) = saved_routing {
+                    session.with_editor_mut(|editor| editor.message_routing = routing);
+                }
+                return Err(mlua::Error::runtime(error.to_string()));
+            }
         }
     }
 

@@ -593,13 +593,40 @@ pub fn nvim_set_current_buf(session: &ApiSession, buf: BufHandle) -> Result<(), 
     if session.with_editor(|editor| editor.buffer(buf).is_err()) {
         return Ok(());
     }
-    // The read events fire here rather than inside `set_current_buffer`
-    // so a `BufReadPre` handler sees a consistent editor before the
-    // buffer actually becomes current (`window.rs` loader contract).
-    crate::window::load_buffer_for_switch(session, buf)?;
-    session
-        .with_editor_mut(|editor| editor.set_current_buffer(buf, BufferRelease::KeepLoaded))
-        .map_err(exception)?;
+    // The loader stages a real empty resident state, switches the current
+    // window to the target, and runs the read lifecycle before installing
+    // file contents. Thus current-buffer operations in `BufReadPre` observe
+    // the target, while the low-level setter itself performs no file I/O.
+    let switched = crate::window::load_buffer_for_switch(
+        session,
+        buf,
+        |session| {
+            session
+                .with_editor_mut(|editor| {
+                    editor
+                        .set_current_buffer(buf, BufferRelease::KeepLoaded)
+                        .map_err(exception)
+                })
+        },
+        move |session, succeeded| {
+            if !succeeded
+                && let Some(old) = old
+            {
+                let _ = session.with_editor_mut(|editor| {
+                    editor
+                        .set_current_buffer(old, BufferRelease::KeepLoaded)
+                });
+            }
+        },
+    )?;
+    if !switched {
+        session
+            .with_editor_mut(|editor| {
+                editor
+                    .set_current_buffer(buf, BufferRelease::KeepLoaded)
+                    .map_err(exception)
+            })?;
+    }
     fire_focus_events(session, &transition.enters, Some(buf))
 }
 
@@ -2558,7 +2585,7 @@ fn dict_bool(dict: &Dict, key: &str) -> Result<Option<bool>, ApiError> {
 /// Coerces an already-validated strict-`Boolean` keyset member
 /// (`nlua_pop_Boolean_strict`): booleans pass through, numbers are truthy
 /// when nonzero, `nil` and an absent key are `false`.
-fn dict_strict_bool(dict: &Dict, key: &str) -> bool {
+pub fn dict_strict_bool(dict: &Dict, key: &str) -> bool {
     match dict.get(&OxStr::from(key)) {
         Some(Object::Boolean(value)) => *value,
         Some(Object::Integer(value)) => *value != 0,

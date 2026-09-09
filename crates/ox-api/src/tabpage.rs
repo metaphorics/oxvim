@@ -165,8 +165,14 @@ pub fn nvim_open_tabpage(
         Some(_) => return Err(invalid_config("after", "expected Integer")),
         None => 0,
     };
-    let (original, original_buffer) =
-        session.with_editor(|editor| (editor.current_tabpage(), editor.current_buffer()));
+    let (original, original_buffer, caller_window) =
+        session.with_editor(|editor| {
+            (
+                editor.current_tabpage(),
+                editor.current_buffer(),
+                editor.current_window(),
+            )
+        });
     let original_buffer =
         original_buffer.ok_or_else(|| ApiError::exception("No current buffer"))?;
     if enter {
@@ -207,11 +213,49 @@ pub fn nvim_open_tabpage(
     let window = session
         .with_editor(|editor| editor.tabpage(tabpage).map(TabpageState::current_window))
         .map_err(|_| ApiError::exception("Tabpage was closed immediately"))?;
-    session
-        .with_editor_mut(|editor| {
-            editor.set_window_buffer(window, buffer, BufferRelease::KeepLoaded)
-        })
-        .map_err(exception)?;
+    let switched = crate::window::load_buffer_for_switch(
+        session,
+        buffer,
+        move |session| {
+            session.with_editor_mut(|editor| {
+                if editor.current_window() != Some(window) {
+                    editor.set_current_window(window).map_err(exception)?;
+                }
+                editor
+                    .set_window_buffer(window, buffer, BufferRelease::KeepLoaded)
+                    .map_err(exception)
+            })
+        },
+        move |session, succeeded| {
+            session.with_editor_mut(|editor| {
+                if !succeeded
+                    && editor
+                        .window(window)
+                        .is_ok_and(|state| state.buffer == buffer)
+                    && editor.buffer(original_buffer).is_ok()
+                {
+                    let _ = editor.set_window_buffer(
+                        window,
+                        original_buffer,
+                        BufferRelease::KeepLoaded,
+                    );
+                }
+                if !enter
+                    && let Some(caller_window) = caller_window
+                    && editor.window(caller_window).is_ok()
+                {
+                    let _ = editor.set_current_window(caller_window);
+                }
+            });
+        },
+    )?;
+    if !switched {
+        session
+            .with_editor_mut(|editor| {
+                editor.set_window_buffer(window, buffer, BufferRelease::KeepLoaded)
+            })
+            .map_err(exception)?;
+    }
     if session.with_editor(|editor| editor.tabpage(tabpage).is_err()) {
         return Err(ApiError::exception("Tabpage was closed immediately"));
     }

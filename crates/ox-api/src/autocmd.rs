@@ -114,10 +114,11 @@ fn run_in_buffer_context(
         return Ok(None);
     }
     // Upstream `ctx_switch` (legacy `aucmd_prepbuf`) enters the target even
-    // when its text is not resident; `set_current_buffer` materializes an
-    // unloaded buffer through the same empty-text policy `set_window_buffer`
-    // already applies. Only a target wiped between planning and firing still
-    // runs in place — there is no window state left to enter.
+    // when its text is not resident; materialize an empty state explicitly
+    // before the low-level setter so the callback observes the target as
+    // current without opening its named file. Only a target wiped between
+    // planning and firing still runs in place — there is no window state left
+    // to enter.
     let target_live = session.with_editor(|editor| {
         let target = if buffer.is_current() {
             editor.current_buffer()
@@ -183,7 +184,7 @@ fn run_in_buffer_context(
                 None => {
                     let original = caller_buffer.unwrap_or(target);
                     editor
-                        .set_current_buffer(target, BufferRelease::KeepLoaded)
+                        .enter_buffer_context(target)
                         .map_err(switch_error)?;
                     Some((caller, original))
                 }

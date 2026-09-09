@@ -1014,16 +1014,13 @@ pub fn nvim_buf_call(
                 }
                 Some(_) => None, // caller shows target (covered above)
                 None => {
-                    // Hidden buffer: take over the caller window.
+                    // Hidden buffer: take over the caller window. Context
+                    // switches bind unloaded buffers without opening files.
                     let original = caller_buffer.unwrap_or(buffer);
-                    if editor
-                        .set_current_buffer(buffer, BufferRelease::KeepLoaded)
-                        .is_ok()
-                    {
-                        Some((caller, original))
-                    } else {
-                        None
-                    }
+                    editor
+                        .enter_buffer_context(buffer)
+                        .ok()
+                        .map(|()| (caller, original))
                 }
             }
         }),

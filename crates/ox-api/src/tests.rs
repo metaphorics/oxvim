@@ -513,6 +513,82 @@ fn set_current_buf_fires_the_buffer_lifecycle_in_order() {
     assert_eq!(actions.borrow().len(), 3, "same buffer must not fire");
 }
 
+#[test]
+fn set_current_buf_read_hook_sets_target_buffer_local_option() {
+    let (editor, source, _, _) = editor_with_lines(&["source"]);
+    let session = session_with(editor);
+    let path = std::env::temp_dir().join(format!(
+        "oxvim-api-current-buffer-hook-{}",
+        std::process::id()
+    ));
+    std::fs::write(&path, b"target\n").unwrap();
+    crate::global::nvim_set_option_value(
+        &session,
+        OxStr::from("shiftwidth"),
+        Object::Integer(8),
+        dict(&[("scope", Object::String(OxStr::from("local")))]),
+    )
+    .unwrap();
+    let target = session.with_editor_mut(|editor| {
+        let target = editor.create_buffer(true).unwrap();
+        let state = editor.buffer_mut(target).unwrap();
+        state.set_name(OxStr::from(path.to_string_lossy().as_ref()));
+        state.unload().unwrap();
+        target
+    });
+    let setlocal = Rc::new(|session: &crate::ApiSession| {
+        crate::global::nvim_set_option_value(
+            session,
+            OxStr::from("shiftwidth"),
+            Object::Integer(3),
+            dict(&[("scope", Object::String(OxStr::from("local")))]),
+        )
+        .map(|_| ())
+    });
+    crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("BufReadPre")),
+        dict(&[
+            ("pattern", Object::String(OxStr::from("*"))),
+            ("command", Object::String(OxStr::from("setlocal shiftwidth=3"))),
+        ]),
+    )
+    .unwrap();
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions,
+            reenter: Some(setlocal),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::global::nvim_set_current_buf(&session, target).unwrap();
+
+    assert_eq!(
+        session.with_editor(|editor| {
+            editor
+                .options()
+                .get_buffer(target, "shiftwidth")
+                .unwrap()
+                .clone()
+        }),
+        OptionValue::Number(3),
+    );
+    assert_eq!(
+        session.with_editor(|editor| {
+            editor
+                .options()
+                .get_buffer(source, "shiftwidth")
+                .unwrap()
+                .clone()
+        }),
+        OptionValue::Number(8),
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
 /// A nonexistent target fails through `find_buffer_by_handle`'s
 /// `VALIDATE_INT` before any event (api/vim.c:967,
 /// api/private/helpers.c:263-275): a validation-type `Invalid buffer id`,
@@ -7816,6 +7892,106 @@ fn buf_get_offset_no_virtual_newline_when_eol_and_fixeol_both_false() {
         crate::buffer::nvim_buf_get_offset(&session, buffer, 3).unwrap(),
         11
     );
+}
+
+#[test]
+fn open_tabpage_loads_unloaded_buffer_before_read_hooks() {
+    let (editor, source, original_tab, _) = editor_with_lines(&["source"]);
+    let session = session_with(editor);
+    let path = std::env::temp_dir().join(format!(
+        "oxvim-api-open-tabpage-hook-{}",
+        std::process::id()
+    ));
+    std::fs::write(&path, b"target\n").unwrap();
+    crate::global::nvim_set_option_value(
+        &session,
+        OxStr::from("shiftwidth"),
+        Object::Integer(8),
+        dict(&[("scope", Object::String(OxStr::from("local")))]),
+    )
+    .unwrap();
+    let target = session.with_editor_mut(|editor| {
+        let target = editor.create_buffer(true).unwrap();
+        let state = editor.buffer_mut(target).unwrap();
+        state.set_name(OxStr::from(path.to_string_lossy().as_ref()));
+        state.unload().unwrap();
+        target
+    });
+    crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("BufReadPre")),
+        dict(&[
+            ("pattern", Object::String(OxStr::from("*"))),
+            ("command", Object::String(OxStr::from("setlocal shiftwidth=3"))),
+        ]),
+    )
+    .unwrap();
+    let setlocal = Rc::new(|session: &crate::ApiSession| {
+        crate::global::nvim_set_option_value(
+            session,
+            OxStr::from("shiftwidth"),
+            Object::Integer(3),
+            dict(&[("scope", Object::String(OxStr::from("local")))]),
+        )
+        .map(|_| ())
+    });
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: Rc::new(RefCell::new(Vec::new())),
+            reenter: Some(setlocal),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    let tab = crate::tabpage::nvim_open_tabpage(&session, target, false, dict(&[])).unwrap();
+
+    assert_eq!(
+        session.with_editor(Editor::current_tabpage),
+        Some(original_tab)
+    );
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(source)
+    );
+    assert_eq!(
+        session.with_editor(|editor| {
+            editor
+                .buffer(target)
+                .unwrap()
+                .text()
+                .unwrap()
+                .line(1)
+        }),
+        Ok(b"target".to_vec())
+    );
+    assert_eq!(
+        session.with_editor(|editor| {
+            editor
+                .options()
+                .get_buffer(target, "shiftwidth")
+                .unwrap()
+                .clone()
+        }),
+        OptionValue::Number(3)
+    );
+    assert_eq!(
+        session.with_editor(|editor| {
+            editor
+                .options()
+                .get_buffer(source, "shiftwidth")
+                .unwrap()
+                .clone()
+        }),
+        OptionValue::Number(8)
+    );
+    let window = session
+        .with_editor(|editor| editor.tabpage(tab).unwrap().current_window());
+    assert_eq!(
+        session.with_editor(|editor| editor.window(window).unwrap().buffer),
+        target
+    );
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

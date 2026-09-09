@@ -3276,21 +3276,18 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
             command,
             BufferRemoveKind::Unload,
         ),
-        "args" => access.with_ex_editor(|editor| command_args(runtime, editor, command)),
-        "next" => access.with_ex_editor(|editor| command_next(runtime, editor, command)),
+        "args" => command_args(runtime, access, scope, lua, command),
+        "next" => command_next(runtime, access, scope, lua, command),
         "first" | "rewind" => {
-            access.with_ex_editor(|editor| command_argument_absolute(runtime, editor, command, 0))
+            command_argument_absolute(runtime, access, scope, lua, command, 0)
         }
-        "last" => access
-            .with_ex_editor(|editor| command_argument_absolute(runtime, editor, command, i64::MAX)),
-        "argument" => access.with_ex_editor(|editor| command_argument(runtime, editor, command)),
-        "previous" | "Next" => {
-            access.with_ex_editor(|editor| command_previous(runtime, editor, command))
-        }
+        "last" => command_argument_absolute(runtime, access, scope, lua, command, i64::MAX),
+        "argument" => command_argument(runtime, access, scope, lua, command),
+        "previous" | "Next" => command_previous(runtime, access, scope, lua, command),
         "wnext" => {
             let flow = command_write(runtime, access, scope, lua, command);
             if matches!(flow, Flow::Normal) && !runtime.write_silent_fail {
-                access.with_ex_editor(|editor| command_next(runtime, editor, command))
+                command_next(runtime, access, scope, lua, command)
             } else {
                 flow
             }
@@ -3298,7 +3295,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "wprevious" => {
             let flow = command_write(runtime, access, scope, lua, command);
             if matches!(flow, Flow::Normal) && !runtime.write_silent_fail {
-                access.with_ex_editor(|editor| command_previous(runtime, editor, command))
+                command_previous(runtime, access, scope, lua, command)
             } else {
                 flow
             }
@@ -6641,6 +6638,63 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
             return flow;
         }
     }
+    let unloaded = !access.with_ex_editor(|editor| {
+        editor
+            .buffer(handle)
+            .is_ok_and(|state| state.residency.is_loaded())
+    });
+    if unloaded
+        && access
+            .with_ex_editor(|editor| editor.current_window())
+            .is_some()
+    {
+        let old = access.with_ex_editor(|editor| editor.current_buffer());
+        match load_buffer_for_switch(
+            runtime,
+            access,
+            scope,
+            lua,
+            handle,
+            || access.with_ex_editor(|editor| editor.set_current_buffer(handle, BufferRelease::KeepLoaded)),
+            || {
+                if let Some(old) = old {
+                    let _ = access.with_ex_editor(|editor| {
+                        editor.set_current_buffer(old, BufferRelease::KeepLoaded)
+                    });
+                }
+            },
+        ) {
+            Ok(_) => {}
+            Err(LoadSwitchError::Flow(flow)) => return flow,
+            Err(LoadSwitchError::Editor(error)) => {
+                return error_flow(runtime, "E948", error.to_string());
+            }
+        }
+    } else if unloaded {
+        // Without a current window there is no context in which to run a
+        // read lifecycle. Load the existing target before creating the first
+        // tabpage, preserving the bootstrap path used for new buffers.
+        let text = match runtime.scripts.io().read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return error_flow(runtime, "E484", format!("Can't open file {}: {error}", path.display()));
+            }
+        };
+        let buffer_text = match Buffer::from_bytes(text.as_bytes()) {
+            Ok(buffer) => buffer,
+            Err(error) => return error_flow(runtime, "E474", error.to_string()),
+        };
+        if let Err(error) = access.with_ex_editor(|editor| {
+            let state = editor.buffer_mut(handle)?;
+            state.load(buffer_text);
+            state.mark_saved();
+            state.flags.set(crate::BufferFlags::NOTEDITED, false);
+            Ok::<_, EditorError>(())
+        }) {
+            return error_flow(runtime, "E948", error.to_string());
+        }
+    }
     if access.with_ex_editor(|editor| editor.current_window().is_none()) {
         match access
             .with_ex_editor(|editor| editor.create_tabpage(handle, DEFAULT_TABPAGE_GEOMETRY))
@@ -6648,8 +6702,9 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
             Ok(_) => {}
             Err(error) => return error_flow(runtime, "E948", error.to_string()),
         }
-    } else if let Err(error) =
-        access.with_ex_editor(|editor| editor.set_current_buffer(handle, BufferRelease::KeepLoaded))
+    } else if !unloaded
+        && let Err(error) =
+            access.with_ex_editor(|editor| editor.set_current_buffer(handle, BufferRelease::KeepLoaded))
     {
         return error_flow(runtime, "E948", error.to_string());
     }
@@ -6679,7 +6734,7 @@ fn command_tag<F: FileIO, E: ExEditorAccess>(
             return tag_step_to(runtime, access, scope, lua, 1, preview);
         }
         "tlast" | "ptlast" => return tag_step_to(runtime, access, scope, lua, usize::MAX, preview),
-        "pop" => return access.with_ex_editor(|editor| command_pop(runtime, editor, command)),
+        "pop" => return command_pop(runtime, access, scope, lua, command),
         _ => {}
     }
     let needle = command.args.trim();
@@ -6920,6 +6975,13 @@ fn jump_to_tag<F: FileIO, E: ExEditorAccess>(
             Ok((handle, _)) => handle,
             Err(flow) => return flow,
         };
+    // `buffer_from_file` reuses an existing named buffer, which the user may
+    // have unloaded since. Upstream reaches a tag target through the
+    // load-capable file path, so read it before deciding where it lands.
+    let flow = prepare_buffer_for_display(runtime, access, scope, lua, handle);
+    if !matches!(flow, Flow::Normal) {
+        return flow;
+    }
     if let Err(flow) = access.with_ex_editor(|editor| {
         open_tag_buffer(
             runtime,
@@ -8054,12 +8116,17 @@ fn tag_forward<F: FileIO, E: ExEditorAccess>(
     flow
 }
 
-fn command_pop<F: FileIO>(
+fn command_pop<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
 ) -> Flow {
-    let Some(window) = editor.current_window() else {
+    // The tag stack records a buffer the user may have unloaded since, so the
+    // pre-checks and the pop run under the editor borrow, the read happens
+    // outside it, and only then does the window switch.
+    let Some(window) = access.with_ex_editor(|editor| editor.current_window()) else {
         return error_flow(runtime, "E73", "Tag stack empty");
     };
     let count = command
@@ -8067,13 +8134,23 @@ fn command_pop<F: FileIO>(
         .and_then(|value| usize::try_from(value).ok())
         .or_else(|| wincmd_range_count(command))
         .unwrap_or(1);
-    let old_idx = editor
-        .window_tag_stack(window)
-        .map_or(1, crate::tags::TagStack::curidx);
-    let item = match editor
-        .window_tag_stack_mut(window)
-        .map(|stack| stack.pop(count))
-    {
+    let old_idx = access.with_ex_editor(|editor| {
+        editor
+            .window_tag_stack(window)
+            .map_or(1, crate::tags::TagStack::curidx)
+    });
+    let restore_curidx = |access: &E| {
+        access.with_ex_editor(|editor| {
+            if let Ok(stack) = editor.window_tag_stack_mut(window) {
+                stack.set_curidx(i64::try_from(old_idx).unwrap_or(i64::MAX));
+            }
+        });
+    };
+    let item = match access.with_ex_editor(|editor| {
+        editor
+            .window_tag_stack_mut(window)
+            .map(|stack| stack.pop(count))
+    }) {
         Ok(Ok(item)) => item,
         Ok(Err(crate::tags::TagStackBoundary::Empty)) => {
             return error_flow(runtime, "E73", "Tag stack empty");
@@ -8086,41 +8163,45 @@ fn command_pop<F: FileIO>(
         }
         Err(_) => return error_flow(runtime, "E73", "Tag stack empty"),
     };
-    let current = editor.current_buffer();
-    if current != Some(item.from_bufnr)
-        && current.is_some_and(|handle| {
-            editor
-                .buffer(handle)
-                .is_ok_and(|buffer| buffer.flags.contains(crate::BufferFlags::MODIFIED))
-        })
-        && !command.bang
-    {
-        if let Ok(stack) = editor.window_tag_stack_mut(window) {
-            stack.set_curidx(i64::try_from(old_idx).unwrap_or(i64::MAX));
-        }
+    let blocked = access.with_ex_editor(|editor| {
+        let current = editor.current_buffer();
+        current != Some(item.from_bufnr)
+            && current.is_some_and(|handle| {
+                editor
+                    .buffer(handle)
+                    .is_ok_and(|buffer| buffer.flags.contains(crate::BufferFlags::MODIFIED))
+            })
+    });
+    if blocked && !command.bang {
+        restore_curidx(access);
         return error_flow(
             runtime,
             "E37",
             "No write since last change (add ! to override)",
         );
     }
-    if editor
-        .set_current_buffer(item.from_bufnr, BufferRelease::KeepLoaded)
+    let flow = prepare_buffer_for_display(runtime, access, scope, lua, item.from_bufnr);
+    if !matches!(flow, Flow::Normal) {
+        restore_curidx(access);
+        return flow;
+    }
+    if access
+        .with_ex_editor(|editor| {
+            editor.set_current_buffer(item.from_bufnr, BufferRelease::KeepLoaded)
+        })
         .is_err()
     {
-        if let Ok(stack) = editor.window_tag_stack_mut(window) {
-            stack.set_curidx(i64::try_from(old_idx).unwrap_or(i64::MAX));
-        }
+        restore_curidx(access);
         return error_flow(runtime, "E555", "At bottom of tag stack");
     }
     let target = Position {
         lnum: item.from_lnum.max(1),
         col: item.from_col.saturating_sub(1),
     };
-    if let Err(error) = editor.set_window_cursor(window, target) {
-        if let Ok(stack) = editor.window_tag_stack_mut(window) {
-            stack.set_curidx(i64::try_from(old_idx).unwrap_or(i64::MAX));
-        }
+    if let Err(error) =
+        access.with_ex_editor(|editor| editor.set_window_cursor(window, target))
+    {
+        restore_curidx(access);
         return error_flow(runtime, "E16", error.to_string());
     }
     Flow::Normal
@@ -11456,20 +11537,44 @@ enum LoadSwitchError {
     Editor(EditorError),
 }
 
+/// Reverses the display change made before a read callback and optionally
+/// returns the target to its unloaded state. The restore callback does not run
+/// user code; it only undoes the low-level buffer/window transition.
+fn rollback_buffer_switch<E: ExEditorAccess, R: FnOnce()>(
+    access: &E,
+    buffer: BufHandle,
+    restore: &mut Option<R>,
+    unload: bool,
+) {
+    if let Some(restore) = restore.take() {
+        restore();
+    }
+    if unload {
+        access.with_ex_editor(|editor| {
+            if let Ok(state) = editor.buffer_mut(buffer) {
+                let _ = state.unload();
+            }
+        });
+    }
+}
+
 /// Loads an unloaded file-backed buffer before a focus switch.
 ///
 /// This is the executor-side counterpart of `call_bufload_with_events`:
-/// `BufReadPre` runs before the second read, and `BufReadPost` runs after the
+/// `BufLeave` has already run, the target is made current with an empty memfile,
+/// `BufReadPre` runs before the real read, and `BufReadPost` runs after the
 /// text is installed. A missing file keeps the new-file path (`BufNewFile`);
 /// unnamed and no-file-read buffers materialize empty text without read
-/// events. A non-`NotFound` read failure preserves the unloaded-buffer
-/// contract instead of attaching fabricated empty text.
+/// events. A non-`NotFound` read failure restores the old buffer, unloads the
+/// staged target, and preserves the unloaded-buffer contract.
 fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
     lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     buffer: BufHandle,
+    switch: impl FnOnce() -> Result<(), EditorError>,
+    restore: impl FnOnce(),
 ) -> Result<bool, LoadSwitchError> {
     let (loaded, name, nofileread) = access
         .with_ex_editor(|editor| {
@@ -11486,6 +11591,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
         return Ok(false);
     }
 
+    let mut restore = Some(restore);
     let Some(path) = (!name.as_bytes().is_empty() && !nofileread)
         .then(|| PathBuf::from(name.to_string_lossy().as_ref()))
     else {
@@ -11498,6 +11604,10 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
                 Ok(())
             })
             .map_err(LoadSwitchError::Editor)?;
+        if let Err(error) = switch() {
+            rollback_buffer_switch(access, buffer, &mut restore, true);
+            return Err(LoadSwitchError::Editor(error));
+        }
         return Ok(true);
     };
 
@@ -11511,6 +11621,23 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
         }
     };
 
+    // `enter_buffer` creates the target's memfile before `BufReadPre`.
+    // Materialize that real empty state explicitly; the low-level setter only
+    // attaches resident buffers and must not perform file I/O.
+    access
+        .with_ex_editor(|editor| -> Result<(), EditorError> {
+            let state = editor.buffer_mut(buffer)?;
+            state.load(Buffer::new());
+            state.mark_saved();
+            state.flags.set(crate::BufferFlags::NOTEDITED, false);
+            Ok(())
+        })
+        .map_err(LoadSwitchError::Editor)?;
+    if let Err(error) = switch() {
+        rollback_buffer_switch(access, buffer, &mut restore, true);
+        return Err(LoadSwitchError::Editor(error));
+    }
+
     if !new_file {
         let flow = fire_buffer_lifecycle(
             runtime,
@@ -11521,50 +11648,88 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
             buffer,
         );
         if !matches!(flow, Flow::Normal) {
+            rollback_buffer_switch(access, buffer, &mut restore, true);
             return Err(LoadSwitchError::Flow(flow));
         }
     }
 
-    let content = if new_file {
-        None
-    } else {
-        Some(
-            runtime
-                .scripts
-                .io()
-                .read_to_string(&path)
-                .map_err(|_| {
-                    LoadSwitchError::Editor(EditorError::Buffer(
-                        crate::buffer::BufferStateError::Unloaded,
-                    ))
-                })?,
-        )
-    };
-    let text = match content.as_deref() {
-        Some(content) => Buffer::from_bytes(content.as_bytes())
-            .map_err(|error| LoadSwitchError::Editor(EditorError::Buffer(error.into())))?,
-        None => Buffer::new(),
-    };
-    access
-        .with_ex_editor(|editor| -> Result<(), EditorError> {
-            let state = editor.buffer_mut(buffer)?;
-            state.load(text);
-            state.mark_saved();
-            state.flags.set(crate::BufferFlags::NOTEDITED, false);
-            Ok(())
-        })
-        .map_err(LoadSwitchError::Editor)?;
+    if new_file {
+        let flow = fire_buffer_lifecycle(
+            runtime,
+            access,
+            scope,
+            lua,
+            &[Event::BufNewFile],
+            buffer,
+        );
+        if !matches!(flow, Flow::Normal) {
+            rollback_buffer_switch(access, buffer, &mut restore, false);
+            return Err(LoadSwitchError::Flow(flow));
+        }
+        return Ok(true);
+    }
 
-    let event = if new_file {
-        Event::BufNewFile
-    } else {
-        Event::BufReadPost
+    let content = match runtime.scripts.io().read_to_string(&path) {
+        Ok(content) => content,
+        Err(_) => {
+            rollback_buffer_switch(access, buffer, &mut restore, true);
+            return Err(LoadSwitchError::Editor(EditorError::Buffer(
+                crate::buffer::BufferStateError::Unloaded,
+            )));
+        }
     };
-    let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[event], buffer);
+    let text = match Buffer::from_bytes(content.as_bytes()) {
+        Ok(text) => text,
+        Err(error) => {
+            rollback_buffer_switch(access, buffer, &mut restore, true);
+            return Err(LoadSwitchError::Editor(EditorError::Buffer(error.into())));
+        }
+    };
+    if let Err(error) = access.with_ex_editor(|editor| -> Result<(), EditorError> {
+        let state = editor.buffer_mut(buffer)?;
+        state.load(text);
+        state.mark_saved();
+        state.flags.set(crate::BufferFlags::NOTEDITED, false);
+        Ok(())
+    }) {
+        rollback_buffer_switch(access, buffer, &mut restore, true);
+        return Err(LoadSwitchError::Editor(error));
+    }
+
+    let flow = fire_buffer_lifecycle(
+        runtime,
+        access,
+        scope,
+        lua,
+        &[Event::BufReadPost],
+        buffer,
+    );
     if !matches!(flow, Flow::Normal) {
+        rollback_buffer_switch(access, buffer, &mut restore, false);
         return Err(LoadSwitchError::Flow(flow));
     }
     Ok(true)
+}
+
+/// Brings an unloaded target to resident state with its read lifecycle,
+/// without changing the current buffer.
+///
+/// A tag jump decides where the buffer lands only after it is readable: the
+/// target may end up in a split, a new tab, or this window. The low-level
+/// setters attach resident buffers and never read, so callers that do not
+/// switch immediately still need the read half on its own.
+fn prepare_buffer_for_display<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    buffer: BufHandle,
+) -> Flow {
+    match load_buffer_for_switch(runtime, access, scope, lua, buffer, || Ok(()), || {}) {
+        Ok(_) => Flow::Normal,
+        Err(LoadSwitchError::Flow(flow)) => flow,
+        Err(LoadSwitchError::Editor(error)) => error_flow(runtime, "E86", error.to_string()),
+    }
 }
 
 /// Fires the leave half of a buffer switch, performs any unloaded-buffer
@@ -11606,15 +11771,34 @@ fn switch_current_buffer<F: FileIO, E: ExEditorAccess>(
     if !access.with_ex_editor(|editor| editor.buffer(target).is_ok()) {
         return Flow::Normal;
     }
-    match load_buffer_for_switch(runtime, access, scope, lua, target) {
-        Ok(_) => {}
+    let switched = match load_buffer_for_switch(
+        runtime,
+        access,
+        scope,
+        lua,
+        target,
+        || {
+            access.with_ex_editor(|editor| {
+                editor.set_current_buffer(target, BufferRelease::KeepLoaded)
+            })
+        },
+        || {
+            if let Some(old) = old {
+                let _ = access.with_ex_editor(|editor| {
+                    editor.set_current_buffer(old, BufferRelease::KeepLoaded)
+                });
+            }
+        },
+    ) {
+        Ok(switched) => switched,
         Err(LoadSwitchError::Flow(flow)) => return flow,
         Err(LoadSwitchError::Editor(error)) => {
             return error_flow(runtime, "E86", error.to_string());
         }
-    }
-    if let Err(error) =
-        access.with_ex_editor(|editor| editor.set_current_buffer(target, BufferRelease::KeepLoaded))
+    };
+    if !switched
+        && let Err(error) =
+            access.with_ex_editor(|editor| editor.set_current_buffer(target, BufferRelease::KeepLoaded))
     {
         return error_flow(runtime, "E86", error.to_string());
     }
@@ -11720,26 +11904,31 @@ fn command_buffer_absolute<F: FileIO, E: ExEditorAccess>(
 /// `:fir[st]`/`:rew[ind]` and `:la[st]`: display the first or last argument
 /// (`ex_rewind`, arglist.c); the winfixbuf guard lives in the shared
 /// `edit_argument_file` sink.
-fn command_argument_absolute<F: FileIO>(
+fn command_argument_absolute<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
     target: i64,
 ) -> Flow {
-    let count = i64::try_from(editor.arglist().len()).unwrap_or(i64::MAX);
+    let count = i64::try_from(access.with_ex_editor(|editor| editor.arglist().len()))
+        .unwrap_or(i64::MAX);
     let entry = if target == i64::MAX {
         count.saturating_sub(1)
     } else {
         0
     };
-    do_argfile(runtime, editor, command.bang, entry)
+    do_argfile(runtime, access, scope, lua, command.bang, entry)
 }
 
 /// `:argu[ment] [count]`: display the count-th argument, defaulting to the
 /// current one (`ex_argument`, arglist.c).
-fn command_argument<F: FileIO>(
+fn command_argument<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
 ) -> Flow {
     let count = command
@@ -11747,10 +11936,21 @@ fn command_argument<F: FileIO>(
         .and_then(|count| i64::try_from(count).ok())
         .or_else(|| command.args.trim().parse::<i64>().ok())
         .unwrap_or_else(|| {
-            i64::try_from(editor.arglist().index()).map_or(1, |index| index.saturating_add(1))
+            access.with_ex_editor(|editor| {
+                i64::try_from(editor.arglist().index())
+                    .map_or(1, |index| index.saturating_add(1))
+            })
         });
-    do_argfile(runtime, editor, command.bang, count.saturating_sub(1))
+    do_argfile(
+        runtime,
+        access,
+        scope,
+        lua,
+        command.bang,
+        count.saturating_sub(1),
+    )
 }
+
 
 fn command_buffer<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
@@ -11949,57 +12149,70 @@ fn buffer_name_matches(name: &OxStr, needle: &str) -> bool {
 /// `:args` (`ex_args`, arglist.c 502): with file arguments the list is
 /// redefined and the first entry edited, exactly like `:next`; without
 /// arguments the list is printed with the current entry in brackets.
-fn command_args<F: FileIO>(
+fn command_args<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
 ) -> Flow {
     if !command.args.trim().is_empty() {
-        return command_next(runtime, editor, command);
+        return command_next(runtime, access, scope, lua, command);
     }
-    let arglist = editor.arglist();
-    if arglist.is_empty() {
-        return Flow::Normal;
-    }
-    let current = arglist.index();
-    let mut line = String::new();
-    for (position, name) in arglist.names().iter().enumerate() {
-        if position > 0 {
-            line.push_str("  ");
+    let line = access.with_ex_editor(|editor| {
+        let arglist = editor.arglist();
+        if arglist.is_empty() {
+            return None;
         }
-        if position == current {
-            line.push('[');
-            line.push_str(&name.to_string_lossy());
-            line.push(']');
-        } else {
-            line.push_str(&name.to_string_lossy());
+        let current = arglist.index();
+        let mut line = String::new();
+        for (position, name) in arglist.names().iter().enumerate() {
+            if position > 0 {
+                line.push_str("  ");
+            }
+            if position == current {
+                line.push('[');
+                line.push_str(&name.to_string_lossy());
+                line.push(']');
+            } else {
+                line.push_str(&name.to_string_lossy());
+            }
         }
+        Some(line)
+    });
+    if let Some(line) = line {
+        access.with_ex_editor(|editor| push_text_message(editor, line, false, false));
     }
-    push_text_message(editor, line, false, false);
     Flow::Normal
 }
 
 /// `:next` (`ex_next`, arglist.c 670): with file arguments the argument
 /// list is redefined and its first entry edited; otherwise the count-th
 /// following entry is edited through `do_argfile`.
-fn command_next<F: FileIO>(
+fn command_next<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
 ) -> Flow {
     let list = command.args.trim();
     if list.is_empty() {
         let step = command_step(command);
-        let target = i64::try_from(editor.arglist().index()).unwrap_or(i64::MAX) + step;
-        return do_argfile(runtime, editor, command.bang, target);
+        let target = access.with_ex_editor(|editor| {
+            i64::try_from(editor.arglist().index()).unwrap_or(i64::MAX) + step
+        });
+        return do_argfile(runtime, access, scope, lua, command.bang, target);
     }
     // The changed-buffer guard runs before the list is replaced (ex_next
     // checks first so a failure leaves the old list intact).
-    if let Some(current) = editor.current_buffer()
-        && editor
-            .buffer(current)
-            .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
-        && !command.bang
+    if access.with_ex_editor(|editor| {
+        editor.current_buffer().is_some_and(|current| {
+            editor
+                .buffer(current)
+                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        })
+    }) && !command.bang
     {
         return error_flow(
             runtime,
@@ -12022,13 +12235,15 @@ fn command_next<F: FileIO>(
     if names.is_empty() {
         return error_flow(runtime, "E479", "No match");
     }
-    editor.arglist_mut().set(
-        names
-            .into_iter()
-            .map(|name| OxStr::from(name.as_str()))
-            .collect(),
-    );
-    do_argfile(runtime, editor, command.bang, 0)
+    access.with_ex_editor(|editor| {
+        editor.arglist_mut().set(
+            names
+                .into_iter()
+                .map(|name| OxStr::from(name.as_str()))
+                .collect(),
+        );
+    });
+    do_argfile(runtime, access, scope, lua, command.bang, 0)
 }
 
 fn command_step(command: &ExCommand) -> i64 {
@@ -12048,44 +12263,54 @@ fn command_step(command: &ExCommand) -> i64 {
     }
     1
 }
-fn command_previous<F: FileIO>(
+fn command_previous<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     command: &ExCommand,
 ) -> Flow {
     let step = command_step(command);
-    let arglist = editor.arglist();
-    let index = i64::try_from(arglist.index()).unwrap_or(i64::MAX);
-    let count = i64::try_from(arglist.len()).unwrap_or(i64::MAX);
+    let (index, count) = access.with_ex_editor(|editor| {
+        (
+            i64::try_from(editor.arglist().index()).unwrap_or(i64::MAX),
+            i64::try_from(editor.arglist().len()).unwrap_or(i64::MAX),
+        )
+    });
     let target = if index - step >= count {
         count - 1
     } else {
         index - step
     };
-    do_argfile(runtime, editor, command.bang, target)
+    do_argfile(runtime, access, scope, lua, command.bang, target)
 }
+
 
 /// Edits entry `target` of the argument list (`do_argfile`, arglist.c
 /// 600): out-of-range targets fail with E163/E164/E165, and the index
 /// only advances when the edit succeeded.
-fn do_argfile<F: FileIO>(
+fn do_argfile<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     force: bool,
     target: i64,
 ) -> Flow {
-    let entry = match editor.arglist().check_target(target) {
+    let entry = match access.with_ex_editor(|editor| editor.arglist().check_target(target)) {
         Ok(entry) => entry,
         Err(error) => return error_flow(runtime, error.code, error.message),
     };
-    let name = editor
-        .arglist()
-        .name(entry)
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let flow = edit_argument_file(runtime, editor, force, &name);
+    let name = access.with_ex_editor(|editor| {
+        editor
+            .arglist()
+            .name(entry)
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    let flow = edit_argument_file(runtime, access, scope, lua, force, &name);
     if matches!(flow, Flow::Normal) {
-        editor.arglist_mut().set_index(entry);
+        access.with_ex_editor(|editor| editor.arglist_mut().set_index(entry));
     }
     flow
 }
@@ -12093,17 +12318,22 @@ fn do_argfile<F: FileIO>(
 /// Displays the argument's file: reuse the buffer already carrying the
 /// name (`alist_name` prefers the associated buffer), else load the file
 /// like `:edit` does, treating a missing file as an empty new buffer.
-fn edit_argument_file<F: FileIO>(
+fn edit_argument_file<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
     force: bool,
     name: &str,
 ) -> Flow {
+    let current = access.with_ex_editor(|editor| editor.current_buffer());
     if !force
-        && let Some(current) = editor.current_buffer()
-        && editor
-            .buffer(current)
-            .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        && let Some(current) = current
+        && access.with_ex_editor(|editor| {
+            editor
+                .buffer(current)
+                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        })
     {
         return error_flow(
             runtime,
@@ -12111,29 +12341,67 @@ fn edit_argument_file<F: FileIO>(
             "No write since last change (add ! to override)",
         );
     }
-    for handle in editor.buffers() {
-        if editor
-            .buffer(handle)
-            .is_ok_and(|state| state.name().as_bytes() == name.as_bytes())
+    let existing = access.with_ex_editor(|editor| {
+        editor.buffers().into_iter().find(|handle| {
+            editor
+                .buffer(*handle)
+                .is_ok_and(|state| state.name().as_bytes() == name.as_bytes())
+        })
+    });
+    if let Some(handle) = existing {
+        // 'winfixbuf' rejects editing a different argument in place
+        // (do_argfile, arglist.c:620); the bang overrides.
+        if current != Some(handle)
+            && let Some(flow) =
+                access.with_ex_editor(|editor| winfixbuf_blocks(runtime, editor, force))
         {
-            // 'winfixbuf' rejects editing a different argument in place
-            // (do_argfile, arglist.c:620); the bang overrides.
-            if editor.current_buffer() != Some(handle)
-                && let Some(flow) = winfixbuf_blocks(runtime, editor, force)
-            {
-                return flow;
-            }
-            return match editor.set_current_buffer(handle, BufferRelease::KeepLoaded) {
-                Ok(()) => Flow::Normal,
-                Err(error) => error_flow(runtime, "E86", error.to_string()),
-            };
+            return flow;
         }
+        return switch_current_buffer(runtime, access, scope, lua, current, handle);
     }
+
     // An argument with no buffer yet opens a new file, which is always a
     // different buffer: same guard.
-    if let Some(flow) = winfixbuf_blocks(runtime, editor, force) {
+    if let Some(flow) =
+        access.with_ex_editor(|editor| winfixbuf_blocks(runtime, editor, force))
+    {
         return flow;
     }
+
+    // A current window lets the shared switch loader own the read lifecycle.
+    // Start with an unloaded named buffer so it performs the same probe,
+    // staging, callbacks, and read as :buffer/:edit.
+    if access
+        .with_ex_editor(|editor| editor.current_window())
+        .is_some()
+    {
+        let handle = match access.with_ex_editor(|editor| -> Result<BufHandle, EditorError> {
+            let handle = editor.create_buffer(true)?;
+            {
+                let state = editor.buffer_mut(handle)?;
+                state.set_name(OxStr::from(name));
+                state.mark_saved();
+            }
+            editor.unload_buffer(handle)?;
+            Ok(handle)
+        }) {
+            Ok(handle) => handle,
+            Err(error) => return error_flow(runtime, "E948", error.to_string()),
+        };
+        let flow = switch_current_buffer(runtime, access, scope, lua, current, handle);
+        if !matches!(flow, Flow::Normal) {
+            access.with_ex_editor(|editor| {
+                if editor.buffer(handle).is_ok() {
+                    let _ = editor.wipe_buffer(handle);
+                }
+            });
+        }
+        return flow;
+    }
+
+    // There is no current window to give the loader a display context. Keep
+    // the bootstrap path that creates the first tabpage around already-read
+    // text; normal argument navigation always takes the branch above.
     let text = match runtime.scripts.io().read_to_string(Path::new(name)) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -12145,16 +12413,18 @@ fn edit_argument_file<F: FileIO>(
         Ok(buffer) => buffer,
         Err(error) => return error_flow(runtime, "E474", error.to_string()),
     };
-    let handle = match editor.create_buffer_with(buffer_text, true) {
+    let handle = match access.with_ex_editor(|editor| -> Result<BufHandle, EditorError> {
+        let handle = editor.create_buffer_with(buffer_text, true)?;
+        let state = editor.buffer_mut(handle)?;
+        state.set_name(OxStr::from(name));
+        state.mark_saved();
+        Ok(handle)
+    }) {
         Ok(handle) => handle,
         Err(error) => return error_flow(runtime, "E948", error.to_string()),
     };
-    if let Ok(state) = editor.buffer_mut(handle) {
-        state.set_name(OxStr::from(name));
-        state.mark_saved();
-    }
-    if editor.current_window().is_none() {
-        return match editor.create_tabpage(
+    match access.with_ex_editor(|editor| {
+        editor.create_tabpage(
             handle,
             crate::Geometry {
                 row: 0,
@@ -12162,14 +12432,10 @@ fn edit_argument_file<F: FileIO>(
                 width: 80,
                 height: 24,
             },
-        ) {
-            Ok(_) => Flow::Normal,
-            Err(error) => error_flow(runtime, "E948", error.to_string()),
-        };
-    }
-    match editor.set_current_buffer(handle, BufferRelease::KeepLoaded) {
-        Ok(()) => Flow::Normal,
-        Err(error) => error_flow(runtime, "E86", error.to_string()),
+        )
+    }) {
+        Ok(_) => Flow::Normal,
+        Err(error) => error_flow(runtime, "E948", error.to_string()),
     }
 }
 
@@ -12213,14 +12479,14 @@ fn command_argdo<F: FileIO, E: ExEditorAccess>(
         if access.with_ex_editor(|editor| editor.arglist().index()) != index
             || !access.with_ex_editor(|editor| editing_argument(editor, index))
         {
-            let flow = access.with_ex_editor(|editor| {
-                do_argfile(
-                    runtime,
-                    editor,
-                    command.bang,
-                    i64::try_from(index).unwrap_or(i64::MAX),
-                )
-            });
+            let flow = do_argfile(
+                runtime,
+                access,
+                scope,
+                lua,
+                command.bang,
+                i64::try_from(index).unwrap_or(i64::MAX),
+            );
             if !matches!(flow, Flow::Normal) {
                 return flow;
             }

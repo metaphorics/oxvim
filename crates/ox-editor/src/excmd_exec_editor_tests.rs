@@ -2020,6 +2020,129 @@ fn autocmd_buffer_switch_reloads_unloaded_file_before_enter_events() {
     assert_eq!(state.text().unwrap().line(2).unwrap(), b"two");
     assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
 }
+/// A read hook's current-buffer option write must land on the buffer being
+/// entered, not the buffer left behind while `BufReadPre` runs.
+#[test]
+fn autocmd_buffer_switch_read_hook_sets_target_buffer_local_option() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("read-hook.txt", "content\n");
+    executor
+        .execute_line(&editor, "setlocal shiftwidth=8")
+        .unwrap();
+    let source = editor.editor().current_buffer().unwrap();
+    executor.execute_line(&editor, "edit read-hook.txt").unwrap();
+    let target = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .set_current_buffer(source, crate::BufferRelease::KeepLoaded)
+        .unwrap();
+    editor.editor_mut().unload_buffer(target).unwrap();
+
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufReadPre * setlocal shiftwidth=3",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, &format!("buffer {}", i64::from(target)))
+        .unwrap();
+
+    assert_eq!(
+        editor
+            .editor()
+            .options()
+            .get_buffer(target, "shiftwidth")
+            .unwrap(),
+        &crate::OptionValue::Number(3),
+    );
+    assert_eq!(
+        editor
+            .editor()
+            .options()
+            .get_buffer(source, "shiftwidth")
+            .unwrap(),
+        &crate::OptionValue::Number(8),
+    );
+}
+
+/// Argument navigation uses the same read lifecycle as `:buffer` when an
+/// argument already has an unloaded named buffer.
+#[test]
+fn argnext_reloads_an_unloaded_argument_buffer() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.scripts().io().insert("arg-next.txt", "loaded\n");
+    let source = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(source)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("arg-source.txt"));
+    let target = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(target)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("arg-next.txt"));
+    editor.editor_mut().unload_buffer(target).unwrap();
+
+    executor
+        .execute_line(&editor, "args arg-source.txt arg-next.txt")
+        .unwrap();
+    executor
+        .execute_line(&editor, "autocmd BufReadPre * setlocal shiftwidth=3")
+        .unwrap();
+    executor.execute_line(&editor, "next").unwrap();
+
+    assert_eq!(editor.editor().current_buffer(), Some(target));
+    assert_eq!(
+        editor.editor().buffer(target).unwrap().text().unwrap().line(1),
+        Ok(b"loaded".to_vec())
+    );
+    assert_eq!(
+        editor
+            .editor()
+            .options()
+            .get_buffer(target, "shiftwidth")
+            .unwrap(),
+        &crate::OptionValue::Number(3),
+    );
+}
+
+/// `:edit` must reload an existing unloaded named buffer before entering it.
+#[test]
+fn edit_reloads_existing_unloaded_named_buffer() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.scripts().io().insert("edit-unloaded.txt", "loaded\n");
+    let target = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(target)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("edit-unloaded.txt"));
+    editor.editor_mut().unload_buffer(target).unwrap();
+    executor
+        .execute_line(&editor, "autocmd BufReadPre * setlocal shiftwidth=3")
+        .unwrap();
+
+    executor
+        .execute_line(&editor, "edit edit-unloaded.txt")
+        .unwrap();
+
+    assert_eq!(editor.editor().current_buffer(), Some(target));
+    assert_eq!(
+        editor.editor().buffer(target).unwrap().text().unwrap().line(1),
+        Ok(b"loaded".to_vec())
+    );
+    assert_eq!(
+        editor
+            .editor()
+            .options()
+            .get_buffer(target, "shiftwidth")
+            .unwrap(),
+        &crate::OptionValue::Number(3),
+    );
+}
 
 /// A missing file retains the new-file load semantics while entering through
 /// the switch path: empty, unmodified text and `BufNewFile`, not read events.
@@ -7456,6 +7579,53 @@ call T()
     assert_eq!(global(b"after_pop"), "Xtest.c");
     assert_eq!(global(b"after_recall"), "Xtest.h");
     assert_eq!(current_name(&editor), "Xtest.h");
+}
+
+#[test]
+fn pop_reloads_a_tag_target_unloaded_since_the_jump() {
+    let io = MemoryFileIO::new();
+    io.insert("Xtags", "test\tXtest.h\t/^void test();$/;\"\tp\n");
+    io.insert("Xtest.c", "int main()\n");
+    io.insert("Xtest.h", "void test();\n");
+    let editor = TestEditorAccess::new(Editor::new());
+    let buffer = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut executor = ExExecutor::with_io(io);
+    executor
+        .execute_script(
+            &editor,
+            "tag-pop-reload.vim",
+            "function! T()
+  set tags=Xtags
+  new Xtest.c
+  let g:origin = bufnr('%')
+  tag test
+  execute 'bunload' g:origin
+  autocmd BufReadPost Xtest.c let g:read_fired = 1
+  pop
+  let g:after_pop = bufname('%')
+  let g:after_lines = join(getline(1, '$'), '|')
+endfunction
+call T()
+",
+        )
+        .unwrap();
+    let global = |name: &[u8]| {
+        crate::excmd_exec::typval_to_text(
+            executor
+                .scope()
+                .get_scoped(ox_eval::scope::ScopeKind::Global, name, 0)
+                .unwrap(),
+        )
+    };
+    // The pop target was unloaded after the jump, so `:pop` must read it back
+    // with its read autocmds rather than failing or arriving empty.
+    assert_eq!(global(b"after_pop"), "Xtest.c");
+    assert_eq!(global(b"after_lines"), "int main()");
+    assert_eq!(global(b"read_fired"), "1");
 }
 
 #[test]

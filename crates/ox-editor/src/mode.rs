@@ -1420,6 +1420,12 @@ impl ModeMachine {
                         "No write since last change (add ! to override)".to_owned(),
                     ));
                 }
+                // Upstream reaches the recorded buffer through the load-capable
+                // file path, so `CTRL-T` onto a buffer unloaded since the jump
+                // reads it back with its autocmds. Normal mode has neither a
+                // `FileIO` nor an autocmd context here, so the setter's
+                // resident-only contract surfaces instead of a reload. The
+                // `:pop` form goes through the Ex path and does reload.
                 if editor
                     .set_current_buffer(item.from_bufnr, BufferRelease::KeepLoaded)
                     .is_err()

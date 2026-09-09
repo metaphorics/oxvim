@@ -27,7 +27,6 @@ use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError};
 use crate::options::{OptionStore, OptionValue};
 use crate::put::{PutDirection, PutEdit, PutPlan, plan_put, put_origin};
 use crate::register::{RegisterError, RegisterKind, Registers};
-use crate::script::{FileIO, RealFileIO};
 use crate::typeahead::Typeahead;
 
 pub(crate) const LOWEST_WINDOW_ID: i64 = 1_000;
@@ -167,11 +166,9 @@ impl MessageIdentity {
 /// One validated `nvim__redraw` request (`keyset.redraw` in
 /// `runtime/doc/api.txt`; `nvim__redraw`, `api/vim.c:2469`).
 ///
-/// The binding owns upstream's validation and resolve rules, so every
-/// field arrives executable: `win`/`buf` `0` already point at the current
-/// window/buffer, and `flush` is the resolved value — the explicit one,
-/// or the implicit true a present `valid` or `range` forces
-/// (`vim.c:2544-2546`).
+/// The binding preserves whether `flush` was present so the redraw pass can
+/// apply the upstream default only when `valid` or `range` is present
+/// (`vim.c:2541-2543`).
 #[expect(
     clippy::struct_excessive_bools,
     reason = "the keyset.redraw action set is boolean flags by upstream definition"
@@ -190,8 +187,9 @@ pub struct RedrawRequest {
     /// `range` `[first, last]`: 0-based, end-exclusive, `-1` for the last
     /// line.
     pub range: Option<(i64, i64)>,
-    /// Resolved `flush`: paint pending updates in this pass.
-    pub flush: bool,
+    /// Caller-supplied `flush`, or `None` when omitted. The server resolves
+    /// the omitted value before deriving the screen/UI-flush decisions.
+    pub flush: Option<bool>,
     /// `cursor`: update the cursor position on screen.
     pub cursor: bool,
     /// `tabline`: redraw the tabline.
@@ -1630,20 +1628,17 @@ impl Editor {
 
     /// Switches the buffer displayed by a window and updates both attachment counts.
     ///
-    /// Entering an unloaded buffer reloads it (`buf_ensure_loaded` on every
-    /// `win_enter` path) through [`Self::unloaded_buffer_text`]. The
-    /// `BufRead*` event family cannot fire here — events run through a host
-    /// executor — so the read-event pair belongs to callback-capable switch
-    /// paths (`switch_current_buffer` and the API window loader), not this
-    /// low-level state transition.
+    /// The target must already be resident. Callback-capable callers own
+    /// unloaded-buffer reads and their `BufRead*` lifecycle before invoking
+    /// this low-level state transition.
     ///
     /// # Errors
     ///
     /// Returns [`EditorError::NoCurrentTabpage`] when a current window or
     /// buffer request has no live tabpage, [`EditorError::UnknownWindow`] or
     /// [`EditorError::UnknownBuffer`] when a handle is not live,
-    /// [`EditorError::Buffer`] when attaching the new buffer fails or its
-    /// file cannot be read ([`BufferStateError::Unloaded`]), or
+    /// [`EditorError::Buffer`] when attaching the new buffer fails, or
+    /// [`BufferStateError::Unloaded`] when the target is not resident, or
     /// [`EditorError::Layout`] when the tabpage rejects the window switch. On
     /// failure the previous window/buffer pairing is unchanged.
     pub fn set_window_buffer(
@@ -1663,17 +1658,10 @@ impl Editor {
         // block cannot be joined by a later edit made after coming back
         // (`window.c:5275-5279`, `buffer.c:1743-1750`).
         self.sync_buffer_undo(old_buffer);
-        // The read finishes before any mutable borrow of the buffer so no
-        // resident-state borrow is held across file IO.
-        let text = self.unloaded_buffer_text(buffer)?;
-        if let Some(state) = self.buffers.get_mut(&buffer) {
-            if let Some(text) = text {
-                state.load(text);
-                state.mark_saved();
-                state.flags.set(crate::BufferFlags::NOTEDITED, false);
-            }
-            state.attach()?;
-        }
+        self.buffers
+            .get_mut(&buffer)
+            .ok_or(EditorError::UnknownBuffer(buffer))?
+            .attach()?;
         let tab = self
             .windows
             .get(&window)
@@ -1708,45 +1696,18 @@ impl Editor {
         Ok(())
     }
 
-    /// Resolves the text an unloaded buffer enters with, or `None` when the
-    /// buffer is already resident.
+    /// Enters a buffer for a silent context switch without opening its file.
     ///
-    /// A named ordinary buffer re-reads its file through the production
-    /// [`FileIO`] seam ([`RealFileIO`]), the way `open_buffer` does; an
-    /// unnamed buffer or a `buftype` upstream never reads (`bt_nofileread`,
-    /// `buffer.c:4071-4077`) materializes empty text. A genuinely missing
-    /// file is the shared new-file semantic (`buffer_from_file`): the buffer
-    /// opens empty and unmodified.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EditorError::Buffer`]`(`[`BufferStateError::Unloaded`]`)`
-    /// when the file exists but cannot be read — attaching fabricated
-    /// saved-empty text instead is what let a later `:write` destroy the
-    /// on-disk file.
-    fn unloaded_buffer_text(&self, buffer: BufHandle) -> Result<Option<Buffer>, EditorError> {
-        let Some(state) = self.buffers.get(&buffer) else {
-            return Ok(None);
-        };
-        if state.residency.is_loaded() {
-            return Ok(None);
+    /// `ctx_switch` gives an unloaded buffer an empty memfile before user code
+    /// runs. File-backed callers use their own read lifecycle; this helper
+    /// preserves that context behavior and then performs the low-level display
+    /// transition, which has no file-I/O side effects.
+    pub fn enter_buffer_context(&mut self, buffer: BufHandle) -> Result<(), EditorError> {
+        let state = self.buffer_mut(buffer)?;
+        if !state.residency.is_loaded() {
+            state.load(Buffer::new());
         }
-        let nofileread = matches!(
-            self.options.get_buffer(buffer, "buftype"),
-            Ok(OptionValue::String(buftype)) if is_nofileread(buftype)
-        );
-        let name = state.name();
-        if name.as_bytes().is_empty() || nofileread {
-            return Ok(Some(Buffer::new()));
-        }
-        let path = PathBuf::from(name.to_string_lossy().as_ref());
-        match RealFileIO.read_to_string(&path) {
-            Ok(content) => Buffer::from_bytes(content.as_bytes())
-                .map(Some)
-                .map_err(|error| EditorError::Buffer(error.into())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(Buffer::new())),
-            Err(_) => Err(EditorError::Buffer(BufferStateError::Unloaded)),
-        }
+        self.set_current_buffer(buffer, BufferRelease::KeepLoaded)
     }
 
     /// Runs `f` in the display context of `buffer` for autocmd execution
@@ -1755,9 +1716,9 @@ impl Editor {
     /// The first existing window already showing `buffer` and not ignoring
     /// `event` through its window-local `eventignorewin` becomes current. If
     /// every window showing the target ignores the event, the callback is
-    /// skipped. A hidden buffer is temporarily displayed in the caller window
-    /// instead of a synthetic handle. Global `eventignore` is checked before
-    /// any window changes.
+    /// skipped. A hidden or unloaded buffer is temporarily displayed in the
+    /// caller window; an unloaded target is materialized with empty text
+    /// before the low-level display transition.
     ///
     /// The outer error is the context switch itself failing; otherwise `f`
     /// runs at most once and its result is reported only after the previous
@@ -1817,7 +1778,7 @@ impl Editor {
             }
             None => {
                 let original = caller_buffer.unwrap_or(target);
-                self.set_current_buffer(target, BufferRelease::KeepLoaded)?;
+                self.enter_buffer_context(target)?;
                 Some((caller, original))
             }
         };
@@ -1878,10 +1839,7 @@ impl Editor {
                 Some(_) => {}
                 None => {
                     let original = caller_buffer.unwrap_or(target);
-                    if self
-                        .set_current_buffer(target, BufferRelease::KeepLoaded)
-                        .is_ok()
-                    {
+                    if self.enter_buffer_context(target).is_ok() {
                         entered = Some((caller, original));
                     }
                 }
@@ -4894,11 +4852,11 @@ mod tests {
         assert_eq!(tabpage.layout().window_count(), 2);
     }
 
-    /// Re-entering an unloaded named buffer must read its file back, not
-    /// fabricate empty saved text: the fabrication let a later `:write`
-    /// replace the file with empty content.
+    /// The low-level window transition requires a resident target. File-backed
+    /// callers stage an empty memfile and own the read lifecycle so
+    /// `BufReadPre` runs after the target is current.
     #[test]
-    fn displaying_an_unloaded_named_buffer_reloads_its_file_content() {
+    fn displaying_an_unloaded_named_buffer_requires_explicit_load() {
         let dir = scratch_dir("reload");
         let path = dir.join("Xreload.txt");
         std::fs::write(&path, b"original\ncontent\n").unwrap();
@@ -4911,16 +4869,15 @@ mod tests {
             .unwrap();
         let window = editor.tabpage(tab).unwrap().current_window();
 
-        editor
+        let error = editor
             .set_window_buffer(window, buffer, BufferRelease::KeepLoaded)
-            .unwrap();
-
-        let state = editor.buffer(buffer).unwrap();
-        let text = state.text().unwrap();
-        assert_eq!(text.line_count(), 2);
-        assert_eq!(text.line(1).unwrap(), b"original");
-        assert_eq!(text.line(2).unwrap(), b"content");
-        assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EditorError::Buffer(BufferStateError::Unloaded)
+        ));
+        assert!(editor.buffer(buffer).unwrap().text().is_err());
+        assert_eq!(editor.window(window).unwrap().buffer, scratch);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -4955,10 +4912,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A missing file is the shared new-file semantic, not a failed load:
-    /// the buffer opens empty and unmodified, like `buffer_from_file`.
+    /// A missing file is handled by the callback-capable loader, not by this
+    /// low-level transition.
     #[test]
-    fn displaying_an_unloaded_named_buffer_with_missing_file_opens_it_empty() {
+    fn displaying_an_unloaded_named_buffer_with_missing_file_requires_explicit_load() {
         let dir = scratch_dir("missing");
         let path = dir.join("Xmissing.txt");
         let mut editor = Editor::new();
@@ -4970,15 +4927,15 @@ mod tests {
             .unwrap();
         let window = editor.tabpage(tab).unwrap().current_window();
 
-        editor
+        let error = editor
             .set_window_buffer(window, buffer, BufferRelease::KeepLoaded)
-            .unwrap();
-
-        let state = editor.buffer(buffer).unwrap();
-        let text = state.text().unwrap();
-        assert_eq!(text.line_count(), 1);
-        assert_eq!(text.line(1).unwrap(), b"");
-        assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EditorError::Buffer(BufferStateError::Unloaded)
+        ));
+        assert!(editor.buffer(buffer).unwrap().text().is_err());
+        assert_eq!(editor.window(window).unwrap().buffer, scratch);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
