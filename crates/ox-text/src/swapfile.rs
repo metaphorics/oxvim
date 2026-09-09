@@ -138,10 +138,9 @@ impl SwapFile {
     ///
     /// # Errors
     ///
-    /// Returns [`SwapError::TooLarge`] when the text, its index, or the
-    /// file name exceeds the block-format limits, the buffer's own line
-    /// error if a line is malformed, and the writer's I/O error if a block
-    /// cannot be written.
+    /// Returns [`SwapError::TooLarge`] when the text or its index exceeds
+    /// the block-format limits, the buffer's own line error if a line is
+    /// malformed, and the writer's I/O error if a block cannot be written.
     pub fn write(&self, mut writer: impl Write) -> Result<(), SwapError> {
         let lines: Vec<Vec<u8>> = (1..=self.buffer.line_count())
             .map(|lnum| self.buffer.line(lnum))
@@ -344,12 +343,19 @@ impl SwapFile {
         {
             return false;
         }
-        let stored = head[B0_FNAME..B0_FNAME + B0_FNAME_LEN]
+        let stored = &head[B0_FNAME..B0_FNAME + B0_FNAME_LEN];
+        // `set_b0_fname` (`memline.c:672-679`) stores at most
+        // `B0_FNAME_SIZE_CRYPT - 1` name bytes and keeps the leading bytes
+        // of an over-long path (`home_replace`, `env.c:999-1112`), which is
+        // the truncation `block_zero` writes: compare like with like, or a
+        // long path would fail its own re-open check forever.
+        let stored_len = stored
             .iter()
-            .take_while(|&&byte| byte != 0)
-            .copied()
-            .collect::<Vec<u8>>();
-        if stored != expected_fname.as_bytes() {
+            .position(|&byte| byte == 0)
+            .unwrap_or(B0_FNAME_LEN);
+        let expected = expected_fname.as_bytes();
+        let expected_len = expected.len().min(B0_FNAME_SIZE_CRYPT - 1);
+        if stored_len != expected_len || stored[..stored_len] != expected[..expected_len] {
             return false;
         }
 
@@ -668,6 +674,20 @@ mod tests {
         SwapFile::read(fs::File::open(path).unwrap()).unwrap()
     }
 
+    /// A genuinely live process that is not this test: the runner's parent,
+    /// else init as a conservative fallback. Used wherever a foreign swapfile
+    /// must survive its rejection.
+    #[cfg(target_os = "linux")]
+    fn live_foreign_pid() -> u32 {
+        fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:\t"))
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .filter(|&pid| pid != 0 && pid != std::process::id())
+            .unwrap_or(1)
+    }
+
     #[test]
     fn own_swapfile_is_reused_across_preserves() {
         let dir = test_dir("own");
@@ -689,6 +709,59 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn own_swapfile_with_long_path_is_reused_across_preserves() {
+        let dir = test_dir("long-own");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let long_name = format!("/{}", "a".repeat(B0_FNAME_SIZE_CRYPT + 100));
+        let path = dir.join("buffer.swp");
+        let owner = identity(std::process::id());
+
+        SwapFile::new(long_name.as_str(), Buffer::from_bytes(b"first\n").unwrap())
+            .with_meta(owner.clone())
+            .write_to(&path)
+            .unwrap();
+        SwapFile::new(long_name.as_str(), Buffer::from_bytes(b"second\n").unwrap())
+            .with_meta(owner)
+            .write_to(&path)
+            .unwrap();
+
+        let snapshot = read_snapshot(&path);
+        // The stored name keeps its leading bytes, cut to the field
+        // capacity (`set_b0_fname`, `memline.c:672-679`).
+        assert_eq!(snapshot.file_name, &long_name[..B0_FNAME_SIZE_CRYPT - 1]);
+        assert_eq!(snapshot.buffer.to_bytes(), b"second\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn long_path_foreign_swapfile_is_rejected() {
+        let dir = test_dir("long-foreign");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let long_name = format!("/{}", "b".repeat(B0_FNAME_SIZE_CRYPT + 100));
+        let path = dir.join("buffer.swp");
+        // A live foreign writer whose truncated block-zero name equals this
+        // buffer's: only the pid must keep it out.
+        let foreign = SwapFile::new(long_name.as_str(), Buffer::from_bytes(b"foreign\n").unwrap())
+            .with_meta(identity(live_foreign_pid()));
+        foreign.write_to(&path).unwrap();
+        let foreign_bytes = fs::read(&path).unwrap();
+
+        let ours = SwapFile::new(long_name.as_str(), Buffer::from_bytes(b"ours\n").unwrap())
+            .with_meta(identity(std::process::id()));
+        let error = ours.write_to(&path).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "malformed or unsupported swapfile: swapfile identity"
+        );
+        // The foreign contents survive untouched.
+        assert_eq!(fs::read(&path).unwrap(), foreign_bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn live_foreign_reservation_is_not_truncated() {
@@ -697,16 +770,10 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("buffer.swp");
         let host = SwapFile::current_hostname();
-        // The test runner's parent is a separate live process. Its PID gives
+        // The test runner's parent is a separate live process; `PPid` gives
         // the competing reservation a real process identity without making
         // the test depend on a second test binary.
-        let winner_pid = fs::read_to_string("/proc/self/status")
-            .unwrap()
-            .lines()
-            .find_map(|line| line.strip_prefix("PPid:\t"))
-            .and_then(|pid| pid.parse::<u32>().ok())
-            .filter(|&pid| pid != 0 && pid != std::process::id())
-            .unwrap_or(1);
+        let winner_pid = live_foreign_pid();
         let mut winner_file =
             SwapFile::reserve_swapfile(&path, FILE_NAME, winner_pid, &host).unwrap();
         assert!(fs::read(&path).unwrap().is_empty());
@@ -725,7 +792,6 @@ mod tests {
         winner.write(&mut winner_file).unwrap();
         winner_file.sync_all().unwrap();
         let winner_bytes = fs::read(&path).unwrap();
-
         let error = loser.write_to(&path).unwrap_err();
         assert_eq!(
             error.to_string(),
