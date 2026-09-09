@@ -1106,47 +1106,44 @@ impl<F: FileIO> ScriptCtx<F> {
         let prefix = format!("<SNR>{sid}_");
         let mut out = String::with_capacity(line.len());
         let mut rest = line;
-        let mut in_literal = false;
+        let mut quoting = Quoting::Bare;
         while !rest.is_empty() {
-            if in_literal {
-                // Inside a literal every byte is data until the closing
-                // quote; a doubled `''` is one escaped quote and stays inside.
-                let Some(quote) = rest.find('\'') else {
-                    out.push_str(rest);
-                    break;
-                };
-                let (head, tail) = rest.split_at(quote + 1);
-                out.push_str(head);
-                if let Some(escaped) = tail.strip_prefix('\'') {
-                    out.push('\'');
-                    rest = escaped;
-                } else {
-                    in_literal = false;
-                    rest = tail;
-                }
-                continue;
-            }
-            let quote = rest.find('\'');
-            let marker = rest.find("<SNR>");
-            match (quote, marker) {
-                (Some(q), Some(m)) if q < m => {
-                    out.push_str(&rest[..=q]);
-                    in_literal = true;
-                    rest = &rest[q + 1..];
-                }
-                (_, Some(m)) => {
-                    out.push_str(&rest[..m]);
+            let Some((at, event)) = next_quote_event(rest, quoting) else {
+                out.push_str(rest);
+                break;
+            };
+            out.push_str(&rest[..at]);
+            rest = &rest[at..];
+            match event {
+                QuoteEvent::Marker => {
                     out.push_str(&prefix);
-                    rest = &rest[m + "<SNR>".len()..];
+                    rest = &rest[SNR_MARKER.len()..];
                 }
-                (Some(q), None) => {
-                    out.push_str(&rest[..=q]);
-                    in_literal = true;
-                    rest = &rest[q + 1..];
+                QuoteEvent::Data => {
+                    out.push('\'');
+                    rest = &rest[1..];
                 }
-                (None, None) => {
-                    out.push_str(rest);
-                    break;
+                QuoteEvent::Double => {
+                    out.push('"');
+                    quoting = match quoting {
+                        Quoting::Double => Quoting::Bare,
+                        _ => Quoting::Double,
+                    };
+                    rest = &rest[1..];
+                }
+                QuoteEvent::LiteralOpen => {
+                    out.push('\'');
+                    quoting = Quoting::Literal;
+                    rest = &rest[1..];
+                }
+                QuoteEvent::LiteralClose => {
+                    out.push('\'');
+                    quoting = Quoting::Bare;
+                    rest = &rest[1..];
+                }
+                QuoteEvent::LiteralEscape => {
+                    out.push_str("''");
+                    rest = &rest[2..];
                 }
             }
         }
@@ -1426,6 +1423,71 @@ impl<F: FileIO> ScriptCtx<F> {
             None => "command line".to_owned(),
         }
     }
+}
+
+const SNR_MARKER: &str = "<SNR>";
+
+/// What the next quote-relevant position in a script line means to
+/// `<SNR>` expansion.
+enum QuoteEvent {
+    /// A `<SNR>` marker to replace with the current prefix.
+    Marker,
+    /// An apostrophe that carries no quoting: English text inside a
+    /// double-quoted string, an Ex mark address, or an unpaired quote.
+    Data,
+    /// A double quote, which opens or closes a run that makes apostrophes
+    /// data without stopping expansion inside it.
+    Double,
+    /// An apostrophe opening a paired single-quoted literal.
+    LiteralOpen,
+    /// The apostrophe closing that literal.
+    LiteralClose,
+    /// A doubled `''` inside a literal: one escaped quote, still inside.
+    LiteralEscape,
+}
+
+/// Where a scan of a script line stands with respect to quoting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quoting {
+    /// Outside any string.
+    Bare,
+    /// Inside a double-quoted run, where apostrophes are data.
+    Double,
+    /// Inside a single-quoted literal, where nothing expands.
+    Literal,
+}
+
+/// Finds the next position in `rest` that changes quoting or needs
+/// expansion, with its meaning under the current quoting state.
+fn next_quote_event(rest: &str, quoting: Quoting) -> Option<(usize, QuoteEvent)> {
+    if quoting == Quoting::Literal {
+        let quote = rest.find('\'')?;
+        let escaped = rest[quote + 1..].starts_with('\'');
+        let event = if escaped {
+            QuoteEvent::LiteralEscape
+        } else {
+            QuoteEvent::LiteralClose
+        };
+        return Some((quote, event));
+    }
+    let marker = rest.find(SNR_MARKER);
+    let quote = rest.find(['\'', '"']);
+    let Some(at) = quote.filter(|at| marker.is_none_or(|marker| *at < marker)) else {
+        return marker.map(|at| (at, QuoteEvent::Marker));
+    };
+    if rest[at..].starts_with('"') {
+        return Some((at, QuoteEvent::Double));
+    }
+    // A literal needs a closing quote on the same line, and an apostrophe
+    // inside a double-quoted run is English text. Opening a literal on
+    // either would suppress every later marker on the line.
+    let paired = quoting == Quoting::Bare && rest[at + 1..].contains('\'');
+    let event = if paired {
+        QuoteEvent::LiteralOpen
+    } else {
+        QuoteEvent::Data
+    };
+    Some((at, event))
 }
 
 impl Default for ScriptCtx<RealFileIO> {
