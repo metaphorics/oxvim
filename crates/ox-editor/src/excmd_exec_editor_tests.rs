@@ -140,6 +140,33 @@ impl FileIO for MemoryFileIO {
     }
 }
 
+#[derive(Default)]
+struct UnreadableFileIO;
+
+impl FileIO for UnreadableFileIO {
+    fn read_to_string(&self, _path: &Path) -> std::io::Result<String> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ))
+    }
+
+    fn write_string(&self, _path: &Path, _contents: &str) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ))
+    }
+
+    fn exists(&self, _path: &Path) -> bool {
+        true
+    }
+
+    fn canonicalize(&self, path: &Path) -> PathBuf {
+        path.to_path_buf()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1897,6 +1924,120 @@ fn edit_fires_bufnew_bufadd_bufenter_for_a_fresh_file() {
     assert_eq!(
         global_value(&executor, "enter"),
         Some(ox_types::Typval::Number(2))
+    );
+}
+
+/// A no-window startup still runs the full read lifecycle for an existing
+/// file. The bootstrap window is current before `BufReadPre`, so the handler
+/// can configure the target through both window- and buffer-scoped APIs.
+#[test]
+fn edit_without_window_fires_read_lifecycle_for_existing_file() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut executor = ExExecutor::with_io(MemoryFileIO::new());
+    executor.scripts().io().insert("startup.txt", "one\ntwo\n");
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufNewFile", "BufEnter"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} *.txt call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufReadPre *.txt let g:pre_current = bufnr('%')",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufReadPre *.txt call setbufvar(bufnr(expand('<afile>')), '&shiftwidth', 3)",
+        )
+        .unwrap();
+
+    executor.execute_line(&editor, "edit startup.txt").unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufEnter"]
+    );
+    let current = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        global_value(&executor, "pre_current"),
+        Some(ox_types::Typval::Number(i64::from(current)))
+    );
+    {
+        let view = editor.editor();
+        let state = view.buffer(current).unwrap();
+        assert_eq!(state.text().unwrap().line(1).unwrap(), b"one");
+    }
+    assert_eq!(
+        editor
+            .editor()
+            .options()
+            .get_buffer(current, "shiftwidth")
+            .unwrap(),
+        &crate::OptionValue::Number(3)
+    );
+}
+
+/// A no-window startup keeps the missing-file distinction: `BufNewFile`
+/// replaces the read-event pair, and the first tabpage still enters the
+/// resulting empty buffer.
+#[test]
+fn edit_without_window_fires_bufnewfile_for_missing_file() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut executor = ExExecutor::with_io(MemoryFileIO::new());
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufNewFile", "BufEnter"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} *.txt call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufNewFile *.txt let g:newfile_current = bufnr('%')",
+        )
+        .unwrap();
+
+    executor
+        .execute_line(&editor, "edit startup-missing.txt")
+        .unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufNew", "BufAdd", "BufNewFile", "BufEnter"]
+    );
+    let current = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        global_value(&executor, "newfile_current"),
+        Some(ox_types::Typval::Number(i64::from(current)))
+    );
+    let view = editor.editor();
+    let state = view.buffer(current).unwrap();
+    assert_eq!(state.text().unwrap().line(1).unwrap(), b"");
+    assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
+}
+
+/// An unreadable startup path retains the file command's E484 contract after
+/// loading is routed through the shared lifecycle helper.
+#[test]
+fn edit_without_window_preserves_e484_for_unreadable_file() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut executor = ExExecutor::with_io(UnreadableFileIO);
+
+    let Err(ExecError::Vim(exception)) = executor.execute_line(&editor, "edit startup.txt") else {
+        panic!("expected E484 for unreadable startup file");
+    };
+    assert_eq!(
+        exception.message(),
+        "Vim(edit):E484: Can't open file startup.txt: permission denied"
     );
 }
 
@@ -4369,10 +4510,20 @@ fn tab_addresses_resolve_in_the_tabpage_domain() {
 fn tabedit_opens_a_file_in_a_new_tabpage() {
     let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
     executor.scripts().io().insert("in.txt", "filetext\n");
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufReadPre *.txt let g:tabedit_current = bufnr('%')",
+        )
+        .unwrap();
     executor.execute_line(&editor, "tabe in.txt").unwrap();
     assert_eq!(tab_count(&editor), 2);
     assert_eq!(buffer_text(&editor), vec!["filetext"]);
     let buffer = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        global_value(&executor, "tabedit_current"),
+        Some(ox_types::Typval::Number(i64::from(buffer)))
+    );
     assert_eq!(
         editor
             .editor()
@@ -4382,6 +4533,44 @@ fn tabedit_opens_a_file_in_a_new_tabpage() {
             .to_string_lossy(),
         "in.txt"
     );
+}
+
+#[test]
+fn split_file_read_hook_sees_target_as_current() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.scripts().io().insert("split.txt", "split-file\n");
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufReadPre *.txt let g:split_current = bufnr('%')",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "split split.txt").unwrap();
+    let buffer = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        global_value(&executor, "split_current"),
+        Some(ox_types::Typval::Number(i64::from(buffer)))
+    );
+    assert_eq!(buffer_text(&editor), vec!["split-file"]);
+}
+
+#[test]
+fn help_file_read_hook_sees_target_as_current() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor
+        .scripts_mut()
+        .add_runtime_root(PathBuf::from("runtime"));
+    executor.scripts().io().insert("runtime/doc/help.txt", "help text\n");
+    executor
+        .execute_line(&editor, "autocmd BufReadPre * let g:help_current = bufnr('%')")
+        .unwrap();
+    executor.execute_line(&editor, "help").unwrap();
+    let buffer = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        global_value(&executor, "help_current"),
+        Some(ox_types::Typval::Number(i64::from(buffer)))
+    );
+    assert_eq!(buffer_text(&editor), vec!["help text"]);
 }
 
 /// `:tabonly` keeps the current tabpage and closes the rest; `:tabo` is its
