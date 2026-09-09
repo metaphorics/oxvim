@@ -8,7 +8,8 @@ use ox_types::{BufHandle, WinHandle};
 use crate::BufferRelease;
 use crate::Editor;
 use crate::layout::{
-    Anchor, Frame, Geometry, Layout, RelativeTo, TabpageState, WinConfig, WindowState,
+    Anchor, CursorScreenPosition, Frame, Geometry, Layout, RelativeTo, TabpageState, WinConfig,
+    WindowState,
 };
 use crate::marks::{Changelists, Jumplist, LocalMarks, MarkLocation};
 use crate::options::{OPTION_COUNT, OPTION_METADATA, OptionError, OptionStore, OptionValue};
@@ -371,8 +372,13 @@ fn floats_are_stably_sorted_by_zindex() {
         let mut config =
             WinConfig::new(RelativeTo::Editor, Anchor::NorthWest, 0.0, 0.0, 4, 2).unwrap();
         config.zindex = zindex;
-        tab.add_float(window, WindowState::new(buffer, position(1, 0)), config)
-            .unwrap();
+        tab.add_float(
+            window,
+            WindowState::new(buffer, position(1, 0)),
+            config,
+            CursorScreenPosition::default(),
+        )
+        .unwrap();
     }
     let ordered: Vec<_> = tab.floating_windows().map(|float| float.window).collect();
     assert_eq!(
@@ -397,8 +403,13 @@ fn cursor_float_freezes_anchor_so_entering_keeps_geometry_resolvable() {
     let mut tab = TabpageState::new(layout);
     let float = window_handle(2);
     let config = WinConfig::new(RelativeTo::Cursor, Anchor::NorthWest, 1.0, 1.0, 4, 2).unwrap();
-    tab.add_float(float, WindowState::new(buffer, position(1, 0)), config)
-        .unwrap();
+    tab.add_float(
+        float,
+        WindowState::new(buffer, position(1, 0)),
+        config,
+        CursorScreenPosition::default(),
+    )
+    .unwrap();
     // The stored config carries the frozen anchor: cursor (1, 0) against
     // topline 1 contributes no offset, so the given row/col survive.
     let stored = tab

@@ -100,6 +100,17 @@ impl WindowState {
         }
     }
 }
+/// Cursor position in rendered screen cells within its anchor window.
+///
+/// The editor computes this before mutably borrowing the tabpage, because the
+/// layout layer owns window geometry but not buffer text or option state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CursorScreenPosition {
+    /// Zero-based screen row within the window.
+    pub row: usize,
+    /// Zero-based screen column within the window.
+    pub col: usize,
+}
 
 /// Per-window API state: window-local variables, match items, and tag stack.
 #[derive(Clone, Debug, PartialEq)]
@@ -1148,9 +1159,10 @@ impl TabpageState {
         &mut self,
         window: WinHandle,
         mut config: WinConfig,
+        cursor: CursorScreenPosition,
     ) -> Result<(), LayoutError> {
         let resolved = self.resolve(window);
-        self.freeze_cursor_anchor(resolved, &mut config);
+        self.freeze_cursor_anchor(resolved, &mut config, cursor);
         config.validate()?;
         let floating = self
             .floats
@@ -1234,6 +1246,20 @@ impl TabpageState {
         self.previous
     }
 
+    /// Resolves the window used as the anchor for a cursor-relative float.
+    ///
+    /// A float opened from the current window is anchored to the previous
+    /// live window when possible, avoiding a self-reference while preserving
+    /// synchronous cursor-relative geometry.
+    pub(crate) fn cursor_anchor_window(&self, window: WinHandle) -> Option<WinHandle> {
+        let resolved = self.resolve(window);
+        if self.current != resolved {
+            return Some(self.current);
+        }
+        self.previous
+            .filter(|previous| *previous != resolved && self.contains(*previous))
+    }
+
     /// Returns floating windows from lowest to highest z-index. Equal z-index
     /// windows remain in insertion order.
     #[must_use]
@@ -1303,7 +1329,6 @@ impl TabpageState {
         }
         Ok(())
     }
-
     /// Folds a cursor-relative anchor into `row`/`col`, freezing the float
     /// against its anchor window.
     ///
@@ -1314,41 +1339,39 @@ impl TabpageState {
     /// window happens to be current. Resolving at query time self-recurses
     /// the moment the float itself becomes current and trips the reference
     /// cycle guard on every redraw.
-    fn freeze_cursor_anchor(&self, window: WinHandle, config: &mut WinConfig) {
+    ///
+    /// The caller supplies the cursor's already-rendered screen position.
+    /// Buffer text and option state live in [`crate::Editor`], so deriving
+    /// those cells here would duplicate the renderer and make the layout
+    /// layer depend on the whole editor.
+    fn freeze_cursor_anchor(
+        &self,
+        window: WinHandle,
+        config: &mut WinConfig,
+        cursor: CursorScreenPosition,
+    ) {
         if !matches!(config.relative, RelativeTo::Cursor) {
             return;
         }
-        let anchor = if self.current != window {
-            self.current
-        } else if let Some(previous) = self
-            .previous
-            .filter(|previous| *previous != window && self.contains(*previous))
-        {
-            // Reconfiguring the current window: anchor to the window entered
-            // from while it is still live.
-            previous
-        } else {
+        let Some(anchor) = self.cursor_anchor_window(window) else {
             // Degenerate anchor: cursor offsets become editor offsets rather
             // than a self-loop that can never resolve.
             config.relative = RelativeTo::Editor;
             return;
         };
-        let (row_offset, col_offset) = self.window(anchor).ok().map_or((0.0, 0.0), |state| {
-            // Display offsets always fit `u32`; anything larger saturates
-            // instead of losing precision into `f64`.
-            let row = u32::try_from(state.cursor.lnum.saturating_sub(state.topline));
-            let col = u32::try_from(state.cursor.col);
-            (
-                row.map_or(f64::from(u32::MAX), f64::from),
-                col.map_or(f64::from(u32::MAX), f64::from),
-            )
-        });
+        // Display offsets always fit `u32`; anything larger saturates
+        // instead of losing precision into `f64`.
+        let row_offset = f64::from(u32::try_from(cursor.row).unwrap_or(u32::MAX));
+        let col_offset = f64::from(u32::try_from(cursor.col).unwrap_or(u32::MAX));
         config.row += row_offset;
         config.col += col_offset;
         config.relative = RelativeTo::Window(anchor);
     }
 
     /// Adds a floating window while preserving stable z-index ordering.
+    ///
+    /// `cursor` is the rendered position of the cursor in the anchor window;
+    /// it is used only when `config.relative` is [`RelativeTo::Cursor`].
     ///
     /// # Errors
     ///
@@ -1362,9 +1385,10 @@ impl TabpageState {
         window: WinHandle,
         state: WindowState,
         mut config: WinConfig,
+        cursor: CursorScreenPosition,
     ) -> Result<(), LayoutError> {
         validate_identity(window)?;
-        self.freeze_cursor_anchor(window, &mut config);
+        self.freeze_cursor_anchor(window, &mut config, cursor);
         config.validate()?;
         if self.contains(window) {
             return Err(LayoutError::DuplicateWindow(window));
