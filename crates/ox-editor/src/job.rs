@@ -545,13 +545,13 @@ impl JobManager {
     }
 
     /// The terminal job projecting into `buffer`, if any, with whether it
-    /// is still running (`terminal_running`, os/shell.c): a live channel
+    /// is still pending (`terminal_running`, os/shell.c): a pending channel
     /// rejects a second attach, a completed one is closed and reused
     /// (`f_jobstart`, eval/funcs.c:3491-3498).
     #[must_use]
     pub fn terminal_job_for_buffer(&self, buffer: ox_types::BufHandle) -> Option<(u64, bool)> {
         self.jobs.iter().find_map(|(id, job)| {
-            (job.terminal_buffer == Some(buffer)).then_some((*id, job.status < 0))
+            (job.terminal_buffer == Some(buffer)).then_some((*id, job.status == -1))
         })
     }
 
@@ -794,6 +794,10 @@ fn lock_queue(
 }
 
 #[cfg(all(test, unix))]
+#[expect(
+    clippy::unwrap_used,
+    reason = "job tests use unwrap to fail immediately on fixture setup errors",
+)]
 mod tests {
     use super::*;
 
@@ -855,6 +859,21 @@ mod tests {
             },
             _ => "unknown",
         }
+    }
+
+    #[test]
+    fn reap_error_marks_terminal_buffer_reusable() {
+        let mut jobs = JobManager::new().unwrap();
+        let buffer = ox_types::BufHandle::try_from(7).unwrap();
+        let mut job_options = options("sleep 10", true);
+        job_options.terminal_buffer = Some(buffer);
+        jobs.start(3, job_options).unwrap();
+        assert_eq!(jobs.terminal_job_for_buffer(buffer), Some((3, true)));
+        lock_queue(&jobs.raw).push_back(RawEvent::Exit(3, Err("reap failed".to_owned())));
+
+        jobs.poll().unwrap();
+
+        assert_eq!(jobs.terminal_job_for_buffer(buffer), Some((3, false)));
     }
 
     #[test]

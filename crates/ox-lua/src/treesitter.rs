@@ -478,8 +478,20 @@ impl UserData for ParserHandle {
                     Option<u64>,
                 )| {
                     check_parser_live(this)?;
-                    let bytes = match input {
-                        Value::String(string) => string.as_bytes().to_vec(),
+                    let old_tree = old
+                        .as_ref()
+                        .map(AnyUserData::borrow::<TreeHandle>)
+                        .transpose()?;
+                    let old_tree_ref = old_tree.as_ref().map(|tree| &tree.0.tree);
+                    let (bytes, parsed) = match input {
+                        Value::String(string) => {
+                            let bytes = string.as_bytes().to_vec();
+                            // Upstream's string branch is deliberately unbounded
+                            // (`treesitter.c:568-574`); timeout applies only to
+                            // live-buffer input below.
+                            let parsed = this.parser.parse(&bytes, old_tree_ref);
+                            (bytes, parsed)
+                        }
                         // Upstream parses live buffer text when the input is a
                         // buffer handle: fetch the lines through `vim.api` on
                         // this same loop thread (unsaved changes included) and
@@ -494,39 +506,38 @@ impl UserData for ParserHandle {
                                 let message = format!("invalid buffer handle: {bufnr}");
                                 return Err(runtime_error(message));
                             }
-                            buffer_bytes(lua, bufnr)?
+                            let bytes = buffer_bytes(lua, bufnr)?;
+                            let timeout = timeout.unwrap_or(0);
+                            let parsed = if timeout == 0 {
+                                this.parser.parse(&bytes, old_tree_ref)
+                            } else {
+                                let started = Instant::now();
+                                let deadline = Duration::from_nanos(timeout);
+                                let length = bytes.len();
+                                let mut input = |offset: usize, _: Point| {
+                                    if offset < length {
+                                        &bytes[offset..]
+                                    } else {
+                                        &[]
+                                    }
+                                };
+                                let mut progress = parse_deadline_callback(started, deadline);
+                                let options = ParseOptions::new().progress_callback(&mut progress);
+                                this.parser
+                                    .parse_with_options(&mut input, old_tree_ref, Some(options))
+                            };
+                            (bytes, parsed)
                         }
                         _ => return Err(runtime_error("expected either string or buffer handle")),
                     };
-                    let old_tree = old
-                        .as_ref()
-                        .map(AnyUserData::borrow::<TreeHandle>)
-                        .transpose()?;
-                    let old_tree_ref = old_tree.as_ref().map(|tree| &tree.0.tree);
-                    let timeout = timeout.unwrap_or(0);
-                    let parsed = if timeout == 0 {
-                        this.parser.parse(&bytes, old_tree_ref)
-                    } else {
-                        let started = Instant::now();
-                        let deadline = Duration::from_nanos(timeout);
-                        let length = bytes.len();
-                        let mut input = |offset: usize, _: Point| {
-                            if offset < length {
-                                &bytes[offset..]
-                            } else {
-                                &[]
-                            }
-                        };
-                        let mut progress = parse_deadline_callback(started, deadline);
-                        let options = ParseOptions::new().progress_callback(&mut progress);
-                        this.parser
-                            .parse_with_options(&mut input, old_tree_ref, Some(options))
-                    }
-                    .ok_or_else(|| {
-                        runtime_error(
-                            "Language was unset, has an incompatible ABI, or parsing timed out.",
-                        )
-                    })?;
+                    let Some(parsed) = parsed else {
+                        if this.parser.language().is_none() {
+                            return Err(runtime_error(
+                                "Language was unset, or has an incompatible ABI.",
+                            ));
+                        }
+                        return Ok(MultiValue::new());
+                    };
                     if let Some(message) = this.logger_error.borrow_mut().take() {
                         return Err(runtime_error(message));
                     }
@@ -543,7 +554,8 @@ impl UserData for ParserHandle {
                     Ok((
                         tree,
                         ranges_table(lua, changed, include_bytes.unwrap_or(false))?,
-                    ))
+                    )
+                        .into_lua_multi(lua)?)
                 },
             ),
         );
@@ -1516,4 +1528,109 @@ unsafe fn query_string_value(
         lua.create_function(|_, ()| Ok(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION))?,
     )?;
     Ok(())
+}
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "parser fixture setup must fail loudly instead of hiding a missing parser",
+)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use mlua::Lua;
+
+    use super::*;
+
+    struct TestScheduler;
+
+    impl Scheduler for TestScheduler {
+        fn schedule_deferred(&self, _work: crate::vim::Work) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn parser_from_environment() -> (PathBuf, String) {
+        if let Some(path) = std::env::var_os("OXVIM_TREE_SITTER_PARSER").map(PathBuf::from) {
+            let language = std::env::var("OXVIM_TREE_SITTER_LANGUAGE")
+                .ok()
+                .or_else(|| {
+                    path.file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "lua".to_owned());
+            assert!(path.is_file(), "tree-sitter parser does not exist: {}", path.display());
+            return (path, language);
+        }
+
+        let root = std::env::var_os("OXVIM_REF_ROOT").map_or_else(
+            || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.references/neovim"),
+            PathBuf::from,
+        );
+        let candidates = [
+            root.join("build/lib/nvim/parser/lua.so"),
+            root.join(".deps/usr/lib/nvim/parser/lua.so"),
+            root.join("build/lib/nvim/parser/c.so"),
+            root.join(".deps/usr/lib/nvim/parser/c.so"),
+        ];
+        let path = candidates
+            .into_iter()
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| {
+                panic!(
+                    "treesitter regression test needs a parser .so: set OXVIM_TREE_SITTER_PARSER \
+                     (+ OXVIM_TREE_SITTER_LANGUAGE) or build .references/neovim"
+                )
+            });
+        let language = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("lua")
+            .to_owned();
+        (path, language)
+    }
+
+    #[test]
+    fn buffer_timeout_returns_nil_and_string_timeout_is_ignored() {
+        let (path, language) = parser_from_environment();
+        // SAFETY: this test exercises the userdata shim, which requires Lua's
+        // debug.getmetatable API to mirror the production runtime.
+        let lua = unsafe { Lua::unsafe_new() };
+        let vim = lua.create_table().unwrap();
+        vim.set("api", lua.create_table().unwrap()).unwrap();
+        lua.globals().set("vim", vim).unwrap();
+        install(&lua, Rc::new(TestScheduler)).unwrap();
+
+        lua.globals()
+            .set("parser_path", path.to_string_lossy().into_owned())
+            .unwrap();
+        lua.globals().set("parser_language", language).unwrap();
+        lua.load(
+            r#"
+            assert(vim._ts_add_language_from_object(parser_path, parser_language))
+            local lines = {}
+            for index = 1, 50000 do
+              lines[index] = 'local value = 1'
+            end
+            vim.api.nvim_list_bufs = function() return { 1 } end
+            vim.api.nvim_buf_get_lines = function() return lines end
+            vim.api.nvim_get_option_value = function() return true end
+
+            local parser = vim._create_ts_parser(parser_language)
+            local ok, tree = pcall(parser.parse, parser, nil, 1, false, 1)
+            assert(ok, 'buffer timeout must be resumable: ' .. tostring(tree))
+            assert(tree == nil, 'buffer timeout must return nil')
+            local resumed = parser:parse(nil, 1)
+            assert(type(resumed) == 'userdata', 'parser must resume after a timeout')
+
+            local string_parser = vim._create_ts_parser(parser_language)
+            local source = table.concat(lines, '\n')
+            ok, tree = pcall(string_parser.parse, string_parser, nil, source, false, 1)
+            assert(ok, 'string parse must ignore timeout: ' .. tostring(tree))
+            assert(type(tree) == 'userdata', 'unbounded string parse must return a tree')
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
 }
