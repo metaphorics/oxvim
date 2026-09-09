@@ -3,7 +3,6 @@
 
 use crate::editor::Editor;
 use crate::excmd_exec::ExEditorAccess;
-use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -155,7 +154,7 @@ fn call_assert_fails_builtin<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     args: &[Typval],
 ) -> ox_eval::Result<Typval> {
     check_assert_arity("assert_fails", args.len())?;
@@ -236,7 +235,7 @@ fn call_assert_beeps_builtin<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     name: &str,
     args: &[Typval],
 ) -> ox_eval::Result<Typval> {

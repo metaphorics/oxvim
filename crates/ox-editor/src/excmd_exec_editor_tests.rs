@@ -21,7 +21,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ use std::rc::Rc;
 
 use ox_text::Buffer;
 
-use crate::excmd_exec::{run_autocmd_plan, sync_editor_into_scope, sync_scope_into_editor};
+use crate::excmd_exec::{run_autocmd_plan, sync_editor_into_scope, sync_scope_into_editor, LuaExec};
 use crate::script::{FileIO, FileKind, FileMetadata};
 use crate::{
     AutocmdContext, AutocmdFilter, AutocmdKind, AutocmdOptions, Editor, Event, ExExecutor,
@@ -313,6 +313,133 @@ fn write_sets_buffer_name_and_clears_modified() {
     let state = e.buffer(buffer).unwrap();
     assert_eq!(state.name().to_string_lossy(), "saved.txt");
     assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
+}
+
+/// BufWrite events retain native bytes while preserving raw `<afile>` and
+/// normalized `<amatch>` (`bufwrite.c:395,408,537`;
+/// `autocmd.c:1530-1544,1556-1633`).
+#[cfg(unix)]
+#[test]
+fn write_autocmds_preserve_non_utf8_target_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = b"bufwrite-\xff.txt";
+    let expected_match = std::env::current_dir()
+        .unwrap()
+        .join(std::ffi::OsStr::from_bytes(path));
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_name(ox_types::OxStr::from(path.as_slice()));
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .mark_modified();
+    executor.scripts().io().insert_bytes(path, "disk");
+
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufWritePre * let g:pre_afile = expand('<afile>')",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufWritePre * let g:pre_amatch = expand('<amatch>')",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufWritePost * let g:post_afile = expand('<afile>')",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufWritePost * let g:post_amatch = expand('<amatch>')",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "write!").unwrap();
+
+    for name in [b"pre_afile".as_slice()] {
+        let value = executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, name, 0)
+            .unwrap();
+        let ox_types::Typval::String(value) = value else {
+            panic!("expected String for {name:?}, got {value:?}");
+        };
+        assert_eq!(value.as_bytes(), path, "{name:?} must preserve native bytes");
+    }
+    for name in [b"post_afile".as_slice()] {
+        let value = executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, name, 0)
+            .unwrap();
+        let ox_types::Typval::String(value) = value else {
+            panic!("expected String for {name:?}, got {value:?}");
+        };
+        assert_eq!(value.as_bytes(), path, "{name:?} must preserve native bytes");
+    }
+    for name in [b"pre_amatch".as_slice(), b"post_amatch".as_slice()] {
+        let value = executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, name, 0)
+            .unwrap();
+        let ox_types::Typval::String(value) = value else {
+            panic!("expected String for {name:?}, got {value:?}");
+        };
+        assert_eq!(
+            value.as_bytes(),
+            expected_match.as_os_str().as_bytes(),
+            "{name:?} must preserve native bytes",
+        );
+    }
+
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .mark_modified();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufWriteCmd * let g:cmd_afile = expand('<afile>')",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufWriteCmd * let g:cmd_amatch = expand('<amatch>')",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "write!").unwrap();
+    let value = executor
+        .scope()
+        .get_scoped(ox_eval::scope::ScopeKind::Global, b"cmd_afile", 0)
+        .unwrap();
+    let ox_types::Typval::String(value) = value else {
+        panic!("expected String for cmd_afile, got {value:?}");
+    };
+    assert_eq!(value.as_bytes(), path, "cmd_afile must preserve native bytes");
+    let value = executor
+        .scope()
+        .get_scoped(ox_eval::scope::ScopeKind::Global, b"cmd_amatch", 0)
+        .unwrap();
+    let ox_types::Typval::String(value) = value else {
+        panic!("expected String for cmd_amatch, got {value:?}");
+    };
+    assert_eq!(
+        value.as_bytes(),
+        expected_match.as_os_str().as_bytes(),
+        "cmd_amatch must preserve native bytes",
+    );
 }
 
 /// A no-op `BufWriteCmd` replaces the write (`bufwrite.c:454-475`): no file
@@ -4697,6 +4824,35 @@ fn edit_does_not_enter_requested_buffer_after_read_callback_switches_away() {
     assert_ne!(current_name, "edit-switch.txt");
 }
 
+/// A `BufReadPost` handler may move focus away from a split target. The shared
+/// loader must then abandon the target entry instead of firing its stale
+/// `BufEnter` (`do_ecmd`, `ex_cmds.c:2687`).
+#[test]
+fn split_does_not_enter_target_after_read_callback_switches_window() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.scripts().io().insert("split-switch.txt", "target\n");
+    executor.execute_line(&editor, "let g:target_enters = 0").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufEnter split-switch.txt let g:target_enters += 1",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "autocmd BufReadPost split-switch.txt wincmd w")
+        .unwrap();
+
+    executor
+        .execute_line(&editor, "split split-switch.txt")
+        .unwrap();
+
+    assert_eq!(
+        global_value(&executor, "target_enters"),
+        Some(ox_types::Typval::Number(0)),
+        "BufReadPost moved focus away; split must not fire BufEnter for the target",
+    );
+}
+
 #[test]
 fn split_existing_file_fires_creation_before_read_lifecycle() {
     let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
@@ -8402,20 +8558,18 @@ struct CallbackRecorder {
 }
 
 impl crate::LuaExec for CallbackRecorder {
-    fn execute_chunk(
-        &mut self,
+    fn execute_chunk(&self,
         _code: &str,
         _args: Vec<Object>,
     ) -> Result<Object, crate::LuaExecError> {
         Ok(Object::Nil)
     }
 
-    fn execute_file(&mut self, _path: &Path) -> Result<(), LuaExecError> {
+    fn execute_file(&self, _path: &Path) -> Result<(), LuaExecError> {
         Err(LuaExecError::Runtime("no files".to_owned()))
     }
 
-    fn invoke_callback(
-        &mut self,
+    fn invoke_callback(&self,
         reference: usize,
         args: Vec<Object>,
     ) -> Result<Object, LuaExecError> {
@@ -8424,6 +8578,174 @@ impl crate::LuaExec for CallbackRecorder {
             .push((reference, args.first().cloned().unwrap_or(Object::Nil)));
         Ok(Object::Nil)
     }
+}
+/// Re-enters an Ex executor while a Lua callback is active. The host itself
+/// is an owned `Rc`, so callback dispatch does not borrow a runtime cell across
+/// the user-code call.
+struct DeliveryReentryHost {
+    editor: Rc<TestEditorAccess>,
+    executor: Rc<RefCell<ExExecutor<MemoryFileIO>>>,
+    remaining: Cell<usize>,
+    inner_result: RefCell<Option<Result<ExecOutcome, ExecError>>>,
+}
+
+impl crate::LuaExec for DeliveryReentryHost {
+    fn execute_chunk(
+        &self,
+        _code: &str,
+        _args: Vec<Object>,
+    ) -> Result<Object, crate::LuaExecError> {
+        Ok(Object::Nil)
+    }
+
+    fn execute_file(&self, _path: &Path) -> Result<(), LuaExecError> {
+        Err(LuaExecError::Runtime("no files".to_owned()))
+    }
+
+    fn invoke_callback(
+        &self,
+        _reference: usize,
+        _args: Vec<Object>,
+    ) -> Result<Object, LuaExecError> {
+        if self.remaining.get() > 0 {
+            self.remaining.set(self.remaining.get() - 1);
+            let result = self
+                .executor
+                .borrow_mut()
+                .execute_line(&*self.editor, "write out.txt");
+            *self.inner_result.borrow_mut() = Some(result);
+        }
+        Ok(Object::Nil)
+    }
+}
+
+#[test]
+fn deferred_callback_reentry_completes_without_host_borrow_gate() {
+    let (base_editor, base_executor) = setup_with_content(&[b"source".to_vec()]);
+    base_executor.scripts().io().insert("out.txt", "old\n");
+    let editor = Rc::new(base_editor);
+    let executor = Rc::new(RefCell::new(base_executor));
+    let host = Rc::new(DeliveryReentryHost {
+        editor: editor.clone(),
+        executor: executor.clone(),
+        remaining: Cell::new(1),
+        inner_result: RefCell::new(None),
+    });
+    executor.borrow_mut().set_lua_exec(host.clone());
+    editor
+        .editor_mut()
+        .autocmds_mut()
+        .register_api(
+            &[Event::BufWritePost],
+            "*",
+            &AutocmdKind::LuaCallback(1),
+            &AutocmdOptions::default(),
+        )
+        .unwrap();
+
+    host.invoke_callback(1, Vec::new()).unwrap();
+    let result = host
+        .inner_result
+        .borrow_mut()
+        .take()
+        .expect("reentrant write must run");
+    assert!(result.is_ok(), "reentrant write failed: {result:?}");
+}
+
+/// One callback can synchronously enter a third executor without a fixed
+/// two-host exhaustion path. The shared counter bounds the fixture while
+/// preserving three callback invocations.
+struct DepthReentryHost {
+    editor: Rc<TestEditorAccess>,
+    executor: Rc<RefCell<ExExecutor<MemoryFileIO>>>,
+    remaining: Rc<Cell<usize>>,
+    calls: Rc<Cell<usize>>,
+}
+
+impl crate::LuaExec for DepthReentryHost {
+    fn execute_chunk(
+        &self,
+        _code: &str,
+        _args: Vec<Object>,
+    ) -> Result<Object, crate::LuaExecError> {
+        Ok(Object::Nil)
+    }
+
+    fn execute_file(&self, _path: &Path) -> Result<(), LuaExecError> {
+        Err(LuaExecError::Runtime("no files".to_owned()))
+    }
+
+    fn invoke_callback(
+        &self,
+        _reference: usize,
+        _args: Vec<Object>,
+    ) -> Result<Object, LuaExecError> {
+        self.calls.set(self.calls.get() + 1);
+        let remaining = self.remaining.get();
+        if remaining == 0 {
+            return Ok(Object::Nil);
+        }
+        self.remaining.set(remaining - 1);
+        self.executor
+            .borrow_mut()
+            .execute_line(&*self.editor, "write out.txt")
+            .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+        Ok(Object::Nil)
+    }
+}
+
+#[test]
+fn third_reentrant_callback_completes_on_a_fresh_executor() {
+    let (base_editor, base_executor) = setup_with_content(&[b"source".to_vec()]);
+    base_executor.scripts().io().insert("out.txt", "old\n");
+    let editor = Rc::new(base_editor);
+    let primary = Rc::new(RefCell::new(base_executor));
+    let secondary = Rc::new(RefCell::new(ExExecutor::with_io(MemoryFileIO::new())));
+    let tertiary = Rc::new(RefCell::new(ExExecutor::with_io(MemoryFileIO::new())));
+    secondary.borrow().scripts().io().insert("out.txt", "old\n");
+    tertiary.borrow().scripts().io().insert("out.txt", "old\n");
+    let remaining = Rc::new(Cell::new(2));
+    let calls = Rc::new(Cell::new(0));
+    let primary_host = Rc::new(DepthReentryHost {
+        editor: editor.clone(),
+        executor: secondary.clone(),
+        remaining: remaining.clone(),
+        calls: calls.clone(),
+    });
+    let secondary_host = Rc::new(DepthReentryHost {
+        editor: editor.clone(),
+        executor: tertiary.clone(),
+        remaining: remaining.clone(),
+        calls: calls.clone(),
+    });
+    let tertiary_host = Rc::new(DepthReentryHost {
+        editor: editor.clone(),
+        executor: primary.clone(),
+        remaining,
+        calls: calls.clone(),
+    });
+    primary
+        .borrow_mut()
+        .set_lua_exec(primary_host.clone());
+    secondary
+        .borrow_mut()
+        .set_lua_exec(secondary_host.clone());
+    tertiary
+        .borrow_mut()
+        .set_lua_exec(tertiary_host.clone());
+    editor
+        .editor_mut()
+        .autocmds_mut()
+        .register_api(
+            &[Event::BufWritePost],
+            "*",
+            &AutocmdKind::LuaCallback(1),
+            &AutocmdOptions::default(),
+        )
+        .unwrap();
+
+    primary_host.invoke_callback(1, Vec::new()).unwrap();
+    assert_eq!(calls.get(), 3);
 }
 
 fn user_command(name: &str, body: &str) -> crate::UserCommand {
@@ -8572,9 +8894,9 @@ fn bwipeout_clears_local_commands_but_bdelete_keeps_them() {
 fn api_callback_command_receives_upstream_opts() {
     let (editor, mut executor) =
         setup_with_content(&[b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
-    let recorder = Rc::new(RefCell::new(CallbackRecorder {
+    let recorder = Rc::new(CallbackRecorder {
         calls: RefCell::new(Vec::new()),
-    }));
+    });
     executor.set_lua_exec(recorder.clone());
     let mut command = user_command("Hello", "");
     command.nargs = '*';
@@ -8588,8 +8910,7 @@ fn api_callback_command_receives_upstream_opts() {
         .execute_line(&editor, "1,2Hello alpha beta")
         .unwrap();
 
-    let recorder_ref = recorder.borrow();
-    let calls = recorder_ref.calls.borrow();
+    let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, 42);
     let Object::Dict(opts) = &calls[0].1 else {
@@ -8638,9 +8959,9 @@ fn range_and_count_defaults_are_shared_by_invocation_and_parse() {
         b"four".to_vec(),
         b"five".to_vec(),
     ]);
-    let recorder = Rc::new(RefCell::new(CallbackRecorder {
+    let recorder = Rc::new(CallbackRecorder {
         calls: RefCell::new(Vec::new()),
-    }));
+    });
     executor.set_lua_exec(recorder.clone());
 
     let mut counted = user_command("Counted", "");
@@ -8682,8 +9003,7 @@ fn range_and_count_defaults_are_shared_by_invocation_and_parse() {
         .unwrap();
     assert_eq!((parsed.line1, parsed.line2), (3, 3));
 
-    let recorder_ref = recorder.borrow();
-    let calls = recorder_ref.calls.borrow();
+    let calls = recorder.calls.borrow();
     let count_of = |index: usize| match &calls[index].1 {
         Object::Dict(opts) => opts
             .0
@@ -9676,7 +9996,7 @@ fn plan_entry_flush_feeds_nested_scope_reads() {
         Event::BufWritePost,
         AutocmdContext {
             buffer: Some(buffer),
-            file_name: Some("out.txt"),
+            file_name: Some(b"out.txt"),
             ..AutocmdContext::default()
         },
     );

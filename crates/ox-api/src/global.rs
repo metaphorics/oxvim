@@ -810,13 +810,14 @@ fn fire_focus_events(
                 .map(|state| state.name().to_string_lossy().into_owned())
         })
         .unwrap_or_default();
+    let name = OxStr::from(name.as_str());
     for &event in events {
         let plan = session.with_editor_mut(|editor| {
             editor.autocmds_mut().plan(
                 event,
                 AutocmdContext {
                     buffer: Some(buffer),
-                    file_name: Some(&name),
+                    file_name: Some(name.as_bytes()),
                     ..AutocmdContext::default()
                 },
             )

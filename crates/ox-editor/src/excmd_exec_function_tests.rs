@@ -1431,26 +1431,25 @@ fn colorscheme_missing_runtime_file_is_e185_without_state_or_event() {
 
 #[derive(Default)]
 struct ColorschemeLua {
-    callback_colors_name: Option<String>,
+    callback_colors_name: RefCell<Option<String>>,
 }
 
 impl LuaExec for ColorschemeLua {
-    fn execute_chunk(&mut self, _code: &str, _args: Vec<Object>) -> Result<Object, LuaExecError> {
+    fn execute_chunk(&self, _code: &str, _args: Vec<Object>) -> Result<Object, LuaExecError> {
         Ok(Object::Nil)
     }
 
-    fn execute_file(&mut self, _path: &Path) -> Result<(), LuaExecError> {
+    fn execute_file(&self, _path: &Path) -> Result<(), LuaExecError> {
         Ok(())
     }
 
-    fn invoke_callback(
-        &mut self,
+    fn invoke_callback(&self,
         _reference: usize,
         args: Vec<Object>,
     ) -> Result<Object, LuaExecError> {
         // The ColorScheme autocmd passes one dict (`file` carries the new
         // colorscheme name, per `apply_autocmds` building the event table).
-        self.callback_colors_name = args.first().and_then(|value| match value {
+        *self.callback_colors_name.borrow_mut() = args.first().and_then(|value| match value {
             Object::Dict(entries) => entries
                 .iter()
                 .find(|(key, _)| key.as_bytes() == b"file")
@@ -1468,7 +1467,7 @@ impl LuaExec for ColorschemeLua {
 fn colorscheme_lua_autocmd_observes_and_preserves_new_global_name() {
     let io = MemoryFileIO::new();
     io.insert("/rt/colors/luaonly.lua", "");
-    let host = Rc::new(RefCell::new(ColorschemeLua::default()));
+    let host = Rc::new(ColorschemeLua::default());
     let editor = TestEditorAccess::new(Editor::new());
     editor
         .editor_mut()
@@ -1488,7 +1487,7 @@ fn colorscheme_lua_autocmd_observes_and_preserves_new_global_name() {
     exec.execute_line(&editor, "colorscheme luaonly").unwrap();
 
     assert_eq!(
-        host.borrow().callback_colors_name.as_deref(),
+        host.callback_colors_name.borrow().as_deref(),
         Some("luaonly")
     );
     assert_eq!(

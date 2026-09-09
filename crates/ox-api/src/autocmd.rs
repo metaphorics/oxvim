@@ -235,13 +235,14 @@ pub(crate) fn fire_filetype(
                 .map(|state| state.name().to_string_lossy().into_owned())
         })
         .unwrap_or_default();
+    let file_name = OxStr::from(file_name.as_str());
     let plan = session.with_editor_mut(|editor| {
         editor.autocmds_mut().plan(
             Event::FileType,
             AutocmdContext {
                 buffer: Some(buffer),
-                file_name: Some(&file_name),
-                match_name: Some(file_type),
+                file_name: Some(file_name.as_bytes()),
+                match_name: Some(file_type.as_bytes()),
                 nested: true,
                 data: None,
             },
@@ -982,7 +983,7 @@ pub fn nvim_exec_autocmds(session: &ApiSession, event: Object, opts: Dict) -> Re
             // `<amatch>` per event kind.
             let context = AutocmdContext {
                 buffer: context_buffer,
-                file_name: file_name.as_deref(),
+                file_name: file_name.as_deref().map(str::as_bytes),
                 match_name: None,
                 nested: true,
                 data: data.as_ref(),

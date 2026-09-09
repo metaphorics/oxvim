@@ -29,7 +29,7 @@ fn ex(value: &str) -> AutocmdKind {
 fn context(buffer: Option<BufHandle>, file_name: Option<&str>) -> AutocmdContext<'_> {
     AutocmdContext {
         buffer,
-        file_name,
+        file_name: file_name.map(str::as_bytes),
         match_name: None,
         // A top-level event is not raised inside a non-nested outer autocmd,
         // so nesting is permitted and no event-level gate applies.
@@ -326,15 +326,15 @@ fn explicit_match_name_preserves_event_and_file_context() {
         Event::FileType,
         AutocmdContext {
             buffer: Some(target),
-            file_name: Some("src/main.py"),
-            match_name: Some("python"),
+            file_name: Some("src/main.py".as_bytes()),
+            match_name: Some(b"python"),
             nested: true,
             data: None,
         },
     );
     let action = &plan.ready[0];
-    assert_eq!(action.match_name, "python");
-    assert_eq!(action.file_name, "src/main.py");
+    assert_eq!(action.match_name, ox_types::OxStr::from("python"));
+    assert_eq!(action.file_name, ox_types::OxStr::from("src/main.py"));
     assert_eq!(action.buffer, Some(target));
 }
 
@@ -598,7 +598,7 @@ fn non_nested_outer_suppresses_whole_nested_event() {
         Event::User,
         AutocmdContext {
             buffer: None,
-            file_name: Some("x"),
+            file_name: Some(b"x"),
             match_name: None,
             nested: false,
             data: None,
@@ -635,7 +635,7 @@ fn nested_outer_plans_all_matching_inner_actions() {
         Event::User,
         AutocmdContext {
             buffer: None,
-            file_name: Some("x"),
+            file_name: Some(b"x"),
             match_name: None,
             nested: true,
             data: None,

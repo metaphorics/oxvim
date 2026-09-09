@@ -19,7 +19,6 @@ use ox_eval::closure_index;
 use ox_eval::exists as exists_in_scope;
 use ox_excmd::{ResolveError, ResolvedCommand, resolve_command};
 use ox_types::{Funcref, Object, OxStr, Special, Typval};
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::input_string_arg;
@@ -98,7 +97,7 @@ fn call_execute_builtin<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     args: &[Typval],
 ) -> ox_eval::Result<Typval> {
     if args.is_empty() {
@@ -173,7 +172,7 @@ fn call_luaeval_builtin<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     args: &[Typval],
 ) -> ox_eval::Result<Typval> {
     let Some(lua) = lua else {
@@ -223,7 +222,7 @@ fn call_luaeval_builtin<F: FileIO, E: ExEditorAccess>(
             "luaeval",
         ));
     }
-    let result = lua.borrow_mut().eval_expression(&expression, args.get(1));
+    let result = lua.eval_expression(&expression, args.get(1));
     let sync = access.with_ex_editor(|editor| sync_editor_into_scope(editor, scope));
     match (result, sync) {
         (Err(LuaExecError::Load(message)), _) => {
@@ -251,27 +250,31 @@ fn expand_special_base<F: FileIO, E: ExEditorAccess>(
     runtime: &ExRuntime<F>,
     access: &E,
     token: &str,
-) -> String {
+) -> OxStr {
     match token {
         "%" => access.with_ex_editor(|editor| {
             editor
                 .current_buffer()
                 .and_then(|buffer| editor.buffer(buffer).ok())
-                .map_or_else(String::new, |buffer| {
-                    buffer.name().to_string_lossy().into_owned()
+                .map_or_else(|| OxStr(Vec::new()), |buffer| {
+                    let name = buffer.name().to_string_lossy();
+                    OxStr::from(name.as_ref())
                 })
         }),
-        "<SID>" => runtime
-            .scripts
-            .current_sid()
-            .map_or_else(String::new, |sid| format!("<SNR>{sid}_")),
+        "<SID>" => runtime.scripts.current_sid().map_or_else(
+            || OxStr(Vec::new()),
+            |sid| {
+                let name = format!("<SNR>{sid}_");
+                OxStr::from(name.as_str())
+            },
+        ),
         "<amatch>" => runtime.active_autocmd.matched.clone(),
         "<afile>" => runtime.active_autocmd.file.clone(),
-        "<abuf>" => runtime
-            .active_autocmd
-            .buffer
-            .map_or_else(String::new, |buffer| i64::from(buffer).to_string()),
-        _ => String::new(),
+        "<abuf>" => runtime.active_autocmd.buffer.map_or_else(|| OxStr(Vec::new()), |buffer| {
+            let number = i64::from(buffer).to_string();
+            OxStr::from(number.as_str())
+        }),
+        _ => OxStr(Vec::new()),
     }
 }
 
@@ -313,15 +316,24 @@ fn call_expand_builtin<F: FileIO, E: ExEditorAccess>(
             let base = expand_special_base(runtime, access, token);
             // `expand()` on an unnamed source yields "" (upstream f_expand:
             // eval_vars marks the result invalid and f_expand returns "").
-            if rest.is_empty() || base.is_empty() {
+            if rest.is_empty() || base.as_bytes().is_empty() {
                 base
             } else {
-                ox_eval::apply_filename_modifiers(Some(&VimRegex), &base, rest.as_bytes())?
+                let base_text = base.to_string_lossy();
+                let modified = ox_eval::apply_filename_modifiers(
+                    Some(&VimRegex),
+                    base_text.as_ref(),
+                    rest.as_bytes(),
+                )?;
+                OxStr::from(modified.as_str())
             }
         }
-        _ => expand_env_esc(text),
+        _ => {
+            let expanded = expand_env_esc(text);
+            OxStr::from(expanded.as_str())
+        }
     };
-    Ok(Typval::String(OxStr(expanded.into_bytes())))
+    Ok(Typval::String(expanded))
 }
 
 fn resolve_function_reference<F: FileIO>(
@@ -496,7 +508,7 @@ fn call_feedkeys_builtin<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     args: &[Typval],
 ) -> ox_eval::Result<Typval> {
     if args.is_empty() || args.len() > 2 {

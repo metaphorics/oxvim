@@ -4,6 +4,7 @@
 //! follow `src/nvim/autocmd.c:887-957`, `src/nvim/autocmd.c:1865-1890`, and
 //! `src/nvim/fileio.c:3694-3869`. Execution belongs to the host.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use ox_types::{BufHandle, Dict, Object, OxStr};
@@ -256,10 +257,10 @@ pub struct AutocmdAction {
     pub pattern: String,
     /// Selected buffer for a buffer-local pattern.
     pub buffer: Option<BufHandle>,
-    /// Match text supplied by this event occurrence.
-    pub match_name: String,
-    /// File text supplied by this event occurrence.
-    pub file_name: String,
+    /// Match bytes supplied by this event occurrence.
+    pub match_name: OxStr,
+    /// File bytes supplied by this event occurrence.
+    pub file_name: OxStr,
     /// Optional user-facing description.
     pub description: Option<String>,
     /// User data supplied by `nvim_exec_autocmds`.
@@ -285,12 +286,12 @@ impl AutocmdAction {
             ),
             (
                 OxStr::from("match"),
-                Object::String(OxStr::from(self.match_name.as_str())),
+                Object::String(self.match_name.clone()),
             ),
             (OxStr::from("buf"), buffer),
             (
                 OxStr::from("file"),
-                Object::String(OxStr::from(self.file_name.as_str())),
+                Object::String(self.file_name.clone()),
             ),
         ];
         if self.group != AugroupId::default() {
@@ -364,10 +365,10 @@ pub struct AutocmdOptions {
 pub struct AutocmdContext<'a> {
     /// Buffer associated with the event.
     pub buffer: Option<BufHandle>,
-    /// Event match name, normally a buffer or file name.
-    pub file_name: Option<&'a str>,
-    /// Explicit event match text when it differs from the associated file.
-    pub match_name: Option<&'a str>,
+    /// Event file name as raw Vim bytes, normally a buffer or file name.
+    pub file_name: Option<&'a [u8]>,
+    /// Explicit event match bytes when they differ from the associated file.
+    pub match_name: Option<&'a [u8]>,
     /// True when this event may fire nested, false when it is raised inside a
     /// non-`++nested` outer autocmd and must be suppressed entirely.
     ///
@@ -1034,25 +1035,30 @@ impl Autocmds {
                 StoredPattern::Glob(_) => None,
             }),
             match_name: match context.match_name {
-                Some(name) => name.to_owned(),
-                None => context.file_name.map_or_else(String::new, |name| {
-                    if entry.event.pattern_kind() == PatternKind::None || name.is_empty() {
-                        name.to_owned()
-                    } else {
-                        let path = std::path::Path::new(name);
-                        if path.is_absolute() {
-                            name.to_owned()
-                        } else {
-                            std::env::current_dir()
-                                .unwrap_or_default()
-                                .join(path)
-                                .to_string_lossy()
-                                .into_owned()
-                        }
+                Some(name) => OxStr::from(name),
+                None => context.file_name.map_or_else(|| OxStr(Vec::new()), |name| {
+                    let name = OxStr::from(name);
+                    if entry.event.pattern_kind() == PatternKind::None || name.as_bytes().is_empty() {
+                        return name;
+                    }
+                    let path = crate::excmd_exec::path_from_ox_str(&name);
+                    if path.is_absolute() {
+                        return name;
+                    }
+                    let full = std::env::current_dir().unwrap_or_default().join(path);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::ffi::OsStrExt;
+
+                        OxStr::from(full.as_os_str().as_bytes())
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        OxStr::from(full.to_string_lossy().as_ref())
                     }
                 }),
             },
-            file_name: context.file_name.unwrap_or_default().to_owned(),
+            file_name: OxStr::from(context.file_name.unwrap_or_default()),
             description: entry.options.description.clone(),
             data: context.data.cloned(),
         }
@@ -1062,12 +1068,16 @@ impl Autocmds {
 fn pattern_matches(
     pattern: &StoredPattern,
     buffer: Option<BufHandle>,
-    file_name: Option<&str>,
+    file_name: Option<&[u8]>,
 ) -> bool {
     match pattern {
         StoredPattern::Buffer(expected) => buffer == Some(*expected),
         StoredPattern::Glob(patterns) => {
-            let name = file_name.unwrap_or_default();
+            let name = match file_name {
+                Some(name) => String::from_utf8_lossy(name),
+                None => Cow::Borrowed(""),
+            };
+            let name = name.as_ref();
             patterns.iter().any(|pattern| {
                 let candidate = if pattern.contains('/') {
                     name

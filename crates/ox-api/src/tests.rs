@@ -2512,7 +2512,10 @@ fn set_option_value_fires_one_populated_filetype_after_commit() {
     let recorded = actions.borrow();
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].api_id, Some(u64::try_from(id).unwrap()));
-    assert_eq!(recorded[0].file_name, expected_name.to_string_lossy());
+    assert_eq!(
+        recorded[0].file_name,
+        OxStr::from(expected_name.to_string_lossy().as_ref()),
+    );
     assert_eq!(recorded[0].buffer, Some(target));
 }
 
@@ -2541,7 +2544,7 @@ fn ft_alias_with_local_scope_fires_for_the_current_buffer() {
 
     let recorded = actions.borrow();
     assert_eq!(recorded.len(), 1);
-    assert_eq!(recorded[0].match_name, "python");
+    assert_eq!(recorded[0].match_name, OxStr::from("python"));
     assert_eq!(recorded[0].buffer, Some(current));
 }
 

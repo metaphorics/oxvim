@@ -144,15 +144,26 @@ const MAX_HOSTLESS_JOB_EVENT_PASSES: usize = 3;
 /// `invoke_callback`, event/loop.c, runs all callbacks on the main stack).
 ///
 /// Phase A drains the batch with a short `ex` borrow. Phase B invokes each
-/// callback with the borrow dropped -- Lua callbacks go straight to the Lua
-/// host, Vimscript callbacks reborrow `ex` for one event. Phase C requeues
-/// the unconsumed tail on handler failure and updates the delivered flag.
+/// callback on the alternate executor's Lua host, leaving the owner host free
+/// for any nested Ex re-entry. Vimscript callbacks reborrow `ex` for one
+/// event. Phase C requeues the unconsumed tail on handler failure and updates
+/// the delivered flag.
 fn deliver_deferred_job_events(
     session: &ApiSession,
     ex: &Rc<RefCell<ExExecutor>>,
+    nested_ex: &Rc<RefCell<ExExecutor>>,
     hostless_passes: &mut usize,
 ) -> Result<bool, String> {
-    let lua = ex.borrow().lua_host();
+    let lua = {
+        let alternate = match nested_ex.try_borrow() {
+            Ok(executor) => executor,
+            Err(_) => return Ok(false),
+        };
+        alternate.lua_host()
+    };
+    if lua.as_ref().is_some_and(|host| host.in_user_code()) {
+        return Ok(false);
+    }
     let mut batch: VecDeque<JobEvent> = ex.borrow_mut().take_deferred_job_events().into();
     if batch.is_empty() {
         *hostless_passes = 0;
@@ -180,7 +191,7 @@ fn deliver_deferred_job_events(
                 continue;
             };
             let args = event.args.iter().map(ox_rpc::typval_to_object).collect();
-            if let Err(lua_error) = lua.borrow_mut().invoke_callback(reference, args) {
+            if let Err(lua_error) = lua.invoke_callback(reference, args) {
                 // The event reached its handler and the handler failed:
                 // consumed, like upstream's per-event multiqueue processing;
                 // requeueing it would retry every drain.
@@ -564,6 +575,7 @@ pub(crate) fn build_embedded_core(
             session: session.clone(),
             ex: ex.clone(),
             nested_ex: nested_ex.clone(),
+            fork_seed: fork_seed.clone(),
             lua: lua.lua().clone(),
             registry: registry.clone(),
             channel_ids: channel_ids.clone(),
@@ -573,6 +585,7 @@ pub(crate) fn build_embedded_core(
             session: session.clone(),
             ex: ex.clone(),
             nested_ex: nested_ex.clone(),
+            fork_seed: fork_seed.clone(),
             lua: lua.lua().clone(),
             registry: registry.clone(),
             channel_ids: channel_ids.clone(),
@@ -587,6 +600,7 @@ pub(crate) fn build_embedded_core(
             registry: registry.clone(),
             ex: ex.clone(),
             nested_ex: nested_ex.clone(),
+            fork_seed: fork_seed.clone(),
             channel_ids: channel_ids.clone(),
             event_loop: event_loop.clone(),
         }),
@@ -596,6 +610,7 @@ pub(crate) fn build_embedded_core(
             registry: registry.clone(),
             ex: ex.clone(),
             nested_ex: nested_ex.clone(),
+            fork_seed: fork_seed.clone(),
             channel_ids: channel_ids.clone(),
             event_loop: event_loop.clone(),
         }),
@@ -628,15 +643,17 @@ pub(crate) fn build_embedded_core(
         .map_err(|error| AppError::Lua(error.to_string()))?;
     let callback_lua = lua.lua().clone();
     let lua = Rc::new(RefCell::new(lua));
+    let user_code_depth = Rc::new(Cell::new(0));
     let callback_host = || {
-        Rc::new(RefCell::new(ServerLuaExec {
+        Rc::new(ServerLuaExec {
             session: session.clone(),
             lua: callback_lua.clone(),
             registry: registry.clone(),
             ex: ex.clone(),
             nested_ex: nested_ex.clone(),
             event_loop: event_loop.clone(),
-        }))
+            user_code_depth: user_code_depth.clone(),
+        })
     };
     ex.borrow_mut().set_lua_exec(callback_host());
     nested_ex.borrow_mut().set_lua_exec(callback_host());
@@ -3754,6 +3771,7 @@ impl NetworkRuntime {
         let delivered = match deliver_deferred_job_events(
             &session,
             &ex,
+            &nested_ex,
             &mut self.hostless_job_event_passes,
         ) {
             Ok(delivered) => delivered,
@@ -4260,12 +4278,26 @@ fn variables_mut(
     }
 }
 
+struct UserCodeGuard(Rc<Cell<u32>>);
+
+impl UserCodeGuard {
+    fn enter(depth: &Rc<Cell<u32>>) -> Self {
+        depth.set(depth.get().saturating_add(1));
+        Self(Rc::clone(depth))
+    }
+}
+
+impl Drop for UserCodeGuard {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
 /// The Lua/Ex host clone shared by every executor surface: the Ex executor's
 /// `LuaExec` host, the API-level `LuaExecutor` slots, and the UI redraw
 /// provider path. All instances hold `Lua` clones backed by the same mlua
 /// registry, so a raw reference has one registry identity while executor
 /// objects remain independently borrowable.
-#[derive(Clone)]
 struct ServerLuaExec {
     session: Rc<ApiSession>,
     lua: Lua,
@@ -4273,10 +4305,12 @@ struct ServerLuaExec {
     ex: Rc<RefCell<ExExecutor>>,
     nested_ex: Rc<RefCell<ExExecutor>>,
     event_loop: EventLoopPump,
+    user_code_depth: Rc<Cell<u32>>,
 }
 
 impl LuaExec for ServerLuaExec {
-    fn execute_chunk(&mut self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError> {
+    fn execute_chunk(&self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError> {
+        let _guard = UserCodeGuard::enter(&self.user_code_depth);
         let _caller = self.session.enter_internal_call();
         // Entry contract (see `dispatch_lua`): pending byte events reach
         // listeners before user code observes buffer state.
@@ -4293,7 +4327,8 @@ impl LuaExec for ServerLuaExec {
         )
     }
 
-    fn execute_file(&mut self, path: &Path) -> Result<(), LuaExecError> {
+    fn execute_file(&self, path: &Path) -> Result<(), LuaExecError> {
+        let _guard = UserCodeGuard::enter(&self.user_code_depth);
         let lua = &self.lua;
         with_scoped_editor_api(
             lua,
@@ -4330,11 +4365,11 @@ impl LuaExec for ServerLuaExec {
         )
     }
 
-    fn invoke_callback(
-        &mut self,
+    fn invoke_callback(&self,
         reference: usize,
         args: Vec<Object>,
     ) -> Result<Object, LuaExecError> {
+        let _guard = UserCodeGuard::enter(&self.user_code_depth);
         let reference = i32::try_from(reference).map_err(|_| {
             LuaExecError::Conversion("Lua callback reference is out of range".to_owned())
         })?;
@@ -4374,7 +4409,11 @@ impl LuaExec for ServerLuaExec {
         )
     }
 
-    fn free_callback(&mut self, reference: usize) -> Result<(), LuaExecError> {
+    fn in_user_code(&self) -> bool {
+        self.user_code_depth.get() > 0
+    }
+
+    fn free_callback(&self, reference: usize) -> Result<(), LuaExecError> {
         let reference = i32::try_from(reference).map_err(|_| {
             LuaExecError::Conversion("Lua callback reference is out of range".to_owned())
         })?;
@@ -4382,15 +4421,15 @@ impl LuaExec for ServerLuaExec {
             .map_err(|error| LuaExecError::Conversion(error.to_string()))
     }
 
-    fn discard_result(&mut self, result: Object) {
+    fn discard_result(&self, result: Object) {
         free_object_refs(&self.lua, &result);
     }
 
-    fn eval_expression(
-        &mut self,
+    fn eval_expression(&self,
         expression: &str,
         arg: Option<&Typval>,
     ) -> Result<Typval, LuaExecError> {
+        let _guard = UserCodeGuard::enter(&self.user_code_depth);
         let lua = &self.lua;
         with_scoped_editor_api(
             lua,
@@ -4424,7 +4463,8 @@ impl LuaExec for ServerLuaExec {
         )
     }
 
-    fn run_event_turn(&mut self) -> Result<(), LuaExecError> {
+    fn run_event_turn(&self) -> Result<(), LuaExecError> {
+        let _guard = UserCodeGuard::enter(&self.user_code_depth);
         // The turn runs under the scoped bindings so a check callback's
         // `vim.api` access dispatches through the session this loop is
         // already executing with.
@@ -4538,15 +4578,17 @@ fn fresh_executors(
     }
     let primary = Rc::new(RefCell::new(primary));
     let nested = Rc::new(RefCell::new(nested));
+    let user_code_depth = Rc::new(Cell::new(0));
     let callback_host = || {
-        Rc::new(RefCell::new(ServerLuaExec {
+        Rc::new(ServerLuaExec {
             session: session.clone(),
             lua: lua.clone(),
             registry: registry.clone(),
             ex: primary.clone(),
             nested_ex: nested.clone(),
             event_loop: event_loop.clone(),
-        }))
+            user_code_depth: user_code_depth.clone(),
+        })
     };
     primary.borrow_mut().set_lua_exec(callback_host());
     nested.borrow_mut().set_lua_exec(callback_host());
@@ -4563,6 +4605,7 @@ struct ApiLuaExecutor {
     registry: Rc<Registry>,
     ex: Rc<RefCell<ExExecutor>>,
     nested_ex: Rc<RefCell<ExExecutor>>,
+    fork_seed: Rc<RefCell<ExExecutor>>,
     channel_ids: ChannelIds,
     event_loop: EventLoopPump,
 }
@@ -4591,8 +4634,7 @@ impl LuaExecutor for ApiLuaExecutor {
         .map_err(lua_exec_error_text)
     }
 
-    fn invoke_callback(
-        &mut self,
+    fn invoke_callback(&mut self,
         session: &ApiSession,
         reference: usize,
         args: Vec<Object>,
@@ -4688,7 +4730,7 @@ impl LuaExecutor for ApiLuaExecutor {
             &self.lua,
             &self.registry,
             &self.session,
-            &self.ex,
+            &self.fork_seed,
             &self.channel_ids,
             &self.event_loop,
         )?;
@@ -4698,6 +4740,7 @@ impl LuaExecutor for ApiLuaExecutor {
             registry: self.registry.clone(),
             ex,
             nested_ex,
+            fork_seed: self.fork_seed.clone(),
             channel_ids: self.channel_ids.clone(),
             event_loop: self.event_loop.clone(),
         }))
@@ -4955,6 +4998,7 @@ struct ServerCommandHost {
     session: Rc<ApiSession>,
     ex: Rc<RefCell<ExExecutor>>,
     nested_ex: Rc<RefCell<ExExecutor>>,
+    fork_seed: Rc<RefCell<ExExecutor>>,
     lua: Lua,
     registry: Rc<Registry>,
     channel_ids: ChannelIds,
@@ -5003,7 +5047,7 @@ impl CommandExecutor for ServerCommandHost {
                 "no free Ex executor for a nested command",
             ));
         };
-        deliver_pending_lua_flush(session, &owner);
+        deliver_pending_lua_flush(session, &owner, &self.ex, &self.nested_ex);
         result
     }
 
@@ -5026,7 +5070,7 @@ impl CommandExecutor for ServerCommandHost {
                 "no free Ex executor for a nested command",
             ));
         };
-        deliver_pending_lua_flush(session, &owner);
+        deliver_pending_lua_flush(session, &owner, &self.ex, &self.nested_ex);
         result
     }
 
@@ -5049,7 +5093,7 @@ impl CommandExecutor for ServerCommandHost {
                 "no free Ex executor for a nested command",
             ));
         };
-        deliver_pending_lua_flush(session, &owner);
+        deliver_pending_lua_flush(session, &owner, &self.ex, &self.nested_ex);
         result
     }
 
@@ -5162,7 +5206,7 @@ impl CommandExecutor for ServerCommandHost {
                 "no free Ex executor for Vimscript expression evaluation",
             ));
         };
-        deliver_pending_lua_flush(session, &owner);
+        deliver_pending_lua_flush(session, &owner, &self.ex, &self.nested_ex);
         result
     }
 
@@ -5194,7 +5238,7 @@ impl CommandExecutor for ServerCommandHost {
                 "no free Ex executor for a Vimscript builtin call",
             ));
         };
-        deliver_pending_lua_flush(session, &owner);
+        deliver_pending_lua_flush(session, &owner, &self.ex, &self.nested_ex);
         result
     }
 
@@ -5219,7 +5263,7 @@ impl CommandExecutor for ServerCommandHost {
             &self.lua,
             &self.registry,
             &self.session,
-            &self.ex,
+            &self.fork_seed,
             &self.channel_ids,
             &self.event_loop,
         )?;
@@ -5227,6 +5271,7 @@ impl CommandExecutor for ServerCommandHost {
             session: self.session.clone(),
             ex,
             nested_ex,
+            fork_seed: self.fork_seed.clone(),
             lua: self.lua.clone(),
             registry: self.registry.clone(),
             channel_ids: self.channel_ids.clone(),
@@ -5444,28 +5489,50 @@ fn dispatch_scoped_builtin(
     // before the builtin returns (multiqueue_process_events,
     // funcs.c:3668/3721); the executor borrow is released here, so this is
     // the first boundary that can run them.
-    deliver_pending_lua_flush(session, &owner);
+    deliver_pending_lua_flush(session, &owner, ex, nested_ex);
     scoped_typval(lua, &result)
 }
 
 /// Delivers a pending `jobwait` Lua flush at a borrow-free boundary, looping
-/// while delivered callbacks re-mark the manager. Delivery is skipped while
-/// the Lua host is borrowed - a Lua chunk holds it across its own execution,
-/// so a `jobwait` called from inside the chunk leaves the marker for the
-/// tick; reentrant `vim.fn` calls made by a callback being delivered meet
-/// the same busy host and defer the same way, which bounds the recursion.
-/// Callback failure reports through the message system, the way the tick
-/// driver treats it.
-fn deliver_pending_lua_flush(session: &ApiSession, owner: &Rc<RefCell<ExExecutor>>) {
-    let host = owner.borrow().lua_host();
-    if let Some(host) = host
-        && host.try_borrow_mut().is_err()
-    {
+/// while delivered callbacks re-mark the manager. Delivery waits while either
+/// selected executor is busy: the owner check preserves the existing
+/// in-progress callback rule, and the alternate check keeps a nested frame
+/// from being re-entered through its host. Callback failure reports through
+/// the message system, the way the tick driver treats it.
+fn deliver_pending_lua_flush(
+    session: &ApiSession,
+    owner: &Rc<RefCell<ExExecutor>>,
+    primary: &Rc<RefCell<ExExecutor>>,
+    nested: &Rc<RefCell<ExExecutor>>,
+) {
+    let owner_in_user_code = {
+        let Ok(executor) = owner.try_borrow() else {
+            return;
+        };
+        executor.lua_host().is_some_and(|host| host.in_user_code())
+    };
+    if owner_in_user_code {
+        return;
+    }
+    let alternate = if Rc::ptr_eq(owner, primary) {
+        nested
+    } else {
+        primary
+    };
+    let alternate_in_user_code = {
+        let Ok(executor) = alternate.try_borrow() else {
+            return;
+        };
+        executor.lua_host().is_some_and(|host| host.in_user_code())
+    };
+    if alternate_in_user_code {
         return;
     }
     let mut hostless_passes = 0usize;
     while owner.borrow_mut().take_lua_flush_pending() {
-        if let Err(error) = deliver_deferred_job_events(session, owner, &mut hostless_passes) {
+        if let Err(error) =
+            deliver_deferred_job_events(session, owner, alternate, &mut hostless_passes)
+        {
             report_job_callback_error(session, &error);
             break;
         }
@@ -5522,7 +5589,7 @@ fn execute_scoped_ex(
             "no free Ex executor for a nested command",
         ));
     };
-    deliver_pending_lua_flush(session, &owner);
+    deliver_pending_lua_flush(session, &owner, ex, nested_ex);
     result.map_err(|error| map_api_exec_error(operation, error))
 }
 
@@ -6680,7 +6747,7 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            if deliver_deferred_job_events(&core.session, &core.ex, &mut 0).unwrap() {
+            if deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0).unwrap() {
                 delivered = true;
                 break;
             }
@@ -6705,7 +6772,8 @@ mod tests {
             .borrow_mut()
             .flush_pty_output(&*core.session)
             .unwrap();
-        let again = deliver_deferred_job_events(&core.session, &core.ex, &mut 0).unwrap();
+        let again =
+            deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0).unwrap();
         assert!(!again, "a delivered on_exit must not re-fire");
     }
 
@@ -6754,7 +6822,9 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            let _delivered = deliver_deferred_job_events(&core.session, &core.ex, &mut 0).unwrap();
+            let _delivered =
+                deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0)
+                    .unwrap();
             let exits = core
                 .ex
                 .borrow_mut()
@@ -6771,6 +6841,78 @@ mod tests {
             "the nested jobstart's on_exit never ran (reentry failed)"
         );
     }
+    // A deferred Lua callback must be able to re-enter the primary executor
+    // and fire a nested Lua autocmd. Before the delivery host is separated
+    // from that executor, this sequence panics when `BufWritePost` re-borrows it.
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture, script, and tick calls must succeed"
+    )]
+    fn deferred_lua_callback_reenters_primary_and_fires_inline_autocmd() {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let core = build_embedded_core(editor, true).unwrap();
+        let process_id = std::process::id();
+        let output =
+            std::env::temp_dir().join(format!("oxvim-deferred-callback-{process_id}.txt"));
+        let lua = core.ex.borrow().lua_host().unwrap();
+        lua
+            .execute_chunk(
+                &format!(
+                    r#"
+                vim.g.deferred_nested_autocmd = 0
+                vim.api.nvim_create_autocmd('BufWritePost', {{
+                  pattern = '*',
+                  callback = function()
+                    vim.g.deferred_nested_autocmd = vim.g.deferred_nested_autocmd + 1
+                  end,
+                }})
+                local function on_exit()
+                  vim.cmd('write {output}')
+                end
+                vim.fn.jobstart({{'sh', '-c', 'exit 0'}}, {{on_exit = on_exit}})
+                "#,
+                    output = output.display(),
+                ),
+                Vec::new(),
+            )
+            .unwrap();
+
+        let mut observed = Typval::Number(0);
+        for _ in 0..500 {
+            core.ex
+                .borrow_mut()
+                .flush_pty_output(&*core.session)
+                .unwrap();
+            let _ = deliver_deferred_job_events(
+                &core.session,
+                &core.ex,
+                &core.nested_ex,
+                &mut 0,
+            )
+            .unwrap();
+            observed = core
+                .ex
+                .borrow_mut()
+                .evaluate_expression(&*core.session, "g:deferred_nested_autocmd")
+                .unwrap();
+            if observed == Typval::Number(1) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            observed,
+            Typval::Number(1),
+            "deferred callback must re-enter the primary executor and run BufEnter"
+        );
+        let _ = std::fs::remove_file(output);
+    }
+
     // A Lua on_exit handler that starts a nested job must run on the primary
     // executor: the tick drops the ex RefCell before each callback, so the
     // nested jobstart does not fall back to the nested manager. Both on_exit
@@ -6788,7 +6930,7 @@ mod tests {
             .unwrap();
         let core = build_embedded_core(editor, true).unwrap();
         let lua = core.ex.borrow().lua_host().unwrap();
-        lua.borrow_mut()
+        lua
             .execute_chunk(
                 "
                 vim.g.exit_count = 0
@@ -6812,7 +6954,8 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            let _ = deliver_deferred_job_events(&core.session, &core.ex, &mut 0).unwrap();
+        let _ = deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0)
+            .unwrap();
             exit_count = core
                 .ex
                 .borrow_mut()
@@ -6850,7 +6993,7 @@ mod tests {
             .unwrap();
         let core = build_embedded_core(editor, true).unwrap();
         let lua = core.ex.borrow().lua_host().unwrap();
-        lua.borrow_mut()
+        lua
             .execute_chunk(
                 r#"
                 vim.g.send_ok = 0
@@ -6872,7 +7015,8 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            let _ = deliver_deferred_job_events(&core.session, &core.ex, &mut 0).unwrap();
+        let _ = deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0)
+            .unwrap();
             send_ok = core
                 .ex
                 .borrow_mut()
@@ -6909,7 +7053,7 @@ mod tests {
             .unwrap();
         let core = build_embedded_core(editor, true).unwrap();
         let lua = core.ex.borrow().lua_host().unwrap();
-        lua.borrow_mut()
+        lua
             .execute_chunk(
                 "
                 vim.g.nested_exited = 0
@@ -6935,7 +7079,8 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            let _ = deliver_deferred_job_events(&core.session, &core.ex, &mut 0).unwrap();
+        let _ = deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0)
+            .unwrap();
             nested_exited = core
                 .ex
                 .borrow_mut()
@@ -6975,7 +7120,7 @@ mod tests {
             .unwrap();
         let core = build_embedded_core(editor, true).unwrap();
         let lua = core.ex.borrow().lua_host().unwrap();
-        lua.borrow_mut()
+        lua
             .execute_chunk(
                 r#"
                 vim.g.stdout_seen = 0
@@ -7006,7 +7151,8 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            let _ = deliver_deferred_job_events(&core.session, &core.ex, &mut 0).unwrap();
+        let _ = deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0)
+            .unwrap();
             stdout_seen = core
                 .ex
                 .borrow_mut()
@@ -7057,7 +7203,7 @@ mod tests {
             args: Vec::new(),
         };
         ex.borrow_mut().defer_job_events(vec![event]);
-        let error = deliver_deferred_job_events(&session, &ex, &mut hostless_passes).unwrap_err();
+        let error = deliver_deferred_job_events(&session, &ex, &ex, &mut hostless_passes).unwrap_err();
         assert!(error.contains("E5108"), "{error}");
         let requeued = ex.borrow_mut().take_deferred_job_events();
         assert_eq!(
@@ -7072,8 +7218,105 @@ mod tests {
         // Redelivery of the requeued batch is stable: same report, same
         // requeue, no duplication.
         ex.borrow_mut().defer_job_events(requeued);
-        assert!(deliver_deferred_job_events(&session, &ex, &mut hostless_passes).is_err());
+        assert!(
+            deliver_deferred_job_events(&session, &ex, &ex, &mut hostless_passes).is_err()
+        );
         assert_eq!(ex.borrow_mut().take_deferred_job_events().len(), 1);
+    }
+
+    /// A host executing user Lua is different from a missing host: it must
+    /// leave the event queued without consuming the hostless retry budget,
+    /// then deliver it exactly once after the host becomes available.
+    #[test]
+    fn busy_lua_host_parks_event_until_a_later_delivery() {
+        struct BusyLua {
+            busy: Cell<bool>,
+            calls: Cell<usize>,
+        }
+        impl LuaExec for BusyLua {
+            fn execute_chunk(
+                &self,
+                _code: &str,
+                _args: Vec<Object>,
+            ) -> Result<Object, LuaExecError> {
+                Ok(Object::Nil)
+            }
+
+            fn execute_file(&self, _path: &Path) -> Result<(), LuaExecError> {
+                Ok(())
+            }
+
+            fn invoke_callback(
+                &self,
+                _reference: usize,
+                _args: Vec<Object>,
+            ) -> Result<Object, LuaExecError> {
+                self.calls.set(self.calls.get() + 1);
+                Ok(Object::Nil)
+            }
+
+            fn in_user_code(&self) -> bool {
+                self.busy.get()
+            }
+        }
+
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let core = build_embedded_core(editor, true).unwrap();
+        let host = Rc::new(BusyLua {
+            busy: Cell::new(true),
+            calls: Cell::new(0),
+        });
+        core.nested_ex.borrow_mut().set_lua_exec(host.clone());
+        let Typval::Dict(receiver) = Typval::dict(Vec::new()) else {
+            unreachable!("Typval::dict builds a dict")
+        };
+        let event = JobEvent {
+            callback: Typval::Funcref(Funcref {
+                name: OxStr::from("probe"),
+                args: Vec::new(),
+                dict: None,
+                registry: Some(42),
+            }),
+            receiver,
+            args: Vec::new(),
+        };
+        core.ex.borrow_mut().defer_job_events(vec![event]);
+
+        let mut hostless_passes = 0usize;
+        for _ in 0..MAX_HOSTLESS_JOB_EVENT_PASSES {
+            assert!(
+                !deliver_deferred_job_events(
+                    &core.session,
+                    &core.ex,
+                    &core.nested_ex,
+                    &mut hostless_passes,
+                )
+                .unwrap(),
+                "a busy host must park, not consume, the event"
+            );
+            let parked = core.ex.borrow_mut().take_deferred_job_events();
+            assert_eq!(parked.len(), 1);
+            core.ex.borrow_mut().defer_job_events(parked);
+        }
+        assert_eq!(host.calls.get(), 0);
+
+        host.busy.set(false);
+        assert!(deliver_deferred_job_events(
+            &core.session,
+            &core.ex,
+            &core.nested_ex,
+            &mut hostless_passes,
+        )
+        .unwrap());
+        assert!(core
+            .ex
+            .borrow_mut()
+            .take_deferred_job_events()
+            .is_empty());
     }
 
     // The tick's borrow-free phase services the Lua work queue, so an idle

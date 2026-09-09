@@ -1,6 +1,5 @@
 //! Parser-backed lvalue resolution for `:let` and `:unlet`.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use ox_eval::lexer::TokenKind;
@@ -111,7 +110,7 @@ pub(crate) fn parse_and_bind_lvalue<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     target: &str,
 ) -> Result<Lvalue, Flow> {
     let target = expand_curly_target(runtime, access, scope, lua, target.trim())?;
@@ -362,7 +361,7 @@ pub(crate) fn expand_curly_target<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     target: &str,
 ) -> Result<String, Flow> {
     if !target.contains('{') {
@@ -449,7 +448,7 @@ fn parse_destructure<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     inner: &str,
 ) -> Result<Lvalue, Flow> {
     let (parts, rest_target) = split_destructure_parts(runtime, inner)?;
@@ -521,7 +520,7 @@ fn bind_expression_chain<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     expression: &Expr,
 ) -> Result<(OxStr, Option<ScopeKind>, Vec<BoundSub>), Flow> {
     let mut subs = Vec::new();
@@ -563,7 +562,7 @@ fn bind_optional_bound<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     expression: Option<&Expr>,
 ) -> Result<Option<Typval>, Flow> {
     match expression {
@@ -576,7 +575,7 @@ fn eval_expression<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     expression: &Expr,
 ) -> Result<Typval, Flow> {
     let regex = VimRegex;

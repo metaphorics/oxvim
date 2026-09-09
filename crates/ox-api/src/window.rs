@@ -715,12 +715,13 @@ fn fire_buffer_event(
                 .map(|state| state.name().to_string_lossy().into_owned())
         })
         .unwrap_or_default();
+    let name = OxStr::from(name.as_str());
     let plan = session.with_editor_mut(|editor| {
         editor.autocmds_mut().plan(
             event,
             AutocmdContext {
                 buffer: Some(buffer),
-                file_name: Some(&name),
+                file_name: Some(name.as_bytes()),
                 ..AutocmdContext::default()
             },
         )
