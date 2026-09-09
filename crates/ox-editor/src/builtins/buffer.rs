@@ -20,8 +20,8 @@ use crate::{Editor, LineReplaceRequest};
 use crate::autocmd::Event;
 use crate::excmd_exec::{
     CurrentBuffer, EvalHost, Flow, fire_buffer_lifecycle, flow_to_eval_error, object_to_typval,
-    option_to_typval, resolve_buffer_argument, typval_number, typval_to_object, typval_to_option,
-    typval_to_text,
+    option_to_typval, path_from_ox_str, resolve_buffer_argument, typval_number, typval_to_object,
+    typval_to_option, typval_to_text,
 };
 
 /// Routes one buffer-state builtin.
@@ -402,7 +402,7 @@ fn call_bufload_with_events<F: FileIO, E: ExEditorAccess>(
     let path = if name.as_bytes().is_empty() || is_nofileread(&buftype) {
         None
     } else {
-        Some(std::path::PathBuf::from(name.to_string_lossy().as_ref()))
+        Some(path_from_ox_str(&name))
     };
     let probe = path
         .as_deref()

@@ -12,7 +12,7 @@
 //! | read fails after a good probe   | none (upstream's E200)      |
 
 use crate::excmd_exec::ExExecutor;
-use crate::script::FileIO;
+use crate::script::{FileIO, RealFileIO};
 use crate::{AutocmdKind, AutocmdOptions, Event};
 use ox_types::{OxStr, Typval};
 use std::cell::RefCell;
@@ -101,9 +101,9 @@ impl FileIO for FaultFileIO {
     }
 }
 
-/// One editor plus a faulted store, with the three `BufRead*`-family events
-/// recorded into `g:order` by a plugin-shaped autocmd.
-fn setup_with_io(io: FaultFileIO) -> (crate::TestEditorAccess, ExExecutor<FaultFileIO>) {
+/// One editor plus the injected [`FileIO`] store, with the three
+/// `BufRead*`-family events recorded into `g:order` by a plugin-shaped autocmd.
+fn setup_with_io<F: FileIO>(io: F) -> (crate::TestEditorAccess, ExExecutor<F>) {
     let mut editor = crate::Editor::new();
     let buffer = editor.create_buffer(true).unwrap();
     editor
@@ -125,7 +125,7 @@ fn setup_with_io(io: FaultFileIO) -> (crate::TestEditorAccess, ExExecutor<FaultF
 
 /// The list value of one global; every pinned value here is `g:`-scoped so
 /// the assertion reads the same surface a plugin would.
-fn global_list(executor: &ExExecutor<FaultFileIO>, name: &str) -> Vec<String> {
+fn global_list<F: FileIO>(executor: &ExExecutor<F>, name: &str) -> Vec<String> {
     let Some((_, value)) = executor
         .scope()
         .global
@@ -149,16 +149,20 @@ fn global_list(executor: &ExExecutor<FaultFileIO>, name: &str) -> Vec<String> {
 }
 
 /// The lifecycle events `bufload()` fired, in order.
-fn order_events(executor: &ExExecutor<FaultFileIO>) -> Vec<String> {
+fn order_events<F: FileIO>(executor: &ExExecutor<F>) -> Vec<String> {
     global_list(executor, "order")
 }
 
 /// The text `bufload()` left in the loaded buffer.
-fn buffer_lines(executor: &ExExecutor<FaultFileIO>) -> Vec<String> {
+fn buffer_lines<F: FileIO>(executor: &ExExecutor<F>) -> Vec<String> {
     global_list(executor, "lines")
 }
 
-fn load(executor: &mut ExExecutor<FaultFileIO>, access: &crate::TestEditorAccess, name: &str) {
+fn load<F: FileIO>(
+    executor: &mut ExExecutor<F>,
+    access: &crate::TestEditorAccess,
+    name: &str,
+) {
     executor
         .execute_line(access, &format!("let g:buf = bufadd('{name}') | call bufload(g:buf)"))
         .unwrap();
@@ -223,6 +227,39 @@ fn bufload_missing_file_fires_bufnewfile_only() {
 
     assert_eq!(order_events(&executor), ["BufNewFile"]);
     assert_eq!(buffer_lines(&executor), [""]);
+}
+
+/// `bufload()` on a buffer whose name holds bytes that are not valid UTF-8
+/// probes and reads the exact Unix path — a real file stored under a raw
+/// 0xff name — so the read family fires with the file's text. A lossy
+/// reconstruction of the name would miss the file and take the `BufNewFile`
+/// path with empty text while keeping the raw name.
+#[cfg(unix)]
+#[test]
+fn bufload_reads_file_whose_name_is_not_utf8() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let root = std::env::temp_dir().join(format!("ox-bufload-bytes-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join(OsStr::from_bytes(b"Xbytes-\xff")), "one\ntwo\n").unwrap();
+    let (access, mut executor) = setup_with_io(RealFileIO);
+    // Single-quoted Vimscript strings keep backslashes literal, so the raw
+    // byte enters through the double-quoted `\xff` escape.
+    let dir = root.to_str().expect("temp root is valid UTF-8");
+    executor
+        .execute_line(
+            &access,
+            &format!("let g:buf = bufadd(\"{dir}/Xbytes-\\xff\") | call bufload(g:buf)"),
+        )
+        .unwrap();
+    executor
+        .execute_line(&access, "let g:lines = getbufline(g:buf, 1, '$')")
+        .unwrap();
+
+    assert_eq!(order_events(&executor), ["BufReadPre", "BufReadPost"]);
+    assert_eq!(buffer_lines(&executor), ["one", "two"]);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A `BufReadPre` action can synchronously call another editor-stateful
