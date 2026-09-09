@@ -21,7 +21,7 @@ use ox_editor::{
     Mode, ModeMachine, OptionValue, PendingEditMode, ServerHost, TypeaheadFlags, UserCommand,
     VisualKind, vim_variable_is_writable,
 };
-use ox_editor::editor::MessageIdentity;
+use ox_editor::editor::{MessageIdentity, RedrawRequest};
 use ox_lua::{
     ApiDispatchContext, BuiltinHost, EventLoopPump, LuaHost, RuntimeRoot as LuaRuntimeRoot,
     Scheduler, VariableHost, VariableScope, Work, bind_api, bind_variables, bind_with,
@@ -32,7 +32,7 @@ use ox_rpc::{CHAN_STDIO, ChannelId, IncrementalDecoder, Message, RedrawBatch};
 use ox_types::{ApiError, BufHandle, Dict, Object, OxStr, TabHandle, Typval, WinHandle};
 use ox_ui::{
     CmdlineState as UiCmdlineState, Compositor, ContentChunk, Emitter, Highlight, HlAttrs,
-    MessageState, PopupItem, PopupmenuState, RedrawOutput, UiOptions,
+    MessageState, PopupItem, PopupmenuState, RedrawOutput,
 };
 #[cfg(unix)]
 use ox_uv::dns;
@@ -312,9 +312,48 @@ pub struct AppState {
     /// Long-lived render state: the layer stack and its grid buffers, rebuilt
     /// in place on each redraw rather than reconstructed.
     compositor: Compositor,
-    /// Attached channels whose `nvim_ui_attach` options set `stdout_tty` —
-    /// the only UIs `nvim_ui_send` delivers to (`api/ui.c:981`).
-    stdout_tty_channels: HashSet<u64>,
+}
+
+/// The two independent effects of one queued `nvim__redraw` batch.
+///
+/// Upstream uses the resolved `flush` value to decide whether to run
+/// `update_screen()`, then starts `flush_ui` from that result and lets
+/// component redraws force a UI flush independently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RedrawPlan {
+    update_screen: bool,
+    flush_ui: bool,
+}
+
+impl RedrawPlan {
+    const NORMAL: Self = Self {
+        update_screen: true,
+        flush_ui: true,
+    };
+
+    fn from_requests(requests: &[RedrawRequest]) -> Self {
+        if requests.is_empty() {
+            return Self::NORMAL;
+        }
+        let mut plan = Self {
+            update_screen: false,
+            flush_ui: false,
+        };
+        for request in requests {
+            let statusline_redraw =
+                request.statusline || request.statuscolumn || request.winbar;
+            let resolved_flush = request
+                .flush
+                .unwrap_or(request.valid.is_some() || request.range.is_some())
+                || statusline_redraw;
+            plan.update_screen |= resolved_flush;
+            plan.flush_ui |= resolved_flush
+                || request.cursor
+                || request.tabline
+                || statusline_redraw;
+        }
+        plan
+    }
 }
 
 /// The editor/Lua/Ex triangle every process mode shares: one editor, one
@@ -659,7 +698,6 @@ impl AppState {
             channel_output,
             emitter: Emitter::new(),
             compositor: Compositor::new(1, 1),
-            stdout_tty_channels: HashSet::new(),
         };
         state.run_startup(cli, timer)?;
         // main.c writes startup message output before the process waits on
@@ -1236,7 +1274,6 @@ impl AppState {
             let outcome = executor.outcome;
             let pending = executor.executor.take_pending_edit_mode();
             drop(executor);
-            drop(ex);
             (result, outcome, pending)
         };
         if let Some(pending) = pending {
@@ -1270,16 +1307,6 @@ impl AppState {
         Ok(())
     }
 
-    fn resize_current_tabpage(&mut self, width: usize, height: usize) -> Result<(), ApiError> {
-        let geometry = Geometry::new(0, 0, width, height)
-            .map_err(|error| ApiError::validation(error.to_string()))?;
-        self.session.with_editor_mut(|editor| {
-            editor
-                .resize_tabpage(TabHandle::CURRENT, geometry)
-                .map_err(|error| ApiError::exception(error.to_string()))
-        })
-    }
-
     fn ui_attach(&mut self, channel: ChannelId, params: &[Object]) -> Result<Object, ApiError> {
         let [Object::Integer(width), Object::Integer(height), raw_options] = params else {
             return Err(ApiError::validation(
@@ -1295,8 +1322,8 @@ impl AppState {
                 ));
             }
         };
-        let width = positive_dimension(*width, "width")?;
-        let height = positive_dimension(*height, "height")?;
+        positive_dimension(*width, "width")?;
+        positive_dimension(*height, "height")?;
         // RGB is the historical default protocol request.  ox-ui implements
         // the modern linegrid protocol only, so RGB implies that supported
         // representation rather than falling back to a legacy cell protocol.
@@ -1309,49 +1336,40 @@ impl AppState {
                 .0
                 .push((OxStr::from("ext_linegrid"), Object::Boolean(true)));
         }
-        self.session
-            .with_render_state(|ui_channels, _, _| {
-                ui_channels.attach(channel.get(), width, height, UiOptions::from_dict(&options))
-            })
-            .map_err(|error| ApiError::exception(error.to_string()))?;
-        if let Err(error) = self.resize_current_tabpage(width, height) {
-            // Roll the attach back; when the rollback itself fails the
-            // channel stays half-attached, so the report says both instead
-            // of returning as if the channel was removed.
-            return match self
-                .session
-                .with_render_state(|ui_channels, _, _| ui_channels.detach(channel.get()))
-            {
-                Ok(_) => Err(error),
-                Err(detach_error) => Err(ApiError::exception(format!(
-                    "{error}; detaching after the failed nvim_ui_attach also failed: {detach_error}"
-                ))),
-            };
-        }
-        if matches!(
-            options.get(&OxStr::from("stdout_tty")),
-            Some(Object::Boolean(true))
-        ) {
-            self.stdout_tty_channels.insert(channel.get());
-        }
+        let Some((_, dispatch)) = self.registry.get("nvim_ui_attach") else {
+            return Err(ApiError::exception("nvim_ui_attach is not registered"));
+        };
+        let caller = self.session.enter_rpc_call(channel);
+        let result = dispatch(
+            &self.session,
+            &[
+                Object::Integer(*width),
+                Object::Integer(*height),
+                Object::Dict(options),
+            ],
+        );
+        drop(caller);
+        let result = result?;
         self.sync_ui_active();
-        Ok(Object::Nil)
+        Ok(result)
     }
 
     fn ui_detach(&mut self, channel: ChannelId, params: &[Object]) -> Result<Object, ApiError> {
         if !params.is_empty() {
             return Err(ApiError::validation("nvim_ui_detach expects no arguments"));
         }
-        self.session.with_render_state(|ui_channels, _, _| {
-            ui_channels
-                .detach(channel.get())
-                .map_err(|error| ApiError::exception(error.to_string()))
-        })?;
+        let Some((_, dispatch)) = self.registry.get("nvim_ui_detach") else {
+            return Err(ApiError::exception("nvim_ui_detach is not registered"));
+        };
+        let caller = self.session.enter_rpc_call(channel);
+        let result = dispatch(&self.session, &[]);
+        drop(caller);
+        let result = result?;
         self.emitter.detach(channel.get());
-        self.stdout_tty_channels.remove(&channel.get());
         self.sync_ui_active();
-        Ok(Object::Nil)
+        Ok(result)
     }
+
 
     /// Mirrors `ui_active()` into the message sink: `msg_use_printf`
     /// (`message.c` line 3013) stops printing as soon as a UI can display the
@@ -1365,20 +1383,21 @@ impl AppState {
     }
 
     fn ui_resize(&mut self, channel: ChannelId, params: &[Object]) -> Result<Object, ApiError> {
-        let [Object::Integer(width), Object::Integer(height)] = params else {
+        let [Object::Integer(_), Object::Integer(_)] = params else {
             return Err(ApiError::validation(
                 "nvim_ui_try_resize expects (Integer, Integer)",
             ));
         };
-        let width = positive_dimension(*width, "width")?;
-        let height = positive_dimension(*height, "height")?;
-        self.resize_current_tabpage(width, height)?;
-        self.session.with_render_state(|ui_channels, _, _| {
-            ui_channels
-                .try_resize(channel.get(), width, height)
-                .map_err(|error| ApiError::exception(error.to_string()))
-        })?;
-        Ok(Object::Nil)
+        // The generated `nvim_ui_try_resize` owns both halves of a resize: the
+        // current tabpage geometry and the channel's grid. Dispatching it keeps
+        // one implementation, so a server-side copy cannot drift from it.
+        let Some((_, dispatch)) = self.registry.get("nvim_ui_try_resize") else {
+            return Err(ApiError::exception("nvim_ui_try_resize is not registered"));
+        };
+        let caller = self.session.enter_rpc_call(channel);
+        let result = dispatch(&self.session, params);
+        drop(caller);
+        result
     }
 
 
@@ -1392,24 +1411,16 @@ impl AppState {
         self.session.with_editor(|editor| editor.redraws_pending())
     }
 
-    /// Applies queued `nvim__redraw` requests before this pass repaints
+    /// Applies queued `nvim__redraw` requests before this pass and derives
+    /// the separate screen-update/UI-flush decisions
     /// (`nvim__redraw`, `api/vim.c:2469`).
     ///
-    /// One pass already recomputes every window, the status widgets, the
-    /// tabline, and the cursor from live editor state and flushes each
-    /// attached channel, so `flush`, `cursor`, and the widget flags are
-    /// honored by the pass itself. What the pass cannot express is
-    /// `valid = false`: the emitter sends only lines that differ from the
-    /// image it retained, while upstream's `redraw_all_later(UPD_NOT_VALID)`
-    /// repaints regardless of what changed. Dropping the retained images
-    /// forces that full retransmit on the emit right after. Channel images
-    /// — not windows — are what the emitter retains, so that is also the
-    /// finest invalidation scope this layer owns.
-    fn drain_redraws(&mut self) {
+    /// `valid = false` is represented by dropping each channel's retained
+    /// image. The next pass then retransmits the complete grid even when the
+    /// request itself declines the immediate screen update.
+    fn drain_redraws(&mut self) -> RedrawPlan {
         let requests = self.session.with_editor_mut(|editor| editor.take_redraws());
-        if requests.is_empty() {
-            return;
-        }
+        let plan = RedrawPlan::from_requests(&requests);
         if requests.iter().any(|request| request.valid == Some(false)) {
             let targets: Vec<u64> = self
                 .session
@@ -1420,8 +1431,51 @@ impl AppState {
                 self.emitter.detach(id);
             }
         }
+        plan
     }
 
+    /// Returns channels whose live UI option state enables `stdout_tty`.
+    ///
+    /// `nvim_ui_attach` and `nvim_ui_set_option` both update the session's
+    /// `ui_extra`; querying the public `nvim_list_uis` dispatcher keeps this
+    /// delivery path on that one source of truth without a server-side copy.
+    fn stdout_tty_ui_ids(&self) -> Result<Vec<u64>, ApiError> {
+        let Some((_, list_uis)) = self.registry.get("nvim_list_uis") else {
+            return Err(ApiError::exception("nvim_list_uis is not registered"));
+        };
+        let Object::Array(uis) = list_uis(&self.session, &[])? else {
+            return Err(ApiError::exception(
+                "nvim_list_uis returned an invalid result",
+            ));
+        };
+        let ids = uis
+            .into_iter()
+            .map(|ui| {
+                let Object::Dict(ui) = ui else {
+                    return Err(ApiError::exception(
+                        "nvim_list_uis returned an invalid UI entry",
+                    ));
+                };
+                let Some(Object::Integer(channel)) = ui.get(&OxStr::from("chan")) else {
+                    return Err(ApiError::exception(
+                        "nvim_list_uis returned an invalid channel id",
+                    ));
+                };
+                let Some(Object::Boolean(stdout_tty)) =
+                    ui.get(&OxStr::from("stdout_tty"))
+                else {
+                    return Err(ApiError::exception(
+                        "nvim_list_uis returned an invalid stdout_tty option",
+                    ));
+                };
+                let channel = u64::try_from(*channel).map_err(|_| {
+                    ApiError::exception("nvim_list_uis returned an invalid channel id")
+                })?;
+                Ok((*stdout_tty).then_some(channel))
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        Ok(ids.into_iter().flatten().collect())
+    }
     /// Delivers queued `nvim_ui_send` payloads into each attached
     /// `stdout_tty` channel's frame (`remote_ui_ui_send`, `api/ui.c:979-988`).
     ///
@@ -1436,6 +1490,7 @@ impl AppState {
         if pending.is_empty() {
             return Ok(());
         }
+
         let mut batch = RedrawBatch::new();
         for content in &pending {
             batch.push("ui_send", vec![Object::String(content.clone())]);
@@ -1444,13 +1499,13 @@ impl AppState {
         let bytes = batch
             .pack()
             .map_err(|error| ApiError::exception(error.to_string()))?;
+        let stdout_tty_ids = self.stdout_tty_ui_ids()?;
         let targets: Vec<u64> = self
             .session
             .with_render_state(|ui_channels, _, _| {
                 ui_channels
                     .iter()
-                    .filter(|(id, _)| self.stdout_tty_channels.contains(id))
-                    .map(|(id, _)| *id)
+                    .filter_map(|(id, _)| stdout_tty_ids.contains(id).then_some(*id))
                     .collect()
             });
         for id in targets {
@@ -1460,38 +1515,41 @@ impl AppState {
     }
 
     fn redraw(&mut self) -> Result<BTreeMap<u64, Vec<u8>>, ApiError> {
-        // Queued `nvim__redraw` requests shape this pass: invalidation must
-        // land before the emit, and the pass itself flushes everything else
-        // they ask for.
-        self.drain_redraws();
+        let plan = self.drain_redraws();
         self.sync_chrome()?;
         self.publish_messages()
             .map_err(|error| ApiError::exception(error.to_string()))?;
-        let (width, height) = self.session.with_render_state(|ui_channels, _, _| {
-            ui_channels.iter().map(|(_, channel)| channel.size()).fold(
-                (1, 1),
-                |(max_width, max_height), (width, height)| {
-                    (max_width.max(width), max_height.max(height))
-                },
-            )
-        });
-        self.session
-            .with_editor(|editor| {
-                self.session.with_render_state(|_, highlights, _| {
-                    self.compositor
-                        .refresh_from_editor(editor, width, height, highlights)
+        if plan.update_screen {
+            let (width, height) = self.session.with_render_state(|ui_channels, _, _| {
+                ui_channels.iter().map(|(_, channel)| channel.size()).fold(
+                    (1, 1),
+                    |(max_width, max_height), (width, height)| {
+                        (max_width.max(width), max_height.max(height))
+                    },
+                )
+            });
+            self.session
+                .with_editor(|editor| {
+                    self.session.with_render_state(|_, highlights, _| {
+                        self.compositor
+                            .refresh_from_editor(editor, width, height, highlights)
+                    })
                 })
-            })
-            .map_err(|error| ApiError::exception(error.to_string()))?;
-        let output = self
-            .session
-            .with_render_state(|ui_channels, highlights, chrome| {
-                self.emitter
-                    .redraw(ui_channels, &self.compositor, highlights, chrome)
-                    .map_err(|error| ApiError::exception(error.to_string()))
-            })?;
-        let RedrawOutput(mut frames, semantic) = output;
-        self.drain_ui_sends(&mut frames)?;
+                .map_err(|error| ApiError::exception(error.to_string()))?;
+        }
+        let RedrawOutput(mut frames, semantic) = if plan.flush_ui {
+            self.session
+                .with_render_state(|ui_channels, highlights, chrome| {
+                    self.emitter
+                        .redraw(ui_channels, &self.compositor, highlights, chrome)
+                        .map_err(|error| ApiError::exception(error.to_string()))
+                })?
+        } else {
+            RedrawOutput(BTreeMap::new(), Vec::new())
+        };
+        if plan.flush_ui {
+            self.drain_ui_sends(&mut frames)?;
+        }
         // vim.ui_attach callbacks (upstream ui_add_cb via the event loop):
         // queued at emission, invoked here with no editor or render-state
         // borrow held.
@@ -2397,7 +2455,7 @@ fn echo_ui_kind(params: &[Object]) -> OxStr {
     if let Some(Object::String(kind)) = opts.get(&OxStr::from("kind")) {
         return kind.clone();
     }
-    let err = matches!(opts.get(&OxStr::from("err")), Some(Object::Boolean(true)));
+    let err = ox_api::dict_strict_bool(opts, "err");
     let history = matches!(params.get(1), Some(Object::Boolean(true)));
     OxStr::from(if err {
         "echoerr"
@@ -2598,6 +2656,7 @@ fn method_is_mutating(method: &str) -> bool {
                 | "nvim_feedkeys"
                 | "nvim_paste"
                 | "nvim_put"
+                | "nvim_ui_set_option"
         )
 }
 
@@ -5764,6 +5823,7 @@ impl Scheduler for LuaScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ox_rpc::decode;
     use ox_types::Funcref;
 
     #[test]
@@ -7265,6 +7325,57 @@ mod tests {
             .any(|window| window == needle.as_bytes())
     }
 
+    /// Decodes one redraw frame into its ordered event names.
+    fn frame_event_names(frame: &[u8]) -> Vec<OxStr> {
+        let Ok(Object::Array(mut outer)) = decode(frame) else {
+            return Vec::new();
+        };
+        let Some(Object::Array(events)) = outer.pop() else {
+            return Vec::new();
+        };
+        events
+            .into_iter()
+            .filter_map(|event| {
+                let Object::Array(mut fields) = event else {
+                    return None;
+                };
+                match fields.drain(..1).next() {
+                    Some(Object::String(name)) => Some(name),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Returns the first `msg_show` kind from an encoded redraw frame.
+    fn frame_msg_show_kind(frame: &[u8]) -> Option<OxStr> {
+        let Ok(Object::Array(mut outer)) = decode(frame) else {
+            return None;
+        };
+        let Some(Object::Array(events)) = outer.pop() else {
+            return None;
+        };
+        for event in events {
+            let Object::Array(fields) = event else {
+                continue;
+            };
+            let mut fields = fields.into_iter();
+            let Some(Object::String(name)) = fields.next() else {
+                continue;
+            };
+            if name != OxStr::from("msg_show") {
+                continue;
+            }
+            let Some(Object::Array(args)) = fields.next() else {
+                continue;
+            };
+            if let Some(Object::String(kind)) = args.first() {
+                return Some(kind.clone());
+            }
+        }
+        None
+    }
+
     /// Fixture with one UI on `0x4242` and a `stdout_tty` UI on `0x4243`:
     /// delivery must target by option, not by attachment.
     #[expect(
@@ -7332,6 +7443,68 @@ mod tests {
         assert!(
             !frame_contains(&frames[&plain.get()], payload),
             "a UI without stdout_tty never receives ui_send"
+        );
+    }
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture and option/send dispatches must succeed"
+    )]
+    fn ui_send_targets_follow_stdout_tty_option_changes() {
+        let mut state = ui_send_state();
+        let tty = ChannelId::new(0x4243);
+        let plain = ChannelId::new(0x4242);
+        let set_stdout_tty = |state: &mut AppState, channel: ChannelId, enabled: bool| {
+            state
+                .dispatch(
+                    channel,
+                    &OxStr::from("nvim_ui_set_option"),
+                    &[
+                        Object::String(OxStr::from("stdout_tty")),
+                        Object::Boolean(enabled),
+                    ],
+                )
+                .unwrap();
+        };
+
+        // Enabling the option after attach must make the formerly plain UI an
+        // eligible target.
+        set_stdout_tty(&mut state, plain, true);
+        let (_, frames) = state
+            .dispatch(
+                plain,
+                &OxStr::from("nvim_ui_send"),
+                &[Object::String(OxStr::from("enabled"))],
+            )
+            .unwrap();
+        assert!(
+            frames
+                .get(&plain.get())
+                .is_some_and(|frame| frame_contains(frame, "enabled")),
+            "enabling stdout_tty after attach must start delivery"
+        );
+
+        // Disabling the initially eligible UI must stop its delivery while
+        // the other enabled UI continues receiving payloads.
+        set_stdout_tty(&mut state, tty, false);
+        let (_, frames) = state
+            .dispatch(
+                tty,
+                &OxStr::from("nvim_ui_send"),
+                &[Object::String(OxStr::from("disabled"))],
+            )
+            .unwrap();
+        assert!(
+            frames
+                .get(&plain.get())
+                .is_some_and(|frame| frame_contains(frame, "disabled")),
+            "the still-enabled UI must continue receiving ui_send"
+        );
+        assert!(
+            !frames
+                .get(&tty.get())
+                .is_some_and(|frame| frame_contains(frame, "disabled")),
+            "disabling stdout_tty after attach must stop delivery"
         );
     }
 
@@ -7668,6 +7841,58 @@ mod tests {
     #[test]
     #[expect(
         clippy::unwrap_used,
+        reason = "the fixture and both redraw dispatches must succeed"
+    )]
+    fn redraw_later_flush_presence_controls_the_ui_flush() {
+        let mut state = ui_send_state();
+        let tty = ChannelId::new(0x4243);
+        let exec = |state: &mut AppState, code: &str| {
+            let (_, frames) = state
+                .dispatch(
+                    tty,
+                    &OxStr::from("nvim_exec_lua"),
+                    &[
+                        Object::String(OxStr::from(code)),
+                        Object::Array(Vec::new()),
+                    ],
+                )
+                .unwrap();
+            frames
+        };
+
+        // An omitted flush defaults to true for a redraw-later action, so the
+        // pass runs: `update_screen` emits its grid events and `ui_flush`
+        // closes the batch with exactly one trailing flush.
+        let frames = exec(&mut state, "vim.api.nvim__redraw{valid = true}");
+        let names = frame_event_names(&frames[&tty.get()]);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| **name == OxStr::from("flush"))
+                .count(),
+            1,
+            "the implicit redraw-later flush emits exactly one flush event"
+        );
+        assert_eq!(
+            names.last(),
+            Some(&OxStr::from("flush")),
+            "the flush must close the batch"
+        );
+        // An explicit false suppresses both update_screen and ui_flush for a
+        // request containing only redraw-later actions.
+        let frames = exec(
+            &mut state,
+            "vim.api.nvim__redraw{valid = true, flush = false}",
+        );
+        assert!(
+            frames.is_empty(),
+            "explicit flush=false must defer the redraw-later batch"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
         reason = "the fixture and the exec_lua dispatch must succeed"
     )]
     fn redraw_range_request_drives_a_scoped_pass() {
@@ -7758,6 +7983,16 @@ mod tests {
             frame_contains(&frames[&tty.get()], "grid_cursor_goto"),
             "the cursor request must update the on-screen cursor"
         );
+        // Cursor presentation forces `ui_flush` even when the caller
+        // explicitly declines the screen-update flush (`vim.c:2589-2595`).
+        let frames = exec(
+            &mut state,
+            "vim.api.nvim__redraw{cursor = true, flush = false}",
+        );
+        assert!(
+            frame_contains(&frames[&tty.get()], "flush"),
+            "cursor redraws force the UI flush upstream"
+        );
         // The widget flags count as actions and drive the same-turn pass;
         // `win = 0` resolves to the current window instead of failing.
         let frames = exec(
@@ -7769,6 +8004,57 @@ mod tests {
             "widget requests must drive a flushed pass"
         );
     }
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the UI attach, echo dispatches, and redraws must succeed"
+    )]
+    fn nvim_echo_numeric_err_uses_the_echoerr_msg_show_kind() {
+        let cli = Cli::default();
+        let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
+        let channel = ChannelId::new(0x4242);
+        state
+            .dispatch(
+                channel,
+                &OxStr::from("nvim_ui_attach"),
+                &[
+                    Object::Integer(80),
+                    Object::Integer(24),
+                    Object::Dict(Dict(vec![
+                        (OxStr::from("ext_linegrid"), Object::Boolean(true)),
+                        (OxStr::from("ext_messages"), Object::Boolean(true)),
+                    ])),
+                ],
+            )
+            .unwrap();
+        let echo = |state: &mut AppState, err: Object| {
+            state
+                .dispatch(
+                    CHAN_STDIO,
+                    &OxStr::from("nvim_echo"),
+                    &[
+                        echo_chunks("failure"),
+                        Object::Boolean(false),
+                        Object::Dict(Dict(vec![(OxStr::from("err"), err)])),
+                    ],
+                )
+                .unwrap();
+            state.redraw().unwrap()
+        };
+        let frames = echo(&mut state, Object::Boolean(true));
+        assert_eq!(
+            frame_msg_show_kind(frames.get(&channel.get()).unwrap()),
+            Some(OxStr::from("echoerr")),
+            "literal true must produce an echoerr msg_show"
+        );
+        let frames = echo(&mut state, Object::Integer(1));
+        assert_eq!(
+            frame_msg_show_kind(frames.get(&channel.get()).unwrap()),
+            Some(OxStr::from("echoerr")),
+            "numeric one must produce the same echoerr msg_show"
+        );
+    }
+
     #[test]
     #[expect(
         clippy::unwrap_used,

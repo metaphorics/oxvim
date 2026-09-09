@@ -478,7 +478,7 @@ fn with_api_host_and_window() -> (LuaHost, Rc<ApiSession>, BufHandle, WinHandle)
 }
 
 #[test]
-fn nvim_redraw_queues_resolved_requests_for_the_redraw_pass() {
+fn nvim_redraw_queues_requests_preserving_flush_presence() {
     let (host, session, buffer, window) = with_api_host_and_window();
     let lua = host.lua();
 
@@ -505,7 +505,7 @@ fn nvim_redraw_queues_resolved_requests_for_the_redraw_pass() {
             buffer: None,
             valid: None,
             range: None,
-            flush: true,
+            flush: Some(true),
             cursor: false,
             tabline: false,
             statusline: false,
@@ -514,26 +514,27 @@ fn nvim_redraw_queues_resolved_requests_for_the_redraw_pass() {
         }
     );
     // `valid = 0` decodes to `Some(false)` (`nlua_pop_Boolean_strict`
-    // compares numbers by `!= 0`), and a redraw-later action forces the
-    // implicit flush (vim.c:2544-2546).
+    // compares numbers by `!= 0`). The omitted `flush` remains absent so the
+    // redraw pass can apply its implicit default at the server boundary.
     assert_eq!(requests[1].valid, Some(false));
-    assert!(requests[1].flush);
+    assert_eq!(requests[1].flush, None);
     // An explicit `flush = false` declines the implicit default.
     assert_eq!(requests[2].valid, Some(false));
-    assert!(!requests[2].flush);
+    assert_eq!(requests[2].flush, Some(false));
     // The `0` sentinels resolve to the current window and its buffer.
     assert_eq!(requests[3].window, Some(window));
     assert!(requests[3].cursor);
     assert_eq!(requests[4].buffer, Some(buffer));
     assert!(requests[4].winbar);
-    // A `range` is a redraw-later action too, so it flushes implicitly.
+    // A `range` is a redraw-later action too; its omitted `flush` remains
+    // absent until the server resolves the upstream implicit default.
     assert_eq!(requests[5].range, Some((1, 3)));
-    assert!(requests[5].flush);
-    // The widget flags decode as their own actions with no implicit flush.
+    assert_eq!(requests[5].flush, None);
+    // The widget flags decode as their own actions with no supplied flush.
     assert!(requests[6].tabline);
     assert!(requests[6].statusline);
     assert!(requests[6].statuscolumn);
-    assert!(!requests[6].flush);
+    assert_eq!(requests[6].flush, None);
 }
 
 #[test]
