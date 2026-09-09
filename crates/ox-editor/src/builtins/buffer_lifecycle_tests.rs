@@ -13,7 +13,8 @@
 
 use crate::excmd_exec::ExExecutor;
 use crate::script::FileIO;
-use ox_types::Typval;
+use crate::{AutocmdKind, AutocmdOptions, Event};
+use ox_types::{OxStr, Typval};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
@@ -222,4 +223,83 @@ fn bufload_missing_file_fires_bufnewfile_only() {
 
     assert_eq!(order_events(&executor), ["BufNewFile"]);
     assert_eq!(buffer_lines(&executor), [""]);
+}
+
+/// A `BufReadPre` action can synchronously call another editor-stateful
+/// builtin. Three buffer-local handlers exercise two nested `bufload()` calls
+/// and an editor query at the third level; a leaked borrow guard would panic
+/// before the final text and lifecycle sequence are observed.
+#[test]
+fn bufload_read_pre_handler_reenters_two_levels() {
+    let io = FaultFileIO::default();
+    io.insert("Xouter", "outer\n");
+    io.insert("Xmiddle", "middle\n");
+    io.insert("Xinner", "inner\n");
+    let (access, mut executor) = setup_with_io(io);
+    let (outer, middle, inner) = {
+        let mut editor = access.editor_mut();
+        (
+            super::add_unloaded_buffer(&mut editor, &OxStr::from("Xouter")).unwrap(),
+            super::add_unloaded_buffer(&mut editor, &OxStr::from("Xmiddle")).unwrap(),
+            super::add_unloaded_buffer(&mut editor, &OxStr::from("Xinner")).unwrap(),
+        )
+    };
+
+    for (buffer, next) in [(outer, middle), (middle, inner)] {
+        access
+            .editor_mut()
+            .autocmds_mut()
+            .register_legacy(
+                &[Event::BufReadPre],
+                "<buffer>",
+                &AutocmdKind::ExString(format!("call bufload({})", i64::from(next))),
+                &AutocmdOptions {
+                    buffer: Some(buffer),
+                    nested: true,
+                    ..AutocmdOptions::default()
+                },
+            )
+            .unwrap();
+    }
+    access
+        .editor_mut()
+        .autocmds_mut()
+        .register_legacy(
+            &[Event::BufReadPre],
+            "<buffer>",
+            &AutocmdKind::ExString(format!("let g:deep = [bufname({})]", i64::from(outer))),
+            &AutocmdOptions {
+                buffer: Some(inner),
+                nested: true,
+                ..AutocmdOptions::default()
+            },
+        )
+        .unwrap();
+
+    executor
+        .execute_line(&access, &format!("call bufload({})", i64::from(outer)))
+        .unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        [
+            "BufReadPre",
+            "BufReadPre",
+            "BufReadPre",
+            "BufReadPost",
+            "BufReadPost",
+            "BufReadPost"
+        ]
+    );
+    assert_eq!(global_list(&executor, "deep"), ["Xouter"]);
+
+    for (buffer, expected) in [(outer, "outer"), (middle, "middle"), (inner, "inner")] {
+        executor
+            .execute_line(
+                &access,
+                &format!("let g:lines = getbufline({}, 1, '$')", i64::from(buffer)),
+            )
+            .unwrap();
+        assert_eq!(buffer_lines(&executor), [expected]);
+    }
 }
