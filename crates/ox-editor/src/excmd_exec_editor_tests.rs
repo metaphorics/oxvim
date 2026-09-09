@@ -3377,6 +3377,31 @@ fn bwipeout_skips_bufunload_for_already_unloaded_target() {
     assert_eq!(order_events(&executor), ["BufDelete", "BufWipeout"]);
 }
 
+/// `:bunload` releases text but keeps the buffer in the ordinary `:ls`
+/// listing; `:bdelete` unlists it and `:bwipeout` removes it entirely.
+/// Upstream: `buffer.c` `close_buffer` — `DOBUF_UNLOAD`/`DOBUF_DEL`/
+/// `DOBUF_WIPE` differ in listed-buffer handling.
+#[test]
+fn buffer_removal_updates_plain_listing_per_command() {
+    for (command, should_list_target) in
+        [("bunload 2", true), ("bdelete 2", false), ("bwipeout 2", false)]
+    {
+        let (editor, mut executor) = setup();
+        let target = editor.editor_mut().create_buffer(true).unwrap();
+
+        executor.execute_line(&editor, command).unwrap();
+        executor.execute_line(&editor, "ls").unwrap();
+
+        let target_number = format!("{:>3}", i64::from(target));
+        let listing = echo_messages(&editor);
+        assert_eq!(
+            listing.iter().any(|row| row.starts_with(&target_number)),
+            should_list_target,
+            "{command}: expected buffer {target:?} listing state {should_list_target}, got {listing:?}"
+        );
+    }
+}
+
 #[test]
 fn bwipeout_does_not_select_an_unloaded_unlisted_replacement() {
     let (editor, mut executor) = setup_with_content(&[b"current".to_vec()]);

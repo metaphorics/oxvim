@@ -8436,8 +8436,7 @@ fn command_enew<F: FileIO, E: ExEditorAccess>(
 enum BufferRemoveKind {
     /// `:bdelete` — unload the resident text and unlist the buffer.
     Delete,
-    /// `:bunload` — unload the resident text; the current implementation also
-    /// unlists, matching the previous behavior (upstream keeps it listed).
+    /// `:bunload` — unload the resident text and keep the buffer listed.
     Unload,
     /// `:bwipeout` — remove the buffer entirely.
     Wipe,
@@ -8664,10 +8663,15 @@ fn command_buffer_remove<F: FileIO, E: ExEditorAccess>(
         // Phase 3 unlists and/or unloads; the borrow ends before wipe events fire.
         let flow = access.with_ex_editor(|editor| {
             match kind {
-                BufferRemoveKind::Delete | BufferRemoveKind::Unload => {
+                BufferRemoveKind::Delete => {
                     if let Ok(state) = editor.buffer_mut(target) {
                         state.flags.set(crate::BufferFlags::LISTED, false);
                     }
+                    if let Err(error) = editor.unload_buffer(target) {
+                        return error_flow(runtime, "E90", error.to_string());
+                    }
+                }
+                BufferRemoveKind::Unload => {
                     if let Err(error) = editor.unload_buffer(target) {
                         return error_flow(runtime, "E90", error.to_string());
                     }
