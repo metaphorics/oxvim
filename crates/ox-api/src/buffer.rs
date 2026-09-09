@@ -2,7 +2,8 @@
 
 use ox_editor::{
     BufferAttachSubscription, BufferEditMode, BufferFlags, BufferRelease, BufferTextEditRequest,
-    Editor, ExtmarkPosition, MarkLocation, Mode, NormalState, OptionValue, VisualKind, VisualState,
+    Editor, EditorError, ExtmarkPosition, MarkLocation, Mode, NormalState, OptionValue, VisualKind,
+    VisualState,
 };
 use ox_text::{Buffer, Position};
 
@@ -971,6 +972,105 @@ pub fn nvim_buf_set_option(
     })
 }
 
+/// Preserves a target buffer's entry residency across a temporary
+/// buffer-context enter and undoes the enter's materialization afterwards.
+/// Upstream `ctx_switch` gives an unloaded buffer an empty memfile so user
+/// code can run in it (`context.c:527-621`) and `ctx_restore` releases that
+/// temporary state again; without the release the next switch sees a loaded
+/// buffer, skips the disk read, and displays empty contents.
+/// Used by `nvim_buf_call`, autocmd firing, and the Lua `vim.with` context bridge.
+pub struct EnteredResidency {
+    target: BufHandle,
+    materialized: Option<u64>,
+}
+impl EnteredResidency {
+    /// Enters `target`'s buffer context after recording whether its text was
+    /// resident, so [`Self::restore`] can tell the empty-text placeholder
+    /// this enter materialized from a buffer the entered code loaded or
+    /// changed itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of resolving or entering `target`.
+    pub fn enter(editor: &mut Editor, target: BufHandle) -> Result<Self, EditorError> {
+        let was_unloaded = editor
+            .buffer(target)
+            .is_ok_and(|state| !state.residency.is_loaded());
+        editor.enter_buffer_context(target)?;
+        let materialized = was_unloaded
+            .then(|| editor.buffer(target).map(|state| state.changedtick()))
+            .transpose()?;
+        Ok(Self {
+            target,
+            materialized,
+        })
+    }
+
+    /// Returns the target to the residency found at entry: a target this
+    /// enter materialized that is still loaded, unattached, unmodified, and
+    /// untouched since the enter goes back to `Unloaded`. Entered code that
+    /// changed the buffer or re-attached it keeps its work.
+    pub(crate) fn restore(&self, editor: &mut Editor) {
+        let Some(entered_tick) = self.materialized else {
+            return;
+        };
+        if !is_untouched_placeholder(editor, self.target, entered_tick) {
+            return;
+        }
+        let _ = editor.unload_buffer(self.target);
+    }
+}
+
+/// Whether the target still holds exactly the empty-text placeholder the
+/// enter materialized: loaded, unattached, unmodified, and at the entry
+/// tick, so unloading it undoes the enter and nothing else.
+fn is_untouched_placeholder(editor: &Editor, target: BufHandle, entered_tick: u64) -> bool {
+    editor.buffer(target).is_ok_and(|state| {
+        state.residency.is_loaded()
+            && state.attachments == 0
+            && !state.flags.contains(BufferFlags::MODIFIED)
+            && state.changedtick() == entered_tick
+    })
+}
+
+/// Puts the entered window's buffer back when the entered code moved it and
+/// the window still exists, then returns the target to its entry residency.
+fn restore_entered_window(
+    editor: &mut Editor,
+    window: WinHandle,
+    original: BufHandle,
+    residency: Option<EnteredResidency>,
+) {
+    if editor
+        .window(window)
+        .is_ok_and(|state| state.buffer != original)
+        && editor.buffer(original).is_ok()
+    {
+        let _ = editor.set_window_buffer(window, original, BufferRelease::KeepLoaded);
+    }
+    if let Some(residency) = residency {
+        residency.restore(editor);
+    }
+}
+
+/// Restores what a buffer-context enter changed (`ctx_restore`,
+/// `context.c:649-747`): the entered window's buffer when the entered code
+/// moved it and the window still exists, the target's entry residency, and
+/// the previous current window. Every failure is swallowed so the entered
+/// code's own result is never masked.
+pub fn restore_buffer_context(
+    editor: &mut Editor,
+    entered: Option<(WinHandle, BufHandle, Option<EnteredResidency>)>,
+    caller: WinHandle,
+) {
+    if let Some((window, original, residency)) = entered {
+        restore_entered_window(editor, window, original, residency);
+    }
+    if editor.current_window() != Some(caller) && editor.window(caller).is_ok() {
+        let _ = editor.set_current_window(caller);
+    }
+}
+
 #[api(since = 7, method)]
 pub fn nvim_buf_call(
     session: &ApiSession,
@@ -991,9 +1091,10 @@ pub fn nvim_buf_call(
     });
     // Enter the target buffer context.  A window already showing the buffer
     // is entered (preferring the caller); a hidden buffer temporarily takes
-    // over the caller window.  `entered` tracks `(window, original_buffer)`
-    // for restoration, mirroring `cs_new_curwin` / `cs_new_curbuf`.
-    let entered: Option<(WinHandle, BufHandle)> = match caller {
+    // over the caller window.  `entered` tracks `(window, original_buffer,
+    // entry residency)` for restoration, mirroring `cs_new_curwin` /
+    // `cs_new_curbuf`.
+    let entered: Option<(WinHandle, BufHandle, Option<EnteredResidency>)> = match caller {
         Some(caller) => session.with_editor_mut(|editor| {
             let current_buf = editor.window(caller).ok().map(|s| s.buffer);
             if current_buf == Some(buffer) {
@@ -1007,7 +1108,7 @@ pub fn nvim_buf_call(
             match visible {
                 Some(window) if window != caller => {
                     if editor.set_current_window(window).is_ok() {
-                        Some((window, buffer))
+                        Some((window, buffer, None))
                     } else {
                         None
                     }
@@ -1015,12 +1116,12 @@ pub fn nvim_buf_call(
                 Some(_) => None, // caller shows target (covered above)
                 None => {
                     // Hidden buffer: take over the caller window. Context
-                    // switches bind unloaded buffers without opening files.
+                    // switches bind unloaded buffers without opening files;
+                    // the entry residency is undone by the restore below.
                     let original = caller_buffer.unwrap_or(buffer);
-                    editor
-                        .enter_buffer_context(buffer)
+                    EnteredResidency::enter(editor, buffer)
                         .ok()
-                        .map(|()| (caller, original))
+                        .map(|residency| (caller, original, Some(residency)))
                 }
             }
         }),
@@ -1056,20 +1157,12 @@ pub fn nvim_buf_call(
     // and visual state are all unwound without masking the callback's result.
     if let Some(caller) = caller {
         session.with_editor_mut(|editor| {
-            // Restore the entered window's buffer if the callback changed it
-            // and the window is still valid (`ctx_restore` `kCtxSwitchBuf`).
-            if let Some((window, expected)) = entered
-                && editor.window(window).is_ok_and(|s| s.buffer != expected)
-                && editor.buffer(expected).is_ok()
-            {
-                let _ = editor.set_window_buffer(window, expected, BufferRelease::KeepLoaded);
-            }
-            // Switch back to the caller window if it is still valid and not
-            // already current (`ctx_restore_curwin` with fallback).
+            // Put the entered window's buffer back, return the target to the
+            // residency its enter found it in, and switch back to the caller
+            // window while both are still valid (`ctx_restore_curwin` with
+            // fallback).
             let prior_previous = editor.previous_window();
-            if editor.current_window() != Some(caller) && editor.window(caller).is_ok() {
-                let _ = editor.set_current_window(caller);
-            }
+            restore_buffer_context(editor, entered, caller);
             if prior_previous == Some(caller) {
                 editor.set_previous_window(previous_before);
             }

@@ -2,8 +2,7 @@
 
 use ox_editor::{
     AugroupId, AutocmdContext, AutocmdDefinition, AutocmdError, AutocmdFilter, AutocmdKind,
-    AutocmdOptions, BufferFlags, BufferRelease, Editor, EditorError, Event, FiringPlan,
-    OptionValue,
+    AutocmdOptions, Editor, EditorError, Event, FiringPlan, OptionValue,
 };
 
 use crate::runtime::{
@@ -12,6 +11,7 @@ use crate::runtime::{
 };
 use crate::{
     ApiError, BufHandle, Dict, Object, OxStr, Registry, RegistryError, WinHandle, api,
+    buffer::{EnteredResidency, restore_buffer_context},
     session::ApiSession,
 };
 
@@ -178,7 +178,7 @@ fn run_in_buffer_context(
         return Ok(Some(run()));
     }
     let changed = session.with_editor_mut(
-        |editor| -> Result<Option<(WinHandle, BufHandle, Option<u64>)>, ApiError> {
+        |editor| -> Result<Option<(WinHandle, BufHandle, Option<EnteredResidency>)>, ApiError> {
             Ok(match selected {
                 Some(window) if window != caller => {
                     editor.set_current_window(window).map_err(switch_error)?;
@@ -189,56 +189,21 @@ fn run_in_buffer_context(
                     let original = caller_buffer.unwrap_or(target);
                     // Upstream `ctx_win_prep` shows a windowless buffer in a
                     // temporary window without touching its memfile, and
-                    // `ctx_restore` restores what it found. This model must
-                    // materialize empty text first, so capture the entry
-                    // residency and the tick the materialization produced;
-                    // only an untouched target is unloaded again on the way
-                    // out.
-                    let was_unloaded = editor
-                        .buffer(target)
-                        .is_ok_and(|state| !state.residency.is_loaded());
-                    editor
-                        .enter_buffer_context(target)
-                        .map_err(switch_error)?;
-                    let materialized = was_unloaded
-                        .then(|| editor.buffer(target).map(|state| state.changedtick()))
-                        .transpose()
-                        .map_err(switch_error)?;
-                    Some((caller, original, materialized))
+                    // `ctx_restore` restores what it found; the shared enter
+                    // records the entry residency for exactly that restore.
+                    let residency =
+                        Some(EnteredResidency::enter(editor, target).map_err(switch_error)?);
+                    Some((caller, original, residency))
                 }
             })
         },
     )?;
     let result = run();
     session.with_editor_mut(|editor| {
-        let materialized = changed.and_then(|(_, _, materialized)| materialized);
-        if let Some((window, original, _)) = changed
-            && editor
-                .window(window)
-                .is_ok_and(|state| state.buffer != original)
-            && editor.buffer(original).is_ok()
-        {
-            let _ = editor.set_window_buffer(window, original, BufferRelease::KeepLoaded);
-        }
-        if let Some(entered_tick) = materialized {
-            // The context materialized an unloaded target, so undo exactly
-            // that on the failure paths too: an unmodified target still
-            // holding the placeholder text goes back to `Unloaded`, or the
-            // next switch would skip its disk read and display empty
-            // contents. A handler that changed the buffer or re-attached it
-            // keeps its state.
-            if editor.buffer(target).is_ok_and(|state| {
-                state.residency.is_loaded()
-                    && state.attachments == 0
-                    && !state.flags.contains(BufferFlags::MODIFIED)
-                    && state.changedtick() == entered_tick
-            }) {
-                let _ = editor.unload_buffer(target);
-            }
-        }
-        if editor.current_window() != Some(caller) && editor.window(caller).is_ok() {
-            let _ = editor.set_current_window(caller);
-        }
+        // The window-buffer restore, the target's entry residency, and the
+        // previous current window unwind together on success and failure
+        // alike, so `run`'s result is never masked.
+        restore_buffer_context(editor, changed, caller);
     });
     Ok(Some(result))
 }

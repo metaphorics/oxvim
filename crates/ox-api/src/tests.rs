@@ -8312,6 +8312,92 @@ fn buf_call_restores_visual_state_even_on_callback_error() {
     );
 }
 
+/// `nvim_buf_call` on a hidden unloaded named buffer enters it without
+/// opening its file — upstream `ctx_switch` (legacy `aucmd_prepbuf`) — so
+/// the context must return the target to its unloaded residency on the way
+/// out: the following switch must reload from disk instead of showing the
+/// empty placeholder the call materialized.
+#[test]
+fn buf_call_restores_unloaded_target_before_following_switch() {
+    let pid = std::process::id();
+    let path = std::env::temp_dir().join(format!("oxvim-api-buf-call-reload-{pid}"));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, b"from disk\n").unwrap();
+
+    let (editor, caller, _, _) = editor_with_lines(&["caller"]);
+    let session = session_with(editor);
+    let target = session.with_editor_mut(|editor| {
+        let target = editor.create_buffer(true).unwrap();
+        let state = editor.buffer_mut(target).unwrap();
+        state.set_name(OxStr::from(path.to_string_lossy().as_ref()));
+        state.unload().unwrap();
+        target
+    });
+
+    let observed = Rc::new(RefCell::new(None));
+    let obs = observed.clone();
+    buf_call(
+        &session,
+        target,
+        Box::new(move |session| {
+            *obs.borrow_mut() = session.with_editor(Editor::current_buffer);
+            Ok(Vec::new())
+        }),
+    );
+
+    assert_eq!(&*observed.borrow(), &Some(target));
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(caller),
+        "the caller's buffer is restored after the callback"
+    );
+    assert!(
+        session.with_editor(|editor| !editor.buffer(target).unwrap().residency.is_loaded()),
+        "the target remains unloaded until the following switch reads it"
+    );
+
+    crate::global::nvim_set_current_buf(&session, target).unwrap();
+    assert_eq!(
+        crate::global::nvim_get_current_buf(&session).unwrap(),
+        target
+    );
+    assert_eq!(
+        crate::buffer::nvim_buf_get_lines(&session, target, 0, -1, true).unwrap(),
+        vec![OxStr::from("from disk")]
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A failing `nvim_buf_call` callback still unwinds the temporary context
+/// and returns an unloaded target to its entry residency before the error
+/// reaches the API caller.
+#[test]
+fn buf_call_error_restores_unloaded_target() {
+    let (editor, caller, _, _) = editor_with_lines(&["caller"]);
+    let session = session_with(editor);
+    let target = session.with_editor_mut(|editor| {
+        let target = editor.create_buffer(true).unwrap();
+        editor.buffer_mut(target).unwrap().unload().unwrap();
+        target
+    });
+
+    buf_call(
+        &session,
+        target,
+        Box::new(|_| Err("callback error".to_string())),
+    );
+
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(caller),
+        "caller buffer restored after callback error"
+    );
+    assert!(
+        session.with_editor(|editor| !editor.buffer(target).unwrap().residency.is_loaded()),
+        "an unloaded target is restored to Unloaded even when the callback errors"
+    );
+}
+
 #[test]
 fn buf_get_offset_empty_buffer_returns_zero_and_one_for_eof() {
     let (editor, buffer, _tab, _win) = editor_with_lines(&[""]);

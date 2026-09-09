@@ -7,8 +7,7 @@ use mlua::{
     FromLuaMulti, Function, Lua, LuaString, MetaMethod, MultiValue, Table, UserData,
     UserDataMethods, Value, Variadic,
 };
-use ox_api::Registry;
-use ox_editor::BufferRelease;
+use ox_api::{EnteredResidency, Registry, restore_buffer_context};
 use ox_editor::editor::RedrawRequest;
 use ox_types::{BufHandle, Object, OxStr, Typval, WinHandle};
 use std::cell::Cell;
@@ -1086,7 +1085,7 @@ fn with_c(
         message_routing,
         process_cwd,
         target_window,
-        entered,
+        mut entered,
     ) = session.with_editor(|editor| {
         let caller = editor.current_window();
         let previous_before = editor.previous_window();
@@ -1111,14 +1110,14 @@ fn with_c(
                 match visible {
                     Some(w) if w != c => {
                         target_window = Some(w);
-                        entered = Some((w, b));
+                        entered = Some((w, b, None));
                     }
                     _ if caller_buffer == Some(b) => {
                         target_window = Some(c);
                     }
                     _ => {
                         target_window = Some(c);
-                        entered = Some((c, caller_buffer.unwrap_or(b)));
+                        entered = Some((c, caller_buffer.unwrap_or(b), None));
                     }
                 }
             }
@@ -1179,30 +1178,40 @@ fn with_c(
                 return Ok(MultiValue::new());
             }
         }
-        if let (Some((window, _)), Some(buffer)) = (entered, buf_handle)
-            && Some(window) == caller
-        {
+        let hidden_target = entered.as_ref().is_some_and(|(window, _, residency)| {
+            Some(*window) == caller && residency.is_none()
+        });
+        if hidden_target && let Some(buffer) = buf_handle {
             // Hidden buffer target: take over the caller window without
-            // opening its file, matching upstream `ctx_switch`.
-            if let Err(error) = session
-                .with_editor_mut(|editor| editor.enter_buffer_context(buffer))
-            {
-                restore_with_c_context(
-                    session,
-                    entered,
-                    caller,
-                    previous_before,
-                    keepcwd,
-                    target_window,
-                    target_local.flatten(),
-                );
-                if keepcwd && let Some(cwd) = &process_cwd {
-                    let _ = std::env::set_current_dir(cwd);
+            // opening its file, matching upstream `ctx_switch`, while
+            // preserving the target's entry residency for restoration.
+            let residency = session.with_editor_mut(|editor| {
+                EnteredResidency::enter(editor, buffer)
+            });
+            match residency {
+                Ok(residency) => {
+                    if let Some((_, _, slot)) = entered.as_mut() {
+                        *slot = Some(residency);
+                    }
                 }
-                if let Some(routing) = saved_routing {
-                    session.with_editor_mut(|editor| editor.message_routing = routing);
+                Err(error) => {
+                    restore_with_c_context(
+                        session,
+                        entered,
+                        caller,
+                        previous_before,
+                        keepcwd,
+                        target_window,
+                        target_local.flatten(),
+                    );
+                    if keepcwd && let Some(cwd) = &process_cwd {
+                        let _ = std::env::set_current_dir(cwd);
+                    }
+                    if let Some(routing) = saved_routing {
+                        session.with_editor_mut(|editor| editor.message_routing = routing);
+                    }
+                    return Err(mlua::Error::runtime(error.to_string()));
                 }
-                return Err(mlua::Error::runtime(error.to_string()));
             }
         }
     }
@@ -1240,23 +1249,16 @@ fn with_c(
 #[allow(clippy::too_many_arguments, reason = "restoration state snapshot")]
 fn restore_with_c_context(
     session: &ox_api::ApiSession,
-    entered: Option<(WinHandle, BufHandle)>,
+    entered: Option<(WinHandle, BufHandle, Option<EnteredResidency>)>,
     caller: Option<WinHandle>,
     previous_before: Option<WinHandle>,
     keepcwd: bool,
     target_window: Option<WinHandle>,
     target_local: Option<(Option<PathBuf>, Option<PathBuf>)>,
 ) {
-    if let Some((window, buffer)) = entered {
+    if let Some(caller) = caller {
         session.with_editor_mut(|editor| {
-            if editor.window(window).is_ok_and(|s| s.buffer != buffer)
-                && editor.buffer(buffer).is_ok()
-            {
-                let _ = editor.set_window_buffer(window, buffer, BufferRelease::KeepLoaded);
-            }
-            if editor.current_window() != Some(window) && editor.window(window).is_ok() {
-                let _ = editor.set_current_window(window);
-            }
+            restore_buffer_context(editor, entered, caller);
         });
     }
 
@@ -1268,14 +1270,6 @@ fn restore_with_c_context(
             if let Ok(state) = editor.window_mut(target) {
                 state.local_directory = local;
                 state.previous_directory = previous;
-            }
-        });
-    }
-
-    if let Some(caller) = caller {
-        session.with_editor_mut(|editor| {
-            if editor.current_window() != Some(caller) && editor.window(caller).is_ok() {
-                let _ = editor.set_current_window(caller);
             }
         });
     }

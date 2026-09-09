@@ -22,6 +22,7 @@ mod runtime;
 mod session;
 
 pub use session::{ApiCallerGuard, ApiSession};
+pub use buffer::{EnteredResidency, restore_buffer_context};
 mod tabpage;
 mod ui;
 mod window;
