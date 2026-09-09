@@ -4980,7 +4980,7 @@ fn command_help<F: FileIO, E: ExEditorAccess>(
             (path, matched.cmd.clone())
         };
         let (handle, created) =
-            match access.with_ex_editor(|editor| buffer_from_file(runtime, editor, &path)) {
+            match buffer_from_file(runtime, access, scope, lua, &path) {
                 Ok((handle, created)) => (handle, created),
                 Err(flow) => return flow,
             };
@@ -6199,7 +6199,8 @@ const DEFAULT_TABPAGE_GEOMETRY: crate::Geometry = crate::Geometry {
 };
 
 /// Stages `path` in a fresh listed buffer named after it, saved-clean and
-/// unloaded. The shared loader performs the probe, read, and lifecycle events.
+/// unloaded. A newly created record announces `BufNew`/`BufAdd` here, matching
+/// `buflist_new` (`buffer.c:2115-2135`); the shared loader owns read events.
 ///
 /// A missing file is not an error: upstream's `:edit`/`:split`/`:tabedit` open
 /// an empty buffer for a name that does not exist yet. Shared by every command
@@ -6207,7 +6208,32 @@ const DEFAULT_TABPAGE_GEOMETRY: crate::Geometry = crate::Geometry {
 /// saved-state bookkeeping have one owner.
 /// Returns the buffer's handle and whether this call created it (rather than
 /// reusing the buffer already named for the path).
-fn buffer_from_file<F: FileIO>(
+fn buffer_from_file<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    path: &std::path::Path,
+) -> Result<(BufHandle, bool), Flow> {
+    let (handle, created) =
+        access.with_ex_editor(|editor| stage_buffer_from_file(runtime, editor, path))?;
+    if created {
+        let flow = fire_buffer_lifecycle(
+            runtime,
+            access,
+            scope,
+            lua,
+            &[Event::BufNew, Event::BufAdd],
+            handle,
+        );
+        if !matches!(flow, Flow::Normal) {
+            return Err(flow);
+        }
+    }
+    Ok((handle, created))
+}
+
+fn stage_buffer_from_file<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     path: &std::path::Path,
@@ -6697,27 +6723,10 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
     if reload_current {
         return edit_reload_current(runtime, access, scope, lua, &path);
     }
-    let (handle, created) =
-        match access.with_ex_editor(|editor| buffer_from_file(runtime, editor, &path)) {
-            Ok((handle, created)) => (handle, created),
-            Err(flow) => return flow,
-        };
-    // `buf_alloc` (`buffer.c:2115-2135`) announces a freshly created listed
-    // buffer before any window enters it, so a failing handler aborts the
-    // entry with the caller still on the old buffer.
-    if created {
-        let flow = fire_buffer_lifecycle(
-            runtime,
-            access,
-            scope,
-            lua,
-            &[Event::BufNew, Event::BufAdd],
-            handle,
-        );
-        if !matches!(flow, Flow::Normal) {
-            return flow;
-        }
-    }
+    let handle = match buffer_from_file(runtime, access, scope, lua, &path) {
+        Ok((handle, _)) => handle,
+        Err(flow) => return flow,
+    };
     let unloaded = !access.with_ex_editor(|editor| {
         editor
             .buffer(handle)
@@ -7042,11 +7051,10 @@ fn jump_to_tag<F: FileIO, E: ExEditorAccess>(
                 .map(|state| (state.buffer, state.cursor, state.coladd))
         })
     });
-    let handle =
-        match access.with_ex_editor(|editor| buffer_from_file(runtime, editor, &chosen.filename)) {
-            Ok((handle, _)) => handle,
-            Err(flow) => return flow,
-        };
+    let handle = match buffer_from_file(runtime, access, scope, lua, &chosen.filename) {
+        Ok((handle, _)) => handle,
+        Err(flow) => return flow,
+    };
     // `buffer_from_file` reuses an existing named buffer, which the user may
     // have unloaded since. Upstream reaches a tag target through the
     // load-capable file path, so read it before deciding where it lands.
@@ -9983,9 +9991,8 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
     // argument keep showing the current one (`ex_splitview`, do_exedit).
     let has_file = !command.args.trim().is_empty();
     let (new_buffer, created_buffer) = if has_file {
-        match access.with_ex_editor(|editor| {
-            buffer_from_file(runtime, editor, &PathBuf::from(command.args.trim()))
-        }) {
+        let path = PathBuf::from(command.args.trim());
+        match buffer_from_file(runtime, access, scope, lua, &path) {
             Ok((handle, created)) => (handle, created),
             Err(flow) => return flow,
         }
@@ -10068,7 +10075,7 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
                     access,
                     scope,
                     lua,
-                    &[Event::BufNew, Event::BufAdd, Event::BufEnter],
+                    &[Event::BufEnter],
                     new_buffer,
                 )
             } else {
@@ -10110,9 +10117,8 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
     {
         return error_flow(runtime, "E16", error.to_string());
     }
-    // A freshly created listed buffer fires `BufNew`/`BufAdd` (`buffer.c`
-    // buf_alloc:2115-2135) and the entry ends with `win_enter`'s `BufEnter`
-    // (`window.c:2722`); reusing an existing buffer raises none here.
+    // `:new`/`:vnew` create an empty listed buffer directly; the file path
+    // already announced its creation in `buffer_from_file`.
     if created_buffer {
         fire_buffer_lifecycle(
             runtime,
@@ -10156,7 +10162,7 @@ fn command_tabnew<F: FileIO, E: ExEditorAccess>(
     let has_file = !name.is_empty();
     let (buffer, created) = if has_file {
         let path = access.with_ex_editor(|editor| argument_path(editor, name));
-        match access.with_ex_editor(|editor| buffer_from_file(runtime, editor, &path)) {
+        match buffer_from_file(runtime, access, scope, lua, &path) {
             Ok((handle, created)) => (handle, created),
             Err(flow) => return flow,
         }

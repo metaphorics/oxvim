@@ -4621,6 +4621,112 @@ fn tabedit_opens_a_file_in_a_new_tabpage() {
 }
 
 #[test]
+fn split_existing_file_fires_creation_before_read_lifecycle() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.scripts().io().insert("split-order.txt", "target\n");
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in [
+        "BufNew",
+        "BufAdd",
+        "BufReadPre",
+        "BufReadPost",
+        "BufNewFile",
+        "BufEnter",
+    ] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} *.txt call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+
+    executor.execute_line(&editor, "split split-order.txt").unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufEnter"]
+    );
+}
+
+#[test]
+fn split_missing_file_fires_creation_before_new_file_lifecycle() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in [
+        "BufNew",
+        "BufAdd",
+        "BufReadPre",
+        "BufReadPost",
+        "BufNewFile",
+        "BufEnter",
+    ] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} *.txt call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+
+    executor
+        .execute_line(&editor, "split split-order-missing.txt")
+        .unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufNew", "BufAdd", "BufNewFile", "BufEnter"]
+    );
+}
+
+#[test]
+fn tabnew_existing_file_fires_creation_before_read_lifecycle() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.scripts().io().insert("tab-order.txt", "target\n");
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufNewFile"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} *.txt call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+
+    executor.execute_line(&editor, "tabnew tab-order.txt").unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufNew", "BufAdd", "BufReadPre", "BufReadPost"]
+    );
+}
+
+#[test]
+fn help_existing_file_fires_creation_before_read_lifecycle() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor
+        .scripts_mut()
+        .add_runtime_root(PathBuf::from("runtime"));
+    executor.scripts().io().insert("runtime/doc/help.txt", "help\n");
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufNewFile"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} * call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+
+    executor.execute_line(&editor, "help").unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufNew", "BufAdd", "BufReadPre", "BufReadPost"]
+    );
+}
+
+#[test]
 fn split_file_read_hook_sees_target_as_current() {
     let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
     executor.scripts().io().insert("split.txt", "split-file\n");
