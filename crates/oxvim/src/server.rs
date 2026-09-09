@@ -4684,10 +4684,9 @@ impl LuaExecutor for ApiLuaExecutor {
 /// Autocmd host installed for API-planned firing (`nvim_exec_autocmds` and
 /// every command path that fires autocmds through the planner).
 ///
-/// Ex-string actions run on the outermost free executor against the editor
-/// the caller is already executing with, so the callback observes the live
-/// editor; Lua callbacks run under the scoped bindings, so re-entrant API
-/// and builtin calls stay on that same editor.
+/// Ex-string actions and Lua callbacks choose one executor pair at the action
+/// boundary. When the pool pair is busy, both kinds use the same fresh pair so
+/// re-entrant API and builtin calls stay on an executor that is actually free.
 #[derive(Clone)]
 struct ServerAutocmdHost {
     session: Rc<ApiSession>,
@@ -4705,33 +4704,27 @@ struct ServerAutocmdHost {
 }
 
 impl ServerAutocmdHost {
+    /// Chooses the executor pair once for one planned action. A Lua callback
+    /// must make the same choice as an Ex-string action: if `ex` is busy, its
+    /// scoped `vim.fn`/`vim.cmd` bindings need the fresh pair too.
+    fn action_pair(&self) -> Result<ExExecutorPair, String> {
+        if self.ex.try_borrow_mut().is_ok() {
+            return Ok((self.ex.clone(), self.nested_ex.clone()));
+        }
+        self.fresh_pair()
+            .ok_or_else(|| "no free Ex executor for an autocmd action".into())
+    }
+
     fn execute_vimscript(
         &self,
         action: &AutocmdAction,
+        pair: &ExExecutorPair,
         execute: impl FnOnce(&mut ExExecutor) -> Result<ExecOutcome, ExecError>,
     ) -> Result<AutocmdExecution, String> {
-        if let Ok(mut ex) = self.ex.try_borrow_mut() {
-            return execute(&mut ex)
-                .map(|_| AutocmdExecution::Keep)
-                .map_err(|error| format_autocmd_exec_error(action, &error));
-        }
-        // The primary executor is busy: fork instead of holding
-        // `nested_ex`, so user code in the action that calls back into
-        // `vim.fn`/`vim.cmd` still finds an executor free (a `:write` with
-        // a BufWritePre action running Lua no longer fails with "no free
-        // Ex executor"). The fork seeds from the never-executed seed, not
-        // a pool member: the dispatching `vim.cmd` holds `nested_ex` at
-        // exactly the depth where the fork is needed, so a pool-member
-        // source failed there. The fork inherits the session's shared
-        // definitions, quit bus, and swap ledger, and carries a fresh
-        // scope like every other deep-reentry fork.
-        let Some((forked, _)) = self.fresh_pair() else {
+        let Ok(mut ex) = pair.0.try_borrow_mut() else {
             return Err("no free Ex executor for an autocmd action".into());
         };
-        let Ok(mut guard) = forked.try_borrow_mut() else {
-            return Err("no free Ex executor for an autocmd action".into());
-        };
-        execute(&mut guard)
+        execute(&mut ex)
             .map(|_| AutocmdExecution::Keep)
             .map_err(|error| format_autocmd_exec_error(action, &error))
     }
@@ -4773,20 +4766,24 @@ impl AutocmdExecutor for ServerAutocmdHost {
         session: &ApiSession,
         action: &AutocmdAction,
     ) -> Result<AutocmdExecution, String> {
+        let pair = self.action_pair()?;
         match &action.kind {
-            AutocmdKind::ExString(source) => self.execute_vimscript(action, |executor| {
-                executor.execute_autocmd_command(session, action, source)
-            }),
-            AutocmdKind::VimscriptFunction(name) => self.execute_vimscript(action, |executor| {
-                executor.execute_autocmd_function(session, action, name)
-            }),
+            AutocmdKind::ExString(source) => {
+                self.execute_vimscript(action, &pair, |executor| {
+                    executor.execute_autocmd_command(session, action, source)
+                })
+            }
+            AutocmdKind::VimscriptFunction(name) => {
+                self.execute_vimscript(action, &pair, |executor| {
+                    executor.execute_autocmd_function(session, action, name)
+                })
+            }
             AutocmdKind::LuaCallback(reference) => {
                 let reference = i32::try_from(*reference)
                     .map_err(|_| "autocmd Lua reference is out of range".to_owned())?;
                 let args = action.callback_args().map_err(|error| error.to_string())?;
-                let (lua, registry, ex, nested_ex) =
-                    (&self.lua, &self.registry, &self.ex, &self.nested_ex);
-                with_scoped_editor_api(lua, registry, ex, nested_ex, session, || {
+                let (lua, registry) = (&self.lua, &self.registry);
+                with_scoped_editor_api(lua, registry, &pair.0, &pair.1, session, || {
                     let value = object_to_lua(lua, &Object::LuaRef(reference))
                         .map_err(|error| LuaExecError::Conversion(error.to_string()))?;
                     let Value::Function(function) = value else {
@@ -5454,14 +5451,117 @@ fn dispatch_scoped_nvim_cmd(
     ox_api::execute_nvim_cmd(session, cmd, opts, &mut executor).map_err(mlua::Error::external)
 }
 
+/// Runs one scoped Ex operation on the selected primary/nested pair. Every
+/// string-form command entry point uses this seam, so `vim.cmd`, the
+/// deprecated `nvim_command`, and `nvim_exec2` cannot fall back to the busy
+/// global command-host pool.
+fn execute_scoped_ex(
+    session: &ApiSession,
+    ex: &Rc<RefCell<ExExecutor>>,
+    nested_ex: &Rc<RefCell<ExExecutor>>,
+    operation: ApiOperation,
+    execute: impl FnOnce(&mut ExExecutor) -> Result<ExecOutcome, ExecError>,
+) -> Result<ExecOutcome, ApiError> {
+    let (result, owner) = if let Ok(mut guard) = ex.try_borrow_mut() {
+        let result = execute(&mut guard);
+        (result, ex.clone())
+    } else if let Ok(mut guard) = nested_ex.try_borrow_mut() {
+        let result = execute(&mut guard);
+        (result, nested_ex.clone())
+    } else {
+        return Err(ApiError::exception(
+            "no free Ex executor for a nested command",
+        ));
+    };
+    deliver_pending_lua_flush(session, &owner);
+    result.map_err(|error| map_api_exec_error(operation, error))
+}
+
+
+/// Executes the deprecated string command API on the selected pair.
+fn dispatch_scoped_nvim_command(
+    session: &ApiSession,
+    ex: &Rc<RefCell<ExExecutor>>,
+    nested_ex: &Rc<RefCell<ExExecutor>>,
+    command: &OxStr,
+) -> Result<(), ApiError> {
+    let command = std::str::from_utf8(command.as_bytes())
+        .map_err(|_| ApiError::validation("Command must be valid UTF-8"))?;
+    execute_scoped_ex(
+        session,
+        ex,
+        nested_ex,
+        ApiOperation::Command,
+        |executor| executor.execute_line(session, command),
+    )
+    .map(|_| ())
+}
+
+/// Executes a scoped string-form `vim.cmd` through the action's selected
+/// executor pair. The ordinary `nvim_exec2` registry path uses the global
+/// command-host pool, whose two members may both be occupied by the caller;
+/// a Lua autocmd callback must stay on the fresh pair selected for that
+/// callback instead.
+fn dispatch_scoped_nvim_exec2(
+    session: &ApiSession,
+    ex: &Rc<RefCell<ExExecutor>>,
+    nested_ex: &Rc<RefCell<ExExecutor>>,
+    source: &OxStr,
+    opts: &Dict,
+) -> Result<Dict, ApiError> {
+    for (key, _) in opts.iter() {
+        if key.as_bytes() != b"output" {
+            return Err(ApiError::validation(format!(
+                "Invalid key: {}",
+                key.to_string_lossy()
+            )));
+        }
+    }
+    let output = match opts.get(&OxStr::from("output")) {
+        None => false,
+        Some(Object::Boolean(value)) => *value,
+        Some(Object::Integer(value)) => *value != 0,
+        Some(_) => return Err(ApiError::validation("Invalid 'output': not a boolean")),
+    };
+    let source = std::str::from_utf8(source.as_bytes())
+        .map_err(|_| ApiError::validation("Command must be valid UTF-8"))?;
+    let message_start = session.with_editor(|editor| editor.messages().len());
+    let result = execute_scoped_ex(
+        session,
+        ex,
+        nested_ex,
+        ApiOperation::Exec2,
+        |executor| executor.execute_script(session, "<nvim>", source),
+    );
+    let captured = result.map(|_| {
+        session.with_editor(|editor| {
+            editor.messages()[message_start..]
+                .iter()
+                .filter(|message| message.kind == MessageKind::Echo)
+                .filter_map(|message| match &message.content {
+                    Object::String(text) => Some(text.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    });
+    session.with_editor_mut(|editor| editor.truncate_messages(message_start));
+    let captured = captured?;
+    Ok(Dict(if output {
+        vec![(OxStr::from("output"), Object::String(OxStr(captured.into_bytes())))]
+    } else {
+        Vec::new()
+    }))
+}
 /// Rebinds the Lua surface over the caller's live session, so Lua re-entered
 /// from Vimscript observes the same state as the enclosing dispatch instead
 /// of a scratch copy: `vim.api` dispatch, `vim._getvar`/`vim._setvar`,
 /// `vim.call` and `vim.fn` all run through `session` (editor access stays
-/// statement-scoped inside each binding), and nested `nvim_cmd` and Vimscript
-/// builtins fall to `nested_ex` (the nested half of the primary/nested
-/// executor pair) once `ex` is borrowed by the enclosing command. Every
-/// original binding is restored when `run` returns.
+/// statement-scoped inside each binding), and command APIs (`nvim_cmd`,
+/// `nvim_command`, and `nvim_exec2`) use the selected primary/nested pair
+/// instead of falling back to the global command-host pool. Every original
+/// binding is restored when `run` returns.
 #[expect(
     clippy::too_many_lines,
     reason = "scoped Lua rebinding and restoration form one lifetime-sensitive transaction"
@@ -5625,6 +5725,104 @@ fn with_scoped_editor_api<T>(
         fn_table.set_metatable(Some(fn_metatable))?;
         vim.set("fn", fn_table)?;
         for (metadata, dispatch) in registry.iter() {
+            if metadata.name == "nvim_command" {
+                let command_ex = ex.clone();
+                let command_nested = nested_ex.clone();
+                api.set(
+                    metadata.name,
+                    shim.call::<Function>(scope.create_function_mut(
+                        move |lua, args: Variadic<Value>| {
+                            let mut converted = Vec::with_capacity(args.len());
+                            for value in args.iter() {
+                                match lua_to_object(lua, value) {
+                                    Ok(value) => converted.push(value),
+                                    Err(error) => return scoped_failure_multi(lua, error),
+                                }
+                            }
+                            if converted.len() != 1 {
+                                return scoped_failure_multi(
+                                    lua,
+                                    format!(
+                                        "Wrong number of arguments: expecting 1 but got {}",
+                                        converted.len()
+                                    ),
+                                );
+                            }
+                            let [Object::String(command)] = converted.as_slice() else {
+                                return scoped_failure_multi(
+                                    lua,
+                                    "Wrong type for argument 1 when calling nvim_command, expecting String",
+                                );
+                            };
+                            if let Err(error) = dispatch_scoped_nvim_command(
+                                session,
+                                &command_ex,
+                                &command_nested,
+                                command,
+                            ) {
+                                return scoped_failure_multi(lua, error);
+                            }
+                            Ok(MultiValue::from_vec(vec![
+                                Value::Boolean(true),
+                                Value::Nil,
+                            ]))
+                        },
+                    )?)?,
+                )?;
+                continue;
+            }
+            if metadata.name == "nvim_exec2" {
+                let exec_ex = ex.clone();
+                let exec_nested = nested_ex.clone();
+                let params = metadata.params;
+                api.set(
+                    metadata.name,
+                    shim.call::<Function>(scope.create_function_mut(
+                        move |lua, args: Variadic<Value>| {
+                            let mut converted = Vec::with_capacity(args.len());
+                            for value in args.iter() {
+                                match lua_to_object(lua, value) {
+                                    Ok(value) => converted.push(value),
+                                    Err(error) => return scoped_failure_multi(lua, error),
+                                }
+                            }
+                            while converted.len() < params.len() {
+                                let (_, kind, optional) = params[converted.len()];
+                                if !optional || kind != ox_api::TypeRef::Dict {
+                                    break;
+                                }
+                                converted.push(Object::Dict(Dict(Vec::new())));
+                            }
+                            let [Object::String(source), Object::Dict(opts)] =
+                                converted.as_slice()
+                            else {
+                                return scoped_failure_multi(
+                                    lua,
+                                    "nvim_exec2 expects (String, optional Dict)",
+                                );
+                            };
+                            let result = match dispatch_scoped_nvim_exec2(
+                                session,
+                                &exec_ex,
+                                &exec_nested,
+                                source,
+                                opts,
+                            ) {
+                                Ok(result) => result,
+                                Err(error) => return scoped_failure_multi(lua, error),
+                            };
+                            match object_to_lua(lua, &Object::Dict(result)) {
+                                Ok(value) => Ok(MultiValue::from_vec(vec![
+                                    Value::Boolean(true),
+                                    value,
+                                ])),
+                                Err(error) => scoped_failure_multi(lua, error),
+                            }
+                        },
+                    )?)?,
+                )?;
+                continue;
+            }
             if metadata.name == "nvim_cmd" {
                 let cmd_ex = ex.clone();
                 let nested_ex = nested_ex.clone();
@@ -6268,6 +6466,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(depth, Object::Integer(3));
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the test requires editor and nested Lua dispatch setup to succeed"
+    )]
+    fn lua_autocmd_callback_reenters_with_both_pool_executors_busy() {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let core = build_embedded_core(editor, true).unwrap();
+        // The outer `:lua` holds `ex`, and its `vim.cmd` holds `nested_ex`.
+        // Every API-created callback must receive one fresh pair before its
+        // command-form re-entry, regardless of which public command spelling
+        // the callback uses.
+        core.ex
+            .borrow_mut()
+            .execute_line(
+                &*core.session,
+                "lua vim.cmd([[lua vim.api.nvim_create_autocmd('User', {pattern = 'OxDeepLuaCommand', callback = function() vim.api.nvim_command('let g:ox_lua_callback_nvim_command = 3') end}); vim.api.nvim_create_autocmd('User', {pattern = 'OxDeepLuaTable', callback = function() vim.cmd({cmd = 'let', args = {'g:ox_lua_callback_table_cmd', '=', '4'}}) end}); vim.api.nvim_create_autocmd('User', {pattern = 'OxDeepLuaString', callback = function() vim.cmd('let g:ox_lua_callback_string_cmd = 5') end}); vim.api.nvim_exec_autocmds('User', {pattern = 'OxDeepLuaCommand'}); vim.api.nvim_exec_autocmds('User', {pattern = 'OxDeepLuaTable'}); vim.api.nvim_exec_autocmds('User', {pattern = 'OxDeepLuaString'})]])",
+            )
+            .unwrap();
+
+        let (_, get_var) = core.registry.get("nvim_get_var").unwrap();
+        for (name, expected) in [
+            ("ox_lua_callback_nvim_command", 3),
+            ("ox_lua_callback_table_cmd", 4),
+            ("ox_lua_callback_string_cmd", 5),
+        ] {
+            let value = get_var(
+                &core.session,
+                &[Object::String(OxStr::from(name))],
+            )
+            .unwrap();
+            assert_eq!(value, Object::Integer(expected));
+        }
     }
     #[cfg(unix)]
     #[test]
@@ -7645,6 +7882,55 @@ mod tests {
     #[test]
     #[expect(
         clippy::unwrap_used,
+        reason = "the fixture, staged payload, and response must succeed"
+    )]
+    fn ui_send_precedes_reply_when_redraw_flush_is_suppressed() {
+        let state = Rc::new(RefCell::new(ui_send_state()));
+        let channel = ChannelId::new(0x4243);
+        let writes = state
+            .borrow_mut()
+            .process_message(
+                channel,
+                Message::Request {
+                    msgid: 17,
+                    method: OxStr::from("nvim_exec_lua"),
+                    params: vec![
+                        Object::String(OxStr::from(
+                            r#"
+                            vim.api.nvim_ui_send("staged")
+                            vim.api.nvim__redraw{flush = false}
+                            return 17
+                            "#,
+                        )),
+                        Object::Array(Vec::new()),
+                    ],
+                },
+            )
+            .unwrap();
+
+        let payload_index = writes
+            .iter()
+            .position(|(target, bytes)| *target == channel.get() && frame_contains(bytes, "staged"))
+            .unwrap();
+        let response_index = writes
+            .iter()
+            .position(|(target, bytes)| {
+                *target == channel.get()
+                    && matches!(
+                        decode_recorded_server_message(bytes),
+                        Message::Response { msgid: 17, .. }
+                    )
+            })
+            .unwrap();
+        assert!(
+            payload_index < response_index,
+            "ui_send must flush before the request response even with flush=false"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
         reason = "the fixture and the exec_lua dispatch must succeed"
     )]
     fn ui_send_from_lua_reaches_stdout_tty_frames() {
@@ -7869,55 +8155,6 @@ mod tests {
         assert_eq!(
             message.as_bytes(),
             b"Wrong type for argument 1 when calling nvim_ui_send, expecting String"
-        );
-    }
-
-    #[test]
-    #[expect(
-        clippy::unwrap_used,
-        reason = "the fixture, staged payload, and response must succeed"
-    )]
-    fn ui_send_precedes_reply_when_redraw_flush_is_suppressed() {
-        let state = Rc::new(RefCell::new(ui_send_state()));
-        let channel = ChannelId::new(0x4243);
-        let writes = state
-            .borrow_mut()
-            .process_message(
-                channel,
-                Message::Request {
-                    msgid: 17,
-                    method: OxStr::from("nvim_exec_lua"),
-                    params: vec![
-                        Object::String(OxStr::from(
-                            r#"
-                            vim.api.nvim_ui_send("staged")
-                            vim.api.nvim__redraw{flush = false}
-                            return 17
-                            "#,
-                        )),
-                        Object::Array(Vec::new()),
-                    ],
-                },
-            )
-            .unwrap();
-
-        let payload_index = writes
-            .iter()
-            .position(|(target, bytes)| *target == channel.get() && frame_contains(bytes, "staged"))
-            .unwrap();
-        let response_index = writes
-            .iter()
-            .position(|(target, bytes)| {
-                *target == channel.get()
-                    && matches!(
-                        decode_recorded_server_message(bytes),
-                        Message::Response { msgid: 17, .. }
-                    )
-            })
-            .unwrap();
-        assert!(
-            payload_index < response_index,
-            "ui_send must flush before the request response even with flush=false"
         );
     }
 
