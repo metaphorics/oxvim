@@ -59,6 +59,14 @@ impl MemoryFileIO {
             .borrow_mut()
             .insert(PathBuf::from(path), content.to_owned());
     }
+    #[cfg(unix)]
+    fn insert_bytes(&self, path: &[u8], content: &str) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(path));
+        self.files.borrow_mut().insert(path, content.to_owned());
+    }
+
 
     fn insert_directory(&self, path: &str) {
         self.directories.borrow_mut().insert(PathBuf::from(path));
@@ -2014,6 +2022,45 @@ fn autocmd_buffer_switch_reloads_unloaded_file_before_enter_events() {
         order_events(&executor),
         ["BufReadPre,", "BufReadPost,", "BufEnter,", "BufWinEnter,"]
     );
+    let view = editor.editor();
+    let state = view.buffer(target).unwrap();
+    assert_eq!(state.text().unwrap().line(1).unwrap(), b"one");
+    assert_eq!(state.text().unwrap().line(2).unwrap(), b"two");
+    assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
+}
+
+/// A byte-preserving buffer name must probe and read the exact Unix path
+/// before firing `BufReadPre`/`BufReadPost`; replacing invalid bytes would
+/// incorrectly take the `BufNewFile` path.
+#[cfg(unix)]
+#[test]
+fn autocmd_buffer_switch_reads_unloaded_non_utf8_file_name() {
+    let (editor, mut executor) = setup();
+    let name = b"reloaded-\xff.txt";
+    executor.scripts().io().insert_bytes(name, "one\ntwo\n");
+    let target = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(target)
+        .unwrap()
+        .set_name(ox_types::OxStr(name.to_vec()));
+    editor.editor_mut().unload_buffer(target).unwrap();
+
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufReadPre", "BufReadPost", "BufNewFile"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} * call add(g:order, '{event},')"),
+            )
+            .unwrap();
+    }
+
+    executor
+        .execute_line(&editor, &format!("buffer {}", i64::from(target)))
+        .unwrap();
+
+    assert_eq!(order_events(&executor), ["BufReadPre,", "BufReadPost,"]);
     let view = editor.editor();
     let state = view.buffer(target).unwrap();
     assert_eq!(state.text().unwrap().line(1).unwrap(), b"one");

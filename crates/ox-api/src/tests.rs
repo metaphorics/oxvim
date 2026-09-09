@@ -366,6 +366,35 @@ fn editor_with_lines(
     let window = editor.tabpage(tab).unwrap().current_window();
     (editor, buffer, tab, window)
 }
+fn editor_with_two_windows() -> (Editor, crate::BufHandle, crate::TabHandle, crate::WinHandle) {
+    let (mut editor, buffer, tab, window) = editor_with_lines(&["target"]);
+    let other = editor
+        .create_buffer_with(Buffer::from_lines(&[b"other".to_vec()], false).unwrap(), true)
+        .unwrap();
+    editor.split_vertical(tab, window, other, true).unwrap();
+    (editor, buffer, tab, window)
+}
+fn set_global_hidden(session: &crate::ApiSession, enabled: bool) {
+    crate::global::nvim_set_option_value(
+        session,
+        OxStr::from("hidden"),
+        Object::Boolean(enabled),
+        dict(&[("scope", Object::String(OxStr::from("global")))]),
+    )
+    .unwrap();
+}
+
+fn set_buffer_hidden_policy(session: &crate::ApiSession, buffer: crate::BufHandle, value: &str) {
+    crate::global::nvim_set_option_value(
+        session,
+        OxStr::from("bufhidden"),
+        Object::String(OxStr::from(value)),
+        dict(&[("buf", Object::Buffer(buffer))]),
+    )
+    .unwrap();
+}
+
+
 
 #[test]
 fn set_current_window_reports_invalid_id_and_switches_valid_window() {
@@ -511,6 +540,71 @@ fn set_current_buf_fires_the_buffer_lifecycle_in_order() {
 
     crate::global::nvim_set_current_buf(&session, second_buffer).unwrap();
     assert_eq!(actions.borrow().len(), 3, "same buffer must not fire");
+}
+
+/// `nvim_set_current_buf` must preserve invalid Unix filename bytes while
+/// probing and reading an unloaded buffer, rather than taking `BufNewFile`.
+#[cfg(unix)]
+#[test]
+fn set_current_buf_reads_unloaded_non_utf8_file_name() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "oxvim-api-byte-path-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let file_name = std::ffi::OsStr::from_bytes(b"target-\xff.txt");
+    let path = root.join(file_name);
+    std::fs::write(&path, b"one\ntwo\n").unwrap();
+
+    let (editor, _source, _, _) = editor_with_lines(&["source"]);
+    let session = session_with(editor);
+    let target = session.with_editor_mut(|editor| {
+        let target = editor.create_buffer(true).unwrap();
+        let state = editor.buffer_mut(target).unwrap();
+        state.set_name(OxStr(path.as_os_str().as_bytes().to_vec()));
+        state.unload().unwrap();
+        target
+    });
+    for event in ["BufReadPre", "BufReadPost", "BufNewFile"] {
+        focus_autocmd(&session, event);
+    }
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: None,
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::global::nvim_set_current_buf(&session, target).unwrap();
+
+    assert_eq!(
+        actions
+            .borrow()
+            .iter()
+            .map(|action| action.event)
+            .collect::<Vec<_>>(),
+        [Event::BufReadPre, Event::BufReadPost]
+    );
+    assert_eq!(
+        session.with_editor(|editor| {
+            editor
+                .buffer(target)
+                .unwrap()
+                .text()
+                .unwrap()
+                .line(1)
+                .unwrap()
+                .to_vec()
+        }),
+        b"one"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1007,6 +1101,186 @@ fn cursor_columns_clamp_but_rows_validate() {
         Err(ApiError::validation("Cursor row outside buffer"))
     );
 }
+
+#[test]
+fn win_close_hidden_keeps_modified_last_buffer() {
+    let (editor, buffer, _, window) = editor_with_two_windows();
+    let session = session_with(editor);
+    set_global_hidden(&session, true);
+    session.with_editor_mut(|editor| {
+        editor
+            .buffer_mut(buffer)
+            .unwrap()
+            .flags
+            .set(ox_editor::BufferFlags::MODIFIED, true);
+    });
+
+    crate::window::nvim_win_close(&session, window, false).unwrap();
+
+    session.with_editor(|editor| {
+        let state = editor.buffer(buffer).unwrap();
+        assert_eq!(state.attachments, 0);
+        assert!(state.residency.is_hidden());
+        assert!(state.flags.contains(ox_editor::BufferFlags::MODIFIED));
+    });
+}
+
+#[test]
+fn win_close_without_hidden_rejects_modified_last_buffer_with_e37() {
+    let (editor, buffer, _, window) = editor_with_two_windows();
+    let session = session_with(editor);
+    set_global_hidden(&session, false);
+    session.with_editor_mut(|editor| {
+        editor
+            .buffer_mut(buffer)
+            .unwrap()
+            .flags
+            .set(ox_editor::BufferFlags::MODIFIED, true);
+    });
+
+    assert_eq!(
+        crate::window::nvim_win_close(&session, window, false),
+        Err(ApiError::exception(
+            "E37: No write since last change (add ! to override)"
+        ))
+    );
+    session.with_editor(|editor| {
+        let state = editor.buffer(buffer).unwrap();
+        assert_eq!(state.attachments, 1);
+        assert!(!state.residency.is_hidden());
+    });
+}
+
+#[test]
+fn win_close_bufhidden_overrides_global_policy_and_controls_release() {
+    let (editor, buffer, _, window) = editor_with_two_windows();
+    let session = session_with(editor);
+    set_global_hidden(&session, false);
+    set_buffer_hidden_policy(&session, buffer, "hide");
+    session.with_editor_mut(|editor| {
+        editor
+            .buffer_mut(buffer)
+            .unwrap()
+            .flags
+            .set(ox_editor::BufferFlags::MODIFIED, true);
+    });
+    crate::window::nvim_win_close(&session, window, false).unwrap();
+    session.with_editor(|editor| {
+        let state = editor.buffer(buffer).unwrap();
+        assert_eq!(state.attachments, 0);
+        assert!(state.residency.is_hidden());
+        assert!(state.flags.contains(ox_editor::BufferFlags::MODIFIED));
+    });
+
+    let (editor, buffer, _, window) = editor_with_two_windows();
+    let session = session_with(editor);
+    set_global_hidden(&session, true);
+    set_buffer_hidden_policy(&session, buffer, "unload");
+    session.with_editor_mut(|editor| {
+        editor
+            .buffer_mut(buffer)
+            .unwrap()
+            .flags
+            .set(ox_editor::BufferFlags::MODIFIED, true);
+    });
+    assert_eq!(
+        crate::window::nvim_win_close(&session, window, false),
+        Err(ApiError::exception(
+            "E37: No write since last change (add ! to override)"
+        ))
+    );
+
+    for policy in ["unload", "delete", "wipe"] {
+        let (editor, buffer, _, window) = editor_with_two_windows();
+        let session = session_with(editor);
+        set_global_hidden(&session, true);
+        set_buffer_hidden_policy(&session, buffer, policy);
+        crate::window::nvim_win_close(&session, window, false).unwrap();
+        session.with_editor(|editor| match policy {
+            "unload" => {
+                let state = editor.buffer(buffer).unwrap();
+                assert!(!state.residency.is_loaded());
+                assert!(state.flags.contains(ox_editor::BufferFlags::LISTED));
+            }
+            "delete" => {
+                let state = editor.buffer(buffer).unwrap();
+                assert!(!state.residency.is_loaded());
+                assert!(!state.flags.contains(ox_editor::BufferFlags::LISTED));
+            }
+            "wipe" => assert!(editor.buffer(buffer).is_err()),
+            _ => unreachable!(),
+        });
+    }
+}
+#[test]
+fn win_close_force_honors_explicit_bufhidden_for_modified_buffer() {
+    for policy in ["unload", "delete", "wipe"] {
+        let (editor, buffer, _, window) = editor_with_two_windows();
+        let session = session_with(editor);
+        set_global_hidden(&session, true);
+        set_buffer_hidden_policy(&session, buffer, policy);
+        session.with_editor_mut(|editor| {
+            editor
+                .buffer_mut(buffer)
+                .unwrap()
+                .flags
+                .set(ox_editor::BufferFlags::MODIFIED, true);
+        });
+
+        crate::window::nvim_win_close(&session, window, true).unwrap();
+
+        session.with_editor(|editor| match policy {
+            "unload" => {
+                let state = editor.buffer(buffer).unwrap();
+                assert!(!state.residency.is_loaded());
+                assert!(!state.flags.contains(ox_editor::BufferFlags::MODIFIED));
+            }
+            "delete" => {
+                let state = editor.buffer(buffer).unwrap();
+                assert!(!state.residency.is_loaded());
+                assert!(!state.flags.contains(ox_editor::BufferFlags::LISTED));
+            }
+            "wipe" => assert!(editor.buffer(buffer).is_err()),
+            _ => unreachable!(),
+        });
+    }
+
+    let (editor, buffer, _, window) = editor_with_two_windows();
+    let session = session_with(editor);
+    set_global_hidden(&session, false);
+    session.with_editor_mut(|editor| {
+        editor
+            .buffer_mut(buffer)
+            .unwrap()
+            .flags
+            .set(ox_editor::BufferFlags::MODIFIED, true);
+    });
+    crate::window::nvim_win_close(&session, window, true).unwrap();
+    session.with_editor(|editor| {
+        let state = editor.buffer(buffer).unwrap();
+        assert!(state.residency.is_hidden());
+        assert!(state.residency.is_loaded());
+        assert!(state.flags.contains(ox_editor::BufferFlags::MODIFIED));
+    });
+}
+#[test]
+fn win_close_bufhidden_does_not_release_buffer_with_other_attachment() {
+    let (mut editor, buffer, tab, window) = editor_with_two_windows();
+    let second = editor.split_vertical(tab, window, buffer, true).unwrap();
+    let session = session_with(editor);
+    set_global_hidden(&session, true);
+    set_buffer_hidden_policy(&session, buffer, "wipe");
+
+    crate::window::nvim_win_close(&session, second, false).unwrap();
+
+    session.with_editor(|editor| {
+        let state = editor.buffer(buffer).unwrap();
+        assert_eq!(state.attachments, 1);
+        assert!(state.residency.is_loaded());
+    });
+}
+
+
 
 #[test]
 fn floating_windows_validate_round_trip_and_close() {

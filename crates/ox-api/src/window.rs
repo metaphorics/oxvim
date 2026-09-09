@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use ox_editor::{
     Anchor, AutocmdContext, Border, BorderText, BufferFlags, BufferRelease, BufferState, Editor,
@@ -787,7 +786,7 @@ where
 
     let mut restore = Some(restore);
     let Some(path) = (!name.as_bytes().is_empty() && !nofileread)
-        .then(|| PathBuf::from(name.to_string_lossy().as_ref()))
+        .then(|| ox_editor::excmd_exec::path_from_ox_str(&name))
     else {
         session.with_editor_mut(|editor| {
             let state = editor.buffer_mut(buffer).map_err(exception)?;
@@ -1215,24 +1214,105 @@ pub fn nvim_win_hide(session: &ApiSession, win: WinHandle) -> Result<(), ApiErro
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BufferClosePolicy {
+    /// Keep the resident buffer when the last window detaches.
+    Hide,
+    /// No explicit `bufhidden` value and the global `hidden` option is off.
+    Default,
+    /// Release resident text but retain the buffer handle.
+    Unload,
+    /// Release resident text and remove the buffer from the listed set.
+    Delete,
+    /// Remove the buffer state after the last window detaches.
+    Wipe,
+}
+
+/// Resolves Neovim's `buf_hide()` decision for a window close.
+///
+/// `bufhidden` takes precedence over the global `hidden` option. Its first
+/// byte is the upstream discriminator: `hide` retains the resident buffer,
+/// while `unload`, `delete`, and `wipe` release it. An empty value inherits
+/// the global option; `Default` records the distinct no-hide case because a
+/// forced close of a modified buffer still retains it unless `bufhidden`
+/// explicitly requests release.
+fn buffer_close_policy(editor: &Editor, buffer: BufHandle) -> BufferClosePolicy {
+    let local = editor
+        .options()
+        .get_buffer(buffer, "bufhidden")
+        .ok()
+        .and_then(|value| match value {
+            OptionValue::String(value) => value.as_bytes().first().copied(),
+            _ => None,
+        });
+    match local {
+        Some(b'h') => BufferClosePolicy::Hide,
+        Some(b'u') => BufferClosePolicy::Unload,
+        Some(b'd') => BufferClosePolicy::Delete,
+        Some(b'w') => BufferClosePolicy::Wipe,
+        _ => match editor.options().get_global("hidden") {
+            Ok(OptionValue::Boolean(true)) => BufferClosePolicy::Hide,
+            _ => BufferClosePolicy::Default,
+        },
+    }
+}
+
 #[api(since = 6, textlock, method)]
 pub fn nvim_win_close(session: &ApiSession, win: WinHandle, force: bool) -> Result<(), ApiError> {
     let win = resolve_window(session, win)?;
     let tab = window_tabpage(session, win)?;
     session.with_editor_mut(|editor| {
-        // `force` only overrides unsaved-change protection: without it,
-        // closing the last window displaying a modified buffer fails with
-        // the E37 the `:close` excmd path raises (`command_close`).
+        // `buf_hide()` lets the global `hidden` option be overridden by the
+        // buffer-local `bufhidden` policy. A modified buffer at its last
+        // attachment still needs to remain resident when `force` is used,
+        // unless `bufhidden` explicitly requests unloading, deletion, or
+        // wiping, because `close_buffer()` applies that override afterward.
         let buffer = editor.window(win).map_err(exception)?.buffer;
-        let abandons_modified = editor.buffer(buffer).is_ok_and(|state| {
-            state.flags.contains(BufferFlags::MODIFIED) && state.attachments == 1
-        });
-        if !force && abandons_modified {
+        let policy = buffer_close_policy(editor, buffer);
+        let (modified, last_attachment) = editor
+            .buffer(buffer)
+            .map(|state| {
+                (
+                    state.flags.contains(BufferFlags::MODIFIED),
+                    state.attachments == 1,
+                )
+            })
+            .unwrap_or((false, false));
+        if !force && modified && last_attachment && !matches!(policy, BufferClosePolicy::Hide) {
             return Err(exception(
                 "E37: No write since last change (add ! to override)",
             ));
         }
-        editor.close_window(tab, win, true).map_err(exception)?;
+        let keep_buffer_loaded = if !last_attachment {
+            true
+        } else if modified {
+            !matches!(
+                policy,
+                BufferClosePolicy::Unload
+                    | BufferClosePolicy::Delete
+                    | BufferClosePolicy::Wipe
+            )
+        } else {
+            matches!(policy, BufferClosePolicy::Hide)
+        };
+        editor
+            .close_window(tab, win, keep_buffer_loaded)
+            .map_err(exception)?;
+        if last_attachment && !keep_buffer_loaded {
+            match policy {
+                BufferClosePolicy::Hide
+                | BufferClosePolicy::Default
+                | BufferClosePolicy::Unload => {}
+                BufferClosePolicy::Delete => {
+                    if let Ok(state) = editor.buffer_mut(buffer) {
+                        state.flags.set(BufferFlags::LISTED, false);
+                    }
+                }
+                BufferClosePolicy::Wipe => {
+                    editor.wipe_buffer(buffer).map_err(exception)?;
+                }
+            }
+        }
         Ok(())
     })
 }
