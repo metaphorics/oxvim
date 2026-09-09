@@ -11,9 +11,11 @@
 //! starve the rest: the first error returns after the drain completes, and the
 //! edit it observed already stands.
 //!
-//! `on_changedtick`, `on_detach`, and `on_reload` remain outside this drain:
-//! the editor currently records committed text mutations only, and does not
-//! yet enqueue those three lifecycle-only callback kinds.
+//! `on_changedtick` rides the same committed-mutation queue as `on_lines` and
+//! `on_bytes`. `on_detach` fires from the release records, before their
+//! registry references are freed, so a detaching plugin still sees the
+//! callback. `on_reload` has no delivery point yet, because the editor has no
+//! whole-buffer re-read path to enqueue one from.
 
 use std::collections::{BTreeMap, HashSet};
 
