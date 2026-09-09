@@ -1212,12 +1212,17 @@ fn win_close_bufhidden_overrides_global_policy_and_controls_release() {
         });
     }
 }
+// `ex_win_close` frees the buffer only when `!need_hide && !buf_hide(buf)`
+// (`ex_docmd.c:5199-5203`), and `need_hide` is true for a changed buffer at
+// its last window. A forced close therefore keeps that buffer resident and
+// modified whatever `bufhidden` says, because `unload`, `delete` and `wipe`
+// make `buf_hide()` false rather than requesting a release here.
 #[test]
-fn win_close_force_honors_explicit_bufhidden_for_modified_buffer() {
-    for policy in ["unload", "delete", "wipe"] {
+fn win_close_force_keeps_a_modified_last_buffer_whatever_bufhidden_says() {
+    for policy in ["unload", "delete", "wipe", "hide"] {
         let (editor, buffer, _, window) = editor_with_two_windows();
         let session = session_with(editor);
-        set_global_hidden(&session, true);
+        set_global_hidden(&session, false);
         set_buffer_hidden_policy(&session, buffer, policy);
         session.with_editor_mut(|editor| {
             editor
@@ -1229,19 +1234,22 @@ fn win_close_force_honors_explicit_bufhidden_for_modified_buffer() {
 
         crate::window::nvim_win_close(&session, window, true).unwrap();
 
-        session.with_editor(|editor| match policy {
-            "unload" => {
-                let state = editor.buffer(buffer).unwrap();
-                assert!(!state.residency.is_loaded());
-                assert!(!state.flags.contains(ox_editor::BufferFlags::MODIFIED));
-            }
-            "delete" => {
-                let state = editor.buffer(buffer).unwrap();
-                assert!(!state.residency.is_loaded());
-                assert!(!state.flags.contains(ox_editor::BufferFlags::LISTED));
-            }
-            "wipe" => assert!(editor.buffer(buffer).is_err()),
-            _ => unreachable!(),
+        session.with_editor(|editor| {
+            let state = editor
+                .buffer(buffer)
+                .unwrap_or_else(|_| panic!("bufhidden={policy} must not wipe a modified buffer"));
+            assert!(
+                state.residency.is_loaded(),
+                "bufhidden={policy} must keep a modified last buffer resident"
+            );
+            assert!(
+                state.flags.contains(ox_editor::BufferFlags::MODIFIED),
+                "bufhidden={policy} must not discard the modification"
+            );
+            assert!(
+                state.flags.contains(ox_editor::BufferFlags::LISTED),
+                "bufhidden={policy} must not unlist a modified buffer"
+            );
         });
     }
 

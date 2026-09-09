@@ -1262,11 +1262,15 @@ pub fn nvim_win_close(session: &ApiSession, win: WinHandle, force: bool) -> Resu
     let win = resolve_window(session, win)?;
     let tab = window_tabpage(session, win)?;
     session.with_editor_mut(|editor| {
-        // `buf_hide()` lets the global `hidden` option be overridden by the
-        // buffer-local `bufhidden` policy. A modified buffer at its last
-        // attachment still needs to remain resident when `force` is used,
-        // unless `bufhidden` explicitly requests unloading, deletion, or
-        // wiping, because `close_buffer()` applies that override afterward.
+        // `ex_win_close` (`ex_docmd.c:5182-5203`) makes two decisions from
+        // `need_hide = bufIsChanged(buf) && buf->b_nwindows <= 1`:
+        // it refuses when `need_hide && !buf_hide(buf) && !forceit`, and it
+        // frees the buffer only when `!need_hide && !buf_hide(buf)`.
+        //
+        // So a modified buffer at its last window is never freed, `force` or
+        // not, and `bufhidden` does not change that: `unload`, `delete` and
+        // `wipe` make `buf_hide()` false (`buffer.c:4113-4121`), which turns
+        // the unforced close into E37 rather than licensing a release.
         let buffer = editor.window(win).map_err(exception)?.buffer;
         let policy = buffer_close_policy(editor, buffer);
         let (modified, last_attachment) = editor
@@ -1278,23 +1282,14 @@ pub fn nvim_win_close(session: &ApiSession, win: WinHandle, force: bool) -> Resu
                 )
             })
             .unwrap_or((false, false));
-        if !force && modified && last_attachment && !matches!(policy, BufferClosePolicy::Hide) {
+        let need_hide = modified && last_attachment;
+        let hides = matches!(policy, BufferClosePolicy::Hide);
+        if need_hide && !hides && !force {
             return Err(exception(
                 "E37: No write since last change (add ! to override)",
             ));
         }
-        let keep_buffer_loaded = if !last_attachment {
-            true
-        } else if modified {
-            !matches!(
-                policy,
-                BufferClosePolicy::Unload
-                    | BufferClosePolicy::Delete
-                    | BufferClosePolicy::Wipe
-            )
-        } else {
-            matches!(policy, BufferClosePolicy::Hide)
-        };
+        let keep_buffer_loaded = need_hide || hides || !last_attachment;
         editor
             .close_window(tab, win, keep_buffer_loaded)
             .map_err(exception)?;
