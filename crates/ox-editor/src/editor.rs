@@ -1619,10 +1619,10 @@ impl Editor {
     ///
     /// Entering an unloaded buffer reloads it (`buf_ensure_loaded` on every
     /// `win_enter` path) through [`Self::unloaded_buffer_text`]. The
-    /// `BufRead*` event family cannot fire here — events run through the
-    /// executor — so the read-event pair belongs to the executor-side
-    /// switch path (`command_buffer`/`fire_buffer_lifecycle` in
-    /// `excmd_exec.rs`).
+    /// `BufRead*` event family cannot fire here — events run through a host
+    /// executor — so the read-event pair belongs to callback-capable switch
+    /// paths (`switch_current_buffer` and the API window loader), not this
+    /// low-level state transition.
     ///
     /// # Errors
     ///
@@ -1672,6 +1672,11 @@ impl Editor {
             .ok_or(EditorError::UnknownTabpage(tab))?;
         if let Err(error) = tabpage.window_mut(window).map(|state| {
             state.alternate_buffer = Some(old_buffer);
+            // Upstream's `w_llist_ref` is meaningful only while the window
+            // displays a quickfix buffer (`IS_LL_WINDOW`, quickfix.c:274-276).
+            // Replacing that buffer ends the display, so the reference must
+            // not follow the window into its next buffer.
+            state.loclist_ref = None;
             state.buffer = buffer;
         }) {
             if let Some(state) = self.buffers.get_mut(&buffer) {
@@ -4427,7 +4432,7 @@ fn buffer_lines_between(
 /// Whether this `buftype` value means a buffer is never read from its name
 /// (`bt_nofileread`, `buffer.c:4071-4077`): `nofile`, `terminal`,
 /// `quickfix`, and `prompt` buffers materialize empty text.
-fn is_nofileread(buftype: &str) -> bool {
+pub(crate) fn is_nofileread(buftype: &str) -> bool {
     matches!(
         buftype.as_bytes(),
         [b'n', _, b'f', ..] | [b't' | b'q' | b'p', ..]

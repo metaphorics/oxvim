@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use ox_editor::{
-    Anchor, Border, BorderText, BufferFlags, BufferRelease, BufferState, Editor, Extmark,
-    ExtmarkPosition, ExtmarkVirtualLinesOverflow, ExtmarkVirtualTextPosition, Margins, OptionStore,
-    OptionValue, RelativeTo, TextAlignment, VirtualTextChunk, WinConfig,
+    Anchor, AutocmdContext, Border, BorderText, BufferFlags, BufferRelease, BufferState, Editor,
+    Event, Extmark, ExtmarkPosition, ExtmarkVirtualLinesOverflow, ExtmarkVirtualTextPosition,
+    FileIO, Margins, OptionStore, OptionValue, RealFileIO, RelativeTo, TextAlignment,
+    VirtualTextChunk, WinConfig,
 };
 use ox_text::{Buffer, Position};
 use unicode_width::UnicodeWidthChar;
@@ -690,6 +692,124 @@ fn set_dimension(
     })
 }
 
+/// Whether an unloaded buffer's `buftype` materializes empty text instead of
+/// reading its name (`bt_nofileread`, `buffer.c:4071-4077`).
+fn is_nofileread(buftype: &str) -> bool {
+    matches!(
+        buftype.as_bytes(),
+        [b'n', _, b'f', ..] | [b't' | b'q' | b'p', ..]
+    )
+}
+
+/// Fires one buffer-read event without holding an editor borrow across the
+/// host callback. The callback may re-enter any API at arbitrary depth.
+fn fire_buffer_read_event(
+    session: &ApiSession,
+    event: Event,
+    buffer: BufHandle,
+) -> Result<(), ApiError> {
+    let name = session
+        .with_editor(|editor| {
+            editor
+                .buffer(buffer)
+                .ok()
+                .map(|state| state.name().to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+    let plan = session.with_editor_mut(|editor| {
+        editor.autocmds_mut().plan(
+            event,
+            AutocmdContext {
+                buffer: Some(buffer),
+                file_name: Some(&name),
+                ..AutocmdContext::default()
+            },
+        )
+    });
+    crate::autocmd::execute_firing_plan(session, plan)
+}
+
+/// Loads an unloaded named buffer before an API buffer switch.
+///
+/// `nvim_win_set_buf` and `nvim_set_current_buf` share the same
+/// `BufReadPre`/`BufReadPost`/`BufNewFile` ordering. The read is deliberately
+/// split around `BufReadPre`: a callback may replace the file before the
+/// second read, and the editor borrow must end before that callback runs.
+pub(crate) fn load_buffer_for_switch(
+    session: &ApiSession,
+    buffer: BufHandle,
+) -> Result<(), ApiError> {
+    let (loaded, name, nofileread) = session.with_editor(|editor| {
+        let state = editor.buffer(buffer).map_err(exception)?;
+        let buftype = match editor.options().get_buffer(buffer, "buftype") {
+            Ok(OptionValue::String(value)) => value.clone(),
+            Ok(_) | Err(_) => String::new(),
+        };
+        Ok::<_, ApiError>((
+            state.residency.is_loaded(),
+            state.name().clone(),
+            is_nofileread(&buftype),
+        ))
+    })?;
+    if loaded {
+        return Ok(());
+    }
+    if name.as_bytes().is_empty() || nofileread {
+        return session.with_editor_mut(|editor| {
+            let state = editor.buffer_mut(buffer).map_err(exception)?;
+            state.load(Buffer::new());
+            state.mark_saved();
+            state.flags.set(BufferFlags::NOTEDITED, false);
+            Ok(())
+        });
+    }
+
+    let path = PathBuf::from(name.to_string_lossy().as_ref());
+    let existing = match RealFileIO.read_to_string(&path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => {
+            return Err(exception(
+                ox_editor::buffer::BufferStateError::Unloaded,
+            ));
+        }
+    };
+    if existing {
+        fire_buffer_read_event(session, Event::BufReadPre, buffer)?;
+    }
+
+    let content = if existing {
+        Some(
+            RealFileIO
+                .read_to_string(&path)
+                .map_err(|_| exception(ox_editor::buffer::BufferStateError::Unloaded))?,
+        )
+    } else {
+        None
+    };
+    session.with_editor_mut(|editor| {
+        let text = match content {
+            Some(content) => Buffer::from_bytes(content.as_bytes()).map_err(exception)?,
+            None => Buffer::new(),
+        };
+        let state = editor.buffer_mut(buffer).map_err(exception)?;
+        state.load(text);
+        state.mark_saved();
+        state.flags.set(BufferFlags::NOTEDITED, false);
+        Ok(())
+    })?;
+
+    fire_buffer_read_event(
+        session,
+        if existing {
+            Event::BufReadPost
+        } else {
+            Event::BufNewFile
+        },
+        buffer,
+    )
+}
+
 #[api(since = 1, method)]
 pub fn nvim_win_get_buf(session: &ApiSession, win: WinHandle) -> Result<BufHandle, ApiError> {
     let win = resolve_window(session, win)?;
@@ -704,6 +824,7 @@ pub fn nvim_win_set_buf(
 ) -> Result<(), ApiError> {
     let win = resolve_window(session, win)?;
     let buf = resolve_buffer(session, buf)?;
+    load_buffer_for_switch(session, buf)?;
     session.with_editor_mut(|editor| {
         editor
             .set_window_buffer(win, buf, BufferRelease::KeepLoaded)
@@ -2363,6 +2484,215 @@ mod tests {
             buffer,
             window,
         )
+    }
+
+    #[derive(Clone)]
+    struct EventRecorder(Rc<RefCell<Vec<String>>>);
+
+    impl crate::AutocmdExecutor for EventRecorder {
+        fn execute(
+            &mut self,
+            action: &ox_editor::AutocmdAction,
+        ) -> Result<crate::AutocmdExecution, String> {
+            self.0.borrow_mut().push(action.event.as_str().to_owned());
+            Ok(crate::AutocmdExecution::Keep)
+        }
+
+        fn release_callback(&mut self, _reference: u64) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn record_events(session: &ApiSession, events: &[&str]) -> Rc<RefCell<Vec<String>>> {
+        for event in events {
+            crate::autocmd::nvim_create_autocmd(
+                session,
+                Object::String(OxStr::from(*event)),
+                dict(&[
+                    ("pattern", Object::String(OxStr::from("*"))),
+                    ("command", Object::String(OxStr::from("echo fired"))),
+                ]),
+            )
+            .unwrap();
+        }
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        crate::set_autocmd_executor(
+            session,
+            Box::new(EventRecorder(actions.clone())),
+            Box::new(EventRecorder(Rc::new(RefCell::new(Vec::new())))),
+        );
+        actions
+    }
+
+    fn unloaded_named_buffer(session: &ApiSession, path: &std::path::Path) -> BufHandle {
+        session.with_editor_mut(|editor| {
+            let target = editor.create_buffer(true).unwrap();
+            let state = editor.buffer_mut(target).unwrap();
+            state.set_name(OxStr::from(path.to_string_lossy().as_ref()));
+            state.unload().unwrap();
+            target
+        })
+    }
+
+    #[test]
+    fn win_set_buf_loads_unloaded_named_buffer_before_read_events() {
+        let (session, _source, window) = session_with(&["source"], 80, 24);
+        let path =
+            std::env::temp_dir().join(format!("oxvim-api-buffer-load-{}", std::process::id()));
+        std::fs::write(&path, b"loaded\n").unwrap();
+        let target = session.with_editor_mut(|editor| {
+            let target = editor.create_buffer(true).unwrap();
+            let state = editor.buffer_mut(target).unwrap();
+            state.set_name(OxStr::from(path.to_string_lossy().as_ref()));
+            state.unload().unwrap();
+            target
+        });
+        for event in ["BufReadPre", "BufReadPost"] {
+            crate::autocmd::nvim_create_autocmd(
+                &session,
+                Object::String(OxStr::from(event)),
+                dict(&[
+                    ("pattern", Object::String(OxStr::from("*"))),
+                    ("command", Object::String(OxStr::from("echo fired"))),
+                ]),
+            )
+            .unwrap();
+        }
+        let events = Rc::new(RefCell::new(Vec::new()));
+        crate::set_autocmd_executor(
+            &session,
+            Box::new(EventRecorder(events.clone())),
+            Box::new(EventRecorder(Rc::new(RefCell::new(Vec::new())))),
+        );
+
+        nvim_win_set_buf(&session, window, target).unwrap();
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            &["BufReadPre".to_owned(), "BufReadPost".to_owned()],
+        );
+        assert_eq!(
+            session.with_editor(|editor| {
+                editor
+                    .buffer(target)
+                    .unwrap()
+                    .text()
+                    .unwrap()
+                    .line(1)
+                    .unwrap()
+            }),
+            b"loaded".to_vec(),
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn set_current_buf_loads_unloaded_named_buffer_before_enter_events() {
+        let (session, source, _window) = session_with(&["source"], 80, 24);
+        let path = std::env::temp_dir().join(format!(
+            "oxvim-api-current-buffer-load-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"loaded\n").unwrap();
+        let target = unloaded_named_buffer(&session, &path);
+        let events = record_events(
+            &session,
+            &[
+                "BufLeave",
+                "BufReadPre",
+                "BufReadPost",
+                "BufEnter",
+                "BufWinEnter",
+            ],
+        );
+
+        crate::global::nvim_set_current_buf(&session, target).unwrap();
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[
+                "BufLeave".to_owned(),
+                "BufReadPre".to_owned(),
+                "BufReadPost".to_owned(),
+                "BufEnter".to_owned(),
+                "BufWinEnter".to_owned(),
+            ],
+        );
+        assert_eq!(
+            session.with_editor(Editor::current_buffer),
+            Some(target),
+            "the current buffer switch must complete after the read lifecycle",
+        );
+        assert_ne!(source, target);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn set_current_buf_missing_named_buffer_fires_new_file_before_enter() {
+        let (session, _source, _window) = session_with(&["source"], 80, 24);
+        let path = std::env::temp_dir().join(format!(
+            "oxvim-api-current-buffer-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let target = unloaded_named_buffer(&session, &path);
+        let events = record_events(
+            &session,
+            &[
+                "BufLeave",
+                "BufReadPre",
+                "BufReadPost",
+                "BufNewFile",
+                "BufEnter",
+                "BufWinEnter",
+            ],
+        );
+
+        crate::global::nvim_set_current_buf(&session, target).unwrap();
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[
+                "BufLeave".to_owned(),
+                "BufNewFile".to_owned(),
+                "BufEnter".to_owned(),
+                "BufWinEnter".to_owned(),
+            ],
+        );
+        let (loaded, line) = session.with_editor(|editor| {
+            let state = editor.buffer(target).unwrap();
+            (state.residency.is_loaded(), state.text().unwrap().line(1).unwrap())
+        });
+        assert!(loaded);
+        assert!(line.is_empty());
+    }
+
+    #[test]
+    fn set_current_buf_failed_read_keeps_named_buffer_unloaded() {
+        let (session, source, _window) = session_with(&["source"], 80, 24);
+        let path = std::env::temp_dir().join(format!(
+            "oxvim-api-current-buffer-failure-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir(&path);
+        std::fs::create_dir(&path).unwrap();
+        let target = unloaded_named_buffer(&session, &path);
+        let events = record_events(&session, &["BufLeave", "BufReadPre"]);
+
+        let error = crate::global::nvim_set_current_buf(&session, target).unwrap_err();
+
+        assert_eq!(error.to_string(), "buffer text is not loaded");
+        assert_eq!(events.borrow().as_slice(), &["BufLeave".to_owned()]);
+        assert_eq!(
+            session.with_editor(Editor::current_buffer),
+            Some(source),
+            "a failed read must not replace the current buffer",
+        );
+        assert!(
+            session.with_editor(|editor| editor.buffer(target).unwrap().text().is_err()),
+            "a non-NotFound read failure must leave the target unloaded",
+        );
+        std::fs::remove_dir(path).unwrap();
     }
 
     fn dict(entries: &[(&str, Object)]) -> Dict {

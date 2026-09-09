@@ -2446,6 +2446,39 @@ mod tests {
     }
 
     #[test]
+    fn switching_quickfix_window_clears_location_list_reference() {
+        let (mut editor, _) = setup();
+        let source_window = editor.current_window().unwrap();
+        let source_buffer = editor.current_buffer().unwrap();
+        call(
+            &mut editor,
+            "setloclist",
+            &[
+                Typval::Number(i64::from(source_window)),
+                Typval::list(vec![item(source_buffer, 2, "entry")]),
+            ],
+        )
+        .unwrap();
+        let list_window = super::open(&mut editor, QfScope::Loclist(source_window)).unwrap();
+        assert_eq!(
+            editor.window(list_window).unwrap().loclist_ref,
+            Some(source_window)
+        );
+
+        let target = editor
+            .create_buffer_with(Buffer::from_bytes(b"target").unwrap(), true)
+            .unwrap();
+        editor
+            .set_window_buffer(list_window, target, BufferRelease::KeepLoaded)
+            .unwrap();
+
+        assert!(
+            QfScope::Loclist(list_window).stack(&editor).is_none(),
+            "a repurposed window must not keep resolving the source loclist",
+        );
+    }
+
+    #[test]
     fn getqflist_all_flag_reports_metadata_keys() {
         // Review finding: `getqflist({'all': 1})` omitted `nr`, `winid`,
         // and `qfbufnr`, and `{'all': 0}` wrongly enabled everything.
