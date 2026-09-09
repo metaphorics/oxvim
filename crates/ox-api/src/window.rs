@@ -700,9 +700,9 @@ fn is_nofileread(buftype: &str) -> bool {
     )
 }
 
-/// Fires one buffer-read event without holding an editor borrow across the
-/// host callback. The callback may re-enter any API at arbitrary depth.
-fn fire_buffer_read_event(
+/// Fires one buffer lifecycle event without holding an editor borrow across
+/// the host callback. The callback may re-enter any API at arbitrary depth.
+fn fire_buffer_event(
     session: &ApiSession,
     event: Event,
     buffer: BufHandle,
@@ -828,14 +828,14 @@ where
     }
 
     if !new_file {
-        if let Err(error) = fire_buffer_read_event(session, Event::BufReadPre, buffer) {
+        if let Err(error) = fire_buffer_event(session, Event::BufReadPre, buffer) {
             finish_buffer_switch(session, buffer, &mut restore, false, true);
             return Err(error);
         }
     }
 
     if new_file {
-        if let Err(error) = fire_buffer_read_event(session, Event::BufNewFile, buffer) {
+        if let Err(error) = fire_buffer_event(session, Event::BufNewFile, buffer) {
             finish_buffer_switch(session, buffer, &mut restore, false, false);
             return Err(error);
         }
@@ -870,7 +870,7 @@ where
         return Err(error);
     }
 
-    if let Err(error) = fire_buffer_read_event(session, Event::BufReadPost, buffer) {
+    if let Err(error) = fire_buffer_event(session, Event::BufReadPost, buffer) {
         finish_buffer_switch(session, buffer, &mut restore, false, false);
         return Err(error);
     }
@@ -1261,43 +1261,84 @@ fn buffer_close_policy(editor: &Editor, buffer: BufHandle) -> BufferClosePolicy 
 pub fn nvim_win_close(session: &ApiSession, win: WinHandle, force: bool) -> Result<(), ApiError> {
     let win = resolve_window(session, win)?;
     let tab = window_tabpage(session, win)?;
-    session.with_editor_mut(|editor| {
-        // `ex_win_close` (`ex_docmd.c:5182-5203`) makes two decisions from
-        // `need_hide = bufIsChanged(buf) && buf->b_nwindows <= 1`:
-        // it refuses when `need_hide && !buf_hide(buf) && !forceit`, and it
-        // frees the buffer only when `!need_hide && !buf_hide(buf)`.
-        //
-        // So a modified buffer at its last window is never freed, `force` or
-        // not, and `bufhidden` does not change that: `unload`, `delete` and
-        // `wipe` make `buf_hide()` false (`buffer.c:4113-4121`), which turns
-        // the unforced close into E37 rather than licensing a release.
-        let buffer = editor.window(win).map_err(exception)?.buffer;
-        let policy = buffer_close_policy(editor, buffer);
-        let (modified, last_attachment) = editor
-            .buffer(buffer)
-            .map(|state| {
-                (
-                    state.flags.contains(BufferFlags::MODIFIED),
-                    state.attachments == 1,
-                )
-            })
-            .unwrap_or((false, false));
-        let need_hide = modified && last_attachment;
-        let hides = matches!(policy, BufferClosePolicy::Hide);
-        if need_hide && !hides && !force {
-            return Err(exception(
-                "E37: No write since last change (add ! to override)",
-            ));
+    // `ex_win_close` (`ex_docmd.c:5182-5203`) makes two decisions from
+    // `need_hide = bufIsChanged(buf) && buf->b_nwindows <= 1`:
+    // it refuses when `need_hide && !buf_hide(buf) && !forceit`, and it frees
+    // the buffer only when `!need_hide && !buf_hide(buf)`.
+    let (buffer, policy, modified, last_attachment, was_loaded) =
+        session.with_editor(|editor| -> Result<_, ApiError> {
+            let buffer = editor.window(win).map_err(exception)?.buffer;
+            let policy = buffer_close_policy(editor, buffer);
+            let state = editor.buffer(buffer).ok();
+            Ok((
+                buffer,
+                policy,
+                state.is_some_and(|state| state.flags.contains(BufferFlags::MODIFIED)),
+                state.is_some_and(|state| state.attachments == 1),
+                state.is_some_and(|state| state.residency.is_loaded()),
+            ))
+        })?;
+    let need_hide = modified && last_attachment;
+    let hides = matches!(policy, BufferClosePolicy::Hide);
+    if need_hide && !hides && !force {
+        return Err(exception(
+            "E37: No write since last change (add ! to override)",
+        ));
+    }
+    let keep_buffer_loaded = need_hide || hides || !last_attachment;
+
+    // `buf_freeall` (`buffer.c:851-869`) fires the lifecycle in this order
+    // while the buffer and its window are still live. Each plan is staged
+    // under a short editor borrow and executed after that borrow ends, so a
+    // callback may re-enter the API or remove the target.
+    let mut events = Vec::new();
+    if !keep_buffer_loaded && was_loaded {
+        events.push(Event::BufUnload);
+    }
+    if !keep_buffer_loaded {
+        match policy {
+            BufferClosePolicy::Delete => events.push(Event::BufDelete),
+            BufferClosePolicy::Wipe => {
+                events.push(Event::BufDelete);
+                events.push(Event::BufWipeout);
+            }
+            BufferClosePolicy::Hide
+            | BufferClosePolicy::Default
+            | BufferClosePolicy::Unload => {}
         }
-        let keep_buffer_loaded = need_hide || hides || !last_attachment;
+    }
+    for event in events {
+        fire_buffer_event(session, event, buffer)?;
+        let target_live = session.with_editor(|editor| {
+            editor
+                .window(win)
+                .is_ok_and(|state| state.buffer == buffer)
+                && editor.buffer(buffer).is_ok()
+        });
+        if !target_live {
+            return Ok(());
+        }
+    }
+
+    session.with_editor_mut(|editor| {
+        // An event may have attached the buffer elsewhere or closed this
+        // window without deleting the buffer. Revalidate before committing
+        // the structural removal and its policy-specific state change.
+        if !editor
+            .window(win)
+            .is_ok_and(|state| state.buffer == buffer)
+        {
+            return Ok(());
+        }
         editor
             .close_window(tab, win, keep_buffer_loaded)
             .map_err(exception)?;
-        if last_attachment && !keep_buffer_loaded {
+        if !keep_buffer_loaded
+            && editor
+                .buffer(buffer)
+                .is_ok_and(|state| state.attachments == 0)
+        {
             match policy {
-                BufferClosePolicy::Hide
-                | BufferClosePolicy::Default
-                | BufferClosePolicy::Unload => {}
                 BufferClosePolicy::Delete => {
                     if let Ok(state) = editor.buffer_mut(buffer) {
                         state.flags.set(BufferFlags::LISTED, false);
@@ -1306,6 +1347,9 @@ pub fn nvim_win_close(session: &ApiSession, win: WinHandle, force: bool) -> Resu
                 BufferClosePolicy::Wipe => {
                     editor.wipe_buffer(buffer).map_err(exception)?;
                 }
+                BufferClosePolicy::Hide
+                | BufferClosePolicy::Default
+                | BufferClosePolicy::Unload => {}
             }
         }
         Ok(())

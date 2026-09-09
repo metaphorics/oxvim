@@ -4620,6 +4620,83 @@ fn tabedit_opens_a_file_in_a_new_tabpage() {
     );
 }
 
+/// Creation callbacks for a split run after the destination window exists.
+///
+/// Upstream `ex_splitview` (`ex_docmd.c:5637`) creates the split before
+/// `do_exedit`, so `BufNew`/`BufAdd` callbacks observe the new window.
+#[test]
+fn split_creation_callbacks_see_the_destination_window() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.scripts().io().insert("split-window.txt", "target\n");
+    executor
+        .execute_line(&editor, "let g:bufnew_windows = [] | let g:bufadd_windows = []")
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufNew *.txt call add(g:bufnew_windows, win_getid())",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufAdd *.txt call add(g:bufadd_windows, win_getid())",
+        )
+        .unwrap();
+
+    executor
+        .execute_line(&editor, "split split-window.txt")
+        .unwrap();
+
+    let destination = editor.editor().current_window().unwrap();
+    let expected = i64::from(destination);
+    let recorded = |name: &str| match global_value(&executor, name) {
+        Some(ox_types::Typval::List(list)) => list
+            .borrow()
+            .items
+            .iter()
+            .map(|value| match value {
+                ox_types::Typval::Number(number) => *number,
+                other => panic!("expected window ids, got {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        other => panic!("expected a List, got {other:?}"),
+    };
+    assert_eq!(recorded("bufnew_windows"), vec![expected]);
+    assert_eq!(recorded("bufadd_windows"), vec![expected]);
+}
+
+/// A read callback may enter another buffer while `:edit` is loading. The
+/// command must not emit a stale `BufEnter` for the requested file afterward.
+#[test]
+fn edit_does_not_enter_requested_buffer_after_read_callback_switches_away() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.scripts().io().insert("edit-switch.txt", "target\n");
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufEnter *.txt call add(g:order, expand('<afile>'))",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "autocmd BufReadPre *.txt enew")
+        .unwrap();
+
+    executor.execute_line(&editor, "edit edit-switch.txt").unwrap();
+
+    assert_eq!(order_events(&executor), Vec::<String>::new());
+    let current = editor.editor().current_buffer().unwrap();
+    let current_name = editor
+        .editor()
+        .buffer(current)
+        .unwrap()
+        .name()
+        .to_string_lossy()
+        .into_owned();
+    assert_ne!(current_name, "edit-switch.txt");
+}
+
 #[test]
 fn split_existing_file_fires_creation_before_read_lifecycle() {
     let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);

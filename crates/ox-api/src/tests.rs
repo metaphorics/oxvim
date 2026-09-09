@@ -1125,6 +1125,44 @@ fn win_close_hidden_keeps_modified_last_buffer() {
     });
 }
 
+/// Closing the last window of a wiped buffer stages the upstream
+/// `BufUnload` → `BufDelete` → `BufWipeout` sequence before the editor frees
+/// the buffer (`window.c:2791`, `buffer.c:851-869`).
+#[test]
+fn win_close_stages_buffer_removal_lifecycle_before_wipe() {
+    let (editor, buffer, _, window) = editor_with_two_windows();
+    let session = session_with(editor);
+    set_global_hidden(&session, true);
+    set_buffer_hidden_policy(&session, buffer, "wipe");
+    for event in ["BufUnload", "BufDelete", "BufWipeout"] {
+        focus_autocmd(&session, event);
+    }
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: None,
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::window::nvim_win_close(&session, window, false).unwrap();
+
+    assert_eq!(
+        actions
+            .borrow()
+            .iter()
+            .map(|action| action.event)
+            .collect::<Vec<_>>(),
+        [Event::BufUnload, Event::BufDelete, Event::BufWipeout]
+    );
+    session.with_editor(|editor| {
+        assert!(editor.buffer(buffer).is_err());
+        assert!(editor.window(window).is_err());
+    });
+}
+
 #[test]
 fn win_close_without_hidden_rejects_modified_last_buffer_with_e37() {
     let (editor, buffer, _, window) = editor_with_two_windows();
