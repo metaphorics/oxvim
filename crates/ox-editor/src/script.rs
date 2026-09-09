@@ -1084,16 +1084,73 @@ impl<F: FileIO> ScriptCtx<F> {
             .collect()
     }
 
-    /// Expands `<SNR>` in one script text line to the current SID's prefix.
+    /// Expands `<SNR>` in one script text line to the current SID's prefix,
+    /// outside single-quoted string literals.
     ///
-    /// Upstream expands `<SNR>` to `<SID>{sid}_` wherever it appears in a
-    /// sourced line (`src/nvim/ex_docmd.c:9543-9566`).
+    /// Upstream never rewrites the line: `<SNR>` becomes `<SNR>{sid}_` when a
+    /// function name is translated (`eval/userfunc.c:1967`,
+    /// `trans_function_name`), so a literal `<SNR>` inside a string stays as
+    /// the author wrote it. This rewrite stands in for that translation, and
+    /// a whole-line replace would corrupt string data.
+    ///
+    /// Only single quotes are honored here. They are unambiguous: the sole
+    /// escape is a doubled `''` (`eval.c`, `eval_lit_string`). A double quote
+    /// opens either a string or a comment depending on command position, so
+    /// telling them apart needs the parser rather than a scan, and a
+    /// `<SNR>` inside a double-quoted string is still expanded.
     #[must_use]
     pub fn expand_snr(&self, line: &str, sid: Sid) -> String {
         if !line.contains("<SNR>") {
             return line.to_owned();
         }
-        line.replace("<SNR>", &format!("<SNR>{sid}_"))
+        let prefix = format!("<SNR>{sid}_");
+        let mut out = String::with_capacity(line.len());
+        let mut rest = line;
+        let mut in_literal = false;
+        while !rest.is_empty() {
+            if in_literal {
+                // Inside a literal every byte is data until the closing
+                // quote; a doubled `''` is one escaped quote and stays inside.
+                let Some(quote) = rest.find('\'') else {
+                    out.push_str(rest);
+                    break;
+                };
+                let (head, tail) = rest.split_at(quote + 1);
+                out.push_str(head);
+                if let Some(escaped) = tail.strip_prefix('\'') {
+                    out.push('\'');
+                    rest = escaped;
+                } else {
+                    in_literal = false;
+                    rest = tail;
+                }
+                continue;
+            }
+            let quote = rest.find('\'');
+            let marker = rest.find("<SNR>");
+            match (quote, marker) {
+                (Some(q), Some(m)) if q < m => {
+                    out.push_str(&rest[..=q]);
+                    in_literal = true;
+                    rest = &rest[q + 1..];
+                }
+                (_, Some(m)) => {
+                    out.push_str(&rest[..m]);
+                    out.push_str(&prefix);
+                    rest = &rest[m + "<SNR>".len()..];
+                }
+                (Some(q), None) => {
+                    out.push_str(&rest[..=q]);
+                    in_literal = true;
+                    rest = &rest[q + 1..];
+                }
+                (None, None) => {
+                    out.push_str(rest);
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// Canonical current `<SNR>` prefix (`<SNR>{sid}_`), when sourcing.
