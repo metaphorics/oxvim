@@ -52,8 +52,8 @@ pub use autocmd::{
     PatternKind,
 };
 pub use buffer::{
-    BufferAttachSubscription, BufferFlags, BufferState, BufferStateError, BufferTextEditError,
-    BufferTextEditRequest,
+    BufferAttachSubscription, BufferBytesEvent, BufferFlags, BufferState, BufferStateError,
+    BufferTextEditError, BufferTextEditRequest,
 };
 pub use decoration::Decorations;
 pub use editor::{
@@ -146,6 +146,8 @@ mod mode_tests;
 mod ops_tests;
 #[cfg(test)]
 mod position_tests;
+#[cfg(test)]
+mod script_alias_tests;
 #[cfg(test)]
 mod task09d_tests;
 #[cfg(test)]

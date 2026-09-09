@@ -516,19 +516,13 @@ fn validate_value(
     let (Some(kind), OptionValue::String(value)) = (metadata.list, value) else {
         return Ok(());
     };
-    validate_list(kind, value, metadata.deny_duplicates).map_err(|reason| {
-        OptionError::InvalidList {
-            name: metadata.name,
-            reason,
-        }
+    validate_list(kind, value).map_err(|reason| OptionError::InvalidList {
+        name: metadata.name,
+        reason,
     })
 }
 
-fn validate_list(
-    kind: OptionListKind,
-    value: &str,
-    deny_duplicates: bool,
-) -> Result<(), &'static str> {
+fn validate_list(kind: OptionListKind, value: &str) -> Result<(), &'static str> {
     match kind {
         OptionListKind::Flags => validate_flags(value),
         OptionListKind::FlagsComma => validate_comma_flags(value),
@@ -553,9 +547,9 @@ fn validate_list(
                     validate_colon_item(item)?;
                 }
             }
-            if deny_duplicates && has_duplicate_items(value) {
-                return Err("duplicate comma-list item");
-            }
+            // Upstream allows duplicates on plain set (`:set path=.,,`
+            // keeps both empties); `deny_duplicates` only drops items on
+            // `+=`/`^=`, which `modify_comma_list` already handles.
             Ok(())
         }
     }

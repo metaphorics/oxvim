@@ -219,6 +219,16 @@ impl QuickfixStack {
     pub fn is_empty(&self) -> bool {
         self.lists.is_empty()
     }
+    /// Titles in history order with the current list flagged, for
+    /// `:chistory` (`ex_chistory`, quickfix.c).
+    #[must_use]
+    pub fn history(&self) -> Vec<(OxStr, bool)> {
+        self.lists
+            .iter()
+            .enumerate()
+            .map(|(index, list)| (list.title().clone(), index == self.current))
+            .collect()
+    }
 
     /// One-based position of the current list, or 0 when empty.
     #[must_use]
@@ -238,6 +248,33 @@ impl QuickfixStack {
     pub fn clear(&mut self) {
         self.lists.clear();
         self.current = 0;
+    }
+
+    /// `:chistory`/`:lhistory` with a count: go to the one-based list.
+    /// Bounds mirror the walk errors (`ex_chistory`).
+    ///
+    /// # Errors
+    ///
+    /// Returns E42 when the history is empty, E380 below the first list, or
+    /// E381 past the last list.
+    pub fn goto_history(&mut self, number: usize) -> std::result::Result<(), QuickfixError> {
+        if self.lists.is_empty() {
+            return Err(QuickfixError::no_errors());
+        }
+        if number < 1 {
+            return Err(QuickfixError {
+                code: "E380",
+                message: "At bottom of quickfix stack".to_owned(),
+            });
+        }
+        if number > self.lists.len() {
+            return Err(QuickfixError {
+                code: "E381",
+                message: "At top of quickfix stack".to_owned(),
+            });
+        }
+        self.current = number - 1;
+        Ok(())
     }
 
     /// `:colder`/`:cnewer`: walk the list history. E380 before the first
@@ -389,10 +426,25 @@ pub enum QfScope {
 }
 
 impl QfScope {
+    /// Follows a location-list display window to its source window
+    /// (upstream `GET_LOC_LIST`, quickfix.c:286).
+    fn resolve(self, editor: &Editor) -> Self {
+        match self {
+            Self::Loclist(window) => Self::Loclist(
+                editor
+                    .window(window)
+                    .ok()
+                    .and_then(|state| state.loclist_ref)
+                    .unwrap_or(window),
+            ),
+            Self::Quickfix => self,
+        }
+    }
+
     /// The stack for reads; `None` when a location list was never created
     /// (`GET_LOC_LIST` returning NULL, quickfix.c:286).
     pub(crate) fn stack(self, editor: &Editor) -> Option<&QuickfixStack> {
-        match self {
+        match self.resolve(editor) {
             Self::Quickfix => Some(editor.quickfix()),
             Self::Loclist(window) => editor.loclist(window),
         }
@@ -401,7 +453,7 @@ impl QfScope {
     /// The stack for writes, allocating a location list on first use
     /// (`ll_get_or_alloc_list`, quickfix.c:2127-2145).
     pub(crate) fn stack_mut(self, editor: &mut Editor) -> &mut QuickfixStack {
-        match self {
+        match self.resolve(editor) {
             Self::Quickfix => editor.quickfix_mut(),
             Self::Loclist(window) => editor.loclist_or_alloc_mut(window),
         }
@@ -1358,6 +1410,7 @@ pub fn open(editor: &mut Editor, scope: QfScope) -> std::result::Result<WinHandl
         editor
             .set_current_window(window)
             .map_err(|error| QuickfixError::editor(&error))?;
+        tag_loclist_window(editor, scope, window);
         return Ok(window);
     }
     let window =
@@ -1380,7 +1433,23 @@ pub fn open(editor: &mut Editor, scope: QfScope) -> std::result::Result<WinHandl
     editor
         .set_current_window(window)
         .map_err(|error| QuickfixError::editor(&error))?;
+    tag_loclist_window(editor, scope, window);
     Ok(window)
+}
+
+/// Records the source window on a location-list display window (upstream
+/// `w_llist_ref`). A reused or fresh window showing another window's list
+/// reads through it.
+fn tag_loclist_window(editor: &mut Editor, scope: QfScope, window: WinHandle) {
+    let QfScope::Loclist(source) = scope else {
+        return;
+    };
+    if source == window {
+        return;
+    }
+    if let Ok(state) = editor.window_mut(window) {
+        state.loclist_ref = Some(source);
+    }
 }
 
 /// Closes the list window if one is open in the current tabpage.
@@ -2374,6 +2443,39 @@ mod tests {
         assert_eq!(editor.window(reopened).unwrap().buffer, qf_buffer);
         // The repurposed window keeps its normal buffer.
         assert_eq!(editor.window(window).unwrap().buffer, buffer);
+    }
+
+    #[test]
+    fn switching_quickfix_window_clears_location_list_reference() {
+        let (mut editor, _) = setup();
+        let source_window = editor.current_window().unwrap();
+        let source_buffer = editor.current_buffer().unwrap();
+        call(
+            &mut editor,
+            "setloclist",
+            &[
+                Typval::Number(i64::from(source_window)),
+                Typval::list(vec![item(source_buffer, 2, "entry")]),
+            ],
+        )
+        .unwrap();
+        let list_window = super::open(&mut editor, QfScope::Loclist(source_window)).unwrap();
+        assert_eq!(
+            editor.window(list_window).unwrap().loclist_ref,
+            Some(source_window)
+        );
+
+        let target = editor
+            .create_buffer_with(Buffer::from_bytes(b"target").unwrap(), true)
+            .unwrap();
+        editor
+            .set_window_buffer(list_window, target, BufferRelease::KeepLoaded)
+            .unwrap();
+
+        assert!(
+            QfScope::Loclist(list_window).stack(&editor).is_none(),
+            "a repurposed window must not keep resolving the source loclist",
+        );
     }
 
     #[test]

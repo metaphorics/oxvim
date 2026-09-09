@@ -279,6 +279,40 @@ fn cquit_and_qall_exit_codes_follow_ex_docmd() {
     assert_eq!(forced.status.code(), Some(0));
 }
 #[test]
+fn startup_command_errors_display_and_continue_with_exit_zero() {
+    // Upstream runs every `--cmd`/`-c`/`+cmd` line through its own
+    // `do_cmdline`: even an uncaught exception prints and startup
+    // continues with exit 0 (verified `+break`, `+throw`, and `--cmd
+    // throw` against the reference binary).
+    let stray = oxvim()
+        .args(["-u", "NONE", "--headless", "+break", "+qall!"])
+        .output()
+        .expect("spawn oxvim");
+    assert_eq!(stray.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&stray.stderr).contains("E587"));
+    let thrown = oxvim()
+        .args(["-u", "NONE", "--headless", "+throw 'boom'", "+qall!"])
+        .output()
+        .expect("spawn oxvim");
+    assert_eq!(thrown.status.code(), Some(0));
+    // The value surfaces; the upstream `E605: Exception not caught:`
+    // wrapper is a separate display gap (unpinned anywhere).
+    assert!(String::from_utf8_lossy(&thrown.stderr).contains("boom"));
+    let pre = oxvim()
+        .args([
+            "-u",
+            "NONE",
+            "--headless",
+            "--cmd",
+            "throw 'preboom'",
+            "+qall!",
+        ])
+        .output()
+        .expect("spawn oxvim");
+    assert_eq!(pre.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&pre.stderr).contains("preboom"));
+}
+#[test]
 fn lua_entry_receives_script_and_trailing_arguments() {
     let path = std::env::temp_dir().join(format!("oxvim-args-{}.lua", std::process::id()));
     std::fs::write(&path, "io.write(arg[0], '|', arg[1], '|', arg[2])").expect("write Lua script");

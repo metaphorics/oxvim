@@ -47,6 +47,9 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "win_gotoid" => host
             .access
             .with_ex_editor(|editor| call_win_gotoid_builtin(editor, args)),
+        "win_gettype" => host
+            .access
+            .with_ex_editor(|editor| call_win_gettype_builtin(editor, args)),
         "winbufnr" => host
             .access
             .with_ex_editor(|editor| call_winbufnr_builtin(editor, args)),
@@ -279,6 +282,48 @@ fn window_number(windows: &[ox_types::WinHandle], target: ox_types::WinHandle) -
         .map_or(0, |index| index + 1);
     Typval::Number(i64::try_from(number).unwrap_or(i64::MAX))
 }
+
+fn resolve_window_by_number(editor: &Editor, number: i64) -> Option<WinHandle> {
+    resolve_window_by_number_impl(editor, number, false)
+}
+
+fn resolve_tiled_window_by_number(editor: &Editor, number: i64) -> Option<WinHandle> {
+    resolve_window_by_number_impl(editor, number, true)
+}
+
+fn resolve_window_by_number_impl(
+    editor: &Editor,
+    number: i64,
+    exclude_floats: bool,
+) -> Option<WinHandle> {
+    if number == 0 {
+        return editor.current_window();
+    }
+    if number < 0 {
+        return None;
+    }
+    if number >= LOWEST_WINDOW_ID {
+        return editor.find_window_by_id(number);
+    }
+    let tab = editor.current_tabpage()?;
+    let windows = editor.tabpage_windows(tab).ok()?;
+    let floats: Vec<WinHandle> = if exclude_floats {
+        editor
+            .tabpage(tab)
+            .ok()
+            .map(|tab| tab.floating_windows().map(|float| float.window).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let index = one_based_index(number)?;
+    windows
+        .iter()
+        .filter(|window| !floats.contains(window))
+        .nth(index)
+        .copied()
+}
+
 /// `winbufnr({nr})`: the buffer displayed by a window number or id.
 fn call_winbufnr_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
     if args.is_empty() {
@@ -295,20 +340,8 @@ fn call_winbufnr_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Ty
             "Too many arguments for function: winbufnr",
         ));
     }
-
     let number = number_value(&args[0])?;
-    let window = if number < 0 {
-        None
-    } else if number == 0 {
-        editor.current_window()
-    } else if number < LOWEST_WINDOW_ID {
-        editor.current_tabpage().and_then(|tab| {
-            let windows = editor.tabpage_windows(tab).ok()?;
-            one_based_index(number).and_then(|index| windows.get(index).copied())
-        })
-    } else {
-        editor.find_window_by_id(number)
-    };
+    let window = resolve_window_by_number(editor, number);
     let buffer = window
         .and_then(|window| editor.window(window).ok())
         .map_or(-1, |state| i64::from(state.buffer));
@@ -470,6 +503,61 @@ fn call_win_gotoid_builtin(editor: &mut Editor, args: &[Typval]) -> ox_eval::Res
             .map_err(|error| EvalError::new("E957", 0, error.to_string()))?;
     }
     Ok(Typval::Number(1))
+}
+
+/// `win_gettype([{nr}])`: the window's kind (`f_win_gettype`,
+/// `eval/window.c:705-729`). Lookup matches upstream: ids at or above
+/// `LOWEST_WINDOW_ID` resolve by handle, smaller numbers are current-
+/// tabpage positions, and anything unresolvable answers `"unknown"`.
+/// The kind order matches upstream too: preview, floating, command,
+/// quickfix/loclist, else `""`. Two arms cannot fire in this model and
+/// are documented, not faked: there is no context-switch window (never
+/// `"autocmd"`) and no tracked command-line window buffer (never
+/// `"command"`).
+fn call_win_gettype_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    if args.len() > 1 {
+        return Err(EvalError::new(
+            "E118",
+            0,
+            "Too many arguments for function: win_gettype",
+        ));
+    }
+    let number = match args.first() {
+        None => 0,
+        Some(value) => number_value(value)?,
+    };
+    let window = resolve_tiled_window_by_number(editor, number);
+    let Some(window) = window else {
+        return Ok(Typval::String(OxStr::from("unknown")));
+    };
+    if matches!(
+        editor.options().get_window(window, "previewwindow"),
+        Ok(OptionValue::Boolean(true))
+    ) {
+        return Ok(Typval::String(OxStr::from("preview")));
+    }
+    if editor.window_config(window).ok().flatten().is_some() {
+        return Ok(Typval::String(OxStr::from("popup")));
+    }
+    let buffer_quickfix = editor
+        .window(window)
+        .ok()
+        .and_then(|state| editor.options().get_buffer(state.buffer, "buftype").ok())
+        .is_some_and(|value| matches!(value, OptionValue::String(text) if text == "quickfix"));
+    if buffer_quickfix {
+        let source = editor
+            .window(window)
+            .ok()
+            .and_then(|state| state.loclist_ref)
+            .unwrap_or(window);
+        let kind = if editor.loclist(source).is_some() {
+            "loclist"
+        } else {
+            "quickfix"
+        };
+        return Ok(Typval::String(OxStr::from(kind)));
+    }
+    Ok(Typval::String(OxStr::from("")))
 }
 
 fn call_window_builtin(editor: &Editor, name: &str, args: &[Typval]) -> Typval {
@@ -1105,5 +1193,105 @@ mod tests {
             panic!("getwininfo(unknown id) must return a list")
         };
         assert!(list.borrow().items.is_empty());
+    }
+
+    #[test]
+    fn win_gettype_zero_resolves_current_window() {
+        let editor = editor_with_window();
+        let kind = call_win_gettype_builtin(&editor, &[Typval::Number(0)]).unwrap();
+        assert_eq!(kind, Typval::String(OxStr::from("")));
+    }
+
+    #[test]
+    fn win_gettype_explicit_id_resolves_window() {
+        let editor = editor_with_window();
+        let current = editor.current_window().unwrap();
+        let kind =
+            call_win_gettype_builtin(&editor, &[Typval::Number(i64::from(current))]).unwrap();
+        assert_eq!(kind, Typval::String(OxStr::from("")));
+
+        let unknown = call_win_gettype_builtin(&editor, &[Typval::Number(9_999_999)]).unwrap();
+        assert_eq!(unknown, Typval::String(OxStr::from("unknown")));
+    }
+
+    #[test]
+    fn win_gettype_numbered_lookup_skips_floating_window() {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        let tab = editor
+            .create_tabpage(buffer, crate::layout::Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let tiled = editor.current_window().unwrap();
+
+        let float_buffer = editor.create_buffer(true).unwrap();
+        let config = crate::layout::WinConfig::new(
+            crate::layout::RelativeTo::Editor,
+            crate::layout::Anchor::NorthWest,
+            0.0,
+            0.0,
+            3,
+            2,
+        )
+        .unwrap();
+        let float = editor.open_float(tab, float_buffer, config).unwrap();
+
+        // The tiled window stays current; the float is not in the numbered
+        // sequence, so `win_gettype(1)` still resolves the tiled window.
+        assert_eq!(editor.current_window(), Some(tiled));
+        let kind = call_win_gettype_builtin(&editor, &[Typval::Number(1)]).unwrap();
+        assert_eq!(kind, Typval::String(OxStr::from("")));
+
+        // An explicit floating-window id still reports "popup".
+        let kind = call_win_gettype_builtin(&editor, &[Typval::Number(i64::from(float))]).unwrap();
+        assert_eq!(kind, Typval::String(OxStr::from("popup")));
+    }
+
+    fn qf_item(buffer: ox_types::BufHandle, lnum: i64, text: &str) -> Typval {
+        Typval::dict(vec![
+            (OxStr::from("bufnr"), Typval::Number(i64::from(buffer))),
+            (OxStr::from("lnum"), Typval::Number(lnum)),
+            (OxStr::from("text"), Typval::String(OxStr::from(text))),
+        ])
+    }
+
+    #[test]
+    fn win_gettype_classifies_loclist_and_quickfix_windows() {
+        let mut editor = Editor::new();
+        let buffer = editor
+            .create_buffer_with(Buffer::from_bytes(b"alpha\nbravo\n").unwrap(), true)
+            .unwrap();
+        editor
+            .create_tabpage(buffer, crate::layout::Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let source = editor.current_window().unwrap();
+
+        // A `:lopen` display window points to the source window's loclist.
+        crate::quickfix::call(
+            &mut editor,
+            "setloclist",
+            &[
+                Typval::Number(0),
+                Typval::list(vec![qf_item(buffer, 1, "loc-a")]),
+            ],
+        )
+        .unwrap();
+        let loclist_window =
+            crate::quickfix::open(&mut editor, crate::quickfix::QfScope::Loclist(source)).unwrap();
+        let kind = call_win_gettype_builtin(&editor, &[Typval::Number(i64::from(loclist_window))])
+            .unwrap();
+        assert_eq!(kind, Typval::String(OxStr::from("loclist")));
+
+        // A `:copen` quickfix window is not a location list.
+        crate::quickfix::call(
+            &mut editor,
+            "setqflist",
+            &[Typval::list(vec![qf_item(buffer, 2, "qf-a")])],
+        )
+        .unwrap();
+        let quickfix_window =
+            crate::quickfix::open(&mut editor, crate::quickfix::QfScope::Quickfix).unwrap();
+        let kind = call_win_gettype_builtin(&editor, &[Typval::Number(i64::from(quickfix_window))])
+            .unwrap();
+        assert_eq!(kind, Typval::String(OxStr::from("quickfix")));
     }
 }

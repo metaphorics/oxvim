@@ -4,12 +4,13 @@ use std::collections::BTreeMap;
 
 use ox_text::buffer::LineSplice;
 use ox_text::{Buffer, BufferError, Cursor, LineEdit, Position, UndoError, UndoStep, UndoTree};
-use ox_types::{Dict, OxStr};
+use ox_types::{BufHandle, Dict, OxStr};
 use thiserror::Error;
 
 use crate::NamespaceId;
 use crate::extmark::{
     ExtmarkError, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, ExtmarkSpliceUndo, TextSplice,
+    extent_end,
 };
 use crate::fold::FoldError;
 use crate::marks::LocalMarks;
@@ -31,6 +32,194 @@ pub struct BufferAttachSubscription {
     pub send_buffer: bool,
     /// Event and callback options supplied by the caller.
     pub options: Dict,
+}
+
+/// A removed attachment together with the buffer whose lifecycle ended.
+///
+/// The buffer handle is retained after a wipe so the Lua `on_detach`
+/// callback can still receive the same `(event, buffer)` arguments that
+/// Neovim sends before it frees the attachment.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BufferSubscriptionRelease {
+    /// Buffer whose attachment was removed.
+    pub buffer: BufHandle,
+    /// Removed attachment and its callback references.
+    pub subscription: BufferAttachSubscription,
+}
+
+/// The projection of one committed buffer update used by line, reload, and
+/// RPC notifications.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BufferUpdateKind {
+    /// A text splice, with the complete post-edit lines for the linewise
+    /// callback and RPC notification.
+    Mutation {
+        /// Number of old lines replaced by the splice.
+        old_line_count: usize,
+        /// Byte size of the old lines, including one newline per line.
+        old_byte_size: usize,
+        /// UTF-32 size of the old lines, including one newline per line.
+        deleted_codepoints: usize,
+        /// UTF-16 size of the old lines, including one newline per line.
+        deleted_codeunits: usize,
+        /// Complete lines in the post-edit range.
+        new_lines: Vec<Vec<u8>>,
+    },
+    /// The initial contents sent to an RPC attachment.
+    Initial {
+        /// Complete contents of the attached buffer.
+        new_lines: Vec<Vec<u8>>,
+    },
+    /// A whole-buffer text replacement (`BufferState::load` over a loaded
+    /// buffer). Upstream reports no splice for a re-read — `buf_updates_unload`
+    /// ends the update session and lets the re-read replace the text — so this
+    /// kind carries no geometry and must never surface as a line or byte delta.
+    Reload,
+    /// The initial changedtick-only notification for an RPC attachment that
+    /// did not request the buffer contents.
+    Changedtick,
+}
+
+/// One committed buffer update. Mutation updates project onto the upstream
+/// `nvim_buf_attach` `on_bytes` argument shape: the change start as a
+/// zero-based row, byte column, and byte offset, plus the replaced and
+/// inserted spans as row/column extents and byte lengths. Positions are
+/// buffer-text coordinates: the old span addresses the pre-edit text, the
+/// new span the post-edit text, and both share the same start. Reload updates
+/// carry no splice, so all of their position fields are zero. The tick is the
+/// script-visible changedtick the callback observes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BufferBytesEvent {
+    /// Subscription identities present when this update committed.
+    pub subscribers: Vec<u128>,
+    /// Script-visible changedtick after the update.
+    pub tick: u64,
+    /// Zero-based start row.
+    pub start_row: usize,
+    /// Start byte column.
+    pub start_col: usize,
+    /// Start byte offset into the buffer text.
+    pub start_byte: usize,
+    /// Rows spanned by the replaced text.
+    pub old_row: usize,
+    /// Replaced byte columns on the end row.
+    pub old_col: usize,
+    /// Replaced byte length.
+    pub old_byte: usize,
+    /// Rows spanned by the inserted text.
+    pub new_row: usize,
+    /// Inserted byte columns on the end row.
+    pub new_col: usize,
+    /// Inserted byte length.
+    pub new_byte: usize,
+    /// Linewise and channel-facing projection of this update.
+    pub update: BufferUpdateKind,
+}
+
+impl BufferBytesEvent {
+    fn initial(subscriber: u128, tick: u64, new_lines: Vec<Vec<u8>>) -> Self {
+        Self {
+            subscribers: vec![subscriber],
+            tick,
+            start_row: 0,
+            start_col: 0,
+            start_byte: 0,
+            old_row: 0,
+            old_col: 0,
+            old_byte: 0,
+            new_row: 0,
+            new_col: 0,
+            new_byte: 0,
+            update: BufferUpdateKind::Initial { new_lines },
+        }
+    }
+
+    fn changedtick(subscriber: u128, tick: u64) -> Self {
+        Self::changedtick_for(vec![subscriber], tick)
+    }
+
+    fn changedtick_for(subscribers: Vec<u128>, tick: u64) -> Self {
+        Self {
+            subscribers,
+            tick,
+            start_row: 0,
+            start_col: 0,
+            start_byte: 0,
+            old_row: 0,
+            old_col: 0,
+            old_byte: 0,
+            new_row: 0,
+            new_col: 0,
+            new_byte: 0,
+            update: BufferUpdateKind::Changedtick,
+        }
+    }
+    fn reload_for(subscribers: Vec<u128>, tick: u64) -> Self {
+        Self {
+            subscribers,
+            tick,
+            start_row: 0,
+            start_col: 0,
+            start_byte: 0,
+            old_row: 0,
+            old_col: 0,
+            old_byte: 0,
+            new_row: 0,
+            new_col: 0,
+            new_byte: 0,
+            update: BufferUpdateKind::Reload,
+        }
+    }
+}
+
+/// Byte length of the span from `start` (inclusive) to `end` (exclusive)
+/// across full line bodies: `lines[0]` is the start row's whole line
+/// without its terminator. Rows past the vector (an insertion end landing
+/// on the following line) contribute nothing; their newline was already
+/// counted by the previous row.
+fn span_bytes(lines: &[Vec<u8>], start: ExtmarkPosition, end: ExtmarkPosition) -> usize {
+    let mut bytes = 0;
+    for row in start.row..=end.row {
+        let line_len = lines.get(row - start.row).map_or(0, Vec::len);
+        if row == start.row && row == end.row {
+            bytes += end.column.saturating_sub(start.column);
+        } else if row == start.row {
+            bytes += line_len.saturating_sub(start.column) + 1;
+        } else if row == end.row {
+            bytes += end.column;
+        } else {
+            bytes += line_len + 1;
+        }
+    }
+    bytes
+}
+
+/// Returns the linewise byte, UTF-32, and UTF-16 sizes of deleted lines.
+///
+/// Buffer text is UTF-8 by construction. `from_utf8_lossy` keeps this helper
+/// total for the editor's internal invariant while matching the replacement
+/// character accounting if an invalid byte sequence ever crosses this seam.
+fn linewise_deleted_sizes(lines: &[Vec<u8>]) -> (usize, usize, usize) {
+    lines.iter().fold((0, 0, 0), |(bytes, codepoints, codeunits), line| {
+        let text = String::from_utf8_lossy(line);
+        (
+            bytes.saturating_add(line.len().saturating_add(1)),
+            codepoints.saturating_add(text.chars().count().saturating_add(1)),
+            codeunits.saturating_add(text.encode_utf16().count().saturating_add(1)),
+        )
+    })
+}
+
+
+/// End column relative to the change start: absolute when the span covers
+/// several rows, start-relative within a single row, matching upstream
+/// `on_bytes` (`buf_updates_send_tick` reports the same two shapes).
+fn end_column(end: ExtmarkPosition, start: ExtmarkPosition) -> usize {
+    if end.row == start.row {
+        end.column.saturating_sub(start.column)
+    } else {
+        end.column
+    }
 }
 
 /// Failures while changing a buffer or its lifecycle.
@@ -182,8 +371,14 @@ pub struct BufferState {
     /// Bumped by every variable writer; the differential Ex-variable sync
     /// skips re-reading an unchanged map.
     variables_version: u64,
-    /// Attached RPC channels keyed by channel identity.
-    subscriptions: BTreeMap<u64, BufferAttachSubscription>,
+    /// RPC subscriptions use channel keys; Lua keys occupy the wider namespace.
+    subscriptions: BTreeMap<u128, BufferAttachSubscription>,
+    /// Subscriptions removed while the buffer is still owned by the editor.
+    /// The Lua host drains this queue after the editor borrow ends.
+    pending_subscription_releases: Vec<BufferAttachSubscription>,
+    next_lua_subscription: u128,
+    /// Committed buffer updates and their original recipients, in commit order.
+    pending_bytes: Vec<BufferBytesEvent>,
     /// Branch-preserving undo history.
     pub undo: UndoTree,
     /// Named and special buffer-local marks.
@@ -263,6 +458,9 @@ impl BufferState {
             locked_vars: Vec::new(),
             variables_version: 1,
             subscriptions: BTreeMap::new(),
+            pending_subscription_releases: Vec::new(),
+            next_lua_subscription: u128::from(u64::MAX) + 1,
+            pending_bytes: Vec::new(),
             undo: UndoTree::new(),
             marks: LocalMarks::new(),
             extmarks: Extmarks::new(),
@@ -339,6 +537,20 @@ impl BufferState {
         &mut self.variables
     }
 
+    /// Counts queued mutation events without taking them, for the dispatch
+    /// gate that drains only when a call queued new events.
+    #[must_use]
+    pub fn pending_bytes_len(&self) -> usize {
+        self.pending_bytes.len()
+    }
+
+    /// Counts queued update and detach work without taking it, for the Lua
+    /// dispatch gate that must deliver lifecycle callbacks after editor code.
+    #[must_use]
+    pub fn pending_callback_work_len(&self) -> usize {
+        self.pending_bytes.len() + self.pending_subscription_releases.len()
+    }
+
     /// Returns whether a buffer-local variable is locked by `:lockvar`.
     #[must_use]
     pub fn is_var_locked(&self, name: &OxStr) -> bool {
@@ -361,12 +573,176 @@ impl BufferState {
 
     /// Returns requested buffer event subscriptions.
     #[must_use]
-    pub const fn subscriptions(&self) -> &BTreeMap<u64, BufferAttachSubscription> {
+    pub const fn subscriptions(&self) -> &BTreeMap<u128, BufferAttachSubscription> {
         &self.subscriptions
     }
 
+    /// Takes the queued buffer update events in commit order, leaving the
+    /// queue empty. The Lua-side drain calls this before invoking callbacks, so
+    /// no editor borrow is held while user code runs.
+    pub fn take_bytes_events(&mut self) -> Vec<BufferBytesEvent> {
+        std::mem::take(&mut self.pending_bytes)
+    }
+
+    /// Puts undelivered events back at the front of the queue.
+    ///
+    /// A channel transport can fail after the editor has committed a change.
+    /// Keeping those events queued lets the owning server retry or report the
+    /// failure without silently losing the mutation notification.
+    pub fn prepend_bytes_events(&mut self, mut events: Vec<BufferBytesEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        events.append(&mut self.pending_bytes);
+        self.pending_bytes = events;
+    }
+
+    /// Adds a subscription, queuing the previous value when its identity is reused.
+    pub fn insert_subscription(
+        &mut self,
+        id: u128,
+        subscription: BufferAttachSubscription,
+    ) {
+        let is_rpc = subscription.channel_id != 0;
+        let send_buffer = subscription.send_buffer;
+        if let Some(previous) = self.subscriptions.insert(id, subscription) {
+            self.pending_subscription_releases.push(previous);
+        }
+        if is_rpc {
+            let event = if send_buffer {
+                BufferBytesEvent::initial(id, self.script_changedtick(), self.snapshot_lines())
+            } else {
+                BufferBytesEvent::changedtick(id, self.script_changedtick())
+            };
+            self.pending_bytes.push(event);
+        }
+    }
+    fn snapshot_lines(&self) -> Vec<Vec<u8>> {
+        (1..=self.text.line_count())
+            .map(|lnum| match self.text.line(lnum) {
+                Ok(line) => line,
+                Err(error) => unreachable!("resident buffer line must exist: {error}"),
+            })
+            .collect()
+    }
+    /// Adds a distinct Lua attachment without sharing RPC channel identities.
+    /// Returns the unique subscription id assigned to this attachment.
+    pub fn attach_lua(&mut self, subscription: BufferAttachSubscription) -> u128 {
+        let id = self.next_lua_subscription;
+        self.next_lua_subscription += 1;
+        self.insert_subscription(id, subscription);
+        id
+    }
+    /// Removes one attachment and its pending deliveries.
+    pub fn remove_subscription(&mut self, id: u128) {
+        if let Some(subscription) = self.subscriptions.remove(&id) {
+            self.pending_subscription_releases.push(subscription);
+        }
+        for event in &mut self.pending_bytes {
+            event.subscribers.retain(|recipient| *recipient != id);
+        }
+        self.pending_bytes
+            .retain(|event| !event.subscribers.is_empty());
+    }
+
+    /// Removes one attachment as part of a reload without creating a normal
+    /// release record. The reload drain owns that record so it can preserve
+    /// callback ordering before freeing its Lua references.
+    pub fn remove_subscription_for_reload(
+        &mut self,
+        id: u128,
+    ) -> Option<BufferAttachSubscription> {
+        let subscription = self.subscriptions.remove(&id)?;
+        for event in &mut self.pending_bytes {
+            event.subscribers.retain(|recipient| *recipient != id);
+        }
+        self.pending_bytes
+            .retain(|event| !event.subscribers.is_empty());
+        Some(subscription)
+    }
+
+    /// Removes every attachment owned by `channel_id` and its pending
+    /// deliveries. Used by `nvim_buf_detach` for both RPC channels and
+    /// in-process Lua calls.
+    pub fn remove_subscriptions_by_channel(&mut self, channel_id: u64) {
+        let removed: Vec<u128> = self
+            .subscriptions
+            .iter()
+            .filter_map(|(id, sub)| (sub.channel_id == channel_id).then_some(*id))
+            .collect();
+        if removed.is_empty() {
+            return;
+        }
+        for id in &removed {
+            if let Some(subscription) = self.subscriptions.remove(id) {
+                self.pending_subscription_releases.push(subscription);
+            }
+        }
+        for event in &mut self.pending_bytes {
+            event.subscribers.retain(|id| !removed.contains(id));
+        }
+        self.pending_bytes
+            .retain(|event| !event.subscribers.is_empty());
+    }
+
+    /// Takes removed subscriptions while preserving this buffer's handle.
+    ///
+    /// Editor-level drains use this form so lifecycle callbacks can run after
+    /// the editor borrow ends without having to recover a wiped buffer.
+    pub fn take_pending_subscription_releases_for(
+        &mut self,
+        buffer: BufHandle,
+    ) -> Vec<BufferSubscriptionRelease> {
+        std::mem::take(&mut self.pending_subscription_releases)
+            .into_iter()
+            .map(|subscription| BufferSubscriptionRelease {
+                buffer,
+                subscription,
+            })
+            .collect()
+    }
+
+    /// Consumes a buffer while retaining the handle on every release record.
+    pub fn into_released_subscriptions_for(
+        mut self,
+        buffer: BufHandle,
+    ) -> Vec<BufferSubscriptionRelease> {
+        let mut released = std::mem::take(&mut self.pending_subscription_releases)
+            .into_iter()
+            .map(|subscription| BufferSubscriptionRelease {
+                buffer,
+                subscription,
+            })
+            .collect::<Vec<_>>();
+        released.extend(
+            std::mem::take(&mut self.subscriptions)
+                .into_values()
+                .map(|subscription| BufferSubscriptionRelease {
+                    buffer,
+                    subscription,
+                }),
+        );
+        released
+    }
+
+    /// Takes subscriptions removed while the buffer remains owned by the editor.
+    pub fn take_pending_subscription_releases(&mut self) -> Vec<BufferAttachSubscription> {
+        std::mem::take(&mut self.pending_subscription_releases)
+    }
+
+    /// Consumes a buffer and returns every subscription that still owns refs.
+    ///
+    /// Callers that remove a buffer must pass the returned subscriptions to the
+    /// Lua host before dropping them; no editor-owned code knows how to free
+    /// the registry values.
+    pub fn into_released_subscriptions(mut self) -> Vec<BufferAttachSubscription> {
+        let mut released = std::mem::take(&mut self.pending_subscription_releases);
+        released.extend(std::mem::take(&mut self.subscriptions).into_values());
+        released
+    }
+
     /// Returns mutable requested buffer event subscriptions.
-    pub const fn subscriptions_mut(&mut self) -> &mut BTreeMap<u64, BufferAttachSubscription> {
+    pub const fn subscriptions_mut(&mut self) -> &mut BTreeMap<u128, BufferAttachSubscription> {
         &mut self.subscriptions
     }
 
@@ -423,7 +799,14 @@ impl BufferState {
         }
     }
 
-    /// Replaces unloaded resident text before a window attaches.
+    /// Replaces resident text wholesale: an unloaded buffer's first read
+    /// before a window attaches, or a loaded buffer's `:edit!` re-read.
+    ///
+    /// A re-read of a loaded buffer queues one reload event for every active
+    /// attachment, mirroring upstream `buf_updates_unload` with `can_reload`:
+    /// the Lua drain keeps those supplying `on_reload`, detaches the rest, and
+    /// ends RPC channels. An unloaded buffer has no attachments to notify
+    /// because unloading released them, so first reads queue nothing.
     pub fn load(&mut self, text: Buffer) {
         self.text = text;
         self.bump_changedtick();
@@ -441,6 +824,25 @@ impl BufferState {
         } else {
             BufferResidency::Displayed
         };
+        self.queue_reload_event();
+    }
+
+    /// Queues a whole-buffer reload notification for every active attachment.
+    ///
+    /// The Lua drain keeps attachments that supply `on_reload`, sends
+    /// `on_detach` for the rest, and ends RPC channels. The reload kind carries
+    /// no splice geometry, so the replacement cannot be replayed as a line or
+    /// byte delta.
+    fn queue_reload_event(&mut self) {
+        let recipients: Vec<u128> = self.subscriptions.keys().copied().collect();
+        if recipients.is_empty() {
+            return;
+        }
+        self.pending_bytes
+            .push(BufferBytesEvent::reload_for(
+                recipients,
+                self.script_changedtick(),
+            ));
     }
 
     /// Attaches one window to resident text.
@@ -499,8 +901,20 @@ impl BufferState {
         splice: TextSplice,
     ) -> Result<(), BufferStateError> {
         self.require_loaded()?;
+        let before = self.text.line(lnum)?;
         self.text.replace_lines(lnum, lnum, &[line])?;
         self.bump_changedtick();
+        // Prompt edits bypass undo but not attach callbacks: project the
+        // same byte event from a synthetic single-line splice.
+        let after = self.text.line(lnum)?;
+        let edit = PreparedBufferTextEdit {
+            start_line: lnum,
+            before: vec![before],
+            after: vec![after],
+            splice,
+        };
+        let event = self.bytes_event(&edit)?;
+        self.pending_bytes.push(event);
         self.marks.splice(lnum, 1, 1);
         let _ = self.extmarks.splice_recording(splice);
         self.splice_folds(lnum, 1, 1)?;
@@ -874,7 +1288,31 @@ impl BufferState {
             } else {
                 (&edit.before, &edit.after)
             };
+            let start_row = edit.start.saturating_sub(1);
+            let (old_byte_size, deleted_codepoints, deleted_codeunits) =
+                linewise_deleted_sizes(remove);
+            let event = BufferBytesEvent {
+                subscribers: self.subscriptions.keys().copied().collect(),
+                tick: self.script_changedtick(),
+                start_row,
+                start_col: 0,
+                start_byte: self.text.byte_of_line(edit.start)?,
+                old_row: remove.len(),
+                old_col: 0,
+                old_byte: old_byte_size,
+                new_row: apply.len(),
+                new_col: 0,
+                new_byte: apply.iter().map(|line| line.len() + 1).sum(),
+                update: BufferUpdateKind::Mutation {
+                    old_line_count: remove.len(),
+                    old_byte_size,
+                    deleted_codepoints,
+                    deleted_codeunits,
+                    new_lines: apply.clone(),
+                },
+            };
             self.replay_text(edit.start, remove, apply)?;
+            self.pending_bytes.push(event);
             self.marks.splice(edit.start, remove.len(), apply.len());
             let recorded = self
                 .extmark_undo
@@ -946,13 +1384,18 @@ impl BufferState {
     ///
     /// # Errors
     ///
-    /// Returns [`BufferStateError::Unloaded`] when the buffer text is not resident.
+    /// Returns [`BufferStateError::Unloaded`] when the buffer text is not
+    /// resident.
     pub fn set_eol(&mut self, has_eol: bool) -> Result<(), BufferStateError> {
         self.require_loaded()?;
         let changed = self.text.has_eol() != has_eol;
         self.text.set_eol(has_eol);
         if changed {
             self.bump_changedtick();
+            self.pending_bytes.push(BufferBytesEvent::changedtick_for(
+                self.subscriptions.keys().copied().collect(),
+                self.script_changedtick(),
+            ));
             self.folds.invalidate(self.changedtick());
         }
         self.refresh_modified();
@@ -979,7 +1422,9 @@ impl BufferState {
         self.saved_changedtick = self.changedtick();
         self.saved_has_eol = self.text.has_eol();
         self.saved_undo_state = (0, 0);
-        self.subscriptions.clear();
+        self.pending_subscription_releases
+            .extend(std::mem::take(&mut self.subscriptions).into_values());
+        self.pending_bytes.clear();
     }
 
     /// Writes a prepared splice's lines into the resident text.
@@ -1013,10 +1458,56 @@ impl BufferState {
     ) -> Result<u64, BufferStateError> {
         self.write_prepared_lines(&edit)?;
         self.bump_changedtick();
+        // The byte offsets below address the pre-write text, whose line
+        // prefix is unchanged by this edit; the tick is post-bump, which is
+        // what the callback observes through `b:changedtick`.
+        let event = self.bytes_event(&edit)?;
+        self.pending_bytes.push(event);
         let seq = self.record_committed_splice(edit, cursor_before, cursor_after, timestamp)?;
         self.refresh_modified();
         self.bump_derived_ticks();
         Ok(seq)
+    }
+
+    /// Projects one committed splice onto the `on_bytes` argument shape.
+    /// Must run after a successful write: the changedtick is already
+    /// bumped, and the pre-write line prefix still addresses the change
+    /// start. Fails only when the start line has no byte offset, which
+    /// cannot happen for a splice the text layer just accepted.
+    fn bytes_event(
+        &self,
+        edit: &PreparedBufferTextEdit,
+    ) -> Result<BufferBytesEvent, BufferStateError> {
+        let start = edit.splice.start;
+        let old_end = edit.splice.old_end();
+        let new_end = extent_end(start, edit.splice.new_extent);
+        // One-based line of the change start in either text generation:
+        // lines before it are untouched by this edit.
+        let start_byte = self.text.byte_of_line(start.row + 1)? + start.column;
+        let old_byte = span_bytes(&edit.before, start, old_end);
+        let new_byte = span_bytes(&edit.after, start, new_end);
+        let (old_byte_size, deleted_codepoints, deleted_codeunits) =
+            linewise_deleted_sizes(&edit.before);
+        Ok(BufferBytesEvent {
+            subscribers: self.subscriptions.keys().copied().collect(),
+            tick: self.script_changedtick(),
+            start_row: start.row,
+            start_col: start.column,
+            start_byte,
+            old_row: old_end.row.saturating_sub(start.row),
+            old_col: end_column(old_end, start),
+            old_byte,
+            new_row: new_end.row.saturating_sub(start.row),
+            new_col: end_column(new_end, start),
+            new_byte,
+            update: BufferUpdateKind::Mutation {
+                old_line_count: edit.before.len(),
+                old_byte_size,
+                deleted_codepoints,
+                deleted_codeunits,
+                new_lines: edit.after.clone(),
+            },
+        })
     }
 
     fn record_committed_splice(
@@ -1061,6 +1552,10 @@ impl BufferState {
         if prepared.is_empty() {
             return Ok(0);
         }
+        let events = prepared
+            .iter()
+            .map(|edit| self.bytes_event(edit))
+            .collect::<Result<Vec<_>, _>>()?;
         let splices: Vec<LineSplice<'_>> = prepared
             .iter()
             // The end line cannot overflow: both operands are bounded by the
@@ -1075,6 +1570,10 @@ impl BufferState {
             .replace_lines_disjoint(&splices)
             .map_err(BufferStateError::from)?;
         self.bump_changedtick();
+        for mut event in events {
+            event.tick = self.script_changedtick();
+            self.pending_bytes.push(event);
+        }
         let mut seq = 0;
         for edit in prepared {
             debug_assert!(edit.preserves_line_count());
@@ -1427,5 +1926,177 @@ mod tests {
         assert_eq!(range_tuple(&state, namespace, id), (0, 4, None, false));
         state.redo().unwrap();
         assert_eq!(range_tuple(&state, namespace, id), (0, 1, None, false));
+    }
+
+    #[test]
+    fn commit_records_bytes_event_for_line_replace() {
+        let (mut editor, buffer, _) = editor_with(b"a\nb\nc\n");
+        let state = editor.buffer_mut(buffer).unwrap();
+        state
+            .replace_lines(2, 2, &[b"XY".to_vec()], position(1, 0), position(2, 2), 0)
+            .unwrap();
+        let events = state.take_bytes_events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            (event.start_row, event.start_col, event.start_byte),
+            (1, 0, 2)
+        );
+        // Full-line spans use the extent shape (terminator included):
+        // replacing "b" with "XY" reports old=(1,0,2), new=(1,0,3),
+        // matching the reference `on_bytes` for the same edit.
+        assert_eq!((event.old_row, event.old_col, event.old_byte), (1, 0, 2));
+        assert_eq!((event.new_row, event.new_col, event.new_byte), (1, 0, 3));
+        assert_eq!(event.tick, state.script_changedtick());
+        assert!(state.take_bytes_events().is_empty());
+    }
+
+    #[test]
+    fn commit_records_bytes_event_for_line_insert() {
+        let (mut editor, buffer, _) = editor_with(b"a\nb\n");
+        let state = editor.buffer_mut(buffer).unwrap();
+        state
+            .insert_lines(0, &[b"Z".to_vec()], position(1, 0), position(2, 0), 0)
+            .unwrap();
+        let events = state.take_bytes_events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            (event.start_row, event.start_col, event.start_byte),
+            (0, 0, 0)
+        );
+        assert_eq!((event.old_row, event.old_col, event.old_byte), (0, 0, 0));
+        // Inserting one line reports the added line plus its newline.
+        assert_eq!((event.new_row, event.new_col, event.new_byte), (1, 0, 2));
+    }
+
+    #[test]
+    fn undo_and_redo_emit_bytes_events() {
+        let (mut editor, buffer, _) = editor_with(b"a\nb\nc\n");
+        let state = editor.buffer_mut(buffer).unwrap();
+        state
+            .replace_lines(2, 2, &[b"XY".to_vec()], position(1, 0), position(2, 2), 0)
+            .unwrap();
+
+        let forward = state.take_bytes_events();
+        assert_eq!(forward.len(), 1);
+        assert_eq!(
+            (
+                forward[0].start_row,
+                forward[0].start_col,
+                forward[0].start_byte
+            ),
+            (1, 0, 2)
+        );
+
+        state.undo().unwrap();
+        let undo = state.take_bytes_events();
+        assert_eq!(undo.len(), 1);
+        let event = &undo[0];
+        assert_eq!(
+            (event.start_row, event.start_col, event.start_byte),
+            (1, 0, 2)
+        );
+        // Undo removes "XY" (2 bytes + newline = 3) and inserts "b" (1 byte + newline = 2).
+        assert_eq!((event.old_row, event.old_col, event.old_byte), (1, 0, 3));
+        assert_eq!((event.new_row, event.new_col, event.new_byte), (1, 0, 2));
+
+        state.redo().unwrap();
+        let redo = state.take_bytes_events();
+        assert_eq!(redo.len(), 1);
+        let event = &redo[0];
+        assert_eq!(
+            (event.start_row, event.start_col, event.start_byte),
+            (1, 0, 2)
+        );
+        // Redo does the inverse: removes "b" and inserts "XY".
+        assert_eq!((event.old_row, event.old_col, event.old_byte), (1, 0, 2));
+        assert_eq!((event.new_row, event.new_col, event.new_byte), (1, 0, 3));
+    }
+
+    #[test]
+    fn line_preserving_batch_reports_pre_edit_offsets() {
+        let (mut editor, buffer, window) = editor_with(b"a\nb\nc\n");
+        let requests = &[
+            BufferTextEditRequest {
+                start: ExtmarkPosition::new(0, 0),
+                end: ExtmarkPosition::new(0, 1),
+                replacement: vec![b"longer".to_vec()],
+            },
+            BufferTextEditRequest {
+                start: ExtmarkPosition::new(1, 0),
+                end: ExtmarkPosition::new(1, 1),
+                replacement: vec![b"also longer".to_vec()],
+            },
+            BufferTextEditRequest {
+                start: ExtmarkPosition::new(2, 0),
+                end: ExtmarkPosition::new(2, 1),
+                replacement: vec![b"c2".to_vec()],
+            },
+        ];
+        editor
+            .replace_buffer_texts(buffer, window, requests, position(1, 0), position(1, 0), 0)
+            .unwrap();
+
+        let state = editor.buffer_mut(buffer).unwrap();
+        let events = state.take_bytes_events();
+        assert_eq!(events.len(), 3);
+        // Offsets must be pre-edit: 0 for line 1, 2 for line 2, 4 for line 3.
+        assert_eq!((events[0].start_row, events[0].start_byte), (0, 0));
+        assert_eq!((events[1].start_row, events[1].start_byte), (1, 2));
+        assert_eq!((events[2].start_row, events[2].start_byte), (2, 4));
+
+        // Sanity check the batch really changed all three lines.
+        let text = state.text().unwrap().to_bytes();
+        assert_eq!(text, b"longer\nalso longer\nc2\n");
+    }
+
+    #[test]
+    fn load_enqueues_reload_event_for_lua_attachments() {
+        let (mut editor, buffer, _) = editor_with(b"a\nb\n");
+        let state = editor.buffer_mut(buffer).unwrap();
+        let lua_id = state.attach_lua(BufferAttachSubscription {
+            channel_id: 0,
+            send_buffer: false,
+            options: Dict(Vec::new()),
+        });
+        state.insert_subscription(
+            7,
+            BufferAttachSubscription {
+                channel_id: 7,
+                send_buffer: false,
+                options: Dict(Vec::new()),
+            },
+        );
+        // Drop the RPC attachment's initial notification so the reload event
+        // is the only queued item the assertions see.
+        assert_eq!(state.take_bytes_events().len(), 1);
+        state.load(Buffer::from_bytes(b"replaced\n").unwrap());
+
+        let events = state.take_bytes_events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        // The drain decides whether each listed attachment is kept, detached,
+        // or ended as an RPC channel.
+        assert_eq!(event.subscribers, vec![7, lua_id]);
+        assert_eq!(event.tick, state.script_changedtick());
+        assert_eq!(event.update, BufferUpdateKind::Reload);
+        // A re-read has no splice geometry: it must not replay as a delta.
+        assert_eq!(
+            (
+                event.start_row, event.start_col, event.start_byte, event.old_row,
+                event.old_col, event.old_byte, event.new_row, event.new_col,
+                event.new_byte,
+            ),
+            (0, 0, 0, 0, 0, 0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn load_queues_no_reload_event_without_attachments() {
+        let (mut editor, buffer, _) = editor_with(b"a\n");
+        let state = editor.buffer_mut(buffer).unwrap();
+        state.load(Buffer::from_bytes(b"b\n").unwrap());
+        assert!(state.take_bytes_events().is_empty());
     }
 }

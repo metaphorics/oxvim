@@ -2,7 +2,6 @@
 
 use std::collections::HashSet;
 use std::rc::Rc;
-
 use ox_editor::{
     AutocmdContext, BufferRelease, Editor, EditorError, Event, FocusContainer, K_SPECIAL,
     KE_FILLER, KS_EXTRA, KS_MODIFIER, KS_SPECIAL, KS_ZERO, Keys, MOD_MASK_ALT, MOD_MASK_CTRL,
@@ -594,9 +593,40 @@ pub fn nvim_set_current_buf(session: &ApiSession, buf: BufHandle) -> Result<(), 
     if session.with_editor(|editor| editor.buffer(buf).is_err()) {
         return Ok(());
     }
-    session
-        .with_editor_mut(|editor| editor.set_current_buffer(buf, BufferRelease::KeepLoaded))
-        .map_err(exception)?;
+    // The loader stages a real empty resident state, switches the current
+    // window to the target, and runs the read lifecycle before installing
+    // file contents. Thus current-buffer operations in `BufReadPre` observe
+    // the target, while the low-level setter itself performs no file I/O.
+    let switched = crate::window::load_buffer_for_switch(
+        session,
+        buf,
+        |session| {
+            session
+                .with_editor_mut(|editor| {
+                    editor
+                        .set_current_buffer(buf, BufferRelease::KeepLoaded)
+                        .map_err(exception)
+                })
+        },
+        move |session, succeeded| {
+            if !succeeded
+                && let Some(old) = old
+            {
+                let _ = session.with_editor_mut(|editor| {
+                    editor
+                        .set_current_buffer(old, BufferRelease::KeepLoaded)
+                });
+            }
+        },
+    )?;
+    if !switched {
+        session
+            .with_editor_mut(|editor| {
+                editor
+                    .set_current_buffer(buf, BufferRelease::KeepLoaded)
+                    .map_err(exception)
+            })?;
+    }
     fire_focus_events(session, &transition.enters, Some(buf))
 }
 
@@ -780,13 +810,14 @@ fn fire_focus_events(
                 .map(|state| state.name().to_string_lossy().into_owned())
         })
         .unwrap_or_default();
+    let name = OxStr::from(name.as_str());
     for &event in events {
         let plan = session.with_editor_mut(|editor| {
             editor.autocmds_mut().plan(
                 event,
                 AutocmdContext {
                     buffer: Some(buffer),
-                    file_name: Some(&name),
+                    file_name: Some(name.as_bytes()),
                     ..AutocmdContext::default()
                 },
             )
@@ -1380,13 +1411,35 @@ pub fn nvim_echo(
     opts: Dict,
 ) -> Result<Object, ApiError> {
     validate_echo_chunks(&chunks)?;
-    if let Some((key, _)) = opts.iter().find(|(key, _)| key.as_bytes() != b"err") {
-        return Err(ApiError::validation(format!(
-            "Echo option '{}' is unavailable",
-            key.to_string_lossy()
-        )));
+    // Upstream `Dict(echo_opts)` members (`api/keysets_defs.h` and
+    // `runtime/doc/api.txt`): `err` selects the error kind, `verbose`
+    // gates on 'verbose', and `kind`, `id`, `title`, `status`, `percent`,
+    // `source`, `data`, `_truncate` ride along for the progress and
+    // truncation display layers.
+    // The editor sink has no per-kind display layer yet, so it still
+    // emits a plain `echo`/`emsg` for all accepted `kind`s, while the
+    // returned id does replace same-id entries in the identity store.
+    // Every value is checked against its declared keyset type, and the
+    // progress-only fields carry the `api/vim.c` body validations, before
+    // the message-id is resolved.
+    validate_echo_opts(&opts)?;
+    validate_progress_opts(&opts, history)?;
+    validate_message_id(session, &opts)?;
+    // `verbose` messages show only when 'verbose' is nonzero (upstream
+    // `verbose_enter` around the echo).
+    if dict_strict_bool(&opts, "verbose") {
+        let level = session.with_editor(|editor| match editor.options().get_global("verbose") {
+            Ok(OptionValue::Number(level)) => *level,
+            _ => 0,
+        });
+        if level == 0 {
+            return Ok(Object::Integer(-1));
+        }
     }
-    let kind = if dict_bool(&opts, "err")? == Some(true) {
+    let id = message_id(session, &opts);
+    let progress_data = is_progress_message(&opts)
+        .then(|| progress_event_data(&opts, &id, &chunks));
+    let kind = if dict_strict_bool(&opts, "err") {
         MessageKind::Error
     } else {
         MessageKind::Echo
@@ -1399,9 +1452,264 @@ pub fn nvim_echo(
             leading_newline: true,
         });
     });
-    Ok(Object::Integer(-1))
+    if let Some(data) = progress_data {
+        let ctx = AutocmdContext {
+            data: Some(&data),
+            ..AutocmdContext::default()
+        };
+        let plan = session
+            .with_editor_mut(|editor| editor.autocmds_mut().plan(Event::Progress, ctx));
+        crate::autocmd::execute_firing_plan(session, plan)?;
+    }
+    Ok(id)
 }
 
+/// Validates the `Dict(echo_opts)` members against their declared keyset
+/// types and rejects unknown keys.
+///
+/// Upstream type-checks each present member while decoding the keyset
+/// (`api_dict_to_keydict`, `api/private/helpers.c:803-895`, and its Lua
+/// twin `nlua_pop_keydict`, `lua/converter.c:1285-1345`), in the order the
+/// client supplied the keys. `id` is declared `Union(Integer, String)`,
+/// which both decoders keep as an unchecked `Object`; its only validation
+/// is the session-side [`validate_message_id`].
+fn validate_echo_opts(opts: &Dict) -> Result<(), ApiError> {
+    for (key, value) in opts.iter() {
+        let bytes = key.as_bytes();
+        let boolean = matches!(bytes, b"err" | b"verbose" | b"_truncate");
+        // `nlua_pop_Boolean_strict` (`lua/converter.c:848-871`): booleans
+        // pass, any number coerces (zero simply reads as `false` later,
+        // via `dict_strict_bool`), `nil` is `false`, and anything else
+        // fails with the field-named composite pinned by
+        // `test/functional/lua/api_spec.lua:301`.
+        if boolean {
+            let coerces = matches!(
+                value,
+                Object::Boolean(_) | Object::Integer(_) | Object::Float(_) | Object::Nil
+            );
+            if !coerces {
+                return Err(ApiError::validation(format!(
+                    "Invalid '{}': not a boolean",
+                    key.to_string_lossy()
+                )));
+            }
+            continue;
+        }
+        // The remaining typed members fail the RPC-side `VALIDATE_T`
+        // (`api/private/validate.h:60`) with `api_err_exp`'s
+        // `expected …, got …` shape.
+        let (accepted, expected) = match bytes {
+            b"kind" | b"title" | b"status" | b"source" => {
+                (matches!(value, Object::String(_)), "String")
+            }
+            b"percent" => (matches!(value, Object::Integer(_)), "Integer"),
+            b"data" => (
+                match value {
+                    Object::Dict(_) => true,
+                    // An empty Array doubles as an empty Dict for Lua
+                    // callers (`helpers.c:869-871`).
+                    Object::Array(items) => items.is_empty(),
+                    _ => false,
+                },
+                "Dict",
+            ),
+            // `id` is `Union(Integer, String)`, which both upstream
+            // decoders keep as an unchecked `Object`; it is validated
+            // session-side by `validate_message_id`.
+            b"id" => (true, ""),
+            _ => {
+                return Err(ApiError::validation(format!(
+                    "Echo option '{}' is unavailable",
+                    key.to_string_lossy()
+                )));
+            }
+        };
+        if !accepted {
+            return Err(ApiError::validation(format!(
+                "Invalid '{}': expected {expected}, got {}",
+                key.to_string_lossy(),
+                keyset_typename(value)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The `api_typename` spellings used by upstream keyset `VALIDATE_T` errors.
+/// This is deliberately separate from the option-value helper below:
+/// `api_typename` there preserves this port's existing option diagnostics.
+fn keyset_typename(value: &Object) -> &'static str {
+    match value {
+        Object::Nil => "nil",
+        Object::Boolean(_) => "Boolean",
+        Object::Integer(_) => "Integer",
+        Object::Float(_) => "Float",
+        Object::String(_) => "String",
+        Object::Array(_) => "Array",
+        Object::Dict(_) => "Dict",
+        Object::LuaRef(_) => "Function",
+        Object::Buffer(_) => "Buffer",
+        Object::Window(_) => "Window",
+        Object::Tabpage(_) => "Tabpage",
+    }
+}
+/// Applies the `nvim_echo` body validations from `api/vim.c:848-884`.
+///
+/// A non-progress message rejects every progress-only field, then a
+/// progress message range-checks `percent` and requires a non-empty
+/// `source` other than the reserved `"nvim"`. The conflict label follows
+/// the explicit `opts.kind` when given, else `echoerr`/`echomsg`/`echo` by
+/// `err` and `history`; upstream's `verbose` path keeps a null kind there.
+fn validate_progress_opts(opts: &Dict, history: bool) -> Result<(), ApiError> {
+    let is_progress = is_progress_message(opts);
+    let present = |key: &str| match opts.get(&OxStr::from(key)) {
+        None => false,
+        // The decoded `String`/`Dict` sentinels upstream compares against
+        // (`vim.c:851-853`) are empty and sizeless, so an empty value
+        // counts as absent.
+        Some(Object::String(value)) => !value.as_bytes().is_empty(),
+        Some(Object::Dict(value)) => !value.0.is_empty(),
+        // The keyset decoder normalizes an empty Array to an empty Dict
+        // (`api/private/helpers.c:869-872`).
+        Some(Object::Array(value)) if value.is_empty() => false,
+        Some(_) => true,
+    };
+    if !is_progress {
+        for key in ["status", "title", "percent", "data", "source"] {
+            if present(key) {
+                return Err(ApiError::validation(format!(
+                    "Conflict: title/source/status/percent/data not allowed with kind='{}'",
+                    conflict_kind_label(opts, history)
+                )));
+            }
+        }
+        return Ok(());
+    }
+
+    let Some(Object::String(status)) = opts.get(&OxStr::from("status")) else {
+        return Err(ApiError::validation(
+            "Invalid 'status': expected success|failed|running|cancel",
+        ));
+    };
+    if !matches!(
+        status.as_bytes(),
+        b"success" | b"failed" | b"running" | b"cancel"
+    ) {
+        return Err(ApiError::validation(format!(
+            "Invalid 'status': expected success|failed|running|cancel, got {}",
+            String::from_utf8_lossy(status.as_bytes())
+        )));
+    }
+    if let Some(Object::Integer(percent)) = opts.get(&OxStr::from("percent"))
+        && !(*percent >= 0 && *percent <= 100)
+    {
+        return Err(ApiError::validation("Invalid 'percent': out of range"));
+    }
+    if !present("source") {
+        return Err(ApiError::validation("Required: 'opts.source'"));
+    }
+    let Some(Object::String(source)) = opts.get(&OxStr::from("source")) else {
+        return Ok(());
+    };
+    if source.as_bytes() == b"nvim" {
+        return Err(ApiError::validation("Invalid 'source': 'nvim'"));
+    }
+    Ok(())
+}
+
+/// The `kind` label the conflict message carries (`vim.c:851-854`): the
+/// explicit `opts.kind` when given, else `echoerr`/`echomsg`/`echo` by
+/// `err` and `history`, like `vim.c:841-846`.
+fn conflict_kind_label(opts: &Dict, history: bool) -> String {
+    if let Some(Object::String(kind)) = opts.get(&OxStr::from("kind")) {
+        return String::from_utf8_lossy(kind.as_bytes()).into_owned();
+    }
+    if dict_strict_bool(opts, "err") {
+        return "echoerr".to_owned();
+    }
+    if history {
+        return "echomsg".to_owned();
+    }
+    "echo".to_owned()
+}
+
+/// Validates an explicit integer message-id against this editor session.
+///
+/// Validation is separate from allocation so a suppressed `verbose` call
+/// still rejects an invalid integer without consuming an automatic id.
+fn validate_message_id(session: &ApiSession, opts: &Dict) -> Result<(), ApiError> {
+    let Some(Object::Integer(id)) = opts.get(&OxStr::from("id")) else {
+        return Ok(());
+    };
+    if session.with_state(|state| *id > 0 && *id < state.next_message_id) {
+        Ok(())
+    } else {
+        Err(ApiError::validation(format!("Invalid 'id': {id}")))
+    }
+}
+
+/// Allocates a message-id for `nvim_echo`.
+///
+/// Missing or nil ids consume the next integer in this editor session;
+/// explicit values remain caller-defined after [`validate_message_id`].
+fn message_id(session: &ApiSession, opts: &Dict) -> Object {
+    match opts.get(&OxStr::from("id")) {
+        None | Some(Object::Nil) => Object::Integer(session.with_state_mut(|state| {
+            let id = state.next_message_id;
+            state.next_message_id = state.next_message_id.wrapping_add(1);
+            id
+        })),
+        Some(id) => id.clone(),
+    }
+}
+
+/// Whether `opts.kind` is the documented `progress` kind.
+fn is_progress_message(opts: &Dict) -> bool {
+    matches!(
+        opts.get(&OxStr::from("kind")),
+        Some(Object::String(kind)) if kind.as_bytes() == b"progress"
+    )
+}
+
+/// Builds the `{data: ...}` argument for a `Progress` autocmd occurrence.
+///
+/// Mirrors the `vim.event.progress.data` fields the bundled Lua handlers read.
+fn progress_event_data(opts: &Dict, id: &Object, chunks: &[Object]) -> Object {
+    let text = chunks
+        .iter()
+        .filter_map(|chunk| match chunk {
+            Object::Array(parts) => parts.first().cloned(),
+            _ => None,
+        })
+        .collect();
+    let mut entries = vec![
+        (OxStr::from("id"), id.clone()),
+        (OxStr::from("kind"), Object::String(OxStr::from("progress"))),
+        (OxStr::from("text"), Object::Array(text)),
+    ];
+    if let Some(value) = opts.get(&OxStr::from("data")) {
+        let value = match value {
+            // `api_dict_to_keydict` turns Lua/RPC empty arrays into empty
+            // Dict values before the handler observes them.
+            Object::Array(items) if items.is_empty() => Object::Dict(Dict(Vec::new())),
+            _ => value.clone(),
+        };
+        entries.push((OxStr::from("data"), value));
+    }
+    if let Some(Object::Integer(percent)) = opts.get(&OxStr::from("percent")) {
+        entries.push((OxStr::from("percent"), Object::Integer(*percent)));
+    }
+    if let Some(Object::String(source)) = opts.get(&OxStr::from("source")) {
+        entries.push((OxStr::from("source"), Object::String(source.clone())));
+    }
+    if let Some(Object::String(status)) = opts.get(&OxStr::from("status")) {
+        entries.push((OxStr::from("status"), Object::String(status.clone())));
+    }
+    if let Some(Object::String(title)) = opts.get(&OxStr::from("title")) {
+        entries.push((OxStr::from("title"), Object::String(title.clone())));
+    }
+    Object::Dict(Dict(entries))
+}
 #[derive(Clone, Copy)]
 enum OptionTarget {
     Global,
@@ -2274,6 +2582,19 @@ fn dict_bool(dict: &Dict, key: &str) -> Result<Option<bool>, ApiError> {
         Some(_) => Err(ApiError::validation(format!("opts.{key} must be Boolean"))),
     }
 }
+
+/// Coerces an already-validated strict-`Boolean` keyset member
+/// (`nlua_pop_Boolean_strict`): booleans pass through, numbers are truthy
+/// when nonzero, `nil` and an absent key are `false`.
+pub fn dict_strict_bool(dict: &Dict, key: &str) -> bool {
+    match dict.get(&OxStr::from(key)) {
+        Some(Object::Boolean(value)) => *value,
+        Some(Object::Integer(value)) => *value != 0,
+        Some(Object::Float(value)) => *value != 0.0,
+        _ => false,
+    }
+}
+
 
 fn dict_handle<T, E>(
     dict: &Dict,

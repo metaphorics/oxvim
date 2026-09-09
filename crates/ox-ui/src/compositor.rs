@@ -357,28 +357,63 @@ impl Compositor {
             let buffer = buffer_state.text()?;
             let is_terminal = editor.is_terminal_buffer(state.buffer);
             let marks = buffer_state.extmarks.render_ordered();
-            let sign_slots = marks
+            let line_count = buffer.line_count();
+            // Sparse sign-coverage sweep: the deepest overlap of sign row
+            // ranges decides the slot count; only rows carrying signs are
+            // collected.
+            let mut sign_starts: Vec<usize> = Vec::new();
+            let mut sign_ends: Vec<usize> = Vec::new();
+            for mark in marks
                 .iter()
                 .filter(|mark| mark.placement.attributes.sign_text.is_some())
-                .fold(vec![0usize; buffer.line_count()], |mut rows, mark| {
-                    let start = mark.position().row.min(rows.len());
-                    let end = mark.placement.end.map_or(start, |end| {
-                        end.position.row.min(rows.len().saturating_sub(1))
-                    });
-                    if start < rows.len() {
-                        for count in &mut rows[start..=end.max(start)] {
-                            *count = count.saturating_add(1);
-                        }
-                    }
-                    rows
-                })
-                .into_iter()
-                .max()
-                .unwrap_or(0)
-                .min(3);
+            {
+                let start = mark.position().row;
+                if start >= line_count {
+                    continue;
+                }
+                let end = mark
+                    .placement
+                    .end
+                    .map_or(start, |end| end.position.row)
+                    .min(line_count.saturating_sub(1));
+                sign_starts.push(start);
+                sign_ends.push(end.max(start));
+            }
+            sign_starts.sort_unstable();
+            sign_ends.sort_unstable();
+            let mut sign_slots = 0usize;
+            let mut live = 0usize;
+            let mut expired = 0usize;
+            for &start in &sign_starts {
+                while expired < sign_ends.len() && sign_ends[expired] < start {
+                    live -= 1;
+                    expired += 1;
+                }
+                live += 1;
+                sign_slots = sign_slots.max(live);
+            }
+            let sign_slots = sign_slots.min(3);
             let sign_width = sign_slots.saturating_mul(2);
             let text_height = grid_height;
             let text_width = geometry.width.saturating_sub(sign_width).max(1);
+            // Bin sign marks by buffer row once per redraw so each drawn
+            // segment looks up its line instead of rescanning every mark.
+            let mut sign_marks_by_row: std::collections::HashMap<usize, Vec<usize>> =
+                std::collections::HashMap::new();
+            if sign_width != 0 {
+                let first_row = state.topline.saturating_sub(1);
+                let last_row = first_row.saturating_add(text_height.saturating_sub(1));
+                for (index, mark) in marks.iter().enumerate().rev() {
+                    if mark.placement.attributes.sign_text.is_none() {
+                        continue;
+                    }
+                    let start = mark.position().row;
+                    let end = mark.placement.end.map_or(start, |end| end.position.row);
+                    for row in start.max(first_row)..=end.min(last_row) {
+                        sign_marks_by_row.entry(row).or_default().push(index);
+                    }
+                }
+            }
             let mut screen_row = 0;
             let mut line_number = state.topline;
             let mut watched_extmarks = Vec::new();
@@ -402,28 +437,21 @@ impl Compositor {
                     continue;
                 }
                 let bytes = buffer.line(line_number)?;
-                let line = String::from_utf8_lossy(&bytes);
-                let wrapped = wrapped_segments(&line, text_width);
+                let line_text = String::from_utf8_lossy(&bytes);
+                let wrapped = wrapped_segments(&line_text, text_width);
                 let line_start_row = screen_row;
                 let available_rows = text_height.saturating_sub(screen_row);
                 let truncated = wrapped.len() > available_rows;
                 for (segment, segment_cell_start) in wrapped.iter().take(text_height - screen_row) {
                     if sign_width != 0 {
                         grid.set_hl_span(screen_row, 0, sign_width, sign_id)?;
-                        for (slot, mark) in marks
-                            .iter()
-                            .rev()
-                            .filter(|mark| {
-                                let start = mark.position().row;
-                                let end = mark.placement.end.map_or(start, |end| end.position.row);
-                                start <= line_number.saturating_sub(1)
-                                    && line_number.saturating_sub(1) <= end
-                                    && mark.placement.attributes.sign_text.is_some()
-                            })
-                            .take(sign_slots)
-                            .enumerate()
-                        {
-                            let attributes = &mark.placement.attributes;
+                        let binned = sign_marks_by_row
+                            .get(&line_number.saturating_sub(1))
+                            .into_iter()
+                            .flatten()
+                            .take(sign_slots);
+                        for (slot, mark_index) in binned.enumerate() {
+                            let attributes = &marks[*mark_index].placement.attributes;
                             let mut text = attributes
                                 .sign_text
                                 .as_deref()
@@ -450,7 +478,7 @@ impl Compositor {
                         line_number.saturating_sub(1),
                         sign_width,
                         *segment_cell_start,
-                        &line,
+                        &line_text,
                         &marks,
                         highlights,
                     )?;
@@ -475,9 +503,9 @@ impl Compositor {
                         mark.placement.attributes.virtual_text_position,
                         ox_editor::extmark::ExtmarkVirtualTextPosition::Overlay
                     ) {
-                        display_column(&line, mark.position().column)
+                        display_column(&line_text, mark.position().column)
                     } else {
-                        UnicodeWidthStr::width(line.as_ref()).saturating_add(1)
+                        UnicodeWidthStr::width(line_text.as_ref()).saturating_add(1)
                     };
                     let row = line_start_row.saturating_add(draw_col / text_width);
                     if row < text_height {
@@ -525,8 +553,8 @@ impl Compositor {
                 let before_cursor = (state.topline..state.cursor.lnum)
                     .filter_map(|lnum| buffer.line(lnum).ok())
                     .map(|bytes| {
-                        let line = String::from_utf8_lossy(&bytes);
-                        wrapped_segments(&line, text_width).len()
+                        let line_text = String::from_utf8_lossy(&bytes);
+                        wrapped_segments(&line_text, text_width).len()
                     })
                     .sum::<usize>();
                 let cursor_line = buffer.line(state.cursor.lnum).unwrap_or_default();
@@ -961,22 +989,22 @@ fn terminal_pen_channel(color: TermColor) -> (Option<u32>, Option<u32>) {
     }
 }
 
-fn wrapped_segments(line: &str, width: usize) -> Vec<(String, usize)> {
+fn wrapped_segments(line: &str, width: usize) -> Vec<(&str, usize)> {
     let mut segments = Vec::new();
-    let mut segment = String::new();
+    let mut segment_start = 0usize;
     let mut segment_width = 0usize;
     let mut cell_start = 0usize;
-    for character in line.chars() {
+    for (byte_offset, character) in line.char_indices() {
         let character_width = UnicodeWidthChar::width(character).unwrap_or(0).max(1);
         if segment_width != 0 && segment_width.saturating_add(character_width) > width {
-            segments.push((std::mem::take(&mut segment), cell_start));
+            segments.push((&line[segment_start..byte_offset], cell_start));
             cell_start = cell_start.saturating_add(segment_width);
             segment_width = 0;
+            segment_start = byte_offset;
         }
-        segment.push(character);
         segment_width = segment_width.saturating_add(character_width);
     }
-    segments.push((segment, cell_start));
+    segments.push((&line[segment_start..], cell_start));
     segments
 }
 

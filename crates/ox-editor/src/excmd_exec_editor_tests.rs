@@ -21,7 +21,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -29,10 +29,12 @@ use std::rc::Rc;
 
 use ox_text::Buffer;
 
+use crate::excmd_exec::{run_autocmd_plan, sync_editor_into_scope, sync_scope_into_editor, LuaExec};
 use crate::script::{FileIO, FileKind, FileMetadata};
 use crate::{
-    AutocmdFilter, AutocmdKind, AutocmdOptions, Editor, Event, ExExecutor, ExecError, ExecOutcome,
-    Geometry, Lookup, MapMode, Mode, ModeMachine, TestEditorAccess, VimExceptionKind,
+    AutocmdContext, AutocmdFilter, AutocmdKind, AutocmdOptions, Editor, Event, ExExecutor,
+    ExecError, ExecOutcome, Geometry, Lookup, MapMode, Mode, ModeMachine, TestEditorAccess,
+    VimExceptionKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -57,6 +59,14 @@ impl MemoryFileIO {
             .borrow_mut()
             .insert(PathBuf::from(path), content.to_owned());
     }
+    #[cfg(unix)]
+    fn insert_bytes(&self, path: &[u8], content: &str) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(path));
+        self.files.borrow_mut().insert(path, content.to_owned());
+    }
+
 
     fn insert_directory(&self, path: &str) {
         self.directories.borrow_mut().insert(PathBuf::from(path));
@@ -127,6 +137,33 @@ impl FileIO for MemoryFileIO {
             })?;
         self.files.borrow_mut().insert(to.to_path_buf(), content);
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct UnreadableFileIO;
+
+impl FileIO for UnreadableFileIO {
+    fn read_to_string(&self, _path: &Path) -> std::io::Result<String> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ))
+    }
+
+    fn write_string(&self, _path: &Path, _contents: &str) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        ))
+    }
+
+    fn exists(&self, _path: &Path) -> bool {
+        true
+    }
+
+    fn canonicalize(&self, path: &Path) -> PathBuf {
+        path.to_path_buf()
     }
 }
 
@@ -276,6 +313,218 @@ fn write_sets_buffer_name_and_clears_modified() {
     let state = e.buffer(buffer).unwrap();
     assert_eq!(state.name().to_string_lossy(), "saved.txt");
     assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
+}
+
+/// BufWrite events retain native bytes while preserving raw `<afile>` and
+/// normalized `<amatch>` (`bufwrite.c:395,408,537`;
+/// `autocmd.c:1530-1544,1556-1633`).
+#[cfg(unix)]
+#[test]
+fn write_autocmds_preserve_non_utf8_target_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = b"bufwrite-\xff.txt";
+    let expected_match = std::env::current_dir()
+        .unwrap()
+        .join(std::ffi::OsStr::from_bytes(path));
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_name(ox_types::OxStr::from(path.as_slice()));
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .mark_modified();
+    executor.scripts().io().insert_bytes(path, "disk");
+
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufWritePre * let g:pre_afile = expand('<afile>')",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufWritePre * let g:pre_amatch = expand('<amatch>')",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufWritePost * let g:post_afile = expand('<afile>')",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufWritePost * let g:post_amatch = expand('<amatch>')",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "write!").unwrap();
+
+    for name in [b"pre_afile".as_slice()] {
+        let value = executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, name, 0)
+            .unwrap();
+        let ox_types::Typval::String(value) = value else {
+            panic!("expected String for {name:?}, got {value:?}");
+        };
+        assert_eq!(value.as_bytes(), path, "{name:?} must preserve native bytes");
+    }
+    for name in [b"post_afile".as_slice()] {
+        let value = executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, name, 0)
+            .unwrap();
+        let ox_types::Typval::String(value) = value else {
+            panic!("expected String for {name:?}, got {value:?}");
+        };
+        assert_eq!(value.as_bytes(), path, "{name:?} must preserve native bytes");
+    }
+    for name in [b"pre_amatch".as_slice(), b"post_amatch".as_slice()] {
+        let value = executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, name, 0)
+            .unwrap();
+        let ox_types::Typval::String(value) = value else {
+            panic!("expected String for {name:?}, got {value:?}");
+        };
+        assert_eq!(
+            value.as_bytes(),
+            expected_match.as_os_str().as_bytes(),
+            "{name:?} must preserve native bytes",
+        );
+    }
+
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .mark_modified();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufWriteCmd * let g:cmd_afile = expand('<afile>')",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufWriteCmd * let g:cmd_amatch = expand('<amatch>')",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "write!").unwrap();
+    let value = executor
+        .scope()
+        .get_scoped(ox_eval::scope::ScopeKind::Global, b"cmd_afile", 0)
+        .unwrap();
+    let ox_types::Typval::String(value) = value else {
+        panic!("expected String for cmd_afile, got {value:?}");
+    };
+    assert_eq!(value.as_bytes(), path, "cmd_afile must preserve native bytes");
+    let value = executor
+        .scope()
+        .get_scoped(ox_eval::scope::ScopeKind::Global, b"cmd_amatch", 0)
+        .unwrap();
+    let ox_types::Typval::String(value) = value else {
+        panic!("expected String for cmd_amatch, got {value:?}");
+    };
+    assert_eq!(
+        value.as_bytes(),
+        expected_match.as_os_str().as_bytes(),
+        "cmd_amatch must preserve native bytes",
+    );
+}
+
+/// A no-op `BufWriteCmd` replaces the write (`bufwrite.c:454-475`): no file
+/// appears, the buffer stays modified, and the command still succeeds
+/// silently — the handler owns the write, so there is no save bookkeeping.
+#[test]
+fn buf_write_cmd_noop_keeps_modified_and_writes_nothing() {
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    executor
+        .execute_line(&editor, "au BufWriteCmd * let g:cmd_ran = 1")
+        .unwrap();
+    executor
+        .execute_line(&editor, "au BufWritePost * let g:post_ran = 1")
+        .unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::MODIFIED, true);
+    executor
+        .execute_line_core(&editor, "write out.txt")
+        .unwrap();
+    assert_eq!(executor.scripts().io().content("out.txt"), None);
+    assert!(
+        editor
+            .editor()
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::MODIFIED),
+        "a handler-owned write leaves the modified state the handler left",
+    );
+    assert_eq!(
+        executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"cmd_ran", 0)
+            .ok(),
+        Some(&ox_types::Typval::Number(1)),
+        "the handler ran, so the skip is a replacement, not a missed match",
+    );
+    assert!(
+        executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"post_ran", 0)
+            .is_err(),
+        "no post hook runs after a replacement write",
+    );
+}
+
+/// `BufWriteCmd` replaces the whole pre/write/post sequence
+/// (`bufwrite.c:392-422`): neither `BufWritePre` nor `BufWritePost` fires
+/// when a handler owns the write.
+#[test]
+fn buf_write_cmd_suppresses_pre_and_post() {
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    executor
+        .execute_line(&editor, "au BufWriteCmd * let g:cmd_ran = 1")
+        .unwrap();
+    executor
+        .execute_line(&editor, "au BufWritePre * let g:pre_ran = 1")
+        .unwrap();
+    executor
+        .execute_line(&editor, "au BufWritePost * let g:post_ran = 1")
+        .unwrap();
+    executor
+        .execute_line_core(&editor, "write out.txt")
+        .unwrap();
+    assert_eq!(
+        executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"cmd_ran", 0)
+            .ok(),
+        Some(&ox_types::Typval::Number(1)),
+    );
+    for probe in [b"pre_ran".as_slice(), b"post_ran".as_slice()] {
+        assert!(
+            executor
+                .scope()
+                .get_scoped(ox_eval::scope::ScopeKind::Global, probe, 0)
+                .is_err(),
+            "replacement writes suppress the surrounding hooks",
+        );
+    }
 }
 
 #[test]
@@ -1805,6 +2054,120 @@ fn edit_fires_bufnew_bufadd_bufenter_for_a_fresh_file() {
     );
 }
 
+/// A no-window startup still runs the full read lifecycle for an existing
+/// file. The bootstrap window is current before `BufReadPre`, so the handler
+/// can configure the target through both window- and buffer-scoped APIs.
+#[test]
+fn edit_without_window_fires_read_lifecycle_for_existing_file() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut executor = ExExecutor::with_io(MemoryFileIO::new());
+    executor.scripts().io().insert("startup.txt", "one\ntwo\n");
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufNewFile", "BufEnter"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} *.txt call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufReadPre *.txt let g:pre_current = bufnr('%')",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufReadPre *.txt call setbufvar(bufnr(expand('<afile>')), '&shiftwidth', 3)",
+        )
+        .unwrap();
+
+    executor.execute_line(&editor, "edit startup.txt").unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufEnter"]
+    );
+    let current = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        global_value(&executor, "pre_current"),
+        Some(ox_types::Typval::Number(i64::from(current)))
+    );
+    {
+        let view = editor.editor();
+        let state = view.buffer(current).unwrap();
+        assert_eq!(state.text().unwrap().line(1).unwrap(), b"one");
+    }
+    assert_eq!(
+        editor
+            .editor()
+            .options()
+            .get_buffer(current, "shiftwidth")
+            .unwrap(),
+        &crate::OptionValue::Number(3)
+    );
+}
+
+/// A no-window startup keeps the missing-file distinction: `BufNewFile`
+/// replaces the read-event pair, and the first tabpage still enters the
+/// resulting empty buffer.
+#[test]
+fn edit_without_window_fires_bufnewfile_for_missing_file() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut executor = ExExecutor::with_io(MemoryFileIO::new());
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufNewFile", "BufEnter"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} *.txt call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufNewFile *.txt let g:newfile_current = bufnr('%')",
+        )
+        .unwrap();
+
+    executor
+        .execute_line(&editor, "edit startup-missing.txt")
+        .unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufNew", "BufAdd", "BufNewFile", "BufEnter"]
+    );
+    let current = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        global_value(&executor, "newfile_current"),
+        Some(ox_types::Typval::Number(i64::from(current)))
+    );
+    let view = editor.editor();
+    let state = view.buffer(current).unwrap();
+    assert_eq!(state.text().unwrap().line(1).unwrap(), b"");
+    assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
+}
+
+/// An unreadable startup path retains the file command's E484 contract after
+/// loading is routed through the shared lifecycle helper.
+#[test]
+fn edit_without_window_preserves_e484_for_unreadable_file() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut executor = ExExecutor::with_io(UnreadableFileIO);
+
+    let Err(ExecError::Vim(exception)) = executor.execute_line(&editor, "edit startup.txt") else {
+        panic!("expected E484 for unreadable startup file");
+    };
+    assert_eq!(
+        exception.message(),
+        "Vim(edit):E484: Can't open file startup.txt: permission denied"
+    );
+}
+
 /// `:new` creates an empty listed buffer and runs the same `BufNew`, `BufAdd`,
 /// `BufEnter` sequence bound to the new buffer as `<abuf>`.
 #[test]
@@ -1892,6 +2255,286 @@ fn autocmd_buffer_switch_fires_bufleave_bufenter_bufwinenter_in_order() {
         order_events(&executor),
         ["BufLeave,", "BufEnter,", "BufWinEnter,"]
     );
+}
+
+/// Re-entering an unloaded named buffer routes the read through the callback
+/// path before the normal buffer-enter events (`open_buffer`, fileio.c:428-516).
+#[test]
+fn autocmd_buffer_switch_reloads_unloaded_file_before_enter_events() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("reloaded.txt", "one\ntwo\n");
+    executor.execute_line(&editor, "edit reloaded.txt").unwrap();
+    let target = editor.editor().current_buffer().unwrap();
+    let scratch = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .set_current_buffer(scratch, crate::BufferRelease::KeepLoaded)
+        .unwrap();
+    editor.editor_mut().unload_buffer(target).unwrap();
+
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufReadPre", "BufReadPost", "BufEnter", "BufWinEnter"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} * call add(g:order, '{event},')"),
+            )
+            .unwrap();
+    }
+
+    executor
+        .execute_line(&editor, &format!("buffer {}", i64::from(target)))
+        .unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufReadPre,", "BufReadPost,", "BufEnter,", "BufWinEnter,"]
+    );
+    let view = editor.editor();
+    let state = view.buffer(target).unwrap();
+    assert_eq!(state.text().unwrap().line(1).unwrap(), b"one");
+    assert_eq!(state.text().unwrap().line(2).unwrap(), b"two");
+    assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
+}
+
+/// A byte-preserving buffer name must probe and read the exact Unix path
+/// before firing `BufReadPre`/`BufReadPost`; replacing invalid bytes would
+/// incorrectly take the `BufNewFile` path.
+#[cfg(unix)]
+#[test]
+fn autocmd_buffer_switch_reads_unloaded_non_utf8_file_name() {
+    let (editor, mut executor) = setup();
+    let name = b"reloaded-\xff.txt";
+    executor.scripts().io().insert_bytes(name, "one\ntwo\n");
+    let target = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(target)
+        .unwrap()
+        .set_name(ox_types::OxStr(name.to_vec()));
+    editor.editor_mut().unload_buffer(target).unwrap();
+
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufReadPre", "BufReadPost", "BufNewFile"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} * call add(g:order, '{event},')"),
+            )
+            .unwrap();
+    }
+
+    executor
+        .execute_line(&editor, &format!("buffer {}", i64::from(target)))
+        .unwrap();
+
+    assert_eq!(order_events(&executor), ["BufReadPre,", "BufReadPost,"]);
+    let view = editor.editor();
+    let state = view.buffer(target).unwrap();
+    assert_eq!(state.text().unwrap().line(1).unwrap(), b"one");
+    assert_eq!(state.text().unwrap().line(2).unwrap(), b"two");
+    assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
+}
+/// A read hook's current-buffer option write must land on the buffer being
+/// entered, not the buffer left behind while `BufReadPre` runs.
+#[test]
+fn autocmd_buffer_switch_read_hook_sets_target_buffer_local_option() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("read-hook.txt", "content\n");
+    executor
+        .execute_line(&editor, "setlocal shiftwidth=8")
+        .unwrap();
+    let source = editor.editor().current_buffer().unwrap();
+    executor.execute_line(&editor, "edit read-hook.txt").unwrap();
+    let target = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .set_current_buffer(source, crate::BufferRelease::KeepLoaded)
+        .unwrap();
+    editor.editor_mut().unload_buffer(target).unwrap();
+
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufReadPre * setlocal shiftwidth=3",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, &format!("buffer {}", i64::from(target)))
+        .unwrap();
+
+    assert_eq!(
+        editor
+            .editor()
+            .options()
+            .get_buffer(target, "shiftwidth")
+            .unwrap(),
+        &crate::OptionValue::Number(3),
+    );
+    assert_eq!(
+        editor
+            .editor()
+            .options()
+            .get_buffer(source, "shiftwidth")
+            .unwrap(),
+        &crate::OptionValue::Number(8),
+    );
+}
+
+/// Argument navigation uses the same read lifecycle as `:buffer` when an
+/// argument already has an unloaded named buffer.
+#[test]
+fn argnext_reloads_an_unloaded_argument_buffer() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.scripts().io().insert("arg-next.txt", "loaded\n");
+    let source = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(source)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("arg-source.txt"));
+    let target = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(target)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("arg-next.txt"));
+    editor.editor_mut().unload_buffer(target).unwrap();
+
+    executor
+        .execute_line(&editor, "args arg-source.txt arg-next.txt")
+        .unwrap();
+    executor
+        .execute_line(&editor, "autocmd BufReadPre * setlocal shiftwidth=3")
+        .unwrap();
+    executor.execute_line(&editor, "next").unwrap();
+
+    assert_eq!(editor.editor().current_buffer(), Some(target));
+    assert_eq!(
+        editor.editor().buffer(target).unwrap().text().unwrap().line(1),
+        Ok(b"loaded".to_vec())
+    );
+    assert_eq!(
+        editor
+            .editor()
+            .options()
+            .get_buffer(target, "shiftwidth")
+            .unwrap(),
+        &crate::OptionValue::Number(3),
+    );
+}
+
+/// `:edit` must reload an existing unloaded named buffer before entering it.
+#[test]
+fn edit_reloads_existing_unloaded_named_buffer() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.scripts().io().insert("edit-unloaded.txt", "loaded\n");
+    let target = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(target)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("edit-unloaded.txt"));
+    editor.editor_mut().unload_buffer(target).unwrap();
+    executor
+        .execute_line(&editor, "autocmd BufReadPre * setlocal shiftwidth=3")
+        .unwrap();
+
+    executor
+        .execute_line(&editor, "edit edit-unloaded.txt")
+        .unwrap();
+
+    assert_eq!(editor.editor().current_buffer(), Some(target));
+    assert_eq!(
+        editor.editor().buffer(target).unwrap().text().unwrap().line(1),
+        Ok(b"loaded".to_vec())
+    );
+    assert_eq!(
+        editor
+            .editor()
+            .options()
+            .get_buffer(target, "shiftwidth")
+            .unwrap(),
+        &crate::OptionValue::Number(3),
+    );
+}
+
+/// A missing file retains the new-file load semantics while entering through
+/// the switch path: empty, unmodified text and `BufNewFile`, not read events.
+#[test]
+fn autocmd_buffer_switch_missing_file_uses_new_file_semantics() {
+    let (editor, mut executor) = setup();
+    let target = editor.editor_mut().create_buffer(true).unwrap();
+    let name = format!("missing-{}.txt", std::process::id());
+    editor
+        .editor_mut()
+        .buffer_mut(target)
+        .unwrap()
+        .set_name(ox_types::OxStr::from(name.as_str()));
+    editor.editor_mut().unload_buffer(target).unwrap();
+
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in [
+        "BufReadPre",
+        "BufReadPost",
+        "BufNewFile",
+        "BufEnter",
+        "BufWinEnter",
+    ] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} * call add(g:order, '{event},')"),
+            )
+            .unwrap();
+    }
+
+    executor
+        .execute_line(&editor, &format!("buffer {}", i64::from(target)))
+        .unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufNewFile,", "BufEnter,", "BufWinEnter,"]
+    );
+    let view = editor.editor();
+    let state = view.buffer(target).unwrap();
+    assert_eq!(state.text().unwrap().line(1).unwrap(), b"");
+    assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
+}
+
+/// A non-`NotFound` reload failure preserves the cycle-one contract: the
+/// switch reports E86, leaves the target unloaded, and keeps the old buffer.
+#[test]
+fn autocmd_buffer_switch_failed_read_keeps_target_unloaded() {
+    let dir = std::env::temp_dir().join(format!(
+        "oxvim-excmd-unloaded-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (editor, mut executor) = {
+        let mut raw = Editor::new();
+        let scratch = raw.create_buffer(true).unwrap();
+        raw.create_tabpage(scratch, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let target = raw.create_buffer(true).unwrap();
+        raw.buffer_mut(target)
+            .unwrap()
+            .set_name(ox_types::OxStr::from(dir.to_string_lossy().as_ref()));
+        raw.unload_buffer(target).unwrap();
+        (TestEditorAccess::new(raw), ExExecutor::new())
+    };
+    let target = editor.editor().buffers()[1];
+    let scratch = editor.editor().buffers()[0];
+
+    assert_vim_error(
+        executor.execute_line(&editor, &format!("buffer {}", i64::from(target))),
+        "E86",
+    );
+    assert_eq!(editor.editor().current_buffer(), Some(scratch));
+    assert!(editor.editor().buffer(target).unwrap().text().is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// `:bnext` runs the same sequence; a wrapping `:bnext` on the only listed
@@ -2771,6 +3414,50 @@ fn bufload_errors_on_invalid_name_and_wrong_arity() {
     assert_vim_error(executor.execute_line(&editor, "call bufload(999)"), "E158");
 }
 
+/// `bufload()` on a named buffer whose file does not exist fires
+/// `BufNewFile`, not the `BufReadPre`/`BufReadPost` pair upstream
+/// `readfile` reserves for a file it actually opened (`fileio.c:472-516`;
+/// `autocmd.txt` *BufReadPre*: "Not used if the file doesn't exist").
+/// An existing file keeps the read family.
+#[test]
+fn bufload_missing_file_fires_bufnewfile_not_read_events() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufReadPre", "BufReadPost", "BufNewFile"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} * call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+
+    executor
+        .execute_line(
+            &editor,
+            "let g:missing = bufadd('XmissingFile') | call bufload(g:missing) | let g:loaded = getbufinfo(g:missing)[0].loaded",
+        )
+        .unwrap();
+
+    assert_eq!(order_events(&executor), ["BufNewFile"]);
+    assert_eq!(
+        global_value(&executor, "loaded"),
+        Some(ox_types::Typval::Number(1)),
+        "a missing file still loads the buffer empty"
+    );
+
+    executor.scripts().io().insert("XexistsFile", "data\n");
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "let g:present = bufadd('XexistsFile') | call bufload(g:present)",
+        )
+        .unwrap();
+
+    assert_eq!(order_events(&executor), ["BufReadPre", "BufReadPost"]);
+}
+
 #[test]
 fn bufnr_create_flag_uses_vim_boolean_conversion_after_lookup() {
     let (editor, mut executor) = setup();
@@ -3053,6 +3740,189 @@ fn bwipeout_replaces_window_buffer_and_wipes() {
     let current = editor.editor().current_buffer().unwrap();
     assert_ne!(current, target);
     assert_eq!(buffer_text(&editor), vec!["first"]);
+}
+
+/// `:bdelete` fires `BufUnload` only for resident text, then `BufDelete`;
+/// an already-unloaded target receives only `BufDelete`.
+#[test]
+fn bdelete_skips_bufunload_for_already_unloaded_target() {
+    let (editor, mut executor) = setup_with_content(&[b"loaded".to_vec()]);
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufUnload", "BufDelete"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} * call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+
+    executor.execute_line(&editor, "bdelete").unwrap();
+    assert_eq!(order_events(&executor), ["BufUnload", "BufDelete"]);
+
+    let unloaded = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(unloaded)
+        .unwrap()
+        .unload()
+        .unwrap();
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            &format!("bdelete {}", i64::from(unloaded)),
+        )
+        .unwrap();
+    assert_eq!(order_events(&executor), ["BufDelete"]);
+}
+
+/// `:bwipeout` preserves upstream's `BufUnload`, `BufDelete`, `BufWipeout`
+/// order for resident text and omits `BufUnload` when text was already freed.
+#[test]
+fn bwipeout_skips_bufunload_for_already_unloaded_target() {
+    let (editor, mut executor) = setup_with_content(&[b"loaded".to_vec()]);
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufUnload", "BufDelete", "BufWipeout"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} * call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+
+    executor.execute_line(&editor, "bwipeout").unwrap();
+    assert_eq!(
+        order_events(&executor),
+        ["BufUnload", "BufDelete", "BufWipeout"]
+    );
+
+    let unloaded = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(unloaded)
+        .unwrap()
+        .unload()
+        .unwrap();
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            &format!("bwipeout {}", i64::from(unloaded)),
+        )
+        .unwrap();
+    assert_eq!(order_events(&executor), ["BufDelete", "BufWipeout"]);
+}
+
+/// A lifecycle handler that removes the target itself must not turn the
+/// outer `:bdelete` into `E90`, and the later targets must still be
+/// processed. Upstream `buf_freeall` (`buffer.c`) rechecks its `bufref`
+/// after the events rather than reporting a failure for work the nested
+/// removal already completed.
+#[test]
+fn buffer_delete_continues_when_a_handler_removes_the_target() {
+    let (editor, mut executor) = setup_with_content(&[b"current".to_vec()]);
+    let target = editor.editor_mut().create_buffer(true).unwrap();
+    let last = editor.editor_mut().create_buffer(true).unwrap();
+    executor.execute_line(&editor, "let g:fired = 0").unwrap();
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    // `BufDelete` fires for every target whatever its residency, so it is
+    // the event that can witness the loop reaching the later target; the
+    // recheck after `BufUnload` is covered by the `:bunload` test below.
+    // The handler is not `nested`, so the nested `:bwipeout!` fires no
+    // further events and `g:order` records exactly the targets the outer
+    // command reached.
+    executor
+        .execute_line(
+            &editor,
+            &format!(
+                "autocmd BufDelete * call add(g:order, expand('<abuf>')) | \
+                 if g:fired == 0 | let g:fired = 1 | \
+                 execute 'bwipeout! {}' | endif",
+                i64::from(target)
+            ),
+        )
+        .unwrap();
+
+    executor
+        .execute_line(
+            &editor,
+            &format!("{},{}bdelete", i64::from(target), i64::from(last)),
+        )
+        .unwrap();
+
+    let messages = echo_messages(&editor);
+    assert!(
+        !messages.iter().any(|row| row.contains("E90")),
+        "a nested removal must not surface E90, got {messages:?}"
+    );
+    assert!(
+        editor.editor().buffer(target).is_err(),
+        "the nested handler removed the target"
+    );
+    assert_eq!(
+        order_events(&executor),
+        [target, last].map(|handle| i64::from(handle).to_string()),
+        "the later target must still be reached"
+    );
+}
+
+/// `:bunload` has no `BufDelete` phase, so its recheck after `BufUnload` is
+/// the only thing between a handler that removes the target and a spurious
+/// `E90` for a handle the nested removal already freed.
+#[test]
+fn buffer_unload_reports_no_error_when_a_handler_removes_the_target() {
+    let (editor, mut executor) = setup_with_content(&[b"current".to_vec()]);
+    let target = editor.editor_mut().create_buffer(true).unwrap();
+    executor
+        .execute_line(
+            &editor,
+            &format!(
+                "autocmd BufUnload * execute 'bwipeout! {}'",
+                i64::from(target)
+            ),
+        )
+        .unwrap();
+
+    executor
+        .execute_line(&editor, &format!("bunload {}", i64::from(target)))
+        .unwrap();
+
+    let messages = echo_messages(&editor);
+    assert!(
+        !messages.iter().any(|row| row.contains("E90")),
+        "a nested removal must not surface E90, got {messages:?}"
+    );
+    assert!(
+        editor.editor().buffer(target).is_err(),
+        "the nested handler removed the target"
+    );
+}
+
+/// `:bunload` releases text but keeps the buffer in the ordinary `:ls`
+/// listing; `:bdelete` unlists it and `:bwipeout` removes it entirely.
+/// Upstream: `buffer.c` `close_buffer` — `DOBUF_UNLOAD`/`DOBUF_DEL`/
+/// `DOBUF_WIPE` differ in listed-buffer handling.
+#[test]
+fn buffer_removal_updates_plain_listing_per_command() {
+    for (command, should_list_target) in
+        [("bunload 2", true), ("bdelete 2", false), ("bwipeout 2", false)]
+    {
+        let (editor, mut executor) = setup();
+        let target = editor.editor_mut().create_buffer(true).unwrap();
+
+        executor.execute_line(&editor, command).unwrap();
+        executor.execute_line(&editor, "ls").unwrap();
+
+        let target_number = format!("{:>3}", i64::from(target));
+        let listing = echo_messages(&editor);
+        assert_eq!(
+            listing.iter().any(|row| row.starts_with(&target_number)),
+            should_list_target,
+            "{command}: expected buffer {target:?} listing state {should_list_target}, got {listing:?}"
+        );
+    }
 }
 
 #[test]
@@ -3852,10 +4722,20 @@ fn tab_addresses_resolve_in_the_tabpage_domain() {
 fn tabedit_opens_a_file_in_a_new_tabpage() {
     let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
     executor.scripts().io().insert("in.txt", "filetext\n");
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufReadPre *.txt let g:tabedit_current = bufnr('%')",
+        )
+        .unwrap();
     executor.execute_line(&editor, "tabe in.txt").unwrap();
     assert_eq!(tab_count(&editor), 2);
     assert_eq!(buffer_text(&editor), vec!["filetext"]);
     let buffer = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        global_value(&executor, "tabedit_current"),
+        Some(ox_types::Typval::Number(i64::from(buffer)))
+    );
     assert_eq!(
         editor
             .editor()
@@ -3865,6 +4745,256 @@ fn tabedit_opens_a_file_in_a_new_tabpage() {
             .to_string_lossy(),
         "in.txt"
     );
+}
+
+/// Creation callbacks for a split run after the destination window exists.
+///
+/// Upstream `ex_splitview` (`ex_docmd.c:5637`) creates the split before
+/// `do_exedit`, so `BufNew`/`BufAdd` callbacks observe the new window.
+#[test]
+fn split_creation_callbacks_see_the_destination_window() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.scripts().io().insert("split-window.txt", "target\n");
+    executor
+        .execute_line(&editor, "let g:bufnew_windows = [] | let g:bufadd_windows = []")
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufNew *.txt call add(g:bufnew_windows, win_getid())",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufAdd *.txt call add(g:bufadd_windows, win_getid())",
+        )
+        .unwrap();
+
+    executor
+        .execute_line(&editor, "split split-window.txt")
+        .unwrap();
+
+    let destination = editor.editor().current_window().unwrap();
+    let expected = i64::from(destination);
+    let recorded = |name: &str| match global_value(&executor, name) {
+        Some(ox_types::Typval::List(list)) => list
+            .borrow()
+            .items
+            .iter()
+            .map(|value| match value {
+                ox_types::Typval::Number(number) => *number,
+                other => panic!("expected window ids, got {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        other => panic!("expected a List, got {other:?}"),
+    };
+    assert_eq!(recorded("bufnew_windows"), vec![expected]);
+    assert_eq!(recorded("bufadd_windows"), vec![expected]);
+}
+
+/// A read callback may enter another buffer while `:edit` is loading. The
+/// command must not emit a stale `BufEnter` for the requested file afterward.
+#[test]
+fn edit_does_not_enter_requested_buffer_after_read_callback_switches_away() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.scripts().io().insert("edit-switch.txt", "target\n");
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufEnter *.txt call add(g:order, expand('<afile>'))",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "autocmd BufReadPre *.txt enew")
+        .unwrap();
+
+    executor.execute_line(&editor, "edit edit-switch.txt").unwrap();
+
+    assert_eq!(order_events(&executor), Vec::<String>::new());
+    let current = editor.editor().current_buffer().unwrap();
+    let current_name = editor
+        .editor()
+        .buffer(current)
+        .unwrap()
+        .name()
+        .to_string_lossy()
+        .into_owned();
+    assert_ne!(current_name, "edit-switch.txt");
+}
+
+/// A `BufReadPost` handler may move focus away from a split target. The shared
+/// loader must then abandon the target entry instead of firing its stale
+/// `BufEnter` (`do_ecmd`, `ex_cmds.c:2687`).
+#[test]
+fn split_does_not_enter_target_after_read_callback_switches_window() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.scripts().io().insert("split-switch.txt", "target\n");
+    executor.execute_line(&editor, "let g:target_enters = 0").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufEnter split-switch.txt let g:target_enters += 1",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "autocmd BufReadPost split-switch.txt wincmd w")
+        .unwrap();
+
+    executor
+        .execute_line(&editor, "split split-switch.txt")
+        .unwrap();
+
+    assert_eq!(
+        global_value(&executor, "target_enters"),
+        Some(ox_types::Typval::Number(0)),
+        "BufReadPost moved focus away; split must not fire BufEnter for the target",
+    );
+}
+
+#[test]
+fn split_existing_file_fires_creation_before_read_lifecycle() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.scripts().io().insert("split-order.txt", "target\n");
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in [
+        "BufNew",
+        "BufAdd",
+        "BufReadPre",
+        "BufReadPost",
+        "BufNewFile",
+        "BufEnter",
+    ] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} *.txt call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+
+    executor.execute_line(&editor, "split split-order.txt").unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufEnter"]
+    );
+}
+
+#[test]
+fn split_missing_file_fires_creation_before_new_file_lifecycle() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in [
+        "BufNew",
+        "BufAdd",
+        "BufReadPre",
+        "BufReadPost",
+        "BufNewFile",
+        "BufEnter",
+    ] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} *.txt call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+
+    executor
+        .execute_line(&editor, "split split-order-missing.txt")
+        .unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufNew", "BufAdd", "BufNewFile", "BufEnter"]
+    );
+}
+
+#[test]
+fn tabnew_existing_file_fires_creation_before_read_lifecycle() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor.scripts().io().insert("tab-order.txt", "target\n");
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufNewFile"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} *.txt call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+
+    executor.execute_line(&editor, "tabnew tab-order.txt").unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufNew", "BufAdd", "BufReadPre", "BufReadPost"]
+    );
+}
+
+#[test]
+fn help_existing_file_fires_creation_before_read_lifecycle() {
+    let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
+    executor
+        .scripts_mut()
+        .add_runtime_root(PathBuf::from("runtime"));
+    executor.scripts().io().insert("runtime/doc/help.txt", "help\n");
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufNewFile"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} * call add(g:order, '{event}')"),
+            )
+            .unwrap();
+    }
+
+    executor.execute_line(&editor, "help").unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufNew", "BufAdd", "BufReadPre", "BufReadPost"]
+    );
+}
+
+#[test]
+fn split_file_read_hook_sees_target_as_current() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.scripts().io().insert("split.txt", "split-file\n");
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufReadPre *.txt let g:split_current = bufnr('%')",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "split split.txt").unwrap();
+    let buffer = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        global_value(&executor, "split_current"),
+        Some(ox_types::Typval::Number(i64::from(buffer)))
+    );
+    assert_eq!(buffer_text(&editor), vec!["split-file"]);
+}
+
+#[test]
+fn help_file_read_hook_sees_target_as_current() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor
+        .scripts_mut()
+        .add_runtime_root(PathBuf::from("runtime"));
+    executor.scripts().io().insert("runtime/doc/help.txt", "help text\n");
+    executor
+        .execute_line(&editor, "autocmd BufReadPre * let g:help_current = bufnr('%')")
+        .unwrap();
+    executor.execute_line(&editor, "help").unwrap();
+    let buffer = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        global_value(&executor, "help_current"),
+        Some(ox_types::Typval::Number(i64::from(buffer)))
+    );
+    assert_eq!(buffer_text(&editor), vec!["help text"]);
 }
 
 /// `:tabonly` keeps the current tabpage and closes the rest; `:tabo` is its
@@ -7112,6 +8242,53 @@ call T()
 }
 
 #[test]
+fn pop_reloads_a_tag_target_unloaded_since_the_jump() {
+    let io = MemoryFileIO::new();
+    io.insert("Xtags", "test\tXtest.h\t/^void test();$/;\"\tp\n");
+    io.insert("Xtest.c", "int main()\n");
+    io.insert("Xtest.h", "void test();\n");
+    let editor = TestEditorAccess::new(Editor::new());
+    let buffer = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut executor = ExExecutor::with_io(io);
+    executor
+        .execute_script(
+            &editor,
+            "tag-pop-reload.vim",
+            "function! T()
+  set tags=Xtags
+  new Xtest.c
+  let g:origin = bufnr('%')
+  tag test
+  execute 'bunload' g:origin
+  autocmd BufReadPost Xtest.c let g:read_fired = 1
+  pop
+  let g:after_pop = bufname('%')
+  let g:after_lines = join(getline(1, '$'), '|')
+endfunction
+call T()
+",
+        )
+        .unwrap();
+    let global = |name: &[u8]| {
+        crate::excmd_exec::typval_to_text(
+            executor
+                .scope()
+                .get_scoped(ox_eval::scope::ScopeKind::Global, name, 0)
+                .unwrap(),
+        )
+    };
+    // The pop target was unloaded after the jump, so `:pop` must read it back
+    // with its read autocmds rather than failing or arriving empty.
+    assert_eq!(global(b"after_pop"), "Xtest.c");
+    assert_eq!(global(b"after_lines"), "int main()");
+    assert_eq!(global(b"read_fired"), "1");
+}
+
+#[test]
 fn gettagstack_accepts_window_ids_from_other_tabpages() {
     let io = MemoryFileIO::new();
     let tags = (10..=20).fold(String::new(), |mut tags, number| {
@@ -7381,20 +8558,18 @@ struct CallbackRecorder {
 }
 
 impl crate::LuaExec for CallbackRecorder {
-    fn execute_chunk(
-        &mut self,
+    fn execute_chunk(&self,
         _code: &str,
         _args: Vec<Object>,
     ) -> Result<Object, crate::LuaExecError> {
         Ok(Object::Nil)
     }
 
-    fn execute_file(&mut self, _path: &Path) -> Result<(), LuaExecError> {
+    fn execute_file(&self, _path: &Path) -> Result<(), LuaExecError> {
         Err(LuaExecError::Runtime("no files".to_owned()))
     }
 
-    fn invoke_callback(
-        &mut self,
+    fn invoke_callback(&self,
         reference: usize,
         args: Vec<Object>,
     ) -> Result<Object, LuaExecError> {
@@ -7403,6 +8578,174 @@ impl crate::LuaExec for CallbackRecorder {
             .push((reference, args.first().cloned().unwrap_or(Object::Nil)));
         Ok(Object::Nil)
     }
+}
+/// Re-enters an Ex executor while a Lua callback is active. The host itself
+/// is an owned `Rc`, so callback dispatch does not borrow a runtime cell across
+/// the user-code call.
+struct DeliveryReentryHost {
+    editor: Rc<TestEditorAccess>,
+    executor: Rc<RefCell<ExExecutor<MemoryFileIO>>>,
+    remaining: Cell<usize>,
+    inner_result: RefCell<Option<Result<ExecOutcome, ExecError>>>,
+}
+
+impl crate::LuaExec for DeliveryReentryHost {
+    fn execute_chunk(
+        &self,
+        _code: &str,
+        _args: Vec<Object>,
+    ) -> Result<Object, crate::LuaExecError> {
+        Ok(Object::Nil)
+    }
+
+    fn execute_file(&self, _path: &Path) -> Result<(), LuaExecError> {
+        Err(LuaExecError::Runtime("no files".to_owned()))
+    }
+
+    fn invoke_callback(
+        &self,
+        _reference: usize,
+        _args: Vec<Object>,
+    ) -> Result<Object, LuaExecError> {
+        if self.remaining.get() > 0 {
+            self.remaining.set(self.remaining.get() - 1);
+            let result = self
+                .executor
+                .borrow_mut()
+                .execute_line(&*self.editor, "write out.txt");
+            *self.inner_result.borrow_mut() = Some(result);
+        }
+        Ok(Object::Nil)
+    }
+}
+
+#[test]
+fn deferred_callback_reentry_completes_without_host_borrow_gate() {
+    let (base_editor, base_executor) = setup_with_content(&[b"source".to_vec()]);
+    base_executor.scripts().io().insert("out.txt", "old\n");
+    let editor = Rc::new(base_editor);
+    let executor = Rc::new(RefCell::new(base_executor));
+    let host = Rc::new(DeliveryReentryHost {
+        editor: editor.clone(),
+        executor: executor.clone(),
+        remaining: Cell::new(1),
+        inner_result: RefCell::new(None),
+    });
+    executor.borrow_mut().set_lua_exec(host.clone());
+    editor
+        .editor_mut()
+        .autocmds_mut()
+        .register_api(
+            &[Event::BufWritePost],
+            "*",
+            &AutocmdKind::LuaCallback(1),
+            &AutocmdOptions::default(),
+        )
+        .unwrap();
+
+    host.invoke_callback(1, Vec::new()).unwrap();
+    let result = host
+        .inner_result
+        .borrow_mut()
+        .take()
+        .expect("reentrant write must run");
+    assert!(result.is_ok(), "reentrant write failed: {result:?}");
+}
+
+/// One callback can synchronously enter a third executor without a fixed
+/// two-host exhaustion path. The shared counter bounds the fixture while
+/// preserving three callback invocations.
+struct DepthReentryHost {
+    editor: Rc<TestEditorAccess>,
+    executor: Rc<RefCell<ExExecutor<MemoryFileIO>>>,
+    remaining: Rc<Cell<usize>>,
+    calls: Rc<Cell<usize>>,
+}
+
+impl crate::LuaExec for DepthReentryHost {
+    fn execute_chunk(
+        &self,
+        _code: &str,
+        _args: Vec<Object>,
+    ) -> Result<Object, crate::LuaExecError> {
+        Ok(Object::Nil)
+    }
+
+    fn execute_file(&self, _path: &Path) -> Result<(), LuaExecError> {
+        Err(LuaExecError::Runtime("no files".to_owned()))
+    }
+
+    fn invoke_callback(
+        &self,
+        _reference: usize,
+        _args: Vec<Object>,
+    ) -> Result<Object, LuaExecError> {
+        self.calls.set(self.calls.get() + 1);
+        let remaining = self.remaining.get();
+        if remaining == 0 {
+            return Ok(Object::Nil);
+        }
+        self.remaining.set(remaining - 1);
+        self.executor
+            .borrow_mut()
+            .execute_line(&*self.editor, "write out.txt")
+            .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+        Ok(Object::Nil)
+    }
+}
+
+#[test]
+fn third_reentrant_callback_completes_on_a_fresh_executor() {
+    let (base_editor, base_executor) = setup_with_content(&[b"source".to_vec()]);
+    base_executor.scripts().io().insert("out.txt", "old\n");
+    let editor = Rc::new(base_editor);
+    let primary = Rc::new(RefCell::new(base_executor));
+    let secondary = Rc::new(RefCell::new(ExExecutor::with_io(MemoryFileIO::new())));
+    let tertiary = Rc::new(RefCell::new(ExExecutor::with_io(MemoryFileIO::new())));
+    secondary.borrow().scripts().io().insert("out.txt", "old\n");
+    tertiary.borrow().scripts().io().insert("out.txt", "old\n");
+    let remaining = Rc::new(Cell::new(2));
+    let calls = Rc::new(Cell::new(0));
+    let primary_host = Rc::new(DepthReentryHost {
+        editor: editor.clone(),
+        executor: secondary.clone(),
+        remaining: remaining.clone(),
+        calls: calls.clone(),
+    });
+    let secondary_host = Rc::new(DepthReentryHost {
+        editor: editor.clone(),
+        executor: tertiary.clone(),
+        remaining: remaining.clone(),
+        calls: calls.clone(),
+    });
+    let tertiary_host = Rc::new(DepthReentryHost {
+        editor: editor.clone(),
+        executor: primary.clone(),
+        remaining,
+        calls: calls.clone(),
+    });
+    primary
+        .borrow_mut()
+        .set_lua_exec(primary_host.clone());
+    secondary
+        .borrow_mut()
+        .set_lua_exec(secondary_host.clone());
+    tertiary
+        .borrow_mut()
+        .set_lua_exec(tertiary_host.clone());
+    editor
+        .editor_mut()
+        .autocmds_mut()
+        .register_api(
+            &[Event::BufWritePost],
+            "*",
+            &AutocmdKind::LuaCallback(1),
+            &AutocmdOptions::default(),
+        )
+        .unwrap();
+
+    primary_host.invoke_callback(1, Vec::new()).unwrap();
+    assert_eq!(calls.get(), 3);
 }
 
 fn user_command(name: &str, body: &str) -> crate::UserCommand {
@@ -7551,9 +8894,9 @@ fn bwipeout_clears_local_commands_but_bdelete_keeps_them() {
 fn api_callback_command_receives_upstream_opts() {
     let (editor, mut executor) =
         setup_with_content(&[b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
-    let recorder = Rc::new(RefCell::new(CallbackRecorder {
+    let recorder = Rc::new(CallbackRecorder {
         calls: RefCell::new(Vec::new()),
-    }));
+    });
     executor.set_lua_exec(recorder.clone());
     let mut command = user_command("Hello", "");
     command.nargs = '*';
@@ -7567,8 +8910,7 @@ fn api_callback_command_receives_upstream_opts() {
         .execute_line(&editor, "1,2Hello alpha beta")
         .unwrap();
 
-    let recorder_ref = recorder.borrow();
-    let calls = recorder_ref.calls.borrow();
+    let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, 42);
     let Object::Dict(opts) = &calls[0].1 else {
@@ -7617,9 +8959,9 @@ fn range_and_count_defaults_are_shared_by_invocation_and_parse() {
         b"four".to_vec(),
         b"five".to_vec(),
     ]);
-    let recorder = Rc::new(RefCell::new(CallbackRecorder {
+    let recorder = Rc::new(CallbackRecorder {
         calls: RefCell::new(Vec::new()),
-    }));
+    });
     executor.set_lua_exec(recorder.clone());
 
     let mut counted = user_command("Counted", "");
@@ -7661,8 +9003,7 @@ fn range_and_count_defaults_are_shared_by_invocation_and_parse() {
         .unwrap();
     assert_eq!((parsed.line1, parsed.line2), (3, 3));
 
-    let recorder_ref = recorder.borrow();
-    let calls = recorder_ref.calls.borrow();
+    let calls = recorder.calls.borrow();
     let count_of = |index: usize| match &calls[index].1 {
         Object::Dict(opts) => opts
             .0
@@ -8113,4 +9454,672 @@ fn sort_conflicting_formats_e474() {
 fn sort_invalid_flag_e475() {
     let (editor, mut executor) = setup_with_content(&[b"1".to_vec(), b"2".to_vec()]);
     assert_vim_error(executor.execute_line(&editor, "sort z"), "E475");
+}
+
+fn editor_with_scoped_variables() -> Editor {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    editor
+}
+
+fn local_editor_value(
+    editor: &Editor,
+    kind: ox_eval::scope::ScopeKind,
+    name: &str,
+) -> Option<ox_types::Object> {
+    let key = ox_types::OxStr::from(name);
+    match kind {
+        ox_eval::scope::ScopeKind::Buffer => editor
+            .current_buffer()
+            .and_then(|buffer| editor.buffer(buffer).ok())
+            .and_then(|state| state.variables().get(&key).cloned()),
+        ox_eval::scope::ScopeKind::Window => editor
+            .current_window()
+            .and_then(|window| editor.window_variables(window).ok())
+            .and_then(|variables| variables.get(&key).cloned()),
+        ox_eval::scope::ScopeKind::Tab => editor
+            .current_tabpage()
+            .and_then(|tab| editor.tabpage_variables(tab).ok())
+            .and_then(|variables| variables.get(&key).cloned()),
+        _ => None,
+    }
+}
+
+fn assert_nested_local_write_survives_outer_sync(kind: ox_eval::scope::ScopeKind) {
+    let mut editor = editor_with_scoped_variables();
+    let mut outer = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut outer).unwrap();
+    outer
+        .set_scoped(kind, b"outer", 0, ox_types::Typval::Number(1))
+        .unwrap();
+
+    let mut nested = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut nested).unwrap();
+    nested
+        .set_scoped(kind, b"nested", 0, ox_types::Typval::Number(2))
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &mut nested).unwrap();
+
+    outer
+        .set_scoped(kind, b"outer", 0, ox_types::Typval::Number(3))
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
+
+    assert_eq!(
+        local_editor_value(&editor, kind, "outer"),
+        Some(ox_types::Object::Integer(3)),
+    );
+    assert_eq!(
+        local_editor_value(&editor, kind, "nested"),
+        Some(ox_types::Object::Integer(2)),
+    );
+}
+
+fn assert_outer_local_deletion_survives_nested_sync(kind: ox_eval::scope::ScopeKind) {
+    let mut editor = editor_with_scoped_variables();
+    let key = ox_types::OxStr::from("gone");
+    match kind {
+        ox_eval::scope::ScopeKind::Buffer => editor
+            .buffer_mut(editor.current_buffer().unwrap())
+            .unwrap()
+            .variables_mut()
+            .insert(key.clone(), ox_types::Object::Integer(1)),
+        ox_eval::scope::ScopeKind::Window => editor
+            .window_variables_mut(editor.current_window().unwrap())
+            .unwrap()
+            .insert(key.clone(), ox_types::Object::Integer(1)),
+        ox_eval::scope::ScopeKind::Tab => editor
+            .tabpage_variables_mut(editor.current_tabpage().unwrap())
+            .unwrap()
+            .insert(key.clone(), ox_types::Object::Integer(1)),
+        _ => unreachable!("local deletion test only covers editor-local scopes"),
+    }
+
+    let mut outer = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut outer).unwrap();
+    assert!(outer.remove_pair(kind, b"gone"));
+
+    let mut nested = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut nested).unwrap();
+    nested
+        .set_scoped(kind, b"nested", 0, ox_types::Typval::Number(2))
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &mut nested).unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
+
+    assert_eq!(local_editor_value(&editor, kind, "gone"), None);
+    assert_eq!(
+        local_editor_value(&editor, kind, "nested"),
+        Some(ox_types::Object::Integer(2)),
+    );
+}
+
+#[test]
+fn nested_buffer_write_survives_outer_sync() {
+    assert_nested_local_write_survives_outer_sync(ox_eval::scope::ScopeKind::Buffer);
+}
+
+#[test]
+fn nested_window_write_survives_outer_sync() {
+    assert_nested_local_write_survives_outer_sync(ox_eval::scope::ScopeKind::Window);
+}
+
+#[test]
+fn nested_tab_write_survives_outer_sync() {
+    assert_nested_local_write_survives_outer_sync(ox_eval::scope::ScopeKind::Tab);
+}
+
+#[test]
+fn outer_buffer_deletion_survives_nested_sync() {
+    assert_outer_local_deletion_survives_nested_sync(ox_eval::scope::ScopeKind::Buffer);
+}
+
+#[test]
+fn outer_window_deletion_survives_nested_sync() {
+    assert_outer_local_deletion_survives_nested_sync(ox_eval::scope::ScopeKind::Window);
+}
+
+#[test]
+fn outer_tab_deletion_survives_nested_sync() {
+    assert_outer_local_deletion_survives_nested_sync(ox_eval::scope::ScopeKind::Tab);
+}
+
+#[test]
+fn nested_global_write_survives_outer_sync() {
+    // A reentrant executor's `g:` write must survive the outer
+    // executor's whole-map sync: only keys changed since the mirror
+    // sync back.
+    let mut editor = Editor::new();
+    let mut outer = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut outer).unwrap();
+    outer
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"outer",
+            0,
+            ox_types::Typval::Number(1),
+        )
+        .unwrap();
+    let mut nested = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut nested).unwrap();
+    nested
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"nested",
+            0,
+            ox_types::Typval::Number(2),
+        )
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &mut nested).unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
+    let gvars = editor.gvars();
+    assert_eq!(
+        gvars.get(&ox_types::OxStr::from("outer")),
+        Some(&ox_types::Object::Integer(1))
+    );
+    assert_eq!(
+        gvars.get(&ox_types::OxStr::from("nested")),
+        Some(&ox_types::Object::Integer(2))
+    );
+}
+
+/// Same-key outer/nested writes converge on the later (nested) writer: every
+/// user-code entry flushes outer dirt first (see `run_autocmd_plan`), so the
+/// nested scope mirrors the outer write, the nested write lands on top, and
+/// the outer write-back afterwards carries nothing stale. Upstream has one
+/// scope, so last-writer-wins is the only order.
+#[test]
+fn nested_same_key_write_wins_after_flush() {
+    let mut editor = Editor::new();
+    let mut outer = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut outer).unwrap();
+    outer
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"shared",
+            0,
+            ox_types::Typval::Number(1),
+        )
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
+    let mut nested = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut nested).unwrap();
+    assert_eq!(
+        nested
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"shared", 0)
+            .ok(),
+        Some(&ox_types::Typval::Number(1)),
+        "a nested reader sees the flushed outer write, like upstream's one scope",
+    );
+    nested
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"shared",
+            0,
+            ox_types::Typval::Number(2),
+        )
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &mut nested).unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
+    assert_eq!(
+        editor.gvars().get(&ox_types::OxStr::from("shared")),
+        Some(&ox_types::Object::Integer(2)),
+        "the later nested write survives the outer write-back",
+    );
+}
+
+/// The delete half of the same protocol: an outer removal flushed before
+/// reentry stays removed, and a nested write after it is not resurrected
+/// into — or deleted by — the outer write-back.
+#[test]
+fn outer_delete_then_nested_add_keeps_nested_value() {
+    let mut editor = Editor::new();
+    let mut outer = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut outer).unwrap();
+    outer
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"gone",
+            0,
+            ox_types::Typval::Number(1),
+        )
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
+    assert!(outer.remove_pair(ox_eval::scope::ScopeKind::Global, b"gone"));
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
+    let mut nested = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut nested).unwrap();
+    nested
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"gone",
+            0,
+            ox_types::Typval::Number(2),
+        )
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &mut nested).unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
+    assert_eq!(
+        editor.gvars().get(&ox_types::OxStr::from("gone")),
+        Some(&ox_types::Object::Integer(2)),
+    );
+}
+
+/// The mirror refresh must land updates in the vector, not just push new
+/// keys: replace a value, sync, revert to the earlier value, sync. A
+/// refresh that only pushes would leave the stale snapshot behind and the
+/// revert would compare equal and never reach the live map.
+#[test]
+fn mirror_update_arm_replaces_stale_snapshot() {
+    let mut editor = Editor::new();
+    let mut scope = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut scope).unwrap();
+    for value in [1, 2, 1] {
+        scope
+            .set_scoped(
+                ox_eval::scope::ScopeKind::Global,
+                b"k",
+                0,
+                ox_types::Typval::Number(value),
+            )
+            .unwrap();
+        sync_scope_into_editor(&mut editor, &mut scope).unwrap();
+        assert_eq!(
+            editor.gvars().get(&ox_types::OxStr::from("k")),
+            Some(&ox_types::Object::Integer(value)),
+            "live must follow every write, including a revert",
+        );
+    }
+}
+
+/// Own-file `BufWriteCmd` that leaves the buffer modified: upstream's bare
+/// `FAIL` shows no message, the `|` chain continues, and the buffer stays
+/// modified (verified against the reference binary). The internal failure
+/// is recorded for the advance gates, not surfaced.
+#[test]
+fn buf_write_cmd_own_file_silent_fail_keeps_chain_and_modified() {
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("owned.txt"));
+    executor
+        .execute_line(&editor, "au BufWriteCmd * let g:cmd_ran = 1")
+        .unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::MODIFIED, true);
+    executor
+        .execute_line_core(&editor, "write | let g:after = 1")
+        .unwrap();
+    assert_eq!(executor.scripts().io().content("owned.txt"), None);
+    assert!(
+        editor
+            .editor()
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::MODIFIED),
+        "a handler-owned overwrite leaves the modified state the handler left",
+    );
+    for probe in [b"cmd_ran".as_slice(), b"after".as_slice()] {
+        assert_eq!(
+            executor
+                .scope()
+                .get_scoped(ox_eval::scope::ScopeKind::Global, probe, 0)
+                .ok(),
+            Some(&ox_types::Typval::Number(1)),
+            "handler ran and the bar chain continued past the silent fail",
+        );
+    }
+}
+
+/// `:wq` after a silently failed handler-owned write stays put without
+/// `E37`: upstream's `do_write != FAIL` gate aborts the quit, and there is
+/// no message to report.
+#[test]
+fn wq_after_silent_fail_stays_without_e37() {
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("owned.txt"));
+    executor
+        .execute_line(&editor, "au BufWriteCmd * let g:cmd_ran = 1")
+        .unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::MODIFIED, true);
+    match executor.execute_line(&editor, "wq") {
+        Ok(ExecOutcome::Completed) => {}
+        other => panic!("silent-fail :wq must stay put quietly, got {other:?}"),
+    }
+    assert_eq!(editor.editor().current_buffer(), Some(buffer));
+    assert!(
+        editor
+            .editor()
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::MODIFIED),
+    );
+}
+
+/// `:wnext` after a silently failed handler-owned write does not advance:
+/// the same `do_write != FAIL` gate guards the arglist step
+/// (`ex_cmds.c:2106`).
+#[test]
+fn wnext_after_silent_fail_does_not_advance() {
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("a.txt"));
+    executor.execute_line(&editor, "args a.txt b.txt").unwrap();
+    executor
+        .execute_line(&editor, "au BufWriteCmd * let g:cmd_ran = 1")
+        .unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::MODIFIED, true);
+    match executor.execute_line(&editor, "wnext") {
+        Ok(ExecOutcome::Completed) => {}
+        other => panic!("silent-fail :wnext must stay put quietly, got {other:?}"),
+    }
+    assert_eq!(editor.editor().current_buffer(), Some(buffer));
+}
+
+/// Lexically equivalent parent-directory segments still identify the buffer's
+/// own file, so a handler-owned write keeps the same silent-failure path.
+#[test]
+fn buf_write_cmd_normalizes_parent_segments_for_own_file() {
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("owned.txt"));
+    executor
+        .execute_line(&editor, "au BufWriteCmd * let g:cmd_ran = 1")
+        .unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::MODIFIED, true);
+
+    executor
+        .execute_line_core(&editor, "write nested/../owned.txt")
+        .unwrap();
+
+    assert_eq!(executor.scripts().io().content("nested/../owned.txt"), None);
+    assert!(
+        editor
+            .editor()
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::MODIFIED),
+        "the own-file handler must still own the lexically equivalent target",
+    );
+}
+
+/// `NOTEDITED` clears when a handler-owned write overwrites the buffer's
+/// own file, mirroring the `BF_WRITE_MASK` reset; and an existing target
+/// with a never-edited buffer still raises `E13` without `!`.
+#[test]
+fn buf_write_cmd_overwrite_clears_not_edited_and_e13_gates() {
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("owned.txt"));
+    executor
+        .execute_line(&editor, "au BufWriteCmd * let g:cmd_ran = 1")
+        .unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::NOTEDITED, true);
+    executor.execute_line_core(&editor, "write").unwrap();
+    assert!(
+        !editor
+            .editor()
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::NOTEDITED),
+        "overwriting handler-owned write clears the never-edited mark",
+    );
+    executor.scripts().io().insert("owned.txt", "disk");
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::NOTEDITED, true);
+    assert_vim_error(executor.execute_line(&editor, "write"), "E13");
+}
+
+/// The outer/nested protocol with container values: a nested list replace
+/// lands by value, and the mirror tracks it through a revert.
+#[test]
+fn nested_list_replace_tracks_through_revert() {
+    let mut editor = Editor::new();
+    let mut outer = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut outer).unwrap();
+    outer
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"l",
+            0,
+            ox_types::Typval::list(vec![ox_types::Typval::Number(1)]),
+        )
+        .unwrap();
+    sync_scope_into_editor(&mut editor, &mut outer).unwrap();
+    let mut nested = ox_eval::scope::Scope::new();
+    sync_editor_into_scope(&editor, &mut nested).unwrap();
+    for values in [vec![1, 2], vec![1]] {
+        let items = values
+            .iter()
+            .map(|n| ox_types::Typval::Number(*n))
+            .collect();
+        nested
+            .set_scoped(
+                ox_eval::scope::ScopeKind::Global,
+                b"l",
+                0,
+                ox_types::Typval::list(items),
+            )
+            .unwrap();
+        sync_scope_into_editor(&mut editor, &mut nested).unwrap();
+        sync_scope_into_editor(&mut editor, &mut outer).unwrap();
+        let expected = ox_types::Object::Array(
+            values
+                .iter()
+                .map(|n| ox_types::Object::Integer(*n))
+                .collect(),
+        );
+        assert_eq!(
+            editor.gvars().get(&ox_types::OxStr::from("l")),
+            Some(&expected),
+            "container protocol values track through a revert",
+        );
+    }
+}
+
+/// The plan-entry flush through the real wiring: dirt staged with no
+/// host-call sync between it and the plan must be visible to a scope that
+/// read-syncs after the plan ran (upstream: one scope, always visible).
+#[test]
+fn plan_entry_flush_feeds_nested_scope_reads() {
+    let (editor, mut outer) = setup_with_content(&[b"hi".to_vec()]);
+    outer
+        .execute_line(&editor, "au BufWritePost * let g:from_handler = 1")
+        .unwrap();
+    outer
+        .runtime_scope_mut()
+        .1
+        .set_scoped(
+            ox_eval::scope::ScopeKind::Global,
+            b"x",
+            0,
+            ox_types::Typval::Number(1),
+        )
+        .unwrap();
+    let buffer = editor.editor().current_buffer().unwrap();
+    let plan = editor.editor_mut().autocmds_mut().plan(
+        Event::BufWritePost,
+        AutocmdContext {
+            buffer: Some(buffer),
+            file_name: Some(b"out.txt"),
+            ..AutocmdContext::default()
+        },
+    );
+    let (runtime, scope) = outer.runtime_scope_mut();
+    run_autocmd_plan(runtime, &editor, scope, None, plan);
+    let mut nested = ox_eval::scope::Scope::new();
+    let live = editor.editor();
+    sync_editor_into_scope(&live, &mut nested).unwrap();
+    assert_eq!(
+        nested
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"x", 0)
+            .ok(),
+        Some(&ox_types::Typval::Number(1)),
+        "entry flush makes staged dirt visible to nested readers",
+    );
+    assert_eq!(
+        outer
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"from_handler", 0)
+            .ok(),
+        Some(&ox_types::Typval::Number(1)),
+        "the plan action itself ran",
+    );
+}
+
+#[test]
+fn displayed_plan_error_continues_to_later_actions_at_depth_zero() {
+    // Upstream runs the whole group through one `do_cmdline`: at trylevel
+    // 0 a displayed error continues to the next action — only an
+    // interrupt stops matching (`autocmd.c:1871`). The failing entry is
+    // a Lua callback without an installed host, whose error reaches the
+    // plan loop undisplayed (the instruction loop never sees it).
+    let (editor, mut executor) = setup_with_content(&[b"hi".to_vec()]);
+    editor
+        .editor_mut()
+        .autocmds_mut()
+        .register_api(
+            &[Event::BufWritePost],
+            "*",
+            &AutocmdKind::LuaCallback(1),
+            &AutocmdOptions::default(),
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "au BufWritePost * let g:post_after_error = 1")
+        .unwrap();
+    executor
+        .execute_line_core(&editor, "write out.txt")
+        .unwrap();
+    assert_eq!(
+        executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"post_after_error", 0)
+            .ok(),
+        Some(&ox_types::Typval::Number(1)),
+        "later action must run after a displayed plan error at depth 0",
+    );
+}
+
+#[test]
+fn plan_abort_rules_follow_try_depth_inheritance() {
+    // `try_depth` is inherited, never reset (`ex_docmd.c:724`): past depth
+    // 0 the same failing entry cannot display, so the plan still breaks —
+    // throw-unwind parity for API callers. An explicit `:throw` aborts at
+    // any depth.
+    for (use_core, expect_run) in [(true, true), (false, false)] {
+        let (editor, mut executor) = setup_with_content(&[b"hi".to_vec()]);
+        editor
+            .editor_mut()
+            .autocmds_mut()
+            .register_api(
+                &[Event::BufWritePost],
+                "*",
+                &AutocmdKind::LuaCallback(1),
+                &AutocmdOptions::default(),
+            )
+            .unwrap();
+        executor
+            .execute_line(&editor, "au BufWritePost * let g:depth_pin = 1")
+            .unwrap();
+        if use_core {
+            executor
+                .execute_line_core(&editor, "write out.txt")
+                .unwrap();
+        } else {
+            let _ = executor.execute_line(&editor, "write out.txt");
+        }
+        assert_eq!(
+            executor
+                .scope()
+                .get_scoped(ox_eval::scope::ScopeKind::Global, b"depth_pin", 0)
+                .ok(),
+            expect_run.then_some(&ox_types::Typval::Number(1)),
+            "use_core={use_core}",
+        );
+    }
+    let (editor, mut executor) = setup_with_content(&[b"hi".to_vec()]);
+    executor
+        .execute_line(&editor, "au BufWritePost * throw 'boom'")
+        .unwrap();
+    executor
+        .execute_line(&editor, "au BufWritePost * let g:after_throw = 1")
+        .unwrap();
+    // `buf_write` (`bufwrite.c:1861-1866`): an aborting post handler fails
+    // the command while the completed file write stands.
+    let result = executor.execute_line_core(&editor, "write out.txt");
+    match result {
+        Err(ExecError::Vim(exception)) => assert!(
+            matches!(exception.kind, VimExceptionKind::Throw),
+            "an aborting post handler fails the command as a throw",
+        ),
+        other => panic!("a throwing BufWritePost must fail the write, got {other:?}"),
+    }
+    assert_eq!(
+        executor.scripts().io().content("out.txt"),
+        Some("hi\n".to_owned()),
+        "the completed file write stands despite the post failure",
+    );
+    assert!(
+        executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"after_throw", 0)
+            .is_err(),
+        "explicit :throw must still abort later plan actions",
+    );
 }

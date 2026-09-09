@@ -99,8 +99,11 @@ fn respond(msgid: u32) -> bool {
         msgid,
         result: Ok(Object::Nil),
     };
+    let Ok(bytes) = message.encode_bytes() else {
+        return false;
+    };
     let mut output = io::stdout();
-    output.write_all(&message.encode_bytes()).is_ok() && output.flush().is_ok()
+    output.write_all(&bytes).is_ok() && output.flush().is_ok()
 }
 
 fn play(script: &str) -> bool {
@@ -109,8 +112,11 @@ fn play(script: &str) -> bool {
             method: OxStr::from("redraw"),
             params: batch,
         };
+        let Ok(bytes) = message.encode_bytes() else {
+            return false;
+        };
         let mut output = io::stdout();
-        if output.write_all(&message.encode_bytes()).is_err() || output.flush().is_err() {
+        if output.write_all(&bytes).is_err() || output.flush().is_err() {
             return false;
         }
         thread::sleep(RENDER_PAUSE);

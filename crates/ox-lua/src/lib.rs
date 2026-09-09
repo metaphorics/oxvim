@@ -1,6 +1,7 @@
 // unsafe-permitted crate: FFI surface; safe API exposed to dependents.
 //! mlua-hosted `LuaJIT` executor, converters, and the C-side `vim` Lua table core.
 
+pub mod buf_attach;
 pub mod converter;
 mod embedded;
 pub mod host;

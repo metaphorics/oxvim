@@ -201,6 +201,281 @@ fn signal_binding_supports_luv_module_and_method_forms() {
         .unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn signal_status_reads_live_loop_inside_callback() {
+    let (host, _) = host();
+    host.lua()
+        .load(
+            r"
+            local signal = assert(vim.uv.new_signal())
+            signal_callback_ran = false
+            signal_closing = true
+            assert(signal:start_oneshot('sigusr1', function(signame)
+              assert(signame == 'sigusr1')
+              signal_callback_ran = true
+              signal_closing = signal:is_closing()
+              signal:close()
+            end) == 0)
+            ",
+        )
+        .exec()
+        .unwrap();
+    let raiser = std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        signal_hook::low_level::raise(signal_hook::consts::SIGUSR1)
+            .expect("raise SIGUSR1 for the callback");
+    });
+    host.lua().load("vim.uv.run('default')").exec().unwrap();
+    raiser.join().expect("signal raiser must finish");
+    assert!(
+        host.lua()
+            .globals()
+            .get::<bool>("signal_callback_ran")
+            .unwrap()
+    );
+    assert!(
+        !host.lua().globals().get::<bool>("signal_closing").unwrap(),
+        "signal callback must see its open handle"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_event_binding_lifecycle_reports_enoent_and_closes() {
+    let (host, _) = host();
+    let dir = std::env::temp_dir()
+        .to_str()
+        .expect("temp dir must be UTF-8")
+        .to_owned();
+    host.lua()
+        .load(format!(
+            r"
+            local handle = assert(vim.uv.new_fs_event())
+            local ok, err, name = handle:start('/definitely/not/here-oxvim', {{}}, function() end)
+            assert(ok == nil and name == 'ENOENT', tostring(err))
+            assert(handle:start('{dir}', {{}}, function() end) == 0)
+            assert(handle:stop() == 0)
+            assert(not handle:is_closing())
+            handle:close()
+            assert(handle:is_closing())
+            vim.uv.run('nowait')
+            "
+        ))
+        .exec()
+        .unwrap();
+}
+
+#[test]
+fn fs_event_backend_start_failure_preserves_idle_handle() {
+    let dir = fresh_dir("backend-start-failure");
+    let (host, scheduler) = host();
+    host.lua()
+        .globals()
+        .set("test_dir", dir.to_string_lossy().as_ref())
+        .unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        local handle = assert(vim.uv.new_fs_event())
+        local ok, err, name = handle:start(
+          test_dir,
+          {watch_entry = true, recursive = true},
+          function() end
+        )
+        assert(ok == nil and name == 'ENOTSUP', tostring(err))
+        assert(
+          err == 'ENOTSUP: watch_entry cannot be combined with recursive',
+          tostring(err)
+        )
+        local path, path_err, path_name = handle:getpath()
+        assert(path == nil and path_name == 'EINVAL', tostring(path_err))
+        assert(handle:start(test_dir, {}, function() end) == 0)
+        assert(handle:getpath() == test_dir)
+        handle:close()
+        "#,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn fs_event_start_inside_callback_snapshots_before_mutation() {
+    let dir = fresh_dir("start-callback");
+    let (host, scheduler) = host();
+    host.lua()
+        .globals()
+        .set("test_dir", dir.to_string_lossy().as_ref())
+        .unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        local handle = assert(vim.uv.new_fs_event())
+        local trigger = assert(vim.uv.new_timer())
+        local guard = assert(vim.uv.new_timer())
+        local timed_out = false
+        local event_name
+
+        guard:start(3000, 0, function()
+          timed_out = true
+          if not handle:is_closing() then handle:close() end
+          guard:close()
+          vim.uv.stop()
+        end)
+        trigger:start(0, 0, function()
+          assert(handle:start(test_dir, {}, function(err, filename)
+            assert(err == nil)
+            event_name = filename
+            if not handle:is_closing() then handle:close() end
+            if not guard:is_closing() then guard:close() end
+          end) == 0)
+          assert(handle:getpath() == test_dir)
+
+          local fd = assert(vim.uv.fs_open(test_dir .. '/created.txt', 'w', tonumber('644', 8)))
+          assert(vim.uv.fs_write(fd, 'event') == 5)
+          assert(vim.uv.fs_close(fd))
+          trigger:close()
+        end)
+        vim.uv.run('default')
+        assert(not timed_out, 'fs event did not observe the post-start mutation')
+        assert(event_name == 'created.txt', tostring(event_name))
+        "#,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn fs_event_rejects_mistyped_options_and_coerces_numbers() {
+    let dir = fresh_dir("options");
+    let (host, scheduler) = host();
+    host.lua()
+        .globals()
+        .set("test_dir", dir.to_string_lossy().as_ref())
+        .unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        for _, key in ipairs({'recursive', 'stat', 'watch_entry'}) do
+          local handle = assert(vim.uv.new_fs_event())
+          local ok, err = pcall(handle.start, handle, test_dir, {[key] = 'invalid'}, function() end)
+          assert(not ok, key .. ' must reject a string option')
+          -- mlua appends a traceback to the error object, so pin the exact
+          -- message as a plain-text match rather than by whole-string equality.
+          local want = "Invalid '" .. key .. "': not a boolean"
+          assert(tostring(err):find(want, 1, true) ~= nil, tostring(err))
+
+          assert(handle:start(test_dir, {[key] = 1}, function() end) == 0)
+          assert(handle:stop() == 0)
+          handle:close()
+        end
+        "#,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_event_callback_preserves_non_utf8_filename_bytes() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = fresh_dir("non-utf8");
+    let filename = OsString::from_vec(vec![b'n', b'o', b'n', 0xff, b'8']);
+    let (host, scheduler) = host();
+    host.lua()
+        .globals()
+        .set("test_dir", dir.to_string_lossy().as_ref())
+        .unwrap();
+    host.lua()
+        .load(
+            r#"
+            local handle = assert(vim.uv.new_fs_event())
+            local guard = assert(vim.uv.new_timer())
+            timed_out = false
+            event_name = nil
+            guard:start(3000, 0, function()
+              timed_out = true
+              if not handle:is_closing() then handle:close() end
+              guard:close()
+              vim.uv.stop()
+            end)
+            assert(handle:start(test_dir, {}, function(err, filename)
+              assert(err == nil)
+              event_name = filename
+              if not handle:is_closing() then handle:close() end
+              if not guard:is_closing() then guard:close() end
+            end) == 0)
+            "#,
+        )
+        .exec()
+        .unwrap();
+    std::fs::write(dir.join(&filename), b"payload").unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        vim.uv.run('default')
+        assert(not timed_out, 'fs event did not report the non-UTF-8 filename')
+        assert(event_name == string.char(110, 111, 110, 255, 56), 'filename bytes changed')
+        "#,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_event_start_preserves_non_utf8_watch_path_bytes() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = fresh_dir("non-utf8-watch-path");
+    let watched_name = OsString::from_vec(vec![b'w', b'a', b't', 0xff, b'h']);
+    let watched = dir.join(&watched_name);
+    std::fs::create_dir(&watched).unwrap();
+    let filename = OsString::from_vec(vec![b'e', b'v', 0xfe, b'8']);
+    let watched_bytes = watched.as_os_str().as_encoded_bytes().to_vec();
+    let (host, scheduler) = host();
+    let lua_path = host.lua().create_string(&watched_bytes).unwrap();
+    host.lua().globals().set("test_dir", lua_path).unwrap();
+    host.lua()
+        .load(
+            r#"
+            local handle = assert(vim.uv.new_fs_event())
+            local guard = assert(vim.uv.new_timer())
+            timed_out = false
+            event_name = nil
+            guard:start(3000, 0, function()
+              timed_out = true
+              if not handle:is_closing() then handle:close() end
+              guard:close()
+              vim.uv.stop()
+            end)
+            assert(handle:start(test_dir, {}, function(err, filename)
+              assert(err == nil)
+              event_name = filename
+              if not handle:is_closing() then handle:close() end
+              if not guard:is_closing() then guard:close() end
+            end) == 0)
+            assert(handle:getpath() == test_dir, 'watch path bytes changed')
+            "#,
+        )
+        .exec()
+        .unwrap();
+    std::fs::write(watched.join(&filename), b"payload").unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        vim.uv.run('default')
+        assert(not timed_out, 'fs event did not report the non-UTF-8 watch path')
+        assert(event_name == string.char(101, 118, 254, 56), 'filename bytes changed')
+        "#,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn wait_primitives_poll_the_owned_uv_loop() {
     let (host, scheduler) = host();
@@ -241,6 +516,30 @@ fn phase_handles_support_between_case_cleanup() {
               assert(handle:is_closing())
             end
             vim.wait(0)
+            ",
+        )
+        .exec()
+        .unwrap();
+}
+
+#[test]
+fn phase_status_reads_live_loop_inside_callback() {
+    let (host, _) = host();
+    host.lua()
+        .load(
+            r"
+            local phase = assert(vim.uv.new_idle())
+            phase_active = false
+            phase_closing = true
+            assert(phase:start(function()
+              phase_active = phase:is_active()
+              phase_closing = phase:is_closing()
+              phase:stop()
+              phase:close()
+            end))
+            vim.uv.run('nowait')
+            assert(phase_active, 'phase callback must see its active handle')
+            assert(not phase_closing, 'phase callback must see its open handle')
             ",
         )
         .exec()
@@ -440,11 +739,13 @@ fn tcp_loopback_accepts_reads_and_writes() {
             local address = assert(server:getsockname())
             assert(server:listen(16, function(err)
               assert(err == nil)
+              assert(not server:is_closing(), 'listen callback must see its open handle')
               local peer = vim.uv.new_tcp()
               assert(server:accept(peer))
               peer:read_start(function(read_err, chunk)
                 assert(read_err == nil)
                 if chunk then
+                  assert(not peer:is_closing(), 'read callback must see its open handle')
                   peer:write(chunk)
                 else
                   peer:close()
@@ -455,6 +756,7 @@ fn tcp_loopback_accepts_reads_and_writes() {
             local client = vim.uv.new_tcp()
             client:connect('127.0.0.1', address.port, function(err)
               assert(err == nil)
+              assert(not client:is_closing(), 'connect callback must see its open handle')
               client:read_start(function(read_err, chunk)
                 assert(read_err == nil)
                 if chunk then

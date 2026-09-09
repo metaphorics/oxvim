@@ -173,24 +173,7 @@ pub fn export_vim_environment() {
 /// buffer that exists at this point (upstream's `curbuf`).
 pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppError> {
     let editor_error = |error: OptionError| AppError::Editor(error.to_string());
-    // main.c `command_line_scan` routes every ShaDa-file request through the
-    // option itself: `-i {file}` at 1430-1432, and `--clean` at 1194-1196,
-    // both via `set_option_value_give_err(kOptShadafile, ...)`, before any
-    // `--cmd` runs. `-l` defaults a still-empty 'shadafile' to `NONE`
-    // (main.c:1438-1442); cli.rs collapses that to `None` while scanning.
-    // `shada_filename` (`shada.c:1289-1316`) then resolves reads and writes
-    // through 'shadafile' alone, and `NONE` disables ShaDa for the session.
-    match &cli.shada {
-        ShadaConfig::None => editor
-            .options_mut()
-            .set_global("shadafile", OptionValue::String("NONE".into()))
-            .map_err(editor_error)?,
-        ShadaConfig::File(path) => editor
-            .options_mut()
-            .set_global("shadafile", OptionValue::String(path.clone()))
-            .map_err(editor_error)?,
-        ShadaConfig::Default => {}
-    }
+    apply_shada_option(editor, &cli.shada, editor_error)?;
     // option.c set_init_default_shell (182-199): the static 'shell' default is
     // the bare name "sh", and startup replaces it with $SHELL when that is set
     // and non-empty, quoting it if it holds a space. The absolute path is the
@@ -233,28 +216,7 @@ pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppEr
             .set_global("write", OptionValue::Boolean(false))
             .map_err(editor_error)?;
     }
-    // option.c:367: 'directory' defaults to the XDG state swap dir with a
-    // trailing `//` (full-path swap names, `stdpaths_user_state_subpath`),
-    // overriding options.lua's empty shipped default; the directory is
-    // created when missing, like every stdpaths default.
-    if let Ok(OptionValue::String(current)) = editor.options().get_global("directory")
-        && current.is_empty()
-        && let Some(state) = ox_editor::script::stdpath(ox_editor::script::StdPath::State)
-            .into_iter()
-            .next()
-            .map(|dir| ox_editor::script::expand_home(&dir))
-    {
-        let _ = std::fs::create_dir_all(format!("{state}/swap"));
-        // 'directory' is a comma-separated list; a comma inside the state
-        // path is escaped exactly like set_string_default's escape_commas
-        // (option.c:367 via stdpaths.c:267-295).
-        let escaped = format!("{state}/swap//").replace(',', r"\,");
-        editor
-            .options_mut()
-            .set_global("directory", OptionValue::String(escaped))
-            .map_err(editor_error)?;
-    }
-    // "-R" also slows the swap file down (`p_uc = 10000`); "-n" turns it off.
+    seed_default_swap_directory(editor, editor_error)?;
     if cli.readonly {
         editor
             .options_mut()
@@ -289,6 +251,80 @@ pub fn apply_startup_options(editor: &mut Editor, cli: &Cli) -> Result<(), AppEr
                 .set_buffer(buffer, name, value)
                 .map_err(editor_error)?;
         }
+    }
+    Ok(())
+}
+/// Routes the startup `shadafile` request through the option itself.
+///
+/// # Errors
+///
+/// Returns the option failure.
+fn apply_shada_option(
+    editor: &mut Editor,
+    shada: &ShadaConfig,
+    editor_error: impl Fn(ox_editor::OptionError) -> AppError,
+) -> Result<(), AppError> {
+    // main.c `command_line_scan` routes every ShaDa-file request through the
+    // option itself: `-i {file}` at 1430-1432, and `--clean` at 1194-1196,
+    // both via `set_option_value_give_err(kOptShadafile, ...)`, before any
+    // `--cmd` runs. `-l` defaults a still-empty 'shadafile' to `NONE`
+    // (main.c:1438-1442); cli.rs collapses that to `None` while scanning.
+    // `shada_filename` (`shada.c:1289-1316`) then resolves reads and writes
+    // through 'shadafile' alone, and `NONE` disables ShaDa for the session.
+    match shada {
+        ShadaConfig::None => editor
+            .options_mut()
+            .set_global("shadafile", OptionValue::String("NONE".into()))
+            .map_err(editor_error)?,
+        ShadaConfig::File(path) => editor
+            .options_mut()
+            .set_global("shadafile", OptionValue::String(path.clone()))
+            .map_err(editor_error)?,
+        ShadaConfig::Default => {}
+    }
+    Ok(())
+}
+
+/// Seeds the default `'directory'` (option.c:367) with the XDG state swap
+/// dir plus trailing `//`, creating the tree owner-only when missing.
+///
+/// # Errors
+///
+/// Returns the directory-creation, permission, or option failure.
+fn seed_default_swap_directory(
+    editor: &mut Editor,
+    editor_error: impl Fn(ox_editor::OptionError) -> AppError,
+) -> Result<(), AppError> {
+    // option.c:367: 'directory' defaults to the XDG state swap dir with a
+    // trailing `//` (full-path swap names, `stdpaths_user_state_subpath`),
+    // overriding options.lua's empty shipped default; the directory is
+    // created when missing, like every stdpaths default.
+    if let Ok(OptionValue::String(current)) = editor.options().get_global("directory")
+        && current.is_empty()
+        && let Some(state) = ox_editor::script::stdpath(ox_editor::script::StdPath::State)
+            .into_iter()
+            .next()
+            .map(|dir| ox_editor::script::expand_home(&dir))
+    {
+        // The swap tree holds buffer snapshots: create it owner-only
+        // and fail loudly instead of installing an untrusted path
+        // (`os_mkdir_recurse` 0700, shada.c:2782-2793).
+        let swap = format!("{state}/swap");
+        std::fs::create_dir_all(&swap).map_err(AppError::Io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&swap, std::fs::Permissions::from_mode(0o700))
+                .map_err(AppError::Io)?;
+        }
+        // 'directory' is a comma-separated list; a comma inside the state
+        // path is escaped exactly like set_string_default's escape_commas
+        // (option.c:367 via stdpaths.c:267-295).
+        let escaped = format!("{state}/swap//").replace(',', r"\,");
+        editor
+            .options_mut()
+            .set_global("directory", OptionValue::String(escaped))
+            .map_err(editor_error)?;
     }
     Ok(())
 }
@@ -330,7 +366,15 @@ pub fn open_startup_buffers(
     } else if cli.stdin_file {
         open_stdin_buffer(editor)?;
     }
-    let buffers = open_startup_files(editor, &cli.files, cli.readonly)?;
+    let buffers = open_startup_files(
+        editor,
+        &cli.files,
+        StartupFlags {
+            readonly: cli.readonly,
+            no_modifiable: cli.no_modifiable,
+            binary: cli.binary,
+        },
+    )?;
     if cli.window_layout != WindowLayout::Single {
         create_startup_windows(editor, cli, &buffers)?;
     }
@@ -348,10 +392,52 @@ pub fn open_startup_buffers(
 /// loads for a named file while that mode is on, so the second and later
 /// files of `-R -o a b` are read-only too. Windows padded with fresh empty
 /// buffers stay writable, because upstream requires `b_ffname != NULL`.
+/// Startup flags that ride on every named file buffer (`-R` is
+/// `readonlymode`, `-M` resets `modifiable` per `reset_modifiable`, `-b`
+/// sets binary I/O): `open_buffer` (buffer.c:258) applies them while it
+/// loads each named file, so the second and later files of `-R -o a b`
+/// (or `-M`/`-b` equivalents) match the first.
+#[derive(Clone, Copy)]
+struct StartupFlags {
+    readonly: bool,
+    no_modifiable: bool,
+    binary: bool,
+}
+
+/// Applies the startup flags to one named file buffer. Runs in both
+/// load branches below: the buffer reused for the first file as well as
+/// every fresh one, since `apply_startup_options` only saw whichever
+/// buffer was current before any file loaded.
+fn apply_startup_file_overlays(
+    editor: &mut Editor,
+    handle: BufHandle,
+    flags: StartupFlags,
+) -> Result<(), AppError> {
+    if flags.readonly {
+        editor
+            .options_mut()
+            .set_buffer(handle, "readonly", OptionValue::Boolean(true))
+            .map_err(|error| AppError::Editor(error.to_string()))?;
+    }
+    if flags.no_modifiable {
+        editor
+            .options_mut()
+            .set_buffer(handle, "modifiable", OptionValue::Boolean(false))
+            .map_err(|error| AppError::Editor(error.to_string()))?;
+    }
+    if flags.binary {
+        editor
+            .options_mut()
+            .set_buffer(handle, "binary", OptionValue::Boolean(true))
+            .map_err(|error| AppError::Editor(error.to_string()))?;
+    }
+    Ok(())
+}
+
 fn open_startup_files(
     editor: &mut Editor,
     files: &[String],
-    readonly: bool,
+    flags: StartupFlags,
 ) -> Result<Vec<BufHandle>, AppError> {
     let first_into_current = editor.current_buffer().is_some_and(|current| {
         editor.buffer(current).is_ok_and(|state| {
@@ -370,6 +456,7 @@ fn open_startup_files(
                 state.load(text);
                 state.set_name(OxStr::from(file.as_str()));
             }
+            apply_startup_file_overlays(editor, current, flags)?;
             handles.push(current);
             continue;
         }
@@ -380,12 +467,7 @@ fn open_startup_files(
             state.set_name(OxStr::from(file.as_str()));
             state.mark_saved();
         }
-        if readonly {
-            editor
-                .options_mut()
-                .set_buffer(handle, "readonly", OptionValue::Boolean(true))
-                .map_err(|error| AppError::Editor(error.to_string()))?;
-        }
+        apply_startup_file_overlays(editor, handle, flags)?;
         handles.push(handle);
     }
     Ok(handles)
@@ -482,6 +564,9 @@ fn create_startup_windows(
 ///
 /// Returns the exit code the last executed command asked for.
 pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
+    // No listener runs here, but startup commands can spawn children:
+    // consume the endpoint before anything can inherit it.
+    ox_sys::unset_env("NVIM_LISTEN_ADDRESS");
     // `main.c` consumes stdin only after the startup commands have run:
     // `--cmd` executes in `exe_pre_commands` (main.c:465), stdin-as-text is
     // read in `read_stdin` (main.c:552), and stdin-as-Ex-commands is
@@ -766,6 +851,11 @@ impl BuiltinHost for ScriptBuiltins {
 struct ImmediateScheduler;
 
 impl Scheduler for ImmediateScheduler {
+    // Executes work inline; there is no draining main loop to defer to.
+    fn defers_to_main_loop(&self) -> bool {
+        false
+    }
+
     fn schedule_deferred(&self, work: Work) -> Result<(), String> {
         work().map_err(|error| error.to_string())
     }

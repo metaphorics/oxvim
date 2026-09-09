@@ -1,7 +1,6 @@
 //! UI attachment, highlight, input, paste, and terminal APIs.
 
 #![allow(non_snake_case)]
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use ox_editor::{
@@ -38,21 +37,17 @@ fn resize_current_tabpage(
     })
 }
 
-fn ui_dict(id: u64, channel: &ox_ui::UiChannel) -> Dict {
+fn ui_dict(id: u64, channel: &ox_ui::UiChannel, extra: Option<&UiExtra>) -> Dict {
     let (width, height) = channel.size();
     let opts = channel.options();
     // `ui_info` reads the per-UI option fields off `RemoteUI` (`ui.c:730-750`);
-    // the aux record carries the ones `UiChannel` does not model. A channel
-    // attached through the server path has no record yet, so defaults apply.
-    let extra = UI_EXTRA.with(|extra| extra.borrow().get(&id).cloned());
-    let rgb = extra.as_ref().is_none_or(|state| state.rgb);
-    let overrid = extra.as_ref().is_some_and(|state| state.overrid);
-    let term_colors = extra
-        .as_ref()
-        .and_then(|state| state.term_colors)
-        .unwrap_or(0);
-    let stdin_tty = extra.as_ref().is_some_and(|state| state.stdin_tty);
-    let stdout_tty = extra.as_ref().is_some_and(|state| state.stdout_tty);
+    // the per-session aux record carries the ones `UiChannel` does not model.
+    // A channel attached through the server path has no record yet, so defaults apply.
+    let rgb = extra.is_none_or(|state| state.rgb);
+    let overrid = extra.is_some_and(|state| state.overrid);
+    let term_colors = extra.and_then(|state| state.term_colors).unwrap_or(0);
+    let stdin_tty = extra.is_some_and(|state| state.stdin_tty);
+    let stdout_tty = extra.is_some_and(|state| state.stdout_tty);
     let mut fields = vec![
         (
             OxStr::from("chan"),
@@ -70,7 +65,7 @@ fn ui_dict(id: u64, channel: &ox_ui::UiChannel) -> Dict {
         (OxStr::from("override"), Object::Boolean(overrid)),
     ];
     // `term_name` is emitted only once set (`ui.c:735-737`).
-    if let Some(term_name) = extra.as_ref().and_then(|state| state.term_name.clone()) {
+    if let Some(term_name) = extra.and_then(|state| state.term_name.clone()) {
         fields.push((OxStr::from("term_name"), Object::String(term_name)));
     }
     fields.extend([
@@ -123,7 +118,7 @@ pub fn nvim_list_uis(session: &ApiSession) -> Result<Vec<Dict>, ApiError> {
         state
             .ui_channels
             .iter()
-            .map(|(id, channel)| ui_dict(*id, channel))
+            .map(|(id, channel)| ui_dict(*id, channel, state.ui_extra.get(id)))
             .collect()
     }))
 }
@@ -150,50 +145,54 @@ pub fn nvim_ui_attach(
             .0
             .push((OxStr::from("ext_linegrid"), Object::Boolean(true)));
     }
+    let channel = request_channel(session);
     session.with_state_mut(|state| {
         state
             .ui_channels
-            .attach(CHANNEL_ID, width, height, UiOptions::from_dict(&options))
+            .attach(channel, width, height, UiOptions::from_dict(&options))
             .map_err(|error| ApiError::exception(error.to_string()))
     })?;
     if let Err(error) = resize_current_tabpage(session, width, height) {
         session.with_state_mut(|state| {
-            let _ = state.ui_channels.detach(CHANNEL_ID);
+            let _ = state.ui_channels.detach(channel);
         });
         return Err(error);
     }
-    UI_EXTRA.with(|extra| {
-        extra
-            .borrow_mut()
-            .insert(CHANNEL_ID, UiExtra::from_options(&options));
+    session.with_state_mut(|state| {
+        state
+            .ui_extra
+            .insert(channel, UiExtra::from_options(&options));
     });
     Ok(())
 }
 
 #[api(since = 1)]
 pub fn nvim_ui_detach(session: &ApiSession) -> Result<(), ApiError> {
+    let channel = request_channel(session);
     session.with_state_mut(|state| {
         state
             .ui_channels
-            .detach(CHANNEL_ID)
+            .detach(channel)
             .map(|_| ())
             .map_err(|error| ApiError::exception(error.to_string()))
     })?;
-    UI_EXTRA.with(|extra| {
-        extra.borrow_mut().remove(&CHANNEL_ID);
+    session.with_state_mut(|state| {
+        state.ui_extra.remove(&channel);
     });
     Ok(())
 }
 
 #[api(since = 1)]
 pub fn nvim_ui_try_resize(session: &ApiSession, width: i64, height: i64) -> Result<(), ApiError> {
+    let channel = request_channel(session);
+    require_ui(session, channel)?;
     let width = dimension(width, "width")?;
     let height = dimension(height, "height")?;
     resize_current_tabpage(session, width, height)?;
     session.with_state_mut(|state| {
         state
             .ui_channels
-            .try_resize(CHANNEL_ID, width, height)
+            .try_resize(channel, width, height)
             .map_err(|error| ApiError::exception(error.to_string()))
     })
 }
@@ -202,14 +201,14 @@ pub fn nvim_ui_try_resize(session: &ApiSession, width: i64, height: i64) -> Resu
 /// the legacy `rgb`/`override`/`term_*`/`stdin_*`/`stdout_tty` options and the
 /// external-popupmenu geometry reported by `nvim_ui_pum_set_*`. Upstream keeps
 /// these on `RemoteUI` (`api/ui.c`); the channel registry owns only the
-/// negotiated `ext_*` capabilities, so the remainder lives here keyed by the
-/// RPC channel id.
+/// negotiated `ext_*` capabilities, so the remainder lives in the owning
+/// [`ApiSession`] state, keyed by that session's channel id.
 #[derive(Clone, Debug, Default)]
 #[expect(
     clippy::struct_excessive_bools,
     reason = "API option shape mirrors the independent RemoteUI option fields"
 )]
-struct UiExtra {
+pub(crate) struct UiExtra {
     /// `rgb` option (default true upstream; `ui_attach` sets it explicitly).
     rgb: bool,
     /// `override` option.
@@ -261,24 +260,17 @@ impl UiExtra {
     }
 }
 
-thread_local! {
-    /// Attached-UI aux state, keyed by RPC channel id. `thread_local` because
-    /// [`ApiSession`] state is `!Sync` and the UI registry is per-session.
-    static UI_EXTRA: RefCell<BTreeMap<u64, UiExtra>> = const { RefCell::new(BTreeMap::new()) };
-}
-
 /// Reports the upstream not-attached error when `channel` has no live UI.
 ///
-/// Mirrors `get_ui_or_err` (`api/ui.c:57-64`): the channel registry is the
-/// source of truth for attachment, so a missing registry entry reports the
-/// same "not attached" failure the `UiChannels` operations produce.
+/// Mirrors `get_ui_or_err` (`api/ui.c:57-64`), including its external
+/// exception text rather than the UI registry's internal diagnostic.
 fn require_ui(session: &ApiSession, channel: u64) -> Result<(), ApiError> {
     let attached = session.with_state(|state| state.ui_channels.get(channel).is_some());
     if attached {
         Ok(())
     } else {
         Err(ApiError::exception(format!(
-            "UI channel {channel} is not attached"
+            "UI not attached to channel: {channel}"
         )))
     }
 }
@@ -301,7 +293,9 @@ fn ui_extra_mut<R>(
     operation: impl FnOnce(&mut UiExtra) -> R,
 ) -> Result<R, ApiError> {
     require_ui(session, channel)?;
-    Ok(UI_EXTRA.with(|extra| operation(extra.borrow_mut().entry(channel).or_default())))
+    Ok(session.with_state_mut(|state| {
+        operation(state.ui_extra.entry(channel).or_default())
+    }))
 }
 
 /// `api_err_exp` shape (`api/private/validate.c:41-58`): a name without a
@@ -645,43 +639,19 @@ pub fn nvim_ui_term_event(
 /// Sends arbitrary data to a UI (`api/ui.c:1102-1106`). Upstream emits a
 /// `ui_send` event to every attached UI with the `stdout_tty` option set
 /// (`remote_ui_ui_send`, `api/ui.c:979-988`).
-///
-/// The `ui_send` frame is a redraw notification, and the only transport that
-/// delivers redraw output to a client is the server's per-request `writes`
-/// queue — not reachable from this layer. Writing the packed frame through
-/// `channel_sink` would instead be drained by `nvim_chan_send` into a terminal
-/// buffer, corrupting it while reaching no UI. So the target set is computed
-/// faithfully (every attached UI that opted into `stdout_tty`) and the call
-/// succeeds; actual `ui_send` delivery is deferred to server-owned redraw
-/// plumbing.
+/// The `ui_send` frame is a redraw notification that must reach the
+/// server-owned per-request `writes` queue (`oxvim/src/server.rs`). This
+/// layer cannot begin/flush a `UiChannel` redraw batch and enqueue the
+/// resulting bytes for the correct channel, so the payload is currently
+/// dropped. Returning success preserves the documented API-level-15
+/// contract; the call cannot fail.
 #[expect(
-    clippy::needless_pass_by_value,
     clippy::unnecessary_wraps,
-    reason = "the RPC ABI deserializes the payload as an owned String and requires a `Result` return"
+    reason = "the generated API dispatcher requires a `Result` return even when this handler cannot fail"
 )]
 #[api(since = 14)]
 pub fn nvim_ui_send(session: &ApiSession, content: OxStr) -> Result<(), ApiError> {
-    let _ = content;
-    // Compute the `stdout_tty` target set exactly as `remote_ui_ui_send`
-    // selects it; delivery is deferred (see the doc comment).
-    let _targets: Vec<u64> = session
-        .with_state(|state| {
-            state
-                .ui_channels
-                .iter()
-                .map(|(channel, _)| *channel)
-                .collect::<Vec<_>>()
-        })
-        .into_iter()
-        .filter(|channel| {
-            UI_EXTRA.with(|extra| {
-                extra
-                    .borrow()
-                    .get(channel)
-                    .is_some_and(|state| state.stdout_tty)
-            })
-        })
-        .collect();
+    let _ = (session, content);
     Ok(())
 }
 
@@ -3320,6 +3290,87 @@ mod tests {
 
     #[expect(
         clippy::unwrap_used,
+        reason = "asserts UI metadata and popup geometry stay isolated per session"
+    )]
+    #[test]
+    fn ui_state_isolated_between_sessions_with_same_channel() {
+        let first = attached_session(&[
+            ("rgb", Object::Boolean(false)),
+            ("term_name", Object::String(OxStr::from("first-terminal"))),
+            ("term_colors", Object::Integer(16)),
+            ("stdin_tty", Object::Boolean(true)),
+            ("stdout_tty", Object::Boolean(true)),
+            ("ext_popupmenu", Object::Boolean(true)),
+        ]);
+        let second = attached_session(&[
+            ("rgb", Object::Boolean(true)),
+            ("term_name", Object::String(OxStr::from("second-terminal"))),
+            ("term_colors", Object::Integer(256)),
+            ("stdin_tty", Object::Boolean(false)),
+            ("stdout_tty", Object::Boolean(false)),
+            ("ext_popupmenu", Object::Boolean(true)),
+        ]);
+
+        nvim_ui_pum_set_height(&first, 5).unwrap();
+        nvim_ui_pum_set_bounds(&first, 10.0, 4.0, 1.0, 2.0).unwrap();
+        nvim_ui_pum_set_height(&second, 9).unwrap();
+        nvim_ui_pum_set_bounds(&second, 20.0, 8.0, 3.0, 4.0).unwrap();
+
+        let first_uis = nvim_list_uis(&first).unwrap();
+        let second_uis = nvim_list_uis(&second).unwrap();
+        assert_eq!(first_uis.len(), 1);
+        assert_eq!(second_uis.len(), 1);
+
+        let ui_settings = |ui: &Dict| {
+            (
+                ui.get(&OxStr::from("rgb")).cloned(),
+                ui.get(&OxStr::from("term_name")).cloned(),
+                ui.get(&OxStr::from("term_colors")).cloned(),
+                ui.get(&OxStr::from("stdin_tty")).cloned(),
+                ui.get(&OxStr::from("stdout_tty")).cloned(),
+            )
+        };
+        assert_eq!(
+            ui_settings(&first_uis[0]),
+            (
+                Some(Object::Boolean(false)),
+                Some(Object::String(OxStr::from("first-terminal"))),
+                Some(Object::Integer(16)),
+                Some(Object::Boolean(true)),
+                Some(Object::Boolean(true)),
+            )
+        );
+        assert_eq!(
+            ui_settings(&second_uis[0]),
+            (
+                Some(Object::Boolean(true)),
+                Some(Object::String(OxStr::from("second-terminal"))),
+                Some(Object::Integer(256)),
+                Some(Object::Boolean(false)),
+                Some(Object::Boolean(false)),
+            )
+        );
+
+        let popup_state = |session: &ApiSession| {
+            session.with_state(|state| {
+                state
+                    .ui_extra
+                    .get(&CHANNEL_ID)
+                    .map(|extra| (extra.pum_nlines, extra.pum_bounds))
+            })
+        };
+        assert_eq!(
+            popup_state(&first),
+            Some((5, Some((10.0, 4.0, 1.0, 2.0))))
+        );
+        assert_eq!(
+            popup_state(&second),
+            Some((9, Some((20.0, 8.0, 3.0, 4.0))))
+        );
+    }
+
+    #[expect(
+        clippy::unwrap_used,
         reason = "asserts the deprecated wrappers drive attach/detach/resize"
     )]
     #[test]
@@ -3343,6 +3394,7 @@ mod tests {
         let session = attached_session(&[]);
         nvim_ui_detach(&session).unwrap();
         for result in [
+            nvim_ui_try_resize(&session, 80, 24).map(|()| Object::Nil),
             nvim_ui_set_focus(&session, true).map(|()| Object::Nil),
             nvim_ui_set_option(&session, OxStr::from("rgb"), Object::Boolean(true))
                 .map(|()| Object::Nil),
@@ -3353,7 +3405,7 @@ mod tests {
             assert_eq!(
                 result,
                 Err(ApiError::exception(
-                    "UI channel 1 is not attached".to_string()
+                    "UI not attached to channel: 1".to_string()
                 ))
             );
         }
@@ -3495,17 +3547,13 @@ mod tests {
         nvim_ui_term_event(&session, OxStr::from("other"), Object::Nil).unwrap();
     }
 
-    #[expect(
-        clippy::unwrap_used,
-        reason = "asserts ui_send succeeds for attached stdout_tty UIs"
-    )]
     #[test]
-    fn ui_send_targets_stdout_tty_uis() {
+    fn ui_send_preserves_success_contract() {
         let session = attached_session(&[("stdout_tty", Object::Boolean(true))]);
-        nvim_ui_send(&session, OxStr::from("\x1b]52;c;AAAA")).unwrap();
-        // Without stdout_tty the call still succeeds (no targets).
-        let session = attached_session(&[]);
-        nvim_ui_send(&session, OxStr::from("x")).unwrap();
+        assert_eq!(
+            nvim_ui_send(&session, OxStr::from("\x1b]52;c;AAAA")),
+            Ok(())
+        );
     }
 
     /// Every task-W2 name resolves in the registry and dispatches through the

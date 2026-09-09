@@ -17,9 +17,11 @@ use super::position::number_value;
 use crate::options::{OptionScope, OptionValue};
 use crate::{Editor, LineReplaceRequest};
 
+use crate::autocmd::Event;
 use crate::excmd_exec::{
-    CurrentBuffer, EvalHost, object_to_typval, option_to_typval, resolve_buffer_argument,
-    typval_number, typval_to_object, typval_to_option, typval_to_text,
+    CurrentBuffer, EvalHost, Flow, fire_buffer_lifecycle, flow_to_eval_error, object_to_typval,
+    option_to_typval, path_from_ox_str, resolve_buffer_argument, typval_number, typval_to_object,
+    typval_to_option, typval_to_text,
 };
 
 /// Routes one buffer-state builtin.
@@ -79,11 +81,7 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "bufexists" => host
             .access
             .with_ex_editor(|editor| call_bufexists_builtin(editor, args)),
-        "bufload" => {
-            let io = host.runtime.scripts.io();
-            host.access
-                .with_ex_editor(|editor| call_bufload_builtin(editor, io, args))
-        }
+        "bufload" => call_bufload_with_events(host, scope, args),
         "getbufline" => host
             .access
             .with_ex_editor(|editor| call_getbufline_builtin(editor, args)),
@@ -356,9 +354,15 @@ fn add_unloaded_buffer(editor: &mut Editor, name: &OxStr) -> ox_eval::Result<Buf
 /// for `nofile`/`quickfix`/`prompt`/`terminal` special types it loads an
 /// empty buffer instead (`bt_nofileread`, `buffer.c:4071-4077`).  The current
 /// buffer and window are never changed.
-fn call_bufload_builtin<F: FileIO>(
-    editor: &mut Editor,
-    io: &F,
+///
+/// A file-backed load fires `BufReadPre` before the read and `BufReadPost`
+/// after it, the way `open_buffer`'s `readfile` does; a name whose file
+/// does not exist fires `BufNewFile` instead. Resolution and the text
+/// install each hold one short borrow; the events fire between borrows
+/// because listeners reenter the editor.
+fn call_bufload_with_events<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    scope: &mut Scope,
     args: &[Typval],
 ) -> ox_eval::Result<Typval> {
     if args.len() != 1 {
@@ -369,43 +373,93 @@ fn call_bufload_builtin<F: FileIO>(
         };
         return Err(EvalError::new(code, 0, message));
     }
-    let argument = args.first();
-    let buffer = resolve_buffer_argument(editor, argument).ok_or_else(|| {
-        let name = argument.map_or_else(String::new, typval_to_text);
-        EvalError::new("E158", 0, format!("Invalid buffer name: {name}"))
-    })?;
-    let (loaded, name) = {
+    let (buffer, name, buftype, loaded) = host.access.with_ex_editor(|editor| {
+        let argument = args.first();
+        let buffer = resolve_buffer_argument(editor, argument).ok_or_else(|| {
+            let name = argument.map_or_else(String::new, typval_to_text);
+            EvalError::new("E158", 0, format!("Invalid buffer name: {name}"))
+        })?;
         let state = editor
             .buffer(buffer)
             .map_err(|error| EvalError::new("E86", 0, error.to_string()))?;
-        (state.residency.is_loaded(), state.name().clone())
-    };
+        let loaded = state.residency.is_loaded();
+        let name = state.name().clone();
+        let buftype = match editor.options().get_buffer(buffer, "buftype") {
+            Ok(OptionValue::String(value)) => value.clone(),
+            Ok(_) | Err(_) => String::new(),
+        };
+        Ok((buffer, name, buftype, loaded))
+    })?;
     if loaded {
         return Ok(Typval::Number(0));
     }
-    let buftype = match editor.options().get_buffer(buffer, "buftype") {
-        Ok(OptionValue::String(value)) => value.clone(),
-        Ok(_) | Err(_) => String::new(),
-    };
-    let text = if name.as_bytes().is_empty() || is_nofileread(&buftype) {
-        Buffer::new()
+    // Upstream `readfile` probes the file with a real open before choosing
+    // the event family (`fileio.c:428-516`): a file that opens reads
+    // between `BufReadPre` and `BufReadPost`; a missing one fires
+    // `BufNewFile` instead; a present but unreadable or non-regular name —
+    // like every `buftype` that never reads — loads without an event. The
+    // probe is a read because the seam has no bare open.
+    let path = if name.as_bytes().is_empty() || is_nofileread(&buftype) {
+        None
     } else {
-        let path = std::path::PathBuf::from(name.to_string_lossy().as_ref());
-        match io.read_to_string(&path) {
-            Ok(content) => Buffer::from_bytes(content.as_bytes())
-                .map_err(|error| EvalError::new("E474", 0, error.to_string()))?,
-            Err(_) => Buffer::new(),
-        }
+        Some(path_from_ox_str(&name))
     };
-    let state = editor
-        .buffer_mut(buffer)
-        .map_err(|error| EvalError::new("E86", 0, error.to_string()))?;
-    state.load(text);
-    state.mark_saved();
-    state.flags.set(crate::BufferFlags::NOTEDITED, false);
+    let probe = path
+        .as_deref()
+        .map(|path| host.runtime.scripts.io().read_to_string(path));
+    let (existing, new_file) = match &probe {
+        Some(Ok(_)) => (true, false),
+        Some(Err(error)) => (false, error.kind() == std::io::ErrorKind::NotFound),
+        _ => (false, false),
+    };
+    if existing {
+        let flow = fire_buffer_lifecycle(
+            host.runtime,
+            host.access,
+            scope,
+            host.lua,
+            &[Event::BufReadPre],
+            buffer,
+        );
+        if !matches!(flow, Flow::Normal) {
+            return Err(flow_to_eval_error(flow, "bufload"));
+        }
+    }
+    // The content read still happens after `BufReadPre` — upstream closes
+    // and reopens around the pre autocmds so a handler can change the file
+    // first; a read that fails after the probe leaves the buffer empty and
+    // fires no post event (upstream's E200 exit).
+    let content = match (existing, path.as_deref()) {
+        (true, Some(path)) => host.runtime.scripts.io().read_to_string(path).ok(),
+        _ => None,
+    };
+    host.access.with_ex_editor(|editor| {
+        let text = match &content {
+            Some(content) => Buffer::from_bytes(content.as_bytes())
+                .map_err(|error| EvalError::new("E474", 0, error.to_string()))?,
+            None => Buffer::new(),
+        };
+        let state = editor
+            .buffer_mut(buffer)
+            .map_err(|error| EvalError::new("E86", 0, error.to_string()))?;
+        state.load(text);
+        state.mark_saved();
+        state.flags.set(crate::BufferFlags::NOTEDITED, false);
+        Ok(())
+    })?;
+    let post = content
+        .is_some()
+        .then_some(Event::BufReadPost)
+        .or(new_file.then_some(Event::BufNewFile));
+    if let Some(event) = post {
+        let flow =
+            fire_buffer_lifecycle(host.runtime, host.access, scope, host.lua, &[event], buffer);
+        if !matches!(flow, Flow::Normal) {
+            return Err(flow_to_eval_error(flow, "bufload"));
+        }
+    }
     Ok(Typval::Number(0))
 }
-
 /// Whether this `buftype` value means `bufload()` should not read a file.
 /// Mirrors upstream `bt_nofileread` (`buffer.c:4071-4077`).
 fn is_nofileread(buftype: &str) -> bool {
@@ -1158,3 +1212,7 @@ fn current_line_address(editor: &mut Editor, value: &Typval) -> ox_eval::Result<
     };
     Ok(usize::try_from(line.max(0)).unwrap_or(usize::MAX))
 }
+
+#[cfg(test)]
+#[cfg_attr(test, path = "buffer_lifecycle_tests.rs")]
+mod buffer_lifecycle_tests;

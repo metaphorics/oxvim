@@ -2,9 +2,9 @@ use std::collections::HashSet;
 
 use crate::{
     AddressBase, COMMANDS, CmdlineContext, CmdlineSpecial, CommandFlags, ErrorCode, ExpansionPart,
-    ModifierKind, Parser, RangeKind, RangeSeparator, ResolvedCommand, UserCommandInfo,
-    UserCommandMatch, UserCommandProvider, command_spec, expand_with, resolve_command,
-    scan_expansions,
+    ModifierKind, Parser, PreviewMagic, RangeKind, RangeSeparator, ResolvedCommand,
+    UserCommandInfo, UserCommandMatch, UserCommandProvider, command_spec, expand_with,
+    parse_preview_pattern, resolve_command, scan_expansions,
 };
 
 fn parse_one(input: &str) -> crate::ExCommand {
@@ -1255,4 +1255,66 @@ fn unknown_command_error_offset_is_byte_accurate() -> Result<(), String> {
     };
     assert_eq!(error.offset, 3);
     Ok(())
+}
+
+/// Unwraps a preview parse for the table test: `unwrap_used` is
+/// denied workspace-wide, so the failure carries its input instead.
+#[allow(clippy::panic, reason = "test helper fails with the input attached")]
+fn must_preview(input: &str) -> crate::PreviewPattern {
+    match parse_preview_pattern(input) {
+        Some(parsed) => parsed,
+        None => panic!("{input:?} should preview"),
+    }
+}
+
+/// `parse_preview_pattern` classification contract
+/// (`parse_pattern_and_range`, `ex_getln.c:276-398`): every whitelisted
+/// family resolves its magic, range default, and pattern, and anything
+/// else previews nothing.
+#[test]
+fn preview_pattern_classifies_families() {
+    let parsed = must_preview("s/foo/");
+    assert_eq!(parsed.magic, PreviewMagic::Default);
+    assert!(parsed.range.is_none());
+    assert!(parsed.default_current_line);
+    assert_eq!(parsed.delimiter, '/');
+    assert_eq!(parsed.pattern, "foo");
+    assert!(!parsed.use_last_pattern);
+
+    let parsed = must_preview("s//");
+    assert!(parsed.use_last_pattern);
+    assert!(parsed.pattern.is_empty());
+
+    let parsed = must_preview("sm/foo/");
+    assert_eq!(parsed.magic, PreviewMagic::ForceMagic);
+    let parsed = must_preview("snom/foo/");
+    assert_eq!(parsed.magic, PreviewMagic::ForceNomagic);
+
+    let parsed = must_preview("%s/foo/");
+    assert!(parsed.range.is_some());
+    let parsed = must_preview("1,3g/x/");
+    assert!(parsed.range.is_some());
+
+    let parsed = must_preview("sort n /foo/");
+    assert_eq!(parsed.magic, PreviewMagic::Default);
+    assert!(!parsed.default_current_line);
+    assert_eq!(parsed.pattern, "foo");
+    let parsed = must_preview("uniq /x/");
+    assert_eq!(parsed.pattern, "x");
+
+    let parsed = must_preview("g/foo/");
+    assert_eq!(parsed.pattern, "foo");
+    let parsed = must_preview("v/bar/");
+    assert_eq!(parsed.pattern, "bar");
+    let parsed = must_preview("g//");
+    assert!(parsed.use_last_pattern);
+    let parsed = must_preview("vimgrep foo");
+    assert_eq!(parsed.pattern, "foo");
+
+    for bare in ["s", "sort", "g", "echo foo", "w", "edit foo"] {
+        assert!(
+            parse_preview_pattern(bare).is_none(),
+            "{bare:?} previews nothing"
+        );
+    }
 }

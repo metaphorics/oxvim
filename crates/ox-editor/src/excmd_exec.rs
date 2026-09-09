@@ -4,10 +4,10 @@
 //! script and function frames, exception transfer, user commands, and the
 //! narrow host adapters needed by `ox-eval` and `ox-regex`.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
 use ox_eval::scope::{OptionScope as EvalOptionScope, ScopeMap};
@@ -41,6 +41,7 @@ use crate::decoration::{CallbackPhase, RedrawEntry};
 use crate::extmark::{
     ExtmarkAttributes, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, NamespaceId, SignGroup,
 };
+use crate::editor::is_nofileread;
 use crate::fold::{FoldMethod, Position as FoldPosition};
 use crate::fs_builtins::split_path_list;
 use crate::lvalue::{
@@ -227,14 +228,14 @@ pub trait LuaExec {
     /// # Errors
     ///
     /// Returns the host's load, runtime, or value-conversion failure.
-    fn execute_chunk(&mut self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError>;
+    fn execute_chunk(&self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError>;
 
     /// Load and execute one Lua file.
     ///
     /// # Errors
     ///
     /// Returns the host's load, runtime, or value-conversion failure.
-    fn execute_file(&mut self, path: &Path) -> Result<(), LuaExecError>;
+    fn execute_file(&self, path: &Path) -> Result<(), LuaExecError>;
 
     /// Evaluate one Lua expression with `_A` bound to `arg` (`luaeval()`).
     ///
@@ -246,8 +247,7 @@ pub trait LuaExec {
     /// Hosts wrap the expression exactly like upstream `nlua_call_luaeval`
     /// (`local _A=select(1,...) return (<expr>)`) and convert the argument
     /// and result with typval semantics.
-    fn eval_expression(
-        &mut self,
+    fn eval_expression(&self,
         _expression: &str,
         _arg: Option<&Typval>,
     ) -> Result<Typval, LuaExecError> {
@@ -261,8 +261,7 @@ pub trait LuaExec {
     /// # Errors
     ///
     /// Returns the host's runtime or value-conversion failure.
-    fn invoke_callback(
-        &mut self,
+    fn invoke_callback(&self,
         _reference: usize,
         _args: Vec<Object>,
     ) -> Result<Object, LuaExecError> {
@@ -276,7 +275,7 @@ pub trait LuaExec {
     /// # Errors
     ///
     /// Returns the host's runtime failure.
-    fn free_callback(&mut self, _reference: usize) -> Result<(), LuaExecError> {
+    fn free_callback(&self, _reference: usize) -> Result<(), LuaExecError> {
         Err(LuaExecError::Runtime(
             "Lua callbacks are not installed".to_owned(),
         ))
@@ -293,12 +292,20 @@ pub trait LuaExec {
     /// # Errors
     ///
     /// Returns the host's runtime failure while servicing the turn.
-    fn run_event_turn(&mut self) -> Result<(), LuaExecError> {
+    fn run_event_turn(&self) -> Result<(), LuaExecError> {
         Ok(())
     }
 
+    /// Returns whether the host is currently executing user Lua.
+    ///
+    /// Event-turn and provider callers use this explicit state instead of
+    /// inferring it from an implementation's ownership mechanism.
+    fn in_user_code(&self) -> bool {
+        false
+    }
+
     /// Consumes a result whose caller does not retain it.
-    fn discard_result(&mut self, _result: Object) {}
+    fn discard_result(&self, _result: Object) {}
 }
 
 /// Accessor seam for Ex execution against a borrowed editor.
@@ -660,15 +667,26 @@ const fn reports_command_line(code: &str) -> bool {
 
 /// Values bound to `<amatch>`, `<afile>`, and `<abuf>` while one autocmd action
 /// runs. Empty/`None` outside an active event.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct ActiveAutocmdContext {
-    pub(crate) matched: String,
-    pub(crate) file: String,
+    pub(crate) matched: OxStr,
+    pub(crate) file: OxStr,
     pub(crate) buffer: Option<BufHandle>,
     /// Upstream `autocmd_nested` (`autocmd.c:1996`): whether the running
     /// handler was defined `++nested`, so events raised while it runs may
     /// execute immediately. `false` outside an active event.
     pub(crate) nested: bool,
+}
+
+impl Default for ActiveAutocmdContext {
+    fn default() -> Self {
+        Self {
+            matched: OxStr(Vec::new()),
+            file: OxStr(Vec::new()),
+            buffer: None,
+            nested: false,
+        }
+    }
 }
 
 /// One entry of a frame's `fc_defer` list: an explicit `defer()` call or
@@ -680,10 +698,6 @@ pub(crate) enum DeferredOp {
     Delete(PathBuf, crate::fs_builtins::DeleteMode),
 }
 
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "the runtime mirrors upstream interpreter globals one-to-one"
-)]
 pub(crate) struct ExRuntime<F: FileIO> {
     pub(crate) scripts: ScriptCtx<F>,
     pub(crate) functions: UserFunctions,
@@ -705,7 +719,9 @@ pub(crate) struct ExRuntime<F: FileIO> {
     /// (`ex_docmd.c:7860-7884`): unset, enabled, or explicitly disabled.
     pub(crate) filetype: FiletypeState,
     /// `getout` (`main.c`:753) has begun, so `VimLeavePre`/`VimLeave` are done.
-    pub(crate) exiting: bool,
+    /// Shared across executors: a nested `:qall` that already fired the
+    /// exit events must suppress the primary's second firing.
+    pub(crate) exiting: Rc<RefCell<bool>>,
     /// `do_one_cmd`'s view of the command it is running, which
     /// `do_errthrow`'s `cmdname` argument (`ex_docmd.c:2385-2387`) and
     /// `append_command` (`ex_docmd.c:2993`) both read.
@@ -753,6 +769,13 @@ pub(crate) struct ExRuntime<F: FileIO> {
     pub(crate) pending_edit_mode: Option<PendingEditMode>,
     /// Whether an uncaught error was displayed during this execution.
     pub(crate) did_emsg: bool,
+    /// A `BufWriteCmd`-owned write left the buffer modified while
+    /// overwriting its own file: upstream's bare `FAIL`
+    /// (`bufwrite.c:469-473`) shows no message and the `|` chain
+    /// continues, but the write did not persist, so `:wq`/`:xit` and
+    /// `:wnext`/`:wprevious` must not advance. Set by `command_write`,
+    /// read by its gating callers; reset on every `:write` entry.
+    pub(crate) write_silent_fail: bool,
     /// The host's live mode machine, installed so `:normal` feeds keys into the
     /// real mode state instead of a throwaway copy. `None` in unit tests that
     /// do not install one; those fall back to a temporary machine.
@@ -760,15 +783,18 @@ pub(crate) struct ExRuntime<F: FileIO> {
     /// Per-buffer swapfile names chosen this session (`mf_fname`): computed
     /// on first use and pinned, so `:swapname`, `swapname()`, `:preserve`,
     /// and exit handling all agree which file carries the buffer's changes.
-    pub(crate) swap_names: HashMap<BufHandle, PathBuf>,
+    /// Shared across the session's executors (primary, nested, forks), so
+    /// a swapfile written reentrantly is cleaned up exactly once.
+    pub(crate) swap_names: Rc<RefCell<HashMap<BufHandle, PathBuf>>>,
     /// Swapfiles written by `:preserve` or the exit sequence
     /// (`mf_set_names`): `ml_close_all(true)` on the normal `getout` path
     /// removes exactly these (`os_exit`, main.c:738), while `preserve_exit`
-    /// leaves them on disk.
-    pub(crate) swap_written: BTreeSet<PathBuf>,
+    /// leaves them on disk. Shared like `swap_names`.
+    pub(crate) swap_written: Rc<RefCell<BTreeSet<PathBuf>>>,
     /// `preserve_exit` (main.c:888): the abnormal-termination path, where
-    /// swapfiles are written and kept instead of removed.
-    pub(crate) preserve_exit: bool,
+    /// swapfiles are written and kept instead of removed. Shared like
+    /// `swap_names`.
+    pub(crate) preserve_exit: Rc<RefCell<bool>>,
     /// Upstream `trylevel` (`ex_eval.c`): nonzero while a `:try` block is
     /// active. When zero, errors display but do not abort script execution
     /// (`cause_errthrow` returns false, `should_abort` returns false). When
@@ -790,22 +816,23 @@ impl<F: FileIO> ExRuntime<F> {
             terminal_exit_message: true,
             redirection: None,
             filetype: FiletypeState::default(),
-            exiting: false,
+            exiting: Rc::new(RefCell::new(false)),
             executing: ExecutingCommand::default(),
             active_autocmd: ActiveAutocmdContext::default(),
             autocmd_busy: 0,
+            did_emsg: false,
+            write_silent_fail: false,
             filetype_autocmd_depth: 0,
             deferred_ops: Vec::new(),
             prev_bang_command: None,
             preview_tag: None,
             closures: ClosureRegistry::new(),
             pending_edit_mode: None,
-            did_emsg: false,
             try_depth: 0,
             mode_machine: None,
-            swap_names: HashMap::new(),
-            swap_written: BTreeSet::new(),
-            preserve_exit: false,
+            swap_names: Rc::new(RefCell::new(HashMap::new())),
+            swap_written: Rc::new(RefCell::new(BTreeSet::new())),
+            preserve_exit: Rc::new(RefCell::new(false)),
         }
     }
 
@@ -901,8 +928,13 @@ impl<F: FileIO> ExRuntime<F> {
 pub struct ExExecutor<F: FileIO = RealFileIO> {
     runtime: ExRuntime<F>,
     scope: Scope,
-    lua: Option<Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<Rc<dyn LuaExec>>,
     last_quit: Option<i64>,
+    /// Process-level quit bus shared with forked executors: `finish_quit`
+    /// records here as well as in `last_quit`, so a `:qall` inside a
+    /// doubly-nested autocmd is drained by the host's absorb pass even
+    /// though the forked executor itself is unreachable afterward.
+    quit_bus: Rc<RefCell<Option<i64>>>,
 }
 
 impl ExExecutor<RealFileIO> {
@@ -972,7 +1004,7 @@ pub(crate) fn drain_typeahead<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     machine: &Rc<RefCell<ModeMachine>>,
 ) -> Flow {
     while !access.with_ex_editor(|editor| editor.typeahead().is_empty()) {
@@ -1040,14 +1072,20 @@ pub(crate) fn drain_typeahead<F: FileIO, E: ExEditorAccess>(
 }
 
 /// Runs the mapping right-hand sides [`ModeMachine::check`] cannot.
-fn run_mapping_action<F: FileIO, E: ExEditorAccess>(
+pub(crate) fn run_mapping_action<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     action: MappingAction,
     options: &MappingOptions,
 ) -> Flow {
+    // Same entry discipline as every other user-code boundary (see
+    // `run_autocmd_plan`): a mapping right-hand side may reenter through
+    // another executor, so scope dirt flushes before it runs.
+    if let Err(error) = access.with_ex_editor(|editor| sync_scope_into_editor(editor, scope)) {
+        return exec_error_flow(runtime, error);
+    }
     match action {
         MappingAction::ExCommands { commands, .. } => {
             let program = program_from_commands(&commands, runtime.scripts.current_line().max(1));
@@ -1082,7 +1120,7 @@ fn run_mapping_action<F: FileIO, E: ExEditorAccess>(
             let Ok(reference) = usize::try_from(id) else {
                 return Flow::NotImplemented(format!("mapping callback {id}"));
             };
-            match lua.borrow_mut().invoke_callback(reference, Vec::new()) {
+            match lua.invoke_callback(reference, Vec::new()) {
                 Ok(_) => Flow::Normal,
                 Err(error) => lua_error_flow(runtime, error, "E5107", "E5108"),
             }
@@ -1114,17 +1152,35 @@ impl<F: FileIO> ExExecutor<F> {
             scope: Scope::new(),
             lua: None,
             last_quit: None,
+            quit_bus: Rc::new(RefCell::new(None)),
         }
     }
 
+    /// Shares the process-level quit bus with `other`, so quits recorded
+    /// by a forked executor reach the host absorb pass. Call on every
+    /// executor of a session pair, and inherit it in forks.
+    pub fn share_quit_bus_from<G: FileIO>(&mut self, other: &ExExecutor<G>) {
+        self.quit_bus = Rc::clone(&other.quit_bus);
+    }
+
+    /// Shares the session-level swap ledger and exit flag with `other`,
+    /// so reentrant and forked executors preserve into one ledger, clean
+    /// up once, and fire the exit events exactly once per process.
+    pub fn share_session_from<G: FileIO>(&mut self, other: &ExExecutor<G>) {
+        self.runtime.swap_names = Rc::clone(&other.runtime.swap_names);
+        self.runtime.swap_written = Rc::clone(&other.runtime.swap_written);
+        self.runtime.preserve_exit = Rc::clone(&other.runtime.preserve_exit);
+        self.runtime.exiting = Rc::clone(&other.runtime.exiting);
+    }
+
     /// Installs the Lua host used by `:lua`, `:luafile`, and `:luado`.
-    pub fn set_lua_exec(&mut self, lua: Rc<RefCell<dyn LuaExec>>) {
+    pub fn set_lua_exec(&mut self, lua: Rc<dyn LuaExec>) {
         self.lua = Some(lua);
     }
 
     /// Returns a clone of the Lua callback host, if one is installed.
     #[must_use]
-    pub fn lua_host(&self) -> Option<Rc<RefCell<dyn LuaExec>>> {
+    pub fn lua_host(&self) -> Option<Rc<dyn LuaExec>> {
         self.lua.clone()
     }
 
@@ -1136,8 +1192,12 @@ impl<F: FileIO> ExExecutor<F> {
         }
     }
 
-    /// Requeues deferred job events onto the installed job manager.
+    /// Requeues deferred job events, installing a job manager when none
+    /// exists so a synthetic or early defer cannot silently drop events.
     pub fn defer_job_events(&mut self, events: Vec<JobEvent>) {
+        if self.runtime.jobs.is_none() {
+            self.runtime.jobs = JobManager::new().ok();
+        }
         if let Some(manager) = self.runtime.jobs.as_mut() {
             manager.defer_events(events);
         }
@@ -1198,6 +1258,12 @@ impl<F: FileIO> ExExecutor<F> {
     /// Process exit requested since the last poll (`:cquit` / `:qall`).
     pub fn take_quit(&mut self) -> Option<i64> {
         self.last_quit.take()
+    }
+
+    /// Process exit recorded by this executor or any executor sharing its
+    /// quit bus, since the last poll.
+    pub fn take_shared_quit(&mut self) -> Option<i64> {
+        self.quit_bus.borrow_mut().take()
     }
     /// Shares one user-command registry with `other`, so a nested executor
     /// sees every definition the primary one carries and vice versa.
@@ -1504,9 +1570,13 @@ impl<F: FileIO> ExExecutor<F> {
         &self.scope
     }
 
-    /// Call any builtin through this executor's persistent runtime, using the
-    /// same dispatch a Vimscript expression gets.
-    ///
+    /// Mutable runtime-plus-scope pair for tests that drive executor
+    /// internals ([`run_autocmd_plan`]) directly: one borrow for both
+    /// disjoint fields (no `execute_*` call leaves dirt behind: they sync).
+    #[cfg(test)]
+    pub(crate) fn runtime_scope_mut(&mut self) -> (&mut ExRuntime<F>, &mut Scope) {
+        (&mut self.runtime, &mut self.scope)
+    }
     /// This is the entry point the Lua `vim.fn`/`vim.call` bridge comes in
     /// through, so it has to answer exactly what Vimscript answers: the
     /// editor-stateful families, user functions, and the regex-backed
@@ -1539,7 +1609,7 @@ impl<F: FileIO> ExExecutor<F> {
             &args,
         );
         self.runtime.try_depth -= 1;
-        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &self.scope))?;
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
         result
     }
 
@@ -1566,7 +1636,7 @@ impl<F: FileIO> ExExecutor<F> {
             expression,
         );
         self.runtime.try_depth -= 1;
-        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &self.scope))?;
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
         match result {
             Ok(value) => Ok(value),
             Err(Flow::Exception(exception)) => Err(ExecError::Vim(exception)),
@@ -1661,7 +1731,7 @@ impl<F: FileIO> ExExecutor<F> {
             program.len(),
         );
         self.finish_quit(access, &flow);
-        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &self.scope))?;
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
         flow_to_result(flow)
     }
 
@@ -1709,7 +1779,7 @@ impl<F: FileIO> ExExecutor<F> {
                 Err(flow) => flow,
             };
             executor.finish_quit(access, &flow);
-            access.with_ex_editor(|editor| sync_scope_into_editor(editor, &executor.scope))?;
+            access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut executor.scope))?;
             flow_to_result(flow)
         })
     }
@@ -1781,7 +1851,7 @@ impl<F: FileIO> ExExecutor<F> {
             program.len(),
         );
         self.finish_quit(access, &flow);
-        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &self.scope))?;
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
         flow_to_result(flow)
     }
 
@@ -1872,7 +1942,7 @@ impl<F: FileIO> ExExecutor<F> {
             }
         }
         self.finish_quit(access, &flow);
-        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &self.scope))?;
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
         flow_to_result(flow)
     }
 
@@ -1940,7 +2010,7 @@ impl<F: FileIO> ExExecutor<F> {
                     );
                     self.finish_quit(access, &flow);
                     access
-                        .with_ex_editor(|editor| sync_scope_into_editor(editor, &self.scope))
+                        .with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))
                         .and_then(|()| flow_to_result(flow))
                 }
                 Err(error) => Err(error),
@@ -1986,6 +2056,7 @@ impl<F: FileIO> ExExecutor<F> {
         }
         if let Flow::Quit(code) = *flow {
             self.last_quit = Some(code);
+            *self.quit_bus.borrow_mut() = Some(code);
         }
         let lua = self.lua.clone();
         fire_exit_autocmds(&mut self.runtime, access, &mut self.scope, lua.as_ref());
@@ -2003,7 +2074,7 @@ impl<F: FileIO> ExExecutor<F> {
         access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
         let lua = self.lua.clone();
         fire_exit_autocmds(&mut self.runtime, access, &mut self.scope, lua.as_ref());
-        if self.runtime.preserve_exit {
+        if *self.runtime.preserve_exit.borrow() {
             // `preserve_exit` (main.c:917-929): `ml_close_notmod` removes
             // the swapfiles of unmodified buffers, `ml_sync_all` flushes the
             // rest, and `ml_close_all(false)` leaves them on disk.
@@ -2014,11 +2085,11 @@ impl<F: FileIO> ExExecutor<F> {
             // `os_exit` -> `ml_close_all(true)` (main.c:738): every swapfile
             // written this session is removed; `os_remove` failures are
             // ignored upstream (memfile.c:178-179).
-            for path in std::mem::take(&mut self.runtime.swap_written) {
+            for path in std::mem::take(&mut *self.runtime.swap_written.borrow_mut()) {
                 let _ = std::fs::remove_file(path);
             }
         }
-        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &self.scope))
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))
     }
 
     /// `preserve_exit` (main.c:888): the abnormal-termination path — a
@@ -2026,7 +2097,7 @@ impl<F: FileIO> ExExecutor<F> {
     /// — where `run_exit_sequence` writes swapfiles and keeps them instead
     /// of removing them (`ml_sync_all` + `ml_close_all(false)`).
     pub fn preserve_exit(&mut self) {
-        self.runtime.preserve_exit = true;
+        *self.runtime.preserve_exit.borrow_mut() = true;
     }
 }
 
@@ -2263,7 +2334,7 @@ pub(crate) fn run_program<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     program: &[Instruction],
     start: usize,
     end: usize,
@@ -2292,7 +2363,7 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     program: &[Instruction],
     start: usize,
     end: usize,
@@ -2512,11 +2583,10 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                     back_edges += 1;
                     if back_edges.is_multiple_of(BREAKCHECK_SKIP)
                         && let Some(lua) = lua
-                        // A re-entrant loop inside a Lua host callback finds
-                        // the host already mutably borrowed; upstream pumps no
-                        // events from inside Lua either, so skip that turn.
-                        && let Ok(mut host) = lua.try_borrow_mut()
-                        && let Err(error) = host.run_event_turn()
+                        // Upstream does not pump events from inside Lua user
+                        // code; hosts expose that state explicitly.
+                        && !lua.in_user_code()
+                        && let Err(error) = lua.run_event_turn()
                     {
                         return lua_error_flow(runtime, error, "E5107", "E5108");
                     }
@@ -2836,7 +2906,7 @@ fn run_deferred_line<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     instruction: &Instruction,
 ) -> Flow {
     let mut program: Vec<Instruction> = Vec::new();
@@ -2901,6 +2971,45 @@ fn run_deferred_line<F: FileIO, E: ExEditorAccess>(
     run_program(runtime, access, scope, lua, &program, 0, end)
 }
 
+/// Holds `:noautocmd` suppression for one command: every event is ignored on
+/// creation (upstream sets `eventignore` to all around the command,
+/// `ex_docmd.c:2461`), and the prior ignore set is restored on drop so no
+/// exit path — including early command errors — can leak the suppression.
+struct IgnoreAllGuard<'a, E: ExEditorAccess> {
+    access: &'a E,
+    saved: Vec<Event>,
+}
+
+impl<'a, E: ExEditorAccess> IgnoreAllGuard<'a, E> {
+    fn take(access: &'a E) -> Self {
+        let saved = access.with_ex_editor(|editor| {
+            Event::ALL
+                .iter()
+                .copied()
+                .filter(|event| editor.autocmds().is_ignored(*event))
+                .collect()
+        });
+        access.with_ex_editor(|editor| {
+            for event in Event::ALL {
+                editor.autocmds_mut().ignore(*event);
+            }
+        });
+        Self { access, saved }
+    }
+}
+
+impl<E: ExEditorAccess> Drop for IgnoreAllGuard<'_, E> {
+    fn drop(&mut self) {
+        self.access.with_ex_editor(|editor| {
+            for event in Event::ALL {
+                editor.autocmds_mut().unignore(*event);
+            }
+            for event in &self.saved {
+                editor.autocmds_mut().ignore(*event);
+            }
+        });
+    }
+}
 #[expect(
     clippy::too_many_lines,
     reason = "the Ex dispatcher keeps command routing and address validation in one ordered match"
@@ -2909,9 +3018,17 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
+    // `:noautocmd` suppresses every event for the command (upstream sets
+    // `eventignore` to all). The guard restores on drop, covering early
+    // exits below.
+    let _noautocmd = command
+        .modifiers
+        .iter()
+        .any(|modifier| modifier.kind == ModifierKind::NoAutocmd)
+        .then(|| IgnoreAllGuard::take(access));
     let name = command.command.name();
     if name == "windo"
         && command.range.is_some()
@@ -2965,7 +3082,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
             command_echo(runtime, access, scope, lua, name, &command.args)
         }
         "messages" => access.with_ex_editor(command_messages),
-        "help" => access.with_ex_editor(|editor| command_help(runtime, editor, command)),
+        "help" => command_help(runtime, access, scope, lua, command),
         "eval" => match eval_text(runtime, access, scope, lua, skipwhite_trim(&command.args)) {
             Ok(_) => Flow::Normal,
             Err(flow) => flow,
@@ -3098,7 +3215,13 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         }
         "write" | "wq" | "xit" => {
             let flow = command_write(runtime, access, scope, lua, command);
-            if matches!(flow, Flow::Normal) && matches!(name, "wq" | "xit") {
+            // A handler-owned write that left the buffer modified failed
+            // silently (`write_silent_fail`): stay put like upstream's
+            // `do_write != FAIL` gate instead of closing into E37.
+            if matches!(flow, Flow::Normal)
+                && matches!(name, "wq" | "xit")
+                && !runtime.write_silent_fail
+            {
                 access.with_ex_editor(|editor| command_close(runtime, editor, command, true))
             } else {
                 flow
@@ -3106,9 +3229,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         }
         "split" | "new" => command_split(runtime, access, scope, lua, command, false),
         "vsplit" | "vnew" => command_split(runtime, access, scope, lua, command, true),
-        "tabnew" | "tabedit" => {
-            access.with_ex_editor(|editor| command_tabnew(runtime, editor, command))
-        }
+        "tabnew" | "tabedit" => command_tabnew(runtime, access, scope, lua, command),
         "tabnext" | "tabn" => command_tabnext(runtime, access, scope, lua, command),
         "tabonly" => access.with_ex_editor(|editor| command_tabonly(runtime, editor, command)),
         "tabclose" | "tabc" => {
@@ -3154,35 +3275,45 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "ls" | "buffers" | "files" => {
             access.with_ex_editor(|editor| command_buffer_list(runtime, editor, command))
         }
-        "bwipeout" | "bwipe" => {
-            access.with_ex_editor(|editor| command_buffer_remove(runtime, editor, command, true))
+        "bwipeout" => {
+            command_buffer_remove(runtime, access, scope, lua, command, BufferRemoveKind::Wipe)
         }
-        "bdelete" | "bdel" | "bunload" | "bun" => {
-            access.with_ex_editor(|editor| command_buffer_remove(runtime, editor, command, false))
-        }
-        "args" => access.with_ex_editor(|editor| command_args(runtime, editor, command)),
-        "next" => access.with_ex_editor(|editor| command_next(runtime, editor, command)),
+        "bdelete" => command_buffer_remove(
+            runtime,
+            access,
+            scope,
+            lua,
+            command,
+            BufferRemoveKind::Delete,
+        ),
+        "bunload" => command_buffer_remove(
+            runtime,
+            access,
+            scope,
+            lua,
+            command,
+            BufferRemoveKind::Unload,
+        ),
+        "args" => command_args(runtime, access, scope, lua, command),
+        "next" => command_next(runtime, access, scope, lua, command),
         "first" | "rewind" => {
-            access.with_ex_editor(|editor| command_argument_absolute(runtime, editor, command, 0))
+            command_argument_absolute(runtime, access, scope, lua, command, 0)
         }
-        "last" => access
-            .with_ex_editor(|editor| command_argument_absolute(runtime, editor, command, i64::MAX)),
-        "argument" => access.with_ex_editor(|editor| command_argument(runtime, editor, command)),
-        "previous" | "Next" => {
-            access.with_ex_editor(|editor| command_previous(runtime, editor, command))
-        }
+        "last" => command_argument_absolute(runtime, access, scope, lua, command, i64::MAX),
+        "argument" => command_argument(runtime, access, scope, lua, command),
+        "previous" | "Next" => command_previous(runtime, access, scope, lua, command),
         "wnext" => {
             let flow = command_write(runtime, access, scope, lua, command);
-            if matches!(flow, Flow::Normal) {
-                access.with_ex_editor(|editor| command_next(runtime, editor, command))
+            if matches!(flow, Flow::Normal) && !runtime.write_silent_fail {
+                command_next(runtime, access, scope, lua, command)
             } else {
                 flow
             }
         }
         "wprevious" => {
             let flow = command_write(runtime, access, scope, lua, command);
-            if matches!(flow, Flow::Normal) {
-                access.with_ex_editor(|editor| command_previous(runtime, editor, command))
+            if matches!(flow, Flow::Normal) && !runtime.write_silent_fail {
+                command_previous(runtime, access, scope, lua, command)
             } else {
                 flow
             }
@@ -3222,6 +3353,9 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         }
         "clist" | "llist" => {
             access.with_ex_editor(|editor| command_quickfix_list(runtime, editor, command))
+        }
+        "chistory" | "lhistory" => {
+            access.with_ex_editor(|editor| command_quickfix_history(runtime, editor, command))
         }
         "copen" | "lopen" => {
             access.with_ex_editor(|editor| command_quickfix_open(runtime, editor, command))
@@ -3294,7 +3428,7 @@ pub(crate) fn eval_text<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     text: &str,
 ) -> Result<Typval, Flow> {
     let expression = ExprParser::new(text.as_bytes())
@@ -3325,7 +3459,7 @@ fn call_builtin_dispatch<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     name: &OxStr,
     args: &[Typval],
 ) -> Result<Typval, ExecError> {
@@ -3357,7 +3491,7 @@ fn eval_condition<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     text: &str,
 ) -> Result<bool, Flow> {
     let value = eval_text(runtime, access, scope, lua, text)?;
@@ -3374,7 +3508,7 @@ fn eval_condition<F: FileIO, E: ExEditorAccess>(
 pub(crate) struct EvalHost<'a, F: FileIO, E: ExEditorAccess> {
     pub(crate) runtime: &'a mut ExRuntime<F>,
     pub(crate) access: &'a E,
-    pub(crate) lua: Option<&'a Rc<RefCell<dyn LuaExec>>>,
+    pub(crate) lua: Option<&'a Rc<dyn LuaExec>>,
     pub(crate) builtins: Builtins<'a>,
     pub(crate) submatches: Option<Vec<String>>,
     pub(crate) escaped_exception: Option<VimException>,
@@ -3403,7 +3537,7 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
                 .with_ex_editor(|editor| sync_scope_into_editor(editor, scope))
                 .map_err(|error| EvalError::new("E5108", 0, error.to_string()))?;
             let callback_args: Vec<Object> = args.iter().map(typval_to_object).collect();
-            let result = lua.borrow_mut().invoke_callback(
+            let result = lua.invoke_callback(
                 usize::try_from(reference).unwrap_or(usize::MAX),
                 callback_args,
             );
@@ -3413,7 +3547,7 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
             return match (result, sync) {
                 (Err(error), _) => Err(EvalError::new("E5108", 0, error.to_string())),
                 (Ok(result), Err(error)) => {
-                    lua.borrow_mut().discard_result(result);
+                    lua.discard_result(result);
                     Err(EvalError::new("E5108", 0, error.to_string()))
                 }
                 (Ok(result), Ok(())) => Ok(object_to_typval(&result)),
@@ -3491,7 +3625,6 @@ impl<F: FileIO, E: ExEditorAccess> EvalHost<'_, F, E> {
             .with_ex_editor(|editor| sync_scope_into_editor(editor, scope))
             .map_err(|error| EvalError::new("E5108", 0, error.to_string()))?;
         let result = lua
-            .borrow_mut()
             .execute_chunk("return vim.api[select(1, ...)](select(2, ...))", call);
         let sync = self
             .access
@@ -3499,7 +3632,7 @@ impl<F: FileIO, E: ExEditorAccess> EvalHost<'_, F, E> {
         match (result, sync) {
             (Err(error), _) => Err(EvalError::new("E5108", 0, error.to_string())),
             (Ok(result), Err(error)) => {
-                lua.borrow_mut().discard_result(result);
+                lua.discard_result(result);
                 Err(EvalError::new("E5108", 0, error.to_string()))
             }
             (Ok(result), Ok(())) => Ok(object_to_typval(&result)),
@@ -3530,7 +3663,11 @@ fn command_resize<F: FileIO>(
             Ok((_, end)) => end.max(1),
             Err(message) => return error_flow(runtime, "E16", message),
         };
-        editor.windows().into_iter().nth(target - 1)
+        let windows = editor
+            .current_tabpage()
+            .and_then(|tab| editor.tabpage_windows(tab).ok())
+            .unwrap_or_default();
+        window_by_number(&windows, target)
     } else {
         editor.current_window()
     };
@@ -3690,7 +3827,7 @@ fn command_redraw<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
 ) -> Flow {
     let Some((window, cursor, last)) = access.with_ex_editor(|editor| {
         let window = editor.current_window()?;
@@ -3795,7 +3932,7 @@ fn callback_args_end(tick: u64) -> Vec<Object> {
 pub(crate) fn run_provider_phase<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     phase: CallbackPhase,
     args: &[Object],
 ) -> Flow {
@@ -3807,14 +3944,13 @@ pub(crate) fn run_provider_phase<F: FileIO, E: ExEditorAccess>(
             continue;
         };
         let Some(lua) = lua else { continue };
-        let Ok(mut host) = lua.try_borrow_mut() else {
+        if lua.in_user_code() {
             continue;
-        };
+        }
         let Ok(reference) = usize::try_from(reference) else {
             continue;
         };
-        if let Err(error) = host.invoke_callback(reference, args.to_vec()) {
-            drop(host);
+        if let Err(error) = lua.invoke_callback(reference, args.to_vec()) {
             return lua_error_flow(runtime, error, "E5107", "E5108");
         }
     }
@@ -4135,7 +4271,7 @@ fn call_user_function<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     name: &str,
     args: Vec<Typval>,
     first_line: usize,
@@ -4154,7 +4290,7 @@ pub(crate) fn call_user_function_with_self<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     name: &str,
     mut args: Vec<Typval>,
     first_line: usize,
@@ -4269,7 +4405,7 @@ fn source_path<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     path: &Path,
     load_once: bool,
 ) -> Result<Flow, ExecError> {
@@ -4323,7 +4459,7 @@ fn drain_frame_defers<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     first_line: usize,
     last_line: usize,
 ) -> Option<Flow> {
@@ -4418,7 +4554,7 @@ fn command_let<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     args: &str,
     constant: bool,
 ) -> Flow {
@@ -4676,7 +4812,7 @@ fn command_set<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     args: &str,
     layer: SetLayer,
 ) -> Flow {
@@ -4747,7 +4883,7 @@ fn command_echo<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     name: &str,
     args: &str,
 ) -> Flow {
@@ -4807,9 +4943,11 @@ fn command_messages(editor: &mut Editor) -> Flow {
     Flow::Normal
 }
 
-fn command_help<F: FileIO>(
+fn command_help<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let requested = command.args.trim();
@@ -4859,30 +4997,123 @@ fn command_help<F: FileIO>(
             };
             (path, matched.cmd.clone())
         };
-        let handle = match buffer_from_file(runtime, editor, &path) {
-            Ok((handle, _)) => handle,
-            Err(flow) => return flow,
+        let (handle, origin) =
+            match buffer_from_file(runtime, access, &path) {
+                Ok((handle, origin)) => (handle, origin),
+                Err(flow) => return flow,
+            };
+        let existing_tabs = access.with_ex_editor(|editor| editor.tabpages());
+        let existing_windows = access.with_ex_editor(|editor| editor.windows());
+        let old_tab = access.with_ex_editor(|editor| editor.current_tabpage());
+        let old_window = access.with_ex_editor(|editor| editor.current_window());
+        let destination = Cell::new(None);
+        let loaded = match load_buffer_for_switch(
+            runtime,
+            access,
+            scope,
+            lua,
+            handle,
+            origin,
+            LoadSwitchFocus::Revalidate,
+            |runtime| {
+                access.with_ex_editor(|editor| {
+                    let result = open_tag_buffer(runtime, editor, handle, true, false, None, false);
+                    if let Err(flow) = result {
+                        return Err(LoadSwitchError::Flow(flow));
+                    }
+                    let Some(window) = editor.windows().into_iter().find(|window| {
+                        editor
+                            .window(*window)
+                            .is_ok_and(|state| state.buffer == handle)
+                    }) else {
+                        return Err(LoadSwitchError::Editor(EditorError::UnknownBuffer(handle)));
+                    };
+                    let tab = editor
+                        .window_tabpage(window)
+                        .map_err(LoadSwitchError::Editor)?;
+                    destination.set(Some((
+                        tab,
+                        window,
+                        !existing_tabs.contains(&tab),
+                        !existing_windows.contains(&window),
+                    )));
+                    Ok(())
+                })
+            },
+            || {
+                if let Some((tab, window, new_tab, new_window)) = destination.take() {
+                    let _ = access.with_ex_editor(|editor| {
+                        if new_tab {
+                            editor.close_tabpage(tab).map(|_| ())
+                        } else if new_window {
+                            editor.close_window(tab, window, true).map(|_| ())
+                        } else {
+                            if let Some(old_tab) = old_tab {
+                                let _ = editor.set_current_tabpage(old_tab);
+                            }
+                            if let Some(old_window) = old_window {
+                                let _ = editor.set_current_window(old_window);
+                            }
+                            Ok(())
+                        }
+                    });
+                }
+            },
+        ) {
+            Ok(LoadSwitchOutcome::Resident) => false,
+            Ok(LoadSwitchOutcome::Entered | LoadSwitchOutcome::Abandoned) => true,
+            Err(LoadSwitchError::Flow(flow)) => {
+                if origin.is_created() {
+                    let _ = access.with_ex_editor(|editor| editor.wipe_buffer(handle));
+                }
+                return flow;
+            }
+            Err(LoadSwitchError::Read { path, error }) => {
+                if origin.is_created() {
+                    let _ = access.with_ex_editor(|editor| editor.wipe_buffer(handle));
+                }
+                return error_flow(
+                    runtime,
+                    "E484",
+                    format!("Can't open file {}: {error}", path.display()),
+                );
+            }
+            Err(LoadSwitchError::Editor(error)) => {
+                if origin.is_created() {
+                    let _ = access.with_ex_editor(|editor| editor.wipe_buffer(handle));
+                }
+                return error_flow(runtime, "E948", error.to_string());
+            }
         };
-        let lines = match buffer_lines(editor, handle) {
+        if !loaded
+            && let Err(flow) = access.with_ex_editor(|editor| {
+                open_tag_buffer(runtime, editor, handle, true, false, None, false)
+            })
+        {
+            return flow;
+        }
+        let lines = match access.with_ex_editor(|editor| buffer_lines(editor, handle)) {
             Ok(lines) => lines,
             Err(message) => return error_flow(runtime, "E149", message),
         };
         let target =
             crate::tags::cmd_target_from(&lines, &command, 0).map(|(position, _)| position);
-        if let Err(flow) = open_tag_buffer(runtime, editor, handle, true, false, None, false) {
-            return flow;
-        }
-        let _ = editor.options_mut().set_buffer(
-            handle,
-            "buftype",
-            OptionValue::String("help".to_owned()),
-        );
-        let _ = editor
-            .options_mut()
-            .set_buffer(handle, "modifiable", OptionValue::Boolean(false));
+        let _ = access.with_ex_editor(|editor| {
+            editor.options_mut().set_buffer(
+                handle,
+                "buftype",
+                OptionValue::String("help".to_owned()),
+            )
+        });
+        let _ = access.with_ex_editor(|editor| {
+            editor
+                .options_mut()
+                .set_buffer(handle, "modifiable", OptionValue::Boolean(false))
+        });
         if let Some(target) = target
-            && let Some(window) = editor.current_window()
-            && let Err(error) = editor.set_window_cursor(window, target)
+            && let Some(window) = access.with_ex_editor(|editor| editor.current_window())
+            && let Err(error) =
+                access.with_ex_editor(|editor| editor.set_window_cursor(window, target))
         {
             return error_flow(runtime, "E16", error.to_string());
         }
@@ -5184,7 +5415,7 @@ fn command_defer<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     if !runtime.can_add_defer() {
@@ -5228,7 +5459,7 @@ fn command_call<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let text = skipwhite_trim(&command.args);
@@ -5325,7 +5556,7 @@ fn command_execute<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     args: &str,
 ) -> Flow {
     let expressions = match ExprParser::new(args.as_bytes()).parse_many() {
@@ -5462,7 +5693,7 @@ fn command_normal<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let keys = Keys::from(command.args.trim_start());
@@ -5491,7 +5722,7 @@ fn run_normal_keys<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     keys: &Keys,
     bang: bool,
     range: Option<(usize, usize)>,
@@ -5576,7 +5807,7 @@ fn command_global<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
     invert: bool,
 ) -> Flow {
@@ -5988,15 +6219,49 @@ const DEFAULT_TABPAGE_GEOMETRY: crate::Geometry = crate::Geometry {
     height: 24,
 };
 
-/// Loads `path` into a fresh listed buffer named after it, saved-clean.
+/// Whether a file-opening command staged a new buffer or reused an existing
+/// one. The loader uses this to place creation events after the destination
+/// switch without making each command hand-thread its own event branch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BufferOrigin {
+    Existing,
+    Created,
+}
+
+impl BufferOrigin {
+    const fn is_created(self) -> bool {
+        matches!(self, Self::Created)
+    }
+}
+
+/// Stages `path` in a fresh listed buffer named after it, saved-clean and
+/// unloaded. The shared loader owns creation and read events so every caller
+/// establishes its destination before those events run.
 ///
 /// A missing file is not an error: upstream's `:edit`/`:split`/`:tabedit` open
 /// an empty buffer for a name that does not exist yet. Shared by every command
-/// that opens a file into a new buffer so the read, the name, and the
-/// saved-stateking have one owner.
-/// Returns the buffer's handle and whether this call created it (rather than
-/// reusing the buffer already named for the path).
-fn buffer_from_file<F: FileIO>(
+/// that opens a file into a new buffer so the name and saved-state bookkeeping
+/// have one owner.
+///
+/// Returns the buffer's handle and its creation origin.
+fn buffer_from_file<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    path: &std::path::Path,
+) -> Result<(BufHandle, BufferOrigin), Flow> {
+    let (handle, created) =
+        access.with_ex_editor(|editor| stage_buffer_from_file(runtime, editor, path))?;
+    Ok((
+        handle,
+        if created {
+            BufferOrigin::Created
+        } else {
+            BufferOrigin::Existing
+        },
+    ))
+}
+
+fn stage_buffer_from_file<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     path: &std::path::Path,
@@ -6005,28 +6270,17 @@ fn buffer_from_file<F: FileIO>(
         return Ok((existing, false));
     }
 
-    let text = match runtime.scripts.io().read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error_flow(
-                runtime,
-                "E484",
-                format!("Can't open file {}: {error}", path.display()),
-            ));
-        }
-    };
-    let buffer_text = match Buffer::from_bytes(text.as_bytes()) {
-        Ok(buffer) => buffer,
-        Err(error) => return Err(error_flow(runtime, "E474", error.to_string())),
-    };
-    let handle = match editor.create_buffer_with(buffer_text, true) {
+    let handle = match editor.create_buffer(true) {
         Ok(handle) => handle,
         Err(error) => return Err(error_flow(runtime, "E948", error.to_string())),
     };
-    if let Ok(buffer) = editor.buffer_mut(handle) {
+    let result = editor.buffer_mut(handle).and_then(|buffer| {
         buffer.set_name(OxStr::from(path.to_string_lossy().as_ref()));
         buffer.mark_saved();
+        buffer.unload().map_err(EditorError::from)
+    });
+    if let Err(error) = result {
+        return Err(error_flow(runtime, "E948", error.to_string()));
     }
     Ok((handle, true))
 }
@@ -6063,7 +6317,7 @@ fn command_runtime<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let raw = command.args.trim();
@@ -6155,7 +6409,7 @@ fn command_packadd<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let name = command.args.trim();
@@ -6356,7 +6610,7 @@ fn command_find<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let pattern = command.args.trim();
@@ -6388,7 +6642,7 @@ fn edit_reload_current<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     path: &Path,
 ) -> Flow {
     let Some(buffer) = access.with_ex_editor(|editor| editor.current_buffer()) else {
@@ -6453,7 +6707,7 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     // `ea.arg` is the file name as written: the parser already skipped leading
@@ -6497,26 +6751,65 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
     if reload_current {
         return edit_reload_current(runtime, access, scope, lua, &path);
     }
-    let (handle, created) =
-        match access.with_ex_editor(|editor| buffer_from_file(runtime, editor, &path)) {
-            Ok((handle, created)) => (handle, created),
-            Err(flow) => return flow,
-        };
-    // `buf_alloc` (`buffer.c:2115-2135`) announces a freshly created listed
-    // buffer before any window enters it, so a failing handler aborts the
-    // entry with the caller still on the old buffer.
-    if created {
-        let flow = fire_buffer_lifecycle(
+    let (handle, origin) = match buffer_from_file(runtime, access, &path) {
+        Ok((handle, origin)) => (handle, origin),
+        Err(flow) => return flow,
+    };
+    let unloaded = !access.with_ex_editor(|editor| {
+        editor
+            .buffer(handle)
+            .is_ok_and(|state| state.residency.is_loaded())
+    });
+    let outcome = if unloaded {
+        let old = access.with_ex_editor(|editor| editor.current_buffer());
+        let has_window = access
+            .with_ex_editor(|editor| editor.current_window())
+            .is_some();
+        let created_tab = Cell::new(None);
+        match load_file_buffer_for_command(
             runtime,
             access,
             scope,
             lua,
-            &[Event::BufNew, Event::BufAdd],
             handle,
-        );
-        if !matches!(flow, Flow::Normal) {
-            return flow;
+            origin,
+            |_runtime| {
+                if has_window {
+                    access.with_ex_editor(|editor| {
+                        editor
+                            .set_current_buffer(handle, BufferRelease::KeepLoaded)
+                            .map_err(LoadSwitchError::Editor)
+                    })
+                } else {
+                    access.with_ex_editor(|editor| {
+                        editor
+                            .create_tabpage(handle, DEFAULT_TABPAGE_GEOMETRY)
+                            .map(|tab| {
+                                created_tab.set(Some(tab));
+                            })
+                            .map_err(LoadSwitchError::Editor)
+                    })
+                }
+            },
+            || {
+                if let Some(tab) = created_tab.take() {
+                    let _ = access.with_ex_editor(|editor| editor.close_tabpage(tab));
+                }
+                if let Some(old) = old {
+                    let _ = access.with_ex_editor(|editor| {
+                        editor.set_current_buffer(old, BufferRelease::KeepLoaded)
+                    });
+                }
+            },
+        ) {
+            Ok(outcome) => outcome,
+            Err(flow) => return flow,
         }
+    } else {
+        LoadSwitchOutcome::Resident
+    };
+    if matches!(outcome, LoadSwitchOutcome::Abandoned) {
+        return Flow::Normal;
     }
     if access.with_ex_editor(|editor| editor.current_window().is_none()) {
         match access
@@ -6525,8 +6818,9 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
             Ok(_) => {}
             Err(error) => return error_flow(runtime, "E948", error.to_string()),
         }
-    } else if let Err(error) =
-        access.with_ex_editor(|editor| editor.set_current_buffer(handle, BufferRelease::KeepLoaded))
+    } else if matches!(outcome, LoadSwitchOutcome::Resident)
+        && let Err(error) =
+            access.with_ex_editor(|editor| editor.set_current_buffer(handle, BufferRelease::KeepLoaded))
     {
         return error_flow(runtime, "E948", error.to_string());
     }
@@ -6543,7 +6837,7 @@ fn command_tag<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let preview = command.command.name().starts_with('p') && command.command.name() != "pop";
@@ -6556,7 +6850,7 @@ fn command_tag<F: FileIO, E: ExEditorAccess>(
             return tag_step_to(runtime, access, scope, lua, 1, preview);
         }
         "tlast" | "ptlast" => return tag_step_to(runtime, access, scope, lua, usize::MAX, preview),
-        "pop" => return access.with_ex_editor(|editor| command_pop(runtime, editor, command)),
+        "pop" => return command_pop(runtime, access, scope, lua, command),
         _ => {}
     }
     let needle = command.args.trim();
@@ -6733,7 +7027,7 @@ fn jump_to_tag<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     needle: &str,
     matches: &[crate::tags::TagMatch],
     index: usize,
@@ -6779,12 +7073,12 @@ fn jump_to_tag<F: FileIO, E: ExEditorAccess>(
         index += 1;
     };
 
-    if swap_choice_aborts(runtime, access, scope, lua, &chosen.filename) {
-        return Flow::Normal;
+    if let Some(flow) = swap_choice_aborts(runtime, access, scope, lua, &chosen.filename) {
+        return flow;
     }
 
     let origin_window = access.with_ex_editor(|editor| editor.current_window());
-    let origin = origin_window.and_then(|window| {
+    let tag_origin = origin_window.and_then(|window| {
         access.with_ex_editor(|editor| {
             editor
                 .window(window)
@@ -6792,22 +7086,34 @@ fn jump_to_tag<F: FileIO, E: ExEditorAccess>(
                 .map(|state| (state.buffer, state.cursor, state.coladd))
         })
     });
-    let handle =
-        match access.with_ex_editor(|editor| buffer_from_file(runtime, editor, &chosen.filename)) {
-            Ok((handle, _)) => handle,
-            Err(flow) => return flow,
-        };
-    if let Err(flow) = access.with_ex_editor(|editor| {
-        open_tag_buffer(
-            runtime,
-            editor,
-            handle,
-            options.split,
-            options.preview,
-            options.tab_after,
-            options.forceit,
-        )
-    }) {
+    let (handle, buffer_origin) = match buffer_from_file(runtime, access, &chosen.filename) {
+        Ok((handle, origin)) => (handle, origin),
+        Err(flow) => return flow,
+    };
+    // `buffer_from_file` reuses an existing named buffer, which the user may
+    // have unloaded since. Upstream reaches a tag target through the
+    // load-capable file path, so read it before deciding where it lands.
+    let flow = if buffer_origin.is_created() {
+        prepare_created_tag_buffer(runtime, access, scope, lua, handle, options)
+    } else {
+        prepare_buffer_for_display(runtime, access, scope, lua, handle, buffer_origin)
+    };
+    if !matches!(flow, Flow::Normal) {
+        return flow;
+    }
+    if !buffer_origin.is_created()
+        && let Err(flow) = access.with_ex_editor(|editor| {
+            open_tag_buffer(
+                runtime,
+                editor,
+                handle,
+                options.split,
+                options.preview,
+                options.tab_after,
+                options.forceit,
+            )
+        })
+    {
         return flow;
     }
 
@@ -6861,7 +7167,7 @@ fn jump_to_tag<F: FileIO, E: ExEditorAccess>(
         return error_flow(runtime, "E16", error.to_string());
     }
 
-    let stack_item = origin.map(|(buffer, cursor, coladd)| crate::tags::TagStackItem {
+    let stack_item = tag_origin.map(|(buffer, cursor, coladd)| crate::tags::TagStackItem {
         tagname: chosen.name.clone(),
         from_bufnr: buffer,
         from_lnum: cursor.lnum,
@@ -7163,11 +7469,11 @@ fn swap_choice_aborts<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     path: &std::path::Path,
-) -> bool {
+) -> Option<Flow> {
     if !runtime.scripts.io().exists(&swap_path_for(path)) {
-        return false;
+        return None;
     }
     scope.replace_pair(
         ScopeKind::Vim,
@@ -7184,7 +7490,7 @@ fn swap_choice_aborts<F: FileIO, E: ExEditorAccess>(
             Event::SwapExists,
             AutocmdContext {
                 buffer,
-                file_name: Some(name.as_str()),
+                file_name: Some(name.as_bytes()),
                 match_name: None,
                 nested: true,
                 data: None,
@@ -7192,11 +7498,15 @@ fn swap_choice_aborts<F: FileIO, E: ExEditorAccess>(
         )
     });
 
-    let _ = run_autocmd_plan(runtime, access, scope, lua, plan);
+    let flow = run_autocmd_plan(runtime, access, scope, lua, plan);
+    if !matches!(&flow, &Flow::Normal) {
+        return Some(flow);
+    }
     matches!(
         scope.get_scoped(ScopeKind::Vim, b"swapchoice", 0),
         Ok(Typval::String(value)) if value.as_bytes().first().is_some_and(|byte| byte.eq_ignore_ascii_case(&b'q'))
     )
+    .then_some(Flow::Normal)
 }
 
 // ---------- swapfile names and lifecycle ----------
@@ -7454,8 +7764,8 @@ fn buffer_swap_name<F: FileIO>(
     editor: &mut Editor,
     buffer: BufHandle,
 ) -> Option<PathBuf> {
-    if let Some(name) = runtime.swap_names.get(&buffer) {
-        return Some(name.clone());
+    if let Some(name) = runtime.swap_names.borrow().get(&buffer).cloned() {
+        return Some(name);
     }
     let candidate = swap_candidate(editor, buffer)?;
     let no_updatecount = matches!(
@@ -7477,7 +7787,7 @@ fn buffer_swap_name<F: FileIO>(
         return None;
     }
     let name = findswapname(runtime, editor, &candidate.file_name, &dirs)?;
-    runtime.swap_names.insert(buffer, name.clone());
+    runtime.swap_names.borrow_mut().insert(buffer, name.clone());
     Some(name)
 }
 
@@ -7574,12 +7884,19 @@ fn preserve_one_swapfile<F: FileIO>(
     let Some(text) = text else {
         return;
     };
+    // A swapfile at this path belongs to us only if this session recorded
+    // writing it. Two sessions in one process share a pid and a host, so
+    // those alone cannot tell one session's swapfile from another's.
+    let session_owns_swapfile = runtime.swap_written.borrow().contains(&name);
     match SwapFile::new(candidate.file_name.clone(), text)
         .with_meta(meta)
-        .write_to(&name)
+        .write_to(
+            &name,
+            ox_text::swapfile::SwapOwnership::for_session(session_owns_swapfile),
+        )
     {
         Ok(()) => {
-            runtime.swap_written.insert(name);
+            runtime.swap_written.borrow_mut().insert(name);
             if report {
                 push_text_message(editor, "File preserved".to_owned(), false, false);
             }
@@ -7615,9 +7932,9 @@ fn preserve_modified_swapfiles<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &m
         };
         if candidate.modified {
             preserve_one_swapfile(runtime, editor, buffer, false);
-        } else if let Some(name) = runtime.swap_names.get(&buffer).cloned() {
+        } else if let Some(name) = runtime.swap_names.borrow().get(&buffer).cloned() {
             // An unmodified buffer's swapfile is not needed for recovery.
-            if runtime.swap_written.remove(&name) {
+            if runtime.swap_written.borrow_mut().remove(&name) {
                 let _ = std::fs::remove_file(&name);
             }
         }
@@ -7654,7 +7971,7 @@ fn tag_step<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     delta: isize,
     preview: bool,
 ) -> Flow {
@@ -7731,7 +8048,7 @@ fn tag_step_to<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     matchnr: usize,
     preview: bool,
 ) -> Flow {
@@ -7835,7 +8152,7 @@ fn tag_forward<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
     preview: bool,
 ) -> Flow {
@@ -7927,12 +8244,17 @@ fn tag_forward<F: FileIO, E: ExEditorAccess>(
     flow
 }
 
-fn command_pop<F: FileIO>(
+fn command_pop<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
-    let Some(window) = editor.current_window() else {
+    // The tag stack records a buffer the user may have unloaded since, so the
+    // pre-checks and the pop run under the editor borrow, the read happens
+    // outside it, and only then does the window switch.
+    let Some(window) = access.with_ex_editor(|editor| editor.current_window()) else {
         return error_flow(runtime, "E73", "Tag stack empty");
     };
     let count = command
@@ -7940,13 +8262,23 @@ fn command_pop<F: FileIO>(
         .and_then(|value| usize::try_from(value).ok())
         .or_else(|| wincmd_range_count(command))
         .unwrap_or(1);
-    let old_idx = editor
-        .window_tag_stack(window)
-        .map_or(1, crate::tags::TagStack::curidx);
-    let item = match editor
-        .window_tag_stack_mut(window)
-        .map(|stack| stack.pop(count))
-    {
+    let old_idx = access.with_ex_editor(|editor| {
+        editor
+            .window_tag_stack(window)
+            .map_or(1, crate::tags::TagStack::curidx)
+    });
+    let restore_curidx = |access: &E| {
+        access.with_ex_editor(|editor| {
+            if let Ok(stack) = editor.window_tag_stack_mut(window) {
+                stack.set_curidx(i64::try_from(old_idx).unwrap_or(i64::MAX));
+            }
+        });
+    };
+    let item = match access.with_ex_editor(|editor| {
+        editor
+            .window_tag_stack_mut(window)
+            .map(|stack| stack.pop(count))
+    }) {
         Ok(Ok(item)) => item,
         Ok(Err(crate::tags::TagStackBoundary::Empty)) => {
             return error_flow(runtime, "E73", "Tag stack empty");
@@ -7959,41 +8291,52 @@ fn command_pop<F: FileIO>(
         }
         Err(_) => return error_flow(runtime, "E73", "Tag stack empty"),
     };
-    let current = editor.current_buffer();
-    if current != Some(item.from_bufnr)
-        && current.is_some_and(|handle| {
-            editor
-                .buffer(handle)
-                .is_ok_and(|buffer| buffer.flags.contains(crate::BufferFlags::MODIFIED))
-        })
-        && !command.bang
-    {
-        if let Ok(stack) = editor.window_tag_stack_mut(window) {
-            stack.set_curidx(i64::try_from(old_idx).unwrap_or(i64::MAX));
-        }
+    let blocked = access.with_ex_editor(|editor| {
+        let current = editor.current_buffer();
+        current != Some(item.from_bufnr)
+            && current.is_some_and(|handle| {
+                editor
+                    .buffer(handle)
+                    .is_ok_and(|buffer| buffer.flags.contains(crate::BufferFlags::MODIFIED))
+            })
+    });
+    if blocked && !command.bang {
+        restore_curidx(access);
         return error_flow(
             runtime,
             "E37",
             "No write since last change (add ! to override)",
         );
     }
-    if editor
-        .set_current_buffer(item.from_bufnr, BufferRelease::KeepLoaded)
+    let flow = prepare_buffer_for_display(
+        runtime,
+        access,
+        scope,
+        lua,
+        item.from_bufnr,
+        BufferOrigin::Existing,
+    );
+    if !matches!(flow, Flow::Normal) {
+        restore_curidx(access);
+        return flow;
+    }
+    if access
+        .with_ex_editor(|editor| {
+            editor.set_current_buffer(item.from_bufnr, BufferRelease::KeepLoaded)
+        })
         .is_err()
     {
-        if let Ok(stack) = editor.window_tag_stack_mut(window) {
-            stack.set_curidx(i64::try_from(old_idx).unwrap_or(i64::MAX));
-        }
+        restore_curidx(access);
         return error_flow(runtime, "E555", "At bottom of tag stack");
     }
     let target = Position {
         lnum: item.from_lnum.max(1),
         col: item.from_col.saturating_sub(1),
     };
-    if let Err(error) = editor.set_window_cursor(window, target) {
-        if let Ok(stack) = editor.window_tag_stack_mut(window) {
-            stack.set_curidx(i64::try_from(old_idx).unwrap_or(i64::MAX));
-        }
+    if let Err(error) =
+        access.with_ex_editor(|editor| editor.set_window_cursor(window, target))
+    {
+        restore_curidx(access);
         return error_flow(runtime, "E16", error.to_string());
     }
     Flow::Normal
@@ -8167,7 +8510,7 @@ fn command_terminal<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let autowrite = access.with_ex_editor(|editor| {
@@ -8232,7 +8575,7 @@ fn command_enew<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     // `:enew` always names a different buffer, so 'winfixbuf' rejects it
@@ -8302,178 +8645,310 @@ fn command_enew<F: FileIO, E: ExEditorAccess>(
     fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufEnter], handle)
 }
 
-/// `:bwipeout`/`:bdelete` (`ex_cmds.c` `ex_bwipe/ex_bdelete)`: resolve the
-/// buffer from the count or argument (defaulting to the current buffer),
-/// move displaying windows onto another buffer, then wipe or unload it.
-/// The modified-buffer guard matches `do_buffer`'s E89.
+/// Lifecycle classification for the `:bdelete`/`:bunload`/`:bwipeout` family.
+/// The parser resolves typed prefixes to canonical names, so dispatch matches
+/// exactly one of these three identities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BufferRemoveKind {
+    /// `:bdelete` — unload the resident text and unlist the buffer.
+    Delete,
+    /// `:bunload` — unload the resident text and keep the buffer listed.
+    Unload,
+    /// `:bwipeout` — remove the buffer entirely.
+    Wipe,
+}
+/// `:bwipeout`/`:bdelete`/`:bunload` (`ex_cmds.c` `ex_bwipe`/`ex_bdelete`/`ex_bunload`):
+/// resolve the buffer from the count or argument (defaulting to the current
+/// buffer), move displaying windows onto another buffer, then delete, unload,
+/// or wipe it. The modified-buffer guard matches `do_buffer`'s E89.
 #[expect(
     clippy::too_many_lines,
     reason = "buffer removal keeps window migration and modified-buffer checks atomic"
 )]
-fn command_buffer_remove<F: FileIO>(
+fn command_buffer_remove<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
-    wipe: bool,
+    kind: BufferRemoveKind,
 ) -> Flow {
-    let arg = command.args.trim();
-    let requested = command
-        .count
-        .and_then(|value| i64::try_from(value).ok())
-        .or_else(|| arg.parse::<i64>().ok());
-    let mut targets = if command.range.is_some() {
-        let (start, end) = match resolve_range(editor, command) {
-            Ok(range) => range,
-            Err(message) => return error_flow(runtime, "E16", message),
-        };
-        editor
-            .buffers()
-            .into_iter()
-            .filter(|handle| {
-                usize::try_from(i64::from(*handle))
-                    .is_ok_and(|number| (start..=end).contains(&number))
-            })
-            .collect::<Vec<_>>()
-    } else {
-        let target =
-            if let Some(handle) = requested.and_then(|value| BufHandle::try_from(value).ok()) {
-                handle
-            } else if arg.is_empty() {
-                match editor.current_buffer() {
-                    Some(handle) => handle,
-                    None => return error_flow(runtime, "E85", "There is no listed buffer"),
-                }
-            } else {
-                let matches: Vec<_> = editor
+    // Phase 1 borrows the editor only to resolve targets and run the
+    // removal guards. Firing lifecycle events runs user code, which must
+    // never execute while an editor borrow is held, so every later phase
+    // re-borrows.
+    let resolved = access.with_ex_editor(
+        |editor| -> Result<(Vec<BufHandle>, std::collections::HashSet<BufHandle>), Flow> {
+            let arg = command.args.trim();
+            let requested = command
+                .count
+                .and_then(|value| i64::try_from(value).ok())
+                .or_else(|| arg.parse::<i64>().ok());
+            let mut targets = if command.range.is_some() {
+                let (start, end) = match resolve_range(editor, command) {
+                    Ok(range) => range,
+                    Err(message) => return Err(error_flow(runtime, "E16", message)),
+                };
+                editor
                     .buffers()
                     .into_iter()
                     .filter(|handle| {
-                        editor
-                            .buffer(*handle)
-                            .is_ok_and(|buffer| buffer_name_matches(buffer.name(), arg))
+                        usize::try_from(i64::from(*handle))
+                            .is_ok_and(|number| (start..=end).contains(&number))
                     })
-                    .collect();
-                match matches.as_slice() {
-                    [handle] => *handle,
-                    [] => {
-                        return error_flow(runtime, "E94", format!("No matching buffer for {arg}"));
-                    }
-                    _ => match editor
-                        .current_buffer()
-                        .filter(|current| matches.contains(current))
-                    {
-                        Some(current) => current,
-                        None => {
-                            return error_flow(
-                                runtime,
-                                "E93",
-                                format!("More than one match for {arg}"),
-                            );
-                        }
-                    },
-                }
-            };
-        vec![target]
-    };
-    if targets.is_empty() {
-        let (code, message) = if wipe {
-            ("E517", "No buffers were wiped out")
-        } else {
-            ("E516", "No buffers were deleted")
-        };
-        return error_flow(runtime, code, message);
-    }
-    // Deleting the current buffer last prevents each replacement from
-    // becoming current and loading just before it is deleted.
-    if let Some(current) = editor.current_buffer()
-        && let Some(index) = targets.iter().position(|target| *target == current)
-    {
-        targets.remove(index);
-        targets.push(current);
-    }
-    for target in &targets {
-        if editor.buffer(*target).is_err() {
-            return error_flow(
-                runtime,
-                "E86",
-                format!("Buffer {} does not exist", i64::from(*target)),
-            );
-        }
-        if !command.bang
-            && editor
-                .buffer(*target)
-                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
-        {
-            return error_flow(
-                runtime,
-                "E89",
-                "No write since last change (add ! to override)",
-            );
-        }
-    }
-
-    let selected: std::collections::HashSet<_> = targets.iter().copied().collect();
-    for target in targets {
-        let attached = editor
-            .windows()
-            .into_iter()
-            .filter(|window| {
-                editor
-                    .window(*window)
-                    .is_ok_and(|state| state.buffer == target)
-            })
-            .collect::<Vec<_>>();
-        if !attached.is_empty() {
-            let replacement = match editor.buffers().into_iter().find(|buffer| {
-                !selected.contains(buffer)
-                    && editor.buffer(*buffer).is_ok_and(|state| {
-                        state.flags.contains(crate::BufferFlags::LISTED)
-                            && state.residency.is_loaded()
-                    })
-            }) {
-                Some(buffer) => buffer,
-                None => match editor.create_buffer(true) {
-                    Ok(handle) => handle,
-                    Err(error) => return error_flow(runtime, "E948", error.to_string()),
-                },
-            };
-            for window in attached {
-                if let Err(error) =
-                    editor.set_window_buffer(window, replacement, BufferRelease::KeepLoaded)
+                    .collect::<Vec<_>>()
+            } else {
+                let target = if let Some(handle) =
+                    requested.and_then(|value| BufHandle::try_from(value).ok())
                 {
-                    return error_flow(runtime, "E948", error.to_string());
+                    handle
+                } else if arg.is_empty() {
+                    match editor.current_buffer() {
+                        Some(handle) => handle,
+                        None => {
+                            return Err(error_flow(runtime, "E85", "There is no listed buffer"));
+                        }
+                    }
+                } else {
+                    let matches: Vec<_> = editor
+                        .buffers()
+                        .into_iter()
+                        .filter(|handle| {
+                            editor
+                                .buffer(*handle)
+                                .is_ok_and(|buffer| buffer_name_matches(buffer.name(), arg))
+                        })
+                        .collect();
+                    match matches.as_slice() {
+                        [handle] => *handle,
+                        [] => {
+                            return Err(error_flow(
+                                runtime,
+                                "E94",
+                                format!("No matching buffer for {arg}"),
+                            ));
+                        }
+                        _ => match editor
+                            .current_buffer()
+                            .filter(|current| matches.contains(current))
+                        {
+                            Some(current) => current,
+                            None => {
+                                return Err(error_flow(
+                                    runtime,
+                                    "E93",
+                                    format!("More than one match for {arg}"),
+                                ));
+                            }
+                        },
+                    }
+                };
+                vec![target]
+            };
+            if targets.is_empty() {
+                let (code, message) = if kind == BufferRemoveKind::Wipe {
+                    ("E517", "No buffers were wiped out")
+                } else {
+                    ("E516", "No buffers were deleted")
+                };
+                return Err(error_flow(runtime, code, message));
+            }
+            // Deleting the current buffer last prevents each replacement from
+            // becoming current and loading just before it is deleted.
+            if let Some(current) = editor.current_buffer()
+                && let Some(index) = targets.iter().position(|target| *target == current)
+            {
+                targets.remove(index);
+                targets.push(current);
+            }
+            for target in &targets {
+                if editor.buffer(*target).is_err() {
+                    return Err(error_flow(
+                        runtime,
+                        "E86",
+                        format!("Buffer {} does not exist", i64::from(*target)),
+                    ));
+                }
+                if !command.bang
+                    && editor
+                        .buffer(*target)
+                        .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+                {
+                    return Err(error_flow(
+                        runtime,
+                        "E89",
+                        "No write since last change (add ! to override)",
+                    ));
                 }
             }
-        }
-        if !wipe {
-            if let Ok(state) = editor.buffer_mut(target) {
-                state.flags.set(crate::BufferFlags::LISTED, false);
-            }
-            if let Err(error) = editor.unload_buffer(target) {
-                return error_flow(runtime, "E90", error.to_string());
+
+            let selected: std::collections::HashSet<_> = targets.iter().copied().collect();
+            Ok((targets, selected))
+        },
+    );
+    let (targets, selected) = match resolved {
+        Ok(pair) => pair,
+        Err(flow) => return flow,
+    };
+    let mut final_flow = Flow::Normal;
+    'target: for target in targets {
+        // Re-validate each target: earlier lifecycle handlers may have removed
+        // or changed it. Upstream `do_buffer` rechecks `buf_valid` and the
+        // changed flag per buffer (`do_bufdel`/`do_buffer`, buffer.c).
+        // Residency is captured in the same snapshot, before any lifecycle
+        // handler for this target can run and unload it: upstream
+        // `buf_freeall` (`buffer.c:851`) fires `BufUnload` only when
+        // `b_ml.ml_mfp != NULL` — the buffer is loaded at that moment.
+        let Some((modified, was_loaded)) = access.with_ex_editor(|editor| {
+            editor.buffer(target).ok().map(|state| {
+                (
+                    state.flags.contains(crate::BufferFlags::MODIFIED),
+                    state.residency.is_loaded(),
+                )
+            })
+        }) else {
+            continue;
+        };
+        if modified && !command.bang {
+            if matches!(&final_flow, &Flow::Normal) {
+                final_flow = error_flow(
+                    runtime,
+                    "E89",
+                    "No write since last change (add ! to override)",
+                );
             }
             continue;
         }
-        if let Err(error) = editor.wipe_buffer(target) {
-            return error_flow(runtime, "E90", error.to_string());
+        // Phase 2 migrates displaying windows; the borrow ends before any
+        // listener runs.
+        let flow = access.with_ex_editor(|editor| {
+            let attached = editor
+                .windows()
+                .into_iter()
+                .filter(|window| {
+                    editor
+                        .window(*window)
+                        .is_ok_and(|state| state.buffer == target)
+                })
+                .collect::<Vec<_>>();
+            if !attached.is_empty() {
+                let replacement = match editor.buffers().into_iter().find(|buffer| {
+                    !selected.contains(buffer)
+                        && editor.buffer(*buffer).is_ok_and(|state| {
+                            state.flags.contains(crate::BufferFlags::LISTED)
+                                && state.residency.is_loaded()
+                        })
+                }) {
+                    Some(buffer) => buffer,
+                    None => match editor.create_buffer(true) {
+                        Ok(handle) => handle,
+                        Err(error) => return error_flow(runtime, "E948", error.to_string()),
+                    },
+                };
+                for window in attached {
+                    if let Err(error) =
+                        editor.set_window_buffer(window, replacement, BufferRelease::KeepLoaded)
+                    {
+                        return error_flow(runtime, "E948", error.to_string());
+                    }
+                }
+            }
+            Flow::Normal
+        });
+        if !matches!(flow, Flow::Normal) {
+            return flow;
         }
-        // A wipe drops the buffer's local user commands; unload/delete do
-        // not (`do_buffer`'s DOBUF_WIPE branch).
-        runtime.user_commands.borrow_mut().remove_buffer(target);
-        for window in editor.windows() {
-            if let Ok(stack) = editor.window_tag_stack_mut(window) {
-                stack.forget_buffer(target);
+        // `do_buffer` (`buffer.c`): unloading fires `BufUnload`; deleting
+        // additionally fires `BufDelete`. Listeners run while the buffer
+        // is still resident, so skip `BufUnload` for a target whose text
+        // was already released before removal began.
+        if was_loaded {
+            let flow =
+                fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufUnload], target);
+            if !matches!(flow, Flow::Normal) {
+                return flow;
+            }
+            // A lifecycle handler may remove the target recursively. Match
+            // upstream's `buf_freeall` buffer-reference check rather than
+            // reporting E90 for a handle that was already removed.
+            if !access.with_ex_editor(|editor| editor.buffer(target).is_ok()) {
+                continue 'target;
             }
         }
-        if runtime
-            .preview_tag
-            .as_ref()
-            .is_some_and(|item| item.from_bufnr == target)
-        {
-            runtime.preview_tag = None;
+        if kind == BufferRemoveKind::Delete {
+            let flow =
+                fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufDelete], target);
+            if !matches!(flow, Flow::Normal) {
+                return flow;
+            }
+            if !access.with_ex_editor(|editor| editor.buffer(target).is_ok()) {
+                continue 'target;
+            }
+        }
+        // Phase 3 unlists and/or unloads; the borrow ends before wipe events fire.
+        let flow = access.with_ex_editor(|editor| {
+            match kind {
+                BufferRemoveKind::Delete => {
+                    if let Ok(state) = editor.buffer_mut(target) {
+                        state.flags.set(crate::BufferFlags::LISTED, false);
+                    }
+                    if let Err(error) = editor.unload_buffer(target) {
+                        return error_flow(runtime, "E90", error.to_string());
+                    }
+                }
+                BufferRemoveKind::Unload => {
+                    if let Err(error) = editor.unload_buffer(target) {
+                        return error_flow(runtime, "E90", error.to_string());
+                    }
+                }
+                BufferRemoveKind::Wipe => {}
+            }
+            Flow::Normal
+        });
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
+        if kind == BufferRemoveKind::Wipe {
+            // Wiping fires `BufDelete` then `BufWipeout` before the buffer is
+            // freed (`do_buffer`'s DOBUF_WIPE branch); `BufUnload` ran above
+            // only when the target was loaded.
+            for event in [Event::BufDelete, Event::BufWipeout] {
+                let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[event], target);
+                if !matches!(flow, Flow::Normal) {
+                    return flow;
+                }
+                if !access.with_ex_editor(|editor| editor.buffer(target).is_ok()) {
+                    continue 'target;
+                }
+            }
+            // Phase 4 frees the buffer and drops its tag state.
+            let flow = access.with_ex_editor(|editor| {
+                if let Err(error) = editor.wipe_buffer(target) {
+                    return error_flow(runtime, "E90", error.to_string());
+                }
+                // A wipe drops the buffer's local user commands; unload/delete do
+                // not (`do_buffer`'s DOBUF_WIPE branch).
+                runtime.user_commands.borrow_mut().remove_buffer(target);
+                for window in editor.windows() {
+                    if let Ok(stack) = editor.window_tag_stack_mut(window) {
+                        stack.forget_buffer(target);
+                    }
+                }
+                if runtime
+                    .preview_tag
+                    .as_ref()
+                    .is_some_and(|item| item.from_bufnr == target)
+                {
+                    runtime.preview_tag = None;
+                }
+                Flow::Normal
+            });
+            if !matches!(flow, Flow::Normal) {
+                return flow;
+            }
         }
     }
-    Flow::Normal
+    final_flow
 }
 
 /// `:read` and `:read !cmd` (`ex_docmd.c` `ex_read`:6163-6195).
@@ -8504,7 +8979,7 @@ fn command_read<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let Some(buffer) = access.with_ex_editor(|editor| editor.current_buffer()) else {
@@ -8555,7 +9030,7 @@ fn command_read<F: FileIO, E: ExEditorAccess>(
                 Event::FileReadCmd,
                 AutocmdContext {
                     buffer: None,
-                    file_name: Some(&name),
+                    file_name: Some(name.as_bytes()),
                     ..AutocmdContext::default()
                 },
             )
@@ -8649,7 +9124,7 @@ fn fire_read_autocmd<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     event: Event,
     matched: Option<&str>,
 ) -> Flow {
@@ -8658,19 +9133,22 @@ fn fire_read_autocmd<F: FileIO, E: ExEditorAccess>(
         // upstream `readfile` which passes `curbuf` alongside `sfname`.
         Some(name) => (
             access.with_ex_editor(|editor| editor.current_buffer()),
-            name.to_owned(),
+            OxStr::from(name),
         ),
-        None => (
-            access.with_ex_editor(|editor| editor.current_buffer()),
-            access.with_ex_editor(|editor| current_buffer_name(editor)),
-        ),
+        None => {
+            let owned = access.with_ex_editor(|editor| current_buffer_name(editor));
+            (
+                access.with_ex_editor(|editor| editor.current_buffer()),
+                OxStr::from(owned.as_str()),
+            )
+        }
     };
     let plan = access.with_ex_editor(|editor| {
         editor.autocmds_mut().plan(
             event,
             AutocmdContext {
                 buffer,
-                file_name: Some(&name),
+                file_name: Some(name.as_bytes()),
                 ..AutocmdContext::default()
             },
         )
@@ -8692,7 +9170,7 @@ fn fire_filetype_autocmd<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     assignment: &OptionAssignment,
 ) -> Flow {
     let Some(buffer) = assignment.buffer else {
@@ -8724,8 +9202,8 @@ fn fire_filetype_autocmd<F: FileIO, E: ExEditorAccess>(
             Event::FileType,
             AutocmdContext {
                 buffer: Some(buffer),
-                file_name: Some(&name),
-                match_name: Some(filetype.as_str()),
+                file_name: Some(name.as_bytes()),
+                match_name: Some(filetype.as_bytes()),
                 nested: true,
                 data: None,
             },
@@ -8746,7 +9224,7 @@ fn fire_shell_filter_post<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
 ) -> Flow {
     let name = access.with_ex_editor(|editor| current_buffer_name(editor));
     let buffer = access.with_ex_editor(|editor| editor.current_buffer());
@@ -8755,7 +9233,7 @@ fn fire_shell_filter_post<F: FileIO, E: ExEditorAccess>(
             Event::ShellFilterPost,
             AutocmdContext {
                 buffer,
-                file_name: Some(&name),
+                file_name: Some(name.as_bytes()),
                 ..AutocmdContext::default()
             },
         )
@@ -8828,7 +9306,7 @@ fn command_file<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let argument = command.args.trim();
@@ -8845,7 +9323,7 @@ fn command_file<F: FileIO, E: ExEditorAccess>(
         return rename_current_buffer(runtime, access, scope, lua, OxStr::from(""));
     }
     if argument.is_empty() {
-        access.with_ex_editor(|editor| show_current_file(runtime, editor));
+        return access.with_ex_editor(|editor| show_current_file(runtime, editor));
     }
     rename_current_buffer(runtime, access, scope, lua, OxStr::from(argument))
 }
@@ -8854,7 +9332,7 @@ fn rename_current_buffer<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     name: OxStr,
 ) -> Flow {
     let Some(buffer) = access.with_ex_editor(|editor| editor.current_buffer()) else {
@@ -8928,9 +9406,13 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
+    // Reset first: filter writes (`:w !cmd`) return before the main path
+    // and neither set nor clear the flag, so a stale `true` must not leak
+    // into their gate checks.
+    runtime.write_silent_fail = false;
     if command.usefilter {
         return command_write_filter(runtime, access, scope, lua, command);
     }
@@ -8951,22 +9433,24 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
         );
     }
     let name = command.args.trim();
-    let path = if name.is_empty() {
+    let (path, target) = if name.is_empty() {
+        // Keep the exact name bytes: a lossy round-trip here would redirect
+        // the write, the existence gate, and the overwrite bookkeeping to a
+        // replacement-character filename for non-UTF-8 buffer names.
         let existing = access.with_ex_editor(|editor| {
-            editor
-                .buffer(buffer)
-                .map(|state| state.name().to_string_lossy().into_owned())
+            editor.buffer(buffer).map(|state| state.name().clone())
         });
-        let existing = match existing {
+        let target = match existing {
             Ok(name) => name,
             Err(error) => return error_flow(runtime, "E32", error.to_string()),
         };
-        if existing.is_empty() {
+        if target.as_bytes().is_empty() {
             return error_flow(runtime, "E32", "No file name");
         }
-        PathBuf::from(existing)
+        let path = path_from_ox_str(&target);
+        (path, target)
     } else {
-        PathBuf::from(name)
+        (PathBuf::from(name), OxStr::from(name))
     };
     if access.with_ex_editor(|editor| {
         editor
@@ -8976,6 +9460,18 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
         && !command.bang
     {
         return error_flow(runtime, "E13", "File exists (add ! to override)");
+    }
+    // `buf_write` (`bufwrite.c`): `BufWriteCmd` handlers replace the file
+    // write entirely; otherwise `BufWritePre` runs first and anything but a
+    // normal flow aborts. Both match the write target, not the buffer name.
+    let perform_write =
+        match buf_write_prelude(runtime, access, scope, lua, buffer, target.as_bytes()) {
+            Ok(perform) => perform,
+            Err(flow) => return flow,
+        };
+    runtime.write_silent_fail = false;
+    if !perform_write {
+        return command_write_did_cmd(runtime, access, buffer, &path);
     }
     let mut bytes = match access.with_ex_editor(|editor| {
         editor
@@ -8999,12 +9495,186 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
     }
     access.with_ex_editor(|editor| {
         if let Ok(state) = editor.buffer_mut(buffer) {
-            state.set_name(OxStr::from(path.to_string_lossy().as_ref()));
+            // The saved name keeps the written path's exact bytes: a lossy
+            // round-trip would rename a non-UTF-8 buffer on its own write,
+            // and the next overwrite check would compare against the wrong
+            // name.
+            #[cfg(unix)]
+            let saved = OxStr(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()).to_vec());
+            #[cfg(not(unix))]
+            let saved: OxStr = OxStr::from(path.to_string_lossy().as_ref());
+            state.set_name(saved);
             state.mark_saved();
             state.flags.set(crate::BufferFlags::NOTEDITED, false);
         }
     });
+    // `buf_write` (`bufwrite.c:1861-1866`): post hooks receive the same
+    // short target bytes on Unix (`fname == sfname`), while `<amatch>` is
+    // normalized by the autocmd planner.
+    buf_write_postlude(runtime, access, scope, lua, buffer, target.as_bytes())
+}
+
+/// The `BufWriteCmd`-owned write (`buf_write_do_autocmds`, `bufwrite.c:454-475`):
+/// a matching handler returns before the file write, so there is no save
+/// bookkeeping, no `BufWritePost`, and no written message. The buffer keeps
+/// whatever modified state the handler left. When it is still modified while
+/// overwriting its own file, upstream returns a bare `FAIL`: no message, the
+/// `|` chain continues, and RPC reports success (verified against the
+/// reference binary, and `TRY_WRAP` only errors on throw/emsg). The internal
+/// failure lands in `write_silent_fail` so the advance gates stay put exactly
+/// like upstream's `do_write != FAIL` checks. Only the never-edited flags
+/// clear, and only when overwriting the buffer's own file, mirroring the
+/// `BF_WRITE_MASK` reset.
+fn command_write_did_cmd<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    buffer: BufHandle,
+    target: &Path,
+) -> Flow {
+    let overwriting = access.with_ex_editor(|editor| {
+        editor
+            .buffer(buffer)
+            .is_ok_and(|state| write_overwrites_buffer(state.name(), target))
+    });
+    if overwriting {
+        access.with_ex_editor(|editor| {
+            if let Ok(state) = editor.buffer_mut(buffer) {
+                state.flags.set(crate::BufferFlags::NOTEDITED, false);
+            }
+        });
+    }
+    runtime.write_silent_fail = overwriting
+        && access.with_ex_editor(|editor| {
+            editor
+                .buffer(buffer)
+                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        });
     Flow::Normal
+}
+
+/// Whether the write target names the buffer's own file. Both sides expand
+/// to absolute paths first (upstream's `FullName_save` before `path_equal`
+/// with `kPathCmpLiteral`). Lexical `.` and `..` components are then
+/// normalized without resolving symlinks. On Unix both sides compare as
+/// bytes, so relative-versus-absolute spellings match while distinct
+/// non-UTF-8 names that collapse to one replacement string never compare
+/// equal; other targets fall back to a lossy rendering, where a collision
+/// can still match.
+fn write_overwrites_buffer(name: &OxStr, target: &Path) -> bool {
+    fn absolute_clean(path: &Path) -> PathBuf {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+        };
+        let mut components = Vec::new();
+        let mut anchored = false;
+        for component in absolute.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir
+                    if matches!(components.last(), Some(Component::Normal(_))) =>
+                {
+                    components.pop();
+                }
+                Component::ParentDir if !anchored => components.push(component),
+                Component::ParentDir => {}
+                Component::Prefix(_) | Component::RootDir => {
+                    anchored = true;
+                    components.push(component);
+                }
+                component => components.push(component),
+            }
+        }
+        components
+            .into_iter()
+            .fold(PathBuf::new(), |mut path, component| {
+                path.push(component.as_os_str());
+                path
+            })
+    }
+    #[cfg(not(unix))]
+    let lossy: String;
+    #[cfg(unix)]
+    let stored: &std::ffi::OsStr = std::os::unix::ffi::OsStrExt::from_bytes(name.as_bytes());
+    #[cfg(not(unix))]
+    let stored: &std::ffi::OsStr = {
+        lossy = String::from_utf8_lossy(name.as_bytes());
+        lossy.as_ref()
+    };
+    absolute_clean(Path::new(stored)) == absolute_clean(target)
+}
+
+/// `buf_write` event prelude (`bufwrite.c`): `BufWriteCmd` handlers replace
+/// the file write, so `Ok(false)` skips it; otherwise `BufWritePre` runs and
+/// anything but a normal flow aborts in `Err`. Both events match the write
+/// target, not the buffer name.
+fn buf_write_prelude<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    buffer: BufHandle,
+    target: &[u8],
+) -> Result<bool, Flow> {
+    let write_cmd_plan = access.with_ex_editor(|editor| {
+        editor.autocmds_mut().plan(
+            Event::BufWriteCmd,
+            AutocmdContext {
+                buffer: Some(buffer),
+                file_name: Some(target),
+                ..AutocmdContext::default()
+            },
+        )
+    });
+    if !write_cmd_plan.ready.is_empty()
+        && (runtime.autocmd_busy == 0 || runtime.active_autocmd.nested)
+    {
+        let flow = run_autocmd_plan(runtime, access, scope, lua, write_cmd_plan);
+        return if matches!(flow, Flow::Normal) {
+            Ok(false)
+        } else {
+            Err(flow)
+        };
+    }
+    let flow = fire_buffer_lifecycle_with(
+        runtime,
+        access,
+        scope,
+        lua,
+        &[Event::BufWritePre],
+        buffer,
+        Some(target),
+    );
+    if matches!(flow, Flow::Normal) {
+        Ok(true)
+    } else {
+        Err(flow)
+    }
+}
+
+/// `buf_write` epilogue (`bufwrite.c:1861-1866`): `BufWritePost` after the
+/// save is recorded. Only an aborting handler flow (a throw or interrupt —
+/// plain handler errors already display-and-continue inside the plan loop)
+/// reaches the caller, failing the command while the completed write
+/// stands; anything else is `Normal`.
+fn buf_write_postlude<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    buffer: BufHandle,
+    target: &[u8],
+) -> Flow {
+    fire_buffer_lifecycle_with(
+        runtime,
+        access,
+        scope,
+        lua,
+        &[Event::BufWritePost],
+        buffer,
+        Some(target),
+    )
 }
 
 /// `:[range]write !cmd` (`ex_cmds.c` `ex_write` → `do_bang(1, eap, false,
@@ -9021,7 +9691,7 @@ fn command_write_filter<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let shell_command = command.args.trim();
@@ -9105,7 +9775,7 @@ fn command_bang<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     // `do_bang`'s `ins_prevcmd` loop: a `!` in the argument (or the bang flag
@@ -9161,7 +9831,7 @@ fn bang_filter_range<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     shell_command: &str,
     command: &ExCommand,
 ) -> Flow {
@@ -9253,7 +9923,7 @@ fn bang_run_shell<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     shell_command: &str,
 ) -> Flow {
     if shell_command.is_empty() {
@@ -9347,7 +10017,7 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
     vertical: bool,
 ) -> Flow {
@@ -9362,23 +10032,107 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
     };
     // `:new` and `:vnew` open an empty buffer; `:split`/`:vsplit` without an
     // argument keep showing the current one (`ex_splitview`, do_exedit).
-    let (new_buffer, created_buffer) = if command.args.trim().is_empty() {
-        if matches!(command.command.name(), "new" | "vnew") {
-            match access.with_ex_editor(|editor| editor.create_buffer(true)) {
-                Ok(handle) => (handle, true),
-                Err(error) => return error_flow(runtime, "E948", error.to_string()),
-            }
-        } else {
-            (buffer, false)
-        }
-    } else {
-        match access.with_ex_editor(|editor| {
-            buffer_from_file(runtime, editor, &PathBuf::from(command.args.trim()))
-        }) {
-            Ok((handle, created)) => (handle, created),
+    let has_file = !command.args.trim().is_empty();
+    let (new_buffer, origin) = if has_file {
+        let path = PathBuf::from(command.args.trim());
+        match buffer_from_file(runtime, access, &path) {
+            Ok((handle, origin)) => (handle, origin),
             Err(flow) => return flow,
         }
+    } else if matches!(command.command.name(), "new" | "vnew") {
+        match access.with_ex_editor(|editor| editor.create_buffer(true)) {
+            Ok(handle) => (handle, BufferOrigin::Created),
+            Err(error) => return error_flow(runtime, "E948", error.to_string()),
+        }
+    } else {
+        (buffer, BufferOrigin::Existing)
     };
+
+    if has_file {
+        // `ex_splitview` creates the destination window before `do_ecmd`
+        // reads a file, so read hooks observe the target as current.
+        let created_window = Cell::new(None);
+        let outcome = match load_buffer_for_switch(
+            runtime,
+            access,
+            scope,
+            lua,
+            new_buffer,
+            origin,
+            LoadSwitchFocus::Revalidate,
+            |_runtime| {
+                let created = if vertical {
+                    access.with_ex_editor(|editor| {
+                        editor.split_left(tab, window, new_buffer, true)
+                    })
+                } else {
+                    access.with_ex_editor(|editor| {
+                        editor.split_above(tab, window, new_buffer, true)
+                    })
+                }
+                .map_err(LoadSwitchError::Editor)?;
+                created_window.set(Some(created));
+                if let Err(error) =
+                    access.with_ex_editor(|editor| editor.set_current_window(created))
+                {
+                    let _ = access.with_ex_editor(|editor| editor.close_window(tab, created, true));
+                    created_window.set(None);
+                    return Err(LoadSwitchError::Editor(error));
+                }
+                Ok(())
+            },
+            || {
+                if let Some(created) = created_window.take() {
+                    let _ = access.with_ex_editor(|editor| {
+                        editor.close_window(tab, created, true)
+                    });
+                }
+            },
+        ) {
+            Ok(outcome) => outcome,
+            Err(LoadSwitchError::Flow(flow)) => {
+                if origin.is_created() {
+                    let _ = access.with_ex_editor(|editor| editor.wipe_buffer(new_buffer));
+                }
+                return flow;
+            }
+            Err(LoadSwitchError::Read { path, error }) => {
+                if origin.is_created() {
+                    let _ = access.with_ex_editor(|editor| editor.wipe_buffer(new_buffer));
+                }
+                return error_flow(
+                    runtime,
+                    "E484",
+                    format!("Can't open file {}: {error}", path.display()),
+                );
+            }
+            Err(LoadSwitchError::Editor(error)) => {
+                if origin.is_created() {
+                    let _ = access.with_ex_editor(|editor| editor.wipe_buffer(new_buffer));
+                }
+                return error_flow(runtime, "E36", error.to_string());
+            }
+        };
+        match outcome {
+            LoadSwitchOutcome::Resident => {}
+            LoadSwitchOutcome::Abandoned => return Flow::Normal,
+            LoadSwitchOutcome::Entered => {
+                return if origin.is_created() {
+                    fire_buffer_lifecycle(
+                        runtime,
+                        access,
+                        scope,
+                        lua,
+                        &[Event::BufEnter],
+                        new_buffer,
+                    )
+                } else {
+                    Flow::Normal
+                };
+            }
+        }
+    }
+
     // `:split` keeps the cursor where it was (`win_split`: the new window
     // copies cursor and viewport from the one it came from), so capture the
     // position before the layout change and restore it in the new window.
@@ -9412,10 +10166,9 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
     {
         return error_flow(runtime, "E16", error.to_string());
     }
-    // A freshly created listed buffer fires `BufNew`/`BufAdd` (`buffer.c`
-    // buf_alloc:2115-2135) and the entry ends with `win_enter`'s `BufEnter`
-    // (`window.c:2722`); reusing an existing buffer raises none here.
-    if created_buffer {
+    // `:new`/`:vnew` create an empty listed buffer directly; announce its
+    // creation only after the fallback split has established the destination.
+    if origin.is_created() {
         fire_buffer_lifecycle(
             runtime,
             access,
@@ -9440,34 +10193,100 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
 ///
 /// `:tabnew` and `:tabedit` differ only in name upstream; both open an empty
 /// buffer without an argument and the named file with one.
-fn command_tabnew<F: FileIO>(
+fn command_tabnew<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
-    let after = match &command.range {
-        None => 0,
-        Some(_) => match resolve_range_raw(editor, command) {
-            Ok((_, end)) => end + 1,
-            Err(message) => return error_flow(runtime, "E16", message),
-        },
+    let after = match access.with_ex_editor(|editor| match &command.range {
+        None => Ok(0),
+        Some(_) => resolve_range_raw(editor, command).map(|(_, end)| end + 1),
+    }) {
+        Ok(after) => after,
+        Err(message) => return error_flow(runtime, "E16", message),
     };
     let name = command.args.trim();
-    let buffer = if name.is_empty() {
-        match editor.create_buffer(true) {
-            Ok(handle) => handle,
-            Err(error) => return error_flow(runtime, "E948", error.to_string()),
-        }
-    } else {
-        match buffer_from_file(runtime, editor, &argument_path(editor, name)) {
-            Ok((handle, _)) => handle,
+    let has_file = !name.is_empty();
+    let (buffer, origin) = if has_file {
+        let path = access.with_ex_editor(|editor| argument_path(editor, name));
+        match buffer_from_file(runtime, access, &path) {
+            Ok((handle, origin)) => (handle, origin),
             Err(flow) => return flow,
         }
+    } else {
+        match access.with_ex_editor(|editor| editor.create_buffer(true)) {
+            Ok(handle) => (handle, BufferOrigin::Created),
+            Err(error) => return error_flow(runtime, "E948", error.to_string()),
+        }
     };
-    match editor.create_tabpage_at(buffer, DEFAULT_TABPAGE_GEOMETRY, after) {
+
+    if has_file || origin.is_created() {
+        // `ex_splitview` creates the tabpage before `do_ecmd` reads a file,
+        // so read hooks observe the target as current.
+        let created_tab = Cell::new(None);
+        let outcome = match load_buffer_for_switch(
+            runtime,
+            access,
+            scope,
+            lua,
+            buffer,
+            origin,
+            LoadSwitchFocus::Revalidate,
+            |_runtime| {
+                access.with_ex_editor(|editor| {
+                    editor
+                        .create_tabpage_at(buffer, DEFAULT_TABPAGE_GEOMETRY, after)
+                        .map(|tab| {
+                            created_tab.set(Some(tab));
+                        })
+                        .map_err(LoadSwitchError::Editor)
+                })
+            },
+            || {
+                if let Some(tab) = created_tab.take() {
+                    let _ = access.with_ex_editor(|editor| editor.close_tabpage(tab));
+                }
+            },
+        ) {
+            Ok(outcome) => outcome,
+            Err(LoadSwitchError::Flow(flow)) => {
+                if origin.is_created() {
+                    let _ = access.with_ex_editor(|editor| editor.wipe_buffer(buffer));
+                }
+                return flow;
+            }
+            Err(LoadSwitchError::Read { path, error }) => {
+                if origin.is_created() {
+                    let _ = access.with_ex_editor(|editor| editor.wipe_buffer(buffer));
+                }
+                return error_flow(
+                    runtime,
+                    "E484",
+                    format!("Can't open file {}: {error}", path.display()),
+                );
+            }
+            Err(LoadSwitchError::Editor(error)) => {
+                if origin.is_created() {
+                    let _ = access.with_ex_editor(|editor| editor.wipe_buffer(buffer));
+                }
+                return error_flow(runtime, "E948", error.to_string());
+            }
+        };
+        if !matches!(outcome, LoadSwitchOutcome::Resident) || origin.is_created() {
+            return Flow::Normal;
+        }
+    }
+
+    match access.with_ex_editor(|editor| {
+        editor.create_tabpage_at(buffer, DEFAULT_TABPAGE_GEOMETRY, after)
+    }) {
         Ok(_) => Flow::Normal,
         Err(error) => {
-            let _ = editor.wipe_buffer(buffer);
+            if origin.is_created() {
+                let _ = access.with_ex_editor(|editor| editor.wipe_buffer(buffer));
+            }
             error_flow(runtime, "E948", error.to_string())
         }
     }
@@ -9477,7 +10296,7 @@ fn command_tabnext<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let argument = command.args.trim();
@@ -9514,7 +10333,7 @@ fn switch_current_tabpage<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     target: TabHandle,
 ) -> Flow {
     if access.with_ex_editor(|editor| editor.current_tabpage()) == Some(target) {
@@ -10874,7 +11693,8 @@ fn command_only<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> F
     let Some(current) = editor.current_window() else {
         return error_flow(runtime, "E749", "No current window");
     };
-    for window in editor.windows() {
+    let windows = editor.tabpage_windows(tab).unwrap_or_default();
+    for window in windows {
         if window != current
             && let Err(error) = editor.close_window(tab, window, true)
         {
@@ -10999,16 +11819,467 @@ fn command_wqall<F: FileIO, E: ExEditorAccess>(
     Flow::Quit(0)
 }
 
-/// Fires the leave half of a buffer switch, performs the switch, and fires
-/// the enter half (`set_curbuf`, buffer.c:1735, then `enter_buffer`,
-/// buffer.c:1850-1851). A failing leave handler abandons the switch with the
-/// caller still on the old buffer, matching `set_curbuf`'s `aborting()`
-/// guards, and the switch error keeps E86 for every `:buffer`-family caller.
+enum LoadSwitchError {
+    /// A read lifecycle handler aborted the buffer entry.
+    Flow(Flow),
+    /// A file read failed; file-opening commands preserve the E484 contract.
+    Read {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+    /// The file could not be loaded without changing the unloaded state.
+    Editor(EditorError),
+}
+
+/// Result of the shared load-and-switch seam. A resident target needs a
+/// caller-owned display step; an entered target completed its lifecycle and
+/// stayed current; an abandoned target was displaced by a lifecycle callback
+/// and must not receive entry events.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoadSwitchOutcome {
+    /// The target was already loaded and the caller still needs to display it.
+    Resident,
+    /// The target was loaded and remained current through its lifecycle.
+    Entered,
+    /// A lifecycle callback moved away from the target.
+    Abandoned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoadSwitchFocus {
+    /// The switch closure established the target as current.
+    Revalidate,
+    /// The caller intentionally keeps its current buffer unchanged.
+    Preserve,
+}
+
+/// Reverses the display change made before a read callback and optionally
+/// returns the target to its unloaded state. The restore callback does not run
+/// user code; it only undoes the low-level buffer/window transition.
+fn rollback_buffer_switch<E: ExEditorAccess, R: FnOnce()>(
+    access: &E,
+    buffer: BufHandle,
+    restore: &mut Option<R>,
+    unload: bool,
+) {
+    if let Some(restore) = restore.take() {
+        restore();
+    }
+    if unload {
+        access.with_ex_editor(|editor| {
+            if let Ok(state) = editor.buffer_mut(buffer) {
+                let _ = state.unload();
+            }
+        });
+    }
+}
+
+/// Builds a filesystem path from Vimscript bytes without a lossy UTF-8 step.
+///
+/// Unix path names are byte sequences, so reconstructing the `OsStr` directly
+/// preserves every byte. Other platforms do not expose arbitrary byte paths;
+/// their native path representation is Unicode, so the display-compatible
+/// lossy conversion is the only meaningful fallback there.
+#[must_use]
+pub fn path_from_ox_str(name: &OxStr) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        PathBuf::from(std::ffi::OsStr::from_bytes(name.as_bytes()))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(name.to_string_lossy().as_ref())
+    }
+}
+
+fn announce_buffer_creation<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    buffer: BufHandle,
+    origin: BufferOrigin,
+) -> Result<(), LoadSwitchError> {
+    if !origin.is_created() {
+        return Ok(());
+    }
+    let flow = fire_buffer_lifecycle(
+        runtime,
+        access,
+        scope,
+        lua,
+        &[Event::BufNew, Event::BufAdd],
+        buffer,
+    );
+    if matches!(flow, Flow::Normal) {
+        Ok(())
+    } else {
+        Err(LoadSwitchError::Flow(flow))
+    }
+}
+
+/// Loads an unloaded file-backed buffer before a focus switch.
+///
+/// The caller's `switch` closure establishes the display context (after any
+/// caller-specific leave events); in-place callers pass a no-op closure.
+/// `BufReadPre` runs before the real read and `BufReadPost` after the text is
+/// installed. Missing files keep the new-file path (`BufNewFile`); unnamed and
+/// no-file-read buffers materialize empty text without read events. A
+/// read failure restores the old buffer, unloads the staged target, and
+/// preserves the unloaded-buffer contract.
+fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    buffer: BufHandle,
+    origin: BufferOrigin,
+    focus: LoadSwitchFocus,
+    switch: impl FnOnce(&mut ExRuntime<F>) -> Result<(), LoadSwitchError>,
+    restore: impl FnOnce(),
+) -> Result<LoadSwitchOutcome, LoadSwitchError> {
+    let abandoned = || {
+        matches!(focus, LoadSwitchFocus::Revalidate)
+            && access.with_ex_editor(|editor| editor.current_buffer()) != Some(buffer)
+    };
+    let entered = || {
+        if abandoned() {
+            LoadSwitchOutcome::Abandoned
+        } else {
+            LoadSwitchOutcome::Entered
+        }
+    };
+    let (loaded, name, nofileread) = access
+        .with_ex_editor(|editor| {
+            let state = editor.buffer(buffer)?;
+            let name = state.name().clone();
+            let nofileread = matches!(
+                editor.options().get_buffer(buffer, "buftype"),
+                Ok(OptionValue::String(buftype)) if is_nofileread(buftype)
+            );
+            Ok((state.residency.is_loaded(), name, nofileread))
+        })
+        .map_err(LoadSwitchError::Editor)?;
+    if loaded && !origin.is_created() {
+        return Ok(LoadSwitchOutcome::Resident);
+    }
+
+    let mut restore = Some(restore);
+    if loaded {
+        if let Err(error) = switch(runtime) {
+            rollback_buffer_switch(access, buffer, &mut restore, false);
+            return Err(error);
+        }
+        if let Err(error) =
+            announce_buffer_creation(runtime, access, scope, lua, buffer, origin)
+        {
+            rollback_buffer_switch(access, buffer, &mut restore, false);
+            return Err(error);
+        }
+        return Ok(entered());
+    }
+
+    let Some(path) = (!name.as_bytes().is_empty() && !nofileread)
+        .then(|| path_from_ox_str(&name))
+    else {
+        access
+            .with_ex_editor(|editor| -> Result<(), EditorError> {
+                let state = editor.buffer_mut(buffer)?;
+                state.load(Buffer::new());
+                state.mark_saved();
+                state.flags.set(crate::BufferFlags::NOTEDITED, false);
+                Ok(())
+            })
+            .map_err(LoadSwitchError::Editor)?;
+        if let Err(error) = switch(runtime) {
+            rollback_buffer_switch(access, buffer, &mut restore, true);
+            return Err(error);
+        }
+        if let Err(error) =
+            announce_buffer_creation(runtime, access, scope, lua, buffer, origin)
+        {
+            rollback_buffer_switch(access, buffer, &mut restore, false);
+            return Err(error);
+        }
+        return Ok(entered());
+    };
+
+    let new_file = match runtime.scripts.io().read_to_string(&path) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            return Err(LoadSwitchError::Read {
+                path: path.clone(),
+                error,
+            });
+        }
+    };
+
+    // `enter_buffer` creates the target's memfile before `BufReadPre`.
+    // Materialize that real empty state explicitly; the low-level setter only
+    // attaches resident buffers and must not perform file I/O.
+    access
+        .with_ex_editor(|editor| -> Result<(), EditorError> {
+            let state = editor.buffer_mut(buffer)?;
+            state.load(Buffer::new());
+            state.mark_saved();
+            state.flags.set(crate::BufferFlags::NOTEDITED, false);
+            Ok(())
+        })
+        .map_err(LoadSwitchError::Editor)?;
+    if let Err(error) = switch(runtime) {
+        rollback_buffer_switch(access, buffer, &mut restore, true);
+        return Err(error);
+    }
+
+    if let Err(error) =
+        announce_buffer_creation(runtime, access, scope, lua, buffer, origin)
+    {
+        rollback_buffer_switch(access, buffer, &mut restore, false);
+        return Err(error);
+    }
+    if !new_file {
+        let flow = fire_buffer_lifecycle(
+            runtime,
+            access,
+            scope,
+            lua,
+            &[Event::BufReadPre],
+            buffer,
+        );
+        if !matches!(flow, Flow::Normal) {
+            rollback_buffer_switch(access, buffer, &mut restore, true);
+            return Err(LoadSwitchError::Flow(flow));
+        }
+    }
+
+    if new_file {
+        let flow = fire_buffer_lifecycle(
+            runtime,
+            access,
+            scope,
+            lua,
+            &[Event::BufNewFile],
+            buffer,
+        );
+        if !matches!(flow, Flow::Normal) {
+            rollback_buffer_switch(access, buffer, &mut restore, false);
+            return Err(LoadSwitchError::Flow(flow));
+        }
+        return Ok(entered());
+    }
+
+    let content = match runtime.scripts.io().read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            rollback_buffer_switch(access, buffer, &mut restore, true);
+            return Err(LoadSwitchError::Read {
+                path: path.clone(),
+                error,
+            });
+        }
+    };
+    let text = match Buffer::from_bytes(content.as_bytes()) {
+        Ok(text) => text,
+        Err(error) => {
+            rollback_buffer_switch(access, buffer, &mut restore, true);
+            return Err(LoadSwitchError::Editor(EditorError::Buffer(error.into())));
+        }
+    };
+    if let Err(error) = access.with_ex_editor(|editor| -> Result<(), EditorError> {
+        let state = editor.buffer_mut(buffer)?;
+        state.load(text);
+        state.mark_saved();
+        state.flags.set(crate::BufferFlags::NOTEDITED, false);
+        Ok(())
+    }) {
+        rollback_buffer_switch(access, buffer, &mut restore, true);
+        return Err(LoadSwitchError::Editor(error));
+    }
+
+    let flow = fire_buffer_lifecycle(
+        runtime,
+        access,
+        scope,
+        lua,
+        &[Event::BufReadPost],
+        buffer,
+    );
+    if !matches!(flow, Flow::Normal) {
+        rollback_buffer_switch(access, buffer, &mut restore, false);
+        return Err(LoadSwitchError::Flow(flow));
+    }
+    Ok(entered())
+}
+
+/// Brings an unloaded target to resident state with its read lifecycle,
+/// without changing the current buffer.
+///
+/// A tag jump decides where the buffer lands only after it is readable: the
+/// target may end up in a split, a new tab, or this window. The low-level
+/// setters attach resident buffers and never read, so callers that do not
+/// switch immediately still need the read half on its own.
+fn prepare_buffer_for_display<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    buffer: BufHandle,
+    origin: BufferOrigin,
+) -> Flow {
+    match load_buffer_for_switch(
+        runtime,
+        access,
+        scope,
+        lua,
+        buffer,
+        origin,
+        LoadSwitchFocus::Preserve,
+        |_| Ok(()),
+        || {},
+    ) {
+        Ok(_) => Flow::Normal,
+        Err(LoadSwitchError::Flow(flow)) => flow,
+        Err(LoadSwitchError::Read { .. }) => {
+            error_flow(runtime, "E86", "buffer text is not loaded")
+        }
+        Err(LoadSwitchError::Editor(error)) => error_flow(runtime, "E86", error.to_string()),
+    }
+}
+fn prepare_created_tag_buffer<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    buffer: BufHandle,
+    options: &TagJumpOptions,
+) -> Flow {
+    let existing_tabs = access.with_ex_editor(|editor| editor.tabpages());
+    let existing_windows = access.with_ex_editor(|editor| editor.windows());
+    let old_tab = access.with_ex_editor(|editor| editor.current_tabpage());
+    let old_window = access.with_ex_editor(|editor| editor.current_window());
+    let destination = Cell::new(None);
+    let loaded = load_buffer_for_switch(
+        runtime,
+        access,
+        scope,
+        lua,
+        buffer,
+        BufferOrigin::Created,
+        LoadSwitchFocus::Revalidate,
+        |runtime| {
+            access.with_ex_editor(|editor| {
+                open_tag_buffer(
+                    runtime,
+                    editor,
+                    buffer,
+                    options.split,
+                    options.preview,
+                    options.tab_after,
+                    options.forceit,
+                )
+                .map_err(LoadSwitchError::Flow)?;
+                let Some(window) = editor.windows().into_iter().find(|window| {
+                    editor
+                        .window(*window)
+                        .is_ok_and(|state| state.buffer == buffer)
+                }) else {
+                    return Err(LoadSwitchError::Editor(EditorError::UnknownBuffer(
+                        buffer,
+                    )));
+                };
+                let tab = editor
+                    .window_tabpage(window)
+                    .map_err(LoadSwitchError::Editor)?;
+                destination.set(Some((
+                    tab,
+                    window,
+                    !existing_tabs.contains(&tab),
+                    !existing_windows.contains(&window),
+                )));
+                Ok(())
+            })
+        },
+        || {
+            if let Some((tab, window, new_tab, new_window)) = destination.take() {
+                let _ = access.with_ex_editor(|editor| {
+                    if new_tab {
+                        editor.close_tabpage(tab).map(|_| ())
+                    } else if new_window {
+                        editor.close_window(tab, window, true).map(|_| ())
+                    } else {
+                        if let Some(old_tab) = old_tab {
+                            let _ = editor.set_current_tabpage(old_tab);
+                        }
+                        if let Some(old_window) = old_window {
+                            let _ = editor.set_current_window(old_window);
+                        }
+                        Ok(())
+                    }
+                });
+            }
+        },
+    );
+    match loaded {
+        Ok(_) => Flow::Normal,
+        Err(LoadSwitchError::Flow(flow)) => flow,
+        Err(LoadSwitchError::Read { .. }) => {
+            error_flow(runtime, "E86", "buffer text is not loaded")
+        }
+        Err(LoadSwitchError::Editor(error)) => error_flow(runtime, "E86", error.to_string()),
+    }
+}
+
+
+/// Loads a file-backed target with file-command error semantics.
+fn load_file_buffer_for_command<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    buffer: BufHandle,
+    origin: BufferOrigin,
+    switch: impl FnOnce(&mut ExRuntime<F>) -> Result<(), LoadSwitchError>,
+    restore: impl FnOnce(),
+) -> Result<LoadSwitchOutcome, Flow> {
+    match load_buffer_for_switch(
+        runtime,
+        access,
+        scope,
+        lua,
+        buffer,
+        origin,
+        LoadSwitchFocus::Revalidate,
+        switch,
+        restore,
+    ) {
+        Ok(loaded) => Ok(loaded),
+        Err(LoadSwitchError::Flow(flow)) => Err(flow),
+        Err(LoadSwitchError::Read { path, error }) => Err(error_flow(
+            runtime,
+            "E484",
+            format!("Can't open file {}: {error}", path.display()),
+        )),
+        Err(LoadSwitchError::Editor(error)) => {
+            Err(error_flow(runtime, "E948", error.to_string()))
+        }
+    }
+}
+
+
+/// Fires the leave half of a buffer switch, performs any unloaded-buffer
+/// reload with its read lifecycle, then fires the enter half.
+///
+/// A failing leave handler abandons the switch with the caller still on the
+/// old buffer, matching `set_curbuf`'s `aborting()` guards, and the switch
+/// error keeps E86 for every `:buffer`-family caller.
 fn switch_current_buffer<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     old: Option<BufHandle>,
     target: BufHandle,
 ) -> Flow {
@@ -11037,8 +12308,44 @@ fn switch_current_buffer<F: FileIO, E: ExEditorAccess>(
     if !access.with_ex_editor(|editor| editor.buffer(target).is_ok()) {
         return Flow::Normal;
     }
-    if let Err(error) =
-        access.with_ex_editor(|editor| editor.set_current_buffer(target, BufferRelease::KeepLoaded))
+    let outcome = match load_buffer_for_switch(
+        runtime,
+        access,
+        scope,
+        lua,
+        target,
+        BufferOrigin::Existing,
+        LoadSwitchFocus::Revalidate,
+        |_runtime| {
+            access.with_ex_editor(|editor| {
+                editor
+                    .set_current_buffer(target, BufferRelease::KeepLoaded)
+                    .map_err(LoadSwitchError::Editor)
+            })
+        },
+        || {
+            if let Some(old) = old {
+                let _ = access.with_ex_editor(|editor| {
+                    editor.set_current_buffer(old, BufferRelease::KeepLoaded)
+                });
+            }
+        },
+    ) {
+        Ok(outcome) => outcome,
+        Err(LoadSwitchError::Flow(flow)) => return flow,
+        Err(LoadSwitchError::Read { .. }) => {
+            return error_flow(runtime, "E86", "buffer text is not loaded");
+        }
+        Err(LoadSwitchError::Editor(error)) => {
+            return error_flow(runtime, "E86", error.to_string());
+        }
+    };
+    if matches!(outcome, LoadSwitchOutcome::Abandoned) {
+        return Flow::Normal;
+    }
+    if matches!(outcome, LoadSwitchOutcome::Resident)
+        && let Err(error) =
+            access.with_ex_editor(|editor| editor.set_current_buffer(target, BufferRelease::KeepLoaded))
     {
         return error_flow(runtime, "E86", error.to_string());
     }
@@ -11049,7 +12356,7 @@ fn command_buffer_step<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
     step: isize,
 ) -> Flow {
@@ -11101,7 +12408,7 @@ fn command_buffer_absolute<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
     target: isize,
 ) -> Flow {
@@ -11144,41 +12451,59 @@ fn command_buffer_absolute<F: FileIO, E: ExEditorAccess>(
 /// `:fir[st]`/`:rew[ind]` and `:la[st]`: display the first or last argument
 /// (`ex_rewind`, arglist.c); the winfixbuf guard lives in the shared
 /// `edit_argument_file` sink.
-fn command_argument_absolute<F: FileIO>(
+fn command_argument_absolute<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
     target: i64,
 ) -> Flow {
-    let count = i64::try_from(editor.arglist().len()).unwrap_or(i64::MAX);
+    let count = i64::try_from(access.with_ex_editor(|editor| editor.arglist().len()))
+        .unwrap_or(i64::MAX);
     let entry = if target == i64::MAX {
         count.saturating_sub(1)
     } else {
         0
     };
-    do_argfile(runtime, editor, command.bang, entry)
+    do_argfile(runtime, access, scope, lua, command.bang, entry)
 }
 
 /// `:argu[ment] [count]`: display the count-th argument, defaulting to the
 /// current one (`ex_argument`, arglist.c).
-fn command_argument<F: FileIO>(
+fn command_argument<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let count = command
         .count
         .and_then(|count| i64::try_from(count).ok())
         .or_else(|| command.args.trim().parse::<i64>().ok())
-        .unwrap_or_else(|| i64::try_from(editor.arglist().index()).unwrap_or(0));
-    do_argfile(runtime, editor, command.bang, count.saturating_sub(1))
+        .unwrap_or_else(|| {
+            access.with_ex_editor(|editor| {
+                i64::try_from(editor.arglist().index())
+                    .map_or(1, |index| index.saturating_add(1))
+            })
+        });
+    do_argfile(
+        runtime,
+        access,
+        scope,
+        lua,
+        command.bang,
+        count.saturating_sub(1),
+    )
 }
+
 
 fn command_buffer<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let arg = command.args.trim();
@@ -11371,57 +12696,70 @@ fn buffer_name_matches(name: &OxStr, needle: &str) -> bool {
 /// `:args` (`ex_args`, arglist.c 502): with file arguments the list is
 /// redefined and the first entry edited, exactly like `:next`; without
 /// arguments the list is printed with the current entry in brackets.
-fn command_args<F: FileIO>(
+fn command_args<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     if !command.args.trim().is_empty() {
-        return command_next(runtime, editor, command);
+        return command_next(runtime, access, scope, lua, command);
     }
-    let arglist = editor.arglist();
-    if arglist.is_empty() {
-        return Flow::Normal;
-    }
-    let current = arglist.index();
-    let mut line = String::new();
-    for (position, name) in arglist.names().iter().enumerate() {
-        if position > 0 {
-            line.push_str("  ");
+    let line = access.with_ex_editor(|editor| {
+        let arglist = editor.arglist();
+        if arglist.is_empty() {
+            return None;
         }
-        if position == current {
-            line.push('[');
-            line.push_str(&name.to_string_lossy());
-            line.push(']');
-        } else {
-            line.push_str(&name.to_string_lossy());
+        let current = arglist.index();
+        let mut line = String::new();
+        for (position, name) in arglist.names().iter().enumerate() {
+            if position > 0 {
+                line.push_str("  ");
+            }
+            if position == current {
+                line.push('[');
+                line.push_str(&name.to_string_lossy());
+                line.push(']');
+            } else {
+                line.push_str(&name.to_string_lossy());
+            }
         }
+        Some(line)
+    });
+    if let Some(line) = line {
+        access.with_ex_editor(|editor| push_text_message(editor, line, false, false));
     }
-    push_text_message(editor, line, false, false);
     Flow::Normal
 }
 
 /// `:next` (`ex_next`, arglist.c 670): with file arguments the argument
 /// list is redefined and its first entry edited; otherwise the count-th
 /// following entry is edited through `do_argfile`.
-fn command_next<F: FileIO>(
+fn command_next<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let list = command.args.trim();
     if list.is_empty() {
         let step = command_step(command);
-        let target = i64::try_from(editor.arglist().index()).unwrap_or(i64::MAX) + step;
-        return do_argfile(runtime, editor, command.bang, target);
+        let target = access.with_ex_editor(|editor| {
+            i64::try_from(editor.arglist().index()).unwrap_or(i64::MAX) + step
+        });
+        return do_argfile(runtime, access, scope, lua, command.bang, target);
     }
     // The changed-buffer guard runs before the list is replaced (ex_next
     // checks first so a failure leaves the old list intact).
-    if let Some(current) = editor.current_buffer()
-        && editor
-            .buffer(current)
-            .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
-        && !command.bang
+    if access.with_ex_editor(|editor| {
+        editor.current_buffer().is_some_and(|current| {
+            editor
+                .buffer(current)
+                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        })
+    }) && !command.bang
     {
         return error_flow(
             runtime,
@@ -11444,13 +12782,15 @@ fn command_next<F: FileIO>(
     if names.is_empty() {
         return error_flow(runtime, "E479", "No match");
     }
-    editor.arglist_mut().set(
-        names
-            .into_iter()
-            .map(|name| OxStr::from(name.as_str()))
-            .collect(),
-    );
-    do_argfile(runtime, editor, command.bang, 0)
+    access.with_ex_editor(|editor| {
+        editor.arglist_mut().set(
+            names
+                .into_iter()
+                .map(|name| OxStr::from(name.as_str()))
+                .collect(),
+        );
+    });
+    do_argfile(runtime, access, scope, lua, command.bang, 0)
 }
 
 fn command_step(command: &ExCommand) -> i64 {
@@ -11470,44 +12810,54 @@ fn command_step(command: &ExCommand) -> i64 {
     }
     1
 }
-fn command_previous<F: FileIO>(
+fn command_previous<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let step = command_step(command);
-    let arglist = editor.arglist();
-    let index = i64::try_from(arglist.index()).unwrap_or(i64::MAX);
-    let count = i64::try_from(arglist.len()).unwrap_or(i64::MAX);
+    let (index, count) = access.with_ex_editor(|editor| {
+        (
+            i64::try_from(editor.arglist().index()).unwrap_or(i64::MAX),
+            i64::try_from(editor.arglist().len()).unwrap_or(i64::MAX),
+        )
+    });
     let target = if index - step >= count {
         count - 1
     } else {
         index - step
     };
-    do_argfile(runtime, editor, command.bang, target)
+    do_argfile(runtime, access, scope, lua, command.bang, target)
 }
+
 
 /// Edits entry `target` of the argument list (`do_argfile`, arglist.c
 /// 600): out-of-range targets fail with E163/E164/E165, and the index
 /// only advances when the edit succeeded.
-fn do_argfile<F: FileIO>(
+fn do_argfile<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     force: bool,
     target: i64,
 ) -> Flow {
-    let entry = match editor.arglist().check_target(target) {
+    let entry = match access.with_ex_editor(|editor| editor.arglist().check_target(target)) {
         Ok(entry) => entry,
         Err(error) => return error_flow(runtime, error.code, error.message),
     };
-    let name = editor
-        .arglist()
-        .name(entry)
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let flow = edit_argument_file(runtime, editor, force, &name);
+    let name = access.with_ex_editor(|editor| {
+        editor
+            .arglist()
+            .name(entry)
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    let flow = edit_argument_file(runtime, access, scope, lua, force, &name);
     if matches!(flow, Flow::Normal) {
-        editor.arglist_mut().set_index(entry);
+        access.with_ex_editor(|editor| editor.arglist_mut().set_index(entry));
     }
     flow
 }
@@ -11515,17 +12865,22 @@ fn do_argfile<F: FileIO>(
 /// Displays the argument's file: reuse the buffer already carrying the
 /// name (`alist_name` prefers the associated buffer), else load the file
 /// like `:edit` does, treating a missing file as an empty new buffer.
-fn edit_argument_file<F: FileIO>(
+fn edit_argument_file<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     force: bool,
     name: &str,
 ) -> Flow {
+    let current = access.with_ex_editor(|editor| editor.current_buffer());
     if !force
-        && let Some(current) = editor.current_buffer()
-        && editor
-            .buffer(current)
-            .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        && let Some(current) = current
+        && access.with_ex_editor(|editor| {
+            editor
+                .buffer(current)
+                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        })
     {
         return error_flow(
             runtime,
@@ -11533,29 +12888,67 @@ fn edit_argument_file<F: FileIO>(
             "No write since last change (add ! to override)",
         );
     }
-    for handle in editor.buffers() {
-        if editor
-            .buffer(handle)
-            .is_ok_and(|state| state.name().as_bytes() == name.as_bytes())
+    let existing = access.with_ex_editor(|editor| {
+        editor.buffers().into_iter().find(|handle| {
+            editor
+                .buffer(*handle)
+                .is_ok_and(|state| state.name().as_bytes() == name.as_bytes())
+        })
+    });
+    if let Some(handle) = existing {
+        // 'winfixbuf' rejects editing a different argument in place
+        // (do_argfile, arglist.c:620); the bang overrides.
+        if current != Some(handle)
+            && let Some(flow) =
+                access.with_ex_editor(|editor| winfixbuf_blocks(runtime, editor, force))
         {
-            // 'winfixbuf' rejects editing a different argument in place
-            // (do_argfile, arglist.c:620); the bang overrides.
-            if editor.current_buffer() != Some(handle)
-                && let Some(flow) = winfixbuf_blocks(runtime, editor, force)
-            {
-                return flow;
-            }
-            return match editor.set_current_buffer(handle, BufferRelease::KeepLoaded) {
-                Ok(()) => Flow::Normal,
-                Err(error) => error_flow(runtime, "E86", error.to_string()),
-            };
+            return flow;
         }
+        return switch_current_buffer(runtime, access, scope, lua, current, handle);
     }
+
     // An argument with no buffer yet opens a new file, which is always a
     // different buffer: same guard.
-    if let Some(flow) = winfixbuf_blocks(runtime, editor, force) {
+    if let Some(flow) =
+        access.with_ex_editor(|editor| winfixbuf_blocks(runtime, editor, force))
+    {
         return flow;
     }
+
+    // A current window lets the shared switch loader own the read lifecycle.
+    // Start with an unloaded named buffer so it performs the same probe,
+    // staging, callbacks, and read as :buffer/:edit.
+    if access
+        .with_ex_editor(|editor| editor.current_window())
+        .is_some()
+    {
+        let handle = match access.with_ex_editor(|editor| -> Result<BufHandle, EditorError> {
+            let handle = editor.create_buffer(true)?;
+            {
+                let state = editor.buffer_mut(handle)?;
+                state.set_name(OxStr::from(name));
+                state.mark_saved();
+            }
+            editor.unload_buffer(handle)?;
+            Ok(handle)
+        }) {
+            Ok(handle) => handle,
+            Err(error) => return error_flow(runtime, "E948", error.to_string()),
+        };
+        let flow = switch_current_buffer(runtime, access, scope, lua, current, handle);
+        if !matches!(flow, Flow::Normal) {
+            access.with_ex_editor(|editor| {
+                if editor.buffer(handle).is_ok() {
+                    let _ = editor.wipe_buffer(handle);
+                }
+            });
+        }
+        return flow;
+    }
+
+    // There is no current window to give the loader a display context. Keep
+    // the bootstrap path that creates the first tabpage around already-read
+    // text; normal argument navigation always takes the branch above.
     let text = match runtime.scripts.io().read_to_string(Path::new(name)) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -11567,16 +12960,18 @@ fn edit_argument_file<F: FileIO>(
         Ok(buffer) => buffer,
         Err(error) => return error_flow(runtime, "E474", error.to_string()),
     };
-    let handle = match editor.create_buffer_with(buffer_text, true) {
+    let handle = match access.with_ex_editor(|editor| -> Result<BufHandle, EditorError> {
+        let handle = editor.create_buffer_with(buffer_text, true)?;
+        let state = editor.buffer_mut(handle)?;
+        state.set_name(OxStr::from(name));
+        state.mark_saved();
+        Ok(handle)
+    }) {
         Ok(handle) => handle,
         Err(error) => return error_flow(runtime, "E948", error.to_string()),
     };
-    if let Ok(state) = editor.buffer_mut(handle) {
-        state.set_name(OxStr::from(name));
-        state.mark_saved();
-    }
-    if editor.current_window().is_none() {
-        return match editor.create_tabpage(
+    match access.with_ex_editor(|editor| {
+        editor.create_tabpage(
             handle,
             crate::Geometry {
                 row: 0,
@@ -11584,14 +12979,10 @@ fn edit_argument_file<F: FileIO>(
                 width: 80,
                 height: 24,
             },
-        ) {
-            Ok(_) => Flow::Normal,
-            Err(error) => error_flow(runtime, "E948", error.to_string()),
-        };
-    }
-    match editor.set_current_buffer(handle, BufferRelease::KeepLoaded) {
-        Ok(()) => Flow::Normal,
-        Err(error) => error_flow(runtime, "E86", error.to_string()),
+        )
+    }) {
+        Ok(_) => Flow::Normal,
+        Err(error) => error_flow(runtime, "E948", error.to_string()),
     }
 }
 
@@ -11603,7 +12994,7 @@ fn command_argdo<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let nested = command.args.trim();
@@ -11635,14 +13026,14 @@ fn command_argdo<F: FileIO, E: ExEditorAccess>(
         if access.with_ex_editor(|editor| editor.arglist().index()) != index
             || !access.with_ex_editor(|editor| editing_argument(editor, index))
         {
-            let flow = access.with_ex_editor(|editor| {
-                do_argfile(
-                    runtime,
-                    editor,
-                    command.bang,
-                    i64::try_from(index).unwrap_or(i64::MAX),
-                )
-            });
+            let flow = do_argfile(
+                runtime,
+                access,
+                scope,
+                lua,
+                command.bang,
+                i64::try_from(index).unwrap_or(i64::MAX),
+            );
             if !matches!(flow, Flow::Normal) {
                 return flow;
             }
@@ -11679,7 +13070,7 @@ fn command_windo<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let nested = command.args.trim();
@@ -11755,7 +13146,7 @@ fn command_put<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let (buffer, position) = access.with_ex_editor(|editor| {
@@ -12739,7 +14130,7 @@ fn source_runtime_file<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     path: &Path,
 ) -> Flow {
     if path.extension().is_some_and(|extension| extension == "lua") {
@@ -12749,7 +14140,7 @@ fn source_runtime_file<F: FileIO, E: ExEditorAccess>(
         if let Err(error) = access.with_ex_editor(|editor| sync_scope_into_editor(editor, scope)) {
             return exec_error_flow(runtime, error);
         }
-        let result = host.borrow_mut().execute_file(path);
+        let result = host.execute_file(path);
         let sync = access.with_ex_editor(|editor| sync_editor_into_scope(editor, scope));
         return match (result, sync) {
             (Err(error), _) => lua_error_flow(runtime, error, "E5112", "E5113"),
@@ -12772,7 +14163,7 @@ fn source_runtime_all<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     names: &str,
 ) -> Flow {
     let roots: Vec<PathBuf> = runtime
@@ -12812,7 +14203,7 @@ fn command_filetype<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let mut arg = command.args.trim();
@@ -12923,7 +14314,7 @@ fn filetype_detect_autocmds<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
 ) -> Flow {
     let Some(group) = access.with_ex_editor(|editor| editor.autocmds().group("filetypedetect"))
     else {
@@ -12946,7 +14337,7 @@ fn filetype_detect_autocmds<F: FileIO, E: ExEditorAccess>(
             group,
             AutocmdContext {
                 buffer,
-                file_name: Some(&name),
+                file_name: Some(name.as_bytes()),
                 ..AutocmdContext::default()
             },
         )
@@ -12958,7 +14349,7 @@ fn command_colorscheme<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let name = command.args.trim();
@@ -13005,7 +14396,7 @@ fn command_colorscheme<F: FileIO, E: ExEditorAccess>(
         editor.autocmds_mut().plan(
             Event::ColorScheme,
             AutocmdContext {
-                file_name: Some(name),
+                file_name: Some(name.as_bytes()),
                 ..AutocmdContext::default()
             },
         )
@@ -13015,7 +14406,7 @@ fn command_colorscheme<F: FileIO, E: ExEditorAccess>(
 
 fn release_removed_autocmds<E: ExEditorAccess>(
     access: &E,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     removals: impl IntoIterator<Item = AutocmdKind>,
 ) -> Result<(), LuaExecError> {
     let mut references = Vec::new();
@@ -13037,7 +14428,7 @@ fn release_removed_autocmds<E: ExEditorAccess>(
         let reference = usize::try_from(reference).map_err(|_| {
             LuaExecError::Conversion("Lua callback reference is out of range".to_owned())
         })?;
-        lua.borrow_mut().free_callback(reference)?;
+        lua.free_callback(reference)?;
     }
     Ok(())
 }
@@ -13046,7 +14437,7 @@ fn run_lua_autocmd_callback<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     action: &crate::AutocmdAction,
     reference: u64,
 ) -> (Flow, bool) {
@@ -13069,7 +14460,9 @@ fn run_lua_autocmd_callback<F: FileIO, E: ExEditorAccess>(
         Ok(args) => args,
         Err(error) => return (error_flow(runtime, "E5108", error.to_string()), false),
     };
-    let result = lua.borrow_mut().invoke_callback(reference, args);
+    // The host is shared immutably; its scoped API frame owns all mutable
+    // executor state needed by the synchronous callback.
+    let result = lua.invoke_callback(reference, args);
     let sync = access.with_ex_editor(|editor| sync_editor_into_scope(editor, scope));
     match (result, sync) {
         (Err(error), _) => (lua_error_flow(runtime, error, "E5107", "E5108"), false),
@@ -13082,15 +14475,27 @@ fn run_lua_autocmd_callback<F: FileIO, E: ExEditorAccess>(
 }
 
 /// Executes one [`FiringPlan`] in order, acknowledging `++once` definitions
-/// as each action starts and stopping at the first non-normal flow
-/// (`autocmd.c` `apply_autocmds_group` runs the matched list in sequence).
-fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
+/// as each action starts. Upstream runs the whole group through one
+/// `do_cmdline`: at trylevel 0 a displayed error continues to the next
+/// action — only an interrupt stops matching (`autocmd.c:1871`) — while
+/// an undisplayed exception aborts the group.
+pub(crate) fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     plan: FiringPlan,
 ) -> Flow {
+    // No user code runs with unflushed scope dirt: any action may reenter
+    // through another executor (a `:lua` payload reaching a pooled host, a
+    // nested API firing), whose read sync mirrors the live map. The flush
+    // runs per action, not once per plan: action N-1 is itself user code
+    // that may have dirtied the maps action N's reentry would otherwise
+    // read stale. Flushing makes outer writes visible to nested readers
+    // and refreshes the mirror, so the later nested write wins
+    // (`bufwrite.c` has one scope, so last-writer-wins is the only order).
+    // Same flush discipline as the Lua entries below. Clean maps early-out
+    // inside the callee, so the steady-state cost is flag checks.
     // `autocmd_busy` (`autocmd.c:1657`): one plan counts as one busy span,
     // matching `apply_autocmds` which sets and restores it around the group.
     runtime.autocmd_busy += 1;
@@ -13098,6 +14503,12 @@ fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
     for action in plan.ready {
         if !access.with_ex_editor(|editor| editor.autocmds().is_entry_live(action.entry_id)) {
             continue;
+        }
+        // A sync failure is internal state corruption, not user-code error:
+        // abort the group rather than display-and-continue.
+        if let Err(error) = access.with_ex_editor(|editor| sync_scope_into_editor(editor, scope)) {
+            flow = exec_error_flow(runtime, error);
+            break;
         }
         let mut removed = Vec::new();
         if action.once
@@ -13162,6 +14573,15 @@ fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
             break;
         }
         if !matches!(action_flow, Flow::Normal) {
+            // Re-attempting display here never double-pushes: actions whose
+            // errors the instruction loop already showed arrive here
+            // undisplayable, so only a first display pushes. `try_depth`
+            // is inherited, never reset (`ex_docmd.c:724`), so past depth
+            // 0 nothing displays and the break preserves throw-unwind
+            // parity for API callers.
+            if display_error_message(runtime, access, &action_flow) {
+                continue;
+            }
             flow = action_flow;
             break;
         }
@@ -13262,33 +14682,60 @@ pub fn focus_transition(
 /// buffer's name as `<afile>`/`<amatch>`, through the shared planner and
 /// [`run_autocmd_plan`]. The first non-normal handler flow wins, so a caller
 /// can abort the entry it is performing.
-fn fire_buffer_lifecycle<F: FileIO, E: ExEditorAccess>(
+pub(crate) fn fire_buffer_lifecycle<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     events: &[Event],
     buffer: BufHandle,
+) -> Flow {
+    fire_buffer_lifecycle_with(runtime, access, scope, lua, events, buffer, None)
+}
+
+/// [`fire_buffer_lifecycle`] with an explicit `<afile>` match name for callers
+/// whose target differs from the buffer name (`:write {file}` matches the
+/// argument upstream, not the buffer).
+fn fire_buffer_lifecycle_with<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    events: &[Event],
+    buffer: BufHandle,
+    file_name: Option<&[u8]>,
 ) -> Flow {
     // `apply_autocmds` (`autocmd.c:1465-1468`): while autocommands are busy,
     // an event raised without `force` fires only through a `++nested` handler.
     if runtime.autocmd_busy > 0 && !runtime.active_autocmd.nested {
         return Flow::Normal;
     }
-    let name = access.with_ex_editor(|editor| {
-        editor
-            .buffer(buffer)
-            .ok()
-            .map(|state| state.name().to_string_lossy().into_owned())
-            .unwrap_or_default()
-    });
+    let owned;
+    let name = if let Some(name) = file_name {
+        name
+    } else {
+        owned = access.with_ex_editor(|editor| {
+            editor
+                .buffer(buffer)
+                .ok()
+                .map(|state| state.name().to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+        owned.as_bytes()
+    };
     for &event in events {
+        // `apply_autocmds` honors ignored events (`:noautocmd` sets
+        // `eventignore` to all); the API firing path already checks this,
+        // the Ex path must too.
+        if access.with_ex_editor(|editor| editor.autocmds().is_ignored(event)) {
+            continue;
+        }
         let plan = access.with_ex_editor(|editor| {
             editor.autocmds_mut().plan(
                 event,
                 AutocmdContext {
                     buffer: Some(buffer),
-                    file_name: Some(&name),
+                    file_name: Some(name),
                     ..AutocmdContext::default()
                 },
             )
@@ -13318,12 +14765,12 @@ fn fire_exit_autocmds<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
 ) {
-    if runtime.exiting {
+    if *runtime.exiting.borrow() {
         return;
     }
-    runtime.exiting = true;
+    *runtime.exiting.borrow_mut() = true;
     for event in [Event::VimLeavePre, Event::VimLeave] {
         let plan = access
             .with_ex_editor(|editor| editor.autocmds_mut().plan(event, AutocmdContext::default()));
@@ -13500,7 +14947,12 @@ pub(crate) fn apply_highlight_spec(
         if let Some(name) = words.next() {
             editor.highlights_mut().remove(name);
         } else {
+            // Upstream `:highlight clear` restores the default groups
+            // (`highlight_init_*`, highlight_group.c `init_highlight`),
+            // it does not leave the table empty: color schemes start
+            // from `hi clear` and only override.
             editor.highlights_mut().clear();
+            crate::highlight_init::init_highlight(editor);
         }
         return Ok(());
     }
@@ -13862,7 +15314,7 @@ fn command_augroup<F: FileIO>(
 fn command_autocmd<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let args = command.args.trim();
@@ -14354,7 +15806,7 @@ fn command_invoke_user<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     name: &str,
     command: &ExCommand,
 ) -> Flow {
@@ -14415,7 +15867,7 @@ fn command_invoke_user<F: FileIO, E: ExEditorAccess>(
             return exec_error_flow(runtime, error);
         }
         let opts = user_command_opts(name, command, &definition, args, line1, line2, count);
-        let result = lua.borrow_mut().invoke_callback(
+        let result = lua.invoke_callback(
             usize::try_from(reference).unwrap_or(usize::MAX),
             vec![Object::Dict(opts)],
         );
@@ -15298,6 +16750,7 @@ fn sync_buffer_scope(editor: &Editor, scope: &mut Scope) -> Result<(), ExecError
             Typval::Number(i64::try_from(state.script_changedtick()).unwrap_or(i64::MAX)),
         ));
         scope.buffer = pairs;
+        refresh_scope_mirror(scope, ScopeKind::Buffer)?;
         scope.synced.set_buffer_identity(Some(buffer));
         scope.synced.set_buffer_version(vars_version);
         scope.synced.clear_dirty(ScopeKind::Buffer);
@@ -15324,6 +16777,211 @@ fn sync_buffer_scope(editor: &Editor, scope: &mut Scope) -> Result<(), ExecError
     Ok(())
 }
 
+/// The scope type exposes one per-scope write-back mirror. Keep the mirrors
+/// for all editor-backed namespaces in that existing carrier, tagging keys by
+/// namespace so a reentrant write can be merged without process-global state.
+/// These tagged keys never reach an editor dictionary.
+const SCOPE_MIRROR_PREFIX: u8 = 0;
+
+fn scope_mirror_tag(kind: ScopeKind) -> Option<u8> {
+    match kind {
+        ScopeKind::Global => Some(b'g'),
+        ScopeKind::Buffer => Some(b'b'),
+        ScopeKind::Window => Some(b'w'),
+        ScopeKind::Tab => Some(b't'),
+        ScopeKind::Script | ScopeKind::Local | ScopeKind::Argument | ScopeKind::Vim => None,
+    }
+}
+
+fn scope_map(scope: &Scope, kind: ScopeKind) -> Option<&ScopeMap> {
+    match kind {
+        ScopeKind::Global => Some(&scope.global),
+        ScopeKind::Buffer => Some(&scope.buffer),
+        ScopeKind::Window => Some(&scope.window),
+        ScopeKind::Tab => Some(&scope.tab),
+        ScopeKind::Script | ScopeKind::Local | ScopeKind::Argument | ScopeKind::Vim => None,
+    }
+}
+
+fn mirror_name(key: &OxStr, tag: u8) -> Option<&[u8]> {
+    let bytes = key.as_bytes();
+    (bytes.len() >= 2 && bytes[0] == SCOPE_MIRROR_PREFIX && bytes[1] == tag)
+        .then(|| &bytes[2..])
+}
+
+fn mirror_key(tag: u8, key: &[u8]) -> OxStr {
+    let mut bytes = Vec::with_capacity(2 + key.len());
+    bytes.push(SCOPE_MIRROR_PREFIX);
+    bytes.push(tag);
+    bytes.extend_from_slice(key);
+    OxStr(bytes)
+}
+
+fn mirrored_key(kind: ScopeKind, key: &[u8]) -> bool {
+    !matches!(kind, ScopeKind::Buffer) || key != b"changedtick"
+}
+
+/// Refresh one tagged mirror entry-wise and by value. Equal values retain
+/// their deep snapshot; only changed values pay for `snapshot_value`, and the
+/// one owned key index keeps the pass linear.
+fn refresh_scope_mirror_map(
+    current: &ScopeMap,
+    mirror: &mut ScopeMap,
+    kind: ScopeKind,
+) -> Result<(), ExecError> {
+    let Some(tag) = scope_mirror_tag(kind) else {
+        return Ok(());
+    };
+    let current_keys: HashSet<&[u8]> = current
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+        .map(|(key, _)| key.as_bytes())
+        .collect();
+    mirror.retain(|(key, _)| {
+        mirror_name(key, tag).is_none_or(|name| current_keys.contains(name))
+    });
+    let mut slots: HashMap<Vec<u8>, usize> = mirror
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (key, _))| {
+            mirror_name(key, tag).map(|name| (name.to_vec(), index))
+        })
+        .collect();
+    for (key, value) in current
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+    {
+        match slots.get(key.as_bytes()).copied() {
+            Some(index) if mirror[index].1 == *value => {}
+            Some(index) => {
+                mirror[index].1 =
+                    ox_eval::scope::snapshot_value(value).map_err(ExecError::Eval)?;
+            }
+            None => {
+                let index = mirror.len();
+                mirror.push((
+                    mirror_key(tag, key.as_bytes()),
+                    ox_eval::scope::snapshot_value(value).map_err(ExecError::Eval)?,
+                ));
+                slots.insert(key.as_bytes().to_vec(), index);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn refresh_scope_mirror(scope: &Scope, kind: ScopeKind) -> Result<(), ExecError> {
+    let Some(current) = scope_map(scope, kind) else {
+        return Ok(());
+    };
+    refresh_scope_mirror_map(
+        current,
+        &mut scope.global_mirror.borrow_mut(),
+        kind,
+    )
+}
+
+/// Merge one dirty scope into its live dictionary and refresh its mirror.
+/// Baseline keys are the only keys eligible for deletion: a live key absent
+/// from both the baseline and the current scope was created reentrantly.
+fn merge_scope_map_into_editor(
+    live: &mut Dict,
+    current: &ScopeMap,
+    mirror: &mut ScopeMap,
+    kind: ScopeKind,
+) -> Result<(), ExecError> {
+    let Some(tag) = scope_mirror_tag(kind) else {
+        return Ok(());
+    };
+    let baseline: HashMap<&[u8], &Typval> = mirror
+        .iter()
+        .filter_map(|(key, value)| mirror_name(key, tag).map(|name| (name, value)))
+        .collect();
+    let current_keys: HashSet<&[u8]> = current
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+        .map(|(key, _)| key.as_bytes())
+        .collect();
+    for (key, value) in current
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+    {
+        let changed = match baseline.get(key.as_bytes()) {
+            Some(previous) => **previous != *value,
+            None => true,
+        };
+        if changed {
+            live.insert(key.clone(), typval_to_object(value));
+        }
+    }
+    for key in baseline.keys() {
+        if !current_keys.contains(key) {
+            live.0.retain(|(live_key, _)| live_key.as_bytes() != *key);
+        }
+    }
+    drop(current_keys);
+    drop(baseline);
+    refresh_scope_mirror_map(current, mirror, kind)
+}
+
+/// Pull live-only or changed values back into a scope after a reentrant write.
+/// The owned slot index keeps the reconciliation keyed to the live entry.
+fn pull_scope_map_from_editor(
+    live: &Dict,
+    current: &mut ScopeMap,
+    mirror: &mut ScopeMap,
+    kind: ScopeKind,
+) -> Result<(), ExecError> {
+    if scope_mirror_tag(kind).is_none() {
+        return Ok(());
+    }
+    let live_keys: HashSet<&[u8]> = live
+        .0
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+        .map(|(key, _)| key.as_bytes())
+        .collect();
+    current.retain(|(key, _)| {
+        !mirrored_key(kind, key.as_bytes()) || live_keys.contains(key.as_bytes())
+    });
+    let current_values: HashMap<&[u8], &Typval> = current
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+        .map(|(key, value)| (key.as_bytes(), value))
+        .collect();
+    let mut pulls = Vec::new();
+    for (key, value) in live
+        .0
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+    {
+        let stale = match current_values.get(key.as_bytes()) {
+            Some(current) => !typval_matches_object(current, value),
+            None => true,
+        };
+        if stale {
+            pulls.push((key.clone(), object_to_typval(value)));
+        }
+    }
+    drop(current_values);
+    let mut slots: HashMap<Vec<u8>, usize> = current
+        .iter()
+        .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
+        .enumerate()
+        .map(|(index, (key, _))| (key.as_bytes().to_vec(), index))
+        .collect();
+    for (key, value) in pulls {
+        match slots.get(key.as_bytes()).copied() {
+            Some(index) => current[index].1 = value,
+            None => {
+                slots.insert(key.as_bytes().to_vec(), current.len());
+                current.push((key, value));
+            }
+        }
+    }
+    refresh_scope_mirror_map(current, mirror, kind)
+}
+
 pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Result<(), ExecError> {
     // Differential sync: a map whose stamp still matches the editor's
     // version is kept as-is, so shared Typval values — and the mutability
@@ -15335,6 +16993,7 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
     let global_version = editor.gvars_version();
     if scope.synced.get(ScopeKind::Global) != global_version {
         scope.global = dict_to_scope(editor.gvars());
+        refresh_scope_mirror(scope, ScopeKind::Global)?;
         scope.synced.set(ScopeKind::Global, global_version);
         scope.synced.clear_dirty(ScopeKind::Global);
     }
@@ -15349,6 +17008,7 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
                     .window_variables(window)
                     .map_err(|error| ExecError::Editor(error.to_string()))?,
             );
+            refresh_scope_mirror(scope, ScopeKind::Window)?;
             scope.synced.set(ScopeKind::Window, window_version);
             scope.synced.clear_dirty(ScopeKind::Window);
         }
@@ -15363,6 +17023,7 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
                     .tabpage_variables(tab)
                     .map_err(|error| ExecError::Editor(error.to_string()))?,
             );
+            refresh_scope_mirror(scope, ScopeKind::Tab)?;
             scope.synced.set(ScopeKind::Tab, tab_version);
             scope.synced.clear_dirty(ScopeKind::Tab);
         }
@@ -15557,42 +17218,83 @@ fn option_matches(value: &OptionValue, existing: &Typval) -> bool {
 /// and no `assign`. A flag can only be set by a scope-side mutation that
 /// happened after the last read sync, so skipping a clean map cannot drop a
 /// write.
-pub(crate) fn sync_scope_into_editor(editor: &mut Editor, scope: &Scope) -> Result<(), ExecError> {
-    if scope.synced.is_dirty(ScopeKind::Global) {
-        *editor.gvars_mut() = scope_to_dict(&scope.global);
-        scope.synced.set(ScopeKind::Global, editor.gvars_version());
+#[expect(
+    clippy::too_many_lines,
+    reason = "one sync contract over all scope kinds; do not split by size"
+)]
+pub(crate) fn sync_scope_into_editor(
+    editor: &mut Editor,
+    scope: &mut Scope,
+) -> Result<(), ExecError> {
+    let global_dirty = scope.synced.is_dirty(ScopeKind::Global);
+    if global_dirty {
+        let live = editor.gvars_mut();
+        let mut mirror = scope.global_mirror.borrow_mut();
+        merge_scope_map_into_editor(live, &scope.global, &mut mirror, ScopeKind::Global)?;
+    }
+    if global_dirty || scope.synced.get(ScopeKind::Global) != editor.gvars_version() {
+        let live = editor.gvars();
+        let mut mirror = scope.global_mirror.borrow_mut();
+        pull_scope_map_from_editor(
+            live,
+            &mut scope.global,
+            &mut mirror,
+            ScopeKind::Global,
+        )?;
+        scope
+            .synced
+            .set(ScopeKind::Global, editor.gvars_version());
+    }
+    if global_dirty {
         scope.synced.clear_dirty(ScopeKind::Global);
     }
+
     // The cached `b:` map belongs to the buffer the read sync mirrored. When
-    // the current buffer has since moved (a Lua callback switched buffers
-    // mid-command) writing it would land in the wrong buffer, so the write is
-    // skipped and the flag stays set: the next read sync sees the identity
-    // change, rebuilds `b:` from the live buffer, and clears it.
-    if scope.synced.is_dirty(ScopeKind::Buffer)
-        && let Some(buffer) = editor
-            .current_buffer()
-            .filter(|buffer| scope.synced.buffer_identity() == Some(*buffer))
+    // the current buffer has since moved, keep the dirt pending: the next
+    // read sync rebuilds `b:` from that buffer instead of writing stale data
+    // into the wrong one.
+    let buffer_dirty = scope.synced.is_dirty(ScopeKind::Buffer);
+    let buffer = editor
+        .current_buffer()
+        .filter(|buffer| scope.synced.buffer_identity() == Some(*buffer));
+    if buffer_dirty
+        && let Some(buffer) = buffer
     {
-        let mut variables = scope_to_dict(&scope.buffer);
-        // The materialized `b:changedtick` never lands in ordinary
-        // variables: the buffer owns the live counter and a stored copy
-        // would go stale.
-        variables
-            .0
-            .retain(|(key, _)| key.as_bytes() != b"changedtick");
         let state = editor
             .buffer_mut(buffer)
             .map_err(|error| ExecError::Editor(error.to_string()))?;
-        *state.variables_mut() = variables;
-        scope.synced.set_buffer_version(state.variables_version());
-        scope.synced.clear_dirty(ScopeKind::Buffer);
+        let live = state.variables_mut();
+        let mut mirror = scope.global_mirror.borrow_mut();
+        merge_scope_map_into_editor(live, &scope.buffer, &mut mirror, ScopeKind::Buffer)?;
     }
+    if let Some(buffer) = buffer {
+        let buffer_version = editor
+            .buffer_variables_version(buffer)
+            .map_err(|error| ExecError::Editor(error.to_string()))?;
+        if buffer_dirty || scope.synced.buffer_version() != buffer_version {
+            let live = editor
+                .buffer(buffer)
+                .map_err(|error| ExecError::Editor(error.to_string()))?
+                .variables();
+            let mut mirror = scope.global_mirror.borrow_mut();
+            pull_scope_map_from_editor(
+                live,
+                &mut scope.buffer,
+                &mut mirror,
+                ScopeKind::Buffer,
+            )?;
+            scope.synced.set_buffer_version(buffer_version);
+        }
+        if buffer_dirty {
+            scope.synced.clear_dirty(ScopeKind::Buffer);
+        }
+    }
+
     // Persist `:lockvar` marks for buffer-scoped variables into editor-owned
     // storage so the API (`nvim_buf_set_var` / `nvim_buf_del_var`) can reject
-    // mutations with "Key is locked".  This is hoisted out of the dirty
+    // mutations with "Key is locked". This is hoisted out of the dirty
     // branch because `:lockvar` modifies `Scope::locked` without marking the
-    // buffer variable map dirty — the lock state must propagate even when
-    // the variable dict itself is unchanged.
+    // buffer variable map dirty.
     if let Some(buffer) = editor
         .current_buffer()
         .filter(|buffer| scope.synced.buffer_identity() == Some(*buffer))
@@ -15607,34 +17309,66 @@ pub(crate) fn sync_scope_into_editor(editor: &mut Editor, scope: &Scope) -> Resu
             state.set_locked_vars(locked_names);
         }
     }
-    if scope.synced.is_dirty(ScopeKind::Window)
+
+    let window_dirty = scope.synced.is_dirty(ScopeKind::Window);
+    if window_dirty
         && let Some(window) = editor.current_window()
     {
-        *editor
+        let live = editor
             .window_variables_mut(window)
-            .map_err(|error| ExecError::Editor(error.to_string()))? = scope_to_dict(&scope.window);
-        scope.synced.set(
-            ScopeKind::Window,
-            editor
-                .window_variables_version(window)
-                .map_err(|error| ExecError::Editor(error.to_string()))?,
-        );
-        scope.synced.clear_dirty(ScopeKind::Window);
+            .map_err(|error| ExecError::Editor(error.to_string()))?;
+        let mut mirror = scope.global_mirror.borrow_mut();
+        merge_scope_map_into_editor(live, &scope.window, &mut mirror, ScopeKind::Window)?;
     }
-    if scope.synced.is_dirty(ScopeKind::Tab)
+    if let Some(window) = editor.current_window() {
+        let window_version = editor
+            .window_variables_version(window)
+            .map_err(|error| ExecError::Editor(error.to_string()))?;
+        if window_dirty || scope.synced.get(ScopeKind::Window) != window_version {
+            let live = editor
+                .window_variables(window)
+                .map_err(|error| ExecError::Editor(error.to_string()))?;
+            let mut mirror = scope.global_mirror.borrow_mut();
+            pull_scope_map_from_editor(
+                live,
+                &mut scope.window,
+                &mut mirror,
+                ScopeKind::Window,
+            )?;
+            scope.synced.set(ScopeKind::Window, window_version);
+        }
+        if window_dirty {
+            scope.synced.clear_dirty(ScopeKind::Window);
+        }
+    }
+
+    let tab_dirty = scope.synced.is_dirty(ScopeKind::Tab);
+    if tab_dirty
         && let Some(tab) = editor.current_tabpage()
     {
-        *editor
+        let live = editor
             .tabpage_variables_mut(tab)
-            .map_err(|error| ExecError::Editor(error.to_string()))? = scope_to_dict(&scope.tab);
-        scope.synced.set(
-            ScopeKind::Tab,
-            editor
-                .tabpage_variables_version(tab)
-                .map_err(|error| ExecError::Editor(error.to_string()))?,
-        );
-        scope.synced.clear_dirty(ScopeKind::Tab);
+            .map_err(|error| ExecError::Editor(error.to_string()))?;
+        let mut mirror = scope.global_mirror.borrow_mut();
+        merge_scope_map_into_editor(live, &scope.tab, &mut mirror, ScopeKind::Tab)?;
     }
+    if let Some(tab) = editor.current_tabpage() {
+        let tab_version = editor
+            .tabpage_variables_version(tab)
+            .map_err(|error| ExecError::Editor(error.to_string()))?;
+        if tab_dirty || scope.synced.get(ScopeKind::Tab) != tab_version {
+            let live = editor
+                .tabpage_variables(tab)
+                .map_err(|error| ExecError::Editor(error.to_string()))?;
+            let mut mirror = scope.global_mirror.borrow_mut();
+            pull_scope_map_from_editor(live, &mut scope.tab, &mut mirror, ScopeKind::Tab)?;
+            scope.synced.set(ScopeKind::Tab, tab_version);
+        }
+        if tab_dirty {
+            scope.synced.clear_dirty(ScopeKind::Tab);
+        }
+    }
+
     if scope.synced.is_dirty(ScopeKind::Vim) {
         *editor.vvars_mut() = scope_to_dict(&scope.vim);
         scope.synced.set(ScopeKind::Vim, editor.vvars_version());
@@ -17609,6 +19343,81 @@ pub(crate) fn object_to_typval(value: &Object) -> Typval {
         Object::Tabpage(value) => Typval::Number(i64::from(*value)),
     }
 }
+// Compare in Object space without allocating the converted container tree.
+// Blob/List and Funcref/Dict are intentionally not Typval-space equivalents.
+fn typval_matches_object(value: &Typval, object: &Object) -> bool {
+    match (value, object) {
+        (Typval::List(list), object) => {
+            list.try_borrow()
+                .map_or(matches!(object, Object::Nil), |data| match object {
+                    Object::Array(items) => {
+                        data.items.len() == items.len()
+                            && data
+                                .items
+                                .iter()
+                                .zip(items)
+                                .all(|(a, b)| typval_matches_object(a, b))
+                    }
+                    _ => false,
+                })
+        }
+        (Typval::Dict(dict), object) => {
+            dict.try_borrow()
+                .map_or(matches!(object, Object::Nil), |data| match object {
+                    Object::Dict(items) => {
+                        data.entries.len() == items.0.len()
+                            && data.entries.iter().zip(&items.0).all(|(a, (key, b))| {
+                                a.key == *key && typval_matches_object(&a.value, b)
+                            })
+                    }
+                    _ => false,
+                })
+        }
+        (Typval::Blob(bytes), Object::Array(items)) => {
+            bytes.len() == items.len()
+                && bytes
+                    .iter()
+                    .zip(items)
+                    .all(|(a, b)| *b == Object::Integer(i64::from(*a)))
+        }
+        (Typval::String(a), Object::String(b)) => a == b,
+        (Typval::Funcref(function) | Typval::Partial(function), Object::Dict(dict)) => {
+            let expected_partial = matches!(value, Typval::Partial(_));
+            let expected_registry = function
+                .registry
+                .and_then(|id| i64::try_from(id).ok())
+                .unwrap_or(-1);
+            let get = |key: &[u8]| {
+                dict.0
+                    .iter()
+                    .find(|(k, _)| k.as_bytes() == key)
+                    .map(|(_, v)| v)
+            };
+            dict.0.len() == 4
+                && get(FUNCREF_MARK)
+                    .is_some_and(|v| matches!(v, Object::String(name) if name == &function.name))
+                && get(b"partial")
+                    .is_some_and(|v| matches!(v, Object::Boolean(p) if *p == expected_partial))
+                && get(b"registry")
+                    .is_some_and(|v| matches!(v, Object::Integer(r) if *r == expected_registry))
+                && get(b"args").is_some_and(|v| {
+                    matches!(
+                        v,
+                        Object::Array(items)
+                            if function.args.len() == items.len()
+                                && function
+                                    .args
+                                    .iter()
+                                    .zip(items)
+                                    .all(|(a, b)| typval_matches_object(a, b))
+                    )
+                })
+        }
+        (Typval::Funcref(_) | Typval::Partial(_), _) => false,
+        _ => typval_to_object(value) == *object,
+    }
+}
+
 /// Converts one Vimscript [`Typval`] to an API [`Object`].
 #[must_use]
 pub fn typval_to_object(value: &Typval) -> Object {
@@ -17793,7 +19602,7 @@ fn command_lua<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let Some(lua) = lua else {
@@ -17833,12 +19642,12 @@ fn command_lua<F: FileIO, E: ExEditorAccess>(
     if let Err(error) = access.with_ex_editor(|editor| sync_scope_into_editor(editor, scope)) {
         return exec_error_flow(runtime, error);
     }
-    let result = lua.borrow_mut().execute_chunk(&code, Vec::new());
+    let result = lua.execute_chunk(&code, Vec::new());
     let sync = access.with_ex_editor(|editor| sync_editor_into_scope(editor, scope));
     match result {
         Err(error) => lua_error_flow(runtime, error, "E5107", "E5108"),
         Ok(result) => {
-            lua.borrow_mut().discard_result(result);
+            lua.discard_result(result);
             match sync {
                 Ok(()) => Flow::Normal,
                 Err(error) => exec_error_flow(runtime, error),
@@ -17851,7 +19660,7 @@ fn command_luafile<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let Some(lua) = lua else {
@@ -17864,7 +19673,7 @@ fn command_luafile<F: FileIO, E: ExEditorAccess>(
     if let Err(error) = access.with_ex_editor(|editor| sync_scope_into_editor(editor, scope)) {
         return exec_error_flow(runtime, error);
     }
-    let result = lua.borrow_mut().execute_file(Path::new(path));
+    let result = lua.execute_file(Path::new(path));
     let sync = access.with_ex_editor(|editor| sync_editor_into_scope(editor, scope));
     match (result, sync) {
         (Err(error), _) => lua_error_flow(runtime, error, "E5112", "E5113"),
@@ -17877,7 +19686,7 @@ fn command_luado<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let Some(lua) = lua else {
@@ -17912,7 +19721,7 @@ fn command_luado<F: FileIO, E: ExEditorAccess>(
         let Some(line) = lines.get(lnum.saturating_sub(1)).cloned() else {
             break;
         };
-        let result = match lua.borrow_mut().execute_chunk(
+        let result = match lua.execute_chunk(
             &chunk,
             vec![
                 Object::String(OxStr(line)),
@@ -17931,7 +19740,7 @@ fn command_luado<F: FileIO, E: ExEditorAccess>(
             Object::Float(value) => Some(value.to_string().into_bytes()),
             _ => None,
         };
-        lua.borrow_mut().discard_result(result);
+        lua.discard_result(result);
         if access.with_ex_editor(|editor| editor.current_buffer()) != Some(buffer) {
             break;
         }
@@ -18137,6 +19946,37 @@ fn command_quickfix_age<F: FileIO>(
         Err(error) => error_flow(runtime, error.code, error.message),
     }
 }
+/// `:chistory` / `:lhistory`: with a count go to that list in the history,
+/// without one print the history (`ex_chistory`, quickfix.c).
+fn command_quickfix_history<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    command: &ExCommand,
+) -> Flow {
+    let scope = quickfix_scope(editor, command.command.name());
+    let Some(stack) = scope.stack(editor) else {
+        return error_flow(runtime, "E776", "No location list");
+    };
+    if let Some(count) = command.count {
+        let number = usize::try_from(count).unwrap_or(usize::MAX);
+        return match scope.stack_mut(editor).goto_history(number) {
+            Ok(()) => Flow::Normal,
+            Err(error) => error_flow(runtime, error.code, error.message),
+        };
+    }
+    for (index, (title, current)) in stack.history().iter().enumerate() {
+        push_info_text_message(
+            editor,
+            format!(
+                "{} {:>2}: {}",
+                if *current { '>' } else { ' ' },
+                index + 1,
+                title.to_string_lossy()
+            ),
+        );
+    }
+    Flow::Normal
+}
 
 /// `:cwin[dow]` / `:lwin[dow]`: open the list window only when the list has
 /// entries (`ex_cwindow`, quickfix.c:3823-3848).
@@ -18168,7 +20008,7 @@ fn command_quickfix_expr<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let value = match eval_text(runtime, access, scope, lua, skipwhite_trim(&command.args)) {
@@ -18194,7 +20034,7 @@ fn command_quickfix_buffer<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     _scope: &mut Scope,
-    _lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    _lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let args = command.args.trim();

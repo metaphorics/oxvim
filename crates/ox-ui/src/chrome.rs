@@ -122,6 +122,14 @@ pub struct PopupmenuState {
     pub col: usize,
     /// Grid containing the anchor.
     pub grid: i64,
+    /// Match-list generation from the completion session: painters use
+    /// it (with the anchor and selection) to tell a rebuilt list from
+    /// mere navigation.
+    pub revision: u64,
+    /// Precomputed `(word, kind, menu)` column widths: measuring every
+    /// item costs O(items) lossy conversions, so it happens once per
+    /// list here instead of on every redraw.
+    pub widths: (usize, usize, usize),
 }
 
 /// Mode cursor descriptor sent by `mode_info_set`.
@@ -326,7 +334,8 @@ impl ChromeState {
     }
 
     /// Shows a popup menu.
-    pub fn show_popupmenu(&mut self, state: PopupmenuState) {
+    pub fn show_popupmenu(&mut self, mut state: PopupmenuState) {
+        state.widths = Self::popup_column_widths(&state.items);
         self.pending.push(UiEvent::new(
             "popupmenu_show",
             vec![
@@ -338,6 +347,28 @@ impl ChromeState {
             ],
         ));
         self.popupmenu = Some(state);
+    }
+
+    /// `(word, kind, menu)` display widths over the whole item list
+    /// (`pum_compute_width` walks every item the same way).
+    fn popup_column_widths(items: &[PopupItem]) -> (usize, usize, usize) {
+        use unicode_width::UnicodeWidthStr;
+        let mut word_width = 0;
+        let mut kind_width = 0;
+        let mut menu_width = 0;
+        for item in items {
+            let word = item.word.to_string_lossy();
+            word_width = word_width.max(word.as_ref().width());
+            let kind = item.kind.to_string_lossy();
+            if !kind.is_empty() {
+                kind_width = kind_width.max(kind.as_ref().width() + 1);
+            }
+            let menu = item.menu.to_string_lossy();
+            if !menu.is_empty() {
+                menu_width = menu_width.max(menu.as_ref().width() + 1);
+            }
+        }
+        (word_width, kind_width, menu_width)
     }
 
     /// Changes the selected popup-menu item.

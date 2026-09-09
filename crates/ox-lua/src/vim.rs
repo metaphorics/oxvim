@@ -2,14 +2,16 @@
 
 use crate::converter::{free_lua_ref, lua_to_object, object_to_lua, object_to_lua_legacy};
 use crate::typval_bridge::{collect_typval_refs, free_typval_refs, lua_to_typval, typval_to_lua};
+use crate::uv_core::CallbackContext;
 use mlua::{
     FromLuaMulti, Function, Lua, LuaString, MetaMethod, MultiValue, Table, UserData,
     UserDataMethods, Value, Variadic,
 };
-use ox_api::Registry;
-use ox_editor::BufferRelease;
+use ox_api::{EnteredResidency, Registry, restore_buffer_context};
+use ox_editor::editor::RedrawRequest;
 use ox_types::{BufHandle, Object, OxStr, Typval, WinHandle};
 use std::cell::Cell;
+use std::io::Write;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -24,6 +26,40 @@ pub trait Scheduler {
     ///
     /// Returns an error when the main-loop adapter cannot enqueue `work`.
     fn schedule_deferred(&self, work: Work) -> Result<(), String>;
+    /// Whether `schedule_deferred` genuinely postpones work to a later
+    /// drained main-loop turn; `false` means it executes work inline and
+    /// the host has no draining main loop.
+    ///
+    /// Inline is the safe default: a host with a real draining main loop
+    /// overrides this with `true`, while inline hosts — including the
+    /// test-only schedulers in `ox-lua/tests/` — inherit the correct
+    /// branch instead of silently queueing work no turn drains.
+    fn defers_to_main_loop(&self) -> bool {
+        false
+    }
+    /// Run queued deferred work now; the wait-pump path.
+    ///
+    /// WHY: upstream's `loop_poll` serves the same `main_loop.events`
+    /// queue `vim.schedule` feeds (`LOOP_PROCESS_EVENTS`, executor.c), so
+    /// a blocking `vim.wait` still advances scheduled continuations. A
+    /// pump that only runs its own timers starves them: the wait never
+    /// observes completion. Hosts with inline scheduling keep the
+    /// no-op default; queued hosts drain their queue.
+    ///
+    /// Returns whether at least one work item ran.
+    fn pump_scheduled(&self) -> bool {
+        false
+    }
+}
+
+/// Vimscript builtins that can modify buffer text and therefore fail while
+/// the Lua API dispatch context holds textlock.
+#[must_use]
+pub fn builtin_textlock(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"append" | b"appendbufline" | b"deletebufline" | b"setbufline" | b"setline"
+    )
 }
 
 /// Vimscript builtin dispatch seam used by `vim.call` and `vim.fn`.
@@ -35,6 +71,11 @@ pub trait BuiltinHost {
     /// Returns an error when the host cannot invoke `name`, including lookup,
     /// argument-conversion, and Vimscript execution failures.
     fn call(&self, name: &OxStr, args: Vec<Typval>) -> Result<Typval, String>;
+
+    /// Whether this function changes editor text while textlock is active.
+    fn is_textlock(&self, name: &OxStr) -> bool {
+        builtin_textlock(name.as_bytes())
+    }
 
     /// Whether this function is safe in a fast callback.
     fn is_fast(&self, _name: &OxStr) -> bool {
@@ -129,6 +170,21 @@ impl ApiDispatchContext {
             .set(self.textlock_depth.get().saturating_add(1));
         TextlockGuard {
             depth: self.textlock_depth.clone(),
+        }
+    }
+
+    /// Reject a text-changing dispatch while the shared callback textlock is
+    /// active.
+    ///
+    /// # Errors
+    ///
+    /// Returns Neovim's exact textlock error when the context is currently
+    /// locked.
+    pub fn ensure_textlock_allows(&self) -> Result<(), String> {
+        if self.text_locked() {
+            Err("E565: Not allowed to change text or change window".to_owned())
+        } else {
+            Ok(())
         }
     }
 
@@ -433,6 +489,12 @@ fn dispatch_builtin(
     {
         return api_failure(lua, error.to_string());
     }
+    if host.is_textlock(&name)
+        && let Some(context) = lua.app_data_ref::<ApiDispatchContext>()
+        && let Err(error) = context.ensure_textlock_allows()
+    {
+        return api_failure(lua, error);
+    }
 
     let mut converted = Vec::with_capacity(args.len());
     let mut arg_refs = Vec::new();
@@ -542,6 +604,10 @@ pub fn bind_api(
 ) -> mlua::Result<()> {
     let vim: Table = lua.globals().get("vim")?;
     let api: Table = vim.get("api")?;
+    // Turn-boundary drains do not enter through a generated API closure, so
+    // register the same context they need to lock callback reentry. Cloning
+    // the context clones its `Rc<Cell<u32>>`, not a snapshot of the depth.
+    lua.set_app_data(context.clone());
     let wrap_api: Function = lua
         .load(
             "local function pack(...) return { n = select('#', ...), ... } end \
@@ -571,8 +637,8 @@ pub fn bind_api(
                         error => error.to_string(),
                     })?;
                 }
-                if textlock && context.text_locked() {
-                    return Err("E565: Not allowed to change text or change window".to_owned());
+                if textlock {
+                    context.ensure_textlock_allows()?;
                 }
                 let mut args = args
                     .iter()
@@ -600,8 +666,23 @@ pub fn bind_api(
                     }
                     args.push(Object::Dict(ox_types::Dict(Vec::new())));
                 }
-                let result = dispatch(context.session(), &args)
-                    .map_err(|error| error.message().to_owned())?;
+                // A read-only call must never run user code: `parse` reads
+                // lines while its parser handle is borrowed, so draining
+                // there would reenter Lua under the borrow. Drain only when
+                // this call queued new events, which is exactly when
+                // upstream fires `on_bytes` synchronously. Same-chunk
+                // observers (a `parse` after `set_lines`) still see edited
+                // trees. The dispatch error wins when both fail.
+                let queued_before = crate::buf_attach::pending_buffer_bytes(context.session());
+                let dispatch_result = dispatch(context.session(), &args);
+                let drain_result =
+                    if crate::buf_attach::pending_buffer_bytes(context.session()) > queued_before {
+                        crate::buf_attach::drain_buffer_callbacks(lua, context.session())
+                    } else {
+                        Ok(())
+                    };
+                let result = dispatch_result.map_err(|error| error.message().to_owned())?;
+                drain_result?;
                 let values = match &result {
                     Object::Array(values) if matches!(name, "nvim_buf_call" | "nvim_win_call") => {
                         values
@@ -658,6 +739,7 @@ pub fn bind_api(
         api.set(name, binding)?;
     }
 
+    let redraw_context = context.clone();
     // api/vim.c `nvim__get_runtime` is an internal, so it is absent from the
     // canonical API metadata the registry is built from, but the package loader
     // in runtime/lua/vim/_init_packages.lua reaches 'runtimepath' through it.
@@ -689,6 +771,123 @@ pub fn bind_api(
     })?;
     let runtime_binding: Function = wrap_api.call(native_runtime)?;
     api.set("nvim__get_runtime", runtime_binding)?;
+    // api/vim.c `nvim__redraw` is an internal like `nvim__get_runtime`
+    // above: absent from the canonical metadata, bound here by hand. The
+    // validation matrix mirrors upstream exactly (its strings are
+    // test-visible, e.g. api/vim_spec.lua's `nvim__redraw` block), and the
+    // request — including whether `flush` was supplied — is queued on the
+    // editor for the server's redraw pass.
+    let native_redraw = lua.create_function(move |lua, opts: Table| {
+        let session = redraw_context.session();
+        let fail = |message: String| -> mlua::Result<(bool, Value)> {
+            Ok((false, Value::String(lua.create_string(message)?)))
+        };
+        let window = match opts.get::<Option<i64>>("win") {
+            Ok(Some(number)) => {
+                let handle = WinHandle::try_from(number)
+                    .map(|handle| validate_win(session, handle))
+                    .ok()
+                    .flatten();
+                if handle.is_none() {
+                    return fail(format!("Invalid window id: {number}"));
+                }
+                handle
+            }
+            Ok(None) => None,
+            Err(error) => return fail(error.to_string()),
+        };
+        let buffer = match opts.get::<Option<i64>>("buf") {
+            Ok(Some(number)) => {
+                let handle = BufHandle::try_from(number)
+                    .map(|handle| validate_buf(session, handle))
+                    .ok()
+                    .flatten();
+                if handle.is_none() {
+                    return fail(format!("Invalid buffer id: {number}"));
+                }
+                handle
+            }
+            Ok(None) => None,
+            Err(error) => return fail(error.to_string()),
+        };
+        if window.is_some() && buffer.is_some() {
+            return fail("cannot use both 'buf' and 'win'".to_owned());
+        }
+        // The action flags are all declared as booleans in the keyset and
+        // decode through `nlua_pop_Boolean_strict` (converter.c:848-871):
+        // booleans pass through, every number decodes (nonzero is true, zero
+        // false), and a nil-valued key is simply absent. Only other types
+        // fail, and the keyset dispatch names the failing field, so the
+        // observable string is `Invalid '<key>': not a boolean`
+        // (api_spec.lua:301 pins the composite for nvim_exec2's `output`).
+        // Presence stays the action signal, so `{valid = 0}` still counts.
+        let boolean_keys = ["cursor", "flush", "tabline", "statusline", "statuscolumn", "winbar", "valid"];
+        for key in boolean_keys {
+            if !opts.contains_key(key).unwrap_or(false) {
+                continue;
+            }
+            match opts.raw_get::<Value>(key)? {
+                Value::Boolean(_) | Value::Integer(_) | Value::Number(_) => {}
+                _ => return fail(format!("Invalid '{key}': not a boolean")),
+            }
+        }
+        let action = boolean_keys
+            .into_iter()
+            .chain(["range"])
+            .any(|key| opts.contains_key(key).unwrap_or(false));
+        if !action {
+            return fail("at least one action required".to_owned());
+        }
+        if opts.contains_key("range").unwrap_or(false) {
+            let valid = opts
+                .get::<Table>("range")
+                .ok()
+                .filter(|range| range.raw_len() == 2)
+                .and_then(|range| {
+                    let first: i64 = range.get(1).ok()?;
+                    let second: i64 = range.get(2).ok()?;
+                    (first >= 0 && second >= -1).then_some(())
+                })
+                .is_some();
+            if !valid {
+                return fail("Invalid 'range': Expected 2-tuple of Integers".to_owned());
+            }
+        }
+        // Decode the validated flags with `nlua_pop_Boolean_strict`
+        // semantics — booleans pass, numbers compare `!= 0`. Keep `flush`
+        // optional: the redraw pass must distinguish an omitted field from an
+        // explicit false before applying `vim.c:2541-2543`.
+        let strict_flag = |key: &str| -> mlua::Result<Option<bool>> {
+            if opts.contains_key(key).unwrap_or(false) {
+                Ok(Some(boolean_strict(opts.raw_get::<Value>(key)?)))
+            } else {
+                Ok(None)
+            }
+        };
+        let validity = strict_flag("valid")?;
+        let range = if opts.contains_key("range").unwrap_or(false) {
+            let range = opts.get::<Table>("range")?;
+            Some((range.get::<i64>(1)?, range.get::<i64>(2)?))
+        } else {
+            None
+        };
+        let request = RedrawRequest {
+            window,
+            buffer,
+            valid: validity,
+            range,
+            flush: strict_flag("flush")?,
+            cursor: strict_flag("cursor")?.unwrap_or(false),
+            tabline: strict_flag("tabline")?.unwrap_or(false),
+            statusline: strict_flag("statusline")?.unwrap_or(false),
+            statuscolumn: strict_flag("statuscolumn")?.unwrap_or(false),
+            winbar: strict_flag("winbar")?.unwrap_or(false),
+        };
+        session.with_editor_mut(|editor| editor.queue_redraw(request));
+        Ok((true, Value::Nil))
+    })?;
+    let redraw_binding: Function = wrap_api.call(native_redraw)?;
+    api.set("nvim__redraw", redraw_binding)?;
     // Ex-to-Lua calls replace `vim.api` temporarily, and user code can replace
     // `tostring`, so both lookups must happen when `print` runs.
     lua.globals().set(
@@ -703,11 +902,43 @@ pub fn bind_api(
                 let rendered: LuaString = to_string.call(value)?;
                 bytes.extend_from_slice(&rendered.as_bytes());
             }
-            let vim: Table = lua.globals().get("vim")?;
-            let api: Table = vim.get("api")?;
-            let out_write: Function = api.get("nvim_out_write")?;
-            out_write.call::<()>(lua.create_string(&bytes)?)?;
-            Ok(())
+            // executor.c:nlua_print queues the emit for fast callbacks
+            // (executor.c:1159-1161) instead of raising E5560; single-threaded
+            // host, so there is no worker-thread branch (executor.c:1154-1158)
+            // to mirror.
+            let context = lua
+                .app_data_ref::<CallbackContext>()
+                .map(|context| (context.scheduler.clone(), context.fast.clone()));
+            if let Some((scheduler, _)) = context.filter(|(_, fast)| fast.in_fast_callback()) {
+                if !scheduler.defers_to_main_loop() {
+                    // Upstream defers to a main loop that always drains
+                    // (executor.c:1159-1161); an inline host executes the
+                    // deferred print immediately, still under the live
+                    // fast-callback guard (E5560). Emit directly to preserve
+                    // the bytes — message-system capture does not apply
+                    // inside fast callbacks by definition. Like the queued
+                    // branch and upstream `nlua_print`, the payload carries
+                    // separators between values, never a trailing newline
+                    // (executor.c:1099-1106).
+                    let mut stdout = std::io::stdout().lock();
+                    return stdout.write_all(&bytes).map_err(mlua::Error::external);
+                }
+                let lua = lua.clone();
+                scheduler
+                    .schedule_deferred(Box::new(move || {
+                        let vim: Table = lua.globals().get("vim")?;
+                        let api: Table = vim.get("api")?;
+                        let out_write: Function = api.get("nvim_out_write")?;
+                        out_write.call::<()>(lua.create_string(&bytes)?)
+                    }))
+                    .map_err(mlua::Error::runtime)
+            } else {
+                let vim: Table = lua.globals().get("vim")?;
+                let api: Table = vim.get("api")?;
+                let out_write: Function = api.get("nvim_out_write")?;
+                out_write.call::<()>(lua.create_string(&bytes)?)?;
+                Ok(())
+            }
         })?,
     )?;
     Ok(())
@@ -733,6 +964,19 @@ pub fn bind_with(
 
 fn truthy(value: &Value) -> bool {
     !matches!(value, Value::Nil | Value::Boolean(false))
+}
+
+/// Decodes a validated `nvim__redraw` action flag the way
+/// `nlua_pop_Boolean_strict` does (converter.c:848-871): booleans pass
+/// through and every number decodes by `!= 0`, so `{valid = 0}` is false.
+/// Only validation-admitted types reach the fallback arm.
+fn boolean_strict(value: Value) -> bool {
+    match value {
+        Value::Boolean(flag) => flag,
+        Value::Integer(number) => number != 0,
+        Value::Number(number) => number != 0.0,
+        other => truthy(&other),
+    }
 }
 
 #[expect(
@@ -877,7 +1121,7 @@ fn with_c(
         message_routing,
         process_cwd,
         target_window,
-        entered,
+        mut entered,
     ) = session.with_editor(|editor| {
         let caller = editor.current_window();
         let previous_before = editor.previous_window();
@@ -902,14 +1146,14 @@ fn with_c(
                 match visible {
                     Some(w) if w != c => {
                         target_window = Some(w);
-                        entered = Some((w, b));
+                        entered = Some((w, b, None));
                     }
                     _ if caller_buffer == Some(b) => {
                         target_window = Some(c);
                     }
                     _ => {
                         target_window = Some(c);
-                        entered = Some((c, caller_buffer.unwrap_or(b)));
+                        entered = Some((c, caller_buffer.unwrap_or(b), None));
                     }
                 }
             }
@@ -970,13 +1214,41 @@ fn with_c(
                 return Ok(MultiValue::new());
             }
         }
-        if let (Some((window, _)), Some(buffer)) = (entered, buf_handle)
-            && Some(window) == caller
-        {
-            // Hidden buffer target: take over the caller window.
-            session.with_editor_mut(|editor| {
-                let _ = editor.set_current_buffer(buffer, BufferRelease::KeepLoaded);
+        let hidden_target = entered.as_ref().is_some_and(|(window, _, residency)| {
+            Some(*window) == caller && residency.is_none()
+        });
+        if hidden_target && let Some(buffer) = buf_handle {
+            // Hidden buffer target: take over the caller window without
+            // opening its file, matching upstream `ctx_switch`, while
+            // preserving the target's entry residency for restoration.
+            let residency = session.with_editor_mut(|editor| {
+                EnteredResidency::enter(editor, buffer)
             });
+            match residency {
+                Ok(residency) => {
+                    if let Some((_, _, slot)) = entered.as_mut() {
+                        *slot = Some(residency);
+                    }
+                }
+                Err(error) => {
+                    restore_with_c_context(
+                        session,
+                        entered,
+                        caller,
+                        previous_before,
+                        keepcwd,
+                        target_window,
+                        target_local.flatten(),
+                    );
+                    if keepcwd && let Some(cwd) = &process_cwd {
+                        let _ = std::env::set_current_dir(cwd);
+                    }
+                    if let Some(routing) = saved_routing {
+                        session.with_editor_mut(|editor| editor.message_routing = routing);
+                    }
+                    return Err(mlua::Error::runtime(error.to_string()));
+                }
+            }
         }
     }
 
@@ -1013,23 +1285,16 @@ fn with_c(
 #[allow(clippy::too_many_arguments, reason = "restoration state snapshot")]
 fn restore_with_c_context(
     session: &ox_api::ApiSession,
-    entered: Option<(WinHandle, BufHandle)>,
+    entered: Option<(WinHandle, BufHandle, Option<EnteredResidency>)>,
     caller: Option<WinHandle>,
     previous_before: Option<WinHandle>,
     keepcwd: bool,
     target_window: Option<WinHandle>,
     target_local: Option<(Option<PathBuf>, Option<PathBuf>)>,
 ) {
-    if let Some((window, buffer)) = entered {
+    if let Some(caller) = caller {
         session.with_editor_mut(|editor| {
-            if editor.window(window).is_ok_and(|s| s.buffer != buffer)
-                && editor.buffer(buffer).is_ok()
-            {
-                let _ = editor.set_window_buffer(window, buffer, BufferRelease::KeepLoaded);
-            }
-            if editor.current_window() != Some(window) && editor.window(window).is_ok() {
-                let _ = editor.set_current_window(window);
-            }
+            restore_buffer_context(editor, entered, caller);
         });
     }
 
@@ -1041,14 +1306,6 @@ fn restore_with_c_context(
             if let Ok(state) = editor.window_mut(target) {
                 state.local_directory = local;
                 state.previous_directory = previous;
-            }
-        });
-    }
-
-    if let Some(caller) = caller {
-        session.with_editor_mut(|editor| {
-            if editor.current_window() != Some(caller) && editor.window(caller).is_ok() {
-                let _ = editor.set_current_window(caller);
             }
         });
     }

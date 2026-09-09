@@ -704,6 +704,160 @@ fn api_registry_dispatches_against_editor_and_enforces_guards() {
 }
 
 #[test]
+fn buffer_lines_callback_rejects_nested_text_change() {
+    let (host, _, _) = with_c_host();
+    let (callback_error, contents): (String, String) = host
+        .lua()
+        .load(
+            r#"
+            local callback_error
+            assert(vim.api.nvim_buf_attach(0, false, {
+                on_lines = function()
+                    local _, err = pcall(
+                        vim.api.nvim_buf_set_lines,
+                        0,
+                        0,
+                        -1,
+                        true,
+                        {"nested"}
+                    )
+                    callback_error = err
+                end,
+            }))
+            vim.api.nvim_buf_set_lines(0, 0, -1, true, {"outer"})
+            return callback_error, table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, true), ",")
+            "#,
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(
+        callback_error,
+        "E565: Not allowed to change text or change window"
+    );
+    assert_eq!(contents, "outer");
+}
+
+#[test]
+fn buffer_callback_error_releases_textlock_for_later_mutation() {
+    let (host, _, _) = with_c_host();
+    let (
+        first_ok,
+        first_error,
+        nested_ok,
+        nested_error,
+        second_ok,
+        second_error,
+        contents,
+    ): (bool, String, bool, String, bool, String, String) = host
+        .lua()
+        .load(
+            r#"
+            local calls = 0
+            local nested_ok, nested_error
+            assert(vim.api.nvim_buf_attach(0, false, {
+                on_lines = function()
+                    calls = calls + 1
+                    if calls == 1 then
+                        nested_ok, nested_error = pcall(
+                            vim.api.nvim_buf_set_lines,
+                            0,
+                            0,
+                            -1,
+                            true,
+                            {"nested"}
+                        )
+                        nested_error = tostring(nested_error)
+                        error("callback boom")
+                    end
+                end,
+            }))
+            local first_ok, first_error = pcall(
+                vim.api.nvim_buf_set_lines,
+                0,
+                0,
+                -1,
+                true,
+                {"first"}
+            )
+            local second_ok, second_error = pcall(
+                vim.api.nvim_buf_set_lines,
+                0,
+                0,
+                -1,
+                true,
+                {"second"}
+            )
+            return
+                first_ok,
+                tostring(first_error),
+                nested_ok,
+                nested_error,
+                second_ok,
+                tostring(second_error),
+                table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, true), ",")
+            "#,
+        )
+        .eval()
+        .unwrap();
+    assert!(!first_ok);
+    assert!(first_error.contains("callback boom"));
+    assert!(!nested_ok);
+    assert_eq!(
+        nested_error,
+        "E565: Not allowed to change text or change window"
+    );
+    assert!(second_ok);
+    assert_eq!(second_error, "nil");
+    assert_eq!(contents, "second");
+}
+
+#[test]
+fn buffer_lines_callback_can_read_while_textlocked() {
+    let (host, _, _) = with_c_host();
+    let (seen, nested_ok, nested_error, contents): (String, bool, String, String) = host
+        .lua()
+        .load(
+            r#"
+            local calls = 0
+            local seen
+            local nested_ok, nested_error
+            assert(vim.api.nvim_buf_attach(0, false, {
+                on_lines = function()
+                    calls = calls + 1
+                    seen = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, true), ",")
+                    if calls == 1 then
+                        nested_ok, nested_error = pcall(
+                            vim.api.nvim_buf_set_lines,
+                            0,
+                            0,
+                            -1,
+                            true,
+                            {"nested"}
+                        )
+                        nested_error = tostring(nested_error)
+                    end
+                end,
+            }))
+            vim.api.nvim_buf_set_lines(0, 0, -1, true, {"outer"})
+            return
+                seen,
+                nested_ok,
+                nested_error,
+                table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, true), ",")
+            "#,
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(seen, "outer");
+    assert!(!nested_ok);
+    assert_eq!(
+        nested_error,
+        "E565: Not allowed to change text or change window"
+    );
+    assert_eq!(contents, "outer");
+}
+
+#[test]
 fn decoration_provider_callback_survives_the_api_call() {
     let (host, _, _) = host();
     let mut editor = Editor::new();

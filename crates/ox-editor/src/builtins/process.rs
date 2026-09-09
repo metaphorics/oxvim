@@ -61,37 +61,30 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "chansend" | "jobsend" => {
             let id = job_id(args.first())?;
             let data = channel_bytes(args.get(1))?;
-            let Some(mut manager) = runtime.jobs.take() else {
+            let Some(manager) = runtime.jobs.take() else {
                 return Ok(Typval::Number(0));
             };
-            let sent = manager
-                .send(id, data)
-                .map_err(|message| EvalError::new("E900", 0, message))?;
-            if access.with_ex_editor(|editor| editor.terminal_channel(id).is_some()) {
-                let mut events = manager
-                    .poll()
-                    .map_err(|message| EvalError::new("E900", 0, message))?;
-                // `f_chansend` only writes: `channel_send` ends in
-                // `wstream_write` (channel.c:661) and no callback fires on
-                // its stack. The polled events go back on the queue for the
-                // main-loop turn -- the tick -- that delivers them
-                // (`schedule_channel_event`, channel.c:729-737); invoking
-                // them here would run Lua callbacks under the borrowed
-                // executor, and their `vim.fn` re-entry would land on the
-                // nested executor's never-pumped job manager.
-                manager.defer_events(std::mem::take(&mut events));
-                runtime.jobs = Some(manager);
-                if let Some(bytes) = runtime
+            let terminal = access.with_ex_editor(|editor| editor.terminal_channel(id).is_some());
+            // `f_chansend` only writes: `channel_send` ends in
+            // `wstream_write` (channel.c:661) and no callback fires on
+            // its stack. The polled events go back on the queue for the
+            // main-loop turn -- the tick -- that delivers them
+            // (`schedule_channel_event`, channel.c:729-737); invoking
+            // them here would run Lua callbacks while the executor is in
+            // user code, and their `vim.fn` re-entry would land on the
+            // nested executor's never-pumped job manager.
+            let (manager, sent) = chansend_send(manager, id, data, terminal);
+            runtime.jobs = Some(manager);
+            let sent = sent?;
+            if terminal
+                && let Some(bytes) = runtime
                     .jobs
                     .as_mut()
                     .and_then(|jobs| jobs.take_pty_output(id))
-                {
-                    access
-                        .with_ex_editor(|editor| editor.append_terminal_buffer(id, &bytes))
-                        .ok();
-                }
-            } else {
-                runtime.jobs = Some(manager);
+            {
+                access
+                    .with_ex_editor(|editor| editor.append_terminal_buffer(id, &bytes))
+                    .ok();
             }
             Ok(Typval::Number(i64::from(sent)))
         }
@@ -195,6 +188,80 @@ fn pty_dimension(extent: usize, fallback: u16) -> u16 {
     }
 }
 
+/// `jobstart(..., {term: true})` guards (`f_jobstart`,
+/// eval/funcs.c:3486-3498) run before the spawn: a modified current
+/// buffer is rejected instead of destroyed, a running terminal rejects
+/// a second attach, and a completed terminal is closed so its buffer is
+/// reused. (`:terminal` always arrives here through its own `enew`, so
+/// these only bite direct `jobstart({term: true})` callers.) Returns
+/// whether the spawn must not proceed (the message is already shown).
+/// Runs the fallible half of `chansend`/`jobsend` with an owned
+/// manager and hands it back for restore on every path: dropping the
+/// manager would close every live non-detached child, so `?` must never
+/// run while the caller owes a restore.
+fn chansend_send(
+    mut manager: JobManager,
+    id: u64,
+    data: Vec<u8>,
+    terminal: bool,
+) -> (JobManager, Result<bool, EvalError>) {
+    let sent = match manager.send(id, data) {
+        Ok(sent) => sent,
+        Err(message) => return (manager, Err(EvalError::new("E900", 0, message))),
+    };
+    if terminal {
+        match manager.poll() {
+            Ok(events) => {
+                manager.defer_events(events);
+                (manager, Ok(sent))
+            }
+            Err(message) => (manager, Err(EvalError::new("E900", 0, message))),
+        }
+    } else {
+        (manager, Ok(sent))
+    }
+}
+
+fn term_attach_rejected<E: ExEditorAccess>(access: &E, manager: &mut JobManager) -> bool {
+    let current = access.with_ex_editor(|editor| editor.current_buffer());
+    let Some(buffer) = current else {
+        return false;
+    };
+    let modified = access.with_ex_editor(|editor| {
+        editor
+            .buffer(buffer)
+            .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+    });
+    if modified {
+        access.with_ex_editor(|editor| {
+            crate::excmd_exec::push_text_message(
+                editor,
+                "jobstart(...,{term=true}) requires unmodified buffer".to_owned(),
+                true,
+                true,
+            );
+        });
+        return true;
+    }
+    let Some((previous, running)) = manager.terminal_job_for_buffer(buffer) else {
+        return false;
+    };
+    if running {
+        access.with_ex_editor(|editor| {
+            crate::excmd_exec::push_text_message(
+                editor,
+                format!("Terminal already connected to buffer {}", i64::from(buffer)),
+                true,
+                true,
+            );
+        });
+        return true;
+    }
+    manager.clear_terminal_buffer(previous);
+    access.with_ex_editor(|editor| editor.close_terminal_channel(previous));
+    false
+}
+
 fn call_job_start<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -230,6 +297,12 @@ fn call_job_start<F: FileIO, E: ExEditorAccess>(
         },
     };
     let term = options.term;
+    if term && term_attach_rejected(access, &mut manager) {
+        // Guard rejections answer 0: upstream initializes the return to
+        // 0 (funcs.c:3369) and only not-executable answers -1.
+        runtime.jobs = Some(manager);
+        return Ok(Typval::Number(0));
+    }
     let started = manager.start(id, options);
     if let Ok(_pid) = started
         && wants_pty
@@ -267,6 +340,21 @@ fn call_job_start<F: FileIO, E: ExEditorAccess>(
         });
         if let Some(buffer) = terminal {
             manager.set_terminal_buffer(id, buffer);
+        } else if started.is_ok() {
+            // The child started but owns no terminal: stop it rather than
+            // leave an orphan with nowhere to project (the `:terminal`
+            // path still reports its own E475 downstream).
+            let _ = manager.stop(id);
+            access.with_ex_editor(|editor| {
+                crate::excmd_exec::push_text_message(
+                    editor,
+                    "jobstart(...,{term=true}) failed to attach the terminal buffer".to_owned(),
+                    true,
+                    true,
+                );
+            });
+            runtime.jobs = Some(manager);
+            return Ok(Typval::Number(-1));
         }
     }
     runtime.jobs = Some(manager);
@@ -577,13 +665,13 @@ fn callback_option(value: Option<Typval>) -> ox_eval::Result<Option<Typval>> {
 /// on the main stack before returning statuses (funcs.c:3666-3670 and
 /// 3721, `multiqueue_process_events`, multiqueue.c:153-162). A
 /// Lua-registered callback instead goes through the Lua host and re-enters
-/// the executor `RefCell` that the enclosing `call_builtin` frame holds;
+/// the executor while the enclosing `call_builtin` frame is in user code;
 /// that re-entry falls to the nested executor, whose separate job manager
 /// nothing pumps, so any job the callback starts would strand. Those
 /// events re-defer here -- upstream encodes the same non-recursion in
 /// `on_channel_event`'s `callback_busy` re-enqueue (channel.c:758-762) --
-/// and the borrow-free driver (the tick's `deliver_deferred_job_events`)
-/// delivers them with no borrow live, so their re-entry lands on the
+/// and the outer driver (the tick's `deliver_deferred_job_events`)
+/// delivers them after user code exits, so their re-entry lands on the
 /// primary executor.
 ///
 /// On a Vimscript handler failure, or when a Lua-registered event arrives
@@ -594,7 +682,7 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
-    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    lua: Option<&Rc<dyn LuaExec>>,
     events: &mut Vec<JobEvent>,
 ) -> ox_eval::Result<()> {
     // Lua-registered events defer to the manager the moment they are
@@ -644,8 +732,8 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
     if lua_deferred {
         // The jobwait flush re-deferred Lua-registered callbacks; upstream
         // delivers them before `jobwait` returns (funcs.c:3668/3721), so
-        // mark the manager for the first borrow-free boundary after the
-        // builtin returns.
+        // mark the manager for the first outer boundary after the
+        // builtin returns, once user code has exited.
         if let Some(jobs) = runtime.jobs.as_mut() {
             jobs.set_lua_flush_pending();
         }
@@ -656,7 +744,7 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
 /// Extracts a Lua registry reference from a job callback, returning `None`
 /// for Vimscript funcrefs and plain string callbacks. A registry reference
 /// re-enters the executor through the Lua host, which is what the
-/// borrow-held delivery must not run; the server's borrow-free driver
+/// in-user-code delivery must not run; the server's outer driver
 /// keeps the same classification in `lua_job_reference`.
 fn event_lua_reference(event: &JobEvent) -> Option<usize> {
     match &event.callback {
@@ -742,7 +830,7 @@ mod tests {
     use crate::{Editor, ExExecutor, Geometry, JobEvent, TestEditorAccess};
     use ox_eval::Scope;
     use ox_types::{Funcref, Object, OxStr, Typval};
-    use std::cell::{Cell, RefCell};
+    use std::cell::Cell;
     use std::path::Path;
     use std::rc::Rc;
 
@@ -913,8 +1001,8 @@ mod tests {
     // `wstream_write`, channel.c:661) and delivery stays on the main loop;
     // here the swept events re-defer and a later drain -- jobwait here, the
     // tick in interactive mode -- delivers them. Delivering them inline
-    // under the borrowed executor is what sent a Lua callback's `vim.fn`
-    // re-entry to the nested executor's never-pumped manager.
+    // while the executor is in user code is what sent a Lua callback's
+    // `vim.fn` re-entry to the nested executor's never-pumped manager.
     #[test]
     fn chansend_poll_defers_swept_events_for_a_later_drain() {
         let _guard = crate::PROCESS_STATE_GUARD
@@ -943,26 +1031,25 @@ mod tests {
         );
     }
 
-    // The delivery split under the executor's borrow: Vimscript callbacks
-    // run on this stack -- upstream's flush processes each waited job's
-    // queue before returning statuses (funcs.c:3721) -- while a
+    // The delivery split while the executor is in user code: Vimscript
+    // callbacks run on this stack -- upstream's flush processes each waited
+    // job's queue before returning statuses (funcs.c:3721) -- while a
     // Lua-registered callback, whose invocation re-enters the executor
-    // `RefCell` the enclosing `call_builtin` frame holds and whose `vim.fn`
+    // from the enclosing `call_builtin` frame's user code and whose `vim.fn`
     // work would land on the nested executor's never-pumped manager,
-    // re-defers for the borrow-free driver. The Lua host must never be
+    // re-defers for the outer driver. The Lua host must never be
     // entered from this stack.
     #[test]
     fn job_event_delivery_runs_vimscript_and_defers_lua_registered_events() {
         struct ProbingLua(Cell<usize>);
         impl LuaExec for ProbingLua {
-            fn execute_chunk(&mut self, _: &str, _: Vec<Object>) -> Result<Object, LuaExecError> {
+            fn execute_chunk(&self, _: &str, _: Vec<Object>) -> Result<Object, LuaExecError> {
                 Err(LuaExecError::Load("unused".to_owned()))
             }
-            fn execute_file(&mut self, _: &Path) -> Result<(), LuaExecError> {
+            fn execute_file(&self, _: &Path) -> Result<(), LuaExecError> {
                 Err(LuaExecError::Load("unused".to_owned()))
             }
-            fn invoke_callback(
-                &mut self,
+            fn invoke_callback(&self,
                 _: usize,
                 _: Vec<Object>,
             ) -> Result<Object, LuaExecError> {
@@ -975,7 +1062,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let editor = TestEditorAccess::new(Editor::new());
         let mut exec = ExExecutor::new();
-        let host = Rc::new(RefCell::new(ProbingLua(Cell::new(0))));
+        let host = Rc::new(ProbingLua(Cell::new(0)));
         exec.set_lua_exec(host.clone());
         exec.execute_script(
             &editor,
@@ -1009,8 +1096,8 @@ mod tests {
             args: args("stdout"),
         };
         exec.defer_job_events(vec![lua_event, vim_event]);
-        // The borrow-held seam's split: Vimscript events invoke on this
-        // stack; Lua-registered ones stay undelivered for the borrow-free
+        // The in-user-code seam's split: Vimscript events invoke on this
+        // stack; Lua-registered ones stay undelivered for the outer
         // driver, exactly as `invoke_job_events` classifies them.
         let mut redeferred = Vec::new();
         for event in exec.take_deferred_job_events() {
@@ -1026,7 +1113,7 @@ mod tests {
             "the Vimscript callback must run on this stack"
         );
         assert_eq!(
-            host.borrow().0.get(),
+            host.0.get(),
             0,
             "the Lua host must not be entered from the Vimscript seam"
         );

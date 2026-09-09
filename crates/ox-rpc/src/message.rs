@@ -13,7 +13,7 @@
 use ox_types::{ApiError, Object, OxStr};
 use rmpv::Value;
 
-use crate::codec::{DecodeError, object_from_value};
+use crate::codec::{DecodeError, EncodeError, object_from_value};
 
 /// A single msgpack-RPC message (`kMessageType*` in `api/private/defs.h`).
 #[derive(Debug, Clone, PartialEq)]
@@ -46,8 +46,13 @@ pub enum Message {
 
 impl Message {
     /// Encode the message to its exact wire bytes.
-    #[must_use]
-    pub fn encode_bytes(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EncodeError`] when a field violates the msgpack wire limits —
+    /// a method name, argument, or collection whose length exceeds the `u32`
+    /// msgpack length field.
+    pub fn encode_bytes(&self) -> Result<Vec<u8>, EncodeError> {
         let frame = match self {
             Message::Request {
                 msgid,
@@ -82,7 +87,9 @@ impl Message {
                 ]),
             },
         };
-        crate::codec::encode(&frame)
+        let mut out = Vec::new();
+        crate::codec::encode(&mut out, &frame)?;
+        Ok(out)
     }
 
     /// Decode a complete message frame from an `rmpv::Value`.
@@ -197,7 +204,7 @@ impl Message {
 /// Upstream seeds `rpc->next_request_id = 1` in `rpc_start()` (`channel.c`) and
 /// post-increments per call, so ids start at 1. After the `u32` counter wraps it
 /// skips 0 (the brief's requirement; `msgid 0` is reserved for broadcast/`rpc_send_event`).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MsgidCounter {
     next: u32,
 }
@@ -205,6 +212,10 @@ pub struct MsgidCounter {
 impl MsgidCounter {
     /// A counter whose first issued id is `1` (upstream `next_request_id = 1`).
     #[must_use]
+    #[expect(
+        clippy::new_without_default,
+        reason = "msgid 0 is reserved for broadcast; a derived Default would issue it"
+    )]
     pub fn new() -> Self {
         Self { next: 1 }
     }
@@ -261,7 +272,7 @@ mod tests {
     // Round-trip a message's wire bytes back through the decoder.
     fn roundtrip(m: &Message) -> Message {
         let mut dec = IncrementalDecoder::new();
-        let got = dec.feed(&m.encode_bytes()).unwrap();
+        let got = dec.feed(&m.encode_bytes().unwrap()).unwrap();
         assert_eq!(got.len(), 1);
         got.into_iter().next().unwrap()
     }
@@ -286,7 +297,7 @@ mod tests {
             b'c', b'o', b'u', b'n', b't', 0x91, // array(1)
             0xd4, 0, 1, // fixext1 type 0 (Buffer), value 1
         ];
-        assert_eq!(m.encode_bytes(), expected);
+        assert_eq!(m.encode_bytes().unwrap(), expected);
         assert_eq!(roundtrip(&m), m);
     }
 
@@ -298,7 +309,7 @@ mod tests {
         };
         // [1, 3, nil, 42]
         let expected: &[u8] = &[0x94, 0x01, 0x03, 0xc0, 0x2a];
-        assert_eq!(m.encode_bytes(), expected);
+        assert_eq!(m.encode_bytes().unwrap(), expected);
         assert_eq!(roundtrip(&m), m);
     }
 
@@ -318,7 +329,7 @@ mod tests {
             0xa7, b'b', b'a', b'd', b' ', b'a', b'r', b'g', // "bad arg"
             0xc0, // nil result
         ];
-        assert_eq!(m.encode_bytes(), expected);
+        assert_eq!(m.encode_bytes().unwrap(), expected);
         assert_eq!(roundtrip(&m), m);
     }
 
@@ -335,7 +346,7 @@ mod tests {
             0xa9, b'n', b'v', b'i', b'm', b'_', b'e', b'c', b'h', b'o', // fixstr(9)
             0x90, // array(0)
         ];
-        assert_eq!(m.encode_bytes(), expected);
+        assert_eq!(m.encode_bytes().unwrap(), expected);
         assert_eq!(roundtrip(&m), m);
     }
 

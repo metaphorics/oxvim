@@ -1,8 +1,9 @@
 //! Buffer-scoped API functions.
 
 use ox_editor::{
-    BufferAttachSubscription, BufferEditMode, BufferRelease, BufferTextEditRequest, Editor,
-    ExtmarkPosition, MarkLocation, Mode, NormalState, OptionValue, VisualKind, VisualState,
+    BufferAttachSubscription, BufferEditMode, BufferFlags, BufferRelease, BufferTextEditRequest,
+    Editor, EditorError, ExtmarkPosition, MarkLocation, Mode, NormalState, OptionValue, VisualKind,
+    VisualState,
 };
 use ox_text::{Buffer, Position};
 
@@ -668,17 +669,20 @@ pub fn nvim_buf_delete(
     let unload = dict_bool(&options, "unload", false)?;
     let buffer = resolve_buffer(session, buffer)?;
     session.with_editor_mut(|editor| {
-        // Windows showing the target buffer must be rehomed onto a replacement
-        // REGARDLESS of `force`; `force` only overrides unsaved-change protection
-        // (src/nvim/api/buffer.c:1039-1059, src/nvim/buffer.c:1039-1059). Since
-        // buffer modified-state is not modeled yet, `force` has no further
-        // observable effect.
-        if editor
+        // `force` only overrides unsaved-change protection: without it a
+        // modified buffer fails with the E89 `do_buffer` raises
+        // (`command_buffer_remove`). Once deletion proceeds, windows showing
+        // the target buffer are rehomed onto a replacement REGARDLESS of
+        // `force` (src/nvim/api/buffer.c:1039-1059, src/nvim/buffer.c:1039-1059).
+        let state = editor
             .buffer(buffer)
-            .map_err(|error| ApiError::exception(error.to_string()))?
-            .attachments
-            != 0
-        {
+            .map_err(|error| ApiError::exception(error.to_string()))?;
+        if !force && state.flags.contains(BufferFlags::MODIFIED) {
+            return Err(ApiError::exception(
+                "E89: No write since last change (add ! to override)",
+            ));
+        }
+        if state.attachments != 0 {
             let replacement = match editor
                 .buffers()
                 .into_iter()
@@ -706,7 +710,6 @@ pub fn nvim_buf_delete(
         }
         Ok(())
     })?;
-    let _ = force;
     if unload {
         session.with_editor_mut(|editor| {
             editor
@@ -969,6 +972,105 @@ pub fn nvim_buf_set_option(
     })
 }
 
+/// Preserves a target buffer's entry residency across a temporary
+/// buffer-context enter and undoes the enter's materialization afterwards.
+/// Upstream `ctx_switch` gives an unloaded buffer an empty memfile so user
+/// code can run in it (`context.c:527-621`) and `ctx_restore` releases that
+/// temporary state again; without the release the next switch sees a loaded
+/// buffer, skips the disk read, and displays empty contents.
+/// Used by `nvim_buf_call`, autocmd firing, and the Lua `vim.with` context bridge.
+pub struct EnteredResidency {
+    target: BufHandle,
+    materialized: Option<u64>,
+}
+impl EnteredResidency {
+    /// Enters `target`'s buffer context after recording whether its text was
+    /// resident, so [`Self::restore`] can tell the empty-text placeholder
+    /// this enter materialized from a buffer the entered code loaded or
+    /// changed itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of resolving or entering `target`.
+    pub fn enter(editor: &mut Editor, target: BufHandle) -> Result<Self, EditorError> {
+        let was_unloaded = editor
+            .buffer(target)
+            .is_ok_and(|state| !state.residency.is_loaded());
+        editor.enter_buffer_context(target)?;
+        let materialized = was_unloaded
+            .then(|| editor.buffer(target).map(|state| state.changedtick()))
+            .transpose()?;
+        Ok(Self {
+            target,
+            materialized,
+        })
+    }
+
+    /// Returns the target to the residency found at entry: a target this
+    /// enter materialized that is still loaded, unattached, unmodified, and
+    /// untouched since the enter goes back to `Unloaded`. Entered code that
+    /// changed the buffer or re-attached it keeps its work.
+    pub(crate) fn restore(&self, editor: &mut Editor) {
+        let Some(entered_tick) = self.materialized else {
+            return;
+        };
+        if !is_untouched_placeholder(editor, self.target, entered_tick) {
+            return;
+        }
+        let _ = editor.unload_buffer(self.target);
+    }
+}
+
+/// Whether the target still holds exactly the empty-text placeholder the
+/// enter materialized: loaded, unattached, unmodified, and at the entry
+/// tick, so unloading it undoes the enter and nothing else.
+fn is_untouched_placeholder(editor: &Editor, target: BufHandle, entered_tick: u64) -> bool {
+    editor.buffer(target).is_ok_and(|state| {
+        state.residency.is_loaded()
+            && state.attachments == 0
+            && !state.flags.contains(BufferFlags::MODIFIED)
+            && state.changedtick() == entered_tick
+    })
+}
+
+/// Puts the entered window's buffer back when the entered code moved it and
+/// the window still exists, then returns the target to its entry residency.
+fn restore_entered_window(
+    editor: &mut Editor,
+    window: WinHandle,
+    original: BufHandle,
+    residency: Option<EnteredResidency>,
+) {
+    if editor
+        .window(window)
+        .is_ok_and(|state| state.buffer != original)
+        && editor.buffer(original).is_ok()
+    {
+        let _ = editor.set_window_buffer(window, original, BufferRelease::KeepLoaded);
+    }
+    if let Some(residency) = residency {
+        residency.restore(editor);
+    }
+}
+
+/// Restores what a buffer-context enter changed (`ctx_restore`,
+/// `context.c:649-747`): the entered window's buffer when the entered code
+/// moved it and the window still exists, the target's entry residency, and
+/// the previous current window. Every failure is swallowed so the entered
+/// code's own result is never masked.
+pub fn restore_buffer_context(
+    editor: &mut Editor,
+    entered: Option<(WinHandle, BufHandle, Option<EnteredResidency>)>,
+    caller: WinHandle,
+) {
+    if let Some((window, original, residency)) = entered {
+        restore_entered_window(editor, window, original, residency);
+    }
+    if editor.current_window() != Some(caller) && editor.window(caller).is_ok() {
+        let _ = editor.set_current_window(caller);
+    }
+}
+
 #[api(since = 7, method)]
 pub fn nvim_buf_call(
     session: &ApiSession,
@@ -989,9 +1091,10 @@ pub fn nvim_buf_call(
     });
     // Enter the target buffer context.  A window already showing the buffer
     // is entered (preferring the caller); a hidden buffer temporarily takes
-    // over the caller window.  `entered` tracks `(window, original_buffer)`
-    // for restoration, mirroring `cs_new_curwin` / `cs_new_curbuf`.
-    let entered: Option<(WinHandle, BufHandle)> = match caller {
+    // over the caller window.  `entered` tracks `(window, original_buffer,
+    // entry residency)` for restoration, mirroring `cs_new_curwin` /
+    // `cs_new_curbuf`.
+    let entered: Option<(WinHandle, BufHandle, Option<EnteredResidency>)> = match caller {
         Some(caller) => session.with_editor_mut(|editor| {
             let current_buf = editor.window(caller).ok().map(|s| s.buffer);
             if current_buf == Some(buffer) {
@@ -1005,23 +1108,20 @@ pub fn nvim_buf_call(
             match visible {
                 Some(window) if window != caller => {
                     if editor.set_current_window(window).is_ok() {
-                        Some((window, buffer))
+                        Some((window, buffer, None))
                     } else {
                         None
                     }
                 }
                 Some(_) => None, // caller shows target (covered above)
                 None => {
-                    // Hidden buffer: take over the caller window.
+                    // Hidden buffer: take over the caller window. Context
+                    // switches bind unloaded buffers without opening files;
+                    // the entry residency is undone by the restore below.
                     let original = caller_buffer.unwrap_or(buffer);
-                    if editor
-                        .set_current_buffer(buffer, BufferRelease::KeepLoaded)
-                        .is_ok()
-                    {
-                        Some((caller, original))
-                    } else {
-                        None
-                    }
+                    EnteredResidency::enter(editor, buffer)
+                        .ok()
+                        .map(|residency| (caller, original, Some(residency)))
                 }
             }
         }),
@@ -1057,20 +1157,12 @@ pub fn nvim_buf_call(
     // and visual state are all unwound without masking the callback's result.
     if let Some(caller) = caller {
         session.with_editor_mut(|editor| {
-            // Restore the entered window's buffer if the callback changed it
-            // and the window is still valid (`ctx_restore` `kCtxSwitchBuf`).
-            if let Some((window, expected)) = entered
-                && editor.window(window).is_ok_and(|s| s.buffer != expected)
-                && editor.buffer(expected).is_ok()
-            {
-                let _ = editor.set_window_buffer(window, expected, BufferRelease::KeepLoaded);
-            }
-            // Switch back to the caller window if it is still valid and not
-            // already current (`ctx_restore_curwin` with fallback).
+            // Put the entered window's buffer back, return the target to the
+            // residency its enter found it in, and switch back to the caller
+            // window while both are still valid (`ctx_restore_curwin` with
+            // fallback).
             let prior_previous = editor.previous_window();
-            if editor.current_window() != Some(caller) && editor.window(caller).is_ok() {
-                let _ = editor.set_current_window(caller);
-            }
+            restore_buffer_context(editor, entered, caller);
             if prior_previous == Some(caller) {
                 editor.set_previous_window(previous_before);
             }
@@ -1285,14 +1377,30 @@ pub fn nvim_buf_attach(
         if !state.residency.is_loaded() {
             return Ok(false);
         }
-        state.subscriptions_mut().insert(
-            API_CHANNEL_ID,
-            BufferAttachSubscription {
-                channel_id: API_CHANNEL_ID,
-                send_buffer,
-                options,
-            },
-        );
+        match session.requesting_channel() {
+            Some(channel) => {
+                // RPC subscriptions are keyed by their channel id, so a
+                // channel can attach at most once per buffer.
+                let subscription_id = u128::from(channel.get());
+                let subscription = BufferAttachSubscription {
+                    channel_id: channel.get(),
+                    send_buffer,
+                    options,
+                };
+                state.insert_subscription(subscription_id, subscription);
+            }
+            None => {
+                // In-process Lua calls get a distinct id per attach so
+                // multiple plugins on the same buffer do not overwrite each
+                // other. Detachment is by a truthy callback return.
+                let subscription = BufferAttachSubscription {
+                    channel_id: API_CHANNEL_ID,
+                    send_buffer,
+                    options,
+                };
+                state.attach_lua(subscription);
+            }
+        }
         Ok(true)
     })
 }
@@ -1307,7 +1415,16 @@ pub fn nvim_buf_detach(session: &ApiSession, buffer: BufHandle) -> Result<bool, 
         if !state.residency.is_loaded() {
             return Ok(false);
         }
-        state.subscriptions_mut().remove(&API_CHANNEL_ID);
+        match session.requesting_channel() {
+            Some(channel) => {
+                state.remove_subscriptions_by_channel(channel.get());
+            }
+            None => {
+                // In-process Lua calls are not tied to an RPC channel;
+                // detach every Lua callback for this buffer.
+                state.remove_subscriptions_by_channel(API_CHANNEL_ID);
+            }
+        }
         Ok(true)
     })
 }
@@ -1393,4 +1510,43 @@ pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(nvim_buf_attach__API_META(), nvim_buf_attach__API_DISPATCH)?;
     registry.register(nvim_buf_detach__API_META(), nvim_buf_detach__API_DISPATCH)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+
+    use super::*;
+
+    #[test]
+    fn buf_attach_detach_queues_callback_refs_for_release() {
+        let editor = Rc::new(RefCell::new(Editor::new()));
+        let buffer = editor.borrow_mut().create_buffer(true).unwrap();
+        let session = ApiSession::new(editor);
+
+        assert!(nvim_buf_attach(
+            &session,
+            buffer,
+            false,
+            Dict(vec![(
+                OxStr::from("on_bytes"),
+                Object::LuaRef(41),
+            )]),
+        )
+        .unwrap());
+        assert!(nvim_buf_detach(&session, buffer).unwrap());
+
+        session.with_editor_mut(|editor| {
+            let state = editor.buffer_mut(buffer).unwrap();
+            assert!(state.subscriptions().is_empty());
+            let released = state.take_pending_subscription_releases();
+            assert_eq!(released.len(), 1);
+            assert_eq!(
+                released[0].options.get(&OxStr::from("on_bytes")),
+                Some(&Object::LuaRef(41))
+            );
+        });
+    }
 }

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use ox_rpc::{DecodeError, IncrementalDecoder, Message, MsgidCounter, RedrawEvent};
+use ox_rpc::{DecodeError, EncodeError, IncrementalDecoder, Message, MsgidCounter, RedrawEvent};
 use ox_types::{ApiError, Dict, Object, OxStr};
 
 const READ_BUFFER_SIZE: usize = 16 * 1024;
@@ -48,6 +48,9 @@ pub enum ClientError {
         #[source]
         source: io::Error,
     },
+    /// A message could not be encoded to msgpack.
+    #[error("could not encode the RPC message: {0}")]
+    Encode(#[from] EncodeError),
     /// The child's stdout could not be read.
     #[error("could not read the RPC stream: {source}")]
     Read {
@@ -192,6 +195,7 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`ClientError::Protocol`] if stdin has already closed,
+    /// [`ClientError::Encode`] if the request cannot be encoded,
     /// [`ClientError::Write`] if the request cannot be written,
     /// [`ClientError::Read`] on a stdout read failure, [`ClientError::Decode`]
     /// on malformed msgpack, [`ClientError::Eof`] when the child closes its
@@ -218,7 +222,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Write`] if the request cannot be written,
+    /// Returns [`ClientError::Encode`] if the request cannot be encoded,
+    /// [`ClientError::Write`] if the request cannot be written,
     /// [`ClientError::Read`] on a stdout read failure, [`ClientError::Decode`]
     /// on malformed msgpack, [`ClientError::Eof`] when the child closes its
     /// stream, [`ClientError::UnexpectedResponse`] for a mismatched reply id,
@@ -233,7 +238,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Write`] if the request cannot be written,
+    /// Returns [`ClientError::Encode`] if the request cannot be encoded,
+    /// [`ClientError::Write`] if the request cannot be written,
     /// [`ClientError::Read`] on a stdout read failure, [`ClientError::Decode`]
     /// on malformed msgpack, [`ClientError::Eof`] when the child closes its
     /// stream, [`ClientError::UnexpectedResponse`] for a mismatched reply id,
@@ -258,7 +264,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Write`] if the request cannot be written,
+    /// Returns [`ClientError::Encode`] if the request cannot be encoded,
+    /// [`ClientError::Write`] if the request cannot be written,
     /// [`ClientError::Read`] on a stdout read failure, [`ClientError::Decode`]
     /// on malformed msgpack, [`ClientError::Eof`] when the child closes its
     /// stream, [`ClientError::UnexpectedResponse`] for a mismatched reply id,
@@ -290,7 +297,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Write`] if the request cannot be written,
+    /// Returns [`ClientError::Encode`] if the request cannot be encoded,
+    /// [`ClientError::Write`] if the request cannot be written,
     /// [`ClientError::Read`] on a stdout read failure, [`ClientError::Decode`]
     /// on malformed msgpack, [`ClientError::Eof`] when the child closes its
     /// stream, [`ClientError::UnexpectedResponse`] for a mismatched reply id,
@@ -466,8 +474,9 @@ enum ReaderEvent {
 }
 
 fn write_message(writer: &mut impl Write, message: &Message) -> Result<(), ClientError> {
+    let bytes = message.encode_bytes()?;
     writer
-        .write_all(&message.encode_bytes())
+        .write_all(&bytes)
         .and_then(|()| writer.flush())
         .map_err(|source| ClientError::Write { source })
 }
@@ -498,19 +507,24 @@ fn read_messages(mut stdout: impl Read, sender: &mpsc::Sender<ReaderEvent>) {
                 let _ = sender.send(event);
                 return;
             }
-            Ok(read) => match decoder.feed(&buffer[..read]) {
-                Ok(messages) => {
-                    for message in messages {
-                        if sender.send(ReaderEvent::Message(message)).is_err() {
-                            return;
-                        }
+            Ok(read) => {
+                let (messages, error) = match decoder.feed(&buffer[..read]) {
+                    Ok(messages) => (messages, None),
+                    // The valid prefix is delivered before the terminal error
+                    // so a response already on the wire is not lost with the
+                    // stream.
+                    Err(failure) => (failure.messages, Some(failure.error)),
+                };
+                for message in messages {
+                    if sender.send(ReaderEvent::Message(message)).is_err() {
+                        return;
                     }
                 }
-                Err(error) => {
+                if let Some(error) = error {
                     let _ = sender.send(ReaderEvent::Decode(error));
                     return;
                 }
-            },
+            }
             Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
             Err(source) => {
                 let _ = sender.send(ReaderEvent::Read(source));
@@ -748,7 +762,7 @@ mod tests {
             ])],
         };
         let mut decoder = IncrementalDecoder::new();
-        let mut messages = decoder.feed(&redraw.encode_bytes()).unwrap();
+        let mut messages = decoder.feed(&redraw.encode_bytes().unwrap()).unwrap();
         let decoded_redraw = messages.remove(0);
         let mut queued = VecDeque::new();
         assert_eq!(
@@ -771,13 +785,35 @@ mod tests {
             method: OxStr::from("nvim_input"),
             params: vec![Object::String(OxStr::from("x"))],
         };
-        let mut bytes = request.encode_bytes();
+        let mut bytes = request.encode_bytes().unwrap();
         bytes.pop();
         let (sender, receiver) = mpsc::channel();
         read_messages(bytes.as_slice(), &sender);
         assert!(matches!(
             receiver.recv().unwrap(),
             ReaderEvent::Decode(DecodeError::Incomplete)
+        ));
+    }
+
+    #[test]
+    fn reader_delivers_decoded_prefix_before_decode_error() {
+        // A valid frame followed by a malformed tail in one read: the decoded
+        // message is delivered first, then the terminal decode error.
+        let response = Message::Response {
+            msgid: 1,
+            result: Ok(Object::Nil),
+        };
+        let mut bytes = response.encode_bytes().unwrap();
+        bytes.extend_from_slice(&[0x91; 100]); // nested arrays past the depth limit
+        let (sender, receiver) = mpsc::channel();
+        read_messages(bytes.as_slice(), &sender);
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ReaderEvent::Message(Message::Response { msgid: 1, .. })
+        ));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ReaderEvent::Decode(DecodeError::Malformed(_))
         ));
     }
 

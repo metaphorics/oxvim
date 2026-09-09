@@ -2199,3 +2199,94 @@ fn autocmd_vimscript_failure_carries_source_label() {
         "current tabpage changed after TabLeave error"
     );
 }
+
+/// Reentrant API calls from an autocmd action must not fail with
+/// "no free Ex executor".
+///
+/// Three shapes, one borrow discipline: the single-main-thread editor runs
+/// nested Ex work on the nested executor (or a fork of it) while the
+/// primary is borrowed. `--noplugin` keeps bundled autocmds (notably
+/// `nvim.autoread`'s match-all `BufWritePost` watcher) out of the firing
+/// plans: at API depth a throwing earlier entry aborts the plan
+/// upstream-style (`ex_docmd.c:724` inherits `trylevel`, so nothing
+/// displays past depth 0), which would mask these assertions. `request`
+/// panics on any RPC error, so reaching the readbacks is itself the
+/// regression assertion.
+#[expect(
+    clippy::expect_used,
+    reason = "g: readback shape is an assertion in the smoke harness"
+)]
+#[test]
+fn autocmd_action_reenters_api_without_executor_error() {
+    let mut oxvim = Embedded::spawn_with(&["--noplugin"]);
+    // A Lua body calling back into `vim.cmd` while `nvim_command('write')`
+    // holds the primary executor: the scoped dispatch must find the
+    // nested executor free.
+    assert_eq!(
+        oxvim.request(
+            "nvim_command",
+            vec![Value::from(
+                "au BufWritePre * lua vim.cmd('let g:nre_fork = 42')",
+            )],
+        ),
+        Value::Nil,
+    );
+    // An Ex action calling a builtin while the primary is borrowed: the
+    // `vim.fn` tier must fall through to the nested executor.
+    let marker = std::env::temp_dir().join(format!("oxvim-smoke-nre-post-{}", std::process::id()));
+    assert_eq!(
+        oxvim.request(
+            "nvim_command",
+            vec![Value::from(format!(
+                "au BufWritePost * call writefile(['POSTED'], '{}')",
+                marker.display()
+            ))],
+        ),
+        Value::Nil,
+    );
+    let target = std::env::temp_dir().join(format!("oxvim-smoke-nre-{}.txt", std::process::id()));
+    assert_eq!(
+        oxvim.request(
+            "nvim_command",
+            vec![Value::from(format!("write {}", target.display()))],
+        ),
+        Value::Nil,
+    );
+    assert_eq!(
+        oxvim.request("nvim_eval", vec![Value::from("g:nre_fork")]),
+        Value::from(42),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("post-action marker file"),
+        "POSTED\n",
+    );
+    // The host path with a borrowed primary (`:lua` holding `ex` while
+    // `nvim_exec_autocmds` fires): the host must fork rather than hold
+    // the nested executor, so the action's own `vim.cmd` still finds it
+    // free. Without the fork this request errors with "no free Ex
+    // executor for a nested command".
+    assert_eq!(
+        oxvim.request(
+            "nvim_command",
+            vec![Value::from(
+                "au User NreHost lua vim.cmd('let g:nre_host = 7')"
+            )],
+        ),
+        Value::Nil,
+    );
+    assert_eq!(
+        oxvim.request(
+            "nvim_command",
+            vec![Value::from(
+                "lua vim.api.nvim_exec_autocmds('User', { pattern = 'NreHost' })",
+            )],
+        ),
+        Value::Nil,
+    );
+    assert_eq!(
+        oxvim.request("nvim_eval", vec![Value::from("g:nre_host")]),
+        Value::from(7),
+    );
+    let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_file(&marker);
+}

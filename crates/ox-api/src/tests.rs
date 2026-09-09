@@ -366,6 +366,35 @@ fn editor_with_lines(
     let window = editor.tabpage(tab).unwrap().current_window();
     (editor, buffer, tab, window)
 }
+fn editor_with_two_windows() -> (Editor, crate::BufHandle, crate::TabHandle, crate::WinHandle) {
+    let (mut editor, buffer, tab, window) = editor_with_lines(&["target"]);
+    let other = editor
+        .create_buffer_with(Buffer::from_lines(&[b"other".to_vec()], false).unwrap(), true)
+        .unwrap();
+    editor.split_vertical(tab, window, other, true).unwrap();
+    (editor, buffer, tab, window)
+}
+fn set_global_hidden(session: &crate::ApiSession, enabled: bool) {
+    crate::global::nvim_set_option_value(
+        session,
+        OxStr::from("hidden"),
+        Object::Boolean(enabled),
+        dict(&[("scope", Object::String(OxStr::from("global")))]),
+    )
+    .unwrap();
+}
+
+fn set_buffer_hidden_policy(session: &crate::ApiSession, buffer: crate::BufHandle, value: &str) {
+    crate::global::nvim_set_option_value(
+        session,
+        OxStr::from("bufhidden"),
+        Object::String(OxStr::from(value)),
+        dict(&[("buf", Object::Buffer(buffer))]),
+    )
+    .unwrap();
+}
+
+
 
 #[test]
 fn set_current_window_reports_invalid_id_and_switches_valid_window() {
@@ -511,6 +540,147 @@ fn set_current_buf_fires_the_buffer_lifecycle_in_order() {
 
     crate::global::nvim_set_current_buf(&session, second_buffer).unwrap();
     assert_eq!(actions.borrow().len(), 3, "same buffer must not fire");
+}
+
+/// `nvim_set_current_buf` must preserve invalid Unix filename bytes while
+/// probing and reading an unloaded buffer, rather than taking `BufNewFile`.
+#[cfg(unix)]
+#[test]
+fn set_current_buf_reads_unloaded_non_utf8_file_name() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "oxvim-api-byte-path-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let file_name = std::ffi::OsStr::from_bytes(b"target-\xff.txt");
+    let path = root.join(file_name);
+    std::fs::write(&path, b"one\ntwo\n").unwrap();
+
+    let (editor, _source, _, _) = editor_with_lines(&["source"]);
+    let session = session_with(editor);
+    let target = session.with_editor_mut(|editor| {
+        let target = editor.create_buffer(true).unwrap();
+        let state = editor.buffer_mut(target).unwrap();
+        state.set_name(OxStr(path.as_os_str().as_bytes().to_vec()));
+        state.unload().unwrap();
+        target
+    });
+    for event in ["BufReadPre", "BufReadPost", "BufNewFile"] {
+        focus_autocmd(&session, event);
+    }
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: None,
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::global::nvim_set_current_buf(&session, target).unwrap();
+
+    assert_eq!(
+        actions
+            .borrow()
+            .iter()
+            .map(|action| action.event)
+            .collect::<Vec<_>>(),
+        [Event::BufReadPre, Event::BufReadPost]
+    );
+    assert_eq!(
+        session.with_editor(|editor| {
+            editor
+                .buffer(target)
+                .unwrap()
+                .text()
+                .unwrap()
+                .line(1)
+                .unwrap()
+                .to_vec()
+        }),
+        b"one"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn set_current_buf_read_hook_sets_target_buffer_local_option() {
+    let (editor, source, _, _) = editor_with_lines(&["source"]);
+    let session = session_with(editor);
+    let path = std::env::temp_dir().join(format!(
+        "oxvim-api-current-buffer-hook-{}",
+        std::process::id()
+    ));
+    std::fs::write(&path, b"target\n").unwrap();
+    crate::global::nvim_set_option_value(
+        &session,
+        OxStr::from("shiftwidth"),
+        Object::Integer(8),
+        dict(&[("scope", Object::String(OxStr::from("local")))]),
+    )
+    .unwrap();
+    let target = session.with_editor_mut(|editor| {
+        let target = editor.create_buffer(true).unwrap();
+        let state = editor.buffer_mut(target).unwrap();
+        state.set_name(OxStr::from(path.to_string_lossy().as_ref()));
+        state.unload().unwrap();
+        target
+    });
+    let setlocal = Rc::new(|session: &crate::ApiSession| {
+        crate::global::nvim_set_option_value(
+            session,
+            OxStr::from("shiftwidth"),
+            Object::Integer(3),
+            dict(&[("scope", Object::String(OxStr::from("local")))]),
+        )
+        .map(|_| ())
+    });
+    crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("BufReadPre")),
+        dict(&[
+            ("pattern", Object::String(OxStr::from("*"))),
+            ("command", Object::String(OxStr::from("setlocal shiftwidth=3"))),
+        ]),
+    )
+    .unwrap();
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions,
+            reenter: Some(setlocal),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::global::nvim_set_current_buf(&session, target).unwrap();
+
+    assert_eq!(
+        session.with_editor(|editor| {
+            editor
+                .options()
+                .get_buffer(target, "shiftwidth")
+                .unwrap()
+                .clone()
+        }),
+        OptionValue::Number(3),
+    );
+    assert_eq!(
+        session.with_editor(|editor| {
+            editor
+                .options()
+                .get_buffer(source, "shiftwidth")
+                .unwrap()
+                .clone()
+        }),
+        OptionValue::Number(8),
+    );
+    std::fs::remove_file(path).unwrap();
 }
 
 /// A nonexistent target fails through `find_buffer_by_handle`'s
@@ -933,6 +1103,232 @@ fn cursor_columns_clamp_but_rows_validate() {
 }
 
 #[test]
+fn win_close_hidden_keeps_modified_last_buffer() {
+    let (editor, buffer, _, window) = editor_with_two_windows();
+    let session = session_with(editor);
+    set_global_hidden(&session, true);
+    session.with_editor_mut(|editor| {
+        editor
+            .buffer_mut(buffer)
+            .unwrap()
+            .flags
+            .set(ox_editor::BufferFlags::MODIFIED, true);
+    });
+
+    crate::window::nvim_win_close(&session, window, false).unwrap();
+
+    session.with_editor(|editor| {
+        let state = editor.buffer(buffer).unwrap();
+        assert_eq!(state.attachments, 0);
+        assert!(state.residency.is_hidden());
+        assert!(state.flags.contains(ox_editor::BufferFlags::MODIFIED));
+    });
+}
+
+/// Closing the last window of a wiped buffer stages the upstream
+/// `BufUnload` → `BufDelete` → `BufWipeout` sequence before the editor frees
+/// the buffer (`window.c:2791`, `buffer.c:851-869`).
+#[test]
+fn win_close_stages_buffer_removal_lifecycle_before_wipe() {
+    let (editor, buffer, _, window) = editor_with_two_windows();
+    let session = session_with(editor);
+    set_global_hidden(&session, true);
+    set_buffer_hidden_policy(&session, buffer, "wipe");
+    for event in ["BufUnload", "BufDelete", "BufWipeout"] {
+        focus_autocmd(&session, event);
+    }
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: None,
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::window::nvim_win_close(&session, window, false).unwrap();
+
+    assert_eq!(
+        actions
+            .borrow()
+            .iter()
+            .map(|action| action.event)
+            .collect::<Vec<_>>(),
+        [Event::BufUnload, Event::BufDelete, Event::BufWipeout]
+    );
+    session.with_editor(|editor| {
+        assert!(editor.buffer(buffer).is_err());
+        assert!(editor.window(window).is_err());
+    });
+}
+
+#[test]
+fn win_close_without_hidden_rejects_modified_last_buffer_with_e37() {
+    let (editor, buffer, _, window) = editor_with_two_windows();
+    let session = session_with(editor);
+    set_global_hidden(&session, false);
+    session.with_editor_mut(|editor| {
+        editor
+            .buffer_mut(buffer)
+            .unwrap()
+            .flags
+            .set(ox_editor::BufferFlags::MODIFIED, true);
+    });
+
+    assert_eq!(
+        crate::window::nvim_win_close(&session, window, false),
+        Err(ApiError::exception(
+            "E37: No write since last change (add ! to override)"
+        ))
+    );
+    session.with_editor(|editor| {
+        let state = editor.buffer(buffer).unwrap();
+        assert_eq!(state.attachments, 1);
+        assert!(!state.residency.is_hidden());
+    });
+}
+
+#[test]
+fn win_close_bufhidden_overrides_global_policy_and_controls_release() {
+    let (editor, buffer, _, window) = editor_with_two_windows();
+    let session = session_with(editor);
+    set_global_hidden(&session, false);
+    set_buffer_hidden_policy(&session, buffer, "hide");
+    session.with_editor_mut(|editor| {
+        editor
+            .buffer_mut(buffer)
+            .unwrap()
+            .flags
+            .set(ox_editor::BufferFlags::MODIFIED, true);
+    });
+    crate::window::nvim_win_close(&session, window, false).unwrap();
+    session.with_editor(|editor| {
+        let state = editor.buffer(buffer).unwrap();
+        assert_eq!(state.attachments, 0);
+        assert!(state.residency.is_hidden());
+        assert!(state.flags.contains(ox_editor::BufferFlags::MODIFIED));
+    });
+
+    let (editor, buffer, _, window) = editor_with_two_windows();
+    let session = session_with(editor);
+    set_global_hidden(&session, true);
+    set_buffer_hidden_policy(&session, buffer, "unload");
+    session.with_editor_mut(|editor| {
+        editor
+            .buffer_mut(buffer)
+            .unwrap()
+            .flags
+            .set(ox_editor::BufferFlags::MODIFIED, true);
+    });
+    assert_eq!(
+        crate::window::nvim_win_close(&session, window, false),
+        Err(ApiError::exception(
+            "E37: No write since last change (add ! to override)"
+        ))
+    );
+
+    for policy in ["unload", "delete", "wipe"] {
+        let (editor, buffer, _, window) = editor_with_two_windows();
+        let session = session_with(editor);
+        set_global_hidden(&session, true);
+        set_buffer_hidden_policy(&session, buffer, policy);
+        crate::window::nvim_win_close(&session, window, false).unwrap();
+        session.with_editor(|editor| match policy {
+            "unload" => {
+                let state = editor.buffer(buffer).unwrap();
+                assert!(!state.residency.is_loaded());
+                assert!(state.flags.contains(ox_editor::BufferFlags::LISTED));
+            }
+            "delete" => {
+                let state = editor.buffer(buffer).unwrap();
+                assert!(!state.residency.is_loaded());
+                assert!(!state.flags.contains(ox_editor::BufferFlags::LISTED));
+            }
+            "wipe" => assert!(editor.buffer(buffer).is_err()),
+            _ => unreachable!(),
+        });
+    }
+}
+// `ex_win_close` frees the buffer only when `!need_hide && !buf_hide(buf)`
+// (`ex_docmd.c:5199-5203`), and `need_hide` is true for a changed buffer at
+// its last window. A forced close therefore keeps that buffer resident and
+// modified whatever `bufhidden` says, because `unload`, `delete` and `wipe`
+// make `buf_hide()` false rather than requesting a release here.
+#[test]
+fn win_close_force_keeps_a_modified_last_buffer_whatever_bufhidden_says() {
+    for policy in ["unload", "delete", "wipe", "hide"] {
+        let (editor, buffer, _, window) = editor_with_two_windows();
+        let session = session_with(editor);
+        set_global_hidden(&session, false);
+        set_buffer_hidden_policy(&session, buffer, policy);
+        session.with_editor_mut(|editor| {
+            editor
+                .buffer_mut(buffer)
+                .unwrap()
+                .flags
+                .set(ox_editor::BufferFlags::MODIFIED, true);
+        });
+
+        crate::window::nvim_win_close(&session, window, true).unwrap();
+
+        session.with_editor(|editor| {
+            let state = editor
+                .buffer(buffer)
+                .unwrap_or_else(|_| panic!("bufhidden={policy} must not wipe a modified buffer"));
+            assert!(
+                state.residency.is_loaded(),
+                "bufhidden={policy} must keep a modified last buffer resident"
+            );
+            assert!(
+                state.flags.contains(ox_editor::BufferFlags::MODIFIED),
+                "bufhidden={policy} must not discard the modification"
+            );
+            assert!(
+                state.flags.contains(ox_editor::BufferFlags::LISTED),
+                "bufhidden={policy} must not unlist a modified buffer"
+            );
+        });
+    }
+
+    let (editor, buffer, _, window) = editor_with_two_windows();
+    let session = session_with(editor);
+    set_global_hidden(&session, false);
+    session.with_editor_mut(|editor| {
+        editor
+            .buffer_mut(buffer)
+            .unwrap()
+            .flags
+            .set(ox_editor::BufferFlags::MODIFIED, true);
+    });
+    crate::window::nvim_win_close(&session, window, true).unwrap();
+    session.with_editor(|editor| {
+        let state = editor.buffer(buffer).unwrap();
+        assert!(state.residency.is_hidden());
+        assert!(state.residency.is_loaded());
+        assert!(state.flags.contains(ox_editor::BufferFlags::MODIFIED));
+    });
+}
+#[test]
+fn win_close_bufhidden_does_not_release_buffer_with_other_attachment() {
+    let (mut editor, buffer, tab, window) = editor_with_two_windows();
+    let second = editor.split_vertical(tab, window, buffer, true).unwrap();
+    let session = session_with(editor);
+    set_global_hidden(&session, true);
+    set_buffer_hidden_policy(&session, buffer, "wipe");
+
+    crate::window::nvim_win_close(&session, second, false).unwrap();
+
+    session.with_editor(|editor| {
+        let state = editor.buffer(buffer).unwrap();
+        assert_eq!(state.attachments, 1);
+        assert!(state.residency.is_loaded());
+    });
+}
+
+
+
+#[test]
 fn floating_windows_validate_round_trip_and_close() {
     let (editor, buffer, _, _) = editor_with_lines(&["one"]);
     let session = session_with(editor);
@@ -1058,6 +1454,7 @@ fn core_registry_metadata_matches_cross_family_sample() {
         }
     }
 }
+
 
 #[test]
 fn registry_dispatch_converts_objects_and_preserves_api_errors() {
@@ -1769,6 +2166,277 @@ fn reentrant_once_callback_sibling_deletion_releases_once() {
     assert_eq!(&*released.borrow(), &[43]);
 }
 
+/// `nvim_exec_autocmds` on an unloaded buffer enters it before running the
+/// callback — upstream `ctx_switch` (legacy `aucmd_prepbuf`) makes the
+/// target current even when its text is not resident — so a callback
+/// observing `nvim_get_current_buf()` sees the target, and the caller's
+/// buffer and the target's unloaded residency are restored afterwards.
+#[test]
+fn exec_autocmds_enters_an_unloaded_target_buffer() {
+    let (mut editor, caller, _tab, _window) = editor_with_lines(&["one"]);
+    let target = editor.create_buffer(true).unwrap();
+    editor.unload_buffer(target).unwrap();
+    let session = session_with(editor);
+    crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[
+            ("buffer", Object::Integer(i64::from(target))),
+            ("callback", Object::LuaRef(44)),
+        ]),
+    )
+    .unwrap();
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let record = {
+        let observed = observed.clone();
+        Rc::new(move |session: &crate::ApiSession| {
+            observed
+                .borrow_mut()
+                .push(crate::global::nvim_get_current_buf(session)?);
+            Ok(())
+        })
+    };
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: Rc::new(RefCell::new(Vec::new())),
+            reenter: Some(record),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::autocmd::nvim_exec_autocmds(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[("buf", Object::Integer(i64::from(target)))]),
+    )
+    .unwrap();
+
+    assert_eq!(&*observed.borrow(), &[target]);
+    assert_eq!(
+        crate::global::nvim_get_current_buf(&session).unwrap(),
+        caller,
+        "the caller's buffer is restored after the callback"
+    );
+    assert!(
+        session.with_editor(|editor| !editor.buffer(target).unwrap().residency.is_loaded()),
+        "an unloaded target is restored to Unloaded once the switch is undone"
+    );
+}
+
+/// The context switch must not turn an unloaded named buffer into a hidden
+/// empty buffer: the next API switch must perform the real disk read.
+#[test]
+fn exec_autocmds_restores_unloaded_target_before_following_switch() {
+    let path = std::env::temp_dir().join(format!(
+        "oxvim-api-exec-autocmds-reload-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, b"from disk\n").unwrap();
+
+    let (editor, caller, _, _) = editor_with_lines(&["caller"]);
+    let session = session_with(editor);
+    let target = session.with_editor_mut(|editor| {
+        let target = editor.create_buffer(true).unwrap();
+        let state = editor.buffer_mut(target).unwrap();
+        state.set_name(OxStr::from(path.to_string_lossy().as_ref()));
+        state.unload().unwrap();
+        target
+    });
+    crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[
+            ("buffer", Object::Integer(i64::from(target))),
+            ("callback", Object::LuaRef(44)),
+        ]),
+    )
+    .unwrap();
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder::default()),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::autocmd::nvim_exec_autocmds(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[("buf", Object::Integer(i64::from(target)))]),
+    )
+    .unwrap();
+
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(caller),
+        "the caller's buffer is restored after the explicit execution"
+    );
+    assert!(
+        session.with_editor(|editor| !editor.buffer(target).unwrap().residency.is_loaded()),
+        "the target remains unloaded until the following switch reads it"
+    );
+
+    crate::global::nvim_set_current_buf(&session, target).unwrap();
+    assert_eq!(
+        crate::global::nvim_get_current_buf(&session).unwrap(),
+        target
+    );
+    assert_eq!(
+        crate::buffer::nvim_buf_get_lines(&session, target, 0, -1, true).unwrap(),
+        vec![OxStr::from("from disk")]
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A callback failure still unwinds the temporary context and restores the
+/// target's entry residency before the error reaches the API caller.
+#[test]
+fn exec_autocmds_error_restores_unloaded_target() {
+    let (mut editor, caller, _, _) = editor_with_lines(&["caller"]);
+    let target = editor.create_buffer(true).unwrap();
+    editor.unload_buffer(target).unwrap();
+    let session = session_with(editor);
+    crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[
+            ("buffer", Object::Integer(i64::from(target))),
+            ("callback", Object::LuaRef(45)),
+        ]),
+    )
+    .unwrap();
+    let fail = Rc::new(|_: &crate::ApiSession| Err(ApiError::exception("boom")));
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: Rc::new(RefCell::new(Vec::new())),
+            reenter: Some(fail),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    assert_eq!(
+        crate::autocmd::nvim_exec_autocmds(
+            &session,
+            Object::String(OxStr::from("BufEnter")),
+            dict(&[("buf", Object::Integer(i64::from(target)))]),
+        ),
+        Err(ApiError::exception("boom"))
+    );
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(caller),
+        "the caller's buffer is restored after the callback error"
+    );
+    assert!(
+        session.with_editor(|editor| !editor.buffer(target).unwrap().residency.is_loaded()),
+        "the callback error must not strand an empty resident target"
+    );
+}
+
+/// A callback that writes real text has taken ownership of the materialized
+/// buffer; restoring the context must not unload and discard that text.
+#[test]
+fn exec_autocmds_keeps_handler_loaded_target_resident() {
+    let (mut editor, caller, _, _) = editor_with_lines(&["caller"]);
+    let target = editor.create_buffer(true).unwrap();
+    editor.unload_buffer(target).unwrap();
+    let session = session_with(editor);
+    crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[
+            ("buffer", Object::Integer(i64::from(target))),
+            ("callback", Object::LuaRef(46)),
+        ]),
+    )
+    .unwrap();
+    let load = Rc::new(move |session: &crate::ApiSession| {
+        crate::buffer::nvim_buf_set_lines(
+            session,
+            target,
+            0,
+            -1,
+            true,
+            vec![OxStr::from("handler content")],
+        )
+    });
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: Rc::new(RefCell::new(Vec::new())),
+            reenter: Some(load),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::autocmd::nvim_exec_autocmds(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[("buf", Object::Integer(i64::from(target)))]),
+    )
+    .unwrap();
+
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(caller),
+        "the caller's buffer is restored after the callback writes"
+    );
+    assert!(
+        session.with_editor(|editor| editor.buffer(target).unwrap().residency.is_loaded()),
+        "a target changed by the callback stays resident"
+    );
+    assert_eq!(
+        crate::buffer::nvim_buf_get_lines(&session, target, 0, -1, true).unwrap(),
+        vec![OxStr::from("handler content")]
+    );
+}
+
+/// A hidden buffer that was already resident is not mistaken for context
+/// materialization and remains loaded after the temporary display.
+#[test]
+fn exec_autocmds_keeps_already_loaded_hidden_target_resident() {
+    let (mut editor, caller, _, _) = editor_with_lines(&["caller"]);
+    let target = editor
+        .create_buffer_with(Buffer::from_lines(&[b"already loaded".to_vec()], false).unwrap(), true)
+        .unwrap();
+    let session = session_with(editor);
+    let before_tick = session.with_editor(|editor| editor.buffer(target).unwrap().changedtick());
+    crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[
+            ("buffer", Object::Integer(i64::from(target))),
+            ("callback", Object::LuaRef(47)),
+        ]),
+    )
+    .unwrap();
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder::default()),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::autocmd::nvim_exec_autocmds(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[("buf", Object::Integer(i64::from(target)))]),
+    )
+    .unwrap();
+
+    let (loaded, after_tick) = session.with_editor(|editor| {
+        let state = editor.buffer(target).unwrap();
+        (state.residency.is_loaded(), state.changedtick())
+    });
+    assert_eq!(session.with_editor(Editor::current_buffer), Some(caller));
+    assert!(loaded, "an already-loaded target remains resident");
+    assert_eq!(after_tick, before_tick, "context restoration does not reload it");
+    assert_eq!(
+        crate::buffer::nvim_buf_get_lines(&session, target, 0, -1, true).unwrap(),
+        vec![OxStr::from("already loaded")]
+    );
+}
+
 fn filetype_autocmd(session: &crate::ApiSession, pattern: &str, once: bool) -> i64 {
     crate::autocmd::nvim_create_autocmd(
         session,
@@ -1844,7 +2512,10 @@ fn set_option_value_fires_one_populated_filetype_after_commit() {
     let recorded = actions.borrow();
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].api_id, Some(u64::try_from(id).unwrap()));
-    assert_eq!(recorded[0].file_name, expected_name.to_string_lossy());
+    assert_eq!(
+        recorded[0].file_name,
+        OxStr::from(expected_name.to_string_lossy().as_ref()),
+    );
     assert_eq!(recorded[0].buffer, Some(target));
 }
 
@@ -1873,7 +2544,7 @@ fn ft_alias_with_local_scope_fires_for_the_current_buffer() {
 
     let recorded = actions.borrow();
     assert_eq!(recorded.len(), 1);
-    assert_eq!(recorded[0].match_name, "python");
+    assert_eq!(recorded[0].match_name, OxStr::from("python"));
     assert_eq!(recorded[0].buffer, Some(current));
 }
 
@@ -2600,6 +3271,75 @@ fn extmark_details_order_limit_delete_and_clear() {
         crate::extmark::nvim_buf_get_extmark_by_id(&session, buffer, namespace, first, dict(&[]))
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn extmark_stacked_hl_group_roundtrips() {
+    let (editor, buffer, _, _) = editor_with_lines(&["text"]);
+    let session = session_with(editor);
+    let namespace = crate::extmark::nvim_create_namespace(&session, OxStr::from("test")).unwrap();
+    // Array form.
+    let id = crate::extmark::nvim_buf_set_extmark(
+        &session,
+        buffer,
+        namespace,
+        0,
+        0,
+        dict(&[(
+            "hl_group",
+            Object::Array(vec![
+                Object::String(OxStr::from("A")),
+                Object::String(OxStr::from("B")),
+            ]),
+        )]),
+    )
+    .unwrap();
+    let marks = crate::extmark::nvim_buf_get_extmarks(
+        &session,
+        buffer,
+        namespace,
+        Object::Integer(0),
+        Object::Integer(-1),
+        dict(&[("details", Object::Boolean(true))]),
+    )
+    .unwrap();
+    let Object::Dict(details) = &marks[0][3] else {
+        panic!("missing details")
+    };
+    assert_eq!(
+        details.get(&OxStr::from("hl_group")),
+        Some(&Object::Array(vec![
+            Object::String(OxStr::from("A")),
+            Object::String(OxStr::from("B"))
+        ]))
+    );
+    // String form stays string.
+    crate::extmark::nvim_buf_del_extmark(&session, buffer, namespace, id).unwrap();
+    crate::extmark::nvim_buf_set_extmark(
+        &session,
+        buffer,
+        namespace,
+        0,
+        0,
+        dict(&[("hl_group", Object::String(OxStr::from("Single")))]),
+    )
+    .unwrap();
+    let marks = crate::extmark::nvim_buf_get_extmarks(
+        &session,
+        buffer,
+        namespace,
+        Object::Integer(0),
+        Object::Integer(-1),
+        dict(&[("details", Object::Boolean(true))]),
+    )
+    .unwrap();
+    let Object::Dict(details) = &marks[0][3] else {
+        panic!("missing details")
+    };
+    assert_eq!(
+        details.get(&OxStr::from("hl_group")),
+        Some(&Object::String(OxStr::from("Single")))
     );
 }
 
@@ -3334,7 +4074,6 @@ fn context_round_trip_restores_gvars() {
         Some(Object::Integer(42))
     );
 }
-
 #[test]
 fn client_info_round_trip_reports_registered_channel() {
     let (editor, _, _, _) = editor_with_lines(&["one"]);
@@ -7614,6 +8353,92 @@ fn buf_call_restores_visual_state_even_on_callback_error() {
     );
 }
 
+/// `nvim_buf_call` on a hidden unloaded named buffer enters it without
+/// opening its file — upstream `ctx_switch` (legacy `aucmd_prepbuf`) — so
+/// the context must return the target to its unloaded residency on the way
+/// out: the following switch must reload from disk instead of showing the
+/// empty placeholder the call materialized.
+#[test]
+fn buf_call_restores_unloaded_target_before_following_switch() {
+    let pid = std::process::id();
+    let path = std::env::temp_dir().join(format!("oxvim-api-buf-call-reload-{pid}"));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, b"from disk\n").unwrap();
+
+    let (editor, caller, _, _) = editor_with_lines(&["caller"]);
+    let session = session_with(editor);
+    let target = session.with_editor_mut(|editor| {
+        let target = editor.create_buffer(true).unwrap();
+        let state = editor.buffer_mut(target).unwrap();
+        state.set_name(OxStr::from(path.to_string_lossy().as_ref()));
+        state.unload().unwrap();
+        target
+    });
+
+    let observed = Rc::new(RefCell::new(None));
+    let obs = observed.clone();
+    buf_call(
+        &session,
+        target,
+        Box::new(move |session| {
+            *obs.borrow_mut() = session.with_editor(Editor::current_buffer);
+            Ok(Vec::new())
+        }),
+    );
+
+    assert_eq!(&*observed.borrow(), &Some(target));
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(caller),
+        "the caller's buffer is restored after the callback"
+    );
+    assert!(
+        session.with_editor(|editor| !editor.buffer(target).unwrap().residency.is_loaded()),
+        "the target remains unloaded until the following switch reads it"
+    );
+
+    crate::global::nvim_set_current_buf(&session, target).unwrap();
+    assert_eq!(
+        crate::global::nvim_get_current_buf(&session).unwrap(),
+        target
+    );
+    assert_eq!(
+        crate::buffer::nvim_buf_get_lines(&session, target, 0, -1, true).unwrap(),
+        vec![OxStr::from("from disk")]
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A failing `nvim_buf_call` callback still unwinds the temporary context
+/// and returns an unloaded target to its entry residency before the error
+/// reaches the API caller.
+#[test]
+fn buf_call_error_restores_unloaded_target() {
+    let (editor, caller, _, _) = editor_with_lines(&["caller"]);
+    let session = session_with(editor);
+    let target = session.with_editor_mut(|editor| {
+        let target = editor.create_buffer(true).unwrap();
+        editor.buffer_mut(target).unwrap().unload().unwrap();
+        target
+    });
+
+    buf_call(
+        &session,
+        target,
+        Box::new(|_| Err("callback error".to_string())),
+    );
+
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(caller),
+        "caller buffer restored after callback error"
+    );
+    assert!(
+        session.with_editor(|editor| !editor.buffer(target).unwrap().residency.is_loaded()),
+        "an unloaded target is restored to Unloaded even when the callback errors"
+    );
+}
+
 #[test]
 fn buf_get_offset_empty_buffer_returns_zero_and_one_for_eof() {
     let (editor, buffer, _tab, _win) = editor_with_lines(&[""]);
@@ -7689,6 +8514,106 @@ fn buf_get_offset_no_virtual_newline_when_eol_and_fixeol_both_false() {
         crate::buffer::nvim_buf_get_offset(&session, buffer, 3).unwrap(),
         11
     );
+}
+
+#[test]
+fn open_tabpage_loads_unloaded_buffer_before_read_hooks() {
+    let (editor, source, original_tab, _) = editor_with_lines(&["source"]);
+    let session = session_with(editor);
+    let path = std::env::temp_dir().join(format!(
+        "oxvim-api-open-tabpage-hook-{}",
+        std::process::id()
+    ));
+    std::fs::write(&path, b"target\n").unwrap();
+    crate::global::nvim_set_option_value(
+        &session,
+        OxStr::from("shiftwidth"),
+        Object::Integer(8),
+        dict(&[("scope", Object::String(OxStr::from("local")))]),
+    )
+    .unwrap();
+    let target = session.with_editor_mut(|editor| {
+        let target = editor.create_buffer(true).unwrap();
+        let state = editor.buffer_mut(target).unwrap();
+        state.set_name(OxStr::from(path.to_string_lossy().as_ref()));
+        state.unload().unwrap();
+        target
+    });
+    crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("BufReadPre")),
+        dict(&[
+            ("pattern", Object::String(OxStr::from("*"))),
+            ("command", Object::String(OxStr::from("setlocal shiftwidth=3"))),
+        ]),
+    )
+    .unwrap();
+    let setlocal = Rc::new(|session: &crate::ApiSession| {
+        crate::global::nvim_set_option_value(
+            session,
+            OxStr::from("shiftwidth"),
+            Object::Integer(3),
+            dict(&[("scope", Object::String(OxStr::from("local")))]),
+        )
+        .map(|_| ())
+    });
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: Rc::new(RefCell::new(Vec::new())),
+            reenter: Some(setlocal),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    let tab = crate::tabpage::nvim_open_tabpage(&session, target, false, dict(&[])).unwrap();
+
+    assert_eq!(
+        session.with_editor(Editor::current_tabpage),
+        Some(original_tab)
+    );
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(source)
+    );
+    assert_eq!(
+        session.with_editor(|editor| {
+            editor
+                .buffer(target)
+                .unwrap()
+                .text()
+                .unwrap()
+                .line(1)
+        }),
+        Ok(b"target".to_vec())
+    );
+    assert_eq!(
+        session.with_editor(|editor| {
+            editor
+                .options()
+                .get_buffer(target, "shiftwidth")
+                .unwrap()
+                .clone()
+        }),
+        OptionValue::Number(3)
+    );
+    assert_eq!(
+        session.with_editor(|editor| {
+            editor
+                .options()
+                .get_buffer(source, "shiftwidth")
+                .unwrap()
+                .clone()
+        }),
+        OptionValue::Number(8)
+    );
+    let window = session
+        .with_editor(|editor| editor.tabpage(tab).unwrap().current_window());
+    assert_eq!(
+        session.with_editor(|editor| editor.window(window).unwrap().buffer),
+        target
+    );
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -8071,4 +8996,504 @@ fn w4_eval_statusline_renders_literal_and_filename() {
         dict(&[("winid", Object::Integer(9_999))]),
     );
     assert!(unknown.is_err(), "unknown winid must fail");
+}
+
+#[test]
+fn nvim_echo_accepts_documented_progress_options_and_rejects_unknown_keys() {
+    let session = session();
+    let chunks = vec![Object::Array(vec![Object::String(OxStr::from(
+        "checking %s",
+    ))])];
+
+    // health.lua-shaped progress call must not error and must return a real
+    // positive message-id instead of -1.
+    let progress = dict(&[
+        ("kind", Object::String(OxStr::from("progress"))),
+        ("source", Object::String(OxStr::from("vim.health"))),
+        ("title", Object::String(OxStr::from("checkhealth"))),
+        ("status", Object::String(OxStr::from("running"))),
+        ("percent", Object::Integer(42)),
+    ]);
+    let result = crate::global::nvim_echo(&session, chunks.clone(), false, progress).unwrap();
+    assert!(matches!(result, Object::Integer(id) if id > 0), "got {result:?}");
+
+    // `spellfile.lua` uses `kind = 'empty'`.
+    let empty = dict(&[("kind", Object::String(OxStr::from("empty")))]);
+    let result = crate::global::nvim_echo(&session, chunks.clone(), false, empty).unwrap();
+    assert!(matches!(result, Object::Integer(id) if id > 0), "got {result:?}");
+
+    // A caller-provided string `id` is returned as-is.
+    let with_id = dict(&[
+        ("kind", Object::String(OxStr::from("progress"))),
+        ("source", Object::String(OxStr::from("tests"))),
+        ("status", Object::String(OxStr::from("running"))),
+        ("id", Object::String(OxStr::from("my.progress"))),
+    ]);
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), false, with_id).unwrap(),
+        Object::String(OxStr::from("my.progress"))
+    );
+
+    // Truly unknown keys still fail.
+    let unknown = dict(&[("bogus", Object::Boolean(true))]);
+    assert!(matches!(
+        crate::global::nvim_echo(&session, chunks, false, unknown),
+        Err(ApiError::Validation(_))
+    ));
+}
+
+#[test]
+fn nvim_echo_validates_integer_message_ids() {
+    let session = session();
+    let chunks = vec![Object::Array(vec![Object::String(OxStr::from("hello"))])];
+
+    // The first automatic id is established before an explicit integer can
+    // refer to it.
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[])),
+        Ok(Object::Integer(1))
+    );
+    assert_eq!(
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[("id", Object::Integer(1))]),
+        ),
+        Ok(Object::Integer(1))
+    );
+    assert_eq!(
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[("id", Object::Integer(2))]),
+        ),
+        Err(ApiError::validation("Invalid 'id': 2"))
+    );
+    assert_eq!(
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[
+                ("id", Object::Integer(0)),
+                ("verbose", Object::Boolean(true)),
+            ]),
+        ),
+        Err(ApiError::validation("Invalid 'id': 0"))
+    );
+    assert_eq!(
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[("id", Object::String(OxStr::from("custom")))]),
+        ),
+        Ok(Object::String(OxStr::from("custom")))
+    );
+    // `Union(Integer, String)` is represented as an Object by both upstream
+    // keyset decoders, so other object types remain caller-defined as well.
+    assert_eq!(
+        crate::global::nvim_echo(
+            &session,
+            chunks,
+            false,
+            dict(&[("id", Object::Boolean(true))]),
+        ),
+        Ok(Object::Boolean(true))
+    );
+}
+
+#[test]
+fn nvim_echo_rejects_wrong_typed_option_values() {
+    let session = session();
+    let chunks = vec![Object::Array(vec![Object::String(OxStr::from("hello"))])];
+
+    // Boolean members fail the strict boolean pop (`api_spec.lua:301`).
+    for key in ["err", "verbose", "_truncate"] {
+        assert_eq!(
+            crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+                (key, Object::String(OxStr::from("x"))),
+            ])),
+            Err(ApiError::validation(format!("Invalid '{key}': not a boolean"))),
+            "{key}",
+        );
+    }
+    // Numbers coerce against zero, `nil` is `false`.
+    assert!(crate::global::nvim_echo(
+        &session,
+        chunks.clone(),
+        false,
+        dict(&[("err", Object::Integer(2))])
+    )
+    .is_ok());
+    assert!(crate::global::nvim_echo(
+        &session,
+        chunks.clone(),
+        false,
+        dict(&[("verbose", Object::Float(0.0))])
+    )
+    .is_ok());
+
+    // The remaining typed members fail the RPC-side `VALIDATE_T` shape.
+    for (key, expected) in [
+        ("kind", "String"),
+        ("title", "String"),
+        ("status", "String"),
+        ("source", "String"),
+        ("percent", "Integer"),
+        ("data", "Dict"),
+    ] {
+        assert_eq!(
+            crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+                (key, Object::Array(vec![Object::Integer(1)])),
+            ])),
+            Err(ApiError::validation(format!(
+                "Invalid '{key}': expected {expected}, got Array"
+            ))),
+            "{key}",
+        );
+    }
+    assert_eq!(
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[("data", Object::Nil)]),
+        ),
+        Err(ApiError::validation(
+            "Invalid 'data': expected Dict, got nil"
+        )),
+    );
+
+}
+
+#[test]
+fn nvim_echo_applies_upstream_progress_validations() {
+    let session = session();
+    let chunks = vec![Object::Array(vec![Object::String(OxStr::from("hello"))])];
+    let progress = |extra: &[(&str, Object)]| {
+        let mut entries = vec![
+            ("kind", Object::String(OxStr::from("progress"))),
+            ("source", Object::String(OxStr::from("tests"))),
+            ("status", Object::String(OxStr::from("running"))),
+        ];
+        for (key, value) in extra {
+            if let Some(slot) = entries.iter_mut().find(|(name, _)| name == key) {
+                slot.1 = value.clone();
+            } else {
+                entries.push((key, value.clone()));
+            }
+        }
+        dict(&entries)
+    };
+
+    // The five progress-only fields are rejected on a plain message with
+    // the defaulted kind label (`messages_spec.lua:3665`).
+    for (key, value) in [
+        ("status", Object::String(OxStr::from("running"))),
+        ("title", Object::String(OxStr::from("TestSuit"))),
+        ("data", Object::Dict(Dict(vec![(OxStr::from("tag"), Object::Integer(1))]))),
+        ("percent", Object::Integer(0)),
+        ("source", Object::String(OxStr::from("tests"))),
+    ] {
+        assert_eq!(
+            crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+                (key, value),
+            ])),
+            Err(ApiError::validation(
+                "Conflict: title/source/status/percent/data not allowed with kind='echo'"
+            )),
+            "{key}",
+        );
+    }
+    assert!(crate::global::nvim_echo(
+        &session,
+        chunks.clone(),
+        false,
+        dict(&[("data", Object::Array(vec![]))]),
+    )
+    .is_ok());
+
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+            ("kind", Object::String(OxStr::from("empty"))),
+            ("title", Object::String(OxStr::from("TestSuit"))),
+        ])),
+        Err(ApiError::validation(
+            "Conflict: title/source/status/percent/data not allowed with kind='empty'"
+        )),
+    );
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), true, dict(&[
+            ("err", Object::Boolean(true)),
+            ("status", Object::String(OxStr::from("running"))),
+        ])),
+        Err(ApiError::validation(
+            "Conflict: title/source/status/percent/data not allowed with kind='echoerr'"
+        )),
+    );
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), true, dict(&[
+            ("title", Object::String(OxStr::from("TestSuit"))),
+        ])),
+        Err(ApiError::validation(
+            "Conflict: title/source/status/percent/data not allowed with kind='echomsg'"
+        )),
+    );
+    // `status` only takes the documented values, and only on progress
+    // messages (`messages_spec.lua:3691`).
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), false, progress(&[(
+            "status",
+            Object::String(OxStr::from("live")),
+        )])),
+        Err(ApiError::validation(
+            "Invalid 'status': expected success|failed|running|cancel, got live"
+        )),
+    );
+
+    // `percent` is range-checked (`messages_spec.lua:3702`, `:3712`).
+    for percent in [-1, 101] {
+        assert_eq!(
+            crate::global::nvim_echo(&session, chunks.clone(), false, progress(&[(
+                "percent",
+                Object::Integer(percent),
+            )])),
+            Err(ApiError::validation("Invalid 'percent': out of range")),
+            "{percent}",
+        );
+    }
+    assert!(crate::global::nvim_echo(&session, chunks.clone(), false, progress(&[(
+        "percent",
+        Object::Integer(100),
+    )]))
+    .is_ok());
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+            ("kind", Object::String(OxStr::from("progress"))),
+            ("source", Object::String(OxStr::from("tests"))),
+        ])),
+        Err(ApiError::validation(
+            "Invalid 'status': expected success|failed|running|cancel"
+        )),
+    );
+
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+            ("kind", Object::String(OxStr::from("progress"))),
+            ("status", Object::String(OxStr::from("running"))),
+            ("source", Object::String(OxStr::from(""))),
+        ])),
+        Err(ApiError::validation("Required: 'opts.source'")),
+    );
+
+    // `source` is required and the reserved name "nvim" is rejected
+    // (`messages_spec.lua:3736`, `vim_spec.lua:4190`).
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+            ("kind", Object::String(OxStr::from("progress"))),
+            ("status", Object::String(OxStr::from("running"))),
+        ])),
+        Err(ApiError::validation("Required: 'opts.source'")),
+    );
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+            ("kind", Object::String(OxStr::from("progress"))),
+            ("status", Object::String(OxStr::from("success"))),
+            ("source", Object::String(OxStr::from("nvim"))),
+        ])),
+        Err(ApiError::validation("Invalid 'source': 'nvim'")),
+    );
+}
+
+#[test]
+fn nvim_echo_data_accepts_dict_and_empty_array() {
+    let session = session();
+    let chunks = vec![Object::Array(vec![Object::String(OxStr::from("hello"))])];
+    let data = dict(&[
+        ("kind", Object::String(OxStr::from("progress"))),
+        ("source", Object::String(OxStr::from("tests"))),
+        ("status", Object::String(OxStr::from("running"))),
+        ("data", Object::Dict(Dict(vec![(
+            OxStr::from("tag"),
+            Object::Integer(1),
+        )]))),
+    ]);
+    assert!(crate::global::nvim_echo(&session, chunks.clone(), false, data).is_ok());
+    let empty_array = dict(&[
+        ("kind", Object::String(OxStr::from("progress"))),
+        ("source", Object::String(OxStr::from("tests"))),
+        ("status", Object::String(OxStr::from("running"))),
+        ("data", Object::Array(vec![])),
+    ]);
+    assert!(crate::global::nvim_echo(&session, chunks, false, empty_array).is_ok());
+}
+
+#[test]
+fn nvim_echo_auto_ids_are_scoped_to_each_api_session() {
+    let first = session();
+    let second = session();
+    let chunks = vec![Object::Array(vec![Object::String(OxStr::from("hello"))])];
+
+    assert_eq!(
+        crate::global::nvim_echo(&first, chunks.clone(), false, dict(&[])),
+        Ok(Object::Integer(1))
+    );
+    assert_eq!(
+        crate::global::nvim_echo(&first, chunks.clone(), false, dict(&[])),
+        Ok(Object::Integer(2))
+    );
+    assert_eq!(
+        crate::global::nvim_echo(&second, chunks.clone(), false, dict(&[])),
+        Ok(Object::Integer(1))
+    );
+
+    drop(first);
+    let fresh = session();
+    assert_eq!(
+        crate::global::nvim_echo(&fresh, chunks, false, dict(&[])),
+        Ok(Object::Integer(1))
+    );
+}
+
+#[test]
+fn nvim_echo_plain_echo_still_pushes_message() {
+    let session = session();
+    let before = session.with_editor(|editor| editor.messages().len());
+    let chunks = vec![Object::Array(vec![Object::String(OxStr::from("hello"))])];
+    let result = crate::global::nvim_echo(&session, chunks, true, dict(&[])).unwrap();
+    assert!(matches!(result, Object::Integer(id) if id > 0), "got {result:?}");
+    let after = session.with_editor(|editor| editor.messages().len());
+    assert_eq!(after, before + 1);
+}
+
+#[test]
+fn nvim_echo_progress_fires_progress_autocmd() {
+    let session = session();
+    let recorder = ActionRecorder::default();
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(recorder.clone()),
+        Box::new(recorder.clone()),
+    );
+    crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("Progress")),
+        dict(&[(
+            "command",
+            Object::String(OxStr::from("let g:progress_fired = 1")),
+        )]),
+    )
+    .unwrap();
+
+    let chunks = vec![Object::Array(vec![Object::String(OxStr::from("msg"))])];
+
+    let opts = dict(&[
+        ("kind", Object::String(OxStr::from("progress"))),
+        ("source", Object::String(OxStr::from("test"))),
+        ("title", Object::String(OxStr::from("test"))),
+        ("status", Object::String(OxStr::from("running"))),
+        ("percent", Object::Integer(25)),
+    ]);
+    assert!(matches!(
+        crate::global::nvim_echo(&session, chunks, false, opts).unwrap(),
+        Object::Integer(id) if id > 0
+    ));
+
+    let actions = recorder.actions.borrow();
+    assert_eq!(actions.len(), 1, "Progress should fire exactly once");
+    assert_eq!(actions[0].event.as_str(), "Progress");
+    let Object::Dict(data) = actions[0].data.as_ref().expect("Progress data") else {
+        panic!("Progress data must be a dict");
+    };
+    assert_eq!(
+        data.get(&OxStr::from("kind")),
+        Some(&Object::String(OxStr::from("progress")))
+    );
+    assert_eq!(
+        data.get(&OxStr::from("title")),
+        Some(&Object::String(OxStr::from("test")))
+    );
+    assert_eq!(
+        data.get(&OxStr::from("status")),
+        Some(&Object::String(OxStr::from("running")))
+    );
+    assert_eq!(
+        data.get(&OxStr::from("percent")),
+        Some(&Object::Integer(25))
+    );
+    assert!(data.get(&OxStr::from("id")).is_some());
+    assert!(data.get(&OxStr::from("text")).is_some());
+}
+
+#[test]
+fn extmark_hl_group_round_trips_string_and_array_source_order() {
+    let (editor, buffer, _, _) = editor_with_lines(&["one", "two"]);
+    let session = session_with(editor);
+    let ns = crate::extmark::nvim_create_namespace(&session, OxStr::from("tests")).unwrap();
+
+    let string_id = crate::extmark::nvim_buf_set_extmark(
+        &session,
+        buffer,
+        ns,
+        0,
+        0,
+        dict(&[("hl_group", Object::String(OxStr::from("Visual")))]),
+    )
+    .unwrap();
+
+    let array_id = crate::extmark::nvim_buf_set_extmark(
+        &session,
+        buffer,
+        ns,
+        1,
+        0,
+        dict(&[(
+            "hl_group",
+            Object::Array(vec![
+                Object::String(OxStr::from("Visual")),
+                Object::String(OxStr::from("Search")),
+            ]),
+        )]),
+    )
+    .unwrap();
+
+    let marks = crate::extmark::nvim_buf_get_extmarks(
+        &session,
+        buffer,
+        ns,
+        Object::Array(vec![Object::Integer(0), Object::Integer(0)]),
+        Object::Integer(-1),
+        dict(&[("details", Object::Boolean(true))]),
+    )
+    .unwrap();
+
+    let string_mark = marks
+        .iter()
+        .find(|mark| mark[0] == Object::Integer(string_id))
+        .expect("string hl_group mark");
+    let Object::Dict(string_details) = &string_mark[3] else {
+        panic!("details must be a dict");
+    };
+    assert_eq!(
+        string_details.get(&OxStr::from("hl_group")),
+        Some(&Object::String(OxStr::from("Visual")))
+    );
+
+    let array_mark = marks
+        .iter()
+        .find(|mark| mark[0] == Object::Integer(array_id))
+        .expect("array hl_group mark");
+    let Object::Dict(array_details) = &array_mark[3] else {
+        panic!("details must be a dict");
+    };
+    assert_eq!(
+        array_details.get(&OxStr::from("hl_group")),
+        Some(&Object::Array(vec![
+            Object::String(OxStr::from("Visual")),
+            Object::String(OxStr::from("Search")),
+        ]))
+    );
 }

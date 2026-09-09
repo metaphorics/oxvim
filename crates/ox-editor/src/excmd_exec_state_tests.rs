@@ -1847,17 +1847,17 @@ use std::rc::Rc;
 
 #[derive(Default)]
 struct FakeLua {
-    chunks: Vec<(String, Vec<Object>)>,
-    files: Vec<PathBuf>,
-    error: Option<LuaExecError>,
-    evals: Vec<(String, Option<Typval>)>,
-    eval_result: Option<Typval>,
+    chunks: RefCell<Vec<(String, Vec<Object>)>>,
+    files: RefCell<Vec<PathBuf>>,
+    error: RefCell<Option<LuaExecError>>,
+    evals: RefCell<Vec<(String, Option<Typval>)>>,
+    eval_result: RefCell<Option<Typval>>,
 }
 
 impl LuaExec for FakeLua {
-    fn execute_chunk(&mut self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError> {
-        self.chunks.push((code.to_owned(), args.clone()));
-        if let Some(error) = self.error.clone() {
+    fn execute_chunk(&self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError> {
+        self.chunks.borrow_mut().push((code.to_owned(), args.clone()));
+        if let Some(error) = self.error.borrow().clone() {
             return Err(error);
         }
         match args.as_slice() {
@@ -1868,25 +1868,24 @@ impl LuaExec for FakeLua {
         }
     }
 
-    fn execute_file(&mut self, path: &Path) -> Result<(), LuaExecError> {
-        self.files.push(path.to_path_buf());
-        self.error.clone().map_or(Ok(()), Err)
+    fn execute_file(&self, path: &Path) -> Result<(), LuaExecError> {
+        self.files.borrow_mut().push(path.to_path_buf());
+        self.error.borrow().clone().map_or(Ok(()), Err)
     }
 
-    fn eval_expression(
-        &mut self,
+    fn eval_expression(&self,
         expression: &str,
         arg: Option<&Typval>,
     ) -> Result<Typval, LuaExecError> {
-        self.evals.push((expression.to_owned(), arg.cloned()));
-        if let Some(error) = self.error.clone() {
+        self.evals.borrow_mut().push((expression.to_owned(), arg.cloned()));
+        if let Some(error) = self.error.borrow().clone() {
             return Err(error);
         }
-        Ok(self.eval_result.clone().unwrap_or(Typval::Number(0)))
+        Ok(self.eval_result.borrow().clone().unwrap_or(Typval::Number(0)))
     }
 }
 
-fn lua_executor(host: Rc<RefCell<FakeLua>>) -> ExExecutor {
+fn lua_executor(host: Rc<FakeLua>) -> ExExecutor {
     let mut executor = ExExecutor::new();
     executor.set_lua_exec(host);
     executor
@@ -1895,12 +1894,12 @@ fn lua_executor(host: Rc<RefCell<FakeLua>>) -> ExExecutor {
 #[test]
 fn lua_executes_exact_chunk() {
     let editor = TestEditorAccess::new(Editor::new());
-    let host = Rc::new(RefCell::new(FakeLua::default()));
+    let host = Rc::new(FakeLua::default());
     lua_executor(host.clone())
         .execute_line(&editor, "lua local x = 1 | 2")
         .unwrap();
     assert_eq!(
-        host.borrow().chunks[0],
+        host.chunks.borrow()[0],
         ("local x = 1 | 2".to_owned(), Vec::new())
     );
 }
@@ -1908,7 +1907,7 @@ fn lua_executes_exact_chunk() {
 #[test]
 fn sourced_lua_heredoc_preserves_body_and_resumes_after_marker() {
     let editor = TestEditorAccess::new(Editor::new());
-    let host = Rc::new(RefCell::new(FakeLua::default()));
+    let host = Rc::new(FakeLua::default());
     let mut executor = lua_executor(host.clone());
 
     executor
@@ -1920,7 +1919,7 @@ fn sourced_lua_heredoc_preserves_body_and_resumes_after_marker() {
         .unwrap();
 
     assert_eq!(
-        host.borrow().chunks[0],
+        host.chunks.borrow()[0],
         (
             "-- body comment\n END\n  trailing spaces  \n".to_owned(),
             Vec::new()
@@ -1938,7 +1937,7 @@ fn sourced_lua_heredoc_preserves_body_and_resumes_after_marker() {
 #[test]
 fn sourced_lua_trim_uses_first_nonempty_body_indent() {
     let editor = TestEditorAccess::new(Editor::new());
-    let host = Rc::new(RefCell::new(FakeLua::default()));
+    let host = Rc::new(FakeLua::default());
     let mut executor = lua_executor(host.clone());
 
     executor
@@ -1950,7 +1949,7 @@ fn sourced_lua_trim_uses_first_nonempty_body_indent() {
         .unwrap();
 
     assert_eq!(
-        host.borrow().chunks[0],
+        host.chunks.borrow()[0],
         ("\nfirst\nsecond\n".to_owned(), Vec::new())
     );
 }
@@ -1958,7 +1957,7 @@ fn sourced_lua_trim_uses_first_nonempty_body_indent() {
 #[test]
 fn sourced_lua_heredoc_accepts_empty_body_and_default_dot_marker() {
     let editor = TestEditorAccess::new(Editor::new());
-    let host = Rc::new(RefCell::new(FakeLua::default()));
+    let host = Rc::new(FakeLua::default());
     let mut executor = lua_executor(host.clone());
 
     executor
@@ -1968,8 +1967,8 @@ fn sourced_lua_heredoc_accepts_empty_body_and_default_dot_marker() {
         .execute_script(&editor, "test.vim", "lua << \" default marker\nreturn 1\n.")
         .unwrap();
 
-    assert_eq!(host.borrow().chunks[0].0, "");
-    assert_eq!(host.borrow().chunks[1].0, "return 1\n");
+    assert_eq!(host.chunks.borrow()[0].0, "");
+    assert_eq!(host.chunks.borrow()[1].0, "return 1\n");
 }
 
 #[test]
@@ -2064,7 +2063,7 @@ fn let_expression_containing_heredoc_text_does_not_consume_source_lines() {
 #[ignore = "FakeLua mock can no longer mutate editor globals"]
 fn lua_global_mutation_is_visible_to_following_ex_command() {
     let editor = TestEditorAccess::new(Editor::new());
-    let host = Rc::new(RefCell::new(FakeLua::default()));
+    let host = Rc::new(FakeLua::default());
     let mut executor = lua_executor(host);
     executor
         .execute_line(&editor, "lua set-test-global")
@@ -2084,12 +2083,12 @@ fn lua_global_mutation_is_visible_to_following_ex_command() {
 #[test]
 fn luafile_executes_named_file() {
     let editor = TestEditorAccess::new(Editor::new());
-    let host = Rc::new(RefCell::new(FakeLua::default()));
+    let host = Rc::new(FakeLua::default());
     lua_executor(host.clone())
         .execute_line(&editor, "luafile runtime/colors/vim.lua")
         .unwrap();
     assert_eq!(
-        host.borrow().files,
+        host.files.borrow().as_slice(),
         [PathBuf::from("runtime/colors/vim.lua")]
     );
 }
@@ -2111,7 +2110,7 @@ fn luado_transforms_every_line_with_line_number() {
             timestamp: 0,
         })
         .unwrap();
-    let host = Rc::new(RefCell::new(FakeLua::default()));
+    let host = Rc::new(FakeLua::default());
     lua_executor(host.clone())
         .execute_line(&editor, "luado return line")
         .unwrap();
@@ -2128,16 +2127,16 @@ fn luado_transforms_every_line_with_line_number() {
         })
         .collect::<Vec<_>>();
     assert_eq!(lines, [b"alpha:1".to_vec(), b"beta:2".to_vec()]);
-    assert_eq!(host.borrow().chunks.len(), 2);
+    assert_eq!(host.chunks.borrow().len(), 2);
 }
 
 #[test]
 fn lua_runtime_error_is_catchable_vim_error() {
     let editor = TestEditorAccess::new(Editor::new());
-    let host = Rc::new(RefCell::new(FakeLua {
-        error: Some(LuaExecError::Runtime("boom".to_owned())),
+    let host = Rc::new(FakeLua {
+        error: RefCell::new(Some(LuaExecError::Runtime("boom".to_owned()))),
         ..FakeLua::default()
-    }));
+    });
     let error = lua_executor(host)
         .execute_line(&editor, "lua error('boom')")
         .unwrap_err();
@@ -2205,10 +2204,10 @@ fn writable_vim_variables_match_upstream_table() {
 #[test]
 fn luaeval_passes_expression_and_argument_to_host() {
     let editor = TestEditorAccess::new(Editor::new());
-    let host = Rc::new(RefCell::new(FakeLua {
-        eval_result: Some(Typval::Number(42)),
+    let host = Rc::new(FakeLua {
+        eval_result: RefCell::new(Some(Typval::Number(42))),
         ..FakeLua::default()
-    }));
+    });
     let mut executor = lua_executor(host.clone());
     executor
         .execute_line(&editor, "let g:answer = luaeval('_A[1] + _A[2]', [40, 2])")
@@ -2220,7 +2219,7 @@ fn luaeval_passes_expression_and_argument_to_host() {
             .unwrap(),
         &Typval::Number(42),
     );
-    let Typval::List(argument) = host.borrow().evals[0].1.clone().unwrap() else {
+    let Typval::List(argument) = host.evals.borrow()[0].1.clone().unwrap() else {
         panic!("expected list argument");
     };
     assert_eq!(
@@ -2232,12 +2231,12 @@ fn luaeval_passes_expression_and_argument_to_host() {
 #[test]
 fn luaeval_without_argument_passes_none_to_host() {
     let editor = TestEditorAccess::new(Editor::new());
-    let host = Rc::new(RefCell::new(FakeLua::default()));
+    let host = Rc::new(FakeLua::default());
     lua_executor(host.clone())
         .execute_line(&editor, "let g:solo = luaeval('pcall(require, \"ffi\")')")
         .unwrap();
-    assert_eq!(host.borrow().evals[0].0, "pcall(require, \"ffi\")");
-    assert!(host.borrow().evals[0].1.is_none());
+    assert_eq!(host.evals.borrow()[0].0, "pcall(require, \"ffi\")");
+    assert!(host.evals.borrow()[0].1.is_none());
 }
 
 #[test]
@@ -2253,7 +2252,7 @@ fn luaeval_without_host_stays_not_implemented() {
 #[test]
 fn luaeval_rejects_wrong_argument_counts() {
     let editor = TestEditorAccess::new(Editor::new());
-    let host = Rc::new(RefCell::new(FakeLua::default()));
+    let host = Rc::new(FakeLua::default());
     let mut executor = lua_executor(host);
     let error = executor
         .execute_line(&editor, "echo luaeval()")
@@ -2268,12 +2267,12 @@ fn luaeval_rejects_wrong_argument_counts() {
 #[test]
 fn luaeval_load_and_runtime_errors_use_upstream_codes() {
     let editor = TestEditorAccess::new(Editor::new());
-    let host = Rc::new(RefCell::new(FakeLua {
-        error: Some(LuaExecError::Load(
+    let host = Rc::new(FakeLua {
+        error: RefCell::new(Some(LuaExecError::Load(
             "[string \"luaeval()\"]:1: syntax".to_owned(),
-        )),
+        ))),
         ..FakeLua::default()
-    }));
+    });
     let error = lua_executor(host)
         .execute_line(&editor, "echo luaeval('synta x')")
         .unwrap_err();
@@ -2288,10 +2287,10 @@ fn luaeval_load_and_runtime_errors_use_upstream_codes() {
     );
 
     let editor = TestEditorAccess::new(Editor::new());
-    let host = Rc::new(RefCell::new(FakeLua {
-        error: Some(LuaExecError::Runtime("boom".to_owned())),
+    let host = Rc::new(FakeLua {
+        error: RefCell::new(Some(LuaExecError::Runtime("boom".to_owned()))),
         ..FakeLua::default()
-    }));
+    });
     let error = lua_executor(host)
         .execute_line(&editor, "echo luaeval('error(1)')")
         .unwrap_err();
@@ -3223,7 +3222,7 @@ fn scope_write_propagates_to_editor_through_dirty_gate() {
 
     // Establish a clean baseline: read, then write back with nothing changed.
     crate::excmd_exec::sync_editor_into_scope(&editor, &mut scope).unwrap();
-    crate::excmd_exec::sync_scope_into_editor(&mut editor, &scope).unwrap();
+    crate::excmd_exec::sync_scope_into_editor(&mut editor, &mut scope).unwrap();
     assert!(!scope.synced.is_dirty(ScopeKind::Global));
 
     scope
@@ -3234,7 +3233,7 @@ fn scope_write_propagates_to_editor_through_dirty_gate() {
         "set_scoped must mark g: dirty"
     );
 
-    crate::excmd_exec::sync_scope_into_editor(&mut editor, &scope).unwrap();
+    crate::excmd_exec::sync_scope_into_editor(&mut editor, &mut scope).unwrap();
 
     let value = editor
         .gvars()
@@ -3470,7 +3469,7 @@ fn scope_sync_property_interleaved_mutations_mirror_editor() {
             }
         }
         crate::excmd_exec::sync_editor_into_scope(&editor, &mut scope).unwrap();
-        crate::excmd_exec::sync_scope_into_editor(&mut editor, &scope).unwrap();
+        crate::excmd_exec::sync_scope_into_editor(&mut editor, &mut scope).unwrap();
         crate::excmd_exec::sync_editor_into_scope(&editor, &mut scope).unwrap();
 
         // Mirror invariant: a freshly synced scope materializes the same

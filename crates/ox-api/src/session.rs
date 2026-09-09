@@ -38,7 +38,10 @@ pub(crate) type CallerStack = Vec<CallerFrame>;
 pub struct SessionState {
     pub(crate) namespaces: BTreeMap<OxStr, u32>,
     pub(crate) next_namespace: u32,
+    /// Automatic `nvim_echo` message ids belong to this editor session.
+    pub(crate) next_message_id: i64,
     pub(crate) ui_channels: UiChannels,
+    pub(crate) ui_extra: BTreeMap<u64, crate::ui::UiExtra>,
     pub(crate) chrome: ChromeState,
     /// Active highlight definitions used for rendering (the namespace selected
     /// by `nvim_set_hl_ns()`/`nvim_set_hl_ns_fast()`, global ns 0 by default).
@@ -109,7 +112,9 @@ impl Default for SessionState {
         Self {
             namespaces: BTreeMap::new(),
             next_namespace: 1,
+            next_message_id: 1,
             ui_channels: UiChannels::new(),
+            ui_extra: BTreeMap::new(),
             chrome: ChromeState::new(),
             highlights: HlState::new(),
             hl_namespaces: BTreeMap::from([(0, HlState::new())]),

@@ -36,6 +36,16 @@ struct ParserHandle {
     scheduler: Rc<dyn Scheduler>,
     logger: Option<Function>,
     logger_error: Rc<RefCell<Option<String>>>,
+    /// Set by `__gc`; every method refuses work afterwards, mirroring
+    /// upstream `parser_check` (`treesitter.c:423`).
+    deleted: bool,
+}
+
+fn check_parser_live(handle: &ParserHandle) -> mlua::Result<()> {
+    if handle.deleted {
+        return Err(runtime_error("Parser has been deleted"));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -56,6 +66,22 @@ struct NodeHandle {
 struct QueryHandle {
     query: Query,
     _language: Arc<LoadedLanguage>,
+    /// Predicates for each pattern, in the order they appear in the query
+    /// source. Captured here because `tree_sitter::Query` sorts them into
+    /// separate `general`/`property` vectors and loses cross-kind order.
+    predicates: Vec<Vec<InspectPredicate>>,
+}
+
+#[derive(Clone, Default)]
+struct InspectPredicate {
+    operator: String,
+    args: Vec<InspectArg>,
+}
+
+#[derive(Clone)]
+enum InspectArg {
+    Capture(u32),
+    String(String),
 }
 
 #[derive(Clone)]
@@ -79,6 +105,25 @@ fn runtime_error(message: impl Into<String>) -> mlua::Error {
 
 fn checked_u32(value: i64, what: &str) -> mlua::Result<u32> {
     u32::try_from(value).map_err(|_| runtime_error(format!("{what} out of bounds")))
+}
+
+fn as_buffer_handle(value: &Value) -> mlua::Result<i64> {
+    match value {
+        Value::Integer(bufnr) => Ok(*bufnr),
+        Value::Number(number) => {
+            // `as` is upstream's conversion: a finite float truncates toward
+            // zero (`(handle_T)lua_tointeger`, treesitter.c:575) and the cast
+            // cannot trap — NaN maps to 0, magnitudes beyond `i64` saturate.
+            // Whatever names no live buffer fails handle resolution with
+            // `invalid buffer handle: %d`, exactly like a stale handle.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "truncation is the specified `(handle_T)lua_tointeger` behavior"
+            )]
+            Ok(*number as i64)
+        }
+        _ => Err(runtime_error("expected either string or buffer handle")),
+    }
 }
 
 /// The message a Rust-side failure must carry into Lua: the plain runtime
@@ -268,6 +313,7 @@ fn add_logging_methods<M: UserDataMethods<ParserHandle>>(methods: &mut M) {
         "_set_logger",
         string_errors_mut(
             |_, this: &mut ParserHandle, (lex, parse, callback): (bool, bool, Function)| {
+                check_parser_live(this)?;
                 let scheduler = this.scheduler.clone();
                 let callback_for_log = callback.clone();
                 let error = this.logger_error.clone();
@@ -304,12 +350,94 @@ fn add_logging_methods<M: UserDataMethods<ParserHandle>>(methods: &mut M) {
     );
 }
 
+/// Reads live buffer text for tree-sitter's buffer-handle `parse` input:
+/// upstream parses the buffer (unsaved changes included), so the lines
+/// come through `vim.api` on this same loop thread. Every line is
+/// newline-terminated, including the last, unless the buffer genuinely
+/// lacks a final EOL (binary, or both 'fixeol' and 'eol' off); see
+/// `buffer_lacks_eol`. Sound under the `add_method_mut` borrow only
+/// because `nvim_buf_get_lines` is a pure read: it fires no autocmd,
+/// so the same parser cannot be reentered mid-call. Never extend this
+/// helper with event-firing calls.
+fn buffer_bytes(lua: &Lua, bufnr: i64) -> mlua::Result<Vec<u8>> {
+    let api: Table = lua.globals().get::<Table>("vim")?.get("api")?;
+    let get_lines: Function = api.get("nvim_buf_get_lines")?;
+    let lines: Table = get_lines.call((bufnr, 0, -1, false))?;
+    let mut bytes = Vec::new();
+    for line in lines.sequence_values::<mlua::LuaString>() {
+        bytes.extend_from_slice(&line?.as_bytes());
+        bytes.push(b'\n');
+    }
+    // Upstream appends the line terminator even for the last line, and
+    // drops it only when the buffer genuinely lacks one: binary, or
+    // both 'fixeol' and 'eol' off (`input_cb`, treesitter.c:479-487).
+    // Without the terminator tree-sitter ends every buffer root one
+    // row early (`{0,0,2,1}` instead of `{0,0,3,0}` on both binaries).
+    if !bytes.is_empty() && !buffer_lacks_eol(lua, &api, bufnr)? {
+        return Ok(bytes);
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    Ok(bytes)
+}
+
+/// Reports whether a buffer genuinely lacks a final EOL: `eol` is off and
+/// either `binary` is on or `fixeol` is off. Mirrors the last-line arm of
+/// upstream `input_cb` (treesitter.c:482-483); option reads go through the same
+/// `vim.api` bridge as the lines above, so no new borrow surface.
+fn buffer_lacks_eol(lua: &Lua, api: &Table, bufnr: i64) -> mlua::Result<bool> {
+    // `nvim_buf_get_option` is deprecated since API level 11; the
+    // supported read is `nvim_get_option_value` with a `buf` scope.
+    let get_option: Function = api.get("nvim_get_option_value")?;
+    let scoped = |name: &str| -> mlua::Result<bool> {
+        let opts = lua.create_table()?;
+        opts.set("buf", bufnr)?;
+        get_option.call((name, opts))
+    };
+    let binary = scoped("binary")?;
+    let fixeol = scoped("fixeol")?;
+    let eol = scoped("eol")?;
+    Ok(!eol && (binary || !fixeol))
+}
+
+/// Reports whether `bufnr` names a live buffer: upstream resolves the
+/// parse argument through the raw handle map (`handle_get_buffer`,
+/// helpers.h:140 — no curbuf special case, unlike
+/// `find_buffer_by_handle`), so `0` and negatives fail exactly like a
+/// stale handle. Read through `vim.api.nvim_list_bufs` on this same
+/// loop thread; a pure read like the line fetch below, so the
+/// `add_method_mut` borrow stays sound.
+fn buffer_handle_resolves(lua: &Lua, bufnr: i64) -> mlua::Result<bool> {
+    let api: Table = lua.globals().get::<Table>("vim")?.get("api")?;
+    let handles: Table = api.get::<Function>("nvim_list_bufs")?.call(())?;
+    for handle in handles.sequence_values::<i64>() {
+        if handle? == bufnr {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 impl UserData for ParserHandle {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one registration closure per parser method; splitting would scatter the method table"
+    )]
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(MetaMethod::ToString, |_, _, ()| Ok("<parser>"));
+        // Upstream exposes `__gc` through `__index`, so the finalizer is
+        // callable explicitly (`parser:__gc()`); mlua reserves the real
+        // `__gc` metamethod, so a regular method of the same name carries
+        // it. Marking deleted is idempotent, like the real finalizer.
+        methods.add_method_mut("__gc", |_, this: &mut ParserHandle, ()| {
+            this.deleted = true;
+            Ok(())
+        });
         methods.add_method_mut(
             "reset",
             string_errors_mut(|_, this: &mut ParserHandle, ()| {
+                check_parser_live(this)?;
                 this.parser.reset();
                 Ok(())
             }),
@@ -317,6 +445,7 @@ impl UserData for ParserHandle {
         methods.add_method_mut(
             "set_included_ranges",
             string_errors_mut(|_, this: &mut ParserHandle, values: Table| {
+                check_parser_live(this)?;
                 let ranges = values
                     .sequence_values::<Value>()
                     .map(|value| value.and_then(range_from_value))
@@ -329,6 +458,7 @@ impl UserData for ParserHandle {
         methods.add_method(
             "included_ranges",
             string_errors(|lua, this: &ParserHandle, include_bytes: Option<bool>| {
+                check_parser_live(this)?;
                 ranges_table(
                     lua,
                     this.parser.included_ranges(),
@@ -336,49 +466,99 @@ impl UserData for ParserHandle {
                 )
             }),
         );
-        methods.add_method_mut("parse", string_errors_mut(|lua, this: &mut ParserHandle, (old, input, include_bytes, timeout): (Option<AnyUserData>, Value, Option<bool>, Option<u64>)| {
-            let bytes = match input {
-                Value::String(string) => string.as_bytes().to_vec(),
-                Value::Integer(_) | Value::Number(_) => {
-                    return Err(runtime_error("expected either string or buffer handle; buffer parsing is unavailable"));
-                }
-                _ => return Err(runtime_error("expected either string or buffer handle")),
-            };
-            let old_tree = old
-                .as_ref()
-                .map(AnyUserData::borrow::<TreeHandle>)
-                .transpose()?;
-            let old_tree_ref = old_tree.as_ref().map(|tree| &tree.0.tree);
-            let timeout = timeout.unwrap_or(0);
-            let parsed = if timeout == 0 {
-                this.parser.parse(&bytes, old_tree_ref)
-            } else {
-                let started = Instant::now();
-                let deadline = Duration::from_nanos(timeout);
-                let length = bytes.len();
-                let mut input = |offset: usize, _: Point| {
-                    if offset < length { &bytes[offset..] } else { &[] }
-                };
-                let mut progress = parse_deadline_callback(started, deadline);
-                let options = ParseOptions::new().progress_callback(&mut progress);
-                this.parser.parse_with_options(&mut input, old_tree_ref, Some(options))
-            }
-            .ok_or_else(|| runtime_error("Language was unset, has an incompatible ABI, or parsing timed out."))?;
-            if let Some(message) = this.logger_error.borrow_mut().take() {
-                return Err(runtime_error(message));
-            }
-            let changed = if let Some(old_tree) = old_tree.as_ref() {
-                old_tree.0.tree.changed_ranges(&parsed).collect::<Vec<_>>()
-            } else {
-                parsed.included_ranges()
-            };
-            let tree = TreeHandle(Arc::new(TreeData {
-                tree: parsed,
-                source: Arc::from(bytes),
-                language: this.language.clone(),
-            }));
-            Ok((tree, ranges_table(lua, changed, include_bytes.unwrap_or(false))?))
-        }));
+        methods.add_method_mut(
+            "parse",
+            string_errors_mut(
+                |lua,
+                 this: &mut ParserHandle,
+                 (old, input, include_bytes, timeout): (
+                    Option<AnyUserData>,
+                    Value,
+                    Option<bool>,
+                    Option<u64>,
+                )| {
+                    check_parser_live(this)?;
+                    let old_tree = old
+                        .as_ref()
+                        .map(AnyUserData::borrow::<TreeHandle>)
+                        .transpose()?;
+                    let old_tree_ref = old_tree.as_ref().map(|tree| &tree.0.tree);
+                    let (bytes, parsed) = match input {
+                        Value::String(string) => {
+                            let bytes = string.as_bytes().to_vec();
+                            // Upstream's string branch is deliberately unbounded
+                            // (`treesitter.c:568-574`); timeout applies only to
+                            // live-buffer input below.
+                            let parsed = this.parser.parse(&bytes, old_tree_ref);
+                            (bytes, parsed)
+                        }
+                        // Upstream parses live buffer text when the input is a
+                        // buffer handle: fetch the lines through `vim.api` on
+                        // this same loop thread (unsaved changes included) and
+                        // join them exactly like the buffer store would.
+                        Value::Integer(_) | Value::Number(_) => {
+                            // Upstream resolves the cast value through
+                            // `handle_get_buffer` before parsing
+                            // (treesitter.c:575-582); a miss raises the bare
+                            // `luaL_argerror` text, like the default arm.
+                            let bufnr = as_buffer_handle(&input)?;
+                            if !buffer_handle_resolves(lua, bufnr)? {
+                                let message = format!("invalid buffer handle: {bufnr}");
+                                return Err(runtime_error(message));
+                            }
+                            let bytes = buffer_bytes(lua, bufnr)?;
+                            let timeout = timeout.unwrap_or(0);
+                            let parsed = if timeout == 0 {
+                                this.parser.parse(&bytes, old_tree_ref)
+                            } else {
+                                let started = Instant::now();
+                                let deadline = Duration::from_nanos(timeout);
+                                let length = bytes.len();
+                                let mut input = |offset: usize, _: Point| {
+                                    if offset < length {
+                                        &bytes[offset..]
+                                    } else {
+                                        &[]
+                                    }
+                                };
+                                let mut progress = parse_deadline_callback(started, deadline);
+                                let options = ParseOptions::new().progress_callback(&mut progress);
+                                this.parser
+                                    .parse_with_options(&mut input, old_tree_ref, Some(options))
+                            };
+                            (bytes, parsed)
+                        }
+                        _ => return Err(runtime_error("expected either string or buffer handle")),
+                    };
+                    let Some(parsed) = parsed else {
+                        if this.parser.language().is_none() {
+                            return Err(runtime_error(
+                                "Language was unset, or has an incompatible ABI.",
+                            ));
+                        }
+                        return Ok(MultiValue::new());
+                    };
+                    if let Some(message) = this.logger_error.borrow_mut().take() {
+                        return Err(runtime_error(message));
+                    }
+                    let changed = if let Some(old_tree) = old_tree.as_ref() {
+                        old_tree.0.tree.changed_ranges(&parsed).collect::<Vec<_>>()
+                    } else {
+                        parsed.included_ranges()
+                    };
+                    let tree = TreeHandle(Arc::new(TreeData {
+                        tree: parsed,
+                        source: Arc::from(bytes),
+                        language: this.language.clone(),
+                    }));
+                    Ok((
+                        tree,
+                        ranges_table(lua, changed, include_bytes.unwrap_or(false))?,
+                    )
+                        .into_lua_multi(lua)?)
+                },
+            ),
+        );
         add_logging_methods(methods);
     }
 }
@@ -747,6 +927,7 @@ impl UserData for NodeHandle {
     }
 }
 
+
 impl UserData for QueryHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(MetaMethod::ToString, |_, _, ()| Ok("<query>"));
@@ -779,29 +960,24 @@ impl UserData for QueryHandle {
                 }
                 result.set("captures", captures)?;
                 let patterns = lua.create_table()?;
-                for index in 0..this.query.pattern_count() {
-                    let predicates = lua.create_table()?;
-                    for (pred_index, predicate) in
-                        this.query.general_predicates(index).iter().enumerate()
-                    {
+                for (index, predicates) in this.predicates.iter().enumerate() {
+                    let predicates_table = lua.create_table()?;
+                    for (slot, predicate) in predicates.iter().enumerate() {
                         let values = lua.create_table()?;
-                        values.raw_set(1, predicate.operator.as_ref())?;
+                        values.raw_set(1, predicate.operator.as_str())?;
                         for (arg_index, arg) in predicate.args.iter().enumerate() {
                             match arg {
-                                tree_sitter::QueryPredicateArg::Capture(id) => values.raw_set(
-                                    arg_index + 2,
-                                    usize::try_from(*id)
-                                        .map_err(|_| runtime_error("capture id out of bounds"))?
-                                        + 1,
-                                )?,
-                                tree_sitter::QueryPredicateArg::String(value) => {
-                                    values.raw_set(arg_index + 2, value.as_ref())?;
+                                InspectArg::Capture(id) => {
+                                    values.raw_set(arg_index + 2, *id + 1)?;
+                                }
+                                InspectArg::String(s) => {
+                                    values.raw_set(arg_index + 2, s.as_str())?;
                                 }
                             }
                         }
-                        predicates.raw_set(pred_index + 1, values)?;
+                        predicates_table.raw_set(slot + 1, values)?;
                     }
-                    patterns.raw_set(index + 1, predicates)?;
+                    patterns.raw_set(index + 1, predicates_table)?;
                 }
                 result.set("patterns", patterns)?;
                 Ok(result)
@@ -968,18 +1144,24 @@ fn inspect_language(lua: &Lua, language: &Language) -> mlua::Result<Table> {
     Ok(result)
 }
 
+/// Reads a query-cursor row/column bound, tolerating the conventional `-1`
+/// ("unbounded", e.g. `iter_matches(root, 0, 0, -1)`). Upstream casts the
+/// Lua integer to `uint32_t`, so `-1` wraps to the maximum; saturating here
+/// reaches the same bound without a wrapping cast.
+fn cursor_bound(value: Option<i64>, default: usize) -> usize {
+    value.map_or(default, |bound| {
+        usize::try_from(bound).unwrap_or(usize::MAX)
+    })
+}
+
 fn configure_cursor(cursor: &mut QueryCursor, options: &Table) -> mlua::Result<()> {
     let start = Point::new(
-        options.get::<Option<usize>>("start_row")?.unwrap_or(0),
-        options.get::<Option<usize>>("start_col")?.unwrap_or(0),
+        cursor_bound(options.get("start_row")?, 0),
+        cursor_bound(options.get("start_col")?, 0),
     );
     let end = Point::new(
-        options
-            .get::<Option<usize>>("end_row")?
-            .unwrap_or(usize::MAX),
-        options
-            .get::<Option<usize>>("end_col")?
-            .unwrap_or(usize::MAX),
+        cursor_bound(options.get("end_row")?, usize::MAX),
+        cursor_bound(options.get("end_col")?, usize::MAX),
     );
     cursor.set_point_range(start..end);
     if let Some(limit) = options.get::<Option<u32>>("match_limit")? {
@@ -1195,9 +1377,95 @@ pub(crate) fn install(lua: &Lua, scheduler: Rc<dyn Scheduler>) -> mlua::Result<(
                 scheduler: scheduler.clone(),
                 logger: None,
                 logger_error: Rc::new(RefCell::new(None)),
+                deleted: false,
             })
         })?,
     )?;
+
+/// Walks the raw predicate steps for a compiled tree-sitter query and returns
+/// them in source order. The safe `Query` API splits predicates into separate
+/// `general`/`property`/`text` vectors, so this is the only way to recover the
+/// interleaved order used by upstream `query_inspect`.
+///
+/// # Safety
+///
+/// `query` must be a valid, non-null `TSQuery` pointer returned by
+/// `ts_query_new` (or `Query::new_raw`). It must outlive this function call.
+unsafe fn parse_query_predicates(
+    query: *const tree_sitter::ffi::TSQuery,
+    pattern_count: usize,
+) -> mlua::Result<Vec<Vec<InspectPredicate>>> {
+    let mut predicates = Vec::with_capacity(pattern_count);
+    for pattern_index in 0..pattern_count {
+        predicates.push(unsafe { parse_pattern_predicates(query, pattern_index)? });
+    }
+    Ok(predicates)
+}
+
+/// # Safety
+///
+/// `query` must be a valid, non-null `TSQuery` pointer that outlives this call.
+unsafe fn parse_pattern_predicates(
+    query: *const tree_sitter::ffi::TSQuery,
+    pattern_index: usize,
+) -> mlua::Result<Vec<InspectPredicate>> {
+    let mut length = 0u32;
+    // SAFETY: `query` is a valid TSQuery pointer by the caller's contract.
+    let steps = unsafe { tree_sitter::ffi::ts_query_predicates_for_pattern(
+        query,
+        pattern_index as u32,
+        &mut length,
+    ) };
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    // SAFETY: `ts_query_predicates_for_pattern` returned `length` valid steps.
+    let steps = unsafe { std::slice::from_raw_parts(steps, length as usize) };
+    let mut pattern_predicates = Vec::new();
+    let mut current = InspectPredicate {
+        operator: String::new(),
+        args: Vec::new(),
+    };
+    let mut has_operator = false;
+    for step in steps {
+        if step.type_ == tree_sitter::ffi::TSQueryPredicateStepTypeDone {
+            if has_operator {
+                pattern_predicates.push(std::mem::take(&mut current));
+                has_operator = false;
+            }
+        } else if step.type_ == tree_sitter::ffi::TSQueryPredicateStepTypeString {
+            // SAFETY: `query` is valid and `value_id` is a string from it.
+            let s = unsafe { query_string_value(query, step.value_id)? };
+            if !has_operator {
+                current.operator = s;
+                has_operator = true;
+            } else {
+                current.args.push(InspectArg::String(s));
+            }
+        } else if step.type_ == tree_sitter::ffi::TSQueryPredicateStepTypeCapture && has_operator {
+            current.args.push(InspectArg::Capture(step.value_id));
+        }
+    }
+    Ok(pattern_predicates)
+}
+
+/// # Safety
+///
+/// `query` must be a valid, non-null `TSQuery` pointer that outlives this call,
+/// and `id` must be a valid string value id in that query.
+unsafe fn query_string_value(
+    query: *const tree_sitter::ffi::TSQuery,
+    id: u32,
+) -> mlua::Result<String> {
+    let mut length = 0u32;
+    // SAFETY: `query` is valid and `id` is a string value id by the caller.
+    let ptr = unsafe { tree_sitter::ffi::ts_query_string_value_for_id(query, id, &mut length) };
+    // SAFETY: `ts_query_string_value_for_id` returned `length` bytes from the query.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), length as usize) };
+    std::str::from_utf8(bytes)
+        .map(|s| s.to_string())
+        .map_err(|_| runtime_error("query string value is not valid UTF-8"))
+}
 
     let registry = languages.clone();
     vim.set(
@@ -1206,13 +1474,18 @@ pub(crate) fn install(lua: &Lua, scheduler: Rc<dyn Scheduler>) -> mlua::Result<(
             let language = registry_language(&registry, &name)?;
             let query = Query::new(&language.language, &source)
                 .map_err(|error| runtime_error(error.to_string()))?;
+            let raw = Query::new_raw(&language.language, &source)
+                .map_err(|error| runtime_error(error.to_string()))?;
+            let predicates = unsafe { parse_query_predicates(raw, query.pattern_count()) };
+            unsafe { tree_sitter::ffi::ts_query_delete(raw) };
+            let predicates = predicates.map_err(|error| runtime_error(error.to_string()))?;
             Ok(QueryHandle {
                 query,
                 _language: language,
+                predicates,
             })
         })?,
     )?;
-
     let registry = languages.clone();
     vim.set(
         "_ts_inspect_language",
@@ -1255,4 +1528,109 @@ pub(crate) fn install(lua: &Lua, scheduler: Rc<dyn Scheduler>) -> mlua::Result<(
         lua.create_function(|_, ()| Ok(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION))?,
     )?;
     Ok(())
+}
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "parser fixture setup must fail loudly instead of hiding a missing parser",
+)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use mlua::Lua;
+
+    use super::*;
+
+    struct TestScheduler;
+
+    impl Scheduler for TestScheduler {
+        fn schedule_deferred(&self, _work: crate::vim::Work) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn parser_from_environment() -> (PathBuf, String) {
+        if let Some(path) = std::env::var_os("OXVIM_TREE_SITTER_PARSER").map(PathBuf::from) {
+            let language = std::env::var("OXVIM_TREE_SITTER_LANGUAGE")
+                .ok()
+                .or_else(|| {
+                    path.file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "lua".to_owned());
+            assert!(path.is_file(), "tree-sitter parser does not exist: {}", path.display());
+            return (path, language);
+        }
+
+        let root = std::env::var_os("OXVIM_REF_ROOT").map_or_else(
+            || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.references/neovim"),
+            PathBuf::from,
+        );
+        let candidates = [
+            root.join("build/lib/nvim/parser/lua.so"),
+            root.join(".deps/usr/lib/nvim/parser/lua.so"),
+            root.join("build/lib/nvim/parser/c.so"),
+            root.join(".deps/usr/lib/nvim/parser/c.so"),
+        ];
+        let path = candidates
+            .into_iter()
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| {
+                panic!(
+                    "treesitter regression test needs a parser .so: set OXVIM_TREE_SITTER_PARSER \
+                     (+ OXVIM_TREE_SITTER_LANGUAGE) or build .references/neovim"
+                )
+            });
+        let language = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("lua")
+            .to_owned();
+        (path, language)
+    }
+
+    #[test]
+    fn buffer_timeout_returns_nil_and_string_timeout_is_ignored() {
+        let (path, language) = parser_from_environment();
+        // SAFETY: this test exercises the userdata shim, which requires Lua's
+        // debug.getmetatable API to mirror the production runtime.
+        let lua = unsafe { Lua::unsafe_new() };
+        let vim = lua.create_table().unwrap();
+        vim.set("api", lua.create_table().unwrap()).unwrap();
+        lua.globals().set("vim", vim).unwrap();
+        install(&lua, Rc::new(TestScheduler)).unwrap();
+
+        lua.globals()
+            .set("parser_path", path.to_string_lossy().into_owned())
+            .unwrap();
+        lua.globals().set("parser_language", language).unwrap();
+        lua.load(
+            r#"
+            assert(vim._ts_add_language_from_object(parser_path, parser_language))
+            local lines = {}
+            for index = 1, 50000 do
+              lines[index] = 'local value = 1'
+            end
+            vim.api.nvim_list_bufs = function() return { 1 } end
+            vim.api.nvim_buf_get_lines = function() return lines end
+            vim.api.nvim_get_option_value = function() return true end
+
+            local parser = vim._create_ts_parser(parser_language)
+            local ok, tree = pcall(parser.parse, parser, nil, 1, false, 1)
+            assert(ok, 'buffer timeout must be resumable: ' .. tostring(tree))
+            assert(tree == nil, 'buffer timeout must return nil')
+            local resumed = parser:parse(nil, 1)
+            assert(type(resumed) == 'userdata', 'parser must resume after a timeout')
+
+            local string_parser = vim._create_ts_parser(parser_language)
+            local source = table.concat(lines, '\n')
+            ok, tree = pcall(string_parser.parse, string_parser, nil, source, false, 1)
+            assert(ok, 'string parse must ignore timeout: ' .. tostring(tree))
+            assert(type(tree) == 'userdata', 'unbounded string parse must return a tree')
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
 }

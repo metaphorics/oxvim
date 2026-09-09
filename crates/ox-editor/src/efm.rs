@@ -1205,7 +1205,7 @@ mod tests {
 
     #[test]
     fn directory_stack_resolves_relative_file() {
-        let dir = std::env::temp_dir().join(format!("oxvim_efm_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oxvim_efm_{}_dirstack", std::process::id()));
         let sub = dir.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("x.c"), "int x;\n").unwrap();
@@ -1267,7 +1267,7 @@ mod tests {
         // %P pushes a file name used by later entries that have no %f;
         // %Q pops it (qf_parse_file_pfx, quickfix.c:1673-1690). %P's %f
         // requires the file to exist (quickfix.c:1345-1347).
-        let dir = std::env::temp_dir().join(format!("oxvim_efm_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oxvim_efm_{}_filestack", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("real.c");
         std::fs::write(&file, "int x;\n").unwrap();

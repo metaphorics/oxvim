@@ -22,6 +22,7 @@ mod runtime;
 mod session;
 
 pub use session::{ApiCallerGuard, ApiSession};
+pub use buffer::{EnteredResidency, restore_buffer_context};
 mod tabpage;
 mod ui;
 mod window;
@@ -32,7 +33,7 @@ mod tests;
 pub use autocmd::execute_firing_plan;
 pub use convert::{FromObject, IntoObject, LuaRef, Nil};
 pub use deprecated::decode_atomic_call;
-pub use global::{CommandExecutor, execute_command, execute_nvim_cmd};
+pub use global::{CommandExecutor, dict_strict_bool, execute_command, execute_nvim_cmd};
 pub use metadata::{ApiType, FunctionMetadata, TypeRef};
 pub use mode::{
     command_history, current_cmdline_text, current_cmdline_type, current_mode_name,

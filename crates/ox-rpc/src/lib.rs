@@ -23,7 +23,7 @@ pub use channel::{
     CHAN_STDERR, CHAN_STDIO, ChannelId, ChannelIdAllocator, ChannelKind, ChannelState,
     nvim_error_event,
 };
-pub use codec::{DecodeError, IncrementalDecoder, decode, encode};
+pub use codec::{DecodeError, EncodeError, FeedError, IncrementalDecoder, decode, encode};
 pub use convert::typval_to_object;
 pub use message::{Message, MsgidCounter};
 pub use metadata::{ApiMetadata, canonical_metadata};

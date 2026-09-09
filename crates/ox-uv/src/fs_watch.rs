@@ -145,7 +145,8 @@ pub struct FsEvent {
 }
 
 impl FsEvent {
-    /// Starts watching `path`; callbacks are posted to the loop pending queue.
+    /// Starts watching `path`; the initial snapshot is taken before this
+    /// method returns, and callbacks are posted to the loop pending queue.
     ///
     /// Existence or identity transitions are `rename`; other metadata changes
     /// are `change`. Directory events carry paths relative to the watched
@@ -187,12 +188,13 @@ impl FsEvent {
         let callback = Arc::new(Mutex::new(callback));
         let thread_active = Arc::clone(&active);
         let thread_callback = Arc::clone(&callback);
+        let baseline = event_snapshot(&path, options).ok();
         let mut thread_path = PathBuf::new();
         path.clone_into(&mut thread_path);
         let thread = match thread::Builder::new()
             .name("ox-uv-fs-event".into())
             .spawn(move || {
-                let mut previous = event_snapshot(&thread_path, options).ok();
+                let mut previous = baseline;
                 while sleep_while_active(&thread_active, FS_EVENT_INTERVAL) {
                     match event_snapshot(&thread_path, options) {
                         Ok(current) => {

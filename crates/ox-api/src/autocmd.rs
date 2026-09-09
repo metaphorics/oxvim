@@ -2,7 +2,7 @@
 
 use ox_editor::{
     AugroupId, AutocmdContext, AutocmdDefinition, AutocmdError, AutocmdFilter, AutocmdKind,
-    AutocmdOptions, BufferRelease, Editor, EditorError, Event, FiringPlan, OptionValue,
+    AutocmdOptions, Editor, EditorError, Event, FiringPlan, OptionValue,
 };
 
 use crate::runtime::{
@@ -11,6 +11,7 @@ use crate::runtime::{
 };
 use crate::{
     ApiError, BufHandle, Dict, Object, OxStr, Registry, RegistryError, WinHandle, api,
+    buffer::{EnteredResidency, restore_buffer_context},
     session::ApiSession,
 };
 
@@ -91,12 +92,16 @@ fn release_removed(
 /// switch and the restore each hold the editor only for their statement, so
 /// `run` re-enters APIs through `session` while no editor borrow is live.
 ///
-/// The first existing window already showing `buffer` and not ignoring
 /// `event` through its window-local `eventignorewin` becomes current; if
 /// every such window ignores the event, or global `eventignore` gates the
 /// event, nothing runs and `None` is returned. A hidden buffer is
-/// temporarily displayed in the caller window. Every window change is undone
-/// on the way out without masking `run`'s result.
+/// temporarily displayed in the caller window; an unloaded one is
+/// materialized through the same empty-text load `set_window_buffer`
+/// performs, so the callback always observes the target as current. Every
+/// window change is undone on the way out, and a target that was unloaded on
+/// entry is unloaded again unless the handler gave it resident content, so
+/// the next switch re-reads its file instead of showing the placeholder —
+/// all without masking `run`'s result.
 ///
 /// # Errors
 ///
@@ -111,6 +116,23 @@ fn run_in_buffer_context(
     let switch_error = |error: EditorError| ApiError::exception(error.to_string());
     if session.with_editor(|editor| editor.autocmds().is_ignored(event)) {
         return Ok(None);
+    }
+    // Upstream `ctx_switch` (legacy `aucmd_prepbuf`) enters the target even
+    // when its text is not resident; materialize an empty state explicitly
+    // before the low-level setter so the callback observes the target as
+    // current without opening its named file. Only a target wiped between
+    // planning and firing still runs in place — there is no window state left
+    // to enter.
+    let target_live = session.with_editor(|editor| {
+        let target = if buffer.is_current() {
+            editor.current_buffer()
+        } else {
+            Some(buffer)
+        };
+        target.map(|handle| editor.buffer(handle).is_ok())
+    });
+    if target_live == Some(false) {
+        return Ok(Some(run()));
     }
     // Decide the entering window without host code in between, so the state
     // cannot move between this read and the switch that follows.
@@ -156,36 +178,32 @@ fn run_in_buffer_context(
         return Ok(Some(run()));
     }
     let changed = session.with_editor_mut(
-        |editor| -> Result<Option<(WinHandle, BufHandle)>, ApiError> {
+        |editor| -> Result<Option<(WinHandle, BufHandle, Option<EnteredResidency>)>, ApiError> {
             Ok(match selected {
                 Some(window) if window != caller => {
                     editor.set_current_window(window).map_err(switch_error)?;
-                    Some((window, target))
+                    Some((window, target, None))
                 }
                 Some(_) => None,
                 None => {
                     let original = caller_buffer.unwrap_or(target);
-                    editor
-                        .set_current_buffer(target, BufferRelease::KeepLoaded)
-                        .map_err(switch_error)?;
-                    Some((caller, original))
+                    // Upstream `ctx_win_prep` shows a windowless buffer in a
+                    // temporary window without touching its memfile, and
+                    // `ctx_restore` restores what it found; the shared enter
+                    // records the entry residency for exactly that restore.
+                    let residency =
+                        Some(EnteredResidency::enter(editor, target).map_err(switch_error)?);
+                    Some((caller, original, residency))
                 }
             })
         },
     )?;
     let result = run();
     session.with_editor_mut(|editor| {
-        if let Some((window, original)) = changed
-            && editor
-                .window(window)
-                .is_ok_and(|state| state.buffer != original)
-            && editor.buffer(original).is_ok()
-        {
-            let _ = editor.set_window_buffer(window, original, BufferRelease::KeepLoaded);
-        }
-        if editor.current_window() != Some(caller) && editor.window(caller).is_ok() {
-            let _ = editor.set_current_window(caller);
-        }
+        // The window-buffer restore, the target's entry residency, and the
+        // previous current window unwind together on success and failure
+        // alike, so `run`'s result is never masked.
+        restore_buffer_context(editor, changed, caller);
     });
     Ok(Some(result))
 }
@@ -217,13 +235,14 @@ pub(crate) fn fire_filetype(
                 .map(|state| state.name().to_string_lossy().into_owned())
         })
         .unwrap_or_default();
+    let file_name = OxStr::from(file_name.as_str());
     let plan = session.with_editor_mut(|editor| {
         editor.autocmds_mut().plan(
             Event::FileType,
             AutocmdContext {
                 buffer: Some(buffer),
-                file_name: Some(&file_name),
-                match_name: Some(file_type),
+                file_name: Some(file_name.as_bytes()),
+                match_name: Some(file_type.as_bytes()),
                 nested: true,
                 data: None,
             },
@@ -964,7 +983,7 @@ pub fn nvim_exec_autocmds(session: &ApiSession, event: Object, opts: Dict) -> Re
             // `<amatch>` per event kind.
             let context = AutocmdContext {
                 buffer: context_buffer,
-                file_name: file_name.as_deref(),
+                file_name: file_name.as_deref().map(str::as_bytes),
                 match_name: None,
                 nested: true,
                 data: data.as_ref(),

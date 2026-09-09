@@ -6,9 +6,9 @@ use ox_editor::decoration::{
     WinCallbackId,
 };
 use ox_editor::{
-    Extmark, ExtmarkAttributes, ExtmarkEnd, ExtmarkGravity, ExtmarkHighlightMode, ExtmarkId,
-    ExtmarkPlacement, ExtmarkPosition, ExtmarkVirtualLinesOverflow, ExtmarkVirtualTextPosition,
-    Extmarks, NamespaceId, VirtualLine, VirtualTextChunk,
+    Extmark, ExtmarkAttributes, ExtmarkEnd, ExtmarkError, ExtmarkGravity, ExtmarkHighlightMode,
+    ExtmarkId, ExtmarkPlacement, ExtmarkPosition, ExtmarkVirtualLinesOverflow,
+    ExtmarkVirtualTextPosition, Extmarks, NamespaceId, VirtualLine, VirtualTextChunk,
 };
 use ox_text::Buffer;
 
@@ -177,16 +177,18 @@ fn parse_virtual_lines_overflow(opts: &Dict) -> Result<(), ApiError> {
     }
 }
 
-fn parse_highlight_groups(opts: &Dict) -> Result<Option<String>, ApiError> {
+fn parse_highlight_groups(opts: &Dict) -> Result<(Option<String>, Vec<String>), ApiError> {
     let Some(value) = opts.get(&OxStr::from("hl_group")) else {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     };
     match value {
-        Object::String(value) => {
-            Ok(Some(String::from_utf8(value.0.clone()).map_err(|_| {
-                ApiError::validation("'hl_group' must be UTF-8")
-            })?))
-        }
+        Object::String(value) => Ok((
+            Some(
+                String::from_utf8(value.0.clone())
+                    .map_err(|_| ApiError::validation("'hl_group' must be UTF-8"))?,
+            ),
+            Vec::new(),
+        )),
         Object::Array(values) => {
             let mut groups = values
                 .iter()
@@ -196,7 +198,15 @@ fn parse_highlight_groups(opts: &Dict) -> Result<Option<String>, ApiError> {
                     _ => Err(ApiError::validation("'hl_group' must contain strings")),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok((!groups.is_empty()).then(|| groups.remove(0)))
+            // Extra groups stack after the first (highest-priority last),
+            // mirroring the `has_hl_multiple` decor entries upstream
+            // (api/extmark.c:876-889).
+            let first = if groups.is_empty() {
+                None
+            } else {
+                Some(groups.remove(0))
+            };
+            Ok((first, groups))
         }
         _ => Err(ApiError::validation("'hl_group' must be a string or array")),
     }
@@ -293,8 +303,10 @@ fn placement(
 }
 
 fn parse_extmark_attributes(opts: &Dict) -> Result<ExtmarkAttributes, ApiError> {
+    let (highlight_group, additional_highlight_groups) = parse_highlight_groups(opts)?;
     let mut attributes = ExtmarkAttributes {
-        highlight_group: parse_highlight_groups(opts)?,
+        highlight_group,
+        additional_highlight_groups,
         sign_text: string(opts, "sign_text")?,
         sign_highlight_group: string(opts, "sign_hl_group")?,
         number_highlight_group: string(opts, "number_hl_group")?,
@@ -536,8 +548,20 @@ fn details(mark: &Extmark) -> Dict {
 }
 
 fn push_string_attributes(values: &mut Vec<(OxStr, Object)>, attributes: &ExtmarkAttributes) {
+    if let Some(primary) = &attributes.highlight_group {
+        let group = if attributes.additional_highlight_groups.is_empty() {
+            Object::String(OxStr::from(primary.as_str()))
+        } else {
+            Object::Array(
+                std::iter::once(primary)
+                    .chain(&attributes.additional_highlight_groups)
+                    .map(|name| Object::String(OxStr::from(name.as_str())))
+                    .collect(),
+            )
+        };
+        values.push((OxStr::from("hl_group"), group));
+    }
     for (key, value) in [
-        ("hl_group", &attributes.highlight_group),
         ("sign_text", &attributes.sign_text),
         ("sign_name", &attributes.sign_name),
         ("sign_hl_group", &attributes.sign_highlight_group),
@@ -1085,10 +1109,18 @@ pub fn nvim_buf_get_extmarks(
             None => state
                 .extmarks
                 .query_all(query_first, query_last, query_limit),
-            Some(namespace) => state
-                .extmarks
-                .query(namespace, query_first, query_last, query_limit)
-                .map_err(|error| ApiError::validation(error.to_string()))?,
+            // A globally allocated namespace never used on this buffer reads
+            // as empty upstream; only truly unallocated ids fail above.
+            Some(namespace) => {
+                match state
+                    .extmarks
+                    .query(namespace, query_first, query_last, query_limit)
+                {
+                    Ok(marks) => marks,
+                    Err(ExtmarkError::UnknownNamespace(_)) => Vec::new(),
+                    Err(error) => return Err(ApiError::validation(error.to_string())),
+                }
+            }
         };
         if overlap {
             marks.retain(|mark| mark_overlaps(mark, lower, upper));

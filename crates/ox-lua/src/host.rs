@@ -236,40 +236,46 @@ impl LuaHost {
 
 fn configure_package_path(lua: &Lua, runtime_root: &RuntimeRoot) -> mlua::Result<()> {
     let package: Table = lua.globals().get("package")?;
-    // An unresolved root is a runtime-less host (tests, tools): it must
-    // resolve nothing, so both fields clear - an empty root would otherwise
-    // contribute the CWD-relative `lua`, and the LuaJIT defaults
-    // (./?.lua source, ./?.so native, vendored luaconf.h LUA_PATH_DEFAULT /
-    // LUA_CPATH_DEFAULT) keep a planted-tree vector open.
+    // Strip every relative `package.path`/`package.cpath` entry before
+    // anything else, including the unresolved-root exit below: the LuaJIT
+    // defaults start with `./?.lua` and `./?.so` (vendored luaconf.h
+    // LUA_PATH_DEFAULT / LUA_CPATH_DEFAULT), so a module planted in the
+    // launch directory would load with full editor privileges. The default
+    // absolute system entries survive: `_init_packages.lua:3-13` harvests
+    // their `/?.so`-style suffix trails for `vim._so_trails` and
+    // `_load_package` resolves native modules over 'runtimepath' (:25-31).
     //
-    // A resolved root mirrors upstream instead of hardening past it:
-    // runtime entries are prepended to `package.path` and win by
-    // precedence - `vim._load_package` sits at `package.loaders` position 2
-    // (runtime/lua/vim/_init_packages.lua:48-49), ahead of the standard
-    // searchers - while the LuaJIT defaults, CWD entries included, survive
-    // after them exactly as in the reference interpreter. `package.cpath`
-    // stays untouched: `_init_packages.lua:3-13` harvests its `/?.so`-style
-    // suffix trails and `_load_package` resolves native modules over
-    // 'runtimepath' (:25-31) - the system library entries in the default
-    // also serve the standard searcher like upstream. Emptying cpath here
-    // would kill the trail harvest and drop the system entries; both would
-    // be behavior drift, not hardening.
+    // Upstream builds `package.path` from 'runtimepath' via
+    // `runtime/lua/vim/_init_packages.lua` and never includes a `.` entry;
+    // a runtime-less host therefore resolves nothing rather than falling
+    // back to the launch directory.
+    for field in ["path", "cpath"] {
+        let existing: String = package.get(field)?;
+        let trusted = existing
+            .split(';')
+            .filter(|entry| Path::new(entry).is_absolute())
+            .collect::<Vec<_>>()
+            .join(";");
+        package.set(field, trusted)?;
+    }
     if runtime_root.resolve("").as_os_str().is_empty() {
-        package.set("path", "")?;
-        return package.set("cpath", "");
+        return Ok(());
     }
     let existing: String = package.get("path")?;
     let lua_root = runtime_root.resolve("lua");
     let module = lua_root.join("?.lua");
     let package_init = lua_root.join("?/init.lua");
-    package.set(
-        "path",
-        format!(
-            "{};{};{existing}",
-            module.to_string_lossy(),
-            package_init.to_string_lossy()
-        ),
-    )
+    let mut entries = vec![
+        module.to_string_lossy().into_owned(),
+        package_init.to_string_lossy().into_owned(),
+    ];
+    entries.extend(
+        existing
+            .split(';')
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_owned),
+    );
+    package.set("path", entries.join(";"))
 }
 
 #[cfg(test)]
@@ -279,7 +285,6 @@ mod tests {
 
     #[test]
     fn configures_package_paths_from_the_runtime_root() {
-        let lua = Lua::new();
         let package_field = |lua: &Lua, field: &str| {
             lua.globals()
                 .get::<Table>("package")
@@ -289,23 +294,136 @@ mod tests {
         };
         let path = |lua: &Lua| package_field(lua, "path");
         let cpath = |lua: &Lua| package_field(lua, "cpath");
-        // A runtime-less host resolves nothing: planted CWD trees stay
-        // unreachable for both source and native modules.
+        let has_relative = |field: &str| -> bool {
+            !field.is_empty()
+                && field
+                    .split(';')
+                    .any(|entry| !Path::new(entry).is_absolute())
+        };
+        let contains_entry = |field: &str, entry: &str| {
+            field.split(';').any(|candidate| candidate == entry)
+        };
+        let defaults = Lua::new();
+        let default_path = path(&defaults);
+        let default_cpath = cpath(&defaults);
+
+        // A runtime-less host keeps only absolute system entries: the LuaJIT
+        // defaults start with `./?.lua` / `./?.so`, so leaving them intact
+        // would let a module planted in the launch directory load with
+        // editor privileges. Absolute entries survive so `vim._so_trails`
+        // keeps harvestable suffixes (_init_packages.lua:3-13).
+        let lua = Lua::new();
         configure_package_path(&lua, &RuntimeRoot::new(PathBuf::new())).unwrap();
-        assert_eq!(path(&lua), "");
-        assert_eq!(cpath(&lua), "");
+        let unresolved_path = path(&lua);
+        let unresolved_cpath = cpath(&lua);
+        assert!(
+            !has_relative(&unresolved_path),
+            "unresolved root left relative path entries: {unresolved_path}"
+        );
+        assert!(
+            !has_relative(&unresolved_cpath),
+            "unresolved root left relative cpath entries: {unresolved_cpath}"
+        );
+        for entry in default_path.split(';').filter(|e| Path::new(e).is_absolute()) {
+            assert!(
+                contains_entry(&unresolved_path, entry),
+                "absolute path entry {entry} was dropped: {unresolved_path}"
+            );
+        }
+        for entry in default_cpath.split(';').filter(|e| Path::new(e).is_absolute()) {
+            assert!(
+                contains_entry(&unresolved_cpath, entry),
+                "absolute cpath entry {entry} was dropped: {unresolved_cpath}"
+            );
+        }
+
         // A resolved host prepends its runtime entries, which win by
-        // precedence over the surviving defaults, and leaves cpath alone:
-        // emptying it would starve `vim._so_trails`
-        // (_init_packages.lua:3-13) and drop the system library entries
-        // the standard searcher uses upstream.
+        // precedence over the surviving defaults, and strips relative
+        // entries from both fields while keeping the absolute system ones.
         let fresh = Lua::new();
-        let default_cpath = cpath(&fresh);
         configure_package_path(&fresh, &RuntimeRoot::new(PathBuf::from("/rt"))).unwrap();
         let seeded = path(&fresh);
-        assert!(seeded.contains("/rt/lua/?.lua"), "{seeded}");
+        assert!(seeded.starts_with("/rt/lua/?.lua;/rt/lua/?/init.lua;"), "{seeded}");
+        assert!(
+            !has_relative(&seeded),
+            "resolved root left relative path entries: {seeded}"
+        );
+        for entry in default_path.split(';').filter(|e| Path::new(e).is_absolute()) {
+            assert!(
+                contains_entry(&seeded, entry),
+                "absolute path entry {entry} was dropped: {seeded}"
+            );
+        }
         let seeded_cpath = cpath(&fresh);
-        assert_eq!(seeded_cpath, default_cpath);
-        assert!(!seeded_cpath.is_empty(), "trails must stay harvestable");
+        assert!(
+            !has_relative(&seeded_cpath),
+            "resolved root left relative cpath entries: {seeded_cpath}"
+        );
+        for entry in default_cpath.split(';').filter(|e| Path::new(e).is_absolute()) {
+            assert!(
+                contains_entry(&seeded_cpath, entry),
+                "absolute cpath entry {entry} was dropped: {seeded_cpath}"
+            );
+        }
+
+        // Empty Lua path elements are default-path substitutions. They must
+        // not reappear when the filtered remainder is empty.
+        let edge = Lua::new();
+        let edge_package: Table = edge.globals().get("package").unwrap();
+        edge_package.set("path", ";;").unwrap();
+        edge_package.set("cpath", ";;").unwrap();
+        configure_package_path(&edge, &RuntimeRoot::new(PathBuf::from("/rt"))).unwrap();
+        assert_eq!(path(&edge), "/rt/lua/?.lua;/rt/lua/?/init.lua");
+        assert_eq!(cpath(&edge), "");
+
+        // The runtime entries remain usable by the ordinary Lua searcher.
+        let runtime = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime");
+        let real_runtime = Lua::new();
+        configure_package_path(&real_runtime, &RuntimeRoot::new(runtime)).unwrap();
+        let _: Table = real_runtime
+            .load("return require('vim.version')")
+            .eval()
+            .unwrap();
+    }
+
+    #[test]
+    fn unresolved_runtime_root_rejects_modules_planted_in_the_launch_directory() {
+        let planted = std::env::temp_dir().join(format!("ox-lua-p3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&planted);
+        std::fs::create_dir_all(&planted).unwrap();
+        std::fs::write(planted.join("evil.lua"), "return 'hijacked'\n").unwrap();
+        std::fs::create_dir_all(planted.join("evil_native")).unwrap();
+        std::fs::write(planted.join("evil_native/init.lua"), "return 'hijacked'\n").unwrap();
+        let previous_dir = std::env::current_dir().unwrap();
+        // The CWD switch must stay inside the guard: a panic or early return
+        // would strand later tests in the planted directory.
+        std::env::set_current_dir(&planted).unwrap();
+        let outcome = std::panic::catch_unwind(|| {
+            let lua = Lua::new();
+            configure_package_path(&lua, &RuntimeRoot::new(PathBuf::new())).unwrap();
+            let source: Result<String, mlua::Error> = lua
+                .load("local ok, value = pcall(require, 'evil') return ok and value or ''")
+                .eval();
+            let native: Result<String, mlua::Error> = lua
+                .load(
+                    "local ok, value = pcall(require, 'evil_native') \
+                     return ok and value or ''",
+                )
+                .eval();
+            (source, native)
+        });
+        std::env::set_current_dir(previous_dir).unwrap();
+        let (loaded, native) = outcome.unwrap();
+        assert_eq!(
+            loaded.unwrap(),
+            "",
+            "planted launch-directory module was loaded"
+        );
+        assert_eq!(
+            native.unwrap(),
+            "",
+            "planted launch-directory package was loaded"
+        );
+        std::fs::remove_dir_all(&planted).unwrap();
     }
 }

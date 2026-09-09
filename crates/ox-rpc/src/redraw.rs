@@ -123,8 +123,12 @@ impl RedrawBatch {
     /// A batch of calls is emitted as one event entry per name —
     /// `[name, args1, args2, …]` — matching `flush_event`'s `1 + ncalls`
     /// accounting.
-    #[must_use]
-    pub fn pack(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::codec::EncodeError`] when an event payload violates
+    /// the msgpack wire limits.
+    pub fn pack(&self) -> Result<Vec<u8>, crate::codec::EncodeError> {
         let events: Vec<Object> = self
             .events
             .iter()
@@ -139,7 +143,9 @@ impl RedrawBatch {
             Object::String(OxStr::from("redraw")),
             Object::Array(events),
         ]);
-        crate::codec::encode(&frame)
+        let mut out = Vec::new();
+        crate::codec::encode(&mut out, &frame)?;
+        Ok(out)
     }
 }
 
@@ -256,7 +262,7 @@ mod tests {
         let mut b = RedrawBatch::new();
         b.grid_line(1, 0, 0, vec![cell("x", 0, 1)], false);
         b.push("flush", vec![]);
-        let bytes = b.pack();
+        let bytes = b.pack()?;
         // Decode the frame and check the shape.
         let v = parse(&bytes);
         let Value::Array(frame) = v else {
@@ -289,7 +295,7 @@ mod tests {
     fn pack_reparses_via_decoder() {
         let mut b = RedrawBatch::new();
         b.grid_line(1, 0, 0, vec![cell("x", 0, 1)], false);
-        let bytes = b.pack();
+        let bytes = b.pack().unwrap();
         // Whole frame is a valid msgpack value (a notification "redraw").
         let obj = crate::codec::decode(&bytes).unwrap();
         assert!(matches!(obj, Object::Array(_)));

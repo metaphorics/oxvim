@@ -32,19 +32,12 @@ pub fn vim_eval(session: &ApiSession, expr: OxStr) -> Result<Object, ApiError> {
 }
 
 #[api(since = 3, deprecated_since = 7)]
-#[expect(
-    unused_variables,
-    clippy::needless_pass_by_value,
-    reason = "deprecated RPC entry keeps the upstream `code` and `args` arguments; dispatch passes them positionally"
-)]
 pub fn nvim_execute_lua(
-    _session: &ApiSession,
+    session: &ApiSession,
     code: OxStr,
     args: Vec<Object>,
 ) -> Result<Object, ApiError> {
-    Err(ApiError::exception(
-        "Lua execution requires an attached Lua host",
-    ))
+    crate::global::nvim_exec_lua(session, code, args)
 }
 
 #[api(since = 1, deprecated_since = 2, method)]
