@@ -2,7 +2,8 @@
 
 use ox_editor::{
     AugroupId, AutocmdContext, AutocmdDefinition, AutocmdError, AutocmdFilter, AutocmdKind,
-    AutocmdOptions, BufferRelease, Editor, EditorError, Event, FiringPlan, OptionValue,
+    AutocmdOptions, BufferFlags, BufferRelease, Editor, EditorError, Event, FiringPlan,
+    OptionValue,
 };
 
 use crate::runtime::{
@@ -97,7 +98,10 @@ fn release_removed(
 /// temporarily displayed in the caller window; an unloaded one is
 /// materialized through the same empty-text load `set_window_buffer`
 /// performs, so the callback always observes the target as current. Every
-/// window change is undone on the way out without masking `run`'s result.
+/// window change is undone on the way out, and a target that was unloaded on
+/// entry is unloaded again unless the handler gave it resident content, so
+/// the next switch re-reads its file instead of showing the placeholder —
+/// all without masking `run`'s result.
 ///
 /// # Errors
 ///
@@ -174,32 +178,63 @@ fn run_in_buffer_context(
         return Ok(Some(run()));
     }
     let changed = session.with_editor_mut(
-        |editor| -> Result<Option<(WinHandle, BufHandle)>, ApiError> {
+        |editor| -> Result<Option<(WinHandle, BufHandle, Option<u64>)>, ApiError> {
             Ok(match selected {
                 Some(window) if window != caller => {
                     editor.set_current_window(window).map_err(switch_error)?;
-                    Some((window, target))
+                    Some((window, target, None))
                 }
                 Some(_) => None,
                 None => {
                     let original = caller_buffer.unwrap_or(target);
+                    // Upstream `ctx_win_prep` shows a windowless buffer in a
+                    // temporary window without touching its memfile, and
+                    // `ctx_restore` restores what it found. This model must
+                    // materialize empty text first, so capture the entry
+                    // residency and the tick the materialization produced;
+                    // only an untouched target is unloaded again on the way
+                    // out.
+                    let was_unloaded = editor
+                        .buffer(target)
+                        .is_ok_and(|state| !state.residency.is_loaded());
                     editor
                         .enter_buffer_context(target)
                         .map_err(switch_error)?;
-                    Some((caller, original))
+                    let materialized = was_unloaded
+                        .then(|| editor.buffer(target).map(|state| state.changedtick()))
+                        .transpose()
+                        .map_err(switch_error)?;
+                    Some((caller, original, materialized))
                 }
             })
         },
     )?;
     let result = run();
     session.with_editor_mut(|editor| {
-        if let Some((window, original)) = changed
+        let materialized = changed.and_then(|(_, _, materialized)| materialized);
+        if let Some((window, original, _)) = changed
             && editor
                 .window(window)
                 .is_ok_and(|state| state.buffer != original)
             && editor.buffer(original).is_ok()
         {
             let _ = editor.set_window_buffer(window, original, BufferRelease::KeepLoaded);
+        }
+        if let Some(entered_tick) = materialized {
+            // The context materialized an unloaded target, so undo exactly
+            // that on the failure paths too: an unmodified target still
+            // holding the placeholder text goes back to `Unloaded`, or the
+            // next switch would skip its disk read and display empty
+            // contents. A handler that changed the buffer or re-attached it
+            // keeps its state.
+            if editor.buffer(target).is_ok_and(|state| {
+                state.residency.is_loaded()
+                    && state.attachments == 0
+                    && !state.flags.contains(BufferFlags::MODIFIED)
+                    && state.changedtick() == entered_tick
+            }) {
+                let _ = editor.unload_buffer(target);
+            }
         }
         if editor.current_window() != Some(caller) && editor.window(caller).is_ok() {
             let _ = editor.set_current_window(caller);

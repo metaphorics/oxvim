@@ -2132,7 +2132,7 @@ fn reentrant_once_callback_sibling_deletion_releases_once() {
 /// callback — upstream `ctx_switch` (legacy `aucmd_prepbuf`) makes the
 /// target current even when its text is not resident — so a callback
 /// observing `nvim_get_current_buf()` sees the target, and the caller's
-/// buffer is current again afterwards.
+/// buffer and the target's unloaded residency are restored afterwards.
 #[test]
 fn exec_autocmds_enters_an_unloaded_target_buffer() {
     let (mut editor, caller, _tab, _window) = editor_with_lines(&["one"]);
@@ -2181,8 +2181,221 @@ fn exec_autocmds_enters_an_unloaded_target_buffer() {
         "the caller's buffer is restored after the callback"
     );
     assert!(
+        session.with_editor(|editor| !editor.buffer(target).unwrap().residency.is_loaded()),
+        "an unloaded target is restored to Unloaded once the switch is undone"
+    );
+}
+
+/// The context switch must not turn an unloaded named buffer into a hidden
+/// empty buffer: the next API switch must perform the real disk read.
+#[test]
+fn exec_autocmds_restores_unloaded_target_before_following_switch() {
+    let path = std::env::temp_dir().join(format!(
+        "oxvim-api-exec-autocmds-reload-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, b"from disk\n").unwrap();
+
+    let (editor, caller, _, _) = editor_with_lines(&["caller"]);
+    let session = session_with(editor);
+    let target = session.with_editor_mut(|editor| {
+        let target = editor.create_buffer(true).unwrap();
+        let state = editor.buffer_mut(target).unwrap();
+        state.set_name(OxStr::from(path.to_string_lossy().as_ref()));
+        state.unload().unwrap();
+        target
+    });
+    crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[
+            ("buffer", Object::Integer(i64::from(target))),
+            ("callback", Object::LuaRef(44)),
+        ]),
+    )
+    .unwrap();
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder::default()),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::autocmd::nvim_exec_autocmds(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[("buf", Object::Integer(i64::from(target)))]),
+    )
+    .unwrap();
+
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(caller),
+        "the caller's buffer is restored after the explicit execution"
+    );
+    assert!(
+        session.with_editor(|editor| !editor.buffer(target).unwrap().residency.is_loaded()),
+        "the target remains unloaded until the following switch reads it"
+    );
+
+    crate::global::nvim_set_current_buf(&session, target).unwrap();
+    assert_eq!(
+        crate::global::nvim_get_current_buf(&session).unwrap(),
+        target
+    );
+    assert_eq!(
+        crate::buffer::nvim_buf_get_lines(&session, target, 0, -1, true).unwrap(),
+        vec![OxStr::from("from disk")]
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A callback failure still unwinds the temporary context and restores the
+/// target's entry residency before the error reaches the API caller.
+#[test]
+fn exec_autocmds_error_restores_unloaded_target() {
+    let (mut editor, caller, _, _) = editor_with_lines(&["caller"]);
+    let target = editor.create_buffer(true).unwrap();
+    editor.unload_buffer(target).unwrap();
+    let session = session_with(editor);
+    crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[
+            ("buffer", Object::Integer(i64::from(target))),
+            ("callback", Object::LuaRef(45)),
+        ]),
+    )
+    .unwrap();
+    let fail = Rc::new(|_: &crate::ApiSession| Err(ApiError::exception("boom")));
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: Rc::new(RefCell::new(Vec::new())),
+            reenter: Some(fail),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    assert_eq!(
+        crate::autocmd::nvim_exec_autocmds(
+            &session,
+            Object::String(OxStr::from("BufEnter")),
+            dict(&[("buf", Object::Integer(i64::from(target)))]),
+        ),
+        Err(ApiError::exception("boom"))
+    );
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(caller),
+        "the caller's buffer is restored after the callback error"
+    );
+    assert!(
+        session.with_editor(|editor| !editor.buffer(target).unwrap().residency.is_loaded()),
+        "the callback error must not strand an empty resident target"
+    );
+}
+
+/// A callback that writes real text has taken ownership of the materialized
+/// buffer; restoring the context must not unload and discard that text.
+#[test]
+fn exec_autocmds_keeps_handler_loaded_target_resident() {
+    let (mut editor, caller, _, _) = editor_with_lines(&["caller"]);
+    let target = editor.create_buffer(true).unwrap();
+    editor.unload_buffer(target).unwrap();
+    let session = session_with(editor);
+    crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[
+            ("buffer", Object::Integer(i64::from(target))),
+            ("callback", Object::LuaRef(46)),
+        ]),
+    )
+    .unwrap();
+    let load = Rc::new(move |session: &crate::ApiSession| {
+        crate::buffer::nvim_buf_set_lines(
+            session,
+            target,
+            0,
+            -1,
+            true,
+            vec![OxStr::from("handler content")],
+        )
+    });
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: Rc::new(RefCell::new(Vec::new())),
+            reenter: Some(load),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::autocmd::nvim_exec_autocmds(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[("buf", Object::Integer(i64::from(target)))]),
+    )
+    .unwrap();
+
+    assert_eq!(
+        session.with_editor(Editor::current_buffer),
+        Some(caller),
+        "the caller's buffer is restored after the callback writes"
+    );
+    assert!(
         session.with_editor(|editor| editor.buffer(target).unwrap().residency.is_loaded()),
-        "the entered target stays loaded once the switch is undone"
+        "a target changed by the callback stays resident"
+    );
+    assert_eq!(
+        crate::buffer::nvim_buf_get_lines(&session, target, 0, -1, true).unwrap(),
+        vec![OxStr::from("handler content")]
+    );
+}
+
+/// A hidden buffer that was already resident is not mistaken for context
+/// materialization and remains loaded after the temporary display.
+#[test]
+fn exec_autocmds_keeps_already_loaded_hidden_target_resident() {
+    let (mut editor, caller, _, _) = editor_with_lines(&["caller"]);
+    let target = editor
+        .create_buffer_with(Buffer::from_lines(&[b"already loaded".to_vec()], false).unwrap(), true)
+        .unwrap();
+    let session = session_with(editor);
+    let before_tick = session.with_editor(|editor| editor.buffer(target).unwrap().changedtick());
+    crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[
+            ("buffer", Object::Integer(i64::from(target))),
+            ("callback", Object::LuaRef(47)),
+        ]),
+    )
+    .unwrap();
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder::default()),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::autocmd::nvim_exec_autocmds(
+        &session,
+        Object::String(OxStr::from("BufEnter")),
+        dict(&[("buf", Object::Integer(i64::from(target)))]),
+    )
+    .unwrap();
+
+    let (loaded, after_tick) = session.with_editor(|editor| {
+        let state = editor.buffer(target).unwrap();
+        (state.residency.is_loaded(), state.changedtick())
+    });
+    assert_eq!(session.with_editor(Editor::current_buffer), Some(caller));
+    assert!(loaded, "an already-loaded target remains resident");
+    assert_eq!(after_tick, before_tick, "context restoration does not reload it");
+    assert_eq!(
+        crate::buffer::nvim_buf_get_lines(&session, target, 0, -1, true).unwrap(),
+        vec![OxStr::from("already loaded")]
     );
 }
 
