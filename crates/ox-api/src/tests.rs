@@ -8227,6 +8227,8 @@ fn nvim_echo_accepts_documented_progress_options_and_rejects_unknown_keys() {
     // A caller-provided string `id` is returned as-is.
     let with_id = dict(&[
         ("kind", Object::String(OxStr::from("progress"))),
+        ("source", Object::String(OxStr::from("tests"))),
+        ("status", Object::String(OxStr::from("running"))),
         ("id", Object::String(OxStr::from("my.progress"))),
     ]);
     assert_eq!(
@@ -8306,6 +8308,232 @@ fn nvim_echo_validates_integer_message_ids() {
 }
 
 #[test]
+fn nvim_echo_rejects_wrong_typed_option_values() {
+    let session = session();
+    let chunks = vec![Object::Array(vec![Object::String(OxStr::from("hello"))])];
+
+    // Boolean members fail the strict boolean pop (`api_spec.lua:301`).
+    for key in ["err", "verbose", "_truncate"] {
+        assert_eq!(
+            crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+                (key, Object::String(OxStr::from("x"))),
+            ])),
+            Err(ApiError::validation(format!("Invalid '{key}': not a boolean"))),
+            "{key}",
+        );
+    }
+    // Numbers coerce against zero, `nil` is `false`.
+    assert!(crate::global::nvim_echo(
+        &session,
+        chunks.clone(),
+        false,
+        dict(&[("err", Object::Integer(2))])
+    )
+    .is_ok());
+    assert!(crate::global::nvim_echo(
+        &session,
+        chunks.clone(),
+        false,
+        dict(&[("verbose", Object::Float(0.0))])
+    )
+    .is_ok());
+
+    // The remaining typed members fail the RPC-side `VALIDATE_T` shape.
+    for (key, expected) in [
+        ("kind", "String"),
+        ("title", "String"),
+        ("status", "String"),
+        ("source", "String"),
+        ("percent", "Integer"),
+        ("data", "Dict"),
+    ] {
+        assert_eq!(
+            crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+                (key, Object::Array(vec![Object::Integer(1)])),
+            ])),
+            Err(ApiError::validation(format!(
+                "Invalid '{key}': expected {expected}, got Array"
+            ))),
+            "{key}",
+        );
+    }
+    assert_eq!(
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[("data", Object::Nil)]),
+        ),
+        Err(ApiError::validation(
+            "Invalid 'data': expected Dict, got nil"
+        )),
+    );
+
+}
+
+#[test]
+fn nvim_echo_applies_upstream_progress_validations() {
+    let session = session();
+    let chunks = vec![Object::Array(vec![Object::String(OxStr::from("hello"))])];
+    let progress = |extra: &[(&str, Object)]| {
+        let mut entries = vec![
+            ("kind", Object::String(OxStr::from("progress"))),
+            ("source", Object::String(OxStr::from("tests"))),
+            ("status", Object::String(OxStr::from("running"))),
+        ];
+        for (key, value) in extra {
+            if let Some(slot) = entries.iter_mut().find(|(name, _)| name == key) {
+                slot.1 = value.clone();
+            } else {
+                entries.push((key, value.clone()));
+            }
+        }
+        dict(&entries)
+    };
+
+    // The five progress-only fields are rejected on a plain message with
+    // the defaulted kind label (`messages_spec.lua:3665`).
+    for (key, value) in [
+        ("status", Object::String(OxStr::from("running"))),
+        ("title", Object::String(OxStr::from("TestSuit"))),
+        ("data", Object::Dict(Dict(vec![(OxStr::from("tag"), Object::Integer(1))]))),
+        ("percent", Object::Integer(0)),
+        ("source", Object::String(OxStr::from("tests"))),
+    ] {
+        assert_eq!(
+            crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+                (key, value),
+            ])),
+            Err(ApiError::validation(
+                "Conflict: title/source/status/percent/data not allowed with kind='echo'"
+            )),
+            "{key}",
+        );
+    }
+    assert!(crate::global::nvim_echo(
+        &session,
+        chunks.clone(),
+        false,
+        dict(&[("data", Object::Array(vec![]))]),
+    )
+    .is_ok());
+
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+            ("kind", Object::String(OxStr::from("empty"))),
+            ("title", Object::String(OxStr::from("TestSuit"))),
+        ])),
+        Err(ApiError::validation(
+            "Conflict: title/source/status/percent/data not allowed with kind='empty'"
+        )),
+    );
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), true, dict(&[
+            ("err", Object::Boolean(true)),
+            ("status", Object::String(OxStr::from("running"))),
+        ])),
+        Err(ApiError::validation(
+            "Conflict: title/source/status/percent/data not allowed with kind='echoerr'"
+        )),
+    );
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), true, dict(&[
+            ("title", Object::String(OxStr::from("TestSuit"))),
+        ])),
+        Err(ApiError::validation(
+            "Conflict: title/source/status/percent/data not allowed with kind='echomsg'"
+        )),
+    );
+    // `status` only takes the documented values, and only on progress
+    // messages (`messages_spec.lua:3691`).
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), false, progress(&[(
+            "status",
+            Object::String(OxStr::from("live")),
+        )])),
+        Err(ApiError::validation(
+            "Invalid 'status': expected success|failed|running|cancel, got live"
+        )),
+    );
+
+    // `percent` is range-checked (`messages_spec.lua:3702`, `:3712`).
+    for percent in [-1, 101] {
+        assert_eq!(
+            crate::global::nvim_echo(&session, chunks.clone(), false, progress(&[(
+                "percent",
+                Object::Integer(percent),
+            )])),
+            Err(ApiError::validation("Invalid 'percent': out of range")),
+            "{percent}",
+        );
+    }
+    assert!(crate::global::nvim_echo(&session, chunks.clone(), false, progress(&[(
+        "percent",
+        Object::Integer(100),
+    )]))
+    .is_ok());
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+            ("kind", Object::String(OxStr::from("progress"))),
+            ("source", Object::String(OxStr::from("tests"))),
+        ])),
+        Err(ApiError::validation(
+            "Invalid 'status': expected success|failed|running|cancel"
+        )),
+    );
+
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+            ("kind", Object::String(OxStr::from("progress"))),
+            ("status", Object::String(OxStr::from("running"))),
+            ("source", Object::String(OxStr::from(""))),
+        ])),
+        Err(ApiError::validation("Required: 'opts.source'")),
+    );
+
+    // `source` is required and the reserved name "nvim" is rejected
+    // (`messages_spec.lua:3736`, `vim_spec.lua:4190`).
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+            ("kind", Object::String(OxStr::from("progress"))),
+            ("status", Object::String(OxStr::from("running"))),
+        ])),
+        Err(ApiError::validation("Required: 'opts.source'")),
+    );
+    assert_eq!(
+        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
+            ("kind", Object::String(OxStr::from("progress"))),
+            ("status", Object::String(OxStr::from("success"))),
+            ("source", Object::String(OxStr::from("nvim"))),
+        ])),
+        Err(ApiError::validation("Invalid 'source': 'nvim'")),
+    );
+}
+
+#[test]
+fn nvim_echo_data_accepts_dict_and_empty_array() {
+    let session = session();
+    let chunks = vec![Object::Array(vec![Object::String(OxStr::from("hello"))])];
+    let data = dict(&[
+        ("kind", Object::String(OxStr::from("progress"))),
+        ("source", Object::String(OxStr::from("tests"))),
+        ("status", Object::String(OxStr::from("running"))),
+        ("data", Object::Dict(Dict(vec![(
+            OxStr::from("tag"),
+            Object::Integer(1),
+        )]))),
+    ]);
+    assert!(crate::global::nvim_echo(&session, chunks.clone(), false, data).is_ok());
+    let empty_array = dict(&[
+        ("kind", Object::String(OxStr::from("progress"))),
+        ("source", Object::String(OxStr::from("tests"))),
+        ("status", Object::String(OxStr::from("running"))),
+        ("data", Object::Array(vec![])),
+    ]);
+    assert!(crate::global::nvim_echo(&session, chunks, false, empty_array).is_ok());
+}
+
+#[test]
 fn nvim_echo_auto_ids_are_scoped_to_each_api_session() {
     let first = session();
     let second = session();
@@ -8363,8 +8591,10 @@ fn nvim_echo_progress_fires_progress_autocmd() {
     .unwrap();
 
     let chunks = vec![Object::Array(vec![Object::String(OxStr::from("msg"))])];
+
     let opts = dict(&[
         ("kind", Object::String(OxStr::from("progress"))),
+        ("source", Object::String(OxStr::from("test"))),
         ("title", Object::String(OxStr::from("test"))),
         ("status", Object::String(OxStr::from("running"))),
         ("percent", Object::Integer(25)),
