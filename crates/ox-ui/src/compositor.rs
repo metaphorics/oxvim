@@ -359,8 +359,8 @@ impl Compositor {
             let marks = buffer_state.extmarks.render_ordered();
             let line_count = buffer.line_count();
             // Sparse sign-coverage sweep: the deepest overlap of sign row
-            // ranges decides the slot count, without allocating a counter
-            // per buffer line on every redraw.
+            // ranges decides the slot count; only rows carrying signs are
+            // collected.
             let mut sign_starts: Vec<usize> = Vec::new();
             let mut sign_ends: Vec<usize> = Vec::new();
             for mark in marks

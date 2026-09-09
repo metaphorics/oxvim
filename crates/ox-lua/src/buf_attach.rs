@@ -581,8 +581,8 @@ fn send_rpc_detach_event(
     .map_err(|error| error.to_string())
 }
 
-/// Resolves the generated `nvim_chan_send` entry lazily, avoiding a registry
-/// build on the common no-RPC-callback path.
+/// Resolves the generated `nvim_chan_send` entry on first use, so the
+/// registry is consulted only when an RPC callback actually needs it.
 fn rpc_dispatch() -> Result<DispatchFn, String> {
     let registry = ox_api::core().map_err(|error| error.to_string())?;
     registry
