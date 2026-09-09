@@ -47,7 +47,7 @@ pub struct BufferSubscriptionRelease {
     pub subscription: BufferAttachSubscription,
 }
 
-/// The projection of one committed buffer update used by line callbacks and
+/// The projection of one committed buffer update used by line, reload, and
 /// RPC notifications.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BufferUpdateKind {
@@ -70,23 +70,29 @@ pub enum BufferUpdateKind {
         /// Complete contents of the attached buffer.
         new_lines: Vec<Vec<u8>>,
     },
+    /// A whole-buffer text replacement (`BufferState::load` over a loaded
+    /// buffer). Upstream reports no splice for a re-read — `buf_updates_unload`
+    /// ends the update session and lets the re-read replace the text — so this
+    /// kind carries no geometry and must never surface as a line or byte delta.
+    Reload,
     /// The initial changedtick-only notification for an RPC attachment that
     /// did not request the buffer contents.
     Changedtick,
 }
 
-/// One committed text mutation projected onto the upstream
+/// One committed buffer update. Mutation updates project onto the upstream
 /// `nvim_buf_attach` `on_bytes` argument shape: the change start as a
 /// zero-based row, byte column, and byte offset, plus the replaced and
 /// inserted spans as row/column extents and byte lengths. Positions are
 /// buffer-text coordinates: the old span addresses the pre-edit text, the
-/// new span the post-edit text, and both share the same start. The tick is the
+/// new span the post-edit text, and both share the same start. Reload updates
+/// carry no splice, so all of their position fields are zero. The tick is the
 /// script-visible changedtick the callback observes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BufferBytesEvent {
-    /// Subscription identities present when this mutation committed.
+    /// Subscription identities present when this update committed.
     pub subscribers: Vec<u128>,
-    /// Script-visible changedtick after the mutation.
+    /// Script-visible changedtick after the update.
     pub tick: u64,
     /// Zero-based start row.
     pub start_row: usize,
@@ -146,6 +152,22 @@ impl BufferBytesEvent {
             new_col: 0,
             new_byte: 0,
             update: BufferUpdateKind::Changedtick,
+        }
+    }
+    fn reload_for(subscribers: Vec<u128>, tick: u64) -> Self {
+        Self {
+            subscribers,
+            tick,
+            start_row: 0,
+            start_col: 0,
+            start_byte: 0,
+            old_row: 0,
+            old_col: 0,
+            old_byte: 0,
+            new_row: 0,
+            new_col: 0,
+            new_byte: 0,
+            update: BufferUpdateKind::Reload,
         }
     }
 }
@@ -355,7 +377,7 @@ pub struct BufferState {
     /// The Lua host drains this queue after the editor borrow ends.
     pending_subscription_releases: Vec<BufferAttachSubscription>,
     next_lua_subscription: u128,
-    /// Committed mutations and their original recipients, in commit order.
+    /// Committed buffer updates and their original recipients, in commit order.
     pending_bytes: Vec<BufferBytesEvent>,
     /// Branch-preserving undo history.
     pub undo: UndoTree,
@@ -555,8 +577,8 @@ impl BufferState {
         &self.subscriptions
     }
 
-    /// Takes the queued mutation events in commit order, leaving the queue
-    /// empty. The Lua-side drain calls this before invoking callbacks, so
+    /// Takes the queued buffer update events in commit order, leaving the
+    /// queue empty. The Lua-side drain calls this before invoking callbacks, so
     /// no editor borrow is held while user code runs.
     pub fn take_bytes_events(&mut self) -> Vec<BufferBytesEvent> {
         std::mem::take(&mut self.pending_bytes)
@@ -621,6 +643,22 @@ impl BufferState {
         }
         self.pending_bytes
             .retain(|event| !event.subscribers.is_empty());
+    }
+
+    /// Removes one attachment as part of a reload without creating a normal
+    /// release record. The reload drain owns that record so it can preserve
+    /// callback ordering before freeing its Lua references.
+    pub fn remove_subscription_for_reload(
+        &mut self,
+        id: u128,
+    ) -> Option<BufferAttachSubscription> {
+        let subscription = self.subscriptions.remove(&id)?;
+        for event in &mut self.pending_bytes {
+            event.subscribers.retain(|recipient| *recipient != id);
+        }
+        self.pending_bytes
+            .retain(|event| !event.subscribers.is_empty());
+        Some(subscription)
     }
 
     /// Removes every attachment owned by `channel_id` and its pending
@@ -761,7 +799,14 @@ impl BufferState {
         }
     }
 
-    /// Replaces unloaded resident text before a window attaches.
+    /// Replaces resident text wholesale: an unloaded buffer's first read
+    /// before a window attaches, or a loaded buffer's `:edit!` re-read.
+    ///
+    /// A re-read of a loaded buffer queues one reload event for every active
+    /// attachment, mirroring upstream `buf_updates_unload` with `can_reload`:
+    /// the Lua drain keeps those supplying `on_reload`, detaches the rest, and
+    /// ends RPC channels. An unloaded buffer has no attachments to notify
+    /// because unloading released them, so first reads queue nothing.
     pub fn load(&mut self, text: Buffer) {
         self.text = text;
         self.bump_changedtick();
@@ -779,6 +824,25 @@ impl BufferState {
         } else {
             BufferResidency::Displayed
         };
+        self.queue_reload_event();
+    }
+
+    /// Queues a whole-buffer reload notification for every active attachment.
+    ///
+    /// The Lua drain keeps attachments that supply `on_reload`, sends
+    /// `on_detach` for the rest, and ends RPC channels. The reload kind carries
+    /// no splice geometry, so the replacement cannot be replayed as a line or
+    /// byte delta.
+    fn queue_reload_event(&mut self) {
+        let recipients: Vec<u128> = self.subscriptions.keys().copied().collect();
+        if recipients.is_empty() {
+            return;
+        }
+        self.pending_bytes
+            .push(BufferBytesEvent::reload_for(
+                recipients,
+                self.script_changedtick(),
+            ));
     }
 
     /// Attaches one window to resident text.
@@ -1985,5 +2049,54 @@ mod tests {
         // Sanity check the batch really changed all three lines.
         let text = state.text().unwrap().to_bytes();
         assert_eq!(text, b"longer\nalso longer\nc2\n");
+    }
+
+    #[test]
+    fn load_enqueues_reload_event_for_lua_attachments() {
+        let (mut editor, buffer, _) = editor_with(b"a\nb\n");
+        let state = editor.buffer_mut(buffer).unwrap();
+        let lua_id = state.attach_lua(BufferAttachSubscription {
+            channel_id: 0,
+            send_buffer: false,
+            options: Dict(Vec::new()),
+        });
+        state.insert_subscription(
+            7,
+            BufferAttachSubscription {
+                channel_id: 7,
+                send_buffer: false,
+                options: Dict(Vec::new()),
+            },
+        );
+        // Drop the RPC attachment's initial notification so the reload event
+        // is the only queued item the assertions see.
+        assert_eq!(state.take_bytes_events().len(), 1);
+        state.load(Buffer::from_bytes(b"replaced\n").unwrap());
+
+        let events = state.take_bytes_events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        // The drain decides whether each listed attachment is kept, detached,
+        // or ended as an RPC channel.
+        assert_eq!(event.subscribers, vec![7, lua_id]);
+        assert_eq!(event.tick, state.script_changedtick());
+        assert_eq!(event.update, BufferUpdateKind::Reload);
+        // A re-read has no splice geometry: it must not replay as a delta.
+        assert_eq!(
+            (
+                event.start_row, event.start_col, event.start_byte, event.old_row,
+                event.old_col, event.old_byte, event.new_row, event.new_col,
+                event.new_byte,
+            ),
+            (0, 0, 0, 0, 0, 0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn load_queues_no_reload_event_without_attachments() {
+        let (mut editor, buffer, _) = editor_with(b"a\n");
+        let state = editor.buffer_mut(buffer).unwrap();
+        state.load(Buffer::from_bytes(b"b\n").unwrap());
+        assert!(state.take_bytes_events().is_empty());
     }
 }

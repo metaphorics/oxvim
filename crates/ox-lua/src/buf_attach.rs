@@ -1,8 +1,8 @@
 //! Delivery of `nvim_buf_attach` Lua callbacks and RPC events for committed
 //! buffer updates.
 //!
-//! The editor records one [`BufferBytesEvent`] per committed splice in the
-//! buffer (see `BufferState::take_bytes_events`); the callbacks themselves
+//! The editor records one [`BufferBytesEvent`] per committed buffer update in
+//! the buffer (see `BufferState::take_bytes_events`); the callbacks themselves
 //! are Lua registry references owned by this layer, so the drain lives here.
 //! Callers drain at every transition into user Lua (chunk entries, callback
 //! invocations, and after each `vim.api` dispatch): the collect phase runs
@@ -11,11 +11,13 @@
 //! starve the rest: the first error returns after the drain completes, and the
 //! edit it observed already stands.
 //!
-//! `on_changedtick` rides the same committed-mutation queue as `on_lines` and
+//! `on_changedtick` rides the same committed-update queue as `on_lines` and
 //! `on_bytes`. `on_detach` fires from the release records, before their
 //! registry references are freed, so a detaching plugin still sees the
-//! callback. `on_reload` has no delivery point yet, because the editor has no
-//! whole-buffer re-read path to enqueue one from.
+//! callback. `on_reload` rides that same queue too: `BufferState::load`
+//! enqueues a whole-buffer event for active attachments when a loaded buffer is
+//! re-read (the `:edit!` path); the drain keeps attachments that supply
+//! `on_reload`, detaches the rest, and ends RPC channels as upstream requires.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -41,6 +43,11 @@ struct CallbackRef {
     utf_sizes: bool,
 }
 
+enum ReloadAction {
+    Keep(CallbackRef),
+    Detach(u128),
+}
+
 /// One buffer's drained callbacks and events. Built under the editor borrow;
 /// invoked after it is released.
 struct PendingDelivery {
@@ -55,6 +62,8 @@ struct PendingBatch {
 
 struct EventDelivery {
     event: BufferBytesEvent,
+    reload_actions: Vec<ReloadAction>,
+    reload_channels: Vec<(u128, u64)>,
     line_refs: Vec<CallbackRef>,
     byte_refs: Vec<CallbackRef>,
     tick_refs: Vec<CallbackRef>,
@@ -196,6 +205,7 @@ fn collect_pending(session: &ApiSession) -> PendingBatch {
     let line_key = OxStr::from("on_lines");
     let bytes_key = OxStr::from("on_bytes");
     let tick_key = OxStr::from("on_changedtick");
+    let reload_key = OxStr::from("on_reload");
     let utf_sizes_key = OxStr::from("utf_sizes");
     session.with_editor_mut(|editor| {
         let mut pending = PendingBatch {
@@ -216,6 +226,8 @@ fn collect_pending(session: &ApiSession) -> PendingBatch {
             for event in events {
                 let mut delivery = EventDelivery {
                     event,
+                    reload_actions: Vec::new(),
+                    reload_channels: Vec::new(),
                     line_refs: Vec::new(),
                     byte_refs: Vec::new(),
                     tick_refs: Vec::new(),
@@ -225,6 +237,20 @@ fn collect_pending(session: &ApiSession) -> PendingBatch {
                     let Some(subscription) = state.subscriptions().get(&id) else {
                         continue;
                     };
+                    if matches!(&delivery.event.update, BufferUpdateKind::Reload) {
+                        if subscription.channel_id != 0 {
+                            delivery
+                                .reload_channels
+                                .push((id, subscription.channel_id));
+                        } else if let Some(callback) =
+                            callback_ref(state, id, &reload_key, &utf_sizes_key)
+                        {
+                            delivery.reload_actions.push(ReloadAction::Keep(callback));
+                        } else {
+                            delivery.reload_actions.push(ReloadAction::Detach(id));
+                        }
+                        continue;
+                    }
                     if subscription.channel_id != 0 {
                         delivery.rpc_channels.push((id, subscription.channel_id));
                         continue;
@@ -258,6 +284,8 @@ fn collect_pending(session: &ApiSession) -> PendingBatch {
                     || !delivery.byte_refs.is_empty()
                     || !delivery.tick_refs.is_empty()
                     || !delivery.rpc_channels.is_empty()
+                    || !delivery.reload_actions.is_empty()
+                    || !delivery.reload_channels.is_empty()
                 {
                     deliveries.push(delivery);
                 }
@@ -386,6 +414,17 @@ fn changedtick_args(
     Ok(args)
 }
 
+/// Builds the two `on_reload` arguments for a whole-buffer re-read.
+fn reload_args(lua: &Lua, buffer: BufHandle) -> Result<Vec<Value>, String> {
+    Ok(vec![
+        Value::String(
+            lua.create_string("reload")
+                .map_err(|error| error.to_string())?,
+        ),
+        Value::Integer(i64::from(buffer)),
+    ])
+}
+
 /// Builds the twelve `on_bytes` arguments for one event: the event name
 /// first (upstream invokes Lua attach callbacks with the name prepended),
 /// then buffer, tick, and the nine position integers.
@@ -474,6 +513,9 @@ fn rpc_message(buffer: BufHandle, event: &BufferBytesEvent) -> Result<Message, S
             method: OxStr::from("nvim_buf_changedtick_event"),
             params: vec![buffer, changedtick],
         }),
+        BufferUpdateKind::Reload => {
+            unreachable!("reload events are never routed to RPC channels");
+        }
     }
 }
 
@@ -503,6 +545,32 @@ fn send_rpc_event(
     .map_err(|error| error.to_string())
 }
 
+/// Sends the end notification used when a reload drops an RPC attachment.
+fn send_rpc_detach_event(
+    dispatch: DispatchFn,
+    session: &ApiSession,
+    buffer: BufHandle,
+    channel: u64,
+) -> Result<(), String> {
+    let message = Message::Notification {
+        method: OxStr::from("nvim_buf_detach_event"),
+        params: vec![Object::Integer(i64::from(buffer))],
+    }
+    .encode_bytes()
+    .map_err(|error| error.to_string())?;
+    let channel =
+        i64::try_from(channel).map_err(|_| "buffer channel is out of range".to_owned())?;
+    dispatch(
+        session,
+        &[
+            Object::Integer(channel),
+            Object::String(OxStr::from(message.as_slice())),
+        ],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
 /// Resolves the generated `nvim_chan_send` entry lazily, avoiding a registry
 /// build on the common no-RPC-callback path.
 fn rpc_dispatch() -> Result<DispatchFn, String> {
@@ -519,17 +587,19 @@ fn is_truthy(value: Value) -> bool {
     !matches!(value, Value::Nil | Value::Boolean(false))
 }
 
-/// Delivers every pending line callback, byte callback, and RPC event in
-/// commit order. Remote notifications are emitted before Lua callbacks for
-/// each event, and line callbacks precede byte callbacks. The loop continues
-/// until the queues stay empty, so a listener that edits only observes settled
-/// state, matching upstream's synchronous nesting.
+/// Delivers every pending reload, line, byte, and RPC event in commit order.
+/// Remote notifications and reload-channel end messages are emitted before
+/// Lua callbacks for each event, and line callbacks precede byte callbacks.
+/// The loop continues until the queues stay empty, so a listener that edits
+/// only observes settled state, matching upstream's synchronous nesting.
 ///
-/// A truthy callback return removes that one subscription before any later
-/// event reaches it; a subscription removed by reentrant user code is skipped
-/// as soon as the drain notices. A transport failure keeps only its
-/// undelivered recipient at the front of that buffer's queue, preventing a
-/// successful sibling channel from receiving a duplicate on retry.
+/// A truthy return from a line, byte, or changedtick callback removes that
+/// subscription before any later event reaches it; `on_reload` is a
+/// notification and ignores its return value. A subscription removed by
+/// reentrant user code is skipped as soon as the drain notices. A transport
+/// failure keeps only its undelivered recipient at the front of that buffer's
+/// queue, preventing a successful sibling channel from receiving a duplicate
+/// on retry.
 ///
 /// # Errors
 ///
@@ -553,7 +623,53 @@ pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), Str
         let mut retries: BTreeMap<BufHandle, Vec<BufferBytesEvent>> = BTreeMap::new();
         for pending in batch.deliveries {
             for event_delivery in pending.events {
+                let mut reload_channels = Vec::new();
+                session.with_editor(|editor| {
+                    let Ok(state) = editor.buffer(pending.buffer) else {
+                        return;
+                    };
+                    for (id, channel) in &event_delivery.reload_channels {
+                        if state.subscriptions().contains_key(id) {
+                            reload_channels.push((*id, *channel));
+                        }
+                    }
+                });
+
                 let mut failed_channels = Vec::new();
+                let mut completed_reload_channels = Vec::new();
+                for (id, channel) in &reload_channels {
+                    let dispatch = match channel_dispatch {
+                        Some(dispatch) => dispatch,
+                        None => match rpc_dispatch() {
+                            Ok(dispatch) => {
+                                channel_dispatch = Some(dispatch);
+                                dispatch
+                            }
+                            Err(error) => {
+                                first_error.get_or_insert(error);
+                                failed_channels.push(*id);
+                                continue;
+                            }
+                        },
+                    };
+                    if let Err(error) =
+                        send_rpc_detach_event(dispatch, session, pending.buffer, *channel)
+                    {
+                        first_error.get_or_insert(error);
+                        failed_channels.push(*id);
+                    } else {
+                        completed_reload_channels.push(*id);
+                    }
+                }
+                if !completed_reload_channels.is_empty() {
+                    session.with_editor_mut(|editor| {
+                        if let Ok(state) = editor.buffer_mut(pending.buffer) {
+                            for id in &completed_reload_channels {
+                                state.remove_subscription_for_reload(*id);
+                            }
+                        }
+                    });
+                }
                 for (id, channel) in &event_delivery.rpc_channels {
                     let dispatch = match channel_dispatch {
                         Some(dispatch) => dispatch,
@@ -600,12 +716,12 @@ pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), Str
                         &event_delivery.event,
                         callback.utf_sizes,
                     ) {
-                            Ok(args) => args,
-                            Err(error) => {
-                                first_error.get_or_insert(error);
-                                continue;
-                            }
-                        };
+                        Ok(args) => args,
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                            continue;
+                        }
+                    };
                     match invoke_callback(lua, callback.reference, args) {
                         Ok(value) => {
                             if is_truthy(value) {
@@ -708,6 +824,67 @@ pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), Str
                         }
                     }
                 }
+                for action in &event_delivery.reload_actions {
+                    match action {
+                        ReloadAction::Detach(id) => {
+                            let release = session.with_editor_mut(|editor| {
+                                let state = editor.buffer_mut(pending.buffer).ok()?;
+                                state
+                                    .remove_subscription_for_reload(*id)
+                                    .map(|subscription| BufferSubscriptionRelease {
+                                        buffer: pending.buffer,
+                                        subscription,
+                                    })
+                            });
+                            detached.insert(*id);
+                            let Some(release) = release else {
+                                continue;
+                            };
+                            if let Err(error) =
+                                invoke_detach_callbacks(lua, std::slice::from_ref(&release))
+                            {
+                                first_error.get_or_insert(error);
+                            }
+                            if let Err(error) =
+                                release_removed_subscriptions(lua, std::slice::from_ref(&release))
+                            {
+                                first_error.get_or_insert(error);
+                            }
+                        }
+                        ReloadAction::Keep(callback) => {
+                            if detached.contains(&callback.id) {
+                                continue;
+                            }
+                            let still_attached = session.with_editor(|editor| {
+                                editor
+                                    .buffer(pending.buffer)
+                                    .is_ok_and(|state| {
+                                        state.subscriptions().contains_key(&callback.id)
+                                    })
+                            });
+                            if !still_attached {
+                                detached.insert(callback.id);
+                                continue;
+                            }
+                            let args = match reload_args(lua, pending.buffer) {
+                                Ok(args) => args,
+                                Err(error) => {
+                                    first_error.get_or_insert(error);
+                                    continue;
+                                }
+                            };
+                            // `on_reload` is a notification, not a detachable
+                            // update callback: upstream keeps this subscription
+                            // regardless of the callback's return value.
+                            match invoke_callback(lua, callback.reference, args) {
+                                Ok(_) => {}
+                                Err(error) => {
+                                    first_error.get_or_insert(error);
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if !failed_channels.is_empty() {
                     let mut event = event_delivery.event;
@@ -802,6 +979,16 @@ mod tests {
     }
 
 
+    fn callback_args(args: &Variadic<Value>) -> Vec<String> {
+        args.iter()
+            .map(|value| match value {
+                Value::Integer(integer) => integer.to_string(),
+                Value::String(text) => text.to_string_lossy(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
     /// `nvim_buf_attach` with `on_bytes` delivers one twelve-argument call
     /// per committed splice, in commit order.
     #[test]
@@ -850,6 +1037,208 @@ mod tests {
         let first_tick: i64 = calls[0][2].parse().unwrap();
         let second_tick: i64 = calls[1][2].parse().unwrap();
         assert!(first_tick < second_tick);
+    }
+
+    /// A whole-buffer re-read invokes `on_reload` without replaying a line or
+    /// byte delta, and a truthy return does not detach the subscription.
+    #[test]
+    fn reload_delivers_callback_without_delta_and_keeps_attachment() {
+        let lua = Lua::new();
+        lua.globals()
+            .set("vim", lua.create_table().unwrap())
+            .unwrap();
+
+        let reload_calls = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+        let line_calls = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+        let byte_calls = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+
+        let reload_seen = Rc::clone(&reload_calls);
+        let reload_callback = lua
+            .create_function(move |_: &Lua, args: Variadic<Value>| {
+                reload_seen.borrow_mut().push(callback_args(&args));
+                // `on_reload` is a notification; upstream keeps the
+                // subscription regardless of a truthy callback result.
+                Ok(Value::Boolean(true))
+            })
+            .unwrap();
+        let line_seen = Rc::clone(&line_calls);
+        let line_callback = lua
+            .create_function(move |_: &Lua, args: Variadic<Value>| {
+                line_seen.borrow_mut().push(callback_args(&args));
+                Ok(Value::Nil)
+            })
+            .unwrap();
+        let byte_seen = Rc::clone(&byte_calls);
+        let byte_callback = lua
+            .create_function(move |_: &Lua, args: Variadic<Value>| {
+                byte_seen.borrow_mut().push(callback_args(&args));
+                Ok(Value::Nil)
+            })
+            .unwrap();
+
+        let Object::LuaRef(reload_ref) =
+            lua_to_object_ref(&lua, &Value::Function(reload_callback)).unwrap()
+        else {
+            unreachable!()
+        };
+        let Object::LuaRef(line_ref) =
+            lua_to_object_ref(&lua, &Value::Function(line_callback)).unwrap()
+        else {
+            unreachable!()
+        };
+        let Object::LuaRef(byte_ref) =
+            lua_to_object_ref(&lua, &Value::Function(byte_callback)).unwrap()
+        else {
+            unreachable!()
+        };
+
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        let tab = editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let window = editor.tabpage(tab).unwrap().current_window();
+        let cursor = editor.window(window).unwrap().cursor;
+        let state = editor.buffer_mut(buffer).unwrap();
+        let id = state.attach_lua(BufferAttachSubscription {
+            channel_id: 0,
+            send_buffer: false,
+            options: Dict(vec![
+                (OxStr::from("on_reload"), Object::LuaRef(reload_ref)),
+                (OxStr::from("on_lines"), Object::LuaRef(line_ref)),
+                (OxStr::from("on_bytes"), Object::LuaRef(byte_ref)),
+            ]),
+        });
+        // Make the re-read replace different text and discard its earlier
+        // mutation event; the reload must still carry no line/byte delta.
+        let replacement = state.text().unwrap().clone();
+        state
+            .replace_lines(1, 1, &[b"before".to_vec()], cursor, cursor, 0)
+            .unwrap();
+        assert_eq!(state.take_bytes_events().len(), 1);
+        state.load(replacement);
+
+        let session = ApiSession::new(Rc::new(RefCell::new(editor)));
+        assert_eq!(pending_buffer_bytes(&session), 1);
+        drain_buffer_callbacks(&lua, &session).unwrap();
+        assert_eq!(pending_buffer_bytes(&session), 0);
+
+        {
+            let reload_calls = reload_calls.borrow();
+            assert_eq!(reload_calls.len(), 1);
+            assert_eq!(
+                reload_calls[0],
+                vec!["reload".to_owned(), i64::from(buffer).to_string()]
+            );
+        }
+        assert!(line_calls.borrow().is_empty());
+        assert!(byte_calls.borrow().is_empty());
+        assert!(session.with_editor(|editor| {
+            editor
+                .buffer(buffer)
+                .unwrap()
+                .subscriptions()
+                .contains_key(&id)
+        }));
+
+        session.with_editor_mut(|editor| {
+            let state = editor.buffer_mut(buffer).unwrap();
+            state
+                .replace_lines(1, 1, &[b"after".to_vec()], cursor, cursor, 0)
+                .unwrap();
+        });
+        drain_buffer_callbacks(&lua, &session).unwrap();
+        assert_eq!(reload_calls.borrow().len(), 1);
+        assert_eq!(line_calls.borrow().len(), 1);
+        assert_eq!(byte_calls.borrow().len(), 1);
+    }
+
+    /// A Lua attachment without `on_reload` receives `on_detach` and no
+    /// longer observes mutations after the buffer is re-read.
+    #[test]
+    fn reload_detaches_lua_attachment_without_on_reload() {
+        let lua = Lua::new();
+        lua.globals()
+            .set("vim", lua.create_table().unwrap())
+            .unwrap();
+
+        let detach_calls = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+        let byte_calls = Rc::new(RefCell::new(Vec::<Vec<String>>::new()));
+        let detach_seen = Rc::clone(&detach_calls);
+        let detach_callback = lua
+            .create_function(move |_: &Lua, args: Variadic<Value>| {
+                detach_seen.borrow_mut().push(callback_args(&args));
+                Ok(Value::Nil)
+            })
+            .unwrap();
+        let byte_seen = Rc::clone(&byte_calls);
+        let byte_callback = lua
+            .create_function(move |_: &Lua, args: Variadic<Value>| {
+                byte_seen.borrow_mut().push(callback_args(&args));
+                Ok(Value::Nil)
+            })
+            .unwrap();
+        let Object::LuaRef(detach_ref) =
+            lua_to_object_ref(&lua, &Value::Function(detach_callback)).unwrap()
+        else {
+            unreachable!()
+        };
+        let Object::LuaRef(byte_ref) =
+            lua_to_object_ref(&lua, &Value::Function(byte_callback)).unwrap()
+        else {
+            unreachable!()
+        };
+
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        let tab = editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let window = editor.tabpage(tab).unwrap().current_window();
+        let cursor = editor.window(window).unwrap().cursor;
+        let state = editor.buffer_mut(buffer).unwrap();
+        let id = state.attach_lua(BufferAttachSubscription {
+            channel_id: 0,
+            send_buffer: false,
+            options: Dict(vec![
+                (OxStr::from("on_detach"), Object::LuaRef(detach_ref)),
+                (OxStr::from("on_bytes"), Object::LuaRef(byte_ref)),
+            ]),
+        });
+        let replacement = state.text().unwrap().clone();
+        state
+            .replace_lines(1, 1, &[b"before".to_vec()], cursor, cursor, 0)
+            .unwrap();
+        assert_eq!(state.take_bytes_events().len(), 1);
+        state.load(replacement);
+
+        let session = ApiSession::new(Rc::new(RefCell::new(editor)));
+        drain_buffer_callbacks(&lua, &session).unwrap();
+        {
+            let detach_calls = detach_calls.borrow();
+            assert_eq!(detach_calls.len(), 1);
+            assert_eq!(
+                detach_calls[0],
+                vec!["detach".to_owned(), i64::from(buffer).to_string()]
+            );
+        }
+        assert!(byte_calls.borrow().is_empty());
+        assert!(session.with_editor(|editor| {
+            !editor
+                .buffer(buffer)
+                .unwrap()
+                .subscriptions()
+                .contains_key(&id)
+        }));
+
+        session.with_editor_mut(|editor| {
+            let state = editor.buffer_mut(buffer).unwrap();
+            state
+                .replace_lines(1, 1, &[b"after".to_vec()], cursor, cursor, 0)
+                .unwrap();
+        });
+        drain_buffer_callbacks(&lua, &session).unwrap();
+        assert!(byte_calls.borrow().is_empty());
     }
 
     /// A second Lua attachment on the same buffer does not replace the first.
@@ -1467,5 +1856,73 @@ mod tests {
             );
             assert_eq!(params[5], Object::Boolean(false));
         }
+    }
+
+    #[test]
+    fn rpc_buffer_attachment_ends_on_reload() {
+        let writes = Rc::new(RefCell::new(Vec::<(u64, Vec<u8>)>::new()));
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        let tab = editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let window = editor.tabpage(tab).unwrap().current_window();
+        let cursor = editor.window(window).unwrap().cursor;
+        let session = ApiSession::new(Rc::new(RefCell::new(editor)));
+        register_channel(&session, ChannelInfo::socket_rpc(ChannelId::new(17))).unwrap();
+        set_channel_sink(
+            &session,
+            Box::new(RecordingChannelSink {
+                writes: Rc::clone(&writes),
+            }),
+        );
+
+        session.with_editor_mut(|editor| {
+            editor
+                .buffer_mut(buffer)
+                .unwrap()
+                .insert_subscription(
+                    17,
+                    BufferAttachSubscription {
+                        channel_id: 17,
+                        send_buffer: false,
+                        options: Dict(Vec::new()),
+                    },
+                );
+        });
+        drain_buffer_callbacks(&Lua::new(), &session).unwrap();
+        assert_eq!(writes.borrow().len(), 1);
+        session.with_editor_mut(|editor| {
+            let state = editor.buffer_mut(buffer).unwrap();
+            let replacement = state.text().unwrap().clone();
+            state.load(replacement);
+        });
+        drain_buffer_callbacks(&Lua::new(), &session).unwrap();
+
+        assert_eq!(writes.borrow().len(), 2);
+        assert_eq!(writes.borrow()[1].0, 17);
+        let Message::Notification { method, params } =
+            decode_recorded_message(&writes.borrow()[1].1)
+        else {
+            unreachable!()
+        };
+        assert_eq!(method, OxStr::from("nvim_buf_detach_event"));
+        assert_eq!(params, vec![Object::Integer(i64::from(buffer))]);
+        assert!(session.with_editor(|editor| {
+            !editor
+                .buffer(buffer)
+                .unwrap()
+                .subscriptions()
+                .contains_key(&17)
+        }));
+
+        session.with_editor_mut(|editor| {
+            let state = editor.buffer_mut(buffer).unwrap();
+            state
+                .replace_lines(1, 1, &[b"after".to_vec()], cursor, cursor, 0)
+                .unwrap();
+        });
+        drain_buffer_callbacks(&Lua::new(), &session).unwrap();
+        assert_eq!(writes.borrow().len(), 2);
     }
 }

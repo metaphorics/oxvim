@@ -2211,6 +2211,27 @@ fn drain_buffer_callbacks_for_state(
     let result = ox_lua::buf_attach::drain_buffer_callbacks(&lua, &session);
     (take_channel_output(&output), result)
 }
+
+/// Runs one message's full callback boundary: drain buffer listeners, fire
+/// pending transitions, then drain again.
+///
+/// Both request loops need this exact sequence, and the second drain is not
+/// redundant: transition autocmds run user code that can queue another buffer
+/// event. A listener failure is returned rather than raised here so the
+/// caller can still write the reply the msgid is owed.
+fn drain_turn_boundary(
+    state: &Rc<RefCell<AppState>>,
+) -> (Vec<(u64, Vec<u8>)>, Result<(), String>) {
+    let (mut writes, first) = drain_buffer_callbacks_for_state(state);
+    fire_pending_transitions_for_state(state);
+    let (more, second) = drain_buffer_callbacks_for_state(state);
+    writes.extend(more);
+    let drained = match (first, second) {
+        (Err(error), _) => Err(error),
+        (Ok(()), result) => result,
+    };
+    (writes, drained)
+}
 /// Drains insert-lifecycle transitions and staged mode switches recorded
 /// during a dispatch without holding an `AppState` borrow: transition
 /// autocmds run user code that can reenter this state, so every dispatch
@@ -2697,16 +2718,7 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
                     break;
                 }
                 let processed = state.borrow_mut().process_message(CHAN_STDIO, message);
-                let (mut buffer_writes, first_drain) =
-                    drain_buffer_callbacks_for_state(&state);
-                fire_pending_transitions_for_state(&state);
-                let (more_buffer_writes, second_drain) =
-                    drain_buffer_callbacks_for_state(&state);
-                buffer_writes.extend(more_buffer_writes);
-                let drained = match (first_drain, second_drain) {
-                    (Err(error), _) => Err(error),
-                    (Ok(()), result) => result,
-                };
+                let (buffer_writes, drained) = drain_turn_boundary(&state);
 
                 for (channel, bytes) in buffer_writes.into_iter().chain(processed?) {
                     if channel == CHAN_STDIO.get() {
@@ -3914,18 +3926,7 @@ impl NetworkRuntime {
             // queued. A listener failure is parked until after the writes
             // flush: one buggy buffer handler must not starve the msgid of
             // its answer (compare the decode_error tail below).
-            let (mut buffer_writes, first_drain) =
-                drain_buffer_callbacks_for_state(&self.state);
-            // Transition autocmds run user code; this runs with no AppState
-            // borrow held. Such callbacks can queue another buffer event.
-            fire_pending_transitions_for_state(&self.state);
-            let (more_buffer_writes, second_drain) =
-                drain_buffer_callbacks_for_state(&self.state);
-            buffer_writes.extend(more_buffer_writes);
-            let drained = match (first_drain, second_drain) {
-                (Err(error), _) => Err(error),
-                (Ok(()), result) => result,
-            };
+            let (buffer_writes, drained) = drain_turn_boundary(&self.state);
             let process_error = process_result.as_ref().err().cloned();
             let writes = match process_result {
                 Ok(writes) => writes,
@@ -7251,6 +7252,95 @@ mod tests {
             event_index < response_index,
             "buffer notification must flush before the attach response"
         );
+    }
+
+    // `:edit!` queues its reload event inside `BufferState::load`, so the
+    // callback only reaches a plugin if the request loop's boundary drains
+    // it. This drives `drain_turn_boundary`, the same function both loops
+    // call, instead of invoking the drain directly.
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture, attachment, and reload command must succeed"
+    )]
+    fn edit_bang_delivers_on_reload_through_the_request_loop() {
+        let dir = std::env::temp_dir().join(format!("oxvim-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("reload.txt");
+        std::fs::write(&path, b"first\n").unwrap();
+
+        let state = Rc::new(RefCell::new(message_state()));
+        let session = state.borrow().session.clone();
+        let lua = {
+            let state = state.borrow();
+            let host = state.lua.borrow();
+            host.lua().clone()
+        };
+        lua.load(
+            r"
+            _G.reload_calls = {}
+            _G.on_reload_cb = function(event, buf)
+              table.insert(_G.reload_calls, event)
+            end
+            ",
+        )
+        .exec()
+        .unwrap();
+        let callback = lua.globals().get::<mlua::Value>("on_reload_cb").unwrap();
+        let Object::LuaRef(reference) = ox_lua::lua_to_object_ref(&lua, &callback).unwrap() else {
+            unreachable!()
+        };
+
+        let edit = format!("edit {}", path.display());
+        state
+            .borrow_mut()
+            .process_message(
+                CHAN_STDIO,
+                Message::Request {
+                    msgid: 1,
+                    method: OxStr::from("nvim_command"),
+                    params: vec![Object::String(OxStr::from(edit.as_str()))],
+                },
+            )
+            .unwrap();
+        drain_turn_boundary(&state).1.unwrap();
+
+        let buffer = session.with_editor(|editor| editor.current_buffer()).unwrap();
+        session.with_editor_mut(|editor| {
+            editor
+                .buffer_mut(buffer)
+                .unwrap()
+                .attach_lua(ox_editor::BufferAttachSubscription {
+                    channel_id: 0,
+                    send_buffer: false,
+                    options: Dict(vec![(
+                        OxStr::from("on_reload"),
+                        Object::LuaRef(reference),
+                    )]),
+                });
+        });
+
+        std::fs::write(&path, b"second\n").unwrap();
+        state
+            .borrow_mut()
+            .process_message(
+                CHAN_STDIO,
+                Message::Request {
+                    msgid: 2,
+                    method: OxStr::from("nvim_command"),
+                    params: vec![Object::String(OxStr::from("edit!"))],
+                },
+            )
+            .unwrap();
+        drain_turn_boundary(&state).1.unwrap();
+
+        let calls: Vec<String> = lua.globals().get("reload_calls").unwrap();
+        assert_eq!(
+            calls,
+            vec!["reload".to_owned()],
+            "the reload must reach on_reload exactly once through the loop boundary"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
