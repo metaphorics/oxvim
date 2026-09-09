@@ -48,14 +48,18 @@ use crate::messages::PrintfSink;
 use crate::runtime::{apply_startup_options, open_startup_buffers, runtime_root};
 use crate::startuptime::StartupTimer;
 
-#[derive(Default)]
+/// Bytes emitted by `nvim_chan_send`, grouped by channel until the owning
+/// transport turn flushes them.
+type ChannelOutput = Rc<RefCell<BTreeMap<u64, Vec<u8>>>>;
+
 struct TerminalChannelSink {
-    output: BTreeMap<u64, Vec<u8>>,
+    output: ChannelOutput,
 }
 
 impl ox_api::ChannelSink for TerminalChannelSink {
     fn send(&mut self, channel: u64, bytes: &[u8]) -> Result<(), String> {
         self.output
+            .borrow_mut()
             .entry(channel)
             .or_default()
             .extend_from_slice(bytes);
@@ -301,6 +305,9 @@ pub struct AppState {
     /// Stdout/stderr message output for the modes with no attached UI.
     printf: PrintfSink,
     lua_work: Rc<RefCell<VecDeque<Work>>>,
+    /// Host-channel bytes are flushed by the transport turn after callbacks
+    /// have completed and before that turn's RPC reply.
+    channel_output: ChannelOutput,
     emitter: Emitter,
     /// Long-lived render state: the layer stack and its grid buffers, rebuilt
     /// in place on each redraw rather than reconstructed.
@@ -322,6 +329,7 @@ pub(crate) struct EmbeddedCore {
     pub(crate) ex: Rc<RefCell<ExExecutor>>,
     pub(crate) nested_ex: Rc<RefCell<ExExecutor>>,
     pub(crate) lua_work: Rc<RefCell<VecDeque<Work>>>,
+    pub(crate) channel_output: ChannelOutput,
 }
 
 /// Wire one editor into the Lua host, the API registry, and the Ex
@@ -494,7 +502,13 @@ pub(crate) fn build_embedded_core(
         }),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
-    ox_api::set_channel_sink(&session, Box::new(TerminalChannelSink::default()));
+    let channel_output = Rc::new(RefCell::new(BTreeMap::new()));
+    ox_api::set_channel_sink(
+        &session,
+        Box::new(TerminalChannelSink {
+            output: channel_output.clone(),
+        }),
+    );
     ox_api::set_job_sink(
         &session,
         Box::new(JobChannelSink {
@@ -594,6 +608,7 @@ pub(crate) fn build_embedded_core(
         ex,
         nested_ex,
         lua_work,
+        channel_output,
     })
 }
 
@@ -622,12 +637,12 @@ impl AppState {
             ex,
             nested_ex,
             lua_work,
+            channel_output,
         } = build_embedded_core(editor, cli.clean)?;
 
         let mode = Rc::new(RefCell::new(ModeMachine::default()));
         ex.borrow_mut().set_mode_machine(mode.clone());
         nested_ex.borrow_mut().set_mode_machine(mode.clone());
-        ox_api::set_mode_machine(&session, mode.clone());
         let mut state = Self {
             session,
             lua,
@@ -641,6 +656,7 @@ impl AppState {
             last_pum: None,
             printf: PrintfSink::default(),
             lua_work,
+            channel_output,
             emitter: Emitter::new(),
             compositor: Compositor::new(1, 1),
             stdout_tty_channels: HashSet::new(),
@@ -1174,7 +1190,11 @@ impl AppState {
         // Same entry contract as the executor path: edits committed since
         // the last Lua entry (key input drained before this request) reach
         // listeners before the chunk observes buffer state.
-        ox_lua::buf_attach::drain_buffer_callbacks(self.lua.borrow().lua(), &self.session)
+        let lua = {
+            let host = self.lua.borrow();
+            host.lua().clone()
+        };
+        ox_lua::buf_attach::drain_buffer_callbacks(&lua, &self.session)
             .map_err(ApiError::exception)?;
         self.lua
             .borrow_mut()
@@ -2113,13 +2133,25 @@ impl AppState {
         self.exit_code
     }
 }
-fn drain_buffer_callbacks_for_state(state: &Rc<RefCell<AppState>>) -> Result<(), String> {
-    let (lua, session) = {
+fn take_channel_output(output: &ChannelOutput) -> Vec<(u64, Vec<u8>)> {
+    std::mem::take(&mut *output.borrow_mut())
+        .into_iter()
+        .collect()
+}
+
+fn drain_buffer_callbacks_for_state(
+    state: &Rc<RefCell<AppState>>,
+) -> (Vec<(u64, Vec<u8>)>, Result<(), String>) {
+    let (lua, session, output) = {
         let state = state.borrow();
-        let lua = state.lua.borrow().lua().clone();
-        (lua, state.session.clone())
+        let lua = {
+            let host = state.lua.borrow();
+            host.lua().clone()
+        };
+        (lua, state.session.clone(), state.channel_output.clone())
     };
-    ox_lua::buf_attach::drain_buffer_callbacks(&lua, &session)
+    let result = ox_lua::buf_attach::drain_buffer_callbacks(&lua, &session);
+    (take_channel_output(&output), result)
 }
 /// Drains insert-lifecycle transitions and staged mode switches recorded
 /// during a dispatch without holding an `AppState` borrow: transition
@@ -2606,10 +2638,18 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
                     break;
                 }
                 let processed = state.borrow_mut().process_message(CHAN_STDIO, message);
-                let drained = drain_buffer_callbacks_for_state(&state);
+                let (mut buffer_writes, first_drain) =
+                    drain_buffer_callbacks_for_state(&state);
                 fire_pending_transitions_for_state(&state);
+                let (more_buffer_writes, second_drain) =
+                    drain_buffer_callbacks_for_state(&state);
+                buffer_writes.extend(more_buffer_writes);
+                let drained = match (first_drain, second_drain) {
+                    (Err(error), _) => Err(error),
+                    (Ok(()), result) => result,
+                };
 
-                for (channel, bytes) in processed? {
+                for (channel, bytes) in buffer_writes.into_iter().chain(processed?) {
                     if channel == CHAN_STDIO.get() {
                         output.write_all(&bytes).map_err(AppError::Io)?;
                     }
@@ -2933,10 +2973,20 @@ fn bind_stdio(
                             }
                             let processed =
                                 state.borrow_mut().process_message(CHAN_STDIO, message);
-                            let drained = drain_buffer_callbacks_for_state(&state);
+                            let (mut buffer_writes, first_drain) =
+                                drain_buffer_callbacks_for_state(&state);
                             fire_pending_transitions_for_state(&state);
+                            let (more_buffer_writes, second_drain) =
+                                drain_buffer_callbacks_for_state(&state);
+                            buffer_writes.extend(more_buffer_writes);
+                            let drained = match (first_drain, second_drain) {
+                                (Err(error), _) => Err(error),
+                                (Ok(()), result) => result,
+                            };
 
-                            for (channel, bytes) in processed? {
+                            for (channel, bytes) in
+                                buffer_writes.into_iter().chain(processed?)
+                            {
                                 if channel == CHAN_STDIO.get() {
                                     output.write_all(&bytes).map_err(AppError::Io)?;
                                 }
@@ -3656,6 +3706,13 @@ impl NetworkRuntime {
         // tick the same way key-driven ones do, still with no AppState
         // borrow held.
         fire_pending_transitions_for_state(&self.state);
+        let (buffer_writes, drained) = drain_buffer_callbacks_for_state(&self.state);
+        if let Err(error) = &drained {
+            report_server_error(&session, error);
+        }
+        // Buffer callbacks can re-enter and request a quit after the first
+        // promotion above, so promote their result before checking state.
+        absorb_pending_quit_parts(&ex, &nested_ex, &mut exiting, &mut exit_code);
         if exiting {
             let mut state = self.state.borrow_mut();
             state.exiting = true;
@@ -3665,14 +3722,16 @@ impl NetworkRuntime {
             uv_loop.stop();
             return Ok(());
         }
-        if !delivered && !changed && !worked && !drove {
+        if !delivered && !changed && !worked && !drove && buffer_writes.is_empty() && drained.is_ok()
+        {
             return Ok(());
         }
-        let writes = self
+        let redraw_writes = self
             .state
             .borrow_mut()
             .redraw()
             .map_err(|error| ox_uv::CallbackError::new(error.to_string()))?;
+        let writes = buffer_writes.into_iter().chain(redraw_writes);
         // Peers live on the accept loop, so their writes go through it, not
         // the main-loop `uv_loop` this tick received. The pump timer and
         // this tick are both main-loop callbacks, so the borrow is free.
@@ -3792,15 +3851,28 @@ impl NetworkRuntime {
                 .process_message(channel, message)
                 .map_err(|error| error.to_string());
             // Buffer listeners run before the reply is written, so an RPC
-            // mutation cannot appear complete while its on_bytes callbacks
-            // are still queued. A listener failure is parked until after the
-            // writes flush: one buggy on_bytes handler must not starve the
-            // msgid of its answer (compare the decode_error tail below).
-            let drained = drain_buffer_callbacks_for_state(&self.state);
+            // mutation cannot appear complete while its callbacks are still
+            // queued. A listener failure is parked until after the writes
+            // flush: one buggy buffer handler must not starve the msgid of
+            // its answer (compare the decode_error tail below).
+            let (mut buffer_writes, first_drain) =
+                drain_buffer_callbacks_for_state(&self.state);
             // Transition autocmds run user code; this runs with no AppState
-            // borrow held.
+            // borrow held. Such callbacks can queue another buffer event.
             fire_pending_transitions_for_state(&self.state);
-            let writes = process_result?;
+            let (more_buffer_writes, second_drain) =
+                drain_buffer_callbacks_for_state(&self.state);
+            buffer_writes.extend(more_buffer_writes);
+            let drained = match (first_drain, second_drain) {
+                (Err(error), _) => Err(error),
+                (Ok(()), result) => result,
+            };
+            let process_error = process_result.as_ref().err().cloned();
+            let writes = match process_result {
+                Ok(writes) => writes,
+                Err(_) => Vec::new(),
+            };
+            let writes = buffer_writes.into_iter().chain(writes);
             for (target, bytes) in writes {
                 if target == CHAN_STDIO.get() {
                     // Mirror `poll_background`: a turn that started on a
@@ -3839,12 +3911,15 @@ impl NetworkRuntime {
                     }
                 }
             }
-            // A failing on_bytes listener is reported, not fatal: the peer
+            // A failing buffer listener is reported, not fatal: the peer
             // must not be dropped for a server-side script error (upstream
             // reports Lua errors via nvim_error_event and continues).
             if let Err(error) = drained {
                 let session = self.state.borrow().session.clone();
                 report_server_error(&session, &error);
+            }
+            if let Some(error) = process_error {
+                return Err(error);
             }
         }
         if let Some(error) = decode_error {
@@ -3865,10 +3940,19 @@ impl NetworkRuntime {
         if let Some(stream) = self.streams.remove(&id) {
             let _ = stream.close(uv_loop);
         }
-        // Transport detached first; channel metadata removal then makes the
-        // peer disappear from `nvim_list_chans()`. Stdio is never a peer.
+        // Transport detached first. Remove buffer subscriptions before
+        // deleting channel metadata so queued events cannot retain a dead
+        // recipient or starve live subscribers on the same mutation.
         if let Some(channel) = channel {
-            let _ = close_channel(&self.state.borrow_mut().session, channel);
+            let session = self.state.borrow().session.clone();
+            session.with_editor_mut(|editor| {
+                for buffer in editor.buffers() {
+                    if let Ok(state) = editor.buffer_mut(buffer) {
+                        state.remove_subscriptions_by_channel(channel.get());
+                    }
+                }
+            });
+            let _ = close_channel(&session, channel);
         }
     }
 }
@@ -6968,6 +7052,145 @@ mod tests {
             )
             .unwrap();
         state
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "event-order tests supply complete MessagePack frames"
+    )]
+    fn decode_recorded_server_message(bytes: &[u8]) -> Message {
+        let mut decoder = IncrementalDecoder::new();
+        let mut messages = decoder.feed(bytes).unwrap();
+        assert_eq!(messages.len(), 1);
+        messages.remove(0)
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture and nested Lua callback must execute successfully"
+    )]
+    fn dispatch_lua_drains_callbacks_without_host_borrow() {
+        let mut state = message_state();
+        let host = state.lua.clone();
+        let lua = {
+            let host = host.borrow();
+            host.lua().clone()
+        };
+        let callback = lua
+            .create_function(move |_, _args: mlua::Variadic<mlua::Value>| {
+                host.try_borrow_mut()
+                    .map(|_| mlua::Value::Nil)
+                    .map_err(|error| mlua::Error::RuntimeError(error.to_string()))
+            })
+            .unwrap();
+        let Object::LuaRef(reference) =
+            ox_lua::lua_to_object_ref(&lua, &mlua::Value::Function(callback)).unwrap()
+        else {
+            unreachable!()
+        };
+        let buffer = state
+            .session
+            .with_editor(|editor| editor.current_buffer())
+            .unwrap();
+        let cursor = state.session.with_editor(|editor| {
+            let window = editor.current_window().unwrap();
+            editor.window(window).unwrap().cursor
+        });
+        state.session.with_editor_mut(|editor| {
+            let state = editor.buffer_mut(buffer).unwrap();
+            state.attach_lua(ox_editor::BufferAttachSubscription {
+                channel_id: 0,
+                send_buffer: false,
+                options: Dict(vec![(
+                    OxStr::from("on_bytes"),
+                    Object::LuaRef(reference),
+                )]),
+            });
+            state
+                .replace_lines(
+                    1,
+                    1,
+                    &[b"reentered".to_vec()],
+                    cursor,
+                    cursor,
+                    0,
+                )
+                .unwrap();
+        });
+
+        // `dispatch_lua` must release its host borrow before this callback
+        // tries to borrow the same host mutably.
+        let (result, _) = state
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_exec_lua"),
+                &[
+                    Object::String(OxStr::from("return 42")),
+                    Object::Array(Vec::new()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(result, Object::Integer(42));
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture, channel registration, and event decode must succeed"
+    )]
+    fn rpc_buffer_events_precede_their_request_response() {
+        let state = Rc::new(RefCell::new(message_state()));
+        let session = state.borrow().session.clone();
+        let channel = ChannelId::new(7);
+        register_channel(&session, ChannelInfo::socket_rpc(channel)).unwrap();
+        let processed = state
+            .borrow_mut()
+            .process_message(
+                channel,
+                Message::Request {
+                    msgid: 1,
+                    method: OxStr::from("nvim_buf_attach"),
+                    params: vec![
+                        Object::Integer(0),
+                        Object::Boolean(true),
+                        Object::Dict(Dict(Vec::new())),
+                    ],
+                },
+            )
+            .unwrap();
+        let (buffer_writes, drained) = drain_buffer_callbacks_for_state(&state);
+        drained.unwrap();
+        assert_eq!(buffer_writes.len(), 1);
+        assert_eq!(buffer_writes[0].0, channel.get());
+        let mut writes = buffer_writes;
+        writes.extend(processed);
+
+        let event_index = writes
+            .iter()
+            .position(|(target, bytes)| {
+                *target == channel.get()
+                    && matches!(
+                        decode_recorded_server_message(bytes),
+                        Message::Notification { ref method, .. }
+                            if method == &OxStr::from("nvim_buf_lines_event")
+                    )
+            })
+            .unwrap();
+        let response_index = writes
+            .iter()
+            .position(|(target, bytes)| {
+                *target == channel.get()
+                    && matches!(
+                        decode_recorded_server_message(bytes),
+                        Message::Response { msgid: 1, .. }
+                    )
+            })
+            .unwrap();
+        assert!(
+            event_index < response_index,
+            "buffer notification must flush before the attach response"
+        );
     }
 
     #[test]

@@ -9,15 +9,19 @@ use ox_text::{Buffer, Position, UndoTree};
 use ox_types::{BufHandle, Dict, Object, OxStr, TabHandle, WinHandle};
 use thiserror::Error;
 
+use crate::builtins::position::cursor_vcol;
+use crate::extmark::{ExtmarkPosition, NamespaceId, SignGroup, TextExtent, TextSplice};
 use crate::arglist::ArgList;
 use crate::autocmd::Autocmds;
 use crate::buffer::{
-    BufferAttachSubscription, BufferState, BufferStateError, BufferTextEditRequest,
+    BufferState, BufferStateError, BufferSubscriptionRelease, BufferTextEditRequest,
 };
 use crate::decoration::Decorations;
-use crate::extmark::{ExtmarkPosition, NamespaceId, SignGroup, TextExtent, TextSplice};
+use crate::layout::{
+    CursorScreenPosition, Geometry, Layout, LayoutError, RelativeTo, TabpageState, WinConfig,
+    WindowState,
+};
 use crate::fold::{FoldError, Position as FoldPosition};
-use crate::layout::{Geometry, Layout, LayoutError, TabpageState, WinConfig, WindowState};
 use crate::mapping::Mappings;
 use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError};
 use crate::options::{OptionStore, OptionValue};
@@ -365,9 +369,9 @@ pub struct TerminalChannelInfo {
 pub struct Editor {
     /// Live buffers in monotonically allocated handle order.
     buffers: BTreeMap<BufHandle, BufferState>,
-    /// Subscriptions removed by wiping a buffer; the Lua host drains this
-    /// queue after the editor borrow ends.
-    pending_subscription_releases: Vec<BufferAttachSubscription>,
+    /// Subscriptions removed by wiping a buffer. The handle stays attached
+    /// so lifecycle callbacks can run after the buffer itself is gone.
+    pending_subscription_releases: Vec<BufferSubscriptionRelease>,
     /// Tabpage owning each live window handle.
     windows: BTreeMap<WinHandle, TabHandle>,
     /// Live tabpages and their tiled/floating layouts, keyed for lookup.
@@ -865,8 +869,17 @@ impl Editor {
         self.buffers.keys().copied().collect()
     }
     /// Takes subscriptions removed by wiping a buffer, leaving the queue empty.
-    pub fn take_pending_subscription_releases(&mut self) -> Vec<BufferAttachSubscription> {
+    ///
+    /// Each record retains the wiped handle for `on_detach` delivery.
+    pub fn take_pending_subscription_releases(&mut self) -> Vec<BufferSubscriptionRelease> {
         std::mem::take(&mut self.pending_subscription_releases)
+    }
+
+    /// Counts attachment releases waiting for the Lua host, including
+    /// subscriptions from buffers already wiped from the editor.
+    #[must_use]
+    pub fn pending_subscription_releases_len(&self) -> usize {
+        self.pending_subscription_releases.len()
     }
 
     /// Returns the highest buffer number ever allocated.
@@ -2897,10 +2910,11 @@ impl Editor {
             window
         };
         let tab = self.window_tabpage(resolved)?;
+        let cursor = self.cursor_position_for_float(tab, resolved, config.relative)?;
         self.tabpages
             .get_mut(&tab)
             .ok_or(EditorError::UnknownTabpage(tab))?
-            .set_window_config(resolved, config)?;
+            .set_window_config(resolved, config, cursor)?;
         Ok(())
     }
 
@@ -2960,7 +2974,7 @@ impl Editor {
             .remove(&buffer)
             .ok_or(EditorError::UnknownBuffer(buffer))?;
         self.pending_subscription_releases
-            .extend(state.into_released_subscriptions());
+            .extend(state.into_released_subscriptions_for(buffer));
         Ok(())
     }
 
@@ -3230,6 +3244,76 @@ impl Editor {
         self.split_window(tab, target, buffer, SplitDirection::Above, enter)
     }
 
+    /// Computes the cursor's rendered position within an anchor window.
+    ///
+    /// `win_config_float` freezes cursor-relative coordinates from `w_wrow`
+    /// and `w_wcol`, not from the cursor's byte position. The layout layer
+    /// cannot derive those values because it does not own buffer text or
+    /// options, so this snapshot is prepared before the tabpage borrow.
+    fn cursor_screen_position(
+        &self,
+        window: WinHandle,
+    ) -> Result<CursorScreenPosition, EditorError> {
+        let (buffer, cursor, topline, coladd) = {
+            let state = self.window(window)?;
+            (state.buffer, state.cursor, state.topline, state.coladd)
+        };
+        let geometry = self.window_geometry(window)?;
+        let tabstop = match self.options().get_buffer(buffer, "tabstop") {
+            Ok(OptionValue::Number(value)) if *value > 0 => usize::try_from(*value).unwrap_or(8),
+            _ => crate::builtins::position::tabstop(self),
+        };
+        let wrap = match self.options().get_window(window, "wrap") {
+            Ok(OptionValue::Boolean(value)) => *value,
+            _ => true,
+        };
+        let text = self.buffer(buffer)?.text()?;
+        let cursor_line = text.line(cursor.lnum).map_err(BufferStateError::from)?;
+        let virtual_column = cursor_vcol(&cursor_line, cursor.col, tabstop).saturating_add(
+            usize::try_from(coladd.max(0)).unwrap_or(usize::MAX),
+        );
+        if !wrap || geometry.width == 0 {
+            return Ok(CursorScreenPosition {
+                row: cursor.lnum.saturating_sub(topline),
+                col: virtual_column,
+            });
+        }
+
+        let first_line = topline.min(cursor.lnum).max(1);
+        let mut row = 0usize;
+        for lnum in first_line..cursor.lnum {
+            let line = text.line(lnum).map_err(BufferStateError::from)?;
+            let line_cells = cursor_vcol(&line, line.len(), tabstop);
+            row = row.saturating_add(wrapped_line_rows(line_cells, geometry.width));
+        }
+        row = row.saturating_add(virtual_column / geometry.width);
+        Ok(CursorScreenPosition {
+            row,
+            col: virtual_column % geometry.width,
+        })
+    }
+
+    /// Captures the rendered cursor position needed when freezing a float.
+    fn cursor_position_for_float(
+        &self,
+        tab: TabHandle,
+        window: WinHandle,
+        relative: RelativeTo,
+    ) -> Result<CursorScreenPosition, EditorError> {
+        if !matches!(relative, RelativeTo::Cursor) {
+            return Ok(CursorScreenPosition::default());
+        }
+        let tabpage = self
+            .tabpages
+            .get(&tab)
+            .ok_or(EditorError::UnknownTabpage(tab))?;
+        tabpage
+            .cursor_anchor_window(window)
+            .map_or(Ok(CursorScreenPosition::default()), |anchor| {
+                self.cursor_screen_position(anchor)
+            })
+    }
+
     /// Opens a floating window in `tab`.
     ///
     /// # Errors
@@ -3251,6 +3335,7 @@ impl Editor {
         self.require_buffer(buffer)?;
         self.require_tabpage(tab)?;
         let window = allocate_window_handle(&mut self.next_window)?;
+        let cursor = self.cursor_position_for_float(tab, window, config.relative)?;
         let state = WindowState::new(buffer, Position { lnum: 1, col: 0 });
         if let Some(buffer_state) = self.buffers.get_mut(&buffer) {
             buffer_state.attach()?;
@@ -3259,7 +3344,7 @@ impl Editor {
             .tabpages
             .get_mut(&tab)
             .ok_or(EditorError::UnknownTabpage(tab))?;
-        if let Err(error) = tabpage.add_float(window, state, config) {
+        if let Err(error) = tabpage.add_float(window, state, config, cursor) {
             if let Some(buffer_state) = self.buffers.get_mut(&buffer) {
                 buffer_state.detach(true);
             }
@@ -4100,6 +4185,11 @@ impl Editor {
         }
     }
 }
+
+fn wrapped_line_rows(cells: usize, width: usize) -> usize {
+    cells.div_ceil(width).max(1)
+}
+
 /// Renderable text rows for a window's viewport.
 ///
 /// Tiled windows reserve a statusline row and the message row from their
@@ -4670,6 +4760,96 @@ mod tests {
 
         let lines = terminal_lines(&editor, channel);
         assert_eq!(lines, vec![b"partial".to_vec()]);
+    }
+
+    fn cursor_float_position(
+        text: &str,
+        cursor_col: usize,
+        width: usize,
+        tabstop: Option<i64>,
+    ) -> (usize, usize) {
+        let mut editor = Editor::new();
+        let buffer = editor
+            .create_buffer_with(Buffer::from_bytes(text.as_bytes()).unwrap(), true)
+            .unwrap();
+        if let Some(tabstop) = tabstop {
+            editor
+                .options_mut()
+                .set_buffer(buffer, "tabstop", OptionValue::Number(tabstop))
+                .unwrap();
+        }
+        let tab = editor
+            .create_tabpage(buffer, Geometry::new(0, 0, width, 8).unwrap())
+            .unwrap();
+        let anchor = editor.tabpage(tab).unwrap().current_window();
+        editor
+            .set_window_cursor(
+                anchor,
+                Position {
+                    lnum: 1,
+                    col: cursor_col,
+                },
+            )
+            .unwrap();
+        let config =
+            WinConfig::new(RelativeTo::Cursor, Anchor::NorthWest, 0.0, 0.0, 1, 1).unwrap();
+        let float = editor.open_float(tab, buffer, config).unwrap();
+        let geometry = editor.window_geometry(float).unwrap();
+        (geometry.row, geometry.col)
+    }
+
+    #[test]
+    fn cursor_float_uses_rendered_ascii_column() {
+        assert_eq!(cursor_float_position("abc", 2, 20, None), (0, 2));
+    }
+
+    #[test]
+    fn cursor_float_uses_effective_tabstop_cells() {
+        assert_eq!(cursor_float_position("a\tb", 2, 20, Some(4)), (0, 4));
+    }
+
+    #[test]
+    fn cursor_float_uses_wide_character_cells() {
+        assert_eq!(cursor_float_position("界x", 3, 20, None), (0, 2));
+    }
+
+    #[test]
+    fn cursor_float_uses_combining_character_cells() {
+        assert_eq!(cursor_float_position("e\u{301}x", 3, 20, None), (0, 1));
+    }
+
+    #[test]
+    fn cursor_float_uses_wrapped_screen_row_and_column() {
+        assert_eq!(cursor_float_position("abcdef", 5, 4, None), (1, 1));
+    }
+
+    #[test]
+    fn set_cursor_float_uses_rendered_cursor_position() {
+        let mut editor = Editor::new();
+        let buffer = editor
+            .create_buffer_with(Buffer::from_bytes(b"a\tb").unwrap(), true)
+            .unwrap();
+        editor
+            .options_mut()
+            .set_buffer(buffer, "tabstop", OptionValue::Number(4))
+            .unwrap();
+        let tab = editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 20, 8).unwrap())
+            .unwrap();
+        let anchor = editor.tabpage(tab).unwrap().current_window();
+        editor
+            .set_window_cursor(anchor, Position { lnum: 1, col: 2 })
+            .unwrap();
+
+        let initial =
+            WinConfig::new(RelativeTo::Editor, Anchor::NorthWest, 0.0, 0.0, 1, 1).unwrap();
+        let float = editor.open_float(tab, buffer, initial).unwrap();
+        let cursor_config =
+            WinConfig::new(RelativeTo::Cursor, Anchor::NorthWest, 0.0, 0.0, 1, 1).unwrap();
+        editor.set_window_config(float, cursor_config).unwrap();
+
+        let geometry = editor.window_geometry(float).unwrap();
+        assert_eq!((geometry.row, geometry.col), (0, 4));
     }
 
     fn scratch_dir(tag: &str) -> PathBuf {
