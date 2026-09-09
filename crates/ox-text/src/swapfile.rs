@@ -216,24 +216,48 @@ impl SwapFile {
         Ok(())
     }
 
-    /// Writes the snapshot to `path`: parents are created when missing
-    /// (`os_mkdir_recurse`, `memline.c:3655-3664`), the file is truncated to
-    /// exactly the snapshot length, and the bytes reach the disk before this
-    /// returns (`mf_sync` `MFS_FLUSH` — the `do_fsync` half of `ml_preserve`,
-    /// `memline.c:1763`).
+    /// Writes the snapshot to `path` using this crate's default process
+    /// liveness probe.
     ///
     /// New files are reserved atomically (`O_EXCL`, `memfile.c:157-160`)
     /// without following symlinks (`O_NOFOLLOW`, `:765-776`) and with
     /// owner-only permissions (`fileio.c:435-444`). Rewrites verify the
     /// creator process and host recorded in block zero before truncating;
     /// a live foreign swapfile is never reused, while a stale one keeps the
-    /// existing recovery behavior.
+    /// existing recovery behavior. Call
+    /// [`Self::write_to_with_process_probe`] when the caller owns a
+    /// platform-specific process liveness probe.
     ///
     /// # Errors
     ///
     /// Returns the parent-directory creation, reservation, serialization,
     /// or sync failure.
     pub fn write_to(&self, path: &Path) -> Result<(), SwapError> {
+        self.write_to_with_process_probe(path, Self::process_is_running)
+    }
+
+    /// Writes the snapshot to `path`, using `process_is_running` when an
+    /// existing swapfile's recorded creator differs from this writer.
+    ///
+    /// The probe receives the recorded process id and returns `true` when
+    /// that process may still be running. It must return `true` when the
+    /// platform cannot determine liveness; only a confirmed-dead process may
+    /// release a foreign swapfile for reuse.
+    ///
+    /// Parents are created when missing (`os_mkdir_recurse`,
+    /// `memline.c:3655-3664`), the file is truncated to exactly the snapshot
+    /// length, and the bytes reach the disk before this returns (`mf_sync`
+    /// `MFS_FLUSH` — the `do_fsync` half of `ml_preserve`, `memline.c:1763`).
+    ///
+    /// # Errors
+    ///
+    /// Returns the parent-directory creation, reservation, serialization,
+    /// or sync failure.
+    pub fn write_to_with_process_probe(
+        &self,
+        path: &Path,
+        process_is_running: fn(u32) -> bool,
+    ) -> Result<(), SwapError> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
             && !parent.exists()
@@ -246,6 +270,7 @@ impl SwapFile {
             &self.file_name,
             self.owner_pid(),
             &host,
+            process_is_running,
         )?;
         self.write(&mut file)?;
         file.sync_all()?;
@@ -261,6 +286,7 @@ impl SwapFile {
         expected_fname: &str,
         expected_pid: u32,
         expected_host: &str,
+        process_is_running: fn(u32) -> bool,
     ) -> Result<std::fs::File, SwapError> {
         #[cfg(unix)]
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -299,6 +325,7 @@ impl SwapFile {
                     expected_fname,
                     expected_pid,
                     expected_host,
+                    process_is_running,
                 ) {
                     return Err(SwapError::Malformed("swapfile identity"));
                 }
@@ -321,6 +348,7 @@ impl SwapFile {
         expected_fname: &str,
         expected_pid: u32,
         expected_host: &str,
+        process_is_running: fn(u32) -> bool,
     ) -> bool {
         // Block zero through the byte-order magic words.
         let mut head = vec![0; ZERO_BLOCK_SIZE];
@@ -376,7 +404,7 @@ impl SwapFile {
         };
         stored_pid == expected_pid
             || stored_pid == 0
-            || !Self::process_is_running(stored_pid)
+            || !process_is_running(stored_pid)
     }
 
     /// Metadata omitted by a caller means this process and host. That keeps
@@ -408,9 +436,14 @@ impl SwapFile {
         }
     }
 
-    /// Linux exposes process liveness without an unsafe platform binding.
-    /// Other targets conservatively retain a foreign file rather than risk
-    /// truncating a process whose liveness cannot be checked safely.
+    /// Default liveness of a recorded creator pid. Linux checks `/proc`;
+    /// macOS and Windows (and other non-Linux targets) conservatively treat
+    /// every nonzero PID as running because their native queries require an
+    /// FFI boundary unavailable to this crate. Callers that own such a
+    /// platform probe should pass it to
+    /// [`Self::write_to_with_process_probe`]. Unknown liveness stays alive:
+    /// deciding a live editor is dead would let two processes share one
+    /// swap file.
     fn process_is_running(pid: u32) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -674,6 +707,14 @@ mod tests {
         SwapFile::read(fs::File::open(path).unwrap()).unwrap()
     }
 
+    fn process_probe_alive(_: u32) -> bool {
+        true
+    }
+
+    fn process_probe_dead(_: u32) -> bool {
+        false
+    }
+
     /// A genuinely live process that is not this test: the runner's parent,
     /// else init as a conservative fallback. Used wherever a foreign swapfile
     /// must survive its rejection.
@@ -775,7 +816,14 @@ mod tests {
         // the test depend on a second test binary.
         let winner_pid = live_foreign_pid();
         let mut winner_file =
-            SwapFile::reserve_swapfile(&path, FILE_NAME, winner_pid, &host).unwrap();
+            SwapFile::reserve_swapfile(
+                &path,
+                FILE_NAME,
+                winner_pid,
+                &host,
+                SwapFile::process_is_running,
+            )
+            .unwrap();
         assert!(fs::read(&path).unwrap().is_empty());
 
         let loser = SwapFile::new(FILE_NAME, Buffer::from_bytes(b"loser\n").unwrap())
@@ -798,6 +846,39 @@ mod tests {
             "malformed or unsupported swapfile: swapfile identity"
         );
         assert_eq!(fs::read(&path).unwrap(), winner_bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn injected_process_probe_controls_foreign_reuse() {
+        let dir = test_dir("injected-probe");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("buffer.swp");
+
+        SwapFile::new(FILE_NAME, Buffer::from_bytes(b"foreign\n").unwrap())
+            .with_meta(identity(u32::MAX))
+            .write_to(&path)
+            .unwrap();
+        let foreign_bytes = fs::read(&path).unwrap();
+
+        let ours = SwapFile::new(FILE_NAME, Buffer::from_bytes(b"ours\n").unwrap())
+            .with_meta(identity(std::process::id()));
+        let error = ours
+            .write_to_with_process_probe(&path, process_probe_alive)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "malformed or unsupported swapfile: swapfile identity"
+        );
+        assert_eq!(fs::read(&path).unwrap(), foreign_bytes);
+
+        ours.write_to_with_process_probe(&path, process_probe_dead)
+            .unwrap();
+        assert_eq!(
+            read_snapshot(&path).buffer.to_bytes(),
+            b"ours\n"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -825,5 +906,15 @@ mod tests {
             b"recovered after stale\n"
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+    /// The running target's liveness probe classifies a dead pid dead and
+    /// this test's own pid alive. `u32::MAX` cannot be a real pid anywhere:
+    /// Unix pids fit `i32`, and Windows pids are multiples of four.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_probe_separates_dead_from_live_pid() {
+        assert!(!SwapFile::process_is_running(0));
+        assert!(!SwapFile::process_is_running(u32::MAX));
+        assert!(SwapFile::process_is_running(std::process::id()));
     }
 }
