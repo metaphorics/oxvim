@@ -1139,6 +1139,10 @@ impl AppState {
             ));
         };
         let mut results = Vec::with_capacity(calls.len());
+        // Atomic items are dispatched one at a time. Drain before the first
+        // item and after each successful item so a later detach cannot erase
+        // a mutation event that was already committed.
+        self.drain_atomic_callbacks()?;
         for (index, call) in calls.iter().enumerate() {
             let (name, args) = ox_api::decode_atomic_call(call)?;
             let name = name.to_string_lossy();
@@ -1148,7 +1152,10 @@ impl AppState {
                 _ => self.atomic_guarded_dispatch(channel, name.as_ref(), args),
             };
             match result {
-                Ok(value) => results.push(value),
+                Ok(value) => {
+                    self.drain_atomic_callbacks()?;
+                    results.push(value);
+                }
                 Err(error) => {
                     return Ok(Object::Array(vec![
                         Object::Array(results),
@@ -1162,6 +1169,17 @@ impl AppState {
             }
         }
         Ok(Object::Array(vec![Object::Array(results), Object::Nil]))
+    }
+
+    /// Drain the same callback queue used by ordinary Lua API dispatch before
+    /// the next atomic item can remove its subscriptions.
+    fn drain_atomic_callbacks(&self) -> Result<(), ApiError> {
+        let lua = {
+            let host = self.lua.borrow();
+            host.lua().clone()
+        };
+        ox_lua::buf_attach::drain_buffer_callbacks(&lua, &self.session)
+            .map_err(ApiError::exception)
     }
 
     /// One `nvim_call_atomic` item under the per-call RPC caller scope the
@@ -1225,6 +1243,7 @@ impl AppState {
         };
         let code = std::str::from_utf8(code.as_bytes())
             .map_err(|_| ApiError::validation("Lua source must be valid UTF-8"))?;
+        let _caller = self.session.enter_internal_call();
         // Same entry contract as the executor path: edits committed since
         // the last Lua entry (key input drained before this request) reach
         // listeners before the chunk observes buffer state.
@@ -4258,6 +4277,7 @@ struct ServerLuaExec {
 
 impl LuaExec for ServerLuaExec {
     fn execute_chunk(&mut self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError> {
+        let _caller = self.session.enter_internal_call();
         // Entry contract (see `dispatch_lua`): pending byte events reach
         // listeners before user code observes buffer state.
         ox_lua::buf_attach::drain_buffer_callbacks(&self.lua, &self.session)
@@ -4554,6 +4574,7 @@ impl LuaExecutor for ApiLuaExecutor {
         code: &str,
         args: Vec<Object>,
     ) -> Result<Object, String> {
+        let _caller = session.enter_internal_call();
         // Edits committed since the last Lua entry (key input, RPC
         // mutations) queue byte events; deliver them before user code
         // runs so attached trees observe edited state first.
@@ -4576,6 +4597,7 @@ impl LuaExecutor for ApiLuaExecutor {
         reference: usize,
         args: Vec<Object>,
     ) -> Result<Object, String> {
+        let _caller = session.enter_internal_call();
         // Same entry contract as `exec`: pending byte events reach
         // listeners before this callback observes buffer state. The
         // nested drain finds an empty queue and returns immediately.
@@ -4615,6 +4637,7 @@ impl LuaExecutor for ApiLuaExecutor {
         reference: usize,
         args: Vec<Object>,
     ) -> Result<Vec<Object>, String> {
+        let _caller = session.enter_internal_call();
         // Same entry contract as `exec` (see above).
         ox_lua::buf_attach::drain_buffer_callbacks(&self.lua, session)?;
         let reference = i32::try_from(reference)
@@ -4938,12 +4961,26 @@ struct ServerCommandHost {
     event_loop: EventLoopPump,
 }
 
+
+
+impl ServerCommandHost {
+    fn ensure_textlock_allows(&self) -> Result<(), ApiError> {
+        let Some(context) = self.lua.app_data_ref::<ApiDispatchContext>() else {
+            return Ok(());
+        };
+        context
+            .ensure_textlock_allows()
+            .map_err(ApiError::exception)
+    }
+}
+
 impl CommandExecutor for ServerCommandHost {
     fn execute(
         &mut self,
         session: &ApiSession,
         commands: &[ox_api::ExCommand],
     ) -> Result<(), ApiError> {
+        self.ensure_textlock_allows()?;
         // Reentrant `nvim_exec2`/`nvim_command` (Vimscript calling the API
         // while a command already runs) executes on the nested executor
         // instead of panicking on the outer borrow. The guard drops at the
@@ -4971,6 +5008,7 @@ impl CommandExecutor for ServerCommandHost {
     }
 
     fn execute_command(&mut self, session: &ApiSession, command: &str) -> Result<(), ApiError> {
+        self.ensure_textlock_allows()?;
         let (result, owner) = if let Ok(mut guard) = self.ex.try_borrow_mut() {
             let result = guard
                 .execute_line(session, command)
@@ -4993,6 +5031,7 @@ impl CommandExecutor for ServerCommandHost {
     }
 
     fn execute_script(&mut self, session: &ApiSession, source: &str) -> Result<(), ApiError> {
+        self.ensure_textlock_allows()?;
         let (result, owner) = if let Ok(mut guard) = self.ex.try_borrow_mut() {
             let result = guard
                 .execute_script(session, "<nvim>", source)
@@ -5339,6 +5378,12 @@ fn dispatch_scoped_builtin(
     args: &[Value],
 ) -> mlua::Result<(bool, Value)> {
     let name = OxStr(name.to_vec());
+    if ox_lua::vim::builtin_textlock(name.as_bytes())
+        && let Some(context) = lua.app_data_ref::<ApiDispatchContext>()
+        && let Err(error) = context.ensure_textlock_allows()
+    {
+        return scoped_failure(lua, error);
+    }
     let mut converted = Vec::with_capacity(args.len());
     let mut references = Vec::new();
     for value in args {
@@ -5457,11 +5502,15 @@ fn dispatch_scoped_nvim_cmd(
 /// global command-host pool.
 fn execute_scoped_ex(
     session: &ApiSession,
+    context: &ApiDispatchContext,
     ex: &Rc<RefCell<ExExecutor>>,
     nested_ex: &Rc<RefCell<ExExecutor>>,
     operation: ApiOperation,
     execute: impl FnOnce(&mut ExExecutor) -> Result<ExecOutcome, ExecError>,
 ) -> Result<ExecOutcome, ApiError> {
+    context
+        .ensure_textlock_allows()
+        .map_err(ApiError::exception)?;
     let (result, owner) = if let Ok(mut guard) = ex.try_borrow_mut() {
         let result = execute(&mut guard);
         (result, ex.clone())
@@ -5481,6 +5530,7 @@ fn execute_scoped_ex(
 /// Executes the deprecated string command API on the selected pair.
 fn dispatch_scoped_nvim_command(
     session: &ApiSession,
+    context: &ApiDispatchContext,
     ex: &Rc<RefCell<ExExecutor>>,
     nested_ex: &Rc<RefCell<ExExecutor>>,
     command: &OxStr,
@@ -5489,6 +5539,7 @@ fn dispatch_scoped_nvim_command(
         .map_err(|_| ApiError::validation("Command must be valid UTF-8"))?;
     execute_scoped_ex(
         session,
+        context,
         ex,
         nested_ex,
         ApiOperation::Command,
@@ -5504,6 +5555,7 @@ fn dispatch_scoped_nvim_command(
 /// callback instead.
 fn dispatch_scoped_nvim_exec2(
     session: &ApiSession,
+    context: &ApiDispatchContext,
     ex: &Rc<RefCell<ExExecutor>>,
     nested_ex: &Rc<RefCell<ExExecutor>>,
     source: &OxStr,
@@ -5528,6 +5580,7 @@ fn dispatch_scoped_nvim_exec2(
     let message_start = session.with_editor(|editor| editor.messages().len());
     let result = execute_scoped_ex(
         session,
+        context,
         ex,
         nested_ex,
         ApiOperation::Exec2,
@@ -5609,6 +5662,17 @@ fn with_scoped_editor_api<T>(
     // Shared by reference so every scope closure copies the borrow instead
     // of the first closure moving the shim away from the rest.
     let shim = &shim;
+    let context = lua
+        .app_data_ref::<ApiDispatchContext>()
+        .map(|context| context.clone())
+        .ok_or_else(|| {
+            LuaExecError::Runtime(
+                "scoped Lua dispatch ran without a registered API dispatch context".to_owned(),
+            )
+        })?;
+    // Every scoped Lua chunk/callback is an in-process API call, even when
+    // the surrounding request arrived over RPC.
+    let _caller = session.enter_internal_call();
     // The caller's real session drives every scoped binding: scope closures
     // accept the non-'static `&ApiSession` borrow, and no throwaway session
     // is ever constructed here.
@@ -5728,6 +5792,7 @@ fn with_scoped_editor_api<T>(
             if metadata.name == "nvim_command" {
                 let command_ex = ex.clone();
                 let command_nested = nested_ex.clone();
+                let command_context = context.clone();
                 api.set(
                     metadata.name,
                     shim.call::<Function>(scope.create_function_mut(
@@ -5756,6 +5821,7 @@ fn with_scoped_editor_api<T>(
                             };
                             if let Err(error) = dispatch_scoped_nvim_command(
                                 session,
+                                &command_context,
                                 &command_ex,
                                 &command_nested,
                                 command,
@@ -5772,6 +5838,7 @@ fn with_scoped_editor_api<T>(
                 continue;
             }
             if metadata.name == "nvim_exec2" {
+                let exec_context = context.clone();
                 let exec_ex = ex.clone();
                 let exec_nested = nested_ex.clone();
                 let params = metadata.params;
@@ -5803,6 +5870,7 @@ fn with_scoped_editor_api<T>(
                             };
                             let result = match dispatch_scoped_nvim_exec2(
                                 session,
+                                &exec_context,
                                 &exec_ex,
                                 &exec_nested,
                                 source,
@@ -5882,11 +5950,18 @@ fn with_scoped_editor_api<T>(
                 )?;
                 continue;
             }
+            let textlock = metadata.textlock;
+            let context = context.clone();
             let params = metadata.params;
             api.set(
                 metadata.name,
                 shim.call::<Function>(scope.create_function_mut(
                     move |lua, args: Variadic<Value>| {
+                        if textlock
+                            && let Err(error) = context.ensure_textlock_allows()
+                        {
+                            return scoped_failure_multi(lua, error);
+                        }
                         let mut converted = Vec::with_capacity(args.len());
                         for value in args.iter() {
                             match lua_to_object(lua, value) {
@@ -7431,6 +7506,286 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, Object::Integer(42));
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the RPC fixture and Lua callback must execute successfully"
+    )]
+    fn lua_buffer_callbacks_reject_vim_fn_text_changes() {
+        let mut state = message_state();
+        let (result, _) = state
+            .dispatch(
+                ChannelId::new(0x5050),
+                &OxStr::from("nvim_exec_lua"),
+                &[
+                    Object::String(OxStr::from(
+                        r#"
+                        local callback_error
+                        local calls = 0
+                        assert(vim.api.nvim_buf_attach(0, false, {
+                          on_lines = function()
+                            calls = calls + 1
+                            if calls == 1 then
+                              local ok, err = pcall(vim.fn.setline, 1, "nested")
+                              callback_error = ok and "ok" or tostring(err)
+                            end
+                          end,
+                        }))
+                        vim.api.nvim_buf_set_lines(0, 0, -1, true, {"outer"})
+                        return callback_error
+                        "#,
+                    )),
+                    Object::Array(Vec::new()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            Object::String(OxStr::from(
+                "E565: Not allowed to change text or change window"
+            ))
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the RPC fixture and scoped Ex callback must execute successfully"
+    )]
+    fn lua_buffer_callbacks_reject_scoped_ex_text_changes() {
+        let mut state = message_state();
+        let (result, _) = state
+            .dispatch(
+                ChannelId::new(0x5055),
+                &OxStr::from("nvim_exec_lua"),
+                &[
+                    Object::String(OxStr::from(
+                        r#"
+                        local callback_error
+                        local calls = 0
+                        assert(vim.api.nvim_buf_attach(0, false, {
+                          on_lines = function()
+                            calls = calls + 1
+                            if calls == 1 then
+                              local ok, err = pcall(function()
+                                vim.api.nvim_exec_lua(
+                                "vim.cmd('call setline(1, \"nested\")')",
+                                {}
+                              )
+                            end)
+                            callback_error = ok and "ok" or tostring(err)
+                            end
+                          end,
+                        }))
+                        vim.api.nvim_buf_set_lines(0, 0, -1, true, {"outer"})
+                        return callback_error
+                        "#,
+                    )),
+                    Object::Array(Vec::new()),
+                ],
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                &result,
+                Object::String(error) if error.as_bytes() != b"ok"
+            ),
+            "scoped Ex mutation unexpectedly succeeded: {result:?}"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the RPC fixture and Lua attachment must execute successfully"
+    )]
+    fn rpc_exec_lua_buffer_attach_uses_the_internal_api_channel() {
+        let mut state = message_state();
+        let channel = ChannelId::new(0x5051);
+        register_channel(&state.session, ChannelInfo::socket_rpc(channel)).unwrap();
+        state
+            .dispatch(
+                channel,
+                &OxStr::from("nvim_exec_lua"),
+                &[
+                    Object::String(OxStr::from(
+                        "assert(vim.api.nvim_buf_attach(0, false, {on_lines = function() end}))",
+                    )),
+                    Object::Array(Vec::new()),
+                ],
+            )
+            .unwrap();
+        let channels = state.session.with_editor(|editor| {
+            let buffer = editor.current_buffer().unwrap();
+            editor
+                .buffer(buffer)
+                .unwrap()
+                .subscriptions()
+                .values()
+                .map(|subscription| subscription.channel_id)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(channels, vec![0]);
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the RPC fixture, queued callback, and command must execute successfully"
+    )]
+    fn queued_lua_callback_attach_uses_the_internal_api_channel() {
+        let mut state = message_state();
+        let channel = ChannelId::new(0x5054);
+        register_channel(&state.session, ChannelInfo::socket_rpc(channel)).unwrap();
+        state
+            .dispatch(
+                channel,
+                &OxStr::from("nvim_exec_lua"),
+                &[
+                    Object::String(OxStr::from(
+                        "assert(vim.api.nvim_buf_attach(0, false, {on_lines = function() vim.api.nvim_buf_attach(0, false, {on_lines = function() end}) end}))",
+                    )),
+                    Object::Array(Vec::new()),
+                ],
+            )
+            .unwrap();
+        let buffer = state
+            .session
+            .with_editor(|editor| editor.current_buffer().unwrap());
+        let cursor = state.session.with_editor(|editor| {
+            let window = editor.current_window().unwrap();
+            editor.window(window).unwrap().cursor
+        });
+        state.session.with_editor_mut(|editor| {
+            editor
+                .buffer_mut(buffer)
+                .unwrap()
+                .replace_lines(
+                    1,
+                    1,
+                    &[b"queued".to_vec()],
+                    cursor,
+                    cursor,
+                    0,
+                )
+                .unwrap();
+        });
+        state
+            .dispatch(
+                channel,
+                &OxStr::from("nvim_command"),
+                &[Object::String(OxStr::from(
+                    "lua vim.api.nvim_buf_attach(0, false, {on_lines = function() end})",
+                ))],
+            )
+            .unwrap();
+        let channels = state.session.with_editor(|editor| {
+            editor
+                .buffer(buffer)
+                .unwrap()
+                .subscriptions()
+                .values()
+                .map(|subscription| subscription.channel_id)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(channels, vec![0, 0, 0]);
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the RPC fixture, channel, and atomic calls must execute successfully"
+    )]
+    fn atomic_buffer_mutation_drains_before_detach() {
+        let mut state = message_state();
+        let channel = ChannelId::new(0x5052);
+        register_channel(&state.session, ChannelInfo::socket_rpc(channel)).unwrap();
+        state
+            .dispatch(
+                channel,
+                &OxStr::from("nvim_buf_attach"),
+                &[
+                    Object::Integer(0),
+                    Object::Boolean(false),
+                    Object::Dict(Dict(Vec::new())),
+                ],
+            )
+            .unwrap();
+        let call = |name: &str, args: Vec<Object>| {
+            Object::Array(vec![
+                Object::String(OxStr::from(name)),
+                Object::Array(args),
+            ])
+        };
+        state
+            .dispatch(
+                channel,
+                &OxStr::from("nvim_call_atomic"),
+                &[Object::Array(vec![
+                    call(
+                        "nvim_buf_set_lines",
+                        vec![
+                            Object::Integer(0),
+                            Object::Integer(0),
+                            Object::Integer(-1),
+                            Object::Boolean(true),
+                            Object::Array(vec![Object::String(OxStr::from("outer"))]),
+                        ],
+                    ),
+                    call("nvim_buf_detach", vec![Object::Integer(0)]),
+                ])],
+            )
+            .unwrap();
+        let writes = take_channel_output(&state.channel_output);
+        let frame = writes
+            .iter()
+            .find(|(target, _)| *target == channel.get())
+            .map(|(_, bytes)| bytes.as_slice())
+            .unwrap_or_default();
+        assert!(
+            frame_contains(frame, "nvim_buf_lines_event"),
+            "atomic mutation must deliver its lines event before detach removes the subscription"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the RPC fixture, channel, and detach calls must execute successfully"
+    )]
+    fn repeated_buffer_detach_reports_true_when_loaded() {
+        let mut state = message_state();
+        let channel = ChannelId::new(0x5053);
+        register_channel(&state.session, ChannelInfo::socket_rpc(channel)).unwrap();
+        state
+            .dispatch(
+                channel,
+                &OxStr::from("nvim_buf_attach"),
+                &[
+                    Object::Integer(0),
+                    Object::Boolean(false),
+                    Object::Dict(Dict(Vec::new())),
+                ],
+            )
+            .unwrap();
+        let (first, _) = state
+            .dispatch(
+                channel,
+                &OxStr::from("nvim_buf_detach"),
+                &[Object::Integer(0)],
+            )
+            .unwrap();
+        let (second, _) = state
+            .dispatch(
+                channel,
+                &OxStr::from("nvim_buf_detach"),
+                &[Object::Integer(0)],
+            )
+            .unwrap();
+        assert_eq!(first, Object::Boolean(true));
+        assert_eq!(second, Object::Boolean(true));
     }
 
     #[test]

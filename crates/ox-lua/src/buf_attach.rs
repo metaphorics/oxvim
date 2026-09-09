@@ -334,6 +334,7 @@ fn invoke_callback(
         return Err("buffer callback reference is not a function".to_owned());
     };
     let _textlock_guard = context.enter_textlock();
+    let _caller_guard = context.session().enter_internal_call();
     function
         .call::<Value>(Variadic::from_iter(args))
         .map_err(|error| error.to_string())

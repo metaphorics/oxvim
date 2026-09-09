@@ -52,6 +52,16 @@ pub trait Scheduler {
     }
 }
 
+/// Vimscript builtins that can modify buffer text and therefore fail while
+/// the Lua API dispatch context holds textlock.
+#[must_use]
+pub fn builtin_textlock(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"append" | b"appendbufline" | b"deletebufline" | b"setbufline" | b"setline"
+    )
+}
+
 /// Vimscript builtin dispatch seam used by `vim.call` and `vim.fn`.
 pub trait BuiltinHost {
     /// Invoke a named Vimscript function with converted arguments.
@@ -61,6 +71,11 @@ pub trait BuiltinHost {
     /// Returns an error when the host cannot invoke `name`, including lookup,
     /// argument-conversion, and Vimscript execution failures.
     fn call(&self, name: &OxStr, args: Vec<Typval>) -> Result<Typval, String>;
+
+    /// Whether this function changes editor text while textlock is active.
+    fn is_textlock(&self, name: &OxStr) -> bool {
+        builtin_textlock(name.as_bytes())
+    }
 
     /// Whether this function is safe in a fast callback.
     fn is_fast(&self, _name: &OxStr) -> bool {
@@ -155,6 +170,21 @@ impl ApiDispatchContext {
             .set(self.textlock_depth.get().saturating_add(1));
         TextlockGuard {
             depth: self.textlock_depth.clone(),
+        }
+    }
+
+    /// Reject a text-changing dispatch while the shared callback textlock is
+    /// active.
+    ///
+    /// # Errors
+    ///
+    /// Returns Neovim's exact textlock error when the context is currently
+    /// locked.
+    pub fn ensure_textlock_allows(&self) -> Result<(), String> {
+        if self.text_locked() {
+            Err("E565: Not allowed to change text or change window".to_owned())
+        } else {
+            Ok(())
         }
     }
 
@@ -459,6 +489,12 @@ fn dispatch_builtin(
     {
         return api_failure(lua, error.to_string());
     }
+    if host.is_textlock(&name)
+        && let Some(context) = lua.app_data_ref::<ApiDispatchContext>()
+        && let Err(error) = context.ensure_textlock_allows()
+    {
+        return api_failure(lua, error);
+    }
 
     let mut converted = Vec::with_capacity(args.len());
     let mut arg_refs = Vec::new();
@@ -601,8 +637,8 @@ pub fn bind_api(
                         error => error.to_string(),
                     })?;
                 }
-                if textlock && context.text_locked() {
-                    return Err("E565: Not allowed to change text or change window".to_owned());
+                if textlock {
+                    context.ensure_textlock_allows()?;
                 }
                 let mut args = args
                     .iter()
