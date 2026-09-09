@@ -458,7 +458,9 @@ pub(crate) fn build_embedded_core(
         api.set("nvim_echo", echo_bind).map_err(to_app_error)?;
         // The built-in OSC52 provider, the tty helper, and the Progress
         // handler call `vim.api.nvim_ui_send` from Lua; the binding queues
-        // through the editor sink exactly like the RPC path.
+        // through the editor sink exactly like the RPC path, including its
+        // malformed-call validation, so Lua sees the generated dispatcher's
+        // error instead of a silent drop.
         let ui_send_session = session.clone();
         let ui_send_bind = lua
             .lua()
@@ -1031,19 +1033,7 @@ impl AppState {
             "nvim_ui_attach" => self.ui_attach(channel, params),
             "nvim_ui_detach" => self.ui_detach(channel, params),
             "nvim_ui_try_resize" => self.ui_resize(channel, params),
-            "nvim_ui_send" => queue_ui_send(&self.session, params),
-            "nvim_echo" => match self.registry.get("nvim_echo") {
-                Some((_, echo)) => dispatch_echo(&self.session, echo, params),
-                None => Err(ApiError::exception("nvim_echo is not registered")),
-            },
-            _ => {
-                let Some((_, dispatch)) = self.registry.get(&name) else {
-                    return Err(ApiError::exception(Registry::invalid_method_message(
-                        name.as_ref(),
-                    )));
-                };
-                dispatch(&self.session, params)
-            }
+            name => intercepted_dispatch(&self.session, &self.registry, name, params),
         };
         drop(caller);
         // Absorb before propagating: user code may have recorded a quit
@@ -1101,18 +1091,7 @@ impl AppState {
             let result = match name.as_ref() {
                 "nvim_get_api_info" => self.dispatch_api_info(channel, args),
                 "nvim_call_atomic" => self.dispatch_call_atomic(channel, args),
-                "nvim_ui_send" => queue_ui_send(&self.session, args),
-                _ => match self.registry.get(&name) {
-                    Some((_, dispatch)) => {
-                        let caller = self.session.enter_rpc_call(channel);
-                        let result = dispatch(&self.session, args);
-                        drop(caller);
-                        result
-                    }
-                    None => Err(ApiError::exception(Registry::invalid_method_message(
-                        name.as_ref(),
-                    ))),
-                },
+                _ => self.atomic_guarded_dispatch(channel, name.as_ref(), args),
             };
             match result {
                 Ok(value) => results.push(value),
@@ -1129,6 +1108,22 @@ impl AppState {
             }
         }
         Ok(Object::Array(vec![Object::Array(results), Object::Nil]))
+    }
+
+    /// One `nvim_call_atomic` item under the per-call RPC caller scope the
+    /// loop has always given registry dispatches. The guard wraps the
+    /// interception itself, so special-cased and plain calls run under one
+    /// shape instead of special cases silently losing the caller frame.
+    fn atomic_guarded_dispatch(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        args: &[Object],
+    ) -> Result<Object, ApiError> {
+        let caller = self.session.enter_rpc_call(channel);
+        let result = intercepted_dispatch(&self.session, &self.registry, name, args);
+        drop(caller);
+        result
     }
 
     fn dispatch_input(&mut self, params: &[Object]) -> Result<Object, ApiError> {
@@ -2441,6 +2436,38 @@ fn settle_echo(
     }
 }
 
+/// Registry dispatch with the two server-level interceptions applied.
+///
+/// Both the top-level RPC dispatcher and every `nvim_call_atomic` item route
+/// through this one place, so a call behaves identically standalone or
+/// nested in a batch: `nvim_echo` carries its identity (armed before the
+/// registry handler, settled after), and `nvim_ui_send` queues its payload
+/// for the server's redraw pass after generated-dispatcher argument
+/// validation instead of hitting the frozen handler that would drop it.
+///
+/// `registry` is passed separately because `AppState` cannot borrow `self`
+/// both mutably (the caller's RPC guard) and immutably here.
+fn intercepted_dispatch(
+    session: &ApiSession,
+    registry: &Registry,
+    name: &str,
+    params: &[Object],
+) -> Result<Object, ApiError> {
+    if name == "nvim_echo" {
+        let Some((_, echo)) = registry.get("nvim_echo") else {
+            return Err(ApiError::exception("nvim_echo is not registered"));
+        };
+        return dispatch_echo(session, echo, params);
+    }
+    if name == "nvim_ui_send" {
+        return queue_ui_send(session, params);
+    }
+    let Some((_, dispatch)) = registry.get(name) else {
+        return Err(ApiError::exception(Registry::invalid_method_message(name)));
+    };
+    dispatch(session, params)
+}
+
 /// One `nvim_echo` dispatch with identity armed before the registry handler.
 /// Every entry path routes through here, so a `Progress` callback observes the
 /// same identity that later calls use for replacement.
@@ -2472,26 +2499,48 @@ fn dispatch_echo(
 
 /// Queues raw `nvim_ui_send` content for the next redraw pass
 /// (`nvim_ui_send`, `api/ui.c:1102-1106`). Upstream forwards the payload to
-/// every UI that negotiated `stdout_tty`, and the call cannot fail, so an
-/// unmatched shape stays the same silent no-op the frozen registry handler
-/// is. The documented signature is `nvim_ui_send({content})`
-/// (`api.txt:3824-3837`); the leading `channel_id` argument is legacy and
-/// ignored, so both shapes deliver. The queue rides the editor sink, so
-/// every entry path — RPC, nested `nvim_call_atomic`, and the Lua `vim.api`
-/// bindings — shares one queue and `AppState::drain_ui_sends` stays the one
-/// owner of frame assembly.
+/// every UI that negotiated `stdout_tty`, and a well-formed call cannot
+/// fail — one String with no eligible UI attached still succeeds. The
+/// documented signature is `nvim_ui_send({content})` (`api.txt:3824-3837`);
+/// `channel_id` is an implicit API parameter, not part of the wire
+/// signature, so the legacy two-argument shape is malformed and rejected
+/// before queueing. The error texts reproduce the generated dispatcher
+/// exactly (the arity check plus `OxStr`'s `Wrong type for argument 1` in
+/// `ox-api-macros`), because every entry path — RPC, `nvim_call_atomic`,
+/// and the Lua `vim.api` bindings — crosses here instead of the registry
+/// handler, and a client must see the same failure it would get from the
+/// advertised level-15 API. The queue rides the editor sink, so all paths
+/// share one queue and `AppState::drain_ui_sends` stays the one owner of
+/// frame assembly.
+
+/// The generated-dispatcher error a malformed `nvim_ui_send` call gets:
+/// every count other than one is the arity error — the legacy leading
+/// `channel_id` shape included, because `channel_id` is an implicit API
+/// parameter, not part of the wire signature — and a one-argument call
+/// fails the `String` type check.
+fn ui_send_validation_error(params: &[Object]) -> ApiError {
+    let [_] = params else {
+        return ApiError::exception(format!(
+            "Wrong number of arguments: expecting 1 but got {}",
+            params.len(),
+        ));
+    };
+    ApiError::exception(
+        "Wrong type for argument 1 when calling nvim_ui_send, expecting String",
+    )
+}
+
 fn queue_ui_send(session: &ApiSession, params: &[Object]) -> Result<Object, ApiError> {
-    let content = match params {
-        [Object::String(content)] => content,
-        [Object::Integer(_), Object::String(content)] => content,
-        _ => return Ok(Object::Nil),
+    let [Object::String(content)] = params else {
+        return Err(ui_send_validation_error(params));
     };
     session.with_editor_mut(|editor| editor.queue_ui_send(content.clone()));
     Ok(Object::Nil)
 }
 
-/// Queues raw `nvim_ui_send` content from a Lua binding, keeping the
-/// level-15 no-failure contract.
+/// Queues raw `nvim_ui_send` content from a Lua binding. Well-formed calls
+/// keep the level-15 no-failure contract; a malformed payload surfaces the
+/// generated dispatcher's validation error as a Lua `RuntimeError`.
 fn queue_lua_ui_send(session: &ApiSession, converted: &[Object]) -> mlua::Result<()> {
     queue_ui_send(session, converted)
         .map(|_| ())
@@ -5467,8 +5516,9 @@ fn with_scoped_editor_api<T>(
                 continue;
             } else if metadata.name == "nvim_ui_send" {
                 // The frozen handler drops the payload; this binding queues
-                // it for the server's redraw pass and keeps the level-15
-                // result.
+                // it for the server's redraw pass. A well-formed call keeps
+                // the level-15 success even with no eligible UI; a malformed
+                // one fails with the generated dispatcher's validation error.
                 api.set(
                     metadata.name,
                     shim.call::<Function>(scope.create_function_mut(
@@ -7044,10 +7094,7 @@ mod tests {
             .dispatch(
                 tty,
                 &OxStr::from("nvim_ui_send"),
-                &[
-                    Object::Integer(0),
-                    Object::String(OxStr::from(payload)),
-                ],
+                &[Object::String(OxStr::from(payload))],
             )
             .unwrap();
         assert_eq!(
@@ -7076,12 +7123,10 @@ mod tests {
         let call = |content: &str| {
             Object::Array(vec![
                 Object::String(OxStr::from("nvim_ui_send")),
-                Object::Array(vec![
-                    Object::Integer(0),
-                    Object::String(OxStr::from(content)),
-                ]),
+                Object::Array(vec![Object::String(OxStr::from(content))]),
             ])
         };
+
         // Two payloads queued in one turn must share one redraw batch, and a
         // later send must not be lost to the channel's next `begin()`
         // discarding the open batch.
@@ -7101,10 +7146,7 @@ mod tests {
             .dispatch(
                 tty,
                 &OxStr::from("nvim_ui_send"),
-                &[
-                    Object::Integer(0),
-                    Object::String(OxStr::from("third")),
-                ],
+                &[Object::String(OxStr::from("third"))],
             )
             .unwrap();
         assert!(
@@ -7153,10 +7195,7 @@ mod tests {
             .dispatch(
                 ChannelId::new(0x4244),
                 &OxStr::from("nvim_ui_send"),
-                &[
-                    Object::Integer(0),
-                    Object::String(OxStr::from("\x1b]52;c;AAAA")),
-                ],
+                &[Object::String(OxStr::from("\x1b]52;c;AAAA"))],
             )
             .unwrap();
         assert_eq!(result, Object::Nil);
@@ -7166,6 +7205,212 @@ mod tests {
         );
     }
 
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture and the dispatches must succeed"
+    )]
+    fn nvim_echo_atomic_batch_carries_identity() {
+        // An `nvim_call_atomic` item must reach the same interception as a
+        // standalone call: the raw registry path left the message's identity
+        // nil, so the next same-id echo appended instead of replacing.
+        let cli = Cli::default();
+        let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
+        let atomic_echo = |text: &str| {
+            Object::Array(vec![
+                Object::String(OxStr::from("nvim_echo")),
+                Object::Array(vec![
+                    echo_chunks(text),
+                    Object::Boolean(true),
+                    Object::Dict(Dict(vec![(
+                        OxStr::from("id"),
+                        Object::String(OxStr::from("my.msg")),
+                    )])),
+                ]),
+            ])
+        };
+        state
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_call_atomic"),
+                &[Object::Array(vec![atomic_echo("first"), atomic_echo("second")])],
+            )
+            .unwrap();
+        state
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_echo"),
+                &[
+                    echo_chunks("third"),
+                    Object::Boolean(true),
+                    Object::Dict(Dict(vec![(
+                        OxStr::from("id"),
+                        Object::String(OxStr::from("my.msg")),
+                    )])),
+                ],
+            )
+            .unwrap();
+        state.session.with_editor(|editor| {
+            assert_eq!(
+                editor.messages().len(),
+                1,
+                "atomic echoes must carry identity so same-id calls replace in place"
+            );
+            assert_eq!(editor.messages()[0].content, echo_chunks("third"));
+            assert_eq!(
+                editor.message_identities()[0].id,
+                Object::String(OxStr::from("my.msg"))
+            );
+        });
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the startup fixture must succeed"
+    )]
+    fn ui_send_malformed_shapes_fail_like_the_generated_dispatcher() {
+        let cli = Cli::default();
+        let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
+        // `channel_id` is an implicit API parameter, not part of the wire
+        // signature, so the legacy two-argument shape is an arity error.
+        let error = state
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_ui_send"),
+                &[Object::Integer(0), Object::String(OxStr::from("payload"))],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ApiError::exception("Wrong number of arguments: expecting 1 but got 2")
+        );
+        let error = state
+            .dispatch(CHAN_STDIO, &OxStr::from("nvim_ui_send"), &[Object::Integer(7)])
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ApiError::exception(
+                "Wrong type for argument 1 when calling nvim_ui_send, expecting String"
+            )
+        );
+        let error = state
+            .dispatch(CHAN_STDIO, &OxStr::from("nvim_ui_send"), &[])
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ApiError::exception("Wrong number of arguments: expecting 1 but got 0")
+        );
+        let error = state
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_ui_send"),
+                &[
+                    Object::Integer(7),
+                    Object::String(OxStr::from("x")),
+                    Object::Integer(9),
+                ],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ApiError::exception("Wrong number of arguments: expecting 1 but got 3")
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the startup fixture must succeed"
+    )]
+    fn ui_send_malformed_in_call_atomic_reports_the_error() {
+        let cli = Cli::default();
+        let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
+        let atomic = |args: Vec<Object>| {
+            Object::Array(vec![
+                Object::String(OxStr::from("nvim_ui_send")),
+                Object::Array(args),
+            ])
+        };
+        // A failed item aborts the batch as `[results, [index, type, text]]`,
+        // carrying the same text the generated dispatcher produces.
+        let (result, frames) = state
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_call_atomic"),
+                &[Object::Array(vec![
+                    atomic(vec![Object::Integer(0), Object::String(OxStr::from("x"))]),
+                    atomic(vec![Object::String(OxStr::from("never reached"))]),
+                ])],
+            )
+            .unwrap();
+        let Object::Array(items) = &result else {
+            panic!("nvim_call_atomic returns [results, error]");
+        };
+        let [Object::Array(partial), Object::Array(report)] = items.as_slice() else {
+            panic!("nvim_call_atomic returns [results, error]");
+        };
+        assert!(partial.is_empty(), "the failed item contributes no result");
+        assert_eq!(report[0], Object::Integer(0), "the failing item index");
+        let Object::String(message) = &report[2] else {
+            panic!("the report carries the error text");
+        };
+        assert_eq!(
+            message.as_bytes(),
+            b"Wrong number of arguments: expecting 1 but got 2"
+        );
+        assert!(
+            frames.is_empty(),
+            "the rejected payload must not reach any UI"
+        );
+        let (result, _) = state
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_call_atomic"),
+                &[Object::Array(vec![atomic(vec![Object::Integer(7)])])],
+            )
+            .unwrap();
+        let Object::Array(items) = &result else {
+            panic!("nvim_call_atomic returns [results, error]");
+        };
+        let Object::Array(report) = &items[1] else {
+            panic!("nvim_call_atomic returns [results, error]");
+        };
+        let Object::String(message) = &report[2] else {
+            panic!("the report carries the error text");
+        };
+        assert_eq!(
+            message.as_bytes(),
+            b"Wrong type for argument 1 when calling nvim_ui_send, expecting String"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the startup fixture must succeed"
+    )]
+    fn ui_send_malformed_lua_reports_the_validation_error() {
+        let cli = Cli::default();
+        let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
+        let error = state
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_exec_lua"),
+                &[
+                    Object::String(OxStr::from(r#"vim.api.nvim_ui_send(42)"#)),
+                    Object::Array(Vec::new()),
+                ],
+            )
+            .unwrap_err();
+        assert!(
+            error.message().contains(
+                "Wrong type for argument 1 when calling nvim_ui_send, expecting String",
+            ),
+            "Lua must surface the generated dispatcher's error, got {}",
+            error.message()
+        );
+    }
     #[test]
     #[expect(
         clippy::unwrap_used,
@@ -7365,6 +7610,11 @@ mod tests {
                 ),
             ]
         };
+        let mut first_opts = base();
+        first_opts.push((
+            OxStr::from("status"),
+            Object::String(OxStr::from("running")),
+        ));
         let (first, _) = state
             .dispatch(
                 CHAN_STDIO,
@@ -7372,7 +7622,7 @@ mod tests {
                 &[
                     echo_chunks("checking a"),
                     Object::Boolean(false),
-                    Object::Dict(Dict(base())),
+                    Object::Dict(Dict(first_opts)),
                 ],
             )
             .unwrap();
@@ -7431,7 +7681,7 @@ mod tests {
                 function! ReenterProgress() abort
                   if g:progress_reentered == 0
                     let g:progress_reentered = 1
-                    call nvim_echo([['nested']], v:false, {'kind': 'progress', 'id': 'outer'})
+                    call nvim_echo([['nested']], v:false, {'kind': 'progress', 'source': 'test', 'status': 'running', 'id': 'outer'})
                   endif
                 endfunction
                 augroup oxvim_echo_reentry
@@ -7443,8 +7693,11 @@ mod tests {
             .unwrap();
         let opts = Object::Dict(Dict(vec![
             (OxStr::from("kind"), Object::String(OxStr::from("progress"))),
+            (OxStr::from("source"), Object::String(OxStr::from("test"))),
+            (OxStr::from("status"), Object::String(OxStr::from("running"))),
             (OxStr::from("id"), Object::String(OxStr::from("outer"))),
         ]));
+
         state
             .dispatch(
                 CHAN_STDIO,
@@ -7500,7 +7753,8 @@ mod tests {
                 function! ReenterProgress() abort
                   if g:progress_reentered == 0
                     let g:progress_reentered = 1
-                    call nvim_echo([['nested']], v:false, {'kind': 'progress'})
+                    call nvim_echo([['nested']], v:false, {'kind': 'progress', 'source': 'test', 'status': 'running'})
+
                   endif
                 endfunction
                 augroup oxvim_echo_generated_reentry
@@ -7512,8 +7766,11 @@ mod tests {
             .unwrap();
         let outer_opts = Object::Dict(Dict(vec![
             (OxStr::from("kind"), Object::String(OxStr::from("progress"))),
+            (OxStr::from("source"), Object::String(OxStr::from("test"))),
+            (OxStr::from("status"), Object::String(OxStr::from("running"))),
             (OxStr::from("id"), Object::String(OxStr::from("outer"))),
         ]));
+
         state
             .dispatch(
                 CHAN_STDIO,
@@ -7545,6 +7802,8 @@ mod tests {
                     Object::Boolean(false),
                     Object::Dict(Dict(vec![
                         (OxStr::from("kind"), Object::String(OxStr::from("progress"))),
+                        (OxStr::from("source"), Object::String(OxStr::from("test"))),
+                        (OxStr::from("status"), Object::String(OxStr::from("running"))),
                         (OxStr::from("id"), Object::Integer(nested_id)),
                     ])),
                 ],
@@ -7583,6 +7842,11 @@ mod tests {
                 ),
             ]
         };
+        let mut first_opts = base();
+        first_opts.push((
+            OxStr::from("status"),
+            Object::String(OxStr::from("running")),
+        ));
         let (first, _) = state
             .dispatch(
                 CHAN_STDIO,
@@ -7590,7 +7854,7 @@ mod tests {
                 &[
                     echo_chunks("checking a"),
                     Object::Boolean(false),
-                    Object::Dict(Dict(base())),
+                    Object::Dict(Dict(first_opts)),
                 ],
             )
             .unwrap();
