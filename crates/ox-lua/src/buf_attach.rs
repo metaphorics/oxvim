@@ -31,6 +31,7 @@ use ox_rpc::Message;
 use ox_types::{BufHandle, Object, OxStr};
 
 use crate::converter::{free_lua_ref, object_to_lua};
+use crate::vim::ApiDispatchContext;
 
 /// One subscription's Lua registry reference plus the identity that owns it.
 ///
@@ -142,6 +143,7 @@ fn detach_callback_ref(subscription: &BufferAttachSubscription) -> Option<i32> {
 /// true for wiped buffers, whose handles are carried by the release record.
 fn invoke_detach_callbacks(
     lua: &Lua,
+    context: &ApiDispatchContext,
     releases: &[BufferSubscriptionRelease],
 ) -> Result<(), String> {
     let mut first_error = None;
@@ -156,7 +158,7 @@ fn invoke_detach_callbacks(
             ),
             Value::Integer(i64::from(release.buffer)),
         ];
-        if let Err(error) = invoke_callback(lua, reference, args) {
+        if let Err(error) = invoke_callback(lua, context, reference, args) {
             first_error.get_or_insert(error);
         }
     }
@@ -317,14 +319,21 @@ pub fn pending_buffer_bytes(session: &ApiSession) -> usize {
     })
 }
 
-/// Calls one stored Lua callback with integer arguments and returns its value
-/// so the caller can decide whether the truthy return detaches.
-fn invoke_callback(lua: &Lua, reference: i32, args: Vec<Value>) -> Result<Value, String> {
+/// Calls one stored Lua callback with integer arguments under the active
+/// dispatch context's textlock and returns its value so the caller can decide
+/// whether the truthy return detaches.
+fn invoke_callback(
+    lua: &Lua,
+    context: &ApiDispatchContext,
+    reference: i32,
+    args: Vec<Value>,
+) -> Result<Value, String> {
     let value =
         object_to_lua(lua, &Object::LuaRef(reference)).map_err(|error| error.to_string())?;
     let Value::Function(function) = value else {
         return Err("buffer callback reference is not a function".to_owned());
     };
+    let _textlock_guard = context.enter_textlock();
     function
         .call::<Value>(Variadic::from_iter(args))
         .map_err(|error| error.to_string())
@@ -604,8 +613,15 @@ fn is_truthy(value: Value) -> bool {
 /// # Errors
 ///
 /// Returns the first listener, transport, or argument-shaping failure as a
-/// string.
+/// string, or an error when no API dispatch context is registered for the Lua
+/// host.
 pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), String> {
+    let context = lua
+        .app_data_ref::<ApiDispatchContext>()
+        .map(|context| context.clone())
+        .ok_or_else(|| {
+            "buffer callback drain ran without a registered API dispatch context".to_owned()
+        })?;
     let mut first_error: Option<String> = None;
     let mut detached: HashSet<u128> = HashSet::new();
     let mut channel_dispatch: Option<DispatchFn> = None;
@@ -614,7 +630,7 @@ pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), Str
         if batch.deliveries.is_empty() && batch.released.is_empty() {
             break;
         }
-        if let Err(error) = invoke_detach_callbacks(lua, &batch.released) {
+        if let Err(error) = invoke_detach_callbacks(lua, &context, &batch.released) {
             first_error.get_or_insert(error);
         }
         if let Err(error) = release_removed_subscriptions(lua, &batch.released) {
@@ -722,7 +738,7 @@ pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), Str
                             continue;
                         }
                     };
-                    match invoke_callback(lua, callback.reference, args) {
+                    match invoke_callback(lua, &context, callback.reference, args) {
                         Ok(value) => {
                             if is_truthy(value) {
                                 detached.insert(callback.id);
@@ -766,7 +782,7 @@ pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), Str
                             detached.insert(callback.id);
                             continue;
                         }
-                        match invoke_callback(lua, callback.reference, args.clone()) {
+                        match invoke_callback(lua, &context, callback.reference, args.clone()) {
                             Ok(value) => {
                                 if is_truthy(value) {
                                     detached.insert(callback.id);
@@ -808,7 +824,7 @@ pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), Str
                             continue;
                         }
                     };
-                    match invoke_callback(lua, callback.reference, args) {
+                    match invoke_callback(lua, &context, callback.reference, args) {
                         Ok(value) => {
                             if is_truthy(value) {
                                 detached.insert(callback.id);
@@ -841,7 +857,7 @@ pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), Str
                                 continue;
                             };
                             if let Err(error) =
-                                invoke_detach_callbacks(lua, std::slice::from_ref(&release))
+                                invoke_detach_callbacks(lua, &context, std::slice::from_ref(&release))
                             {
                                 first_error.get_or_insert(error);
                             }
@@ -876,7 +892,7 @@ pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), Str
                             // `on_reload` is a notification, not a detachable
                             // update callback: upstream keeps this subscription
                             // regardless of the callback's return value.
-                            match invoke_callback(lua, callback.reference, args) {
+                            match invoke_callback(lua, &context, callback.reference, args) {
                                 Ok(_) => {}
                                 Err(error) => {
                                     first_error.get_or_insert(error);
@@ -988,6 +1004,18 @@ mod tests {
             })
             .collect()
     }
+    /// Low-level callback fixtures do not bind `vim.api`; provide the
+    /// mandatory dispatch context without coupling their editor fixture to
+    /// the API-binding integration setup.
+    fn drain_test_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), String> {
+        if lua.app_data_ref::<ApiDispatchContext>().is_some() {
+            return drain_buffer_callbacks(lua, session);
+        }
+        let context_session =
+            Rc::new(ApiSession::new(Rc::new(RefCell::new(Editor::new()))));
+        lua.set_app_data(ApiDispatchContext::new(context_session));
+        drain_buffer_callbacks(lua, session)
+    }
 
     /// `nvim_buf_attach` with `on_bytes` delivers one twelve-argument call
     /// per committed splice, in commit order.
@@ -1020,7 +1048,7 @@ mod tests {
 
         let session = ApiSession::new(Rc::new(RefCell::new(editor)));
         assert_eq!(pending_buffer_bytes(&session), 2);
-        drain_buffer_callbacks(&lua, &session).unwrap();
+        drain_test_callbacks(&lua, &session).unwrap();
         assert_eq!(pending_buffer_bytes(&session), 0);
 
         let calls = calls.borrow();
@@ -1120,7 +1148,7 @@ mod tests {
 
         let session = ApiSession::new(Rc::new(RefCell::new(editor)));
         assert_eq!(pending_buffer_bytes(&session), 1);
-        drain_buffer_callbacks(&lua, &session).unwrap();
+        drain_test_callbacks(&lua, &session).unwrap();
         assert_eq!(pending_buffer_bytes(&session), 0);
 
         {
@@ -1147,7 +1175,7 @@ mod tests {
                 .replace_lines(1, 1, &[b"after".to_vec()], cursor, cursor, 0)
                 .unwrap();
         });
-        drain_buffer_callbacks(&lua, &session).unwrap();
+        drain_test_callbacks(&lua, &session).unwrap();
         assert_eq!(reload_calls.borrow().len(), 1);
         assert_eq!(line_calls.borrow().len(), 1);
         assert_eq!(byte_calls.borrow().len(), 1);
@@ -1213,7 +1241,7 @@ mod tests {
         state.load(replacement);
 
         let session = ApiSession::new(Rc::new(RefCell::new(editor)));
-        drain_buffer_callbacks(&lua, &session).unwrap();
+        drain_test_callbacks(&lua, &session).unwrap();
         {
             let detach_calls = detach_calls.borrow();
             assert_eq!(detach_calls.len(), 1);
@@ -1237,7 +1265,7 @@ mod tests {
                 .replace_lines(1, 1, &[b"after".to_vec()], cursor, cursor, 0)
                 .unwrap();
         });
-        drain_buffer_callbacks(&lua, &session).unwrap();
+        drain_test_callbacks(&lua, &session).unwrap();
         assert!(byte_calls.borrow().is_empty());
     }
 
@@ -1311,7 +1339,7 @@ mod tests {
             .unwrap();
 
         let session = ApiSession::new(Rc::new(RefCell::new(editor)));
-        drain_buffer_callbacks(&lua, &session).unwrap();
+        drain_test_callbacks(&lua, &session).unwrap();
 
         assert_eq!(calls_a.borrow().len(), 1);
         assert_eq!(calls_b.borrow().len(), 1);
@@ -1404,7 +1432,7 @@ mod tests {
             .unwrap();
 
         let session = ApiSession::new(Rc::new(RefCell::new(editor)));
-        drain_buffer_callbacks(&lua, &session).unwrap();
+        drain_test_callbacks(&lua, &session).unwrap();
 
         assert_eq!(calls_a.borrow().len(), 2);
         assert_eq!(calls_b.borrow().len(), 1);
@@ -1476,7 +1504,7 @@ mod tests {
             .unwrap();
 
         let session = ApiSession::new(Rc::new(RefCell::new(editor)));
-        drain_buffer_callbacks(&lua, &session).unwrap();
+        drain_test_callbacks(&lua, &session).unwrap();
 
         assert_eq!(*calls_a.borrow(), 1);
         assert_eq!(*calls_b.borrow(), 2);
@@ -1487,7 +1515,7 @@ mod tests {
                 .unwrap()
                 .remove_subscriptions_by_channel(0);
         });
-        drain_buffer_callbacks(&lua, &session).unwrap();
+        drain_test_callbacks(&lua, &session).unwrap();
         assert_eq!(live_lua_ref_count(&lua), baseline);
     }
 
@@ -1526,7 +1554,7 @@ mod tests {
                     .unwrap()
                     .remove_subscriptions_by_channel(0);
             });
-            drain_buffer_callbacks(&lua, &session).unwrap();
+            drain_test_callbacks(&lua, &session).unwrap();
             assert_eq!(live_lua_ref_count(&lua), baseline);
         }
     }
@@ -1563,7 +1591,7 @@ mod tests {
         });
 
         assert_eq!(live_lua_ref_count(&lua), baseline + 1);
-        drain_buffer_callbacks(&lua, &session).unwrap();
+        drain_test_callbacks(&lua, &session).unwrap();
         assert_eq!(live_lua_ref_count(&lua), baseline);
     }
 
@@ -1610,7 +1638,7 @@ mod tests {
         });
 
         assert_eq!(live_lua_ref_count(&lua), baseline + 2);
-        drain_buffer_callbacks(&lua, &session).unwrap();
+        drain_test_callbacks(&lua, &session).unwrap();
 
         assert_eq!(live_lua_ref_count(&lua), baseline);
     }
@@ -1695,7 +1723,7 @@ mod tests {
             .unwrap();
 
         let session = ApiSession::new(Rc::new(RefCell::new(editor)));
-        drain_buffer_callbacks(&lua, &session).unwrap();
+        drain_test_callbacks(&lua, &session).unwrap();
         assert_eq!(*order.borrow(), vec!["lines", "bytes"]);
 
         let line = &line_calls.borrow()[0];
@@ -1778,7 +1806,7 @@ mod tests {
                     },
                 );
         });
-        drain_buffer_callbacks(&Lua::new(), &session).unwrap();
+        drain_test_callbacks(&Lua::new(), &session).unwrap();
         assert_eq!(writes.borrow().len(), 1);
         assert_eq!(writes.borrow()[0].0, 7);
         let Message::Notification { method, params } =
@@ -1813,7 +1841,7 @@ mod tests {
                     },
                 );
         });
-        drain_buffer_callbacks(&Lua::new(), &session).unwrap();
+        drain_test_callbacks(&Lua::new(), &session).unwrap();
         assert_eq!(writes.borrow().len(), 2);
         assert_eq!(writes.borrow()[1].0, 8);
         let Message::Notification { method, params } =
@@ -1838,7 +1866,7 @@ mod tests {
                 )
                 .unwrap();
         });
-        drain_buffer_callbacks(&Lua::new(), &session).unwrap();
+        drain_test_callbacks(&Lua::new(), &session).unwrap();
         assert_eq!(writes.borrow().len(), 4);
         for (index, channel) in [7, 8].into_iter().enumerate() {
             let (written_channel, bytes) = &writes.borrow()[index + 2];
@@ -1890,14 +1918,14 @@ mod tests {
                     },
                 );
         });
-        drain_buffer_callbacks(&Lua::new(), &session).unwrap();
+        drain_test_callbacks(&Lua::new(), &session).unwrap();
         assert_eq!(writes.borrow().len(), 1);
         session.with_editor_mut(|editor| {
             let state = editor.buffer_mut(buffer).unwrap();
             let replacement = state.text().unwrap().clone();
             state.load(replacement);
         });
-        drain_buffer_callbacks(&Lua::new(), &session).unwrap();
+        drain_test_callbacks(&Lua::new(), &session).unwrap();
 
         assert_eq!(writes.borrow().len(), 2);
         assert_eq!(writes.borrow()[1].0, 17);
@@ -1922,7 +1950,7 @@ mod tests {
                 .replace_lines(1, 1, &[b"after".to_vec()], cursor, cursor, 0)
                 .unwrap();
         });
-        drain_buffer_callbacks(&Lua::new(), &session).unwrap();
+        drain_test_callbacks(&Lua::new(), &session).unwrap();
         assert_eq!(writes.borrow().len(), 2);
     }
 }

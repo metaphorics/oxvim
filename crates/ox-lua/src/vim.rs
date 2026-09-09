@@ -569,6 +569,10 @@ pub fn bind_api(
 ) -> mlua::Result<()> {
     let vim: Table = lua.globals().get("vim")?;
     let api: Table = vim.get("api")?;
+    // Turn-boundary drains do not enter through a generated API closure, so
+    // register the same context they need to lock callback reentry. Cloning
+    // the context clones its `Rc<Cell<u32>>`, not a snapshot of the depth.
+    lua.set_app_data(context.clone());
     let wrap_api: Function = lua
         .load(
             "local function pack(...) return { n = select('#', ...), ... } end \
