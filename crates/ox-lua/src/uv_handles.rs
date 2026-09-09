@@ -1264,6 +1264,11 @@ type FsQueueItem = Result<(String, bool, bool), String>;
 struct FsEventRoute {
     queue: Arc<Mutex<VecDeque<FsQueueItem>>>,
     callback: Function,
+    /// The owning handle's phase cell. The drain rechecks it before every
+    /// delivery so a callback that stopped or closed its own handle
+    /// silences the rest of the batch even on the skipped-removal path
+    /// where the route entry outlives the teardown.
+    phase: Rc<Cell<FsEventPhase>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1281,6 +1286,9 @@ struct LuaFsEvent {
     next_id: Rc<Cell<u64>>,
     phase: Rc<Cell<FsEventPhase>>,
     wake: ox_uv::AsyncSender,
+    /// Last successfully started path, kept across `stop` like luv keeps
+    /// it, so `getpath` answers on a restartable handle too.
+    path: RefCell<Option<String>>,
 }
 
 impl LuaFsEvent {
@@ -1344,8 +1352,12 @@ impl LuaFsEvent {
             FsEventRoute {
                 queue: queue.clone(),
                 callback,
+                phase: self.phase.clone(),
             },
         );
+        // The path is committed with the route: every failure return sits
+        // above this point, so `getpath` never reports a start that refused.
+        *self.path.borrow_mut() = Some(path.clone());
         self.phase.set(FsEventPhase::Pending(id));
         let state = self.state.clone();
         let access = self.access.clone();
@@ -1432,6 +1444,26 @@ impl LuaFsEvent {
         0
     }
 
+    /// luv's `fs_event:getpath()`: the monitored path on success, luv's
+    /// `nil, err, name` fail shape for a handle that never started, and the
+    /// method form's exact "fs event is closed" refusal for a closed one —
+    /// the same string `start` raises there.
+    fn getpath(&self, lua: &Lua) -> mlua::Result<MultiValue> {
+        if self.phase.get() == FsEventPhase::Closed {
+            return Err(mlua::Error::runtime("fs event is closed"));
+        }
+        let Some(path) = self.path.borrow().clone() else {
+            return Ok(MultiValue::from_vec(vec![
+                Value::Nil,
+                Value::String(lua.create_string("EINVAL: fs event is not started")?),
+                Value::String(lua.create_string("EINVAL")?),
+            ]));
+        };
+        Ok(MultiValue::from_vec(vec![Value::String(
+            lua.create_string(path)?,
+        )]))
+    }
+
 }
 impl Drop for LuaFsEvent {
     fn drop(&mut self) {
@@ -1448,6 +1480,7 @@ impl UserData for LuaFsEvent {
             },
         );
         methods.add_method("stop", |_, this, ()| Ok(this.stop_watching()));
+        methods.add_method("getpath", |lua, this, ()| this.getpath(lua));
         methods.add_method("is_closing", |_, this, ()| {
             Ok(this.phase.get() == FsEventPhase::Closed)
         });
@@ -1480,7 +1513,33 @@ fn install_fs_event(
                 next_id: event_next.clone(),
                 phase: Rc::new(Cell::new(FsEventPhase::Idle)),
                 wake: event_wake.clone(),
+                path: RefCell::new(None),
             })
+        })?,
+    )?;
+    // The module forms luv documents beside `new_fs_event`. Each delegates
+    // to the one implementation the method form uses, so lifecycle refusals
+    // keep their exact strings on both surfaces.
+    uv.set(
+        "fs_event_start",
+        lua.create_function(
+            |lua, (handle, path, flags, callback): (AnyUserData, String, Table, Function)| {
+                handle
+                    .borrow::<LuaFsEvent>()?
+                    .start(lua, path, &flags, callback)
+            },
+        )?,
+    )?;
+    uv.set(
+        "fs_event_stop",
+        lua.create_function(|_, handle: AnyUserData| {
+            Ok(handle.borrow::<LuaFsEvent>()?.stop_watching())
+        })?,
+    )?;
+    uv.set(
+        "fs_event_getpath",
+        lua.create_function(|lua, handle: AnyUserData| {
+            handle.borrow::<LuaFsEvent>()?.getpath(lua)
         })?,
     )?;
     Ok(())
@@ -1648,20 +1707,36 @@ pub(crate) fn install(
         // records are collected first (no borrow is held across the Lua
         // call, keeping reentrant `stop`/`close` panic-free) and then
         // delivered with the same traceback reporting as exits.
-        let ready: Vec<(Function, Vec<FsQueueItem>)> = fs_drain_routes
+        let ready: Vec<(u64, Vec<FsQueueItem>)> = fs_drain_routes
             .borrow()
-            .values()
-            .map(|route| {
+            .iter()
+            .map(|(id, route)| {
                 let items = route
                     .queue
                     .lock()
                     .map(|mut pending| Vec::from(std::mem::take(&mut *pending)))
                     .unwrap_or_default();
-                (route.callback.clone(), items)
+                (*id, items)
             })
             .collect();
-        for (callback, items) in ready {
+        for (id, items) in ready {
             for event in items {
+                let Some((callback, phase)) = fs_drain_routes
+                    .borrow()
+                    .get(&id)
+                    .map(|route| (route.callback.clone(), route.phase.clone()))
+                else {
+                    break;
+                };
+                if phase.get() != FsEventPhase::Active(id) {
+                    break;
+                }
+                // A callback is user code that can stop or close its own
+                // handle, so every delivery rechecks the live route state
+                // instead of trusting the snapshot above. `teardown` lands
+                // the phase transition even when it must skip the route
+                // removal, so both checks must pass; neither borrow
+                // survives into the callback.
                 let mut args = MultiValue::new();
                 match event {
                     Ok((filename, change, rename)) => {
@@ -2416,7 +2491,9 @@ mod loop_access_tests {
     reason = "the lifecycle tests construct a host, drive Lua, and panic on assertion failure"
 )]
 mod fs_event_lifecycle_tests {
+    use super::LuaFsEvent;
     use crate::{BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work};
+    use mlua::AnyUserData;
     use ox_types::{OxStr, Typval};
     use std::cell::RefCell;
     use std::collections::VecDeque;
@@ -2677,5 +2754,102 @@ mod fs_event_lifecycle_tests {
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755))
             .expect("unseal directory");
         result.unwrap();
+    }
+
+    /// P1: luv's module forms route through the same backend as the method
+    /// form, so lifecycle refusals keep their exact strings, and `getpath`
+    /// answers on both surfaces. `stop` keeps the monitored path, like luv.
+    #[test]
+    fn fs_event_module_forms_share_backend_with_method_form() {
+        with_watch_dir(
+            "module-forms",
+            r"
+            local handle = assert(vim.uv.new_fs_event())
+            local ok, err = vim.uv.fs_event_getpath(handle)
+            assert(ok == nil and err:find('EINVAL', 1, true), tostring(err))
+
+            assert(vim.uv.fs_event_start(handle, TEST_DIR, {}, function() end) == 0)
+            assert(vim.uv.fs_event_getpath(handle) == TEST_DIR)
+            assert(select('#', handle:getpath()) == 1)
+            assert(handle:getpath() == TEST_DIR)
+            assert(vim.uv.fs_event_stop(handle) == 0)
+            assert(handle:getpath() == TEST_DIR)
+
+            assert(vim.uv.fs_event_start(handle, TEST_DIR, {}, function() end) == 0)
+            local started_ok, started_err =
+              pcall(vim.uv.fs_event_start, handle, TEST_DIR, {}, function() end)
+            assert(not started_ok, 'module-form start on a started handle must refuse')
+            assert(tostring(started_err):find('already started', 1, true), started_err)
+
+            handle:close()
+            local closed_ok, closed_err =
+              pcall(vim.uv.fs_event_start, handle, TEST_DIR, {}, function() end)
+            assert(not closed_ok, 'module-form start on a closed handle must refuse')
+            assert(tostring(closed_err):find('fs event is closed', 1, true), closed_err)
+            local path_ok, path_err = pcall(vim.uv.fs_event_getpath, handle)
+            assert(not path_ok, 'getpath on a closed handle must refuse')
+            assert(tostring(path_err):find('fs event is closed', 1, true), path_err)
+            vim.uv.run('nowait')
+            ",
+        );
+    }
+
+    /// P2: a callback is user code that can stop its own handle, so the
+    /// drain must recheck the route and phase before every delivery. The
+    /// two records are seeded into the live route queue from the test side,
+    /// so the drain snapshot holds them as one batch by construction
+    /// instead of by watcher-thread timing.
+    #[test]
+    fn fs_event_stop_in_callback_silences_rest_of_batch() {
+        let dir = TempWatchDir::new("stop-mid-batch");
+        let host = host();
+        host.lua()
+            .globals()
+            .set("TEST_DIR", dir.path.to_string_lossy().as_ref())
+            .unwrap();
+        host.lua()
+            .load(
+                r"
+                handle = assert(vim.uv.new_fs_event())
+                delivered = {}
+                assert(handle:start(TEST_DIR, {}, function(_, filename)
+                  delivered[#delivered + 1] = filename
+                  handle:stop()
+                end) == 0)
+                -- Land the deferred backend start so the route phase is Active.
+                vim.uv.run('nowait')
+                ",
+            )
+            .exec()
+            .unwrap();
+        let handle = host
+            .lua()
+            .globals()
+            .get::<AnyUserData>("handle")
+            .expect("handle global");
+        {
+            let watcher = handle.borrow::<LuaFsEvent>().expect("fs event userdata");
+            let routes = watcher.routes.borrow_mut();
+            assert_eq!(routes.len(), 1, "the started handle owns one route");
+            for route in routes.values() {
+                let mut queue = route.queue.lock().expect("route queue");
+                queue.push_back(Ok(("a.txt".into(), false, true)));
+                queue.push_back(Ok(("b.txt".into(), true, false)));
+            }
+        }
+        host.lua()
+            .load(
+                r"
+                vim.uv.run('nowait')
+                assert(#delivered >= 1, 'the first event must reach its callback')
+                assert(#delivered == 1,
+                  'events after the callback stopped the handle must never enter plugin code')
+                assert(delivered[1] == 'a.txt', tostring(delivered[1]))
+                assert(not handle:is_closing(), 'stop leaves the handle restartable, not closed')
+                handle:close()
+                ",
+            )
+            .exec()
+            .unwrap();
     }
 }
