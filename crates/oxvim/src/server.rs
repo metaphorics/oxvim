@@ -1547,9 +1547,10 @@ impl AppState {
         } else {
             RedrawOutput(BTreeMap::new(), Vec::new())
         };
-        if plan.flush_ui {
-            self.drain_ui_sends(&mut frames)?;
-        }
+        // `nvim_ui_send` is server-owned plumbing, not part of the screen
+        // redraw decision: a caller may suppress `flush_ui` without
+        // suppressing delivery of a payload queued in the same turn.
+        self.drain_ui_sends(&mut frames)?;
         // vim.ui_attach callbacks (upstream ui_add_cb via the event loop):
         // queued at emission, invoked here with no editor or render-state
         // borrow held.
@@ -7868,6 +7869,55 @@ mod tests {
         assert_eq!(
             message.as_bytes(),
             b"Wrong type for argument 1 when calling nvim_ui_send, expecting String"
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the fixture, staged payload, and response must succeed"
+    )]
+    fn ui_send_precedes_reply_when_redraw_flush_is_suppressed() {
+        let state = Rc::new(RefCell::new(ui_send_state()));
+        let channel = ChannelId::new(0x4243);
+        let writes = state
+            .borrow_mut()
+            .process_message(
+                channel,
+                Message::Request {
+                    msgid: 17,
+                    method: OxStr::from("nvim_exec_lua"),
+                    params: vec![
+                        Object::String(OxStr::from(
+                            r#"
+                            vim.api.nvim_ui_send("staged")
+                            vim.api.nvim__redraw{flush = false}
+                            return 17
+                            "#,
+                        )),
+                        Object::Array(Vec::new()),
+                    ],
+                },
+            )
+            .unwrap();
+
+        let payload_index = writes
+            .iter()
+            .position(|(target, bytes)| *target == channel.get() && frame_contains(bytes, "staged"))
+            .unwrap();
+        let response_index = writes
+            .iter()
+            .position(|(target, bytes)| {
+                *target == channel.get()
+                    && matches!(
+                        decode_recorded_server_message(bytes),
+                        Message::Response { msgid: 17, .. }
+                    )
+            })
+            .unwrap();
+        assert!(
+            payload_index < response_index,
+            "ui_send must flush before the request response even with flush=false"
         );
     }
 
