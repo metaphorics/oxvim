@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
 use ox_eval::scope::{OptionScope as EvalOptionScope, ScopeMap};
@@ -41,6 +41,7 @@ use crate::decoration::{CallbackPhase, RedrawEntry};
 use crate::extmark::{
     ExtmarkAttributes, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, NamespaceId, SignGroup,
 };
+use crate::editor::is_nofileread;
 use crate::fold::{FoldMethod, Position as FoldPosition};
 use crate::fs_builtins::split_path_list;
 use crate::lvalue::{
@@ -9326,20 +9327,44 @@ fn command_write_did_cmd<F: FileIO, E: ExEditorAccess>(
 
 /// Whether the write target names the buffer's own file. Both sides expand
 /// to absolute paths first (upstream's `FullName_save` before `path_equal`
-/// with `kPathCmpLiteral`). On Unix both sides compare as bytes, so
-/// relative-versus-absolute spellings match while distinct non-UTF-8
-/// names that collapse to one replacement string never compare equal;
-/// other targets fall back to a lossy rendering, where a collision can
-/// still match. `..` segments are not
-/// cleaned (`Path` equality drops `.` but not `..`), so `a/../b` and `b`
-/// stay distinct where upstream's full expansion matches them.
+/// with `kPathCmpLiteral`). Lexical `.` and `..` components are then
+/// normalized without resolving symlinks. On Unix both sides compare as
+/// bytes, so relative-versus-absolute spellings match while distinct
+/// non-UTF-8 names that collapse to one replacement string never compare
+/// equal; other targets fall back to a lossy rendering, where a collision
+/// can still match.
 fn write_overwrites_buffer(name: &OxStr, target: &Path) -> bool {
-    fn absolute(path: &Path) -> PathBuf {
-        if path.is_absolute() {
+    fn absolute_clean(path: &Path) -> PathBuf {
+        let absolute = if path.is_absolute() {
             path.to_path_buf()
         } else {
             std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+        };
+        let mut components = Vec::new();
+        let mut anchored = false;
+        for component in absolute.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir
+                    if matches!(components.last(), Some(Component::Normal(_))) =>
+                {
+                    components.pop();
+                }
+                Component::ParentDir if !anchored => components.push(component),
+                Component::ParentDir => {}
+                Component::Prefix(_) | Component::RootDir => {
+                    anchored = true;
+                    components.push(component);
+                }
+                component => components.push(component),
+            }
         }
+        components
+            .into_iter()
+            .fold(PathBuf::new(), |mut path, component| {
+                path.push(component.as_os_str());
+                path
+            })
     }
     #[cfg(not(unix))]
     let lossy: String;
@@ -9350,7 +9375,7 @@ fn write_overwrites_buffer(name: &OxStr, target: &Path) -> bool {
         lossy = String::from_utf8_lossy(name.as_bytes());
         lossy.as_ref()
     };
-    absolute(Path::new(stored)) == absolute(target)
+    absolute_clean(Path::new(stored)) == absolute_clean(target)
 }
 
 /// `buf_write` event prelude (`bufwrite.c`): `BufWriteCmd` handlers replace
@@ -11420,11 +11445,130 @@ fn command_wqall<F: FileIO, E: ExEditorAccess>(
     Flow::Quit(0)
 }
 
-/// Fires the leave half of a buffer switch, performs the switch, and fires
-/// the enter half (`set_curbuf`, buffer.c:1735, then `enter_buffer`,
-/// buffer.c:1850-1851). A failing leave handler abandons the switch with the
-/// caller still on the old buffer, matching `set_curbuf`'s `aborting()`
-/// guards, and the switch error keeps E86 for every `:buffer`-family caller.
+enum LoadSwitchError {
+    /// A read lifecycle handler aborted the buffer entry.
+    Flow(Flow),
+    /// The file could not be loaded without changing the unloaded state.
+    Editor(EditorError),
+}
+
+/// Loads an unloaded file-backed buffer before a focus switch.
+///
+/// This is the executor-side counterpart of `call_bufload_with_events`:
+/// `BufReadPre` runs before the second read, and `BufReadPost` runs after the
+/// text is installed. A missing file keeps the new-file path (`BufNewFile`);
+/// unnamed and no-file-read buffers materialize empty text without read
+/// events. A non-`NotFound` read failure preserves the unloaded-buffer
+/// contract instead of attaching fabricated empty text.
+fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<RefCell<dyn LuaExec>>>,
+    buffer: BufHandle,
+) -> Result<bool, LoadSwitchError> {
+    let (loaded, name, nofileread) = access
+        .with_ex_editor(|editor| {
+            let state = editor.buffer(buffer)?;
+            let name = state.name().clone();
+            let nofileread = matches!(
+                editor.options().get_buffer(buffer, "buftype"),
+                Ok(OptionValue::String(buftype)) if is_nofileread(buftype)
+            );
+            Ok((state.residency.is_loaded(), name, nofileread))
+        })
+        .map_err(LoadSwitchError::Editor)?;
+    if loaded {
+        return Ok(false);
+    }
+
+    let Some(path) = (!name.as_bytes().is_empty() && !nofileread)
+        .then(|| PathBuf::from(name.to_string_lossy().as_ref()))
+    else {
+        access
+            .with_ex_editor(|editor| -> Result<(), EditorError> {
+                let state = editor.buffer_mut(buffer)?;
+                state.load(Buffer::new());
+                state.mark_saved();
+                state.flags.set(crate::BufferFlags::NOTEDITED, false);
+                Ok(())
+            })
+            .map_err(LoadSwitchError::Editor)?;
+        return Ok(true);
+    };
+
+    let new_file = match runtime.scripts.io().read_to_string(&path) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => {
+            return Err(LoadSwitchError::Editor(EditorError::Buffer(
+                crate::buffer::BufferStateError::Unloaded,
+            )));
+        }
+    };
+
+    if !new_file {
+        let flow = fire_buffer_lifecycle(
+            runtime,
+            access,
+            scope,
+            lua,
+            &[Event::BufReadPre],
+            buffer,
+        );
+        if !matches!(flow, Flow::Normal) {
+            return Err(LoadSwitchError::Flow(flow));
+        }
+    }
+
+    let content = if new_file {
+        None
+    } else {
+        Some(
+            runtime
+                .scripts
+                .io()
+                .read_to_string(&path)
+                .map_err(|_| {
+                    LoadSwitchError::Editor(EditorError::Buffer(
+                        crate::buffer::BufferStateError::Unloaded,
+                    ))
+                })?,
+        )
+    };
+    let text = match content.as_deref() {
+        Some(content) => Buffer::from_bytes(content.as_bytes())
+            .map_err(|error| LoadSwitchError::Editor(EditorError::Buffer(error.into())))?,
+        None => Buffer::new(),
+    };
+    access
+        .with_ex_editor(|editor| -> Result<(), EditorError> {
+            let state = editor.buffer_mut(buffer)?;
+            state.load(text);
+            state.mark_saved();
+            state.flags.set(crate::BufferFlags::NOTEDITED, false);
+            Ok(())
+        })
+        .map_err(LoadSwitchError::Editor)?;
+
+    let event = if new_file {
+        Event::BufNewFile
+    } else {
+        Event::BufReadPost
+    };
+    let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[event], buffer);
+    if !matches!(flow, Flow::Normal) {
+        return Err(LoadSwitchError::Flow(flow));
+    }
+    Ok(true)
+}
+
+/// Fires the leave half of a buffer switch, performs any unloaded-buffer
+/// reload with its read lifecycle, then fires the enter half.
+///
+/// A failing leave handler abandons the switch with the caller still on the
+/// old buffer, matching `set_curbuf`'s `aborting()` guards, and the switch
+/// error keeps E86 for every `:buffer`-family caller.
 fn switch_current_buffer<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -11457,6 +11601,13 @@ fn switch_current_buffer<F: FileIO, E: ExEditorAccess>(
     // is instead of surfacing an error after handlers ran.
     if !access.with_ex_editor(|editor| editor.buffer(target).is_ok()) {
         return Flow::Normal;
+    }
+    match load_buffer_for_switch(runtime, access, scope, lua, target) {
+        Ok(_) => {}
+        Err(LoadSwitchError::Flow(flow)) => return flow,
+        Err(LoadSwitchError::Editor(error)) => {
+            return error_flow(runtime, "E86", error.to_string());
+        }
     }
     if let Err(error) =
         access.with_ex_editor(|editor| editor.set_current_buffer(target, BufferRelease::KeepLoaded))

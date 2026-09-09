@@ -1981,6 +1981,124 @@ fn autocmd_buffer_switch_fires_bufleave_bufenter_bufwinenter_in_order() {
     );
 }
 
+/// Re-entering an unloaded named buffer routes the read through the callback
+/// path before the normal buffer-enter events (`open_buffer`, fileio.c:428-516).
+#[test]
+fn autocmd_buffer_switch_reloads_unloaded_file_before_enter_events() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("reloaded.txt", "one\ntwo\n");
+    executor.execute_line(&editor, "edit reloaded.txt").unwrap();
+    let target = editor.editor().current_buffer().unwrap();
+    let scratch = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .set_current_buffer(scratch, crate::BufferRelease::KeepLoaded)
+        .unwrap();
+    editor.editor_mut().unload_buffer(target).unwrap();
+
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in ["BufReadPre", "BufReadPost", "BufEnter", "BufWinEnter"] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} * call add(g:order, '{event},')"),
+            )
+            .unwrap();
+    }
+
+    executor
+        .execute_line(&editor, &format!("buffer {}", i64::from(target)))
+        .unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufReadPre,", "BufReadPost,", "BufEnter,", "BufWinEnter,"]
+    );
+    let view = editor.editor();
+    let state = view.buffer(target).unwrap();
+    assert_eq!(state.text().unwrap().line(1).unwrap(), b"one");
+    assert_eq!(state.text().unwrap().line(2).unwrap(), b"two");
+    assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
+}
+
+/// A missing file retains the new-file load semantics while entering through
+/// the switch path: empty, unmodified text and `BufNewFile`, not read events.
+#[test]
+fn autocmd_buffer_switch_missing_file_uses_new_file_semantics() {
+    let (editor, mut executor) = setup();
+    let target = editor.editor_mut().create_buffer(true).unwrap();
+    let name = format!("missing-{}.txt", std::process::id());
+    editor
+        .editor_mut()
+        .buffer_mut(target)
+        .unwrap()
+        .set_name(ox_types::OxStr::from(name.as_str()));
+    editor.editor_mut().unload_buffer(target).unwrap();
+
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    for event in [
+        "BufReadPre",
+        "BufReadPost",
+        "BufNewFile",
+        "BufEnter",
+        "BufWinEnter",
+    ] {
+        executor
+            .execute_line(
+                &editor,
+                &format!("autocmd {event} * call add(g:order, '{event},')"),
+            )
+            .unwrap();
+    }
+
+    executor
+        .execute_line(&editor, &format!("buffer {}", i64::from(target)))
+        .unwrap();
+
+    assert_eq!(
+        order_events(&executor),
+        ["BufNewFile,", "BufEnter,", "BufWinEnter,"]
+    );
+    let view = editor.editor();
+    let state = view.buffer(target).unwrap();
+    assert_eq!(state.text().unwrap().line(1).unwrap(), b"");
+    assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
+}
+
+/// A non-`NotFound` reload failure preserves the cycle-one contract: the
+/// switch reports E86, leaves the target unloaded, and keeps the old buffer.
+#[test]
+fn autocmd_buffer_switch_failed_read_keeps_target_unloaded() {
+    let dir = std::env::temp_dir().join(format!(
+        "oxvim-excmd-unloaded-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (editor, mut executor) = {
+        let mut raw = Editor::new();
+        let scratch = raw.create_buffer(true).unwrap();
+        raw.create_tabpage(scratch, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let target = raw.create_buffer(true).unwrap();
+        raw.buffer_mut(target)
+            .unwrap()
+            .set_name(ox_types::OxStr::from(dir.to_string_lossy().as_ref()));
+        raw.unload_buffer(target).unwrap();
+        (TestEditorAccess::new(raw), ExExecutor::new())
+    };
+    let target = editor.editor().buffers()[1];
+    let scratch = editor.editor().buffers()[0];
+
+    assert_vim_error(
+        executor.execute_line(&editor, &format!("buffer {}", i64::from(target))),
+        "E86",
+    );
+    assert_eq!(editor.editor().current_buffer(), Some(scratch));
+    assert!(editor.editor().buffer(target).unwrap().text().is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// `:bnext` runs the same sequence; a wrapping `:bnext` on the only listed
 /// buffer is upstream's "nothing to do" (`do_buffer`, buffer.c:1657-1659) and
 /// fires nothing, even with unsaved changes, because the same-buffer return
@@ -8708,6 +8826,43 @@ fn wnext_after_silent_fail_does_not_advance() {
         other => panic!("silent-fail :wnext must stay put quietly, got {other:?}"),
     }
     assert_eq!(editor.editor().current_buffer(), Some(buffer));
+}
+
+/// Lexically equivalent parent-directory segments still identify the buffer's
+/// own file, so a handler-owned write keeps the same silent-failure path.
+#[test]
+fn buf_write_cmd_normalizes_parent_segments_for_own_file() {
+    let (editor, mut executor) = setup_with_content(&[b"content".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("owned.txt"));
+    executor
+        .execute_line(&editor, "au BufWriteCmd * let g:cmd_ran = 1")
+        .unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::MODIFIED, true);
+
+    executor
+        .execute_line_core(&editor, "write nested/../owned.txt")
+        .unwrap();
+
+    assert_eq!(executor.scripts().io().content("nested/../owned.txt"), None);
+    assert!(
+        editor
+            .editor()
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::MODIFIED),
+        "the own-file handler must still own the lexically equivalent target",
+    );
 }
 
 /// `NOTEDITED` clears when a handler-owned write overwrites the buffer's
